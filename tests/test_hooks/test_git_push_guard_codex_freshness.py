@@ -677,7 +677,7 @@ class TestStaleSigilDoesNotWaiveScanners:
         )
         rc = _mod.main()
         assert rc == 2  # freshness waived, but the P1 findings gate still blocks
-        assert "unresolved review findings" in capsys.readouterr().err
+        assert "review-body gate did not pass" in capsys.readouterr().err
 
 
 class TestCheckPrRepoArg:
@@ -726,10 +726,10 @@ class TestCheckPrReportFreshnessLabel:
         monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
         monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
         monkeypatch.setattr(
-            _mod, "_check_pr_review_findings", lambda n, repo=None, strict=False: (False, "")
+            _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
         )
         monkeypatch.setattr(
-            _mod, "_check_inline_review_findings", lambda n, repo=None, strict=False: (False, "")
+            _mod, "_check_inline_review_findings", lambda n, repo=None, force=False: (False, "")
         )
         _mod.check_pr_report("5")
         return capsys.readouterr().out
@@ -790,10 +790,10 @@ class TestReportFreshnessUnreadable:
         monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
         monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
         monkeypatch.setattr(
-            _mod, "_check_pr_review_findings", lambda n, repo=None, strict=False: (False, "")
+            _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
         )
         monkeypatch.setattr(
-            _mod, "_check_inline_review_findings", lambda n, repo=None, strict=False: (False, "")
+            _mod, "_check_inline_review_findings", lambda n, repo=None, force=False: (False, "")
         )
         # freshness gate passes (allowed), but the relabel re-reads fail (None)
         monkeypatch.setattr(_mod, "_check_codex_reviewed_head", lambda n, repo=None: (False, "", HEAD))
@@ -936,8 +936,8 @@ class TestCleanCommentFreshness:
         monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
         monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
         monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
-        monkeypatch.setattr(_mod, "_check_pr_review_findings", lambda n, repo=None, strict=False: (False, ""))
-        monkeypatch.setattr(_mod, "_check_inline_review_findings", lambda n, repo=None, strict=False: (False, ""))
+        monkeypatch.setattr(_mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, ""))
+        monkeypatch.setattr(_mod, "_check_inline_review_findings", lambda n, repo=None, force=False: (False, ""))
         _mod.check_pr_report("1")
         out = capsys.readouterr().out
         assert "clean comment at head" in out
