@@ -529,10 +529,11 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   (`review_enforcement_commit.py`) HARD-BLOCKS the commit at `ESCALATION_ROUND_CAP`
   (3) unless the command carries a deliberate trailing `# escalation-ack`. The
   counter implements the "each find NEW defects" clause literally — so when you
-  `mark` a review, record its OUTCOME:
-  - Review surfaced a NEW **BLOCKER / SHOULD-FIX / P1 / P2** finding → mark as usual
-    (`python3 scripts/review_state.py mark --agent-output <path>`) — the round counts.
-  - Review surfaced **no** new BLOCKER/SHOULD-FIX/P1/P2 finding → add `--clean`
+  `mark` a review, you MUST state its OUTCOME (exactly one flag; a bare `mark` is
+  refused so a clean re-audit can't silently inflate the streak — feea3f71):
+  - Review surfaced a NEW **BLOCKER / SHOULD-FIX / P1 / P2** finding → pass `--defects`
+    (`python3 scripts/review_state.py mark --agent-output <path> --defects`) — the round counts.
+  - Review surfaced **no** new BLOCKER/SHOULD-FIX/P1/P2 finding → pass `--clean`
     (`… mark --agent-output <path> --clean`) — this RESETS the streak
     (circuit-breaker reset-on-success), so honestly-clean multi-commit development
     (independent clean reviews of distinct diffs) never trips the cap.
@@ -540,9 +541,10 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   A round is CLEAN iff the review found no BLOCKER/SHOULD-FIX/P1/P2. NOTEs, nitpicks,
   and dispositioned optional-hardening do NOT make a round defect-bearing — without
   this line a nitpick-prone reviewer would make every round "defect-bearing" and the
-  cap collapses back into raw commit-counting. An unflagged mark counts as
-  defect-bearing by default: a forgotten `--clean` gives a slightly early conscious
-  checkpoint (the safe direction), never a silently-disabled cap. The ack is a
+  cap collapses back into raw commit-counting. `mark` requires exactly one of
+  `--defects` / `--clean` and REFUSES a bare mark (writing no marker → the gate still
+  blocks → you re-run stating the outcome): the safe direction, and it makes a
+  forgotten-flag false streak-inflation impossible. The ack is a
   conscious, logged act (like `# review-override`); adding it — or falsely passing
   `--clean` — WITHOUT the honest review result is the same violation as ignoring the
   prose above (the `--clean` flag mirrors the review record you write to

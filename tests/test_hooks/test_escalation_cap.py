@@ -187,15 +187,17 @@ def _run_hook(command: str, repo: Path, home: Path) -> subprocess.CompletedProce
 def _mark(repo: Path, home: Path, *, clean: bool = False) -> subprocess.CompletedProcess:
     (home / ".genesis" / "last_code_review.txt").write_text("adversarial review: OK\n")
     env = {**os.environ, "HOME": str(home)}
+    # `mark` now requires an explicit review OUTCOME (--clean XOR --defects): a
+    # defect-bearing round passes --defects, a clean round --clean. (Before the
+    # required-outcome change a bare `mark` defaulted to defect-bearing.)
     args = [
         sys.executable,
         str(_REVIEW_STATE),
         "mark",
         "--agent-output",
         str(home / ".genesis" / "last_code_review.txt"),
+        "--clean" if clean else "--defects",
     ]
-    if clean:
-        args.append("--clean")
     return subprocess.run(
         args,
         cwd=str(repo),
@@ -204,6 +206,24 @@ def _mark(repo: Path, home: Path, *, clean: bool = False) -> subprocess.Complete
         text=True,
         timeout=30,
     )
+
+
+def _mark_raw(repo: Path, home: Path, *extra: str) -> subprocess.CompletedProcess:
+    """Run the `mark` CLI with an explicit arg list (no outcome flag injected).
+
+    Used to exercise the required-outcome validation itself — neither/both flags.
+    """
+    (home / ".genesis" / "last_code_review.txt").write_text("adversarial review: OK\n")
+    env = {**os.environ, "HOME": str(home)}
+    args = [
+        sys.executable,
+        str(_REVIEW_STATE),
+        "mark",
+        "--agent-output",
+        str(home / ".genesis" / "last_code_review.txt"),
+        *extra,
+    ]
+    return subprocess.run(args, cwd=str(repo), env=env, capture_output=True, text=True, timeout=30)
 
 
 def _reach_rounds(repo: Path, home: Path, n: int) -> None:
@@ -492,3 +512,97 @@ def test_gate_fails_open_on_infinity_round(repo, home):
     rf.write_text('{"branch": "' + branch + '", "round": 1e999, "last_hash": "x"}')
     res = _run_hook('git commit -m "wip"', repo, home)
     assert res.returncode == 0, res.stdout + res.stderr
+
+
+# ── Fix A: `mark` requires an explicit review OUTCOME (--clean XOR --defects) ──
+# feea3f71 — a clean re-audit marked WITHOUT --clean used to silently inflate the
+# streak toward a false mode-switch block. Requiring an explicit outcome makes that
+# impossible while staying fail-closed (a refusal writes NO marker → gate still blocks).
+
+
+def test_mark_requires_explicit_outcome(repo, home):
+    # A `mark` with neither --clean nor --defects is REFUSED: no marker written, the
+    # round counter is not touched, exit 1. (The safe direction — no marker ⇒ the
+    # commit gate blocks until the caller re-runs stating the outcome.)
+    _stage(repo, "a = 2\n")
+    res = _mark_raw(repo, home)  # no outcome flag
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "outcome" in res.stderr.lower()
+    key = review_state._worktree_key(cwd=str(repo))
+    assert not (home / ".genesis" / "review_markers" / f"{key}.json").exists()
+    assert not (home / ".genesis" / "review_rounds" / f"{key}.json").exists()
+
+
+def test_mark_rejects_contradictory_outcome(repo, home):
+    # Passing BOTH --clean and --defects is a contradiction → refused, no marker.
+    _stage(repo, "a = 2\n")
+    res = _mark_raw(repo, home, "--clean", "--defects")
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "both" in res.stderr.lower()
+    key = review_state._worktree_key(cwd=str(repo))
+    assert not (home / ".genesis" / "review_markers" / f"{key}.json").exists()
+
+
+def test_defects_flag_counts_as_round(repo, home):
+    # --defects marks a defect-bearing round: the streak advances to 1 (parity with
+    # the old flagless default), and the marker is written.
+    _stage(repo, "a = 2\n")
+    res = _mark_raw(repo, home, "--defects")
+    assert res.returncode == 0, res.stderr
+    key = review_state._worktree_key(cwd=str(repo))
+    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
+    assert json.loads(rf.read_text())["round"] == 1
+    assert (home / ".genesis" / "review_markers" / f"{key}.json").exists()
+
+
+def test_clean_flag_still_resets_via_cli(repo, home):
+    # --clean remains the streak-reset path through the required-outcome CLI.
+    _reach_rounds(repo, home, 2)  # two --defects rounds
+    _stage(repo, "clean_now = 1\n")
+    res = _mark_raw(repo, home, "--clean")
+    assert res.returncode == 0, res.stderr
+    assert "streak reset" in res.stdout
+    key = review_state._worktree_key(cwd=str(repo))
+    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
+    assert json.loads(rf.read_text())["round"] == 0
+
+
+def test_defect_loop_with_defects_flag_still_reaches_cap(repo, home):
+    # LOCKING: the required-outcome change must NOT weaken the cap — three
+    # --defects rounds still hard-block the commit at the escalation cap.
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)  # 3 --defects rounds
+    res = _run_hook('git commit -m "wip"', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "escalation cap" in res.stderr
+
+
+# ── Fix C: class-sweep reminder at round>=2 (369bbe0e) — advisory, never blocks ──
+
+
+def test_class_sweep_reminder_at_round_two(repo, home):
+    # On the SECOND defect-bearing round (you're looping), `mark` prints a class-sweep
+    # reminder to stderr — advisory only (exit 0), fired at the decision moment.
+    _reach_rounds(repo, home, 1)  # round 1 (no reminder)
+    _stage(repo, "second = 1\n")
+    res = _mark(repo, home)  # round 2
+    assert res.returncode == 0, res.stderr
+    assert "round 2" in res.stderr
+    assert "class" in res.stderr.lower() and "sweep" in res.stderr.lower()
+
+
+def test_no_reminder_at_round_one(repo, home):
+    # The first defect-bearing round is not a loop yet → no reminder.
+    _stage(repo, "first = 1\n")
+    res = _mark(repo, home)  # round 1
+    assert res.returncode == 0, res.stderr
+    assert "sweep" not in res.stderr.lower()
+
+
+def test_no_reminder_on_clean(repo, home):
+    # A clean mark resets the streak to 0 → never a loop → no reminder, even after
+    # prior defect-bearing rounds.
+    _reach_rounds(repo, home, 2)  # two defect rounds
+    _stage(repo, "clean_now = 1\n")
+    res = _mark(repo, home, clean=True)
+    assert res.returncode == 0, res.stderr
+    assert "sweep" not in res.stderr.lower()

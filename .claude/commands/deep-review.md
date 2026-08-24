@@ -71,10 +71,11 @@ If you're on your 3rd defect-bearing round, STOP at the escalation cap (see SKIL
   (BLOCKER / SHOULD-FIX / CRITICAL / HIGH / MEDIUM / LOW / P1-P3 — a security-reviewer WARNING is
   NOT recognized by the validator, so render it as SHOULD-FIX in the text), at least one
   `file:line`, and ≥400 chars, or the gate rejects the evidence as non-adversarial.
-- `python3 "$ROOT/scripts/review_state.py" mark --agent-output "$EVID"` — add `--clean` IFF the
+- `python3 "$ROOT/scripts/review_state.py" mark --agent-output "$EVID" --defects` — `mark` REQUIRES
+  a review-outcome flag (a bare `mark` is refused). Use `--clean` INSTEAD of `--defects` IFF the
   pass found nothing at **should-fix-or-worse**: genesis-architect → no BLOCKER/SHOULD-FIX;
   genesis-security-reviewer → no CRITICAL/WARNING (WARNING is its "should address" tier); or no
-  P1/P2. A forgotten `--clean` is the safe direction (it counts the round).
+  P1/P2. Stating the outcome is now mandatory, so a clean re-audit can't be mis-counted.
 - Run `mark` AFTER the final `git add` and BEFORE `git commit`. The evidence must be recent when
   you `mark` (its age is checked at mark time), so write-then-mark promptly. Once marked, an
   unchanged staged diff stays cleared by its diff-hash — if you restage or amend, re-mark.

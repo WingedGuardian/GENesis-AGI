@@ -49,6 +49,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The review-enforcement commit gate no longer false-blocks a legitimately-reviewed
+  change.** Two misfires are fixed: (1) a genuine fresh-context adversarial audit whose
+  file:line findings live in the reviewing agent's transcript (rather than the terse
+  hand-written summary) is now recognized — the depth check consults the current
+  session's own review transcript under a stricter review-report signature, so it no
+  longer demands a `# depth-ack`; (2) `review_state.py mark` now requires an explicit
+  outcome flag — `--defects` (the review found a new BLOCKER/SHOULD-FIX/P1/P2) or
+  `--clean` (it did not) — so a clean re-audit can no longer be silently mis-counted as
+  a defect-bearing round and trip the escalation cap. A bare `mark` is refused (writing
+  no marker, so the gate still blocks — fail-closed). The gate additionally prints a
+  class-sweep reminder from the second review round on, at the moment you decide the
+  next fix. No change lets an unreviewed or non-adversarial change through.
 - **A scheduled job that has run repeatedly but never once succeeded now raises a
   health alert.** Such a job was invisible to every alarm: the "silently failing"
   check needs a prior success to measure a gap against, and the consecutive-failure

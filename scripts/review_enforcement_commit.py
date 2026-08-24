@@ -958,8 +958,9 @@ def main() -> None:
                 "adversarial audit (assume bugs, enumerate the edge/boundary/sentinel/"
                 "hierarchy class, READ authoritative semantics for any domain code), save it "
                 "to the per-worktree path from `python3 scripts/review_state.py evidence-path` "
-                "(concurrent sessions don't clobber it), then re-mark:\n"
-                "  python3 scripts/review_state.py mark\n"
+                "(concurrent sessions don't clobber it), then re-mark with the outcome:\n"
+                "  python3 scripts/review_state.py mark --clean   # audit found no new BLOCKER/SHOULD-FIX/P1/P2\n"
+                "  python3 scripts/review_state.py mark --defects # audit found a new one (fix, then re-review)\n"
                 "If the audit genuinely ran but its format isn't recognized, acknowledge with "
                 "a trailing shell comment (outside any quotes):  # depth-ack"
             )
@@ -999,8 +1000,8 @@ def main() -> None:
         _deny(
             "BLOCKED: Code changes exist without review. "
             "Run /review and dispatch the genesis-architect agent (adversarial audit) first, "
-            "save it to `python3 scripts/review_state.py evidence-path`, "
-            "then run: python3 scripts/review_state.py mark\n"
+            "save it to `python3 scripts/review_state.py evidence-path`, then re-mark with the "
+            "outcome: `mark --defects` (a new BLOCKER/SHOULD-FIX/P1/P2) or `mark --clean` (none).\n"
             "If findings are intentionally accepted, append a trailing shell "
             "comment (outside any quotes): '  # review-override'"
         )

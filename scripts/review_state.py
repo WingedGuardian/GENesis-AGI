@@ -21,10 +21,14 @@ gates marking — it is not installed on many hosts.
 CLI usage:
     python3 review_state.py status         # prints current review state
     python3 review_state.py evidence-path  # prints this worktree's evidence path
-    python3 review_state.py mark           # evidence read from the per-worktree path
-    python3 review_state.py mark --agent-output <path>          # explicit override
-    python3 review_state.py mark --agent-output <path> --clean  # clean round → reset streak
+    python3 review_state.py mark --defects # a defect-bearing round (evidence from per-worktree path)
+    python3 review_state.py mark --agent-output <path> --defects  # explicit path + outcome
+    python3 review_state.py mark --agent-output <path> --clean    # clean round → reset streak
     python3 review_state.py diff-hash      # prints current diff hash
+
+``mark`` REQUIRES exactly one review-outcome flag — ``--defects`` (the review found a
+new BLOCKER/SHOULD-FIX/P1/P2) or ``--clean`` (it did not). A bare ``mark`` is refused
+so a clean re-audit can't silently inflate the escalation streak (feea3f71).
 """
 
 from __future__ import annotations
@@ -335,6 +339,155 @@ def _evidence_is_adversarial(text: str) -> tuple[bool, str]:
     return True, "adversarial-audit structure present"
 
 
+# ── Fix B (e1372b30): corroborate depth from the SESSION's own architect transcript ──
+# The primary depth signal is the hand-written SUMMARY (``_evidence_is_adversarial``
+# above). But a genuine genesis-architect adversarial audit's dense file:line findings
+# live in the AGENT TRANSCRIPT, and a terse summary can lack a literal ``file:line``
+# token and be false-blocked. As an ADDITIVE fallback (never a lower bar), we consult
+# THIS session's own subagent transcripts under the SAME ``_evidence_is_adversarial``
+# structural bar. Bounded so a session with many subagents can't make ``mark`` slow.
+_MAX_TRANSCRIPT_FILES = 25  # newest-first scan cap
+_MAX_TRANSCRIPT_BYTES = 4_000_000  # per-file read cap — a huge transcript can't stall mark
+
+
+def _extract_assistant_text(path: Path) -> str:
+    """Concatenate the assistant TEXT blocks from a CC subagent JSONL transcript.
+
+    A CC transcript is one JSON record per line. Only ``type=="assistant"`` records'
+    ``message.content`` text blocks are used — the agent's actual REPORT, where an
+    adversarial audit's severity ladder + file:line findings live. ``thinking`` blocks
+    are internal reasoning and ``tool_use``/``tool_result`` are noise, so both are
+    excluded (using thinking would let a shallow pass's exploratory file:line mentions
+    leak in). Tolerant per-line parse (a partial/malformed line is skipped, mirroring
+    ``_verify_review_log``). Never raises.
+    """
+    parts: list[str] = []
+    try:
+        # Bounded READ (not read-all-then-slice): a pathological multi-GB transcript must
+        # never be fully materialized. read(n) in text mode caps at n characters.
+        with path.open(errors="replace") as fh:
+            raw = fh.read(_MAX_TRANSCRIPT_BYTES)
+    except OSError:
+        return ""
+    for line in raw.splitlines():
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != "assistant":
+            continue
+        msg = rec.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                t = block.get("text")
+                if isinstance(t, str):
+                    parts.append(t)
+    return "\n".join(parts)
+
+
+# The transcript path SCAVENGES the session's subagent outputs rather than reading a
+# deliberately-written evidence file, so it applies a STRICTER bar than the summary: the
+# generic structural bar PLUS a review-report SIGNATURE. CC subagent transcripts record
+# ``agentId`` but NOT ``subagent_type``, so we can't filter by agent — we filter by the
+# review CONTRACT's own markers. The signature must cover EVERY named adversarial reviewer
+# that can be the dispatched audit (a matcher built against one reviewer silently
+# false-blocks the other — the class this regex is derived from BOTH agent specs to close):
+#   • genesis-architect (.claude/agents/genesis-architect.md): "Scope Check:", a
+#     "Ready to merge:" verdict, a completion status (DONE_WITH_CONCERNS / NEEDS_CONTEXT).
+#   • genesis-security-reviewer (…/genesis-security-reviewer.md): tier headers
+#     "Must fix before merge" / "Hardening suggestions" + the "**File**:/**Issue**:/
+#     **Evidence**:/**Fix**:" finding-field contract.
+#   • CODE_AUDITOR JSON: the "severity": contract.
+# The two bare-prose architect tokens are colon-anchored to their structured form so
+# incidental prose ("…once tests pass this is ready to merge") can't vouch.
+_REVIEW_SIGNATURE_RE = re.compile(
+    r"Scope Check:|Ready to merge:|Completion status|DONE_WITH_CONCERNS|NEEDS_CONTEXT"
+    r"|Must fix before merge|Hardening suggestions|\*\*(?:File|Issue|Evidence|Fix)\*\*\s*:"
+    r'|"severity"\s*:',
+    re.IGNORECASE,
+)
+
+
+def _transcript_looks_like_review(text: str) -> tuple[bool, str]:
+    """Stricter bar for the SCAVENGED transcript source: adversarial structure AND a
+    review-report signature. The summary path (deliberately-written evidence) keeps the
+    generic ``_evidence_is_adversarial`` bar; the transcript path adds the signature so a
+    non-review subagent's incidental output can't set the adversarial bit.
+    """
+    ok, msg = _evidence_is_adversarial(text)
+    if not ok:
+        return False, msg
+    if not _REVIEW_SIGNATURE_RE.search(text):
+        return (
+            False,
+            "no review-report signature (Scope Check / Ready to merge / completion status)",
+        )
+    return True, "adversarial review-report structure present"
+
+
+def _transcript_is_adversarial(
+    session_id: str | None = None,
+    projects_dir: Path | None = None,
+) -> tuple[bool, str]:
+    """Whether THIS session ran a fresh adversarial-audit subagent (e.g. genesis-architect).
+
+    Depth-gate fallback for e1372b30: a real adversarial audit whose file:line findings
+    live in the AGENT transcript (not the terse hand-written summary) is false-blocked by
+    the summary-only check. We look at the CURRENT session's own subagent transcripts —
+    bound by ``CLAUDE_CODE_SESSION_ID`` (globally unique, so the project-slug wildcard
+    resolves the one session dir whether the session started in the main tree OR a linked
+    worktree; deriving the slug from ``cwd`` would wrongly point at the worktree path) —
+    and apply a STRICTER bar than the summary (``_transcript_looks_like_review``: the
+    generic structural floor PLUS a review-report signature), because a transcript is a
+    SCAVENGED source — an incidental non-review subagent must not be able to vouch. The
+    floor is never lowered; the PLACE we look widens {summary} → {summary, in-session
+    review transcript}.
+
+    Freshness-bounded exactly like the summary path (``_MAX_EVIDENCE_AGE_SECONDS``): a
+    stale transcript never vouches. This inherits — and does not widen — the summary
+    path's trust model (a recent in-session adversarial audit vouches; the marker is
+    still content-bound to the staged diff by the commit gate). A shallow pass with no
+    real in-session audit has neither a qualifying summary nor a qualifying transcript,
+    so it still BLOCKS.
+
+    Fail-CLOSED: env unset / dir absent / no fresh file / unreadable / malformed →
+    ``(False, reason)``. NEVER raises (depth is advisory; a read error must not block
+    marking a review).
+    """
+    sid = session_id if session_id is not None else os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not sid:
+        return False, "no CLAUDE_CODE_SESSION_ID (transcript corroboration unavailable)"
+    base = projects_dir if projects_dir is not None else (Path.home() / ".claude" / "projects")
+    try:
+        # session-id is globally unique → the '*' slug wildcard matches the one session dir
+        candidates = list(base.glob(f"*/{sid}/subagents/agent-*.jsonl"))
+    except OSError:
+        return False, "projects dir unreadable"
+    now = time.time()
+    fresh: list[tuple[float, Path]] = []
+    for p in candidates:
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        if now - mtime <= _MAX_EVIDENCE_AGE_SECONDS:
+            fresh.append((mtime, p))
+    if not fresh:
+        return False, "no fresh in-session architect transcript"
+    fresh.sort(reverse=True)  # newest first — bound the scan
+    for _mtime, p in fresh[:_MAX_TRANSCRIPT_FILES]:
+        text = _extract_assistant_text(p)
+        if not text:
+            continue
+        ok, _msg = _transcript_looks_like_review(text)
+        if ok:
+            return True, f"adversarial audit corroborated by session transcript {p.name}"
+    return False, "no in-session transcript meets the review bar"
+
+
 def get_marker_depth(cwd: str | None = None) -> tuple[str | None, bool]:
     """``(level, adversarial)`` recorded in the current marker; ``(None, False)`` if absent.
 
@@ -399,6 +552,18 @@ def mark_reviewed(
         )
     except OSError as e:
         depth_msg = f"evidence unreadable ({e})"
+    # Fix B (e1372b30): if the hand-written SUMMARY didn't pass, a real adversarial
+    # audit may still have run — its file:line findings live in THIS session's
+    # genesis-architect transcript, not the terse summary. Consult it under the SAME
+    # structural bar. Additive (only ever GRANTS recognition a real audit earned) and
+    # fail-closed (any error → summary answer stands).
+    if not adversarial:
+        try:
+            transcript_ok, transcript_msg = _transcript_is_adversarial()
+        except Exception:  # noqa: BLE001 - depth is advisory; a fallback error must never block marking
+            transcript_ok, transcript_msg = False, "transcript check errored"
+        if transcript_ok:
+            adversarial, depth_msg = True, transcript_msg
 
     # Authoritative evidence present — write the per-worktree marker.
     state_file = _state_file(cwd)
@@ -438,6 +603,24 @@ def mark_reviewed(
         round_n = 0
     label = "clean → streak reset" if clean else f"round {round_n}"
     print(f"Review marker written: {state['diff_hash']} ({label})")
+    # Class-sweep reminder (369bbe0e): from the SECOND defect-bearing round on this
+    # branch you're in a review→fix loop — the #1 cause of round-after-round loops is
+    # instance-patching the flagged line instead of sweeping the whole defect CLASS. A
+    # print here fires the reminder DETERMINISTICALLY at the mark-time decision moment
+    # (a recall-dependent memory didn't fire during PR #1397's 3-round Codex loop).
+    # Advisory only — never blocks, never touches the return value. A clean round
+    # (round_n == 0) is not a loop, so it correctly emits nothing.
+    if round_n >= 2:
+        print(
+            f"REMINDER (round {round_n}): you're in a review→fix loop. Before the next "
+            "fix, classify ALL findings into defect CLASSES and sweep every sibling — "
+            "every reader of a shared store; both build-paths of a migration "
+            "(create_all_tables + the numbered migration); both ends of a marker/parser "
+            "spec; every commit-A-then-B writer; every status in a state machine. "
+            "Instance-patching the one flagged line is the #1 cause of review-loop churn. "
+            "(See CC memory review_loop_termination.)",
+            file=sys.stderr,
+        )
     return True
 
 
@@ -673,15 +856,43 @@ def main() -> None:
         print(_evidence_file())
 
     elif cmd == "mark":
-        # Parse --agent-output <path> and the optional --clean flag.
+        # Parse --agent-output <path> and the REQUIRED review-outcome flag.
+        # Exactly one of --clean / --defects must be given. The escalation counter
+        # keys on the review OUTCOME, and a silently-omitted flag used to default to
+        # defect-bearing — so a clean re-audit that forgot --clean silently inflated
+        # the streak toward a false mode-switch block (feea3f71). Requiring an explicit
+        # outcome removes that trap while staying FAIL-CLOSED: a refusal writes NO
+        # marker, so the commit gate still blocks until the caller re-runs correctly
+        # (identical safe direction to the stale-evidence REFUSED path above). The
+        # library mark_reviewed(clean=False) default is unchanged, so a programmatic
+        # caller still over-counts (never resets) — no new streak-reset path is opened.
         agent_path = None
-        clean = False
+        saw_clean = False
+        saw_defects = False
         for i, arg in enumerate(sys.argv[2:], 2):
             if arg == "--agent-output" and i + 1 < len(sys.argv):
                 agent_path = sys.argv[i + 1]
             elif arg == "--clean":
-                clean = True
-        if not mark_reviewed(agent_path, clean=clean):
+                saw_clean = True
+            elif arg == "--defects":
+                saw_defects = True
+        if saw_clean and saw_defects:
+            print(
+                "REFUSED: pass exactly one of --clean / --defects, not both "
+                "(contradictory review outcome).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not (saw_clean or saw_defects):
+            print(
+                "REFUSED: `mark` requires the review OUTCOME. Pass --clean (the review "
+                "found no new BLOCKER/SHOULD-FIX/P1/P2) or --defects (it found one). "
+                "This sets the escalation counter; a silent default used to mis-count a "
+                "clean re-audit as defect-bearing and false-block the next commit.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not mark_reviewed(agent_path, clean=saw_clean):
             sys.exit(1)
 
     else:
