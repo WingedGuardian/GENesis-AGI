@@ -392,6 +392,14 @@ When a user shares a file path or URL in conversation:
 - **Plan mode by default** for any task with 3+ steps or architectural
   decisions. If something goes sideways — STOP and re-plan.
 - **Use subagents** to keep main context clean. One concern per subagent.
+- **Verify multi-agent output — never trust one agent's claim.** A subagent
+  fan-out that produces claims you'll act on (audits, diagnoses, source-of-truth
+  maps) gets an independent adversarial verification stage before synthesis:
+  re-derive the load-bearing / contradictory / surprising claims from ground
+  truth (real runtime, not a shell proxy; values, not line-existence),
+  refute-by-default, and let the verdicts override the original reports. Scale
+  to stakes — skip it for a single trivial lookup; apply it whenever the output
+  drives decisions or lands in durable record.
 - **NEVER `rm -rf` the working directory.** Never run destructive commands
   without explicit user confirmation.
 - **Session wrap-up**: structured handoff — what changed, what's pending,

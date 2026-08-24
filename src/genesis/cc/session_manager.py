@@ -9,7 +9,13 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from genesis.cc.types import CCModel, ChannelType, EffortLevel, SessionType
+from genesis.cc.types import (
+    CCModel,
+    ChannelType,
+    EffortLevel,
+    SessionType,
+    session_origin_for_channel,
+)
 from genesis.db.crud import cc_sessions
 
 logger = logging.getLogger(__name__)
@@ -88,6 +94,13 @@ class SessionManager:
             source_tag="foreground",
             thread_id=thread_id,
             chat_id=chat_id,
+            # WS-3 durable gateway origin: a gateway conversation (web/OpenClaw,
+            # WhatsApp, voice) stamps external_untrusted so reflection_window_origin
+            # (which reads cc_sessions.origin_class) does not treat a reflection
+            # overlapping it as first_party and launder its user_model_delta.
+            # Owner-attended (terminal/Telegram) → None (foreground stays NULL,
+            # read as first_party — unchanged).
+            origin_class=session_origin_for_channel(channel),
         )
         return await cc_sessions.get_by_id(self._db, sess_id)
 
