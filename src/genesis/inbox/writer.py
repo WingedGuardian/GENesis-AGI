@@ -15,6 +15,8 @@ import io
 import json
 import logging
 import os
+import sqlite3
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -27,6 +29,23 @@ from genesis.inbox.scanner import RESPONSE_SUFFIX
 logger = logging.getLogger(__name__)
 
 _COUNTER_FILE = ".genesis-counters.json"
+
+# Serializes the counter store's read-modify-write across the to_thread
+# workers write_response dispatches into (threads share this module).
+_COUNTER_LOCK = threading.Lock()
+
+
+def _counter_store_path() -> Path:
+    """Durable counter store, OUTSIDE the vault-sync mirror.
+
+    The old store lived inside the watch dir, where the 5-minute vault sync
+    deleted it every cycle (measured: 175 deletions) — so the 2026-07-29
+    false-positive wipe of the watch dir reset numbering to 1 and every
+    subsequent response silently overwrote an already-delivered vault file.
+    """
+    from genesis import env
+
+    return env.genesis_home() / "state" / "inbox-counters.json"
 
 
 class ResponseWriter:
@@ -75,9 +94,23 @@ class ResponseWriter:
             stem = f"{date_file}-inbox-{slug}"
             base_dir = self._watch_path
 
-        # Always numbered — monotonically increasing, never reuses numbers
-        next_num = _next_counter(base_dir, stem, RESPONSE_SUFFIX)
+        # Always numbered — monotonically increasing, never reuses numbers.
+        # Off-loop: the counter derivation reads/writes the store file and
+        # queries the DB floor (blocking I/O). _next_counter serializes on a
+        # module lock — moving it off the event loop forfeited coroutine
+        # atomicity, and an unlocked read-modify-write of the store would
+        # let two concurrent writes mint the SAME number (the silent-vault-
+        # overwrite failure mode this module exists to prevent).
+        next_num = await asyncio.to_thread(_next_counter, base_dir, stem, RESPONSE_SUFFIX)
         target = base_dir / f"{stem}-{next_num}{RESPONSE_SUFFIX}"
+        if target.exists():
+            # Invariant breach: the freshly-minted number already exists on
+            # disk (the scan floor makes this impossible except under a race
+            # this code failed to serialize). Fail LOUDLY — os.replace below
+            # would silently clobber a delivered response.
+            raise RuntimeError(
+                f"response numbering invariant breach: {target} already exists",
+            )
 
         frontmatter_data = {
             "date": datetime_str,
@@ -99,25 +132,111 @@ class ResponseWriter:
         os.replace(str(tmp_path), str(target))
 
 
+def _db_floor(directory: Path, base_name: str, suffix: str) -> int:
+    """Highest number ever recorded for *base_name* in inbox_items.response_path.
+
+    Fourth numbering floor: even if the counter store AND the watch dir are
+    both lost, the DB's own response history prevents renumbering backwards
+    (a low number silently OVERWRITES an already-delivered vault file).
+    Degrades to 0 (with a warning) if the DB is missing/unreadable — a
+    response write must never fail on a DB hiccup.
+    """
+    # NOTE: `directory` is deliberately unused — response_path rows from ANY
+    # directory with a matching stem inflate this floor. Over-counting only
+    # skips numbers (cosmetic gaps) and inherently covers directory renames;
+    # under-counting is the overwrite bug. Kept for signature symmetry.
+    del directory
+    from genesis import env
+
+    prefix = f"{base_name}-"
+    floor = 0
+    try:
+        db_path = env.genesis_db_path()
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT response_path FROM inbox_items WHERE response_path IS NOT NULL",
+            ).fetchall()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError) as exc:
+        logger.warning(
+            "Counter DB floor unavailable (%s): falling back to store/scan floors",
+            exc,
+            exc_info=True,
+        )
+        return 0
+    for (rp,) in rows:
+        name = Path(rp).name
+        if not name.startswith(prefix) or not name.endswith(suffix):
+            continue
+        num_part = name.removesuffix(suffix)[len(prefix):]
+        try:
+            floor = max(floor, int(num_part))
+        except ValueError:
+            continue  # non-numeric suffix, ignore
+    return floor
+
+
 def _next_counter(directory: Path, base_name: str, suffix: str) -> int:
     """Return the next monotonically increasing number for *base_name*.
 
-    Uses a persistent counter file as primary source of truth, with a
-    filesystem scan as fallback.  The higher of the two wins, so numbers
-    never go backwards even if the counter file is lost or files are deleted.
+    Numbers must NEVER go backwards: a reused number silently overwrites an
+    already-delivered response file in the user's vault (the 2026-07-29
+    incident — a sync false-positive wiped the watch dir including the old
+    in-mirror counter file, numbering restarted at 1, and weeks of responses
+    landed as invisible overwrites of files the user had already read).
+
+    Four floors, the max wins:
+      1. the durable counter store (``~/.genesis/state/``, OUTSIDE the
+         vault-sync mirror — nothing else may delete it),
+      2. the legacy in-mirror counter file (migration: an install upgrading
+         mid-sequence keeps its high-water mark),
+      3. a filesystem scan of the watch dir,
+      4. the DB's ``inbox_items.response_path`` history (survives even a
+         total loss of 1-3).
+
+    Runs off the event loop (write_response wraps it in to_thread), so the
+    store read-modify-write is serialized on a module lock — without it two
+    concurrent calls could mint the same number and silently overwrite.
     """
-    counter_path = directory / _COUNTER_FILE
+    with _COUNTER_LOCK:
+        return _next_counter_locked(directory, base_name, suffix)
 
-    # 1. Read persisted high-water mark
+
+def _next_counter_locked(directory: Path, base_name: str, suffix: str) -> int:
+    store_path = _counter_store_path()
+    dir_key = str(directory)
+
+    # 1. Durable store: {directory: {base_name: high_water}}
+    # Blast-radius discipline: only an unreadable/undecodable FILE resets the
+    # parsed store; a corrupt individual VALUE zeroes this stem's floor but
+    # must never discard (and then re-persist without) every OTHER directory
+    # and stem's high-water mark.
     stored_max = 0
-    if counter_path.exists():
+    store: dict = {}
+    if store_path.exists():
         try:
-            data = json.loads(counter_path.read_text(encoding="utf-8"))
-            stored_max = int(data.get(base_name, 0))
-        except (json.JSONDecodeError, ValueError, OSError):
-            pass  # Corrupted — fall through to filesystem scan
+            loaded = json.loads(store_path.read_text(encoding="utf-8"))
+            store = loaded if isinstance(loaded, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            store = {}  # Unreadable/corrupt file — fall through to other floors
+        try:
+            stored_max = int(store.get(dir_key, {}).get(base_name, 0))
+        except (ValueError, TypeError, AttributeError):
+            stored_max = 0  # Corrupt value — keep the rest of the store intact
 
-    # 2. Scan filesystem for highest existing number (fallback)
+    # 2. Legacy in-mirror counter file (pre-relocation installs)
+    legacy_max = 0
+    legacy_path = directory / _COUNTER_FILE
+    if legacy_path.exists():
+        try:
+            legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+            legacy_max = int(legacy.get(base_name, 0))
+        except (json.JSONDecodeError, ValueError, TypeError, OSError):
+            pass
+
+    # 3. Scan filesystem for highest existing number
     disk_max = 0
     pattern = f"{base_name}-*{suffix}"
     for p in directory.glob(pattern):
@@ -128,23 +247,24 @@ def _next_counter(directory: Path, base_name: str, suffix: str) -> int:
         except ValueError:
             continue  # non-numeric suffix, ignore
 
-    # 3. Next number = max(stored, disk) + 1
-    next_num = max(stored_max, disk_max) + 1
+    # 4. DB response-path history
+    db_max = _db_floor(directory, base_name, suffix)
 
-    # 4. Persist updated counter
+    next_num = max(stored_max, legacy_max, disk_max, db_max) + 1
+
+    # Persist the new high-water mark to the durable store
     try:
-        counters: dict[str, int] = {}
-        if counter_path.exists():
-            try:
-                counters = json.loads(counter_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                counters = {}
-        counters[base_name] = next_num
-        counter_path.write_text(
-            json.dumps(counters, indent=2) + "\n", encoding="utf-8",
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        if not isinstance(store.get(dir_key), dict):
+            store[dir_key] = {}
+        store[dir_key][base_name] = next_num
+        store_path.write_text(
+            json.dumps(store, indent=2) + "\n", encoding="utf-8",
         )
     except OSError:
-        logger.warning("Could not persist counter file %s", counter_path)
+        logger.warning(
+            "Could not persist counter store %s", store_path, exc_info=True,
+        )
 
     return next_num
 

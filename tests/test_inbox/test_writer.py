@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -175,8 +176,10 @@ async def test_monotonic_survives_counter_file_deletion(
         batch_id="f2", source_files=[str(source)],
         evaluation_text="b", item_count=1,
     )
-    # Delete counter file
-    counter_file = tmp_path / ".genesis-counters.json"
+    # Delete counter file (now OUTSIDE the watch path — see _isolate_counter_store)
+    from genesis.inbox import writer as writer_mod
+
+    counter_file = writer_mod._counter_store_path()
     assert counter_file.exists()
     counter_file.unlink()
     # Falls back to disk scan: plan-1.genesis.md and plan-2.genesis.md exist
@@ -243,3 +246,250 @@ async def test_write_escapes_special_yaml_chars(writer: ResponseWriter, tmp_path
     # The dangerous characters should survive round-trip through yaml
     assert "\n" in fm["source_files"][0] or "newline" in fm["source_files"][0]
     assert fm["batch_id"] == 'batch-with-"quotes"'
+
+
+# ── 2026-07-29 incident class: numbering must survive watch-dir destruction ──
+
+
+def _floor_db(tmp_path: Path, rows: list[str | None]) -> Path:
+    """Build a throwaway sqlite DB with an inbox_items.response_path column."""
+    db = tmp_path / "floor.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE inbox_items (response_path TEXT)")
+    conn.executemany("INSERT INTO inbox_items VALUES (?)", [(r,) for r in rows])
+    conn.commit()
+    conn.close()
+    return db
+
+
+@pytest.mark.asyncio
+async def test_counter_survives_full_watch_dir_wipe(
+    writer: ResponseWriter, tmp_path: Path,
+):
+    """REPRO of the 2026-07-29 incident: a sync false-positive wipes EVERY
+    ``*.genesis.md`` in the watch dir (and, before the fix, the counter file
+    that lived beside them).  Numbering must continue, never restart at 1 —
+    a restart silently OVERWRITES already-delivered files in the vault."""
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    for i in range(1, 4):
+        await writer.write_response(
+            batch_id=f"w{i}", source_files=[str(source)],
+            evaluation_text=str(i), item_count=1,
+        )
+    # The wipe: every response file AND any counter file in the watch dir
+    for f in list(tmp_path.glob("*.genesis.md")):
+        f.unlink()
+    legacy = tmp_path / ".genesis-counters.json"
+    if legacy.exists():
+        legacy.unlink()
+    p = await writer.write_response(
+        batch_id="w4", source_files=[str(source)],
+        evaluation_text="after wipe", item_count=1,
+    )
+    assert p.name == "doc-4.genesis.md", (
+        f"numbering restarted at {p.name} after a watch-dir wipe — "
+        "this is the overwrite bug"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_counter_file_written_into_watch_path(
+    writer: ResponseWriter, tmp_path: Path,
+):
+    """The counter store must live OUTSIDE the sync mirror: anything inside
+    the watch dir is deleted by the vault sync every cycle (measured: 175
+    deletions of the old in-mirror counter file)."""
+    source = tmp_path / "note.md"
+    source.write_text("x")
+    await writer.write_response(
+        batch_id="s1", source_files=[str(source)],
+        evaluation_text="a", item_count=1,
+    )
+    assert not (tmp_path / ".genesis-counters.json").exists(), (
+        "counter file written into the watch dir — the sync mirror deletes it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_db_floor_rescues_after_total_state_loss(
+    writer: ResponseWriter, tmp_path: Path, monkeypatch,
+):
+    """Even with the counter store AND the watch dir both empty, the DB's
+    response_path history (inbox_items) must floor the numbering."""
+    db = _floor_db(
+        tmp_path,
+        [f"/some/old/inbox/doc-{n}.genesis.md" for n in (7, 118, 42)],
+    )
+    monkeypatch.setattr("genesis.env.genesis_db_path", lambda: db)
+
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    p = await writer.write_response(
+        batch_id="d1", source_files=[str(source)],
+        evaluation_text="rescued", item_count=1,
+    )
+    assert p.name == "doc-119.genesis.md", (
+        f"got {p.name}: DB floor (max=118) not honored after total state loss"
+    )
+
+
+@pytest.mark.asyncio
+async def test_db_floor_ignores_other_stems_and_junk(
+    writer: ResponseWriter, tmp_path: Path, monkeypatch,
+):
+    """DB floor parses strictly: other stems, non-numeric suffixes, and NULLs
+    must not affect this stem's numbering."""
+    db = _floor_db(
+        tmp_path,
+        [
+            "/x/other-99.genesis.md",
+            "/x/doc-draft.genesis.md",
+            "/x/doc-3.genesis.md",
+            None,
+            "/x/docs-50.genesis.md",  # longer stem, must not match "doc"
+        ],
+    )
+    monkeypatch.setattr("genesis.env.genesis_db_path", lambda: db)
+
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    p = await writer.write_response(
+        batch_id="d2", source_files=[str(source)],
+        evaluation_text="strict", item_count=1,
+    )
+    assert p.name == "doc-4.genesis.md"
+
+
+@pytest.mark.asyncio
+async def test_unreadable_db_does_not_break_writes(
+    writer: ResponseWriter, tmp_path: Path, monkeypatch,
+):
+    """A missing/unreadable DB must degrade to the other floors, not raise."""
+    monkeypatch.setattr(
+        "genesis.env.genesis_db_path", lambda: tmp_path / "nope" / "absent.db",
+    )
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    p1 = await writer.write_response(
+        batch_id="u1", source_files=[str(source)],
+        evaluation_text="a", item_count=1,
+    )
+    p2 = await writer.write_response(
+        batch_id="u2", source_files=[str(source)],
+        evaluation_text="b", item_count=1,
+    )
+    assert p1.name == "doc-1.genesis.md"
+    assert p2.name == "doc-2.genesis.md"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_writes_mint_distinct_numbers(
+    writer: ResponseWriter, tmp_path: Path, monkeypatch,
+):
+    """Locking regression (architect finding): _next_counter runs off-loop
+    via to_thread, so without the module lock two overlapping writes could
+    read the same high-water mark, mint the SAME number, and os.replace
+    would silently clobber the first response — the exact vault-overwrite
+    failure mode this module exists to prevent.
+
+    The patched _db_floor injects latency INSIDE the read-modify-write
+    window so an unlocked implementation fails deterministically instead of
+    only under a lucky interleaving."""
+    import asyncio
+    import time as time_mod
+
+    from genesis.inbox import writer as writer_mod
+
+    real_db_floor = writer_mod._db_floor
+
+    def slow_db_floor(directory, base_name, suffix):
+        time_mod.sleep(0.05)
+        return real_db_floor(directory, base_name, suffix)
+
+    monkeypatch.setattr(writer_mod, "_db_floor", slow_db_floor)
+
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    paths = await asyncio.gather(*[
+        writer.write_response(
+            batch_id=f"g{i}", source_files=[str(source)],
+            evaluation_text=str(i), item_count=1,
+        )
+        for i in range(5)
+    ])
+    names = sorted(p.name for p in paths)
+    assert len(set(names)) == 5, f"duplicate numbers minted concurrently: {names}"
+    assert names == sorted(f"doc-{n}.genesis.md" for n in range(1, 6))
+
+
+@pytest.mark.asyncio
+async def test_corrupt_store_value_spares_other_entries(
+    writer: ResponseWriter, tmp_path: Path,
+):
+    """Blast-radius lock (architect finding): a corrupt individual VALUE in
+    the store must zero only that stem's floor — never discard (and then
+    re-persist without) every other directory/stem's high-water mark."""
+    import json
+
+    from genesis.inbox import writer as writer_mod
+
+    store_path = writer_mod._counter_store_path()
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text(json.dumps({
+        str(tmp_path): {"doc": "garbage"},
+        "/other/inbox": {"Genesis": 118},
+    }))
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    await writer.write_response(
+        batch_id="cv1", source_files=[str(source)],
+        evaluation_text="a", item_count=1,
+    )
+    persisted = json.loads(store_path.read_text())
+    assert persisted.get("/other/inbox", {}).get("Genesis") == 118, (
+        "sibling directory's high-water mark destroyed by a corrupt value"
+    )
+
+
+@pytest.mark.asyncio
+async def test_flat_legacy_store_copied_to_new_location_is_safe(
+    writer: ResponseWriter, tmp_path: Path,
+):
+    """An operator copying the OLD flat-format file ({stem: N}) into the new
+    location must not crash numbering (values are dicts in the new schema)."""
+    import json
+
+    from genesis.inbox import writer as writer_mod
+
+    store_path = writer_mod._counter_store_path()
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text(json.dumps({"doc": 7}))  # legacy flat shape
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    p = await writer.write_response(
+        batch_id="fl1", source_files=[str(source)],
+        evaluation_text="a", item_count=1,
+    )
+    # Flat shape isn't the new schema: its keys are stems, not directories,
+    # so it contributes no floor — numbering starts fresh from other floors.
+    assert p.name == "doc-1.genesis.md"
+
+
+@pytest.mark.asyncio
+async def test_legacy_in_mirror_counter_still_honored(
+    writer: ResponseWriter, tmp_path: Path,
+):
+    """Migration: a surviving legacy ``.genesis-counters.json`` in the watch
+    dir (old location) is still read as a floor, so an install upgrading
+    mid-sequence never renumbers backwards."""
+    import json
+
+    (tmp_path / ".genesis-counters.json").write_text(json.dumps({"doc": 9}))
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    p = await writer.write_response(
+        batch_id="l1", source_files=[str(source)],
+        evaluation_text="migrated", item_count=1,
+    )
+    assert p.name == "doc-10.genesis.md"
