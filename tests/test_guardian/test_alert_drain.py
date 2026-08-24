@@ -49,7 +49,7 @@ def _enqueue(root, **kw):
 @pytest.mark.asyncio
 async def test_delivered_unlinks_and_uses_identity_topic(tmp_path, monkeypatch):
     root = tmp_path / "queue"
-    monkeypatch.setattr(alert_drain, "_QUEUE_ROOT", root)
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
     _enqueue(root, dedupe_key="backup:k1")
     pipe = _FakePipeline(OutreachStatus.DELIVERED)
 
@@ -67,7 +67,7 @@ async def test_delivered_unlinks_and_uses_identity_topic(tmp_path, monkeypatch):
 async def test_rejected_is_terminal_unlinks(tmp_path, monkeypatch):
     # REJECTED (outreach dedup) must NOT wedge the entry forever.
     root = tmp_path / "queue"
-    monkeypatch.setattr(alert_drain, "_QUEUE_ROOT", root)
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
     _enqueue(root, dedupe_key="backup:k1")
     await alert_drain._make_drainer(_RT(pipeline=_FakePipeline(OutreachStatus.REJECTED)))()
     assert q.list_queued(root) == []
@@ -76,7 +76,7 @@ async def test_rejected_is_terminal_unlinks(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_failed_keeps_for_retry(tmp_path, monkeypatch):
     root = tmp_path / "queue"
-    monkeypatch.setattr(alert_drain, "_QUEUE_ROOT", root)
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
     _enqueue(root)
     await alert_drain._make_drainer(_RT(pipeline=_FakePipeline(OutreachStatus.FAILED)))()
     assert len(q.list_queued(root)) == 1  # transient → kept
@@ -85,7 +85,7 @@ async def test_failed_keeps_for_retry(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_unwired_pipeline_keeps_entry(tmp_path, monkeypatch):
     root = tmp_path / "queue"
-    monkeypatch.setattr(alert_drain, "_QUEUE_ROOT", root)
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
     _enqueue(root)
     await alert_drain._make_drainer(_RT(pipeline=None))()  # outreach not up yet
     assert len(q.list_queued(root)) == 1  # kept, never lost
@@ -94,7 +94,7 @@ async def test_unwired_pipeline_keeps_entry(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_empty_queue_is_noop(tmp_path, monkeypatch):
     root = tmp_path / "queue"
-    monkeypatch.setattr(alert_drain, "_QUEUE_ROOT", root)
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
     # No entries — drainer runs clean, no pipeline call.
     pipe = _FakePipeline(OutreachStatus.DELIVERED)
     await alert_drain._make_drainer(_RT(pipeline=pipe))()

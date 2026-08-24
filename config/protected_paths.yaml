@@ -72,6 +72,9 @@ contribution_forbidden:
     reason: "Same — any path"
   - pattern: ".env"
     reason: "Local env overrides — must stay local"
+  # Security scanner config — a contribution must never weaken the gate that scans it
+  - pattern: ".gitleaks.toml"
+    reason: "The sanitizer's own secret-scan rules; a contribution that edits them could silently disable secret detection for every future contribution"
   # User-specific configs
   - pattern: "config/research-profiles/**"
     reason: "Private research interests"

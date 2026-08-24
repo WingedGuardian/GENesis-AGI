@@ -200,6 +200,8 @@ async def test_light_memory_hits_capped_at_7(db, identity_dir):
         await observations.create(
             db, id=f"cap-{i}", source="test", type="metric",
             content=f"Observation {i}", priority="medium", created_at=now,
+            # WS-3: first-party so the fail-closed read gate surfaces them.
+            origin_class="first_party",
         )
 
     # tick-1 → anomaly focus (includes memory_hits)
@@ -229,6 +231,8 @@ async def test_light_focus_aware_context_stripping(db, identity_dir):
         db, id="fa-obs", source="test", type="metric",
         content="Test observation", priority="medium",
         created_at=datetime.now(UTC).isoformat(),
+        # WS-3: first-party so the fail-closed read gate surfaces it.
+        origin_class="first_party",
     )
 
     loader = IdentityLoader(identity_dir)

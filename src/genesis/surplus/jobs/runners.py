@@ -137,15 +137,47 @@ async def run_career_outreach_monitor(sched: SchedulerContext) -> None:
         if result.mode == "off":
             # Disabled-by-config: record NOTHING (neither success nor failure) so the
             # actuator stays invisible in job-health on installs that never enabled it
-            # (surplus convention — cf. _guard.SKIP).
+            # (surplus convention — cf. _guard.SKIP). An unreachable bridge is NOT this
+            # case — it surfaces errors=1 and is recorded as a failure below.
             return
-        if result.auto_runs or result.nudged or result.seeded or result.errors:
+        if (
+            result.auto_runs
+            or result.nudged
+            or result.verify_failed
+            or result.errors
+        ):
             logger.info(
                 "Career outreach: mode=%s auto_runs=%d working=%d nudged=%d "
-                "seeded=%d errors=%d",
+                "verify_failed=%d errors=%d",
                 result.mode, result.auto_runs, result.drafts_working,
-                result.nudged, result.seeded, result.errors,
+                result.nudged, result.verify_failed, result.errors,
             )
+        # No-progress visibility: the engine drafted but its own accuracy gate refused
+        # every attempt (verify_failed) and nothing staged/nudged. verify_failed is
+        # correctly NOT a job-health failure (the gate working), so a SINGLE such tick
+        # is normal; but a PERSISTENT run of them = a possibly-broken verifier that
+        # record_success would otherwise hide. Surface it loudly per-tick (WARNING).
+        # Gate on `not errors`: on a MIXED tick (a hard dispatch/read/nudge error also
+        # occurred) the failure is recorded below — a "verifier refused every attempt"
+        # warning would be a second, misleading diagnosis. Cross-tick threshold
+        # alerting (durable counters) is a tracked follow-up.
+        if (
+            result.verify_failed
+            and not result.errors
+            and not (result.auto_runs or result.nudged)
+        ):
+            logger.warning(
+                "Career outreach: NO-PROGRESS tick — %d verify_failed, 0 staged/nudged "
+                "(engine drafted but its own gate refused all). Persistent recurrence "
+                "signals a possibly-broken verifier job-health cannot see.",
+                result.verify_failed,
+            )
+            if sched._event_bus:
+                await sched._event_bus.emit(
+                    Subsystem.RECON, Severity.WARNING,
+                    "career_outreach.no_progress",
+                    f"{result.verify_failed} verify_failed, 0 staged this tick",
+                )
         if sched._event_bus:
             await sched._event_bus.emit(
                 Subsystem.RECON, Severity.DEBUG,

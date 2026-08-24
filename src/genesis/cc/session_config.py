@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from genesis.cc.types import CCModel, EffortLevel
+from genesis.cc.types import SPAWN_TOOL_NAMES, CCModel, EffortLevel
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -22,6 +22,11 @@ _READONLY_DISALLOWED = [
     "Bash",
     "NotebookEdit",
 ]
+# NOTE: not spawn-locked — the live surplus path (SurplusLLMExecutor) runs via the
+# tool-less Router (surplus/executor.py), NOT a claude -p CC session, so it has no
+# spawn tools to deny; build_surplus_config()'s disallowed_tools is consumed only for
+# its system_prompt (direct_session.py). Surplus is intentionally outside the
+# spawn-lockdown scope (test_cc/test_spawn_lockdown.py).
 
 # NOTE: Destructive git operations (force push, hard reset, clean) are guarded
 # by PreToolUse hooks in .claude/settings.json, NOT by disallowed_tools.
@@ -73,11 +78,12 @@ _REFLECTION_MCP_SERVERS: tuple[tuple[str, str], ...] = (
 # (Read/Grep/Glob/WebFetch/WebSearch/ToolSearch/CronList/Task{Get,List,Output}/
 # ListMcpResourcesTool/ReadMcpResource*Tool) are left available. CC internals
 # aren't introspectable, so this is an explicit list; the scope test re-checks it.
-# Task/Workflow/Skill are denied because they SPAWN — a subagent would escape the
-# lockdown.
+# The spawn/escape-class builtins (Agent/Task/Workflow/Skill) are denied because a
+# child they spawn would escape the lockdown with a fresh, unrestricted toolset — the
+# whole set lives in SPAWN_TOOL_NAMES so every restricted session denies it identically.
 _REFLECTION_DENY_BUILTINS: tuple[str, ...] = (
     "Bash", "Write", "Edit", "NotebookEdit",
-    "Task", "Workflow", "Skill",
+    *SPAWN_TOOL_NAMES,
     "SendMessage", "ReportFindings",
     "CronCreate", "CronDelete", "ScheduleWakeup", "Monitor",
     "TaskCreate", "TaskUpdate", "TaskStop",

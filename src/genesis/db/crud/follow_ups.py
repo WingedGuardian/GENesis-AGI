@@ -187,6 +187,21 @@ async def get_by_status(
     return [dict(row) for row in await cursor.fetchall()]
 
 
+async def get_open_followups(db: aiosqlite.Connection) -> list[dict]:
+    """Hot follow_up rows still open (pending or in_progress), oldest first.
+
+    ONE statement, so it is a single consistent snapshot: a concurrent writer
+    moving a row in_progress<->pending can never make it fall between two
+    queries (the repo-pulse reconciler's loader must not silently drop such a
+    row and then advance its PR cursor past it). Cold ``tabled``/``idea`` rows
+    are excluded (kind='follow_up')."""
+    cursor = await db.execute(
+        "SELECT * FROM follow_ups WHERE kind = 'follow_up' "
+        "AND status IN ('pending', 'in_progress') ORDER BY created_at ASC"
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
 async def get_actionable(
     db: aiosqlite.Connection,
     *,
@@ -382,6 +397,52 @@ async def update_notes(
         params,
     )
     await db.commit()
+    return cursor.rowcount > 0
+
+
+async def absorb_followup(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    evidence: str,
+    require_unpinned: bool = False,
+    commit: bool = True,
+) -> bool:
+    """Mark a still-open HOT follow_up 'completed' with PR evidence (repo-pulse absorb).
+
+    Conditional by design — only a row still in ``('pending','in_progress')``
+    transitions. The detached repo-pulse worker races ego/foreground writers, so
+    an unconditional ``update_status`` would clobber a concurrent transition (e.g.
+    a user just set it 'blocked'); the WHERE guard makes the absorb
+    lost-update-safe and replay-idempotent (a re-covered enumeration window
+    matches nothing on the second run).
+
+    Lane invariants are enforced ATOMICALLY here, not from the caller's stale
+    load-time snapshot (a concurrent pin or ``kind``→``tabled`` between load and
+    this UPDATE could otherwise slip past them): ``kind='follow_up'`` is ALWAYS
+    required, so the cold ``tabled``/``idea`` lanes are never absorbed by either
+    caller. ``require_unpinned=True`` (the worker's auto-absorb) additionally
+    refuses pinned rows atomically — honouring "automation never auto-resolves a
+    pinned row"; the dashboard confirm passes ``False`` because a human
+    explicitly confirming a pinned proposal is an intended override. ``evidence``
+    is APPENDED to any existing ``resolution_notes`` (prior context is never
+    lost). Returns True iff a row changed.
+    """
+    where = "id = ? AND kind = 'follow_up' AND status IN ('pending', 'in_progress')"
+    if require_unpinned:
+        where += " AND pinned = 0"
+    cursor = await db.execute(
+        "UPDATE follow_ups SET status = 'completed', completed_at = ?, "
+        "resolution_notes = TRIM("
+        "COALESCE(resolution_notes || char(10) || char(10), '') || ?"
+        f") WHERE {where}",  # noqa: S608 — where is composed of string literals only
+        (_now_iso(), evidence, id),
+    )
+    # commit=False lets a caller stage this completion and commit it in the SAME
+    # transaction as a related write (the worker commits the absorb + its audit
+    # annotation together via repo_pulse.insert_annotation).
+    if commit:
+        await db.commit()
     return cursor.rowcount > 0
 
 

@@ -271,7 +271,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE: ${{ github.event.before }}
           HEAD_SHA: ${{ github.sha }}
         run: |
@@ -285,25 +284,22 @@ jobs:
           pf="$(mktemp)"
           printf '%s' "$PRIV" > "$pf"
 
-          # Collect ADDED lines across EVERY commit's patch in the range — NOT
-          # the net tree-to-tree diff. A value added in one commit and removed in
-          # a later commit of the same PR/push leaves the net diff clean, yet the
-          # value stays in published Git history and becomes an ancestor of main
-          # (Codex P1). `git log -p --no-merges` emits each non-merge commit's
-          # patch; pre-existing legit content is still out of scope (only commits
-          # in this range are shown). Keep all '^+' lines INCLUDING the
-          # '+++ b/path' headers (repo-relative paths never match an exact install
-          # value, and a '^+++' filter would drop added content beginning '++').
-          added=""
+          # Collect the ADDED lines across EVERY commit's patch in range — NOT
+          # the net tree-to-tree diff (a value added then removed within the same
+          # PR/push leaves the net diff clean yet stays in published history).
+          # RANGE SELECTION is security-critical and lives in tested Python:
+          # scripts/ci/leak_scan_added_lines.py. For a pull_request it anchors on
+          # the merge ref's first parent (HEAD^1 = main@ci), NOT the stale
+          # github.event.pull_request.base.sha — base.sha lags main, so
+          # base.sha..HEAD used to re-sweep (and re-flag) values main itself
+          # added-then-removed since the PR was opened. The helper keeps every
+          # '^+' line incl. '+++ b/path' headers, and fails CLOSED (nonzero exit)
+          # on an unresolvable range rather than emitting empty (a fail-OPEN).
+          # See tests/test_scripts/test_leak_scan_added_lines.py.
+          added="$(python3 scripts/ci/leak_scan_added_lines.py)"
           body=""
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            added="$(git log -p --no-merges "${PR_BASE_SHA}..HEAD" 2>/dev/null | grep -E '^\+' || true)"
             body="$(gh pr view "$PR_NUMBER" --json body -q .body 2>/dev/null || echo '')"
-          elif git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
-            added="$(git log -p --no-merges "${PUSH_BEFORE}..${HEAD_SHA}" 2>/dev/null | grep -E '^\+' || true)"
-          else
-            # New branch / unknown base — scan the tip commit's patch (best effort).
-            added="$(git show "${HEAD_SHA}" 2>/dev/null | grep -E '^\+' || true)"
           fi
 
           printf '%s\n%s\n' "$added" "$body" | python3 scripts/ci/private_pattern_scan.py --patterns "$pf"
@@ -363,6 +359,23 @@ jobs:
         run: pip install pyyaml
       - name: Subsystem-map drift guard
         run: python scripts/check_subsystem_map.py
+
+  shared-artifact-consumer-check:
+    # Shared-artifact registry guard: docs/architecture/shared-artifacts.md must
+    # declare every code consumer of each registered artifact — a NEW consumer a
+    # documenting file never learned about is a doc that lies → error. The reader
+    # diff is a fixed-string content scan of src/ + scripts/, so no git history is
+    # needed (no fetch-depth: 0). See scripts/check_shared_artifact_consumers.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install checker dependency
+        run: pip install pyyaml
+      - name: Shared-artifact consumer drift guard
+        run: python scripts/check_shared_artifact_consumers.py
 
   hook-versions-check:
     # Completeness backstop for .genesis-hook-versions: every version of a

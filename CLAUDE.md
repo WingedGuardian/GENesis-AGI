@@ -335,7 +335,11 @@ the working documents — ledger rows are the durable index, not a duplicate.
 `Ledger: <item-id>` (the 32-hex row id) on its own line in the PR body —
 the repo-pulse worker auto-absorbs the row with PR evidence at the next
 session boundary. A bare id without the marker reads as context, not
-completion (proposal only).
+completion (proposal only). The identical convention exists for a **hot
+follow-up** row: cite `Follow-up: <id>` (the 32-hex follow_up id) and the
+worker completes that row with PR evidence the same way (bare id → proposal;
+pinned rows surface as a proposal for human confirmation, never auto-completed;
+`tabled` rows are never touched).
 
 ## Knowledge Ingestion (Conversational Path)
 
@@ -388,6 +392,14 @@ When a user shares a file path or URL in conversation:
 - **Plan mode by default** for any task with 3+ steps or architectural
   decisions. If something goes sideways — STOP and re-plan.
 - **Use subagents** to keep main context clean. One concern per subagent.
+- **Verify multi-agent output — never trust one agent's claim.** A subagent
+  fan-out that produces claims you'll act on (audits, diagnoses, source-of-truth
+  maps) gets an independent adversarial verification stage before synthesis:
+  re-derive the load-bearing / contradictory / surprising claims from ground
+  truth (real runtime, not a shell proxy; values, not line-existence),
+  refute-by-default, and let the verdicts override the original reports. Scale
+  to stakes — skip it for a single trivial lookup; apply it whenever the output
+  drives decisions or lands in durable record.
 - **NEVER `rm -rf` the working directory.** Never run destructive commands
   without explicit user confirmation.
 - **Session wrap-up**: structured handoff — what changed, what's pending,
@@ -443,3 +455,19 @@ When a user shares a file path or URL in conversation:
   "just a couple of examples" is always implied.
 - Dev-specific rules (commit prefixes, targeted tests, push/PR workflow,
   capability registration) are in the genesis-development skill.
+
+## Advisory Output Standards (all channels)
+
+- **Recommendations carry falsifiability.** Advice states what would
+  change it ("I'd flip to switch if the migration estimate comes in
+  under a week"). Extends the Confidence Framework's falsifiability
+  rule from hypotheses/fixes to recommendations and decisions.
+- **Residue standard.** A good response leaves the situation smaller:
+  fewer open loops, an obvious next step, a usable artifact (decision
+  frame, draft, plan) over commentary. This is the quality bar for
+  conversational answers, digests, and triage output alike.
+- **Effort proportional to stakes.** Match depth — search, verification,
+  response length — to the stakes and ambiguity of the question, not its
+  wording. Simple question → simple answer. High-stakes with a checkable
+  factual pivot → verify before advising; don't hand the user homework
+  the tools could do. Never pad, never bluff to skip a lookup.

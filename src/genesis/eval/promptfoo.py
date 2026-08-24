@@ -8,6 +8,7 @@ Requires Node.js and promptfoo installed (`npx promptfoo` or global).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import shlex
@@ -18,7 +19,12 @@ from pathlib import Path
 
 import yaml
 
+from genesis.util.proc_kill import kill_process_group
 from genesis.util.tmp import big_tmp_dir
+
+# Bound for the post-kill pipe drain (SIGKILL of the group closes the pipes
+# near-instantly; this is headroom, not a wait we expect to use).
+_KILL_DRAIN_S = 30.0
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +57,7 @@ async def compare_models(
     """Run a promptfoo A/B comparison between two models.
 
     Args:
-        model_a: First model identifier (litellm format, e.g. "groq/llama-3.3-70b-versatile")
+        model_a: First model identifier (litellm format, e.g. "groq/openai/gpt-oss-120b")
         model_b: Second model identifier
         dataset_path: Path to the eval dataset YAML
         delay_ms: Delay between requests (for rate limiting, e.g. 31000 for 2 RPM)
@@ -75,15 +81,34 @@ async def compare_models(
         ]
         logger.info("Running promptfoo: %s", cmd_parts)
 
+        # Popen + start_new_session (not subprocess.run): promptfoo is a Node
+        # launcher (`npx promptfoo` → node → workers) — run()'s timeout kills
+        # only the direct child and orphans the tree. Own group → guarded
+        # killpg reaps it all.
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd_parts,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout_s,
                 cwd=tmpdir,
+                start_new_session=True,
             )
+        except OSError as exc:
+            return ComparisonReport(
+                model_a=model_a, model_b=model_b,
+                dataset=dataset_path.stem,
+                model_a_score=0, model_b_score=0,
+                winner="tie",
+                success=False,
+                error=f"promptfoo spawn failed: {exc}",
+            )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_s)
         except subprocess.TimeoutExpired:
+            kill_process_group(proc)
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                proc.communicate(timeout=_KILL_DRAIN_S)  # bounded drain/reap
             return ComparisonReport(
                 model_a=model_a, model_b=model_b,
                 dataset=dataset_path.stem,
@@ -92,6 +117,15 @@ async def compare_models(
                 success=False,
                 error=f"promptfoo timed out after {timeout_s}s",
             )
+        except BaseException:
+            # subprocess.run() killed the child on ANY exception (incl.
+            # Ctrl+C) — preserve that. With start_new_session the terminal
+            # SIGINT never reaches the detached node tree, so this handler
+            # is the only thing preventing an interrupt from leaking it.
+            kill_process_group(proc)
+            with contextlib.suppress(Exception):
+                proc.communicate(timeout=_KILL_DRAIN_S)
+            raise
 
         if proc.returncode != 0:
             return ComparisonReport(
@@ -100,8 +134,8 @@ async def compare_models(
                 model_a_score=0, model_b_score=0,
                 winner="tie",
                 success=False,
-                error=f"promptfoo failed (rc={proc.returncode}): {proc.stderr[:500]}",
-                raw_output=proc.stdout[:2000],
+                error=f"promptfoo failed (rc={proc.returncode}): {stderr[:500]}",
+                raw_output=stdout[:2000],
             )
 
         # Parse output
@@ -115,7 +149,7 @@ async def compare_models(
                 winner="tie",
                 success=False,
                 error=f"failed to parse promptfoo output: {e}",
-                raw_output=proc.stdout[:2000],
+                raw_output=stdout[:2000],
             )
 
         return _parse_results(model_a, model_b, dataset_path.stem, results)

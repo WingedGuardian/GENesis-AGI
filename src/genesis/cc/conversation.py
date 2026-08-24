@@ -30,7 +30,10 @@ from genesis.cc.types import (
     ChannelType,
     EffortLevel,
     StreamEvent,
+    is_owner_attended_channel,
     origin_delivery_supported,
+    session_origin_for_channel,
+    task_detected_origin,
 )
 from genesis.db.crud import cc_sessions
 from genesis.observability.call_site_recorder import record_last_run
@@ -165,8 +168,19 @@ class ConversationLoop:
         channel: ChannelType,
         thread_id: str | None = None,
         chat_id: str | None = None,
+        intent_text: str | None = None,
     ) -> str:
-        """Process a user message and return the response text."""
+        """Process a user message and return the response text.
+
+        ``intent_text`` (WS-3): the OWNER-authored text to scan for slash intents
+        (/task, /model, /effort, /resume) when *text* is a composite the caller
+        built (e.g. a Telegram quote-reply = quoted bot message + owner reply).
+        Quoted bot text can relay external content (inbox digests, recon
+        findings), so scanning it would let that content forge an owner-authorized
+        /task or flip the model. When set, control tokens + task-intent content
+        come ONLY from ``intent_text`` while *text* stays the LLM prompt (so the
+        quoted context is preserved). ``None`` → scan *text* itself (unchanged).
+        """
         try:
             from genesis.runtime import GenesisRuntime
             rt = GenesisRuntime.instance()
@@ -175,11 +189,18 @@ class ConversationLoop:
         except Exception:
             pass  # Don't let idle tracking break conversation
 
-        # Inline failure detection: scan user input for correction patterns
-        self._fire_user_correction_scan(text)
+        scan_text = intent_text if intent_text is not None else text
+        # Inline failure detection: scan owner-authored input for correction patterns
+        self._fire_user_correction_scan(scan_text)
 
-        intent = self._intent_parser.parse(text)
-        prompt_text = intent.cleaned_text or intent.raw_text
+        intent = self._intent_parser.parse(scan_text)
+        if intent_text is not None:
+            # Composite: keep full context for the LLM; task content is owner-only.
+            prompt_text = text
+            task_content = intent.cleaned_text or intent_text
+        else:
+            prompt_text = intent.cleaned_text or intent.raw_text
+            task_content = prompt_text
 
         if intent.task_requested:
             try:
@@ -192,9 +213,14 @@ class ConversationLoop:
                     id=str(_uuid.uuid4()),
                     source="conversation_intent",
                     type="task_detected",
-                    content=prompt_text,
+                    # WS-3: owner-authored content only (never the quoted composite)
+                    content=task_content,
                     priority="medium",
                     created_at=datetime.now(UTC).isoformat(),
+                    # WS-3: source is channel-agnostic (conversation_intent), so
+                    # stamp origin by channel — owner-attended (terminal/Telegram)
+                    # carries dispatch authority; gateway channels → external.
+                    origin_class=task_detected_origin(channel),
                     skip_if_duplicate=True,
                 )
             except Exception:
@@ -273,9 +299,16 @@ class ConversationLoop:
                 skip_permissions=True,
                 append_system_prompt=True,
                 roster_eligible=True,
-                # WS-3 B4: owner-attended interactive conversation — spare it
-                # from the gate-4 pushed-surfaces enforce drop.
-                supervised=True,
+                # WS-3 B4/gate-4: spare the pushed-surfaces enforce drop ONLY for
+                # owner-attended channels (terminal/Telegram). A gateway
+                # conversation (web/OpenClaw, WhatsApp, voice) is NOT owner-
+                # authenticated, so it stays unsupervised — fail-closed toward
+                # dropping wrapped-external pushed content, never injecting it.
+                supervised=is_owner_attended_channel(channel),
+                # WS-3 gate-4 producer half: gateway → external_untrusted so the
+                # session's own memory/observation_write calls are stamped
+                # untrusted (owner-attended → None → first_party coalesce).
+                origin=session_origin_for_channel(channel),
                 # Owner-attended interactive session: keep the full user-scoped
                 # MCP toolset. Opt OUT of secure-by-default strict scoping
                 # (see CCInvocation.strict_mcp_config).
@@ -421,11 +454,14 @@ class ConversationLoop:
         thread_id: str | None = None,
         session_key: str | None = None,
         chat_id: str | None = None,
+        intent_text: str | None = None,
     ) -> str:
         """Like handle_message but uses streaming for live progress.
 
         ``session_key`` (opaque) is stamped on the CC invocation so a caller's
         interrupt (Telegram /stop) targets this session's subprocess (cc-loop-01).
+        ``intent_text`` (WS-3): owner-authored text to scan for slash intents when
+        *text* is a composite (quote-reply) — see :meth:`handle_message`.
         """
         try:
             from genesis.runtime import GenesisRuntime
@@ -435,11 +471,18 @@ class ConversationLoop:
         except Exception:
             pass  # Don't let idle tracking break conversation
 
-        # Inline failure detection: scan user input for correction patterns
-        self._fire_user_correction_scan(text)
+        scan_text = intent_text if intent_text is not None else text
+        # Inline failure detection: scan owner-authored input for correction patterns
+        self._fire_user_correction_scan(scan_text)
 
-        intent = self._intent_parser.parse(text)
-        prompt_text = intent.cleaned_text or intent.raw_text
+        intent = self._intent_parser.parse(scan_text)
+        if intent_text is not None:
+            # Composite: keep full context for the LLM; task content is owner-only.
+            prompt_text = text
+            task_content = intent.cleaned_text or intent_text
+        else:
+            prompt_text = intent.cleaned_text or intent.raw_text
+            task_content = prompt_text
 
         if intent.task_requested:
             try:
@@ -452,9 +495,14 @@ class ConversationLoop:
                     id=str(_uuid.uuid4()),
                     source="conversation_intent",
                     type="task_detected",
-                    content=prompt_text,
+                    # WS-3: owner-authored content only (never the quoted composite)
+                    content=task_content,
                     priority="medium",
                     created_at=datetime.now(UTC).isoformat(),
+                    # WS-3: source is channel-agnostic (conversation_intent), so
+                    # stamp origin by channel — owner-attended (terminal/Telegram)
+                    # carries dispatch authority; gateway channels → external.
+                    origin_class=task_detected_origin(channel),
                     skip_if_duplicate=True,
                 )
             except Exception:
@@ -464,11 +512,9 @@ class ConversationLoop:
             self._db, user_id=user_id, channel=str(channel),
             thread_id=thread_id,
         )
-        session_was_reset = False
         if session and self._should_reset(session):
             self._session_locks.pop(session["id"], None)
             await self._session_mgr.complete(session["id"])
-            session_was_reset = True
             session = None
 
         model = intent.model_override or (
@@ -522,9 +568,15 @@ class ConversationLoop:
             # notify the user and inject conversation context.
             cc_sid = session.get("cc_session_id")
             recovery_context = ""
-            if not cc_sid and (session_was_reset or not session.get("message_count")):
+            # Every fresh (non-resumed) CC session gets the recovery recap —
+            # the old `or not session.get("message_count")` clause read a
+            # column that does not exist (always falsy), so this HAS always
+            # fired on fresh sessions; the condition now says so honestly.
+            if not cc_sid:
                 recovery_context = await self._build_recovery_context(
-                    user_id, channel, thread_id,
+                    str(chat_id) if chat_id else user_id.replace("tg-", ""),
+                    channel,
+                    thread_id,
                 )
                 if recovery_context and on_event:
                     await on_event(StreamEvent(
@@ -545,6 +597,15 @@ class ConversationLoop:
                 )
                 system_prompt = await self._enrich_with_context(
                     system_prompt, prompt_text,
+                )
+                # Always tell a fresh telegram session which chat it is in
+                # (enables the scoped conversation_history scroll-up). Use the
+                # REAL chat id (correct in groups); fall back to the DM
+                # convention (user id == chat id in private chats).
+                system_prompt += self._conversation_identity_block(
+                    str(chat_id) if chat_id else user_id.replace("tg-", ""),
+                    channel,
+                    thread_id,
                 )
                 if recovery_context:
                     system_prompt += (
@@ -581,9 +642,16 @@ class ConversationLoop:
                 append_system_prompt=True,
                 session_key=session_key,
                 roster_eligible=True,
-                # WS-3 B4: owner-attended interactive conversation — spare it
-                # from the gate-4 pushed-surfaces enforce drop.
-                supervised=True,
+                # WS-3 B4/gate-4: spare the pushed-surfaces enforce drop ONLY for
+                # owner-attended channels (terminal/Telegram). A gateway
+                # conversation (web/OpenClaw, WhatsApp, voice) is NOT owner-
+                # authenticated, so it stays unsupervised — fail-closed toward
+                # dropping wrapped-external pushed content, never injecting it.
+                supervised=is_owner_attended_channel(channel),
+                # WS-3 gate-4 producer half: gateway → external_untrusted so the
+                # session's own memory/observation_write calls are stamped
+                # untrusted (owner-attended → None → first_party coalesce).
+                origin=session_origin_for_channel(channel),
                 # Owner-attended interactive session: keep the full user-scoped
                 # MCP toolset. Opt OUT of secure-by-default strict scoping
                 # (see CCInvocation.strict_mcp_config).
@@ -863,8 +931,11 @@ class ConversationLoop:
             append_system_prompt=True,
             session_key=session_key,  # cc-loop-01: keep /stop working on retry
             roster_eligible=True,  # fresh retry stays roster-routable (no resume)
-            # WS-3 B4: owner-attended interactive conversation (fresh retry).
-            supervised=True,
+            # WS-3 B4/gate-4 (fresh retry): supervised ONLY for owner-attended
+            # channels (terminal/Telegram); gateway conversations stay
+            # unsupervised. Mirrors the primary invocation sites above.
+            supervised=is_owner_attended_channel(channel),
+            origin=session_origin_for_channel(channel),  # WS-3 gate-4 producer half
             # Owner-attended interactive session: keep the full user-scoped MCP
             # toolset. Opt OUT of secure-by-default strict scoping
             # (see CCInvocation.strict_mcp_config).
@@ -1301,50 +1372,163 @@ class ConversationLoop:
             logger.warning("Context injection skipped", exc_info=True)
         return system_prompt
 
+    # Total BYTE budget for the recovery recap (env-overridable settings
+    # lever: GENESIS_RECOVERY_CONTEXT_BUDGET). Sized so several full-length
+    # analytical replies survive — the old per-message 300-char HEAD chop
+    # dropped exactly the part that matters (numbered options/conclusions sit
+    # at the END of long replies; measured miss 2026-08-18: "option 3" at char
+    # ~3,850 of a 4,463-char reply).
+    RECOVERY_CONTEXT_BUDGET = 6000
+    RECOVERY_CONTEXT_MESSAGES = 20
+
+    @staticmethod
+    def _conversation_identity_block(
+        chat_ref: str,
+        channel: ChannelType,
+        thread_id: str | None,
+    ) -> str:
+        """One prompt block telling the session WHICH chat it is in, so it can
+        scroll up on demand. Without an explicit chat_id the model cannot make
+        a scoped ``conversation_history`` call — the 2026-08-18 failure mode
+        was a session truthfully claiming earlier context "isn't retrievable"
+        while the full thread sat one tool call away.
+
+        ``chat_ref`` is the REAL chat id (the handler's ``msg.chat.id`` —
+        negative for groups), optionally ``tg-``-prefixed. Never pass a
+        sender/user id here: in group/topic sessions the sender's personal id
+        is a valid-looking number that would misdirect scoped scroll-up at
+        the sender's private DM.
+        """
+        if str(channel) != "telegram":
+            return ""
+        chat_id_str = chat_ref.replace("tg-", "")
+        try:
+            int(chat_id_str)  # negative group ids are valid
+        except ValueError:
+            return ""
+        thread_note = f", thread_id={thread_id}" if thread_id else ""
+        # Scope the suggested call to the ACTIVE topic when in a forum thread —
+        # an unscoped group call would pull unrelated topics' messages.
+        thread_arg = f", thread_id={thread_id}" if thread_id else ""
+        return (
+            "\n\n## Conversation identity\n"
+            f"This is the Telegram chat with chat_id={chat_id_str}{thread_note}. "
+            "When the user references earlier conversation that is not in your "
+            "context, SCROLL UP before claiming it is unavailable: call "
+            f"`conversation_history(channel='telegram', chat_id={chat_id_str}"
+            f"{thread_arg}, limit=50)` (add `before=<oldest timestamp seen>` to "
+            "page further back). Messages return full-length."
+        )
+
     async def _build_recovery_context(
         self,
-        user_id: str,
+        chat_ref: str,
         channel: ChannelType,
         thread_id: str | None,
     ) -> str:
         """Load recent messages for session recovery context injection.
 
+        ``chat_ref``: the real chat id (optionally ``tg-``-prefixed; negative
+        for groups) — same contract as ``_conversation_identity_block``.
+
+        Byte-budgeted and TAIL-biased: messages are kept whole newest-first
+        until the budget runs low; a message too large for the remaining
+        budget keeps its END (marked with a leading ellipsis), because that is
+        where long analytical replies put their conclusions and option lists.
         Returns a formatted string of recent conversation, or "" if none.
         """
         if str(channel) != "telegram":
             return ""
         try:
+            import os
+
             from genesis.db.crud.telegram_messages import query_recent
 
-            # Extract numeric chat_id from user_id (tg-<id>)
-            chat_id_str = user_id.replace("tg-", "")
-            if not chat_id_str.isdigit():
+            try:
+                chat_id = int(chat_ref.replace("tg-", ""))
+            except ValueError:
                 return ""
-            chat_id = int(chat_id_str)
+
+            try:
+                budget = int(
+                    os.environ.get("GENESIS_RECOVERY_CONTEXT_BUDGET", "")
+                    or self.RECOVERY_CONTEXT_BUDGET,
+                )
+            except ValueError:
+                budget = self.RECOVERY_CONTEXT_BUDGET
+            budget = max(500, budget)
 
             messages = await query_recent(
                 self._db,
                 chat_id,
                 thread_id=int(thread_id) if thread_id else None,
-                limit=10,
+                limit=self.RECOVERY_CONTEXT_MESSAGES,
             )
             if not messages:
                 return ""
 
-            lines = []
-            for m in messages:
-                sender = m.get("sender", "?")
-                content = m.get("content", "")
-                if content:
-                    prefix = "User" if sender == "user" else "Genesis"
-                    # Truncate long messages
-                    if len(content) > 300:
-                        content = content[:300] + "..."
-                    lines.append(f"{prefix}: {content}")
+            def _tail_by_bytes(s: str, max_bytes: int) -> str:
+                """Longest end-slice of ``s`` whose UTF-8 length ≤ max_bytes, cut
+                on a CHARACTER boundary. Slicing raw bytes then decoding with
+                errors='ignore' drops only the leading partial multibyte char, so
+                the result is always valid UTF-8 (never a U+FFFD)."""
+                if max_bytes <= 0:
+                    return ""
+                encoded = s.encode()
+                if len(encoded) <= max_bytes:
+                    return s
+                return encoded[-max_bytes:].decode("utf-8", errors="ignore")
 
-            if not lines:
+            # Walk newest → oldest, spending the BYTE budget where recency is;
+            # then restore chronological order for readability. Bytes (not chars)
+            # so a multibyte-heavy transcript can't balloon the real payload ~3-4x.
+            kept: list[str] = []
+            remaining = budget  # bytes
+            for m in reversed(messages):
+                content = str(m.get("content") or "")
+                if not content:
+                    continue
+                prefix = "User" if m.get("sender") == "user" else "Genesis"
+                line = f"{prefix}: {content}"
+                # Charge the "\n" that "\n".join will insert before this line
+                # (one per line after the first) so the budget is enforced on the
+                # ACTUAL recap size, not the sum of lines alone.
+                sep = 1 if kept else 0
+                line_bytes = len(line.encode()) + sep
+                if line_bytes <= remaining:
+                    kept.append(line)
+                    remaining -= line_bytes
+                elif remaining - sep > 200:
+                    # Tail-keep: the end of a long reply carries its
+                    # conclusions/option lists — never the head alone. Measured
+                    # in bytes, cut on a char boundary so the recap stays valid
+                    # UTF-8. Reserve the separator + exact marker cost so the kept
+                    # entry (and its joining newline) fits.
+                    marker = f"{prefix}: …"
+                    tail = _tail_by_bytes(
+                        content, remaining - sep - len(marker.encode()),
+                    )
+                    kept.append(marker + tail)
+                    remaining = 0
+                else:
+                    # Doesn't fit and no room for a meaningful tail — STOP
+                    # rather than skip: appending a smaller OLDER message here
+                    # would leave an unmarked hole mid-recap.
+                    break
+                if remaining <= 0:
+                    break
+            if not kept:
                 return ""
-            return "\n".join(lines)
+            kept.reverse()
+            recap = "\n".join(kept)
+            logger.info(
+                "Recovery context built for chat %s: %d msgs, %d/%d bytes",
+                chat_id,
+                len(kept),
+                len(recap.encode()),
+                budget,
+            )
+            return recap
         except Exception:
             logger.warning("Failed to load recovery context", exc_info=True)
             return ""

@@ -176,14 +176,43 @@ def _cd_target(raw: str):
         return _CWD_UNKNOWN
     if len(p) >= 2 and p[0] in "'\"" and p[-1] == p[0]:
         inner = p[1:-1]
-        if p[0] == '"' and ("$" in inner or "`" in inner):
+        # Double quotes still expand $/`, and consume a backslash ONLY before
+        # $ ` " \ or newline (bash manual "Double Quotes"; verified vs bash 5.2:
+        # `"\q"` keeps the backslash literally, `"\$"`/`"\\"` collapse). A literal
+        # read is unfaithful exactly for those — UNKNOWN. A backslash before an
+        # ordinary char (`"/tmp/repo\q"`) is part of the literal pathname and
+        # stays allowed (Codex P2, #1371). Single quotes suppress ALL expansion,
+        # so the literal read is always faithful.
+        if p[0] == '"' and (any(ch in inner for ch in "$`") or re.search(r'\\[$`"\\\n]', inner)):
             return _CWD_UNKNOWN
         return inner
     if " " in p or "\t" in p:
         return _CWD_UNKNOWN
     if p.startswith("~"):
+        # Faithful for every non-adversarial command (30% of real commits use
+        # `cd ~/…`). ACCEPTED RESIDUE, deliberately outside the threat model: a
+        # same-command `HOME=` reassignment would make bash expand `~` differently
+        # than the hook — but that is deliberate evasion, not an accident, and the
+        # gate is an accident-prevention/friction layer, not a sandbox (a
+        # deliberate evader already has `python -c 'subprocess.run(["git", …])'`,
+        # which no Bash-string guard can see). Denying tilde would tax every
+        # legitimate commit to block an evasion class that stays open elsewhere.
         p = os.path.expanduser(p)
-    if any(ch in p for ch in "$`*?"):
+    # Any special char bash would act on (the manual's closed lists — expansion
+    # triggers: brace `{`, parameter `$`, command-subst backtick, escapes `\`,
+    # globs `*?[`, tilde handled above; plus the in-segment metacharacters
+    # `()<>`, e.g. process substitution `<(…)`): bash would transform the word or
+    # parse it as syntax, so our literal join would check a DIFFERENT dir than
+    # bash enters, and a planted look-alike ("shadow") dir would even pass the
+    # isdir validation. Unresolvable → UNKNOWN.
+    if any(ch in p for ch in "$`*?[{\\()<>"):
+        return _CWD_UNKNOWN
+    # A RELATIVE target with CDPATH in the environment: bash's cd consults CDPATH
+    # and may enter a directory OUTSIDE the resolved join — unverifiable. EXEMPT
+    # a first pathname component of `.` or `..`: POSIX cd (and bash 5.2, verified)
+    # skips the CDPATH search for those, so `cd ./wt` stays deterministically
+    # resolvable even under CDPATH (Codex P2, #1371).
+    if not os.path.isabs(p) and os.environ.get("CDPATH") and p.split("/", 1)[0] not in (".", ".."):
         return _CWD_UNKNOWN
     return p
 
@@ -203,7 +232,25 @@ def _resolve_against(current, target: str):
     return os.path.normpath(os.path.join(current, target))
 
 
-def _effective_diff_cwd(command: str, payload: dict, segs: list):
+def _existing_dir_or_unknown(resolved):
+    """POSITIVE validation of a resolved effective cwd: a ``str`` that is not an
+    existing directory becomes ``_CWD_UNKNOWN``.
+
+    This is the categorical closure for every unexpanded-token form (`-C 'main*'`,
+    `-C ~/x` quoted, `cd main\\o`, glob chars, future metachars we didn't
+    enumerate): if the token had shell expansion we didn't perform, the joined
+    literal path almost surely does not exist — and a branch read against a
+    nonexistent dir returned "unknown"/OSError, which used to slip PAST Rule 1
+    (audit finding, 2026-08-11, confirmed by execution). A legit commit always
+    runs in a real directory, so requiring existence adds no friction. ``None``
+    passes through (no payload cwd — pre-existing fallback semantics).
+    """
+    if isinstance(resolved, str) and not os.path.isdir(resolved):
+        return _CWD_UNKNOWN
+    return resolved
+
+
+def _effective_diff_cwd(command: str, payload: dict, segs: list, commit_seg=None):
     """The ABSOLUTE dir whose index the commit inspects — ``str``/``None``/UNKNOWN.
 
     Resolution mirrors git_push_guard (self-contained; no import):
@@ -213,8 +260,15 @@ def _effective_diff_cwd(command: str, payload: dict, segs: list):
          commit`` runs in B). Relative cds/-C resolve against the running cwd; an
          unresolvable one ⇒ UNKNOWN. Falls back to the payload cwd as the base.
       3. ``git -C <dir>`` on the commit segment overrides, resolved against that.
+      4. A resolved dir that does not EXIST ⇒ UNKNOWN (positive validation — see
+         :func:`_existing_dir_or_unknown`).
+
+    ``commit_seg`` selects WHICH commit segment to resolve for (default: the
+    first) — a chained ``git commit … && git -C /elsewhere commit …`` has a
+    DIFFERENT effective cwd per segment, and Rule 1 must check each.
     """
-    commit_seg = next((s for s in segs if git_subcommand(s.argv) == "commit"), None)
+    if commit_seg is None:
+        commit_seg = next((s for s in segs if git_subcommand(s.argv) == "commit"), None)
     if commit_seg is not None and getattr(commit_seg, "depth", 0) > 0:
         return _CWD_UNKNOWN
 
@@ -222,9 +276,26 @@ def _effective_diff_cwd(command: str, payload: dict, segs: list):
     cur = os.path.normpath(base) if isinstance(base, str) and base else None
     target_raw = getattr(commit_seg, "raw", None) if commit_seg is not None else None
     if target_raw is not None:
+        # Locate commit_seg by POSITION (occurrence index among top-level segments
+        # sharing its raw), not by first-raw-match: in a chain of commits with
+        # IDENTICAL raw text (`cd /wt && git commit -m same; cd /other && git
+        # commit -m same`) a raw-equality break stopped at the FIRST occurrence
+        # for BOTH segments, so the second commit inherited the first's cwd —
+        # bypassing the direct-to-main check AND blinding the different-dirs
+        # check (Codex P1, #1371). Identity (`s is commit_seg`) picks the right
+        # occurrence; depth-0 filtering keeps the count aligned with
+        # split_segments (nested segments don't appear as top-level raws).
+        same_raw = [
+            s for s in segs if getattr(s, "depth", 0) == 0 and getattr(s, "raw", None) == target_raw
+        ]
+        occ = next((i for i, s in enumerate(same_raw) if s is commit_seg), 0)
+        seen = 0
         for raw in split_segments(command):
             if raw == target_raw:
-                break
+                if seen == occ:
+                    break
+                seen += 1
+                continue  # an earlier same-raw occurrence (a commit, never a cd)
             cd = _cd_target(raw)
             if cd is _CWD_UNKNOWN:
                 cur = _CWD_UNKNOWN
@@ -233,8 +304,19 @@ def _effective_diff_cwd(command: str, payload: dict, segs: list):
     if commit_seg is not None:
         dash_c = _seg_dash_C(getattr(commit_seg, "argv", None))
         if dash_c is not None:
-            return _resolve_against(cur, dash_c)
-    return cur
+            if dash_c.startswith("~") or any(ch in dash_c for ch in "$`\\*?[{()<>"):
+                # Any special char in a `-C` target (the bash manual's closed
+                # lists — expansion triggers: tilde, parameter `$`, command-subst
+                # backtick, escapes `\`, globs `*?[`, brace `{`; in-segment
+                # metacharacters `()<>` incl. process substitution): UNRESOLVABLE,
+                # same class as `cd "$WT"`. The argv token has lost its quoting,
+                # so we cannot tell an expanding form from a quoted-literal one —
+                # and a planted shadow dir matching the LITERAL token would pass
+                # the isdir validation while bash expands into a different dir.
+                # NEVER resolved from context — see the Rule-1 teach-only note.
+                return _CWD_UNKNOWN
+            return _existing_dir_or_unknown(_resolve_against(cur, dash_c))
+    return _existing_dir_or_unknown(cur)
 
 
 def _staged_files(cwd: str | None) -> list[str] | None:
@@ -375,6 +457,142 @@ def _commit_may_add_content(segs: list) -> bool:
     return False
 
 
+# ── Chain state-mutation guards (Codex P1 #1371) ─────────────────────────────
+# The Rule-1 branch read and the review marker are both sampled ONCE at hook time,
+# before any segment runs — so a chain that CHANGES the branch or STAGES new content
+# between commits lands a later commit in a state the hook never inspected. Two
+# conservative, fail-closed checks close that (see main()).
+# git_subcommand cannot resolve user ALIASES (they live in git config), so a
+# habitual `co=checkout` (`git co main && git commit`) moves HEAD to main undetected
+# — and it also defeats Rule 1's own hook-time branch read the same way. Accepted
+# residue: resolving aliases would require reading git config, outside this static
+# accident-prevention guard's model (a deliberate evader already has `python -c`).
+_BRANCH_MUTATING_SUBCMDS = frozenset({"switch", "checkout"})
+# Characters that make a branch-target token unresolvable to a literal name (a
+# variable/command-subst/glob/escape) — same intent as _cd_target's set. A target
+# carrying any of these can't be proven ≠ main, so it fails closed.
+_UNRESOLVABLE_TARGET_CHARS = "$`*?[{\\()<>~"
+
+
+def _branch_mutation_risk(argv: list[str]) -> str | None:
+    """Whether a ``git switch``/``git checkout`` could move HEAD toward main/master or
+    an unverifiable branch.
+
+    Returns ``"main"`` if it could land HEAD on main/master, ``"unknown"`` if the
+    target is unresolvable (a variable/subst/glob/``-`` previous-branch), else
+    ``None`` — a literal non-main branch (``checkout -b feature``) carries no
+    direct-to-main risk, and a FILE-RESTORE form moves no branch at all.
+
+    Only HEAD-MOVING forms are assessed, to avoid false-blocking file restores
+    (``git checkout HEAD~1 -- f`` / ``git checkout main f.py``, which leave HEAD put):
+      * the branch-create flags ``-c/-C`` (switch) / ``-b/-B`` (checkout) → the name
+        they carry is created+checked-out (HEAD-moving). Their value may be a
+        SEPARATE token (``-B main``), ATTACHED (``-Bmain``), inside a short CLUSTER
+        (``-qBmain`` / ``-qB main``), or a long ``--create=``/``--force-create=``
+        form (Codex P1 #1371 — a bare-token check let ``-Bmain`` reach main);
+      * bare ``git switch <branch>`` → HEAD-moving;
+      * bare ``git checkout <x>`` → HEAD-moving ONLY as the pure switch form: no
+        ``--`` and exactly ONE operand (``checkout <ref> <path>`` or ``checkout --
+        <path>`` is a restore → not assessed).
+    argv is quote-stripped by shell_parse, so a ``$VAR`` target survives as a literal
+    ``$…`` token and reads as unresolvable. ACCEPTED RESIDUE (deliberate-evasion,
+    outside the accident model — like the alias/symbolic-ref note above): a git long-
+    option ABBREVIATION of the create flags (``--force-c=main``) is not matched."""
+    sub = git_subcommand(argv)
+    # advance past git global options to just after the subcommand token
+    i = 1
+    while i < len(argv):
+        if argv[i] in _GIT_GLOBAL_VALUE_FLAGS:
+            i += 2
+            continue
+        if argv[i].startswith("-"):
+            i += 1
+            continue
+        break
+    i += 1
+    new_branch_vals: list[str] = []  # branch-create flag values → definitely HEAD-moving
+    positionals: list[str] = []
+    has_dashdash = False
+    _CREATE_SHORTS = "bBcC"  # checkout -b/-B, switch -c/-C — all NAME the new branch
+    _CREATE_LONGS = ("--create", "--force-create")  # switch long forms; value = branch
+    while i < len(argv):
+        t = argv[i]
+        if t == "--":
+            has_dashdash = True
+            break
+        if t == "-":  # previous-branch shorthand (a bare positional, not a flag)
+            positionals.append("-")
+            i += 1
+            continue
+        if t.startswith("--"):
+            name, eq, val = t.partition("=")
+            if name in _CREATE_LONGS:
+                if eq:
+                    new_branch_vals.append(val)  # --force-create=main
+                elif i + 1 < len(argv):
+                    new_branch_vals.append(argv[i + 1])  # --create main
+                    i += 1
+            i += 1
+            continue
+        if t.startswith("-") and len(t) > 1:
+            # Decompose the short cluster letter-wise (pflag semantics — see
+            # feedback_cli_guard_pflag_clustering): a branch-create letter takes the
+            # REST of the token as its value if any (``-Bmain`` / ``-qBmain``), else
+            # the NEXT token (``-B main`` / ``-qB main``). Boolean letters (q/f/…)
+            # before it are consumed in place.
+            letters = t[1:]
+            for j, ch in enumerate(letters):
+                if ch in _CREATE_SHORTS:
+                    rest = letters[j + 1 :]
+                    if rest:
+                        new_branch_vals.append(rest)
+                    elif i + 1 < len(argv):
+                        new_branch_vals.append(argv[i + 1])
+                        i += 1
+                    break
+            i += 1
+            continue
+        positionals.append(t)
+        i += 1
+
+    if new_branch_vals:
+        targets = new_branch_vals
+    elif sub == "switch":
+        targets = positionals
+    elif has_dashdash or len(positionals) != 1:
+        targets = []  # checkout file-restore form → HEAD not moved
+    else:
+        targets = positionals  # bare `git checkout <branch>` → the switch form
+
+    for t in targets:
+        if t in ("main", "master"):
+            return "main"
+        if t == "-" or any(ch in t for ch in _UNRESOLVABLE_TARGET_CHARS):
+            return "unknown"
+    return None
+
+
+def _worktree_root(cwd: str) -> str:
+    """The git worktree ROOT that owns ``cwd`` (canonicalized), or ``realpath(cwd)``
+    as a fallback. Two different SUBDIRECTORIES of one worktree — and a symlink alias
+    of it — resolve to the same root, so a legitimate same-worktree commit chain
+    (which shares ONE index + review marker) is not mistaken for different-directory
+    commits (Codex P2 #1371). Fail-safe: any git error falls back to realpath."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        root = r.stdout.strip()
+        if r.returncode == 0 and root:
+            return os.path.realpath(root)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return os.path.realpath(cwd)
+
+
 def main() -> None:
     # Parse tool input
     payload = read_payload()
@@ -410,9 +628,10 @@ def main() -> None:
     # Resolve the dir the commit actually targets (git -C / the LAST cd before
     # the commit segment / payload cwd). A decoy `cd A && …; cd B && git commit`
     # runs in B, and B is what we must inspect. An ambiguous cwd (variable /
-    # subshell / depth>0) yields the _CWD_UNKNOWN sentinel → fail closed.
+    # subshell / depth>0 / nonexistent dir) yields the _CWD_UNKNOWN sentinel →
+    # fail closed (the Rule-1 loop below denies it for every commit segment).
+    # `cwd` (first commit segment's dir) feeds the round/staged/marker checks.
     eff_cwd = _effective_diff_cwd(command, payload, segs)
-    cwd_unknown = eff_cwd is _CWD_UNKNOWN
     cwd = eff_cwd if isinstance(eff_cwd, str) else None
 
     # Import review_state from same directory
@@ -434,16 +653,140 @@ def main() -> None:
         # If review_state.py is missing, fail open — don't block
         sys.exit(0)
 
-    branch = get_current_branch(cwd=cwd)
-
     # Rule 1: Block commits on main. Fail closed when the cwd is ambiguous — we
-    # cannot prove the commit is NOT landing on main, so treat it as such.
-    if cwd_unknown or branch in ("main", "master"):
-        _deny(
-            "BLOCKED: Direct commits to main are not allowed. "
-            "Create a branch first: git checkout -b <scope>/<description>"
+    # cannot prove the commit is NOT landing on main, so treat it as such. The two
+    # causes get DISTINCT messages: an unresolvable cwd is NOT a branch violation,
+    # and labeling it "Direct commits to main" sent sessions chasing a branch
+    # problem they didn't have (the recurring worktree false-block, root-caused
+    # 2026-08-10). cwd_unknown is checked FIRST — when the cwd can't be resolved,
+    # a branch read would use the hook's own cwd and is meaningless.
+    #
+    # DELIBERATELY teach-only: the gate never resolves a `$VAR` cwd, even from a
+    # same-command literal assignment. Four adversarial-review rounds (2026-08-11)
+    # each found a distinct false-ALLOW-to-main in static variable resolution
+    # (source/eval/read reassignment, export multi-assign, shell functions,
+    # $PWD/CDPATH semantics, printf -v, multiple -C) — bash variable STATE is not
+    # statically resolvable, so we don't try (see
+    # feedback_no_handrolled_shell_parsing_for_guards).
+    #
+    # EVERY commit segment is checked, not just the first — a chained
+    # `git commit … && git -C /elsewhere commit …` runs its second commit in a
+    # DIFFERENT dir (audit finding 3, 2026-08-11, confirmed by execution).
+    all_commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
+
+    # Branch-mutation guard (Codex P1 #1371): get_current_branch() below reads the
+    # branch ONCE at hook time, before any segment runs. A `git switch main` /
+    # `git checkout main` (or an unresolvable target) EARLIER in the chain than a
+    # commit lands that commit on a branch this read cannot see — slipping the
+    # direct-to-main block. Fail closed when a pre-commit branch mutation could reach
+    # main/master or is unresolvable; a literal non-main target (`git checkout -b
+    # feature && git commit`, the flow this gate itself recommends) carries no
+    # direct-to-main risk and stays allowed.
+    #
+    # SCOPE IS CONSCIOUSLY BOUNDED — do NOT keep adding forms one at a time (user
+    # decision 2026-08-12, after the escalation cap fired on this axis). This covers
+    # the COMMON, accident-plausible ways HEAD reaches main before a commit — bare
+    # `switch/checkout main`, `-b/-B/-c/-C main` (separate / attached / clustered /
+    # long `--create=`), `-`/`$VAR` targets. The exotic HEAD-movers — a git long-option
+    # ABBREVIATION (`--force-c=main`), reflog `@{-1}`, a remote-tracking ref resolving
+    # to main, `git symbolic-ref`, and user checkout ALIASES (`co`) — are ACCEPTED
+    # RESIDUE: they are deliberate-evasion, outside this accident-prevention gate's
+    # threat model (a deliberate evader already has `python -c 'subprocess…'`, which no
+    # Bash-string guard can see). A future Codex/architect finding of one of THOSE is
+    # a `tabled` residue record, NOT another patch here (feedback_no_handrolled_shell_
+    # parsing_for_guards / feedback_cli_guard_pflag_clustering).
+    if all_commit_segs:
+        last_commit_i = max(i for i, s in enumerate(segs) if git_subcommand(s.argv) == "commit")
+        for i, s in enumerate(segs):
+            if i >= last_commit_i:
+                break
+            if git_subcommand(s.argv) in _BRANCH_MUTATING_SUBCMDS and _branch_mutation_risk(s.argv):
+                _deny(
+                    "BLOCKED: this command switches branches (git switch/checkout to "
+                    "main/master or an unresolvable target) before a commit, so the "
+                    "guard cannot verify which branch the commit lands on. Run the "
+                    "branch switch and the commit as SEPARATE commands."
+                )
+                return
+
+    seg_cwds = []
+    for seg in all_commit_segs:
+        seg_cwd = _effective_diff_cwd(command, payload, segs, commit_seg=seg)
+        if seg_cwd is _CWD_UNKNOWN:
+            _deny(
+                "BLOCKED: cannot verify which branch this commit lands on — its "
+                "working directory comes from a shell variable, command "
+                "substitution, subshell, or unexpanded/nonexistent path that this "
+                "guard cannot safely evaluate, so it fails closed. Re-run with a "
+                "LITERAL absolute path: `cd /abs/path && git commit …` or "
+                '`git -C /abs/path commit …` (not `cd "$VAR"`).'
+            )
+            return
+        seg_cwds.append(seg_cwd)
+        seg_branch = get_current_branch(cwd=seg_cwd if isinstance(seg_cwd, str) else None)
+        if seg_branch in ("main", "master"):
+            _deny(
+                "BLOCKED: Direct commits to main are not allowed. "
+                "Create a branch first: git checkout -b <scope>/<description>"
+            )
+            return
+    # Commits chained into DIFFERENT dirs share this one gate, but the review
+    # marker checked below (Rule 2) belongs to the FIRST commit's worktree only —
+    # a second repo's commit would ride an approval that never inspected it.
+    # Mirror the push guard's multiple-publish rule: one gated commit dir per
+    # command. (Same-dir chains — `git commit … ; git commit --amend` — pass.)
+    # ``None`` (no payload cwd → the hook's own cwd) counts as its own dir: it is
+    # not provably equal to an explicit path, so a mixed chain fails closed.
+    # Compare by GIT WORKTREE IDENTITY, not the raw path: the marker and index are
+    # owned by the worktree ROOT, so two different SUBDIRECTORIES of one worktree —
+    # and a symlink alias of it — are ONE gated unit and must not read as different
+    # dirs (Codex P2, #1371; a bare-realpath compare still false-blocked the
+    # different-subdir case). Only resolved when ≥2 commits actually chain, to avoid
+    # the extra git call on the common single-commit path.
+    if len(all_commit_segs) >= 2:
+        distinct_dirs = {_worktree_root(c) if isinstance(c, str) else c for c in seg_cwds}
+        if len(distinct_dirs) > 1:
+            _deny(
+                "BLOCKED: this command chains git commits into DIFFERENT worktrees, "
+                "which would share a single review gate (the review marker covers only "
+                "the first commit's worktree). Run each commit as its own command so "
+                "each is gated separately."
+            )
+            return
+
+        # Content-binding guard (Codex P1 #1371): a same-worktree chain can record
+        # UNREVIEWED content in a later commit under the first commit's marker — the
+        # marker + index are sampled ONCE at hook time. ALLOWLIST the one shape the
+        # hook can prove records the reviewed diff, and fail closed on everything else:
+        # a blocklist of "dangerous staging subcommands" leaked repeatedly (a `git add`
+        # between, `-am`/pathspec on a later commit, `git stash pop --index`,
+        # cherry-pick) — the architecture signal from
+        # feedback_no_handrolled_shell_parsing_for_guards. Provably safe iff EVERY
+        # commit after the first is a PURE `--amend` (no -a/-i/-o/-p/pathspec, so it
+        # re-records the first commit's content, not new material) AND NO other git
+        # command runs between the first and last commit (a non-commit git segment
+        # could re-stage; an unknown git subcommand fails closed). Non-git commands
+        # (echo/sed/build steps) are fine — a pure `--amend` never stages unstaged
+        # working-tree edits. Anything else → run each commit as a separate command.
+        commit_positions = [i for i, s in enumerate(segs) if git_subcommand(s.argv) == "commit"]
+        impure_later_commit = any(
+            "--amend" not in s.argv or _commit_can_select_content(s.argv)
+            for s in all_commit_segs[1:]
         )
-        return
+        git_between_commits = any(
+            git_subcommand(segs[i].argv) not in (None, "commit")
+            for i in range(commit_positions[0] + 1, commit_positions[-1])
+        )
+        if impure_later_commit or git_between_commits:
+            _deny(
+                "BLOCKED: this chains multiple commits in one worktree in a shape the "
+                "single review gate cannot bind to the reviewed diff — a later commit "
+                "stages its own content (-a/-i/-o/-p or a pathspec), is not a pure "
+                "`--amend`, or another git command runs between the commits. Run each "
+                "commit as a SEPARATE command so each is gated against its own "
+                "reviewed diff."
+            )
+            return
 
     # Rule 3: review escalation cap. After ESCALATION_ROUND_CAP CONSECUTIVE
     # defect-bearing review→fix→re-review rounds on this change (a clean review
@@ -614,8 +957,9 @@ def main() -> None:
                 "inline pass is FALSE CONFIDENCE, not clearance. Dispatch a genesis-architect "
                 "adversarial audit (assume bugs, enumerate the edge/boundary/sentinel/"
                 "hierarchy class, READ authoritative semantics for any domain code), save it "
-                "to ~/.genesis/last_code_review.txt, then re-mark:\n"
-                "  python3 scripts/review_state.py mark --agent-output ~/.genesis/last_code_review.txt\n"
+                "to the per-worktree path from `python3 scripts/review_state.py evidence-path` "
+                "(concurrent sessions don't clobber it), then re-mark:\n"
+                "  python3 scripts/review_state.py mark\n"
                 "If the audit genuinely ran but its format isn't recognized, acknowledge with "
                 "a trailing shell comment (outside any quotes):  # depth-ack"
             )
@@ -655,7 +999,8 @@ def main() -> None:
         _deny(
             "BLOCKED: Code changes exist without review. "
             "Run /review and dispatch the genesis-architect agent (adversarial audit) first, "
-            "then run: python3 scripts/review_state.py mark --agent-output ~/.genesis/last_code_review.txt\n"
+            "save it to `python3 scripts/review_state.py evidence-path`, "
+            "then run: python3 scripts/review_state.py mark\n"
             "If findings are intentionally accepted, append a trailing shell "
             "comment (outside any quotes): '  # review-override'"
         )

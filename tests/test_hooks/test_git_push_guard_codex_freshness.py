@@ -16,6 +16,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 _WORKTREE = Path(__file__).resolve().parent.parent.parent
 _HOOKS_DIR = _WORKTREE / "scripts" / "hooks"
 _spec = importlib.util.spec_from_file_location("git_push_guard", _HOOKS_DIR / "git_push_guard.py")
@@ -26,9 +28,42 @@ HEAD = "0cd13afeb51025af5dc7bd24df1ffa57cd2babab"
 STALE = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_codex_comments(monkeypatch):
+    """Default: NO Codex issue-comments, so the clean-comment freshness fallback in
+    ``_check_codex_reviewed_head`` is network-free unless a test opts in. Tests override
+    with their own ``monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", …)`` (later wins)."""
+    monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
+
+
 def _reviews_jsonl(*commit_ids, login="chatgpt-codex-connector[bot]"):
     """One JSON object per line, matching gh api .../reviews --jq '{login, commit_id}'."""
     return "\n".join(json.dumps({"login": login, "commit_id": cid}) for cid in commit_ids)
+
+
+def _scheduled_marker(head=HEAD, *, login="owner", author_association="OWNER"):
+    """_TEST_GH_SCHEDULED_COMMENTS shape — one OWNER-authored row carrying a marker for
+    EVERY required kind (code-review + leaks) naming ``head``, so the scheduled gate is
+    satisfied and these freshness/binding cases exercise their own target
+    (author_association=OWNER satisfies the trust check regardless of derived repo owner)."""
+    markers = "\n".join(
+        f"<!-- genesis-scheduled-review: head={head} kind={k} -->"
+        for k in ("code-review", "leaks")
+    )
+    body = "Scheduled review complete.\n" + markers
+    return json.dumps({"login": login, "author_association": author_association, "body": body})
+
+
+def _clean_comment_jsonl(
+    short_sha, *, login="chatgpt-codex-connector[bot]", user_type="Bot", flavour="Swish!"
+):
+    """One Codex CLEAN issue-comment, matching the real body shape (variable flavour
+    sentence + a backtick-wrapped abbreviated ``Reviewed commit`` sha)."""
+    body = (
+        f"Codex Review: Didn't find any major issues. {flavour}\n\n"
+        f"**Reviewed commit:** `{short_sha}`\n\n<details>info</details>"
+    )
+    return json.dumps({"login": login, "type": user_type, "body": body})
 
 
 class TestReviewedCommitParsing:
@@ -339,3 +374,570 @@ class TestDeriveRepoFromCwd:
         # fails closed.
         monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "$VAR")
         assert _mod._derive_repo_from_cwd("/x") is None
+
+
+def _reviews_jsonl_state(*entries, login="chatgpt-codex-connector[bot]"):
+    """One JSON object per line with an explicit state: entries are (commit_id, state)."""
+    return "\n".join(
+        json.dumps({"login": login, "commit_id": cid, "state": state}) for cid, state in entries
+    )
+
+
+def _compare_json(status="ahead", files=None):
+    return json.dumps({"status": status, "files": files or []})
+
+
+def _code_file(path="src/module_a.py", additions=80, deletions=0, has_patch=True, **kw):
+    f = {
+        "filename": path,
+        "additions": additions,
+        "deletions": deletions,
+        "status": kw.get("status", "modified"),
+        "has_patch": has_patch,
+    }
+    if "previous_filename" in kw:
+        f["previous_filename"] = kw["previous_filename"]
+    return f
+
+
+class TestDismissedAndMalformedReviews:
+    """DISMISSED must not vouch for a commit; malformed NDJSON must not crash."""
+
+    def test_dismissed_latest_falls_back_to_earlier(self, monkeypatch):
+        # Latest Codex review at HEAD is DISMISSED → the earlier (stale) one governs.
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_REVIEWS",
+            _reviews_jsonl_state((STALE, "COMMENTED"), (HEAD, "DISMISSED")),
+        )
+        assert _mod._latest_codex_reviewed_sha("5") == STALE
+
+    def test_all_dismissed_is_absent(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl_state((HEAD, "DISMISSED")))
+        assert _mod._latest_codex_reviewed_sha("5") is None
+
+    def test_missing_state_counts_as_active(self, monkeypatch):
+        # Backward-compat: pre-existing seam entries carry no state.
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD))
+        assert _mod._latest_codex_reviewed_sha("5") == HEAD
+
+    def test_non_dict_json_line_skipped(self, monkeypatch):
+        # A valid-JSON non-object line (`null`) must be SKIPPED, not raise
+        # AttributeError out of the "None on any parse error" contract.
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "null\n" + _reviews_jsonl(HEAD))
+        assert _mod._latest_codex_reviewed_sha("5") == HEAD
+
+
+class TestPostReviewDeltaClassify:
+    """_classify_post_review_delta over the _TEST_GH_COMPARE seam."""
+
+    def _lvl(self, monkeypatch, payload):
+        monkeypatch.setenv("_TEST_GH_COMPARE", payload)
+        return _mod._classify_post_review_delta(STALE, HEAD, None)
+
+    def test_identical_is_inline(self, monkeypatch):
+        assert self._lvl(monkeypatch, _compare_json("identical")) == "inline"
+
+    def test_behind_fails_closed(self, monkeypatch):
+        # Codex P1 #1373: `behind` (head is an ANCESTOR of the reviewed commit) does
+        # NOT make head a content-subset — if the reviewed commit deleted code and the
+        # PR reset to its parent, head carries code Codex never approved. Must NOT be
+        # inline; it falls to the not-ahead/diverged branch → None → block.
+        assert self._lvl(monkeypatch, _compare_json("behind")) is None
+        assert self._lvl(monkeypatch, _compare_json("behind", [_code_file()])) is None
+
+    def test_ahead_substantial(self, monkeypatch):
+        assert self._lvl(monkeypatch, _compare_json("ahead", [_code_file()])) == "substantial"
+
+    def test_ahead_trivial_is_inline(self, monkeypatch):
+        assert self._lvl(monkeypatch, _compare_json("ahead", [_code_file(additions=3)])) == "inline"
+
+    def test_diverged_substantial_still_classifies(self, monkeypatch):
+        # A rebase/force-push rewrite must NOT be assumed trivial.
+        assert self._lvl(monkeypatch, _compare_json("diverged", [_code_file()])) == "substantial"
+
+    def test_docs_only_delta_is_inline(self, monkeypatch):
+        docs = [_code_file(path="README.md", additions=200)]
+        assert self._lvl(monkeypatch, _compare_json("ahead", docs)) == "inline"
+
+    def test_truncated_compare_is_substantial(self, monkeypatch):
+        files = [_code_file(path=f"docs/f{i}.md", additions=1) for i in range(300)]
+        assert self._lvl(monkeypatch, _compare_json("ahead", files)) == "substantial"
+
+    def test_unknown_status_fails_closed(self, monkeypatch):
+        # Codex P2 #1373: a MISSING/unknown status (`{status:null,files:[]}` from a
+        # truncated compare) must fail CLOSED (None → caller blocks), NOT fall
+        # through to file classification where empty files would read "inline" and
+        # let a STALE review bind the merge on an unverified delta.
+        import json as _json
+
+        assert self._lvl(monkeypatch, _json.dumps({"status": None, "files": []})) is None
+        assert self._lvl(monkeypatch, _json.dumps({"files": []})) is None  # status absent
+        assert self._lvl(monkeypatch, _json.dumps({"status": "weird", "files": []})) is None
+
+    def test_non_dict_payload_unclassifiable(self, monkeypatch):
+        assert self._lvl(monkeypatch, "null") is None
+
+    def test_files_not_list_unclassifiable(self, monkeypatch):
+        assert self._lvl(monkeypatch, json.dumps({"status": "ahead", "files": "oops"})) is None
+
+
+class TestSmartDeltaFreshness:
+    """Stale review + delta classification inside _check_codex_reviewed_head."""
+
+    def _setup_stale(self, monkeypatch, compare_payload):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(STALE))
+        monkeypatch.setenv("_TEST_GH_COMPARE", compare_payload)
+
+    def test_stale_trivial_delta_allows_and_binds_head(self, monkeypatch):
+        self._setup_stale(monkeypatch, _compare_json("ahead", [_code_file(additions=3)]))
+        block, msg, verified = _mod._check_codex_reviewed_head("5")
+        assert block is False
+        # TOCTOU: the triviality claim is about exactly this head — merge must bind to it.
+        assert verified == HEAD
+
+    def test_stale_substantial_delta_blocks(self, monkeypatch):
+        self._setup_stale(monkeypatch, _compare_json("ahead", [_code_file()]))
+        block, msg, verified = _mod._check_codex_reviewed_head("5")
+        assert block is True and verified is None
+        assert "SUBSTANTIAL" in msg
+        assert "stale-review-override" in msg
+
+    def test_stale_unclassifiable_delta_blocks(self, monkeypatch):
+        # Triviality is an exception granted only on positive evidence — an
+        # unclassifiable compare (fail direction of a fail-CLOSED gate) blocks.
+        self._setup_stale(monkeypatch, "null")
+        block, msg, _ = _mod._check_codex_reviewed_head("5")
+        assert block is True
+        assert "could not be classified" in msg
+
+    def test_absent_review_still_blocks(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv("_TEST_GH_COMPARE", _compare_json("identical"))
+        block, msg, _ = _mod._check_codex_reviewed_head("5")
+        assert block is True  # absent is not narrowed by smart-delta
+        assert "stale-review-override" in msg
+
+
+class TestMainLevelIntegration:
+    """main()-level wiring: TOCTOU binding enforcement + sigil decoupling.
+
+    These run the REAL _check_codex_reviewed_head / _check_base_is_default via
+    the _TEST_GH_* seams (only _check_mergeable and the two advisory scanners
+    are stubbed), so the `if verified_head:` binding block and the sigil routing
+    in main() are actually exercised — previously zero tests reached them
+    (architect SHOULD-FIX on #1366: delete the binding block and nothing went red).
+    """
+
+    def _drive(self, monkeypatch, command, *, reviews=None, compare=None):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD) if reviews is None else reviews
+        )
+        if compare is not None:
+            monkeypatch.setenv("_TEST_GH_COMPARE", compare)
+        monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+        monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", "main")
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "t", "conclusion": "SUCCESS"}])
+        )
+        # A valid OWNER scheduled-review marker AT head, so the scheduled-review merge
+        # gate is satisfied and these cases keep exercising the freshness/binding wiring
+        # they target (not the new gate).
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _scheduled_marker(HEAD))
+        monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(
+            _mod, "_check_pr_review_findings", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            _mod, "_check_inline_review_findings", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            _mod,
+            "read_payload",
+            lambda: {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            },
+        )
+        return _mod.main()
+
+    # ── TOCTOU binding (fresh review at HEAD → binding REQUIRED) ──
+    def test_unbound_merge_blocks(self, monkeypatch, capsys):
+        rc = self._drive(monkeypatch, "gh pr merge 5 --squash --admin")
+        assert rc == 2
+        assert "must be bound" in capsys.readouterr().err
+
+    def test_bound_merge_passes(self, monkeypatch):
+        rc = self._drive(monkeypatch, f"gh pr merge 5 --squash --admin --match-head-commit {HEAD}")
+        assert rc == 0
+
+    def test_shadow_flag_blocks(self, monkeypatch, capsys):
+        rc = self._drive(
+            monkeypatch,
+            f"gh pr merge 5 --squash --admin --body x --match-head-commit {HEAD}",
+        )
+        assert rc == 2
+        assert "shadow" in capsys.readouterr().err.lower()
+
+    def test_mismatched_binding_blocks(self, monkeypatch, capsys):
+        rc = self._drive(monkeypatch, f"gh pr merge 5 --squash --admin --match-head-commit {STALE}")
+        assert rc == 2
+        assert "does not" in capsys.readouterr().err
+
+    # ── Sigil decoupling (stale review + substantial delta) ──
+    def _stale_substantial(self):
+        return dict(
+            reviews=_reviews_jsonl(STALE),
+            compare=_compare_json("ahead", [_code_file()]),
+        )
+
+    def test_review_override_does_not_waive_freshness(self, monkeypatch, capsys):
+        rc = self._drive(
+            monkeypatch,
+            "gh pr merge 5 --squash --admin  # review-override",
+            **self._stale_substantial(),
+        )
+        assert rc == 2  # the P1-findings sigil must NOT waive the freshness gate
+        assert "STALE" in capsys.readouterr().err
+
+    def test_stale_review_override_waives_freshness(self, monkeypatch):
+        rc = self._drive(
+            monkeypatch,
+            "gh pr merge 5 --squash --admin  # stale-review-override",
+            **self._stale_substantial(),
+        )
+        assert rc == 0  # waived; verified_head None → binding not required
+
+    def test_no_sigil_stale_substantial_blocks(self, monkeypatch):
+        rc = self._drive(monkeypatch, "gh pr merge 5 --squash --admin", **self._stale_substantial())
+        assert rc == 2
+
+    # ── Smart-delta through main(): stale + trivial → allowed but still bound ──
+    def test_stale_trivial_requires_binding(self, monkeypatch, capsys):
+        rc = self._drive(
+            monkeypatch,
+            "gh pr merge 5 --squash --admin",
+            reviews=_reviews_jsonl(STALE),
+            compare=_compare_json("ahead", [_code_file(additions=3)]),
+        )
+        assert rc == 2  # allowed by smart-delta, but the merge must bind to HEAD
+        assert "must be bound" in capsys.readouterr().err
+
+    def test_stale_trivial_bound_passes(self, monkeypatch):
+        rc = self._drive(
+            monkeypatch,
+            f"gh pr merge 5 --squash --admin --match-head-commit {HEAD}",
+            reviews=_reviews_jsonl(STALE),
+            compare=_compare_json("ahead", [_code_file(additions=3)]),
+        )
+        assert rc == 0
+
+
+class TestStaleSigilDoesNotWaiveScanners:
+    """The reverse decoupling direction: # stale-review-override must NOT feed the
+    finding scanners' force — a stale-sigil merge with an unresolved P1 still blocks.
+    (Architect F5 on this patch: the forward direction alone left a regression that
+    routes stale_override into the scanners undetected.)"""
+
+    def test_stale_sigil_p1_findings_still_block(self, monkeypatch, capsys):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(STALE))
+        monkeypatch.setenv("_TEST_GH_COMPARE", _compare_json("ahead", [_code_file()]))
+        monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+        monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", "main")
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "t", "conclusion": "SUCCESS"}])
+        )
+        # Scheduled review satisfied at head → the stale-override merge reaches the
+        # finding scanner this test is about (not the new scheduled gate).
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _scheduled_marker(HEAD))
+        monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        # Scanner stub blocks UNLESS its own force (i.e. # review-override) is set.
+        monkeypatch.setattr(
+            _mod,
+            "_check_pr_review_findings",
+            lambda n, force=False, repo=None: (not force, "" if force else "P1 unresolved"),
+        )
+        monkeypatch.setattr(
+            _mod, "_check_inline_review_findings", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            _mod,
+            "read_payload",
+            lambda: {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": "gh pr merge 5 --squash --admin  # stale-review-override"
+                },
+            },
+        )
+        rc = _mod.main()
+        assert rc == 2  # freshness waived, but the P1 findings gate still blocks
+        assert "review-body gate did not pass" in capsys.readouterr().err
+
+
+class TestCheckPrRepoArg:
+    """--check-pr accepts every normal gh repo spelling (Codex P2 on #1366)."""
+
+    def test_separate_long(self):
+        assert _mod._parse_check_pr_repo(["--repo", "octo/voice"]) == "octo/voice"
+
+    def test_separate_short(self):
+        assert _mod._parse_check_pr_repo(["-R", "octo/voice"]) == "octo/voice"
+
+    def test_equals_long(self):
+        assert _mod._parse_check_pr_repo(["--repo=octo/voice"]) == "octo/voice"
+
+    def test_equals_short(self):
+        assert _mod._parse_check_pr_repo(["-R=octo/voice"]) == "octo/voice"
+
+    def test_absent(self):
+        assert _mod._parse_check_pr_repo([]) is None
+
+    def test_glued_short(self):
+        # pflag shorthand `-Rowner/repo` — enforcement accepts it; the report must too
+        # (architect F3: unrecognized → silently checked the CWD repo).
+        assert _mod._parse_check_pr_repo(["-Rocto/voice"]) == "octo/voice"
+
+    def test_explicit_empty_value_rejected(self):
+        # Codex P2 #1373: an EXPLICITLY empty repo value must be distinguishable from
+        # "no option" (None → cwd repo) so the caller can reject it rather than
+        # silently report the WRONG same-numbered PR.
+        for argv in (["--repo"], ["--repo="], ["-R"], ["-R="]):
+            assert _mod._parse_check_pr_repo(argv) is _mod._CHECK_PR_REPO_EMPTY, argv
+
+    def test_no_option_is_none(self):
+        assert _mod._parse_check_pr_repo(["--squash", "--admin"]) is None
+
+
+class TestCheckPrReportFreshnessLabel:
+    """Codex P2 #1373: the canonical report must not print 'ok (current)' when the
+    review is STALE-but-trivial — the structured stdout would mislead consumers."""
+
+    def _run_report(self, monkeypatch, capsys, reviews, compare):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", reviews)
+        monkeypatch.setenv("_TEST_GH_COMPARE", compare)
+        monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
+        monkeypatch.setattr(
+            _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
+        )
+        monkeypatch.setattr(
+            _mod, "_check_inline_review_findings", lambda n, repo=None, force=False: (False, "")
+        )
+        _mod.check_pr_report("5")
+        return capsys.readouterr().out
+
+    def test_stale_trivial_labeled_stale(self, monkeypatch, capsys):
+        out = self._run_report(
+            monkeypatch,
+            capsys,
+            reviews=_reviews_jsonl(STALE),
+            compare=_compare_json("ahead", [_code_file(additions=3)]),
+        )
+        assert "codex-at-head" in out
+        assert "STALE review" in out
+        assert "ok (current)" not in out
+
+    def test_current_labeled_current(self, monkeypatch, capsys):
+        out = self._run_report(
+            monkeypatch,
+            capsys,
+            reviews=_reviews_jsonl(HEAD),
+            compare=_compare_json("identical"),
+        )
+        assert "ok (current)" in out
+
+
+class TestMergeDeadline:
+    """Codex P1 #1373: _gh_timeout bounds the AGGREGATE merge-path gh time under the
+    hook's ~60s wall-clock via a shared deadline, so per-call caps can't sum past it."""
+
+    def test_no_deadline_returns_cap(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_merge_deadline", None)
+        assert _mod._gh_timeout(8) == 8
+        assert _mod._gh_timeout(6) == 6
+
+    def test_deadline_clamps_to_remaining(self, monkeypatch):
+        import time as _t
+
+        monkeypatch.setattr(_mod, "_merge_deadline", _t.monotonic() + 3)
+        # remaining ~3s < cap 8 → clamped toward remaining (not the full cap)
+        assert _mod._gh_timeout(8) <= 3.5
+
+    def test_expired_deadline_floors_at_one(self, monkeypatch):
+        import time as _t
+
+        monkeypatch.setattr(_mod, "_merge_deadline", _t.monotonic() - 5)  # already past
+        assert _mod._gh_timeout(8) == 1.0  # fail FAST, never negative/zero
+
+    def test_budget_under_wallclock(self):
+        # The documented worst-case pre-binding aggregate must leave headroom under 60s.
+        assert _mod._MERGE_GATE_BUDGET_S <= 50
+
+
+class TestReportFreshnessUnreadable:
+    """Codex P2 #1373: a failed relabel re-read must not read as 'ok (current)'."""
+
+    def test_failed_reread_labeled_unverified(self, monkeypatch, capsys):
+        monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
+        monkeypatch.setattr(
+            _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
+        )
+        monkeypatch.setattr(
+            _mod, "_check_inline_review_findings", lambda n, repo=None, force=False: (False, "")
+        )
+        # freshness gate passes (allowed), but the relabel re-reads fail (None)
+        monkeypatch.setattr(_mod, "_check_codex_reviewed_head", lambda n, repo=None: (False, "", HEAD))
+        monkeypatch.setattr(_mod, "_latest_codex_reviewed_sha", lambda n, repo=None: None)
+        monkeypatch.setattr(_mod, "_pr_head_sha", lambda n, repo=None: None)
+        _mod.check_pr_report("5")
+        out = capsys.readouterr().out
+        assert "unverified" in out
+        assert "ok (current)" not in out
+
+
+class TestCleanCommentParsing:
+    """_latest_codex_clean_comment_sha — parse the real Codex clean-comment shape."""
+
+    @pytest.mark.parametrize(
+        "flavour",
+        ["Swish!", "You're on a roll.", "Keep them coming!", ":rocket:", "What shall we delve into next?"],
+    )
+    def test_parses_all_flavour_variants(self, monkeypatch, flavour):
+        # Anchor is the STABLE prefix "Didn't find any major issues", not the flavour.
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl("0cd13afeb5", flavour=flavour))
+        assert _mod._latest_codex_clean_comment_sha("1") == "0cd13afeb5"
+
+    def test_latest_clean_comment_wins(self, monkeypatch):
+        # Comments come oldest-first; the most recent clean comment wins.
+        lines = "\n".join([_clean_comment_jsonl("aaaaaaa"), _clean_comment_jsonl("bbbbbbb")])
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", lines)
+        assert _mod._latest_codex_clean_comment_sha("1") == "bbbbbbb"
+
+    def test_sha_lowercased(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl("0CD13AFEB5"))
+        assert _mod._latest_codex_clean_comment_sha("1") == "0cd13afeb5"
+
+    def test_clean_marker_without_sha_is_none(self, monkeypatch):
+        body = json.dumps(
+            {"login": "chatgpt-codex-connector[bot]", "type": "Bot",
+             "body": "Codex Review: Didn't find any major issues. Swish!"}
+        )
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", body)
+        assert _mod._latest_codex_clean_comment_sha("1") is None  # fail-closed
+
+    def test_sha_without_clean_marker_is_none(self, monkeypatch):
+        # A FINDINGS comment carries a Reviewed-commit line but no clean marker.
+        body = json.dumps(
+            {"login": "chatgpt-codex-connector[bot]", "type": "Bot",
+             "body": "### Codex Review\n[P1] a real bug\n\n**Reviewed commit:** `0cd13afeb5`"}
+        )
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", body)
+        assert _mod._latest_codex_clean_comment_sha("1") is None
+
+    def test_non_codex_author_ignored(self, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl("0cd13afeb5", login="attacker", user_type="User")
+        )
+        assert _mod._latest_codex_clean_comment_sha("1") is None
+
+    def test_codex_login_but_not_bot_type_ignored(self, monkeypatch):
+        # Belt-and-suspenders: correct login string but user.type != Bot → ignored.
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl("0cd13afeb5", user_type="User")
+        )
+        assert _mod._latest_codex_clean_comment_sha("1") is None
+
+    def test_short_sha_below_min_length_rejected(self, monkeypatch):
+        # <7 hex is not a usable prefix (the regex floors at 7).
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl("0cd13"))
+        assert _mod._latest_codex_clean_comment_sha("1") is None
+
+
+class TestCleanCommentFreshness:
+    """_check_codex_reviewed_head — a clean Codex ISSUE-COMMENT at head satisfies
+    freshness even when the review-object path can't (absent / stale review)."""
+
+    def test_no_review_object_but_clean_comment_at_head_allows(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")  # no review object → would block
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl(HEAD[:10]))
+        block, msg, head = _mod._check_codex_reviewed_head("1")
+        assert block is False and msg == "" and head == HEAD  # bound for --match-head-commit
+
+    def test_stale_review_object_but_clean_comment_at_head_allows(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(STALE))  # stale → would block
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl(HEAD[:10]))
+        block, _, head = _mod._check_codex_reviewed_head("1")
+        assert block is False and head == HEAD
+
+    def test_clean_comment_for_different_sha_still_blocks(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl(STALE[:10]))  # not head
+        block, msg, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True and "no codex review" in msg.lower()
+
+    def test_clean_marker_without_sha_still_blocks(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_COMMENTS",
+            json.dumps({"login": "chatgpt-codex-connector[bot]", "type": "Bot",
+                        "body": "Codex Review: Didn't find any major issues. Swish!"}),
+        )
+        block, _, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True  # fail-closed: marker alone never vouches
+
+    def test_findings_comment_with_sha_still_blocks(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_COMMENTS",
+            json.dumps({"login": "chatgpt-codex-connector[bot]", "type": "Bot",
+                        "body": f"### Codex Review\n[P1] bug\n\n**Reviewed commit:** `{HEAD[:10]}`"}),
+        )
+        block, _, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True
+
+    def test_spoofed_author_clean_comment_still_blocks(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_COMMENTS",
+            _clean_comment_jsonl(HEAD[:10], login="attacker", user_type="User"),
+        )
+        block, _, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True
+
+    def test_current_review_object_does_not_need_comment(self, monkeypatch):
+        # Fast path: a review object at head allows without any comment.
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD))
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")  # none needed
+        block, _, head = _mod._check_codex_reviewed_head("1")
+        assert block is False and head == HEAD
+
+    def test_report_labels_clean_comment_at_head(self, monkeypatch, capsys):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl(HEAD[:10]))
+        # Stub the other gates so the report runs; we only assert the codex-at-head label.
+        monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
+        monkeypatch.setattr(_mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, ""))
+        monkeypatch.setattr(_mod, "_check_inline_review_findings", lambda n, repo=None, force=False: (False, ""))
+        _mod.check_pr_report("1")
+        out = capsys.readouterr().out
+        assert "clean comment at head" in out

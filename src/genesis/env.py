@@ -102,6 +102,19 @@ def genesis_home() -> Path:
     return Path(value).expanduser() if value else Path.home() / ".genesis"
 
 
+def alert_queue_root() -> Path:
+    """Durable alert-queue root for the CONTAINER side (``~/.genesis/alerts/queue``).
+
+    Resolved via ``genesis_home()`` so it honors the ``GENESIS_HOME`` override.
+    That lets the test suite isolate it to a tmp dir (see the
+    ``_isolate_alert_queue`` conftest fixture) instead of writing real alerts the
+    live server would drain to the owner's Telegram. The HOST guardian uses
+    ``config.state_path/"alerts"/"queue"`` (a different, non-home path) and is
+    unaffected by this resolver.
+    """
+    return genesis_home() / "alerts" / "queue"
+
+
 def internal_api_token_path() -> Path:
     """Path to the persistent internal API token (generated once at server boot).
 

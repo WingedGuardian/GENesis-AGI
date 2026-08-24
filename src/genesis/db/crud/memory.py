@@ -10,6 +10,7 @@ import re
 
 import aiosqlite
 
+from genesis.db.crud._fts import fetch_fts
 from genesis.db.timeutil import canonical_iso
 
 
@@ -137,6 +138,11 @@ async def search(
         params.append(collection)
     sql += " LIMIT ?"
     params.append(limit)
+    # DELIBERATELY no OR-fallback here (unlike search_ranked / knowledge.search_fts).
+    # memory.search's only callers are the entity-name resolver
+    # (linker._find_entity_by_name), which picks results[0] and must NOT be
+    # widened to single-term OR matches — that would bypass its difflib quality
+    # gate and create spurious graph links. Keep this path strict AND.
     rows = await db.execute_fetchall(sql, params)
     return [
         {"memory_id": r[0], "content": r[1], "source_type": r[2], "collection": r[3]} for r in rows
@@ -214,7 +220,10 @@ async def search_ranked(
         params.extend(include_only_subsystems)
     sql += " ORDER BY rank LIMIT ?"
     params.append(limit)
-    rows = await db.execute_fetchall(sql, params)
+    # AND-first, OR-fallback on zero rows (see _fts.fetch_fts). Skipped when the
+    # query is already a structured boolean expression (expand_query output),
+    # since re-tokenising a parenthesised OR/AND query would corrupt it.
+    rows = await fetch_fts(db, sql, params, boolean=boolean)
     return [
         {
             "memory_id": r[0],

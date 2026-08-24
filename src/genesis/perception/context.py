@@ -282,6 +282,11 @@ class ContextAssembler:
         if depth_value in ("deep", "strategic"):
             chain_section = await self._build_light_chain_context(db, depth_value)
 
+        # WS-3: this memory-hit context feeds the reflection prompt pipeline, so
+        # exclude external/unknown-origin rows at both passes (NULL fail-closed).
+        # `source_in` is not provenance (source is a free write param), so pass-1
+        # needs the origin gate too.
+        _safe = list(observations.SAFE_SURFACING_ORIGINS)
         try:
             # Pass 1: reflection-origin observations (exclude micro — low-value
             # free-model output that adds noise to higher-depth context).
@@ -291,6 +296,7 @@ class ContextAssembler:
                 source_in=_REFLECTION_SOURCES,
                 limit=refl_cap,
                 exclude_types=("micro_reflection",),
+                origin_class_in=_safe,
             )
             # Pass 2: everything else
             other_obs = await observations.query(
@@ -298,6 +304,7 @@ class ContextAssembler:
                 resolved=False,
                 limit=other_cap,
                 exclude_types=("micro_reflection",),
+                origin_class_in=_safe,
             )
 
             # Depth-specific age guard — drop observations older than the cutoff
@@ -386,6 +393,8 @@ class ContextAssembler:
                 resolved=False,
                 type="light_reflection",
                 limit=15,
+                # WS-3: light-chain content feeds the reflection prompt.
+                origin_class_in=list(observations.SAFE_SURFACING_ORIGINS),
             )
             # Filter to observations since last run at this depth
             light_obs = [o for o in light_obs if o.get("created_at", "") >= since]

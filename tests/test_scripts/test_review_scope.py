@@ -532,3 +532,107 @@ def test_hook_silent_on_clean_tree(tmp_path):
     repo = _mk_repo(tmp_path)
     out = _run_prompt_hook(repo)
     assert out.strip() == ""
+
+
+# --------------------------------------------------------------------------- #
+# classify_compare_substantiality — GitHub compare-API files[] → substantiality
+# (the merge review-freshness gate's delta classifier). Pure; no git/network.
+# --------------------------------------------------------------------------- #
+def _cf(filename, additions=0, deletions=0, status="modified", has_patch=True, previous_filename=None):
+    f = {
+        "filename": filename,
+        "additions": additions,
+        "deletions": deletions,
+        "status": status,
+        "has_patch": has_patch,
+    }
+    if previous_filename:
+        f["previous_filename"] = previous_filename
+    return f
+
+
+def test_compare_empty_is_inline():
+    assert _rs.classify_compare_substantiality([]) == "inline"
+    assert _rs.classify_compare_substantiality(None) == "inline"
+
+
+def test_compare_large_single_code_file_is_substantial():
+    assert _rs.classify_compare_substantiality([_cf("src/app.py", additions=60, deletions=5)]) == "substantial"
+
+
+def test_compare_small_single_code_file_is_inline():
+    assert _rs.classify_compare_substantiality([_cf("src/app.py", additions=8, deletions=1)]) == "inline"
+
+
+def test_compare_two_code_files_is_substantial():
+    files = [_cf("a.py", additions=3), _cf("b.py", additions=4)]
+    assert _rs.classify_compare_substantiality(files) == "substantial"
+
+
+def test_compare_docs_only_is_inline():
+    assert _rs.classify_compare_substantiality([_cf("README.md", additions=200)]) == "inline"
+
+
+def test_compare_domain_sensitive_small_is_substantial():
+    assert _rs.classify_compare_substantiality([_cf("src/auth_session.py", additions=3)]) == "substantial"
+
+
+def test_compare_binary_asset_excluded():
+    # Binary asset (no patch, 0 lines, not a rename) must NOT count as a code file:
+    # binary + ONE small code file = 1 reviewable code file → inline. If the binary
+    # were wrongly counted it would be 2 code files → substantial (discriminating).
+    files = [
+        _cf("logo.png", additions=0, deletions=0, status="added", has_patch=False),
+        _cf("src/app.py", additions=4, deletions=1),
+    ]
+    assert _rs.classify_compare_substantiality(files) == "inline"
+
+
+def test_compare_rename_side_domain_sensitivity():
+    files = [_cf("src/x.py", additions=0, deletions=0, status="renamed", previous_filename="src/auth.py")]
+    assert _rs.classify_compare_substantiality(files) == "substantial"
+
+
+def test_compare_non_dict_entry_skipped():
+    files = [None, "junk", _cf("src/app.py", additions=4)]
+    assert _rs.classify_compare_substantiality(files) == "inline"
+
+
+def test_compare_suppressed_code_file_is_substantial():
+    # Architect F4: a CODE-category file with no patch and zero counted lines is
+    # UNVERIFIABLE (an over-limit/suppressed text diff, if the API emits one) —
+    # it must fail toward review, never silently exclude like a binary asset.
+    files = [_cf("src/generated_big.py", additions=0, deletions=0, status="added", has_patch=False)]
+    assert _rs.classify_compare_substantiality(files) == "substantial"
+
+
+def test_compare_malformed_counts_on_code_file_is_substantial():
+    # Architect F7: unparseable additions/deletions on a code file must not lean
+    # "trivial" (lines=0) — malformed data on reviewable code fails toward review.
+    files = [{"filename": "src/app.py", "additions": "lots", "deletions": 0,
+              "status": "modified", "has_patch": True}]
+    assert _rs.classify_compare_substantiality(files) == "substantial"
+
+
+def test_compare_binary_noncode_asset_still_excluded():
+    # The F4 fix must NOT flip genuine binary assets: a no-patch/0-lines PNG is
+    # still excluded (non-code category), so binary+small-code stays inline.
+    files = [
+        _cf("logo.png", additions=0, deletions=0, status="added", has_patch=False),
+        _cf("src/app.py", additions=4, deletions=1),
+    ]
+    assert _rs.classify_compare_substantiality(files) == "inline"
+
+
+def test_compare_rename_code_to_docs_counts_source():
+    # Codex P2 #1373: a 200-line rename FROM code TO an excluded docs dest must still
+    # classify substantial — the source (code) carries the magnitude, not the dest.
+    files = [_cf("docs/foo.md", additions=150, deletions=50, status="renamed",
+                 previous_filename="src/foo.py")]
+    assert _rs.classify_compare_substantiality(files) == "substantial"
+
+
+def test_compare_rename_docs_to_docs_still_inline():
+    # A docs->docs rename (neither side reviewable code) stays inline.
+    files = [_cf("docs/b.md", additions=150, status="renamed", previous_filename="docs/a.md")]
+    assert _rs.classify_compare_substantiality(files) == "inline"

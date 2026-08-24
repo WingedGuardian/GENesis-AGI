@@ -50,6 +50,17 @@ MARKER_RE = re.compile(r"[Ll]edger:\s*([0-9a-f]{32})(?![0-9a-fA-F])")
 # Bare 32-hex token — context citation, proposal-only. Lookarounds reject
 # tokens embedded in longer hex runs (40-hex SHAs).
 BARE_HEX_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-f]{32})(?![0-9a-fA-F])")
+# `Follow-up: <32-hex>` marker — the standalone-follow_up completion citation
+# (a8a4f59e). Anchored at BOTH ends (`^[ \t]*…[ \t]*$`, MULTILINE) to enforce the
+# documented "on its own line" convention: "follow-up" is ordinary English, so
+# neither an inline/negated mention ("this is not a follow-up: <id>") NOR a
+# trailing qualification ("Follow-up: <id> — context only") may trip the
+# destructive live auto-complete; both fall through to a non-destructive bare-hex
+# PROPOSAL. Prefix case-insensitive + hyphen-optional (Follow-up/follow-up/
+# FOLLOW-UP/Followup); the id is same-line only ([ \t]*, not \s*) and
+# lowercase-strict (uuid4.hex); the end anchor also rejects a 40-hex SHA (its
+# 32-prefix can't sit at line end).
+FOLLOWUP_MARKER_RE = re.compile(r"^[ \t]*(?i:follow-?up):[ \t]*([0-9a-f]{32})[ \t]*$", re.MULTILINE)
 
 _HEX32_RE = re.compile(r"[0-9a-f]{32}")
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$")
@@ -91,6 +102,11 @@ def extract_bare_ids(text: str) -> set[str]:
     return set(BARE_HEX_RE.findall(text or ""))
 
 
+def extract_followup_marker_ids(text: str) -> set[str]:
+    """32-hex ids cited with the explicit ``Follow-up:`` completion marker."""
+    return set(FOLLOWUP_MARKER_RE.findall(text or ""))
+
+
 def build_item_index(open_items: list[dict]) -> dict[str, dict]:
     """Map every addressable 32-hex token to its open ledger row.
 
@@ -110,6 +126,16 @@ def build_item_index(open_items: list[dict]) -> dict[str, dict]:
     return index
 
 
+def _pr_text(pr: dict) -> str:
+    """PR title+body as one newline-normalized block. GitHub normalizes PR-body
+    textarea input to CRLF, so a real ``Follow-up: <id>\\r\\n`` line has a stray
+    ``\\r`` between the id and ``\\n`` that the line-anchored ``FOLLOWUP_MARKER_RE``
+    (``[ \\t]*$``) cannot match. Collapsing ``\\r\\n``/``\\r`` to ``\\n`` keeps the
+    marker working on real GitHub input (bare/ledger matching is unaffected)."""
+    text = f"{pr.get('title') or ''}\n{pr.get('body') or ''}"
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def match_exact(prs: list[dict], open_items: list[dict]) -> list[dict]:
     """Deterministic id-citation matches: ``via='marker'`` or ``via='bare'``.
 
@@ -121,9 +147,44 @@ def match_exact(prs: list[dict], open_items: list[dict]) -> list[dict]:
     index = build_item_index(open_items)
     matches: list[dict] = []
     for pr in prs:
-        text = f"{pr.get('title') or ''}\n{pr.get('body') or ''}"
+        text = _pr_text(pr)
         marker_ids = extract_marker_ids(text)
-        bare_ids = extract_bare_ids(text) - marker_ids
+        # A `Follow-up: <id>` citation is owned by the follow-up lane; its hex
+        # must not double as a ledger bare-hex proposal (de-collision, a8a4f59e).
+        bare_ids = extract_bare_ids(text) - marker_ids - extract_followup_marker_ids(text)
+        seen_items: set[str] = set()
+        for token in sorted(marker_ids):
+            item = index.get(token)
+            if item is not None and item["id"] not in seen_items:
+                seen_items.add(item["id"])
+                matches.append({"item": item, "pr": pr, "via": "marker"})
+        for token in sorted(bare_ids):
+            item = index.get(token)
+            if item is not None and item["id"] not in seen_items:
+                seen_items.add(item["id"])
+                matches.append({"item": item, "pr": pr, "via": "bare"})
+    return matches
+
+
+def match_followup(prs: list[dict], followups: list[dict]) -> list[dict]:
+    """Deterministic id-citation matches for standalone ``follow_ups`` rows.
+
+    The follow-up analogue of ``match_exact``: ``via='marker'`` (a
+    ``Follow-up: <id>`` citation) is absorb-eligible; ``via='bare'`` (a bare
+    32-hex token) is proposal-only. Follow_up rows have NO ``source_ref`` — they
+    are addressed by ``id`` alone (so no ``build_item_index`` source-token
+    layer). Bare tokens carried by EITHER convention's marker (``Follow-up:`` or
+    ``Ledger:``) are excluded, so a marker citation never doubles as a bare
+    proposal. One match per (follow_up, pr) pair; a marker hit swallows the same
+    pair's bare hit. Result dicts share ``match_exact``'s ``{item, pr, via}``
+    shape so the worker treats both lanes uniformly.
+    """
+    index = {str(f["id"]): f for f in followups if f.get("id")}
+    matches: list[dict] = []
+    for pr in prs:
+        text = _pr_text(pr)
+        marker_ids = extract_followup_marker_ids(text)
+        bare_ids = extract_bare_ids(text) - marker_ids - extract_marker_ids(text)
         seen_items: set[str] = set()
         for token in sorted(marker_ids):
             item = index.get(token)

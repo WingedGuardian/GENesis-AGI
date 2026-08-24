@@ -220,15 +220,87 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 437c56c0 2026-08-09
+verified: d71d1d39 2026-08-18
 ```
+
+- **Subagent-spawn lockdown — one source of truth across the restricted sessions**
+  (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A restricted
+  session escapes its tool restrictions if it can spawn a child that inherits a fresh,
+  unrestricted toolset. `Agent` is the current CC tool name; `Task` the obsolete alias;
+  `Workflow` orchestrates subagents; `Skill` can run in a subagent. The denylists had
+  drifted (sentinel-degraded blocked the class, reflection blocked all but `Agent`,
+  inbox/mail/experimentation blocked only a subset); those sessions now all reference
+  `SPAWN_TOOL_NAMES` — reflection (`_REFLECTION_DENY_BUILTINS`), the inbox/mail judges,
+  and the experimentation completion (each asserted against the LIVE `--disallowedTools`
+  value, not an orphaned constant). `sentinel/dispatcher._DEGRADED_DISALLOWED_TOOLS` keeps
+  its own literal (deliberate import-cycle avoidance) but is held ⊇ by
+  `tests/test_cc/test_spawn_lockdown.py`, which locks the class so a new denylist that
+  forgets spawn-blocking fails CI. The mail judge — whose prompt uses NO tools — now runs
+  an ACT-NOTHING denylist (Bash + all file-edit + spawn + side-effecting actions + web
+  tools, closing the Read+WebFetch exfil path), and its empty-MCP config is resolved via
+  the canonical `build_mcp_config("none")` (the old hand-counted `parents[2]` path pointed
+  at a nonexistent `src/config/no_mcp.json`). The inbox judge denies every genesis MCP
+  *write* (`memory_store`/`settings_update`/`follow_up_create`/…) via
+  `build_reflection_disallowed` minus `Bash`, keeping the reads it needs plus the optional
+  `observation_write`. RESIDUALS on the inbox judge: (1) `Bash` — STILL retained for the
+  `yt-dlp`/`curl` YouTube-fetch path (injection→RCE surface, open — follow-up 727a3724);
+  (2) the PRIVILEGED-WRITE consumers of forged observations are now gated (the
+  memory-provenance work): `observation_write` stamps the session origin
+  (`session_origin_from_env`) so an eval-session write lands `external_untrusted`, and BOTH
+  user-model consumers — `process_pending_deltas` (accept) and `synthesize_narrative`
+  (evidence → USER_KNOWLEDGE.md) — read only trusted-origin deltas via the SQL
+  `origin_class_in=TRUSTED_PRIVILEGED_WRITE_ORIGINS` filter (filtering in-query, not
+  post-LIMIT, so a forged-delta flood can't starve trusted deltas out of the window, and a
+  TTL-resolved barred delta can't launder into the narrative). Fail-closed on NULL; barred
+  rows are left for the 14-day TTL, never discarded. The autonomy-dispatcher `task_detected`
+  pickup applies the same trust check (`immunity.is_trusted_for_privileged_write`) SKIP-ONLY
+  — it refuses dispatch without resolving/hiding the row (the path is inert today; producer
+  stamping is in the follow-up).
+  **WS-3 observation write-provenance + laundering-critical read exclusions (PR-1, built
+  2026-08-22):** origin is now definite at the WRITE boundary — the CRUD chokepoint
+  (`db/crud/observations.py` `create()`/`upsert()` → `derive_observation_origin`) classifies
+  EVERY caller (explicit arg → session env → source map → **NULL fail-closed**), so the
+  observation `source` space (uncurated, ~200 live values) is NON-load-bearing for security: a
+  missed/novel external writer degrades to NULL → excluded, never trusted. Channel-attended
+  `task_detected` writes stamp `owner`/`external_untrusted` via `cc.types.task_detected_origin`;
+  the two stdlib-only raw-INSERT hooks (`proactive_memory_hook` pivot writer,
+  `emit_bugfix_audit`) stamp origin inline. Migration 0085 backfills historical rows. On the
+  READ side, the LAUNDERING-CRITICAL surfaces now EXCLUDE external/unknown-origin content
+  (fail-closed: `origin_class IN ('owner','first_party')`, NULL excluded) —
+  `essential_knowledge._recent_decisions` + `_active_session_pivots` (the always-loaded L1
+  file), `reflection.gather_evaluation_context` (×4) + `_recent_observations` +
+  `gather_for_calibration`, and `perception.context._build_memory_hits` + `_build_light_chain`
+  (the deep-reflection/perception prompt pipeline) — severing the external→reflection→
+  `first_party`-stamped-delta laundering path, with a deep-reflection prompt-rule belt and a
+  write-side coverage guardrail (`tests/test_security/test_observation_surface_coverage.py`)
+  that fails CI on any raw `INSERT INTO observations` bypass. The gate-4 pushed-surfaces
+  `supervised` exemption is now channel-aware (owner-attended only). Session-origin coverage
+  is durable across the gateway class: `get_or_create_foreground` (web/OpenClaw) and
+  `register_voice_session` (voice) stamp `external_untrusted` on the `cc_sessions` row, so
+  `reflection_window_origin` cannot read a NULL as first-party and launder an overlapping
+  reflection's `user_model_delta` (0085 also grandfathers pre-deploy gateway/voice rows). The
+  learning triage pipeline's per-session `retrospective`/`cc_debrief` observations are stamped
+  with the analyzed conversation's channel origin (`cc.types.observation_origin_for_channel`),
+  forwarded to BOTH the observations row and its memory-store copy — an inbox/mail session's
+  debrief learnings can no longer surface first-party; and the coverage guardrail now follows
+  the indirect `ObservationWriter.write` path + module-constant sources. On Telegram
+  quote-replies, slash-command/task intent is parsed from the owner's own reply only (not the
+  quoted composite), closing the `/task`+`/model`+`/effort`+`/resume` forge via quoted bot
+  text. **STILL PARTIAL (PR-2, tracked follow-up):** the read-side breadth — the ~28 ego/sentinel/guardian/surplus/dashboard/
+  MCP reads that should WRAP (not exclude) external content in a shared `render_safe` renderer,
+  plus a read-side discovery guardrail and the boundary-marker zero-width normalization on the
+  wrap path.
+  **Out of scope (tracked follow-up):** `cc/direct_session` (its `research` profile runs a
+  DOCUMENTED deep-research `Workflow` — blocking the class there would break that path) and
+  the autonomy-executor sessions; those legitimately spawn/orchestrate and need a
+  sandbox-preserving Workflow or an accepted-porousness decision.
 
 - **Reflection tool lockdown — read-only + observations only**
   (`session_config.build_reflection_disallowed`, wired at `reflection_bridge/_bridge.py`
   into the reflection `CCInvocation.disallowed_tools`). Deep/strategic reflections run
   with a DERIVED denylist = (live `genesis-health` + `genesis-memory` registry − a read
-  allowlist − `observation_write`) + the write/action built-ins (Bash/Write/Edit/Task/
-  Workflow/Skill/…), so a future write tool is auto-denied. `--allowedTools` is NOT a
+  allowlist − `observation_write`) + the write/action built-ins (Bash/Write/Edit/Agent/
+  Task/Workflow/Skill/…), so a future write tool is auto-denied. `--allowedTools` is NOT a
   strict allowlist under `--dangerously-skip-permissions` (verified empirically 2026-08-07
   via the init-event tool list — it left Bash available); only `--disallowedTools` removes
   a tool, so the scoping is a denylist. Guards (`tests/test_cc/test_reflection_tool_scope.py`):
@@ -471,7 +543,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: 557d3587 2026-08-09
+verified: e425b35c 2026-08-21
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -519,11 +591,25 @@ verified: 557d3587 2026-08-09
   `off`/`observe`/`live` + `GENESIS_CAREER_OUTREACH_DISABLED` kill). Bridge
   lazy-resolved at tick; `execute_operation` returns an error DICT (never raises)
   so a dispatch error surfaces → job-health failure; `check_health_cached` gates;
-  absent-module → clean no-op (generic installs). The external engine's own
-  staged-draft state is the source of truth; a `career_outreach_nudged` observation is the
-  per-company nudge-dedup ledger so a re-tick / undelivered nudge never
-  double-nudges. ONE daily job (`max_instances=1` is per-job; a second would race
-  the single remote). Discovery-sweep driving is GROUNDWORK-deferred.
+  absent-module → clean no-op (generic installs). The owner nudge lists the drafts
+  THIS tick's auto-run staged (the engine's own `Staged` replies — no mailbox census,
+  which is unreliable: a bare SSH `claude -p` read answers from priors, returning a
+  false-empty list); a `career_outreach_nudged` observation is the per-company
+  nudge-dedup ledger. Observe mode is a bridge-REACHABILITY probe (a minimal dispatch
+  proving the `claude -p` hop answers — module `check_health_cached` alone does not,
+  it passes even when the remote's model auth is dead), NOT a seeder. ONE daily job
+  (`max_instances=1` is per-job; a second would race
+  the single remote). Discovery-sweep driving is GROUNDWORK-deferred. The auto-run
+  drives the engine's COMPLETE flow INCLUDING its own accuracy/verification gate
+  (never bypassed) under a headless contract. The reply is classified ONCE into a
+  closed outcome set (`classify_autorun_reply` → NoneLeft/Staged/VerifyFailed/
+  ModuleError/ProtocolError) — every malformed shape collapses to ProtocolError, so
+  the tick loop matches on outcome TYPE and never branches on raw payload (robust by
+  construction). A gate-refused draft is `VerifyFailed` (NOT a job-health error); a
+  same-company re-selection breaks the loop. Turn/timeout budgets (`dispatch_max_turns` default 80 via the ipc
+  per-call `max_turns` override; `dispatch_timeout_s` default 900, capped 1800 by
+  config + a 3600 SSH-adapter ceiling) cover the gated flow (research → draft →
+  verify → stage), MEASURED ~5.5 min live.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
   (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,
   research, recon, pipeline), not runtime init.
@@ -822,6 +908,12 @@ verified: ca875c4b 2026-07-24
   deployed_commit via `~/.genesis/host_gateway_state.json`; collectors in
   `observability/snapshots/deploy_health.py`), `high` on any drift, `critical`
   only sustained (≥7d AND ≥20 commits, or a missing unit alerted >24h).
+  Also (hourly) ego cycle liveness (`_check_ego_liveness`, `ego/liveness.py`): an
+  ego with no COMPLETED cycle past a conservative multiple of its current
+  interval (the `job_health.last_success` gap — never the `is_running`/heartbeat/
+  `next_fire_at` proxies that stay green through a deadlock) raises one
+  self-superseding `high` `ego_alert` per ego, auto-resolving when a cycle lands;
+  `gated`/`paused`/fresh-install are never stalls.
   Also per-tick (WS-2 M10) the SINGLE designated `alert_events` writer:
   `_persist_health_alerts` recomputes the firing set via the pure
   `mcp/health/errors.py::_compute_alerts()` and reconciles a durable open-set
@@ -999,12 +1091,25 @@ verified: fbcf8ee4 2026-07-21
   discipline is load-bearing here. Loops that actually run: triage pipeline,
   procedural extraction (extract → judge → promote hourly, novelty +
   contradiction gates), weekly skill evolution, daily triage calibration.
-  Weekly skill evolution auto-applies MINOR SKILL.md edits at autonomy>=2 past
-  a STRUCTURAL check (`skills/validator.py`); a shadow **skill-edit Critic**
-  (`skills/skill_edit_critic.py` + `eval/rubrics/skill_edit_regression.py`)
-  now screens each auto-applied edit for self-modification pathologies via the
-  `judge` call site and LOGS a verdict (`skill_evolution_gate` observations) —
-  it never blocks the edit (WS1 shadow). A complementary **held-out replay
+  Weekly skill evolution is **propose-only** (autonomous auto-apply retired
+  2026-08-01, #1276): it STAGES every SKILL.md edit (MINOR and larger) as a
+  `skill_proposal` observation for human/CC review and never writes a skill
+  file — no proposal is ever blocked or auto-applied. Under propose-only NO
+  cognitive-file-modification ledger pre-image is created (the apply/resolve
+  path that would record one is a deferred follow-up). Two ADVISORY signals ride
+  the staged proposal for the reviewer, and neither gates staging: a deterministic
+  validator suite (`skills/validator.py` — structure, trigger coverage,
+  testability/vague-language, size, examples, and MINOR-content consistency; any
+  hard failure un-passes it) whose outcome is recorded as a `validated` flag
+  (for MINOR it reflects that suite; for MODERATE+ an LLM apply-recommendation)
+  plus `validation_detail` on failure; and, WHEN ENABLED (gate on, router +
+  baseline available), a shadow
+  **skill-edit Critic** (`skills/skill_edit_critic.py` +
+  `eval/rubrics/skill_edit_regression.py`) that screens for self-modification
+  pathologies via the `judge` call site and logs a `skill_evolution_gate`
+  verdict (WS1 shadow). The validator suite above is live (advisory); only the
+  `autonomy_level` param is retained as (currently unread) groundwork for the
+  future WS1 `enforce` mode. A complementary **held-out replay
   gate** (`eval/skill_replay/`, tool `skill_replay_run`) goes further — it
   REPLAYS a frozen per-skill golden suite (`~/.genesis/eval/skill_golden/`,
   authored via `eval/skill_golden_set.py`) against OLD vs NEW content in
@@ -1404,7 +1509,7 @@ verified: 3c514f3e 2026-08-10
   don't merge them. Memory-resilience invariants are first-class facts:
   container `cgroup_memory_swap_max` (tri-state — "0" IS the 2026-07 wedge
   state) + `oomd_user_slice_kill` (config-plane scan of user.slice.d drop-ins,
-  laid down by `scripts/lib/memory_resilience.sh` from bootstrap/update) and
+  laid down by `scripts/lib/memory_resilience.sh` from install/bootstrap/update) and
   host-plane `swap_total_kb`, so the annotation layer flags unprotected
   installs (see docs/reference/memory-resilience.md). Network-resilience
   invariants are first-class too: container `networkd_keep_configuration` +
@@ -1450,8 +1555,12 @@ verified: 9037d45b 2026-07-07
   generation (`scripts/generate_skill_catalog.py` scans `.claude/skills/`,
   `src/genesis/skills/`, `~/.genesis/skill-library/` →
   `~/.genesis/skill_catalog.json`, self-heals hourly), consumed by the
-  injection hook and by autonomous-session resources. Skill refinement is a
-  tracked cognitive-file modification (`learning/skills/applicator.py`).
+  injection hook and by autonomous-session resources. Skill refinement is
+  propose-only: `learning/skills/applicator.py` STAGES a proposal for human/CC
+  review and never writes a skill file. Recording it as a tracked
+  cognitive-file modification is DEFERRED — no ledger pre-image is captured
+  under propose-only; the apply/resolve path that would create one is a
+  follow-up (future WS1 `enforce`).
   Voice-master exemplars are on the contribution FORBIDDEN list.
   Cross-tool export: `scripts/export_agents_md.py` writes a body-scope
   inventory (skills + action tools, never memory/brain) into a managed

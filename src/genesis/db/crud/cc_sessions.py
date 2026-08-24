@@ -505,12 +505,19 @@ async def register_voice_session(
     make re-registration idempotent across restarts and replays.
     Returns True if a new row was inserted.
     """
+    # WS-3: voice is a gateway channel — far-field, multi-speaker STT means the
+    # user_text may be a non-owner human in the room, so it is NOT owner-attended
+    # (is_owner_attended_channel excludes it). Stamp external_untrusted durably so
+    # reflection_window_origin (which reads cc_sessions.origin_class) treats a
+    # reflection overlapping a voice session as external and does NOT launder its
+    # user_model_delta to first_party. A speaker-authenticated upgrade to owner is
+    # future W1b work. NULL would read as first_party — the exact hole this closes.
     cursor = await db.execute(
         "INSERT OR IGNORE INTO cc_sessions "
         "(id, cc_session_id, session_type, channel, model, source_tag, "
-        " status, started_at, last_activity_at, satellite_id) "
+        " status, started_at, last_activity_at, satellite_id, origin_class) "
         "VALUES (?, ?, 'foreground', ?, 'voice', 'voice', "
-        " 'active', ?, ?, ?)",
+        " 'active', ?, ?, ?, 'external_untrusted')",
         (id, id, channel, started_at, started_at, satellite_id),
     )
     await db.commit()

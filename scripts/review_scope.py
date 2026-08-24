@@ -660,6 +660,73 @@ def classify_range_substantiality(base: str, cwd: str | None = None) -> str:
     return _classify_diff([f"{base}...HEAD"], cwd)
 
 
+def classify_compare_substantiality(files: list[dict] | None) -> str:
+    """Substantiality of a GitHub COMPARE-API ``files[]`` list — for the merge
+    review-freshness gate (the delta the independent reviewer has NOT seen).
+
+    Reuses the shared :func:`_substantiality_level` predicate over records built from
+    the compare payload instead of a local ``git diff`` — the merge hook runs locally
+    and the reviewed SHA may not be in the local object store (a past PR head), so the
+    delta is fetched remotely (``gh api repos/…/compare/{base}...{head}``) and passed
+    here. An empty / ``None`` list means no reviewable delta → ``"inline"``. Never
+    touches git; never raises.
+
+    Each compare file record carries ``filename``, ``additions``, ``deletions``,
+    ``status`` (added/modified/renamed/…), optional ``previous_filename`` (rename src),
+    and ``has_patch`` (False for binary/too-large). Binary detection is best-effort: a
+    file with no patch and zero line changes that is not a pure rename is treated as a
+    binary asset and excluded (mirrors the ``binary`` exclusion the git-diff path gets
+    from ``--numstat`` ``-`` counts).
+    """
+    records: list[dict] = []
+    per_file: dict[str, int] = {}
+    binary: set[str] = set()
+    for f in files or []:
+        if not isinstance(f, dict):
+            continue
+        path = f.get("filename")
+        if not path:
+            continue
+        untrusted = False
+        try:
+            lines = int(f.get("additions") or 0) + int(f.get("deletions") or 0)
+        except (TypeError, ValueError):
+            lines = 0
+            untrusted = True  # malformed counts — can't lean "trivial" on them
+        per_file[path] = lines
+        records.append({"path": path})
+        prev = f.get("previous_filename")  # rename source — domain-sensitivity on either side
+        if prev:
+            records.append({"path": prev})
+            # Attribute the rename's line count to the SOURCE too (Codex P2 #1373): a
+            # rename FROM code TO an excluded dest (`src/foo.py → docs/foo.md`) would
+            # otherwise contribute NOTHING — the docs dest is excluded and the source
+            # carried no count — so a 200-line code removal/rewrite classified "inline"
+            # and let a stale review pass. ``max`` avoids double-inflation while
+            # ensuring the reviewable side (whichever it is) carries the magnitude;
+            # _substantiality_level only counts reviewable paths, so an excluded prev
+            # is harmless.
+            per_file[prev] = max(per_file.get(prev, 0), lines)
+        has_patch = f.get("has_patch")
+        if has_patch is None:
+            has_patch = "patch" in f
+        if not has_patch and lines == 0 and f.get("status") not in ("renamed", "copied"):
+            # No patch + no counted lines: for an untagged asset (image, archive —
+            # ``_scope_tag`` maps no pattern, and note ``_category`` calls every
+            # non-docs/test path "code", so category alone cannot tell a .png from
+            # a .py) that is the binary shape — exclude like the git-diff path
+            # does. But a SOURCE-shaped file (a recognized scope tag: backend/
+            # frontend/api/…) in that shape is an over-limit/suppressed text diff:
+            # its content is unverifiable, and "trivial" needs positive evidence.
+            if _category(path) == "code" and _scope_tag(path):
+                untrusted = True
+            else:
+                binary.add(path)
+        if untrusted and not _is_vendored(path) and _category(path) == "code" and _scope_tag(path):
+            return "substantial"  # unverifiable source delta — fail toward review
+    return _substantiality_level(records, per_file, binary)
+
+
 def render_reminder_block(manifest: dict | None) -> str:
     """Human-readable manifest for the review reminder, or "" when nothing to add.
 

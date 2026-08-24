@@ -313,7 +313,14 @@ async def _pulse_lookup(db, cc_session_id: str) -> dict:
     try:
         from genesis.db.crud.repo_pulse import list_annotations, summary
 
-        annotations = await list_annotations(db, session_id=cc_session_id, limit=100)
+        # Ledger-only: this per-session panel keys on item_session_id, which is
+        # a ledger-shaped binding. follow_up-target proposals are session-agnostic
+        # (source_session is often NULL) and get their own global surface (a
+        # tracked follow-up); rendering them here would either hide the NULL ones
+        # or offer a ledger confirm command that can't resolve a follow_up id.
+        annotations = await list_annotations(
+            db, session_id=cc_session_id, target_kind="ledger", limit=100
+        )
         health = await summary(db)
     except Exception as exc:
         logger.debug("pulse tables unavailable (pre-0062 install?): %s", exc)
@@ -424,6 +431,7 @@ async def cc_sessions_pulse_resolve(annotation_id: str):
 
 async def _resolve_pulse(db, annotation_id: str, status: str) -> tuple[dict, int]:
     """Resolve core (extracted so tests exercise it on the fixture loop)."""
+    from genesis.db.crud.follow_ups import absorb_followup
     from genesis.db.crud.repo_pulse import get_annotation, resolve_annotation
     from genesis.db.crud.session_charters import get_ledger_item, ledger_update
 
@@ -432,12 +440,16 @@ async def _resolve_pulse(db, annotation_id: str, status: str) -> tuple[dict, int
         row = await get_annotation(db, annotation_id)
         if row is None or row["status"] != "proposed":
             return {"error": "unknown or already-resolved annotation"}, 404
-        # Resolve the annotation FIRST: its conditional proposed→terminal
-        # UPDATE is the race arbiter. Two concurrent resolutions can't both
-        # win it, so the ledger absorb below only ever runs for the winner —
-        # never an absorbed item under a rejected annotation. (The inverse
-        # residue — confirmed annotation, absorb missed — is visible and
-        # human-fixable via the injected hint.)
+        # Resolve the annotation FIRST — the conditional proposed→terminal UPDATE
+        # is the race arbiter: a concurrent confirm+reject can't both win it, so
+        # the absorb below only ever runs for the confirm winner, never under a
+        # rejected annotation. (Absorb-FIRST was tried and REVERTED: it reopened a
+        # WORSE residue — a follow_up completed under a human-REJECTED annotation,
+        # permanent + invisible since reconcile never revisits a terminal row.)
+        # The milder residue this order can leave — a confirmed annotation whose
+        # absorb missed because the row moved off-open — is accepted, consistent
+        # with the ledger path; the follow_up confirm surface is dormant anyway
+        # until the global proposal surface lands.
         ok = await resolve_annotation(
             db,
             annotation_id,
@@ -447,15 +459,21 @@ async def _resolve_pulse(db, annotation_id: str, status: str) -> tuple[dict, int
         )
         absorbed = False
         if ok and status == "confirmed":
-            item = await get_ledger_item(db, row["item_id"])
-            if item is not None and item.get("status") in ("open", "in_progress"):
-                absorbed = await ledger_update(
-                    db,
-                    row["item_id"],
-                    status="absorbed",
-                    evidence=f"PR #{row['pr_number']}: {row['pr_title'] or ''} "
-                    f"[pulse confirm via dashboard]",
-                )
+            # Dispatch by store: a follow_up-target annotation absorbs the
+            # follow_up (conditional open-only), NOT a ledger row that doesn't
+            # exist. Defensive default 'ledger' keeps pre-0084 rows correct.
+            target_kind = dict(row).get("target_kind") or "ledger"
+            evidence = (
+                f"PR #{row['pr_number']}: {row['pr_title'] or ''} [pulse confirm via dashboard]"
+            )
+            if target_kind == "follow_up":
+                absorbed = await absorb_followup(db, row["item_id"], evidence=evidence)
+            else:
+                item = await get_ledger_item(db, row["item_id"])
+                if item is not None and item.get("status") in ("open", "in_progress"):
+                    absorbed = await ledger_update(
+                        db, row["item_id"], status="absorbed", evidence=evidence
+                    )
     except (sqlite3.Error, aiosqlite.Error) as exc:
         logger.error("pulse resolve failed: %s", exc)
         return {"error": "pulse store unavailable"}, 503

@@ -358,6 +358,30 @@ def _is_harness_envelope(prompt: str) -> bool:
     return prompt.lstrip().startswith(_HARNESS_ENVELOPE_PREFIXES)
 
 
+# WS-3 observation provenance. Literals mirror memory.provenance.ORIGIN_* — kept
+# stdlib-only here so the never-block write path takes no genesis import.
+_VALID_ORIGIN_CLASSES = frozenset({"owner", "first_party", "external_untrusted"})
+
+
+def _pivot_origin_class() -> str:
+    """origin_class for a conversation_pivot row written by THIS hook.
+
+    This hook ``sys.exit(0)``s at the top of the module when
+    ``GENESIS_CC_SESSION == "1"``, so it only ever runs in a user-launched
+    INTERACTIVE terminal session — i.e. the owner. Every Genesis-dispatched or
+    external session sets ``GENESIS_CC_SESSION=1`` (cc/invoker.py:396,
+    session_awareness/headless.py:78) and never reaches here; and
+    ``GENESIS_SESSION_ORIGIN`` is only ever set ALONGSIDE that guard
+    (invoker.py:412), so it cannot be present past the exit. The origin is
+    therefore ``owner``. The env read below is belt-and-suspenders for a
+    hypothetical future spawn path that sets an origin without the CC_SESSION
+    guard; it cannot fire today (fail-closed to owner is safe — the read side
+    keeps owner/first_party and this surface is the owner's own pivot trail).
+    """
+    origin = os.environ.get("GENESIS_SESSION_ORIGIN")
+    return origin if origin in _VALID_ORIGIN_CLASSES else "owner"
+
+
 def _record_pivot_observation(
     db_path: Path,
     session_id: str,
@@ -374,8 +398,9 @@ def _record_pivot_observation(
         try:
             conn.execute(
                 "INSERT INTO observations"
-                " (id, source, type, content, priority, created_at, expires_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " (id, source, type, content, priority, created_at, expires_at,"
+                " origin_class)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     _uuid.uuid4().hex,
                     f"session:{session_id}",
@@ -384,6 +409,7 @@ def _record_pivot_observation(
                     "low",
                     now.isoformat(),
                     expires_at,
+                    _pivot_origin_class(),
                 ),
             )
             conn.commit()
@@ -984,6 +1010,46 @@ def _ensure_knowledge_retrieved_count(db_path: Path) -> None:
         pass  # Never block
 
 
+def _liveness_detail() -> str:
+    """Best-effort loop-health suffix for the degraded banner.
+
+    One quick GET to the OFF-loop liveness probe (a sync route that answers even
+    when the event loop is starved), returning e.g. ``" (loop lag 4200ms,
+    executor backlog 37)"`` or ``""`` on any failure. Never raises. Only called on
+    the "reachable but under load" branches — the connect-refused branch means the
+    server is down and there is nothing to probe. The tight budget is safe: the
+    server already answered (503) or is reachable-but-slow only on the LOOP, and
+    this route bypasses the loop, so it returns in milliseconds.
+    """
+    import httpx
+
+    try:
+        url = f"{_SERVER_BASE}/api/genesis/liveness"
+        with httpx.Client(timeout=httpx.Timeout(0.6, connect=0.2), trust_env=False) as client:
+            resp = client.get(url)
+        if resp.status_code != 200:
+            return ""
+        loop = resp.json().get("loop")
+        if not isinstance(loop, dict):
+            return ""
+        # A wedged loop (or a dead sampler) keeps returning the LAST sample with a
+        # growing sample_age_s — don't present stale drift/executor depth as current
+        # load. Past a freshness window, report the staleness instead of the number.
+        age = loop.get("sample_age_s")
+        if isinstance(age, (int, float)) and age > 30:
+            return f" (loop sample stale {age:.0f}s — possibly wedged)"
+        parts: list[str] = []
+        lag = loop.get("lag_ms")
+        if isinstance(lag, (int, float)):
+            parts.append(f"loop lag {lag:.0f}ms")
+        execu = loop.get("executor")
+        if isinstance(execu, dict) and isinstance(execu.get("pending"), int):
+            parts.append(f"executor backlog {execu['pending']}")
+        return f" ({', '.join(parts)})" if parts else ""
+    except Exception:
+        return ""
+
+
 def _server_failure_reason(
     *, status: int | None = None, detail: str = "", exc: BaseException | None = None
 ) -> str:
@@ -993,7 +1059,9 @@ def _server_failure_reason(
     timeout — e.g. mid-restart) from a server that IS reachable but whose recall
     call failed or ran past its 4.5s budget (a 503 / read-timeout). Calling the
     latter "unreachable" both misleads and masks the real latency story, so the
-    banner names the actual cause instead.
+    banner names the actual cause instead — and on the reachable-but-loaded
+    branches appends the live loop-lag / executor backlog so "under load" is a
+    number, not a guess.
     """
     import httpx
 
@@ -1004,14 +1072,18 @@ def _server_failure_reason(
         if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
             return "genesis-server unreachable (connection refused — likely restarting or down)"
         if isinstance(exc, httpx.TimeoutException):
-            return f"recall timed out after {_SERVER_TIMEOUT_S:g}s (server reachable, under load)"
+            return (
+                f"recall timed out after {_SERVER_TIMEOUT_S:g}s "
+                f"(server reachable, under load){_liveness_detail()}"
+            )
         return "recall call failed (server reachable)"
     if status is not None and status != 200:
         base = f"server returned HTTP {status} (reachable"
         if status == 503:
             base += ", over budget or still booting"
         base += ")"
-        return f"{base}: {detail}" if detail else base
+        base = f"{base}: {detail}" if detail else base
+        return f"{base}{_liveness_detail()}"
     return "genesis-server unavailable"
 
 

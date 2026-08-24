@@ -1761,9 +1761,16 @@ TABLES = {
             norm_name   TEXT NOT NULL,
             entity_type TEXT NOT NULL CHECK (entity_type IN (
                 'code_file','code_symbol','pr','commit',
-                'product','device','repo','subsystem','person','org','concept'
+                'product','device','repo','subsystem','person','org','concept',
+                -- MW-3 §6.4 first-card classes: host = a machine, install = a
+                -- Genesis deployment on a host, project = a user project.
+                'host','install','project'
             )),
             summary     TEXT,
+            -- MW-3 B3 card-materialization state (NULL/0 = never carded =
+            -- today's behavior; refresh job dirties + regenerates).
+            summary_updated_at TEXT,
+            summary_dirty INTEGER NOT NULL DEFAULT 0,
             source      TEXT NOT NULL DEFAULT 'extracted',
             status      TEXT NOT NULL DEFAULT 'active'
                             CHECK (status IN ('active','merged','gone')),
@@ -1976,7 +1983,10 @@ TABLES = {
                             CHECK(status IN ('applied','proposed','confirmed',
                                              'rejected','superseded')),
             resolved_at     TEXT,
-            resolution_ref  TEXT
+            resolution_ref  TEXT,
+            -- 'ledger' | 'follow_up' — which store item_id addresses (a8a4f59e).
+            -- LAST column: ALTER appends here, so fresh/migrated order stays in parity.
+            target_kind     TEXT NOT NULL DEFAULT 'ledger'
         )
     """,
     # ── WS-2 sensor fabric (M9/M10) ──────────────────────────────────────
@@ -2559,7 +2569,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_slse_session ON session_ledger_shadow_events(session_id, observed_at)",
     "CREATE INDEX IF NOT EXISTS idx_slse_observed ON session_ledger_shadow_events(observed_at)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_rpa_dedupe "
-    "ON repo_pulse_annotations(tier, item_id, pr_number)",
+    "ON repo_pulse_annotations(tier, target_kind, item_id, pr_number)",
     "CREATE INDEX IF NOT EXISTS idx_rpa_status ON repo_pulse_annotations(status, observed_at)",
     "CREATE INDEX IF NOT EXISTS idx_rpa_session ON repo_pulse_annotations(item_session_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_rpr_started ON repo_pulse_runs(started_at)",

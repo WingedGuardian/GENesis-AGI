@@ -7,21 +7,24 @@ Used by:
 - genesis_stop_hook.py (Stop hook)
 - Claude (after /review + code-reviewer agent complete)
 
-The marker file records a hash of ``git diff --cached --stat`` (staged changes
-only) at the time review was done.  If staged content changes, the marker
+The marker file records a hash of ``git diff --cached --raw --no-abbrev -z`` (staged
+changes only) at the time review was done.  If staged content changes, the marker
 becomes stale and review is required again.  Unstaged working-tree edits
 (e.g. from Codex) do not trigger review enforcement.
 
-Review evidence: the authoritative signal is the code-reviewer agent output
-(``~/.genesis/last_code_review.txt``). gstack skill-usage telemetry, when
-present, is recorded as advisory corroboration but never gates marking — it is
-not installed on many hosts.
+Review evidence: the authoritative signal is the code-reviewer agent output. It
+defaults to a PER-WORKTREE path (``review_state.py evidence-path``) so concurrent
+sessions don't overwrite each other's audit; ``--agent-output`` overrides it. gstack
+skill-usage telemetry, when present, is recorded as advisory corroboration but never
+gates marking — it is not installed on many hosts.
 
 CLI usage:
-    python3 review_state.py status     # prints current review state
-    python3 review_state.py mark --agent-output <path>          # defect-bearing round
+    python3 review_state.py status         # prints current review state
+    python3 review_state.py evidence-path  # prints this worktree's evidence path
+    python3 review_state.py mark           # evidence read from the per-worktree path
+    python3 review_state.py mark --agent-output <path>          # explicit override
     python3 review_state.py mark --agent-output <path> --clean  # clean round → reset streak
-    python3 review_state.py diff-hash  # prints current diff hash
+    python3 review_state.py diff-hash      # prints current diff hash
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -48,17 +52,27 @@ ESCALATION_ROUND_CAP = 3
 # Legacy single-file marker (pre per-worktree scoping). Only read as a fallback
 # so an in-flight review from before an upgrade isn't lost mid-session.
 _LEGACY_STATE_FILE = Path.home() / ".genesis" / "review_state.json"
+# Per-worktree review-EVIDENCE (the code-reviewer/genesis-architect audit output the
+# depth gate validates). Per-worktree — like the marker/round — so concurrent
+# sessions don't overwrite each other's evidence (which would validate one session's
+# marker against ANOTHER session's audit). Keyed by the same _worktree_key.
+_EVIDENCE_DIR = Path.home() / ".genesis" / "review_evidence"
 _MAX_EVIDENCE_AGE_SECONDS = 1800  # 30 minutes
 _GSTACK_ANALYTICS = Path.home() / ".gstack" / "analytics" / "skill-usage.jsonl"
 
 
-def _worktree_key(cwd: str | None = None) -> str:
-    """Stable per-worktree key from the git worktree root.
+def _worktree_root(cwd: str | None = None) -> str:
+    """Absolute worktree root used to key per-worktree state.
 
-    Concurrent CC sessions each work in their own git worktree; a single global
-    marker file let them clobber each other's review state (session B's commit
-    reset session A's marker mid-workflow). Keying the marker by worktree root
-    isolates them. Falls back to "default" outside a git repo.
+    Primary: ``git rev-parse --show-toplevel``. Fallback — git missing or timed out,
+    LIKELIEST under the concurrent load this keying exists to survive: walk up from
+    ``cwd`` to the nearest ``.git`` (a directory in the main tree, a FILE in a linked
+    worktree) and use that directory; if none is found, use the resolved ``cwd``.
+
+    CRITICAL: the fallback stays PER-LOCATION — never a single shared constant. The
+    old ``"default"`` fallback meant a transient git hiccup collapsed every concurrent
+    session onto ONE key, reopening the cross-session clobber #1244 fixed (observed as
+    a marker vanishing / round counter resetting mid-workflow).
     """
     try:
         result = subprocess.run(
@@ -70,10 +84,37 @@ def _worktree_key(cwd: str | None = None) -> str:
         )
         root = result.stdout.strip()
         if root:
-            return hashlib.sha256(root.encode()).hexdigest()[:12]
+            # realpath so the git-success key matches the fallback (which resolves
+            # symlinks) for the SAME worktree — otherwise a git-success mark and a
+            # git-failed hook check could compute different keys and disagree.
+            return os.path.realpath(root)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
-    return "default"
+    base = Path(cwd).resolve() if cwd else Path.cwd()
+    for d in (base, *base.parents):
+        if (d / ".git").exists():
+            return str(d)
+    return str(base)
+
+
+def _worktree_key(cwd: str | None = None) -> str:
+    """Stable, per-location key from the worktree root (see ``_worktree_root``).
+
+    Concurrent CC sessions each work in their own git worktree; a single global
+    marker file let them clobber each other's review state (session B's commit reset
+    session A's marker mid-workflow). Keying by worktree root isolates them — and the
+    key stays isolated even when git is briefly unavailable (no shared fallback).
+    """
+    return hashlib.sha256(_worktree_root(cwd).encode()).hexdigest()[:12]
+
+
+def _evidence_file(cwd: str | None = None) -> Path:
+    """Per-worktree review-evidence path (``--agent-output`` default).
+
+    Same worktree key as the marker/round so a session's evidence can't be
+    overwritten by a concurrent session between writing it and marking the review.
+    """
+    return _EVIDENCE_DIR / f"{_worktree_key(cwd)}.txt"
 
 
 def _state_file(cwd: str | None = None) -> Path:
@@ -82,11 +123,27 @@ def _state_file(cwd: str | None = None) -> Path:
 
 
 def get_current_diff_hash(cwd: str | None = None) -> str:
-    """SHA-256 of ``git diff --cached --stat`` output (staged changes only).
+    """SHA-256 of ``git diff --cached --raw --no-abbrev -z`` output (staged only).
 
     Only staged changes trigger review enforcement.  Unstaged changes
     (e.g. from Codex or other tools editing the working tree) are ignored
     so they don't cause false-positive review blocks.
+
+    Uses ``--raw --no-abbrev -z`` — a NUL-separated, BYTE-oriented machine format
+    that is:
+    - **width-independent**: unlike ``--stat`` (path truncation + change-bar
+      scaling by ``COLUMNS``/terminal), so the SAME staged content no longer
+      hashes differently when ``mark`` (one width) and the commit gate (another
+      width) run — the systematic false "code changes without review" block;
+    - **content-complete**: the destination blob OID changes on ANY content
+      change, INCLUDING binary (unlike ``--numstat``, which collapses every
+      binary change to ``-\\t-\\t<path>`` and would let a same-path binary
+      swap read as already-reviewed). ``--no-abbrev`` pins full 40-char OIDs so
+      the hash can't shift with git's auto-abbreviation length; and
+    - **byte-exact on paths**: ``-z`` NUL-separates records and emits RAW path
+      bytes (no ``core.quotePath`` quoting, no trailing-whitespace loss). The
+      output is hashed as bytes with NO stripping, so a rename ``foo`` → ``foo ``
+      (or any non-UTF8 / whitespace path) cannot collide with the original.
 
     Args:
         cwd: Working directory for git commands. When None, uses the
@@ -94,16 +151,25 @@ def get_current_diff_hash(cwd: str | None = None) -> str:
     """
     try:
         result = subprocess.run(
-            ["git", "diff", "--cached", "--stat"],
-            capture_output=True,
-            text=True,
+            ["git", "diff", "--cached", "--raw", "--no-abbrev", "-z"],
+            capture_output=True,  # bytes (no text= → no newline/encoding munging)
             timeout=10,
             cwd=cwd,
+            # --stat output is TERMINAL-WIDTH sensitive: git truncates long paths
+            # to fit COLUMNS (honored even without a tty). The mark is written from
+            # one process (COLUMNS often unset → width 80) and checked from the
+            # hook process (COLUMNS tracks the live terminal), so a long staged
+            # path hashed differently in the two and the gate intermittently
+            # denied a freshly-marked commit as "without review" (MEASURED
+            # 2026-08-11: identical index → 62e24043 @80/unset, cd67763b @120,
+            # a3966055 @200). Pin the width so the hash is env-independent; 80
+            # matches the unset default, so previously stored markers stay valid.
+            env={**os.environ, "COLUMNS": "80"},
         )
-        content = result.stdout.strip()
+        content = result.stdout  # raw bytes; do NOT strip (would drop trailing-ws paths)
         if not content:
             return "clean"
-        return hashlib.sha256(content.encode()).hexdigest()[:16]
+        return hashlib.sha256(content).hexdigest()[:16]
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return "unknown"
 
@@ -136,10 +202,12 @@ def is_review_current(cwd: str | None = None) -> bool:
 def marker_content_current(cwd: str | None = None) -> bool:
     """Whether the marker's recorded FULL-content hash binds the CURRENT staged diff.
 
-    Stricter than :func:`is_review_current` (which compares the stat-only ``diff_hash``,
-    so a same-shape content swap reads as current). Used by the commit depth gate to
-    grant adversarial clearance ONLY when the marked content IS the staged content —
-    an audit of diff A must not clear a different-content diff B of the same shape.
+    A belt-and-suspenders companion to :func:`is_review_current`. Since ``diff_hash``
+    became OID-based (``git diff --cached --raw --no-abbrev``) it is already
+    content-complete — a same-shape content swap changes it too — so this full-patch
+    bind is now redundant defense-in-depth rather than a strictness upgrade. The commit
+    depth gate still uses it to grant adversarial clearance ONLY when the marked content
+    IS the staged content (an audit of diff A must not clear a different diff B).
     Fails CLOSED: a real staged hash that mismatches / is absent / errors → False.
     """
     current = _staged_content_hash(cwd=cwd)
@@ -306,7 +374,7 @@ def mark_reviewed(
     _review_found, review_msg = _verify_review_log()
 
     # Check 2 (authoritative): code-reviewer agent output must exist and be recent.
-    agent_path = agent_output_path or str(Path.home() / ".genesis" / "last_code_review.txt")
+    agent_path = agent_output_path or str(_evidence_file(cwd))
     agent_ok, agent_msg = _verify_agent_output(agent_path)
     if not agent_ok:
         print(f"REFUSED: {agent_msg}", file=sys.stderr)
@@ -337,10 +405,10 @@ def mark_reviewed(
     state_file.parent.mkdir(parents=True, exist_ok=True)
     state = {
         "diff_hash": get_current_diff_hash(cwd=cwd),
-        # FULL-content hash of the reviewed diff. diff_hash is stat-only (files + line
-        # counts), so a same-shape content swap collides under it; the depth gate binds
-        # adversarial clearance to THIS instead, so an audit of diff A cannot clear a
-        # different-content diff B that shares A's shape (see marker_content_current).
+        # FULL-patch content hash — a belt-and-suspenders bind for the depth gate (an
+        # audit of diff A must not clear a different diff B). diff_hash is now OID-based
+        # (--raw --no-abbrev) and already content-complete, so this is redundant
+        # defense-in-depth, kept as an independent signal (see marker_content_current).
         "content_hash": _staged_content_hash(cwd=cwd),
         "reviewed_at": datetime.now(UTC).isoformat(),
         "review_evidence": review_msg,  # advisory annotation (gstack corroboration)
@@ -413,12 +481,15 @@ def _round_file(cwd: str | None = None) -> Path:
 
 
 def _staged_content_hash(cwd: str | None = None) -> str:
-    """SHA-256 of the FULL staged diff (``git diff --cached``) — content, not stat.
+    """SHA-256 of the FULL staged patch (``git diff --cached``).
 
-    Round detection must distinguish two genuinely different fixes to the same
-    file: ``get_current_diff_hash`` hashes ``--stat`` (file + line counts only), so
-    ``x = 2`` → ``x = 3`` collide under it. This hashes the actual staged content so
-    any real change since the last mark reads as a new round.
+    A belt-and-suspenders content bind for the depth gate. ``get_current_diff_hash``
+    is now OID-based (``--raw --no-abbrev``) and already distinguishes two different
+    fixes to the same file, so this full-patch hash is redundant defense-in-depth —
+    kept (and wired at the depth gate) as a second, independent content signal. (The
+    patch body carries the actual +/- content, so it is content-sensitive; the
+    abbreviated OID in the ``index`` header is harmless — mark and hook run in the same
+    repo/env, so it never diverges between the two.)
     """
     try:
         result = subprocess.run(
@@ -574,7 +645,7 @@ def get_current_branch(cwd: str | None = None) -> str:
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print("Usage: review_state.py [status|mark|diff-hash]", file=sys.stderr)
+        print("Usage: review_state.py [status|mark|diff-hash|evidence-path]", file=sys.stderr)
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -593,6 +664,13 @@ def main() -> None:
 
     elif cmd == "diff-hash":
         print(get_current_diff_hash())
+
+    elif cmd == "evidence-path":
+        # Create the dir so a `save-to $(evidence-path)` shell redirect (the flow the
+        # hook/SKILL instructions describe) doesn't fail on a fresh host — otherwise
+        # the evidence write fails, `mark` finds no evidence, and the gate REFUSES.
+        _EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        print(_evidence_file())
 
     elif cmd == "mark":
         # Parse --agent-output <path> and the optional --clean flag.

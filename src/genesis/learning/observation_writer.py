@@ -55,6 +55,7 @@ class _MemoryStore(Protocol):
         auto_link: bool = ...,
         source_pipeline: str | None = ...,
         source_subsystem: str | None = ...,
+        origin_class: str | None = ...,
         invalid_at: str | None = ...,
     ) -> str: ...
 
@@ -98,8 +99,21 @@ class ObservationWriter:
         priority: str,
         category: str | None = None,
         content_hash: str | None = None,
+        origin_class: str | None = None,
     ) -> str:
-        """Dual-write: observations table + MemoryStore (if available)."""
+        """Dual-write: observations table + MemoryStore (if available).
+
+        ``origin_class`` (WS-3): an EXPLICIT provenance override for sources whose
+        trust is NOT derivable from the source string — the learning pipeline's
+        ``retrospective``/``cc_debrief`` observations, whose content characterizes
+        the ANALYZED session and must inherit THAT session's channel origin (else
+        an inbox/mail retrospective launders external content in as first-party).
+        When ``None`` (every other caller) the origin is resolved fail-closed from
+        the ``source`` map in both the observations chokepoint AND the MemoryStore
+        copy — unchanged behaviour. When set, it wins at both (create's
+        ``_resolve_origin`` and ``derive_origin_class`` both give explicit first
+        precedence), so the two stores stay consistent.
+        """
         obs_id = str(uuid.uuid4())
         now_dt = datetime.now(UTC)
         now = now_dt.isoformat()
@@ -123,6 +137,7 @@ class ObservationWriter:
             created_at=now,
             content_hash=content_hash,
             expires_at=expires_at,
+            origin_class=origin_class,
             skip_if_duplicate=True,
         )
         if result is None:
@@ -148,6 +163,7 @@ class ObservationWriter:
                     confidence=0.6,
                     source_pipeline=source,
                     source_subsystem=subsystem,
+                    origin_class=origin_class,
                     invalid_at=expires_at,
                 )
             except Exception:

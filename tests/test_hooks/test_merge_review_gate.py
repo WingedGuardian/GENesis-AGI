@@ -759,9 +759,12 @@ class TestCheckPrReviewFindings:
     """Unit tests for _check_pr_review_findings()."""
 
     def _make_gh_output(self, comments: list[tuple[str, str, str]]) -> str:
-        """Build mock gh api JSON output: [{login, type, body}, ...]."""
-        return json.dumps(
-            [{"login": login, "type": utype, "body": body} for login, utype, body in comments]
+        """Build mock ``gh api --paginate --jq '.[] | {…}'`` output: one compact
+        JSON object per line (JSONL), matching the per-element jq the code now
+        uses. An empty list yields "" (gh emits nothing for zero comments)."""
+        return "\n".join(
+            json.dumps({"login": login, "type": utype, "body": body})
+            for login, utype, body in comments
         )
 
     def test_no_comments_allows_merge(self, guard_module):
@@ -776,6 +779,36 @@ class TestCheckPrReviewFindings:
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert not should_block
         assert msg == ""
+
+    def test_paginated_multiline_findings_parsed_and_blocked(self, guard_module):
+        """Regression: issues/N/comments must be fetched with --paginate and
+        parsed as per-line JSONL.
+
+        Without --paginate a [P1]/ERROR beyond the first REST page (30 comments)
+        was silently dropped and the merge — this scan runs on the live merge
+        path with strict=False — sailed through; the old whole-body json.loads
+        also choked on the JSONL that --paginate emits (→ _scan_unreadable →
+        fail-open). Feed a multi-line JSONL response whose most-recent comment
+        carries an ERROR and assert the gate blocks AND that --paginate is
+        actually requested.
+        """
+        output = self._make_gh_output(
+            [
+                ("chatgpt-codex-connector[bot]", "Bot", "## Structural Review\n\nEarlier note."),
+                ("chatgpt-codex-connector[bot]", "Bot", "### ERROR — raw SQL in production code"),
+            ]
+        )
+        assert "\n" in output  # guard: genuinely multi-line JSONL, not a single array blob
+        with patch.object(guard_module.subprocess, "run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=output, stderr="",
+            )
+            should_block, _ = guard_module._check_pr_review_findings("100")
+            gh_argv = mock_run.call_args.args[0]
+        assert should_block
+        # Paged fetch requests explicit query params (per_page/page), not --paginate.
+        assert "per_page=100" in gh_argv
+        assert "page=1" in gh_argv
 
     def test_clean_review_allows_merge(self, guard_module):
         """Review comment with CLEAN verdict → allow."""
@@ -892,8 +925,8 @@ class TestCheckPrReviewFindings:
         should_block, msg = guard_module._check_pr_review_findings("100", force=True)
         assert not should_block
 
-    def test_api_error_fails_open(self, guard_module):
-        """gh api returning error → fail-open (allow merge)."""
+    def test_api_error_fails_closed(self, guard_module):
+        """gh api returning error → fail-CLOSED (block; unreadable scan, PR #1434)."""
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=[],
@@ -902,14 +935,16 @@ class TestCheckPrReviewFindings:
                 stderr="API error",
             )
             should_block, msg = guard_module._check_pr_review_findings("100")
-        assert not should_block
+        assert should_block
+        assert "UNREADABLE" in msg
 
-    def test_api_timeout_fails_open(self, guard_module):
-        """gh api timeout → fail-open."""
+    def test_api_timeout_fails_closed(self, guard_module):
+        """gh api timeout → fail-CLOSED (block; unreadable scan, PR #1434)."""
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.side_effect = subprocess.TimeoutExpired(cmd="gh", timeout=15)
             should_block, msg = guard_module._check_pr_review_findings("100")
-        assert not should_block
+        assert should_block
+        assert "UNREADABLE" in msg
 
     def test_newer_clean_review_overrides_old_error(self, guard_module):
         """When latest bot comment is clean, old ERROR is considered resolved."""
@@ -1023,10 +1058,10 @@ class TestCheckPrReviewFindings:
 
     def test_null_body_fails_open(self, guard_module):
         """GitHub API returning body: null should not crash."""
+        # JSONL (one object per line) to match the per-element --jq the code uses;
+        # body: null must coerce to "" rather than crash.
         output = json.dumps(
-            [
-                {"login": "chatgpt-codex-connector[bot]", "type": "Bot", "body": None},
-            ]
+            {"login": "chatgpt-codex-connector[bot]", "type": "Bot", "body": None}
         )
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
@@ -1170,7 +1205,8 @@ class TestCheckInlineReviewFindings:
         err = capsys.readouterr().err
         assert "[P2] Preserve multi-word ledger keys" in err
 
-    def test_replied_p1_is_acknowledged(self, guard_module):
+    def test_replied_p1_is_acknowledged_by_maintainer(self, guard_module):
+        """A MAINTAINER reply (author_association OWNER/MEMBER/COLLABORATOR) acks a P1."""
         comments = [
             self._codex(1, _P1_BODY),
             {
@@ -1178,12 +1214,33 @@ class TestCheckInlineReviewFindings:
                 "reply_to": 1,
                 "login": "WingedGuardian",
                 "type": "User",
+                "assoc": "OWNER",
                 "body": "Fixed in abc123.",
             },
         ]
         with self._mock(guard_module, comments):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+
+    def test_non_maintainer_reply_does_not_acknowledge_p1(self, guard_module):
+        """LOW-a: a reply from a non-authority account (NONE / throwaway / PR author
+        with no push rights) must NOT silence a real P1 — it still blocks."""
+        for assoc in ("NONE", "FIRST_TIME_CONTRIBUTOR", "CONTRIBUTOR", None):
+            comments = [
+                self._codex(1, _P1_BODY),
+                {
+                    "id": 2,
+                    "reply_to": 1,
+                    "login": "drive-by-account",
+                    "type": "User",
+                    "assoc": assoc,
+                    "body": "lgtm",
+                },
+            ]
+            with self._mock(guard_module, comments):
+                block, msg = guard_module._check_inline_review_findings("100")
+            assert block, f"assoc={assoc!r} should NOT acknowledge the P1"
+            assert "Make queue claim atomic" in msg
 
     def test_force_override_allows(self, guard_module):
         block, _ = guard_module._check_inline_review_findings(
@@ -1192,17 +1249,46 @@ class TestCheckInlineReviewFindings:
         )
         assert not block
 
-    def test_api_error_fails_open(self, guard_module):
+    def test_api_error_fails_closed(self, guard_module):
+        """Unreadable inline scan → fail-CLOSED (block; PR #1434)."""
         with self._mock(guard_module, [], rc=1):
-            block, _ = guard_module._check_inline_review_findings("100")
-        assert not block
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "UNREADABLE" in msg
 
     def test_gh_call_paginates(self, guard_module):
         # Findings beyond REST page 1 (30 comments) must still gate —
         # the very first PR through this gate (#996) drew a P1 for it.
+        # The paged fetch requests explicit per_page/page query params.
         with self._mock(guard_module, []) as run_mock:
             guard_module._check_inline_review_findings("100")
-        assert "--paginate" in run_mock.call_args[0][0]
+        argv = run_mock.call_args[0][0]
+        assert "per_page=100" in argv
+        assert "page=1" in argv
+
+    def test_inline_fetch_uses_default_ascending_order(self, guard_module):
+        # The inline scan fetches in the endpoint's DEFAULT ascending (oldest-first)
+        # order — NO sort/direction params. Descending (newest-first) page-number paging
+        # would never revisit page 1, so a P1 appended mid-scan on a >100-comment PR
+        # could go unseen (Codex P2). Ascending puts an appended comment on the last
+        # page, which sequential pagination reaches.
+        with self._mock(guard_module, []) as run_mock:
+            guard_module._check_inline_review_findings("100")
+        argv = run_mock.call_args[0][0]
+        assert "sort=created" not in argv
+        assert "direction=desc" not in argv
+        assert any("pulls/100/comments" in tok for tok in argv)
+
+    def test_body_fetch_uses_default_ascending_order(self, guard_module):
+        with patch.object(
+            guard_module.subprocess, "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+        ) as run_mock:
+            guard_module._check_pr_review_findings("100")
+        argv = run_mock.call_args[0][0]
+        assert "sort=created" not in argv
+        assert "direction=desc" not in argv
+        assert any("issues/100/comments" in tok for tok in argv)
 
     def test_p1_beyond_first_page_blocks(self, guard_module):
         filler = [self._codex(i, "note") for i in range(1, 32)]
@@ -1253,6 +1339,11 @@ class TestResolvePrNumber:
             ("gh pr merge 5 | tee 777", "5"),
             ("gh pr merge --admin xyz\necho 456", None),  # newline chain
             ("gh pr merge 123\necho 456", "123"),
+            # A dangling value flag must NOT swallow the separator as its value
+            # and then read a CHAINED command's digits (E3 guard: naive value-
+            # skipping would return 999 here). 2026-08-19.
+            ("gh pr merge --subject ; gh pr merge 999", None),
+            ("gh pr merge -db ; gh pr merge 999", None),
         ],
     )
     def test_stops_at_shell_separator(self, guard_module, cmd, expected):
@@ -1263,6 +1354,58 @@ class TestResolvePrNumber:
         # not resolve as the PR number.
         cmd = 'gh pr merge --subject "fix 123"'
         assert guard_module._extract_pr_number(cmd) is None
+
+    @pytest.mark.parametrize(
+        ("cmd", "expected"),
+        [
+            # E3 (2026-08-19): an UNQUOTED numeric value that gh consumes as a
+            # value-flag's argument must NOT be read as the PR number — gh takes
+            # the trailing bare positional as the PR. `gh pr merge --subject 123 5`
+            # merges PR 5 (subject "123"); the old loop returned 123 (the flag
+            # value) → the gates checked the WRONG PR. Long, short, cluster,
+            # and non-shadow (--match-head-commit / --repo) value flags all apply.
+            ("gh pr merge --subject 123 5", "5"),
+            ("gh pr merge -t 123 5", "5"),
+            ("gh pr merge --body 123 5", "5"),
+            ("gh pr merge --match-head-commit 123 5 --admin", "5"),
+            ("gh pr merge --repo 123 5", "5"),
+            ("gh pr merge -db 123 5", "5"),  # -d(bool)+-b(value): -b eats 123
+        ],
+    )
+    def test_unquoted_flag_value_not_pr_number(self, guard_module, cmd, expected):
+        assert guard_module._extract_pr_number(cmd) == expected
+
+    @pytest.mark.parametrize(
+        ("cmd", "expected"),
+        [
+            # GLUED value flags (sibling of E3, found in adversarial review): a
+            # `--flag=value` long or a `-fvalue` short does NOT consume a next
+            # token, so it falls through to the positional matchers — and the URL
+            # matcher's `\S*` prefix would read a `/pull/N` smuggled INSIDE the
+            # value as the PR while gh merges the trailing positional. A positional
+            # PR ref never starts with '-'; the matchers must skip '-'-prefixed
+            # tokens. gh merges 5 in every case here.
+            ("gh pr merge --body=https://github.com/o/r/pull/999 5", "5"),
+            ("gh pr merge -bhttps://github.com/o/r/pull/999 5", "5"),
+            ("gh pr merge --body-file=/tmp/x/pull/42 5", "5"),
+        ],
+    )
+    def test_glued_flag_value_url_not_pr_number(self, guard_module, cmd, expected):
+        assert guard_module._extract_pr_number(cmd) == expected
+
+    @pytest.mark.parametrize(
+        ("cmd", "expected"),
+        [
+            # Regression LOCKS (must stay green): a positional BEFORE any flag is
+            # still the PR; a GLUED long value flag never leaks its digits.
+            ("gh pr merge 123 --subject 456", "123"),
+            ("gh pr merge --subject=99 5", "5"),
+            ("gh pr merge -db123 5", "5"),  # glued short value: -b's value is 123
+            ("gh pr merge -- 5", "5"),  # -- end-of-options: the positional still resolves
+        ],
+    )
+    def test_positional_pr_still_resolved(self, guard_module, cmd, expected):
+        assert guard_module._extract_pr_number(cmd) == expected
 
     def test_resolves_current_branch_pr(self, guard_module):
         with patch.object(
@@ -1392,6 +1535,138 @@ class TestPrCiStatus:
         assert guard_module._pr_ci_status("1") == ("unknown", [])
 
 
+class TestPrCiStatusCancelSibling:
+    """Concurrency-cancel dedup (approach B): a CANCELLED CheckRun is dropped IFF a
+    check of the SAME identity (name + workflowName) concluded SUCCESS AT OR AFTER
+    it — so a superseded `cancel-in-progress` duplicate (cancel older than its
+    re-run's success) drops, but a SUCCESS-then-cancel re-run on an unchanged head
+    still blocks. Both sides are terminal COMPLETED runs (always carry completedAt);
+    every unresolvable case (no identity, no completedAt, no later success) fails
+    closed to red."""
+
+    @staticmethod
+    def _set(monkeypatch, checks):
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps(checks))
+
+    def test_cancel_with_success_sibling_is_green(self, guard_module, monkeypatch):
+        # The ec925917 incident: concurrency-cancelled CodeQL dups (older) + their
+        # successful re-runs (newer, same name + workflowName). Must read green.
+        self._set(monkeypatch, [
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+            {"name": "Analyze (actions)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "Analyze (actions)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_cancel_without_success_sibling_stays_red(self, guard_module, monkeypatch):
+        # A genuine cancel with no same-identity success still blocks the merge.
+        self._set(monkeypatch, [
+            {"name": "Analyze", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED"},
+            {"name": "lint", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["Analyze"])
+
+    def test_cross_workflow_same_name_does_not_drop(self, guard_module, monkeypatch):
+        # SECURITY (HIGH lock): a same-NAME success from a DIFFERENT workflow is
+        # NOT a valid sibling and must not mask a genuinely-cancelled required
+        # check. Identity is (name, workflowName), so this stays red. Under a
+        # bare-name match this would wrongly go green.
+        self._set(monkeypatch, [
+            {"name": "test-suite", "workflowName": "real-ci", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "test-suite", "workflowName": "decoy", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["test-suite"])
+
+    def test_cancel_without_workflowname_stays_red(self, guard_module, monkeypatch):
+        # Fail-closed: a CANCELLED entry with no resolvable workflowName has no
+        # identity, so even a later same-name SUCCESS cannot drop it — stays red.
+        self._set(monkeypatch, [
+            {"name": "x", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "x", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["x"])
+
+    def test_cancel_plus_inflight_rerun_never_green(self, guard_module, monkeypatch):
+        # Cancel + an in-flight re-run of the same identity, no success yet → must
+        # NOT read green (the re-run is still running; nothing has passed).
+        self._set(monkeypatch, [
+            {"name": "Analyze", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED"},
+            {"name": "Analyze", "workflowName": "CodeQL", "status": "IN_PROGRESS", "conclusion": None},
+        ])
+        assert guard_module._pr_ci_status("1")[0] != "green"
+
+    def test_cancel_sibling_does_not_launder_other_failure(self, guard_module, monkeypatch):
+        # Dropping a cancelled-with-sibling must never hide a DIFFERENT check's
+        # real failure — the core wrong-green guard.
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+            {"name": "lint", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["lint"])
+
+    def test_timed_out_with_success_sibling_still_red(self, guard_module, monkeypatch):
+        # Scope lock: ONLY CANCELLED is laundered. TIMED_OUT carries a real
+        # verdict and still blocks even with a same-identity success.
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "TIMED_OUT"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+    def test_statuscontext_success_does_not_drop_checkrun_cancel(self, guard_module, monkeypatch):
+        # A legacy StatusContext SUCCESS (no workflowName) has no CheckRun identity
+        # and is NOT a valid sibling for a CheckRun CANCELLED of the same name —
+        # the cancel stays red (closes the cross-shape collision surface).
+        self._set(monkeypatch, [
+            {"context": "ci/legacy", "state": "SUCCESS"},
+            {"name": "ci/legacy", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["ci/legacy"])
+
+    def test_pending_preserved_when_sibling_dropped(self, guard_module, monkeypatch):
+        # Dropping a cancelled-with-sibling must not swallow an UNRELATED pending
+        # check — the merge still blocks on the in-flight one.
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+            {"name": "deploy", "workflowName": "CI", "status": "IN_PROGRESS", "conclusion": None},
+        ])
+        assert guard_module._pr_ci_status("1") == ("pending", ["deploy"])
+
+    def test_nameless_cancel_not_dropped_by_nameless_success(self, guard_module, monkeypatch):
+        # Entries with no name/workflowName have no identity (_ci_identity → None)
+        # and are excluded from the sibling set — a nameless SUCCESS can't license
+        # dropping a nameless CANCELLED. Stays red (fail-safe over-block).
+        self._set(monkeypatch, [
+            {"status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"status": "COMPLETED", "conclusion": "CANCELLED"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["check"])
+
+    def test_success_then_cancel_on_unchanged_head_stays_red(self, guard_module, monkeypatch):
+        # Codex P1: a job passed (older), then was re-run on the UNCHANGED head and
+        # that re-run was CANCELLED (newer). The latest attempt never passed, so the
+        # cancel is NOT superseded by a later success → stays red. Under a bare
+        # set-membership match (no completedAt) this wrongly returned green.
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:05:00Z"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+    def test_cancel_without_completedat_stays_red(self, guard_module, monkeypatch):
+        # Fail-closed: a CANCELLED entry with no completedAt can't be proven
+        # superseded (no timestamp to order it), so even a same-identity SUCCESS
+        # does not drop it — stays red.
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+
 class TestCiOverrideSigil:
     """The `# ci-override` sigil is quote-aware and (at the call site) bound to
     the merge segment — it cannot be spoofed from a quoted --body or a chained
@@ -1470,6 +1745,12 @@ class TestCiGateEndToEnd:
             "_check_base_is_default",
             lambda n, force=False, repo=None: (False, ""),
         )
+        # Scheduled-Claude-review gate is a real network check too — pass-through.
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, force=False, strict=False: None,
+        )
 
     def test_red_ci_blocks_exit_2(self, guard_module, monkeypatch, capsys):
         monkeypatch.setenv(
@@ -1524,8 +1805,11 @@ class TestCiGateEndToEnd:
 
 
 class TestCiStatusUnfinishedStates:
-    """P1 fix: ANY non-terminal check status counts as pending (not just
-    QUEUED/IN_PROGRESS) — a new/renamed unfinished state can't read as green."""
+    """Full enumeration of GitHub's status/conclusion/state domains — no
+    unenumerated value may read green: ANY non-terminal status ⇒ pending; an
+    unrecognized *terminal* conclusion (e.g. STALE, or a value GitHub adds later)
+    ⇒ red (fail-closed); a legacy EXPECTED context ⇒ pending. A null conclusion on
+    a COMPLETED run is genuine no-verdict data and stays a benign ignore."""
 
     @staticmethod
     def _set(monkeypatch, checks):
@@ -1549,6 +1833,35 @@ class TestCiStatusUnfinishedStates:
             {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
         ])
         assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_stale_conclusion_is_red(self, guard_module, monkeypatch):
+        # STALE = a superseded/outdated run (GitHub's own term) — NOT a pass. On a
+        # gate that forces --admin (sole CI enforcement) it must block, not read
+        # green. Under the prior code this silently ignored → green.
+        self._set(monkeypatch, [
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "STALE"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["Analyze (python)"])
+
+    def test_stale_mixed_with_success_still_red(self, guard_module, monkeypatch):
+        self._set(monkeypatch, [
+            {"name": "codeql", "status": "COMPLETED", "conclusion": "STALE"},
+            {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["codeql"])
+
+    def test_unrecognized_terminal_conclusion_fails_closed_red(self, guard_module, monkeypatch):
+        # A COMPLETED run with a conclusion GitHub adds later must fail closed to
+        # red, never silently ignore (the class root cause behind the STALE gap).
+        self._set(monkeypatch, [{"name": "test", "status": "COMPLETED", "conclusion": "SOME_FUTURE_VERDICT"}])
+        assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+    def test_expected_statuscontext_is_pending(self, guard_module, monkeypatch):
+        # A legacy StatusContext EXPECTED (a required context that hasn't reported
+        # yet) must read pending, not fall through to unknown (which callers treat
+        # as non-blocking).
+        self._set(monkeypatch, [{"context": "ci/required", "state": "EXPECTED"}])
+        assert guard_module._pr_ci_status("1") == ("pending", ["ci/required"])
 
 
 class TestMergeableAllowlist:
@@ -1578,6 +1891,11 @@ class TestMergeableAllowlist:
             guard_module,
             "_check_codex_reviewed_head",
             lambda n, force=False, repo=None: (False, "", None),
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, force=False, strict=False: None,
         )
 
     @pytest.mark.parametrize("bad", [None, "", "UNKNOWN", "SOMETHING_NEW"])
@@ -1648,6 +1966,11 @@ class TestRepoDerivationGate:
             guard_module,
             "_check_codex_reviewed_head",
             lambda n, force=False, repo=None: (False, "", None),
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, force=False, strict=False: None,
         )
 
     def test_derived_repo_threads_into_gates(self, guard_module, monkeypatch):
@@ -1755,58 +2078,41 @@ class TestRepoDerivationGate:
         assert seen["repo"] is None  # not derived → cwd repo (unchanged behavior)
 
 
-class TestStrictScanMode:
-    """F-report (Codex P2, round 6): a finding scan that could not be READ (gh
-    error/timeout/malformed) must not be reported as clean. Report mode passes
-    strict=True → an unreadable scan blocks/fails; enforcement (default) stays
-    fail-open for Codex-quota/outage tolerance. An EMPTY result (quota) is clean
-    in both modes."""
+class TestUnreadableScanFailsClosed:
+    """PR #1434: a finding scan that could not be READ (gh error/timeout/malformed)
+    or completed (clipped budget) ALWAYS fails CLOSED — it blocks a merge and shows as
+    a failure line in the report. The old fail-OPEN merge path (a silent pass) was the
+    CRITICAL. An EMPTY result read COMPLETELY (Codex quota / no comments) stays clean."""
 
-    def test_body_error_fails_closed_when_strict(self, guard_module):
+    def test_body_error_fails_closed(self, guard_module):
         with patch.object(
             guard_module.subprocess,
             "run",
             return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="x"),
         ):
-            block, msg = guard_module._check_pr_review_findings("1", strict=True)
+            block, msg = guard_module._check_pr_review_findings("1")
         assert block is True and "unreadable" in msg.lower()
 
-    def test_body_error_fails_open_by_default(self, guard_module):
+    def test_body_empty_is_clean(self, guard_module):
+        # Empty (quota / no comments) is NOT an error — a complete empty read is clean.
+        # Under `--paginate --jq '.[] | {…}'` gh emits nothing (not "[]") for
+        # zero comments, so the empty output is an empty string.
         with patch.object(
             guard_module.subprocess,
             "run",
-            return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="x"),
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=""),
         ):
             block, _ = guard_module._check_pr_review_findings("1")
         assert block is False
 
-    def test_body_empty_is_clean_even_when_strict(self, guard_module):
-        # Empty (quota / no comments) is NOT an error — clean in both modes.
-        with patch.object(
-            guard_module.subprocess,
-            "run",
-            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="[]"),
-        ):
-            block, _ = guard_module._check_pr_review_findings("1", strict=True)
-        assert block is False
-
-    def test_inline_error_fails_closed_when_strict(self, guard_module):
+    def test_inline_error_fails_closed(self, guard_module):
         with patch.object(
             guard_module.subprocess,
             "run",
             return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="x"),
         ):
-            block, msg = guard_module._check_inline_review_findings("1", strict=True)
+            block, msg = guard_module._check_inline_review_findings("1")
         assert block is True and "unreadable" in msg.lower()
-
-    def test_inline_error_fails_open_by_default(self, guard_module):
-        with patch.object(
-            guard_module.subprocess,
-            "run",
-            return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="x"),
-        ):
-            block, _ = guard_module._check_inline_review_findings("1")
-        assert block is False
 
     def test_report_counts_unreadable_scan_as_failure(self, guard_module, monkeypatch, capsys):
         # The canonical report must not print "all gates pass" when a scan errored.
@@ -1820,18 +2126,16 @@ class TestStrictScanMode:
             "_check_codex_reviewed_head",
             lambda n, force=False, repo=None: (False, "", "h"),
         )
-        # Body scan errors (strict → block); inline clean.
+        # Body scan unreadable → block (fail-closed); inline clean.
         monkeypatch.setattr(
             guard_module,
             "_check_pr_review_findings",
-            lambda n, repo=None, strict=False: (True, "could not read review-body comments")
-            if strict
-            else (False, ""),
+            lambda n, repo=None: (True, "could not read review-body comments"),
         )
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None, strict=False: (False, ""),
+            lambda n, repo=None: (False, ""),
         )
         assert guard_module.check_pr_report("5") == 1
         out = capsys.readouterr().out
@@ -1872,6 +2176,14 @@ class TestGateOrdering:
         )
         monkeypatch.setattr(
             guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, force=False, strict=False: (
+                calls.append("scheduled"),
+                None,
+            )[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
             "_check_pr_review_findings",
             lambda n, force=False, repo=None: (calls.append("body"), (False, ""))[1],
         )
@@ -1907,16 +2219,59 @@ class TestGateOrdering:
         monkeypatch.setattr(
             guard_module,
             "_check_pr_review_findings",
-            lambda n, repo=None, strict=False: (calls.append("body"), (False, ""))[1],
+            lambda n, repo=None: (calls.append("body"), (False, ""))[1],
         )
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None, strict=False: (calls.append("inline"), (False, ""))[1],
+            lambda n, repo=None: (calls.append("inline"), (False, ""))[1],
         )
         guard_module.check_pr_report("5")
         assert calls.index("freshness") < calls.index("body")
         assert calls.index("freshness") < calls.index("inline")
+
+
+class TestLowBFreshnessBackstop:
+    """PR #1434 LOW-b (verify-only): the review-body reverse-walk can fall through a
+    non-verdict newest comment to an OLDER stale CLEAN verdict and report clean. That is
+    NOT sufficient to authorize a merge on its own — the freshness gate
+    (_check_codex_reviewed_head) independently requires a CURRENT review at HEAD and runs
+    BEFORE the finding scans. So a stale-clean body scan cannot smuggle a merge past a
+    head with no current review: freshness blocks first. This test pins that backstop."""
+
+    def _payload(self, cmd):
+        return {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": cmd},
+        }
+
+    def test_stale_clean_body_scan_blocked_by_freshness(self, guard_module, monkeypatch):
+        reached = {"body": False}
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "test", "conclusion": "SUCCESS"}])
+        )
+        monkeypatch.setattr(
+            guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
+        )
+        # Freshness FAILS: no current Codex review at head (the realistic stale-head case).
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (True, "no current review at head", None),
+        )
+        # Body scan WOULD return stale-clean — but must never be reached / never decisive.
+        def _body(n, force=False, repo=None):
+            reached["body"] = True
+            return (False, "")
+        monkeypatch.setattr(guard_module, "_check_pr_review_findings", _body)
+        monkeypatch.setattr(
+            guard_module, "read_payload", lambda: self._payload("gh pr merge 5 --squash --admin")
+        )
+        # Merge is BLOCKED by freshness, despite the body scan being clean.
+        assert guard_module.main() == 2
+        assert reached["body"] is False  # freshness gated first — stale-clean never decided it
 
 
 class TestMultiMergeBlocked:
@@ -1935,3 +2290,199 @@ class TestMultiMergeBlocked:
     def test_single_merge_not_tripped_by_multi_guard(self):
         res = _run_guard("gh pr merge 1 --squash --admin")
         assert "multiple publish/merge" not in res.stderr
+
+
+_NEL = "\u0085"  # Unicode NEL: splitlines() breaks on it, split("\n") does not
+
+
+def _cp(rows, rc=0):
+    """A CompletedProcess whose stdout is JSONL of the given already-serialized rows."""
+    return subprocess.CompletedProcess(args=[], returncode=rc, stdout="\n".join(rows), stderr="")
+
+
+class TestFetchCommentsPaged:
+    """The shared paginated comment-fetch primitive (_fetch_comments_paged):
+    accumulates pages, distinguishes first-page vs later-page failure, is NEL-safe,
+    and drops non-dict lines (Codex A: P1b partial-read + P2 NEL/non-dict)."""
+
+    def test_accumulates_across_pages_until_short_page(self, guard_module):
+        p1 = [json.dumps({"login": "a", "body": f"c{i}"}) for i in range(100)]  # full → fetch p2
+        p2 = [json.dumps({"login": "a", "body": f"d{i}"}) for i in range(50)]   # short → last
+        with patch.object(guard_module.subprocess, "run", side_effect=[_cp(p1), _cp(p2)]):
+            objs, complete = guard_module._fetch_comments_paged("issues/1/comments", "1", None, ".[]")
+        assert len(objs) == 150
+        assert complete is True
+
+    def test_first_page_error_returns_none_incomplete(self, guard_module):
+        with patch.object(guard_module.subprocess, "run", return_value=_cp([], rc=1)):
+            objs, complete = guard_module._fetch_comments_paged("issues/1/comments", "1", None, ".[]")
+        assert objs is None and complete is False
+
+    def test_first_page_exception_returns_none_incomplete(self, guard_module):
+        with patch.object(guard_module.subprocess, "run",
+                          side_effect=subprocess.TimeoutExpired(cmd="gh", timeout=8)):
+            objs, complete = guard_module._fetch_comments_paged("issues/1/comments", "1", None, ".[]")
+        assert objs is None and complete is False
+
+    def test_later_page_failure_keeps_accumulated_but_incomplete(self, guard_module):
+        p1 = [json.dumps({"login": "a", "body": f"c{i}"}) for i in range(100)]
+        with patch.object(guard_module.subprocess, "run",
+                          side_effect=[_cp(p1), subprocess.TimeoutExpired(cmd="gh", timeout=8)]):
+            objs, complete = guard_module._fetch_comments_paged("issues/1/comments", "1", None, ".[]")
+        assert len(objs) == 100 and complete is False
+
+    def test_nel_inside_body_does_not_fragment(self, guard_module):
+        # A raw U+0085 (NEL) inside a JSON string must NOT split the JSONL line
+        # (splitlines would → both fragments fail json.loads → the comment is lost).
+        line = json.dumps({"login": "a", "body": "head" + _NEL + "tail"}, ensure_ascii=False)
+        assert "" + _NEL + "" in line  # the raw NEL is present in the emitted line
+        with patch.object(guard_module.subprocess, "run", return_value=_cp([line])):
+            objs, complete = guard_module._fetch_comments_paged("issues/1/comments", "1", None, ".[]")
+        assert len(objs) == 1 and objs[0]["body"] == "head" + _NEL + "tail" and complete is True
+
+    def test_non_dict_lines_dropped(self, guard_module):
+        rows = [json.dumps({"login": "a", "body": "ok"}), json.dumps("bare string"), json.dumps(42)]
+        with patch.object(guard_module.subprocess, "run", return_value=_cp(rows)):
+            objs, complete = guard_module._fetch_comments_paged("issues/1/comments", "1", None, ".[]")
+        assert objs == [{"login": "a", "body": "ok"}] and complete is True
+
+    def test_out_of_budget_before_page1_blocks_without_calling_gh(self, guard_module, monkeypatch):
+        # HIGH (PR #1434): an already-expired merge deadline stops the loop BEFORE any gh
+        # call — page 1 → (None, incomplete) → caller fails closed. No unbounded gh spawns.
+        monkeypatch.setattr(guard_module, "_merge_deadline", guard_module.time.monotonic() - 1.0)
+        with patch.object(guard_module.subprocess, "run") as run_mock:
+            objs, complete = guard_module._fetch_comments_paged("issues/1/comments", "1", None, ".[]")
+        assert objs is None and complete is False
+        run_mock.assert_not_called()
+
+    def test_budget_exhausted_mid_flood_stops_early(self, guard_module, monkeypatch):
+        # A comment-flood where every page SUCCEEDS fast: the between-page deadline check
+        # must stop the loop once the budget is spent, returning INCOMPLETE (fail-closed),
+        # instead of spawning all 100 pages and blowing the hook's wall-clock.
+        full = [json.dumps({"login": "a", "body": f"c{i}"}) for i in range(100)]  # full → wants next
+        clock = {"t": 0.0}
+        monkeypatch.setattr(guard_module.time, "monotonic", lambda: clock["t"])
+        monkeypatch.setattr(guard_module, "_merge_deadline", 5.0)
+        def run_and_advance(*a, **k):
+            clock["t"] += 3.0  # each page burns 3s; 5s deadline crossed after 2 pages
+            return _cp(full)
+        with patch.object(guard_module.subprocess, "run", side_effect=run_and_advance) as run_mock:
+            objs, complete = guard_module._fetch_comments_paged("issues/1/comments", "1", None, ".[]")
+        assert complete is False  # stopped early → incomplete → caller blocks
+        assert run_mock.call_count < guard_module._MAX_COMMENT_PAGES  # NOT all 100 pages
+        assert len(objs) == 200  # two full pages read before the budget gate fired
+
+    def test_all_unparseable_page_is_unreadable(self, guard_module):
+        # LOW (PR #1434 defense-in-depth): a non-empty page whose every line fails
+        # json.loads (malformed body, rc==0) is unreadable, NOT a clean short page.
+        garbage = _cp(["this is not json", "{broken", "<html>error</html>"])
+        with patch.object(guard_module.subprocess, "run", return_value=garbage):
+            objs, complete = guard_module._fetch_comments_paged("issues/1/comments", "1", None, ".[]")
+        assert objs is None and complete is False
+
+
+_BODY_ERR = "### ERROR — raw SQL in production code"
+
+
+def _body_out(triples):
+    """gh output for the review-body scanner: (login, type, body) triples, oldest→newest."""
+    return _cp([json.dumps({"login": lg, "type": tp, "body": bd}) for lg, tp, bd in triples])
+
+
+def _codex_page_newest(newest_login, newest_body):
+    """A FULL page (100 rows: 99 codex notes + 1 newest) so the helper fetches page 2."""
+    rows = [json.dumps({"login": "chatgpt-codex-connector[bot]", "type": "Bot", "body": f"note {i}"})
+            for i in range(99)]
+    rows.append(json.dumps({"login": newest_login, "type": "Bot", "body": newest_body}))
+    return _cp(rows)
+
+
+class TestReviewBodyVerdictBearing:
+    """Review-body scanner: only a recognized review bot's verdict marker sets state
+    (Codex A P1a — a non-verdict status/dependabot comment no longer masks a finding),
+    NEL bodies parse (P2), and a seen finding survives an incomplete read (P1b)."""
+
+    def test_github_actions_status_after_error_still_blocks(self, guard_module):
+        # github-actions[bot] is IN _REVIEW_BOTS but its CI comment carries no verdict
+        # marker; newer than the codex ERROR, it must NOT clear the finding.
+        with patch.object(guard_module.subprocess, "run", return_value=_body_out([
+            ("chatgpt-codex-connector[bot]", "Bot", _BODY_ERR),
+            ("github-actions[bot]", "Bot", "CI run succeeded — all checks green."),
+        ])):
+            block, _ = guard_module._check_pr_review_findings("100")
+        assert block
+
+    def test_dependabot_comment_after_error_still_blocks(self, guard_module):
+        with patch.object(guard_module.subprocess, "run", return_value=_body_out([
+            ("chatgpt-codex-connector[bot]", "Bot", _BODY_ERR),
+            ("dependabot[bot]", "Bot", "Bumped urllib3 from 2.0 to 2.1."),
+        ])):
+            block, _ = guard_module._check_pr_review_findings("100")
+        assert block
+
+    def test_nel_in_error_body_parses_and_blocks(self, guard_module):
+        line = json.dumps(
+            {"login": "chatgpt-codex-connector[bot]", "type": "Bot",
+             "body": _BODY_ERR + "" + _NEL + " (see thread)"},
+            ensure_ascii=False,
+        )
+        assert "" + _NEL + "" in line
+        with patch.object(guard_module.subprocess, "run",
+                          return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=line, stderr="")):
+            block, _ = guard_module._check_pr_review_findings("100")
+        assert block
+
+    def test_finding_on_page1_survives_later_page_timeout(self, guard_module):
+        with patch.object(guard_module.subprocess, "run",
+                          side_effect=[_codex_page_newest("chatgpt-codex-connector[bot]", _BODY_ERR),
+                                       subprocess.TimeoutExpired(cmd="gh", timeout=8)]):
+            block, _ = guard_module._check_pr_review_findings("100")
+        assert block  # the seen ERROR stands despite the later-page timeout
+
+    def test_clean_page1_incomplete_read_fails_closed(self, guard_module):
+        # Newest verdict is clean, but a later page failed → cannot confirm no newer
+        # finding. Fail-closed (PR #1434): the incomplete read BLOCKS, not a silent pass.
+        def se():
+            return [_codex_page_newest("chatgpt-codex-connector[bot]", "VERDICT: PASS"),
+                    subprocess.TimeoutExpired(cmd="gh", timeout=8)]
+        with patch.object(guard_module.subprocess, "run", side_effect=se()):
+            block, msg = guard_module._check_pr_review_findings("100")
+        assert block is True
+        assert "unreadable" in msg.lower()
+
+
+class TestInlinePaginationRobustness:
+    """Inline scanner shares the paged fetch: NEL bodies parse, and a P1 on an early
+    page survives a later-page failure; no-P1 + incomplete read fails closed in strict."""
+
+    def _codex(self, cid, body, reply_to=None):
+        return {"id": cid, "reply_to": reply_to, "login": "chatgpt-codex-connector[bot]",
+                "type": "Bot", "body": body}
+
+    def test_nel_in_inline_p1_parses_and_blocks(self, guard_module):
+        c = self._codex(1, _P1_BODY.replace("Details here.", "Details" + _NEL + "here."))
+        line = json.dumps(c, ensure_ascii=False)
+        assert "" + _NEL + "" in line
+        with patch.object(guard_module.subprocess, "run",
+                          return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=line, stderr="")):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_p1_on_page1_survives_later_page_timeout(self, guard_module):
+        rows = [json.dumps(self._codex(i, "note")) for i in range(99)]
+        rows.append(json.dumps(self._codex(99, _P1_BODY)))  # newest, full page → fetch p2
+        with patch.object(guard_module.subprocess, "run",
+                          side_effect=[_cp(rows), subprocess.TimeoutExpired(cmd="gh", timeout=8)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_no_p1_incomplete_read_fails_closed(self, guard_module):
+        rows = [json.dumps(self._codex(i, "just a note")) for i in range(100)]  # full page, no P1
+        def se():
+            return [_cp(rows), subprocess.TimeoutExpired(cmd="gh", timeout=8)]
+        # No P1 seen, but a later page failed → cannot confirm absence. Fail-closed
+        # (PR #1434): the incomplete read BLOCKS.
+        with patch.object(guard_module.subprocess, "run", side_effect=se()):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block is True
+        assert "unreadable" in msg.lower()
