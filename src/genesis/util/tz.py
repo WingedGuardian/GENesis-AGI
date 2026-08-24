@@ -7,7 +7,7 @@ use these functions for storage — only for rendering to the user.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from genesis.env import user_timezone as _get_user_timezone
@@ -79,3 +79,36 @@ def parse_utc_iso(iso_str: str | None) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt
+
+
+def local_day_boundary(hour: int = 0, *, now: datetime | None = None) -> datetime:
+    """Most recent day boundary at *hour* local time, as a UTC-aware datetime.
+
+    The boundary is ``hour:00`` in the user's local timezone — today's if that
+    instant has already passed, otherwise yesterday's. This is a read-path
+    comparison helper (like :func:`parse_utc_iso`), not a display helper: it
+    lets "has a new local day started since <stored UTC timestamp>?" be answered
+    correctly regardless of the gap between the user's timezone and UTC.
+
+    Returned in **UTC** on purpose. Genesis stores timestamps as UTC ISO strings
+    (``...+00:00``); those sort/compare lexicographically only when every value
+    carries the same offset, so a boundary serialized with a local offset
+    (``...-04:00``) would silently break a string ``<`` comparison in SQL. UTC
+    return keeps ``.isoformat()`` and ``datetime`` comparisons both correct.
+
+    *now* (UTC-aware) is injectable for deterministic tests; defaults to the
+    current instant.
+    """
+    if now is None:
+        now_utc = datetime.now(UTC)
+    elif now.tzinfo is None:
+        # Naive input is treated as UTC (matches parse_utc_iso's convention),
+        # never as system-local — the module stores/compares everything in UTC.
+        now_utc = now.replace(tzinfo=UTC)
+    else:
+        now_utc = now.astimezone(UTC)
+    now_local = now_utc.astimezone(_USER_TZ)
+    boundary_local = now_local.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if now_local < boundary_local:
+        boundary_local -= timedelta(days=1)
+    return boundary_local.astimezone(UTC)
