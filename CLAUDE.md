@@ -402,10 +402,6 @@ When a user shares a file path or URL in conversation:
   UNCERTAIN verdict never overturns a well-grounded finding. Verify the
   conclusions the synthesis step itself creates, not just its inputs. Scale to
   stakes; skip only a trivial single-fact lookup.
-- **Waiving a review gate is not waiving the findings.** Skipping the review
-  *ceremony* for a trivial change never licenses ignoring a reviewer's
-  *substantive* findings — engage them on merits (verify, then fix or
-  consciously accept with a reason), gate-waived or not.
 - **NEVER `rm -rf` the working directory.** Never run destructive commands
   without explicit user confirmation.
 - **Session wrap-up**: structured handoff — what changed, what's pending,
