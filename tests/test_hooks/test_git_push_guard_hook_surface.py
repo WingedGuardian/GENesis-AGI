@@ -33,6 +33,7 @@ _spec.loader.exec_module(_mod)
 
 HEAD = "0cd13afeb51025af5dc7bd24df1ffa57cd2babab"
 STALE = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+BASE = "b" * 40
 
 
 def _compare_json(*filenames, status="ahead", previous=None):
@@ -139,6 +140,7 @@ class TestOverrideEvidenceGate:
         self.dir = tmp_path / "override_evidence"
         monkeypatch.setenv("GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR", str(self.dir))
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_BASE_OID", BASE)
         monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
 
     def test_non_hook_pr_force_passes_without_evidence(self, monkeypatch):
@@ -156,7 +158,7 @@ class TestOverrideEvidenceGate:
     def test_hook_pr_force_with_evidence_passes(self, monkeypatch, capsys):
         monkeypatch.setenv("_TEST_GH_PR_FILES", _files_jsonl("scripts/hooks/git_push_guard.py"))
         self.dir.mkdir(parents=True)
-        (self.dir / f"local__1__{HEAD}.txt").write_text(
+        (self.dir / f"local__1__{BASE[:12]}__{HEAD}.txt").write_text(
             "reviewer: claude-code adversarial (codex quota-dead)\nfindings: none\n"
         )
         should_block, msg, verified = _mod._check_codex_reviewed_head("1", force=True)
@@ -165,14 +167,14 @@ class TestOverrideEvidenceGate:
     def test_hook_pr_force_with_empty_evidence_blocks(self, monkeypatch):
         monkeypatch.setenv("_TEST_GH_PR_FILES", _files_jsonl("scripts/hooks/git_push_guard.py"))
         self.dir.mkdir(parents=True)
-        (self.dir / f"local__1__{HEAD}.txt").write_text("")
+        (self.dir / f"local__1__{BASE[:12]}__{HEAD}.txt").write_text("")
         should_block, msg, verified = _mod._check_codex_reviewed_head("1", force=True)
         assert should_block
 
     def test_hook_pr_force_evidence_for_wrong_sha_blocks(self, monkeypatch):
         monkeypatch.setenv("_TEST_GH_PR_FILES", _files_jsonl("scripts/hooks/git_push_guard.py"))
         self.dir.mkdir(parents=True)
-        (self.dir / f"local__1__{STALE}.txt").write_text("evidence for an older head\n")
+        (self.dir / f"local__1__{BASE[:12]}__{STALE}.txt").write_text("evidence for an older head\n")
         should_block, msg, verified = _mod._check_codex_reviewed_head("1", force=True)
         assert should_block
 
@@ -330,11 +332,12 @@ class TestRound1P2Regressions:
         d.mkdir()
         monkeypatch.setenv("GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR", str(d))
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_BASE_OID", BASE)
         monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
         monkeypatch.setenv(
             "_TEST_GH_PR_FILES", _files_jsonl("scripts/hooks/git_push_guard.py")
         )
-        (d / f"ownera_repoa__1__{HEAD}.txt").write_text("evidence for repo A PR 1\n")
+        (d / f"ownera_repoa__1__{BASE[:12]}__{HEAD}.txt").write_text("evidence for repo A PR 1\n")
         blocked, msg, _ = _mod._check_codex_reviewed_head(
             "2", force=True, repo="ownerb/repob"
         )
@@ -343,3 +346,42 @@ class TestRound1P2Regressions:
             "1", force=True, repo="ownera/repoa"
         )
         assert not blocked
+
+
+class TestBaseBoundEvidence:
+    """Round-2 P2: evidence must be bound to the base that defined the
+    reviewed effective diff — a retarget/advancing base (same head) must not
+    be vouched for by old evidence."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, tmp_path, monkeypatch):
+        self.dir = tmp_path / "ev"
+        self.dir.mkdir()
+        monkeypatch.setenv("GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR", str(self.dir))
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES", _files_jsonl("scripts/hooks/git_push_guard.py")
+        )
+
+    def test_evidence_for_old_base_blocks_after_base_moves(self, monkeypatch):
+        (self.dir / f"local__1__{BASE[:12]}__{HEAD}.txt").write_text("reviewed\n")
+        monkeypatch.setenv("_TEST_GH_BASE_OID", "c" * 40)  # base advanced
+        blocked, msg, _ = _mod._check_codex_reviewed_head("1", force=True)
+        assert blocked
+
+    def test_evidence_for_current_base_passes(self, monkeypatch):
+        (self.dir / f"local__1__{BASE[:12]}__{HEAD}.txt").write_text("reviewed\n")
+        monkeypatch.setenv("_TEST_GH_BASE_OID", BASE)
+        blocked, msg, _ = _mod._check_codex_reviewed_head("1", force=True)
+        assert not blocked
+
+    def test_unreadable_base_blocks(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_BASE_OID", "")
+        blocked, msg, _ = _mod._check_codex_reviewed_head("1", force=True)
+        assert blocked
+
+    def test_malformed_base_blocks(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_BASE_OID", "not-a-sha")
+        blocked, msg, _ = _mod._check_codex_reviewed_head("1", force=True)
+        assert blocked

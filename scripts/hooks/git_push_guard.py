@@ -1152,6 +1152,45 @@ def _pr_head_sha(pr_num: str, repo: str | None = None) -> str | None:
     return sha or None
 
 
+def _pr_base_sha(pr_num: str, repo: str | None = None) -> str | None:
+    """The LIVE tip oid of the PR's base branch, or None on any error.
+
+    Deliberately NOT ``pulls/N → .base.sha``: that field is a SNAPSHOT taken at
+    PR creation/retarget and does not advance with the base branch (measured
+    2026-08-23 against live PRs — three pre-merge PRs still reported the old
+    tip while a post-merge control reported the new one). The evidence binding
+    exists precisely for the base-advanced case, so it must read the branch
+    ref's current tip: resolve ``baseRefName`` (existing helper + seam), then
+    ``commits/{ref}``. Consumed by the hook-surface override evidence identity
+    (see _hook_surface_override_check). Tests inject via ``_TEST_GH_BASE_OID``.
+    """
+    raw = os.environ.get("_TEST_GH_BASE_OID")
+    if raw is None:
+        ref = _pr_base_ref(pr_num, repo=repo)
+        if not ref or any(c.isspace() for c in ref):
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/commits/{ref}",
+                    "--jq",
+                    ".sha",
+                ],
+                capture_output=True,
+                text=True,
+                # Merge-path budget (see main()): runs ONLY on the rare
+                # stale-review-override path; fail direction is closed there.
+                timeout=_gh_timeout(6),
+            )
+            raw = result.stdout if result.returncode == 0 else ""
+        except Exception:
+            return None
+    sha = (raw or "").strip()
+    return sha or None
+
+
 def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
     """EVERY Codex review record ``{commit_id, state}`` on the PR, oldest-first,
     or None on any API/parse error (distinct from ``[]`` = query succeeded, no
@@ -1561,7 +1600,7 @@ def _is_hook_surface_path(path: str) -> bool:
 
 def _override_evidence_dir() -> str:
     """Directory holding fallback-review evidence files
-    (``<repo>__<pr>__<head-sha>.txt``).
+    (``<repo>__<pr>__<base-tip-12>__<head-sha>.txt``).
 
     ``GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR`` overrides (config knob + test seam);
     default lives outside the repo so evidence survives worktree removal and is
@@ -1684,13 +1723,31 @@ def _hook_surface_override_check(pr_num: str, repo: str | None = None) -> tuple[
                 f"cannot key fallback-review evidence. Retry."
             ),
         )
-    # Evidence identity = repo + PR + head (Codex P2, round 1): a commit sha
-    # alone does not identify the PR/base whose FULL diff the fallback review
-    # covered — the same head can appear on another PR or in a fork, and
-    # sha-only evidence would silently vouch there too. An unresolvable repo
-    # degrades to the "local" namespace (still PR- and head-bound).
+    # Evidence identity = repo + PR + BASE + head (Codex P2s, rounds 1+2): a
+    # commit sha alone does not identify the PR/base whose FULL diff the
+    # fallback review covered — the same head can appear on another PR or in a
+    # fork, and (round 2) a retarget or advancing default branch changes the
+    # effective diff while head stays put; the sigil this path serves also
+    # waives _check_base_is_default, so base must be bound HERE. The bound value
+    # is the base branch's LIVE tip (never pulls/N.base.sha — a creation-time
+    # snapshot; see _pr_base_sha): binding to the live tip over-expires (any
+    # base move → re-record) — the safe direction on this rare, user-authorized
+    # path. Fail-closed on an unreadable base.
+    base = _pr_base_sha(pr_num, repo=repo)
+    if not base or not re.fullmatch(r"[0-9a-f]{40}", base.strip().lower()):
+        return (
+            True,
+            (
+                f"PR #{pr_num}'s BASE sha could not be read (or was malformed) — "
+                f"fallback-review evidence is base-bound and cannot be verified. "
+                f"Retry."
+            ),
+        )
+    base = base.strip().lower()
     repo_slug = (_normalize_repo(repo) or "local").replace("/", "_")
-    evidence_path = os.path.join(_override_evidence_dir(), f"{repo_slug}__{pr_num}__{head}.txt")
+    evidence_path = os.path.join(
+        _override_evidence_dir(), f"{repo_slug}__{pr_num}__{base[:12]}__{head}.txt"
+    )
     try:
         has_evidence = os.path.getsize(evidence_path) > 0
     except OSError:
@@ -1725,7 +1782,8 @@ def _hook_surface_override_check(pr_num: str, repo: str | None = None) -> tuple[
             f"  3. Record reviewer + findings + dispositions in:\n"
             f"       {evidence_path}\n"
             f"  4. Re-run this merge (same sigil). A new push changes the head "
-            f"sha — re-review and re-key.\n"
+            f"sha, and a base-branch change (retarget OR base advancing) "
+            f"re-keys too — re-review and re-record.\n"
             f"WHY: 2026-08-23 — an unreviewed merge on this surface disarms every "
             f"other gate; the GitHub Codex review is the required evidence class "
             f"(user decision), and this file's own history (#1432: 13 findings "

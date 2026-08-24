@@ -538,7 +538,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `.claude/settings.json`, `.claude/hooks/**`) is the guard code itself: the merge gate
   (1) never classifies its stale-review delta as "review-trivial", and (2) refuses
   `# stale-review-override` unless recorded fallback-review evidence exists for the
-  EXACT head sha (`~/.genesis/override_review_evidence/<repo>__<pr>__<sha>.txt`). The override
+  EXACT head sha (`~/.genesis/override_review_evidence/<repo>__<pr>__<base12>__<sha>.txt`). The override
   procedure requires the user's explicit authorization, then a fallback adversarial
   review (local `codex exec` when quota allows, else genesis-architect), evidence
   recorded, then the merge re-run — the gate's block message walks through it.
