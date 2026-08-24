@@ -702,3 +702,26 @@ async def test_build_fresh_invocation_applies_routing_for_channel(loop):
         channel=ChannelType.TERMINAL,
     )
     assert _BG_RESEARCH_ROUTING not in (inv_term.system_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_should_reset_uses_local_midnight_not_utc(loop, monkeypatch):
+    """_should_reset keys the daily reset off LOCAL midnight, not UTC midnight.
+
+    Regression guard: a UTC-offset install used to reset sessions at ~20:00
+    local (UTC midnight) instead of local midnight.
+    """
+    from zoneinfo import ZoneInfo
+
+    import genesis.util.tz as tz_module
+
+    monkeypatch.setattr(tz_module, "_USER_TZ", ZoneInfo("America/New_York"))
+
+    # now = 2026-08-24 12:00 UTC (08:00 EDT). Local midnight = 2026-08-24 04:00 UTC.
+    now = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
+
+    # Started 02:00 UTC — before LOCAL midnight (04:00 UTC) but after UTC
+    # midnight (00:00 UTC). Local semantics → reset; buggy UTC → no reset.
+    assert loop._should_reset({"started_at": "2026-08-24T02:00:00+00:00"}, now=now) is True
+    # Started 06:00 UTC — after local midnight → not stale yet today.
+    assert loop._should_reset({"started_at": "2026-08-24T06:00:00+00:00"}, now=now) is False

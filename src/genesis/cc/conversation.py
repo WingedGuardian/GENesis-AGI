@@ -7,7 +7,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from genesis.cc import rate_limit_park, roster
@@ -37,6 +37,7 @@ from genesis.cc.types import (
 )
 from genesis.db.crud import cc_sessions
 from genesis.observability.call_site_recorder import record_last_run
+from genesis.util import tz
 
 if TYPE_CHECKING:
     from genesis.cc.contingency import CCContingencyDispatcher
@@ -1620,11 +1621,19 @@ class ConversationLoop:
         except Exception:
             logger.debug("User correction scan failed", exc_info=True)
 
-    def _should_reset(self, session: dict) -> bool:
+    def _should_reset(self, session: dict, *, now: datetime | None = None) -> bool:
         """Check if session is from a previous day boundary.
+
+        The boundary is local-midnight (``day_boundary_hour`` in the user's
+        timezone), not UTC-midnight — otherwise the daily reset fires at
+        ~20:00 local instead of local midnight for a UTC-offset install
+        (see :func:`genesis.util.tz.local_day_boundary`).
 
         Supergroup topic sessions (thread_id set) are persistent — they
         only compact when CC context limits are hit, never by day boundary.
+
+        *now* is injectable for deterministic tests; defaults to the current
+        instant.
         """
         # Supergroup topic sessions are persistent — no daily reset
         if session.get("thread_id"):
@@ -1635,10 +1644,5 @@ class ConversationLoop:
         started_dt = datetime.fromisoformat(started)
         if started_dt.tzinfo is None:
             started_dt = started_dt.replace(tzinfo=UTC)
-        now = datetime.now(UTC)
-        boundary = now.replace(
-            hour=self._day_boundary_hour, minute=0, second=0, microsecond=0,
-        )
-        if now < boundary:
-            boundary -= timedelta(days=1)
+        boundary = tz.local_day_boundary(self._day_boundary_hour, now=now)
         return started_dt < boundary
