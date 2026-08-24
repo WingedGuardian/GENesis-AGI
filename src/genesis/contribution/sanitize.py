@@ -500,20 +500,33 @@ def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
     hits: list[Finding] = []
     for file, line_no, text in parsed.added_lines:
         if not text.strip():
+            # Load-bearing (not just an optimization): `detect-secrets scan
+            # --string=` with an EMPTY value scans the whole CWD tree instead of
+            # the string, which would misfire + mis-parse. Skipping blank lines
+            # keeps `text` non-empty when `--string={text}` is built below.
             continue
         try:
+            # Use the `--string=<value>` form (NOT `--string <value>`): a line
+            # whose content starts with `-` — a Markdown `---` rule, a `--flag`
+            # example, both common in issue/PR prose — would otherwise be read by
+            # argparse as an unknown OPTION ("unrecognized arguments", exit 2),
+            # which the nonzero-exit branch below turns into a spurious
+            # fail-closed BLOCK. Binding the value with `=` makes argparse take
+            # it literally even when it starts with a dash; scan semantics are
+            # identical for every other input.
             proc = subprocess.run(
-                ["detect-secrets", "scan", "--string", text],
+                ["detect-secrets", "scan", f"--string={text}"],
                 capture_output=True,
                 text=True,
                 timeout=5,
                 check=False,
             )
-        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        except (subprocess.TimeoutExpired, OSError) as exc:
             # Fail CLOSED: the REQUIRED secret-scan floor could not run on this
-            # line, so we cannot assert it is secret-free — BLOCK rather than
-            # let an unscanned line pass (the old `continue` was a fail-OPEN hole
-            # through a fail-CLOSED component).
+            # line (binary vanished, or an oversized argv → OSError/E2BIG), so we
+            # cannot assert it is secret-free — BLOCK rather than let an unscanned
+            # line pass (the old `continue` was a fail-OPEN hole through a
+            # fail-CLOSED component). OSError also covers FileNotFoundError.
             hits.append(
                 Finding(
                     kind=FindingKind.SECRET,
