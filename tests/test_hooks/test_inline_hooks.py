@@ -609,23 +609,24 @@ class TestBashHookGitPushForce:
 
 
 class TestBashHookGitResetHard:
-    """The INLINE mega-guard no longer owns `git reset --hard` (2026-08 git-discard
-    consolidation): it moved to the tracked git_discard_guard.py (wired in the Bash
-    matcher + delegated to by bash_safety_hook.sh), with a `# discard-override`
-    escape — see tests/test_hooks/test_git_discard_guard.py. These assert the
-    inline guard PASSES reset --hard through (returncode 0); it is not the owner."""
+    """The inline blob is the dependency-free BLOCK FLOOR for `git reset --hard`
+    (2026-08-24 recoverability redesign): deciding destructiveness from argv is an
+    open-set parser problem, so the Python guard (git_discard_guard.py) no longer
+    blocks — it only SNAPSHOTS for recovery. The crude substring block is an honest
+    best-effort speed-bump that holds even on a fresh checkout with no venv. These
+    assert the inline guard OWNS reset --hard (returncode 2)."""
 
-    def test_git_reset_hard_not_inline_blocked(self, bash_hook_command: str) -> None:
+    def test_git_reset_hard_inline_blocked(self, bash_hook_command: str) -> None:
         result = run_hook(bash_hook_command, {"command": "git reset --hard"})
-        assert result.returncode == 0
+        assert result.returncode == 2
 
-    def test_git_reset_hard_with_ref_not_inline_blocked(self, bash_hook_command: str) -> None:
+    def test_git_reset_hard_with_ref_inline_blocked(self, bash_hook_command: str) -> None:
         result = run_hook(bash_hook_command, {"command": "git reset --hard HEAD~3"})
-        assert result.returncode == 0
+        assert result.returncode == 2
 
-    def test_git_reset_hard_origin_not_inline_blocked(self, bash_hook_command: str) -> None:
+    def test_git_reset_hard_origin_inline_blocked(self, bash_hook_command: str) -> None:
         result = run_hook(bash_hook_command, {"command": "git reset --hard origin/main"})
-        assert result.returncode == 0
+        assert result.returncode == 2
 
     def test_git_reset_soft_allowed(self, bash_hook_command: str) -> None:
         """git reset --soft HEAD~1 -> allowed."""
@@ -649,36 +650,35 @@ class TestBashHookGitResetHard:
 
 
 class TestBashHookGitClean:
-    """The INLINE mega-guard no longer owns `git clean -f` (2026-08 git-discard
-    consolidation): it moved to git_discard_guard.py, which ALSO closes the
-    substring-bypass holes the old inline glob missed (-xf / --force) — see
-    tests/test_hooks/test_git_discard_guard.py. These assert the inline guard
-    PASSES clean through (returncode 0); it is not the owner."""
+    """The inline blob NO LONGER owns `git clean` (2026-08-24 recoverability
+    redesign). clean is UNrecoverable (`git stash create` can't capture untracked
+    files), so it needs a REAL block — but deciding a clean's destructiveness from
+    a quote-NAIVE inline regex mis-fires on `git checkout clean-branch`,
+    `git commit -m "clean up"`, etc. So clean is now owned by the precise,
+    quote-aware tracked guard git_discard_guard.py (invoked via
+    bash_safety_hook.sh globally + the project git_discard_guard hook), EXACTLY as
+    force-push and worktree-remove were moved out of this blob to their tracked
+    guards. The inline blob must NOT block clean (returncode 0) — see
+    tests/test_scripts/test_bash_safety_hook.py::TestGitCleanFloor for the real
+    enforcement, and test_git_discard_guard.py for the guard's closed-set logic."""
 
-    def test_git_clean_f_not_inline_blocked(self, bash_hook_command: str) -> None:
-        result = run_hook(bash_hook_command, {"command": "git clean -f"})
-        assert result.returncode == 0
-
-    def test_git_clean_fd_not_inline_blocked(self, bash_hook_command: str) -> None:
-        result = run_hook(bash_hook_command, {"command": "git clean -fd"})
-        assert result.returncode == 0
-
-    def test_git_clean_fdx_not_inline_blocked(self, bash_hook_command: str) -> None:
-        result = run_hook(bash_hook_command, {"command": "git clean -fdx"})
-        assert result.returncode == 0
-
-    def test_git_clean_fx_not_inline_blocked(self, bash_hook_command: str) -> None:
-        result = run_hook(bash_hook_command, {"command": "git clean -fx"})
-        assert result.returncode == 0
-
-    def test_git_clean_n_allowed(self, bash_hook_command: str) -> None:
-        """git clean -n -> allowed (dry run, no -f)."""
-        result = run_hook(bash_hook_command, {"command": "git clean -n"})
-        assert result.returncode == 0
-
-    def test_git_clean_nd_allowed(self, bash_hook_command: str) -> None:
-        """git clean -nd -> allowed (dry run with directories)."""
-        result = run_hook(bash_hook_command, {"command": "git clean -nd"})
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git clean -f",
+            "git clean -fd",
+            "git clean --force",
+            "git clean -xf",
+            "git clean -f .",
+            "git clean",
+            # the false-blocks a naive inline `clean` match WOULD have caused:
+            "git checkout clean-branch",
+            "git diff clean.py",
+            'git commit -m "clean up the repo"',
+        ],
+    )
+    def test_git_clean_not_inline_blocked(self, bash_hook_command: str, cmd: str) -> None:
+        result = run_hook(bash_hook_command, {"command": cmd})
         assert result.returncode == 0
 
 

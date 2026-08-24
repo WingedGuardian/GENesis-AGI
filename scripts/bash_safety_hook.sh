@@ -160,45 +160,85 @@ case "$CMD" in
         ;;
 esac
 
-# git-discard safety — DELEGATE to the Python guard (git_discard_guard.py: one
-# parser, zero divergence with the project-level hook). Closed-set coarse blocks
-# (reset --hard/--merge; clean unless the exact dry-run whitelist; checkout/
-# switch with force) + snapshot-then-allow (other checkout/restore/switch get a
-# `git stash create` recovery sha logged before running) — all with a
-# `# discard-override` escape. Checked BEFORE the softer push/PR warnings
-# below (a "git push" warning exits 0 and would short-circuit a hard-block).
-# Pre-filtered so the python spawn cost is paid only for discard-shaped git ops.
-# On guard-unavailable/crash, fall back to the legacy reset/clean globs (degraded,
-# NEVER open — same policy as the rm delegation above). checkout/restore had no
-# prior guard, so they get no degraded fallback (nothing to preserve).
-# Pre-filter mirrors the guard's _TRIGGER_SUBSTRINGS: non-contiguous (`git -C
-# dir checkout`, `git --git-dir /x reset`) and `switch` shapes must reach the
-# python guard too (adversarial-review F5 — the old contiguous "git checkout"
-# globs silently skipped them). The guard re-filters precisely; this only
-# bounds the python spawn cost.
+# git-discard safety (2026-08-24 recoverability redesign; the review loop proved
+# that DECIDING destructiveness from argv is an open-set parser problem — every
+# round found another spelling). Structure:
+#   (1) reset --hard SPEED-BUMP — a dependency-free substring block, kept only as
+#       a best-effort nudge. reset is RECOVERABLE (the snapshot net below undoes
+#       it), so any spelling that dodges this substring is recovered, not lost.
+#       Checked BEFORE the softer push/PR warnings below (a "git push" warning
+#       exits 0 and would short-circuit a block).
+#   (2) git_discard_guard.py — the PRECISE, quote-aware authority (invoked just
+#       below): it SNAPSHOTS checkout/restore/switch/reset (advisory) and BLOCKS
+#       a non-dry-run `git clean` (clean is UNrecoverable — `stash create` cannot
+#       capture untracked files — so it keeps a real closed-set block, honoring
+#       `# discard-override`). A coarse dependency-free clean block survives ONLY
+#       as a python-LESS fallback there (the guard is stdlib-only, so that
+#       fallback is an extreme edge). Making the guard authoritative — not a
+#       parallel coarse regex — is deliberate: only a quote-aware parser can tell
+#       `git clean -f` from `git commit -m "clean up"` / `git checkout clean-x`.
 case "$CMD" in
-    *git*checkout*|*git*restore*|*git*reset*|*git*clean*|*git*switch*)
-        _gd_delegated=0
+    *"git reset --hard"*)
+        echo "BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user." >&2
+        exit 2;;
+esac
+# git_discard_guard.py — the PRECISE, quote-aware authority for both jobs:
+#   * SNAPSHOT (advisory, exit 0) for checkout/restore/switch/reset — leaves a
+#     recovery sha; a crash/miss never blocks.
+#   * BLOCK (exit 2) for a non-dry-run `git clean` — clean is UNrecoverable
+#     (`git stash create` can't capture untracked files), so it keeps a real,
+#     closed-set block that honors `# discard-override`.
+# We invoke it once and propagate ONLY exit 2 (the clean block). Any OTHER
+# non-zero is a guard crash -> stay advisory (fail-OPEN for the recoverable
+# verbs, never a false block). A quote-aware guard here is why the coarse floor
+# below is a python-LESS-only fallback: only the guard can tell `git clean -f`
+# from `git commit -m "clean up"` / `git checkout clean-branch` / a message that
+# merely mentions clean. The broad `*git*clean*` etc. pre-filter is just a cheap
+# gate; the guard re-filters precisely by verb/argv.
+case "$CMD" in
+    *git*checkout*|*git*restore*|*git*reset*|*git*switch*|*git*clean*)
         _py=$(command -v python3 2>/dev/null || true)
+        _handled=0
         if [ -n "$_py" ] && [ -f "$SCRIPT_DIR/hooks/git_discard_guard.py" ]; then
-            _gd_delegated=1
+            # Propagate ONLY exit 2 (the clean block). rc 0 = guard ran (snapshot
+            # done / clean allowed) -> skip the fallback. A CRASH (rc != 0,2 — e.g.
+            # a partially-synced scripts/hooks/ missing a sibling module) leaves
+            # _handled=0 so the coarse fallback STILL protects the UNrecoverable
+            # clean verb (clean must fail CLOSED). Mirrors the rm-delegation idiom
+            # above. A crash never false-blocks the recoverable verbs: the fallback
+            # only ever matches `git clean`, so for checkout/restore/switch/reset it
+            # finds nothing and stays advisory.
             _rc=0
             printf '%s' "$RAW" | "$_py" "$SCRIPT_DIR/hooks/git_discard_guard.py" >&2 || _rc=$?
             if [ "$_rc" -eq 2 ]; then
                 exit 2
-            elif [ "$_rc" -ne 0 ]; then
-                _gd_delegated=0  # guard crashed/unusable — legacy fallback below
+            elif [ "$_rc" -eq 0 ]; then
+                _handled=1
             fi
         fi
-        if [ "$_gd_delegated" -eq 0 ]; then
-            case "$CMD" in
-                *"git reset --hard"*)
-                    echo "BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user." >&2
-                    exit 2;;
-                *"git clean -f"*)  # substring also covers -fd
-                    echo "BLOCKED: git clean removes untracked files permanently. Ask the user first." >&2
-                    exit 2;;
-            esac
+        if [ "$_handled" -eq 0 ]; then
+            # Coarse dependency-free clean block — reached when python3/the guard is
+            # ABSENT or the guard CRASHED. Quote-NAIVE best-effort: unlike reset
+            # --hard (recoverable), clean is unrecoverable, so it must catch every
+            # non-dry-run form. MEASURED (git 2.43): any dry-run flag makes clean
+            # print-only, so ALLOW iff a dry-run flag rides in the clean segment,
+            # BLOCK the complement. Splits on & too (background) so a dry-run in one
+            # bg command can't mask a destructive clean in another. `clean` must be
+            # a token adjacent to a `git` invocation (dodges the worst
+            # message/branch/file false-blocks); honors `# discard-override`.
+            _gcb=0
+            while IFS= read -r _seg; do
+                printf '%s' "$_seg" | grep -qE '(^|[[:space:]])git([[:space:]]+-[cC][[:space:]]+[^[:space:]]+)*[[:space:]]+clean([[:space:]]|$)' || continue
+                printf '%s' "$_seg" | grep -qE -- '(^|[[:space:]])-[dfxXneqi]*n[dfxXneqi]*([[:space:]]|$)|--dry-run' && continue
+                case "$_seg" in *"#"*discard-override*) continue ;; esac
+                _gcb=1
+            done <<EOF
+$(printf '%s\n' "$CMD" | sed -E 's/\|\||&&|;|\||&/\n/g')
+EOF
+            if [ "$_gcb" -eq 1 ]; then
+                echo "BLOCKED: git clean permanently deletes untracked files (not snapshot-recoverable). Preview with 'git clean -nd', append '# discard-override', or ask the user." >&2
+                exit 2
+            fi
         fi
         ;;
 esac

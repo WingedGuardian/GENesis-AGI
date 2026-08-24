@@ -20,6 +20,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SETTINGS = _REPO_ROOT / ".claude" / "settings.json"
 
@@ -82,14 +84,37 @@ class TestRemovedArms:
         # remove`; the inline --force arm was redundant.
         assert _run("git worktree remove --force /tmp/wt").returncode == 0
 
-    def test_reset_hard_not_inline_blocked(self):
-        # git_discard_guard.py (tracked project hook + bash_safety delegation) now
-        # owns reset --hard; the inline blob no longer duplicates it.
-        assert _run("git reset --hard HEAD~1").returncode == 0
 
-    def test_clean_f_not_inline_blocked(self):
-        # git_discard_guard.py now owns git clean -f/--force; inline no longer does.
-        assert _run("git clean -fd").returncode == 0
+class TestInlineDiscardFloor:
+    """The inline blob keeps ONLY the reset --hard speed-bump (2026-08-24
+    recoverability redesign). reset is recoverable (the snapshot net undoes it),
+    so a crude substring block is a fine dependency-free nudge. `git clean` is NO
+    LONGER handled here — it is UNrecoverable and needs a precise, quote-aware
+    block that a naive inline regex can't give (it would false-block
+    `git checkout clean-branch`, `git commit -m "clean up"`), so it moved to the
+    tracked guard git_discard_guard.py (bash_safety global + project hook), like
+    force-push/worktree-remove before it. The inline blob must NOT block clean."""
+
+    def test_reset_hard_inline_blocked(self):
+        assert _run("git reset --hard HEAD~1").returncode == 2
+
+    def test_reset_soft_allowed(self):
+        assert _run("git reset --soft HEAD~1").returncode == 0
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git clean -f",
+            "git clean --force",
+            "git clean -fd",
+            "git clean",
+            "git clean -nd",
+            "git checkout clean-branch",  # would false-block under a naive match
+            'git commit -m "clean up"',
+        ],
+    )
+    def test_clean_not_inline_blocked(self, cmd):
+        assert _run(cmd).returncode == 0
 
 
 class TestUnrelatedAllowed:
