@@ -34,7 +34,8 @@ the claim to two provable pieces:
    index (it mutates NOTHING — no ref, no stash list entry, no tree change) and
    the sha is logged to ``~/.genesis/git_discard_snapshots.jsonl`` with a
    recovery note on stderr. If the command then discards work, recovery is
-   ``git stash apply <sha>``. A MISS (unresolvable cwd, non-repo, git error,
+   ``git stash apply --index <sha>`` (``--index`` restores the staged/
+   unstaged split; drop it if the apply conflicts). A MISS (unresolvable cwd, non-repo, git error,
    clean tree) silently allows — degrading exactly to the status quo, never to
    a false block and never to a false guarantee.
 
@@ -66,12 +67,24 @@ DOCUMENTED RESIDUALS (honest claim — the snapshot is a best-effort net):
     bash_safety_hook delegation run this guard per Bash call → a dirty
     checkout may log two snapshot rows (harmless; the wider dedup is the
     all-hooks-review follow-up).
+  * The snapshot is taken BEFORE the whole Bash payload runs (PreToolUse) —
+    edits produced by an EARLIER segment of the same compound
+    (``gen > f.py && git checkout -- f.py``) post-date it and are not
+    captured. Inherent to the hook boundary; split such compounds.
+  * Submodule recursion via CONFIG FILE (``submodule.recurse=true`` in
+    gitconfig) is invisible to argv: nested-worktree resets it triggers are
+    neither blocked nor snapshotted (the explicit ``--recurse-submodules``
+    flag — incl. ``=value`` and abbreviated spellings — and the canonical
+    separated ``-c submodule.recurse=true`` ARE blocked; glued/exotic ``-c``
+    spellings are part of this residual; a superproject ``stash create``
+    stores nothing from a dirty submodule — measured).
 """
 
 from __future__ import annotations
 
 import contextlib
 import datetime
+import fcntl
 import json
 import os
 import subprocess
@@ -107,6 +120,12 @@ _CLEAN_DRY_RUN_REQUIRED = frozenset({"-n", "--dry-run", "-nd", "-dn"})
 # Literal force tokens for checkout/switch (long forms; short clusters are
 # handled structurally by _has_force_cluster).
 _CHECKOUT_FORCE_TOKENS = frozenset({"--force", "--discard-changes"})
+# Explicit submodule recursion resets NESTED worktrees that the superproject
+# snapshot cannot capture (measured: `git stash create` in a superproject with
+# a dirty submodule returns NO sha) — so flag-form recursion is a coarse BLOCK
+# on checkout/switch/restore (Codex round-2 P1). The CONFIG form
+# (submodule.recurse=true) is invisible to argv — documented residual.
+_RECURSE_SUBMODULES_FLAG = "--recurse-submodules"
 
 
 def _snapshot_log_path() -> str:
@@ -141,14 +160,23 @@ def _tokens_after_subcommand(argv: list[str], sub: str) -> list[str]:
 
 
 def _has_abbrev_of(argv: list[str], long_flags: tuple[str, ...]) -> bool:
-    """git parse-options accepts any unambiguous long-flag PREFIX (``--har`` ==
-    ``--hard``), so literal membership alone under-blocks (adversarial-review
-    F2, executed: ``git reset --har`` hard-resets unblocked). Closed PREFIX-set
-    check, over-block direction: any ``--``-token of length >= 4 that prefixes a
-    blocked long flag counts (ambiguous prefixes over-block — git errors on
-    them anyway)."""
+    """git parse-options accepts any unambiguous long-flag PREFIX — including
+    SINGLE-LETTER ones: measured on git 2.43, ``git reset --h`` performs a full
+    hard reset and ``git checkout --f`` force-switches (Codex round-2 P1; the
+    earlier ``len >= 4`` floor was empirically wrong). Tokens are normalized at
+    ``=`` before matching: optional-arg spellings (``--recurse-submodules=yes``,
+    abbreviated ``--recurse=yes``) are longer than the flag, so raw prefix
+    matching missed them (adversarial-review round-3 BLOCKER, measured). The
+    ``f == h`` arm also makes exact ``=``-forms of every blocked flag match.
+    Closed PREFIX-set check, over-block direction: any ``--``-token whose
+    pre-``=`` head is length >= 3 (anything beyond the bare ``--`` separator)
+    and prefixes a blocked long flag counts. Ambiguous prefixes and no-arg
+    flags given values (``--force=true``) over-block — git errors on those
+    itself, so nothing legitimate is lost."""
     return any(
-        t.startswith("--") and len(t) >= 4 and any(f.startswith(t) for f in long_flags)
+        (h := t.split("=", 1)[0]).startswith("--")
+        and len(h) >= 3
+        and any(f == h or f.startswith(h) for f in long_flags)
         for t in argv[1:]
     )
 
@@ -170,8 +198,8 @@ def _coarse_violations(cmd: str) -> list[str]:
         if seg.exe != "git":
             continue
         argv_set = set(seg.argv[1:])
-        if not argv_set & {"reset", "clean", "checkout", "switch"}:
-            continue
+        if not argv_set & {"reset", "clean", "checkout", "switch", "restore"}:
+            continue  # restore participates only in the recurse-submodules block
         if has_trailing_override(seg.raw, _OVERRIDE_SIGIL):
             continue
         if "reset" in argv_set and (
@@ -195,11 +223,35 @@ def _coarse_violations(cmd: str) -> list[str]:
                     "else — including path arguments — needs `# discard-override`. "
                     "Preview with `git clean -nd` first."
                 )
-        if argv_set & {"checkout", "switch"} and (
+        if argv_set & {"checkout", "switch", "restore"} and (
+            _RECURSE_SUBMODULES_FLAG in argv_set
+            or _has_abbrev_of(seg.argv, (_RECURSE_SUBMODULES_FLAG,))
+            # canonical -c spelling puts the config form IN argv — cheap
+            # closed-set literal; exotic glued spellings stay a residual
+            or "submodule.recurse=true" in argv_set
+        ):
+            reasons.append(
+                "`--recurse-submodules` resets NESTED submodule worktrees that "
+                "the recovery snapshot cannot capture (a superproject `git stash "
+                "create` stores nothing from a dirty submodule). Commit/stash "
+                "inside the submodule first, or append `# discard-override`."
+            )
+        # Per-verb force tuples (adversarial-review F5): --discard-changes is
+        # SWITCH-only — including it in checkout's tuple made `git checkout
+        # --d` (a unique abbreviation of harmless --detach) over-block. On
+        # switch, --d is genuinely ambiguous (--detach/--discard-changes), so
+        # blocking there is free.
+        checkout_force = "checkout" in argv_set and (
+            "--force" in argv_set
+            or _has_force_cluster(seg.argv)
+            or _has_abbrev_of(seg.argv, ("--force",))
+        )
+        switch_force = "switch" in argv_set and (
             _CHECKOUT_FORCE_TOKENS & argv_set
             or _has_force_cluster(seg.argv)
             or _has_abbrev_of(seg.argv, tuple(_CHECKOUT_FORCE_TOKENS))
-        ):
+        )
+        if checkout_force or switch_force:
             reasons.append(
                 "`git checkout/switch` with force (`-f`/`--force`/"
                 "`--discard-changes`) throws away local changes. Stash or commit "
@@ -277,22 +329,35 @@ def _record_snapshots(cmd: str, payload: dict) -> None:
         }
         try:
             log_path = _snapshot_log_path()
-            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            with open(log_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(row) + "\n")
-            # Self-trim: no external rotation/consumer exists (F8). Keep the
-            # newest half when the file outgrows the cap.
-            if os.path.getsize(log_path) > _SNAPSHOT_LOG_MAX_BYTES:
-                with open(log_path, encoding="utf-8") as fh:
-                    lines = fh.readlines()
-                with open(log_path, "w", encoding="utf-8") as fh:
-                    fh.writelines(lines[len(lines) // 2 :])
+            # A relative override has an empty dirname — makedirs("") raises
+            # and would silently drop the row (Codex round-2 P2).
+            os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+            # Append + trim under an exclusive flock on a SIDECAR lock file:
+            # locking the log fh itself is defeated by the trim's os.replace
+            # (the lock identity is the OLD inode — a waiter would acquire the
+            # orphaned inode and append invisibly; demonstrated in review).
+            # The sidecar is never replaced, so every writer serializes on the
+            # same inode. Trim rewrites via temp + os.replace (atomic).
+            with open(log_path + ".lock", "a", encoding="utf-8") as lk:
+                fcntl.flock(lk, fcntl.LOCK_EX)
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(row) + "\n")
+                if os.path.getsize(log_path) > _SNAPSHOT_LOG_MAX_BYTES:
+                    with open(log_path, encoding="utf-8") as rd:
+                        lines = rd.readlines()
+                    tmp = log_path + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as wr:
+                        wr.writelines(lines[len(lines) // 2 :])
+                    os.replace(tmp, log_path)
+                # lock releases on close
         except OSError:
             pass  # the stderr note below still carries the recovery sha
         print(
             f"[git-discard-guard] uncommitted state in {cwd} snapshotted as "
             f"{sha[:12]} — if this command discarded work you needed: "
-            f"git stash apply {sha}  (log: {_snapshot_log_path()})",
+            f"git stash apply --index {sha}  (--index restores the staged/"
+            f"unstaged split; drop it if the apply conflicts. "
+            f"log: {_snapshot_log_path()})",
             file=sys.stderr,
         )
 

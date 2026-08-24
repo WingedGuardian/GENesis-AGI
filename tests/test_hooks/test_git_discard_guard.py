@@ -221,14 +221,22 @@ def test_incident_checkout_discard_is_recoverable(repo, snap_log):
     sha = rows[0]["sha"]
     assert rows[0]["cwd"] == str(repo)
 
-    # The discard actually happens (the guard ALLOWED it)…
+    # The discard actually happens (the guard ALLOWED it) — then simulate
+    # TOTAL loss (hard reset wipes both files AND the staged split), so the
+    # --cached assertions below can ONLY pass if --index actually restored
+    # keep.py INTO the index (plain apply restores it unstaged — F4
+    # discrimination) and the byte assertions prove full content recovery.
     _git(repo, "checkout", "--", "tracked.py")
     assert (repo / "tracked.py").read_text() == "orig\n"
+    _git(repo, "reset", "--hard")
+    assert (repo / "keep.py").read_text() == "keep\n"  # staged edit gone too
 
-    # …and the snapshot restores the exact bytes, staged AND unstaged.
-    _git(repo, "stash", "apply", sha)
+    _git(repo, "stash", "apply", "--index", sha)
     assert (repo / "tracked.py").read_text() == "precious unstaged edit\n"
     assert (repo / "keep.py").read_text() == "precious staged edit\n"
+    staged = _git(repo, "diff", "--cached", "--name-only")
+    assert "keep.py" in staged  # staged hunk restored AS staged
+    assert "tracked.py" not in staged
 
 
 def test_clean_tree_writes_no_snapshot(repo, snap_log):
@@ -308,10 +316,37 @@ def test_long_flag_abbreviations_block():
     assert _blocks("git switch --discard main")
 
 
-def test_short_ambiguous_prefix_not_matched():
-    # "--h" (len 3) is below the abbrev floor — git itself errors on ambiguous
-    # prefixes, so nothing is lost by allowing.
-    assert not _blocks("git reset --h")
+def test_single_letter_abbreviations_block():
+    # MEASURED on git 2.43 (Codex round-2 P1): `git reset --h` performs a full
+    # hard reset and `git checkout --f` force-switches — single-letter long
+    # prefixes are accepted by git, so the floor is len >= 3 (`--X`).
+    assert _blocks("git reset --h")
+    assert _blocks("git checkout --f main")
+    assert _blocks("git switch --f main")
+
+
+def test_recurse_submodules_blocks():
+    # MEASURED: a superproject `git stash create` stores NOTHING from a dirty
+    # submodule, so recursive restoration is unrecoverable — flag-form blocks
+    # on all three verbs (+ abbreviations); config-form is a documented residual.
+    assert _blocks("git checkout --recurse-submodules -- sm")
+    assert _blocks("git restore --recurse-submodules sm")
+    assert _blocks("git switch --recurse-submodules b2")
+    assert _blocks("git checkout --recurse -- sm")  # abbreviation prefix
+    # measured bypass (round-3 BLOCKER): optional-arg = spellings parse as
+    # boolean-true recursion and were longer than the flag -> prefix miss
+    assert _blocks("git checkout --recurse-submodules=yes main")
+    assert _blocks("git checkout --recurse=yes main")
+    assert _blocks("git -c submodule.recurse=true checkout main")
+    assert not _blocks("git restore sm")  # plain restore stays snapshot-then-allow
+
+
+def test_checkout_detach_abbreviation_allows():
+    # --d on checkout uniquely abbreviates harmless --detach (F5: the
+    # switch-only --discard-changes must not over-block it); on switch --d is
+    # ambiguous so blocking is free.
+    assert not _blocks("git checkout --d HEAD~1")
+    assert _blocks("git switch --d b2")
 
 
 def test_verdict_crash_propagates_for_fail_closed_conversion(monkeypatch):
@@ -374,3 +409,31 @@ def test_main_ignores_non_git(monkeypatch):
 def test_main_fails_open_on_garbage_payload(monkeypatch):
     monkeypatch.setattr(_gd, "read_payload", lambda: (_ for _ in ()).throw(KeyError("x")))
     assert _gd.main() == 0
+
+
+def test_relative_snapshot_log_override(repo, tmp_path, monkeypatch):
+    # A relative GENESIS_DISCARD_SNAPSHOT_LOG has an empty dirname —
+    # makedirs("") used to raise and silently drop the row (Codex round-2 P2).
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_LOG", "rel_snapshots.jsonl")
+    (repo / "tracked.py").write_text("dirty\n")
+    _gd._record_snapshots("git checkout -- tracked.py", {"cwd": str(repo)})
+    assert (tmp_path / "rel_snapshots.jsonl").exists()
+    assert len(_rows(tmp_path / "rel_snapshots.jsonl")) == 1
+
+
+def test_log_trim_keeps_newest_half(tmp_path, monkeypatch, repo):
+    log = tmp_path / "snap.jsonl"
+    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_LOG", str(log))
+    # Pre-fill past the cap with old rows, then snapshot once: the trim keeps
+    # the newest half and the new row survives (atomic replace under flock).
+    monkeypatch.setattr(_gd, "_SNAPSHOT_LOG_MAX_BYTES", 2000)
+    log.write_text("\n".join(f'{{"ts":"old","sha":"{i:040d}"}}' for i in range(50)) + "\n")
+    (repo / "tracked.py").write_text("dirty\n")
+    _gd._record_snapshots("git checkout -- tracked.py", {"cwd": str(repo)})
+    rows = _rows(log)
+    assert rows, "log must survive the trim"
+    assert rows[-1]["cwd"] == str(repo)  # the just-appended row is retained
+    # the trim must have actually FIRED (a crashed trim swallowed by the
+    # OSError handler would leave all 51 rows and still pass the above — F3)
+    assert len(rows) < 50
