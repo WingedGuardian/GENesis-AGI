@@ -1,10 +1,15 @@
 """Tests for the truthful liveness fields on the surplus snapshot.
 
-surplus_status() now exposes stalled / last_success_at / stall_reason / liveness_error
-from job_health["surplus_dispatch"] via compute_pulse_liveness, so a WEDGED surplus
-scheduler stops reading green (the idle-proxy `status` hid it). Fail-LOUD: any read
-error, or an inability to determine the pause state (no live runtime), yields
-liveness_error=True (→ dashboard `unknown`), never a defaulted-False that reads green.
+surplus_status() exposes stalled / last_success_at / stall_reason / liveness_error so
+a WEDGED surplus scheduler stops reading green (the idle-proxy `status` hid it). The
+verdict is computed robust-by-construction from ONE authoritative source — the
+BOOTSTRAPPED runtime's in-memory surplus_dispatch pulse — and EVERY way that read can
+be uncertain collapses to liveness_error (dashboard → unknown), never a defaulted-False
+that reads green. This enumerates and locks that whole uncertainty class:
+  - stale pulse (not paused) -> stalled; recent -> healthy; paused -> not stalled
+  - no runtime / unbootstrapped zombie singleton -> unavailable
+  - no pulse on record (never started) -> unavailable
+  - non-null unparseable pulse (corruption / legacy data) -> unavailable
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from genesis.observability.snapshots.surplus import surplus_status
 from genesis.runtime._core import GenesisRuntime
 
 NOW = datetime.now(UTC)
+_UNSET = object()
 
 
 @pytest.fixture
@@ -38,9 +44,29 @@ def runtime_singleton():
     GenesisRuntime._instance = original
 
 
-def _install_runtime(*, paused=False, present=True):
-    GenesisRuntime._instance = (
-        SimpleNamespace(paused=paused, idle_detector=None) if present else None
+def _install_runtime(
+    *, present=True, bootstrapped=True, paused=False, pulse_min_ago=_UNSET, pulse_raw=_UNSET
+):
+    """Inject a stub runtime whose in-memory _job_health holds the surplus pulse.
+
+    pulse_min_ago: seed last_success that many minutes before NOW.
+    pulse_raw: seed a literal last_success value (e.g. a garbage string).
+    neither set: no surplus_dispatch entry at all (never pulsed).
+    """
+    if not present:
+        GenesisRuntime._instance = None
+        return
+    entry = {}
+    if pulse_raw is not _UNSET:
+        entry = {"surplus_dispatch": {"last_success": pulse_raw}}
+    elif pulse_min_ago is not _UNSET:
+        ts = (NOW - timedelta(minutes=pulse_min_ago)).isoformat()
+        entry = {"surplus_dispatch": {"last_success": ts}}
+    GenesisRuntime._instance = SimpleNamespace(
+        is_bootstrapped=bootstrapped,
+        _job_health=entry,
+        paused=paused,
+        idle_detector=None,
     )
 
 
@@ -49,75 +75,76 @@ class _FakeQueue:
         return 0
 
 
-def _fake_surplus(is_idle=True):
+def _fake_surplus():
     return SimpleNamespace(
         _dispatch_interval=5,
-        _idle_detector=SimpleNamespace(is_idle=lambda: is_idle),
+        _idle_detector=SimpleNamespace(is_idle=lambda: True),
         _queue=_FakeQueue(),
     )
 
 
-async def _seed_last_success(db, *, minutes_ago):
-    ts = (NOW - timedelta(minutes=minutes_ago)).isoformat()
-    await db.execute(
-        "INSERT INTO job_health (job_name, last_run, last_success, updated_at) VALUES (?, ?, ?, ?)",
-        ("surplus_dispatch", ts, ts, ts),
-    )
-    await db.commit()
+@pytest.mark.asyncio
+async def test_stale_pulse_not_paused_is_stalled(db, runtime_singleton):
+    """No completed dispatch in 5h, not paused → stalled with a reason."""
+    _install_runtime(paused=False, pulse_min_ago=5 * 60)
+    r = await surplus_status(db, _fake_surplus())
+    assert r["stalled"] is True
+    assert r["liveness_error"] is False
+    assert r["stall_reason"]
+    assert r["last_success_at"] is not None
 
 
 @pytest.mark.asyncio
-async def test_stale_surplus_not_paused_reports_stalled(db, runtime_singleton):
-    """No completed dispatch in 5h, not paused → stalled=True with a reason."""
-    _install_runtime(paused=False)
-    await _seed_last_success(db, minutes_ago=5 * 60)
-    result = await surplus_status(db, _fake_surplus())
-    assert result["stalled"] is True
-    assert result["liveness_error"] is False
-    assert result["stall_reason"]
-    assert result["last_success_at"] is not None
+async def test_recent_pulse_not_stalled(db, runtime_singleton):
+    _install_runtime(paused=False, pulse_min_ago=2)
+    r = await surplus_status(db, _fake_surplus())
+    assert r["stalled"] is False
+    assert r["liveness_error"] is False
 
 
 @pytest.mark.asyncio
-async def test_recent_surplus_not_stalled(db, runtime_singleton):
-    _install_runtime(paused=False)
-    await _seed_last_success(db, minutes_ago=5)
-    result = await surplus_status(db, _fake_surplus())
-    assert result["stalled"] is False
-    assert result["liveness_error"] is False
+async def test_paused_not_stalled(db, runtime_singleton):
+    """A globally-paused surplus legitimately freezes its pulse → never a stall."""
+    _install_runtime(paused=True, pulse_min_ago=5 * 60)
+    r = await surplus_status(db, _fake_surplus())
+    assert r["stalled"] is False
+    assert r["liveness_error"] is False
 
 
 @pytest.mark.asyncio
-async def test_paused_surplus_not_stalled(db, runtime_singleton):
-    """A globally-paused surplus legitimately freezes last_success → never a stall."""
-    _install_runtime(paused=True)
-    await _seed_last_success(db, minutes_ago=5 * 60)
-    result = await surplus_status(db, _fake_surplus())
-    assert result["stalled"] is False
-    assert result["liveness_error"] is False
-
-
-@pytest.mark.asyncio
-async def test_no_runtime_reports_liveness_error(db, runtime_singleton):
-    """The standalone-MCP hole: db present but NO live runtime (can't read pause) →
-    liveness_error, never a defaulted-False that reads green while wedged."""
+async def test_no_runtime_is_unavailable(db, runtime_singleton):
     _install_runtime(present=False)
-    await _seed_last_success(db, minutes_ago=5 * 60)
-    # surplus=None mirrors the standalone_health.py:198 call.
-    result = await surplus_status(db, None)
-    assert result["liveness_error"] is True
-    assert result["stalled"] is False
+    r = await surplus_status(db, None)
+    assert r["liveness_error"] is True
+    assert r["stalled"] is False
 
 
 @pytest.mark.asyncio
-async def test_never_pulsed_reports_unavailable(db, runtime_singleton):
-    """No completed cycle EVER (no job_health row) → UNAVAILABLE, not green. A
-    scheduler that crashed before its first heartbeat is not owned by the
-    job_never_succeeded alarm (it needs last_run + >=3 failures), so a live handle
-    would otherwise read healthy. Must be liveness_error (dashboard → unknown),
-    never stalled and never green."""
-    _install_runtime(paused=False)
-    result = await surplus_status(db, _fake_surplus())
-    assert result["liveness_error"] is True
-    assert result["stalled"] is False
-    assert result["last_success_at"] is None
+async def test_unbootstrapped_zombie_is_unavailable(db, runtime_singleton):
+    """A zombie singleton another MCP tool constructed (is_bootstrapped False) must not
+    be trusted for pause/pulse — its state would make liveness depend on call order."""
+    _install_runtime(bootstrapped=False, paused=False, pulse_min_ago=5 * 60)
+    r = await surplus_status(db, _fake_surplus())
+    assert r["liveness_error"] is True
+    assert r["stalled"] is False
+
+
+@pytest.mark.asyncio
+async def test_never_pulsed_is_unavailable(db, runtime_singleton):
+    """No surplus_dispatch entry at all (never started / crashed pre-first-heartbeat) →
+    unavailable, not green — the job_never_succeeded alarm doesn't own this."""
+    _install_runtime(paused=False)  # no pulse seeded
+    r = await surplus_status(db, _fake_surplus())
+    assert r["liveness_error"] is True
+    assert r["stalled"] is False
+    assert r["last_success_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_unparseable_pulse_is_unavailable(db, runtime_singleton):
+    """A non-null but malformed pulse (corruption / legacy data) is NOT a valid pulse →
+    unavailable, never a silent stalled=False that reads green."""
+    _install_runtime(paused=False, pulse_raw="not-a-timestamp")
+    r = await surplus_status(db, _fake_surplus())
+    assert r["liveness_error"] is True
+    assert r["stalled"] is False

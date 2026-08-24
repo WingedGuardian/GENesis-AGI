@@ -71,54 +71,58 @@ async def surplus_status(
             pass
 
     # Truthful liveness (mirrors routes/ego.py:112-144). surplus_dispatch records
-    # success UNCONDITIONALLY every ~5 min at loop entry, so a stale last_success
-    # means the dispatch loop stopped firing / a dispatch hung — a real fault the
-    # idle-proxy `status` above hides (a wedged scheduler reads "idle" → green).
-    # Computed from job_health INDEPENDENT of the `surplus` handle so the standalone
-    # MCP surface (surplus=None) is not a green hole. Fail-LOUD: any read error, or
-    # an inability to read the pause state (no live runtime), → liveness_error
-    # (dashboard renders `unknown`), NEVER a defaulted-False that reads green while
-    # wedged. `paused` is excluded because a paused loop legitimately skips its
-    # success record (scheduler.py:823 before :835).
+    # success UNCONDITIONALLY every ~5 min at loop entry, so a stale pulse means the
+    # dispatch loop stopped firing / a dispatch hung — a real fault the idle-proxy
+    # `status` above hides (a wedged scheduler reads "idle" → green). `paused` is
+    # excluded because a paused loop legitimately skips its success record
+    # (scheduler.py:823 before :835).
+    #
+    # Robust-by-construction fail-loud: exactly ONE authoritative source (the
+    # BOOTSTRAPPED runtime's in-memory surplus_dispatch pulse), and EVERY way the
+    # read can be uncertain collapses to liveness_error (dashboard renders `unknown`),
+    # never a defaulted-False that reads green. The uncertain cases, all closed here:
+    #   - no runtime, or an unbootstrapped zombie singleton another MCP tool
+    #     constructed (peek can return it; its pause state is meaningless) → its state
+    #     would make liveness depend on MCP call order;
+    #   - no pulse on record (never started / crashed before the first heartbeat,
+    #     which scheduler.py:549-556 swallows) — NOT owned by the job_never_succeeded
+    #     alarm (that needs last_run + >=3 failures);
+    #   - a non-null but unparseable pulse (row corruption / legacy / manual data).
+    # We read the IN-MEMORY pulse, not the DB copy: record_job_success updates
+    # rt._job_health synchronously but persists fire-and-forget with swallowed DB
+    # errors, so a DB read would go stale and FALSE-RED a healthy scheduler when
+    # persistence lags. The in-memory value is the live pulse the loop actually writes.
     last_success_at = None
     stalled = False
     stall_reason = None
     liveness_error = False
     try:
-        if db is None:
-            raise RuntimeError("no db handle — cannot read job_health")
-        from genesis.db.crud.job_health import get_job_last_success
         from genesis.observability.liveness import compute_pulse_liveness
         from genesis.runtime._core import GenesisRuntime
 
         rt = GenesisRuntime.peek()
-        if rt is None:
-            raise RuntimeError("no live runtime — cannot read pause state")
-        last_success = await get_job_last_success(db, "surplus_dispatch")
-        if last_success is None:
-            # Never a completed cycle. Either fresh-booting (the initial heartbeat
-            # lands within seconds — scheduler.py:553) or the scheduler crashed
-            # before its first pulse / never started (that init exception is
-            # swallowed at scheduler.py:549-556). The job_never_succeeded alarm does
-            # NOT own this case (it needs last_run + >=3 failures), so a live
-            # scheduler handle would otherwise let the tile read green forever.
-            # Cannot confirm liveness without a single pulse → unavailable (unknown),
-            # never green. Self-clears the instant the first success lands.
-            liveness_error = True
-        else:
-            interval = (
-                getattr(surplus, "_dispatch_interval", 5) if surplus is not None else 5
-            )
-            live = compute_pulse_liveness(
-                last_success_at=last_success,
-                expected_interval_minutes=interval,
-                paused=bool(rt.paused),
-            )
-            last_success_at = live.last_success_at
-            stalled = live.stalled
-            stall_reason = live.reason
+        if rt is None or not rt.is_bootstrapped:
+            raise RuntimeError("no bootstrapped runtime — cannot confirm liveness")
+        raw_pulse = (
+            (getattr(rt, "_job_health", None) or {}).get("surplus_dispatch") or {}
+        ).get("last_success")
+        interval = (
+            getattr(surplus, "_dispatch_interval", 5) if surplus is not None else 5
+        )
+        live = compute_pulse_liveness(
+            last_success_at=raw_pulse,
+            expected_interval_minutes=interval,
+            paused=bool(rt.paused),
+        )
+        # overdue_minutes is None iff the pulse was absent or unparseable — either
+        # way liveness is not confirmable → unavailable, never green.
+        if live.overdue_minutes is None:
+            raise RuntimeError("no parseable pulse on record — cannot confirm liveness")
+        last_success_at = live.last_success_at
+        stalled = live.stalled
+        stall_reason = live.reason
     except Exception:
-        logger.debug("surplus liveness computation failed", exc_info=True)
+        logger.debug("surplus liveness unavailable", exc_info=True)
         liveness_error = True
 
     return {
