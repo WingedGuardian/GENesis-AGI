@@ -392,14 +392,20 @@ When a user shares a file path or URL in conversation:
 - **Plan mode by default** for any task with 3+ steps or architectural
   decisions. If something goes sideways — STOP and re-plan.
 - **Use subagents** to keep main context clean. One concern per subagent.
-- **Verify multi-agent output — never trust one agent's claim.** A subagent
-  fan-out that produces claims you'll act on (audits, diagnoses, source-of-truth
-  maps) gets an independent adversarial verification stage before synthesis:
-  re-derive the load-bearing / contradictory / surprising claims from ground
-  truth (real runtime, not a shell proxy; values, not line-existence),
-  refute-by-default, and let the verdicts override the original reports. Scale
-  to stakes — skip it for a single trivial lookup; apply it whenever the output
-  drives decisions or lands in durable record.
+- **Verify agent output — never trust one agent's claim.** Any subagent output
+  you'll act on — a fan-out audit, a diagnosis, a source-of-truth map, or a
+  *single* actionable report — gets an independent adversarial verification pass
+  before it drives a decision or lands in durable record: re-derive the
+  load-bearing / contradictory / surprising claims from ground truth (real
+  runtime, not a shell proxy; values, not line-existence), refute-by-default. A
+  verdict overrides the original ONLY when conclusive — an inconclusive /
+  UNCERTAIN verdict never overturns a well-grounded finding. Verify the
+  conclusions the synthesis step itself creates, not just its inputs. Scale to
+  stakes; skip only a trivial single-fact lookup.
+- **Waiving a review gate is not waiving the findings.** Skipping the review
+  *ceremony* for a trivial change never licenses ignoring a reviewer's
+  *substantive* findings — engage them on merits (verify, then fix or
+  consciously accept with a reason), gate-waived or not.
 - **NEVER `rm -rf` the working directory.** Never run destructive commands
   without explicit user confirmation.
 - **Session wrap-up**: structured handoff — what changed, what's pending,
