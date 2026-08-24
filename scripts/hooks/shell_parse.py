@@ -364,9 +364,21 @@ def is_pytest_invocation(seg: Segment) -> bool:
         return True
     if seg.exe.startswith("python"):
         argv = seg.argv
-        for i, tok in enumerate(argv):
-            if tok == "-m" and i + 1 < len(argv) and argv[i + 1] == "pytest":
-                return True
+        i = 1
+        while i < len(argv):
+            tok = argv[i]
+            if tok == "-m":  # `python -m pytest …`
+                return i + 1 < len(argv) and argv[i + 1] == "pytest"
+            if tok in ("-c", "-W", "-X"):  # flags that consume the next token
+                i += 2
+                continue
+            if tok.startswith("-"):
+                i += 1
+                continue
+            # First non-flag = the program python runs. Only a pytest console-script
+            # entrypoint (a /path/.../pytest) is a pytest run; `python script.py …`
+            # is NOT, even if `-m pytest` appears later as the SCRIPT's own args.
+            return "/" in tok and _basename(tok) == "pytest"
     return False
 
 

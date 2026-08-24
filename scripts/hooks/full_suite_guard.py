@@ -70,31 +70,36 @@ def _pytest_args(seg: Segment) -> list[str]:
 
 
 def _targets_specific_test(args: list[str]) -> bool:
-    """True if args name a specific ``.py`` file/nodeid OR carry a -k/-m selector.
+    """True if this pytest arg list is a TARGETED run (allow), False for a bare or
+    directory-touching run (block).
 
-    False for a bare run or directory-only args — the case this hook blocks.
+    Targeted = a -k/-m/--pyargs selector, OR at least one specific .py file/nodeid
+    and NO bare-directory positional. A file mixed with a directory
+    (``pytest tests/foo.py tests/``) still runs the whole directory, so it blocks.
     """
+    has_selector = False
+    has_file = False
+    has_dir = False
     i = 0
     while i < len(args):
         arg = args[i]
         if arg.startswith("-"):
             # a -k/-m selector (separate value, =form, or glued) narrows the run
-            if arg in ("-k", "-m") or arg.startswith(("-k", "-m", "--keyword")):
-                return True
-            if arg == "--pyargs":  # --pyargs pkg.mod → import-path targeting = a targeted run
-                return True
-            if arg in _VALUE_FLAGS:
+            if arg in ("-k", "-m") or arg.startswith(("-k", "-m", "--keyword")) or arg == "--pyargs":
+                has_selector = True
+            elif arg in _VALUE_FLAGS:
                 i += 2  # skip the flag AND its value
                 continue
             i += 1
             continue
         # A real .py file or nodeid — NOT a mere substring, so a directory like
-        # tests/.pytest_cache/ or foo.python_stuff/ does not defeat the block.
+        # tests/.pytest_cache/ or foo.python_stuff/ counts as a directory, not a file.
         if arg.endswith(".py") or ".py::" in arg:
-            return True
-        # a bare directory / non-file positional path → not targeted; keep scanning
+            has_file = True
+        else:
+            has_dir = True  # a bare directory / non-file positional path
         i += 1
-    return False
+    return has_selector or (has_file and not has_dir)
 
 
 def main() -> None:

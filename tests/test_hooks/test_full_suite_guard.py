@@ -69,6 +69,15 @@ class TestTargetsSpecificTest:
     def test_pyargs_is_targeted(self):
         assert _mod._targets_specific_test(["--pyargs", "genesis.tests.test_mod"])
 
+    def test_file_mixed_with_dir_not_targeted(self):
+        # a specific file AND a bare directory still runs the whole directory → block
+        assert not _mod._targets_specific_test(["tests/foo.py", "tests/"])
+        assert not _mod._targets_specific_test(["tests/", "tests/foo.py"])
+
+    def test_selector_with_dir_still_targeted(self):
+        # a -k/-m selector narrows the run even when a directory is present
+        assert _mod._targets_specific_test(["tests/", "-k", "test_bar"])
+
 
 def _run_guard(command: str) -> subprocess.CompletedProcess:
     payload = json.dumps({"tool_input": {"command": command}, "tool_name": "Bash"})
@@ -134,3 +143,7 @@ class TestEndToEnd:
     def test_pyargs_run_allowed(self):
         r = _run_guard("pytest --pyargs genesis.tests.test_mod")
         assert r.returncode == 0, r.stderr
+
+    def test_file_plus_dir_blocks(self):
+        # a file mixed with a whole directory runs the dir → must block
+        assert _run_guard("pytest tests/foo/test_bar.py tests/").returncode == 2

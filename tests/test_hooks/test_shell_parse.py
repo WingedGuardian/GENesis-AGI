@@ -56,6 +56,18 @@ class TestPytestDetection:
     def test_pytest_cov_module_not_matched(self):
         assert not sp.command_runs_pytest("python -m pytest_cov")
 
+    def test_python_script_with_m_pytest_args_not_matched(self):
+        # `-m pytest` here are the SCRIPT's own args, not python's — not a pytest run
+        assert not sp.command_runs_pytest("python script.py -m pytest")
+
+    def test_python_running_pytest_entrypoint_matched(self):
+        # python executing the pytest console-script (a /path/.../pytest) IS a run
+        seg = sp.analyze("python /venv/bin/pytest -q")[0]
+        assert sp.is_pytest_invocation(seg)
+
+    def test_python_flags_before_m_pytest_matched(self):
+        assert sp.command_runs_pytest("python -X faulthandler -m pytest tests/x.py")
+
 
 # ── git subcommand resolution through wrappers ──────────────────────────
 
