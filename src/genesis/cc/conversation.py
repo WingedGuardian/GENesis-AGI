@@ -1625,8 +1625,8 @@ class ConversationLoop:
         """Check if session is from a previous day boundary.
 
         The boundary is local-midnight (``day_boundary_hour`` in the user's
-        timezone), not UTC-midnight — otherwise the daily reset fires at
-        ~20:00 local instead of local midnight for a UTC-offset install
+        timezone), not UTC-midnight — otherwise the daily reset fires at the
+        UTC-midnight instant instead of local midnight on any UTC-offset install
         (see :func:`genesis.util.tz.local_day_boundary`).
 
         Supergroup topic sessions (thread_id set) are persistent — they

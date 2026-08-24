@@ -289,9 +289,10 @@ async def test_check_morning_reset_uses_local_utc_boundary(db, manager, monkeypa
 
     import genesis.util.tz as tz_module
 
-    monkeypatch.setattr(tz_module, "_USER_TZ", ZoneInfo("America/New_York"))
+    # Fixed UTC-4 offset (Etc/GMT+4) — no real location, install-generic.
+    monkeypatch.setattr(tz_module, "_USER_TZ", ZoneInfo("Etc/GMT+4"))
 
-    # now = 2026-08-24 12:00 UTC (08:00 EDT). Local midnight = 2026-08-24 04:00 UTC.
+    # now = 2026-08-24 12:00 UTC (08:00 at UTC-4). Local midnight = 2026-08-24 04:00 UTC.
     now = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
 
     # Background session last-active 02:00 UTC — before the local boundary → stale.
