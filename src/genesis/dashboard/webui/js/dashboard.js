@@ -3694,6 +3694,13 @@
           if (Array.isArray(queues.errors) && queues.errors.length > 0) {
             return { state: "unknown", reason: "some queue counters could not be collected" };
           }
+          // Queue honesty is DEPTH-based by design; a drain-liveness verdict is
+          // intentionally omitted. A dead drainer only harms once work backs up, and
+          // the depth checks above (dead_letters / deferred_recovery / deferred_stuck
+          // / deferred_processing / pending_embeddings) already catch exactly that.
+          // The only durable "drain job" pulse (deferred_work_prune) is a daily 45-day
+          // GC, not the drainer — keying liveness on it would measure the wrong thing
+          // with a ~4-day threshold, buying a false-red vector for zero coverage gain.
           const worklist = queues.deferred_worklist || 0;
           return { state: "healthy", reason: worklist > 0 ? `queues clear — ${worklist} worklist item(s) in flight` : "queues are clear" };
         },
@@ -3727,6 +3734,16 @@
         surplusSemantic() {
           const surplus = this.health.surplus;
           if (!surplus || surplus.status === "unknown") return { state: "unknown", reason: "surplus scheduler data unavailable" };
+          // Fail-LOUD (mirror egoSemantic): if the liveness read itself errored,
+          // `stalled` defaulted to false — surfacing that as healthy would recreate
+          // the exact false-green this instrumentation exists to kill.
+          if (surplus.liveness_error) return { state: "unknown", reason: "surplus liveness data unavailable (read error)" };
+          // Truthful wedged-detector: surplus_dispatch pulses success every ~5 min,
+          // so a stale last_success (past the conservative threshold, and not paused)
+          // means the dispatch loop stopped firing — a genuine fault the idle-proxy
+          // `status` hides (a wedged scheduler reads "idle" → green). Computed
+          // server-side from job_health (observability.liveness).
+          if (surplus.stalled) return { state: "error", reason: `surplus scheduler stalled — ${surplus.stall_reason || "no recent dispatch"}` };
           const failed = surplus.tasks_failed_24h || 0;
           const completed = surplus.tasks_completed_24h || 0;
           if (failed > 0 && completed > 0 && failed / (completed + failed) > 0.2) {

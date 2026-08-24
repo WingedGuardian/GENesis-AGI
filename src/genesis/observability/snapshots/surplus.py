@@ -70,9 +70,50 @@ async def surplus_status(
         except Exception:
             pass
 
+    # Truthful liveness (mirrors routes/ego.py:112-144). surplus_dispatch records
+    # success UNCONDITIONALLY every ~5 min at loop entry, so a stale last_success
+    # means the dispatch loop stopped firing / a dispatch hung — a real fault the
+    # idle-proxy `status` above hides (a wedged scheduler reads "idle" → green).
+    # Computed from job_health INDEPENDENT of the `surplus` handle so the standalone
+    # MCP surface (surplus=None) is not a green hole. Fail-LOUD: any read error, or
+    # an inability to read the pause state (no live runtime), → liveness_error
+    # (dashboard renders `unknown`), NEVER a defaulted-False that reads green while
+    # wedged. `paused` is excluded because a paused loop legitimately skips its
+    # success record (scheduler.py:823 before :835).
+    last_success_at = None
+    stalled = False
+    stall_reason = None
+    liveness_error = False
+    try:
+        if db is None:
+            raise RuntimeError("no db handle — cannot read job_health")
+        from genesis.db.crud.job_health import get_job_last_success
+        from genesis.observability.liveness import compute_pulse_liveness
+        from genesis.runtime._core import GenesisRuntime
+
+        rt = GenesisRuntime.peek()
+        if rt is None:
+            raise RuntimeError("no live runtime — cannot read pause state")
+        interval = getattr(surplus, "_dispatch_interval", 5) if surplus is not None else 5
+        live = compute_pulse_liveness(
+            last_success_at=await get_job_last_success(db, "surplus_dispatch"),
+            expected_interval_minutes=interval,
+            paused=bool(rt.paused),
+        )
+        last_success_at = live.last_success_at
+        stalled = live.stalled
+        stall_reason = live.reason
+    except Exception:
+        logger.debug("surplus liveness computation failed", exc_info=True)
+        liveness_error = True
+
     return {
         "status": status,
         "queue_depth": queue_depth,
         "tasks_completed_24h": tasks_completed_24h,
         "tasks_failed_24h": tasks_failed_24h,
+        "last_success_at": last_success_at,
+        "stalled": stalled,
+        "stall_reason": stall_reason,
+        "liveness_error": liveness_error,
     }

@@ -53,13 +53,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-# Stalled only once the intent→completion lag exceeds this many multiples of the
-# CURRENT (possibly backed-off) interval...
-STALL_INTERVAL_MULTIPLE = 4
-# ...and never before this hard floor, so a transient (a single cycle awaiting a
-# soon-resolving state) never trips. Suppression is handled structurally by the
-# intent signal, so this floor does NOT need to cover quiet-hours windows.
-STALL_FLOOR_MINUTES = 3 * 60
+# The conservative threshold model is shared with compute_pulse_liveness and now
+# lives in the cross-cutting observability layer (ego depends DOWN onto it, never the
+# reverse). Re-exported here so existing `from genesis.ego.liveness import
+# stall_threshold_minutes / STALL_*` imports keep resolving.
+from genesis.observability.liveness import (  # noqa: F401  (re-exported)
+    STALL_FLOOR_MINUTES,
+    STALL_INTERVAL_MULTIPLE,
+    stall_threshold_minutes,
+)
 
 
 @dataclass(frozen=True)
@@ -81,15 +83,6 @@ def _parse(iso: str | None) -> datetime | None:
     except (ValueError, TypeError):
         return None
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
-
-
-def stall_threshold_minutes(current_interval_minutes: float) -> float:
-    """The conservative overdue threshold for a given current interval."""
-    try:
-        interval = float(current_interval_minutes)
-    except (TypeError, ValueError):
-        interval = 0.0
-    return max(interval * STALL_INTERVAL_MULTIPLE, float(STALL_FLOOR_MINUTES))
 
 
 def compute_ego_liveness(
