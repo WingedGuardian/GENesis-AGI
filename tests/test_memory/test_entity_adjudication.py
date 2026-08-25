@@ -489,6 +489,109 @@ async def test_reapprove_not_clobbered_by_readjudication(db):
 
 
 @pytest.mark.asyncio
+async def test_stale_voids_approval_no_silent_reapply(db):
+    """BLOCKER regression: a drifted APPROVED proposal is marked stale AND loses its
+    approval, so it cannot silently re-apply after re-adjudication under norms the
+    human never saw. mark_stale is the only transition that re-opens an approved row."""
+    a = await _mk_entity(db, "john smith", "john smith")
+    b = await _mk_entity(db, "jon smith", "jon smith")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="john smith",
+        norm_b="jon smith",
+    )
+    pk = adj_crud.pair_key(a, b)
+    await adj_crud.approve(db, pair_key=pk, approved_by="jay")
+    # `a` drifts (rename) before apply — still active, so it will re-pair later.
+    await db.execute("UPDATE entities SET norm_name='john q smith' WHERE entity_id=?", (a,))
+    await db.commit()
+
+    counts = await adj.apply_approved_merges(db, budget=10)
+    assert counts["stale"] == 1 and counts["merged"] == 0
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "stale"
+    assert row["approved_at"] is None and row["approved_by"] is None  # approval VOIDED
+
+    # Re-adjudication re-proposes the pair (record_verdict preserves approval if any —
+    # but there is none now, so the re-proposed row is UN-approved).
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="john q smith",
+        norm_b="jon smith",
+    )
+    assert (await adj_crud.get_by_pair(db, a, b))["approved_at"] is None
+    # And it does NOT apply without a fresh human approval.
+    counts2 = await adj.apply_approved_merges(db, budget=10)
+    assert counts2["merged"] == 0
+    assert await _status(db, b) == "active"
+
+
+@pytest.mark.asyncio
+async def test_apply_batch_isolates_failing_row(db, monkeypatch):
+    """A row that raises in merge_entity is rolled back + skipped; other approved rows
+    in the same batch still apply, and the failed row's partial write is discarded."""
+    g1 = await _mk_entity(db, "good a", "good a")
+    g2 = await _mk_entity(db, "good b", "good b")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=g1,
+        entity_b=g2,
+        verdict="proposed_merge",
+        loser_id=g2,
+        survivor_id=g1,
+        norm_a="good a",
+        norm_b="good b",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(g1, g2), approved_by="jay")
+    b1 = await _mk_entity(db, "bad a", "bad a")
+    b2 = await _mk_entity(db, "bad b", "bad b")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=b1,
+        entity_b=b2,
+        verdict="proposed_merge",
+        loser_id=b2,
+        survivor_id=b1,
+        norm_a="bad a",
+        norm_b="bad b",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(b1, b2), approved_by="jay")
+
+    real_merge = entities_crud.merge_entity
+
+    async def _flaky(db_, *, loser_id, survivor_id, _commit=True):
+        if loser_id == b2:  # write a partial row, then raise → must be rolled back
+            await db_.execute(
+                "INSERT INTO entity_mentions "
+                "(memory_id, entity_id, provenance, confidence, source, created_at) "
+                "VALUES ('partial', ?, 'EXTRACTED', 0.9, 's', '2026-01-01T00:00:00+00:00')",
+                (survivor_id,),
+            )
+            raise RuntimeError("boom mid-merge")
+        return await real_merge(db_, loser_id=loser_id, survivor_id=survivor_id, _commit=_commit)
+
+    monkeypatch.setattr(entities_crud, "merge_entity", _flaky)
+
+    counts = await adj.apply_approved_merges(db, budget=10)
+    assert counts["merged"] == 1 and counts.get("errors", 0) == 1
+    assert await _status(db, g2) == "merged"  # good pair applied
+    assert await _status(db, b2) == "active"  # failed pair NOT merged
+    # the failed row's partial mention was rolled back
+    cur = await db.execute("SELECT count(*) FROM entity_mentions WHERE memory_id='partial'")
+    assert (await cur.fetchone())[0] == 0
+
+
+@pytest.mark.asyncio
 async def test_run_observation_emitted_and_user_visible(db):
     from genesis.db.crud.observations import INTERNAL_OBS_TYPES
 

@@ -545,27 +545,43 @@ async def _apply_proposed_backlog(
     """
     proposals = await adj_crud.list_proposed_merges(db, limit=budget, approved_only=True)
     for p in proposals:
-        # A `stale` verdict is not a dead end: the reconcile sweep's dedup set
-        # (settled_pair_keys) excludes stale, so a stale pair is re-enqueued on
-        # the next sweep pass and re-adjudicated with its current identities.
-        ent_a = await _resolve_active(db, p["entity_a"])
-        ent_b = await _resolve_active(db, p["entity_b"])
-        if ent_a is None or ent_b is None or ent_a["entity_id"] == ent_b["entity_id"]:
-            await adj_crud.mark_stale(db, pair_key=p["pair_key"])
-            counts["stale"] += 1
+        # Per-row isolation: one row that raises must not abort the whole approved
+        # batch, and a partial merge_entity transaction must be rolled back so a
+        # later commit (by this loop or a concurrent coroutine on the shared
+        # connection) can't flush it as half-applied corruption. merge_entity
+        # commits on success, so applied rows are already durable; a failure raises
+        # BEFORE its commit, and db.rollback() discards only that partial.
+        try:
+            # A `stale` verdict is not a dead end: the reconcile sweep's dedup set
+            # (settled_pair_keys) excludes stale, so a stale pair is re-enqueued on
+            # the next sweep pass and re-adjudicated with its current identities.
+            # (mark_stale also VOIDS the human approval — the thing they approved
+            # changed, so it must be re-reviewed before it can apply again.)
+            ent_a = await _resolve_active(db, p["entity_a"])
+            ent_b = await _resolve_active(db, p["entity_b"])
+            if ent_a is None or ent_b is None or ent_a["entity_id"] == ent_b["entity_id"]:
+                await adj_crud.mark_stale(db, pair_key=p["pair_key"])
+                counts["stale"] += 1
+                continue
+            # norm_name drift → the thing we judged is not the thing we'd merge now.
+            if ent_a["norm_name"] != p.get("norm_a") or ent_b["norm_name"] != p.get("norm_b"):
+                await adj_crud.mark_stale(db, pair_key=p["pair_key"])
+                counts["stale"] += 1
+                continue
+            survivor_id, loser_id = await _pick_survivor(db, ent_a, ent_b)
+            await entities_crud.merge_entity(db, loser_id=loser_id, survivor_id=survivor_id)
+            await adj_crud.mark_applied(
+                db, pair_key=p["pair_key"], loser_id=loser_id, survivor_id=survivor_id
+            )
+            counts["merged"] += 1
+            _note_merge(example_merges, ent_a, ent_b)
+        except Exception:
+            logger.exception(
+                "entity apply row failed, rolling back partial merge: %s", p.get("pair_key")
+            )
+            await db.rollback()
+            counts["errors"] = counts.get("errors", 0) + 1
             continue
-        # norm_name drift → the thing we judged is not the thing we'd merge now.
-        if ent_a["norm_name"] != p.get("norm_a") or ent_b["norm_name"] != p.get("norm_b"):
-            await adj_crud.mark_stale(db, pair_key=p["pair_key"])
-            counts["stale"] += 1
-            continue
-        survivor_id, loser_id = await _pick_survivor(db, ent_a, ent_b)
-        await entities_crud.merge_entity(db, loser_id=loser_id, survivor_id=survivor_id)
-        await adj_crud.mark_applied(
-            db, pair_key=p["pair_key"], loser_id=loser_id, survivor_id=survivor_id
-        )
-        counts["merged"] += 1
-        _note_merge(example_merges, ent_a, ent_b)
 
 
 async def apply_approved_merges(db: aiosqlite.Connection, *, budget: int = 50) -> dict[str, int]:

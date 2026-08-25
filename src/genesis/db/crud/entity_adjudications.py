@@ -262,9 +262,18 @@ async def mark_applied(
 
 
 async def mark_stale(db: aiosqlite.Connection, *, pair_key: str, _commit: bool = True) -> None:
-    """Mark a proposal that no longer holds (one side merged/renamed/gone)."""
+    """Mark a proposal that no longer holds (one side merged/renamed/gone).
+
+    VOIDS any human approval. ``stale`` is the ONLY transition that re-opens an
+    approved row for re-proposal (the sweep excludes stale from settled_pair_keys,
+    and record_verdict deliberately preserves approved_at on re-adjudication). So if
+    stale kept the approval, a merge approved under identity-state v1 would silently
+    re-apply under drifted identity-state v2 that the human never saw — defeating the
+    gate. Staleness means "the thing you approved changed": the approval must not survive.
+    """
     await db.execute(
-        "UPDATE entity_adjudications SET verdict = 'stale' WHERE pair_key = ?",
+        "UPDATE entity_adjudications SET verdict = 'stale', "
+        "approved_at = NULL, approved_by = NULL WHERE pair_key = ?",
         (pair_key,),
     )
     if _commit:
