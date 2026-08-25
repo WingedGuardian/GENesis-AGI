@@ -294,12 +294,22 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
 
     Command-position tokens (`then`/`do`/`!`/`(`/`{` …) can wrap a command inside
     a control structure or subshell; a leading `(` may be GLUED to the command
-    (`(git`). Reserved words are stripped ONLY at true command position: once a
-    wrapper (`sudo`/`env`/…) or a `VAR=x` assignment has been consumed, a
-    following reserved word is the command NAME (`command if …` runs `if`; `X=1
-    then …` runs `then`), so stripping stops. A leading `(` may nest (`( (cmd) )`
-    spaced); its matching trailing `)` closers (as many as `(` openers consumed)
-    are peeled off the operand(s) carrying the close.
+    (`(git`). Reserved words are stripped UNCONDITIONALLY at the front so the real
+    command is revealed through any control wrapper (`time ! git push`,
+    `if git push; then …`, `until git push; do …` all resolve to `git push`). A
+    leading `(` may nest (`( (cmd) )` spaced); its matching trailing `)` closers
+    (as many as `(` openers consumed) are peeled off the operand(s) carrying the
+    close.
+
+    Accepted SAFE-DIRECTION residual: a reserved word that is genuinely a command
+    NAME rather than a control keyword (`command if git push` — `command` runs an
+    executable literally named `if`) is still stripped, so analyze() over-resolves
+    to `git push` and the push gate fires on a push bash would not actually run.
+    That is an OVER-gate (a spurious block of an exotic, near-never-typed form),
+    never a MISS — the monotonic-safe direction. Modelling wrapper-vs-keyword
+    precisely was tried (round-2 `wrapper_consumed`) and REMOVED: it turned the
+    over-gate into a real false-negative (`time ! git push` → exe `!` → push gate
+    MISS), which is the unsafe direction. #1457 round-3.
 
     Redirection syntax is deliberately NOT touched here: this resolver feeds
     flag/value parsers (`git_subcommand`, `gh_pr_subcommand`, `commit_skips_hooks`)
@@ -323,7 +333,6 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         return []  # `((…))` arithmetic evaluation — no external command runs
     i = 0
     open_parens = 0
-    wrapper_consumed = False  # a wrapper/VAR= turns a following reserved word into a name
     while i < len(argv):
         tok = argv[i]
         if tok.startswith("("):  # subshell opener, bare `( git` or glued `(git`
@@ -333,17 +342,15 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
             else:
                 argv[i] = tok[1:]  # "(git" -> "git"; reprocess (token strictly shrinks)
             continue
-        if tok in _CMD_POSITION_WORDS and not wrapper_consumed:
+        if tok in _CMD_POSITION_WORDS:
             i += 1  # reserved word / brace-group opener at command position
             continue
         if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
             i += 1  # leading VAR=value assignment
-            wrapper_consumed = True
             continue
         spec = _WRAPPER_SPEC.get(_basename(tok))
         if spec is None:
             break
-        wrapper_consumed = True
         argflags, positional = spec
         i += 1
         # consume the wrapper's own value-flags and leading positional args
@@ -372,7 +379,8 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         # subshell close — up to the number of `(` openers consumed, scanning from
         # the end (a redirection can follow the closer: `(rm -rf /x) 2>/dev/null`).
         # A redirect target that itself ends in `)` (`(cmd) > 'log)'`) is a rare
-        # form a POSITIONAL consumer resolves safe-direction via strip_redirections.
+        # form a POSITIONAL consumer resolves safe-direction via its own local
+        # redirection skip (protected_paths/destructive `_REDIR_TOKEN`).
         remaining = open_parens
         j = len(result) - 1
         while remaining > 0 and j >= 0:

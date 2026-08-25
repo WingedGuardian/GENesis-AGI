@@ -357,12 +357,14 @@ class TestCommandPositionStrip:
 
 
 class TestCleanArgvHardening:
-    """Round-2: the revealed argv is CLEAN — arithmetic runs nothing, count-matched
-    subshell closers are peeled, and a control word after a wrapper is the command
-    name. All changes are safe-direction (they remove an over-block/over-gate); a
-    real git/gh/rm is never hidden. (Redirection cleanup is NOT done in analyze —
-    it is a positional-consumer concern handled locally in full_suite_guard; see
-    TestGateDesyncProtection here + the redirection tests in test_full_suite_guard.)"""
+    """Round-2/3: the revealed argv is CLEAN — arithmetic `((…))` runs nothing and
+    count-matched subshell closers are peeled. Control words strip UNCONDITIONALLY
+    (round-1 behavior), so a control wrapper can only ever OVER-gate (safe), never
+    hide a real git/gh/rm. (The round-2 `wrapper_consumed` refinement was reverted
+    in round-3 — it turned the safe over-gate into a real false-negative on
+    `time ! git push`; see test_control_word_after_wrapper_over_gates_safe and the
+    F6 regression lock below.) Redirection cleanup is NOT done in analyze — it would
+    desync the git/gh/commit flag/value gates; see TestGateDesyncProtection."""
 
     def _detects(self, cmd: str, exe: str, sub: str | None = None) -> bool:
         for s in sp.analyze(cmd):
@@ -397,9 +399,9 @@ class TestCleanArgvHardening:
         assert self._detects("(( $(rm -rf /) ))", "rm")
 
     # NOTE: analyze() does NOT strip redirections — that would desync the
-    # git/gh/commit flag/value gates (see TestGateDesyncProtection). Redirection
-    # cleanup is a POSITIONAL-consumer concern, handled locally inside
-    # full_suite_guard's arg walk (see test_full_suite_guard.py).
+    # git/gh/commit flag/value gates (see TestGateDesyncProtection). Redirection is
+    # left in the argv; a consumer that reads POSITIONALS (protected_paths,
+    # destructive) skips it LOCALLY, after its own flag/value handling.
 
     # ── process substitution is left intact by analyze ───────────────────
     def test_process_substitution_not_stripped(self):
@@ -412,18 +414,40 @@ class TestCleanArgvHardening:
         seg = sp.analyze("( (pytest tests/x.py) )")[0]
         assert seg.exe == "pytest" and seg.argv == ["pytest", "tests/x.py"]
 
-    # ── control word after a wrapper is the command NAME ─────────────────
-    def test_control_word_after_wrapper_is_name(self):
-        # `command if git push` runs a program literally named `if`; NOT git push
-        assert not self._detects("command if git push", "git", "push")
+    # ── control words strip UNCONDITIONALLY → safe OVER-gate, never a MISS ──
+    def test_control_word_after_wrapper_over_gates_safe(self):
+        # `command if git push` runs a program literally named `if` (NOT git push),
+        # but we strip `if` and gate the push anyway. That is an OVER-gate on an
+        # exotic form — the SAFE direction. Modelling wrapper-vs-keyword precisely
+        # (round-2 `wrapper_consumed`) was reverted because it MISSED `time ! git
+        # push`; over-gating this near-never-typed form is the acceptable cost.
+        assert self._detects("command if git push", "git", "push")
 
     def test_control_word_at_position_still_strips(self):
         # a bare `if <cmd>` — the condition IS the command — still resolves through
         assert self._detects("if git diff --quiet", "git", "diff")
 
-    def test_var_assignment_then_keyword_is_name(self):
-        # `X=1 then git push` — assignment then run a program named `then`
-        assert not self._detects("X=1 then git push", "git", "push")
+    def test_var_assignment_then_keyword_over_gates_safe(self):
+        # `X=1 then git push` — assignment then a word that MAY be a command name;
+        # we strip `then` and gate the push (safe over-gate, same rationale).
+        assert self._detects("X=1 then git push", "git", "push")
+
+    # ── F6 REGRESSION LOCK: control wrappers must DETECT the real git push ──
+    # These are the exact round-2 false-negatives (`wrapper_consumed` resolved exe
+    # to `!`/`if` → push gate MISS). Bash actually runs `git push` in every one
+    # (`time`/`command` are wrappers; `!` negates; `if`/`then` front the command),
+    # so a MISS here is a real security regression. Pins the revert; forbids any
+    # future re-introduction of a wrapper-position flag from regressing it.
+    def test_f6_control_wrappers_detect_git_push(self):
+        for cmd in (
+            "time ! git push",
+            "time if git push",
+            "command if git push",
+            "X=1 then git push",
+            "! git push",
+            "if git push",
+        ):
+            assert self._detects(cmd, "git", "push"), f"MISSED git push in: {cmd!r}"
 
     # ── MONOTONICITY: real danger is never hidden by any strip ───────────
     def test_monotonic_protected_target_survives(self):
