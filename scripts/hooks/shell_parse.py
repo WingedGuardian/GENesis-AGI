@@ -290,43 +290,60 @@ def _basename(token: str) -> str:
 def _strip_wrappers(argv: list[str]) -> list[str]:
     """Drop leading shell command-position tokens, env-assignments (VAR=x), and
     wrapper commands (sudo/env/…) so the returned argv[0] is the ACTUAL executed
-    command.
+    command, and peel the matching subshell-close `)` off the revealed argv.
 
     Command-position tokens (`then`/`do`/`!`/`(`/`{` …) can wrap a command inside
     a control structure or subshell; a leading `(` may be GLUED to the command
-    (`(git`). When a leading `(` is stripped, one balancing trailing `)` is
-    stripped off the last token so a path/operand consumer sees the real value
-    (`(rm -rf ~/x)` → operand `~/x`, not `~/x)`). ``env``/``sudo`` may be
-    followed by their own ``VAR=x`` and flags before the real command.
+    (`(git`). Reserved words are stripped ONLY at true command position: once a
+    wrapper (`sudo`/`env`/…) or a `VAR=x` assignment has been consumed, a
+    following reserved word is the command NAME (`command if …` runs `if`; `X=1
+    then …` runs `then`), so stripping stops. A leading `(` may nest (`( (cmd) )`
+    spaced); its matching trailing `)` closers (as many as `(` openers consumed)
+    are peeled off the operand(s) carrying the close.
 
-    Over-match-safe / MONOTONIC: the command-position and `(` branches fire ONLY
-    when argv[0] is a control token / `(`-prefixed, so a normal command
-    (argv[0] ∈ {git, gh, rm, …}) falls straight through and is returned
-    byte-for-byte unchanged — the strip can only REVEAL a hidden command, never
-    hide a caught one. (`((…))` is bash ARITHMETIC, not command execution, so a
-    single balancing closer is sufficient.)
+    Redirection syntax is deliberately NOT touched here: this resolver feeds
+    flag/value parsers (`git_subcommand`, `gh_pr_subcommand`, `commit_skips_hooks`)
+    and dropping a token would shift positions and let a value-flag swallow the
+    real gated token (a fail-closed-gate bypass — #1457 round-2). A consumer that
+    reads POSITIONALS skips redirections LOCALLY, inside its own walk and AFTER its
+    own flag/value handling (full_suite_guard, protected_paths, destructive each do)
+    — never as a pre-pass, which would recreate the same desync.
+
+    Safe-direction / MONOTONIC for security: the arithmetic, command-position and
+    `(` branches fire ONLY when argv[0] is `((`-prefixed / a control token /
+    `(`-prefixed, so a normal command (argv[0] ∈ {git, gh, rm, …}) resolves to the
+    same exe and the same argv and is returned byte-for-byte unchanged — the strip
+    can REVEAL a hidden command but never hide a caught one. `((…))` is bash
+    ARITHMETIC evaluation, which runs NO external command, so its outer segment
+    resolves to nothing (a command hidden in a `$(…)` inside it still surfaces via
+    analyze()'s separate substitution path).
     """
-    argv = list(argv)  # local copy — we may rebind a glued `(token` / strip a closer
+    argv = list(argv)  # local copy — we may rebind a glued `(token` / strip closers
+    if argv and argv[0].startswith("(("):
+        return []  # `((…))` arithmetic evaluation — no external command runs
     i = 0
-    stripped_open_paren = False
+    open_parens = 0
+    wrapper_consumed = False  # a wrapper/VAR= turns a following reserved word into a name
     while i < len(argv):
         tok = argv[i]
-        if tok.startswith("("):  # subshell opener, bare `( git` or glued `(git`/`((git`
-            stripped_open_paren = True
+        if tok.startswith("("):  # subshell opener, bare `( git` or glued `(git`
+            open_parens += 1
             if tok == "(":
                 i += 1
             else:
                 argv[i] = tok[1:]  # "(git" -> "git"; reprocess (token strictly shrinks)
             continue
-        if tok in _CMD_POSITION_WORDS:  # reserved word / brace-group opener at cmd position
-            i += 1
+        if tok in _CMD_POSITION_WORDS and not wrapper_consumed:
+            i += 1  # reserved word / brace-group opener at command position
             continue
         if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
             i += 1  # leading VAR=value assignment
+            wrapper_consumed = True
             continue
         spec = _WRAPPER_SPEC.get(_basename(tok))
         if spec is None:
             break
+        wrapper_consumed = True
         argflags, positional = spec
         i += 1
         # consume the wrapper's own value-flags and leading positional args
@@ -349,20 +366,25 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
                 i += 1
                 continue
             break  # this bare word is the wrapped command
-    result = argv[i:]
-    if stripped_open_paren and result:
-        # Strip ONE balancing trailing `)` off the token that carries the subshell
-        # close. It is not always the LAST token — a redirection can follow the
-        # closer (`(rm -rf /x) 2>/dev/null` → the `)` is glued to `/x`), so scan
-        # from the end for the first `)`-bearing token so the revealed argv stays
-        # clean for a consumer that reads the operand value.
-        for j in range(len(result) - 1, -1, -1):
-            if result[j].endswith(")"):
-                if result[j] == ")":
-                    del result[j]
-                else:
-                    result[j] = result[j][:-1]
-                break
+    result = list(argv[i:])  # redirections are NOT stripped here (see docstring)
+    if open_parens and result:
+        # Peel matching trailing `)` closers off the operand(s) carrying the
+        # subshell close — up to the number of `(` openers consumed, scanning from
+        # the end (a redirection can follow the closer: `(rm -rf /x) 2>/dev/null`).
+        # A redirect target that itself ends in `)` (`(cmd) > 'log)'`) is a rare
+        # form a POSITIONAL consumer resolves safe-direction via strip_redirections.
+        remaining = open_parens
+        j = len(result) - 1
+        while remaining > 0 and j >= 0:
+            if result[j] == ")":
+                del result[j]
+                remaining -= 1
+                j -= 1
+            elif result[j].endswith(")"):
+                result[j] = result[j][:-1]
+                remaining -= 1  # stay on j — the token may carry another glued `)`
+            else:
+                j -= 1
     return result
 
 

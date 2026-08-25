@@ -78,6 +78,36 @@ class TestTargetsSpecificTest:
         # a -k/-m selector narrows the run even when a directory is present
         assert _mod._targets_specific_test(["tests/", "-k", "test_bar"])
 
+    # ── redirections are stripped locally so they don't read as directories ──
+    def test_bare_redirection_after_file_targeted(self):
+        # `pytest foo.py > log` — the `> log` is a redirection, not a dir target
+        assert _mod._targets_specific_test(["tests/foo.py", ">", "log"])
+
+    def test_glued_redirection_after_file_targeted(self):
+        assert _mod._targets_specific_test(["tests/foo.py", "2>/dev/null"])
+        assert _mod._targets_specific_test(["tests/foo.py", ">", "log", "2>&1"])
+
+    def test_redirection_does_not_rescue_whole_dir(self):
+        # a redirection must not turn a whole-directory run into a targeted one
+        assert not _mod._targets_specific_test(["tests/", ">", "log"])
+
+    # ── value-flag desync guard: a `<`/`>`-leading flag VALUE must NOT be treated
+    #    as a redirection (that would let the flag swallow a following directory —
+    #    an under-block; #1457 round-2, caught by the architect re-review) ──
+    def test_value_flag_angle_value_does_not_swallow_dir(self):
+        # `-p '<x>' tests/ tests/foo.py` runs the whole tests/ dir → MUST block
+        assert not _mod._targets_specific_test(["-p", "<x>", "tests/", "tests/foo.py"])
+        assert not _mod._targets_specific_test(["-o", "<x>", "tests/"])
+        assert not _mod._targets_specific_test(["--rootdir", ">x", "tests/", "tests/foo.py"])
+
+    def test_value_flag_angle_value_then_file_targeted(self):
+        # only a file after the consumed `<`-value → still a targeted run (allow)
+        assert _mod._targets_specific_test(["-p", "<x>", "tests/foo.py"])
+
+    def test_value_flag_normal_value_with_trailing_redirection(self):
+        # normal plugin value AND a redirection together still resolve correctly
+        assert _mod._targets_specific_test(["-p", "no:cacheprovider", "tests/foo.py", ">", "log"])
+
 
 def _run_guard(command: str) -> subprocess.CompletedProcess:
     payload = json.dumps({"tool_input": {"command": command}, "tool_name": "Bash"})
@@ -119,6 +149,18 @@ class TestEndToEnd:
 
     def test_file_after_value_flag_allowed(self):
         assert _run_guard("python -m pytest -p no:cacheprovider tests/foo.py").returncode == 0
+
+    def test_targeted_file_with_redirection_allowed(self):
+        # F4: a targeted run with output redirection must not be blocked
+        assert _run_guard("pytest tests/foo/test_bar.py > /tmp/log").returncode == 0
+        assert _run_guard("pytest tests/foo/test_bar.py 2>/dev/null").returncode == 0
+
+    def test_grouped_targeted_with_redirection_allowed(self):
+        # control-position resolution + local redir strip: `(pytest file) > log`
+        assert _run_guard("(pytest tests/foo/test_bar.py) > /tmp/log").returncode == 0
+
+    def test_whole_dir_with_redirection_still_blocks(self):
+        assert _run_guard("pytest tests/ > /tmp/log").returncode == 2
 
     # --- override + non-pytest ---
     def test_override_allows_dir_run(self):

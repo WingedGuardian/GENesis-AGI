@@ -354,3 +354,113 @@ class TestCommandPositionStrip:
         # a real git command whose ARG looks like a keyword is unaffected
         seg = sp.analyze("git checkout then")[0]
         assert seg.exe == "git" and sp.git_subcommand(seg.argv) == "checkout"
+
+
+class TestCleanArgvHardening:
+    """Round-2: the revealed argv is CLEAN — arithmetic runs nothing, count-matched
+    subshell closers are peeled, and a control word after a wrapper is the command
+    name. All changes are safe-direction (they remove an over-block/over-gate); a
+    real git/gh/rm is never hidden. (Redirection cleanup is NOT done in analyze —
+    it is a positional-consumer concern handled locally in full_suite_guard; see
+    TestGateDesyncProtection here + the redirection tests in test_full_suite_guard.)"""
+
+    def _detects(self, cmd: str, exe: str, sub: str | None = None) -> bool:
+        for s in sp.analyze(cmd):
+            if s.exe != exe:
+                continue
+            if sub is None:
+                return True
+            if exe == "git" and sp.git_subcommand(s.argv) == sub:
+                return True
+            if exe == "gh" and sp.gh_pr_subcommand(s.argv) == sub:
+                return True
+        return False
+
+    # ── arithmetic `((…))` executes NO external command ──────────────────
+    def test_arith_double_paren_runs_nothing(self):
+        # `((rm -rf / 1))` is arithmetic evaluation, not a subshell rm
+        assert not self._detects("((rm -rf / 1))", "rm")
+
+    def test_arith_increment_no_exe(self):
+        segs = sp.analyze("((i++))")
+        assert segs and segs[0].exe == ""
+
+    def test_arith_glued_git_not_gated(self):
+        # `((git push))` evaluates `git`,`push` as arith variables — no push runs
+        assert not self._detects("((git push))", "git", "push")
+
+    def test_arith_with_command_sub_STILL_surfaces_inner(self):
+        # MONOTONICITY: a real command hidden in $(…) inside arithmetic must NOT
+        # be hidden by the arithmetic early-return — it surfaces via analyze()'s
+        # separate substitution path (at depth>0).
+        assert self._detects("(( $(git push --force) ))", "git", "push")
+        assert self._detects("(( $(rm -rf /) ))", "rm")
+
+    # NOTE: analyze() does NOT strip redirections — that would desync the
+    # git/gh/commit flag/value gates (see TestGateDesyncProtection). Redirection
+    # cleanup is a POSITIONAL-consumer concern, handled locally inside
+    # full_suite_guard's arg walk (see test_full_suite_guard.py).
+
+    # ── process substitution is left intact by analyze ───────────────────
+    def test_process_substitution_not_stripped(self):
+        seg = sp.analyze("diff <(cat a) b")[0]
+        assert seg.exe == "diff"
+        assert any(t.startswith("<(") for t in seg.argv)  # procsub token preserved
+
+    # ── count-matched trailing closer (nested groups) ────────────────────
+    def test_nested_group_closer_fully_stripped(self):
+        seg = sp.analyze("( (pytest tests/x.py) )")[0]
+        assert seg.exe == "pytest" and seg.argv == ["pytest", "tests/x.py"]
+
+    # ── control word after a wrapper is the command NAME ─────────────────
+    def test_control_word_after_wrapper_is_name(self):
+        # `command if git push` runs a program literally named `if`; NOT git push
+        assert not self._detects("command if git push", "git", "push")
+
+    def test_control_word_at_position_still_strips(self):
+        # a bare `if <cmd>` — the condition IS the command — still resolves through
+        assert self._detects("if git diff --quiet", "git", "diff")
+
+    def test_var_assignment_then_keyword_is_name(self):
+        # `X=1 then git push` — assignment then run a program named `then`
+        assert not self._detects("X=1 then git push", "git", "push")
+
+    # ── MONOTONICITY: real danger is never hidden by any strip ───────────
+    def test_monotonic_protected_target_survives(self):
+        seg = sp.analyze("(rm -rf ~/protected)")[0]
+        assert seg.exe == "rm" and "~/protected" in seg.argv
+
+    def test_monotonic_redir_does_not_hide_target(self):
+        # `rm -rf / > log` — analyze leaves the redirection in place, so the `/`
+        # danger token stays visible to the guard (redirs never hide a target)
+        seg = sp.analyze("rm -rf / > log")[0]
+        assert seg.exe == "rm" and "/" in seg.argv
+
+    def test_monotonic_clean_through_control(self):
+        assert self._detects("(git clean -f)", "git", "clean")
+        assert self._detects("then git clean -f", "git", "clean")
+
+
+class TestGateDesyncProtection:
+    """The reason redirection stripping is NOT in the shared resolver: shlex drops
+    quotes, so a quoted flag VALUE beginning with `<`/`>` must NOT desync the
+    git/gh/commit flag/value gates. Each gate accessor must be IDENTICAL for a
+    `<`-leading value and a plain value (found + fixed on #1457 round-2)."""
+
+    def test_commit_no_verify_gate_not_desynced(self):
+        # a message beginning with `<` must not let `-m` swallow --no-verify
+        nv = "--no" + "-verify"
+        plain = sp.analyze(f"git commit -m msg {nv}")[0].argv
+        angle = sp.analyze(f"git commit -m <x> {nv}")[0].argv
+        assert sp.commit_skips_hooks(plain) is True
+        assert sp.commit_skips_hooks(angle) is True  # NOT desynced to False
+
+    def test_git_subcommand_not_desynced(self):
+        # `git -C <dir> push` — the `-C` value must not swallow `push`
+        assert sp.git_subcommand(sp.analyze("git -C dir push")[0].argv) == "push"
+        assert sp.git_subcommand(sp.analyze("git -C <dir> push")[0].argv) == "push"
+
+    def test_gh_pr_subcommand_not_desynced(self):
+        # `gh pr -R <o/r> merge 5` — the `-R` value must not swallow `merge`
+        assert sp.gh_pr_subcommand(sp.analyze("gh pr -R o/r merge 5")[0].argv) == "merge"
+        assert sp.gh_pr_subcommand(sp.analyze("gh pr -R <o/r> merge 5")[0].argv) == "merge"

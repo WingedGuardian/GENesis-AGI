@@ -23,6 +23,7 @@ Blocked:
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 # Self-locate so the sibling imports resolve whether CC runs this as a script or
@@ -57,6 +58,13 @@ _VALUE_FLAGS = {
     "-n",
 }
 
+# Redirection operator prefix (optionally fd-/`&`-prefixed). Matched INSIDE the
+# arg walk, AFTER value-flag consumption, so a flag's `<`/`>`-value is never
+# mistaken for a redirect and its following token is not swallowed (a pre-pass
+# strip would — an under-block; found on #1457 round-2). A bare operator consumes
+# the next token as its target; a glued operator is standalone.
+_REDIR = re.compile(r"^(?:\d+|&)?(?:>>|>\||>&|<<<|<<|<>|<&|<|>)")
+
 
 def _pytest_args(seg: Segment) -> list[str]:
     """Positional+flag args AFTER the pytest command word (entrypoint stripped)."""
@@ -76,6 +84,11 @@ def _targets_specific_test(args: list[str]) -> bool:
     Targeted = a -k/-m/--pyargs selector, OR at least one specific .py file/nodeid
     and NO bare-directory positional. A file mixed with a directory
     (``pytest tests/foo.py tests/``) still runs the whole directory, so it blocks.
+
+    A redirection (``pytest foo.py > log``) is not a directory positional; it is
+    skipped INSIDE this walk, AFTER value-flag consumption, so a flag whose value
+    begins with ``<``/``>`` is not mistaken for a redirect (a pre-pass strip would
+    then swallow the following directory — an under-block; found on #1457 round-2).
     """
     has_selector = False
     has_file = False
@@ -92,6 +105,13 @@ def _targets_specific_test(args: list[str]) -> bool:
                 continue
             i += 1
             continue
+        # A redirection operator/target is not a test path. Process substitution
+        # (`<(…)` / `>(…)`) is NOT a redirection — leave it as a positional.
+        if not arg.startswith(("<(", ">(")):
+            m = _REDIR.match(arg)
+            if m:
+                i += 2 if arg == m.group(0) else 1  # bare op: skip its target too
+                continue
         # A real .py file or nodeid — NOT a mere substring, so a directory like
         # tests/.pytest_cache/ or foo.python_stuff/ counts as a directory, not a file.
         if arg.endswith(".py") or ".py::" in arg:
