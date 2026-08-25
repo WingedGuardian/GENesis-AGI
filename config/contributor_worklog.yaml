@@ -46,6 +46,10 @@ max_held: 25
 # missing key, or any other value keeps human approval ON. This is a POSTURE flag,
 # NOT the stop switch: the stop is `mode: off` / GENESIS_CONTRIBUTOR_WORKLOG_DISABLED
 # (which freezes the drain, including already-approved held rows).
+# OVERLAY-ONLY: this key is deliberately NOT accepted by settings_update() or the
+# dashboard — disabling an approval gate on irreversible public posting must be a
+# conscious edit of the gitignored ~/.genesis/config/contributor_worklog.local.yaml
+# overlay, never a single unconfirmed API/dashboard call.
 require_approval: true
 
 # Cautious-rollout rate cap: the maximum number of issues the drain will actually

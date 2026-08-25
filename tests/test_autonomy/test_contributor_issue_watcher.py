@@ -461,6 +461,64 @@ async def test_adopt_not_blocked_by_cap(db, monkeypatch):
     assert row["issue_number"] == 7  # adopted the existing issue despite the cap
 
 
+@pytest.mark.asyncio
+async def test_adopt_old_issue_does_not_consume_cap(db, monkeypatch):
+    """Codex P2: adopting an OLD/human-made issue stamps ITS creation time as
+    posted_at, so it does NOT burn a daily-cap slot — only issues created in the
+    window count. Here an old adopt + a real create both resolve under cap=1."""
+    _mode(monkeypatch, "live")
+    _cap(monkeypatch, 1)
+    old = "2020-01-01T00:00:00Z"
+    existing = json.dumps(
+        [
+            {
+                "number": 7,
+                "title": "old adopt",
+                "url": f"https://github.com/{_REPO}/issues/7",
+                "createdAt": old,
+            }
+        ]
+    )
+    gh = _FakeGh(list_out=existing)
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    pid1, rid1, mgr = await _seed_held(db, title="old adopt", mode="live")
+    await mgr.resolve(rid1, status="approved")
+    pid2, rid2, _ = await _seed_held(db, title="a real new post", mode="live")
+    await mgr.resolve(rid2, status="approved")
+
+    n = await ciw.drain_pending_issue_posts(_RT(db))
+    assert n == 2  # both resolve
+    row1 = await pip.get_by_id(db, pid1)
+    assert row1["status"] == "posted"
+    # adopt stamped the OLD creation time (normalized Z -> +00:00), so it's out of window
+    assert row1["posted_at"].startswith("2020-01-01T00:00:00")
+    row2 = await pip.get_by_id(db, pid2)
+    assert row2["status"] == "posted"  # the real create was NOT deferred by the adopt
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_recheck_halts_mid_tick(db, monkeypatch):
+    """Codex P2: a mode flip to off DURING a tick halts the create — the mode is
+    re-read live immediately before the external create, not just once per tick."""
+    calls = {"n": 0}
+
+    def _flip():
+        calls["n"] += 1
+        return "live" if calls["n"] == 1 else "off"  # live at drain top, off at pre-create recheck
+
+    monkeypatch.setattr(ciw, "effective_mode", _flip)
+    _cap(monkeypatch, 5)
+    gh = _FakeGh(list_out="[]")
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    pid, rid, mgr = await _seed_held(db, mode="live")
+    await mgr.resolve(rid, status="approved")
+
+    n = await ciw.drain_pending_issue_posts(_RT(db))
+    assert n == 0
+    assert not gh.created()  # create halted by the mid-tick kill
+    assert (await pip.get_by_id(db, pid))["status"] == "held"  # left held → retries when live
+
+
 # ── end-to-end: propose (auto-approve) → drain (post), no human ─────────────
 
 
@@ -480,6 +538,10 @@ async def test_e2e_autoapprove_then_drain_posts(db, tmp_path, monkeypatch):
     monkeypatch.setattr(ci, "effective_mode", lambda: "live")
     monkeypatch.setattr(ci, "load_config", lambda: {"max_held": 25})
     monkeypatch.setattr(ci, "require_approval", lambda: False)
+    # Install-agnostic: the autonomous pin calls _default_repo(); on a fresh clone
+    # (no github config) that returns a bare name and would error. Pin it to _REPO so
+    # the test exercises the post path, not the empty-config edge (covered elsewhere).
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)
     res = await ci._impl_contributor_issue_propose(
         db, title="Autonomous newcomer task", body="A clean, public-safe task.", repo=_REPO
     )

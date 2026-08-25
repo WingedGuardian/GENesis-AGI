@@ -146,6 +146,11 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         config_filename="contributor_worklog.yaml",
         readonly=False,
         needs_restart=False,  # drain re-reads each tick
+        # require_approval is overlay-only (the validator rejects it): strip it from
+        # the settings GET too, so a whole-config dashboard PUT can never echo it back
+        # and 422 the entire save. Disabling this approval gate must be a deliberate
+        # overlay-file edit, never a UI round-trip.
+        hidden_fields=frozenset({"require_approval"}),
     ),
     "memory_integrity": SettingsDomain(
         name="memory_integrity",
@@ -1314,7 +1319,12 @@ def _validate_contributor_worklog(changes: dict) -> list[str]:
     from genesis.autonomy.contributor_worklog_config import _INT_KNOBS, MODES
 
     errors: list[str] = []
-    _BOOL_KEYS = ("enabled", "require_approval")
+    _BOOL_KEYS = ("enabled",)
+    # NOTE: `require_approval` is DELIBERATELY not settings-writable. It disables an
+    # approval gate on irreversible public posting, so flipping it must be a
+    # conscious config-file edit (the gitignored ~/.genesis overlay), never a single
+    # unconfirmed settings_update() / dashboard PUT. Rejecting it here (as an unknown
+    # key) closes both mutation paths; the overlay is read directly by require_approval().
     valid_keys = (*_BOOL_KEYS, "mode", *_INT_KNOBS)
     for key, value in changes.items():
         if key not in valid_keys:

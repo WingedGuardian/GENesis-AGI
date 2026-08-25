@@ -18,8 +18,9 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   surfaces as an approval request). A cautious-rollout `max_posts_per_day` cap
   limits how many issues post per rolling 24h, so a bad batch surfaces one at a
   time rather than all at once; `mode: off` (or `GENESIS_CONTRIBUTOR_WORKLOG_DISABLED`)
-  stops posting instantly and freezes the queue. Ships SAFE — `require_approval`
-  defaults true, so a fresh install still requires human approval before any post.
+  halts posting — re-checked immediately before each create — and freezes the queue.
+  Ships SAFE — `require_approval` defaults true, and it is overlay-file-only (not a
+  one-call settings/dashboard toggle), so a fresh install always requires human approval.
 
 ### Fixed
 

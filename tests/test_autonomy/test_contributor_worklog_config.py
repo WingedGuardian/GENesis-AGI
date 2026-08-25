@@ -209,14 +209,27 @@ def test_domain_registered():
     assert "contributor_worklog" in _DOMAIN_VALIDATORS
 
 
+def test_require_approval_is_hidden_and_not_writable():
+    """SECURITY guard (not cosmetic): `require_approval` must be BOTH stripped from the
+    settings GET (`hidden_fields`, so a whole-config dashboard PUT can't echo it back)
+    AND rejected by the validator (so no unconfirmed settings_update/PUT can disable the
+    approval gate). Disabling it is an overlay-FILE-only act. A refactor that treats
+    hidden_fields as UI-cosmetic — or re-adds the key to the writable set — fails here."""
+    d = _DOMAIN_REGISTRY["contributor_worklog"]
+    assert "require_approval" in d.hidden_fields  # GET-strip
+    assert _validate_contributor_worklog(
+        {"require_approval": False}
+    )  # PUT-reject (non-empty errors)
+    assert _validate_contributor_worklog({"require_approval": True})
+
+
 def test_validator_accepts_valid_changes():
     assert _validate_contributor_worklog({"enabled": False}) == []
     assert _validate_contributor_worklog({"mode": "off"}) == []
     assert _validate_contributor_worklog({"mode": "propose_only"}) == []
     assert _validate_contributor_worklog({"mode": "live"}) == []
     assert _validate_contributor_worklog({"retention_days": 60, "max_held": 5}) == []
-    assert _validate_contributor_worklog({"require_approval": False}) == []
-    assert _validate_contributor_worklog({"require_approval": True, "max_posts_per_day": 3}) == []
+    assert _validate_contributor_worklog({"max_posts_per_day": 3}) == []
 
 
 def test_validator_rejects_bad_values():
@@ -225,9 +238,16 @@ def test_validator_rejects_bad_values():
     assert _validate_contributor_worklog({"retention_days": 0})
     assert _validate_contributor_worklog({"max_held": True})
     assert _validate_contributor_worklog({"bogus": 1})
-    assert _validate_contributor_worklog({"require_approval": "yes"})  # must be a boolean
     assert _validate_contributor_worklog({"max_posts_per_day": 0})  # positive int only
     assert _validate_contributor_worklog({"max_posts_per_day": True})
+
+
+def test_validator_rejects_require_approval_overlay_only():
+    """`require_approval` is NOT settings-writable — disabling an approval gate on
+    public posting must be a deliberate overlay-file edit, not an unconfirmed
+    settings_update()/dashboard call. Both values are rejected as an unknown key."""
+    assert _validate_contributor_worklog({"require_approval": False})
+    assert _validate_contributor_worklog({"require_approval": True})
 
 
 def test_base_config_file_matches_defaults():

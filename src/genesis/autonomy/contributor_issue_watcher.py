@@ -84,6 +84,19 @@ def _issue_number_from_url(url: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _normalize_ts(raw: str | None) -> str | None:
+    """Normalize a GitHub ``Z``-suffixed timestamp to the same ``+00:00`` isoformat as
+    ``datetime.now(UTC).isoformat()``, so ``posted_at`` stays format-uniform for the
+    string comparison in ``count_posted_since``. Returns None on a missing/malformed
+    value (the caller falls back to ``now`` — fail-safe: counts toward the cap)."""
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).isoformat()
+    except (ValueError, TypeError):
+        return None
+
+
 def _find_open_issue_by_title(repo: str, title_norm: str) -> tuple[bool, dict | None]:
     """Look for an OPEN issue on *repo* whose normalized title matches. Returns
     ``(ok, issue|None)`` — ``ok=False`` means the lookup itself failed (caller
@@ -105,7 +118,7 @@ def _find_open_issue_by_title(repo: str, title_norm: str) -> tuple[bool, dict | 
             "--state",
             "open",
             "--json",
-            "number,title,url",
+            "number,title,url,createdAt",
             "--limit",
             "200",
         ]
@@ -207,8 +220,23 @@ async def _resolve_approved(
         # Already open (a prior cycle posted then crashed before mark_posted, OR a
         # human/other path opened it). Adopt it — idempotent, no second issue.
         num = existing.get("number") or _issue_number_from_url(existing.get("url", ""))
+        # Stamp the ADOPTED issue's OWN creation time as posted_at (not ``now``) so an
+        # old/human-made issue we merely reconcile does NOT consume the cautious-rollout
+        # daily cap — the cap counts issues actually CREATED in the window. A
+        # crash-recovery adopt (we created it seconds ago) has a recent createdAt, so it
+        # still counts correctly; a missing createdAt falls back to ``now`` (fail-safe:
+        # counts, i.e. under-posts).
+        # KNOWN INTERACTION (accepted): an old posted_at also makes prune_terminal
+        # (COALESCE(posted_at,…)) reap this tracking row earlier than the 30d retention.
+        # Bounded/safe — the pre-post open-issue dedup (_find_open_issue_by_title,
+        # state=open) still backstops a re-proposal of the same title, so an early-pruned
+        # adopt cannot produce a duplicate OPEN issue.
+        # Normalize gh's `Z` suffix to the same `+00:00` isoformat as ``now`` so the
+        # string `posted_at >= since` comparison in count_posted_since is format-uniform
+        # (no Z-vs-+00:00 footgun); a malformed value falls back to ``now`` (fail-safe).
+        adopt_ts = _normalize_ts(existing.get("createdAt")) or now
         if await pip.mark_posted(
-            rt_db, row["id"], issue_number=num, issue_url=existing.get("url"), posted_at=now
+            rt_db, row["id"], issue_number=num, issue_url=existing.get("url"), posted_at=adopt_ts
         ):
             await approval_crud.mark_consumed(rt_db, row["request_id"], consumed_at=now)
             logger.info(
@@ -237,6 +265,14 @@ async def _resolve_approved(
             posted_recent,
             max_posts_per_day,
         )
+        return False
+
+    # Kill-switch recheck: re-read the mode LIVE immediately before the external
+    # create so a ``mode: off`` / env-kill flipped mid-tick halts THIS post too — not
+    # just at the next tick boundary. Makes the STOP effective per-create, so the
+    # worst a mid-tick flip can leak is an in-flight create already past this point.
+    if effective_mode() != "live":
+        logger.info("Contributor issue %s deferred — lever no longer live at post time", row["id"])
         return False
 
     # Observe the egress, THEN post. mark_posted BEFORE mark_consumed so a crash
