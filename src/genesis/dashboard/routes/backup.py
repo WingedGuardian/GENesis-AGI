@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import urllib.parse
+from datetime import UTC, datetime
 from pathlib import Path
 
 from flask import jsonify, request
@@ -297,6 +298,178 @@ def _destinations(status: dict | None, repo: str | None) -> dict:
     return {"tier1": tier1, "tier2": tier2}
 
 
+# ── Health verdict (server-authoritative banner state) ────────────────
+
+_INTERVAL_HOURS = {"3h": 3, "6h": 6, "12h": 12, "daily": 24}
+
+
+def _scrub_reason(text: str | None) -> str | None:
+    """Sanitize a failure_reason for the UNAUTHENTICATED banner.
+
+    ``backup.sh`` only JSON-escapes the reason; it can still embed a home path
+    (which carries a username) or raw gpg output. Strip ``/home/<user>`` → ``~``
+    and cap the length before it is rendered on the unauth ``/status`` route.
+    """
+    if not text:
+        return text
+    scrubbed = text.replace(str(_HOME), "~")
+    scrubbed = re.sub(r"/home/[^/\s]+", "~", scrubbed)
+    if len(scrubbed) > 200:
+        scrubbed = scrubbed[:199] + "…"
+    return scrubbed
+
+
+def _parse_usec(value: str | None) -> datetime | None:
+    """systemd ``…USec`` (microseconds since epoch, decimal string) → aware
+    datetime, or ``None`` for empty/``infinity``/unparseable values."""
+    if not value:
+        return None
+    v = value.strip()
+    if not v.isdigit():
+        return None
+    try:
+        return datetime.fromtimestamp(int(v) / 1_000_000, tz=UTC)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _backup_health(
+    last_backup: dict | None,
+    schedule: dict | None,
+    destinations: dict | None,
+    *,
+    configured: bool,
+    resolved_backend: str,
+) -> dict:
+    """One authoritative backup-health verdict for the page-top banner.
+
+    Returns ``{"state": "ok"|"warn"|"critical", "code": <slug>, "reason": <text>}``
+    — precedence, first match wins. Computed server-side so the banner has ZERO
+    client-side coordination: no dependency on a second config fetch (the client
+    ``backupConfig``), and no client-clock staleness math. ``state == "ok"`` means
+    the banner is hidden.
+    """
+    lb = last_backup if isinstance(last_backup, dict) else None
+    sch = schedule or {}
+
+    # 1. Recorded FAILURE (success explicitly False) — the most urgent state.
+    if lb is not None and lb.get("success") is False:
+        reason = "The last backup run failed"
+        fr = _scrub_reason(lb.get("failure_reason"))
+        if fr:
+            reason += f" ({fr})"
+        return {
+            "state": "critical",
+            "code": "failed",
+            "reason": reason + " — check the Backup tab.",
+        }
+
+    # 2. Not configured — CURRENT signals only (a saved repo setting or a real
+    #    clone), never a lingering prior run: a stale success record survives clone
+    #    or secrets removal, and backup.sh cannot recreate the clone without the
+    #    repo setting, so it must not mask the unconfigured state. Checked BEFORE the
+    #    malformed-record branch so an abandoned install carrying a leftover garbage
+    #    record still gets the more actionable "not configured" message.
+    if not configured:
+        return {
+            "state": "warn",
+            "code": "unconfigured",
+            "reason": "Backups are not configured — your data is not being backed up. "
+            "Set one up on the Backup tab.",
+        }
+
+    # 3. Configured, but no backup has ever run.
+    if lb is None:
+        return {
+            "state": "warn",
+            "code": "never_run",
+            "reason": "Backups are configured but have never run — check the Backup tab.",
+        }
+
+    # 4. A present-but-malformed record (valid JSON, no boolean `success`) must not
+    #    slip through to "healthy" — a `{}` or operator-repaired record reads as
+    #    unreadable, not clean. (lb is non-None here — branch 3 handled None.)
+    if not isinstance(lb.get("success"), bool):
+        return {
+            "state": "warn",
+            "code": "unreadable_status",
+            "reason": "The last backup status record is unreadable — check the Backup tab.",
+        }
+
+    # 5. Scheduled but the timer is not running (stopped out-of-band / failed to
+    #    start): unattended backups have silently stopped even though the last run
+    #    succeeded.
+    if sch.get("enabled") and not sch.get("active"):
+        return {
+            "state": "warn",
+            "code": "timer_stopped",
+            "reason": "Backups are scheduled but the timer is not running — unattended "
+            "backups have stopped. Check the Backup tab.",
+        }
+
+    # 6. Overdue — the last successful backup is too old. For a KNOWN enabled
+    #    interval use a pure age floor (interval*2 + 1h): an active timer can
+    #    silently SKIP runs, leaving a stale timestamp while `next_run` is still in
+    #    the future, so a future next_run does NOT prove recency there. For a
+    #    custom/unknown/disabled schedule use a 7-day floor but suppress when a
+    #    valid future `next_run` exists — a monthly custom timer legitimately runs
+    #    less often than weekly and is not overdue.
+    ts = lb.get("timestamp")
+    if ts:
+        try:
+            age_h = (datetime.now(UTC) - datetime.fromisoformat(ts)).total_seconds() / 3600
+        except (ValueError, TypeError):
+            age_h = None
+        if age_h is not None:
+            interval_h = _INTERVAL_HOURS.get(sch.get("interval")) if sch.get("enabled") else None
+            if interval_h:
+                floor_h: float = interval_h * 2 + 1
+                overdue = age_h > floor_h
+                detail = f", well past the {interval_h}h schedule"
+            else:
+                floor_h = 24 * 7
+                next_run = _parse_usec(sch.get("next_run"))
+                next_run_future = next_run is not None and next_run > datetime.now(UTC)
+                overdue = age_h > floor_h and not next_run_future
+                detail = ""
+            if overdue:
+                return {
+                    "state": "warn",
+                    "code": "overdue",
+                    "reason": "Backups are overdue — the last successful backup was about "
+                    f"{round(age_h)}h ago{detail}. Check the Backup tab.",
+                }
+
+    # 7. Tier-1 (GitHub) push did not complete — the local backup succeeded but
+    #    commits are not replicated to the remote (a prior push failed and today's
+    #    run had nothing new to commit, so `success` stays True).
+    if lb.get("tier1_pushed") is False:
+        return {
+            "state": "warn",
+            "code": "tier1_unpushed",
+            "reason": "Backups are not fully replicated to GitHub — the last run succeeded "
+            "locally but commits are not pushed to the remote. Check the Backup tab.",
+        }
+
+    # 8. Off-site (Tier-2) copy configured but incomplete. Gate on the RESOLVED
+    #    backend (CURRENT config), not the last status record's `tier2_backend`: a
+    #    Tier-2 backend disabled after a partial run must not keep warning off a
+    #    stale record. Require an explicit incompleteness signal so an info-less
+    #    legacy record stays quiet.
+    if resolved_backend and resolved_backend != "none":
+        t2 = (destinations or {}).get("tier2") or {}
+        status = t2.get("status")
+        if (status is not None and status != "ok") or t2.get("confirmed") is False:
+            return {
+                "state": "warn",
+                "code": "tier2_incomplete",
+                "reason": "The off-site backup copy is incomplete — your local backup "
+                "succeeded but the off-site copy did not finish. Check the Backup tab.",
+            }
+
+    return {"state": "ok", "code": "healthy", "reason": ""}
+
+
 # ── Routes ────────────────────────────────────────────────────────────
 
 
@@ -320,6 +493,12 @@ def backup_status():
                 # Allowlist projection — a future field in backup.sh's status
                 # line cannot auto-leak through this unauthenticated route.
                 last_backup = {k: v for k, v in raw.items() if k in _STATUS_SAFE_FIELDS}
+                # failure_reason can embed a home path (which carries a username) or
+                # raw gpg output; scrub it HERE so the sanitized value is the only one
+                # that ever reaches this unauthenticated response — the banner reason
+                # and this raw field must not disagree.
+                if last_backup.get("failure_reason"):
+                    last_backup["failure_reason"] = _scrub_reason(last_backup["failure_reason"])
         except (json.JSONDecodeError, OSError):
             last_backup = None
     result["last_backup"] = last_backup
@@ -327,6 +506,21 @@ def backup_status():
     result["repo"] = _backup_repo_url()
     result["schedule"] = _timer_state()
     result["destinations"] = _destinations(last_backup, result["repo"])
+
+    # Server-authoritative health verdict for the page-top banner. `configured`
+    # uses CURRENT signals only — a saved repo setting, a real clone (`.git`, not
+    # just the directory), or a resolvable origin — never a lingering prior run.
+    from genesis.dashboard.routes.secrets import _key_value
+
+    repo_setting = (_key_value("GENESIS_BACKUP_REPO") or "").strip()
+    configured = bool(repo_setting or (_BACKUP_DIR / ".git").is_dir() or result["repo"])
+    result["backup_health"] = _backup_health(
+        last_backup,
+        result["schedule"],
+        result["destinations"],
+        configured=configured,
+        resolved_backend=_resolved_backend(),
+    )
 
     return jsonify(result)
 

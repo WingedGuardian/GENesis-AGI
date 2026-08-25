@@ -199,10 +199,17 @@ def test_set_timer_enabled_false_disables_now():
 def test_calendar_maps_are_consistent():
     """Every short OnCalendar we WRITE must normalise (per systemd) to exactly
     the long form we READ back — guards the two hand-maintained maps drifting."""
-    from genesis.dashboard.routes.backup import _CALENDAR_TO_INTERVAL, _INTERVAL_TO_CALENDAR
+    from genesis.dashboard.routes.backup import (
+        _CALENDAR_TO_INTERVAL,
+        _INTERVAL_HOURS,
+        _INTERVAL_TO_CALENDAR,
+    )
 
-    # Both maps describe the same 4 presets.
+    # All three preset maps describe the same known intervals — _INTERVAL_HOURS
+    # (the overdue-floor map) must not silently drift from the schedule maps, or a
+    # renamed/added preset falls through to the weaker 7-day custom floor.
     assert set(_INTERVAL_TO_CALENDAR) == set(_CALENDAR_TO_INTERVAL.values())
+    assert set(_INTERVAL_HOURS) == set(_INTERVAL_TO_CALENDAR)
     for key, short in _INTERVAL_TO_CALENDAR.items():
         out = subprocess.run(
             ["systemd-analyze", "calendar", short], capture_output=True, text=True, timeout=10
@@ -658,3 +665,239 @@ def test_sensitive_re_masks_backup_nas_pass():
     assert not _SENSITIVE_RE.search("GENESIS_BACKUP_NAS_SHARE")
     assert not _SENSITIVE_RE.search("GENESIS_BACKUP_NAS_USER")
     assert not _SENSITIVE_RE.search("GENESIS_BACKUP_LOCAL_PATH")
+
+
+# ── _backup_health (server-authoritative banner verdict) ──────────────
+# Seed timestamps NOW-RELATIVE, never absolute literals: an absolute date + a
+# now()-based age check is a wall-clock time-bomb that flips to failing once the
+# calendar crosses the threshold.
+from datetime import UTC, datetime, timedelta  # noqa: E402
+
+
+def _iso_ago(**kw) -> str:
+    return (datetime.now(UTC) - timedelta(**kw)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _usec_from_now(**kw) -> str:
+    dt = datetime.now(UTC) + timedelta(**kw)
+    return str(int(dt.timestamp() * 1_000_000))
+
+
+def _health(lb, sch, dest, configured=True, resolved_backend="none"):
+    from genesis.dashboard.routes.backup import _backup_health
+
+    return _backup_health(lb, sch, dest, configured=configured, resolved_backend=resolved_backend)
+
+
+def _sch(enabled=True, active=True, interval="6h", next_run=None):
+    return {"enabled": enabled, "active": active, "interval": interval, "next_run": next_run}
+
+
+def _healthy_lb():
+    return {"success": True, "timestamp": _iso_ago(hours=1), "tier1_pushed": True}
+
+
+def test_health_healthy_hides_banner():
+    r = _health(
+        _healthy_lb(), _sch(next_run=_usec_from_now(hours=5)), {"tier2": {"backend": "none"}}
+    )
+    assert r["state"] == "ok" and r["code"] == "healthy"
+
+
+def test_health_failed_is_critical():
+    lb = {
+        "success": False,
+        "failure_reason": "Qdrant backup failed",
+        "timestamp": _iso_ago(hours=1),
+    }
+    r = _health(lb, _sch(), {})
+    assert r["state"] == "critical" and r["code"] == "failed"
+    assert "Qdrant backup failed" in r["reason"]
+
+
+def test_health_failed_scrubs_home_path():
+    lb = {"success": False, "failure_reason": "gpg: keyring /home/operator/.gnupg/x failed"}
+    r = _health(lb, _sch(), {})
+    assert "/home/operator" not in r["reason"] and "~" in r["reason"]
+
+
+def test_health_failure_outranks_unconfigured():
+    # A recorded failure is the most urgent state — it must not be masked by the
+    # unconfigured check even when configured is False.
+    lb = {"success": False, "failure_reason": "boom"}
+    r = _health(lb, _sch(), {}, configured=False)
+    assert r["code"] == "failed"
+
+
+def test_health_malformed_record_is_unreadable():
+    # #12: a valid-JSON record lacking a boolean `success` must not read healthy.
+    assert _health({}, _sch(), {})["code"] == "unreadable_status"
+    assert _health({"timestamp": _iso_ago(hours=1)}, _sch(), {})["code"] == "unreadable_status"
+
+
+def test_health_unconfigured_masks_stale_success():
+    # #1/#6: a lingering successful run must not suppress the unconfigured banner.
+    r = _health(_healthy_lb(), _sch(), {}, configured=False)
+    assert r["state"] == "warn" and r["code"] == "unconfigured"
+
+
+def test_health_never_run():
+    r = _health(None, _sch(), {}, configured=True)
+    assert r["code"] == "never_run"
+
+
+def test_health_timer_stopped():
+    # #2: enabled schedule, timer not running, last run succeeded.
+    r = _health(_healthy_lb(), _sch(enabled=True, active=False), {})
+    assert r["code"] == "timer_stopped"
+
+
+def test_health_overdue_known_interval():
+    # #2: active 6h timer, last success 20h ago (missed cycles) → overdue.
+    lb = {"success": True, "timestamp": _iso_ago(hours=20), "tier1_pushed": True}
+    r = _health(lb, _sch(interval="6h", next_run=_usec_from_now(hours=5)), {})
+    assert r["code"] == "overdue"
+    # A future next_run does NOT rescue a known short interval (an active timer can
+    # silently SKIP runs), so overdue still fires.
+
+
+def test_health_not_overdue_within_known_floor():
+    lb = {"success": True, "timestamp": _iso_ago(hours=5), "tier1_pushed": True}
+    r = _health(
+        lb, _sch(interval="6h", next_run=_usec_from_now(hours=1)), {"tier2": {"backend": "none"}}
+    )
+    assert r["state"] == "ok"
+
+
+def test_health_custom_not_overdue_with_future_next_run():
+    # #13: a monthly custom schedule 10 days old is NOT overdue while its next run
+    # is still weeks away.
+    lb = {"success": True, "timestamp": _iso_ago(days=10), "tier1_pushed": True}
+    sch = _sch(interval="custom", next_run=_usec_from_now(days=20))
+    assert _health(lb, sch, {"tier2": {"backend": "none"}})["state"] == "ok"
+
+
+def test_health_custom_overdue_without_next_run():
+    lb = {"success": True, "timestamp": _iso_ago(days=10), "tier1_pushed": True}
+    sch = _sch(interval="custom", next_run=None)
+    assert _health(lb, sch, {})["code"] == "overdue"
+
+
+def test_health_tier1_unpushed():
+    # #3: local backup succeeded but commits are not on the remote.
+    lb = {"success": True, "timestamp": _iso_ago(hours=1), "tier1_pushed": False}
+    assert _health(lb, _sch(next_run=_usec_from_now(hours=5)), {})["code"] == "tier1_unpushed"
+
+
+def test_health_tier2_incomplete_partial():
+    dest = {"tier2": {"backend": "smb", "status": "partial", "confirmed": False}}
+    r = _health(_healthy_lb(), _sch(next_run=_usec_from_now(hours=5)), dest, resolved_backend="smb")
+    assert r["code"] == "tier2_incomplete"
+
+
+def test_health_tier2_incomplete_confirmed_false():
+    dest = {"tier2": {"backend": "smb", "status": "ok", "confirmed": False}}
+    r = _health(_healthy_lb(), _sch(next_run=_usec_from_now(hours=5)), dest, resolved_backend="smb")
+    assert r["code"] == "tier2_incomplete"
+
+
+def test_health_tier2_ignored_when_backend_disabled():
+    # #11: Tier-2 disabled after a partial run — a stale status record must not keep
+    # warning. Gate on the RESOLVED (current) backend, not the record's tier2_backend.
+    dest = {"tier2": {"backend": "smb", "status": "partial", "confirmed": False}}
+    r = _health(
+        _healthy_lb(), _sch(next_run=_usec_from_now(hours=5)), dest, resolved_backend="none"
+    )
+    assert r["state"] == "ok"
+
+
+def test_health_unparseable_timestamp_does_not_raise():
+    lb = {"success": True, "timestamp": "not-a-date", "tier1_pushed": True}
+    r = _health(lb, _sch(next_run=_usec_from_now(hours=5)), {"tier2": {"backend": "none"}})
+    assert r["state"] == "ok"  # overdue math skipped, not crashed
+
+
+def test_scrub_reason():
+    from genesis.dashboard.routes.backup import _HOME, _scrub_reason
+
+    assert _scrub_reason(None) is None
+    assert _scrub_reason("") == ""
+    assert _scrub_reason("err /home/bob/data") == "err ~/data"
+    assert str(_HOME) not in _scrub_reason(f"x {_HOME}/y")
+    long = _scrub_reason("z" * 500)
+    assert len(long) <= 200 and long.endswith("…")
+
+
+def test_parse_usec():
+    from genesis.dashboard.routes.backup import _parse_usec
+
+    assert _parse_usec(None) is None
+    assert _parse_usec("") is None
+    assert _parse_usec("infinity") is None
+    assert _parse_usec("abc") is None
+    dt = _parse_usec("1756070400000000")
+    assert dt is not None and dt.tzinfo is not None
+
+
+# ── GET status: backup_health wiring (incl. #10 real-clone configured) ─
+def test_status_includes_backup_health_healthy(client, tmp_path):
+    status = {
+        "success": True,
+        "timestamp": _iso_ago(hours=1),
+        "tier1_pushed": True,
+        "tier2_status": "ok",
+    }
+    patches = _status_env(tmp_path, status, authed=True)
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patch(
+            f"{_SEC}._key_value",
+            side_effect=lambda k: "https://example/r.git" if k == "GENESIS_BACKUP_REPO" else "",
+        ),
+    ):
+        data = client.get("/api/genesis/backup/status").get_json()
+    assert data["backup_health"]["code"] == "healthy"
+
+
+def test_status_backup_health_unconfigured_needs_real_clone(client, tmp_path):
+    # #10: _BACKUP_DIR exists but has no .git, no repo setting → unconfigured.
+    status = {"success": True, "timestamp": _iso_ago(hours=1), "tier1_pushed": True}
+    patches = _status_env(tmp_path, status, authed=True)
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patch(f"{_SEC}._key_value", side_effect=lambda k: ""),
+    ):
+        data = client.get("/api/genesis/backup/status").get_json()
+    assert data["backup_health"]["code"] == "unconfigured"
+
+
+def test_status_scrubs_home_path_from_entire_body(client, tmp_path):
+    # A failed backup's failure_reason can embed a home path (username). It must be
+    # absent from the ENTIRE unauthenticated /status body — not just backup_health,
+    # but the sibling last_backup.failure_reason field too.
+    status = {
+        "success": False,
+        "timestamp": _iso_ago(hours=1),
+        "failure_reason": "gpg: keyring /home/operator/.gnupg/pubring.kbx failed",
+    }
+    patches = _status_env(tmp_path, status, authed=False)
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patch(f"{_SEC}._key_value", side_effect=lambda k: ""),
+    ):
+        data = client.get("/api/genesis/backup/status").get_json()
+    assert "/home/operator" not in str(data)
+    assert data["last_backup"]["failure_reason"] and "~" in data["last_backup"]["failure_reason"]
+    assert data["backup_health"]["code"] == "failed"

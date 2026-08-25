@@ -185,6 +185,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Page-top backup-health banner (server-authoritative).** The dashboard now
+  surfaces a page-top banner when backups need attention — unconfigured, never run,
+  last run failed, timer stopped, overdue, replication incomplete, or an unreadable
+  status record — and stays hidden when healthy. The health verdict
+  (`{state, code, reason}`) is computed once on the server in
+  `routes/backup.py::_backup_health` and added to `/api/genesis/backup/status`; the
+  client only renders it. Computing it server-side removes the client-side
+  fetch-coordination and clock-skew failure modes entirely, keys "configured" and
+  the off-site-incomplete check on current signals (a real `.git` clone, the
+  resolved Tier-2 backend) rather than a stale status record, treats a malformed
+  status record as unreadable instead of healthy, and does not false-flag a valid
+  custom schedule as overdue. The failure reason rendered on the (unauthenticated)
+  status route is sanitized to strip home-directory paths.
 - **One-click "lobby" terminal door — reattach the whole CC fleet after a client
   reboot.** `generate-ssh-config.sh` now emits a dedicated `Host <host>-lobby`
   block (placed ahead of the numeric-slot wildcard, since ssh takes the first
