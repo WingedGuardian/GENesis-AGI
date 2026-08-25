@@ -110,6 +110,9 @@ async def test_auto_approved_when_require_approval_false(db, live, monkeypatch):
     scan_prose still ran (the row exists = it passed). The approval never sits
     `pending`, so it never surfaces as an approval request."""
     monkeypatch.setattr(ci, "require_approval", lambda: False)
+    # Install-agnostic: autonomous mode pins repo to _default_repo(); on a config-less
+    # CI clone that's a bare name and would error. Pin it to a valid slug.
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)
     res = await _propose(db, title="Add a util test", body="Cover the empty-input case.")
     assert res["status"] == "held"
     assert res["auto_approved"] is True
@@ -138,6 +141,7 @@ async def test_auto_approved_propose_only_is_dry_run_terminal(db, monkeypatch):
     monkeypatch.setattr(ci, "effective_mode", lambda: "propose_only")
     monkeypatch.setattr(ci, "load_config", lambda: {"max_held": 25})
     monkeypatch.setattr(ci, "require_approval", lambda: False)
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)  # install-agnostic (see above)
     res = await _propose(db, title="Dry-run task", body="Should not post.")
     assert res["status"] == "held"
     assert res["auto_approved"] is True
