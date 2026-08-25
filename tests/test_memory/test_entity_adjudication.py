@@ -349,6 +349,8 @@ async def test_live_phase0_applies_proposed_backlog(db):
         norm_a="kappa",
         norm_b="kappaa",
     )
+    # PR-1 gate: a shadow proposal is applied ONLY after a human approves it.
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="test")
     counts = await adj.run_adjudication_drain(db, _router({}), mode="live", budget=10)
     assert counts["merged"] == 1
     assert await _status(db, b) == "merged"
@@ -369,10 +371,121 @@ async def test_live_phase0_stale_on_norm_drift(db):
         norm_a="lambda",
         norm_b="OLD-DIFFERENT-NORM",
     )
+    # Even an APPROVED proposal is not applied if identity drifted — staleness
+    # guard still wins over approval.
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="test")
     counts = await adj.run_adjudication_drain(db, _router({}), mode="live", budget=10)
     assert counts["stale"] == 1 and counts["merged"] == 0
     assert await _status(db, b) == "active"  # not applied
     assert (await adj_crud.get_by_pair(db, a, b))["verdict"] == "stale"
+
+
+@pytest.mark.asyncio
+async def test_live_backlog_skips_unapproved(db):
+    """The core PR-1 gate: an UN-approved proposal is never applied, even in live."""
+    a = await _mk_entity(db, "mu", "mu")
+    b = await _mk_entity(db, "muu", "muu")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="mu",
+        norm_b="muu",
+    )
+    # No approve() call → the backlog scan (approved_only) must skip it.
+    counts = await adj.run_adjudication_drain(db, _router({}), mode="live", budget=10)
+    assert counts["merged"] == 0
+    assert await _status(db, b) == "active"  # NOT merged
+    assert (await adj_crud.get_by_pair(db, a, b))["verdict"] == "proposed_merge"
+
+
+@pytest.mark.asyncio
+async def test_apply_approved_merges_applies_and_stamps(db):
+    """apply_approved_merges (mode-independent) applies an approved proposal + journals it."""
+    a = await _mk_entity(db, "nu", "nu")
+    b = await _mk_entity(db, "nuu", "nuu")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="nu",
+        norm_b="nuu",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="jay")
+
+    counts = await adj.apply_approved_merges(db, budget=10)  # no mode='live' needed
+
+    assert counts["merged"] == 1
+    assert await _status(db, b) == "merged"
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "merge" and row["applied_at"]
+    # reversibility snapshot written
+    cur = await db.execute("SELECT loser_id FROM entity_merge_journal WHERE loser_id = ?", (b,))
+    assert await cur.fetchone() is not None
+
+
+@pytest.mark.asyncio
+async def test_reject_records_distinct_and_not_applied(db):
+    """Rejecting a proposal makes it 'distinct' (never applied) and drops approval."""
+    a = await _mk_entity(db, "xi", "xi")
+    b = await _mk_entity(db, "xii", "xii")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+    )
+    moved = await adj_crud.reject(db, pair_key=adj_crud.pair_key(a, b), reason="different things")
+    assert moved is True
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "distinct" and row["approved_at"] is None
+    # A distinct pair is settled → excluded from re-nomination.
+    assert adj_crud.pair_key(a, b) in await adj_crud.settled_pair_keys(db)
+    # And it is never applied.
+    counts = await adj.apply_approved_merges(db, budget=10)
+    assert counts["merged"] == 0
+    assert await _status(db, b) == "active"
+
+
+@pytest.mark.asyncio
+async def test_reapprove_not_clobbered_by_readjudication(db):
+    """A re-adjudication of an already-approved pair must NOT wipe the approval."""
+    a = await _mk_entity(db, "omicron", "omicron")
+    b = await _mk_entity(db, "omicronn", "omicronn")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="omicron",
+        norm_b="omicronn",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="jay")
+    # Re-judge records a fresh proposed_merge on the same pair (upsert on pair_key).
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="omicron",
+        norm_b="omicronn",
+        provider="strong-model",
+    )
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["approved_at"] is not None and row["approved_by"] == "jay"
+    assert row["provider"] == "strong-model"  # the re-judge DID update other fields
 
 
 @pytest.mark.asyncio

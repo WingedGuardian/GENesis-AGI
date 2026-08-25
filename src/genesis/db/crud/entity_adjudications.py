@@ -33,6 +33,8 @@ _COLS = (
     "updated_b",
     "created_at",
     "applied_at",
+    "approved_at",
+    "approved_by",
 )
 
 
@@ -94,6 +96,10 @@ async def record_verdict(
              updated_a = excluded.updated_a,
              updated_b = excluded.updated_b,
              applied_at = excluded.applied_at""",
+        # DELIBERATELY absent from the INSERT column list and the ON CONFLICT SET:
+        # approved_at / approved_by. A re-adjudication of an already-approved pair
+        # (e.g. the strong-model re-judge) must NEVER wipe a human approval — the
+        # gate depends on it. Locked by test_reapprove_not_clobbered_by_readjudication.
         (
             row_id,
             key,
@@ -151,12 +157,86 @@ async def settled_pair_keys(db: aiosqlite.Connection) -> set[str]:
     return {r[0] for r in await cursor.fetchall()}
 
 
-async def list_proposed_merges(db: aiosqlite.Connection, *, limit: int = 100) -> list[dict]:
-    """Rows awaiting application on the flip to live mode (verdict='proposed_merge'),
-    oldest first."""
+async def list_proposed_merges(
+    db: aiosqlite.Connection, *, limit: int = 100, approved_only: bool = False
+) -> list[dict]:
+    """proposed_merge rows, oldest first.
+
+    ``approved_only=True`` (the apply path) restricts to rows a human has approved
+    (``approved_at IS NOT NULL``) — the gate that prevents any un-reviewed merge
+    from being applied, even after the drainer flips to ``live``. ``False`` (the
+    review surface) lists ALL proposals so a human can triage them.
+    """
+    clause = "verdict = 'proposed_merge'"
+    if approved_only:
+        clause += " AND approved_at IS NOT NULL"
     cursor = await db.execute(
         f"SELECT {', '.join(_COLS)} FROM entity_adjudications "
-        "WHERE verdict = 'proposed_merge' ORDER BY created_at ASC LIMIT ?",
+        f"WHERE {clause} ORDER BY created_at ASC LIMIT ?",
+        (limit,),
+    )
+    return [_row_to_dict(r) for r in await cursor.fetchall()]
+
+
+async def approve(
+    db: aiosqlite.Connection, *, pair_key: str, approved_by: str, _commit: bool = True
+) -> bool:
+    """Human-approve a proposed_merge for application. Returns True if a row moved.
+
+    Only a ``proposed_merge`` row can be approved (an already-applied 'merge' or a
+    'distinct'/'stale' verdict is left untouched). Idempotent: re-approving an
+    already-approved row is a no-op that still returns True.
+    """
+    now = datetime.now(UTC).isoformat()
+    cursor = await db.execute(
+        "UPDATE entity_adjudications SET approved_at = COALESCE(approved_at, ?), "
+        "approved_by = COALESCE(approved_by, ?) "
+        "WHERE pair_key = ? AND verdict = 'proposed_merge'",
+        (now, approved_by, pair_key),
+    )
+    if _commit:
+        await db.commit()
+    return cursor.rowcount > 0
+
+
+async def reject(
+    db: aiosqlite.Connection, *, pair_key: str, reason: str, _commit: bool = True
+) -> bool:
+    """Human-reject a proposed_merge: record it as 'distinct' so it is never applied.
+
+    A 'distinct' verdict lands in ``settled_pair_keys`` (excluded from the sweep's
+    re-nomination), so the pair does not bounce back. Returns True if a row moved.
+    Clears any prior approval on the row (the human's final call is 'do not merge').
+    """
+    cursor = await db.execute(
+        "UPDATE entity_adjudications SET verdict = 'distinct', approved_at = NULL, "
+        "approved_by = NULL, reasoning = ? WHERE pair_key = ? AND verdict = 'proposed_merge'",
+        (f"human-reject: {reason}", pair_key),
+    )
+    if _commit:
+        await db.commit()
+    return cursor.rowcount > 0
+
+
+async def list_for_review(
+    db: aiosqlite.Connection, *, status: str = "proposed", limit: int = 100
+) -> list[dict]:
+    """List adjudication rows for the human review surface.
+
+    ``status``: 'proposed' (unapproved proposals awaiting review), 'approved'
+    (approved, awaiting apply), or 'all' proposed_merge rows regardless of approval.
+    """
+    if status == "proposed":
+        clause = "verdict = 'proposed_merge' AND approved_at IS NULL"
+    elif status == "approved":
+        clause = "verdict = 'proposed_merge' AND approved_at IS NOT NULL"
+    elif status == "all":
+        clause = "verdict = 'proposed_merge'"
+    else:
+        raise ValueError(f"list_for_review: unknown status {status!r}")
+    cursor = await db.execute(
+        f"SELECT {', '.join(_COLS)} FROM entity_adjudications "
+        f"WHERE {clause} ORDER BY created_at ASC LIMIT ?",
         (limit,),
     )
     return [_row_to_dict(r) for r in await cursor.fetchall()]

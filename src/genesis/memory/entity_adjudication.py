@@ -500,6 +500,10 @@ async def _process_row(
         # changed the mention counts survivor selection is based on, so choosing
         # from the pre-race snapshot could tombstone the now-better-attested node.
         survivor_id, loser_id = await _pick_survivor(db, fresh_a, fresh_b)
+        # NEW-pair live path: a freshly-adjudicated pair auto-merges in `live` mode
+        # WITHOUT the human-approval gate (that gate is Phase 0 / the backlog only).
+        # This is deliberate — but it means flipping mode→'live' is NOT globally safe
+        # for NEW pairs; that is a separate Phase-B decision. Prod stays propose_only.
         await entities_crud.merge_entity(db, loser_id=loser_id, survivor_id=survivor_id)
         await adj_crud.record_verdict(
             db,
@@ -534,10 +538,12 @@ async def _apply_proposed_backlog(
 ) -> None:
     """Live-mode Phase 0: apply proposed_merge verdicts stored during shadow.
 
-    Staleness guard: an identity that drifted since the proposal (one side
-    merged/renamed/gone) is marked ``stale`` and NOT applied.
+    Human-approval gate: ONLY rows a human approved (``approved_at IS NOT NULL``)
+    are applied — so flipping the drainer to ``live`` can never bulk-auto-apply the
+    un-reviewed shadow backlog. Staleness guard: an identity that drifted since the
+    proposal (one side merged/renamed/gone) is marked ``stale`` and NOT applied.
     """
-    proposals = await adj_crud.list_proposed_merges(db, limit=budget)
+    proposals = await adj_crud.list_proposed_merges(db, limit=budget, approved_only=True)
     for p in proposals:
         # A `stale` verdict is not a dead end: the reconcile sweep's dedup set
         # (settled_pair_keys) excludes stale, so a stale pair is re-enqueued on
@@ -560,6 +566,23 @@ async def _apply_proposed_backlog(
         )
         counts["merged"] += 1
         _note_merge(example_merges, ent_a, ent_b)
+
+
+async def apply_approved_merges(db: aiosqlite.Connection, *, budget: int = 50) -> dict[str, int]:
+    """Apply human-APPROVED proposed_merge rows — mode-independent.
+
+    Intended entry point for the review surface (MCP tool, wired in PR-2): once a
+    human approves rows, this applies them WITHOUT requiring the drainer be flipped
+    to ``live`` (which would also grant new-pair auto-merge authority). NOTE: as of
+    PR-1 the only caller is the test suite — PR-2 wires the MCP tool. Reuses the SAME
+    gated, staleness-guarded apply loop as the live-mode Phase 0
+    (``_apply_proposed_backlog``, which lists only approved rows). Returns a counts
+    summary: {'merged': N, 'stale': M}.
+    """
+    counts = {"merged": 0, "stale": 0}
+    example_merges: list[str] = []
+    await _apply_proposed_backlog(db, counts, example_merges, budget=budget)
+    return counts
 
 
 async def _exhaust(db: aiosqlite.Connection, item: dict, counts: dict[str, int]) -> None:

@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
@@ -363,6 +363,76 @@ async def memories_mentioning(
     return out
 
 
+async def _journal_merge(
+    db: aiosqlite.Connection, *, loser_id: str, survivor_id: str, now: str
+) -> None:
+    """Write the pre-delete reversibility snapshot of the loser to entity_merge_journal.
+
+    Captures the loser's identity plus its mention and link rows exactly as they
+    stand before ``merge_entity`` copies-then-DELETEs them, so a later
+    ``unmerge_entity`` can reconstruct the loser node. No commit — runs inside the
+    caller's merge transaction.
+    """
+    cur = await db.execute(
+        "SELECT name, norm_name, entity_type FROM entities WHERE entity_id = ?",
+        (loser_id,),
+    )
+    row = await cur.fetchone()
+    loser_name, loser_norm, loser_type = (row[0], row[1], row[2]) if row else (None, None, None)
+    mcur = await db.execute(
+        "SELECT memory_id, provenance, confidence, source, created_at "
+        "FROM entity_mentions WHERE entity_id = ?",
+        (loser_id,),
+    )
+    mentions = [
+        {
+            "memory_id": r[0],
+            "provenance": r[1],
+            "confidence": r[2],
+            "source": r[3],
+            "created_at": r[4],
+        }
+        for r in await mcur.fetchall()
+    ]
+    lcur = await db.execute(
+        "SELECT source_id, target_id, link_type, provenance, confidence, "
+        "evidence_memory_id, valid_at, invalid_at, invalidated_by, created_at "
+        "FROM entity_links WHERE source_id = ? OR target_id = ?",
+        (loser_id, loser_id),
+    )
+    links = [
+        {
+            "source_id": r[0],
+            "target_id": r[1],
+            "link_type": r[2],
+            "provenance": r[3],
+            "confidence": r[4],
+            "evidence_memory_id": r[5],
+            "valid_at": r[6],
+            "invalid_at": r[7],
+            "invalidated_by": r[8],
+            "created_at": r[9],
+        }
+        for r in await lcur.fetchall()
+    ]
+    await db.execute(
+        "INSERT INTO entity_merge_journal "
+        "(id, loser_id, survivor_id, loser_name, loser_norm, loser_type, "
+        "mentions_json, links_json, merged_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            uuid.uuid4().hex,
+            loser_id,
+            survivor_id,
+            loser_name,
+            loser_norm,
+            loser_type,
+            json.dumps(mentions),
+            json.dumps(links),
+            now,
+        ),
+    )
+
+
 async def merge_entity(
     db: aiosqlite.Connection,
     *,
@@ -384,6 +454,11 @@ async def merge_entity(
     if loser_id == survivor_id:
         raise ValueError(f"merge_entity: self-merge refused (loser == survivor == {loser_id!r})")
     now = datetime.now(UTC).isoformat()
+    # Reversibility journal: snapshot the loser BEFORE the destructive DELETEs
+    # below. merge_entity physically removes the loser's mention/link rows, so
+    # without this an applied merge cannot be undone (see entity_merge_journal +
+    # the unmerge_entity follow-up). Same transaction as the merge itself.
+    await _journal_merge(db, loser_id=loser_id, survivor_id=survivor_id, now=now)
     await db.execute(
         "INSERT INTO entity_mentions "
         "(memory_id, entity_id, provenance, confidence, source, created_at) "
@@ -435,6 +510,34 @@ async def merge_entity(
     )
     if _commit:
         await db.commit()
+
+
+async def prune_merge_journal(
+    db: aiosqlite.Connection,
+    *,
+    older_than_days: int = 180,
+    now: str,
+    _commit: bool = True,
+) -> int:
+    """Delete ``entity_merge_journal`` rows older than *older_than_days*.
+
+    Retention for the unbounded reversibility journal (wired into
+    ``scripts/disk_hygiene.sh``). The window is generous (180d default) because the
+    journal is a safety net for ``unmerge_entity`` — it must outlive the "did we
+    mis-merge?" discovery window, not just an audit horizon. ``now`` is injected
+    (never wall-clock here) for deterministic tests. No-ops before migration 0086
+    (table-existence guard). Returns rows deleted.
+    """
+    cur = await db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='entity_merge_journal'"
+    )
+    if not await cur.fetchone():
+        return 0
+    cutoff = (datetime.fromisoformat(now) - timedelta(days=older_than_days)).isoformat()
+    cursor = await db.execute("DELETE FROM entity_merge_journal WHERE merged_at < ?", (cutoff,))
+    if _commit:
+        await db.commit()
+    return cursor.rowcount or 0
 
 
 async def delete_entities_cascade(

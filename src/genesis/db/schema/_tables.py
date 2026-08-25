@@ -1843,7 +1843,30 @@ TABLES = {
             updated_a    TEXT,
             updated_b    TEXT,
             created_at   TEXT NOT NULL,
-            applied_at   TEXT
+            applied_at   TEXT,
+            -- Human review gate (PR-1): a proposed_merge is applied ONLY after a
+            -- human sets approved_at. NULL = unreviewed; the apply path filters
+            -- on approved_at IS NOT NULL so no merge is ever auto-applied.
+            approved_at  TEXT,
+            approved_by  TEXT
+        )
+    """,
+    # Reversibility journal (PR-1): a pre-delete snapshot of the loser's identity
+    # + mentions + links, written INSIDE merge_entity before the destructive
+    # DELETEs, so an applied merge can be undone (unmerge_entity — follow-up).
+    # merge_entity DELETEs the loser's mention/link rows, so without this snapshot
+    # a merge is irreversible. Retention: pruned by age in disk_hygiene.
+    "entity_merge_journal": """
+        CREATE TABLE IF NOT EXISTS entity_merge_journal (
+            id           TEXT PRIMARY KEY,
+            loser_id     TEXT NOT NULL,
+            survivor_id  TEXT NOT NULL,
+            loser_name   TEXT,
+            loser_norm   TEXT,
+            loser_type   TEXT,
+            mentions_json TEXT,
+            links_json   TEXT,
+            merged_at    TEXT NOT NULL
         )
     """,
     # Session-manager durable spine (PR-2a, migration 0058). session_id is the
@@ -2385,6 +2408,11 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_entity_links_target ON entity_links(target_id)",
     # entity adjudication ledger — hot query is the propose_only→live backlog scan
     "CREATE INDEX IF NOT EXISTS idx_entity_adjud_verdict ON entity_adjudications(verdict)",
+    # Human-approved backlog scan: verdict='proposed_merge' AND approved_at IS NOT NULL.
+    "CREATE INDEX IF NOT EXISTS idx_entity_adjud_approved ON entity_adjudications(verdict, approved_at)",
+    # Merge journal: unmerge lookup by loser, and age-prune by merged_at.
+    "CREATE INDEX IF NOT EXISTS idx_entity_merge_journal_loser ON entity_merge_journal(loser_id)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_merge_journal_merged_at ON entity_merge_journal(merged_at)",
     # pending embeddings
     "CREATE INDEX IF NOT EXISTS idx_pending_embeddings_status ON pending_embeddings(status)",
     "CREATE INDEX IF NOT EXISTS idx_pending_embeddings_memory ON pending_embeddings(memory_id)",
