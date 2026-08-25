@@ -29,9 +29,12 @@ enrolled artifacts by their consumer set — it is not a general prose↔code ch
 ### `cc_oauth_token.env` — fallback CC OAuth setup-token
 
 A `claude setup-token` credential (`~/.genesis/cc_oauth_token.env`, synced to the
-host shared mount) injected as `CLAUDE_CODE_OAUTH_TOKEN` **only** when a primary
-`claude login` is confirmed dead. Written by `scripts/store_cc_token.sh`; accessed
-directly by filename *and* transitively via `credential_bridge.load_cc_oauth_token()`.
+host shared mount) injected as `CLAUDE_CODE_OAUTH_TOKEN` when a primary
+`claude login` is confirmed dead — with ONE documented exception: the
+interactive-slot `GENESIS_CC_SLOT_OAUTH=always` lever (see `cc-slot.sh` below)
+deliberately injects over a live login too. Written by `scripts/store_cc_token.sh`;
+accessed directly by filename *and* transitively via
+`credential_bridge.load_cc_oauth_token()` / `login_health.read_fallback_token()`.
 
 ```yaml shared-artifact
 artifact: cc_oauth_token.env
@@ -39,6 +42,7 @@ documented_in: scripts/store_cc_token.sh
 match_literals: [cc_oauth_token.env, load_cc_oauth_token]
 readers:
   - src/genesis/cc/login_health.py
+  - src/genesis/cc/login_gate.py
   - src/genesis/guardian/diagnosis.py
   - src/genesis/onboarding/floor.py
   - scripts/guardian-gateway.sh
@@ -49,14 +53,20 @@ allowlist:
 
 - `cc/login_health.py` — injects it into the container's own CC sessions
   (foreground + background) when the container login is hard-expired.
+- `cc/login_gate.py` — the interactive-slot decision gate: reads the token (via
+  `read_fallback_token`) to decide whether a slot should inject it, applying the
+  invoker's fallback exclusions (fail-closed lever, competing-auth, stale-token).
 - `guardian/diagnosis.py` — injects it into the host Guardian recovery brain when
   the host's own login is dead (transitive, via the loader).
 - `onboarding/floor.py` — reads it as an auth-present signal at bootstrap.
 - `scripts/guardian-gateway.sh` — references the synced host copy.
-- `scripts/cc-slot.sh` — on interactive slot CREATE, when the primary login is
-  dead (decision via `genesis.cc.login_gate`, which reuses `login_health`),
-  extracts the token INSIDE the pane shell and exports `CLAUDE_CODE_OAUTH_TOKEN`
-  so the session survives without a re-login prompt (login-dead-conditional;
-  lever `GENESIS_CC_SLOT_OAUTH`).
+- `scripts/cc-slot.sh` — on interactive slot CREATE, decides via
+  `genesis.cc.login_gate` (a faithful mirror of the invoker's fallback contract:
+  fail-closed lever, competing-auth/peer-route exclusion, stale-token exclusion),
+  then extracts the token INSIDE the pane shell with the same parser
+  (`login_health.read_fallback_token`) and exports `CLAUDE_CODE_OAUTH_TOKEN` so
+  the session survives without a re-login prompt. Default `conditional` (inject
+  only when the login is dead); `always` overrides a live login (loses Remote
+  Control / connectors); `off` disables. Lever `GENESIS_CC_SLOT_OAUTH`.
 - `guardian/credential_bridge.py` (allowlist) — the loader/propagator home
   (`load_cc_oauth_token`, `_CC_TOKEN_SOURCE`), not a business consumer.

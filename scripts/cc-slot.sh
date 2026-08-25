@@ -189,32 +189,31 @@ fi
 # docs/architecture/shared-artifacts.md.
 _OAUTH_SRC=""
 _slot_oauth_mode="${GENESIS_CC_SLOT_OAUTH:-conditional}"
-_slot_oauth_mode="${_slot_oauth_mode,,}"   # normalize case so bash + the gate agree
+_slot_oauth_mode="${_slot_oauth_mode,,}"   # normalize; the gate is the value authority
 if [ "$_SESSION_EXISTS" = "0" ] && [ "$_slot_oauth_mode" != "off" ] && [ "$_HAS_BARE" = "0" ]; then
-    # Gate exits 0 = inject. `if` guard keeps a non-zero exit from aborting the
-    # launch under `set -e`; `timeout 30` bounds a hung probe (the gate's own
-    # 15s probe timeout + interpreter startup) so a human's slot never wedges.
-    # Hand the RESOLVED mode to the gate via `env`: a plain
+    # The gate both DECIDES and AUTHORS the notice: on inject it exits 0 and
+    # prints the mode-appropriate human notice to stdout — captured here so the
+    # notice text lives in ONE place (no bash/gate divergence), and so lever
+    # semantics (unknown value → fail-closed, peer-route/override exclusion,
+    # stale-token exclusion) are enforced solely in genesis.cc.login_gate, a
+    # faithful mirror of CCInvoker's fallback contract. `if …; then` keeps a
+    # non-zero exit from aborting the launch under `set -e`; `timeout 30` bounds
+    # a hung probe. `env` hands the resolved mode across (a plain
     # `GENESIS_CC_SLOT_OAUTH=always` in ~/.genesis/cc-slot.env is a non-exported
-    # shell var, so the Python subprocess would otherwise never see it and would
-    # default to `conditional` — silently breaking `always`.
-    if timeout 30 env GENESIS_CC_SLOT_OAUTH="$_slot_oauth_mode" "${GENESIS_ROOT}/.venv/bin/python" -m genesis.cc.login_gate; then
-        if [ "$_slot_oauth_mode" = "always" ]; then
-            _oauth_notice="Genesis: forced onto the setup-token (GENESIS_CC_SLOT_OAUTH=always) — Remote Control and claude.ai connectors are OFF; set the lever to conditional and restart this slot to use /login. Local MCP servers still work."
-        else
-            _oauth_notice="Genesis: primary CC login is dead — running on the stored setup-token. Remote Control and claude.ai connectors are OFF until you /login. Local MCP servers still work."
-        fi
-        # Shell-quote the notice so it cannot break out of the pane command
-        # string — the notice text is static today, but %q makes ANY future edit
-        # (a quote, backtick, or $) injection-proof by construction, not by luck.
+    # shell var the subprocess would otherwise never see).
+    if _oauth_notice=$(timeout 30 env GENESIS_CC_SLOT_OAUTH="$_slot_oauth_mode" \
+            "${GENESIS_ROOT}/.venv/bin/python" -m genesis.cc.login_gate); then
+        # %q so the notice cannot break out of the pane command string (any
+        # future notice edit is injection-proof by construction, not by luck).
         _notice_q=$(printf '%q' "$_oauth_notice")
-        # Runs in the PANE shell: extract ONLY the token var (not a full source —
-        # avoids evaluating the file as shell / exporting GENESIS_CC_TOKEN_CREATED_AT),
-        # export it so claude inherits it, then print the (shell-quoted) notice to
-        # stderr. Never echoes the token value. `$(...)`, `~`, and the file read all
-        # defer to the pane shell (the `\$` / literal single-quotes keep them
-        # unexpanded here); ${_notice_q} is already a safe single shell word.
-        _OAUTH_SRC="if [ -r ~/.genesis/cc_oauth_token.env ]; then export CLAUDE_CODE_OAUTH_TOKEN=\"\$(sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' ~/.genesis/cc_oauth_token.env)\"; printf '%s\\n' ${_notice_q} >&2; fi; "
+        # Runs in the PANE shell: read the token with the SAME parser the gate
+        # used (login_health.read_fallback_token — no sed/parser divergence),
+        # export it ONLY when non-empty (a failed/empty read never exports a
+        # blank credential), then echo the notice to stderr. The token flows
+        # python-stdout → $(...) → a shell var → the process ENV, never any argv
+        # (no ps/scrollback leak). `$(...)`, `\$`, and the literal single-quoted
+        # python defer to the pane shell; ${GENESIS_ROOT}/${_notice_q} expand here.
+        _OAUTH_SRC="_gt=\"\$(\"${GENESIS_ROOT}/.venv/bin/python\" -c 'import sys; from genesis.cc.login_health import read_fallback_token as r; sys.stdout.write(r() or str())' 2>/dev/null)\"; if [ -n \"\$_gt\" ]; then export CLAUDE_CODE_OAUTH_TOKEN=\"\$_gt\"; printf '%s\\n' ${_notice_q} >&2; fi; unset _gt; "
     fi
 fi
 

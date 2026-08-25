@@ -4,23 +4,34 @@
 inject the stored 1-year setup-token (``CLAUDE_CODE_OAUTH_TOKEN``) so an
 interactive session survives a dead ``/login`` without a re-login prompt.
 
-Contract: exit 0 = inject, exit 1 = do NOT inject. Prints NOTHING sensitive
-(never the token). Fails CLOSED — any error → exit 1 (the slot keeps its normal
-login behavior; a dead login just prompts ``/login`` as it does today).
+Contract: exit 0 = inject, exit 1 = do NOT inject. On exit 0 the gate prints the
+human-facing notice (which the pane echoes to stderr) to STDOUT — and NOTHING
+sensitive (never the token). Fails CLOSED — any error → exit 1 (the slot keeps
+its normal login behavior; a dead login just prompts ``/login`` as today).
 
-Decision authority is SHARED, not re-implemented: the ``conditional`` mode calls
-``login_health.fallback_env_if_login_dead`` — the same gate CCInvoker uses
-(invoker.py) — so the container never grows two divergent notions of "login is
-dead" (per the leaky per-consumer-classification lesson).
+This gate is the SINGLE authority for the whole slot-fallback decision, and a
+faithful mirror of ``CCInvoker._apply_login_fallback`` (invoker.py). Beyond the
+shared ``login_health.fallback_env_if_login_dead`` gate it also enforces:
+
+- **Fail-closed lever**: only ``conditional`` / ``always`` / ``off`` inject as
+  documented; any other value (a typo like ``of``) is rejected, not silently
+  treated as ``conditional``.
+- **Competing-auth exclusion**: never inject when another auth mechanism is in
+  play — a peer-route (``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_AUTH_TOKEN``), an API
+  key (``ANTHROPIC_API_KEY``), an already-present ``CLAUDE_CODE_OAUTH_TOKEN``, or
+  a custom ``CLAUDE_CONFIG_DIR``. This preserves the invoker's credential-
+  isolation contract (the Anthropic setup-token must never travel toward a
+  third-party endpoint), for BOTH ``conditional`` and ``always``.
+- **Stale-token exclusion**: a setup-token past its ~1-year life is treated as
+  absent (shared ``login_health.fallback_token_is_stale``), for both modes.
 
 Lever ``GENESIS_CC_SLOT_OAUTH``:
 - ``conditional`` (default): inject ONLY when the interactive login is
   hard-expired AND a live ``claude auth status`` probe confirms logged-out.
-  Preserves Remote Control + claude.ai connectors while the login is alive
-  (the env var is simply absent then, so CC uses ``/login``).
-- ``always``: inject whenever a setup-token exists, bypassing the login gate.
-  Overrides even a live login (loses connectors until the lever is set back to
-  ``conditional`` and the slot restarts).
+  Preserves Remote Control + claude.ai connectors while the login is alive.
+- ``always``: inject whenever a (fresh) setup-token exists, bypassing the login
+  gate. Overrides even a live login (loses connectors until the lever is set
+  back to ``conditional`` and the slot restarts).
 - ``off``: never inject (kill switch / per-slot opt-out).
 
 The 60s probe cache in ``login_health`` is per-process, so it does NOT amortize
@@ -35,23 +46,85 @@ import asyncio
 import os
 import sys
 
+_VALID_MODES = ("conditional", "always", "off")
+
+# Env markers that mean "another auth mechanism owns this session" — the exact
+# set CCInvoker._apply_login_fallback excludes (invoker.py). Full parity: never
+# cross the Anthropic setup-token into a peer-routed (ANTHROPIC_BASE_URL/
+# AUTH_TOKEN) or alternately-authed (ANTHROPIC_API_KEY) process, never clobber an
+# already-present CLAUDE_CODE_OAUTH_TOKEN, and never inject over a custom
+# CLAUDE_CONFIG_DIR. The last matters because read_fallback_token() reads ONE
+# fixed, global token (~/.genesis/cc_oauth_token.env) — NOT config-dir-scoped —
+# so a slot pointed at a different Claude identity via CLAUDE_CONFIG_DIR must not
+# be silently re-authed as the primary operator. Normal slots never set it, so
+# this only excludes deliberately custom-config-dir slots (same tradeoff the
+# invoker accepts).
+_COMPETING_AUTH_ENV = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CONFIG_DIR",
+)
+
+_NOTICE_CONDITIONAL = (
+    "Genesis: primary CC login is dead — running on the stored setup-token. "
+    "Remote Control and claude.ai connectors are OFF until you /login. "
+    "Local MCP servers still work."
+)
+_NOTICE_ALWAYS = (
+    "Genesis: forced onto the setup-token (GENESIS_CC_SLOT_OAUTH=always) — "
+    "Remote Control and claude.ai connectors are OFF; set the lever to "
+    "conditional and restart this slot to use /login. Local MCP servers still work."
+)
+
 
 def _mode() -> str:
     return (os.environ.get("GENESIS_CC_SLOT_OAUTH") or "conditional").strip().lower()
 
 
-async def _should_inject() -> bool:
-    """True iff this slot should inject the setup-token, per the lever."""
+def _competing_auth() -> str | None:
+    """Name of a competing-auth env var that is set (non-empty), else None."""
+    for name in _COMPETING_AUTH_ENV:
+        if os.environ.get(name):
+            return name
+    return None
+
+
+async def _decide() -> str | None:
+    """Return the notice to show if this slot should inject, else None."""
     # Imported lazily so the module stays cheap to import and the gate's only
     # heavy dependency (login_health → asyncio/subprocess) loads on demand.
     from genesis.cc import login_health
 
     mode = _mode()
     if mode == "off":
-        return False
+        return None
+    if mode not in _VALID_MODES:
+        print(
+            f"Genesis: unknown GENESIS_CC_SLOT_OAUTH={mode!r} — not injecting "
+            "(allowed: conditional, always, off).",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
+    # Never inject over a competing auth mechanism (credential-isolation parity
+    # with the invoker) — applies to BOTH conditional and always.
+    competing = _competing_auth()
+    if competing:
+        print(
+            f"Genesis: {competing} is set — leaving auth to it, not injecting the setup-token.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
 
     if mode == "always":
-        return login_health.read_fallback_token() is not None
+        token = login_health.read_fallback_token()
+        if token is None or login_health.fallback_token_is_stale():
+            return None
+        return _NOTICE_ALWAYS
 
     # conditional (default): reuse the shared login-dead gate. Wrap the probe so
     # the ONE case where it actually runs (login already hard-dead) emits a
@@ -68,14 +141,20 @@ async def _should_inject() -> bool:
         return await login_health.probe_logged_out(cc_path)
 
     env = await login_health.fallback_env_if_login_dead(probe=probe, cc_path=cc_path)
-    return env is not None
+    return _NOTICE_CONDITIONAL if env is not None else None
 
 
 def main() -> int:
     try:
-        return 0 if asyncio.run(_should_inject()) else 1
+        notice = asyncio.run(_decide())
     except Exception:  # noqa: BLE001 — fail-closed: never inject on error
         return 1
+    if notice is None:
+        return 1
+    # STDOUT carries ONLY the human notice (never the token); cc-slot.sh captures
+    # it and the pane echoes it to stderr.
+    print(notice)
+    return 0
 
 
 if __name__ == "__main__":
