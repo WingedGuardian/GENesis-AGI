@@ -24,6 +24,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The run_in_background pipe guard no longer false-blocks a `|` inside a quoted
+  argument.** The old inline check (`${CMD//||/ }` then `grep -qF "|"`) blocked any
+  literal `|`, so backgrounding `gh api … --jq '.[] | .x'` or `grep -F '|' file`
+  was wrongly rejected. It's now a small Python hook (`background_pipe_guard.py`)
+  using the canonical quote/redirect-aware parser (`shell_parse.has_top_level_pipe`),
+  so only a genuine top-level pipe — whose backgrounded stdout really is swallowed —
+  blocks; a `|` in quotes, a `||`, or a `>|` redirect does not. (Convenience guard:
+  a `|` inside a heredoc body or `case` pattern is a documented residual that may
+  still over-block — never a security bypass.)
+
 - **The merge gate no longer blocks on a review finding that lands on a
   documentation file.** An inline `[P1]` finding anchored to a doc path
   (`CHANGELOG`, `README`, `LICENSE`/`NOTICE`, `docs/**`, `*.rst`) is now surfaced

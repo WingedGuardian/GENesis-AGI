@@ -273,6 +273,49 @@ def split_segments(command: str) -> list[str]:
     return [s.strip() for s in segs if s.strip()]
 
 
+def has_top_level_pipe(command: str) -> bool:
+    """Whether *command* contains a real top-level shell PIPE (``a | b``).
+
+    Quote- and redirect-aware (shares ``split_segments``' scanner): a ``|`` inside
+    a quoted string (a jq program, ``grep -F '|'``), a ``||`` control operator, or a
+    ``>|`` redirect operator is NOT a pipe. Used by the run_in_background guard: a
+    piped background command's stdout is swallowed, so ONLY a genuine pipe should
+    block it — a quoted ``|`` must not.
+
+    NOT heredoc/case-block aware (the same documented limits as ``split_segments``):
+    a ``|`` inside a ``<<EOF`` body or a ``case`` pattern may read as a pipe. This is
+    an accepted residual for a CONVENIENCE guard (friction, not a sandbox) — the
+    worst case is an over-block the user reworks, never a security bypass.
+    """
+    i, n = 0, len(command)
+    quote: str | None = None
+    while i < n:
+        c = command[i]
+        if quote:
+            if quote == '"' and c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c
+            i += 1
+            continue
+        if command[i : i + 2] in ("&&", "||"):  # control operators, not a pipe
+            i += 2
+            continue
+        op_len = _redirect_operator_len(command, i)
+        if op_len is not None:  # a redirect operator (incl. ``>|``) — skip it whole
+            i += op_len
+            continue
+        if c == "|":  # unquoted, not ``||``, not part of ``>|`` → a real pipe
+            return True
+        i += 1
+    return False
+
+
 def _strip_trailing_comment(seg: str) -> str:
     """Remove an unquoted ``#`` comment (whitespace-preceded or at start) to EOL."""
     out: list[str] = []

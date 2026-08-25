@@ -10,6 +10,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "hooks"))
 import shell_parse as sp  # noqa: E402
 
@@ -422,3 +424,46 @@ class TestRedirects:
         # command to hide); documents the accepted argv-residual, not a regression.
         segs = sp.analyze("echo hi 2>$LOGDIR/out")
         assert not any(s.exe in ("rm", "rmdir") for s in segs)
+
+
+# ── has_top_level_pipe (run_in_background pipe guard, quote/redirect-aware) ──
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "a | b",
+        "cat x|grep y",
+        "make |& tee log",  # |& = 2>&1 | — a real pipe
+        "a || b | c",  # a genuine pipe survives past the ||
+        "a > out.log | b",  # pipe after a redirect
+        "ls; foo | bar",
+    ],
+)
+def test_has_top_level_pipe_true(cmd):
+    assert sp.has_top_level_pipe(cmd) is True
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "a || b",  # control operator, not a pipe
+        "a && b",
+        "echo hello world",
+        "grep -F '|' file",  # | inside single quotes (the classic false-positive)
+        "jq '.a | .b' data.json",  # | inside a quoted jq program
+        'jq ".x | .y" data.json',  # | inside double quotes
+        "git 2>| out push",  # >| is a redirect operator, not a pipe
+        "git 2>/dev/null push",
+        "printf '%s' payload",
+    ],
+)
+def test_has_top_level_pipe_false(cmd):
+    assert sp.has_top_level_pipe(cmd) is False
+
+
+def test_has_top_level_pipe_case_pattern_is_known_residual():
+    # DOCUMENTED residual: a `|` in a case pattern (or heredoc body) is not tracked
+    # by the shared scanner, so it reads as a pipe. Accepted for a convenience guard
+    # (worst case: an over-block the user reworks, never a security bypass).
+    assert sp.has_top_level_pipe("case $x in a|b) echo hi;; esac") is True
