@@ -81,6 +81,24 @@ def test_degenerate_interval_uses_floor():
     assert stall_threshold_minutes(-5) == STALL_FLOOR_MINUTES
 
 
+def test_materially_future_pulse_is_not_confirmable():
+    """A pulse well in the FUTURE (clock stepped backward / corrupt data) is not a
+    confirmable recent success: overdue_minutes is None (caller → unavailable), and
+    NEVER a green from the negative age. Without this it would read healthy and hide a
+    wedged scheduler until now catches up."""
+    v = _live(success_min_ago=-30)  # 30 min in the future
+    assert v.stalled is False
+    assert v.overdue_minutes is None
+
+
+def test_small_future_skew_is_tolerated():
+    """A pulse a couple minutes ahead (sub-tolerance clock jitter) is still 'recent' →
+    healthy with a real (negative) overdue, not forced unavailable."""
+    v = _live(success_min_ago=-2)  # 2 min future, within the 5m tolerance
+    assert v.stalled is False
+    assert v.overdue_minutes is not None
+
+
 def test_large_interval_scales_threshold():
     """A slow job (interval*4 > floor) needs a proportionally larger gap → a
     legitimately slow cadence never false-reds."""

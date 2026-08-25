@@ -148,3 +148,13 @@ async def test_unparseable_pulse_is_unavailable(db, runtime_singleton):
     r = await surplus_status(db, _fake_surplus())
     assert r["liveness_error"] is True
     assert r["stalled"] is False
+
+
+@pytest.mark.asyncio
+async def test_future_pulse_is_unavailable(db, runtime_singleton):
+    """A pulse materially in the future (clock stepped backward / corruption) is not a
+    confirmable recent success → unavailable, never green from the negative age."""
+    _install_runtime(paused=False, pulse_min_ago=-30)  # 30 min in the future
+    r = await surplus_status(db, _fake_surplus())
+    assert r["liveness_error"] is True
+    assert r["stalled"] is False

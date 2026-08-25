@@ -3733,12 +3733,14 @@
 
         surplusSemantic() {
           const surplus = this.health.surplus;
-          if (!surplus || surplus.status === "unknown") return { state: "unknown", reason: "surplus scheduler data unavailable" };
-          // Fail-LOUD (mirror egoSemantic): if the liveness read errored, or the
-          // scheduler has never recorded a single completed cycle (crashed before
-          // its first pulse / never started — NOT owned by the job_never_succeeded
-          // alarm), `stalled` is false but the tile must NOT read green — surfacing
-          // either as healthy would recreate the false-green this exists to kill.
+          if (!surplus) return { state: "unknown", reason: "surplus scheduler data unavailable" };
+          // Liveness (from the AUTHORITATIVE pulse) precedes the auxiliary activity
+          // `status`: the independent idle/activity probe can throw (status="unknown")
+          // while the pulse still CONFIRMS a stall — that confirmed stall must surface
+          // as an error, not be masked as merely unknown by an early status guard.
+          // Fail-LOUD (mirror egoSemantic): a liveness read error, or a scheduler that
+          // never recorded a completed cycle (crashed before its first pulse — NOT
+          // owned by the job_never_succeeded alarm), is unknown, never green.
           if (surplus.liveness_error) return { state: "unknown", reason: "surplus liveness unavailable (read error or no completed cycle on record)" };
           // Truthful wedged-detector: surplus_dispatch pulses success every ~5 min,
           // so a stale last_success (past the conservative threshold, and not paused)
@@ -3746,6 +3748,9 @@
           // `status` hides (a wedged scheduler reads "idle" → green). Computed
           // server-side from job_health (observability.liveness).
           if (surplus.stalled) return { state: "error", reason: `surplus scheduler stalled — ${surplus.stall_reason || "no recent dispatch"}` };
+          // Only now defer to the auxiliary activity probe: liveness was readable and
+          // not stalled, so an unknown activity status is genuinely just unknown.
+          if (surplus.status === "unknown") return { state: "unknown", reason: "surplus scheduler data unavailable" };
           const failed = surplus.tasks_failed_24h || 0;
           const completed = surplus.tasks_completed_24h || 0;
           if (failed > 0 && completed > 0 && failed / (completed + failed) > 0.2) {

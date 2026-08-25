@@ -46,6 +46,11 @@ STALL_INTERVAL_MULTIPLE = 4
 # ...and never before this hard floor, so a transient (a single missed cycle) never
 # trips and a fast cadence (surplus's 5 min → 20 min) still needs 3h of silence.
 STALL_FLOOR_MINUTES = 3 * 60
+# A pulse more than this many minutes in the FUTURE is treated as not-confirmable
+# (the wall clock stepped backward since the heartbeat, or corrupt data ahead of now),
+# never as a recent success — small enough to bound any false-green window, generous
+# enough to ignore sub-minute clock jitter.
+FUTURE_SKEW_TOLERANCE_MINUTES = 5
 
 
 def _parse(iso: str | None) -> datetime | None:
@@ -96,6 +101,11 @@ def compute_pulse_liveness(
     Callers pass ``paused`` from live runtime state; an inability to determine it
     must likewise be handled by the caller as UNKNOWN (fail-loud), never by passing
     ``paused=False`` (which would false-RED a stale but legitimately-suppressed job).
+
+    The ``overdue_minutes is None`` sentinel is the caller's single "cannot confirm →
+    unavailable" signal: it is None iff ``last_success`` is absent, unparseable, OR
+    materially in the future (clock skew / corruption) — every non-confirmable pulse,
+    and never a valid recent-past one.
     """
     now = now or datetime.now(UTC)
     threshold = stall_threshold_minutes(expected_interval_minutes)
@@ -107,6 +117,14 @@ def compute_pulse_liveness(
         return PulseLiveness(last_success_at, False, None, threshold, None)
 
     overdue = (now - success).total_seconds() / 60.0
+
+    # A pulse materially in the FUTURE (clock stepped backward since the heartbeat, or
+    # a parseable-but-corrupt value ahead of now) is not a confirmable recent-past
+    # pulse: a naive `overdue > threshold` would read the negative age as healthy and
+    # hide a wedged scheduler until now catches up. Signal it via the same None
+    # sentinel the caller treats as "cannot confirm" → unavailable, never green.
+    if overdue < -FUTURE_SKEW_TOLERANCE_MINUTES:
+        return PulseLiveness(last_success_at, False, None, threshold, None)
 
     # Paused legitimately freezes the success pulse — never a stall.
     if paused:
