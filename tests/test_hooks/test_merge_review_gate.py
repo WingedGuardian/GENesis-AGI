@@ -1423,10 +1423,45 @@ class TestCheckInlineReviewFindings:
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
 
-    def test_inline_p1_on_docs_txt_does_not_block(self, guard_module):
-        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="docs/guide.txt")]):
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "docs/requirements.txt",   # pip deps (repo classifies as config)
+            "docs/constraints.txt",    # pip constraints
+            "docs/CMakeLists.txt",     # CMake build
+            "docs/meson_options.txt",  # Meson build
+            "docs/guide.txt",          # plain .txt is ambiguous → fail-closed
+        ],
+    )
+    def test_inline_p1_txt_manifest_or_ambiguous_under_docs_blocks(
+        self, guard_module, path
+    ):
+        # Codex P1: `.txt` is NOT an unambiguous doc extension — a build/dep
+        # manifest carries it too. Only a known doc STEM (LICENSE.txt) is prose.
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path=path)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block, f"{path!r} is an ambiguous .txt — must block"
+
+    @pytest.mark.parametrize("path", ["LICENSE.txt", "README.txt", "docs/README.txt"])
+    def test_inline_p1_known_stem_txt_does_not_block(self, guard_module, path):
+        # A doc-named STEM pins the file as prose, so .txt is safe there.
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path=path)]):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "docs/guide\x7f.md",  # DEL
+            "docs/guide\x85.md",  # NEL (C1) — gh --jq emits literally
+            "docs/guide\x9f.md",  # C1 upper bound
+        ],
+    )
+    def test_inline_p1_c1_del_control_char_path_blocks(self, guard_module, path):
+        # Codex P2: reject the COMPLETE control range (DEL + C1), not just C0.
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path=path)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
 
 
 class TestResolvePrNumber:

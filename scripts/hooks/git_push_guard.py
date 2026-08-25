@@ -870,17 +870,23 @@ _INLINE_MARKUP_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}")
 # block a merge (a CHANGELOG typo, a README wording nit). This is a FAIL-CLOSED
 # ALLOWLIST — a path is exempted only when it is provably prose; everything else
 # blocks. Prose is: (1) a known doc-named file (CHANGELOG/README/LICENSE/NOTICE/…)
-# with a doc or empty extension, at any depth; (2) any file with a documentation
-# extension (.md/.rst/.txt/…) UNDER a top-level ``docs/``; or (3) any ``*.rst``
-# anywhere. A random top-level ``NOTES.md``, ANY source/config/executable file
-# even under ``docs/`` (``docs/conf.py``, ``docs/build.rs``, ``docs/config.yaml``,
-# ``docs/Makefile``), a missing/empty path, or a path bearing a control character
-# is NON-doc and STILL BLOCKS — the gate never opens for a code path merely
-# mislabeled. Only the inline endpoint carries a per-file path; the review-BODY
-# gate is PR-level and stays unfiltered. (Denylist of code extensions was rejected
-# in review: it can't enumerate every source/config type — an allowlist fails
-# closed on the unknown.)
-_DOC_EXTS = {"md", "markdown", "rst", "txt", "adoc"}
+# with a doc/text/empty extension, at any depth; (2) any UNAMBIGUOUS documentation
+# extension (.md/.rst/.markdown/.adoc) UNDER a top-level ``docs/``; or (3) any
+# ``*.rst`` anywhere. A random top-level ``NOTES.md``, ANY source/config/executable
+# file even under ``docs/`` (``docs/conf.py``, ``docs/build.rs``, ``docs/config.yaml``,
+# ``docs/Makefile``), a missing/empty path, or a path bearing a control character is
+# NON-doc and STILL BLOCKS — the gate never opens for a code path merely mislabeled.
+# ``.txt`` is deliberately NOT a blanket doc extension: it is ambiguous (a build/dep
+# manifest — ``docs/requirements.txt``, ``docs/CMakeLists.txt`` — carries it too, and
+# this repo classifies such files as config), so ``.txt`` is prose ONLY on a known
+# doc-named stem (``LICENSE.txt``, ``README.txt``). Only the inline endpoint carries
+# a per-file path; the review-BODY gate is PR-level and stays unfiltered. (A denylist
+# of code extensions was rejected in review: it can't enumerate every source/config
+# type — an allowlist fails closed on the unknown.)
+_DOC_EXTS = {"md", "markdown", "rst", "adoc"}
+# Extensions permitted on a KNOWN doc-named stem only (rule 1). ``.txt``/empty are
+# safe here because the STEM already pins the file as prose (LICENSE, README).
+_DOC_STEM_EXTS = _DOC_EXTS | {"txt", ""}
 _DOC_STEMS = {
     "changelog",
     "readme",
@@ -895,21 +901,24 @@ _DOC_STEMS = {
 def _is_doc_path(path: str) -> bool:
     """Whether a review finding's file *path* is documentation whose findings do
     NOT block a merge. FAIL-CLOSED allowlist (see the section comment): anything
-    not provably prose — a source/config file under ``docs/``, a random top-level
-    ``*.md``, a missing path, or a control-char-bearing path — blocks."""
-    if not path or any(ord(c) < 0x20 for c in path):
+    not provably prose — a source/config/manifest file under ``docs/`` (incl. a
+    ``.txt`` build manifest), a random top-level ``*.md``, a missing path, or a
+    control-char-bearing path — blocks."""
+    # Reject the COMPLETE control-character range (Unicode Cc): C0 (<0x20), DEL
+    # (0x7F), and C1 (0x80-0x9F, incl. NEL 0x85 which ``gh --jq`` emits literally).
+    if not path or any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in path):
         return False  # empty or control-char-bearing → block (fail-closed)
     base = path.rsplit("/", 1)[-1]
     stem, dot, ext = base.rpartition(".")
     ext = ext.lower() if dot else ""
     stem_l = (stem if dot else base).lower()
-    # (1) A known doc-named file with a doc/empty extension, at any depth.
-    if stem_l in _DOC_STEMS and ext in _DOC_EXTS | {""}:
+    # (1) A known doc-named file with a doc/text/empty extension, at any depth.
+    if stem_l in _DOC_STEMS and ext in _DOC_STEM_EXTS:
         return True
     # (2) A pure documentation format (reStructuredText) anywhere.
     if ext == "rst":
         return True
-    # (3) A documentation-extension file under a top-level docs/ directory.
+    # (3) An unambiguous documentation extension under a top-level docs/ directory.
     return ext in _DOC_EXTS and path.startswith("docs/")
 
 
