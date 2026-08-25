@@ -302,6 +302,17 @@ async def test_bad_repo_error(db, live):
     assert res["status"] == "error"
 
 
+@pytest.mark.asyncio
+async def test_malformed_repo_components_rejected(db, live):
+    """repo must have non-empty owner AND name — a slug with an empty component
+    ('owner/', '/repo', '/', 'a//b') errors with NO row, so the drain never retries
+    an invalid `gh --repo` forever (Codex round-3 P2)."""
+    for bad in ("owner/", "/repo", "/", "a//b"):
+        res = await ci._impl_contributor_issue_propose(db, title="t title", body="b body", repo=bad)
+        assert res["status"] == "error", bad
+    assert await pip.list_held(db) == []
+
+
 # ── batch approve-all must NEVER sweep a held issue (public-repo write) ─────
 
 

@@ -96,11 +96,13 @@ async def _impl_contributor_issue_propose(
                 default_repo,
             )
             repo = default_repo
-    # Validate the FINAL repo value — AFTER any autonomous pin — so a bare
-    # ``_default_repo()`` (configured owner absent → no ``owner/`` prefix) is
-    # rejected here instead of creating a hold the drain would send to an invalid
-    # ``gh --repo`` and retry forever.
-    if "/" not in repo:
+    # Validate the FINAL repo value — AFTER any autonomous pin — so a malformed
+    # destination is rejected here instead of creating a hold the drain would send to
+    # an invalid ``gh --repo`` and retry forever (consuming max_held). Require every
+    # slash-separated component non-empty: ``owner/`` , ``/repo`` , ``/`` , ``a//b``
+    # are all rejected, while ``owner/name`` (and gh's ``host/owner/repo``) pass.
+    _parts = repo.split("/")
+    if len(_parts) < 2 or not all(_parts):
         return {"status": "error", "reason": f"repo must be owner/name, got {repo!r}"}
     source_ref = (source_follow_up_id or "").strip() or None
     label_list = [str(x).strip() for x in (labels or []) if str(x).strip()]

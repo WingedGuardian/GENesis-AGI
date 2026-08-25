@@ -425,7 +425,7 @@ gated — that contract is one-directional.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: d50f37ad 2026-08-25
+verified: d8204a0c 2026-08-25
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
