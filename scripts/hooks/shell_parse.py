@@ -216,20 +216,36 @@ def split_segments(command: str) -> list[str]:
                 i = j
                 continue
             j0 = j
-            if j < n:  # measure ONE target token (quote-aware), else a bare op
-                if t in ("'", '"'):
-                    j += 1
-                    while j < n:
-                        if t == '"' and command[j] == "\\" and j + 1 < n:
+            if j < n and t not in _TARGET_STOP:
+                # Measure ONE complete shell word (the closed bash word grammar): a
+                # run of characters ended only by an UNQUOTED, UNESCAPED delimiter.
+                # A backslash escapes the next char (incl. a space); single/double
+                # quotes open a span that suppresses delimiters (with `\` active only
+                # inside double quotes), and adjacent quoted/plain runs concatenate
+                # into one word. Scanning the whole word — not stopping at the first
+                # escaped/quoted space — is what keeps `git 2>err\ log push` /
+                # `git 2>pre"a b"post push` from hiding the push/commit subcommand.
+                wq: str | None = None  # in-word quote state
+                while j < n:
+                    ch = command[j]
+                    if wq is not None:
+                        if wq == '"' and ch == "\\" and j + 1 < n:
                             j += 2
                             continue
-                        if command[j] == t:
-                            j += 1
-                            break
+                        if ch == wq:
+                            wq = None
                         j += 1
-                elif t not in _TARGET_STOP:
-                    while j < n and command[j] not in _TARGET_STOP:
+                        continue
+                    if ch == "\\" and j + 1 < n:  # unquoted backslash escapes next char
+                        j += 2
+                        continue
+                    if ch in ("'", '"'):  # a quote span begins (or concatenates)
+                        wq = ch
                         j += 1
+                        continue
+                    if ch in _TARGET_STOP:  # unquoted delimiter ends the word
+                        break
+                    j += 1
             # Strip ONLY a plain-filename target. A target that can carry a command
             # expansion — a ``$`` (``$(…)`` / bare ``$VAR``) or a backtick, in any
             # quoting — is LEFT in the segment text (rewind and let normal processing

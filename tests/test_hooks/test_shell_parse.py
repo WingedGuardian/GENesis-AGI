@@ -265,6 +265,24 @@ class TestRedirects:
         # `2>&1` splits on '&' under the old tokenizer, hiding push in a bogus seg
         assert _push_blocked("git 2>&1 push origin main")
 
+    def test_leading_redirect_escaped_space_target_push_blocked(self):
+        # bash: `error\ log` is ONE target word (escaped space) → the real command
+        # is `git push`. The target scan must consume the whole word, not stop at
+        # the escaped space (else the subcommand mis-reads as 'log' → fail-open).
+        cmd = r"git 2>error\ log push origin main"
+        assert sp.git_subcommand(sp.analyze(cmd)[0].argv) == "push"
+        assert _push_blocked(cmd)
+
+    def test_leading_redirect_concatenated_quote_target_push_blocked(self):
+        # bash: `pre"error log"post` is ONE word (concatenated quoting) → `git push`.
+        cmd = 'git 2>pre"error log"post push origin main'
+        assert sp.git_subcommand(sp.analyze(cmd)[0].argv) == "push"
+        assert _push_blocked(cmd)
+
+    def test_leading_redirect_escaped_space_target_commit_no_verify(self):
+        # same fail-open on the commit gate: `err\ log` is one target word.
+        assert _commit_nv(rf"git 2>err\ log commit '{NV}' -m x")
+
     def test_leading_redirect_commit_no_verify(self):
         assert _commit_nv(f"git 2>/dev/null commit '{NV}' -m x")
 
@@ -310,6 +328,14 @@ class TestRedirects:
 
     def test_fd_dup_target_stripped(self):
         assert sp.analyze("pytest tests/x.py >&2")[0].argv == ["pytest", "tests/x.py"]
+
+    def test_escaped_space_redirect_target_stripped(self):
+        # an escaped space keeps the target as ONE word → fully stripped from argv
+        assert sp.analyze(r"pytest tests/x.py 2>err\ log")[0].argv == ["pytest", "tests/x.py"]
+
+    def test_concatenated_quote_redirect_target_stripped(self):
+        # `pre"a b"post` is one concatenated word target → stripped whole
+        assert sp.analyze('pytest tests/x.py 2>pre"a b"post')[0].argv == ["pytest", "tests/x.py"]
 
     # --- pytest detection survives redirects ---
     def test_pytest_detected_with_redirect(self):
