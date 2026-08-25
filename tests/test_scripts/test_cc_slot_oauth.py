@@ -69,14 +69,16 @@ def test_no_token_leak_via_tmux_e(script_text):
 
 
 def test_pane_command_interpolates_oauth_prefix(script_text):
-    assert "${_OAUTH_SRC}claude " in script_text
+    # The token-prep prefix runs BEFORE cd, leaving the `cd && claude` guard intact.
+    assert "${_OAUTH_SRC}cd ${GENESIS_ROOT} && claude " in script_text
 
 
-def test_claude_grouped_behind_cd_guard(script_text):
-    # `_OAUTH_SRC` ends in `;`, so without a brace group `cd $ROOT && <prefix>;
-    # claude` binds the `&&` to the prefix only and claude runs even if cd fails.
-    # The `{ ...; }` keeps claude under the cd-guard.
-    assert "cd ${GENESIS_ROOT} && { ${_OAUTH_SRC}claude " in script_text
+def test_claude_stays_under_cd_guard(script_text):
+    # `_OAUTH_SRC` ends in `;`. Placing it AFTER the `&&` (`cd $ROOT && <prefix>;
+    # claude`) would bind the `&&` to the prefix only and run claude even if cd
+    # fails. Keeping the prefix BEFORE cd preserves the original `cd && claude` guard.
+    assert "${_OAUTH_SRC}cd ${GENESIS_ROOT} && claude " in script_text
+    assert "&& { ${_OAUTH_SRC}claude" not in script_text  # not the brace-group shape
 
 
 def _extract_oauth_src_line(script_text: str) -> str:
@@ -143,9 +145,10 @@ printf 'TOKEN=[%s]\\n' "${{CLAUDE_CODE_OAUTH_TOKEN:-}}"
 
 
 def _extract_launch_line(script_text: str) -> str:
-    """The tmux pane-command argument (the `"cd ${GENESIS_ROOT} && …"` string)."""
+    """The tmux pane-command argument (the `"${_OAUTH_SRC}cd ${GENESIS_ROOT} && …"`
+    string)."""
     for line in script_text.splitlines():
-        if line.lstrip().startswith('"cd ${GENESIS_ROOT} &&'):
+        if line.lstrip().startswith('"${_OAUTH_SRC}cd ${GENESIS_ROOT} &&'):
             return line.strip()
     raise AssertionError("could not find the exec-tmux pane command in cc-slot.sh")
 
