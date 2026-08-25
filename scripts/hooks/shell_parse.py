@@ -578,9 +578,47 @@ def _nested_script(argv: list[str]) -> str:
 # ── git-specific helpers ────────────────────────────────────────────────
 
 
-def git_subcommand(argv: list[str]) -> str | None:
-    """The git subcommand for an argv whose executable is git, skipping git
-    global options (including ``-c KEY=VAL`` / ``-C DIR`` which take a value)."""
+def _skip_redirect_substitution(argv: list[str], start: int) -> int:
+    """Advance past a command-substitution / var artifact in *argv* beginning at
+    ``argv[start]`` — a ``$()``/backtick/``$VAR`` REDIRECT TARGET that
+    ``split_segments`` deliberately left in the segment text (so ``_substitutions``
+    still sees the nested command for the destructive-command guard) and that
+    word-splitting then scattered across tokens. Returns the index of the first
+    token AFTER the artifact.
+
+    Bounded: balances a ``$( … )`` body by paren depth and matches a ``` `…` ```
+    pair, both across word-split tokens; a bare ``$VAR`` skips alone. An exotic
+    body (a paren/backtick nested inside a quote WITHIN the substitution) is a
+    documented residual — this is an approval-gate friction layer, not a sandbox.
+    """
+    t = argv[start]
+    i = start + 1
+    if "$(" in t:  # $( … ) — balance parens across tokens
+        depth = t.count("(") - t.count(")")
+        while i < len(argv) and depth > 0:
+            depth += argv[i].count("(") - argv[i].count(")")
+            i += 1
+        return i
+    if "`" in t and t.count("`") % 2 == 1:  # `…` opener left unclosed in this token
+        while i < len(argv) and argv[i].count("`") % 2 == 0:
+            i += 1
+        if i < len(argv):
+            i += 1  # the token that closes the backtick pair
+        return i
+    return i  # a bare $VAR (or a self-closed `x`/$(x)) — skip the single token
+
+
+def _subcommand_index(argv: list[str]) -> int | None:
+    """Index of the git subcommand token in *argv* (``argv[0] == 'git'``), or None.
+
+    Skips git global options (+ their values, e.g. ``-C DIR`` / ``-c KEY=VAL``)
+    AND a command-substitution / var artifact left in argv by a ``$()``/backtick
+    redirect target — the latter must NOT be read as the subcommand, or a segment
+    like ``git 2>$(x) push --force`` resolves to ``$(x`` and slips the push/commit
+    approval gates (git_push_guard gates on ``git_subcommand(argv) == 'push'`` /
+    ``'commit'``). The nested command itself stays visible to the destructive-command
+    guard via ``_substitutions`` — this closes only the subcommand-misread.
+    """
     if not argv or _basename(argv[0]) != "git":
         return None
     i = 1
@@ -592,8 +630,19 @@ def git_subcommand(argv: list[str]) -> str | None:
         if t.startswith("-"):
             i += 1
             continue
-        return t
+        if t.startswith("$") or "$(" in t or "`" in t:
+            i = _skip_redirect_substitution(argv, i)
+            continue
+        return i
     return None
+
+
+def git_subcommand(argv: list[str]) -> str | None:
+    """The git subcommand for an argv whose executable is git, skipping git global
+    options (``-c KEY=VAL`` / ``-C DIR``) and ``$()``/backtick redirect-target
+    artifacts (see ``_subcommand_index``)."""
+    idx = _subcommand_index(argv)
+    return argv[idx] if idx is not None else None
 
 
 def gh_pr_subcommand(argv: list[str]) -> str | None:
@@ -634,20 +683,11 @@ def commit_skips_hooks(argv: list[str]) -> bool:
     Parses real argv tokens, so a quoted ``'--no-verify'`` counts and an
     attached message ``-minitial`` does NOT (that is ``-m initial``).
     """
-    if git_subcommand(argv) != "commit":
+    idx = _subcommand_index(argv)
+    if idx is None or argv[idx] != "commit":
         return False
-    # Advance past git global options (+ their values) to the "commit" token.
-    i = 1
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_OPTS_WITH_ARG:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break  # argv[i] == "commit"
-    i += 1  # move past "commit"
+    # idx already skipped git global options + any $()/backtick redirect artifact.
+    i = idx + 1  # move past "commit"
     while i < len(argv):
         tok = argv[i]
         if tok == "--":

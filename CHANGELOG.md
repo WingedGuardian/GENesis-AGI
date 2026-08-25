@@ -24,6 +24,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A `$()`/backtick redirect target before a git subcommand no longer slips the
+  push/commit approval gates.** After the redirect-parsing fix, a substitution
+  redirect target (e.g. `git 2>$(cmd) push --force`, `git 2>\`cmd\` commit
+  --no-verify`) is deliberately left in the argv so the nested command stays
+  visible to the destructive-command guard — but it word-split into positional
+  tokens that `shell_parse.git_subcommand` mis-read as the subcommand (`'$(rm'`
+  instead of `push`), so `git_push_guard`'s push/commit gates skipped that segment.
+  `git_subcommand`/`commit_skips_hooks` now skip a `$()`/backtick/`$VAR` artifact
+  (paren- and backtick-balanced across word-split tokens) before reading the
+  subcommand. Bounded, per git_push_guard's threat model: an exotic body (a paren
+  or backtick nested inside a quote within the substitution) is a documented
+  residual — approval-gate friction, not a sandbox.
+
 - **The merge gate no longer blocks on a review finding that lands on a
   documentation file.** An inline `[P1]` finding anchored to a doc path
   (`CHANGELOG`, `README`, `LICENSE`/`NOTICE`, `docs/**`, `*.rst`) is now surfaced

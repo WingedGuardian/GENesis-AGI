@@ -422,3 +422,48 @@ class TestRedirects:
         # command to hide); documents the accepted argv-residual, not a regression.
         segs = sp.analyze("echo hi 2>$LOGDIR/out")
         assert not any(s.exe in ("rm", "rmdir") for s in segs)
+
+
+class TestGitSubcommandSubstitutionSkip:
+    """A $()/backtick/$VAR redirect target BEFORE the git subcommand must not be
+    read as the subcommand — else git_push_guard's push/commit approval gates
+    (which key on git_subcommand(argv)) silently skip that segment. The nested
+    command stays visible to the destructive-command guard via _substitutions;
+    this closes only the subcommand-misread. (Residual from #1455's review.)"""
+
+    def _sub(self, cmd):
+        seg = next(s for s in sp.analyze(cmd) if s.exe == "git")
+        return sp.git_subcommand(seg.argv)
+
+    def _ci(self, cmd):
+        return any(sp.commit_skips_hooks(s.argv) for s in sp.analyze(cmd) if s.exe == "git")
+
+    def test_dollar_paren_before_push(self):
+        assert self._sub("git 2>$(rm x) push origin main --force") == "push"
+
+    def test_backtick_before_commit_no_verify(self):
+        assert self._ci("git 2>`x` commit --no-verify") is True
+
+    def test_multiword_substitution_before_commit(self):
+        assert self._sub("git 2>$(rm x y z) commit -n") == "commit"
+        assert self._ci("git 2>$(rm x y z) commit -n") is True
+
+    def test_bare_var_before_subcommand(self):
+        assert self._sub("git 2>$VAR status") == "status"
+
+    def test_substitution_only_no_subcommand(self):
+        seg = next(s for s in sp.analyze("git 2>$(rm x)") if s.exe == "git")
+        assert sp.git_subcommand(seg.argv) is None
+
+    def test_plain_commands_unregressed(self):
+        assert self._sub("git push") == "push"
+        assert self._sub("git commit --no-verify") == "commit"
+        assert self._ci("git commit --no-verify") is True
+        assert self._ci("git commit -m 'no verify here'") is False
+        assert self._sub("git -C /tmp -c a=b status") == "status"
+
+    def test_direct_argv_word_split_artifact(self):
+        # The $() body word-splits across argv tokens — both must be skipped.
+        assert sp.git_subcommand(["git", "$(rm", "x)", "push"]) == "push"
+        assert sp.git_subcommand(["git", "`rm", "x`", "commit"]) == "commit"
+        assert sp.commit_skips_hooks(["git", "$(rm", "x)", "commit", "--no-verify"]) is True
