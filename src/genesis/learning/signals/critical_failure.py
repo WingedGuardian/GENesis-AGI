@@ -33,6 +33,20 @@ _WEDGED_AGE_S = 1.0
 # watchdog + the stall-stack sampler.
 _STALE_CEILING_S = 30.0
 
+# The generic explainer used on a healthy (0.0) reading and appended after the
+# specific failing-probe names on a genuine DOWN/DEGRADED reading. Kept as a module
+# constant so the genuine-failure path and the default path stay in sync (and so the
+# #1390 invariants — mentions probes, distinguishes CLOUD LLM-provider status — hold
+# on every non-suppressed reading).
+_DEFAULT_NOTE = (
+    "0.0=DB/Qdrant (+Ollama if enabled) health probes all healthy. "
+    "0.5=a probe DEGRADED, 1.0=a probe DOWN. This tracks LOCAL "
+    "infrastructure/service health (including the local Ollama if "
+    "enabled), NOT cloud LLM-provider availability. A DOWN caused "
+    "purely by probe timeouts while the event loop is starved is "
+    "suppressed (the reading then carries a SUPPRESSED baseline_note)."
+)
+
 
 class CriticalFailureCollector:
     """Runs health probes: 1.0 if any DOWN, 0.5 if any DEGRADED, 0.0 if all HEALTHY.
@@ -79,8 +93,32 @@ class CriticalFailureCollector:
             suppressed = self._starvation_suppressed(results)
             if suppressed is not None:
                 return suppressed
+            down_names = ", ".join(
+                r.name for r in results if r.status == ProbeStatus.DOWN
+            )
+            return self._reading(
+                value, baseline_note=self._genuine_note("DOWN", down_names)
+            )
+
+        if value == 0.5:
+            degraded_names = ", ".join(
+                r.name for r in results if r.status == ProbeStatus.DEGRADED
+            )
+            return self._reading(
+                value, baseline_note=self._genuine_note("DEGRADED", degraded_names)
+            )
 
         return self._reading(value)
+
+    def _genuine_note(self, status: str, names: str) -> str:
+        """Name the specific probe(s) that failed, ahead of the default explainer.
+
+        The failing-probe identity goes in ``baseline_note`` — the only field the tick
+        serializer AND the reflection prompt formatter retain (``metadata`` is dropped
+        by both) — so a reflection can state WHICH service failed instead of guessing
+        "(DB, Qdrant, or Ollama)".
+        """
+        return f"Probe(s) {status}: {names}. {_DEFAULT_NOTE}"
 
     def _starvation_suppressed(
         self, results: list[ProbeResult]
@@ -191,14 +229,6 @@ class CriticalFailureCollector:
             value=value,
             source="health_probes",
             collected_at=datetime.now(UTC).isoformat(),
-            baseline_note=baseline_note
-            or (
-                "0.0=DB/Qdrant (+Ollama if enabled) health probes all healthy. "
-                "0.5=a probe DEGRADED, 1.0=a probe DOWN. This tracks LOCAL "
-                "infrastructure/service health (including the local Ollama if "
-                "enabled), NOT cloud LLM-provider availability. A DOWN caused "
-                "purely by probe timeouts while the event loop is starved is "
-                "suppressed (the reading then carries a SUPPRESSED baseline_note)."
-            ),
+            baseline_note=baseline_note or _DEFAULT_NOTE,
             metadata=metadata,
         )

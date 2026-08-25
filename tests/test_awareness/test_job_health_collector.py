@@ -69,3 +69,40 @@ async def test_value_clamped_at_1():
 async def test_signal_name():
     collector = JobHealthCollector()
     assert collector.signal_name == "scheduled_job_health"
+
+
+@pytest.mark.asyncio
+async def test_firing_note_names_the_failing_jobs():
+    # When jobs are failing, the baseline_note (the field rendered into reflection
+    # prompts) must NAME which jobs — the healthy generic note lacks any job name, so
+    # asserting the name proves the fix injected it. metadata is never rendered, so
+    # names must live in baseline_note, not metadata (matching the docstring's intent).
+    health = {
+        "weekly_assessment": {"consecutive_failures": 3},
+        "surplus_tick": {"consecutive_failures": 0},
+    }
+    reading = await JobHealthCollector(runtime=_MockRuntime(health), failure_threshold=2).collect()
+    assert reading.value == 0.75
+    note = (reading.baseline_note or "").lower()
+    assert "weekly_assessment" in note, note
+    assert "surplus_tick" not in note, note  # healthy job not named
+    assert "metadata" not in note, note
+
+
+@pytest.mark.asyncio
+async def test_firing_note_names_all_failing_jobs():
+    health = {
+        "job_alpha": {"consecutive_failures": 5},
+        "job_beta": {"consecutive_failures": 4},
+    }
+    reading = await JobHealthCollector(runtime=_MockRuntime(health), failure_threshold=2).collect()
+    note = (reading.baseline_note or "").lower()
+    assert "job_alpha" in note and "job_beta" in note, note
+
+
+@pytest.mark.asyncio
+async def test_healthy_note_has_no_job_names():
+    health = {"weekly_assessment": {"consecutive_failures": 0}}
+    reading = await JobHealthCollector(runtime=_MockRuntime(health), failure_threshold=2).collect()
+    assert reading.value == 0.0
+    assert "weekly_assessment" not in (reading.baseline_note or "").lower()

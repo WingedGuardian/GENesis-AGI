@@ -20,6 +20,16 @@ from genesis.awareness.types import SignalReading
 from genesis.learning.signals.critical_failure import CriticalFailureCollector
 from genesis.learning.signals.pending_items import PendingItemCollector
 from genesis.learning.signals.sentinel_activity import SentinelActivityCollector
+from genesis.observability.types import ProbeResult, ProbeStatus
+
+
+def _probe(name: str, status: ProbeStatus, *, timed_out: bool = False):
+    """Zero-arg callable yielding a crafted ProbeResult (mirrors the starvation suite)."""
+
+    async def _run() -> ProbeResult:
+        return ProbeResult(name=name, status=status, latency_ms=1.0, timed_out=timed_out)
+
+    return _run
 
 
 async def test_critical_failure_note_describes_health_probes_not_providers():
@@ -132,3 +142,60 @@ async def test_scheduler_liveness_healthy_note_scopes_to_surplus_only():
     assert reading.value == 0.0
     assert isinstance(reading, SignalReading)
     assert "only" in (reading.baseline_note or "").lower(), reading.baseline_note
+
+
+# --- critical_failure: a GENUINE (non-suppressed) failure must NAME which probe ---
+# The default note lists "DB/Qdrant/Ollama" generically, so a real DOWN told the
+# reflection LLM nothing about WHICH service failed — it hedged "(DB, Qdrant, or
+# Ollama)". These pin that the failing probe's NAME lands in baseline_note (the only
+# field the tick serializer + signal_format render; metadata is dropped by both).
+# Distinctive probe names are used so a pass proves the name was injected, not merely
+# present in the generic explainer text.
+
+
+async def test_critical_failure_genuine_down_names_the_probe():
+    # Hard-error DOWN (timed_out=False) is never starvation-suppressed -> genuine 1.0.
+    r = await CriticalFailureCollector(
+        [_probe("qdrant_primary", ProbeStatus.DOWN, timed_out=False)]
+    ).collect()
+    assert r.value == 1.0
+    note = (r.baseline_note or "").lower()
+    assert "qdrant_primary" in note, note
+    # #1390/#1398 lesson: never point the LLM at metadata (signal_format drops it).
+    assert "metadata" not in note, note
+
+
+async def test_critical_failure_genuine_down_names_all_down_probes_only():
+    r = await CriticalFailureCollector(
+        [
+            _probe("db_primary", ProbeStatus.DOWN, timed_out=False),
+            _probe("qdrant_primary", ProbeStatus.DOWN, timed_out=False),
+            _probe("ollama_local", ProbeStatus.HEALTHY),
+        ]
+    ).collect()
+    assert r.value == 1.0
+    note = (r.baseline_note or "").lower()
+    assert "db_primary" in note and "qdrant_primary" in note, note
+    # a HEALTHY probe must NOT be named as failing
+    assert "ollama_local" not in note, note
+
+
+async def test_critical_failure_degraded_names_the_probe():
+    r = await CriticalFailureCollector(
+        [
+            _probe("ollama_local", ProbeStatus.DEGRADED),
+            _probe("db_primary", ProbeStatus.HEALTHY),
+        ]
+    ).collect()
+    assert r.value == 0.5
+    note = (r.baseline_note or "").lower()
+    assert "ollama_local" in note, note
+    assert "db_primary" not in note, note  # healthy probe not named
+    assert "metadata" not in note, note
+
+
+async def test_critical_failure_healthy_note_unchanged_no_probe_names():
+    # The all-healthy 0.0 path keeps the generic explainer (no per-probe names).
+    r = await CriticalFailureCollector([_probe("qdrant_primary", ProbeStatus.HEALTHY)]).collect()
+    assert r.value == 0.0
+    assert "qdrant_primary" not in (r.baseline_note or "").lower()
