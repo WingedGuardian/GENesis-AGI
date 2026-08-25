@@ -123,6 +123,19 @@ from shell_parse import (  # noqa: E402
     split_segments,
 )
 
+# Local push allowlist (offline re-push cache). SOFT dependency, guarded exactly
+# like the review_state import above: a module-LOAD exception must degrade to
+# None (→ the pure live-ls-remote republish path, i.e. today's behavior), NEVER
+# propagate — a raising import exits 1, which CC treats as non-blocking, silently
+# disabling EVERY fail-closed gate in this file. push_allowlist itself is
+# fail-open by contract (its calls never raise); None here only covers an
+# import-time breakage (absent module, SyntaxError). It can only ever RELAX a
+# re-push of a branch already confirmed on the remote — never a first push.
+try:
+    import push_allowlist  # noqa: E402 — scripts/hooks is on sys.path[0]
+except Exception:  # noqa: BLE001 — see the review_state guard's rationale (108-114)
+    push_allowlist = None
+
 # Sentinel: the effective cwd cannot be confidently resolved (a cd into a
 # variable/command-substitution, a subshell, or a target nested at depth>0).
 # Callers MUST fail closed on it — block the merge, do not soften a force push.
@@ -3128,14 +3141,39 @@ def main() -> int:
                     and cur
                     and cur not in ("main", "master")
                     and _push_targets_current_branch(push_segs[0], cur, push_remote, cwd=pcwd)
-                    and _push_is_republish(push_remote, cur, pcwd)
                 ):
+                    # This push plainly updates the current branch `cur`, so it
+                    # qualifies for the first-push-only relaxation IF `cur` is
+                    # already on the remote. Decide that via the LOCAL allowlist
+                    # first (offline — immune to the transient ls-remote failure
+                    # that otherwise fail-closes _push_is_republish to a re-prompt),
+                    # then fall back to the live ls-remote leg. On an ls-remote HIT,
+                    # RECORD the confirmed-on-remote fact so later re-pushes decide
+                    # offline. SECURITY: the allowlist is written ONLY here, ONLY on
+                    # an ls-remote HIT (which proves `cur` is on the remote → its
+                    # first push was already approved), so it can never authorize a
+                    # genuine first push; a broken/absent push_allowlist degrades to
+                    # the pure ls-remote path (import guarded to None above).
+                    urls = _remote_push_urls(push_remote, cwd=pcwd) if push_remote else set()
                     # Deferred (NOT an inline return) so any hard-block in a compound
                     # command still takes precedence — see push_allow_reason above.
-                    push_allow_reason = (
-                        f"re-push to '{cur}' (already on the remote — approved on "
-                        f"its first push); only the first push of a branch/PR prompts."
-                    )
+                    if push_allowlist is not None and push_allowlist.is_recorded(urls, cur):
+                        push_allow_reason = (
+                            f"re-push to '{cur}' (recorded as already on the remote — "
+                            f"approved on its first push); only the first push prompts."
+                        )
+                    elif _push_is_republish(push_remote, cur, pcwd):
+                        if push_allowlist is not None and urls:
+                            push_allowlist.record(urls, cur)
+                        push_allow_reason = (
+                            f"re-push to '{cur}' (already on the remote — approved on "
+                            f"its first push); only the first push of a branch/PR prompts."
+                        )
+                    else:
+                        ask_reason = (
+                            f"git push needs your approval before publishing externally "
+                            f"(target: {branch or 'default'})."
+                        )
                 else:
                     ask_reason = (
                         f"git push needs your approval before publishing externally "

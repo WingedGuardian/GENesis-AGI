@@ -9,6 +9,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **The dashboard Surplus health tile no longer reads green while the surplus
+  scheduler is wedged.** Its verdict previously came from an activity proxy that
+  shows "idle" for a stalled scheduler, so a stuck surplus loop appeared healthy —
+  the same class of false-green just fixed for the ego tiles. It now reports a
+  genuine stall (no completed dispatch cycle for hours, when not paused) as an
+  error, and fails loud (`unknown`) if the liveness data can't be read, never green.
+  Thresholds are conservative (3h floor) so a normal quiet system never false-alarms.
+
 ### Changed
 
 - **Executor Gate 2 (`17_executor_review`) leads with paid DeepSeek V4-pro.**
@@ -49,6 +59,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A transient `git ls-remote` failure no longer re-prompts an already-approved
+  branch push.** The push-approval hook prompts only on a branch's FIRST push; a
+  re-push of fixes to the same, already-published branch should be silent. But the
+  "already on the remote?" check was a live `git ls-remote` that fail-closes to a
+  prompt on any network hiccup, so a flaky network re-prompted every re-push. A new
+  stdlib allowlist (`scripts/hooks/push_allowlist.py`, state in
+  `~/.genesis/pushed_branches.json`) caches the confirmed-on-remote fact locally so
+  re-pushes are decided OFFLINE. It is keyed on (branch, remote push-URL set) — never
+  the remote name — so the same branch name on a different repo is never conflated,
+  and it is written ONLY on a live ls-remote HIT (which proves the branch is already
+  on the remote), so it can never authorize a genuine first push. Corrupt/absent
+  state and any error fail OPEN to the existing prompt path; entries expire after 90
+  days (a recorded branch stays trusted for that window even if its remote copy is
+  later deleted).
 - **A scheduled job that has run repeatedly but never once succeeded now raises a
   health alert.** Such a job was invisible to every alarm: the "silently failing"
   check needs a prior success to measure a gap against, and the consecutive-failure

@@ -3694,6 +3694,13 @@
           if (Array.isArray(queues.errors) && queues.errors.length > 0) {
             return { state: "unknown", reason: "some queue counters could not be collected" };
           }
+          // Queue honesty is DEPTH-based by design; a drain-liveness verdict is
+          // intentionally omitted. A dead drainer only harms once work backs up, and
+          // the depth checks above (dead_letters / deferred_recovery / deferred_stuck
+          // / deferred_processing / pending_embeddings) already catch exactly that.
+          // The only durable "drain job" pulse (deferred_work_prune) is a daily 45-day
+          // GC, not the drainer — keying liveness on it would measure the wrong thing
+          // with a ~4-day threshold, buying a false-red vector for zero coverage gain.
           const worklist = queues.deferred_worklist || 0;
           return { state: "healthy", reason: worklist > 0 ? `queues clear — ${worklist} worklist item(s) in flight` : "queues are clear" };
         },
@@ -3726,7 +3733,24 @@
 
         surplusSemantic() {
           const surplus = this.health.surplus;
-          if (!surplus || surplus.status === "unknown") return { state: "unknown", reason: "surplus scheduler data unavailable" };
+          if (!surplus) return { state: "unknown", reason: "surplus scheduler data unavailable" };
+          // Liveness (from the AUTHORITATIVE pulse) precedes the auxiliary activity
+          // `status`: the independent idle/activity probe can throw (status="unknown")
+          // while the pulse still CONFIRMS a stall — that confirmed stall must surface
+          // as an error, not be masked as merely unknown by an early status guard.
+          // Fail-LOUD (mirror egoSemantic): a liveness read error, or a scheduler that
+          // never recorded a completed cycle (crashed before its first pulse — NOT
+          // owned by the job_never_succeeded alarm), is unknown, never green.
+          if (surplus.liveness_error) return { state: "unknown", reason: "surplus liveness unavailable (read error or no completed cycle on record)" };
+          // Truthful wedged-detector: surplus_dispatch pulses success every ~5 min,
+          // so a stale last_success (past the conservative threshold, and not paused)
+          // means the dispatch loop stopped firing — a genuine fault the idle-proxy
+          // `status` hides (a wedged scheduler reads "idle" → green). Computed
+          // server-side from job_health (observability.liveness).
+          if (surplus.stalled) return { state: "error", reason: `surplus scheduler stalled — ${surplus.stall_reason || "no recent dispatch"}` };
+          // Only now defer to the auxiliary activity probe: liveness was readable and
+          // not stalled, so an unknown activity status is genuinely just unknown.
+          if (surplus.status === "unknown") return { state: "unknown", reason: "surplus scheduler data unavailable" };
           const failed = surplus.tasks_failed_24h || 0;
           const completed = surplus.tasks_completed_24h || 0;
           if (failed > 0 && completed > 0 && failed / (completed + failed) > 0.2) {
