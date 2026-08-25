@@ -20,6 +20,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Security
 
+- **A leading shell redirect can no longer slip the push/commit approval gates.**
+  The shared command parser now recognizes shell redirections (`2>/dev/null`,
+  `> out.log`, `2>&1`, `&>log`, `>| f`, `< in`, `<<<`) and consumes the operator
+  and its target instead of leaking them into the parsed argv. Previously a
+  *leading* redirect (`git 2>/dev/null push --force`, `git 2>&1 commit --no-verify`)
+  made the parser read the redirect token as the git subcommand, so the push and
+  commit gates never recognized the command and skipped their approval checks. As
+  a bonus, a targeted local `pytest` run that redirects output
+  (`pytest tests/x.py 2>&1`) is no longer misclassified as a whole-suite run.
+
 - **Observation content can no longer launder untrusted origin into privileged
   cognitive surfaces.** Observation rows now carry a definite origin stamped at the
   write boundary: the CRUD chokepoint classifies every writer (explicit origin →

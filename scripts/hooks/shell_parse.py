@@ -12,6 +12,9 @@ naive approaches fail on, e.g.:
   push`` (MUST match),
 * a nested script ``bash -c 'git commit -n …'`` (the inner command MUST be
   seen),
+* a leading redirect ``git 2>/dev/null push`` / ``git 2>&1 commit`` whose
+  operator must NOT be mistaken for the subcommand (the push/commit gates MUST
+  still match — a leaking redirect once let these slip),
 * an approval comment ``# review-override`` that belongs to ONE command segment
   and must not authorize the next.
 
@@ -109,6 +112,37 @@ class Segment:
     depth: int = 0  # 0 = top level, >0 = inside a sh -c script
 
 
+def _redirect_operator_len(command: str, i: int) -> int | None:
+    """Length of a shell REDIRECT operator starting at ``command[i]``, else None.
+
+    The closed bash redirect grammar (operator only — a leading fd digit is
+    already buffered and the following target is consumed by the caller):
+    ``>`` ``>>`` ``>&`` ``>|`` ``<`` ``<<`` ``<<<`` ``<&`` ``&>`` ``&>>``.
+    A bare ``&`` (background) and a bare ``|`` (pipe) are NOT redirects — they
+    stay control operators. Process substitution ``>(…)``/``<(…)`` is
+    deliberately NOT treated as a redirect (see ``_substitutions``' documented
+    gap); ``>(`` returns length 1 here so the ``(`` is handled normally.
+    """
+    n = len(command)
+    c = command[i]
+    if c == "&":  # &> / &>> only — a lone '&' is the background control operator
+        if i + 1 < n and command[i + 1] == ">":
+            return 3 if (i + 2 < n and command[i + 2] == ">") else 2
+        return None
+    if c == ">":
+        nxt = command[i + 1] if i + 1 < n else ""
+        return 2 if nxt in (">", "&", "|") else 1
+    if c == "<":
+        if command[i + 1 : i + 3] == "<<":  # <<<
+            return 3
+        nxt = command[i + 1] if i + 1 < n else ""
+        return 2 if nxt in ("<", "&") else 1
+    return None
+
+
+_TARGET_STOP = (" ", "\t", "\n", ";", "|", "&", "<", ">", "(", ")")
+
+
 def split_segments(command: str) -> list[str]:
     """Split a command line into executed segments on shell operators.
 
@@ -116,6 +150,20 @@ def split_segments(command: str) -> list[str]:
     ``&&``, ``||``, ``;``, ``|``, ``&`` and newlines. A ``#`` comment (opened
     outside quotes) runs to end-of-line and is retained in the segment text so
     override detection can see it.
+
+    Redirect-aware: a redirection (``2>/dev/null``, ``> out.log``, ``2>&1``,
+    ``&>log``, ``>| f``, ``< in``, ``<<<here``) is consumed — operator AND target
+    — and kept OUT of the segment text, so a redirect neither leaks a phantom
+    positional into argv nor mis-splits on an embedded ``&``/``|`` (``2>&1`` used
+    to split on the ``&``, hiding a following ``git push`` in a bogus segment and
+    slipping the push gate). Only a PLAIN-filename target is stripped; a target that
+    can carry a command expansion (any ``$`` or backtick — ``2>$(rm x)``,
+    ``2>"$(rm x)"``, ``<<<"$(…)"``, ``2>$VAR``, ``<(…)``, ``>(…)``) is LEFT in the
+    text so the canonical ``_substitutions`` still sees any nested command (a
+    substitution used as a redirect target EXECUTES). Such a target's token then
+    stays in argv — a documented residual for this exotic form (these gates are
+    friction, not a sandbox); a bare ``2>/dev/null`` is a plain filename and IS
+    stripped, so the common push-gate fail-open stays closed.
     """
     segs: list[str] = []
     buf: list[str] = []
@@ -143,6 +191,60 @@ def split_segments(command: str) -> list[str]:
             segs.append("".join(buf))
             buf = []
             i += 2
+            continue
+        op_len = _redirect_operator_len(command, i)
+        if op_len is not None:
+            # Drop a standalone leading fd digit-run (the '2' of ` 2>`), but NOT a
+            # digit that ends a word (`push2>x` keeps 'push2' — never a fail-open
+            # onto a bare 'push'); '&>' never carries an fd prefix.
+            if c != "&":
+                k = len(buf)
+                while k > 0 and buf[k - 1].isdigit():
+                    k -= 1
+                if k < len(buf) and (k == 0 or buf[k - 1].isspace()):
+                    del buf[k:]
+            j = i + op_len
+            while j < n and command[j] in (" ", "\t"):  # gap before the target
+                j += 1
+            t = command[j] if j < n else ""
+            tnext = command[j + 1] if j + 1 < n else ""
+            # A process substitution as the target (`<(…)`, `>(…)`) begins with a
+            # metachar the plain consumer would stop on — leave it in the text (it
+            # executes, like any substitution); consume only the operator.
+            if t in ("<", ">") and tnext == "(":
+                buf.append(" ")
+                i = j
+                continue
+            j0 = j
+            if j < n:  # measure ONE target token (quote-aware), else a bare op
+                if t in ("'", '"'):
+                    j += 1
+                    while j < n:
+                        if t == '"' and command[j] == "\\" and j + 1 < n:
+                            j += 2
+                            continue
+                        if command[j] == t:
+                            j += 1
+                            break
+                        j += 1
+                elif t not in _TARGET_STOP:
+                    while j < n and command[j] not in _TARGET_STOP:
+                        j += 1
+            # Strip ONLY a plain-filename target. A target that can carry a command
+            # expansion — a ``$`` (``$(…)`` / bare ``$VAR``) or a backtick, in any
+            # quoting — is LEFT in the segment text (rewind and let normal processing
+            # re-scan it): this delegates ALL expansion/quoting semantics to the one
+            # canonical ``_substitutions`` parser (which expands ``$(…)`` unquoted and
+            # in double quotes so a nested command stays visible to the destructive
+            # guard, and correctly does NOT expand inside single quotes) instead of
+            # re-deciding them here. Only cost: such a target's token stays in argv —
+            # the pre-existing, documented residual for this exotic form.
+            if "$" in command[j0:j] or "`" in command[j0:j]:
+                buf.append(" ")
+                i = j0  # rewind — normal processing + _substitutions handle the target
+                continue
+            buf.append(" ")  # plain filename target — operator + target both dropped
+            i = j
             continue
         if c in (";", "|", "&", "\n"):
             segs.append("".join(buf))
