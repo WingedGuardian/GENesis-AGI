@@ -94,6 +94,16 @@ _WRAPPER_SPEC = {
 _WRAPPERS = set(_WRAPPER_SPEC)
 # Interpreters that run a script string passed after -c; recurse into it.
 _NESTED = {"bash", "sh", "dash", "zsh", "ksh", "ash"}
+# Shell tokens that can front a SIMPLE COMMAND within a segment (after
+# split_segments has already cut on ; | & && || newline). Stripping them at
+# command position lets analyze() resolve the real exe THROUGH a control
+# structure or group — `if …; then git clean -f; fi`, `while …; do …`,
+# `! git clean`, `{ git clean -f; }` — so a gate that keys on `seg.exe == git`
+# is not silently skipped. EXCLUDES `for/case/select/in` (they front a WORD, not
+# a command: `for x in a b`) and all block CLOSERS (`fi done esac } )` — never
+# precede a command). Group opener `(` (bare and GLUED, `(git`) is handled
+# structurally in _strip_wrappers, not via this set.
+_CMD_POSITION_WORDS = frozenset({"!", "if", "elif", "while", "until", "then", "do", "else", "{"})
 # git global options that consume the FOLLOWING token as their value.
 _GIT_OPTS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"}
 # git-commit short flags that consume the REST of their short-bundle as a value
@@ -396,15 +406,63 @@ def _basename(token: str) -> str:
 
 
 def _strip_wrappers(argv: list[str]) -> list[str]:
-    """Drop leading env-assignments (VAR=x) and wrapper commands (sudo/env/…).
+    """Drop leading shell command-position tokens, env-assignments (VAR=x), and
+    wrapper commands (sudo/env/…) so the returned argv[0] is the ACTUAL executed
+    command, and peel the matching subshell-close `)` off the revealed argv.
 
-    Returns the argv of the actual command. ``env`` / ``sudo`` may be followed
-    by their own ``VAR=x`` assignments and flags before the real command.
+    Command-position tokens (`then`/`do`/`!`/`(`/`{` …) can wrap a command inside
+    a control structure or subshell; a leading `(` may be GLUED to the command
+    (`(git`). Reserved words are stripped UNCONDITIONALLY at the front so the real
+    command is revealed through any control wrapper (`time ! git push`,
+    `if git push; then …`, `until git push; do …` all resolve to `git push`). A
+    leading `(` may nest (`( (cmd) )` spaced); its matching trailing `)` closers
+    (as many as `(` openers consumed) are peeled off the operand(s) carrying the
+    close.
+
+    Accepted SAFE-DIRECTION residual: a reserved word that is genuinely a command
+    NAME rather than a control keyword (`command if git push` — `command` runs an
+    executable literally named `if`) is still stripped, so analyze() over-resolves
+    to `git push` and the push gate fires on a push bash would not actually run.
+    That is an OVER-gate (a spurious block of an exotic, near-never-typed form),
+    never a MISS — the monotonic-safe direction. Modelling wrapper-vs-keyword
+    precisely was tried (round-2 `wrapper_consumed`) and REMOVED: it turned the
+    over-gate into a real false-negative (`time ! git push` → exe `!` → push gate
+    MISS), which is the unsafe direction. #1457 round-3.
+
+    Redirection syntax is deliberately NOT touched here: this resolver feeds
+    flag/value parsers (`git_subcommand`, `gh_pr_subcommand`, `commit_skips_hooks`)
+    and dropping a token would shift positions and let a value-flag swallow the
+    real gated token (a fail-closed-gate bypass — #1457 round-2). A consumer that
+    reads POSITIONALS skips redirections LOCALLY, inside its own walk and AFTER its
+    own flag/value handling (full_suite_guard, protected_paths, destructive each do)
+    — never as a pre-pass, which would recreate the same desync.
+
+    Safe-direction / MONOTONIC for security: the arithmetic, command-position and
+    `(` branches fire ONLY when argv[0] is `((`-prefixed / a control token /
+    `(`-prefixed, so a normal command (argv[0] ∈ {git, gh, rm, …}) resolves to the
+    same exe and the same argv and is returned byte-for-byte unchanged — the strip
+    can REVEAL a hidden command but never hide a caught one. `((…))` is bash
+    ARITHMETIC evaluation, which runs NO external command, so its outer segment
+    resolves to nothing (a command hidden in a `$(…)` inside it still surfaces via
+    analyze()'s separate substitution path).
     """
+    argv = list(argv)  # local copy — we may rebind a glued `(token` / strip closers
+    if argv and argv[0].startswith("(("):
+        return []  # `((…))` arithmetic evaluation — no external command runs
     i = 0
-    n = len(argv)
-    while i < n:
+    open_parens = 0
+    while i < len(argv):
         tok = argv[i]
+        if tok.startswith("("):  # subshell opener, bare `( git` or glued `(git`
+            open_parens += 1
+            if tok == "(":
+                i += 1
+            else:
+                argv[i] = tok[1:]  # "(git" -> "git"; reprocess (token strictly shrinks)
+            continue
+        if tok in _CMD_POSITION_WORDS:
+            i += 1  # reserved word / brace-group opener at command position
+            continue
         if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
             i += 1  # leading VAR=value assignment
             continue
@@ -414,7 +472,7 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         argflags, positional = spec
         i += 1
         # consume the wrapper's own value-flags and leading positional args
-        while i < n:
+        while i < len(argv):
             t = argv[i]
             if t == "--":
                 i += 1
@@ -433,7 +491,27 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
                 i += 1
                 continue
             break  # this bare word is the wrapped command
-    return argv[i:]
+    result = list(argv[i:])  # redirections are NOT stripped here (see docstring)
+    if open_parens and result:
+        # Peel matching trailing `)` closers off the operand(s) carrying the
+        # subshell close — up to the number of `(` openers consumed, scanning from
+        # the end (a redirection can follow the closer: `(rm -rf /x) 2>/dev/null`).
+        # A redirect target that itself ends in `)` (`(cmd) > 'log)'`) is a rare
+        # form a POSITIONAL consumer resolves safe-direction via its own local
+        # redirection skip (protected_paths/destructive `_REDIR_TOKEN`).
+        remaining = open_parens
+        j = len(result) - 1
+        while remaining > 0 and j >= 0:
+            if result[j] == ")":
+                del result[j]
+                remaining -= 1
+                j -= 1
+            elif result[j].endswith(")"):
+                result[j] = result[j][:-1]
+                remaining -= 1  # stay on j — the token may carry another glued `)`
+            else:
+                j -= 1
+    return result
 
 
 def analyze(command: str) -> list[Segment]:
