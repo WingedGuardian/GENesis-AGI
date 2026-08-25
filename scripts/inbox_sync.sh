@@ -10,12 +10,8 @@
 # Response files use .genesis.md suffix (sibling to source files).
 # No subdirectory needed — everything lives in the same folder.
 #
-# Local state files (all ".genesis-*", excluded from the step-1 mirror so the
-# sync can never delete its own state — the old in-mirror response counter was
-# deleted every cycle for months before this was caught):
-#   .genesis-seen        names ever seen in a HEALTHY vault listing (deletion
-#                        evidence: only a file the vault once had can be
-#                        "deleted from the vault")
+# Local state files (".genesis-*", excluded from the step-1 mirror so the sync
+# can never delete its own state):
 #   .genesis-lsf-stderr  stderr of the last listing attempt (kept out of the
 #                        listing data so error text can never join a
 #                        membership decision)
@@ -48,45 +44,42 @@ fi
         --verbose 2>&1
 
     # 2. Detect user-deleted .genesis.md files:
-    #    If a local .genesis.md file is >10min old, was seen on the vault at
-    #    least once (a push we KNOW succeeded), but is missing from a HEALTHY
-    #    vault listing — the user deleted it in Obsidian; clean up locally too.
-    #    Grace period: cron runs every 5min, so new files get pushed within
-    #    5min; after 10min an unlisted-but-seen file must be a user deletion.
+    #    A local .genesis.md file >10min old that is missing from a HEALTHY
+    #    vault listing was deleted by the user in Obsidian; clean it up locally.
+    #    Grace period: cron runs every 5min, so new files push within 5min;
+    #    after 10min an unlisted file is treated as a user deletion.
     #
-    #    FAIL-CLOSED (2026-08-24): the listing below is the sole evidence for
-    #    "the user deleted this". If `rclone lsf` fails (Dropbox API outage),
-    #    an empty listing must NEVER be read as "everything was deleted" —
-    #    on 2026-07-29 exactly that wiped all 150 local response files and
-    #    reset the response counter. A skipped cleanup cycle is harmless
-    #    (the next healthy cycle catches real deletions); a false-positive
-    #    wipe is not. The .genesis-seen requirement closes the sibling hole:
-    #    a response the push step never landed (quota/upload failures while
-    #    the listing stays healthy) is absent from the vault WITHOUT being a
-    #    user deletion — it must be retried, not reaped. Bulk deletions on a
-    #    HEALTHY listing are still honored (a blocked bulk delete would
-    #    resurrect user-deleted files via the push in step 3) but logged
-    #    loudly for the audit trail.
+    #    FAIL-CLOSED (2026-08-24): the listing is the sole evidence for "the
+    #    user deleted this". If `rclone lsf` fails (Dropbox API outage), an
+    #    empty listing must NEVER be read as "everything was deleted" — on
+    #    2026-07-29 exactly that wiped all 150 local response files and reset
+    #    the response counter. On a failed listing we skip cleanup AND hold
+    #    back the push of >grace-age files (step 3), so an old local copy of a
+    #    vault-side deletion cannot be re-uploaded (resurrected) before the
+    #    next healthy cycle cleans it. Bulk deletions on a HEALTHY listing are
+    #    still honored (blocking would resurrect user-deleted files via the
+    #    push) but logged loudly.
+    #
+    #    KNOWN LIMITATION (deferred, tracked): a response whose push never
+    #    landed (upload fails while the listing stays healthy) is absent from
+    #    the vault WITHOUT being a user deletion, and is reaped after the grace
+    #    period. Protecting that edge needs a durable "seen on the vault"
+    #    ledger — deferred to its own change. This behavior is no worse than
+    #    the pre-2026-08-24 script (which had neither the ledger nor fail-closed).
     LSF_ERR="$LOCAL_PATH/.genesis-lsf-stderr"
-    SEEN="$LOCAL_PATH/.genesis-seen"
+    PUSH_MAX_AGE=""
     # Never write state through a pre-planted symlink (defense-in-depth;
-    # single-tenant box, but rm -f is free and rm does not follow symlinks)
-    rm -f -- "$LSF_ERR" "$SEEN.tmp"
+    # single-tenant box, but rm -f is free and rm does not follow symlinks).
+    rm -f -- "$LSF_ERR"
     if REMOTE_GENESIS=$(rclone lsf "dropbox:$DROPBOX_PATH" --include "*.genesis.md" 2>"$LSF_ERR"); then
         remote_count=$(printf '%s\n' "$REMOTE_GENESIS" | grep -c . || true)
-        # Record every vault-listed name as "seen on the vault at least once"
-        { [ -f "$SEEN" ] && cat "$SEEN"; printf '%s\n' "$REMOTE_GENESIS"; } \
-            | grep . | LC_ALL=C sort -u > "$SEEN.tmp" && mv "$SEEN.tmp" "$SEEN"
         cleaned=0
         for f in "$LOCAL_PATH"/*.genesis.md; do
             [ -f "$f" ] || continue
             fname=$(basename -- "$f")
+            # Filename is DATA, never grep/rm options: grep -qxF -- / rm --.
             if ! printf '%s\n' "$REMOTE_GENESIS" | grep -qxF -- "$fname"; then
-                # Absent from the vault: only a user deletion if the vault
-                # ever had it — otherwise it's an un-landed push (keep and
-                # let step 3 retry it).
-                if grep -qxF -- "$fname" "$SEEN" 2>/dev/null \
-                    && [ "$(find "$f" -mmin +10 2>/dev/null)" ]; then
+                if [ "$(find "$f" -mmin +10 2>/dev/null)" ]; then
                     if rm -- "$f"; then
                         # Control chars stripped from the audit line (log
                         # injection defense-in-depth); UTF-8 titles intact.
@@ -102,13 +95,26 @@ fi
         fi
     else
         lsf_rc=$?
-        echo "SKIP cleanup: vault listing failed (rc=$lsf_rc) — refusing to treat an empty listing as mass deletion. rclone stderr: $(tr -d '[:cntrl:]' < "$LSF_ERR" 2>/dev/null)"
+        # Listing unhealthy: hold back the push of >grace-age files so an old
+        # local copy of a vault-side deletion cannot be resurrected. Fresh
+        # responses (<10min) still ship promptly.
+        PUSH_MAX_AGE="10m"
+        echo "SKIP cleanup: vault listing failed (rc=$lsf_rc) — refusing to treat an empty listing as mass deletion; holding back push of >${PUSH_MAX_AGE} files. rclone stderr: $(tr -d '[:cntrl:]' < "$LSF_ERR" 2>/dev/null)"
     fi
 
-    # 3. Push: local .genesis.md files → Dropbox (responses back to vault)
-    rclone copy "$LOCAL_PATH" "dropbox:$DROPBOX_PATH" \
-        --include "*.genesis.md" \
-        --verbose 2>&1
+    # 3. Push: local .genesis.md files → Dropbox (responses back to vault).
+    #    On a failed-listing cycle PUSH_MAX_AGE gates this to fresh files only
+    #    (see step 2) so a not-yet-cleaned deletion can't be re-uploaded.
+    if [ -n "$PUSH_MAX_AGE" ]; then
+        rclone copy "$LOCAL_PATH" "dropbox:$DROPBOX_PATH" \
+            --include "*.genesis.md" \
+            --max-age "$PUSH_MAX_AGE" \
+            --verbose 2>&1
+    else
+        rclone copy "$LOCAL_PATH" "dropbox:$DROPBOX_PATH" \
+            --include "*.genesis.md" \
+            --verbose 2>&1
+    fi
 
     echo "--- done ---"
 } >> "$LOG" 2>&1
