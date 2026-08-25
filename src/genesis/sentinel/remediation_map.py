@@ -271,6 +271,19 @@ UNMAPPED_BY_DESIGN: dict[str, str] = {
         "IS restartable). It stays a user-visible WARNING health alert for a "
         "human to fix at the source; the firefighter is never woken for it."
     ),
+    "subsystem_stale:": (
+        "A heartbeat-emitting subsystem (ego/surplus/inbox/dashboard/outreach) "
+        "stopped pulsing — total cessation of its scheduler/loop. The cause is "
+        "heterogeneous and NOT reliably restart-fixable: the motivating case was "
+        "an ego cadence DEADLOCK (a pending-approval pre-flight, fixed in code by "
+        "#1422), where a container.services restart would not clear it and could "
+        "restart-loop (contrast awareness:tick_overdue / job_stale:, which are "
+        "genuine restartable wedges). So it stays a user-visible health alert "
+        "(ego CRITICAL, the rest WARNING) + a red ego tile for a human to "
+        "diagnose the specific cause; the firefighter is never woken for it. "
+        "(This is a surfacing signal — PR-C adds no autonomous remediation "
+        "authority.)"
+    ),
 }
 
 
