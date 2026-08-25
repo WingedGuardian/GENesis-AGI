@@ -199,12 +199,17 @@ if [ "$_SESSION_EXISTS" = "0" ] && [ "$_slot_oauth_mode" != "off" ] && [ "$_HAS_
         else
             _oauth_notice="Genesis: primary CC login is dead — running on the stored setup-token. Remote Control and claude.ai connectors are OFF until you /login. Local MCP servers still work."
         fi
+        # Shell-quote the notice so it cannot break out of the pane command
+        # string — the notice text is static today, but %q makes ANY future edit
+        # (a quote, backtick, or $) injection-proof by construction, not by luck.
+        _notice_q=$(printf '%q' "$_oauth_notice")
         # Runs in the PANE shell: extract ONLY the token var (not a full source —
         # avoids evaluating the file as shell / exporting GENESIS_CC_TOKEN_CREATED_AT),
-        # export it so claude inherits it, then print the notice to stderr. Never
-        # echoes the token value. `$(...)`, `~`, and the file read all defer to
-        # the pane shell (the `\$` / literal single-quotes keep them unexpanded here).
-        _OAUTH_SRC="if [ -r ~/.genesis/cc_oauth_token.env ]; then export CLAUDE_CODE_OAUTH_TOKEN=\"\$(sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' ~/.genesis/cc_oauth_token.env)\"; printf '%s\\n' \"${_oauth_notice}\" >&2; fi; "
+        # export it so claude inherits it, then print the (shell-quoted) notice to
+        # stderr. Never echoes the token value. `$(...)`, `~`, and the file read all
+        # defer to the pane shell (the `\$` / literal single-quotes keep them
+        # unexpanded here); ${_notice_q} is already a safe single shell word.
+        _OAUTH_SRC="if [ -r ~/.genesis/cc_oauth_token.env ]; then export CLAUDE_CODE_OAUTH_TOKEN=\"\$(sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' ~/.genesis/cc_oauth_token.env)\"; printf '%s\\n' ${_notice_q} >&2; fi; "
     fi
 fi
 

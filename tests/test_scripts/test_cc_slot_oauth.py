@@ -83,6 +83,7 @@ def test_prefix_defers_build_and_exports_in_pane(tmp_path, script_text):
     harness = f"""
 set -u
 _oauth_notice="Genesis: test notice, no connectors"
+_notice_q=$(printf '%q' "$_oauth_notice")
 {oauth_src_line}
 # 1) build-time: the token value must NOT appear in the built string
 case "$_OAUTH_SRC" in
@@ -107,3 +108,41 @@ printf 'CREATED=[%s]\\n' "${{GENESIS_CC_TOKEN_CREATED_AT:-}}"
     assert "CREATED=[]" in proc.stdout, proc.stdout
     # The notice goes to stderr, and must never contain the token value.
     assert "sk-ant-oat-DYNTOKEN" not in proc.stderr
+
+
+def test_notice_text_cannot_inject_shell(tmp_path, script_text):
+    """A notice string with quotes/`/$ must never break out of the command.
+
+    Regression guard for the %q hardening: even if a future edit gives the
+    notice a `"`/backtick/`$`-laden value, building + running the real
+    _OAUTH_SRC line must NOT execute an injected command. Seeds a payload that
+    would `touch` a canary and asserts the canary never appears.
+    """
+    home = tmp_path
+    (home / ".genesis").mkdir()
+    (home / ".genesis" / "cc_oauth_token.env").write_text(
+        "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-DYNTOKEN\nGENESIS_CC_TOKEN_CREATED_AT=1\n",
+    )
+    canary = home / "PWNED"
+    oauth_src_line = _extract_oauth_src_line(script_text)
+    # A malicious notice: closes a naive double-quote, runs a command, re-opens.
+    payload = f'evil"; touch {canary}; echo "$(touch {canary})`touch {canary}`'
+
+    harness = f"""
+set -u
+_oauth_notice={payload!r}
+_notice_q=$(printf '%q' "$_oauth_notice")
+{oauth_src_line}
+eval "$_OAUTH_SRC"
+printf 'TOKEN=[%s]\\n' "${{CLAUDE_CODE_OAUTH_TOKEN:-}}"
+"""
+    proc = subprocess.run(
+        ["bash", "-c", harness],
+        cwd=str(home),
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    )
+    assert not canary.exists(), "notice text injected a shell command (canary created)"
+    # The token export must still work despite the hostile notice.
+    assert "TOKEN=[sk-ant-oat-DYNTOKEN]" in proc.stdout, proc.stdout
