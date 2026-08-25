@@ -114,10 +114,11 @@ async def surplus_status(
             expected_interval_minutes=interval,
             paused=bool(rt.paused),
         )
-        # overdue_minutes is None iff the pulse was absent or unparseable — either
-        # way liveness is not confirmable → unavailable, never green.
+        # overdue_minutes is None iff the pulse is not a confirmable recent-past
+        # timestamp — absent, unparseable, OR materially in the future (clock skew /
+        # corruption). Either way liveness is not confirmable → unavailable, never green.
         if live.overdue_minutes is None:
-            raise RuntimeError("no parseable pulse on record — cannot confirm liveness")
+            raise RuntimeError("no confirmable pulse on record — cannot confirm liveness")
         last_success_at = live.last_success_at
         stalled = live.stalled
         stall_reason = live.reason
