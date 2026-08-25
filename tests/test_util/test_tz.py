@@ -156,3 +156,19 @@ class TestLocalDayBoundary:
         aware = datetime(2026, 8, 24, 3, 0, tzinfo=UTC)
         assert local_day_boundary(0, now=naive) == local_day_boundary(0, now=aware)
         assert local_day_boundary(0, now=naive) == datetime(2026, 8, 23, 4, 0, tzinfo=UTC)
+
+    def test_boundary_monotonic_across_midnight_dst_fallback(self, monkeypatch):
+        # A zone that falls back at LOCAL midnight (America/Havana on 2026-11-01)
+        # makes midnight ambiguous — it occurs twice. The boundary must pin to a
+        # single fold so it never jumps backward across the repeated hour;
+        # otherwise the daily reset can fire twice on one local date.
+        monkeypatch.setattr(tz_module, "_USER_TZ", ZoneInfo("America/Havana"))
+        boundaries = [
+            local_day_boundary(0, now=datetime(2026, 11, 1, h, 0, tzinfo=UTC)) for h in range(2, 10)
+        ]
+        assert boundaries == sorted(boundaries)  # monotonic non-decreasing
+        # During the repeated midnight (05:00Z) the boundary stays at the FIRST
+        # occurrence (04:00Z), not the second — the fold=0 pin.
+        assert local_day_boundary(0, now=datetime(2026, 11, 1, 5, 0, tzinfo=UTC)) == datetime(
+            2026, 11, 1, 4, 0, tzinfo=UTC
+        )

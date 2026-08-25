@@ -108,7 +108,12 @@ def local_day_boundary(hour: int = 0, *, now: datetime | None = None) -> datetim
     else:
         now_utc = now.astimezone(UTC)
     now_local = now_utc.astimezone(_USER_TZ)
-    boundary_local = now_local.replace(hour=hour, minute=0, second=0, microsecond=0)
+    # fold=0 pins the boundary to a single occurrence of the wall-clock time.
+    # Without it, .replace() inherits now_local.fold, so in a zone that falls
+    # back at the boundary hour (e.g. America/Havana at local midnight) the
+    # boundary would be non-monotonic across the repeated hour (04:00Z→05:00Z→
+    # 04:00Z), which can fire the daily reset twice on one local date.
+    boundary_local = now_local.replace(hour=hour, minute=0, second=0, microsecond=0, fold=0)
     if now_local < boundary_local:
         boundary_local -= timedelta(days=1)
     return boundary_local.astimezone(UTC)
