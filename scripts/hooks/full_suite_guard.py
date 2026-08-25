@@ -14,10 +14,12 @@ is not misread as a run.
 Allowed:
   - pytest tests/foo/test_bar.py            (a specific file / nodeid)
   - pytest tests/foo -k test_bar            (a -k/-m selector narrows the run)
+  - pytest tests/foo.py --basetemp /wt      (a path-valued flag's value is not a target)
   - pytest tests/ -q  # full-suite-ok       (explicit override)
 Blocked:
   - pytest -v                               (no path at all)
   - python -m pytest tests/test_scripts/    (a whole directory)
+  - pytest tests/foo.py tests/              (a file + a whole dir still runs the dir)
 """
 
 from __future__ import annotations
@@ -38,23 +40,38 @@ from shell_parse import (  # noqa: E402
 
 _OVERRIDE = "full-suite-ok"
 
-# pytest flags that consume the FOLLOWING token as their value (so that value is
-# not a positional path). Non-exhaustive but covers the common ones; an unlisted
-# value-flag only risks fail-OPEN (not blocking), never a wrong block.
+# pytest flags that consume the FOLLOWING token as their value, so that value is not
+# mistaken for a positional. This matters because _targets_specific_test blocks on a
+# bare-directory positional: a path/glob-valued flag's separate-token value
+# (``--basetemp /wt``, ``--doctest-glob '*.py'``) would otherwise look like a directory
+# (a WRONG block) or a .py file (a FAIL-OPEN). The path/glob-valued built-ins below are
+# taken from ``pytest --help``. Non-exhaustive BY DESIGN: an UNLISTED value-flag whose
+# separate-token value is a non-.py string falls back to a safe BLOCK (a false-block,
+# overridable with ``# full-suite-ok``) — never a fail-open. The one fail-open risk is a
+# value ENDING in .py, so the .py-glob flag ``--doctest-glob`` is listed explicitly.
 _VALUE_FLAGS = {
+    # config + common plugin flags (values are not paths)
     "-p",
-    "--tb",
-    "--timeout",
-    "--rootdir",
     "-c",
     "-W",
-    "--override-ini",
     "-o",
+    "-n",
+    "--tb",
+    "--timeout",
+    "--override-ini",
     "--deselect",
+    "--maxfail",
+    # path / dir / glob-valued built-ins (pytest --help) — the false-block-prone ones
+    "--rootdir",
+    "--basetemp",
+    "--confcutdir",
+    "--config-file",
     "--ignore",
     "--ignore-glob",
-    "--maxfail",
-    "-n",
+    "--doctest-glob",
+    "--junit-xml",
+    "--junitxml",
+    "--log-file",
 }
 
 
@@ -75,7 +92,12 @@ def _targets_specific_test(args: list[str]) -> bool:
 
     Targeted = a -k/-m/--pyargs selector, OR at least one specific .py file/nodeid
     and NO bare-directory positional. A file mixed with a directory
-    (``pytest tests/foo.py tests/``) still runs the whole directory, so it blocks.
+    (``pytest tests/foo.py tests/``) still runs the WHOLE directory — pytest UNIONS
+    positionals, so a named file does not narrow the run; it remains the OOM-inducing
+    full run this guard exists to stop, and therefore blocks. Distinguishing a real
+    directory positional from a value-flag's path value (``--basetemp /wt``) is the job
+    of ``_VALUE_FLAGS`` (which consumes the value); an unlisted value-flag falls back to
+    a safe BLOCK, never a fail-open (see the ``_VALUE_FLAGS`` note).
     """
     has_selector = False
     has_file = False

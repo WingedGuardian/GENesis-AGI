@@ -11,6 +11,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The Contributor Work-Log can post curated newcomer issues autonomously
+  (opt-in).** A new `require_approval: false` lever lets the curator's
+  privacy-vetted issues post without a per-item approval prompt — Genesis is the
+  gate (the fail-closed privacy scan still runs on every draft, and the row never
+  surfaces as an approval request). A cautious-rollout `max_posts_per_day` cap
+  limits how many issues post per rolling 24h, so a bad batch surfaces one at a
+  time rather than all at once; `mode: off` (or `GENESIS_CONTRIBUTOR_WORKLOG_DISABLED`)
+  halts posting — re-checked immediately before each create — and freezes the queue.
+  Ships SAFE — `require_approval` defaults true, and it is overlay-file-only (not a
+  one-call settings/dashboard toggle), so a fresh install always requires human approval.
 - **A per-prompt nudge when a session's memory MCP is running stale code.** Each
   Claude Code session's MCP subprocesses snapshot their code at spawn and never
   reload, so a deploy landing mid-session leaves recall — and its current security
