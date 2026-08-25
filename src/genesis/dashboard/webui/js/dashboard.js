@@ -24,7 +24,7 @@
 
         configFiles: [],
         // providerActivity moved to operationalVitals
-        errorSummary: { groups: [], active_alerts: [], totals: { events: 0, dead_letters: 0, deferred_failures: 0 } },
+        errorSummary: { groups: [], active_alerts: [], totals: { events: 0, dead_letters: 0, deferred_failures: 0 }, partial: false, sources_failed: [] },
         budgets: [],
         // providerHealthSummary removed — provider data now in health.api_keys
         routingConfig: null,
@@ -4414,6 +4414,10 @@
           }
           if (activeGroups > 0) {
             items.push({ level: "warning", title: `${activeGroups} active error group${activeGroups === 1 ? "" : "s"}`, detail: "grouped warnings/errors across events, dead letters, or deferred work", href: "/genesis/errors" });
+          }
+          if (this.errorSummary.partial) {
+            const failed = (this.errorSummary.sources_failed || []).join(", ");
+            items.push({ level: "warning", title: "Error data incomplete", detail: `some error sources did not load (${failed}); counts may understate reality`, href: "/genesis/errors" });
           }
           if ((this.health.queues?.dead_letters || 0) > 0) {
             items.push({ level: "critical", title: `${this.health.queues.dead_letters} dead letters`, detail: "requests exhausted all fallback providers; open the errors view to inspect", href: "/genesis/errors" });
