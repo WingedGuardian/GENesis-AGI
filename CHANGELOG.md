@@ -24,6 +24,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The merge gate no longer blocks on a review finding that lands on a
+  documentation file.** An inline `[P1]` finding anchored to a doc path
+  (`CHANGELOG`, `README`, `LICENSE`/`NOTICE`, `docs/**`, `*.rst`) is now surfaced
+  to stderr but does not block the merge — a changelog typo or README nit is not a
+  code defect. Safe by default: any non-doc path, a missing path, or an
+  executable/source file even under `docs/` (e.g. `docs/conf.py`) still blocks,
+  and the PR-level review-body gate is unchanged. Applies to `git_push_guard`'s
+  inline-findings scan on both the `--check-pr` and merge paths.
+
 - **The dashboard Surplus health tile no longer reads green while the surplus
   scheduler is wedged.** Its verdict previously came from an activity proxy that
   shows "idle" for a stalled scheduler, so a stuck surplus loop appeared healthy —
