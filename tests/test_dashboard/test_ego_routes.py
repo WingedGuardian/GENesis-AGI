@@ -373,14 +373,23 @@ _EGO_CONFIG = SimpleNamespace(
 )
 
 
-def _status_response(client, *, hb_return=None, hb_side_effect=None):
+def _status_response(client, *, hb_return=None, hb_side_effect=None, booted_ago_s=0.0):
     """Hit /ego/status with the ego-heartbeat-staleness read stubbed.
 
     Mirrors the full ego_status dependency surface so the endpoint returns 200
     and we can assert the new top-level heartbeat fields are wired into the JSON.
+
+    ``booted_ago_s`` sets ``rt._bootstrap_completed_at`` that many seconds ago
+    (the P2-5 no_heartbeat boot-grace hook); ``None`` sets it to None (degraded
+    boot). Default 0.0 = just booted (within grace).
     """
+    from datetime import UTC, datetime, timedelta
+
     rt = _mock_runtime()
     rt._genesis_ego_cadence_manager = None  # keep the cadence snapshot JSON-safe
+    rt._bootstrap_completed_at = (
+        None if booted_ago_s is None else datetime.now(UTC) - timedelta(seconds=booted_ago_s)
+    )
     hb_mock = (
         AsyncMock(side_effect=hb_side_effect)
         if hb_side_effect is not None
@@ -424,13 +433,33 @@ class TestEgoStatusHeartbeat:
         assert data["ego_heartbeat_stale"] is True
         assert data["ego_heartbeat_error"] is False
 
-    def test_no_heartbeat_empty_state_not_stale(self, client):
+    def test_no_heartbeat_within_boot_grace_not_error(self, client):
+        """Just after boot (ego's first pulse pending), no_heartbeat is benign —
+        not stale, not error (P2-5 grace)."""
         resp = _status_response(
-            client, hb_return={"status": "no_heartbeat", "last_seen": None}
+            client, hb_return={"status": "no_heartbeat", "last_seen": None}, booted_ago_s=5.0
         )
         data = resp.get_json()
         assert data["ego_heartbeat_stale"] is False
         assert data["ego_heartbeat_error"] is False
+
+    def test_no_heartbeat_past_boot_grace_is_error(self, client):
+        """Long after boot with STILL no pulse on record → real absence, surfaced
+        as error (unknown), never a green tile (P2-5)."""
+        resp = _status_response(
+            client, hb_return={"status": "no_heartbeat", "last_seen": None}, booted_ago_s=3600.0
+        )
+        data = resp.get_json()
+        assert data["ego_heartbeat_stale"] is False
+        assert data["ego_heartbeat_error"] is True
+
+    def test_no_heartbeat_degraded_boot_is_error(self, client):
+        """No boot stamp (degraded boot) → no grace → fail-loud to error (P2-5)."""
+        resp = _status_response(
+            client, hb_return={"status": "no_heartbeat", "last_seen": None}, booted_ago_s=None
+        )
+        data = resp.get_json()
+        assert data["ego_heartbeat_error"] is True
 
     def test_unknown_status_is_error(self, client):
         resp = _status_response(

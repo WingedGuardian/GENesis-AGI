@@ -1,6 +1,6 @@
 """Tests for morning report generator."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import pytest
@@ -69,6 +69,43 @@ async def test_generate_returns_outreach_request(db, mock_health, mock_drafter):
     assert req.signal_type == "morning_report"
     assert req.salience_score == 0.0
     assert "morning" in req.topic.lower() or "report" in req.topic.lower()
+
+
+@pytest.mark.asyncio
+async def test_critical_issues_dedupes_subsystem_stale(db, mock_health, mock_drafter):
+    """A subsystem already surfaced as a subsystem_stale:<name> alert is NOT listed
+    a second time by the heartbeat-staleness block (P2-6 dedup). A subsystem with a
+    heartbeat but NO alert (surplus) is still surfaced once."""
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    alerts = [
+        {
+            "id": "subsystem_stale:inbox",
+            "severity": "WARNING",
+            "message": "Subsystem 'inbox' heartbeat overdue — no pulse in 9000s",
+        },
+    ]
+    heartbeats = {
+        "inbox": {"status": "overdue", "age_seconds": 9000, "last_seen": "x"},
+        "surplus": {"status": "overdue", "age_seconds": 5000, "last_seen": "y"},
+    }
+    with (
+        patch(
+            "genesis.mcp.health_mcp._impl_health_alerts",
+            new=AsyncMock(return_value=alerts),
+        ),
+        patch(
+            "genesis.mcp.health.manifest._impl_subsystem_heartbeats",
+            new=AsyncMock(return_value=heartbeats),
+        ),
+    ):
+        text = await gen._get_critical_issues()
+
+    assert text is not None
+    # inbox appears exactly once — via its alert line, NOT duplicated by the hb block.
+    assert text.count("'inbox'") == 1
+    assert "subsystem_stale:inbox" in text
+    # surplus has a heartbeat but no alert → still surfaced once by the hb block.
+    assert "'surplus'" in text
 
 
 @pytest.mark.asyncio

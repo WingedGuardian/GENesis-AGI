@@ -39,13 +39,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   its heartbeat pulse goes silent — but nothing turned that into a signal, so the
   Ego tile (and the rollup badge) could show green while the egos were dead, and no
   alert was raised. Now the Errors view raises a `subsystem_stale:<name>` alert when
-  a heartbeat-emitting subsystem (ego, surplus, inbox, dashboard, outreach) goes
-  overdue past its threshold (ego → critical, the rest → warning), and the Ego tile
-  flips to error ("scheduler stopped — no heartbeat in Nh"), failing loud
-  (`unknown`) if the signal can't be read. This complements the existing
+  the ego (→ critical), inbox, or dashboard (→ warning) scheduler goes overdue past
+  its threshold, and the Ego tile flips to error ("scheduler stopped — no heartbeat
+  in Nh"), failing loud (`unknown`) if the signal can't be read. The alert is
+  pause-aware — a deliberately paused Genesis no longer false-alarms — and never
+  fires on a merely idle or freshly-booted install. This complements the existing
   "running-but-failing" job alarms, which cannot see a job that has stopped running
-  at all. Note: only the pulse-emitting subsystems get stopped-firing detection;
-  other scheduled jobs keep the existing failure-gap alarms.
+  at all. (Surplus already surfaces a wedged/dead loop via its own dashboard tile;
+  outreach total-cessation is tracked separately, since its heartbeat only runs once
+  a messaging channel is configured.)
 - **The merge gate no longer blocks on a review finding that lands on a
   documentation file.** An inline `[P1]` finding anchored to a doc path
   (`CHANGELOG`, `README`, `LICENSE`/`NOTICE`, `docs/**`, `*.rst`) is now surfaced

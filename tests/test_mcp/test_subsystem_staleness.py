@@ -4,11 +4,18 @@ Two surfaces, one shared signal (``compute_heartbeat_staleness``):
   - ``_impl_health_alerts`` emits a ``subsystem_stale:<name>`` alert when a
     heartbeat-emitting subsystem's last durable ``heartbeat`` event is older
     than its per-subsystem overdue threshold (its scheduler/loop stopped — a
-    silent death the failure-gap job alarms cannot see). ego → CRITICAL, the
-    other four → WARNING. reflection is excluded (its pulse is emitted by the
-    awareness loop) and awareness is excluded (it has ``awareness:tick_overdue``).
+    silent death the failure-gap job alarms cannot see). The alert set is
+    ``ego`` (CRITICAL) + ``inbox`` + ``dashboard`` (WARNING). **surplus** is
+    dropped (PR-B's shipped tile already flips red on a wedged/dead surplus via
+    its job_health signal) and **outreach** is dropped (its pulse is
+    config-gated — never fires on a Telegram-less install). reflection/awareness
+    stay excluded (reflection's pulse tracks the awareness loop; awareness has
+    ``awareness:tick_overdue``).
   - ``compute_heartbeat_staleness`` — the pure per-subsystem verdict the alert
-    AND the ego dashboard tile both read, so the two can never disagree.
+    AND the ego dashboard tile both read, so the two can never disagree. It is
+    pause-aware for the pause-gated subsystems ({surplus, inbox}, whose pulse
+    stops behind their loop's ``if paused: return``) and fails loud on a corrupt
+    or future timestamp.
 
 Exercised against a REAL in-memory SQLite ``events`` table so the crud query +
 threshold math are tested, not mocked away.
@@ -17,6 +24,7 @@ threshold math are tested, not mocked away.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
@@ -91,6 +99,36 @@ async def test_staleness_unparseable_timestamp_is_unknown(db):
 
 
 @pytest.mark.asyncio
+async def test_staleness_future_timestamp_is_unknown(db):
+    """A pulse materially in the FUTURE (clock skew / corrupt row) cannot confirm
+    liveness → unknown, never a false 'alive' from a negative age (P2-3)."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    await _seed_heartbeat(db, "ego", age_seconds=-3600)  # 1h in the future
+    hb = await compute_heartbeat_staleness("ego", db=db)
+    assert hb["status"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_staleness_uses_freshest_of_db_and_ring(db):
+    """A fresh in-memory ring pulse beats a stale DB row (the ring updates
+    synchronously; the DB persists fire-and-forget) → alive, not overdue (P2-2)."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    # DB has an OVERDUE ego pulse (5h), ring has a FRESH one (10s).
+    await _seed_heartbeat(db, "ego", age_seconds=5 * 3600)
+    fresh_event = SimpleNamespace(
+        subsystem=SimpleNamespace(value="ego"),
+        event_type="heartbeat",
+        timestamp=_iso_ago(10),
+    )
+    fake_bus = SimpleNamespace(_ring=[fresh_event])
+    with patch("genesis.mcp.health_mcp._event_bus", fake_bus):
+        hb = await compute_heartbeat_staleness("ego", db=db)
+    assert hb["status"] == "alive"  # freshest wins, not the stale DB row
+
+
+@pytest.mark.asyncio
 async def test_staleness_unknown_subsystem_is_no_heartbeat(db):
     """A name not in the threshold table degrades to no_heartbeat, never raises."""
     from genesis.mcp.health.manifest import compute_heartbeat_staleness
@@ -132,29 +170,115 @@ async def test_staleness_read_error_raises_when_requested():
         await compute_heartbeat_staleness("ego", db=bad_db, raise_on_error=True)
 
 
-# ── subsystem_stale alert (via _impl_health_alerts) ──────────────────────────
+# ── pause-guard (pause-gated subsystems only) ────────────────────────────────
 
 
-async def _run_alerts_with_db(db):
-    """Run the real _compute_alerts path with `db` as the health service DB."""
+@pytest.mark.asyncio
+async def test_staleness_paused_downgrades_surplus(db):
+    """surplus's pulse stops behind ``if paused: return`` — so an overdue surplus
+    while globally paused is NOT dead → downgraded to 'paused', not 'overdue'."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    await _seed_heartbeat(db, "surplus", age_seconds=2 * 3600)  # > 600 threshold
+    hb = await compute_heartbeat_staleness("surplus", db=db, paused=True)
+    assert hb["status"] == "paused"
+
+
+@pytest.mark.asyncio
+async def test_staleness_paused_downgrades_inbox(db):
+    """inbox is pause-gated too → overdue-while-paused downgrades to 'paused'."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    await _seed_heartbeat(db, "inbox", age_seconds=3 * 3600)  # > 7200 threshold
+    hb = await compute_heartbeat_staleness("inbox", db=db, paused=True)
+    assert hb["status"] == "paused"
+
+
+@pytest.mark.asyncio
+async def test_staleness_paused_does_not_downgrade_ego(db):
+    """ego's heartbeat pulses THROUGH pause (dedicated job) — so an overdue ego
+    even while paused is a genuine scheduler death and stays 'overdue'."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    await _seed_heartbeat(db, "ego", age_seconds=5 * 3600)
+    hb = await compute_heartbeat_staleness("ego", db=db, paused=True)
+    assert hb["status"] == "overdue"
+
+
+@pytest.mark.asyncio
+async def test_staleness_not_paused_still_overdue(db):
+    """A pause-gated subsystem overdue while NOT paused → overdue (real stall)."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    await _seed_heartbeat(db, "inbox", age_seconds=3 * 3600)
+    hb = await compute_heartbeat_staleness("inbox", db=db, paused=False)
+    assert hb["status"] == "overdue"
+
+
+# ── loosened thresholds (near-zero false-reds) ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_inbox_threshold_loosened_no_false_fire_at_90min(db):
+    """inbox check interval is 30min; a 90min gap (one slow/skipped check) is
+    within the loosened 4× (7200s) threshold → alive, not a false overdue."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    await _seed_heartbeat(db, "inbox", age_seconds=90 * 60)  # 90min — one skip
+    assert (await compute_heartbeat_staleness("inbox", db=db))["status"] == "alive"
+
+
+@pytest.mark.asyncio
+async def test_inbox_overdue_past_threshold(db):
+    """A 2.5h inbox gap (> the 7200s threshold) is genuinely stale → overdue."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    await _seed_heartbeat(db, "inbox", age_seconds=150 * 60)  # 2.5h
+    assert (await compute_heartbeat_staleness("inbox", db=db))["status"] == "overdue"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_threshold_loosened(db):
+    """dashboard pulses every 60s; overdue at 600s (10×), not 240s (4×)."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    await _seed_heartbeat(db, "dashboard", age_seconds=5 * 60)  # 5min → alive
+    assert (await compute_heartbeat_staleness("dashboard", db=db))["status"] == "alive"
+
+
+# ── subsystem_stale alert (via _impl_health_alerts / _compute_alerts) ─────────
+
+
+def _snapshot():
+    return {
+        "call_sites": {},
+        "infrastructure": {},
+        "cc_sessions": {},
+        "queues": {},
+        "awareness": {},
+        "services": {},
+    }
+
+
+async def _run_alerts_with_db(db, *, paused: bool = False):
+    """Run the real _compute_alerts path with `db` as the health service DB.
+
+    ``paused`` patches the runtime pause flag the helper reads for pause-gated
+    subsystems (deterministic — never depends on a leaked singleton).
+    """
+    from genesis.runtime._core import GenesisRuntime
+
     svc = MagicMock()
     svc._db = db
-    svc.snapshot = AsyncMock(
-        return_value={
-            "call_sites": {},
-            "infrastructure": {},
-            "cc_sessions": {},
-            "queues": {},
-            "awareness": {},
-            "services": {},
-        }
-    )
+    svc.snapshot = AsyncMock(return_value=_snapshot())
+    stub_rt = SimpleNamespace(paused=paused)
     with (
         patch("genesis.mcp.health_mcp._service", svc),
         patch("genesis.mcp.health_mcp._activity_tracker", None),
         patch("genesis.mcp.health_mcp._job_retry_registry", None),
         patch("genesis.mcp.health_mcp._alert_history", {}),
         patch("genesis.mcp.health_mcp._event_bus", None),
+        patch.object(GenesisRuntime, "peek", return_value=stub_rt),
     ):
         from genesis.mcp.health.errors import _impl_health_alerts
 
@@ -178,28 +302,73 @@ async def test_ego_cessation_alerts_critical(db):
 
 
 @pytest.mark.asyncio
-async def test_non_ego_cessation_alerts_warning(db):
-    """A stalled inbox (2h old vs 1h threshold) → subsystem_stale:inbox WARNING."""
-    await _seed_heartbeat(db, "inbox", age_seconds=2 * 3600)
+async def test_unknown_heartbeat_surfaces_warning_not_silent(db):
+    """An UNREADABLE ego heartbeat (corrupt/clock-skewed ts) → a WARNING
+    subsystem_heartbeat_unknown:ego ('liveness cannot be confirmed'), never a silent
+    skip and never a mislabeled subsystem_stale:ego (which would assert death)."""
+    await db.execute(
+        "INSERT INTO events (id, timestamp, subsystem, severity, event_type, "
+        "message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("u1", "not-a-date", "ego", "debug", "heartbeat", "bad", "not-a-date"),
+    )
+    await db.commit()
     alerts = await _run_alerts_with_db(db)
-    stale = _stale(alerts)
-    inbox = next((a for a in stale if a["id"] == "subsystem_stale:inbox"), None)
+    ids = {a["id"] for a in alerts}
+    assert "subsystem_heartbeat_unknown:ego" in ids
+    unk = next(a for a in alerts if a["id"] == "subsystem_heartbeat_unknown:ego")
+    assert unk["severity"] == "WARNING"
+    assert "subsystem_stale:ego" not in ids  # not mislabeled as a death
+
+
+@pytest.mark.asyncio
+async def test_inbox_cessation_alerts_warning(db):
+    """A stalled inbox (3h old vs 2h threshold) → subsystem_stale:inbox WARNING."""
+    await _seed_heartbeat(db, "inbox", age_seconds=3 * 3600)
+    alerts = await _run_alerts_with_db(db)
+    inbox = next((a for a in _stale(alerts) if a["id"] == "subsystem_stale:inbox"), None)
     assert inbox is not None
     assert inbox["severity"] == "WARNING"
 
 
 @pytest.mark.asyncio
-async def test_alive_subsystem_does_not_alert(db):
-    """A freshly-pulsing subsystem emits no subsystem_stale alert."""
-    await _seed_heartbeat(db, "surplus", age_seconds=5)
+async def test_dashboard_cessation_alerts_warning(db):
+    """A stalled dashboard (11min vs 10min threshold) → subsystem_stale:dashboard."""
+    await _seed_heartbeat(db, "dashboard", age_seconds=11 * 60)
+    alerts = await _run_alerts_with_db(db)
+    dash = next((a for a in _stale(alerts) if a["id"] == "subsystem_stale:dashboard"), None)
+    assert dash is not None
+    assert dash["severity"] == "WARNING"
+
+
+@pytest.mark.asyncio
+async def test_surplus_dropped_from_alert_set(db):
+    """surplus is DROPPED from the alert set (PR-B's tile already covers it) —
+    even a badly-overdue surplus emits NO subsystem_stale:surplus."""
+    await _seed_heartbeat(db, "surplus", age_seconds=3 * 3600)  # ≫ 600 threshold
     alerts = await _run_alerts_with_db(db)
     assert not [a for a in _stale(alerts) if a["id"] == "subsystem_stale:surplus"]
 
 
 @pytest.mark.asyncio
+async def test_outreach_dropped_from_alert_set(db):
+    """outreach is DROPPED (config-gated pulse → false-alarm trap) — even a
+    3-day-old outreach heartbeat emits NO subsystem_stale:outreach."""
+    await _seed_heartbeat(db, "outreach", age_seconds=3 * 86400)  # ≫ 172800 threshold
+    alerts = await _run_alerts_with_db(db)
+    assert not [a for a in _stale(alerts) if a["id"] == "subsystem_stale:outreach"]
+
+
+@pytest.mark.asyncio
+async def test_alive_subsystem_does_not_alert(db):
+    """A freshly-pulsing alert-set subsystem emits no subsystem_stale alert."""
+    await _seed_heartbeat(db, "inbox", age_seconds=10)
+    alerts = await _run_alerts_with_db(db)
+    assert not [a for a in _stale(alerts) if a["id"] == "subsystem_stale:inbox"]
+
+
+@pytest.mark.asyncio
 async def test_reflection_is_excluded(db):
-    """reflection is DROPPED from the alert set (its pulse tracks the awareness
-    loop, not reflection-engine liveness) even when overdue."""
+    """reflection is not in the alert set even when overdue."""
     await _seed_heartbeat(db, "reflection", age_seconds=5 * 3600)  # > 14400 threshold
     alerts = await _run_alerts_with_db(db)
     assert not [a for a in _stale(alerts) if a["id"] == "subsystem_stale:reflection"]
@@ -222,17 +391,169 @@ async def test_empty_state_no_alerts(db):
 
 
 @pytest.mark.asyncio
+async def test_paused_inbox_is_suppressed(db):
+    """A globally-paused Genesis must NOT alert on inbox (its pulse legitimately
+    stops on pause) — the helper downgrades it, so no subsystem_stale:inbox."""
+    await _seed_heartbeat(db, "inbox", age_seconds=3 * 3600)
+    alerts = await _run_alerts_with_db(db, paused=True)
+    assert not [a for a in _stale(alerts) if a["id"] == "subsystem_stale:inbox"]
+
+
+@pytest.mark.asyncio
+async def test_paused_ego_still_alerts(db):
+    """ego pulses through pause → a dead ego while paused STILL alerts (a paused
+    box must not mask a genuinely dead ego scheduler)."""
+    await _seed_heartbeat(db, "ego", age_seconds=5 * 3600)
+    alerts = await _run_alerts_with_db(db, paused=True)
+    assert any(a["id"] == "subsystem_stale:ego" for a in _stale(alerts))
+
+
+@pytest.mark.asyncio
+async def test_read_error_preserves_open_alert(db):
+    """P2-4 fail-open fix: if the staleness read for a subsystem RAISES, a
+    genuinely-open subsystem_stale alert for it must be PRESERVED in current_ids
+    (so reconcile can't auto-resolve a real death on a transient read blip)."""
+    from genesis.db.crud import alert_events as ae_crud
+    from genesis.runtime._core import GenesisRuntime
+
+    # An open subsystem_stale:inbox already on the durable open-set.
+    await ae_crud.reconcile_open_set(
+        db,
+        active=[
+            {
+                "alert_id": "subsystem_stale:inbox",
+                "source": "health",
+                "severity": "WARNING",
+                "message": "inbox overdue",
+            }
+        ],
+        now=datetime.now(UTC).isoformat(),
+    )
+
+    async def _raise_for_inbox(name, **kwargs):
+        if name == "inbox":
+            raise aiosqlite.OperationalError("boom")
+        return {"status": "alive", "last_seen": _iso_ago(10), "age_seconds": 10.0}
+
+    svc = MagicMock()
+    svc._db = db
+    svc.snapshot = AsyncMock(return_value=_snapshot())
+    stub_rt = SimpleNamespace(paused=False)
+    with (
+        patch("genesis.mcp.health_mcp._service", svc),
+        patch("genesis.mcp.health_mcp._activity_tracker", None),
+        patch("genesis.mcp.health_mcp._job_retry_registry", None),
+        patch("genesis.mcp.health_mcp._alert_history", {}),
+        patch("genesis.mcp.health_mcp._event_bus", None),
+        patch.object(GenesisRuntime, "peek", return_value=stub_rt),
+        patch(
+            "genesis.mcp.health.manifest.compute_heartbeat_staleness",
+            new=AsyncMock(side_effect=_raise_for_inbox),
+        ),
+    ):
+        from genesis.mcp.health.errors import _compute_alerts
+
+        alerts, current_ids = await _compute_alerts()
+
+    alert_ids = {a["id"] for a in alerts}
+    # The open inbox alert is RE-EMITTED into the alerts list — that is the
+    # container the reconcile writer builds its active-set from (loop.py:158-166),
+    # so the read blip cannot auto-resolve a genuinely-open death alert. It is also
+    # in current_ids (lockstep with every other emit, for alert-history dedup).
+    assert "subsystem_stale:inbox" in alert_ids
+    assert "subsystem_stale:inbox" in current_ids
+    # ego/dashboard read fine and are alive → NOT re-emitted / not open.
+    assert "subsystem_stale:ego" not in alert_ids
+    assert "subsystem_stale:dashboard" not in alert_ids
+
+
+async def _compute_alerts_with_hb_side_effect(db, side_effect):
+    """Run the real _compute_alerts with compute_heartbeat_staleness stubbed to
+    `side_effect` (e.g. raise for one subsystem). Returns (alerts, current_ids)."""
+    from genesis.runtime._core import GenesisRuntime
+
+    svc = MagicMock()
+    svc._db = db
+    svc.snapshot = AsyncMock(return_value=_snapshot())
+    stub_rt = SimpleNamespace(paused=False)
+    with (
+        patch("genesis.mcp.health_mcp._service", svc),
+        patch("genesis.mcp.health_mcp._activity_tracker", None),
+        patch("genesis.mcp.health_mcp._job_retry_registry", None),
+        patch("genesis.mcp.health_mcp._alert_history", {}),
+        patch("genesis.mcp.health_mcp._event_bus", None),
+        patch.object(GenesisRuntime, "peek", return_value=stub_rt),
+        patch(
+            "genesis.mcp.health.manifest.compute_heartbeat_staleness",
+            new=AsyncMock(side_effect=side_effect),
+        ),
+    ):
+        from genesis.mcp.health.errors import _compute_alerts
+
+        return await _compute_alerts()
+
+
+@pytest.mark.asyncio
+async def test_read_error_preserves_open_unknown_alert(db):
+    """SF-1: the fail-open guard preserves BOTH alert families the block emits — an
+    open subsystem_heartbeat_unknown alert must not flap (auto-resolve) on a
+    read-failure tick, only the subsystem_stale family."""
+    from genesis.db.crud import alert_events as ae_crud
+
+    await ae_crud.reconcile_open_set(
+        db,
+        active=[
+            {
+                "alert_id": "subsystem_heartbeat_unknown:inbox",
+                "source": "health",
+                "severity": "WARNING",
+                "message": "inbox heartbeat unreadable",
+            }
+        ],
+        now=datetime.now(UTC).isoformat(),
+    )
+
+    async def _raise_for_inbox(name, **kwargs):
+        if name == "inbox":
+            raise aiosqlite.OperationalError("boom")
+        return {"status": "alive", "last_seen": _iso_ago(10), "age_seconds": 10.0}
+
+    alerts, current_ids = await _compute_alerts_with_hb_side_effect(db, _raise_for_inbox)
+    alert_ids = {a["id"] for a in alerts}
+    assert "subsystem_heartbeat_unknown:inbox" in alert_ids  # preserved, not flapped
+    assert "subsystem_heartbeat_unknown:inbox" in current_ids
+
+
+@pytest.mark.asyncio
+async def test_freshest_ignores_corrupt_future_db_row(db):
+    """N-2: a corrupt FUTURE db heartbeat must not mask a valid fresh ring pulse —
+    the subsystem reads alive, not a false unknown."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    await _seed_heartbeat(db, "ego", age_seconds=-3600)  # DB row 1h in the FUTURE
+    fresh_event = SimpleNamespace(
+        subsystem=SimpleNamespace(value="ego"),
+        event_type="heartbeat",
+        timestamp=_iso_ago(10),  # valid fresh ring pulse
+    )
+    fake_bus = SimpleNamespace(_ring=[fresh_event])
+    with patch("genesis.mcp.health_mcp._event_bus", fake_bus):
+        hb = await compute_heartbeat_staleness("ego", db=db)
+    assert hb["status"] == "alive"
+
+
+@pytest.mark.asyncio
 async def test_helper_failure_isolated_from_other_alerts(db):
-    """If the pulse-staleness block raises, the OTHER alerts still compute (its
-    own try/except isolates it) and it is ERROR-logged, never a silent green."""
+    """If the pulse-staleness block raises wholesale, the OTHER alerts still
+    compute (its own try/except isolates it) — never a silent crash/green."""
     await _seed_heartbeat(db, "ego", age_seconds=5 * 3600)
     with patch(
         "genesis.mcp.health.manifest.compute_heartbeat_staleness",
         new=AsyncMock(side_effect=RuntimeError("boom")),
     ):
-        # Should not raise; alerts list still returns (other blocks intact).
         alerts = await _run_alerts_with_db(db)
-    assert _stale(alerts) == []  # block failed → no subsystem_stale alerts, but no crash
+    # Block failed for every subsystem, none open on the durable set → none emitted.
+    assert _stale(alerts) == []
 
 
 # ── heartbeat GC preserves the last pulse (durable staleness signal) ─────────

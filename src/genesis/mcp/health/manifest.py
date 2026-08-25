@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -157,7 +157,11 @@ async def _impl_bootstrap_manifest() -> dict:
 HEARTBEAT_EXPECTED = {
     "awareness": (300, 360),      # 5 min tick, error at 6 min
     "surplus": (300, 600),
-    "inbox": (1800, 3600),
+    # inbox checks every 30 min (inbox/types.py check_interval_seconds=1800).
+    # overdue=4× (7200s) so one slow/skipped check doesn't false-fire; a 2×
+    # (3600s) threshold was too tight. (Assumes the default interval; a custom
+    # check_interval_seconds should scale this — derive-from-config is a nicety.)
+    "inbox": (1800, 7200),
     # Reflections only fire when signals warrant; calm periods can be quiet
     # for hours. An idle alive-pulse (awareness loop) keeps this fresh during
     # legitimate idle, so overdue=4h (matches ego) avoids false "dark" alarms.
@@ -165,21 +169,84 @@ HEARTBEAT_EXPECTED = {
     # (6 min), the cc resilience axis, and the deferred-work backlog.
     "reflection": (600, 14400),
     "outreach": (86400, 172800),
-    "dashboard": (120, 240),
+    "dashboard": (120, 600),      # 60s daemon-thread pulse; overdue at 10× (was 4×)
     "ego": (300, 14400),          # 5-min liveness pulse (ego_heartbeat job), overdue at 4h
 }
 
+# Subsystems whose heartbeat is emitted only AFTER their loop's
+# ``if paused: return`` guard — so a deliberately-paused Genesis stops their
+# pulse and they would false-read as dead. VERIFIED emit-after-pause sites:
+# surplus (surplus/scheduler.py:823-853) and inbox (inbox/monitor.py:2120-2154).
+# ego (dedicated ``ego_heartbeat`` job) and dashboard (dedicated daemon thread)
+# pulse THROUGH pause, so they are NOT here — an overdue-while-paused for them is
+# a genuine scheduler death that must still surface. See compute_heartbeat_staleness.
+_PAUSE_GATED_HEARTBEATS = frozenset({"surplus", "inbox"})
+
+# A heartbeat more than this far in the FUTURE (clock skew / corrupt row) cannot
+# confirm liveness → verdict "unknown", never a false "alive" from a negative age.
+# Mirrors observability/liveness.py FUTURE_SKEW_TOLERANCE_MINUTES (kept local to
+# avoid an import cycle into that module from the health manifest).
+_FUTURE_SKEW_TOLERANCE_S = 5 * 60
+
+
+def _read_global_paused() -> bool:
+    """Best-effort read of the global runtime pause flag (never constructs a
+    zombie singleton; defaults to NOT-paused so a read failure surfaces the
+    alert rather than silently masking a real death)."""
+    try:
+        from genesis.runtime import GenesisRuntime
+
+        rt = GenesisRuntime.peek()
+        return bool(rt.paused) if rt is not None else False
+    except Exception:
+        logger.debug("global pause read failed; treating as not-paused", exc_info=True)
+        return False
+
+
+def _freshest_timestamp(
+    a: str | None, b: str | None, *, not_after: datetime | None = None
+) -> str | None:
+    """Return the freshest USABLE ISO timestamp (tolerant of None/unparseable).
+
+    The durable ``events`` row and the in-memory event-bus ring can each hold the
+    newest pulse — the ring updates synchronously while the DB persists
+    fire-and-forget, so a fresh pulse can live only in the ring for a moment. Take
+    the freshest so a DB-lagged read never false-REDs a live subsystem (P2-2).
+
+    ``not_after`` (typically now + skew tolerance) marks a value as materially
+    future/corrupt: such a candidate must NOT win over a valid non-future one, or a
+    corrupt future DB row would mask a fresh ring pulse and yield a false "unknown".
+    A future/unparseable value is returned ONLY as a last resort (sole candidate),
+    so the caller still surfaces "unknown" rather than a spurious "alive"."""
+    best: str | None = None  # freshest qualifying (parseable, not materially-future)
+    best_dt: datetime | None = None
+    fallback: str | None = None  # any value at all, if nothing qualifies
+    for ts in (a, b):
+        if not ts:
+            continue
+        if fallback is None:
+            fallback = ts
+        try:
+            dt = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            continue
+        if not_after is not None and dt > not_after:
+            continue  # materially-future/corrupt → never beats a valid non-future one
+        if best_dt is None or dt > best_dt:
+            best, best_dt = ts, dt
+    return best if best is not None else fallback
+
 
 async def compute_heartbeat_staleness(
-    name: str, db=None, raise_on_error: bool = False
+    name: str, db=None, raise_on_error: bool = False, paused: bool | None = None
 ) -> dict:
     """Staleness verdict for ONE heartbeat-emitting subsystem.
 
-    Reads the latest durable ``heartbeat`` event for *name* (falling back to the
-    in-memory event-bus ring) and compares its age to the subsystem's overdue
-    threshold in :data:`HEARTBEAT_EXPECTED`. Returns the same per-subsystem shape
-    :func:`_impl_subsystem_heartbeats` yields:
-    ``{status: alive|overdue|no_heartbeat|unknown, last_seen, age_seconds?}``.
+    Reads the latest durable ``heartbeat`` event for *name* AND the in-memory
+    event-bus ring, uses the FRESHEST of the two, and compares its age to the
+    subsystem's overdue threshold in :data:`HEARTBEAT_EXPECTED`. Returns the same
+    per-subsystem shape :func:`_impl_subsystem_heartbeats` yields:
+    ``{status: alive|overdue|paused|no_heartbeat|unknown, last_seen, age_seconds?}``.
 
     *db* defaults to the health service's connection; a caller with its own
     runtime connection (e.g. the ego dashboard route) passes it explicitly.
@@ -191,6 +258,15 @@ async def compute_heartbeat_staleness(
     rather than paint a healthy tile over a broken read. (Truly unexpected
     exception types always propagate — matching the original display behavior of
     surfacing ``is_error`` rather than silently dropping a real bug.)
+
+    *paused*: for a :data:`_PAUSE_GATED_HEARTBEATS` subsystem (surplus/inbox,
+    whose pulse stops behind their loop's ``if paused: return``), a would-be
+    ``overdue`` verdict while Genesis is globally paused is downgraded to
+    ``paused`` — a deliberately-paused subsystem is not a dead one. ``None`` (the
+    default) reads the live global pause flag; callers may pass an explicit bool
+    (tests, or a caller that already read it). Non-pause-gated subsystems
+    (ego/dashboard) pulse THROUGH pause, so an ``overdue`` for them is a real
+    death and is never downgraded.
 
     An unknown *name* (not in the threshold table) → ``no_heartbeat``; never raises
     for that reason.
@@ -207,7 +283,7 @@ async def compute_heartbeat_staleness(
         db = _service._db if _service else None
     _event_bus = health_mcp_mod._event_bus
 
-    last_ts = None
+    db_ts = None
     if db is not None:
         try:
             from genesis.db.crud import events as events_crud
@@ -216,7 +292,7 @@ async def compute_heartbeat_staleness(
                 db, subsystem=name, event_type="heartbeat", limit=1
             )
             if rows:
-                last_ts = rows[0].get("timestamp")
+                db_ts = rows[0].get("timestamp")
         except (aiosqlite.Error, ImportError, AttributeError, TimeoutError):
             # Narrow catch: DB query failure (aiosqlite.Error, TimeoutError),
             # broken import chain (ImportError), or malformed row shape
@@ -232,7 +308,8 @@ async def compute_heartbeat_staleness(
             if raise_on_error:
                 raise
 
-    if not last_ts and _event_bus is not None and hasattr(_event_bus, "_ring"):
+    ring_ts = None
+    if _event_bus is not None and hasattr(_event_bus, "_ring"):
         for event in reversed(_event_bus._ring):
             sub_val = (
                 event.subsystem.value
@@ -240,20 +317,42 @@ async def compute_heartbeat_staleness(
                 else str(event.subsystem)
             )
             if sub_val == name and event.event_type == "heartbeat":
-                last_ts = event.timestamp
+                ring_ts = event.timestamp
                 break
+
+    # Use the freshest of the durable row and the in-memory ring — a DB-lagged
+    # read must never false-RED a subsystem that just pulsed (P2-2) — but a corrupt
+    # future row must not mask a valid fresh pulse, so exclude materially-future
+    # candidates from winning (N-2).
+    _now = datetime.now(UTC)
+    last_ts = _freshest_timestamp(
+        db_ts, ring_ts, not_after=_now + timedelta(seconds=_FUTURE_SKEW_TOLERANCE_S)
+    )
 
     if last_ts is None:
         return {"status": "no_heartbeat", "last_seen": None}
     try:
-        age_s = (datetime.now(UTC) - datetime.fromisoformat(last_ts)).total_seconds()
-        return {
-            "status": "overdue" if age_s > overdue_s else "alive",
-            "last_seen": last_ts,
-            "age_seconds": round(age_s, 1),
-        }
+        age_s = (_now - datetime.fromisoformat(last_ts)).total_seconds()
     except (ValueError, TypeError):
         return {"status": "unknown", "last_seen": last_ts}
+
+    # A pulse materially in the future (clock skew / corrupt row) cannot confirm
+    # liveness → unknown, never a false "alive" from a negative age (P2-3).
+    if age_s < -_FUTURE_SKEW_TOLERANCE_S:
+        return {"status": "unknown", "last_seen": last_ts}
+
+    if age_s <= overdue_s:
+        return {"status": "alive", "last_seen": last_ts, "age_seconds": round(age_s, 1)}
+
+    # Overdue. For a pause-gated subsystem, a globally-paused Genesis is NOT a
+    # dead one — its pulse legitimately stops on pause. Downgrade to a non-overdue
+    # "paused" verdict so no consumer (alert / morning report / tile) reads it as
+    # death. ego/dashboard pulse through pause, so they are never downgraded.
+    if name in _PAUSE_GATED_HEARTBEATS:
+        is_paused = paused if paused is not None else _read_global_paused()
+        if is_paused:
+            return {"status": "paused", "last_seen": last_ts, "age_seconds": round(age_s, 1)}
+    return {"status": "overdue", "last_seen": last_ts, "age_seconds": round(age_s, 1)}
 
 
 async def _impl_subsystem_heartbeats() -> dict:

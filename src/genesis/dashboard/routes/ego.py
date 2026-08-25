@@ -164,15 +164,31 @@ async def ego_status():
     ego_heartbeat_age_s = None
     ego_heartbeat_error = False
     try:
-        from genesis.mcp.health.manifest import compute_heartbeat_staleness
+        from datetime import UTC, datetime
+
+        from genesis.mcp.health.manifest import (
+            HEARTBEAT_EXPECTED,
+            compute_heartbeat_staleness,
+        )
 
         hb = await compute_heartbeat_staleness("ego", db=rt._db, raise_on_error=True)
         status = hb.get("status")
         ego_heartbeat_stale = status == "overdue"
         ego_heartbeat_age_s = hb.get("age_seconds")
-        # unknown (unparseable ts) can't confirm liveness → surface as error, not
-        # healthy.
+        # unknown (unparseable/future ts) can't confirm liveness → error, not healthy.
         ego_heartbeat_error = status == "unknown"
+        # no_heartbeat = NO pulse on record. ego emits a "start" pulse at bootstrap
+        # (cadence.py:302), so past a short boot-grace window this is a real absence
+        # (never-started / lost), NOT a healthy tile. Within the grace window (just
+        # after boot, ego's first pulse pending) it is benign. A None boot stamp
+        # (degraded boot) → no grace → treat as error (fail-loud, the safe way). (P2-5)
+        if status == "no_heartbeat":
+            _booted_at = getattr(rt, "_bootstrap_completed_at", None)
+            _grace_s = HEARTBEAT_EXPECTED["ego"][0] + 60  # one pulse interval + margin
+            within_grace = False
+            if _booted_at is not None:
+                within_grace = (datetime.now(UTC) - _booted_at).total_seconds() < _grace_s
+            ego_heartbeat_error = not within_grace
     except Exception:
         import logging as _logging
 
