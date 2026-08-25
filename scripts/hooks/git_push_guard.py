@@ -50,17 +50,21 @@ post a comment (issue comment) or PR review whose body contains a marker
 ``<!-- genesis-scheduled-review: head=<full-40-hex-sha> kind=<name> -->`` naming the exact
 head it reviewed AND which routine it was (``kind``). The merge gate
 (``_check_scheduled_claude_reviewed_head``) blocks unless an owner-authored marker for
-EVERY kind in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` (currently code-review + leaks) names
+EVERY effective required kind (``_required_scheduled_review_kinds()`` — DEFAULT
+code-review + leaks, with the leak scanner irreducible; an install may relax the optional
+kinds to advisory via ``merge_gate.required_scheduled_reviews`` in genesis.yaml) names
 the PR's CURRENT head — so if any required routine never ran, ran on a stale commit, or
-was rate-limited, the merge is blocked (naming the missing kinds). SCOPE: this gate
+was rate-limited, the merge is blocked (naming the missing kinds). An ADVISORY routine
+(one relaxed out of the required set locally) still posts its review on the PR to be read
+and addressed, but its absence does not block. SCOPE: this gate
 enforces ONLY when the merge targets the configured PUBLIC repo — the declared
 ``github.user``/``github.public_repo`` in ``~/.genesis/config/genesis.yaml``
 (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any OTHER repo
 (a private fork, the voice repo, backups) no-ops, since the required ``/schedule``
 routines run only on the public repo. Deployment note: on the public repo the required
 routines ARE configured (the deploy precondition); a clone that runs on its own public
-repo without a producer uses `# scheduled-review-override` (or removes/edits
-`_REQUIRED_SCHEDULED_REVIEW_KINDS`) — the override valve is the escape by design, not an
+repo without a producer uses `# scheduled-review-override` (or relaxes the optional kinds
+via ``merge_gate.required_scheduled_reviews``) — the override valve is the escape by design, not an
 opt-in flag. Fail-closed on scope uncertainty: if the canonical repo is undeterminable
 the gate ENGAGES rather than silently disarming.
 A DISMISSED or PENDING (draft) review no longer vouches (its marker is ignored), mirroring
@@ -1791,7 +1795,7 @@ def _check_codex_reviewed_head(
 # conscious "merge without a scheduled review" case — it didn't run / is rate-limited).
 # A scheduled-review marker is an HTML comment ``<!-- genesis-scheduled-review:
 # head=<40hex> kind=<name> -->``. Each SCHEDULED routine stamps its own ``kind`` so
-# the gate can require that EVERY routine in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` ran
+# the gate can require that EVERY routine in ``_required_scheduled_review_kinds()`` ran
 # on the current head — a single routine's marker no longer satisfies the gate on its
 # own. head/kind are parsed from the marker BLOCK (order-tolerant) and BOTH must be
 # present in the SAME marker to count.
@@ -1805,10 +1809,90 @@ _SCHEDULED_REVIEW_BLOCK_RE = re.compile(
 _SCHEDULED_REVIEW_HEAD_RE = re.compile(r"\bhead=([0-9a-f]{40})(?=\s|\Z)")
 _SCHEDULED_REVIEW_KIND_RE = re.compile(r"\bkind=([a-z0-9][a-z0-9._-]*)(?=\s|\Z)")
 
-# Every scheduled routine whose completion the merge gate requires, by ``kind``. A PR
-# merges only when a valid owner-authored marker for EACH of these names the current
-# head. Change this tuple to add/remove required routines.
-_REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
+# Default scheduled-review kinds the merge gate REQUIRES at head. A PR merges only when
+# a valid owner-authored marker for EACH effective required kind names the current head.
+# The DEFAULT is the full set (shipped to every install, unchanged); an install may relax
+# the OPTIONAL kinds locally — see _required_scheduled_review_kinds() for the lever.
+_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
+# The leak/secret scanner is IRREDUCIBLE: always required, never removable by config. A
+# secret reaching a public repo is irreversible, so no local policy may waive it.
+_IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
+# Every kind an install is ALLOWED to name in config. A configured kind outside this set
+# (a typo, a wrong type, a stale routine name) can never be satisfied by a real marker, so
+# the whole config is treated as invalid and we fail closed to the default rather than let
+# it either wedge merges forever or silently narrow the required set.
+_KNOWN_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
+
+
+def _validate_configured_kinds(items: object) -> list[str] | None:
+    """Lowercase + validate a configured kind list. Returns the cleaned list (possibly
+    empty, meaning "only the irreducible kinds"), or None if ANYTHING is off — not a list,
+    a non-string element, a blank element, or an unknown kind. None makes the caller fail
+    CLOSED to the full default rather than honor a malformed/ambiguous relaxation."""
+    if not isinstance(items, list):
+        return None
+    out: list[str] = []
+    for k in items:
+        if not isinstance(k, str):
+            return None  # wrong type (e.g. [123]) -> invalid -> default
+        kk = k.strip().lower()  # normalize to the lowercase marker grammar
+        if not kk or kk not in _KNOWN_SCHEDULED_REVIEW_KINDS:
+            return None  # blank ([" "]) or unknown ([foo]) -> invalid -> default
+        out.append(kk)
+    return out
+
+
+def _required_scheduled_review_kinds() -> tuple[str, ...]:
+    """The scheduled-review kinds the merge gate REQUIRES at head, as a tuple.
+
+    Default is the full set (``code-review`` + ``leaks``) — shipped unchanged to every
+    install. An install MAY relax the OPTIONAL kinds (e.g. make the structural
+    code-review ADVISORY, so its absence no longer blocks — its review still posts on the
+    PR to be read/addressed if it ran) via LOCAL config, keeping install policy out of the
+    public default:
+
+        # ~/.genesis/config/genesis.yaml
+        merge_gate:
+          required_scheduled_reviews: [leaks]
+
+    The leak/secret scanner (``_IRREDUCIBLE_...``) is ALWAYS unioned in and CANNOT be
+    dropped by config. Fail-CLOSED toward MORE review: a missing key / unreadable file /
+    parse error / duplicate key / wrong-type / blank / unknown kind ALL fall back to the
+    full default set, never to fewer kinds. Configured kinds are validated against
+    ``_KNOWN_SCHEDULED_REVIEW_KINDS`` and lowercased to the marker grammar. Test seam:
+    ``_TEST_REQUIRED_SCHEDULED_REVIEWS`` (comma-separated) overrides the config file.
+    """
+    raw = os.environ.get("_TEST_REQUIRED_SCHEDULED_REVIEWS")
+    configured: list[str] | None = None
+    if raw is not None:
+        # Test seam: comma-list; empties dropped so "" means "only the irreducible kinds".
+        configured = _validate_configured_kinds([k.strip() for k in raw.split(",") if k.strip()])
+    else:
+        try:
+            import yaml  # lazy: keep the hook import-light; the genesis venv has pyyaml
+
+            path = os.path.expanduser("~/.genesis/config/genesis.yaml")
+            with open(path) as fh:
+                text = fh.read()
+            # yaml.safe_load silently keeps the LAST value for a repeated key, so a
+            # badly-merged file (two merge_gate: or required_scheduled_reviews: lines)
+            # could quietly narrow the required set. Catch the realistic cases with a
+            # line scan (the repo's idiom — no unsafe custom Loader) and fail closed.
+            if (
+                len(re.findall(r"(?m)^merge_gate\s*:", text)) > 1
+                or len(re.findall(r"(?m)^\s*required_scheduled_reviews\s*:", text)) > 1
+            ):
+                raise ValueError("duplicate merge_gate/required_scheduled_reviews key")
+            cfg = yaml.safe_load(text) or {}
+            configured = _validate_configured_kinds(
+                (cfg.get("merge_gate") or {}).get("required_scheduled_reviews")
+            )
+        except Exception:
+            configured = None  # fail-closed: fall back to the full default set below
+    kinds = configured if configured is not None else list(_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS)
+    # leaks (and any irreducible kind) is always required, even if config omits it.
+    merged = list(dict.fromkeys([*kinds, *_IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS]))
+    return tuple(merged)
 
 
 def _canonical_public_repo() -> str | None:
@@ -1996,7 +2080,7 @@ def _check_scheduled_claude_reviewed_head(
 ) -> str | None:
     """Block a merge unless EVERY required scheduled Claude review (by the repo OWNER)
     has run on the PR's CURRENT head. Returns ``None`` when a valid owner marker for
-    each kind in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` names ``head_sha`` exactly (full
+    each kind in ``_required_scheduled_review_kinds()`` names ``head_sha`` exactly (full
     40-char), else a BLOCK MESSAGE naming the MISSING kinds.
 
     Fail-CLOSED — this gate never passes on absence of positive evidence: if the head
@@ -2039,12 +2123,13 @@ def _check_scheduled_claude_reviewed_head(
             f"Retry, or append '# scheduled-review-override' to merge anyway."
         )
     kinds_here = markers.get(head, set())
-    missing = [k for k in _REQUIRED_SCHEDULED_REVIEW_KINDS if k not in kinds_here]
+    required = _required_scheduled_review_kinds()
+    missing = [k for k in required if k not in kinds_here]
     if not missing:
         return None
     return (
         f"scheduled Claude review(s) missing at head {head[:12]}: {', '.join(missing)} "
-        f"(required: {', '.join(_REQUIRED_SCHEDULED_REVIEW_KINDS)}; present: "
+        f"(required: {', '.join(required)}; present: "
         f"{', '.join(sorted(kinds_here)) or 'none'}).\n"
         f"Each routine posts a comment/review carrying "
         f"'<!-- genesis-scheduled-review: head=<sha> kind=<name> -->' once it runs on THIS "
