@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -474,6 +476,247 @@ async def test_flat_legacy_store_copied_to_new_location_is_safe(
     # Flat shape isn't the new schema: its keys are stems, not directories,
     # so it contributes no floor — numbering starts fresh from other floors.
     assert p.name == "doc-1.genesis.md"
+
+
+_CROSS_PROC_WORKER = '''
+import asyncio, os, sys
+from pathlib import Path
+from genesis.inbox.writer import ResponseWriter
+w = ResponseWriter(watch_path=Path(sys.argv[1]))
+p = asyncio.run(w.write_response(
+    batch_id="x", source_files=[sys.argv[1] + "/doc.md"],
+    evaluation_text="proc-" + sys.argv[2], item_count=1,
+))
+sys.stdout.write(p.name)
+'''
+
+
+def test_cross_process_allocation_mints_distinct_numbers(tmp_path: Path):
+    """Codex P1: the module lock only serializes threads in ONE interpreter;
+    a second writer PROCESS (scripts/inbox_check.py overlapping the server)
+    can mint the same number and clobber an evaluation. The os.link reservation
+    must make allocation atomic ACROSS processes. Runs N real subprocesses
+    writing the same stem concurrently and asserts distinct filenames + no
+    lost content."""
+    import subprocess
+
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    (watch / "doc.md").write_text("src")
+    env = {
+        **os.environ,
+        "GENESIS_HOME": str(tmp_path / "ghome"),   # isolate the counter store
+        "GENESIS_DB_PATH": str(tmp_path / "nope.db"),  # DB floor → 0
+    }
+    n = 8
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _CROSS_PROC_WORKER, str(watch), str(i)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        for i in range(n)
+    ]
+    names = []
+    for p in procs:
+        out, err = p.communicate(timeout=60)
+        assert p.returncode == 0, err
+        names.append(out.strip())
+
+    assert len(set(names)) == n, f"processes minted duplicate numbers: {names}"
+    files = sorted(watch.glob("doc-*.genesis.md"))
+    assert len(files) == n, f"expected {n} distinct response files, got {len(files)}"
+    # No content lost: every proc's body survives in exactly one file.
+    bodies = "".join(f.read_text() for f in files)
+    for i in range(n):
+        assert f"proc-{i}" in bodies, f"proc-{i}'s evaluation was clobbered"
+
+
+@pytest.mark.asyncio
+async def test_allocation_safe_even_with_lock_disabled(
+    writer: ResponseWriter, tmp_path: Path, monkeypatch,
+):
+    """The atomic os.link reservation — not the lock — is the correctness
+    guarantee. With the lock neutered, concurrent allocations still mint
+    distinct numbers (the loser of a link race re-derives and retries)."""
+    import asyncio
+    import contextlib
+
+    from genesis.inbox import writer as writer_mod
+
+    monkeypatch.setattr(writer_mod, "_COUNTER_LOCK", contextlib.nullcontext())
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    paths = await asyncio.gather(*[
+        writer.write_response(
+            batch_id=f"n{i}", source_files=[str(source)],
+            evaluation_text=str(i), item_count=1,
+        )
+        for i in range(6)
+    ])
+    names = sorted(p.name for p in paths)
+    assert len(set(names)) == 6, f"duplicate numbers minted without the lock: {names}"
+
+
+@pytest.mark.asyncio
+async def test_db_floor_consulted_when_local_floors_stale_but_nonzero(
+    writer: ResponseWriter, tmp_path: Path, monkeypatch,
+):
+    """Deciding-round finding: a PARTIAL restore leaves the store AND the disk
+    nonzero but STALE (both trail the DB's true delivery history). Any gate
+    that skips the DB when the local floors are nonzero re-mints an
+    already-delivered number and overwrites a vault file. The DB floor — the
+    one floor a vault restore can't roll back — must be consulted
+    unconditionally."""
+    import json as _json
+
+    from genesis.inbox import writer as writer_mod
+
+    # Partial restore: store says doc=5, disk holds doc-1..5, DB knows doc-118.
+    store_path = writer_mod._counter_store_path()
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text(_json.dumps({str(tmp_path): {"doc": 5}}))
+    for n in (1, 2, 3, 4, 5):
+        (tmp_path / f"doc-{n}.genesis.md").write_text("stale-restored")
+    db = _floor_db(tmp_path, ["/x/doc-118.genesis.md"])
+    monkeypatch.setattr("genesis.env.genesis_db_path", lambda: db)
+
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    p = await writer.write_response(
+        batch_id="pr", source_files=[str(source)],
+        evaluation_text="a", item_count=1,
+    )
+    assert p.name == "doc-119.genesis.md", (
+        f"got {p.name}: DB floor (118) skipped because store(5)+disk(5) were "
+        "nonzero-but-stale — this overwrites delivered vault responses"
+    )
+
+
+@pytest.mark.asyncio
+async def test_db_floor_consulted_when_store_empty_despite_disk_files(
+    writer: ResponseWriter, tmp_path: Path, monkeypatch,
+):
+    """Recovery correctness: the DB floor is gated on the AUTHORITATIVE store,
+    not on disk/legacy. After a store loss the watch dir may hold only a few
+    partially-recovered files (low disk_max) while the vault history reaches
+    far higher — skipping the DB floor because disk is nonzero would mint a
+    number that OVERWRITES a delivered vault file."""
+    db = _floor_db(tmp_path, [f"/x/doc-{n}.genesis.md" for n in (117, 118)])
+    monkeypatch.setattr("genesis.env.genesis_db_path", lambda: db)
+
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    # A few low-numbered local files survived (disk_max=3); the store is empty.
+    for n in (1, 2, 3):
+        (tmp_path / f"doc-{n}.genesis.md").write_text("recovered")
+
+    p = await writer.write_response(
+        batch_id="rc", source_files=[str(source)],
+        evaluation_text="a", item_count=1,
+    )
+    assert p.name == "doc-119.genesis.md", (
+        f"got {p.name}: DB floor (118) skipped because disk_max(3) was nonzero "
+        "— this overwrites a delivered vault response"
+    )
+
+
+@pytest.mark.asyncio
+async def test_db_floor_runs_when_disk_empty_even_if_store_lags(
+    writer: ResponseWriter, tmp_path: Path, monkeypatch,
+):
+    """Whole-class-audit BLOCKER: the DB recovery floor must run whenever the
+    watch dir is wiped (disk_max==0), NOT only when the store reads 0. The
+    store is best-effort/cross-process and can silently lag the DB; gating on
+    stored_max alone would skip the DB after a wipe and re-mint an
+    already-delivered number, overwriting a vault file."""
+    import json as _json
+
+    from genesis.inbox import writer as writer_mod
+
+    # Store LAGS the DB: it holds doc=5 (a stale/lost-update value), the watch
+    # dir is empty (wiped), and the DB knows doc-118 was delivered.
+    store_path = writer_mod._counter_store_path()
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text(_json.dumps({str(tmp_path): {"doc": 5}}))
+    db = _floor_db(tmp_path, ["/x/doc-118.genesis.md"])
+    monkeypatch.setattr("genesis.env.genesis_db_path", lambda: db)
+
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    p = await writer.write_response(
+        batch_id="lag", source_files=[str(source)],
+        evaluation_text="a", item_count=1,
+    )
+    assert p.name == "doc-119.genesis.md", (
+        f"got {p.name}: DB floor (118) suppressed by a lagging store after a "
+        "wipe — this overwrites a delivered vault response"
+    )
+
+
+def test_cross_process_store_records_true_high_water(tmp_path: Path):
+    """Whole-class-audit SHOULD-FIX: the store RMW is cross-process-locked
+    (fcntl.flock), so concurrent writer processes cannot lose a stem's advance
+    (last-writer-wins). After N concurrent writes the store must record the
+    true high-water N, not a lagged value."""
+    import json as _json
+    import subprocess
+
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    (watch / "doc.md").write_text("src")
+    ghome = tmp_path / "ghome"
+    env = {
+        **os.environ,
+        "GENESIS_HOME": str(ghome),
+        "GENESIS_DB_PATH": str(tmp_path / "nope.db"),
+    }
+    n = 8
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _CROSS_PROC_WORKER, str(watch), str(i)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        for i in range(n)
+    ]
+    for p in procs:
+        _, err = p.communicate(timeout=60)
+        assert p.returncode == 0, err
+
+    store = _json.loads((ghome / "state" / "inbox-counters.json").read_text())
+    assert store[str(watch)]["doc"] == n, (
+        f"store high-water {store[str(watch)]['doc']} != {n} — a concurrent "
+        "process lost-updated the store (cross-process lock missing)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_db_floor_reads_path_with_uri_reserved_char(
+    writer: ResponseWriter, tmp_path: Path, monkeypatch,
+):
+    """Codex P2: a DB path containing a URI-reserved char (# / ?) must be
+    percent-encoded, not interpolated raw — else SQLite opens the wrong file
+    and the recovery floor silently degrades to 0."""
+    weird_dir = tmp_path / "a#b"
+    weird_dir.mkdir()
+    db = weird_dir / "genesis.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE inbox_items (response_path TEXT)")
+    conn.execute(
+        "INSERT INTO inbox_items VALUES (?)", ("/x/doc-77.genesis.md",),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr("genesis.env.genesis_db_path", lambda: db)
+
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    p = await writer.write_response(
+        batch_id="u1", source_files=[str(source)],
+        evaluation_text="a", item_count=1,
+    )
+    assert p.name == "doc-78.genesis.md", (
+        f"got {p.name}: DB at a '#'-containing path not read (URI misparse)"
+    )
 
 
 @pytest.mark.asyncio

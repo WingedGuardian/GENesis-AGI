@@ -11,11 +11,13 @@ No subdirectory needed — the .genesis.md suffix marks response files.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import io
 import json
 import logging
 import os
 import sqlite3
+import tempfile
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,8 +33,15 @@ logger = logging.getLogger(__name__)
 _COUNTER_FILE = ".genesis-counters.json"
 
 # Serializes the counter store's read-modify-write across the to_thread
-# workers write_response dispatches into (threads share this module).
+# workers write_response dispatches into (threads share this module). This
+# only reduces intra-process contention; cross-process allocation safety comes
+# from the atomic os.link reservation in _allocate_and_link.
 _COUNTER_LOCK = threading.Lock()
+
+# Bound on re-derivation attempts when a concurrent writer takes our number.
+# Each retry advances past the collision, so this only trips under pathological
+# contention (or a wedged filesystem), where failing loud beats spinning.
+_ALLOC_MAX_RETRIES = 50
 
 
 def _counter_store_path() -> Path:
@@ -94,42 +103,57 @@ class ResponseWriter:
             stem = f"{date_file}-inbox-{slug}"
             base_dir = self._watch_path
 
-        # Always numbered — monotonically increasing, never reuses numbers.
-        # Off-loop: the counter derivation reads/writes the store file and
-        # queries the DB floor (blocking I/O). _next_counter serializes on a
-        # module lock — moving it off the event loop forfeited coroutine
-        # atomicity, and an unlocked read-modify-write of the store would
-        # let two concurrent writes mint the SAME number (the silent-vault-
-        # overwrite failure mode this module exists to prevent).
-        next_num = await asyncio.to_thread(_next_counter, base_dir, stem, RESPONSE_SUFFIX)
-        target = base_dir / f"{stem}-{next_num}{RESPONSE_SUFFIX}"
-        if target.exists():
-            # Invariant breach: the freshly-minted number already exists on
-            # disk (the scan floor makes this impossible except under a race
-            # this code failed to serialize). Fail LOUDLY — os.replace below
-            # would silently clobber a delivered response.
-            raise RuntimeError(
-                f"response numbering invariant breach: {target} already exists",
-            )
-
         frontmatter_data = {
             "date": datetime_str,
             "source_files": source_files,
             "batch_id": batch_id,
         }
-        frontmatter = _dump_frontmatter(frontmatter_data)
+        body = _dump_frontmatter(frontmatter_data) + evaluation_text + "\n"
 
-        body = frontmatter + evaluation_text + "\n"
-
-        # Atomic write: .tmp → rename
-        tmp_path = target.with_suffix(".tmp")
-        await asyncio.to_thread(self._write_atomic, tmp_path, target, body)
-        return target
+        # Allocate the number and place the file in one atomic, cross-process
+        # step. The number must NEVER be reused (a reused number silently
+        # overwrites a delivered vault response — the 2026-07-29 incident).
+        # A module lock only serializes threads in ONE interpreter, but a
+        # second WRITER PROCESS (scripts/inbox_check.py overlapping the
+        # server) can read the same floors and mint the same number. So the
+        # reservation is the filesystem itself: os.link() is atomic and fails
+        # if the target exists, across processes. On collision we re-derive
+        # (the loser's next _next_counter sees the winner's file on disk / in
+        # the store and bumps) and retry.
+        return await asyncio.to_thread(
+            self._allocate_and_link, base_dir, stem, RESPONSE_SUFFIX, body,
+        )
 
     @staticmethod
-    def _write_atomic(tmp_path: Path, target: Path, content: str) -> None:
-        tmp_path.write_text(content, encoding="utf-8")
-        os.replace(str(tmp_path), str(target))
+    def _allocate_and_link(
+        base_dir: Path, stem: str, suffix: str, body: str,
+    ) -> Path:
+        # Write the content to a unique tmp in the SAME dir (same fs → link is
+        # atomic and the target appears fully-formed, never partial). The
+        # ".genesis-" prefix means a crash-leaked tmp is BOTH scanner-ignored
+        # (dot-prefixed) AND excluded from the vault sync (--exclude ".genesis-*")
+        # — it can never leak into the user's Obsidian folder.
+        fd, tmp_name = tempfile.mkstemp(
+            dir=base_dir, prefix=".genesis-tmp-", suffix=".tmp",
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            for _ in range(_ALLOC_MAX_RETRIES):
+                next_num = _next_counter(base_dir, stem, suffix)
+                target = base_dir / f"{stem}-{next_num}{suffix}"
+                try:
+                    os.link(str(tmp_path), str(target))  # atomic; ENOENT-safe
+                except FileExistsError:
+                    continue  # another writer took this number — re-derive
+                return target
+            raise RuntimeError(
+                f"could not allocate a unique response number for {stem!r} "
+                f"after {_ALLOC_MAX_RETRIES} attempts",
+            )
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
 
 def _db_floor(directory: Path, base_name: str, suffix: str) -> int:
@@ -146,13 +170,20 @@ def _db_floor(directory: Path, base_name: str, suffix: str) -> int:
     # skips numbers (cosmetic gaps) and inherently covers directory renames;
     # under-counting is the overwrite bug. Kept for signature symmetry.
     del directory
+    from urllib.parse import quote
+
     from genesis import env
 
     prefix = f"{base_name}-"
     floor = 0
     try:
         db_path = env.genesis_db_path()
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        # Percent-encode the path: a valid filename char that is URI-reserved
+        # (?, #, %) would otherwise be parsed as a query/fragment, silently
+        # opening the WRONG database (or degrading to a 0 floor) and defeating
+        # this recovery floor. safe="/" keeps path separators literal.
+        uri = f"file:{quote(str(db_path), safe='/')}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
         try:
             rows = conn.execute(
                 "SELECT response_path FROM inbox_items WHERE response_path IS NOT NULL",
@@ -200,12 +231,27 @@ def _next_counter(directory: Path, base_name: str, suffix: str) -> int:
     store read-modify-write is serialized on a module lock — without it two
     concurrent calls could mint the same number and silently overwrite.
     """
-    with _COUNTER_LOCK:
-        return _next_counter_locked(directory, base_name, suffix)
-
-
-def _next_counter_locked(directory: Path, base_name: str, suffix: str) -> int:
     store_path = _counter_store_path()
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = store_path.with_name(store_path.name + ".lock")
+    # _COUNTER_LOCK serializes threads in THIS interpreter; fcntl.flock
+    # serializes the store read-modify-write across PROCESSES (the server and
+    # scripts/inbox_check.py can run concurrently). Both are required: without
+    # the cross-process lock, a whole-file RMW loses a sibling stem's advance
+    # (last-writer-wins) and the store — the authority trusted after a wipe —
+    # silently lags. The lock is a stable sidecar file (never replaced), so the
+    # atomic tmp+os.replace of the store below can't drop it.
+    with _COUNTER_LOCK, open(lock_path, "w") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            return _next_counter_locked(directory, base_name, suffix, store_path)
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
+def _next_counter_locked(
+    directory: Path, base_name: str, suffix: str, store_path: Path,
+) -> int:
     dir_key = str(directory)
 
     # 1. Durable store: {directory: {base_name: high_water}}
@@ -247,20 +293,40 @@ def _next_counter_locked(directory: Path, base_name: str, suffix: str) -> int:
         except ValueError:
             continue  # non-numeric suffix, ignore
 
-    # 4. DB response-path history
+    # 4. DB response-path history — the ONE floor a vault-sync restore cannot
+    #    roll back (inbox_items is the server's own append-only delivery log,
+    #    not synced from the vault). Consulted UNCONDITIONALLY: any gate that
+    #    trusts the local store/disk floors to decide whether to skip it
+    #    under-counts when those floors are stale-but-nonzero — a PARTIAL
+    #    restore (a sync-conflict rollback that leaves a few old files + an old
+    #    store) has store>0 AND disk>0 yet both trail the DB, so a gate re-mints
+    #    an already-delivered number and overwrites a vault file (the exact
+    #    2026-07-29 failure class). Earlier gates on stored_max, then on
+    #    stored_max||disk_max, each left a floor combination that under-counts;
+    #    removing the gate removes the whole class. The O(history) scan is
+    #    bounded (personal-scale inbox) and runs off the event loop — on a
+    #    silent-data-loss path, correctness beats the micro-optimization.
     db_max = _db_floor(directory, base_name, suffix)
 
     next_num = max(stored_max, legacy_max, disk_max, db_max) + 1
 
-    # Persist the new high-water mark to the durable store
+    # Persist the new high-water mark to the durable store (atomically, under
+    # the flock held by the caller — tmp-in-same-dir + os.replace so a reader
+    # never sees a torn file and a crash can't truncate the store).
     try:
-        store_path.parent.mkdir(parents=True, exist_ok=True)
         if not isinstance(store.get(dir_key), dict):
             store[dir_key] = {}
         store[dir_key][base_name] = next_num
-        store_path.write_text(
-            json.dumps(store, indent=2) + "\n", encoding="utf-8",
+        fd, tmp_name = tempfile.mkstemp(
+            dir=store_path.parent, prefix=".inbox-counters-", suffix=".tmp",
         )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(store, indent=2) + "\n")
+            os.replace(tmp_name, store_path)
+        except OSError:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
     except OSError:
         logger.warning(
             "Could not persist counter store %s", store_path, exc_info=True,
