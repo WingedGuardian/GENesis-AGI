@@ -231,9 +231,13 @@ fi
 # stop) may reap the wrapper before the trailer runs — the watchgod OOM sampler
 # covers that subset. Capture is best-effort and never alters the exit code.
 # `\$` defers expansion to the pane's shell; the `${...}` expand here in cc-slot.sh.
+# The `{ ${_OAUTH_SRC}claude …; }` brace group keeps claude UNDER the `cd &&`
+# guard: `_OAUTH_SRC` ends in `;`, so an un-grouped `cd $ROOT && <prefix>; claude`
+# would bind the `&&` to the prefix only and launch claude even when cd fails.
+# Do NOT unwrap it (test_cd_guard_skips_claude_on_bad_cd).
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
     -e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" \
     -e "LANG=$LANG" \
-    "cd ${GENESIS_ROOT} && ${_OAUTH_SRC}claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+    "cd ${GENESIS_ROOT} && { ${_OAUTH_SRC}claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; }; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"

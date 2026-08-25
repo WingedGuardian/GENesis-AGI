@@ -101,8 +101,12 @@ async def _decide() -> str | None:
     if mode == "off":
         return None
     if mode not in _VALID_MODES:
+        # Do NOT echo the raw lever value — CodeQL's clear-text-logging taint
+        # rule flags ANY env-var value reaching a log as sensitive (false
+        # positive here: the lever is conditional/always/off, never a secret),
+        # and the value adds nothing the allowed-set line doesn't.
         print(
-            f"Genesis: unknown GENESIS_CC_SLOT_OAUTH={mode!r} — not injecting "
+            "Genesis: unknown GENESIS_CC_SLOT_OAUTH value — not injecting "
             "(allowed: conditional, always, off).",
             file=sys.stderr,
             flush=True,

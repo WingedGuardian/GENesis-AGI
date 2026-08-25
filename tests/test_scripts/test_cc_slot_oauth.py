@@ -72,6 +72,13 @@ def test_pane_command_interpolates_oauth_prefix(script_text):
     assert "${_OAUTH_SRC}claude " in script_text
 
 
+def test_claude_grouped_behind_cd_guard(script_text):
+    # `_OAUTH_SRC` ends in `;`, so without a brace group `cd $ROOT && <prefix>;
+    # claude` binds the `&&` to the prefix only and claude runs even if cd fails.
+    # The `{ ...; }` keeps claude under the cd-guard.
+    assert "cd ${GENESIS_ROOT} && { ${_OAUTH_SRC}claude " in script_text
+
+
 def _extract_oauth_src_line(script_text: str) -> str:
     for line in script_text.splitlines():
         if line.lstrip().startswith('_OAUTH_SRC="_gt='):
@@ -133,6 +140,70 @@ printf 'TOKEN=[%s]\\n' "${{CLAUDE_CODE_OAUTH_TOKEN:-}}"
 """
     proc = _run_pane(harness, home)
     assert "TOKEN=[]" in proc.stdout, proc.stdout  # non-empty guard held
+
+
+def _extract_launch_line(script_text: str) -> str:
+    """The tmux pane-command argument (the `"cd ${GENESIS_ROOT} && …"` string)."""
+    for line in script_text.splitlines():
+        if line.lstrip().startswith('"cd ${GENESIS_ROOT} &&'):
+            return line.strip()
+    raise AssertionError("could not find the exec-tmux pane command in cc-slot.sh")
+
+
+def _run_cd_guard(script_text: str, root: str, canary: Path, fakebin: Path):
+    """Run the REAL pane launch string with a fake `claude` (touches the canary)
+    and a `;`-terminated _OAUTH_SRC (mimics the real prefix). Returns (rc, canary_exists).
+    """
+    launch = _extract_launch_line(script_text)
+    harness = f"""
+set -u
+export PATH="{fakebin}:/usr/bin:/bin"
+export CDGUARD_CANARY={str(canary)!r}
+GENESIS_ROOT={root!r}
+_OAUTH_SRC="export CDGUARD_PREFIX_RAN=1; "
+CC_PERM_FLAG=""
+CLAUDE_ARGS_Q=""
+SLOT="test"
+pane_cmd={launch}
+bash -c "$pane_cmd"
+echo "PANE_EXIT=$?"
+"""
+    proc = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+    )
+    return proc, canary.exists()
+
+
+def test_cd_guard_skips_claude_on_bad_cd(tmp_path, script_text):
+    """With a `;`-terminated _OAUTH_SRC, a FAILED cd must not launch claude — and a
+    SUCCESSFUL cd must. Proves the `{ …; }` grouping (verify-RED vs the un-grouped
+    `cd && <prefix>; claude`, which runs claude regardless of cd)."""
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    fake_claude = fakebin / "claude"
+    fake_claude.write_text('#!/usr/bin/env bash\ntouch "$CDGUARD_CANARY"\nexit 0\n')
+    fake_claude.chmod(0o755)
+
+    # bad cd → claude NOT run, pane exits with cd's failure code
+    canary_bad = tmp_path / "PANE_RAN_BAD"
+    proc_bad, ran_bad = _run_cd_guard(
+        script_text,
+        str(tmp_path / "does-not-exist"),
+        canary_bad,
+        fakebin,
+    )
+    assert not ran_bad, f"claude ran despite a failed cd\n{proc_bad.stdout}\n{proc_bad.stderr}"
+    assert "PANE_EXIT=0" not in proc_bad.stdout, proc_bad.stdout
+
+    # good cd → claude DOES run, pane exits 0
+    good_root = tmp_path / "good"
+    good_root.mkdir()
+    canary_good = tmp_path / "PANE_RAN_GOOD"
+    proc_good, ran_good = _run_cd_guard(script_text, str(good_root), canary_good, fakebin)
+    assert ran_good, f"claude did not run on a good cd\n{proc_good.stdout}\n{proc_good.stderr}"
+    assert "PANE_EXIT=0" in proc_good.stdout, proc_good.stdout
 
 
 def test_notice_text_cannot_inject_shell(tmp_path, script_text):
