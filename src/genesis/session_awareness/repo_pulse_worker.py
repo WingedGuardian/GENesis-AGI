@@ -40,6 +40,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from genesis.db.crud import follow_ups as followups_crud
+from genesis.db.crud import pending_issue_posts as pip_crud
 from genesis.db.crud import repo_pulse as pulse_crud
 from genesis.db.crud.session_charters import ledger_all, ledger_update
 from genesis.env import genesis_db_path
@@ -49,6 +50,7 @@ from genesis.session_awareness.repo_pulse import (
     PULSE_MODEL,
     PULSE_TIMEOUT_S,
     build_fuzzy_prompt,
+    match_closed_issues,
     match_exact,
     match_followup,
     parse_matches,
@@ -58,7 +60,7 @@ from genesis.session_awareness.repo_pulse_config import (
     knob_int,
     load_config,
 )
-from genesis.session_awareness.repo_pulse_gh import list_merged_prs
+from genesis.session_awareness.repo_pulse_gh import list_merged_prs, resolve_default_branch
 
 CURSOR_FILENAME = "cursor.json"
 LOCK_FILENAME = "pulse.lock"
@@ -240,6 +242,28 @@ async def _load_open_followups(db_path: Path | str) -> list[dict] | None:
         return None
     rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
     return rows
+
+
+async def _load_posted_index(db_path: Path | str, repo: str) -> dict[int, str] | None:
+    """POSTED, follow_up-sourced issues in *repo* as ``issue_number → follow_up id``
+    (the WS-A close-loop join). Mirrors ``_load_open_followups``'s fail posture: a
+    MISSING ``pending_issue_posts`` table is a pre-#1341 install (nothing posted to
+    reconcile) → ``{}`` (skip the lane); a genuine read failure → ``None`` (fail the
+    run, keep the cursor, re-cover next run).
+    """
+    import aiosqlite
+
+    try:
+        async with aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='pending_issue_posts'"
+            )
+            if not await cur.fetchone():
+                return {}  # pre-#1341 / bare DB — nothing posted to reconcile, skip
+            return await pip_crud.posted_index_for_repo(db, repo)
+    except Exception:
+        return None
 
 
 async def _reconcile(db_path: Path | str, now_iso: str) -> dict[str, int]:
@@ -742,6 +766,137 @@ async def _run_locked(
                     )
     if followup_items:
         detail_notes.append(f"followup exact={n_followup}/{len(followup_items)} open")
+
+    # ── issue-close lane (WS-A) ──────────────────────────────────────────
+    # Resolve a follow_up when an EXTERNAL contributor PR CLOSES the
+    # Genesis-posted issue that follow_up spawned (`Closes #N` ->
+    # closingIssuesReferences). Complements the `Follow-up: <id>` marker lane
+    # above — contributors cite the ISSUE, not our internal follow_up id, so the
+    # marker lane never fires for them. Rides the SAME already-fetched `prs`;
+    # reuses absorb_followup + the target_kind="follow_up" annotation store +
+    # re-absorb dedup verbatim. The join is scoped by the pulse-resolved `repo`
+    # (SF1) so a config/origin divergence can only silence it, never mis-target.
+    # Only fires for POSTED, follow_up-sourced issues -> an empty index (the
+    # common case) is a cheap no-op.
+    n_closes = 0
+    if followup_items:  # nothing to resolve if there are no open follow_ups
+        posted_index = await _load_posted_index(db_path, repo)
+        if posted_index is None:
+            detail_notes.append("posted_index_read_failed")
+            recorded = await _record_run(
+                db_path,
+                **_base_row(
+                    status="failed",
+                    repo=repo,
+                    n_prs=len(prs),
+                    n_open_items=len(open_items),
+                    n_exact=n_exact,
+                ),
+                annotations=annotations,
+            )
+            if recorded:
+                _write_cursor(root, cursor, merged_at=None)
+            await _record_telemetry(db_path, "failed", "posted_index_read_failed")
+            return {"status": "failed", "detail": "posted_index_read_failed", "n_exact": n_exact}
+        if posted_index and any(pr.get("closingIssuesReferences") for pr in prs):
+            # Resolve the default branch (one gh call) ONLY when there are posted
+            # follow_up issues AND at least one PR in the window carries a closing
+            # reference — the common empty case never pays for the round-trip.
+            default_branch = await resolve_default_branch()
+            if not default_branch:
+                # Can't confirm the default branch -> SKIP the lane (fail-safe):
+                # honoring `Closes #N` on the wrong branch would falsely absorb a
+                # still-open issue's follow_up. A skip just re-covers next run.
+                detail_notes.append("issue-close skipped (default-branch unresolved)")
+            else:
+                followup_index = {str(f["id"]): f for f in followup_items if f.get("id")}
+                closes_matches = match_closed_issues(
+                    prs,
+                    posted_index,
+                    followup_index,
+                    run_repo=repo,
+                    default_branch=default_branch,
+                )
+                if closes_matches:
+                    import aiosqlite
+
+                    async with aiosqlite.connect(str(db_path), timeout=10) as db:
+                        await db.execute("PRAGMA busy_timeout=5000")
+                        db.row_factory = aiosqlite.Row
+                        if not await pulse_crud.tables_available(db):
+                            closes_matches = []
+                        for m in closes_matches:
+                            item, pr = m["item"], m["pr"]
+                            if await pulse_crud.annotation_exists(
+                                db, "exact", item["id"], pr["number"], target_kind="follow_up"
+                            ):
+                                # Re-absorb guard, status-agnostic (any prior annotation
+                                # for this (follow_up, PR) key blocks — incl. a same-PR
+                                # marker hit). The one divergent case — a contributor PR
+                                # that ALSO carries the raw follow_up id as a bare token,
+                                # so the marker lane wrote a 'proposed' first — is
+                                # effectively impossible (contributors don't know internal
+                                # follow_up ids) and can only ever UNDER-absorb, never
+                                # falsely complete.
+                                continue
+                            n_closes += 1
+                            pinned = bool(item.get("pinned"))
+                            if mode == "live" and not pinned:
+                                evidence = (
+                                    f"PR #{pr['number']}: {str(pr.get('title') or '')[:120]} "
+                                    f"(merged {pr.get('mergedAt')}) [repo-pulse issue-close]"
+                                )
+                                if await followups_crud.absorb_followup(
+                                    db,
+                                    item["id"],
+                                    evidence=evidence,
+                                    require_unpinned=True,
+                                    commit=False,
+                                ):
+                                    # Atomic absorb+annotation (Codex-P1 invariant):
+                                    # commit the completion together with its audit
+                                    # annotation so a crash can't orphan either.
+                                    applied = _followup_annotation(
+                                        "applied", item, pr, rationale="issue-close (Closes #N)"
+                                    )
+                                    await pulse_crud.insert_annotation(
+                                        db, applied, run_id=run_id, commit=True
+                                    )
+                                    annotations.append(applied)
+                                    continue
+                                # Absorb no-op: the follow_up left 'open' between load
+                                # and now (e.g. the marker lane completed it this run
+                                # via another PR) — a proposal, not a false absorb.
+                                annotations.append(
+                                    _followup_annotation(
+                                        "proposed",
+                                        item,
+                                        pr,
+                                        rationale="issue-close (absorb missed)",
+                                    )
+                                )
+                            elif pinned:
+                                # Pinned invariant: automation never auto-resolves a
+                                # pinned row — a close hit is a proposal a human confirms.
+                                annotations.append(
+                                    _followup_annotation(
+                                        "proposed",
+                                        item,
+                                        pr,
+                                        rationale="issue-close (pinned, proposal-only)",
+                                    )
+                                )
+                            else:  # propose_only mode
+                                annotations.append(
+                                    _followup_annotation(
+                                        "proposed",
+                                        item,
+                                        pr,
+                                        rationale="issue-close (propose_only)",
+                                    )
+                                )
+    if n_closes:
+        detail_notes.append(f"issue-close exact={n_closes}")
 
     remaining = [i for i in open_items if i["id"] not in absorbed]
     n_fuzzy = 0

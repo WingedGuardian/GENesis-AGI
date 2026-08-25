@@ -283,3 +283,38 @@ class TestCrud:
         )
         assert await pip.mark_rejected(db, "p1", rejected_at=_TS) is False
         assert (await pip.get_by_id(db, "p1"))["status"] == "dry_run"
+
+
+# --------------------------------------------------------------------------- #
+# WS-A close-loop join: posted_index_for_repo
+# --------------------------------------------------------------------------- #
+class TestPostedIndexForRepo:
+    """issue_number → source_ref map for POSTED, follow_up-sourced rows only."""
+
+    _REPO = "acme/widgets"  # synthetic — install-agnostic
+
+    async def _make(self, db, *, id, source_ref, status, issue_number=None, repo=None):
+        row = {**_ROW, "id": id, "request_id": f"req-{id}", "repo": repo or self._REPO}
+        row["source_ref"] = source_ref
+        await pip.create(db, **row)
+        if status == "posted":
+            await pip.mark_posted(db, id, issue_number=issue_number, issue_url="u", posted_at=_TS)
+        elif status == "dry_run":
+            await pip.mark_dry_run(db, id, dry_run_at=_TS)
+
+    @pytest.mark.asyncio
+    async def test_only_posted_followup_rows_indexed(self, db):
+        await self._make(db, id="a", source_ref="fu-1", status="posted", issue_number=101)
+        await self._make(db, id="b", source_ref="fu-2", status="held")  # not posted
+        await self._make(db, id="c", source_ref=None, status="posted", issue_number=102)  # Cat-1
+        await self._make(db, id="d", source_ref="fu-3", status="dry_run")  # terminal, no post
+        await self._make(
+            db, id="e", source_ref="fu-4", status="posted", issue_number=103, repo="other/repo"
+        )
+        idx = await pip.posted_index_for_repo(db, self._REPO)
+        assert idx == {101: "fu-1"}  # b/c/d/e all correctly excluded
+
+    @pytest.mark.asyncio
+    async def test_empty_when_nothing_posted(self, db):
+        await self._make(db, id="a", source_ref="fu-1", status="held")
+        assert await pip.posted_index_for_repo(db, self._REPO) == {}

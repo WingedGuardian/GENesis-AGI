@@ -117,6 +117,33 @@ async def list_dedup_active(db: aiosqlite.Connection, repo: str) -> list[dict]:
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def posted_index_for_repo(db: aiosqlite.Connection, repo: str) -> dict[int, str]:
+    """Map ``issue_number → source_ref`` (the follow_up id) for POSTED,
+    follow_up-sourced issues in *repo* — the WS-A close-loop join.
+
+    A merged contributor PR's closed issue number resolves the follow_up that
+    spawned the issue. Only 'posted' rows carry an ``issue_number``; only
+    ``source='follow_up'`` rows carry a ``source_ref`` to resolve (Cat-1
+    codebase issues have ``source_ref`` NULL → excluded). There is no UNIQUE
+    index on (repo, issue_number); a duplicate issue_number would be a data
+    anomaly, so the FIRST row (by rowid) wins rather than corrupting the map.
+    Requires ``db.row_factory = aiosqlite.Row``.
+    """
+    cursor = await db.execute(
+        "SELECT issue_number, source_ref FROM pending_issue_posts "
+        "WHERE repo = ? AND status = 'posted' "
+        "AND issue_number IS NOT NULL AND source_ref IS NOT NULL "
+        "ORDER BY rowid",
+        (repo,),
+    )
+    index: dict[int, str] = {}
+    for row in await cursor.fetchall():
+        number = int(row["issue_number"])
+        if number not in index:
+            index[number] = str(row["source_ref"])
+    return index
+
+
 async def mark_dry_run(db: aiosqlite.Connection, id: str, *, dry_run_at: str) -> bool:
     """Transition held → dry_run (propose_only: approved but not posted). TERMINAL
     — a later post/reject must not override it, so a lever flip to 'live' never

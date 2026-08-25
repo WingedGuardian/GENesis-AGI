@@ -775,6 +775,166 @@ async def test_followup_proposal_survives_reconcile_while_open(
     assert anns[0]["status"] == "proposed"  # SURVIVES — the BLOCKER fix
 
 
+# ── issue-close lane (WS-A): contributor-PR close reconciliation ───────────
+# A contributor PR that CLOSES a Genesis-posted issue (Closes #N) resolves the
+# follow_up that spawned the issue — riding the same absorb+annotate machinery.
+
+CLOSE_REPO = "owner/repo"  # matches _gh's default fake repo slug
+
+
+async def _seed_posted_issue(
+    db_path, *, issue_number=101, source_ref=FU, repo=CLOSE_REPO, status="posted"
+):
+    """Create pending_issue_posts (absent from the base fixture) + one row."""
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.execute(TABLES["pending_issue_posts"])
+        await db.execute(
+            "INSERT INTO pending_issue_posts "
+            "(id, request_id, repo, title, body, source, source_ref, cell_domain, "
+            " cell_verb, cell_risk_class, held_at, mode, status, issue_number) "
+            "VALUES (?, ?, ?, 't', 'b', 'follow_up', ?, 'github', 'issue_create', "
+            " 'bulk', '2026-07-10T00:00:00', 'live', ?, ?)",
+            (
+                f"pp-{issue_number}",
+                f"req-{issue_number}",
+                repo,
+                source_ref,
+                status,
+                issue_number if status == "posted" else None,
+            ),
+        )
+        await db.commit()
+
+
+def _close_ref(number, repo=CLOSE_REPO):
+    owner, _, name = repo.partition("/")
+    return {
+        "number": number,
+        "repository": {"name": name, "owner": {"login": owner}},
+        "url": f"https://github.com/{repo}/issues/{number}",
+    }
+
+
+def _pr_closes(number=1300, base="main", refs=None, merged=MERGED_NEW):
+    pr = _pr(number=number, title="fix: contributor patch", merged=merged)
+    pr["baseRefName"] = base
+    pr["closingIssuesReferences"] = refs if refs is not None else [_close_ref(101)]
+    return pr
+
+
+@pytest.fixture
+def default_branch_main(monkeypatch):
+    async def fake(*a, **k):
+        return "main"
+
+    monkeypatch.setattr(rpw, "resolve_default_branch", fake)
+
+
+@pytest.mark.asyncio
+async def test_issue_close_absorbs_in_live(
+    pulse_root, db_path, monkeypatch, live_mode, default_branch_main
+):
+    await _seed_followup(db_path)
+    await _seed_posted_issue(db_path, issue_number=101, source_ref=FU)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr_closes(refs=[_close_ref(101)])]))
+    assert out["status"] == "ok"
+    row = await _followup_row(db_path)
+    assert row["status"] == "completed"
+    assert "PR #1300" in row["resolution_notes"]
+    assert "[repo-pulse issue-close]" in row["resolution_notes"]
+    anns = await _anns(db_path, target_kind="follow_up")
+    assert len(anns) == 1
+    assert anns[0]["status"] == "applied"
+    assert anns[0]["rationale"] == "issue-close (Closes #N)"
+
+
+@pytest.mark.asyncio
+async def test_issue_close_pinned_is_proposal(
+    pulse_root, db_path, monkeypatch, live_mode, default_branch_main
+):
+    await _seed_followup(db_path, pinned=1)
+    await _seed_posted_issue(db_path)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr_closes()]))
+    assert out["status"] == "ok"
+    assert (await _followup_row(db_path))["status"] == "pending"  # never auto-resolved
+    anns = await _anns(db_path, target_kind="follow_up")
+    assert anns[0]["status"] == "proposed"
+    assert "pinned" in anns[0]["rationale"]
+
+
+@pytest.mark.asyncio
+async def test_issue_close_propose_only(pulse_root, db_path, monkeypatch, default_branch_main):
+    monkeypatch.setattr(rpw, "effective_mode", lambda: "propose_only")
+    await _seed_followup(db_path)
+    await _seed_posted_issue(db_path)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr_closes()]))
+    assert out["status"] == "ok"
+    assert (await _followup_row(db_path))["status"] == "pending"
+    anns = await _anns(db_path, target_kind="follow_up")
+    assert anns[0]["status"] == "proposed"
+    assert "propose_only" in anns[0]["rationale"]
+
+
+@pytest.mark.asyncio
+async def test_issue_close_non_default_branch_no_absorb(
+    pulse_root, db_path, monkeypatch, live_mode, default_branch_main
+):
+    await _seed_followup(db_path)
+    await _seed_posted_issue(db_path)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr_closes(base="release/2.0")]))
+    assert out["status"] == "ok"
+    assert (await _followup_row(db_path))["status"] == "pending"  # branch guard held
+    assert await _anns(db_path, target_kind="follow_up") == []
+
+
+@pytest.mark.asyncio
+async def test_issue_close_missing_table_skips_not_fails(
+    pulse_root, db_path, monkeypatch, live_mode
+):
+    # pending_issue_posts absent (pre-#1341 install) -> lane skips, run still ok.
+    await _seed_followup(db_path)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr_closes()]))
+    assert out["status"] == "ok"
+    assert (await _followup_row(db_path))["status"] == "pending"
+    assert await _anns(db_path, target_kind="follow_up") == []
+
+
+@pytest.mark.asyncio
+async def test_issue_close_dedup_guard_across_runs(
+    pulse_root, db_path, monkeypatch, default_branch_main
+):
+    # propose_only keeps the follow_up OPEN, so a re-covered window re-matches it —
+    # the annotation_exists guard must prevent a duplicate annotation.
+    monkeypatch.setattr(rpw, "effective_mode", lambda: "propose_only")
+    await _seed_followup(db_path)
+    await _seed_posted_issue(db_path)
+    await _run(db_path, monkeypatch, gh=_gh([_pr_closes(number=1300)]))
+    await _run(db_path, monkeypatch, gh=_gh([_pr_closes(number=1300, merged=MERGED_NEXT)]))
+    anns = await _anns(db_path, target_kind="follow_up")
+    assert len(anns) == 1  # same (tier, target_kind, item_id, pr_number) key -> guarded
+
+
+@pytest.mark.asyncio
+async def test_issue_close_posted_index_read_failure_fails_run(
+    pulse_root, db_path, monkeypatch, live_mode, default_branch_main
+):
+    # A GENUINE posted-index read failure (None, not {}) must FAIL the run and
+    # keep the cursor — never a false absorb, never a silent skip.
+    await _seed_followup(db_path)
+    await _seed_posted_issue(db_path)
+
+    async def _boom(*a, **k):
+        return None
+
+    monkeypatch.setattr(rpw, "_load_posted_index", _boom)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr_closes()]))
+    assert out["status"] == "failed"
+    assert out["detail"] == "posted_index_read_failed"
+    assert (await _followup_row(db_path))["status"] == "pending"  # no absorb
+    assert await _anns(db_path, target_kind="follow_up") == []
+    assert not _cursor(pulse_root).get("last_merged_at")  # cursor not advanced
+
+
 @pytest.mark.asyncio
 async def test_followup_proposal_confirmed_when_completed_with_pr(
     pulse_root, db_path, monkeypatch, live_mode

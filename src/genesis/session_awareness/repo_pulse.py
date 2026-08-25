@@ -199,6 +199,76 @@ def match_followup(prs: list[dict], followups: list[dict]) -> list[dict]:
     return matches
 
 
+def _ref_repo(ref: dict) -> str:
+    """``owner/name`` of a ``closingIssuesReferences`` entry, or '' if malformed.
+
+    Matches the JSON shape ``gh pr list --json closingIssuesReferences`` returns:
+    ``{"number": N, "repository": {"name": ..., "owner": {"login": ...}}, "url": ...}``.
+    """
+    repository = ref.get("repository") or {}
+    owner = (repository.get("owner") or {}).get("login") or ""
+    name = repository.get("name") or ""
+    return f"{owner}/{name}" if owner and name else ""
+
+
+def match_closed_issues(
+    prs: list[dict],
+    posted_index: dict[int, str],
+    followup_index: dict[str, dict],
+    *,
+    run_repo: str,
+    default_branch: str,
+) -> list[dict]:
+    """Deterministic 'a contributor PR closed a Genesis-posted issue' matches (WS-A).
+
+    The contributor analogue of ``match_followup``. A merged PR carrying a
+    ``Closes #N`` keyword (→ GitHub's ``closingIssuesReferences``) that closes an
+    issue Genesis posted for a follow_up resolves that follow_up — closing the
+    tracking loop the ``Follow-up: <id>`` marker lane can't (contributors cite the
+    ISSUE, not our internal follow_up id). Keyed on the closed issue number:
+    ``posted_index`` maps ``issue_number → follow_up id`` (POSTED, follow_up-sourced
+    rows only), ``followup_index`` maps ``id → open follow_up row``. ``via='closes'``
+    is absorb-eligible — a ``Closes`` keyword is an explicit completion signal (like
+    a ``Follow-up:`` marker), not a bare mention.
+
+    Two safety filters, both verified against the real gh JSON shape:
+    - **default-branch only** — GitHub auto-closes a linked issue only when the PR
+      merges to the default branch, so a PR merged to a release/feature branch that
+      carries ``Closes #N`` (and does NOT close the issue) must not absorb the
+      follow_up. Gate on ``pr['baseRefName'] == default_branch``.
+    - **same-repo only** — ``closingIssuesReferences`` can name a foreign repo
+      (``Closes owner/other#5``); a foreign ``#N`` must not collide with a
+      same-numbered local issue. Keep only refs whose repository == ``run_repo``.
+
+    One match per ``(follow_up, pr)`` pair; result dicts share ``match_followup``'s
+    ``{item, pr, via}`` shape so the worker treats every exact lane uniformly. Pure
+    over dicts — the DB reads that build the two indexes live in the worker.
+    """
+    if not run_repo or not default_branch:
+        return []  # unresolved scoping → never match (fail-safe; worker also gates)
+    matches: list[dict] = []
+    for pr in prs:
+        if str(pr.get("baseRefName") or "") != default_branch:
+            continue
+        seen_items: set[str] = set()
+        for ref in pr.get("closingIssuesReferences") or []:
+            if not isinstance(ref, dict):
+                continue  # defensive: drop a malformed ref (gh JSON-shape drift)
+            if _ref_repo(ref) != run_repo:
+                continue
+            number = ref.get("number")
+            if not isinstance(number, int) or isinstance(number, bool):
+                continue
+            followup_id = posted_index.get(number)
+            if not followup_id:
+                continue
+            item = followup_index.get(str(followup_id))
+            if item is not None and item["id"] not in seen_items:
+                seen_items.add(item["id"])
+                matches.append({"item": item, "pr": pr, "via": "closes"})
+    return matches
+
+
 def build_fuzzy_prompt(
     open_items: list[dict], prs: list[dict]
 ) -> tuple[str, list[dict], list[dict]]:

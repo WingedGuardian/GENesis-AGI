@@ -9,6 +9,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **Contributor-issue close loop.** When an external contributor's merged PR
+  closes a GitHub issue Genesis posted from the Contributor Work-Log (via a
+  `Closes #N` keyword), the repo-pulse worker now auto-resolves the originating
+  follow-up — so shipped contributor work no longer lingers as a false TODO.
+  Scoped to default-branch merges and same-repo references; idempotent, and
+  fails closed on any ambiguity (empty/unresolvable state no-ops; a genuine read
+  failure fails the run and preserves the cursor to re-cover). Gated by the same
+  `repo_pulse` lever.
+
 ### Changed
 
 - **Executor Gate 2 (`17_executor_review`) leads with paid DeepSeek V4-pro.**
