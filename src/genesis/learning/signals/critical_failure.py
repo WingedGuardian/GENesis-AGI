@@ -33,14 +33,29 @@ _WEDGED_AGE_S = 1.0
 # watchdog + the stall-stack sampler.
 _STALE_CEILING_S = 30.0
 
+# The loop-lag sampler republishes a cleared (lagging=False) sample ~one 0.5s
+# interval after a stall ends, so reading the single latest sample just after a
+# stall can miss it (measured: 4 false 1.0s on 2026-08-24/25 lost that race by
+# 1.9-147ms). We also accept loop_health.recently_lagging() within this window as
+# LIVE starvation evidence. ~3x the 0.5s sampler interval: long enough to cover
+# the cleared-republish gap plus scheduling jitter. It DOES widen the already-
+# accepted masking residual (see _starvation_suppressed) from ~0.5s to <=window_s
+# — a real lag that cleared up to window_s before a genuinely-hung dependency's
+# timeout can suppress that timeout for the tick — but bounded and self-healing:
+# the next tick with a healthy loop and no fresh lag re-probes and fires 1.0. Only
+# the sampler ever records lag, so this never fabricates starvation.
+_RECENT_LAG_WINDOW_S = 1.5
+
 
 class CriticalFailureCollector:
     """Runs health probes: 1.0 if any DOWN, 0.5 if any DEGRADED, 0.0 if all HEALTHY.
 
     Loop-starvation guard: a DOWN whose probes *all* timed out, while the event
-    loop is demonstrably starved (a WEDGED or fresh+lagging loop-health sample),
-    is reclassified to 0.0 — a probe timing out because the loop couldn't
-    schedule it is not an infrastructure outage. Fail-closed: a hard-error DOWN,
+    loop is demonstrably starved (a WEDGED, fresh+lagging, or recently-lagging
+    loop-health sample — the last closes a TOCTOU race where the sampler already
+    republished a cleared sample), is reclassified to 0.0 — a probe timing out
+    because the loop couldn't schedule it is not an infrastructure outage.
+    Fail-closed: a hard-error DOWN,
     a mixed batch with any non-timeout DOWN, a healthy loop, or absent
     loop-health evidence all keep 1.0; and any error in the suppression check
     keeps the un-suppressed value (the ``_safe_collect`` wrapper would otherwise
@@ -55,10 +70,12 @@ class CriticalFailureCollector:
         *,
         wedged_age_s: float = _WEDGED_AGE_S,
         stale_ceiling_s: float = _STALE_CEILING_S,
+        recent_lag_window_s: float = _RECENT_LAG_WINDOW_S,
     ) -> None:
         self._probes = probes
         self._wedged_age_s = wedged_age_s
         self._stale_ceiling_s = stale_ceiling_s
+        self._recent_lag_window_s = recent_lag_window_s
 
     async def collect(self) -> SignalReading:
         if not self._probes:
@@ -111,7 +128,15 @@ class CriticalFailureCollector:
             # in that case, symmetrically for lagging True and False.
             fresh_lagging = age <= self._wedged_age_s and sample.lagging
             loop_wedged = self._wedged_age_s < age <= self._stale_ceiling_s
-            if not fresh_lagging and not loop_wedged:
+            # Third live-evidence path: the sampler OBSERVED lag within the recent
+            # window but has since republished a cleared sample (the TOCTOU race
+            # that fired the 4 measured false positives). Only the sampler records
+            # lag, so this never fabricates starvation; it does extend the accepted
+            # masking residual (below) to <=_RECENT_LAG_WINDOW_S, still bounded and
+            # self-healing. A genuine outage (healthy loop, no recent lag) fails all
+            # three paths and keeps 1.0.
+            recently_lagging = loop_health.recently_lagging(self._recent_lag_window_s)
+            if not fresh_lagging and not loop_wedged and not recently_lagging:
                 return None
             probes_named = ",".join(r.name for r in down)
             # Preserve a genuine DEGRADED (e.g. a 503 — the service RESPONDED, not

@@ -41,6 +41,13 @@ def _sample(*, age_s: float, lagging: bool, drift_ms: float = 2600.0):
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_recent_lag_memory(monkeypatch):
+    """The recent-lag memory is a module global; reset it around every test so a
+    prior test's lag can't leak into a case that expects no recent lag."""
+    monkeypatch.setattr(loop_health, "_last_lagging_monotonic", None)
+
+
 @pytest.mark.asyncio
 async def test_all_timeout_down_under_wedged_loop_suppressed(monkeypatch):
     # Wedged: the on-loop sampler stopped publishing (stale sample, age > threshold).
@@ -189,3 +196,44 @@ async def test_all_healthy():
     c = CriticalFailureCollector([_probe("qdrant", ProbeStatus.HEALTHY)])
     r = await c.collect()
     assert r.value == 0.0
+
+
+# --- recent-lag window: close the cleared-republish TOCTOU race ---
+# The sampler republishes a cleared (fresh, lagging=False) sample ~0.5s after a
+# stall ends; a consumer reading just after that swap saw the loop "healthy" and
+# fired a false 1.0 (4 measured FPs, 2026-08-24/25, lost the race by 1.9-147ms).
+# recently_lagging() retains a short memory of the sampler's last LAGGING
+# observation so that just-expired live evidence still suppresses — without
+# loosening what counts as lag (only the sampler sets it).
+
+
+@pytest.mark.asyncio
+async def test_recent_lag_suppresses_after_cleared_republish(monkeypatch):
+    # read() is fresh + NOT lagging (the cleared republish), but the sampler
+    # observed lag 0.6s ago -> still live starvation evidence -> suppress.
+    monkeypatch.setattr(loop_health, "read", lambda: _sample(age_s=0.1, lagging=False))
+    monkeypatch.setattr(loop_health, "_last_lagging_monotonic", time.monotonic() - 0.6)
+    c = CriticalFailureCollector([_probe("qdrant", ProbeStatus.DOWN, timed_out=True)])
+    r = await c.collect()
+    assert r.value == 0.0
+
+
+@pytest.mark.asyncio
+async def test_stale_recent_lag_beyond_window_still_fires(monkeypatch):
+    # A lag observed long ago (beyond the window) is NOT live evidence — a genuine
+    # same-tick timeout must still fire 1.0. Guards against over-suppression.
+    monkeypatch.setattr(loop_health, "read", lambda: _sample(age_s=0.1, lagging=False))
+    monkeypatch.setattr(loop_health, "_last_lagging_monotonic", time.monotonic() - 30.0)
+    c = CriticalFailureCollector([_probe("qdrant", ProbeStatus.DOWN, timed_out=True)])
+    r = await c.collect()
+    assert r.value == 1.0
+
+
+@pytest.mark.asyncio
+async def test_healthy_loop_no_recent_lag_still_fires(monkeypatch):
+    # Fresh healthy sample AND no recent lag at all -> a genuine outage fires 1.0.
+    monkeypatch.setattr(loop_health, "read", lambda: _sample(age_s=0.1, lagging=False))
+    monkeypatch.setattr(loop_health, "_last_lagging_monotonic", None)
+    c = CriticalFailureCollector([_probe("qdrant", ProbeStatus.DOWN, timed_out=True)])
+    r = await c.collect()
+    assert r.value == 1.0
