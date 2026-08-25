@@ -1804,6 +1804,29 @@ _DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
 # The leak/secret scanner is IRREDUCIBLE: always required, never removable by config. A
 # secret reaching a public repo is irreversible, so no local policy may waive it.
 _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
+# Every kind an install is ALLOWED to name in config. A configured kind outside this set
+# (a typo, a wrong type, a stale routine name) can never be satisfied by a real marker, so
+# the whole config is treated as invalid and we fail closed to the default rather than let
+# it either wedge merges forever or silently narrow the required set.
+_KNOWN_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
+
+
+def _validate_configured_kinds(items: object) -> list[str] | None:
+    """Lowercase + validate a configured kind list. Returns the cleaned list (possibly
+    empty, meaning "only the irreducible kinds"), or None if ANYTHING is off — not a list,
+    a non-string element, a blank element, or an unknown kind. None makes the caller fail
+    CLOSED to the full default rather than honor a malformed/ambiguous relaxation."""
+    if not isinstance(items, list):
+        return None
+    out: list[str] = []
+    for k in items:
+        if not isinstance(k, str):
+            return None  # wrong type (e.g. [123]) -> invalid -> default
+        kk = k.strip().lower()  # normalize to the lowercase marker grammar
+        if not kk or kk not in _KNOWN_SCHEDULED_REVIEW_KINDS:
+            return None  # blank ([" "]) or unknown ([foo]) -> invalid -> default
+        out.append(kk)
+    return out
 
 
 def _required_scheduled_review_kinds() -> tuple[str, ...]:
@@ -1821,25 +1844,36 @@ def _required_scheduled_review_kinds() -> tuple[str, ...]:
 
     The leak/secret scanner (``_IRREDUCIBLE_...``) is ALWAYS unioned in and CANNOT be
     dropped by config. Fail-CLOSED toward MORE review: a missing key / unreadable file /
-    parse error falls back to the full default set, never to fewer kinds. Test seam:
+    parse error / duplicate key / wrong-type / blank / unknown kind ALL fall back to the
+    full default set, never to fewer kinds. Configured kinds are validated against
+    ``_KNOWN_SCHEDULED_REVIEW_KINDS`` and lowercased to the marker grammar. Test seam:
     ``_TEST_REQUIRED_SCHEDULED_REVIEWS`` (comma-separated) overrides the config file.
     """
-    # Kinds are LOWERCASED to match the marker grammar (kind= is lowercase-only, see
-    # _SCHEDULED_REVIEW_KIND_RE): a mis-cased config entry must not become a kind no
-    # marker can ever satisfy (which would silently wedge that gate forever).
     raw = os.environ.get("_TEST_REQUIRED_SCHEDULED_REVIEWS")
     configured: list[str] | None = None
     if raw is not None:
-        configured = [k.strip().lower() for k in raw.split(",") if k.strip()]
+        # Test seam: comma-list; empties dropped so "" means "only the irreducible kinds".
+        configured = _validate_configured_kinds([k.strip() for k in raw.split(",") if k.strip()])
     else:
         try:
             import yaml  # lazy: keep the hook import-light; the genesis venv has pyyaml
 
-            with open(os.path.expanduser("~/.genesis/config/genesis.yaml")) as fh:
-                cfg = yaml.safe_load(fh) or {}
-            val = (cfg.get("merge_gate") or {}).get("required_scheduled_reviews")
-            if isinstance(val, list):
-                configured = [str(k).strip().lower() for k in val if str(k).strip()]
+            path = os.path.expanduser("~/.genesis/config/genesis.yaml")
+            with open(path) as fh:
+                text = fh.read()
+            # yaml.safe_load silently keeps the LAST value for a repeated key, so a
+            # badly-merged file (two merge_gate: or required_scheduled_reviews: lines)
+            # could quietly narrow the required set. Catch the realistic cases with a
+            # line scan (the repo's idiom — no unsafe custom Loader) and fail closed.
+            if (
+                len(re.findall(r"(?m)^merge_gate\s*:", text)) > 1
+                or len(re.findall(r"(?m)^\s*required_scheduled_reviews\s*:", text)) > 1
+            ):
+                raise ValueError("duplicate merge_gate/required_scheduled_reviews key")
+            cfg = yaml.safe_load(text) or {}
+            configured = _validate_configured_kinds(
+                (cfg.get("merge_gate") or {}).get("required_scheduled_reviews")
+            )
         except Exception:
             configured = None  # fail-closed: fall back to the full default set below
     kinds = configured if configured is not None else list(_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS)

@@ -1002,6 +1002,44 @@ class TestRequiredScheduledReviewKinds:
         monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "Code-Review,LEAKS")
         assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
 
+    def test_env_unknown_kind_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "bogus")
+        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+
+    @staticmethod
+    def _write_cfg(tmp_path, monkeypatch, body):
+        monkeypatch.delenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", raising=False)
+        cfgdir = tmp_path / ".genesis" / "config"
+        cfgdir.mkdir(parents=True)
+        (cfgdir / "genesis.yaml").write_text(body)
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+    def test_config_wrong_type_element_fails_closed(self, monkeypatch, tmp_path):
+        self._write_cfg(tmp_path, monkeypatch, "merge_gate:\n  required_scheduled_reviews: [123]\n")
+        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+
+    def test_config_blank_element_fails_closed(self, monkeypatch, tmp_path):
+        self._write_cfg(tmp_path, monkeypatch, "merge_gate:\n  required_scheduled_reviews: [' ']\n")
+        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+
+    def test_config_unknown_kind_fails_closed(self, monkeypatch, tmp_path):
+        self._write_cfg(tmp_path, monkeypatch, "merge_gate:\n  required_scheduled_reviews: [foo]\n")
+        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+
+    def test_config_empty_list_is_leaks_only(self, monkeypatch, tmp_path):
+        self._write_cfg(tmp_path, monkeypatch, "merge_gate:\n  required_scheduled_reviews: []\n")
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
+
+    def test_duplicate_key_fails_closed(self, monkeypatch, tmp_path):
+        # A badly-merged file with two merge_gate blocks whose last says [leaks] must
+        # NOT silently drop code-review; duplicate keys fail closed to the default.
+        body = (
+            "merge_gate:\n  required_scheduled_reviews: [code-review, leaks]\n"
+            "merge_gate:\n  required_scheduled_reviews: [leaks]\n"
+        )
+        self._write_cfg(tmp_path, monkeypatch, body)
+        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+
     def test_reads_config_file(self, monkeypatch, tmp_path):
         monkeypatch.delenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", raising=False)
         cfgdir = tmp_path / ".genesis" / "config"
