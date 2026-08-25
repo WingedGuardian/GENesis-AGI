@@ -100,6 +100,102 @@ async def test_propose_only_message_hints_dry_run(db, monkeypatch):
     assert "dry-run" in res["message"].lower()
 
 
+# ── autonomous posture: require_approval=False auto-resolves at propose ─────
+
+
+@pytest.mark.asyncio
+async def test_auto_approved_when_require_approval_false(db, live, monkeypatch):
+    """With the human gate off (this install's opt-in), propose resolves its OWN
+    approval server-side so the drain treats the hold as approved without a human.
+    scan_prose still ran (the row exists = it passed). The approval never sits
+    `pending`, so it never surfaces as an approval request."""
+    monkeypatch.setattr(ci, "require_approval", lambda: False)
+    # Install-agnostic: autonomous mode pins repo to _default_repo(); on a config-less
+    # CI clone that's a bare name and would error. Pin it to a valid slug.
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)
+    res = await _propose(db, title="Add a util test", body="Cover the empty-input case.")
+    assert res["status"] == "held"
+    assert res["auto_approved"] is True
+    assert "auto-approved" in res["message"].lower()
+
+    appr = await ar.get_by_id(db, res["request_id"])
+    assert appr["status"] == "approved"
+    assert appr["resolved_by"] == "genesis:contributor-worklog"
+
+
+@pytest.mark.asyncio
+async def test_requires_approval_leaves_pending(db, live):
+    """Default posture (require_approval True via the `live` fixture's config,
+    which omits the key → default True): the approval stays pending for a human."""
+    res = await _propose(db, title="Another task", body="Needs owner sign-off.")
+    assert res["status"] == "held"
+    assert res["auto_approved"] is False
+    assert (await ar.get_by_id(db, res["request_id"]))["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_auto_approved_propose_only_is_dry_run_terminal(db, monkeypatch):
+    """Auto-approve in propose_only: the approval is resolved, but the ROW is
+    stamped propose_only → the drain will dry-run it (terminal, 0 posts). Lets a
+    propose_only curator run self-complete for inspection with no human, no post."""
+    monkeypatch.setattr(ci, "effective_mode", lambda: "propose_only")
+    monkeypatch.setattr(ci, "load_config", lambda: {"max_held": 25})
+    monkeypatch.setattr(ci, "require_approval", lambda: False)
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)  # install-agnostic (see above)
+    res = await _propose(db, title="Dry-run task", body="Should not post.")
+    assert res["status"] == "held"
+    assert res["auto_approved"] is True
+    assert res["mode"] == "propose_only"
+    assert "dry-run" in res["message"].lower()
+    row = await pip.get_by_id(db, res["pending_id"])
+    assert row["mode"] == "propose_only"  # dry-run-terminal stamp preserved
+    assert (await ar.get_by_id(db, res["request_id"]))["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_autonomous_pins_repo_to_default(db, live, monkeypatch):
+    """Under autonomous posting the UNTRUSTED curator cannot redirect the post to
+    another repo — the destination is pinned to this install's configured repo
+    (Genesis vets destination, not just content)."""
+    monkeypatch.setattr(ci, "require_approval", lambda: False)
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)
+    res = await ci._impl_contributor_issue_propose(
+        db, title="Redirect attempt", body="A clean body.", repo="attacker/other-repo"
+    )
+    assert res["status"] == "held"
+    assert res["repo"] == _REPO  # pinned, not attacker/other-repo
+    assert (await pip.get_by_id(db, res["pending_id"]))["repo"] == _REPO
+
+
+@pytest.mark.asyncio
+async def test_autonomous_bare_default_repo_errors(db, live, monkeypatch):
+    """Codex P2 regression: if the configured owner is absent, _default_repo() is a
+    bare name (no owner/); the autonomous pin must NOT create a hold with a malformed
+    --repo — the final repo value is validated AFTER pinning, so this errors with no
+    row (else the drain retries an invalid `gh --repo` forever)."""
+    monkeypatch.setattr(ci, "require_approval", lambda: False)
+    monkeypatch.setattr(ci, "_default_repo", lambda: "GENesis-AGI")  # bare, owner absent
+    res = await ci._impl_contributor_issue_propose(
+        db, title="x title", body="y body", repo="WingedGuardian/GENesis-AGI"
+    )
+    assert res["status"] == "error"
+    assert await pip.list_held(db) == []
+    cur = await db.execute("SELECT COUNT(*) FROM approval_requests")
+    assert (await cur.fetchone())[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_human_posture_keeps_curator_repo(db, live, monkeypatch):
+    """With the human gate ON (default), a curator-supplied repo is kept — a human
+    reviews the destination before it posts, so no pin is needed."""
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)
+    res = await ci._impl_contributor_issue_propose(
+        db, title="Other repo task", body="A clean body.", repo="WingedGuardian/GENesis-Voice"
+    )
+    assert res["status"] == "held"
+    assert res["repo"] == "WingedGuardian/GENesis-Voice"  # not pinned under human review
+
+
 # ── fail-closed sanitizer ─────────────────────────────────────────────────
 
 
@@ -208,6 +304,17 @@ async def test_bad_source_error(db, live):
 async def test_bad_repo_error(db, live):
     res = await _propose(db, title="t", body="b", repo="not-a-repo")
     assert res["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_malformed_repo_components_rejected(db, live):
+    """repo must have non-empty owner AND name — a slug with an empty component
+    ('owner/', '/repo', '/', 'a//b') errors with NO row, so the drain never retries
+    an invalid `gh --repo` forever (Codex round-3 P2)."""
+    for bad in ("owner/", "/repo", "/", "a//b"):
+        res = await ci._impl_contributor_issue_propose(db, title="t title", body="b body", repo=bad)
+        assert res["status"] == "error", bad
+    assert await pip.list_held(db) == []
 
 
 # ── batch approve-all must NEVER sweep a held issue (public-repo write) ─────
