@@ -1183,14 +1183,17 @@ class TestCheckInlineReviewFindings:
             ),
         )
 
-    def _codex(self, cid, body, reply_to=None):
-        return {
+    def _codex(self, cid, body, reply_to=None, path=None):
+        d = {
             "id": cid,
             "reply_to": reply_to,
             "login": "chatgpt-codex-connector[bot]",
             "type": "Bot",
             "body": body,
         }
+        if path is not None:
+            d["path"] = path
+        return d
 
     def test_inline_p1_blocks_with_title(self, guard_module):
         with self._mock(guard_module, [self._codex(1, _P1_BODY)]):
@@ -1310,6 +1313,120 @@ class TestCheckInlineReviewFindings:
             block, _ = guard_module._check_inline_review_findings("100")
         # type=User AND not in the inline bot set → not an automated finding
         assert block is False
+
+    # ── doc-path allowlist (ledger 54eb3752) ─────────────────────────────
+    # A P1 whose inline finding sits on a DOCUMENTATION file does not block the
+    # merge; a code file — including a code file UNDER docs/ — still blocks. Safe
+    # default: any path not on the explicit allowlist blocks.
+    def test_inline_p1_on_changelog_does_not_block(self, guard_module, capsys):
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="CHANGELOG.md")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+        assert "documentation" in capsys.readouterr().err.lower()
+
+    def test_inline_p1_on_readme_does_not_block(self, guard_module):
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="README.md")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_inline_p1_under_docs_dir_does_not_block(self, guard_module):
+        with self._mock(
+            guard_module, [self._codex(1, _P1_BODY, path="docs/architecture/x.md")]
+        ):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_inline_p1_on_rst_does_not_block(self, guard_module):
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="guide.rst")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_inline_p1_on_code_path_still_blocks(self, guard_module):
+        with self._mock(
+            guard_module, [self._codex(1, _P1_BODY, path="src/genesis/foo.py")]
+        ):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "Make queue claim atomic" in msg
+
+    def test_inline_p1_on_random_md_still_blocks(self, guard_module):
+        # Safe default: a non-allowlisted *.md (not CHANGELOG/README, not under
+        # docs/) is NOT a doc → still blocks.
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="NOTES.md")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_inline_p1_on_code_under_docs_still_blocks(self, guard_module):
+        # docs/conf.py is executable Python — a finding there must still block.
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="docs/conf.py")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_inline_p1_missing_path_still_blocks(self, guard_module):
+        # A finding with no path (malformed/absent) fails SAFE → blocks.
+        with self._mock(guard_module, [self._codex(1, _P1_BODY)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_mixed_doc_and_code_p1_blocks_naming_code(self, guard_module):
+        comments = [
+            self._codex(1, _P1_BODY, path="CHANGELOG.md"),
+            self._codex(
+                2,
+                "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-red)"
+                "</sub></sub>  Real code defect in router**\n\nDetails.",
+                path="src/genesis/router.py",
+            ),
+        ]
+        with self._mock(guard_module, comments):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "Real code defect in router" in msg
+        assert "Make queue claim atomic" not in msg  # the doc P1 is not listed
+
+    def test_jq_projects_path(self, guard_module):
+        # The test seam bypasses jq, so lock the projection by asserting the argv
+        # the production fetch sends includes `path: .path`.
+        with self._mock(guard_module, []) as run_mock:
+            guard_module._check_inline_review_findings("100")
+        argv = run_mock.call_args[0][0]
+        assert any("path: .path" in tok for tok in argv)
+
+    # Fail-closed allowlist (security review HIGH): a NON-prose extension under
+    # docs/ must still block — the exemption is an allowlist of doc extensions,
+    # NOT a denylist of a few known code extensions.
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "docs/build.rs",       # Rust source
+            "docs/config.yaml",    # CI/build config
+            "docs/notebook.ipynb", # Jupyter (contains code)
+            "docs/init.sql",       # SQL
+            "docs/Script.java",    # Java
+            "docs/deploy.ps1",     # PowerShell
+            "docs/Makefile",       # extensionless build file (now fail-closed)
+        ],
+    )
+    def test_inline_p1_non_prose_under_docs_still_blocks(self, guard_module, path):
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path=path)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block, f"{path!r} under docs/ is not prose — must block"
+
+    def test_inline_p1_trailing_newline_path_blocks(self, guard_module):
+        # Security review LOW: a trailing newline must not defeat the exemption.
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="docs/conf.py\n")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_inline_p1_on_license_no_ext_does_not_block(self, guard_module):
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="LICENSE")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_inline_p1_on_docs_txt_does_not_block(self, guard_module):
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="docs/guide.txt")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
 
 
 class TestResolvePrNumber:
