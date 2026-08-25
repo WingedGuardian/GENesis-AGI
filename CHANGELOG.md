@@ -22,6 +22,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `open_pr_stale_days`, `max_open_prs`, `open_pr_resurface_days`,
   `open_pr_max_surface`); `GENESIS_REPO_PULSE_DISABLED` / `enabled: false` stop it.
 
+- **The Contributor Work-Log can post curated newcomer issues autonomously
+  (opt-in).** A new `require_approval: false` lever lets the curator's
+  privacy-vetted issues post without a per-item approval prompt — Genesis is the
+  gate (the fail-closed privacy scan still runs on every draft, and the row never
+  surfaces as an approval request). A cautious-rollout `max_posts_per_day` cap
+  limits how many issues post per rolling 24h, so a bad batch surfaces one at a
+  time rather than all at once; `mode: off` (or `GENESIS_CONTRIBUTOR_WORKLOG_DISABLED`)
+  halts posting — re-checked immediately before each create — and freezes the queue.
+  Ships SAFE — `require_approval` defaults true, and it is overlay-file-only (not a
+  one-call settings/dashboard toggle), so a fresh install always requires human approval.
+
 - **A per-prompt nudge when a session's memory MCP is running stale code.** Each
   Claude Code session's MCP subprocesses snapshot their code at spawn and never
   reload, so a deploy landing mid-session leaves recall — and its current security
@@ -80,6 +91,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   gate; the other repointed sites stay on free flash.
 
 ### Security
+
+- **A leading shell redirect can no longer slip the push/commit approval gates.**
+  The shared command parser now recognizes shell redirections (`2>/dev/null`,
+  `> out.log`, `2>&1`, `&>log`, `>| f`, `< in`, `<<<`) and consumes the operator
+  and its target instead of leaking them into the parsed argv. Previously a
+  *leading* redirect (`git 2>/dev/null push --force`, `git 2>&1 commit --no-verify`)
+  made the parser read the redirect token as the git subcommand, so the push and
+  commit gates never recognized the command and skipped their approval checks. The
+  redirect target is measured as one complete shell word, so an escaped or
+  concatenated-quote space inside it (`git 2>err\ log push`,
+  `git 2>pre"a b"post push`) no longer hides the subcommand either. As
+  a bonus, a targeted local `pytest` run that redirects output
+  (`pytest tests/x.py 2>&1`) is no longer misclassified as a whole-suite run.
 
 - **Observation content can no longer launder untrusted origin into privileged
   cognitive surfaces.** Observation rows now carry a definite origin stamped at the

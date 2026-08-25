@@ -49,6 +49,9 @@ _CASES = [
     ("timeout_auto_expire", "system"),
     # system: sentinel alarm clear (sentinel/dispatcher.py ~:1767)
     ("alarm_cleared", "system"),
+    # system: autonomous Genesis self-approval (mcp/health/contributor_issue.py,
+    # require_approval off) — NOT human-earned authority.
+    ("genesis:contributor-worklog", "system"),
     # system: housekeeping jobs
     ("cleanup:self-send-spam", "system"),
     ("cleanup:orphaned-pre-fix-approval", "system"),
