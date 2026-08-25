@@ -102,6 +102,24 @@ async def mark_posted(
     return cursor.rowcount > 0
 
 
+async def count_posted_since(db: aiosqlite.Connection, *, since: str) -> int:
+    """Number of issues actually POSTED to GitHub at/after ``since`` (ISO-UTC ts) —
+    the poster drain's rolling-window rate-limit count (cautious-rollout cap).
+
+    Counts ``status='posted'`` only, so ``dry_run`` holds (propose_only) never
+    consume a slot and the count is reconstructed from the durable table (survives
+    a mid-window restart — an in-memory counter would not). Mirrors
+    ``autonomous_email_sends.count_for_cell_since``. Global (not repo-scoped): the
+    cautious-rollout intent is total owner exposure, and this install posts to one
+    repo — global generalizes cleanly to a multi-repo future."""
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM pending_issue_posts WHERE status = 'posted' AND posted_at >= ?",
+        (since,),
+    )
+    row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
 async def list_dedup_active(db: aiosqlite.Connection, repo: str) -> list[dict]:
     """Rows in *repo* that should block a duplicate proposal: still awaiting
     owner review ('held') or already live ('posted'). ``dry_run`` deliberately

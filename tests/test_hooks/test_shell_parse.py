@@ -363,8 +363,10 @@ class TestCleanArgvHardening:
     hide a real git/gh/rm. (The round-2 `wrapper_consumed` refinement was reverted
     in round-3 — it turned the safe over-gate into a real false-negative on
     `time ! git push`; see test_control_word_after_wrapper_over_gates_safe and the
-    F6 regression lock below.) Redirection cleanup is NOT done in analyze — it would
-    desync the git/gh/commit flag/value gates; see TestGateDesyncProtection."""
+    F6 regression lock below.) Redirection handling lives in the shared tokenizer
+    (split_segments, #1455) and is quote-aware, so a quoted flag value that merely
+    resembles a redirect is preserved and the gates are not desynced; see
+    TestGateDesyncProtection (and TestRedirects for real redirects)."""
 
     def _detects(self, cmd: str, exe: str, sub: str | None = None) -> bool:
         for s in sp.analyze(cmd):
@@ -398,16 +400,11 @@ class TestCleanArgvHardening:
         assert self._detects("(( $(git push --force) ))", "git", "push")
         assert self._detects("(( $(rm -rf /) ))", "rm")
 
-    # NOTE: analyze() does NOT strip redirections — that would desync the
-    # git/gh/commit flag/value gates (see TestGateDesyncProtection). Redirection is
-    # left in the argv; a consumer that reads POSITIONALS (protected_paths,
-    # destructive) skips it LOCALLY, after its own flag/value handling.
-
-    # ── process substitution is left intact by analyze ───────────────────
-    def test_process_substitution_not_stripped(self):
-        seg = sp.analyze("diff <(cat a) b")[0]
-        assert seg.exe == "diff"
-        assert any(t.startswith("<(") for t in seg.argv)  # procsub token preserved
+    # NOTE: redirection tokenization lives in the shared tokenizer (split_segments,
+    # #1455) — quote-aware, so a quoted flag value resembling a redirect is kept (see
+    # TestGateDesyncProtection); real redirects + process substitution are covered by
+    # TestRedirects below. This class covers only the control-position/arith/closer
+    # resolution in _strip_wrappers, which composes on top of that tokenization.
 
     # ── count-matched trailing closer (nested groups) ────────────────────
     def test_nested_group_closer_fully_stripped(self):
@@ -455,8 +452,9 @@ class TestCleanArgvHardening:
         assert seg.exe == "rm" and "~/protected" in seg.argv
 
     def test_monotonic_redir_does_not_hide_target(self):
-        # `rm -rf / > log` — analyze leaves the redirection in place, so the `/`
-        # danger token stays visible to the guard (redirs never hide a target)
+        # `rm -rf / > log` — the shared tokenizer strips `> log` (a real redirect),
+        # but the `/` danger token precedes it and stays visible to the guard, so a
+        # trailing redirect never hides an rm target.
         seg = sp.analyze("rm -rf / > log")[0]
         assert seg.exe == "rm" and "/" in seg.argv
 
@@ -466,25 +464,209 @@ class TestCleanArgvHardening:
 
 
 class TestGateDesyncProtection:
-    """The reason redirection stripping is NOT in the shared resolver: shlex drops
-    quotes, so a quoted flag VALUE beginning with `<`/`>` must NOT desync the
-    git/gh/commit flag/value gates. Each gate accessor must be IDENTICAL for a
-    `<`-leading value and a plain value (found + fixed on #1457 round-2)."""
+    """A QUOTED flag VALUE that merely resembles a redirect (`git commit -m '<x>'`)
+    must NOT be treated as a redirect and must NOT desync the git/gh/commit
+    flag/value gates. The shared tokenizer (split_segments, #1455) is quote-aware,
+    so the `<`/`>` inside the quotes is preserved as the flag's value; the accessor
+    must be IDENTICAL for a quoted `<`-leading value and a plain quoted value.
+    (An UNQUOTED `git -C <dir> push` genuinely IS a bash redirect and is correctly
+    stripped by the tokenizer — that case is covered by TestRedirects, not here.)"""
 
     def test_commit_no_verify_gate_not_desynced(self):
-        # a message beginning with `<` must not let `-m` swallow --no-verify
+        # a quoted message beginning with `<` must not let `-m` swallow --no-verify
         nv = "--no" + "-verify"
-        plain = sp.analyze(f"git commit -m msg {nv}")[0].argv
-        angle = sp.analyze(f"git commit -m <x> {nv}")[0].argv
+        plain = sp.analyze(f"git commit -m 'msg' {nv}")[0].argv
+        angle = sp.analyze(f"git commit -m '<x>' {nv}")[0].argv
         assert sp.commit_skips_hooks(plain) is True
         assert sp.commit_skips_hooks(angle) is True  # NOT desynced to False
 
     def test_git_subcommand_not_desynced(self):
-        # `git -C <dir> push` — the `-C` value must not swallow `push`
-        assert sp.git_subcommand(sp.analyze("git -C dir push")[0].argv) == "push"
-        assert sp.git_subcommand(sp.analyze("git -C <dir> push")[0].argv) == "push"
+        # `git -C '<dir>' push` — the quoted `-C` value must not swallow `push`
+        assert sp.git_subcommand(sp.analyze("git -C 'dir' push")[0].argv) == "push"
+        assert sp.git_subcommand(sp.analyze("git -C '<dir>' push")[0].argv) == "push"
 
     def test_gh_pr_subcommand_not_desynced(self):
-        # `gh pr -R <o/r> merge 5` — the `-R` value must not swallow `merge`
-        assert sp.gh_pr_subcommand(sp.analyze("gh pr -R o/r merge 5")[0].argv) == "merge"
-        assert sp.gh_pr_subcommand(sp.analyze("gh pr -R <o/r> merge 5")[0].argv) == "merge"
+        # `gh pr -R '<o/r>' merge 5` — the quoted `-R` value must not swallow `merge`
+        assert sp.gh_pr_subcommand(sp.analyze("gh pr -R 'o/r' merge 5")[0].argv) == "merge"
+        assert sp.gh_pr_subcommand(sp.analyze("gh pr -R '<o/r>' merge 5")[0].argv) == "merge"
+
+
+# ── shell redirects: fd leaks + &/| mis-splits ──────────────────────────
+#
+# split_segments had no redirect grammar, so (a) simple redirects leaked into
+# argv as phantom positionals and (b) `2>&1`/`&>`/`>|` mis-split on their
+# embedded `&`/`|`. Both are guard bypasses: a LEADING redirect made
+# git_subcommand return the redirect token, so `git 2>/dev/null push` slipped the
+# push gate. These lock the closed redirect grammar.
+
+
+class TestRedirects:
+    # --- SECURITY: a leading redirect must not hide the git subcommand ---
+    def test_leading_stderr_redirect_push_recognized(self):
+        argv = sp.analyze("git 2>/dev/null push origin main --force")[0].argv
+        assert sp.git_subcommand(argv) == "push"
+
+    def test_leading_redirect_push_blocked(self):
+        assert _push_blocked("git 2>/dev/null push origin main")
+
+    def test_leading_dup_redirect_push_blocked(self):
+        # `2>&1` splits on '&' under the old tokenizer, hiding push in a bogus seg
+        assert _push_blocked("git 2>&1 push origin main")
+
+    def test_leading_redirect_escaped_space_target_push_blocked(self):
+        # bash: `error\ log` is ONE target word (escaped space) → the real command
+        # is `git push`. The target scan must consume the whole word, not stop at
+        # the escaped space (else the subcommand mis-reads as 'log' → fail-open).
+        cmd = r"git 2>error\ log push origin main"
+        assert sp.git_subcommand(sp.analyze(cmd)[0].argv) == "push"
+        assert _push_blocked(cmd)
+
+    def test_leading_redirect_concatenated_quote_target_push_blocked(self):
+        # bash: `pre"error log"post` is ONE word (concatenated quoting) → `git push`.
+        cmd = 'git 2>pre"error log"post push origin main'
+        assert sp.git_subcommand(sp.analyze(cmd)[0].argv) == "push"
+        assert _push_blocked(cmd)
+
+    def test_leading_redirect_escaped_space_target_commit_no_verify(self):
+        # same fail-open on the commit gate: `err\ log` is one target word.
+        assert _commit_nv(rf"git 2>err\ log commit '{NV}' -m x")
+
+    def test_leading_redirect_commit_no_verify(self):
+        assert _commit_nv(f"git 2>/dev/null commit '{NV}' -m x")
+
+    def test_leading_redirect_commit_recognized(self):
+        segs = sp.analyze("git 1>/dev/null commit -m x")
+        assert any(sp.git_subcommand(s.argv) == "commit" for s in segs)
+
+    # --- redirects stripped from argv ---
+    def test_glued_stderr_redirect_stripped(self):
+        assert sp.analyze("pytest tests/x.py 2>/dev/null")[0].argv == ["pytest", "tests/x.py"]
+
+    def test_separated_stdout_redirect_stripped(self):
+        assert sp.analyze("pytest tests/x.py > out.log")[0].argv == ["pytest", "tests/x.py"]
+
+    def test_append_redirect_stripped(self):
+        assert sp.analyze("pytest tests/x.py >> out.log")[0].argv == ["pytest", "tests/x.py"]
+
+    def test_combined_out_and_dup_redirect(self):
+        segs = sp.analyze("pytest tests/x.py > out.log 2>&1")
+        assert segs[0].argv == ["pytest", "tests/x.py"]
+        assert len(segs) == 1  # no bogus trailing '1' segment
+
+    def test_ampersand_redirect_stripped(self):
+        segs = sp.analyze("pytest tests/x.py &>log")
+        assert segs[0].argv == ["pytest", "tests/x.py"]
+        assert len(segs) == 1  # not split on the leading '&'
+
+    def test_ampersand_append_redirect_stripped(self):
+        assert sp.analyze("pytest tests/x.py &>> log")[0].argv == ["pytest", "tests/x.py"]
+
+    def test_noclobber_redirect_stripped(self):
+        segs = sp.analyze("pytest tests/x.py >| out")
+        assert segs[0].argv == ["pytest", "tests/x.py"]
+        assert len(segs) == 1  # not split on the embedded '|'
+
+    def test_input_redirect_stripped(self):
+        assert sp.analyze("pytest tests/x.py < in.txt")[0].argv == ["pytest", "tests/x.py"]
+
+    def test_herestring_redirect_stripped(self):
+        # a plain here-string target strips (operator + word). A $-bearing target is
+        # deliberately LEFT (see test_dollar_var_redirect_target_left_but_harmless).
+        assert sp.analyze("grep foo <<<plainword")[0].argv == ["grep", "foo"]
+
+    def test_fd_dup_target_stripped(self):
+        assert sp.analyze("pytest tests/x.py >&2")[0].argv == ["pytest", "tests/x.py"]
+
+    def test_escaped_space_redirect_target_stripped(self):
+        # an escaped space keeps the target as ONE word → fully stripped from argv
+        assert sp.analyze(r"pytest tests/x.py 2>err\ log")[0].argv == ["pytest", "tests/x.py"]
+
+    def test_concatenated_quote_redirect_target_stripped(self):
+        # `pre"a b"post` is one concatenated word target → stripped whole
+        assert sp.analyze('pytest tests/x.py 2>pre"a b"post')[0].argv == ["pytest", "tests/x.py"]
+
+    # --- pytest detection survives redirects ---
+    def test_pytest_detected_with_redirect(self):
+        assert sp.command_runs_pytest("python -m pytest tests/x.py -v 2>&1")
+        assert sp.command_runs_pytest("pytest tests/x.py 2>/dev/null")
+
+    # --- REGRESSION: real operators & quotes unaffected ---
+    def test_background_ampersand_still_splits(self):
+        exes = [s.exe for s in sp.analyze("sleep 1 & echo done")]
+        assert "sleep" in exes and "echo" in exes
+
+    def test_pipe_still_splits(self):
+        assert [s.exe for s in sp.analyze("cat x | grep y")] == ["cat", "grep"]
+
+    def test_redirect_char_in_quotes_preserved(self):
+        seg = sp.analyze('git commit -m "a > b | c"')[0]
+        assert sp.git_subcommand(seg.argv) == "commit"
+        assert "a > b | c" in seg.argv  # quoted metachars are one token, not stripped
+
+    def test_and_or_operators_unaffected(self):
+        assert sp.command_runs_pytest("ruff check . && pytest -q")
+
+    def test_redirect_then_pipe(self):
+        segs = sp.analyze("grep x f 2>/dev/null | wc -l")
+        assert [s.exe for s in segs] == ["grep", "wc"]
+        assert segs[0].argv == ["grep", "x", "f"]
+
+    def test_override_survives_redirect(self):
+        seg = sp.analyze("git push origin main > out.log # review-override")[0]
+        assert seg.override
+        assert sp.git_subcommand(seg.argv) == "push"
+
+    def test_word_ending_in_digit_not_treated_as_fd(self):
+        # `push2>x` — the digit is part of the word, not a standalone fd, so the
+        # command word 'push2' is preserved (no fail-open onto a bare 'push').
+        assert sp.git_subcommand(sp.analyze("git push2>x")[0].argv) == "push2"
+
+    # --- a substitution AS the redirect target still executes → stay visible ---
+    def test_cmd_substitution_redirect_target_keeps_rm_visible(self):
+        # `2>$(rm -rf x)` runs the rm to produce the filename. The nested rm MUST
+        # remain a visible segment for the destructive-command guard (regression:
+        # the target-consumer once ate the '$', hiding the substitution).
+        segs = sp.analyze("echo hi 2>$(rm -rf /tmp/genesis-x)")
+        assert any(s.exe == "rm" and "-rf" in s.argv for s in segs)
+
+    def test_backtick_substitution_redirect_target_keeps_command_visible(self):
+        segs = sp.analyze("echo hi 2>`rm -rf /tmp/genesis-x`")
+        assert any(s.exe == "rm" for s in segs)
+
+    def test_substitution_target_does_not_break_adjacent_plain_redirect(self):
+        # a plain redirect elsewhere still strips normally
+        assert sp.analyze("pytest tests/x.py 2>/dev/null")[0].argv == ["pytest", "tests/x.py"]
+
+    def test_double_quoted_substitution_redirect_target_keeps_rm_visible(self):
+        # bash expands $(…) inside DOUBLE quotes → the rm runs → must stay visible
+        segs = sp.analyze('echo hi 2>"$(rm -rf /tmp/genesis-x)"')
+        assert any(s.exe == "rm" for s in segs)
+
+    def test_herestring_double_quoted_substitution_keeps_rm_visible(self):
+        segs = sp.analyze('grep foo <<<"$(rm -rf /tmp/genesis-x)"')
+        assert any(s.exe == "rm" for s in segs)
+
+    def test_double_quoted_backtick_redirect_target_keeps_rm_visible(self):
+        segs = sp.analyze('echo x 2>"`rm -rf /tmp/genesis-x`"')
+        assert any(s.exe == "rm" for s in segs)
+
+    def test_single_quoted_substitution_redirect_target_correctly_hidden(self):
+        # bash does NOT expand inside SINGLE quotes → nothing runs → correct to hide
+        segs = sp.analyze("echo x 2>'$(rm -rf /tmp/genesis-x)'")
+        assert not any(s.exe == "rm" for s in segs)
+
+    def test_plain_quoted_filename_redirect_target_stripped(self):
+        # a quoted filename target with NO substitution strips normally
+        assert sp.analyze('pytest tests/x.py 2>"my log.txt"')[0].argv == ["pytest", "tests/x.py"]
+
+    def test_embedded_substitution_in_redirect_target_keeps_rm_visible(self):
+        # a substitution EMBEDDED in an otherwise-plain unquoted target (not at the
+        # first char) still expands and runs — must stay visible (round-3 variant).
+        segs = sp.analyze("echo hi 2>pre$(rm -rf /tmp/genesis-x)post")
+        assert any(s.exe == "rm" for s in segs)
+
+    def test_dollar_var_redirect_target_left_but_harmless(self):
+        # a bare $VAR target has no command substitution — left in text (no nested
+        # command to hide); documents the accepted argv-residual, not a regression.
+        segs = sp.analyze("echo hi 2>$LOGDIR/out")
+        assert not any(s.exe in ("rm", "rmdir") for s in segs)

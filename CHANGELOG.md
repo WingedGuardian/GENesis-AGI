@@ -9,6 +9,66 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **The Contributor Work-Log can post curated newcomer issues autonomously
+  (opt-in).** A new `require_approval: false` lever lets the curator's
+  privacy-vetted issues post without a per-item approval prompt — Genesis is the
+  gate (the fail-closed privacy scan still runs on every draft, and the row never
+  surfaces as an approval request). A cautious-rollout `max_posts_per_day` cap
+  limits how many issues post per rolling 24h, so a bad batch surfaces one at a
+  time rather than all at once; `mode: off` (or `GENESIS_CONTRIBUTOR_WORKLOG_DISABLED`)
+  halts posting — re-checked immediately before each create — and freezes the queue.
+  Ships SAFE — `require_approval` defaults true, and it is overlay-file-only (not a
+  one-call settings/dashboard toggle), so a fresh install always requires human approval.
+- **A per-prompt nudge when a session's memory MCP is running stale code.** Each
+  Claude Code session's MCP subprocesses snapshot their code at spawn and never
+  reload, so a deploy landing mid-session leaves recall — and its current security
+  read-exclusions — on the old code until the session restarts (there is no
+  auto-restart). The UserPromptSubmit hook now emits a one-line nudge when this
+  session's MCP predates the last successful deploy, reusing the exact
+  `commit_identity.is_stale` verdict the dashboard stale-code badge uses (a session
+  *ahead* of the deploy, e.g. a manual `git pull`, is never flagged). Throttled per
+  session and fail-open: a fresh session stays silent, and any read/parse miss emits
+  nothing.
+
+### Fixed
+
+- **The merge gate no longer blocks on a review finding that lands on a
+  documentation file.** An inline `[P1]` finding anchored to a doc path
+  (`CHANGELOG`, `README`, `LICENSE`/`NOTICE`, `docs/**`, `*.rst`) is now surfaced
+  to stderr but does not block the merge — a changelog typo or README nit is not a
+  code defect. Safe by default: any non-doc path, a missing path, or an
+  executable/source file even under `docs/` (e.g. `docs/conf.py`) still blocks,
+  and the PR-level review-body gate is unchanged. Applies to `git_push_guard`'s
+  inline-findings scan on both the `--check-pr` and merge paths.
+
+- **The dashboard Surplus health tile no longer reads green while the surplus
+  scheduler is wedged.** Its verdict previously came from an activity proxy that
+  shows "idle" for a stalled scheduler, so a stuck surplus loop appeared healthy —
+  the same class of false-green just fixed for the ego tiles. It now reports a
+  genuine stall (no completed dispatch cycle for hours, when not paused) as an
+  error, and fails loud (`unknown`) if the liveness data can't be read, never green.
+  Thresholds are conservative (3h floor) so a normal quiet system never false-alarms.
+
+- **The Errors view no longer shows a clean "0 errors" when a data source is
+  actually down.** The unified-errors endpoint queried each source (events, dead
+  letters, deferred work, resolutions, alerts) behind a silent catch, so a DB/FTS
+  outage returned HTTP 200 with zero counts and read as "data is clean". It now
+  reports which sources failed (`partial` / `sources_failed`); the Errors tab shows
+  a "data may be incomplete" banner and suppresses the clean-state check, and the
+  overview attention list flags the degrade.
+- **Operational Vitals no longer reports embedding throughput as `0` on a query
+  failure.** A failed SQLite read for "Points written/24h" / "Pending queue"
+  previously wrote a literal `0`, indistinguishable from a real zero. It now
+  degrades to `—` with a `throughput_error` reason, distinct from Qdrant
+  reachability.
+- **A scheduler-heartbeat probe that cannot evaluate now surfaces a WARNING event
+  instead of failing silent.** The probe's exception path previously returned
+  `healthy` with no signal; it now emits a WARNING (visible on the Errors tab)
+  while deliberately keeping the probe result `healthy`, so the remediation engine
+  does not treat "can't evaluate" as a downed scheduler and page hourly.
+
 ### Changed
 
 - **Executor Gate 2 (`17_executor_review`) leads with paid DeepSeek V4-pro.**
@@ -19,6 +79,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   gate; the other repointed sites stay on free flash.
 
 ### Security
+
+- **A leading shell redirect can no longer slip the push/commit approval gates.**
+  The shared command parser now recognizes shell redirections (`2>/dev/null`,
+  `> out.log`, `2>&1`, `&>log`, `>| f`, `< in`, `<<<`) and consumes the operator
+  and its target instead of leaking them into the parsed argv. Previously a
+  *leading* redirect (`git 2>/dev/null push --force`, `git 2>&1 commit --no-verify`)
+  made the parser read the redirect token as the git subcommand, so the push and
+  commit gates never recognized the command and skipped their approval checks. The
+  redirect target is measured as one complete shell word, so an escaped or
+  concatenated-quote space inside it (`git 2>err\ log push`,
+  `git 2>pre"a b"post push`) no longer hides the subcommand either. As
+  a bonus, a targeted local `pytest` run that redirects output
+  (`pytest tests/x.py 2>&1`) is no longer misclassified as a whole-suite run.
 
 - **Observation content can no longer launder untrusted origin into privileged
   cognitive surfaces.** Observation rows now carry a definite origin stamped at the
@@ -49,6 +122,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A transient `git ls-remote` failure no longer re-prompts an already-approved
+  branch push.** The push-approval hook prompts only on a branch's FIRST push; a
+  re-push of fixes to the same, already-published branch should be silent. But the
+  "already on the remote?" check was a live `git ls-remote` that fail-closes to a
+  prompt on any network hiccup, so a flaky network re-prompted every re-push. A new
+  stdlib allowlist (`scripts/hooks/push_allowlist.py`, state in
+  `~/.genesis/pushed_branches.json`) caches the confirmed-on-remote fact locally so
+  re-pushes are decided OFFLINE. It is keyed on (branch, remote push-URL set) — never
+  the remote name — so the same branch name on a different repo is never conflated,
+  and it is written ONLY on a live ls-remote HIT (which proves the branch is already
+  on the remote), so it can never authorize a genuine first push. Corrupt/absent
+  state and any error fail OPEN to the existing prompt path; entries expire after 90
+  days (a recorded branch stays trusted for that window even if its remote copy is
+  later deleted).
 - **A scheduled job that has run repeatedly but never once succeeded now raises a
   health alert.** Such a job was invisible to every alarm: the "silently failing"
   check needs a prior success to measure a gap against, and the consecutive-failure
