@@ -1,8 +1,14 @@
-"""Timezone display helpers — UTC storage, user-local display.
+"""Timezone helpers — UTC storage, user-local display and comparison.
 
-All Genesis timestamps are stored as UTC ISO 8601 strings. This module
-provides display-time conversion to the user's local timezone. Never
-use these functions for storage — only for rendering to the user.
+All Genesis timestamps are stored as UTC ISO 8601 strings. This module has two
+kinds of helper; NEITHER is for storage (always store UTC):
+
+- Display helpers (``fmt``, ``fmt_short``) — convert a stored UTC string to a
+  user-local formatted string for rendering. Never use their output for storage
+  or comparison.
+- Read-path comparison helpers (``parse_utc_iso``, ``local_day_boundary``) —
+  return UTC-aware ``datetime``s for arithmetic/comparison on the read path
+  (e.g. "has a new local day started?"), never for display.
 """
 
 from __future__ import annotations
@@ -85,7 +91,9 @@ def local_day_boundary(hour: int = 0, *, now: datetime | None = None) -> datetim
     """Most recent day boundary at *hour* local time, as a UTC-aware datetime.
 
     The boundary is ``hour:00`` in the user's local timezone — today's if that
-    instant has already passed, otherwise yesterday's. This is a read-path
+    instant has already passed (in UTC), otherwise yesterday's; a boundary
+    wall-time skipped by a spring-forward gap likewise falls back to the prior
+    day so the result is never in the future. This is a read-path
     comparison helper (like :func:`parse_utc_iso`), not a display helper: it
     lets "has a new local day started since <stored UTC timestamp>?" be answered
     correctly regardless of the gap between the user's timezone and UTC.
@@ -114,6 +122,14 @@ def local_day_boundary(hour: int = 0, *, now: datetime | None = None) -> datetim
     # boundary would be non-monotonic across the repeated hour (04:00Z→05:00Z→
     # 04:00Z), which can fire the daily reset twice on one local date.
     boundary_local = now_local.replace(hour=hour, minute=0, second=0, microsecond=0, fold=0)
-    if now_local < boundary_local:
-        boundary_local -= timedelta(days=1)
-    return boundary_local.astimezone(UTC)
+    # The boundary is "the most recent occurrence at or before now" — it must
+    # NEVER be in the future. Compare in UTC (not local wall-clock): a local
+    # comparison is wrong across DST edges — a spring-forward gap can map a
+    # nonexistent boundary wall-time to a *future* UTC instant while
+    # now_local >= boundary_local still holds (e.g. Antarctica/Casey, hour=3,
+    # after a multi-hour jump). Stepping back a day in UTC is correct for both
+    # DST directions and the normal case.
+    boundary_utc = boundary_local.astimezone(UTC)
+    if boundary_utc > now_utc:
+        boundary_utc = (boundary_local - timedelta(days=1)).astimezone(UTC)
+    return boundary_utc

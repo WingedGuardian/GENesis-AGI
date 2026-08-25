@@ -172,3 +172,16 @@ class TestLocalDayBoundary:
         assert local_day_boundary(0, now=datetime(2026, 11, 1, 5, 0, tzinfo=UTC)) == datetime(
             2026, 11, 1, 4, 0, tzinfo=UTC
         )
+
+    def test_boundary_never_future_across_spring_forward_gap(self, monkeypatch):
+        # A multi-hour spring-forward jump can map a nonexistent boundary wall
+        # time to a FUTURE UTC instant when compared in local wall-clock. The
+        # boundary must never be later than now — enforced by the UTC comparison
+        # + day step-back (else both reset consumers treat fresh sessions as
+        # stale until that future instant). Antarctica/Casey jumped 3h on
+        # 2020-10-04; at 03:15 local (16:15Z) the 03:00 boundary is in the gap.
+        monkeypatch.setattr(tz_module, "_USER_TZ", ZoneInfo("Antarctica/Casey"))
+        now = datetime(2020, 10, 3, 16, 15, tzinfo=UTC)
+        boundary = local_day_boundary(3, now=now)
+        assert boundary <= now  # never in the future
+        assert boundary == datetime(2020, 10, 2, 19, 0, tzinfo=UTC)
