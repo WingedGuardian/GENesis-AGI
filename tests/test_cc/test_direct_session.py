@@ -542,3 +542,75 @@ async def test_record_outcome_missing_file_marks_failed(db, tmp_path):
     prop = await get_proposal(db, "prop-miss")
     assert prop["status"] == "failed"
     assert "verification_failed" in (prop["user_response"] or "")
+
+
+# --- dispatch-outcome recall visibility (B2a) ---
+#
+# Dispatch outcomes must be RETRIEVABLE by default recall / the proactive hook so
+# the ego (and CC sessions) can recall what happened to a dispatch. Two gaps this
+# locks: (1) a SUCCESSFUL dispatch wrote no memory at all; (2) the failure memory
+# was tagged source_subsystem="ego", which EXCLUDES it from default recall. The
+# fix stores both polarities WITHOUT source_subsystem (operational history, not
+# internal decisional output — classified in test_store_subsystem_coverage's
+# USER_CONTEXT_ALLOWLIST).
+
+
+class _RecordingStore:
+    """Fake MemoryStore implementing the real .store(**kwargs) contract."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def store(self, **kwargs):
+        self.calls.append(kwargs)
+        return "mem-id"
+
+
+def _recording_runner(db, store):
+    from types import SimpleNamespace
+
+    return DirectSessionRunner(
+        invoker=AsyncMock(),
+        session_manager=AsyncMock(),
+        config_builder=AsyncMock(),
+        runtime=SimpleNamespace(_db=db, _memory_store=store),
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_success_writes_recallable_memory(db):
+    """A successful dispatch must write a memory tagged dispatch_success, and it
+    must be recallable (NO source_subsystem, else default recall excludes it)."""
+    from genesis.db.crud.ego import create_proposal
+
+    store = _RecordingStore()
+    await create_proposal(db, id="prop-ok", action_type="dispatch", content="x", status="executed")
+    req = DirectSessionRequest(prompt="t", caller_context="ego_proposal:prop-ok")
+    res = DirectSessionResult(session_id="s-ok", success=True, output_text="all done")
+    await _recording_runner(db, store)._record_proposal_outcome(req, res)
+
+    succ = [c for c in store.calls if "dispatch_success" in (c.get("tags") or [])]
+    assert len(succ) == 1, "a successful dispatch must write exactly one outcome memory"
+    assert "prop-ok" in succ[0].get("content", "")
+    assert succ[0].get("source_subsystem") is None, (
+        "dispatch outcome memories must be recallable — no source_subsystem tag"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_failure_memory_is_recallable(db):
+    """A failed dispatch's memory must also be recallable (untagged), symmetric
+    with success — today it is tagged source_subsystem='ego' and hidden."""
+    from genesis.db.crud.ego import create_proposal
+
+    store = _RecordingStore()
+    await create_proposal(db, id="prop-bad", action_type="dispatch", content="x", status="executed")
+    req = DirectSessionRequest(prompt="t", caller_context="ego_proposal:prop-bad")
+    res = DirectSessionResult(session_id="s-bad", success=False, output_text="it broke")
+    await _recording_runner(db, store)._record_proposal_outcome(req, res)
+
+    fail = [c for c in store.calls if "dispatch_failure" in (c.get("tags") or [])]
+    assert len(fail) == 1, "a failed dispatch must write exactly one outcome memory"
+    assert fail[0].get("source_subsystem") is None, (
+        "dispatch outcome memories must be recallable — no source_subsystem tag"
+    )

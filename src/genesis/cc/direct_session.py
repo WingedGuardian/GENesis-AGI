@@ -1156,7 +1156,6 @@ class DirectSessionRunner:
                                 memory_type="episodic",
                                 wing="autonomy",
                                 room="ego",
-                                source_subsystem="ego",
                             )
                     except Exception:
                         logger.debug(
@@ -1188,22 +1187,31 @@ class DirectSessionRunner:
                 success=result.success,
                 summary=summary,
             )
-            # On failure: create observation so ego sees it next cycle
-            if not result.success:
-                try:
-                    store = getattr(self._rt, "_memory_store", None)
-                    if store is not None:
-                        await store.store(
-                            content=(f"Ego dispatch FAILED for proposal {proposal_id}: {summary}"),
-                            source="ego_dispatch_outcome",
-                            tags=["ego", "dispatch_failure"],
-                            memory_type="episodic",
-                            wing="autonomy",
-                            room="ego",
-                            source_subsystem="ego",
-                        )
-                except Exception:
-                    logger.debug("Failed to store failure observation", exc_info=True)
+            # Record the dispatch outcome (BOTH polarities) as a retrievable
+            # memory so the ego and later CC sessions can recall what happened to
+            # a dispatch — not just failures. Stored WITHOUT source_subsystem: a
+            # dispatch outcome is operational history, not internal decisional
+            # output, so it must stay in default recall / the proactive hook
+            # (classified in test_store_subsystem_coverage's USER_CONTEXT_ALLOWLIST).
+            try:
+                store = getattr(self._rt, "_memory_store", None)
+                if store is not None:
+                    if result.success:
+                        content = f"Ego dispatch SUCCEEDED for proposal {proposal_id}: {summary}"
+                        outcome_tag = "dispatch_success"
+                    else:
+                        content = f"Ego dispatch FAILED for proposal {proposal_id}: {summary}"
+                        outcome_tag = "dispatch_failure"
+                    await store.store(
+                        content=content,
+                        source="ego_dispatch_outcome",
+                        tags=["ego", outcome_tag],
+                        memory_type="episodic",
+                        wing="autonomy",
+                        room="ego",
+                    )
+            except Exception:
+                logger.debug("Failed to store dispatch outcome observation", exc_info=True)
         except Exception:
             logger.warning(
                 "Failed to record proposal outcome for %s",
