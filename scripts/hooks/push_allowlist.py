@@ -101,10 +101,13 @@ def _sanitize_url(url: str) -> str | None:
       ``file:///x``) → None (fall back to ls-remote).
     - scp-like ssh (``[user@]host:path``): git's OWN rule distinguishes this from a
       local path by "a ``:`` with NO ``/`` before it" (a slash before the first
-      colon means a local path). We honor that exactly, then strip any ``user@``
-      prefix. A colon that appears AFTER a slash (e.g. ``backups/2026-01-01T12:00/
-      repo.git``) is therefore a RELATIVE LOCAL path, not scp — critical, since a
-      relative path is ambiguous across worktrees.
+      colon means a local path). We honor that exactly and keep the FULL string
+      including any ``user@`` — the SSH login is part of the repo identity (the path
+      is relative to that login's home), so ``alice@host:r`` ≠ ``bob@host:r``; scp
+      has no password field, so nothing there is a credential to strip. A colon that
+      appears AFTER a slash (e.g. ``backups/2026-01-01T12:00/repo.git``) is therefore
+      a RELATIVE LOCAL path, not scp — critical, since a relative path is ambiguous
+      across worktrees.
     - Absolute local path (``/…``): stable, kept as-is.
     - RELATIVE local path (``../x``, ``./x``, ``~/x``, ``x/y.git``, ``x/y:z``): None.
       Git resolves it relative to each repo, so the same raw string can denote
@@ -139,11 +142,13 @@ def _sanitize_url(url: str) -> str | None:
     colon = u.find(":")
     slash = u.find("/")
     if colon > 0 and (slash == -1 or colon < slash) and not u.startswith((".", "~")):
-        authority = u[:colon]  # [user@]host
-        path = u[colon:]  # ':path'
-        if "@" in authority:  # strip scp userinfo (git@… etc.) — never persist it
-            authority = authority.rsplit("@", 1)[1]
-        return f"{authority}{path}" if authority else None
+        # Keep the FULL scp form incl. any ``user@``: the SSH login is part of the
+        # repo IDENTITY — an scp path is relative to that login's home on the host,
+        # so ``alice@host:repo`` and ``bob@host:repo`` are DIFFERENT repositories and
+        # must NOT collide to the same key. scp syntax has no password field, so
+        # there is no credential to strip here (unlike a scheme-URL ``user:<PAT>@``,
+        # handled above by urlsplit).
+        return u
     # Relative local path (incl. a colon that sits AFTER a slash) — do not key.
     return None
 

@@ -157,8 +157,9 @@ def test_sanitize_url_classification_matrix():
     assert pa._sanitize_url("https://user@/x") is None
     assert pa._sanitize_url("https://a@b@host/x") == "https://host/x"
     assert pa._sanitize_url("https://host/a@b") == "https://host/a@b"
-    # scp-like: ONLY when ':' has no '/' before it; userinfo stripped.
-    assert pa._sanitize_url("git@github.com:o/r.git") == "github.com:o/r.git"
+    # scp-like: ONLY when ':' has no '/' before it; FULL form kept incl. user@
+    # (the SSH login is part of repo identity — scp path is relative to its home).
+    assert pa._sanitize_url("git@github.com:o/r.git") == "git@github.com:o/r.git"
     assert pa._sanitize_url("host:path/x") == "host:path/x"
     # absolute local path — stable.
     assert pa._sanitize_url("/srv/git/a.git") == "/srv/git/a.git"
@@ -184,12 +185,18 @@ def test_relative_path_with_colon_not_offline_allowed(home):
     assert pa.is_recorded({ambiguous}, "feat/x") is False
 
 
-def test_scp_userinfo_stripped_from_stored_url(home):
-    """An scp ``user@`` prefix is never persisted verbatim; matching still works."""
+def test_scp_user_is_part_of_the_key(home):
+    """The scp SSH login is repo identity, not a credential: it is kept in the key,
+    and two different logins to the same host:path must NOT collide (a relative scp
+    path resolves under each login's home = different repos)."""
     pa.record({"git@github.com:o/r.git"}, "feat/x")
     data = json.loads(_state(home).read_text())
-    assert data["branches"]["feat/x"]["urls"] == ["github.com:o/r.git"]
+    assert data["branches"]["feat/x"]["urls"] == ["git@github.com:o/r.git"]
     assert pa.is_recorded({"git@github.com:o/r.git"}, "feat/x") is True
+    # alice@host:repo and bob@host:repo are DIFFERENT repos → no offline conflation.
+    pa.record({"alice@host:repo.git"}, "feat/y")
+    assert pa.is_recorded({"bob@host:repo.git"}, "feat/y") is False
+    assert pa.is_recorded({"alice@host:repo.git"}, "feat/y") is True
 
 
 # ── REPLACE semantics (C2) ────────────────────────────────────────────
