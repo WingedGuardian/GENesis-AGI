@@ -9,6 +9,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **The dashboard Surplus health tile no longer reads green while the surplus
+  scheduler is wedged.** Its verdict previously came from an activity proxy that
+  shows "idle" for a stalled scheduler, so a stuck surplus loop appeared healthy —
+  the same class of false-green just fixed for the ego tiles. It now reports a
+  genuine stall (no completed dispatch cycle for hours, when not paused) as an
+  error, and fails loud (`unknown`) if the liveness data can't be read, never green.
+  Thresholds are conservative (3h floor) so a normal quiet system never false-alarms.
+
 ### Changed
 
 - **Executor Gate 2 (`17_executor_review`) leads with paid DeepSeek V4-pro.**
