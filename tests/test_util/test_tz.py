@@ -177,11 +177,111 @@ class TestLocalDayBoundary:
         # A multi-hour spring-forward jump can map a nonexistent boundary wall
         # time to a FUTURE UTC instant when compared in local wall-clock. The
         # boundary must never be later than now — enforced by the UTC comparison
-        # + day step-back (else both reset consumers treat fresh sessions as
-        # stale until that future instant). Antarctica/Casey jumped 3h on
-        # 2020-10-04; at 03:15 local (16:15Z) the 03:00 boundary is in the gap.
+        # + windowed candidate selection (else both reset consumers treat fresh
+        # sessions as stale until that future instant). Antarctica/Casey jumped 3h
+        # on 2020-10-04; at 03:15 local (16:15Z) the 03:00 boundary is in the gap.
         monkeypatch.setattr(tz_module, "_USER_TZ", ZoneInfo("Antarctica/Casey"))
         now = datetime(2020, 10, 3, 16, 15, tzinfo=UTC)
         boundary = local_day_boundary(3, now=now)
         assert boundary <= now  # never in the future
         assert boundary == datetime(2020, 10, 2, 19, 0, tzinfo=UTC)
+
+    def test_boundary_never_future_across_fallback_over_midnight(self, monkeypatch):
+        # THE 4th DST edge (windowed-max regression guard). A >1h fall-back moves
+        # the wall clock BACKWARD across the boundary hour, regressing the local
+        # date. The most recent real boundary then sits on a local date one day
+        # AHEAD of now's local date yet already elapsed in UTC — a loop that only
+        # walks BACKWARD from now's local date can never generate it and returns a
+        # 24h-stale, non-monotonic boundary. Antarctica/Casey fell back +11→+08 at
+        # 2010-03-04 15:00Z (wall clock Mar-05 02:00 → Mar-04 23:00).
+        monkeypatch.setattr(tz_module, "_USER_TZ", ZoneInfo("Antarctica/Casey"))
+        now = datetime(2010, 3, 4, 15, 0, tzinfo=UTC)  # 23:00 Mar-04 local (regressed)
+        boundary = local_day_boundary(0, now=now)
+        assert boundary <= now  # never in the future
+        # Correct = local Mar-05 00:00 fold=0 = 2010-03-04T13:00Z (already elapsed),
+        # NOT local Mar-04 00:00 = 2010-03-03T13:00Z (24h stale).
+        assert boundary == datetime(2010, 3, 4, 13, 0, tzinfo=UTC)
+
+    def test_boundary_monotonic_across_fallback_over_midnight(self, monkeypatch):
+        # The same fall-back must not make the boundary jump BACKWARD as now
+        # advances (the round-1 non-monotonicity class, re-guarded for this edge).
+        monkeypatch.setattr(tz_module, "_USER_TZ", ZoneInfo("Antarctica/Casey"))
+        boundaries = [
+            local_day_boundary(0, now=datetime(2010, 3, 4, h, 0, tzinfo=UTC)) for h in range(12, 20)
+        ]
+        assert boundaries == sorted(boundaries)  # monotonic non-decreasing
+
+    def test_boundary_across_skipped_whole_calendar_day(self, monkeypatch):
+        # Pacific/Apia crossed the dateline and DELETED 2011-12-30 entirely. The
+        # most recent real boundary is TWO local dates back — a single fixed day
+        # step-back is insufficient (imaginary Dec-30 06:00 normalizes to the same
+        # future instant as Dec-31 06:00). Must resolve to the most recent REAL
+        # boundary <= now (Dec 29 06:00 local = 2011-12-29T16:00Z).
+        monkeypatch.setattr(tz_module, "_USER_TZ", ZoneInfo("Pacific/Apia"))
+        now = datetime(2011, 12, 30, 10, 30, tzinfo=UTC)  # 00:30 Dec 31 local
+        boundary = local_day_boundary(6, now=now)
+        assert boundary <= now  # never in the future
+        assert boundary == datetime(2011, 12, 29, 16, 0, tzinfo=UTC)
+
+    def test_boundary_brute_force_matches_wide_oracle(self, monkeypatch):
+        # Correct-by-construction PROOF (not sampled point-patches): across a
+        # curated set of pathological zones x representative hours x a
+        # transition-dense now-grid, local_day_boundary must (a) equal an
+        # independent WIDE-window oracle, (b) never be in the future, and (c) be
+        # monotonic non-decreasing as now advances. Checking the whole
+        # (zone, hour, now) grid — not a handful of shapes — is what closes the
+        # DST class so a new edge cannot slip through. Verify-RED: this fails
+        # against the prior single-step-back loop (Apia 2011 skip + Casey 2010
+        # fall-back-over-midnight both land in the window).
+        zones = [
+            "Antarctica/Casey",
+            "Pacific/Apia",
+            "America/Havana",
+            "Australia/Lord_Howe",
+            "Pacific/Chatham",
+            "Pacific/Kiritimati",
+            "America/Sao_Paulo",
+            "Etc/GMT+5",
+        ]
+        hours = [0, 3, 6, 23]
+
+        def wide_oracle(hour: int, now_utc: datetime, zone: ZoneInfo) -> datetime:
+            # Reference: window STRICTLY WIDER (-2..4) than the function's own
+            # (-1..2), so agreement proves the narrow window sufficient and the
+            # max-<=-now selection correct. (Wider than needed: max real DST
+            # date-shift is one day either way, so -2..4 already over-covers.)
+            nl = now_utc.astimezone(zone)
+            cands = [
+                (nl - timedelta(days=d))
+                .replace(hour=hour, minute=0, second=0, microsecond=0, fold=0)
+                .astimezone(UTC)
+                for d in range(-2, 5)
+            ]
+            past = [c for c in cands if c <= now_utc]
+            return max(past) if past else min(cands)
+
+        start = datetime(2010, 1, 1, tzinfo=UTC)
+        step = timedelta(hours=12)
+        n_steps = int(timedelta(days=730) / step)  # ~2 years, transition-dense
+        for zname in zones:
+            zone = ZoneInfo(zname)
+            monkeypatch.setattr(tz_module, "_USER_TZ", zone)
+            for hour in hours:
+                prev = None
+                now = start
+                for _ in range(n_steps):
+                    got = local_day_boundary(hour, now=now)
+                    assert got <= now, (
+                        f"{zname} h={hour} now={now.isoformat()} future={got.isoformat()}"
+                    )
+                    assert got == wide_oracle(hour, now, zone), (
+                        f"{zname} h={hour} now={now.isoformat()} "
+                        f"got={got.isoformat()} oracle={wide_oracle(hour, now, zone).isoformat()}"
+                    )
+                    if prev is not None:
+                        assert got >= prev, (
+                            f"{zname} h={hour} backward jump {prev.isoformat()} -> "
+                            f"{got.isoformat()} at now={now.isoformat()}"
+                        )
+                    prev = got
+                    now += step

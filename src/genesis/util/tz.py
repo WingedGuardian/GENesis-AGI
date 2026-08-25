@@ -20,6 +20,13 @@ from genesis.env import user_timezone as _get_user_timezone
 
 _DEFAULT_TZ = "UTC"
 
+# Bounds the candidate window in local_day_boundary. Candidates span one local
+# date AHEAD of now (needed for a fall-back that regresses the local date) back
+# through this many days; a real boundary at or before now always exists within
+# that span because no DST transition shifts the local date by more than one day
+# in either direction.
+_MAX_BOUNDARY_LOOKBACK_DAYS = 3
+
 try:
     _USER_TZ = ZoneInfo(_get_user_timezone())
 except (ZoneInfoNotFoundError, KeyError):
@@ -90,19 +97,38 @@ def parse_utc_iso(iso_str: str | None) -> datetime | None:
 def local_day_boundary(hour: int = 0, *, now: datetime | None = None) -> datetime:
     """Most recent day boundary at *hour* local time, as a UTC-aware datetime.
 
-    The boundary is ``hour:00`` in the user's local timezone — today's if that
-    instant has already passed (in UTC), otherwise yesterday's; a boundary
-    wall-time skipped by a spring-forward gap likewise falls back to the prior
-    day so the result is never in the future. This is a read-path
-    comparison helper (like :func:`parse_utc_iso`), not a display helper: it
-    lets "has a new local day started since <stored UTC timestamp>?" be answered
-    correctly regardless of the gap between the user's timezone and UTC.
+    The boundary is ``hour:00`` in the user's local timezone: the most recent
+    such instant at or before *now* (compared in UTC), so the result is never in
+    the future. This is a read-path comparison helper (like
+    :func:`parse_utc_iso`), not a display helper: it lets "has a new local day
+    started since <stored UTC timestamp>?" be answered correctly regardless of
+    the gap between the user's timezone and UTC.
 
     Returned in **UTC** on purpose. Genesis stores timestamps as UTC ISO strings
     (``...+00:00``); those sort/compare lexicographically only when every value
     carries the same offset, so a boundary serialized with a local offset
     (``...-04:00``) would silently break a string ``<`` comparison in SQL. UTC
     return keeps ``.isoformat()`` and ``datetime`` comparisons both correct.
+
+    DST correctness. A naive "today's ``hour:00``, else yesterday's" is wrong
+    because the ``hour:00`` wall time can be nonexistent (spring-forward gap),
+    ambiguous (fall-back repeats it), or land on a local date a dateline change
+    deleted or shifted. Two shapes in particular defeat single-direction logic:
+
+    * a whole calendar day can be skipped, so the most recent real boundary is
+      two local dates back (Pacific/Apia dropped 2011-12-30);
+    * a >1h fall-back can move the wall clock backward across the boundary hour,
+      *regressing* the local date, so the most recent boundary sits on a local
+      date one day AHEAD of *now*'s local date yet already elapsed in UTC
+      (Antarctica/Casey, hour=0, on 2010-03-04).
+
+    So candidates are generated over a window spanning one local date ahead of
+    *now* back through :data:`_MAX_BOUNDARY_LOOKBACK_DAYS`, each normalized with
+    ``fold=0`` (an ambiguous boundary pins to its FIRST occurrence — a daily
+    reset must fire once, not twice), and the most recent candidate whose UTC
+    instant is ``<= now`` is returned. This is monotonic in *now* and never in
+    the future. The window is sufficient because no real DST transition shifts
+    the local date by more than one day in either direction.
 
     *now* (UTC-aware) is injectable for deterministic tests; defaults to the
     current instant.
@@ -116,20 +142,18 @@ def local_day_boundary(hour: int = 0, *, now: datetime | None = None) -> datetim
     else:
         now_utc = now.astimezone(UTC)
     now_local = now_utc.astimezone(_USER_TZ)
-    # fold=0 pins the boundary to a single occurrence of the wall-clock time.
-    # Without it, .replace() inherits now_local.fold, so in a zone that falls
-    # back at the boundary hour (e.g. America/Havana at local midnight) the
-    # boundary would be non-monotonic across the repeated hour (04:00Z→05:00Z→
-    # 04:00Z), which can fire the daily reset twice on one local date.
-    boundary_local = now_local.replace(hour=hour, minute=0, second=0, microsecond=0, fold=0)
-    # The boundary is "the most recent occurrence at or before now" — it must
-    # NEVER be in the future. Compare in UTC (not local wall-clock): a local
-    # comparison is wrong across DST edges — a spring-forward gap can map a
-    # nonexistent boundary wall-time to a *future* UTC instant while
-    # now_local >= boundary_local still holds (e.g. Antarctica/Casey, hour=3,
-    # after a multi-hour jump). Stepping back a day in UTC is correct for both
-    # DST directions and the normal case.
-    boundary_utc = boundary_local.astimezone(UTC)
-    if boundary_utc > now_utc:
-        boundary_utc = (boundary_local - timedelta(days=1)).astimezone(UTC)
-    return boundary_utc
+    # Generate fold=0 ``hour:00`` candidates from one local date ahead of now
+    # back through the lookback window, and return the most recent at or before
+    # now (in UTC). Taking the max <= now — rather than the first while walking
+    # backward — is what stays correct when local-date order does not track UTC
+    # order (the whole-day-skip and fall-back-across-midnight cases above).
+    candidates = [
+        (now_local - timedelta(days=days_back))
+        .replace(hour=hour, minute=0, second=0, microsecond=0, fold=0)
+        .astimezone(UTC)
+        for days_back in range(-1, _MAX_BOUNDARY_LOOKBACK_DAYS)
+    ]
+    past = [c for c in candidates if c <= now_utc]
+    # Fail-safe (should be unreachable — a real boundary always exists within
+    # ~1 day): the oldest candidate, never a future instant.
+    return max(past) if past else min(candidates)
