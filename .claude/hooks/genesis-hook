@@ -20,10 +20,21 @@ GENESIS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # `git worktree list | head`: head closes the pipe after one line, so with many
 # worktrees git gets SIGPIPE, and under `set -euo pipefail` that silently kills
 # this launcher (exit 141, no stderr), breaking every hook in the worktree.
-_common_dir="$(cd "$GENESIS_ROOT" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null)" || _common_dir=""
+# `env -u` scrubs ambient Git location overrides for THIS discovery: an exported
+# GIT_DIR / GIT_WORK_TREE / GIT_COMMON_DIR would otherwise resolve an UNRELATED repo
+# despite the `cd`, redirecting every hook (security gates included) to a foreign
+# checkout's same-named script.
+_common_dir="$(cd "$GENESIS_ROOT" 2>/dev/null && env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git rev-parse --git-common-dir 2>/dev/null)" || _common_dir=""
 MAIN_ROOT=""
 if [[ -n "$_common_dir" ]]; then
     MAIN_ROOT="$(cd "$GENESIS_ROOT" 2>/dev/null && cd "$(dirname "$_common_dir")" 2>/dev/null && pwd)" || MAIN_ROOT=""
+fi
+# Trust MAIN_ROOT only if it actually looks like a Genesis checkout. A
+# `--separate-git-dir` clone makes `--git-common-dir` point at external metadata
+# whose parent is NOT the worktree root, which would send hooks to a bogus path;
+# require a `scripts/` dir there, else fall back to GENESIS_ROOT (the non-worktree path).
+if [[ -n "$MAIN_ROOT" && ! -d "$MAIN_ROOT/scripts" ]]; then
+    MAIN_ROOT=""
 fi
 
 # Resolve the hook SCRIPT ROOT: the MAIN worktree by default, so every session

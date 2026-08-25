@@ -135,3 +135,60 @@ def test_script_path_resolves_from_main_root_in_code():
     assert "HOOK_ROOT" in code
     assert 'SCRIPT_PATH="$HOOK_ROOT/scripts/$SCRIPT_NAME"' in code
     assert "GENESIS_HOOK_DEV_LOCAL" in code
+
+
+def test_ambient_git_dir_env_ignored_for_hook_discovery(tmp_path):
+    """An exported GIT_DIR must NOT redirect hook resolution to a foreign repo —
+    otherwise an ambient Git env could point every hook (security gates included)
+    at a foreign checkout's same-named script. The launcher scrubs GIT_* for the
+    git-common-dir discovery."""
+    main, wt = _make_main_and_worktree(tmp_path)
+    foreign = tmp_path / "foreign"
+    (foreign / ".claude" / "hooks").mkdir(parents=True)
+    (foreign / "scripts").mkdir()
+    shutil.copy(_WRAPPER, foreign / ".claude" / "hooks" / "genesis-hook")
+    (foreign / "scripts" / "probe.py").write_text("print('FOREIGN')\n")
+    genv = {
+        **os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=foreign, check=True, env=genv)
+    env = {k: v for k, v in os.environ.items() if k != "GENESIS_HOOK_DEV_LOCAL"}
+    env["GIT_DIR"] = str(foreign / ".git")  # ambient override pointing at the foreign repo
+    proc = subprocess.run(
+        [str(wt / ".claude" / "hooks" / "genesis-hook"), "probe.py"],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "MAIN", f"ambient GIT_DIR leaked into discovery: {proc.stdout!r}"
+
+
+def test_separate_git_dir_falls_back_to_own_scripts(tmp_path):
+    """A `git init --separate-git-dir` checkout makes `--git-common-dir` return
+    external metadata whose parent has no `scripts/`; the launcher must REJECT that
+    MAIN_ROOT and fall back to running its OWN copy, not resolve a bogus path."""
+    workdir = tmp_path / "work"
+    (workdir / ".claude" / "hooks").mkdir(parents=True)
+    (workdir / "scripts").mkdir()
+    shutil.copy(_WRAPPER, workdir / ".claude" / "hooks" / "genesis-hook")
+    (workdir / ".claude" / "hooks" / "genesis-hook").chmod(0o755)
+    (workdir / "scripts" / "probe.py").write_text("print('OWN')\n")
+    vb = workdir / ".venv" / "bin"
+    vb.mkdir(parents=True)
+    (vb / "python").symlink_to(sys.executable)
+    sepgit = tmp_path / "sepmeta" / "gitdir"
+    sepgit.parent.mkdir(parents=True)  # git init --separate-git-dir requires the parent to exist
+    genv = {
+        **os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(
+        ["git", "init", "-q", f"--separate-git-dir={sepgit}", str(workdir)], check=True, env=genv
+    )
+    env = {k: v for k, v in os.environ.items() if k != "GENESIS_HOOK_DEV_LOCAL"}
+    proc = subprocess.run(
+        [str(workdir / ".claude" / "hooks" / "genesis-hook"), "probe.py"],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "OWN", f"resolved a bogus MAIN_ROOT: {proc.stdout!r}"
