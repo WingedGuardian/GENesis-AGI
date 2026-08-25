@@ -241,3 +241,116 @@ class TestGhPr:
 
     def test_not_gh(self):
         assert sp.gh_pr_subcommand(["git", "pr", "create"]) is None
+
+
+# ── shell command-position resolution (reserved words + group openers) ───
+# A destructive command wrapped in a control structure or group — `if …; then
+# git clean -f; fi`, `(git clean -f)`, `{ git clean -f; }`, `! git clean -f` —
+# must still resolve exe=git so the discard/push/rm gates see it. Without this,
+# analyze() commits exe to the leading `then`/`(git`/`{` token and every gate
+# that keys on `seg.exe == "git"/"gh"/"rm"` silently skips the segment.
+
+
+class TestCommandPositionStrip:
+    def _detects(self, cmd: str, exe: str, sub: str | None = None) -> bool:
+        for s in sp.analyze(cmd):
+            if s.exe != exe:
+                continue
+            if sub is None:
+                return True
+            if exe == "git" and sp.git_subcommand(s.argv) == sub:
+                return True
+            if exe == "gh" and sp.gh_pr_subcommand(s.argv) == sub:
+                return True
+        return False
+
+    # reserved words that front a command (same segment as the keyword)
+    def test_then_git_clean(self):
+        assert self._detects("then git clean -f", "git", "clean")
+
+    def test_do_git_push(self):
+        assert self._detects("do git push --force", "git", "push")
+
+    def test_else_git_reset(self):
+        assert self._detects("else git reset --hard", "git", "reset")
+
+    def test_elif_git(self):
+        assert self._detects("elif git diff --quiet", "git", "diff")
+
+    def test_bang_negation(self):
+        assert self._detects("! git clean -fdx", "git", "clean")
+
+    def test_if_condition_command(self):
+        # `if git diff --quiet; then …` → the condition IS a git command
+        assert self._detects("if git diff --quiet", "git", "diff")
+
+    def test_while_until_condition(self):
+        assert self._detects("while git fetch --all", "git", "fetch")
+        assert self._detects("until git pull", "git", "pull")
+
+    # group openers — spaced and GLUED
+    def test_subshell_spaced(self):
+        assert self._detects("( git clean -f )", "git", "clean")
+
+    def test_subshell_glued(self):
+        assert self._detects("(git clean -f)", "git", "clean")
+
+    def test_brace_group(self):
+        assert self._detects("{ git clean -f; }", "git", "clean")
+
+    def test_glued_gh_pr_merge(self):
+        assert self._detects("(gh pr merge 5 --admin)", "gh", "merge")
+
+    # realistic compound control structures
+    def test_if_then_fi(self):
+        assert self._detects("if true; then git clean -f; fi", "git", "clean")
+
+    def test_while_do_done(self):
+        assert self._detects("while :; do git push --force origin main; done", "git", "push")
+
+    def test_glued_rm(self):
+        assert self._detects("(rm -rf ~)", "rm")
+
+    # trailing group-closer must be stripped off the last operand so a path
+    # consumer (protected_paths) sees the real path, not `…/x)`
+    def test_trailing_closer_stripped_glued(self):
+        seg = sp.analyze("(rm -rf /tmp/x)")[0]
+        assert seg.exe == "rm"
+        assert seg.argv[-1] == "/tmp/x"  # not "/tmp/x)"
+
+    def test_trailing_closer_stripped_spaced(self):
+        seg = sp.analyze("( rm -rf /tmp/x )")[0]
+        assert seg.exe == "rm"
+        assert ")" not in seg.argv
+
+    def test_trailing_closer_with_redirection_after(self):
+        # a redirection can follow the subshell close: `(rm -rf /x) 2>/dev/null`
+        # → the `)` is glued to `/x`, NOT to the last token → must still be stripped
+        seg = sp.analyze("(rm -rf /etc) 2>/dev/null")[0]
+        assert seg.exe == "rm"
+        assert "/etc" in seg.argv and "/etc)" not in seg.argv
+
+    def test_trailing_closer_redirection_git(self):
+        seg = sp.analyze("(git push origin main) >log 2>&1")[0]
+        assert seg.exe == "git" and sp.git_subcommand(seg.argv) == "push"
+        assert "main" in seg.argv and "main)" not in seg.argv
+
+    # ── SAFETY / MONOTONICITY: normal commands and non-command positions ──
+    def test_plain_unchanged(self):
+        seg = sp.analyze("git push origin main")[0]
+        assert seg.exe == "git" and seg.argv == ["git", "push", "origin", "main"]
+
+    def test_reserved_word_inside_message_not_stripped(self):
+        # `then`/`do` inside a commit MESSAGE are operands, never stripped
+        seg = sp.analyze('git commit -m "then do the push"')[0]
+        assert seg.exe == "git" and sp.git_subcommand(seg.argv) == "commit"
+        assert "then do the push" in seg.argv  # message token intact
+
+    def test_for_loop_header_value_is_not_a_command(self):
+        # `for x in git` — the `git` is a loop VALUE, must NOT resolve to exe git
+        assert not self._detects("for x in git checkout", "git")
+
+    def test_branch_named_like_keyword_still_git(self):
+        # a real git command whose ARG looks like a keyword is unaffected
+        seg = sp.analyze("git checkout then")[0]
+        assert seg.exe == "git" and sp.git_subcommand(seg.argv) == "checkout"

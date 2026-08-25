@@ -117,7 +117,13 @@ def _rm_violations(cmd: str) -> list[str] | None:
     violations: list[str] = []
     i = 0
     while i < len(tokens):
-        if os.path.basename(tokens[i]) != "rm":
+        # Resolve `rm` through a shell subshell opener GLUED to the command
+        # (`(rm`, `((rm`). This guard scans every token, so SPACED control forms
+        # (`( rm`, `then rm`, `{ rm`) already tokenize `rm` standalone; only the
+        # glued opener hid it (`basename("(rm") == "(rm"`), a `(rm -rf /)` bypass.
+        # A glued trailing `)` on the target needs no handling — it keeps a
+        # dangerous target shallow (`/)` → depth 1), which _check_target blocks.
+        if os.path.basename(tokens[i].lstrip("(")) != "rm":
             i += 1
             continue
 

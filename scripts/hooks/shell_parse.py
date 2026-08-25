@@ -91,6 +91,16 @@ _WRAPPER_SPEC = {
 _WRAPPERS = set(_WRAPPER_SPEC)
 # Interpreters that run a script string passed after -c; recurse into it.
 _NESTED = {"bash", "sh", "dash", "zsh", "ksh", "ash"}
+# Shell tokens that can front a SIMPLE COMMAND within a segment (after
+# split_segments has already cut on ; | & && || newline). Stripping them at
+# command position lets analyze() resolve the real exe THROUGH a control
+# structure or group — `if …; then git clean -f; fi`, `while …; do …`,
+# `! git clean`, `{ git clean -f; }` — so a gate that keys on `seg.exe == git`
+# is not silently skipped. EXCLUDES `for/case/select/in` (they front a WORD, not
+# a command: `for x in a b`) and all block CLOSERS (`fi done esac } )` — never
+# precede a command). Group opener `(` (bare and GLUED, `(git`) is handled
+# structurally in _strip_wrappers, not via this set.
+_CMD_POSITION_WORDS = frozenset({"!", "if", "elif", "while", "until", "then", "do", "else", "{"})
 # git global options that consume the FOLLOWING token as their value.
 _GIT_OPTS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"}
 # git-commit short flags that consume the REST of their short-bundle as a value
@@ -278,15 +288,39 @@ def _basename(token: str) -> str:
 
 
 def _strip_wrappers(argv: list[str]) -> list[str]:
-    """Drop leading env-assignments (VAR=x) and wrapper commands (sudo/env/…).
+    """Drop leading shell command-position tokens, env-assignments (VAR=x), and
+    wrapper commands (sudo/env/…) so the returned argv[0] is the ACTUAL executed
+    command.
 
-    Returns the argv of the actual command. ``env`` / ``sudo`` may be followed
-    by their own ``VAR=x`` assignments and flags before the real command.
+    Command-position tokens (`then`/`do`/`!`/`(`/`{` …) can wrap a command inside
+    a control structure or subshell; a leading `(` may be GLUED to the command
+    (`(git`). When a leading `(` is stripped, one balancing trailing `)` is
+    stripped off the last token so a path/operand consumer sees the real value
+    (`(rm -rf ~/x)` → operand `~/x`, not `~/x)`). ``env``/``sudo`` may be
+    followed by their own ``VAR=x`` and flags before the real command.
+
+    Over-match-safe / MONOTONIC: the command-position and `(` branches fire ONLY
+    when argv[0] is a control token / `(`-prefixed, so a normal command
+    (argv[0] ∈ {git, gh, rm, …}) falls straight through and is returned
+    byte-for-byte unchanged — the strip can only REVEAL a hidden command, never
+    hide a caught one. (`((…))` is bash ARITHMETIC, not command execution, so a
+    single balancing closer is sufficient.)
     """
+    argv = list(argv)  # local copy — we may rebind a glued `(token` / strip a closer
     i = 0
-    n = len(argv)
-    while i < n:
+    stripped_open_paren = False
+    while i < len(argv):
         tok = argv[i]
+        if tok.startswith("("):  # subshell opener, bare `( git` or glued `(git`/`((git`
+            stripped_open_paren = True
+            if tok == "(":
+                i += 1
+            else:
+                argv[i] = tok[1:]  # "(git" -> "git"; reprocess (token strictly shrinks)
+            continue
+        if tok in _CMD_POSITION_WORDS:  # reserved word / brace-group opener at cmd position
+            i += 1
+            continue
         if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
             i += 1  # leading VAR=value assignment
             continue
@@ -296,7 +330,7 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         argflags, positional = spec
         i += 1
         # consume the wrapper's own value-flags and leading positional args
-        while i < n:
+        while i < len(argv):
             t = argv[i]
             if t == "--":
                 i += 1
@@ -315,7 +349,21 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
                 i += 1
                 continue
             break  # this bare word is the wrapped command
-    return argv[i:]
+    result = argv[i:]
+    if stripped_open_paren and result:
+        # Strip ONE balancing trailing `)` off the token that carries the subshell
+        # close. It is not always the LAST token — a redirection can follow the
+        # closer (`(rm -rf /x) 2>/dev/null` → the `)` is glued to `/x`), so scan
+        # from the end for the first `)`-bearing token so the revealed argv stays
+        # clean for a consumer that reads the operand value.
+        for j in range(len(result) - 1, -1, -1):
+            if result[j].endswith(")"):
+                if result[j] == ")":
+                    del result[j]
+                else:
+                    result[j] = result[j][:-1]
+                break
+    return result
 
 
 def analyze(command: str) -> list[Segment]:
