@@ -189,11 +189,16 @@ fi
 # docs/architecture/shared-artifacts.md.
 _OAUTH_SRC=""
 _slot_oauth_mode="${GENESIS_CC_SLOT_OAUTH:-conditional}"
+_slot_oauth_mode="${_slot_oauth_mode,,}"   # normalize case so bash + the gate agree
 if [ "$_SESSION_EXISTS" = "0" ] && [ "$_slot_oauth_mode" != "off" ] && [ "$_HAS_BARE" = "0" ]; then
     # Gate exits 0 = inject. `if` guard keeps a non-zero exit from aborting the
     # launch under `set -e`; `timeout 30` bounds a hung probe (the gate's own
     # 15s probe timeout + interpreter startup) so a human's slot never wedges.
-    if timeout 30 "${GENESIS_ROOT}/.venv/bin/python" -m genesis.cc.login_gate; then
+    # Hand the RESOLVED mode to the gate via `env`: a plain
+    # `GENESIS_CC_SLOT_OAUTH=always` in ~/.genesis/cc-slot.env is a non-exported
+    # shell var, so the Python subprocess would otherwise never see it and would
+    # default to `conditional` — silently breaking `always`.
+    if timeout 30 env GENESIS_CC_SLOT_OAUTH="$_slot_oauth_mode" "${GENESIS_ROOT}/.venv/bin/python" -m genesis.cc.login_gate; then
         if [ "$_slot_oauth_mode" = "always" ]; then
             _oauth_notice="Genesis: forced onto the setup-token (GENESIS_CC_SLOT_OAUTH=always) — Remote Control and claude.ai connectors are OFF; set the lever to conditional and restart this slot to use /login. Local MCP servers still work."
         else

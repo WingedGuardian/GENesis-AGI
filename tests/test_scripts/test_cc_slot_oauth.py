@@ -64,6 +64,13 @@ def test_pane_command_interpolates_oauth_prefix(script_text):
     assert "${_OAUTH_SRC}claude " in script_text
 
 
+def test_gate_receives_lever_via_env(script_text):
+    # A plain `GENESIS_CC_SLOT_OAUTH=always` in cc-slot.env is a non-exported
+    # shell var; the gate subprocess must be handed the resolved mode explicitly
+    # via `env`, or `always` silently degrades to `conditional`.
+    assert 'env GENESIS_CC_SLOT_OAUTH="$_slot_oauth_mode"' in script_text
+
+
 def _extract_oauth_src_line(script_text: str) -> str:
     for line in script_text.splitlines():
         if line.lstrip().startswith('_OAUTH_SRC="if'):
