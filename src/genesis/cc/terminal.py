@@ -99,7 +99,7 @@ def main() -> None:
     parser.add_argument("--user", default="local", help="User ID (default: local)")
     parser.add_argument(
         "--boundary-hour", type=int, default=0,
-        help="UTC hour for morning reset (default: 0)",
+        help="Local-time hour (user timezone) for the daily reset (default: 0 = local midnight)",
     )
     parser.add_argument("--verbose", action="store_true", help="Show debug info")
     args = parser.parse_args()
