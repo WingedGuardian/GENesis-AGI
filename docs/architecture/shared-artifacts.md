@@ -42,6 +42,7 @@ readers:
   - src/genesis/guardian/diagnosis.py
   - src/genesis/onboarding/floor.py
   - scripts/guardian-gateway.sh
+  - scripts/cc-slot.sh
 allowlist:
   - src/genesis/guardian/credential_bridge.py
 ```
@@ -52,5 +53,10 @@ allowlist:
   the host's own login is dead (transitive, via the loader).
 - `onboarding/floor.py` — reads it as an auth-present signal at bootstrap.
 - `scripts/guardian-gateway.sh` — references the synced host copy.
+- `scripts/cc-slot.sh` — on interactive slot CREATE, when the primary login is
+  dead (decision via `genesis.cc.login_gate`, which reuses `login_health`),
+  extracts the token INSIDE the pane shell and exports `CLAUDE_CODE_OAUTH_TOKEN`
+  so the session survives without a re-login prompt (login-dead-conditional;
+  lever `GENESIS_CC_SLOT_OAUTH`).
 - `guardian/credential_bridge.py` (allowlist) — the loader/propagator home
   (`load_cc_oauth_token`, `_CC_TOKEN_SOURCE`), not a business consumer.

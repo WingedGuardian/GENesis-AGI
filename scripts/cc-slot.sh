@@ -106,8 +106,11 @@ existing=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
            | grep -cE "^${SESSION_PREFIX}-[0-9]+$" || true)
 
 # Reattaching to existing session — always allow ('=' = exact-name match)
+_SESSION_EXISTS=0
 if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
-    :  # bypass cap check
+    _SESSION_EXISTS=1  # bypass cap check; also skips the OAuth gate below —
+                       # attach does NOT re-run the pane command, so any token
+                       # injection would be moot (and would waste a probe).
 elif [[ $existing -ge $max_sessions ]]; then
     echo "ERROR: Session cap reached (${existing}/${max_sessions} active)." >&2
     echo "RAM: ${avail_mb}MB available, ${RESERVED_MB}MB reserved, ${PER_SESSION_MB}MB/session" >&2
@@ -138,6 +141,10 @@ export CLAUDE_CODE_TMPDIR="$HOME/.genesis/cc-tmp"
 # --dangerously-skip-permissions, set GENESIS_CC_PERMISSION_MODE=bypass. SSH
 # RemoteCommand does not source .bashrc, so this script also reads an optional
 # ~/.genesis/cc-slot.env (e.g. a single line: GENESIS_CC_PERMISSION_MODE=bypass).
+# That file is also where the OAuth-durability lever lives:
+# GENESIS_CC_SLOT_OAUTH=conditional (default) | always | off — set `off` for a
+# slot that must keep Remote Control / claude.ai connectors even after the login
+# dies (see the OAuth block below).
 # Headless/autonomous CC sessions (CCInvoker -p) keep bypass separately — no
 # human is present to answer a prompt.
 if [ -f "${HOME}/.genesis/cc-slot.env" ]; then
@@ -157,14 +164,48 @@ esac
 # A caller-supplied permission flag suppresses CC_PERM_FLAG so claude never
 # receives two conflicting permission arguments.
 CLAUDE_ARGS_Q=""
+_HAS_BARE=0
 if [[ ${#CLAUDE_EXTRA_ARGS[@]} -gt 0 ]]; then
     for arg in "${CLAUDE_EXTRA_ARGS[@]}"; do
         case "$arg" in
             --dangerously-skip-permissions|--permission-mode|--permission-mode=*)
                 CC_PERM_FLAG="" ;;
         esac
+        # --bare ignores CLAUDE_CODE_OAUTH_TOKEN (CC auth precedence), so
+        # injecting the setup-token would be inert — skip the OAuth gate below.
+        [ "$arg" = "--bare" ] && _HAS_BARE=1
     done
     CLAUDE_ARGS_Q=$(printf ' %q' "${CLAUDE_EXTRA_ARGS[@]}")
+fi
+
+# --- OAuth login durability (login-dead-conditional; WS-1) -------------------
+# On slot CREATE only: if the interactive /login is dead, continue this pane on
+# the stored 1-year setup-token so the session survives without a re-login
+# prompt. genesis.cc.login_gate makes the decision (reusing login_health's
+# shared login-dead gate — one authority, same as CCInvoker); the token itself
+# is read INSIDE the pane shell (never in any argv/ps) via a conditional prefix
+# on the command string. Lever GENESIS_CC_SLOT_OAUTH=conditional(default)|always|off.
+# cc-slot.sh is a registered reader of cc_oauth_token.env — see
+# docs/architecture/shared-artifacts.md.
+_OAUTH_SRC=""
+_slot_oauth_mode="${GENESIS_CC_SLOT_OAUTH:-conditional}"
+if [ "$_SESSION_EXISTS" = "0" ] && [ "$_slot_oauth_mode" != "off" ] && [ "$_HAS_BARE" = "0" ]; then
+    # Gate exits 0 = inject. `if` guard keeps a non-zero exit from aborting the
+    # launch under `set -e`; `timeout 30` bounds a hung probe (the gate's own
+    # 15s probe timeout + interpreter startup) so a human's slot never wedges.
+    if timeout 30 "${GENESIS_ROOT}/.venv/bin/python" -m genesis.cc.login_gate; then
+        if [ "$_slot_oauth_mode" = "always" ]; then
+            _oauth_notice="Genesis: forced onto the setup-token (GENESIS_CC_SLOT_OAUTH=always) — Remote Control and claude.ai connectors are OFF; set the lever to conditional and restart this slot to use /login. Local MCP servers still work."
+        else
+            _oauth_notice="Genesis: primary CC login is dead — running on the stored setup-token. Remote Control and claude.ai connectors are OFF until you /login. Local MCP servers still work."
+        fi
+        # Runs in the PANE shell: extract ONLY the token var (not a full source —
+        # avoids evaluating the file as shell / exporting GENESIS_CC_TOKEN_CREATED_AT),
+        # export it so claude inherits it, then print the notice to stderr. Never
+        # echoes the token value. `$(...)`, `~`, and the file read all defer to
+        # the pane shell (the `\$` / literal single-quotes keep them unexpanded here).
+        _OAUTH_SRC="if [ -r ~/.genesis/cc_oauth_token.env ]; then export CLAUDE_CODE_OAUTH_TOKEN=\"\$(sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' ~/.genesis/cc_oauth_token.env)\"; printf '%s\\n' \"${_oauth_notice}\" >&2; fi; "
+    fi
 fi
 
 # -u: force UTF-8 output even if a future client's locale detection fails.
@@ -186,4 +227,4 @@ exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
     -e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" \
     -e "LANG=$LANG" \
-    "cd ${GENESIS_ROOT} && claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+    "cd ${GENESIS_ROOT} && ${_OAUTH_SRC}claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
