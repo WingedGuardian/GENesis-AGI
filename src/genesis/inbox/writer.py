@@ -11,7 +11,6 @@ No subdirectory needed — the .genesis.md suffix marks response files.
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import io
 import json
 import logging
@@ -218,35 +217,26 @@ def _next_counter(directory: Path, base_name: str, suffix: str) -> int:
     in-mirror counter file, numbering restarted at 1, and weeks of responses
     landed as invisible overwrites of files the user had already read).
 
-    Four floors, the max wins:
-      1. the durable counter store (``~/.genesis/state/``, OUTSIDE the
-         vault-sync mirror — nothing else may delete it),
-      2. the legacy in-mirror counter file (migration: an install upgrading
-         mid-sequence keeps its high-water mark),
-      3. a filesystem scan of the watch dir,
-      4. the DB's ``inbox_items.response_path`` history (survives even a
-         total loss of 1-3).
-
-    Runs off the event loop (write_response wraps it in to_thread), so the
-    store read-modify-write is serialized on a module lock — without it two
-    concurrent calls could mint the same number and silently overwrite.
+    CORRECTNESS rests on TWO things only, neither of which can fail a write:
+      * the DB delivery floor (``inbox_items.response_path`` — the server's
+        append-only, never-rolled-back log), consulted UNCONDITIONALLY, and
+      * the atomic ``os.link`` reservation in the caller (cross-process safe).
+    Everything else is a best-effort OPTIMIZATION that must never raise into
+    the write path:
+      1. the durable counter store (``~/.genesis/state/``) — a cache/extra
+         floor; a stale or lost-updated value is harmless because the DB is
+         the authority, so it needs no cross-process lock,
+      2. the legacy in-mirror counter file (migration high-water),
+      3. a filesystem scan of the watch dir.
+    The module ``threading.Lock`` only trims intra-process link-retry
+    contention (a pure in-memory acquire — it cannot fail on a read-only FS);
+    there is deliberately NO ``fcntl`` lock and NO store ``mkdir`` here — an
+    unavailable ~/.genesis/state (read-only GENESIS_HOME) must degrade to the
+    DB/disk floors + os.link, never fail the response (Codex P1).
     """
     store_path = _counter_store_path()
-    store_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = store_path.with_name(store_path.name + ".lock")
-    # _COUNTER_LOCK serializes threads in THIS interpreter; fcntl.flock
-    # serializes the store read-modify-write across PROCESSES (the server and
-    # scripts/inbox_check.py can run concurrently). Both are required: without
-    # the cross-process lock, a whole-file RMW loses a sibling stem's advance
-    # (last-writer-wins) and the store — the authority trusted after a wipe —
-    # silently lags. The lock is a stable sidecar file (never replaced), so the
-    # atomic tmp+os.replace of the store below can't drop it.
-    with _COUNTER_LOCK, open(lock_path, "w") as lock_fh:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-        try:
-            return _next_counter_locked(directory, base_name, suffix, store_path)
-        finally:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+    with _COUNTER_LOCK:
+        return _next_counter_locked(directory, base_name, suffix, store_path)
 
 
 def _next_counter_locked(
@@ -310,10 +300,14 @@ def _next_counter_locked(
 
     next_num = max(stored_max, legacy_max, disk_max, db_max) + 1
 
-    # Persist the new high-water mark to the durable store (atomically, under
-    # the flock held by the caller — tmp-in-same-dir + os.replace so a reader
-    # never sees a torn file and a crash can't truncate the store).
+    # Persist the new high-water mark to the durable store — BEST EFFORT ONLY.
+    # The store is a cache/extra floor, never the authority (the DB is), so any
+    # failure here (read-only GENESIS_HOME, a missing/permission-damaged state
+    # dir) is swallowed and the response is STILL written — correctness rests on
+    # the DB floor + os.link, not on this. Atomic tmp+os.replace so a reader
+    # never sees a torn file and a crash can't truncate the store.
     try:
+        store_path.parent.mkdir(parents=True, exist_ok=True)
         if not isinstance(store.get(dir_key), dict):
             store[dir_key] = {}
         store[dir_key][base_name] = next_num

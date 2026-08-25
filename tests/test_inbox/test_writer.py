@@ -653,40 +653,45 @@ async def test_db_floor_runs_when_disk_empty_even_if_store_lags(
     )
 
 
-def test_cross_process_store_records_true_high_water(tmp_path: Path):
-    """Whole-class-audit SHOULD-FIX: the store RMW is cross-process-locked
-    (fcntl.flock), so concurrent writer processes cannot lose a stem's advance
-    (last-writer-wins). After N concurrent writes the store must record the
-    true high-water N, not a lagged value."""
-    import json as _json
-    import subprocess
+@pytest.mark.asyncio
+async def test_write_survives_unwritable_counter_store(
+    writer: ResponseWriter, tmp_path: Path, monkeypatch,
+):
+    """Codex P1(b) regression: the counter store is a best-effort OPTIMIZATION,
+    never load-bearing. If ~/.genesis/state cannot be created/written (read-only
+    GENESIS_HOME) while the inbox stays writable, the response MUST still be
+    written (DB/disk floors + os.link carry correctness) — not fail and get
+    baselined complete with no response."""
+    from genesis.inbox import writer as writer_mod
 
-    watch = tmp_path / "inbox"
-    watch.mkdir()
-    (watch / "doc.md").write_text("src")
-    ghome = tmp_path / "ghome"
-    env = {
-        **os.environ,
-        "GENESIS_HOME": str(ghome),
-        "GENESIS_DB_PATH": str(tmp_path / "nope.db"),
-    }
-    n = 8
-    procs = [
-        subprocess.Popen(
-            [sys.executable, "-c", _CROSS_PROC_WORKER, str(watch), str(i)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
-        )
-        for i in range(n)
-    ]
-    for p in procs:
-        _, err = p.communicate(timeout=60)
-        assert p.returncode == 0, err
-
-    store = _json.loads((ghome / "state" / "inbox-counters.json").read_text())
-    assert store[str(watch)]["doc"] == n, (
-        f"store high-water {store[str(watch)]['doc']} != {n} — a concurrent "
-        "process lost-updated the store (cross-process lock missing)"
+    # Point the store at a path under a read-only parent so mkdir/write fail.
+    ro = tmp_path / "ro-home"
+    ro.mkdir()
+    (ro / "state").mkdir()
+    monkeypatch.setattr(
+        writer_mod, "_counter_store_path",
+        lambda: ro / "state" / "inbox-counters.json",
     )
+    ro_state = ro / "state"
+    original_mode = ro_state.stat().st_mode
+    ro_state.chmod(0o500)  # read+execute only → mkstemp/replace fail
+    try:
+        source = tmp_path / "doc.md"
+        source.write_text("x")
+        p1 = await writer.write_response(
+            batch_id="ro1", source_files=[str(source)],
+            evaluation_text="a", item_count=1,
+        )
+        p2 = await writer.write_response(
+            batch_id="ro2", source_files=[str(source)],
+            evaluation_text="b", item_count=1,
+        )
+    finally:
+        ro_state.chmod(original_mode)
+    # Writes succeeded and numbering still advanced via the disk floor.
+    assert p1.name == "doc-1.genesis.md"
+    assert p2.name == "doc-2.genesis.md"
+    assert p1.exists() and p2.exists()
 
 
 @pytest.mark.asyncio
