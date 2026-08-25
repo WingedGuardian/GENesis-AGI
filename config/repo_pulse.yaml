@@ -67,8 +67,9 @@ open_pr_stale_days: 7
 # gh --limit for the open-PR fetch (separate from max_prs, which is merged-only).
 max_open_prs: 50
 
-# A still-stale PR that was already surfaced re-appears once it has been on the
-# seen-map this many days (then ages out and stops nagging).
+# Keep surfacing a still-stale PR for this many days AFTER it is first shown, then
+# go quiet (until it leaves the stalled set and returns as a fresh episode). This
+# is a nag-window duration, NOT a re-appear-after delay.
 open_pr_resurface_days: 7
 
 # Max PRs listed inline per session (the rest collapse to "+N more").

@@ -39,13 +39,13 @@ def _seen_path(home: Path) -> Path:
     return home / ".genesis" / "repo_pulse" / "open_prs_seen.json"
 
 
-def _write_cache(home: Path, prs, *, age_hours=0) -> None:
+def _write_cache(home: Path, prs, *, age_hours=0, repo="o/r", capped=False) -> None:
     computed = (datetime.now(UTC) - timedelta(hours=age_hours)).isoformat()
     cache = _cache_path(home)
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text(
         json.dumps(
-            {"version": 1, "computed_at": computed, "repo": "o/r", "prs": prs, "limit_hit": False}
+            {"version": 1, "computed_at": computed, "repo": repo, "prs": prs, "limit_hit": capped}
         )
     )
 
@@ -124,3 +124,31 @@ def test_resurfaces_on_second_run(tmp_path):
     first = _run(home)
     second = _run(home)  # within resurface window
     assert "[Open PRs]" in first and "[Open PRs]" in second
+
+
+def test_capped_cache_shows_floor_count(tmp_path):
+    home = tmp_path / "home"
+    _write_cache(home, [_openpr(1379, 12), _openpr(1223, 9)], capped=True)
+    out = _run(home)
+    assert out.startswith("[Open PRs] ≥2 open PRs idle")  # ≥2, a floor
+
+
+def test_seen_map_namespaced_by_repo(tmp_path):
+    home = tmp_path / "home"
+    _write_cache(home, [_openpr(1379, 12)], repo="owner/therepo")
+    _run(home)
+    surfaced = json.loads(_seen_path(home).read_text())["surfaced"]
+    assert "owner/therepo#1379" in surfaced  # keyed by repo slug + number
+
+
+def test_seen_map_pruned_when_pr_no_longer_stalled(tmp_path):
+    home = tmp_path / "home"
+    # 1st run: stale → surfaced + recorded.
+    _write_cache(home, [_openpr(1379, 12)])
+    assert "#1379" in _run(home)
+    assert "o/r#1379" in json.loads(_seen_path(home).read_text())["surfaced"]
+    # 2nd run: same PR now recent (not stalled) → its entry is PRUNED, so a later
+    # re-stale is a fresh episode rather than a wrongly-aged-out suppression.
+    _write_cache(home, [_openpr(1379, 2)])  # 2d < 7d threshold
+    _run(home)
+    assert "o/r#1379" not in json.loads(_seen_path(home).read_text())["surfaced"]

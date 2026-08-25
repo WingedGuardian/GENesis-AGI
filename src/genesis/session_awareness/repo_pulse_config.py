@@ -58,7 +58,7 @@ DEFAULTS: dict[str, Any] = {
     "open_pr_enabled": True,  # master switch for the open-PR lane (bool)
     "open_pr_stale_days": 7,  # a PR idle >= this many days is "stale"
     "max_open_prs": 50,  # gh --limit for the open-PR fetch
-    "open_pr_resurface_days": 7,  # re-surface a still-stale PR after this long
+    "open_pr_resurface_days": 7,  # keep surfacing a still-stale PR for this many days after first shown, then go quiet
     "open_pr_max_surface": 5,  # max PRs shown inline per session
 }
 

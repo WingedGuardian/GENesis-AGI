@@ -414,3 +414,10 @@ def test_open_pr_paths_are_home_anchored():
     assert rp.open_prs_seen_path().name == "open_prs_seen.json"
     assert rp.open_prs_cache_path().parent == rp.open_prs_seen_path().parent
     assert rp.open_prs_cache_path().parent.name == "repo_pulse"
+
+
+def test_format_open_pr_injection_capped_shows_floor():
+    text = rp.format_open_pr_injection(["#1 (12d)", "#2 (9d)"], 7, capped=True)
+    assert text.startswith("[Open PRs] ≥2 open PRs idle ≥7d — ")
+    # uncapped stays an exact count
+    assert rp.format_open_pr_injection(["#1 (12d)"], 7).startswith("[Open PRs] 1 open PR idle")

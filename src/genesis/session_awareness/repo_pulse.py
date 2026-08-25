@@ -404,10 +404,12 @@ def format_open_pr_clause(pr: dict) -> str:
     return f"#{pr['number']} ({pr['stale_days']}d{suffix})"
 
 
-def format_open_pr_injection(lines: list[str], stale_days: int) -> str:
+def format_open_pr_injection(lines: list[str], stale_days: int, *, capped: bool = False) -> str:
     """The single inline line for the open-PR surface. Empty -> ''. The header
-    count is the TRUE total (shown clauses + any '+N more' overflow). NEVER says
-    'ready to merge' — a visibility nudge, not a merge signal."""
+    count is the TRUE total (shown clauses + any '+N more' overflow). When ``capped``
+    (the worker's fetch hit its limit, so the open set is only partially known) the
+    count is rendered as a floor (``≥N``) — an honest lower bound, never a silent
+    exact count. NEVER says 'ready to merge' — a visibility nudge, not a merge signal."""
     if not lines:
         return ""
     shown = [ln for ln in lines if not ln.startswith("+")]
@@ -418,8 +420,9 @@ def format_open_pr_injection(lines: list[str], stale_days: int) -> str:
                 overflow = int(ln[1 : -len(" more")])
     total = len(shown) + overflow
     noun = "PR" if total == 1 else "PRs"
+    count = f"≥{total}" if capped else str(total)
     return (
-        f"[Open PRs] {total} open {noun} idle ≥{stale_days}d — "
+        f"[Open PRs] {count} open {noun} idle ≥{stale_days}d — "
         + " · ".join(lines)
         + '. Ask "show PRs" to review.'
     )

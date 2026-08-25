@@ -58,11 +58,11 @@ def main() -> None:
         except Exception:
             return
         prs = data.get("prs") if isinstance(data, dict) else None
-        if not isinstance(prs, list) or not prs:
-            return
+        if not isinstance(prs, list):
+            return  # malformed cache — nothing to compute or prune against
 
         now = datetime.now(UTC)
-        # Freshness TTL: never surface a dead worker's stale snapshot.
+        # Freshness TTL: never surface (or prune against) a dead worker's stale snapshot.
         computed = pr_watch._parse_ts(data.get("computed_at"))
         if computed is None or (now - computed).total_seconds() > _MAX_CACHE_AGE_S:
             return
@@ -71,25 +71,36 @@ def main() -> None:
         resurface = pulse_cfg.knob_int(cfg, "open_pr_resurface_days")
         max_surface = pulse_cfg.knob_int(cfg, "open_pr_max_surface")
 
+        # Namespace the seen-map by the cache's live repo slug so a PR number from a
+        # DIFFERENT repo (a re-pointed remote / fork) can't collide with an aged-out
+        # entry of the same number (Codex P2).
+        repo_slug = str(data.get("repo") or "?")
         stalled = repo_pulse.select_stalled_open_prs(prs, now=now, stale_days=stale_days)
-        if not stalled:
-            return
 
         seen_path = repo_pulse.open_prs_seen_path()
         surfaced, _existed = pr_watch.load_sidecar(seen_path)
+        # ALWAYS rebuild the seen-map from the CURRENT stalled set — even when it is
+        # empty — so an entry for a PR that has left the stalled set is dropped; keeping
+        # its old first_ts would wrongly age it out and it would not resurface when it
+        # goes stale again (Codex P2). select_to_surface([]) returns an empty map, which
+        # is the correct pruned state.
         lines, new_surfaced = pr_watch.select_to_surface(
             stalled,
             surfaced,
             now,
             resurface,
             max_surface,
-            id_getter=lambda p: str(p["number"]),
+            id_getter=lambda p: f"{repo_slug}#{p['number']}",
             renderer=repo_pulse.format_open_pr_clause,
         )
-        # Persist seen-state even when nothing new to show (records baselines).
         pr_watch.save_sidecar(seen_path, new_surfaced)
 
-        text = repo_pulse.format_open_pr_injection(lines, stale_days)
+        # A capped fetch (>max_open_prs open PRs) does not cover the whole open set —
+        # render the count as a floor (≥N) so it is reported honestly as a lower bound,
+        # never a silent exact count (Codex P2).
+        text = repo_pulse.format_open_pr_injection(
+            lines, stale_days, capped=bool(data.get("limit_hit"))
+        )
         if text:
             print(text)
             sys.stdout.flush()

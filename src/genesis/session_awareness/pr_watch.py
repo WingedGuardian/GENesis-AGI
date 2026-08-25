@@ -192,7 +192,12 @@ def select_to_surface(
             to_show.append(n)
             continue
         first_ts = _parse_ts(prev.get("first_ts")) or now
-        new_surfaced[nid] = {"first_ts": prev.get("first_ts") or now.isoformat()}
+        # Persist a VALID prior first_ts verbatim; HEAL an unparseable/corrupt one to
+        # now so a torn/tampered sidecar entry cannot nag every session forever
+        # (the show decision above already heals; this heals the persisted value).
+        new_surfaced[nid] = {
+            "first_ts": prev.get("first_ts") if _parse_ts(prev.get("first_ts")) else now.isoformat()
+        }
         if first_ts.timestamp() >= resurface_cutoff:
             to_show.append(n)
 
