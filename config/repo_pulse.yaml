@@ -47,3 +47,29 @@ max_proposals_per_run: 10
 # Proposals below this confidence are stored but never surfaced at charter
 # injection (the dashboard still shows them).
 inject_confidence_floor: 0.7
+
+# ── Open-PR lane (session-manager PR-4c) ────────────────────────────────────
+# An age-based, passive inline surface: the worker fetches the OPEN-PR set into
+# ~/.genesis/repo_pulse/open_prs.json each non-debounced boundary, and the
+# SessionStart hook (surface_open_prs.py) shows the age-stale ones as one line.
+# It is visibility-only — NO CI/review state, never "ready to merge", no
+# Telegram, no follow-up rows, no auto-merge. GENESIS_REPO_PULSE_DISABLED and
+# `enabled: false` both stop it (the hook and the worker respectively).
+
+# Master switch for the open-PR lane specifically (independent of the fuzzy/
+# exact merged-PR tiers above).
+open_pr_enabled: true
+
+# A PR whose last update (updatedAt) is at least this many days ago is "stale"
+# and eligible to surface.
+open_pr_stale_days: 7
+
+# gh --limit for the open-PR fetch (separate from max_prs, which is merged-only).
+max_open_prs: 50
+
+# A still-stale PR that was already surfaced re-appears once it has been on the
+# seen-map this many days (then ages out and stops nagging).
+open_pr_resurface_days: 7
+
+# Max PRs listed inline per session (the rest collapse to "+N more").
+open_pr_max_surface: 5

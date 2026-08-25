@@ -117,3 +117,84 @@ async def test_malformed_pr_rows_dropped():
     # limit_hit reflects the RAW count — a capped window full of junk is
     # still a capped window
     assert out["limit_hit"] is False
+
+
+# ── list_open_prs (session-manager PR-4c open-PR lane) ──────────────────────
+
+
+def _open_pr(number, updated, **extra):
+    d = {
+        "number": number,
+        "title": "t",
+        "url": f"https://x/pull/{number}",
+        "isDraft": False,
+        "mergeable": "MERGEABLE",
+        "updatedAt": updated,
+        "createdAt": updated,
+        "author": {"login": "human", "is_bot": False},
+    }
+    d.update(extra)
+    return d
+
+
+@pytest.mark.asyncio
+async def test_list_open_prs_requests_open_state_and_fields():
+    prs = [_open_pr(2, "2026-08-10T00:00:00Z"), _open_pr(1, "2026-08-01T00:00:00Z")]
+    run = _fake_runner({"repo": (0, "owner/real-repo\n", ""), "pr": (0, json.dumps(prs), "")})
+    out = await gh.list_open_prs(runner=run)
+    assert out["repo"] == "owner/real-repo"
+    assert out["limit_hit"] is False
+    assert {p["number"] for p in out["prs"]} == {1, 2}
+    pr_argv = run.calls[1]
+    assert "--state" in pr_argv and pr_argv[pr_argv.index("--state") + 1] == "open"
+    joined = " ".join(pr_argv)
+    assert "updatedAt" in joined and "author" in joined and "isDraft" in joined
+    # age-based ONLY: never queries CI/review state
+    assert "statusCheckRollup" not in joined and "reviewDecision" not in joined
+
+
+@pytest.mark.asyncio
+async def test_list_open_prs_explicit_repo_skips_resolve():
+    run = _fake_runner({"pr": (0, "[]", "")})
+    out = await gh.list_open_prs(repo="o/r", runner=run)
+    assert out == {"repo": "o/r", "prs": [], "limit_hit": False}
+    assert len(run.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_list_open_prs_failures_are_errors_not_raise():
+    for responses in (
+        {"pr": (1, "", "HTTP 502")},
+        {"pr": (0, "not json", "")},
+        {"pr": (0, '{"a": 1}', "")},
+    ):
+        run = _fake_runner(responses)
+        out = await gh.list_open_prs(repo="o/r", runner=run)
+        assert "error" in out
+
+
+@pytest.mark.asyncio
+async def test_list_open_prs_slug_resolve_failure_is_error():
+    run = _fake_runner({"repo": (1, "", "not a git repo")})
+    out = await gh.list_open_prs(runner=run)
+    assert out == {"error": "repo slug resolve failed"}
+
+
+@pytest.mark.asyncio
+async def test_list_open_prs_malformed_rows_dropped():
+    raw = [
+        _open_pr(1, "2026-08-01T00:00:00Z"),
+        {"number": "2", "updatedAt": "2026-08-02T00:00:00Z"},  # str number
+        "not a dict",
+    ]
+    run = _fake_runner({"pr": (0, json.dumps(raw), "")})
+    out = await gh.list_open_prs(repo="o/r", runner=run)
+    assert [p["number"] for p in out["prs"]] == [1]
+
+
+@pytest.mark.asyncio
+async def test_list_open_prs_limit_hit_is_loud():
+    prs = [_open_pr(i, "2026-08-01T00:00:00Z") for i in range(3)]
+    run = _fake_runner({"pr": (0, json.dumps(prs), "")})
+    out = await gh.list_open_prs(repo="o/r", limit=3, runner=run)
+    assert out["limit_hit"] is True

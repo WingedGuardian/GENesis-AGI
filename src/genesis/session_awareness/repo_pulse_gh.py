@@ -143,3 +143,57 @@ async def list_merged_prs(
     ]
     prs.sort(key=lambda p: p["mergedAt"])
     return {"repo": repo, "prs": prs, "limit_hit": len(raw) >= limit}
+
+
+# Open-PR lane fields (session-manager PR-4c). Deliberately NOT PR_FIELDS
+# (merged-only): the open-PR surface keys on updatedAt for age, the author's
+# ``is_bot`` flag for the dependabot tag, and isDraft/mergeable for the clause.
+# NO statusCheckRollup / reviewDecision — the surface is age-based only (every
+# owner PR reads REVIEW_REQUIRED forever, so it carries no signal).
+OPEN_PR_FIELDS = "number,title,url,isDraft,mergeable,updatedAt,createdAt,author"
+
+
+async def list_open_prs(
+    *,
+    limit: int = 50,
+    repo: str | None = None,
+    runner: Runner | None = None,
+) -> dict:
+    """Enumerate OPEN PRs for the age-stale SessionStart surface.
+
+    Returns ``{"repo", "prs", "limit_hit"}`` (prs in gh's default order — the
+    hook computes ``stale_days`` client-side, so no sort dependency here), or
+    ``{"error": ...}`` without raising. Rows missing an int ``number`` are
+    dropped (gh contract violation, not a crash). Slug resolves LIVE (same
+    stale-config hardening as ``list_merged_prs``).
+    """
+    run = runner or _default_runner
+    if repo is None:
+        repo = await resolve_repo(run)
+        if repo is None:
+            return {"error": "repo slug resolve failed"}
+    rc, out, err = await run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--json",
+            OPEN_PR_FIELDS,
+            "--limit",
+            str(limit),
+        ]
+    )
+    if rc != 0:
+        return {"error": f"open pr list failed (rc={rc}): {err.strip()[:400]}"}
+    try:
+        raw = json.loads(out)
+    except json.JSONDecodeError as exc:
+        return {"error": f"open pr list returned invalid JSON: {exc}"}
+    if not isinstance(raw, list):
+        return {"error": "open pr list returned a non-list payload"}
+    prs = [pr for pr in raw if isinstance(pr, dict) and isinstance(pr.get("number"), int)]
+    return {"repo": repo, "prs": prs, "limit_hit": len(raw) >= limit}

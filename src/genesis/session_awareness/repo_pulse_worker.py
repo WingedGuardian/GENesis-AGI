@@ -51,6 +51,7 @@ from genesis.session_awareness.repo_pulse import (
     build_fuzzy_prompt,
     match_exact,
     match_followup,
+    open_prs_cache_path,
     parse_matches,
 )
 from genesis.session_awareness.repo_pulse_config import (
@@ -58,7 +59,7 @@ from genesis.session_awareness.repo_pulse_config import (
     knob_int,
     load_config,
 )
-from genesis.session_awareness.repo_pulse_gh import list_merged_prs
+from genesis.session_awareness.repo_pulse_gh import list_merged_prs, list_open_prs
 
 CURSOR_FILENAME = "cursor.json"
 LOCK_FILENAME = "pulse.lock"
@@ -465,6 +466,35 @@ async def _run_locked(
     cursor_before = cursor.get("last_merged_at")
     now_iso = _now()
     detail_notes: list[str] = []
+
+    # ── Open-PR lane (session-manager PR-4c) ─────────────────────────────────
+    # Fetch the open-PR set into a home-anchored cache for the SessionStart
+    # surface. Placed HERE — after the debounce gate, before the merged-PR
+    # enumeration and its no_new_prs/failed early-returns — because open PRs go
+    # stale on WALL-CLOCK, not on new merges: behind those early-returns the cache
+    # would never refresh on a boundary with no newly-merged PRs. Own try/except
+    # (a gh/parse failure must never skip the merged lanes or _record_run); it
+    # NEVER touches the cursor and writes only the fetch cache. A failure is
+    # surfaced on the run row's detail (this module reports via DB telemetry, not
+    # logging).
+    if cfg.get("open_pr_enabled", True):
+        try:
+            open_listing = await list_open_prs(limit=knob_int(cfg, "max_open_prs"))
+            if "error" in open_listing:
+                detail_notes.append(f"open_pr_lane: {str(open_listing['error'])[:120]}")
+            else:
+                _atomic_write_json(
+                    open_prs_cache_path(),
+                    {
+                        "version": 1,
+                        "computed_at": now_iso,
+                        "repo": open_listing["repo"],
+                        "prs": open_listing["prs"],
+                        "limit_hit": open_listing["limit_hit"],
+                    },
+                )
+        except Exception as exc:  # never break the merged lanes / _record_run
+            detail_notes.append(f"open_pr_lane_failed: {str(exc)[:120]}")
 
     reconciled = await _reconcile(db_path, now_iso)
     if reconciled:

@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import tempfile
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -157,25 +158,34 @@ def select_to_surface(
     now: datetime,
     resurface_days: int,
     max_surface: int,
+    *,
+    id_getter: Callable[[dict[str, Any]], str] | None = None,
+    renderer: Callable[[dict[str, Any]], str] | None = None,
 ) -> tuple[list[str], dict[str, dict[str, Any]]]:
-    """Decide which notifications to surface this run and compute the next
-    sidecar.
+    """Decide which items to surface this run and compute the next sidecar.
 
-    Per notification (already lookback-filtered, newest first):
+    Per item (already lookback/staleness-filtered, most-relevant first):
     - unseen -> surface, record first_ts=now
     - seen, first surfaced <= resurface_days ago -> resurface
     - seen, aged past resurface_days -> keep in sidecar, do NOT surface
 
-    The next sidecar is built ONLY from the current notification set, so any id
-    that has fallen outside the lookback window is pruned automatically (no
-    unbounded growth, no retention step).
+    The next sidecar is built ONLY from the current item set, so any id that has
+    fallen outside the window is pruned automatically (no unbounded growth, no
+    retention step).
+
+    ``id_getter``/``renderer`` default to the steward-notification shape
+    (``str(n["id"])`` / ``render_clause``); the open-PR lane passes its own
+    (``str(pr["number"])`` / ``format_open_pr_clause``) so this surface/seen-map
+    logic is REUSED, not forked.
     """
+    key_of = id_getter or (lambda n: str(n["id"]))
+    render = renderer or render_clause
     resurface_cutoff = now.timestamp() - resurface_days * 86400
     new_surfaced: dict[str, dict[str, Any]] = {}
     to_show: list[dict[str, Any]] = []
 
     for n in notifs:
-        nid = str(n["id"])
+        nid = key_of(n)
         prev = surfaced.get(nid)
         if prev is None:
             new_surfaced[nid] = {"first_ts": now.isoformat()}
@@ -186,7 +196,7 @@ def select_to_surface(
         if first_ts.timestamp() >= resurface_cutoff:
             to_show.append(n)
 
-    lines = [render_clause(n) for n in to_show[: max(max_surface, 0)]]
+    lines = [render(n) for n in to_show[: max(max_surface, 0)]]
     overflow = len(to_show) - len(lines)
     if overflow > 0:
         lines.append(f"+{overflow} more")

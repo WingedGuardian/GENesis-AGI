@@ -1286,13 +1286,13 @@ def _validate_repo_pulse(changes: dict) -> list[str]:
     from genesis.session_awareness.repo_pulse_config import _INT_KNOBS, MODES
 
     errors: list[str] = []
-    valid_keys = ("enabled", "mode", *_INT_KNOBS, "inject_confidence_floor")
+    valid_keys = ("enabled", "open_pr_enabled", "mode", *_INT_KNOBS, "inject_confidence_floor")
     for key, value in changes.items():
         if key not in valid_keys:
             errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
-        elif key == "enabled":
+        elif key in ("enabled", "open_pr_enabled"):
             if not isinstance(value, bool):
-                errors.append("'enabled' must be a boolean")
+                errors.append(f"'{key}' must be a boolean")
         elif key == "mode":
             if value not in MODES:
                 errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
