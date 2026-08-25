@@ -3779,6 +3779,20 @@
               ueCad?.gated_error || geCad?.gated_error) {
             return { state: "unknown", reason: "ego liveness data unavailable (read error)" };
           }
+          // Total-cessation (scheduler death): the ego_heartbeat pulse went stale.
+          // Fail-LOUD on a broken read (unknown), then flag a genuinely dead
+          // scheduler as error. This is the blind spot the per-ego intent-lag
+          // `stalled` below cannot see — on total cessation both ego timestamps
+          // freeze together, the lag never opens, and the tile would otherwise
+          // read green (the 3-day-dead-ego-shows-healthy bug). Scheduler-level:
+          // shared across both ego managers (see routes/ego.py).
+          if (ego.ego_heartbeat_error) {
+            return { state: "unknown", reason: "ego heartbeat data unavailable (read error)" };
+          }
+          if (ego.ego_heartbeat_stale) {
+            const hrs = ego.ego_heartbeat_age_s ? Math.round(ego.ego_heartbeat_age_s / 3600) : "?";
+            return { state: "error", reason: `ego scheduler stopped — no heartbeat in ${hrs}h` };
+          }
           // Circuit breaker on either ego
           if (ueCad?.consecutive_failures >= 3 || geCad?.consecutive_failures >= 3) {
             const which = (ueCad?.consecutive_failures >= 3 ? "CEO" : "") +

@@ -148,83 +148,118 @@ async def _impl_bootstrap_manifest() -> dict:
         }
 
 
-async def _impl_subsystem_heartbeats() -> dict:
+# (expected_interval_s, overdue_threshold_s) per heartbeat-emitting subsystem.
+# ONE source of truth for the subsystem_heartbeats display tool, the
+# ``subsystem_stale:<name>`` pulse-staleness alert (errors.py), and the ego
+# dashboard tile (routes/ego.py) — so those surfaces can never disagree.
+# ``expected_interval_s`` is currently informational; ``overdue_s`` drives the
+# verdict.
+HEARTBEAT_EXPECTED = {
+    "awareness": (300, 360),      # 5 min tick, error at 6 min
+    "surplus": (300, 600),
+    "inbox": (1800, 3600),
+    # Reflections only fire when signals warrant; calm periods can be quiet
+    # for hours. An idle alive-pulse (awareness loop) keeps this fresh during
+    # legitimate idle, so overdue=4h (matches ego) avoids false "dark" alarms.
+    # A real reflection outage surfaces faster via the awareness heartbeat
+    # (6 min), the cc resilience axis, and the deferred-work backlog.
+    "reflection": (600, 14400),
+    "outreach": (86400, 172800),
+    "dashboard": (120, 240),
+    "ego": (300, 14400),          # 5-min liveness pulse (ego_heartbeat job), overdue at 4h
+}
+
+
+async def compute_heartbeat_staleness(
+    name: str, db=None, raise_on_error: bool = False
+) -> dict:
+    """Staleness verdict for ONE heartbeat-emitting subsystem.
+
+    Reads the latest durable ``heartbeat`` event for *name* (falling back to the
+    in-memory event-bus ring) and compares its age to the subsystem's overdue
+    threshold in :data:`HEARTBEAT_EXPECTED`. Returns the same per-subsystem shape
+    :func:`_impl_subsystem_heartbeats` yields:
+    ``{status: alive|overdue|no_heartbeat|unknown, last_seen, age_seconds?}``.
+
+    *db* defaults to the health service's connection; a caller with its own
+    runtime connection (e.g. the ego dashboard route) passes it explicitly.
+
+    *raise_on_error*: by default a caught query error is ERROR-logged and the
+    verdict degrades to ``no_heartbeat`` (best-effort, as the display/alert paths
+    want). A caller that renders a POSITIVE health assertion (the ego tile) passes
+    ``True`` so the read failure RE-RAISES and it can fail loud (surface unknown)
+    rather than paint a healthy tile over a broken read. (Truly unexpected
+    exception types always propagate — matching the original display behavior of
+    surfacing ``is_error`` rather than silently dropping a real bug.)
+
+    An unknown *name* (not in the threshold table) → ``no_heartbeat``; never raises
+    for that reason.
+    """
     import genesis.mcp.health_mcp as health_mcp_mod
 
-    _service = health_mcp_mod._service
+    entry = HEARTBEAT_EXPECTED.get(name)
+    if entry is None:
+        return {"status": "no_heartbeat", "last_seen": None}
+    _interval_s, overdue_s = entry
+
+    if db is None:
+        _service = health_mcp_mod._service
+        db = _service._db if _service else None
     _event_bus = health_mcp_mod._event_bus
 
-    # (expected_interval_s, overdue_threshold_s)
-    expected = {
-        "awareness": (300, 360),      # 5 min tick, error at 6 min
-        "surplus": (300, 600),
-        "inbox": (1800, 3600),
-        # Reflections only fire when signals warrant; calm periods can be quiet
-        # for hours. An idle alive-pulse (awareness loop) keeps this fresh during
-        # legitimate idle, so overdue=4h (matches ego) avoids false "dark" alarms.
-        # A real reflection outage surfaces faster via the awareness heartbeat
-        # (6 min), the cc resilience axis, and the deferred-work backlog.
-        "reflection": (600, 14400),
-        "outreach": (86400, 172800),
-        "dashboard": (120, 240),
-        "ego": (300, 14400),          # 5-min liveness pulse (ego_heartbeat job), overdue at 4h
+    last_ts = None
+    if db is not None:
+        try:
+            from genesis.db.crud import events as events_crud
+
+            rows = await events_crud.query(
+                db, subsystem=name, event_type="heartbeat", limit=1
+            )
+            if rows:
+                last_ts = rows[0].get("timestamp")
+        except (aiosqlite.Error, ImportError, AttributeError, TimeoutError):
+            # Narrow catch: DB query failure (aiosqlite.Error, TimeoutError),
+            # broken import chain (ImportError), or malformed row shape
+            # (AttributeError). Log at ERROR — a heartbeat probe failure against a
+            # wired DB is an operational failure. A POSITIVE-assertion caller
+            # (the ego tile) sets raise_on_error so this fails loud (unknown)
+            # instead of a spurious healthy tile; the display/alert callers
+            # degrade to no_heartbeat (absence, logged). Unexpected exception
+            # types still bubble on purpose (FastMCP is_error over a silent drop).
+            logger.error(
+                "Heartbeat timestamp query failed for subsystem %s", name, exc_info=True
+            )
+            if raise_on_error:
+                raise
+
+    if not last_ts and _event_bus is not None and hasattr(_event_bus, "_ring"):
+        for event in reversed(_event_bus._ring):
+            sub_val = (
+                event.subsystem.value
+                if hasattr(event.subsystem, "value")
+                else str(event.subsystem)
+            )
+            if sub_val == name and event.event_type == "heartbeat":
+                last_ts = event.timestamp
+                break
+
+    if last_ts is None:
+        return {"status": "no_heartbeat", "last_seen": None}
+    try:
+        age_s = (datetime.now(UTC) - datetime.fromisoformat(last_ts)).total_seconds()
+        return {
+            "status": "overdue" if age_s > overdue_s else "alive",
+            "last_seen": last_ts,
+            "age_seconds": round(age_s, 1),
+        }
+    except (ValueError, TypeError):
+        return {"status": "unknown", "last_seen": last_ts}
+
+
+async def _impl_subsystem_heartbeats() -> dict:
+    return {
+        name: await compute_heartbeat_staleness(name) for name in HEARTBEAT_EXPECTED
     }
-
-    result = {}
-    now = datetime.now(UTC)
-
-    for name, (_interval_s, overdue_s) in expected.items():
-        last_ts = None
-
-        if _service and _service._db:
-            try:
-                from genesis.db.crud import events as events_crud
-
-                rows = await events_crud.query(
-                    _service._db,
-                    subsystem=name,
-                    event_type="heartbeat",
-                    limit=1,
-                )
-                if rows:
-                    last_ts = rows[0].get("timestamp")
-            except (aiosqlite.Error, ImportError, AttributeError, TimeoutError):
-                # Narrow catch: DB query failure (aiosqlite.Error,
-                # TimeoutError), broken import chain for events_crud
-                # (ImportError), or malformed row shape on access
-                # (AttributeError). Log at ERROR per observability
-                # rules — a heartbeat probe failure against a wired
-                # service is an operational failure, not tracing
-                # noise. Unexpected exception types bubble up on
-                # purpose: we'd rather see ``is_error=True`` on the
-                # FastMCP result than silently drop a real bug.
-                logger.error(
-                    "Heartbeat timestamp query failed for subsystem %s",
-                    name, exc_info=True,
-                )
-
-        if not last_ts and _event_bus and hasattr(_event_bus, "_ring"):
-            for event in reversed(_event_bus._ring):
-                sub_val = event.subsystem.value if hasattr(event.subsystem, "value") else str(event.subsystem)
-                if sub_val == name and event.event_type == "heartbeat":
-                    last_ts = event.timestamp
-                    break
-
-        if last_ts is None:
-            result[name] = {"status": "no_heartbeat", "last_seen": None}
-        else:
-            try:
-                age_s = (now - datetime.fromisoformat(last_ts)).total_seconds()
-                overdue = age_s > overdue_s
-                result[name] = {
-                    "status": "overdue" if overdue else "alive",
-                    "last_seen": last_ts,
-                    "age_seconds": round(age_s, 1),
-                }
-            except (ValueError, TypeError):
-                result[name] = {"status": "unknown", "last_seen": last_ts}
-
-    return result
 
 
 async def _impl_job_health() -> dict:

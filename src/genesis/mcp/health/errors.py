@@ -939,6 +939,48 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
             # operational fault, not an expected-absent-table case, so ERROR.
             logger.error("Never-succeeded job alert check failed", exc_info=True)
 
+    # ── Stopped-firing subsystems (total-cessation) ──────────────────
+    # Each heartbeat-emitting subsystem pulses a durable ``heartbeat`` event
+    # every cycle; when that pulse goes overdue past its per-subsystem threshold
+    # the scheduler/loop has stopped — a SILENT death the failure-gap alarms
+    # above cannot see (those need a RUNNING-but-failing job; a stopped job never
+    # advances last_run either). Complements job_stale/job_never_succeeded.
+    # reflection is excluded (its pulse is emitted by the awareness loop, so it
+    # re-detects awareness/DB liveness, not reflection-engine death); awareness
+    # has its own more-precise ``awareness:tick_overdue`` alert above. ego →
+    # CRITICAL (a dead ego scheduler is the failure this batch began with), the
+    # rest → WARNING. Coverage cap: the ~90 non-pulse scheduled jobs get ONLY the
+    # failure-gap signals above — no durable per-job schedule source exists to
+    # detect their stopped-firing (in-memory jobstore; IntervalTrigger resets on
+    # restart). The shared ``compute_heartbeat_staleness`` reads the same signal
+    # the ego dashboard tile does, so alert and tile can never disagree.
+    try:
+        from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+        for _hb_name in ("ego", "surplus", "inbox", "dashboard", "outreach"):
+            _hb = await compute_heartbeat_staleness(_hb_name)
+            if _hb.get("status") != "overdue":
+                continue  # alive / no_heartbeat (empty-state) / unknown → no alert
+            _age = int(_hb.get("age_seconds") or 0)
+            _last_seen = str(_hb.get("last_seen") or "")[:19]
+            alert_id = f"subsystem_stale:{_hb_name}"
+            alerts.append(
+                {
+                    "id": alert_id,
+                    "severity": "CRITICAL" if _hb_name == "ego" else "WARNING",
+                    "message": (
+                        f"Subsystem '{_hb_name}' heartbeat overdue — no pulse in "
+                        f"{_age}s (last seen {_last_seen}); its scheduler/loop may "
+                        f"have died"
+                    ),
+                }
+            )
+            current_ids.add(alert_id)
+    except Exception:
+        # Own try/except so a pulse-staleness read failure can't blind the other
+        # alert blocks; ERROR-logged (never a silent green).
+        logger.error("Subsystem pulse-staleness alert check failed", exc_info=True)
+
     # ── Genesis update available ─────────────────────────────────────
     if _service and _service._db:
         try:

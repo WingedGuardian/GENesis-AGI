@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -360,4 +361,88 @@ class TestEgoRevisionGuard:
                 json={"status": "approved", "revision_num": 2},
             )
         assert resp.status_code == 404
+
+
+# ── /api/genesis/ego/status — heartbeat total-cessation tile signal ──────────
+
+_EGO_CONFIG = SimpleNamespace(
+    enabled=True, model="opus", default_effort="high",
+    morning_report_effort="high", cadence_minutes=90, max_interval_minutes=4320,
+    morning_report_enabled=True, genesis_cadence_minutes=90,
+    genesis_max_interval_minutes=4320, shadow_morning_report=False, board_size=5,
+)
+
+
+def _status_response(client, *, hb_return=None, hb_side_effect=None):
+    """Hit /ego/status with the ego-heartbeat-staleness read stubbed.
+
+    Mirrors the full ego_status dependency surface so the endpoint returns 200
+    and we can assert the new top-level heartbeat fields are wired into the JSON.
+    """
+    rt = _mock_runtime()
+    rt._genesis_ego_cadence_manager = None  # keep the cadence snapshot JSON-safe
+    hb_mock = (
+        AsyncMock(side_effect=hb_side_effect)
+        if hb_side_effect is not None
+        else AsyncMock(return_value=hb_return)
+    )
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.ego.config.load_ego_config", return_value=_EGO_CONFIG),
+        patch("genesis.db.crud.ego.daily_ego_cost", new=AsyncMock(return_value=0.0)),
+        patch("genesis.db.crud.ego.get_state", new=AsyncMock(return_value=None)),
+        patch("genesis.db.crud.ego.list_recent_cycles", new=AsyncMock(return_value=[])),
+        patch("genesis.db.crud.ego.list_pending_proposals", new=AsyncMock(return_value=[])),
+        patch("genesis.db.crud.ego.count_uncompacted", new=AsyncMock(return_value=0)),
+        patch("genesis.db.crud.ego.daily_dispatch_cost", new=AsyncMock(return_value=0.0)),
+        patch("genesis.db.crud.ego.rolling_daily_ego_cost", new=AsyncMock(return_value=0.0)),
+        patch("genesis.db.crud.ego.has_pending_cli_approval", new=AsyncMock(return_value=False)),
+        patch("genesis.mcp.health.manifest.compute_heartbeat_staleness", new=hb_mock),
+    ):
+        MockRT.instance.return_value = rt
+        return client.get("/api/genesis/ego/status")
+
+
+class TestEgoStatusHeartbeat:
+    """The ego tile flips red on scheduler-death (heartbeat staleness), fails
+    loud on a broken read, and never false-reds a fresh install."""
+
+    def test_alive_heartbeat_not_stale(self, client):
+        resp = _status_response(
+            client, hb_return={"status": "alive", "age_seconds": 12.0, "last_seen": "x"}
+        )
+        data = resp.get_json()
+        assert data["ego_heartbeat_stale"] is False
+        assert data["ego_heartbeat_error"] is False
+        assert data["ego_heartbeat_age_s"] == 12.0
+
+    def test_overdue_heartbeat_is_stale(self, client):
+        resp = _status_response(
+            client, hb_return={"status": "overdue", "age_seconds": 18000.0, "last_seen": "x"}
+        )
+        data = resp.get_json()
+        assert data["ego_heartbeat_stale"] is True
+        assert data["ego_heartbeat_error"] is False
+
+    def test_no_heartbeat_empty_state_not_stale(self, client):
+        resp = _status_response(
+            client, hb_return={"status": "no_heartbeat", "last_seen": None}
+        )
+        data = resp.get_json()
+        assert data["ego_heartbeat_stale"] is False
+        assert data["ego_heartbeat_error"] is False
+
+    def test_unknown_status_is_error(self, client):
+        resp = _status_response(
+            client, hb_return={"status": "unknown", "last_seen": "bad"}
+        )
+        data = resp.get_json()
+        assert data["ego_heartbeat_error"] is True
+        assert data["ego_heartbeat_stale"] is False
+
+    def test_read_exception_fails_loud(self, client):
+        resp = _status_response(client, hb_side_effect=RuntimeError("db down"))
+        data = resp.get_json()
+        assert data["ego_heartbeat_error"] is True
+        assert data["ego_heartbeat_stale"] is False
 
