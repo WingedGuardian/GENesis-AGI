@@ -9,6 +9,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **A per-prompt nudge when a session's memory MCP is running stale code.** Each
+  Claude Code session's MCP subprocesses snapshot their code at spawn and never
+  reload, so a deploy landing mid-session leaves recall — and its current security
+  read-exclusions — on the old code until the session restarts (there is no
+  auto-restart). The UserPromptSubmit hook now emits a one-line nudge when this
+  session's MCP predates the last successful deploy, reusing the exact
+  `commit_identity.is_stale` verdict the dashboard stale-code badge uses (a session
+  *ahead* of the deploy, e.g. a manual `git pull`, is never flagged). Throttled per
+  session and fail-open: a fresh session stays silent, and any read/parse miss emits
+  nothing.
+
 ### Fixed
 
 - **The dashboard Surplus health tile no longer reads green while the surplus
