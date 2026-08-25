@@ -467,3 +467,27 @@ def test_has_top_level_pipe_case_pattern_is_known_residual():
     # by the shared scanner, so it reads as a pipe. Accepted for a convenience guard
     # (worst case: an over-block the user reworks, never a security bypass).
     assert sp.has_top_level_pipe("case $x in a|b) echo hi;; esac") is True
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "x=$(cat a | b)",  # $() output is captured, not streamed to bg stdout
+        "echo $(seq 1 3 | tail -1)",
+        "x=`cat a | b`",  # backtick substitution
+        "RESULT=$(gh api foo | jq .name)",  # the common idiom
+    ],
+)
+def test_has_top_level_pipe_substitution_is_not_a_bg_pipe(cmd):
+    assert sp.has_top_level_pipe(cmd) is False
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "$(cmd) | filter",  # a REAL pipe after a substitution closes
+        "(cat a | b)",  # a bare subshell DOES stream to the bg stdout
+    ],
+)
+def test_has_top_level_pipe_real_pipe_around_substitution(cmd):
+    assert sp.has_top_level_pipe(cmd) is True
