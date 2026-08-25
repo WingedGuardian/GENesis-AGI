@@ -129,6 +129,51 @@ async def test_staleness_uses_freshest_of_db_and_ring(db):
 
 
 @pytest.mark.asyncio
+async def test_corrupt_future_row_does_not_hide_valid_pulse(db):
+    """A materially-future heartbeat sorts FIRST under the events table's TEXT
+    ORDER BY, but the window scan still finds the newest valid pulse beneath it →
+    alive, never a stuck/never-resolving verdict off the bad row (#9)."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    await _seed_heartbeat(db, "ego", age_seconds=-100 * 365 * 86400)  # ~century in future
+    await _seed_heartbeat(db, "ego", age_seconds=30)  # fresh valid pulse beneath it
+    hb = await compute_heartbeat_staleness("ego", db=db)
+    assert hb["status"] == "alive"
+
+
+@pytest.mark.asyncio
+async def test_naive_timestamp_normalized_not_crash(db):
+    """A naive (tz-less) heartbeat timestamp is normalized to UTC by the shared
+    parser, not a TypeError that breaks the whole helper (#8)."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    naive = datetime.now(UTC).replace(tzinfo=None).isoformat()  # no offset
+    await db.execute(
+        "INSERT INTO events (id, timestamp, subsystem, severity, event_type, "
+        "message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("n1", naive, "ego", "debug", "heartbeat", "naive", naive),
+    )
+    await db.commit()
+    hb = await compute_heartbeat_staleness("ego", db=db)
+    assert hb["status"] == "alive"  # normalized + recent → alive, not unknown/crash
+
+
+def test_read_global_paused_reads_persisted_file(tmp_path):
+    """_read_global_paused reads the persisted pause file (the cross-process source
+    of truth), NOT the in-memory runtime singleton — so the pause-guard works in the
+    standalone health MCP where no GenesisRuntime is bootstrapped (#7)."""
+    from genesis.mcp.health import manifest as _m
+
+    pf = tmp_path / "paused.json"
+    with patch.object(_m, "_PAUSE_FILE", pf):
+        assert _m._read_global_paused() is False  # absent file → not paused
+        pf.write_text('{"paused": true}')
+        assert _m._read_global_paused() is True
+        pf.write_text('{"paused": false}')
+        assert _m._read_global_paused() is False
+
+
+@pytest.mark.asyncio
 async def test_staleness_unknown_subsystem_is_no_heartbeat(db):
     """A name not in the threshold table degrades to no_heartbeat, never raises."""
     from genesis.mcp.health.manifest import compute_heartbeat_staleness
@@ -263,22 +308,19 @@ def _snapshot():
 async def _run_alerts_with_db(db, *, paused: bool = False):
     """Run the real _compute_alerts path with `db` as the health service DB.
 
-    ``paused`` patches the runtime pause flag the helper reads for pause-gated
-    subsystems (deterministic — never depends on a leaked singleton).
+    ``paused`` stubs the persisted-pause read the helper uses for pause-gated
+    subsystems (deterministic — never touches the real ~/.genesis/paused.json).
     """
-    from genesis.runtime._core import GenesisRuntime
-
     svc = MagicMock()
     svc._db = db
     svc.snapshot = AsyncMock(return_value=_snapshot())
-    stub_rt = SimpleNamespace(paused=paused)
     with (
         patch("genesis.mcp.health_mcp._service", svc),
         patch("genesis.mcp.health_mcp._activity_tracker", None),
         patch("genesis.mcp.health_mcp._job_retry_registry", None),
         patch("genesis.mcp.health_mcp._alert_history", {}),
         patch("genesis.mcp.health_mcp._event_bus", None),
-        patch.object(GenesisRuntime, "peek", return_value=stub_rt),
+        patch("genesis.mcp.health.manifest._read_global_paused", return_value=paused),
     ):
         from genesis.mcp.health.errors import _impl_health_alerts
 
@@ -470,19 +512,16 @@ async def test_read_error_preserves_open_alert(db):
 async def _compute_alerts_with_hb_side_effect(db, side_effect):
     """Run the real _compute_alerts with compute_heartbeat_staleness stubbed to
     `side_effect` (e.g. raise for one subsystem). Returns (alerts, current_ids)."""
-    from genesis.runtime._core import GenesisRuntime
-
     svc = MagicMock()
     svc._db = db
     svc.snapshot = AsyncMock(return_value=_snapshot())
-    stub_rt = SimpleNamespace(paused=False)
     with (
         patch("genesis.mcp.health_mcp._service", svc),
         patch("genesis.mcp.health_mcp._activity_tracker", None),
         patch("genesis.mcp.health_mcp._job_retry_registry", None),
         patch("genesis.mcp.health_mcp._alert_history", {}),
         patch("genesis.mcp.health_mcp._event_bus", None),
-        patch.object(GenesisRuntime, "peek", return_value=stub_rt),
+        patch("genesis.mcp.health.manifest._read_global_paused", return_value=False),
         patch(
             "genesis.mcp.health.manifest.compute_heartbeat_staleness",
             new=AsyncMock(side_effect=side_effect),

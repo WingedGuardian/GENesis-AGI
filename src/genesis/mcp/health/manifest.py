@@ -12,6 +12,7 @@ import aiosqlite
 from genesis.env import db_busy_timeout_ms
 from genesis.mcp.health import mcp  # noqa: E402
 from genesis.mcp.health.constants import JOB_STALE_GAP_DAYS
+from genesis.observability.liveness import FUTURE_SKEW_TOLERANCE_MINUTES, parse_iso_utc
 
 logger = logging.getLogger(__name__)
 
@@ -182,59 +183,62 @@ HEARTBEAT_EXPECTED = {
 # a genuine scheduler death that must still surface. See compute_heartbeat_staleness.
 _PAUSE_GATED_HEARTBEATS = frozenset({"surplus", "inbox"})
 
-# A heartbeat more than this far in the FUTURE (clock skew / corrupt row) cannot
-# confirm liveness → verdict "unknown", never a false "alive" from a negative age.
-# Mirrors observability/liveness.py FUTURE_SKEW_TOLERANCE_MINUTES (kept local to
-# avoid an import cycle into that module from the health manifest).
-_FUTURE_SKEW_TOLERANCE_S = 5 * 60
+# How many recent heartbeat rows to scan for the newest USABLE pulse. >1 so a few
+# unparseable / materially-future rows (which sort FIRST under the events table's
+# TEXT ``ORDER BY timestamp DESC`` — a "2099-.." or "not-a-date" value) can't hide
+# the valid pulses beneath them and pin a LIMIT-1 read on a bad row forever (#9). A
+# window with NO valid non-future row → ``unknown`` (corrupt) or ``no_heartbeat``
+# (empty), never a spurious verdict off the bad row. Residual (bounded, surfaced,
+# not silent): if MORE than this many future/unparseable rows sort ahead of the
+# newest valid pulse it reads ``unknown`` until they age out — needs sustained
+# future-timestamp corruption, which the keep-latest GC otherwise bounds.
+_HEARTBEAT_SCAN_LIMIT = 25
+
+# Path of the cross-process pause file (single source of truth for pause; the
+# standalone health MCP has no bootstrapped GenesisRuntime, so peek() is None there).
+_PAUSE_FILE = Path.home() / ".genesis" / "paused.json"
 
 
 def _read_global_paused() -> bool:
-    """Best-effort read of the global runtime pause flag (never constructs a
-    zombie singleton; defaults to NOT-paused so a read failure surfaces the
-    alert rather than silently masking a real death)."""
-    try:
-        from genesis.runtime import GenesisRuntime
+    """Global pause state, read cross-process-safe from the persisted pause file.
 
-        rt = GenesisRuntime.peek()
-        return bool(rt.paused) if rt is not None else False
+    Pause is persisted to ``~/.genesis/paused.json`` (present with ``paused:true``
+    when paused, ABSENT when not — see runtime/_pause_state.py) — the source of
+    truth EVERY process sees, including the standalone health MCP, whose
+    ``StandaloneHealthDataService`` has no bootstrapped GenesisRuntime (so a
+    runtime-singleton read would always return not-paused there and false-alarm a
+    paused subsystem). Absent file / read error → not-paused, so a read failure
+    surfaces the alert (fail-loud) rather than masking a real death."""
+    try:
+        if not _PAUSE_FILE.exists():
+            return False
+        import json
+
+        return bool(json.loads(_PAUSE_FILE.read_text()).get("paused", False))
     except Exception:
         logger.debug("global pause read failed; treating as not-paused", exc_info=True)
         return False
 
 
-def _freshest_timestamp(
-    a: str | None, b: str | None, *, not_after: datetime | None = None
-) -> str | None:
-    """Return the freshest USABLE ISO timestamp (tolerant of None/unparseable).
+def _newest_valid_ts(candidates_newest_first, *, now: datetime) -> tuple[str | None, bool]:
+    """Pick the newest USABLE heartbeat ISO from an ordered (newest-first) iterable.
 
-    The durable ``events`` row and the in-memory event-bus ring can each hold the
-    newest pulse — the ring updates synchronously while the DB persists
-    fire-and-forget, so a fresh pulse can live only in the ring for a moment. Take
-    the freshest so a DB-lagged read never false-REDs a live subsystem (P2-2).
-
-    ``not_after`` (typically now + skew tolerance) marks a value as materially
-    future/corrupt: such a candidate must NOT win over a valid non-future one, or a
-    corrupt future DB row would mask a fresh ring pulse and yield a false "unknown".
-    A future/unparseable value is returned ONLY as a last resort (sole candidate),
-    so the caller still surfaces "unknown" rather than a spurious "alive"."""
-    best: str | None = None  # freshest qualifying (parseable, not materially-future)
-    best_dt: datetime | None = None
-    fallback: str | None = None  # any value at all, if nothing qualifies
-    for ts in (a, b):
-        if not ts:
+    Returns ``(iso, saw_any)``: *iso* is the newest candidate that parses to an aware
+    UTC datetime no more than the skew tolerance in the future (the shared
+    ``parse_iso_utc`` normalizes naive values, fixing mixed-awareness TypeErrors);
+    *saw_any* is True iff any candidate string was seen at all (used to tell a
+    corrupt-but-present pulse — ``unknown`` — from a fresh install — ``no_heartbeat``).
+    A materially-future or unparseable candidate is skipped, never chosen."""
+    bound = now + timedelta(minutes=FUTURE_SKEW_TOLERANCE_MINUTES)
+    saw_any = False
+    for iso in candidates_newest_first:
+        if not iso:
             continue
-        if fallback is None:
-            fallback = ts
-        try:
-            dt = datetime.fromisoformat(ts)
-        except (ValueError, TypeError):
-            continue
-        if not_after is not None and dt > not_after:
-            continue  # materially-future/corrupt → never beats a valid non-future one
-        if best_dt is None or dt > best_dt:
-            best, best_dt = ts, dt
-    return best if best is not None else fallback
+        saw_any = True
+        dt = parse_iso_utc(iso)
+        if dt is not None and dt <= bound:
+            return iso, saw_any
+    return None, saw_any
 
 
 async def compute_heartbeat_staleness(
@@ -283,16 +287,26 @@ async def compute_heartbeat_staleness(
         db = _service._db if _service else None
     _event_bus = health_mcp_mod._event_bus
 
-    db_ts = None
+    _now = datetime.now(UTC)
+
+    # Durable candidates: a WINDOW of the newest heartbeat rows (not just LIMIT 1).
+    # A corrupt / materially-future timestamp sorts FIRST under the events table's
+    # TEXT ``ORDER BY timestamp DESC``, so a single-row read could pin the verdict on
+    # a bad row forever; scanning a window lets ``_newest_valid_ts`` skip past the bad
+    # rows to the newest genuinely-usable pulse (#9). A window with only future /
+    # unparseable rows → unknown (surfaced, per the liveness contract), never silent.
+    db_candidates: list[str | None] = []
     if db is not None:
         try:
             from genesis.db.crud import events as events_crud
 
             rows = await events_crud.query(
-                db, subsystem=name, event_type="heartbeat", limit=1
+                db,
+                subsystem=name,
+                event_type="heartbeat",
+                limit=_HEARTBEAT_SCAN_LIMIT,
             )
-            if rows:
-                db_ts = rows[0].get("timestamp")
+            db_candidates = [r.get("timestamp") for r in rows]
         except (aiosqlite.Error, ImportError, AttributeError, TimeoutError):
             # Narrow catch: DB query failure (aiosqlite.Error, TimeoutError),
             # broken import chain (ImportError), or malformed row shape
@@ -308,7 +322,9 @@ async def compute_heartbeat_staleness(
             if raise_on_error:
                 raise
 
-    ring_ts = None
+    # In-memory ring: a fresher not-yet-persisted pulse (the DB write is async),
+    # newest-first.
+    ring_candidates: list[str | None] = []
     if _event_bus is not None and hasattr(_event_bus, "_ring"):
         for event in reversed(_event_bus._ring):
             sub_val = (
@@ -317,29 +333,30 @@ async def compute_heartbeat_staleness(
                 else str(event.subsystem)
             )
             if sub_val == name and event.event_type == "heartbeat":
-                ring_ts = event.timestamp
-                break
+                ring_candidates.append(event.timestamp)
 
-    # Use the freshest of the durable row and the in-memory ring — a DB-lagged
-    # read must never false-RED a subsystem that just pulsed (P2-2) — but a corrupt
-    # future row must not mask a valid fresh pulse, so exclude materially-future
-    # candidates from winning (N-2).
-    _now = datetime.now(UTC)
-    last_ts = _freshest_timestamp(
-        db_ts, ring_ts, not_after=_now + timedelta(seconds=_FUTURE_SKEW_TOLERANCE_S)
-    )
+    # Newest USABLE pulse across both sources — freshest wins (P2-2), naive values
+    # normalized (fixes mixed-awareness TypeError), materially-future / unparseable
+    # skipped. saw_* records whether a candidate string existed at all, so a
+    # corrupt-but-present pulse (unknown) is told from a fresh install (no_heartbeat).
+    db_ts, saw_db = _newest_valid_ts(db_candidates, now=_now)
+    ring_ts, saw_ring = _newest_valid_ts(ring_candidates, now=_now)
+    last_ts = None
+    last_dt: datetime | None = None
+    for cand in (db_ts, ring_ts):
+        if cand is None:
+            continue
+        cand_dt = parse_iso_utc(cand)
+        if cand_dt is not None and (last_dt is None or cand_dt > last_dt):
+            last_ts, last_dt = cand, cand_dt
 
-    if last_ts is None:
-        return {"status": "no_heartbeat", "last_seen": None}
-    try:
-        age_s = (_now - datetime.fromisoformat(last_ts)).total_seconds()
-    except (ValueError, TypeError):
-        return {"status": "unknown", "last_seen": last_ts}
+    if last_ts is None or last_dt is None:
+        # No usable pulse. A candidate WAS present but unusable → unknown (can't
+        # confirm liveness); nothing at all → no_heartbeat (fresh-install empty-state).
+        status = "unknown" if (saw_db or saw_ring) else "no_heartbeat"
+        return {"status": status, "last_seen": None}
 
-    # A pulse materially in the future (clock skew / corrupt row) cannot confirm
-    # liveness → unknown, never a false "alive" from a negative age (P2-3).
-    if age_s < -_FUTURE_SKEW_TOLERANCE_S:
-        return {"status": "unknown", "last_seen": last_ts}
+    age_s = (_now - last_dt).total_seconds()
 
     if age_s <= overdue_s:
         return {"status": "alive", "last_seen": last_ts, "age_seconds": round(age_s, 1)}
