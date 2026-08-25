@@ -942,10 +942,6 @@
                         </span>
                       </div>
                     </template>
-                    <div style="display: flex; gap: 1rem; margin-top: 0.4rem; opacity: 0.8; font-size: 0.7rem;">
-                      <span x-text="'Points written/24h: ' + (v.qdrant?.embedded_24h ?? '—')"></span>
-                      <span x-text="'Pending queue: ' + (v.qdrant?.pending_queue ?? '—')"></span>
-                    </div>
                     <template x-if="(v.qdrant?.warnings || []).length > 0">
                       <div style="margin-top: 0.4rem;">
                         <template x-for="w in v.qdrant.warnings" :key="w">
@@ -955,6 +951,17 @@
                       </div>
                     </template>
                   </div>
+                </template>
+                <!-- Embedding throughput is read from SQLite — a DIFFERENT dependency
+                     than Qdrant reachability — so it renders regardless of the Qdrant
+                     error state and surfaces its own throughput_error. -->
+                <div style="display: flex; gap: 1rem; margin-top: 0.4rem; opacity: 0.8; font-size: 0.7rem;">
+                  <span x-text="'Points written/24h: ' + (v.qdrant?.embedded_24h ?? '—')"></span>
+                  <span x-text="'Pending queue: ' + (v.qdrant?.pending_queue ?? '—')"></span>
+                </div>
+                <template x-if="v.qdrant?.throughput_error">
+                  <div style="font-size: 0.68rem; color: #f0ad4e; margin-top: 0.2rem;"
+                       x-text="'Throughput unavailable: ' + v.qdrant.throughput_error"></div>
                 </template>
               </div>
             </div>

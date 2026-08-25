@@ -19,6 +19,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   error, and fails loud (`unknown`) if the liveness data can't be read, never green.
   Thresholds are conservative (3h floor) so a normal quiet system never false-alarms.
 
+- **The Errors view no longer shows a clean "0 errors" when a data source is
+  actually down.** The unified-errors endpoint queried each source (events, dead
+  letters, deferred work, resolutions, alerts) behind a silent catch, so a DB/FTS
+  outage returned HTTP 200 with zero counts and read as "data is clean". It now
+  reports which sources failed (`partial` / `sources_failed`); the Errors tab shows
+  a "data may be incomplete" banner and suppresses the clean-state check, and the
+  overview attention list flags the degrade.
+- **Operational Vitals no longer reports embedding throughput as `0` on a query
+  failure.** A failed SQLite read for "Points written/24h" / "Pending queue"
+  previously wrote a literal `0`, indistinguishable from a real zero. It now
+  degrades to `—` with a `throughput_error` reason, distinct from Qdrant
+  reachability.
+- **A scheduler-heartbeat probe that cannot evaluate now surfaces a WARNING event
+  instead of failing silent.** The probe's exception path previously returned
+  `healthy` with no signal; it now emits a WARNING (visible on the Errors tab)
+  while deliberately keeping the probe result `healthy`, so the remediation engine
+  does not treat "can't evaluate" as a downed scheduler and page hourly.
+
 ### Changed
 
 - **Executor Gate 2 (`17_executor_review`) leads with paid DeepSeek V4-pro.**

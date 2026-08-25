@@ -148,7 +148,18 @@ async def operational_vitals():
 
 async def _build_qdrant_section(rt) -> dict:
     """Qdrant vector store: collections, points, real embedding throughput."""
-    section: dict = {"collections": [], "total_points": 0, "error": None}
+    # pending_queue/embedded_24h read from SQLite (a DIFFERENT dependency than
+    # Qdrant reachability, tracked by `error`); throughput_error surfaces a SQLite
+    # read failure so a failed query renders "—" + a reason, never a literal 0 that
+    # is indistinguishable from a real zero.
+    section: dict = {
+        "collections": [],
+        "total_points": 0,
+        "error": None,
+        "pending_queue": None,
+        "embedded_24h": None,
+        "throughput_error": None,
+    }
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             collections_url = qdrant_collections_url()
@@ -210,7 +221,9 @@ async def _build_qdrant_section(rt) -> dict:
             row = await cursor.fetchone()
             section["pending_queue"] = row[0] if row else 0
         except Exception:
-            pass
+            section["pending_queue"] = None
+            section["throughput_error"] = "query failed"
+            logger.warning("Failed to query pending_embeddings queue", exc_info=True)
 
         # Real embedding throughput from activity_log (not just pending_embeddings)
         try:
@@ -222,7 +235,9 @@ async def _build_qdrant_section(rt) -> dict:
             row = await cursor.fetchone()
             section["embedded_24h"] = row[0] if row else 0
         except Exception:
-            section["embedded_24h"] = 0
+            section["embedded_24h"] = None
+            section["throughput_error"] = "query failed"
+            logger.warning("Failed to query embedding throughput", exc_info=True)
 
     return section
 
