@@ -725,6 +725,136 @@ async def test_db_floor_reads_path_with_uri_reserved_char(
 
 
 @pytest.mark.asyncio
+async def test_db_floor_skips_malformed_row(
+    writer: ResponseWriter, tmp_path: Path, monkeypatch,
+):
+    """Codex P2: a BLOB / non-str response_path row must be skipped, not crash
+    the floor and fail the response write."""
+    db = tmp_path / "floor.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE inbox_items (response_path)")  # no affinity
+    conn.execute("INSERT INTO inbox_items VALUES (?)", (b"\x00\x01binary",))
+    conn.execute("INSERT INTO inbox_items VALUES (?)", ("/x/doc-118.genesis.md",))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr("genesis.env.genesis_db_path", lambda: db)
+
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    p = await writer.write_response(
+        batch_id="mr", source_files=[str(source)],
+        evaluation_text="a", item_count=1,
+    )
+    assert p.name == "doc-119.genesis.md", (
+        f"got {p.name}: a malformed DB row broke the floor (expected the good "
+        "row doc-118 to still be honored)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_response_file_has_standard_perms(
+    writer: ResponseWriter, tmp_path: Path,
+):
+    """Codex P2: the published response must carry umask-derived perms (as an
+    ordinary write would), not mkstemp's owner-only 0o600."""
+    from genesis.inbox import writer as writer_mod
+
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    p = await writer.write_response(
+        batch_id="pm", source_files=[str(source)],
+        evaluation_text="a", item_count=1,
+    )
+    expected = 0o666 & ~writer_mod._UMASK
+    assert (p.stat().st_mode & 0o777) == expected, (
+        f"perms {oct(p.stat().st_mode & 0o777)} != {oct(expected)} "
+        "(mkstemp's 0o600 leaked to the response)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_chmod_failure_does_not_fail_write(
+    writer: ResponseWriter, tmp_path: Path, monkeypatch,
+):
+    """Whole-class audit F1: the perms chmod is a best-effort optimization —
+    a chmod failure (e.g. a network/FUSE fs) must NOT fail the response write
+    (that would be baselined complete with no response)."""
+    real_chmod = os.chmod
+
+    def boom(path, *a, **k):
+        if str(path).endswith(".tmp") and ".genesis-tmp-" in str(path):
+            raise OSError("simulated chmod failure")
+        return real_chmod(path, *a, **k)
+
+    monkeypatch.setattr(os, "chmod", boom)
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    p = await writer.write_response(
+        batch_id="cf", source_files=[str(source)],
+        evaluation_text="a", item_count=1,
+    )
+    assert p.name == "doc-1.genesis.md" and p.exists(), (
+        "a chmod failure masked the response write"
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_writes_do_not_touch_process_umask(
+    writer: ResponseWriter, tmp_path: Path,
+):
+    """Whole-class audit F2: perms come from the import-time _UMASK snapshot,
+    never a per-write os.umask() (process-global — racy on the to_thread pool
+    and can permanently corrupt the process umask). Concurrent writes must
+    leave the live process umask untouched."""
+    import asyncio
+
+    before = os.umask(0o022)
+    os.umask(before)
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    await asyncio.gather(*[
+        writer.write_response(
+            batch_id=f"u{i}", source_files=[str(source)],
+            evaluation_text=str(i), item_count=1,
+        )
+        for i in range(6)
+    ])
+    after = os.umask(0o022)
+    os.umask(after)
+    assert after == before, (
+        f"process umask changed {oct(before)}→{oct(after)} during writes "
+        "(per-write os.umask race)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_tmp_cleanup_failure_does_not_mask_publish(
+    writer: ResponseWriter, tmp_path: Path, monkeypatch,
+):
+    """Codex P2: a failed tmp unlink after a successful os.link must not mask
+    the already-published response."""
+    import pathlib
+
+    real_unlink = pathlib.Path.unlink
+
+    def boom(self, *args, **kwargs):
+        if self.name.startswith(".genesis-tmp-"):
+            raise OSError("simulated unlink failure")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", boom)
+    source = tmp_path / "doc.md"
+    source.write_text("x")
+    p = await writer.write_response(
+        batch_id="cm", source_files=[str(source)],
+        evaluation_text="a", item_count=1,
+    )
+    assert p.name == "doc-1.genesis.md" and p.exists(), (
+        "a tmp-cleanup failure masked a successfully published response"
+    )
+
+
+@pytest.mark.asyncio
 async def test_legacy_in_mirror_counter_still_honored(
     writer: ResponseWriter, tmp_path: Path,
 ):

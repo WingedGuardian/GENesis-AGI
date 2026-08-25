@@ -42,6 +42,14 @@ _COUNTER_LOCK = threading.Lock()
 # contention (or a wedged filesystem), where failing loud beats spinning.
 _ALLOC_MAX_RETRIES = 50
 
+# Process umask, read ONCE at import (single-threaded). os.umask is a
+# process-global getter-by-setter: reading it per-write on the to_thread pool
+# would race (wrong perms) and could permanently clobber the process umask for
+# every unrelated file the server writes. Runtime umask changes are effectively
+# never, so an import-time snapshot is correct in practice.
+_UMASK = os.umask(0o022)
+os.umask(_UMASK)
+
 
 def _counter_store_path() -> Path:
     """Durable counter store, OUTSIDE the vault-sync mirror.
@@ -139,11 +147,25 @@ class ResponseWriter:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(body)
+            # mkstemp forces 0o600; the published response (a hardlink to this
+            # inode) should carry the perms an ordinary write would (umask-
+            # derived, from the import-time snapshot — never read os.umask here,
+            # it is process-global and races on the to_thread pool). Best-effort:
+            # a chmod failure (e.g. a network/FUSE fs) must NEVER fail the write.
+            try:
+                os.chmod(tmp_path, 0o666 & ~_UMASK)
+            except OSError:
+                logger.warning(
+                    "Could not set response perms on %s (best-effort)",
+                    tmp_path, exc_info=True,
+                )
             for _ in range(_ALLOC_MAX_RETRIES):
                 next_num = _next_counter(base_dir, stem, suffix)
                 target = base_dir / f"{stem}-{next_num}{suffix}"
                 try:
-                    os.link(str(tmp_path), str(target))  # atomic; ENOENT-safe
+                    # atomic create-or-fail: EEXIST → retry; other errno
+                    # (ENOSPC/EMLINK/EXDEV/EACCES) propagate and fail loud.
+                    os.link(str(tmp_path), str(target))
                 except FileExistsError:
                     continue  # another writer took this number — re-derive
                 return target
@@ -152,7 +174,14 @@ class ResponseWriter:
                 f"after {_ALLOC_MAX_RETRIES} attempts",
             )
         finally:
-            tmp_path.unlink(missing_ok=True)
+            # Best-effort cleanup: a failed tmp unlink must NEVER mask an
+            # already-published response (os.link succeeded → the file exists).
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "Could not remove allocation tmp %s", tmp_path, exc_info=True,
+                )
 
 
 def _db_floor(directory: Path, base_name: str, suffix: str) -> int:
@@ -197,14 +226,15 @@ def _db_floor(directory: Path, base_name: str, suffix: str) -> int:
         )
         return 0
     for (rp,) in rows:
-        name = Path(rp).name
-        if not name.startswith(prefix) or not name.endswith(suffix):
-            continue
-        num_part = name.removesuffix(suffix)[len(prefix):]
+        # A single malformed row (a BLOB/non-str response_path) must never
+        # crash the whole floor and fail the response write — skip it.
         try:
-            floor = max(floor, int(num_part))
-        except ValueError:
-            continue  # non-numeric suffix, ignore
+            name = Path(rp).name
+            if not name.startswith(prefix) or not name.endswith(suffix):
+                continue
+            floor = max(floor, int(name.removesuffix(suffix)[len(prefix):]))
+        except (TypeError, ValueError, OSError):
+            continue  # non-str path or non-numeric suffix — ignore
     return floor
 
 
