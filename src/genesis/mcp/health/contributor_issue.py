@@ -6,9 +6,16 @@ GitHub issue and calls this tool. Here — NOT in the untrusted curator subproce
 — the draft passes the fail-closed prose sanitizer
 (:func:`genesis.contribution.scan_prose`), and only if clean is it parked in
 ``pending_issue_posts`` (status='held') with a linked ``approval_requests`` row.
-The owner reviews the FULL body + approves/rejects per item on the dashboard; a
-separate poster drain (``contributor_issue_watcher``) posts it below the gate on
-approval (in ``live`` mode) or dry-runs it (in ``propose_only``).
+By default the owner reviews the FULL body + approves/rejects per item on the
+dashboard; a separate poster drain (``contributor_issue_watcher``) posts it below
+the gate on approval (in ``live`` mode) or dry-runs it (in ``propose_only``).
+
+Autonomous posture (this install's opt-in): when ``require_approval`` is false,
+this tool resolves its OWN approval server-side (``resolved_by=
+"genesis:contributor-worklog"``) so the drain posts without a human — Genesis is
+the vetting authority (``scan_prose`` here + the curator's rewrite + the
+``max_posts_per_day`` drain cap). The row never sits ``pending``, so nothing
+surfaces as an owner approval request.
 
 Mirrors the WS-8 email autonomy gate exactly (two-row create, approval FIRST so
 a crash never orphans a hold). DB access mirrors ``evo_run`` — the long-lived
@@ -34,7 +41,9 @@ from genesis.autonomy.contributor_worklog_config import (
     knob_int,
     load_config,
     normalize_title,
+    require_approval,
 )
+from genesis.autonomy.types import ApprovalStatus
 from genesis.contribution import scan_prose
 from genesis.contribution.findings import Severity
 from genesis.db.crud import pending_issue_posts as pip
@@ -75,6 +84,20 @@ async def _impl_contributor_issue_propose(
     repo = (repo or "").strip() or _default_repo()
     if "/" not in repo:
         return {"status": "error", "reason": f"repo must be owner/name, got {repo!r}"}
+    # Autonomous posture (require_approval off): the untrusted curator's repo
+    # override loses its human-review backstop, so pin the destination to this
+    # install's configured public repo — Genesis vets DESTINATION, not just content.
+    human_required = require_approval()
+    if not human_required:
+        default_repo = _default_repo()
+        if repo != default_repo:
+            logger.warning(
+                "contributor_issue_propose: autonomous mode ignores curator repo "
+                "override %r → pinning to %r",
+                repo,
+                default_repo,
+            )
+            repo = default_repo
     source_ref = (source_follow_up_id or "").strip() or None
     label_list = [str(x).strip() for x in (labels or []) if str(x).strip()]
 
@@ -161,20 +184,54 @@ async def _impl_contributor_issue_propose(
         mode,
         source,
     )
+
+    # Autonomous (Genesis-vetted) posture — resolve our OWN approval server-side so
+    # the drain treats the hold as approved without a human in the loop. FAIL-CLOSED:
+    # only an explicit ``require_approval: false`` in this install's overlay reaches
+    # here; every other value keeps the human gate (require_approval() default True).
+    # scan_prose already passed above (the fail-closed privacy gate); the curator
+    # LLM's self-vetting + the ``max_posts_per_day`` drain cap are the remaining
+    # backstops. The row never sits ``pending``, so it never surfaces as an approval
+    # request on the dashboard / morning report. This is a POSTURE flag, NOT the stop
+    # switch — the brake is ``mode: off`` / the env kill (freezes the drain).
+    auto_approved = not human_required
+    # Fail-safe: if resolve() reports the row was not pending (impossible for a
+    # just-created timeout_seconds=None request, but guard anyway), leave it for a
+    # human rather than claim auto_approved — DB state and the returned message must
+    # never diverge. Short-circuit: resolve() is not called when the human gate is on.
+    if auto_approved and not await approval.resolve(
+        request_id,
+        status=ApprovalStatus.APPROVED,
+        resolved_by="genesis:contributor-worklog",
+    ):
+        logger.warning(
+            "contributor_issue_propose: auto-approve resolve failed for %s — left pending",
+            request_id,
+        )
+        auto_approved = False
+
+    if auto_approved:
+        message = (
+            "Auto-approved (Genesis-vetted); will post autonomously on the next "
+            "drain tick (live mode, within the daily cap)."
+            if mode == "live"
+            else "Auto-approved (Genesis-vetted) but propose_only — dry-run terminal, "
+            "not posted. Flip the lever to live to post."
+        )
+    else:
+        message = "Issue draft held for owner approval on the dashboard. " + (
+            "It will post on approval (live mode)."
+            if mode == "live"
+            else "On approval it is dry-run only (propose_only) — flip to live to post."
+        )
     return {
         "status": "held",
         "pending_id": pending_id,
         "request_id": request_id,
         "repo": repo,
         "mode": mode,
-        "message": (
-            "Issue draft held for owner approval on the dashboard. "
-            + (
-                "It will post on approval (live mode)."
-                if mode == "live"
-                else "On approval it is dry-run only (propose_only) — flip to live to post."
-            )
-        ),
+        "auto_approved": auto_approved,
+        "message": message,
     }
 
 

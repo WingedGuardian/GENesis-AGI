@@ -1314,13 +1314,14 @@ def _validate_contributor_worklog(changes: dict) -> list[str]:
     from genesis.autonomy.contributor_worklog_config import _INT_KNOBS, MODES
 
     errors: list[str] = []
-    valid_keys = ("enabled", "mode", *_INT_KNOBS)
+    _BOOL_KEYS = ("enabled", "require_approval")
+    valid_keys = (*_BOOL_KEYS, "mode", *_INT_KNOBS)
     for key, value in changes.items():
         if key not in valid_keys:
             errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
-        elif key == "enabled":
+        elif key in _BOOL_KEYS:
             if not isinstance(value, bool):
-                errors.append("'enabled' must be a boolean")
+                errors.append(f"'{key}' must be a boolean")
         elif key == "mode":
             if value not in MODES:
                 errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")

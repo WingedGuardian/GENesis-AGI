@@ -39,11 +39,13 @@ import json
 import logging
 import re
 import subprocess
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from genesis.autonomy import shadow_gate
 from genesis.autonomy.contributor_worklog_config import (
     effective_mode,
+    knob_int,
+    load_config,
     normalize_title,
 )
 from genesis.db.crud import approval_requests as approval_crud
@@ -150,7 +152,9 @@ def _labels_of(row: dict) -> list[str]:
         return []
 
 
-async def _resolve_approved(rt_db, row: dict, mode: str, now: str) -> bool:
+async def _resolve_approved(
+    rt_db, row: dict, mode: str, now: str, *, max_posts_per_day: int
+) -> bool:
     """Handle an approved hold. *mode* is the CURRENT lever (``effective_mode``
     at this tick); ``row['mode']`` is the lever STAMPED at propose time. Returns
     True iff the row was resolved (posted / dry-run / adopted); returns False
@@ -215,6 +219,26 @@ async def _resolve_approved(rt_db, row: dict, mode: str, now: str) -> bool:
             return True
         return False
 
+    # Cautious-rollout rate cap: bound real CREATEs per rolling 24h. Enforced HERE —
+    # AFTER the adopt branch (the ADOPTING row is never gated by the cap, so
+    # crash-recovery always reconciles; the real issue it reconciles still counts
+    # toward the window) and BEFORE the create. Re-counted per row from the durable
+    # ``posted`` rows, so N approved rows
+    # in one drain tick are correctly bounded (each ``mark_posted`` commits → the next
+    # row's count includes it) and the count survives a mid-window restart. At the cap
+    # → leave held, retry next window. ``max_posts_per_day`` is knob_int-coerced ≥ 1 by
+    # the caller, so a mistyped/0/negative value can never uncap the poster.
+    since = (datetime.fromisoformat(now) - timedelta(hours=24)).isoformat()
+    posted_recent = await pip.count_posted_since(rt_db, since=since)
+    if posted_recent >= max_posts_per_day:
+        logger.info(
+            "Contributor issue %s deferred — daily post cap reached (%d/%d in last 24h)",
+            row["id"],
+            posted_recent,
+            max_posts_per_day,
+        )
+        return False
+
     # Observe the egress, THEN post. mark_posted BEFORE mark_consumed so a crash
     # after the post can't re-post (the row leaves 'held').
     await shadow_gate.observe_github_issue_create(
@@ -249,6 +273,11 @@ async def drain_pending_issue_posts(rt: object) -> int:
     if mode == "off":
         return 0
 
+    # Rate-cap VALUE read once per tick (live, no cache); the per-row COUNT that
+    # actually enforces it lives in _resolve_approved. knob_int coerces a
+    # bad/0/negative value to a safe positive default — the cap can never be uncapped.
+    cap = knob_int(load_config(), "max_posts_per_day")
+
     resolved = 0
     for row in await pip.list_held(db):
         now = datetime.now(UTC).isoformat()
@@ -276,7 +305,7 @@ async def drain_pending_issue_posts(rt: object) -> int:
                     row["id"],
                 )
                 continue
-            if await _resolve_approved(db, row, mode, now):
+            if await _resolve_approved(db, row, mode, now, max_posts_per_day=cap):
                 resolved += 1
         elif status in ("rejected", "cancelled"):
             if await pip.mark_rejected(db, row["id"], rejected_at=now):

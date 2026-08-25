@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime
 
 import aiosqlite
 import pytest
@@ -327,3 +328,173 @@ async def test_off_mode_short_circuits(db, monkeypatch):
 async def test_no_db_returns_zero(monkeypatch):
     _mode(monkeypatch, "live")
     assert await ciw.drain_pending_issue_posts(_RT(None)) == 0
+
+
+# ── cautious-rollout rate cap (max_posts_per_day) ──────────────────────────
+
+
+def _cap(monkeypatch, n: int):
+    """Force the per-tick post cap to *n* (drain reads it via load_config)."""
+    monkeypatch.setattr(ciw, "load_config", lambda: {"max_posts_per_day": n})
+
+
+async def _seed_posted(db, *, title, posted_at):
+    """A row already POSTED (counts toward the rolling cap). No approval needed —
+    count_posted_since counts status='posted' directly."""
+    pid = str(uuid.uuid4())
+    await pip.create(
+        db,
+        id=pid,
+        request_id=str(uuid.uuid4()),
+        repo=_REPO,
+        title=title,
+        body="b",
+        source="codebase",
+        cell_domain="github",
+        cell_verb="issue_create",
+        cell_risk_class="bulk",
+        held_at="2026-08-07T00:00:00",
+        mode="live",
+    )
+    await pip.mark_posted(db, pid, issue_number=1, issue_url="u", posted_at=posted_at)
+    return pid
+
+
+@pytest.mark.asyncio
+async def test_rate_cap_defers_when_at_limit(db, monkeypatch):
+    """At the cap, a ready live row is NOT posted — left held to retry next window."""
+    _mode(monkeypatch, "live")
+    _cap(monkeypatch, 1)
+    gh = _FakeGh(list_out="[]")
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    await _seed_posted(db, title="Already posted today", posted_at=datetime.now(UTC).isoformat())
+    pid, rid, mgr = await _seed_held(db, title="Next in line", mode="live")
+    await mgr.resolve(rid, status="approved")
+
+    n = await ciw.drain_pending_issue_posts(_RT(db))
+    assert n == 0
+    assert not gh.created()  # cap reached → no CREATE
+    assert (await pip.get_by_id(db, pid))["status"] == "held"  # left held → retries
+    assert (await ar.get_by_id(db, rid))["consumed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_rate_cap_allows_under_limit(db, monkeypatch):
+    _mode(monkeypatch, "live")
+    _cap(monkeypatch, 2)
+    gh = _FakeGh(list_out="[]")
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    await _seed_posted(db, title="One already", posted_at=datetime.now(UTC).isoformat())
+    pid, rid, mgr = await _seed_held(db, title="Under the cap", mode="live")
+    await mgr.resolve(rid, status="approved")
+
+    n = await ciw.drain_pending_issue_posts(_RT(db))
+    assert n == 1
+    assert gh.created()
+    assert (await pip.get_by_id(db, pid))["status"] == "posted"
+
+
+@pytest.mark.asyncio
+async def test_rate_cap_bounds_a_single_tick(db, monkeypatch):
+    """Two ready live rows in ONE tick with cap=1 → exactly ONE posts; the per-row
+    count includes the one just posted this tick (mark_posted commits per row)."""
+    _mode(monkeypatch, "live")
+    _cap(monkeypatch, 1)
+    gh = _FakeGh(list_out="[]")
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    pid1, rid1, mgr = await _seed_held(db, title="First to post", mode="live")
+    await mgr.resolve(rid1, status="approved")
+    pid2, rid2, _ = await _seed_held(db, title="Second, over cap", mode="live")
+    await mgr.resolve(rid2, status="approved")
+
+    n = await ciw.drain_pending_issue_posts(_RT(db))
+    assert n == 1  # only one resolved
+    statuses = {
+        (await pip.get_by_id(db, pid1))["status"],
+        (await pip.get_by_id(db, pid2))["status"],
+    }
+    assert statuses == {"posted", "held"}  # one posted, one deferred
+
+
+@pytest.mark.asyncio
+async def test_rate_cap_ignores_dry_runs(db, monkeypatch):
+    """dry_run holds (propose_only) never consume a slot — count is status='posted'."""
+    _mode(monkeypatch, "live")
+    _cap(monkeypatch, 1)
+    gh = _FakeGh(list_out="[]")
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    # a dry-run row exists but must NOT count against the cap
+    drpid, drrid, drmgr = await _seed_held(db, title="A dry run", mode="propose_only")
+    await drmgr.resolve(drrid, status="approved")
+    # drain once in propose_only? no — just mark it dry_run directly to isolate the cap
+    await pip.mark_dry_run(db, drpid, dry_run_at=datetime.now(UTC).isoformat())
+    pid, rid, mgr = await _seed_held(db, title="A real post", mode="live")
+    await mgr.resolve(rid, status="approved")
+
+    n = await ciw.drain_pending_issue_posts(_RT(db))
+    assert n == 1
+    assert gh.created()  # cap not consumed by the dry_run → posts
+    assert (await pip.get_by_id(db, pid))["status"] == "posted"
+
+
+@pytest.mark.asyncio
+async def test_adopt_not_blocked_by_cap(db, monkeypatch):
+    """Crash-recovery adopt (an issue already open on the repo) must reconcile even
+    at the cap — the cap gates CREATEs, not the idempotent adopt (which is BEFORE
+    the cap check)."""
+    _mode(monkeypatch, "live")
+    _cap(monkeypatch, 1)
+    existing = json.dumps(
+        [{"number": 7, "title": "adopt me", "url": f"https://github.com/{_REPO}/issues/7"}]
+    )
+    gh = _FakeGh(list_out=existing)
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    await _seed_posted(db, title="At the cap already", posted_at=datetime.now(UTC).isoformat())
+    pid, rid, mgr = await _seed_held(db, title="Adopt me", mode="live")
+    await mgr.resolve(rid, status="approved")
+
+    n = await ciw.drain_pending_issue_posts(_RT(db))
+    assert n == 1
+    assert not gh.created()  # adopted, not created
+    row = await pip.get_by_id(db, pid)
+    assert row["status"] == "posted"
+    assert row["issue_number"] == 7  # adopted the existing issue despite the cap
+
+
+# ── end-to-end: propose (auto-approve) → drain (post), no human ─────────────
+
+
+@pytest.mark.asyncio
+async def test_e2e_autoapprove_then_drain_posts(db, tmp_path, monkeypatch):
+    """Integration of the full autonomous path: require_approval=False → the propose
+    tool auto-approves its own hold → the drain posts it (live, under cap) with NO
+    human in the loop. Guards against a future refactor decoupling the two halves."""
+    from genesis.mcp.health import contributor_issue as ci
+
+    # scan_prose fails closed on a missing fingerprint file — point at a present empty one.
+    fp = tmp_path / "fingerprints.txt"
+    fp.write_text("")
+    monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(fp))
+
+    # propose side: live + autonomous posture
+    monkeypatch.setattr(ci, "effective_mode", lambda: "live")
+    monkeypatch.setattr(ci, "load_config", lambda: {"max_held": 25})
+    monkeypatch.setattr(ci, "require_approval", lambda: False)
+    res = await ci._impl_contributor_issue_propose(
+        db, title="Autonomous newcomer task", body="A clean, public-safe task.", repo=_REPO
+    )
+    assert res["status"] == "held"
+    assert res["auto_approved"] is True
+    assert (await ar.get_by_id(db, res["request_id"]))["status"] == "approved"
+
+    # drain side: live, cap not reached, gh mocked → posts with no human approval
+    _mode(monkeypatch, "live")
+    _cap(monkeypatch, 2)
+    gh = _FakeGh(list_out="[]")
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    n = await ciw.drain_pending_issue_posts(_RT(db))
+    assert n == 1
+    assert gh.created()  # posted end-to-end, never touched by a human
+    row = await pip.get_by_id(db, res["pending_id"])
+    assert row["status"] == "posted"
+    assert row["issue_number"] == 42

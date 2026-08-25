@@ -425,7 +425,7 @@ gated — that contract is one-directional.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 2f0239cb 2026-08-07
+verified: d50f37ad 2026-08-25
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -447,14 +447,22 @@ verified: 2f0239cb 2026-08-07
   curator-drafted issue via the fail-closed `contribution/sanitize.py scan_prose`
   (title+body+labels — every string that egresses), then HOLDS it: the
   `approval_requests` row FIRST, then `pending_issue_posts` (mirroring the email
-  gate). Each hold is per-item owner-approved on the dashboard (excluded from
-  `approve_all_pending`, like email). The `contributor_issue_watcher` drain
+  gate). By default each hold is per-item owner-approved on the dashboard (excluded
+  from `approve_all_pending`, like email). **Autonomous posture (opt-in,
+  `require_approval: false`):** the propose tool resolves its OWN approval
+  server-side (`resolved_by="genesis:contributor-worklog"`, fail-CLOSED — only an
+  explicit boolean false disables the human gate; default true so a fresh clone
+  never auto-posts), so the curator posts without a human — Genesis is the vetting
+  authority (scan_prose + the rate cap). The `contributor_issue_watcher` drain
   (every 5 min, learning scheduler) resolves approved holds under the
   `contributor_worklog` mode lever (`autonomy/contributor_worklog_config.py`,
   default `propose_only`): `live` → `gh issue create` (shadow-gated door
   `observe_github_issue_create`, `mark_posted` BEFORE `mark_consumed` +
-  pre-post `gh issue list` dedup for idempotency); `propose_only` → dry-run
-  terminal (never posts). Terminal rows pruned >30d via
+  pre-post `gh issue list` dedup for idempotency), rate-limited by
+  `max_posts_per_day` (rolling-24h `count_posted_since`, per-row before the create
+  so N approved rows in one tick are bounded; cautious-rollout brake); `propose_only`
+  → dry-run terminal (never posts). The STOP is `mode: off` / the env kill (freezes
+  the drain, incl. approved held rows). Terminal rows pruned >30d via
   `scripts/prune_contributor_issue_posts.py`; held rows never pruned. The
   curator campaigns are LOCAL user data (uncommitted).
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
