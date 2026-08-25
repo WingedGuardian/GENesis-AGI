@@ -164,6 +164,23 @@ async def test_autonomous_pins_repo_to_default(db, live, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_autonomous_bare_default_repo_errors(db, live, monkeypatch):
+    """Codex P2 regression: if the configured owner is absent, _default_repo() is a
+    bare name (no owner/); the autonomous pin must NOT create a hold with a malformed
+    --repo — the final repo value is validated AFTER pinning, so this errors with no
+    row (else the drain retries an invalid `gh --repo` forever)."""
+    monkeypatch.setattr(ci, "require_approval", lambda: False)
+    monkeypatch.setattr(ci, "_default_repo", lambda: "GENesis-AGI")  # bare, owner absent
+    res = await ci._impl_contributor_issue_propose(
+        db, title="x title", body="y body", repo="WingedGuardian/GENesis-AGI"
+    )
+    assert res["status"] == "error"
+    assert await pip.list_held(db) == []
+    cur = await db.execute("SELECT COUNT(*) FROM approval_requests")
+    assert (await cur.fetchone())[0] == 0
+
+
+@pytest.mark.asyncio
 async def test_human_posture_keeps_curator_repo(db, live, monkeypatch):
     """With the human gate ON (default), a curator-supplied repo is kept — a human
     reviews the destination before it posts, so no pin is needed."""

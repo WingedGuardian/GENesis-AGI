@@ -82,8 +82,6 @@ async def _impl_contributor_issue_propose(
         return {"status": "error", "reason": f"source must be follow_up|codebase, got {source!r}"}
 
     repo = (repo or "").strip() or _default_repo()
-    if "/" not in repo:
-        return {"status": "error", "reason": f"repo must be owner/name, got {repo!r}"}
     # Autonomous posture (require_approval off): the untrusted curator's repo
     # override loses its human-review backstop, so pin the destination to this
     # install's configured public repo — Genesis vets DESTINATION, not just content.
@@ -98,6 +96,12 @@ async def _impl_contributor_issue_propose(
                 default_repo,
             )
             repo = default_repo
+    # Validate the FINAL repo value — AFTER any autonomous pin — so a bare
+    # ``_default_repo()`` (configured owner absent → no ``owner/`` prefix) is
+    # rejected here instead of creating a hold the drain would send to an invalid
+    # ``gh --repo`` and retry forever.
+    if "/" not in repo:
+        return {"status": "error", "reason": f"repo must be owner/name, got {repo!r}"}
     source_ref = (source_follow_up_id or "").strip() or None
     label_list = [str(x).strip() for x in (labels or []) if str(x).strip()]
 
