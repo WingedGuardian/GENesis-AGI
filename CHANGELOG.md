@@ -62,7 +62,9 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   on the remote), so it can never authorize a genuine first push. Corrupt/absent
   state and any error fail OPEN to the existing prompt path; entries expire after 90
   days (a recorded branch stays trusted for that window even if its remote copy is
-  later deleted). Such a job was invisible to every alarm: the "silently failing"
+  later deleted).
+- **A scheduled job that has run repeatedly but never once succeeded now raises a
+  health alert.** Such a job was invisible to every alarm: the "silently failing"
   check needs a prior success to measure a gap against, and the consecutive-failure
   counter resets on every restart. So a job that failed from its very first run —
   e.g. a daily actuator whose external login expired on day one — could fail silently

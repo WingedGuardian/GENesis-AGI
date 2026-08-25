@@ -22,9 +22,15 @@ file can only cause an EXTRA prompt, never a silent first push.
 KEYING
 ------
 Keyed on (branch name, remote PUSH-URL set) — NOT remote name (names vary per
-clone). A record matches only when the push's resolved push-urls INTERSECT the
-recorded set, so the same branch name on a DIFFERENT repo is never conflated. An
-empty push-url set (unresolvable remote) never matches and is never recorded.
+clone). A record matches only when EVERY current push-url is covered by the
+recorded set (subset, not a partial intersection): git pushes to every configured
+push URL, so a newly-added destination must re-prompt rather than ride an old
+url's cache hit. The same branch name on a DIFFERENT repo is never conflated. URLs
+are SANITIZED before storing/matching — userinfo/credentials are stripped (a token
+in ``https://user:<PAT>@host`` is never persisted to the plaintext state file),
+and a RELATIVE local path (ambiguous across worktrees) makes the whole decision
+fall back to ls-remote. An empty push-url set (unresolvable remote) never matches
+and is never recorded.
 
 TRUST WINDOW (conscious acceptance)
 -----------------------------------
@@ -47,8 +53,9 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 _VERSION = 1
 RETENTION_DAYS = 90
@@ -81,6 +88,85 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _sanitize_url(url: str) -> str | None:
+    """A credential-free, STABLE key form of a push URL, or None if the URL must
+    NOT be used for an offline cache decision.
+
+    - Scheme URL (``scheme://[userinfo@]host/path``): parsed with the CANONICAL
+      stdlib ``urllib.parse.urlsplit`` (never a hand-rolled split of an unbounded
+      grammar). The key drops the ``userinfo`` (``https://user:<PAT>@host/repo`` →
+      ``https://host/repo``, so a token is never persisted or keyed on), lowercases
+      the case-insensitive scheme + host, preserves host port and IPv6 brackets and
+      the path, and drops the fragment. A form with no host (``https://user@/x``,
+      ``file:///x``) → None (fall back to ls-remote).
+    - scp-like ssh (``[user@]host:path``): git's OWN rule distinguishes this from a
+      local path by "a ``:`` with NO ``/`` before it" (a slash before the first
+      colon means a local path). We honor that exactly, then strip any ``user@``
+      prefix. A colon that appears AFTER a slash (e.g. ``backups/2026-01-01T12:00/
+      repo.git``) is therefore a RELATIVE LOCAL path, not scp — critical, since a
+      relative path is ambiguous across worktrees.
+    - Absolute local path (``/…``): stable, kept as-is.
+    - RELATIVE local path (``../x``, ``./x``, ``~/x``, ``x/y.git``, ``x/y:z``): None.
+      Git resolves it relative to each repo, so the same raw string can denote
+      DIFFERENT repositories across worktrees; the caller must fall back to
+      ls-remote (a prompt) rather than risk a cross-repo silent push.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return None
+    u = url.strip()
+    # Scheme URL — parse with the CANONICAL stdlib parser, never a hand-split of an
+    # unbounded grammar. ``urlsplit`` lowercases the scheme + host, drops the
+    # userinfo (so an embedded ``user:<PAT>@`` token never reaches the key), and
+    # separates host/port/path/query correctly (incl. IPv6 literals).
+    if "://" in u:
+        try:
+            parts = urlsplit(u)
+            host = parts.hostname  # already lowercased, userinfo-stripped
+        except Exception:
+            return None
+        if not parts.scheme or not host:
+            return None  # no scheme/host (e.g. ``https://user@/x``, ``file:///…``) → don't key
+        if ":" in host:  # IPv6 literal — urlsplit strips the brackets; restore them
+            host = f"[{host}]"
+        if parts.port is not None:
+            host = f"{host}:{parts.port}"
+        # Credential-free rebuild: userinfo dropped, fragment dropped, path+query kept.
+        return urlunsplit((parts.scheme.lower(), host, parts.path, parts.query, ""))
+    # Absolute local path.
+    if u.startswith("/"):
+        return u
+    # scp-like ssh — only when a ':' appears with NO '/' before it (git's rule).
+    colon = u.find(":")
+    slash = u.find("/")
+    if colon > 0 and (slash == -1 or colon < slash) and not u.startswith((".", "~")):
+        authority = u[:colon]  # [user@]host
+        path = u[colon:]  # ':path'
+        if "@" in authority:  # strip scp userinfo (git@… etc.) — never persist it
+            authority = authority.rsplit("@", 1)[1]
+        return f"{authority}{path}" if authority else None
+    # Relative local path (incl. a colon that sits AFTER a slash) — do not key.
+    return None
+
+
+def _keyable_urls(push_urls: set[str]) -> set[str] | None:
+    """The sanitized, credential-free key set for ``push_urls`` — or None if the
+    set is empty OR ANY member is non-keyable (a relative local path).
+
+    None means "cannot decide offline": git pushes to EVERY push URL, so if even
+    one destination is ambiguous the whole push must fall back to ls-remote (a
+    prompt) rather than be offline-allowed or partially recorded.
+    """
+    if not push_urls:
+        return None
+    out: set[str] = set()
+    for u in push_urls:
+        s = _sanitize_url(u)
+        if s is None:
+            return None
+        out.add(s)
+    return out
+
+
 def _entry_is_fresh(entry: object, now: datetime) -> bool:
     """Whether ``entry``'s ISO ``ts`` is within ``RETENTION_DAYS``.
 
@@ -99,18 +185,30 @@ def _entry_is_fresh(entry: object, now: datetime) -> bool:
         return False
     if when.tzinfo is None:
         when = when.replace(tzinfo=UTC)
-    return (now - when).days < RETENTION_DAYS
+    # Require a NON-NEGATIVE age as well as < RETENTION_DAYS: a FUTURE ts (a clock
+    # that was ahead at record time and later corrected, or a tampered/corrupt
+    # state file) would otherwise read as fresh far beyond the window — its
+    # negative age has a negative ``.days``, which is always < RETENTION_DAYS.
+    return timedelta(0) <= (now - when) < timedelta(days=RETENTION_DAYS)
 
 
 def is_recorded(push_urls: set[str], branch: str) -> bool:
-    """True iff ``branch`` is recorded, still fresh, AND its recorded push-urls
-    INTERSECT ``push_urls``.
+    """True iff ``branch`` is recorded, still fresh, AND EVERY current push-url is
+    covered by the recorded set (subset, not a partial intersection).
 
-    Empty ``push_urls`` (unresolvable remote) → False (fall back to ls-remote).
-    Any error → False (fail-open to the prompt path).
+    Subset — not intersection — because git pushes to EVERY configured push URL:
+    if a new destination was added after recording, a partial-intersection hit
+    would silently publish the branch to that never-approved destination. Requiring
+    all current urls ⊆ recorded forces a re-prompt when a new push url appears.
+
+    Empty ``push_urls`` or any non-keyable (relative-path) url → False (fall back
+    to ls-remote). Any error → False (fail-open to the prompt path).
     """
     try:
-        if not push_urls or not branch:
+        if not branch:
+            return False
+        keyable = _keyable_urls(push_urls)
+        if not keyable:  # empty or an ambiguous relative-path url → can't decide offline
             return False
         data = _load(_state_path())
         entry = data.get("branches", {}).get(branch)
@@ -119,7 +217,7 @@ def is_recorded(push_urls: set[str], branch: str) -> bool:
         recorded = entry.get("urls")
         if not isinstance(recorded, list):
             return False
-        return bool(set(recorded) & set(push_urls))
+        return keyable <= set(recorded)
     except Exception:
         return False
 
@@ -128,13 +226,19 @@ def record(push_urls: set[str], branch: str) -> None:
     """Record ``branch`` as confirmed-on-remote for ``push_urls`` (REPLACE the
     url set), pruning stale entries in the same write.
 
-    No-op if ``push_urls`` is empty (can't key it safely) or ``branch`` is falsy.
-    Atomic tmp-write + ``os.replace``. FAIL-OPEN — never raises. Concurrent
-    writers can at worst DROP an entry (last self-consistent map wins) → a
-    redundant prompt, never a phantom record.
+    No-op if ``branch`` is falsy, ``push_urls`` is empty, or ANY url is non-keyable
+    (a relative local path — see ``_sanitize_url``): an ambiguous destination must
+    never be cached. Stored urls are SANITIZED (userinfo/credentials stripped) so
+    the plaintext state file never persists a token. Atomic tmp-write +
+    ``os.replace``. FAIL-OPEN — never raises. Concurrent writers can at worst DROP
+    an entry (last self-consistent map wins) → a redundant prompt, never a phantom
+    record.
     """
     try:
-        if not push_urls or not branch:
+        if not branch:
+            return
+        keyable = _keyable_urls(push_urls)
+        if not keyable:  # empty or an ambiguous relative-path url → don't cache
             return
         path = _state_path()
         now = _now()
@@ -144,7 +248,7 @@ def record(push_urls: set[str], branch: str) -> None:
         for name in [n for n, e in list(branches.items()) if not _entry_is_fresh(e, now)]:
             del branches[name]
         branches[branch] = {
-            "urls": sorted(push_urls),  # REPLACE, not union — tighter allowlist
+            "urls": sorted(keyable),  # sanitized, credential-free; REPLACE not union
             "ts": now.isoformat(),
         }
         data["version"] = _VERSION
