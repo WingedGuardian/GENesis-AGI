@@ -823,10 +823,14 @@ findings below, a gated `gh pr merge`:
   Claude review (a `/schedule` cloud routine) posts as the repo OWNER's account and
   must carry a marker `<!-- genesis-scheduled-review: head=<full-40-hex-sha> kind=<name> -->`
   naming the exact head it reviewed AND which routine it is (`kind`). The gate blocks
-  unless an owner-authored marker for EVERY kind in `_REQUIRED_SCHEDULED_REVIEW_KINDS`
-  (currently `code-review` + `leaks`) names the PR's current head — so if any required
-  routine never ran, ran on a stale commit, or was rate-limited, the merge blocks
-  (naming the missing kinds). If a routine is pending or rate-limited, wait for it, or
+  unless an owner-authored marker for EVERY effective required kind
+  (`_required_scheduled_review_kinds()` — DEFAULT `code-review` + `leaks`; the leak/secret
+  scanner is irreducible and always required; an install may relax the OPTIONAL kinds to
+  ADVISORY via `merge_gate.required_scheduled_reviews: [<kinds>]` in local `genesis.yaml`)
+  names the PR's current head — so if any required routine never ran, ran on a stale
+  commit, or was rate-limited, the merge blocks (naming the missing kinds). An ADVISORY
+  routine still posts its review on the PR to be read/addressed, but its absence does not
+  block. If a required routine is pending or rate-limited, wait for it, or
   append `# scheduled-review-override` to merge anyway (the conscious "merge without the
   scheduled reviews" case). The marker means "ran **clean**", not merely "ran": a
   review whose body carries a blocking finding (`[P1]`/`HARD BLOCK`/`### ERROR`, unless a

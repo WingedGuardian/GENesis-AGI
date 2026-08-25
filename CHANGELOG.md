@@ -21,6 +21,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   halts posting — re-checked immediately before each create — and freezes the queue.
   Ships SAFE — `require_approval` defaults true, and it is overlay-file-only (not a
   one-call settings/dashboard toggle), so a fresh install always requires human approval.
+- **A per-prompt nudge when a session's memory MCP is running stale code.** Each
+  Claude Code session's MCP subprocesses snapshot their code at spawn and never
+  reload, so a deploy landing mid-session leaves recall — and its current security
+  read-exclusions — on the old code until the session restarts (there is no
+  auto-restart). The UserPromptSubmit hook now emits a one-line nudge when this
+  session's MCP predates the last successful deploy, reusing the exact
+  `commit_identity.is_stale` verdict the dashboard stale-code badge uses (a session
+  *ahead* of the deploy, e.g. a manual `git pull`, is never flagged). Throttled per
+  session and fail-open: a fresh session stays silent, and any read/parse miss emits
+  nothing.
 
 ### Fixed
 
@@ -31,6 +41,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   genuine stall (no completed dispatch cycle for hours, when not paused) as an
   error, and fails loud (`unknown`) if the liveness data can't be read, never green.
   Thresholds are conservative (3h floor) so a normal quiet system never false-alarms.
+
+- **The Errors view no longer shows a clean "0 errors" when a data source is
+  actually down.** The unified-errors endpoint queried each source (events, dead
+  letters, deferred work, resolutions, alerts) behind a silent catch, so a DB/FTS
+  outage returned HTTP 200 with zero counts and read as "data is clean". It now
+  reports which sources failed (`partial` / `sources_failed`); the Errors tab shows
+  a "data may be incomplete" banner and suppresses the clean-state check, and the
+  overview attention list flags the degrade.
+- **Operational Vitals no longer reports embedding throughput as `0` on a query
+  failure.** A failed SQLite read for "Points written/24h" / "Pending queue"
+  previously wrote a literal `0`, indistinguishable from a real zero. It now
+  degrades to `—` with a `throughput_error` reason, distinct from Qdrant
+  reachability.
+- **A scheduler-heartbeat probe that cannot evaluate now surfaces a WARNING event
+  instead of failing silent.** The probe's exception path previously returned
+  `healthy` with no signal; it now emits a WARNING (visible on the Errors tab)
+  while deliberately keeping the probe result `healthy`, so the remediation engine
+  does not treat "can't evaluate" as a downed scheduler and page hourly.
 
 ### Changed
 
@@ -72,6 +100,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A transient `git ls-remote` failure no longer re-prompts an already-approved
+  branch push.** The push-approval hook prompts only on a branch's FIRST push; a
+  re-push of fixes to the same, already-published branch should be silent. But the
+  "already on the remote?" check was a live `git ls-remote` that fail-closes to a
+  prompt on any network hiccup, so a flaky network re-prompted every re-push. A new
+  stdlib allowlist (`scripts/hooks/push_allowlist.py`, state in
+  `~/.genesis/pushed_branches.json`) caches the confirmed-on-remote fact locally so
+  re-pushes are decided OFFLINE. It is keyed on (branch, remote push-URL set) — never
+  the remote name — so the same branch name on a different repo is never conflated,
+  and it is written ONLY on a live ls-remote HIT (which proves the branch is already
+  on the remote), so it can never authorize a genuine first push. Corrupt/absent
+  state and any error fail OPEN to the existing prompt path; entries expire after 90
+  days (a recorded branch stays trusted for that window even if its remote copy is
+  later deleted).
 - **A scheduled job that has run repeatedly but never once succeeded now raises a
   health alert.** Such a job was invisible to every alarm: the "silently failing"
   check needs a prior success to measure a gap against, and the consecutive-failure

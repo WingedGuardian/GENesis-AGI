@@ -504,3 +504,31 @@ class TestProbeSchedulerHeartbeats:
         assert result.status == ProbeStatus.HEALTHY
         assert "no live runtime" in result.message
         inst.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_probe_exception_emits_warning_but_stays_healthy(self):
+        """A genuine probe-eval error is SURFACED as a WARNING event (which lands
+        on the Errors tab via the event bus) but the ProbeResult stays HEALTHY:
+        remediation treats any non-HEALTHY status identically to DOWN and would
+        fire an hourly outreach storm on a 'can't evaluate' branch. Honest signal,
+        zero new pager noise."""
+        from genesis.observability.types import Severity, Subsystem
+
+        class _RaisingJH:
+            def get(self, *a, **k):
+                raise RuntimeError("job_health corrupt")
+
+        bus = MagicMock()
+        bus.emit = AsyncMock()
+        stub_rt = MagicMock()
+        stub_rt.event_bus = bus
+        with patch("genesis.runtime.GenesisRuntime.peek", return_value=stub_rt):
+            result = await probe_scheduler_heartbeats(_RaisingJH(), clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.HEALTHY
+        assert bus.emit.await_count == 1
+        # emit(subsystem, severity, event_type, message, **details) — positional
+        # or kw, so check the whole passed-value set.
+        args, kwargs = bus.emit.call_args
+        passed = {*args, *kwargs.values()}
+        assert Severity.WARNING in passed
+        assert Subsystem.HEALTH in passed
