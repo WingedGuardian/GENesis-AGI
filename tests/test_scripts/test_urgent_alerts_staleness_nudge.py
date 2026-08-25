@@ -118,8 +118,15 @@ def test_last_deploy_missing_table(tmp_path):
 
 
 def test_ro_uri_encodes_special_chars_and_is_idempotent():
+    from urllib.parse import unquote, urlsplit
+
+    # An ordinary path is not over-encoded and round-trips. Accept both pathname2url
+    # spellings — 3.12 "file:/abs" and 3.14 "file:///abs" (empty authority) — since both
+    # are valid SQLite URIs that decode to the same path.
     clean = "/home/u/genesis/data/genesis.db"
-    assert _ua._ro_uri(Path(clean)) == f"file:{clean}?mode=ro"  # ordinary path: unchanged
+    uri = _ua._ro_uri(Path(clean))
+    assert uri.startswith("file:") and uri.endswith("?mode=ro")
+    assert unquote(urlsplit(uri[: -len("?mode=ro")]).path) == clean
     weird = _ua._ro_uri(Path("/a?b/c#d/genesis.db"))
     assert weird.endswith("?mode=ro")
     path_part = weird[len("file:") : -len("?mode=ro")]
