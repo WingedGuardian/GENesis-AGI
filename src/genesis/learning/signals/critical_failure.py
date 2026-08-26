@@ -191,10 +191,17 @@ class CriticalFailureCollector:
                 for r in results
                 if not (r.status == ProbeStatus.DOWN and r.timed_out)
             ]
+            # Value is decoupled from the name-join: a DEGRADED probe drives residual
+            # 0.5 regardless of its name (an empty name must never flip 0.5 -> 0.0).
             residual = (
                 0.5
                 if any(r.status == ProbeStatus.DEGRADED for r in non_suppressed)
                 else 0.0
+            )
+            residual_degraded = ", ".join(
+                r.name
+                for r in non_suppressed
+                if r.status == ProbeStatus.DEGRADED
             )
             # Accepted residual: if a dependency is GENUINELY timing out
             # (blackholed/overloaded) at the same instant the loop is wedged, this
@@ -217,8 +224,14 @@ class CriticalFailureCollector:
             # tick serializer + reflection prompt formatter actually retain
             # (metadata is dropped by both) — so a suppressed reading is never
             # mistaken for a genuinely-healthy 0.0.
+            # Name the residual DEGRADED probe(s) too — a suppressed reading that says
+            # only "a degraded probe remains" leaves the reflection unable to identify
+            # WHICH service degraded (same identity-preservation invariant as the
+            # genuine path).
             remainder = (
-                "a genuinely-degraded probe remains" if residual else "no other fault"
+                f"a genuinely-degraded probe remains: {residual_degraded}"
+                if residual
+                else "no other fault"
             )
             return self._reading(
                 residual,
