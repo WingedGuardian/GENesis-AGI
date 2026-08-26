@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -698,3 +699,109 @@ def test_exec_flag_asks(published_feat):
     res = _run_at("git push --exec=/tmp/helper origin feat/x", published_feat)
     assert res.returncode == 0, res.stderr
     assert _decision(res) == "ask"
+
+
+# ── push_allowlist offline cache (the transient-ls-remote-failure fix) ─────────
+# The re-push gate's canonical "already on the remote?" check is a live
+# ``git ls-remote`` that FAIL-CLOSES to a prompt on any network failure, so a
+# transient failure re-prompts an already-approved branch (the #1262 gap).
+# ``push_allowlist`` caches the confirmed-on-remote fact LOCALLY so a re-push is
+# decided OFFLINE. These prove: a live HIT records the branch; a recorded branch
+# is allowed offline even when ls-remote CANNOT succeed; the SAME failure WITHOUT
+# a record still prompts (fail-closed); and a record for a DIFFERENT repo url does
+# not authorize an offline allow (no branch-name conflation across repos).
+
+
+@pytest.fixture(autouse=True)
+def _isolate_push_allowlist_home(tmp_path, monkeypatch):
+    """Redirect GENESIS_HOME to a per-test tmp dir.
+
+    The re-push gate now WRITES push_allowlist state under GENESIS_HOME on an
+    ls-remote HIT (and READS it for the offline fast-path), so without this every
+    test that reaches the re-push arm would read/pollute the developer's real
+    ``~/.genesis/pushed_branches.json`` (isolation lesson from #1406). ``_run`` /
+    ``_run_at`` copy ``os.environ`` into the subprocess, so the guard child sees
+    the same isolated home.
+    """
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "allowlist-home"))
+
+
+def _pa():
+    """Import the ``push_allowlist`` module under test (scripts/hooks)."""
+    sys.path.insert(0, str(_GUARD.parent))
+    import push_allowlist
+
+    return push_allowlist
+
+
+def _push_urls(clone: str) -> set[str]:
+    """origin's push-url SET exactly as the guard's ``_remote_push_urls`` resolves it."""
+    out = subprocess.run(
+        ["git", "-C", clone, "remote", "get-url", "--push", "--all", "origin"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return {ln.strip() for ln in out.stdout.splitlines() if ln.strip()}
+
+
+def test_republish_hit_records_branch(published_feat):
+    """A normal re-push (live ls-remote HIT) ALLOWS and RECORDS feat/x for later
+    offline decisions."""
+    pa = _pa()
+    res = _run_at("git push", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "allow"
+    assert pa.is_recorded(_push_urls(published_feat), "feat/x") is True
+
+
+def test_republish_offline_allow_when_ls_remote_fails(published_feat, tmp_path):
+    """Core RED→GREEN: with feat/x recorded, a re-push is ALLOWED OFFLINE even when
+    ls-remote cannot reach the remote (the transient-failure case #1262 mishandled).
+
+    Deleting the bare remote makes ``git ls-remote`` fail while leaving the url
+    config — and thus the allowlist key — intact, so the allow can ONLY come from
+    the local record."""
+    pa = _pa()
+    pa.record(_push_urls(published_feat), "feat/x")
+    shutil.rmtree(tmp_path / "remote.git")  # ls-remote now fails; url config unchanged
+    res = _run_at("git push", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "allow"
+
+
+def test_ls_remote_failure_without_record_asks(published_feat, tmp_path):
+    """Fail-closed: the SAME ls-remote failure but NOTHING recorded → PROMPT, never
+    a silent allow. Proves the offline allow above is caused by the record, not by
+    the ls-remote failure itself."""
+    shutil.rmtree(tmp_path / "remote.git")
+    res = _run_at("git push", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_recorded_wrong_repo_url_does_not_allow_offline(published_feat, tmp_path):
+    """URL-keying: a record for a DIFFERENT repo's url must not authorize feat/x
+    here. ls-remote failing + a disjoint-url record → PROMPT (no conflation)."""
+    pa = _pa()
+    pa.record({"git@github.com:someone/else.git"}, "feat/x")
+    shutil.rmtree(tmp_path / "remote.git")
+    res = _run_at("git push", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_integration_record_stays_under_isolated_home(published_feat, tmp_path):
+    """Hardening (security-review NOTE): guard against a future ``_run``/``_run_at``
+    refactor silently reintroducing the #1406 real-``~/.genesis`` leak class. The
+    gate now WRITES push_allowlist state on an ls-remote HIT; that write MUST land
+    under the isolated tmp GENESIS_HOME. If the subprocess ever stops inheriting
+    GENESIS_HOME, this fails loudly here instead of writing the developer's real
+    home."""
+    res = _run_at("git push", published_feat)  # live ls-remote HIT → records feat/x
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "allow"
+    assert (tmp_path / "allowlist-home" / "pushed_branches.json").exists(), (
+        "record did not land under the isolated GENESIS_HOME — the guard subprocess "
+        "no longer inherits GENESIS_HOME? (real-~/.genesis leak risk)"
+    )

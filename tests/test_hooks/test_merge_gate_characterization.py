@@ -67,8 +67,16 @@ def _pin_canonical_public_repo(monkeypatch):
     public repo to the corpus's merge target (``REPO``) via the ``_TEST_CANONICAL_
     PUBLIC_REPO`` seam, so EVERY case deterministically ENGAGES the scheduled gate
     on every host. The off-public-repo NO-OP is exercised by its own case, which
-    overrides this seam to a different repo."""
+    overrides this seam to a different repo.
+
+    Also pin ``_TEST_REQUIRED_SCHEDULED_REVIEWS`` to the DEFAULT policy
+    (code-review + leaks): the required-kinds are now config-driven from the same
+    ``genesis.yaml``, so without this pin the corpus (which asserts the default
+    both-required behavior) would read the host's real local override and go
+    non-deterministic. The relaxed/advisory path is covered by its own unit tests
+    in test_git_push_guard_codex_freshness.py."""
     monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", REPO)
+    monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "code-review,leaks")
     yield
 
 

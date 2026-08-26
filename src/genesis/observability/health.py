@@ -301,6 +301,35 @@ async def probe_scheduler_heartbeats(
         )
     except Exception as exc:
         latency = (time.monotonic() - start) * 1000
+        # Surface the eval failure LOUDLY as a WARNING event (which persists to the
+        # events table and shows on the Errors tab) — but keep the ProbeResult
+        # HEALTHY. This probe's status is consumed ONLY by the remediation engine,
+        # which treats any non-HEALTHY status identically to DOWN (remediation.py
+        # _evaluate) and would fire the hourly scheduler_heartbeat_alert *outreach*
+        # on this "can't evaluate" branch. Emitting the event gives honest signal
+        # without that pager storm; flipping the status would only add noise (this
+        # probe feeds no dashboard tile).
+        # Not cooldown-gated: a persistent "can't evaluate" fault re-emits once per
+        # awareness tick, but repeats collapse under the Errors-tab event grouping
+        # and ride normal event pruning. Add a last-emitted gate only if that volume
+        # ever proves excessive (it hasn't — this branch fires only when job_health
+        # itself is unreadable, a rare hard fault).
+        try:
+            from genesis.observability.types import Severity, Subsystem
+            from genesis.runtime import GenesisRuntime
+
+            rt = GenesisRuntime.peek()
+            if rt is not None and rt.event_bus is not None:
+                await rt.event_bus.emit(
+                    Subsystem.HEALTH,
+                    Severity.WARNING,
+                    "scheduler_heartbeat_probe_error",
+                    f"scheduler-heartbeat probe could not evaluate: {exc}",
+                )
+        except Exception:
+            logger.debug(
+                "scheduler-heartbeat probe error-event emit failed", exc_info=True
+            )
         return ProbeResult(
             name="scheduler_heartbeats",
             status=ProbeStatus.HEALTHY,  # can't evaluate ≠ schedulers dead

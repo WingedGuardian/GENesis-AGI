@@ -17,6 +17,7 @@ from genesis.cc.types import (
     session_origin_for_channel,
 )
 from genesis.db.crud import cc_sessions
+from genesis.util import tz
 
 logger = logging.getLogger(__name__)
 
@@ -192,22 +193,21 @@ class SessionManager:
         now = datetime.now(UTC).isoformat()
         await cc_sessions.update_activity(self._db, session_id, last_activity_at=now)
 
-    async def check_morning_reset(self, *, user_id: str) -> bool:
+    async def check_morning_reset(self, *, user_id: str, now: datetime | None = None) -> bool:
         """Check if sessions from a previous day boundary should be reset.
 
         Returns True if there are completed/expired sessions from before
         the current day boundary (suggesting a new day has started).
+
+        The boundary is local-midnight (``day_boundary_hour`` in the user's
+        timezone) serialized in UTC — matching the ``+00:00`` timestamps stored
+        in ``cc_sessions`` so the ``query_stale`` string ``<`` comparison stays
+        lexicographically correct (see :func:`genesis.util.tz.local_day_boundary`).
+
+        *now* is injectable for deterministic tests; defaults to the current
+        instant.
         """
-        now = datetime.now(UTC)
-        boundary = now.replace(
-            hour=self._day_boundary_hour,
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
-        if now < boundary:
-            boundary -= timedelta(days=1)
-        boundary_iso = boundary.isoformat()
+        boundary_iso = tz.local_day_boundary(self._day_boundary_hour, now=now).isoformat()
 
         # Check if there are sessions that completed before today's boundary
         rows = await cc_sessions.query_stale(self._db, older_than=boundary_iso)

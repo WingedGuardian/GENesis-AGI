@@ -4,6 +4,11 @@
         "DISABLE_UPDATES": "1"
     },
     "cleanupPeriodDays": 180,
+    "attribution": {
+        "commit": "",
+        "pr": "",
+        "sessionUrl": false
+    },
     "hooks": {
         "SessionStart": [
             {

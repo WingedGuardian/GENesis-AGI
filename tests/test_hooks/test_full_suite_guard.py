@@ -70,9 +70,24 @@ class TestTargetsSpecificTest:
         assert _mod._targets_specific_test(["--pyargs", "genesis.tests.test_mod"])
 
     def test_file_mixed_with_dir_not_targeted(self):
-        # a specific file AND a bare directory still runs the whole directory → block
+        # a specific file AND a bare directory still runs the WHOLE directory (pytest
+        # unions positionals) → the OOM-inducing full run → block.
         assert not _mod._targets_specific_test(["tests/foo.py", "tests/"])
         assert not _mod._targets_specific_test(["tests/", "tests/foo.py"])
+
+    def test_value_flag_path_value_then_file_allowed(self):
+        # A path/glob-valued flag now in _VALUE_FLAGS (--basetemp/--confcutdir) consumes
+        # its value, so the value is NOT mistaken for a directory positional and does not
+        # wrongly block a run that names a real .py file. (The friction bug this PR fixes.)
+        assert _mod._targets_specific_test(["tests/foo.py", "--basetemp", "/wt/.pytmp"])
+        assert _mod._targets_specific_test(["--confcutdir", "/wt", "tests/foo.py"])
+
+    def test_value_flag_dotpy_value_alone_still_blocks(self):
+        # _VALUE_FLAGS earns its keep on the fail-OPEN direction too: a value ENDING in
+        # .py (`-p foo.py`, `--doctest-glob '*.py'`) is the flag's value, not a test
+        # target, so a bare run must still BLOCK — the value must not fake a `.py` file.
+        assert not _mod._targets_specific_test(["-p", "foo.py"])
+        assert not _mod._targets_specific_test(["--doctest-glob", "*.py"])
 
     def test_selector_with_dir_still_targeted(self):
         # a -k/-m selector narrows the run even when a directory is present
@@ -145,5 +160,26 @@ class TestEndToEnd:
         assert r.returncode == 0, r.stderr
 
     def test_file_plus_dir_blocks(self):
-        # a file mixed with a whole directory runs the dir → must block
+        # a file mixed with a whole directory runs the dir (pytest unions positionals)
+        # → the OOM full run → must block (would fail-OPEN under `has_selector or has_file`).
         assert _run_guard("pytest tests/foo/test_bar.py tests/").returncode == 2
+
+    def test_doctest_glob_py_value_with_dir_blocks(self):
+        # a .py-glob flag value must not fake a file target and let a whole-dir run pass:
+        # --doctest-glob consumes '*.py', leaving a bare tests/ directory run → block.
+        assert _run_guard("pytest --doctest-glob '*.py' tests/").returncode == 2
+
+    def test_value_flag_path_then_file_allowed_e2e(self):
+        # the friction bug end-to-end: a path-valued flag (--basetemp) no longer
+        # false-blocks a run that names a specific file.
+        r = _run_guard("pytest tests/test_hooks/test_full_suite_guard.py --basetemp /tmp/x")
+        assert r.returncode == 0, r.stderr
+
+    def test_redirect_then_file_allowed(self):
+        # post-#1455 a redirect (2>&1) is stripped from argv, so a named file still allows.
+        assert _run_guard("pytest tests/foo/test_bar.py 2>&1").returncode == 0
+
+    def test_redirect_target_py_no_file_still_blocks(self):
+        # post-#1455 the redirect TARGET (errors.py) is stripped from argv, so this is a
+        # bare pytest → BLOCK (no phantom .py file target).
+        assert _run_guard("pytest 2> errors.py").returncode == 2

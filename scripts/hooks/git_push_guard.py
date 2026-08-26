@@ -50,17 +50,21 @@ post a comment (issue comment) or PR review whose body contains a marker
 ``<!-- genesis-scheduled-review: head=<full-40-hex-sha> kind=<name> -->`` naming the exact
 head it reviewed AND which routine it was (``kind``). The merge gate
 (``_check_scheduled_claude_reviewed_head``) blocks unless an owner-authored marker for
-EVERY kind in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` (currently code-review + leaks) names
+EVERY effective required kind (``_required_scheduled_review_kinds()`` — DEFAULT
+code-review + leaks, with the leak scanner irreducible; an install may relax the optional
+kinds to advisory via ``merge_gate.required_scheduled_reviews`` in genesis.yaml) names
 the PR's CURRENT head — so if any required routine never ran, ran on a stale commit, or
-was rate-limited, the merge is blocked (naming the missing kinds). SCOPE: this gate
+was rate-limited, the merge is blocked (naming the missing kinds). An ADVISORY routine
+(one relaxed out of the required set locally) still posts its review on the PR to be read
+and addressed, but its absence does not block. SCOPE: this gate
 enforces ONLY when the merge targets the configured PUBLIC repo — the declared
 ``github.user``/``github.public_repo`` in ``~/.genesis/config/genesis.yaml``
 (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any OTHER repo
 (a private fork, the voice repo, backups) no-ops, since the required ``/schedule``
 routines run only on the public repo. Deployment note: on the public repo the required
 routines ARE configured (the deploy precondition); a clone that runs on its own public
-repo without a producer uses `# scheduled-review-override` (or removes/edits
-`_REQUIRED_SCHEDULED_REVIEW_KINDS`) — the override valve is the escape by design, not an
+repo without a producer uses `# scheduled-review-override` (or relaxes the optional kinds
+via ``merge_gate.required_scheduled_reviews``) — the override valve is the escape by design, not an
 opt-in flag. Fail-closed on scope uncertainty: if the canonical repo is undeterminable
 the gate ENGAGES rather than silently disarming.
 A DISMISSED or PENDING (draft) review no longer vouches (its marker is ignored), mirroring
@@ -122,6 +126,19 @@ from shell_parse import (  # noqa: E402
     has_trailing_override,
     split_segments,
 )
+
+# Local push allowlist (offline re-push cache). SOFT dependency, guarded exactly
+# like the review_state import above: a module-LOAD exception must degrade to
+# None (→ the pure live-ls-remote republish path, i.e. today's behavior), NEVER
+# propagate — a raising import exits 1, which CC treats as non-blocking, silently
+# disabling EVERY fail-closed gate in this file. push_allowlist itself is
+# fail-open by contract (its calls never raise); None here only covers an
+# import-time breakage (absent module, SyntaxError). It can only ever RELAX a
+# re-push of a branch already confirmed on the remote — never a first push.
+try:
+    import push_allowlist  # noqa: E402 — scripts/hooks is on sys.path[0]
+except Exception:  # noqa: BLE001 — see the review_state guard's rationale (108-114)
+    push_allowlist = None
 
 # Sentinel: the effective cwd cannot be confidently resolved (a cd into a
 # variable/command-substitution, a subshell, or a target nested at depth>0).
@@ -852,6 +869,63 @@ _MAINTAINER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 # Badge/markup prefix stripped when rendering a finding's title line.
 _INLINE_MARKUP_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}")
 
+# ── Documentation-path allowlist for review findings (ledger 54eb3752) ───────
+# A P1 inline finding on a DOCUMENTATION file is not a code defect and must not
+# block a merge (a CHANGELOG typo, a README wording nit). This is a FAIL-CLOSED
+# ALLOWLIST — a path is exempted only when it is provably prose; everything else
+# blocks. Prose is: (1) a known doc-named file (CHANGELOG/README/LICENSE/NOTICE/…)
+# with a doc/text/empty extension, at any depth; (2) any UNAMBIGUOUS documentation
+# extension (.md/.rst/.markdown/.adoc) UNDER a top-level ``docs/``; or (3) any
+# ``*.rst`` anywhere. A random top-level ``NOTES.md``, ANY source/config/executable
+# file even under ``docs/`` (``docs/conf.py``, ``docs/build.rs``, ``docs/config.yaml``,
+# ``docs/Makefile``), a missing/empty path, or a path bearing a control character is
+# NON-doc and STILL BLOCKS — the gate never opens for a code path merely mislabeled.
+# ``.txt`` is deliberately NOT a blanket doc extension: it is ambiguous (a build/dep
+# manifest — ``docs/requirements.txt``, ``docs/CMakeLists.txt`` — carries it too, and
+# this repo classifies such files as config), so ``.txt`` is prose ONLY on a known
+# doc-named stem (``LICENSE.txt``, ``README.txt``). Only the inline endpoint carries
+# a per-file path; the review-BODY gate is PR-level and stays unfiltered. (A denylist
+# of code extensions was rejected in review: it can't enumerate every source/config
+# type — an allowlist fails closed on the unknown.)
+_DOC_EXTS = {"md", "markdown", "rst", "adoc"}
+# Extensions permitted on a KNOWN doc-named stem only (rule 1). ``.txt``/empty are
+# safe here because the STEM already pins the file as prose (LICENSE, README).
+_DOC_STEM_EXTS = _DOC_EXTS | {"txt", ""}
+_DOC_STEMS = {
+    "changelog",
+    "readme",
+    "license",
+    "notice",
+    "copying",
+    "authors",
+    "contributing",
+}
+
+
+def _is_doc_path(path: str) -> bool:
+    """Whether a review finding's file *path* is documentation whose findings do
+    NOT block a merge. FAIL-CLOSED allowlist (see the section comment): anything
+    not provably prose — a source/config/manifest file under ``docs/`` (incl. a
+    ``.txt`` build manifest), a random top-level ``*.md``, a missing path, or a
+    control-char-bearing path — blocks."""
+    # Reject the COMPLETE control-character range (Unicode Cc): C0 (<0x20), DEL
+    # (0x7F), and C1 (0x80-0x9F, incl. NEL 0x85 which ``gh --jq`` emits literally).
+    if not path or any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in path):
+        return False  # empty or control-char-bearing → block (fail-closed)
+    base = path.rsplit("/", 1)[-1]
+    stem, dot, ext = base.rpartition(".")
+    ext = ext.lower() if dot else ""
+    stem_l = (stem if dot else base).lower()
+    # (1) A known doc-named file with a doc/text/empty extension, at any depth.
+    if stem_l in _DOC_STEMS and ext in _DOC_STEM_EXTS:
+        return True
+    # (2) A pure documentation format (reStructuredText) anywhere.
+    if ext == "rst":
+        return True
+    # (3) An unambiguous documentation extension under a top-level docs/ directory.
+    return ext in _DOC_EXTS and path.startswith("docs/")
+
+
 # ── Direct-sqlite-write detection ────────────────────────────────────────────
 # Robust bare-keyword match (the historical approach). A SINGLE statement keyword
 # is inherently immune to shell quoting/escapes AND SQL comments BETWEEN tokens,
@@ -1061,7 +1135,7 @@ def _check_inline_review_findings(
         pr_num,
         repo,
         ".[] | {id: .id, reply_to: .in_reply_to_id, login: .user.login, "
-        "type: .user.type, assoc: .author_association, body: .body}",
+        "type: .user.type, assoc: .author_association, path: .path, body: .body}",
     )
     if raw is None:
         return _scan_unreadable("inline review comments")
@@ -1078,6 +1152,7 @@ def _check_inline_review_findings(
     }
     p1: list[str] = []
     p2: list[str] = []
+    doc_skipped: list[str] = []  # P1s on doc paths — surfaced, never blocking
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
         body = c.get("body") or ""
@@ -1088,10 +1163,24 @@ def _check_inline_review_findings(
         if _INLINE_P1_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — treated as acknowledged
+            if _is_doc_path(c.get("path") or ""):
+                # A P1 on a documentation file (ledger 54eb3752) is surfaced but
+                # does NOT block; a code file (incl. code under docs/) still does.
+                doc_skipped.append(_inline_title(body))
+                continue
             p1.append(_inline_title(body))
         elif _INLINE_P2_RE.search(body):
             p2.append(_inline_title(body))
 
+    if doc_skipped:
+        print(
+            f"NOTE: PR #{pr_num} — {len(doc_skipped)} inline [P1] finding(s) on "
+            f"documentation paths (CHANGELOG/README/LICENSE/NOTICE/docs/**/*.rst) "
+            f"NOT blocking:",
+            file=sys.stderr,
+        )
+        for title in doc_skipped[:5]:
+            print(f"  [doc P1] {title}", file=sys.stderr)
     if p2:
         print(
             f"WARNING: PR #{pr_num} has {len(p2)} inline [P2] review "
@@ -1778,7 +1867,7 @@ def _check_codex_reviewed_head(
 # conscious "merge without a scheduled review" case — it didn't run / is rate-limited).
 # A scheduled-review marker is an HTML comment ``<!-- genesis-scheduled-review:
 # head=<40hex> kind=<name> -->``. Each SCHEDULED routine stamps its own ``kind`` so
-# the gate can require that EVERY routine in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` ran
+# the gate can require that EVERY routine in ``_required_scheduled_review_kinds()`` ran
 # on the current head — a single routine's marker no longer satisfies the gate on its
 # own. head/kind are parsed from the marker BLOCK (order-tolerant) and BOTH must be
 # present in the SAME marker to count.
@@ -1792,10 +1881,90 @@ _SCHEDULED_REVIEW_BLOCK_RE = re.compile(
 _SCHEDULED_REVIEW_HEAD_RE = re.compile(r"\bhead=([0-9a-f]{40})(?=\s|\Z)")
 _SCHEDULED_REVIEW_KIND_RE = re.compile(r"\bkind=([a-z0-9][a-z0-9._-]*)(?=\s|\Z)")
 
-# Every scheduled routine whose completion the merge gate requires, by ``kind``. A PR
-# merges only when a valid owner-authored marker for EACH of these names the current
-# head. Change this tuple to add/remove required routines.
-_REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
+# Default scheduled-review kinds the merge gate REQUIRES at head. A PR merges only when
+# a valid owner-authored marker for EACH effective required kind names the current head.
+# The DEFAULT is the full set (shipped to every install, unchanged); an install may relax
+# the OPTIONAL kinds locally — see _required_scheduled_review_kinds() for the lever.
+_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
+# The leak/secret scanner is IRREDUCIBLE: always required, never removable by config. A
+# secret reaching a public repo is irreversible, so no local policy may waive it.
+_IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
+# Every kind an install is ALLOWED to name in config. A configured kind outside this set
+# (a typo, a wrong type, a stale routine name) can never be satisfied by a real marker, so
+# the whole config is treated as invalid and we fail closed to the default rather than let
+# it either wedge merges forever or silently narrow the required set.
+_KNOWN_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
+
+
+def _validate_configured_kinds(items: object) -> list[str] | None:
+    """Lowercase + validate a configured kind list. Returns the cleaned list (possibly
+    empty, meaning "only the irreducible kinds"), or None if ANYTHING is off — not a list,
+    a non-string element, a blank element, or an unknown kind. None makes the caller fail
+    CLOSED to the full default rather than honor a malformed/ambiguous relaxation."""
+    if not isinstance(items, list):
+        return None
+    out: list[str] = []
+    for k in items:
+        if not isinstance(k, str):
+            return None  # wrong type (e.g. [123]) -> invalid -> default
+        kk = k.strip().lower()  # normalize to the lowercase marker grammar
+        if not kk or kk not in _KNOWN_SCHEDULED_REVIEW_KINDS:
+            return None  # blank ([" "]) or unknown ([foo]) -> invalid -> default
+        out.append(kk)
+    return out
+
+
+def _required_scheduled_review_kinds() -> tuple[str, ...]:
+    """The scheduled-review kinds the merge gate REQUIRES at head, as a tuple.
+
+    Default is the full set (``code-review`` + ``leaks``) — shipped unchanged to every
+    install. An install MAY relax the OPTIONAL kinds (e.g. make the structural
+    code-review ADVISORY, so its absence no longer blocks — its review still posts on the
+    PR to be read/addressed if it ran) via LOCAL config, keeping install policy out of the
+    public default:
+
+        # ~/.genesis/config/genesis.yaml
+        merge_gate:
+          required_scheduled_reviews: [leaks]
+
+    The leak/secret scanner (``_IRREDUCIBLE_...``) is ALWAYS unioned in and CANNOT be
+    dropped by config. Fail-CLOSED toward MORE review: a missing key / unreadable file /
+    parse error / duplicate key / wrong-type / blank / unknown kind ALL fall back to the
+    full default set, never to fewer kinds. Configured kinds are validated against
+    ``_KNOWN_SCHEDULED_REVIEW_KINDS`` and lowercased to the marker grammar. Test seam:
+    ``_TEST_REQUIRED_SCHEDULED_REVIEWS`` (comma-separated) overrides the config file.
+    """
+    raw = os.environ.get("_TEST_REQUIRED_SCHEDULED_REVIEWS")
+    configured: list[str] | None = None
+    if raw is not None:
+        # Test seam: comma-list; empties dropped so "" means "only the irreducible kinds".
+        configured = _validate_configured_kinds([k.strip() for k in raw.split(",") if k.strip()])
+    else:
+        try:
+            import yaml  # lazy: keep the hook import-light; the genesis venv has pyyaml
+
+            path = os.path.expanduser("~/.genesis/config/genesis.yaml")
+            with open(path) as fh:
+                text = fh.read()
+            # yaml.safe_load silently keeps the LAST value for a repeated key, so a
+            # badly-merged file (two merge_gate: or required_scheduled_reviews: lines)
+            # could quietly narrow the required set. Catch the realistic cases with a
+            # line scan (the repo's idiom — no unsafe custom Loader) and fail closed.
+            if (
+                len(re.findall(r"(?m)^merge_gate\s*:", text)) > 1
+                or len(re.findall(r"(?m)^\s*required_scheduled_reviews\s*:", text)) > 1
+            ):
+                raise ValueError("duplicate merge_gate/required_scheduled_reviews key")
+            cfg = yaml.safe_load(text) or {}
+            configured = _validate_configured_kinds(
+                (cfg.get("merge_gate") or {}).get("required_scheduled_reviews")
+            )
+        except Exception:
+            configured = None  # fail-closed: fall back to the full default set below
+    kinds = configured if configured is not None else list(_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS)
+    # leaks (and any irreducible kind) is always required, even if config omits it.
+    merged = list(dict.fromkeys([*kinds, *_IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS]))
+    return tuple(merged)
 
 
 def _canonical_public_repo() -> str | None:
@@ -1983,7 +2152,7 @@ def _check_scheduled_claude_reviewed_head(
 ) -> str | None:
     """Block a merge unless EVERY required scheduled Claude review (by the repo OWNER)
     has run on the PR's CURRENT head. Returns ``None`` when a valid owner marker for
-    each kind in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` names ``head_sha`` exactly (full
+    each kind in ``_required_scheduled_review_kinds()`` names ``head_sha`` exactly (full
     40-char), else a BLOCK MESSAGE naming the MISSING kinds.
 
     Fail-CLOSED — this gate never passes on absence of positive evidence: if the head
@@ -2026,12 +2195,13 @@ def _check_scheduled_claude_reviewed_head(
             f"Retry, or append '# scheduled-review-override' to merge anyway."
         )
     kinds_here = markers.get(head, set())
-    missing = [k for k in _REQUIRED_SCHEDULED_REVIEW_KINDS if k not in kinds_here]
+    required = _required_scheduled_review_kinds()
+    missing = [k for k in required if k not in kinds_here]
     if not missing:
         return None
     return (
         f"scheduled Claude review(s) missing at head {head[:12]}: {', '.join(missing)} "
-        f"(required: {', '.join(_REQUIRED_SCHEDULED_REVIEW_KINDS)}; present: "
+        f"(required: {', '.join(required)}; present: "
         f"{', '.join(sorted(kinds_here)) or 'none'}).\n"
         f"Each routine posts a comment/review carrying "
         f"'<!-- genesis-scheduled-review: head=<sha> kind=<name> -->' once it runs on THIS "
@@ -3128,14 +3298,39 @@ def main() -> int:
                     and cur
                     and cur not in ("main", "master")
                     and _push_targets_current_branch(push_segs[0], cur, push_remote, cwd=pcwd)
-                    and _push_is_republish(push_remote, cur, pcwd)
                 ):
+                    # This push plainly updates the current branch `cur`, so it
+                    # qualifies for the first-push-only relaxation IF `cur` is
+                    # already on the remote. Decide that via the LOCAL allowlist
+                    # first (offline — immune to the transient ls-remote failure
+                    # that otherwise fail-closes _push_is_republish to a re-prompt),
+                    # then fall back to the live ls-remote leg. On an ls-remote HIT,
+                    # RECORD the confirmed-on-remote fact so later re-pushes decide
+                    # offline. SECURITY: the allowlist is written ONLY here, ONLY on
+                    # an ls-remote HIT (which proves `cur` is on the remote → its
+                    # first push was already approved), so it can never authorize a
+                    # genuine first push; a broken/absent push_allowlist degrades to
+                    # the pure ls-remote path (import guarded to None above).
+                    urls = _remote_push_urls(push_remote, cwd=pcwd) if push_remote else set()
                     # Deferred (NOT an inline return) so any hard-block in a compound
                     # command still takes precedence — see push_allow_reason above.
-                    push_allow_reason = (
-                        f"re-push to '{cur}' (already on the remote — approved on "
-                        f"its first push); only the first push of a branch/PR prompts."
-                    )
+                    if push_allowlist is not None and push_allowlist.is_recorded(urls, cur):
+                        push_allow_reason = (
+                            f"re-push to '{cur}' (recorded as already on the remote — "
+                            f"approved on its first push); only the first push prompts."
+                        )
+                    elif _push_is_republish(push_remote, cur, pcwd):
+                        if push_allowlist is not None and urls:
+                            push_allowlist.record(urls, cur)
+                        push_allow_reason = (
+                            f"re-push to '{cur}' (already on the remote — approved on "
+                            f"its first push); only the first push of a branch/PR prompts."
+                        )
+                    else:
+                        ask_reason = (
+                            f"git push needs your approval before publishing externally "
+                            f"(target: {branch or 'default'})."
+                        )
                 else:
                     ask_reason = (
                         f"git push needs your approval before publishing externally "

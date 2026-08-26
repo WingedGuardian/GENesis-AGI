@@ -265,6 +265,43 @@ class TestCrud:
         assert (await pip.get_by_id(db, "p1"))["status"] == "posted"
 
     @pytest.mark.asyncio
+    async def test_count_posted_since(self, db):
+        """The rate-cap count: only status='posted' rows with posted_at >= since.
+        dry_run / held / rejected rows and out-of-window posts are excluded."""
+        # in-window posted (x2)
+        await pip.create(db, **{**_ROW, "id": "a", "request_id": "ra"})
+        await pip.mark_posted(
+            db, "a", issue_number=1, issue_url="u", posted_at="2026-08-07T12:00:00"
+        )
+        await pip.create(db, **{**_ROW, "id": "b", "request_id": "rb"})
+        await pip.mark_posted(
+            db, "b", issue_number=2, issue_url="u", posted_at="2026-08-07T13:00:00"
+        )
+        # out-of-window posted (before `since`)
+        await pip.create(db, **{**_ROW, "id": "old", "request_id": "ro"})
+        await pip.mark_posted(
+            db, "old", issue_number=3, issue_url="u", posted_at="2026-08-05T00:00:00"
+        )
+        # dry_run + held + rejected must NOT count
+        await pip.create(db, **{**_ROW, "id": "dr", "request_id": "rdr"})
+        await pip.mark_dry_run(db, "dr", dry_run_at="2026-08-07T12:30:00")
+        await pip.create(db, **{**_ROW, "id": "held", "request_id": "rh"})  # stays held
+        await pip.create(db, **{**_ROW, "id": "rej", "request_id": "rr"})
+        await pip.mark_rejected(db, "rej", rejected_at="2026-08-07T12:30:00")
+
+        since = "2026-08-07T00:00:00"
+        assert await pip.count_posted_since(db, since=since) == 2
+        # a since AFTER both posts → zero
+        assert await pip.count_posted_since(db, since="2026-08-08T00:00:00") == 0
+        # empty-table / first-run → zero (fresh install correctness)
+        async with aiosqlite.connect(":memory:") as fresh:
+            fresh.row_factory = aiosqlite.Row
+            from genesis.db.schema import create_all_tables
+
+            await create_all_tables(fresh)
+            assert await pip.count_posted_since(fresh, since=since) == 0
+
+    @pytest.mark.asyncio
     async def test_mark_dry_run_once(self, db):
         # propose_only path: an approved hold is dry-run-terminal — shadow-observed
         # once, marked 'dry_run', and NEVER posted (flipping the lever to 'live'

@@ -22,6 +22,8 @@
         groups: [],
         activeAlerts: [],
         totals: { events: 0, dead_letters: 0, deferred_failures: 0 },
+        partial: false,
+        sourcesFailed: [],
         loading: true,
         error: null,
         lastSuccess: null,
@@ -70,6 +72,8 @@
               this.groups = data.groups || [];
               this.activeAlerts = data.active_alerts || [];
               this.totals = data.totals || { events: 0, dead_letters: 0, deferred_failures: 0 };
+              this.partial = data.partial || false;
+              this.sourcesFailed = data.sources_failed || [];
               this.error = null;
               this.finishFetch();
             } else {
@@ -233,6 +237,13 @@
 
         get totalErrors() {
           return this.totals.events + this.totals.dead_letters + this.totals.deferred_failures;
+        },
+
+        // The "data is clean" empty state is honest ONLY when every source loaded.
+        // A partial fetch that returned zero groups must not read as clean.
+        get showCleanState() {
+          return !this.loading && this.groups.length === 0
+            && this.fetchState !== 'fetch_error' && !this.partial;
         },
 
         get subsystems() {
@@ -642,6 +653,14 @@
       </div>
     </div>
 
+    <!-- Partial-data banner — one or more error sources did not load, so the
+         counts below are incomplete. -->
+    <div class="error-banner" x-show="$store.genesisErrors.partial" x-transition
+         style="background:#7a5c00; color:#fff;">
+      <span class="material-symbols-outlined">warning</span>
+      <span x-text="'Error data may be incomplete — sources not loaded: ' + ($store.genesisErrors.sourcesFailed || []).join(', ')"></span>
+    </div>
+
     <!-- Summary bar -->
     <div class="summary-bar" x-show="!$store.genesisErrors.loading">
       <div class="summary-stat">
@@ -789,7 +808,7 @@
     </div>
 
     <!-- Empty state -->
-    <div class="empty-state" x-show="!$store.genesisErrors.loading && $store.genesisErrors.groups.length === 0 && $store.genesisErrors.fetchState !== 'fetch_error'">
+    <div class="empty-state" x-show="$store.genesisErrors.showCleanState">
       <span class="material-symbols-outlined">check_circle</span>
       <span x-text="'No errors matching the last ' + $store.genesisErrors.filters.timeRange + '. Current data is clean.'"></span>
     </div>
