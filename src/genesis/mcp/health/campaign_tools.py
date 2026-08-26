@@ -76,6 +76,15 @@ async def _impl_campaign_create(
     initial_state: dict | None = None,
 ) -> dict:
     """Create and activate a new campaign."""
+    # Normalize the name up front so the uniqueness check below and the stored value
+    # AGREE — crud.create_campaign also strips as the storage choke point, but the
+    # pre-check here runs on the raw arg, so without this a control-char name could
+    # pass the raw-name check yet collide on the stripped stored value. Hygiene, not
+    # validation: a printable name is untouched.
+    from genesis.security.sanitizer import strip_control_chars
+
+    name = strip_control_chars(name)
+
     # Validate the session profile against the live registry BEFORE persisting.
     # An unknown profile would pass here but raise ValueError at DirectSession
     # init on every tick — a silent campaign outage. Mirrors user_job_tools.py /
