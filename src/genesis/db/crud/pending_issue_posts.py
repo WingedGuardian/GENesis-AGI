@@ -140,16 +140,24 @@ async def posted_index_for_repo(db: aiosqlite.Connection, repo: str) -> dict[int
     follow_up-sourced issues in *repo* — the WS-A close-loop join.
 
     A merged contributor PR's closed issue number resolves the follow_up that
-    spawned the issue. Only 'posted' rows carry an ``issue_number``; only
-    ``source='follow_up'`` rows carry a ``source_ref`` to resolve (Cat-1
-    codebase issues have ``source_ref`` NULL → excluded). There is no UNIQUE
-    index on (repo, issue_number); a duplicate issue_number would be a data
-    anomaly, so the FIRST row (by rowid) wins rather than corrupting the map.
+    spawned the issue. Only 'posted' rows carry an ``issue_number``; the map is
+    scoped to ``source='follow_up'`` rows (the authoritative filter — write-time
+    does not enforce that only follow_up rows carry a ``source_ref``, so a stray
+    ``source_ref`` on a Cat-1 ``codebase`` row must not leak in). Cat-1 codebase
+    issues have ``source_ref`` NULL and are excluded by both the source and the
+    NOT-NULL guard. There is no UNIQUE index on (repo, issue_number); a duplicate
+    issue_number would be a data anomaly, so the FIRST row (by rowid) wins rather
+    than corrupting the map.
+
+    The ``repo`` comparison is ``COLLATE NOCASE``: the stored repo is
+    config-derived while the caller's repo is gh-canonical (``gh repo view``), and
+    a casing divergence would otherwise silently no-op the whole close-loop.
     Requires ``db.row_factory = aiosqlite.Row``.
     """
     cursor = await db.execute(
         "SELECT issue_number, source_ref FROM pending_issue_posts "
-        "WHERE repo = ? AND status = 'posted' "
+        "WHERE repo = ? COLLATE NOCASE AND status = 'posted' "
+        "AND source = 'follow_up' "
         "AND issue_number IS NOT NULL AND source_ref IS NOT NULL "
         "ORDER BY rowid",
         (repo,),
@@ -201,12 +209,28 @@ async def prune_terminal(db: aiosqlite.Connection, *, older_than_days: int = 30,
     timestamp is older than *older_than_days*. ``held`` rows are NEVER pruned —
     they await the owner indefinitely. ``now`` is injected (never wall-clock) so
     the cutover is deterministic and testable. Wired into ``disk_hygiene.sh``.
-    Returns the number of rows deleted."""
+    Returns the number of rows deleted.
+
+    Close-loop protection: a ``'posted'`` row whose ``source_ref`` is a STILL-OPEN
+    follow_up is retained regardless of age — the WS-A close-loop reads it to map
+    ``issue_number → follow_up`` when a contributor later closes the issue. Pruning
+    it (an issue can stay open past *older_than_days* before a close lands) would
+    orphan the follow_up so it never resolves. "Open" mirrors the exact predicate
+    the close-loop resolves against (``get_open_followups`` / ``absorb_followup``):
+    ``kind='follow_up' AND status IN ('pending', 'in_progress')``. A ``'posted'``
+    row with ``source_ref`` NULL (codebase) OR whose follow_up is resolved/tabled
+    stays prunable; non-posted terminal rows are always prunable."""
     cutoff = _iso_days_before(now, older_than_days)
     cursor = await db.execute(
         "DELETE FROM pending_issue_posts "
         "WHERE status IN ('posted', 'rejected', 'expired', 'dry_run') "
-        "AND COALESCE(posted_at, rejected_at, dry_run_at, held_at) < ?",
+        "AND COALESCE(posted_at, rejected_at, dry_run_at, held_at) < ? "
+        "AND NOT (status = 'posted' AND source_ref IS NOT NULL AND EXISTS ("
+        "  SELECT 1 FROM follow_ups f "
+        "  WHERE f.id = pending_issue_posts.source_ref "
+        "  AND f.kind = 'follow_up' "
+        "  AND f.status IN ('pending', 'in_progress')"
+        "))",
         (cutoff,),
     )
     await db.commit()

@@ -169,7 +169,12 @@ async def _impl_contributor_issue_propose(
         db,
         id=pending_id,
         request_id=request_id,
-        repo=repo,
+        # Belt-and-suspenders for the WS-A close-loop join: store the repo in a
+        # deterministic canonical form (lowercase) so a config-vs-gh casing
+        # divergence can't strand the mapping. gh treats owner/name as
+        # case-insensitive, so a lowercased slug still posts correctly. The
+        # primary defense is the COLLATE NOCASE read in posted_index_for_repo.
+        repo=repo.lower(),
         title=title,
         body=body,
         labels=json.dumps(label_list) if label_list else None,

@@ -841,10 +841,33 @@ async def _run_locked(
             # reference — the common empty case never pays for the round-trip.
             default_branch = await resolve_default_branch()
             if not default_branch:
-                # Can't confirm the default branch -> SKIP the lane (fail-safe):
-                # honoring `Closes #N` on the wrong branch would falsely absorb a
-                # still-open issue's follow_up. A skip just re-covers next run.
+                # Can't confirm the default branch -> FAIL the run and keep the
+                # cursor (fail-safe): honoring `Closes #N` on the wrong branch would
+                # falsely absorb a still-open issue's follow_up. Falling THROUGH to
+                # the end-of-run ok would advance the watermark past this skipped
+                # closing PR, permanently dropping the close event — so we must fail
+                # exactly like the posted_index_read_failed branch above and let the
+                # window re-cover next run. Mirrors that branch verbatim.
                 detail_notes.append("issue-close skipped (default-branch unresolved)")
+                recorded = await _record_run(
+                    db_path,
+                    **_base_row(
+                        status="failed",
+                        repo=repo,
+                        n_prs=len(prs),
+                        n_open_items=len(open_items),
+                        n_exact=n_exact,
+                    ),
+                    annotations=annotations,
+                )
+                if recorded:
+                    _write_cursor(root, cursor, merged_at=None)
+                await _record_telemetry(db_path, "failed", "default_branch_unresolved")
+                return {
+                    "status": "failed",
+                    "detail": "default_branch_unresolved",
+                    "n_exact": n_exact,
+                }
             else:
                 followup_index = {str(f["id"]): f for f in followup_items if f.get("id")}
                 closes_matches = match_closed_issues(

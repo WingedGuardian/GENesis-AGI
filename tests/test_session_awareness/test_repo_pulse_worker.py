@@ -966,6 +966,31 @@ async def test_issue_close_posted_index_read_failure_fails_run(
 
 
 @pytest.mark.asyncio
+async def test_issue_close_default_branch_unresolved_fails_run(
+    pulse_root, db_path, monkeypatch, live_mode
+):
+    # The default branch can't be confirmed (resolve_default_branch -> None). The
+    # lane must NOT fall through to an end-of-run ok that advances the cursor PAST
+    # the skipped closing PR (permanently dropping the close event) — it FAILS the
+    # run and keeps the cursor so the window re-covers next run.
+    _write_cursor_file(pulse_root, last_merged_at=MERGED_OLD)
+    await _seed_followup(db_path)
+    await _seed_posted_issue(db_path, issue_number=101, source_ref=FU)
+
+    async def _unresolved(*a, **k):
+        return None
+
+    monkeypatch.setattr(rpw, "resolve_default_branch", _unresolved)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr_closes(refs=[_close_ref(101)])]))
+    assert out["status"] == "failed"
+    assert out["detail"] == "default_branch_unresolved"
+    assert (await _followup_row(db_path))["status"] == "pending"  # no absorb
+    assert await _anns(db_path, target_kind="follow_up") == []
+    # cursor NOT advanced past the skipped closing PR (stays at the seeded value)
+    assert _cursor(pulse_root)["last_merged_at"] == MERGED_OLD
+
+
+@pytest.mark.asyncio
 async def test_followup_proposal_confirmed_when_completed_with_pr(
     pulse_root, db_path, monkeypatch, live_mode
 ):
