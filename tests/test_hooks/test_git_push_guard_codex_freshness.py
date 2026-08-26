@@ -32,7 +32,9 @@ STALE = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 def _hermetic_codex_comments(monkeypatch):
     """Default: NO Codex issue-comments, so the clean-comment freshness fallback in
     ``_check_codex_reviewed_head`` is network-free unless a test opts in. Tests override
-    with their own ``monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", …)`` (later wins)."""
+    with their own ``monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", …)`` (later wins).
+    (The required-CI-workflow seam pin these green rollup fixtures rely on is the
+    shared autouse fixture in tests/test_hooks/conftest.py.)"""
     monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
 
 
@@ -539,7 +541,8 @@ class TestMainLevelIntegration:
         monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
         monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", "main")
         monkeypatch.setenv(
-            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "t", "conclusion": "SUCCESS"}])
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps([{"name": "t", "workflowName": "CI", "conclusion": "SUCCESS"}]),
         )
         # A valid OWNER scheduled-review marker AT head, so the scheduled-review merge
         # gate is satisfied and these cases keep exercising the freshness/binding wiring
@@ -648,7 +651,8 @@ class TestStaleSigilDoesNotWaiveScanners:
         monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
         monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", "main")
         monkeypatch.setenv(
-            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "t", "conclusion": "SUCCESS"}])
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps([{"name": "t", "workflowName": "CI", "conclusion": "SUCCESS"}]),
         )
         # Scheduled review satisfied at head → the stale-override merge reaches the
         # finding scanner this test is about (not the new scheduled gate).
