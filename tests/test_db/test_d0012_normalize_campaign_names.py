@@ -57,3 +57,37 @@ def test_noop_on_clean_install(tmp_path, monkeypatch):
 
     assert d0012.verify() is True
     assert d0012.migrate() == {"normalized": 0, "skipped_collision": 0}
+
+
+def test_multi_dirty_collide_no_clean_holder(tmp_path, monkeypatch):
+    # LOAD-BEARING lock: three dirty rows all normalize to "foo" with NO pre-existing
+    # clean holder. Only the in-loop names.discard/add mutation stops the 2nd/3rd
+    # UPDATE from hitting UNIQUE(name) -> IntegrityError. A refactor that builds `names`
+    # once (no mutation) would pass every OTHER test yet crash here. First row wins,
+    # the rest are skipped, nothing is merged, and it stays idempotent.
+    db_path = tmp_path / "genesis.db"
+    _seed(db_path, [("c1", "foo\n"), ("c2", "foo\r"), ("c3", "foo\t")])
+    monkeypatch.setattr(d0012, "genesis_db_path", lambda: str(db_path))
+
+    assert d0012.migrate() == {"normalized": 1, "skipped_collision": 2}
+    db = sqlite3.connect(db_path)
+    names = {r[0] for r in db.execute("SELECT name FROM campaigns").fetchall()}
+    db.close()
+    assert "foo" in names and len(names) == 3  # one won; none merged (still 3 rows)
+    assert d0012.migrate() == {"normalized": 0, "skipped_collision": 2}  # idempotent
+    assert d0012.verify() is True
+
+
+def test_all_control_name_normalizes_to_empty(tmp_path, monkeypatch):
+    # Documented accepted outcome: an all-control-char name -> "" (single-line),
+    # consistent with what the write-boundary strip would produce for the same input.
+    db_path = tmp_path / "genesis.db"
+    _seed(db_path, [("c1", "\n\t\r")])
+    monkeypatch.setattr(d0012, "genesis_db_path", lambda: str(db_path))
+
+    assert d0012.migrate() == {"normalized": 1, "skipped_collision": 0}
+    db = sqlite3.connect(db_path)
+    names = {r[0] for r in db.execute("SELECT name FROM campaigns").fetchall()}
+    db.close()
+    assert names == {""}
+    assert d0012.verify() is True
