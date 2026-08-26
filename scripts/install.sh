@@ -1324,23 +1324,24 @@ fi
 # recovery `claude -p` is single-brain and never nests, so host-setup.sh deliberately
 # does NOT set the nesting default.) See docs/reference/cc-compatibility.md.
 _settings_file="$HOME/.claude/settings.json"
-mkdir -p "$HOME/.claude"
-if [ ! -f "$_settings_file" ]; then
-    cat > "$_settings_file" <<'CCSETTINGS'
-{
-  "env": {
-    "DISABLE_AUTOUPDATER": "1",
-    "DISABLE_UPDATES": "1",
-    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "2"
-  }
-}
-CCSETTINGS
-    echo "    + Created $_settings_file with auto-updater suppression + subagent-nesting default"
-else
-    # Merge — preserves any existing env vars and other top-level keys.
-    if python3 - "$_settings_file" <<'PYEOF' 2>/dev/null
-import json, sys
-path = sys.argv[1]
+# The two auto-updater keys are owned by cc_ensure_updater_suppressed
+# (scripts/lib/cc_version.sh, sourced above) — the SAME function the align path
+# re-runs on every install/bootstrap/update, so setup and steady-state can't drift
+# apart. It creates the file when absent and never clobbers an unparseable one.
+if ! cc_ensure_updater_suppressed "$_settings_file"; then
+    echo "    WARNING: Could not set auto-updater suppression in $_settings_file"
+    echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\"}}"
+    SETUP_WARNINGS=1
+fi
+# Subagent-nesting default is container-only and set-if-absent (a deliberate
+# operator override — 0 to disable, or higher — is preserved), so it stays here
+# rather than in the shared updater-suppression function.
+if python3 - "$_settings_file" <<'PYEOF' 2>/dev/null
+import json, os, stat, sys, tempfile
+# Mirrors cc_ensure_updater_suppressed's write contract: follow symlinks (dotfiles
+# setups) and preserve the original mode — a rename installs a FRESH inode, which
+# would silently widen a 0600 credential-bearing settings.json to 0644.
+path = os.path.realpath(sys.argv[1])
 try:
     with open(path) as f:
         data = json.load(f)
@@ -1351,30 +1352,32 @@ if not isinstance(data, dict):
 env = data.setdefault("env", {})
 if not isinstance(env, dict):
     sys.exit(2)
-changed = False
-for key in ("DISABLE_AUTOUPDATER", "DISABLE_UPDATES"):
-    if env.get(key) != "1":
-        env[key] = "1"
-        changed = True
-# Genesis default: allow ONE level of subagent nesting (session->subagent->subagent
-# = 3 tiers) on CC 2.1.217+, which made nested spawning opt-in (default 1 = none).
-# Set-if-absent so a deliberate operator override (0 to disable, or higher) is kept.
 if "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH" not in env:
     env["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] = "2"
-    changed = True
-if changed:
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-    print("merged")
-else:
-    print("unchanged")
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        mode = 0o600
+    fd, tmp = tempfile.mkstemp(
+        dir=os.path.dirname(path) or ".", prefix=".settings.", suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 PYEOF
-    then
-        echo "    + Auto-updater suppression + subagent-nesting default set in $_settings_file"
-    else
-        echo "    WARNING: Could not merge auto-updater settings into $_settings_file"
-        echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\", \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
-    fi
+then
+    # Report ONLY what this block verified. The suppression outcome is reported by
+    # its own branch above — claiming it here would print a success line on the
+    # exact path where suppression just failed.
+    echo "    + Subagent-nesting default set in $_settings_file"
+else
+    echo "    WARNING: Could not set the subagent-nesting default in $_settings_file"
+    echo "    Add manually:  {\"env\": {\"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
 fi
 
 # Login guidance (interactive only)

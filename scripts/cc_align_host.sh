@@ -55,27 +55,38 @@ if ! flock -n "$LOCK_FD"; then
     exit 0
 fi
 
-# ── Guardian-less install → clean no-op ──
-if [ ! -f "$GUARDIAN_CONFIG" ]; then
-    echo "cc_align_host: no guardian_remote.yaml — host alignment not applicable (no-op)"
-    exit 0
-fi
 if [ ! -f "$CC_ENV" ]; then
     echo "cc_align_host: $CC_ENV missing — cannot resolve pins (skipping)"
-    exit 0
-fi
-if [ ! -f "$SSH_KEY" ]; then
-    echo "cc_align_host: guardian SSH key $SSH_KEY missing — cannot reach host (skipping)"
     exit 0
 fi
 
 # ── Resolve the repo pins + the shared aligner. unset first so an inherited
 # env override never beats the repo pin (the exact bug cc_version.sh warns
 # about); the source defines cc_align_host_sync AND sets CC_VERSION/NODE_MAJOR.
+# Sourced BEFORE the guardian/ssh checks below so the CONTAINER-side reconcile
+# that follows runs on every install, guardian or not.
 HOST_CC_DEGRADED=""
 unset CC_VERSION NODE_MAJOR
 # shellcheck source=/dev/null
 source "$CC_ENV"
+
+# ── Container-side auto-updater suppression (runs on EVERY install, before the
+# guardian gates). This timer is the only RECURRING CC path on the box: without
+# this line, both machines' suppression is re-asserted solely by an
+# operator-triggered update.sh/bootstrap.sh, so a settings file that drifts after
+# setup stays unprotected indefinitely — and an unsuppressed auto-updater makes
+# the pin advisory. Non-fatal; loud only when it actually repairs something.
+cc_ensure_updater_suppressed || true
+
+# ── Guardian-less install → nothing further to align (host legs below) ──
+if [ ! -f "$GUARDIAN_CONFIG" ]; then
+    echo "cc_align_host: no guardian_remote.yaml — host alignment not applicable (no-op)"
+    exit 0
+fi
+if [ ! -f "$SSH_KEY" ]; then
+    echo "cc_align_host: guardian SSH key $SSH_KEY missing — cannot reach host (skipping)"
+    exit 0
+fi
 
 # ── Parse host_ip / host_user (yaml.safe_load for robustness, mirroring
 # update.sh). A missing/broken venv python or unparseable config → clean skip.

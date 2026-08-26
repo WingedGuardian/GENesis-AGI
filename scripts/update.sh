@@ -485,6 +485,14 @@ _sync_deploy_targets() {
             echo "  WARNING: container Claude Code sync failed"
             HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}container_cc_sync"
         fi
+        # cc_ensure_local also re-asserts auto-updater suppression (it sets
+        # CC_SUPPRESSION_STATE). Surface a non-ok outcome the same way as a version
+        # sync failure: an unsuppressed auto-updater makes the pin advisory, and a
+        # REPEATED repair means something on this box keeps rewriting settings.json
+        # — neither should live only as a line in a long deploy log.
+        if [ "${CC_SUPPRESSION_STATE:-ok}" != "ok" ]; then
+            HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_${CC_SUPPRESSION_STATE}"
+        fi
         cc_shadow_scan || true
     else
         echo "  WARNING: $_cc_env missing — skipping container CC sync"

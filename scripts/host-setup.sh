@@ -1321,45 +1321,22 @@ mkdir -p "$_host_home/.claude"
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
     chown "$_host_user:" "$_host_home/.claude" 2>/dev/null || true
 fi
-if [ ! -f "$_host_settings_file" ]; then
-    cat > "$_host_settings_file" <<'CCSETTINGS'
-{
-  "env": {
-    "DISABLE_AUTOUPDATER": "1",
-    "DISABLE_UPDATES": "1"
-  }
-}
-CCSETTINGS
-    chown "$_host_user:" "$_host_settings_file" 2>/dev/null || true
-    echo "  + Created $_host_settings_file with auto-updater suppression"
+# Same shared owner of these two keys as the container leg and the align path:
+# cc_ensure_updater_suppressed (scripts/lib/cc_version.sh, sourced above). One
+# implementation, so the host and container can't drift apart — and the host is
+# where an unsuppressed auto-updater bites hardest (it silently moved a host
+# several minor versions past the pin, running the Guardian recovery brain on an
+# unvetted CC). Creates the file when absent; never clobbers an unparseable one.
+if cc_ensure_updater_suppressed "$_host_settings_file"; then
+    echo "  + Auto-updater suppression set in $_host_settings_file"
 else
-    if python3 - "$_host_settings_file" <<'PYEOF' 2>/dev/null
-import json, sys
-path = sys.argv[1]
-try:
-    with open(path) as f:
-        data = json.load(f)
-except Exception:
-    sys.exit(2)
-if not isinstance(data, dict):
-    sys.exit(2)
-env = data.setdefault("env", {})
-if not isinstance(env, dict):
-    sys.exit(2)
-changed = False
-for key in ("DISABLE_AUTOUPDATER", "DISABLE_UPDATES"):
-    if env.get(key) != "1":
-        env[key] = "1"
-        changed = True
-if changed:
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-PYEOF
-    then
-        echo "  + Auto-updater suppression set in $_host_settings_file"
-    else
-        echo "  WARNING: Could not merge auto-updater settings into $_host_settings_file"
-    fi
+    echo "  WARNING: Could not set auto-updater suppression in $_host_settings_file"
+    echo "  Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\"}}"
+fi
+# Under sudo the file above may be created as root — hand it back to the operator
+# so their CC can rewrite it (chown the file too, not just the directory).
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    chown "$_host_user:" "$_host_settings_file" 2>/dev/null || true
 fi
 
 # ── Shared user-level CLAUDE.md on the host (D16) ──────────────

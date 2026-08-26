@@ -44,6 +44,18 @@ One pin, both machines, no drift:
    **only if it differs from the pin** — dispatches `update-cc <pin>` to the
    Guardian gateway on the host. The dispatch is idempotent (acts only on drift)
    and non-fatal (a failed host update leaves the previous working CC in place).
+4. **Confirm the pin can still hold.** `update.sh` re-asserts auto-updater
+   suppression automatically (via `cc_ensure_local` → `cc_ensure_updater_suppressed`),
+   so watch its output for a `! CC auto-updater suppression was MISSING` line — that
+   means something on this machine rewrote `~/.claude/settings.json`, and a repeat is
+   worth investigating rather than letting it be silently re-repaired every run. To
+   check by hand on either machine:
+   ```bash
+   python3 -c "import json,os;p=os.path.expanduser('~/.claude/settings.json');e=(json.load(open(p)) if os.path.exists(p) else {}).get('env',{});print({k:e.get(k) for k in ('DISABLE_AUTOUPDATER','DISABLE_UPDATES')})"
+   ```
+   Both must read `1`. A missing file, or either key `None`, means **not suppressed** —
+   and a pin with an un-suppressed auto-updater is not a pin. See §Auto-Updater
+   Suppression Requires User-Level Settings.
 
 The host install runs through the gateway's `update-cc <semver>` op
 (`scripts/guardian-gateway.sh`): it validates the argument as a bare semver,
@@ -404,14 +416,50 @@ project directory. The auto-updater runs in contexts where repo settings don't a
 **user-level** `~/.claude/settings.json` on every machine running Genesis (container
 + host VM). This is the file with authority for global CC behavior.
 
-**Automated:** `scripts/install.sh` and `scripts/host-setup.sh` now create or merge
-these env vars into `~/.claude/settings.json` during setup (preserving any existing
-keys). Fresh installs no longer need manual intervention.
+**Automated — and re-asserted on every align, not just at setup.** Both keys are owned
+by one shared function, **`cc_ensure_updater_suppressed`** (`scripts/lib/cc_version.sh`):
 
-This file is per-machine and NOT tracked in the repo. Without the install-script
-automation, CC silently bumps versions out from under us — we discovered this when
-the host VM was running 2.1.119 despite the 2.1.87 script pin, and again mid-session
-when the container auto-updated from 2.1.159 to 2.1.160.
+- `scripts/install.sh` (container) and `scripts/host-setup.sh` (host) call it at setup —
+  it creates `~/.claude/settings.json` when absent and merges into an existing one,
+  preserving every other key.
+- **`cc_ensure_local` calls it FIRST on every align** — i.e. on every `install.sh`,
+  `bootstrap.sh`, and `update.sh` run. Deliberately ahead of the pin/npm checks, because
+  the common path is "already at pin", which returns early, and that steady state is
+  exactly when settings drift would otherwise go unnoticed.
+- **The nightly `genesis-cc-align.timer` reconciles the container too** — `cc_align_host.sh`
+  calls it before its guardian gates, so the box self-heals daily instead of waiting for
+  an operator-triggered update. (Without that line the ONLY re-assert on either machine
+  was a manual `update.sh`/`bootstrap.sh`/`install.sh`.)
+- **A non-ok outcome reaches health, not just the log** — the function sets
+  `CC_SUPPRESSION_STATE` (`ok` / `repaired` / `failed`), and `update.sh` folds anything
+  other than `ok` into `HOST_CC_DEGRADED` → `update_history` → deploy health, the same
+  channel a container/host *version* sync failure uses.
+
+It is idempotent and silent when correct, and **loud when it repairs drift**
+(`! CC auto-updater suppression was MISSING in … — restored: …` on stderr, so it shows
+up in update/bootstrap output). It never overwrites a settings file it cannot parse —
+a corrupt or foreign file is reported and left alone, since destroying operator settings
+is worse than the drift.
+
+**Why the re-assert exists (2026-08-26):** setup-time-only was not enough. This install
+was found with `DISABLE_AUTOUPDATER=1` present but **`DISABLE_UPDATES` missing** from the
+user-level file, and nothing in the recurring paths (`update.sh`, `genesis-cc-align.timer`,
+`cc_version.sh`) re-checked it — so a drifted install stayed silently unprotected and the
+pin could be violated with no signal. The npm pin only governs what a *deliberate* install
+writes; these two keys are what stop CC moving on its own.
+
+This file is per-machine and NOT tracked in the repo. Without this automation CC silently
+bumps versions out from under us — discovered when the host VM was running 2.1.119 despite
+the 2.1.87 script pin, and again mid-session when the container auto-updated from 2.1.159
+to 2.1.160.
+
+**Known coverage gap (the HOST's `settings.json` only):** the container is reconciled on
+every align *and* nightly (above). The host's user-level file is written by `host-setup.sh`
+at setup, and the nightly timer re-aligns the host's CC *version* through the guardian
+gateway but cannot reach the host's `settings.json` — there is no gateway op for it. So
+host *version* drift self-heals nightly, host *settings* drift does not: re-run
+`host-setup.sh`, or check the file by hand, if the host is ever suspected of
+self-updating.
 
 ### Cache Inflation (since ~2.1.100, accepted)
 

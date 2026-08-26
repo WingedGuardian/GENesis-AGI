@@ -35,6 +35,127 @@ NODE_MAJOR="${NODE_MAJOR:-22}"
 CC_PROBE_DIRS="${CC_PROBE_DIRS:-/usr/local/bin:/usr/bin:$HOME/.npm-global/bin}"
 
 
+# cc_ensure_updater_suppressed — re-assert CC auto-updater suppression.
+#
+# Ensures BOTH `DISABLE_AUTOUPDATER=1` and `DISABLE_UPDATES=1` in the USER-level
+# ~/.claude/settings.json (arg 1 overrides the path, for the host leg).
+#
+# WHY BOTH, AND WHY USER-LEVEL: repo/project settings apply only when CC is
+# launched from that directory, and the auto-updater runs in contexts where they
+# do not — which is how a machine once self-bumped past the pin mid-session, and
+# how a host VM ended up several minor versions ahead of the script pin with the
+# Guardian recovery brain running an unvetted CC. The npm pin only decides what a
+# DELIBERATE install writes; these two keys are what stop CC moving on its own.
+#
+# WHY IT LIVES ON THE ALIGN PATH: install.sh/host-setup.sh set these at SETUP
+# time only. Nothing re-asserted them afterwards, so an install whose settings
+# drifted (hand-edit, a tool rewriting the file, a partial restore) stayed
+# silently unprotected forever — the pin could be violated with no signal. This
+# runs from cc_ensure_local, i.e. on every install/bootstrap/update align, so the
+# suppression is re-established as often as the pin itself.
+#
+# Idempotent and NON-FATAL. Deliberately QUIET when already correct (it runs on
+# every align); LOUD only when it actually repairs drift, so a silent regression
+# becomes visible in update/bootstrap output instead of rotting unnoticed.
+# Never clobbers a settings file it cannot parse — a corrupt/foreign file is
+# reported, not overwritten (destroying user settings is worse than the drift).
+# Both suppressions below are cross-file blindness, not dead code: the linter only
+# sees THIS file, where the call is arg-less and the state variable is never read.
+# In reality host-setup.sh passes the host operator's settings path, and update.sh
+# consumes CC_SUPPRESSION_STATE (folding it into HOST_CC_DEGRADED).
+# shellcheck disable=SC2120,SC2034
+cc_ensure_updater_suppressed() {
+    local settings_file="${1:-$HOME/.claude/settings.json}"
+    # Outcome for callers that surface health (update.sh folds a non-ok value into
+    # HOST_CC_DEGRADED -> update_history -> deploy health). `ok` | `repaired` |
+    # `failed`. A stderr line alone is not a signal — it dies in a long deploy log.
+    CC_SUPPRESSION_STATE=ok
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        # NOTE: the create path this replaced used a pure-bash heredoc, so a
+        # python3-less machine could still get a correct file on a FRESH install.
+        # Both live callers guarantee python3 (install.sh is a Python installer;
+        # host-setup.sh apt-installs python3 before this runs), so there is no
+        # live trigger — but keep that ordering in mind before moving either call.
+        CC_SUPPRESSION_STATE=failed
+        echo "  WARNING: cc_ensure_updater_suppressed: python3 not found — cannot verify" \
+             "auto-updater suppression in $settings_file (CC may self-update past the pin)" >&2
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$settings_file")" 2>/dev/null || true
+
+    local out
+    if ! out="$(python3 - "$settings_file" <<'PYEOF' 2>/dev/null
+import json, os, stat, sys, tempfile
+
+# Resolve symlinks FIRST: a dotfiles-managed settings.json is common, and
+# write-by-rename onto the link would replace it with a regular file — forking
+# the operator's dotfiles copy (which keeps the stale content) from the live one,
+# permanently and silently. Follow the link and rewrite the real target.
+path = os.path.realpath(sys.argv[1])
+REQUIRED = {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}
+
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:
+        sys.exit(2)          # unparseable — report, never clobber
+    if not isinstance(data, dict):
+        sys.exit(2)
+else:
+    data = {}
+
+env = data.setdefault("env", {})
+if not isinstance(env, dict):
+    sys.exit(2)
+
+repaired = [k for k, v in REQUIRED.items() if env.get(k) != v]
+if repaired:
+    for k in repaired:
+        env[k] = REQUIRED[k]
+    # Atomic replace, but write-by-rename discards the ORIGINAL inode's metadata,
+    # so carry the mode across explicitly. settings.json's `env` block is where
+    # operators put provider API keys: a 0600 file silently returning as 0644
+    # (umask default on a fresh inode) would widen a credential store. mkstemp
+    # also creates 0600 up front — no world-readable window mid-write — and uses
+    # a unique name, so two concurrent aligns can't collide on a fixed `.tmp`.
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        mode = 0o600         # brand-new file: secrets-adjacent, start private
+    fd, tmp = tempfile.mkstemp(
+        dir=os.path.dirname(path) or ".", prefix=".settings.", suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)       # never leave a stray temp holding the contents
+        raise
+    print(" ".join(sorted(repaired)))
+PYEOF
+    )"; then
+        CC_SUPPRESSION_STATE=failed
+        echo "  WARNING: cc_ensure_updater_suppressed: could not read/merge $settings_file" \
+             "(left untouched) — verify DISABLE_AUTOUPDATER=1 and DISABLE_UPDATES=1 by hand," \
+             "or CC may self-update past the pin" >&2
+        return 1
+    fi
+
+    if [ -n "$out" ]; then
+        # Drift repaired — say so loudly; this should be rare, and a repeat means
+        # something on this machine is rewriting the file.
+        CC_SUPPRESSION_STATE=repaired
+        echo "  ! CC auto-updater suppression was MISSING in $settings_file — restored: $out" >&2
+    fi
+    return 0
+}
+
+
 # cc_ensure_local — install or align the LOCAL Claude Code CLI to $CC_VERSION.
 #
 # Idempotent, non-fatal, drift-healing. Container/local ONLY — the host VM's CC
@@ -58,6 +179,13 @@ CC_PROBE_DIRS="${CC_PROBE_DIRS:-/usr/local/bin:/usr/bin:$HOME/.npm-global/bin}"
 # `npm install @X.Y.Z` pins exactly X.Y.Z). NOTE `claude --version` prints
 # "2.1.173 (Claude Code)", so the version is field 1 (awk '{print $1}').
 cc_ensure_local() {
+    # FIRST, before any early return: re-assert auto-updater suppression. This is
+    # deliberately ahead of the pin/npm checks — the common path is "already at
+    # pin", which returns early, and that steady state is exactly when settings
+    # drift would otherwise go unnoticed. Non-fatal: a failure here must never
+    # stop the version align.
+    cc_ensure_updater_suppressed || true
+
     local pin="${CC_VERSION:-}"
     if [ -z "$pin" ]; then
         echo "  cc_ensure_local: CC_VERSION unset — skipping" >&2
