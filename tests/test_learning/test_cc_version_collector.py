@@ -54,6 +54,39 @@ def _mock_version(version: str):
     )
 
 
+def _capture_tracked_task(store: list):
+    """Stand in for tracked_task: capture the coroutine so the test can drive it.
+
+    Impact analysis is now dispatched OFF the signal loop via tracked_task, so
+    collect() returns before it runs. Tests capture the coroutine and either await
+    it (to assert analysis behaviour) or close() it (to assert collect() did NOT
+    block on it).
+    """
+    def _fake(coro, **kwargs):
+        store.append(coro)
+        return MagicMock()  # stand-in Task; the test drives the coroutine
+
+    return _fake
+
+
+@pytest.fixture(autouse=True)
+def _no_real_background_analysis():
+    """Neutralize the backgrounded impact analysis by default.
+
+    collect() now dispatches impact analysis via tracked_task; a version-change
+    test that doesn't care about analysis would otherwise spawn a REAL background
+    task doing subprocess/network I/O that lingers past the test's event loop
+    ("Event loop is closed"). This closes the coroutine instead. Tests that DO
+    assert analysis behaviour re-patch tracked_task within their own ``with``.
+    """
+    def _close(coro, **kwargs):
+        coro.close()
+        return MagicMock()
+
+    with patch("genesis.learning.signals.cc_version.tracked_task", _close):
+        yield
+
+
 class TestVersionDetection:
     """CC version change detection."""
 
@@ -157,12 +190,17 @@ class TestAnalyzerIntegration:
         with _mock_version("1.0.0"):
             await collector.collect()  # Store initial
 
+        tasks: list = []
         with (
             _mock_version("1.1.0"),
             patch("genesis.recon.cc_update_analyzer.CCUpdateAnalyzer") as MockAnalyzer,
+            patch("genesis.learning.signals.cc_version.tracked_task",
+                  _capture_tracked_task(tasks)),
         ):
             MockAnalyzer.return_value.analyze = mock_analyze
             reading = await collector.collect()
+            for coro in tasks:  # run the backgrounded impact analysis
+                await coro
 
         assert reading.value == 1.0
         MockAnalyzer.assert_called_once_with(db=db, router=router, pipeline=None, memory_store=None)
@@ -184,8 +222,8 @@ class TestAnalyzerIntegration:
         MockAnalyzer.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_analyzer_timeout_still_signals(self, db) -> None:
-        """When analyzer times out, signal still fires with value=1.0."""
+    async def test_slow_analysis_does_not_block_signal(self, db) -> None:
+        """A slow analysis runs OFF the signal loop — collect() returns immediately."""
         router = MagicMock()
         collector = CCVersionCollector(db, router=router)
 
@@ -195,16 +233,23 @@ class TestAnalyzerIntegration:
         async def slow_analyze(*args, **kwargs):
             await asyncio.sleep(999)
 
+        tasks: list = []
         with (
             _mock_version("1.1.0"),
             patch("genesis.recon.cc_update_analyzer.CCUpdateAnalyzer") as MockAnalyzer,
-            patch("genesis.learning.signals.cc_version.asyncio.wait_for", side_effect=TimeoutError),
+            patch("genesis.learning.signals.cc_version.tracked_task",
+                  _capture_tracked_task(tasks)),
         ):
             MockAnalyzer.return_value.analyze = AsyncMock(side_effect=slow_analyze)
+            # If analysis were still inline this would hang on sleep(999); it returns
+            # at once because analysis is dispatched to a background task.
             reading = await collector.collect()
 
         assert reading.value == 1.0
         assert reading.failed is False
+        assert len(tasks) == 1  # analysis WAS dispatched, just not awaited here
+        for coro in tasks:  # discard the slow coro without running it
+            coro.close()
 
     @pytest.mark.asyncio
     async def test_analyzer_exception_still_signals(self, db) -> None:
@@ -215,12 +260,19 @@ class TestAnalyzerIntegration:
         with _mock_version("1.0.0"):
             await collector.collect()
 
+        tasks: list = []
         with (
             _mock_version("1.1.0"),
             patch("genesis.recon.cc_update_analyzer.CCUpdateAnalyzer") as MockAnalyzer,
+            patch("genesis.learning.signals.cc_version.tracked_task",
+                  _capture_tracked_task(tasks)),
         ):
             MockAnalyzer.return_value.analyze = AsyncMock(side_effect=RuntimeError("boom"))
             reading = await collector.collect()
+            # The backgrounded analysis raises internally; _analyze_update swallows
+            # it, so awaiting the coro completes cleanly and the signal is unaffected.
+            for coro in tasks:
+                await coro
 
         assert reading.value == 1.0
         assert reading.failed is False
@@ -235,12 +287,17 @@ class TestAnalyzerIntegration:
         with _mock_version("1.0.0"):
             await collector.collect()
 
+        tasks: list = []
         with (
             _mock_version("1.1.0"),
             patch("genesis.recon.cc_update_analyzer.CCUpdateAnalyzer") as MockAnalyzer,
+            patch("genesis.learning.signals.cc_version.tracked_task",
+                  _capture_tracked_task(tasks)),
         ):
             MockAnalyzer.return_value.analyze = mock_analyze
             reading = await collector.collect()
+            for coro in tasks:
+                await coro
 
         assert reading.value == 1.0
         # Analyzer is called with router=None — it works without LLM, just stores basic finding
@@ -298,12 +355,17 @@ class TestAnalyzerIntegration:
         with _mock_version("1.0.0"):
             await collector.collect()
 
+        tasks: list = []
         with (
             _mock_version("1.1.0"),
             patch("genesis.recon.cc_update_analyzer.CCUpdateAnalyzer") as MockAnalyzer,
+            patch("genesis.learning.signals.cc_version.tracked_task",
+                  _capture_tracked_task(tasks)),
         ):
             MockAnalyzer.return_value.analyze = mock_analyze
             await collector.collect()
+            for coro in tasks:
+                await coro
 
         MockAnalyzer.assert_called_once_with(db=db, router=router, pipeline=mock_pipeline, memory_store=None)
 

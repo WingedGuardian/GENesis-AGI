@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import aiosqlite
 
 from genesis.awareness.types import SignalReading
+from genesis.util.tasks import tracked_task
 
 if TYPE_CHECKING:
     from genesis.routing.router import Router
@@ -81,12 +82,30 @@ class CCVersionCollector:
         if current != last_known:
             try:
                 await self._store_version_change(last_known, current)
-                await self._analyze_update(last_known, current)
             except Exception:
                 logger.warning(
-                    "Failed to store/analyze CC version change %s -> %s",
+                    "Failed to store CC version change %s -> %s",
                     last_known, current, exc_info=True,
                 )
+            # Impact analysis is best-effort ENRICHMENT, dispatched OFF the signal
+            # loop. The version-change observation is already persisted above; and
+            # analyze() is now map-reduce (up to _MAX_CHUNKS rate-gated LLM calls),
+            # so awaiting it inline would both (a) block the whole awareness signal
+            # tick for the analysis duration and (b) force a fixed caller deadline
+            # that — on an install whose only keyed free provider is RPM-limited —
+            # cancels the analysis and stores NO finding on the exact large-jump
+            # case it exists for. A tracked background task removes both: the tick
+            # returns immediately and the finding lands when analysis completes.
+            # _analyze_update catches + logs its own failures at WARNING (incl. the
+            # 600s timeout); tracked_task's done-callback is only the backstop for an
+            # unexpected escape. Retention is NOT provided by tracked_task (it keeps
+            # no registry) — the coroutine stays alive via its await-chain (each
+            # awaited fetch/LLM/DB future back-references the task); keep its first
+            # step an awaited loop future, or GC-mid-run risk returns.
+            tracked_task(
+                self._analyze_update(last_known, current),
+                name="cc-version-impact-analysis",
+            )
             logger.info("CC version changed: %s -> %s", last_known, current)
             return SignalReading(
                 name=self.signal_name,
@@ -278,7 +297,18 @@ class CCVersionCollector:
                 db=self._db, router=self._router,
                 pipeline=pipeline, memory_store=memory_store,
             )
-            result = await asyncio.wait_for(analyzer.analyze(old, new), timeout=30)
+            # 600s SAFETY bound — this runs in a tracked background task (see
+            # collect()), NOT on the signal-tick critical path, so a generous cap is
+            # free: it bounds only a genuinely-hung analyze (wedged gather / stuck
+            # subprocess) while never cancelling legitimate work. analyze() is now
+            # map-reduce — up to _MAX_CHUNKS rate-gated LLM calls — whose worst
+            # realistic wall-clock (all chunks serialized on a single 4-RPM provider:
+            # ~_MAX_CHUNKS*15s + fetch) is well under 600s, and 600s is well under the
+            # 900s watchdog. Per-call router timeouts already bound each individual
+            # call. The old inline 30s made the big multi-release jump the FAILURE
+            # case (deadline cancelled it before the finding stored); off-path + 600s
+            # removes that class entirely.
+            result = await asyncio.wait_for(analyzer.analyze(old, new), timeout=600)
             logger.info(
                 "CC update analysis complete: %s → %s [%s]",
                 old, new, result.get("impact", "unknown"),

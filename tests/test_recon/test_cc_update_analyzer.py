@@ -817,3 +817,124 @@ class TestKnowledgeIngestion:
         assert "Fixed --bare MCP bug" in body
         assert "## Raw changelog" in body
         assert "bare fix" in body
+
+
+class TestHardeningClassA_SizeBounding:
+    """Every chunk fed to an LLM call must fit the smallest provider's budget."""
+
+    def test_chunk_budget_fits_smallest_provider_tpm(self) -> None:
+        # groq-free (gpt-oss-120b) caps at 8000 TPM; a chunk must leave room for
+        # the ~600-token prompt + output + reasoning inflation. ~16k chars ~= 4k tokens.
+        from genesis.recon.cc_update_analyzer import _CHUNK_BUDGET
+
+        assert _CHUNK_BUDGET <= 20000
+
+    def test_headerless_body_over_budget_is_length_split(self) -> None:
+        # The [PARTIAL] fallback body has no `## X.Y.Z` headers; it must still be
+        # bounded, not returned as one oversized chunk.
+        body = "[PARTIAL] " + ("word " * 8000)  # ~40k chars, no headers
+        chunks = CCUpdateAnalyzer._chunk_changelog(body, budget=16000, max_chunks=12)
+        assert len(chunks) >= 2
+        assert all(len(c) <= 16000 for c in chunks)
+
+    def test_oversized_single_section_is_length_split(self) -> None:
+        # A single release section larger than budget must be split, not emitted whole.
+        big_section = "## 2.1.99\n\n" + ("x " * 12000)  # ~24k chars in one section
+        chunks = CCUpdateAnalyzer._chunk_changelog(big_section, budget=16000, max_chunks=12)
+        assert len(chunks) >= 2
+        assert all(len(c) <= 16000 for c in chunks)
+
+    def test_small_changelog_stays_single_chunk(self) -> None:
+        # Regression guard: a normal small bump must still be one chunk.
+        cl = "## 2.1.5\n\n- a\n\n## 2.1.4\n\n- b"
+        chunks = CCUpdateAnalyzer._chunk_changelog(cl, budget=16000, max_chunks=12)
+        assert len(chunks) == 1
+
+    def test_maxchunks_marker_keeps_last_chunk_within_budget(self) -> None:
+        # When the cap bites and the last kept chunk is already at budget, the loud
+        # omission marker must NOT push it over budget (invariant holds on the
+        # omission path too).
+        sections = "".join(f"## 2.1.{n}\n\n" + ("q" * 15980) + "\n\n" for n in range(30, 0, -1))
+        chunks = CCUpdateAnalyzer._chunk_changelog(sections, budget=16000, max_chunks=3)
+        assert len(chunks) == 3
+        assert "omitted" in chunks[-1]  # loud marker present
+        assert all(len(c) <= 16000 for c in chunks)  # and still within budget
+
+
+class TestHardeningClassB_ChainDistribution:
+    """N gathered route_calls must distribute across the chain, not serialize."""
+
+    @pytest.mark.asyncio
+    async def test_each_chunk_gets_distinct_chain_offset(self, db) -> None:
+        router = AsyncMock()
+        router.route_call = AsyncMock(return_value=_llm(IMPACT_INFORMATIONAL, "s", "d"))
+        analyzer = CCUpdateAnalyzer(db=db, router=router)
+        with patch.object(analyzer, "_chunk_changelog", return_value=["c0", "c1", "c2"]):
+            await analyzer._analyze_range("2.1.3", "2.1.9", "irrelevant")
+        offsets = sorted(
+            call.kwargs.get("chain_offset", 0)
+            for call in router.route_call.await_args_list
+        )
+        assert offsets == [0, 1, 2]  # distributed across the chain, not all 0
+
+
+class TestHardeningClassC_OutputNormalization:
+    """Untrusted LLM JSON is normalized to the full contract at one boundary."""
+
+    @pytest.mark.asyncio
+    async def test_list_impact_dict_falls_back_no_crash(self, db) -> None:
+        # A dict with an unhashable (list) impact must NOT reach the reducer.
+        bad = MagicMock()
+        bad.success = True
+        bad.content = json.dumps({"impact": ["breaking"], "summary": "s", "details": "d"})
+        router = AsyncMock()
+        router.route_call = AsyncMock(return_value=bad)
+        analyzer = CCUpdateAnalyzer(db=db, router=router)
+        out = await analyzer._llm_analyze("2.1.4", "2.1.5", "Fixed a leak")
+        assert isinstance(out, dict)
+        assert out["impact"] in (IMPACT_INFORMATIONAL, IMPACT_ACTION_NEEDED)
+        assert isinstance(out["summary"], str) and isinstance(out["details"], str)
+
+    @pytest.mark.asyncio
+    async def test_numeric_fields_coerced_to_str(self, db) -> None:
+        # Valid impact but non-str summary/details must be coerced, not passed through.
+        bad = MagicMock()
+        bad.success = True
+        bad.content = json.dumps({"impact": IMPACT_BREAKING, "summary": 42, "details": 99})
+        router = AsyncMock()
+        router.route_call = AsyncMock(return_value=bad)
+        analyzer = CCUpdateAnalyzer(db=db, router=router)
+        out = await analyzer._llm_analyze("2.1.4", "2.1.5", "x")
+        assert out["impact"] == IMPACT_BREAKING
+        assert isinstance(out["summary"], str) and isinstance(out["details"], str)
+
+    @pytest.mark.asyncio
+    async def test_multichunk_malformed_payload_end_to_end_no_crash(self, db) -> None:
+        # The reducer/ingest/alert must survive a malformed chunk payload end to end.
+        good = _llm(IMPACT_INFORMATIONAL, "A", "dA")
+        bad = MagicMock()
+        bad.success = True
+        bad.content = json.dumps({"impact": {"x": 1}, "details": [1, 2], "summary": None})
+        router = AsyncMock()
+        router.route_call = AsyncMock(side_effect=[good, bad])
+        analyzer = CCUpdateAnalyzer(db=db, router=router)
+        with patch.object(analyzer, "_fetch_changelog", new_callable=AsyncMock,
+                          return_value="## 2.1.5\n- x"), \
+             patch.object(analyzer, "_chunk_changelog", return_value=["c1", "c2"]):
+            result = await analyzer.analyze("2.1.3", "2.1.5")
+        assert isinstance(result["impact"], str)
+        assert "finding_id" in result
+
+    def test_coerce_returns_none_on_unhashable_impact(self) -> None:
+        # An unhashable impact must return None (-> fallback), never raise on the
+        # `in frozenset` membership test.
+        assert CCUpdateAnalyzer._coerce_analysis({"impact": ["breaking"], "summary": "s"}) is None
+        assert CCUpdateAnalyzer._coerce_analysis({"impact": {"x": 1}}) is None
+        assert CCUpdateAnalyzer._coerce_analysis("not a dict") is None
+        assert CCUpdateAnalyzer._coerce_analysis({"summary": "no impact key"}) is None
+
+    def test_coerce_normalizes_valid_payload_to_str_fields(self) -> None:
+        out = CCUpdateAnalyzer._coerce_analysis(
+            {"impact": IMPACT_BREAKING, "summary": 42, "details": None},
+        )
+        assert out == {"impact": IMPACT_BREAKING, "summary": "42", "details": ""}
