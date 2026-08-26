@@ -696,10 +696,19 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
                         (see _ci_identity + success_latest) — strict identity,
                         terminal completedAt comparison only, fail-closed.
       * ``"pending"`` — a check is still queued/running (and none are red)
-      * ``"unknown"`` — could not determine (API error, no checks, or an
-                        unrecognized payload shape) → callers FAIL OPEN, because
-                        blocking a merge on our own inability to read CI would be
-                        worse than the gap this gate closes.
+      * ``"absent"``  — a READABLE but genuinely EMPTY rollup (``[]``): zero checks
+                        exist, i.e. CI has NOT run. A DEFINITE fact, not a read
+                        failure — so the merge arm fail-CLOSES on it ON THE CANONICAL
+                        REPO (where CI always runs), waivable by ``# ci-override``.
+                        Off the canonical repo (which may legitimately have no CI) the
+                        caller lets it pass. This is the state that catches a
+                        conflicting branch / dropped ``pull_request`` trigger, which
+                        would otherwise merge un-CI'd.
+      * ``"unknown"`` — could NOT determine: an API error, empty/no output, an
+                        unparseable payload, or a non-empty payload with no CI-shaped
+                        entries. Callers FAIL OPEN, because blocking a merge on our own
+                        inability to read CI would be worse than the gap this closes.
+                        (Contrast with ``"absent"``: unreadable ≠ definitely-zero.)
 
     Tests inject via the ``_TEST_GH_CI_ROLLUP`` env var (a JSON array like
     ``gh pr view --json statusCheckRollup``) so no network is needed.
@@ -728,12 +737,23 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
             raw = result.stdout.strip()
         except Exception:
             return "unknown", []
+    if not raw:
+        # No output to read (empty stdout / unset seam): we cannot tell zero-checks
+        # from a silent read failure → fail-OPEN "unknown", never "absent".
+        return "unknown", []
     try:
-        checks = json.loads(raw) if raw else []
+        checks = json.loads(raw)
     except Exception:
         return "unknown", []
-    if not isinstance(checks, list) or not checks:
+    if not isinstance(checks, list):
         return "unknown", []
+    if not checks:
+        # A READABLE, genuinely-empty rollup: zero checks exist = CI has NOT run.
+        # Distinct from "unknown" (a read we could not complete) — this is a definite
+        # fact, so the canonical-repo merge arm fail-CLOSES on it (see main()): merging
+        # an empty-check PR is an un-CI'd merge. gh emits `[]` here when pull_request CI
+        # never fired (e.g. a conflicting branch suppresses the whole suite).
+        return "absent", []
 
     # First pass: for each strict identity (name, workflowName), the latest
     # `completedAt` among its SUCCESS CheckRuns on this head. A CANCELLED entry is
@@ -815,6 +835,15 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         return "pending", sorted(set(pending))
     if not saw_recognized:
         return "unknown", []  # payload had no CI-shaped entries
+    # KNOWN RESIDUAL (deferred, Codex #1484 P2): "green" here means every check that
+    # IS present concluded success — it does NOT assert the REQUIRED CI workflow ran.
+    # A partial rollup (e.g. only a green CodeQL, the CI suite absent) reads green.
+    # The "absent" branch above only catches a FULLY-empty rollup (the conflicting-
+    # branch symptom, where CI+CodeQL are both pull_request-gated and neither builds).
+    # Closing the partial case robustly needs a config-driven "required CI check
+    # identity" (a required-CI analogue of _required_scheduled_review_kinds) so it
+    # does NOT false-block an install whose CI is legitimately path-filtered/skipped
+    # for a docs-only PR. Tracked as a follow-up; not bundled here.
     return "green", []
 
 
@@ -3485,6 +3514,13 @@ def main() -> int:
                         f"BLOCKED: PR #{pr_num} has merge conflicts. Resolve before merging.",
                         file=sys.stderr,
                     )
+                    print(
+                        "A conflicting branch ALSO suppresses all pull_request CI (GitHub "
+                        "cannot build the merge ref), so no CI runs until you merge the "
+                        "base branch (usually main) into your PR branch — that resolves "
+                        "both at once.",
+                        file=sys.stderr,
+                    )
                     return 2
                 if mergeable != "MERGEABLE":
                     # Allowlist (fail-CLOSED): anything that is not a definite
@@ -3499,7 +3535,10 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     print(
-                        "GitHub may still be computing it, or the query failed. Wait and retry.",
+                        "GitHub may still be computing it, or the query failed. Wait and "
+                        "retry. A conflicting or still-computing branch also suppresses "
+                        "pull_request CI, so if CI never appears check "
+                        f"`gh pr view {pr_num} --json mergeable` first.",
                         file=sys.stderr,
                     )
                     return 2
@@ -3511,8 +3550,12 @@ def main() -> int:
                 # past a red `test` job — exactly how main was broken on
                 # 2026-07-28. Block red/pending CI unless a conscious, separate
                 # `# ci-override` is appended (never waived by --admin or
-                # # review-override). Fail-OPEN on "unknown" so a transient API
-                # hiccup can't wedge merges.
+                # # review-override). Fail-OPEN on "unknown" (a read we could not
+                # complete) so a transient API hiccup can't wedge merges — but
+                # fail-CLOSED on "absent" (a readable EMPTY check set = CI never ran)
+                # ON THE CANONICAL REPO (where CI always runs), so a conflicting branch
+                # or dropped pull_request trigger can't slip an un-CI'd merge through
+                # (handled just below).
                 ci_state, ci_bad = _pr_ci_status(pr_num, repo=merge_repo)
                 ci_override = has_trailing_override(merge_seg.raw, "ci-override")
                 if ci_state in ("red", "pending") and not ci_override:
@@ -3534,6 +3577,30 @@ def main() -> int:
                     print(
                         f"NOTE: CI {ci_state.upper()} on #{pr_num} "
                         f"({', '.join(ci_bad[:6])}) — merging via # ci-override "
+                        "(consciously accepted).",
+                        file=sys.stderr,
+                    )
+                # "absent" = a readable EMPTY check set (CI never ran). On the canonical
+                # public repo CI ALWAYS runs, so an empty set is anomalous → fail-CLOSED
+                # (a conflicting branch / dropped pull_request trigger would otherwise
+                # merge un-CI'd). Off the canonical repo (may legitimately have no CI)
+                # this stays fail-OPEN. Waived by the same conscious `# ci-override`.
+                # Scoped via the canonical-repo test (shared with the scheduled gate).
+                elif ci_state == "absent" and _scheduled_gate_applies(merge_repo):
+                    if not ci_override:
+                        print(
+                            f"BLOCKED: No CI checks have run on PR #{pr_num} (an empty "
+                            "check set). On the canonical repo CI always runs, so "
+                            "pull_request CI never fired — most often the branch was "
+                            "CONFLICTING (merge origin/main into it to resolve BOTH) or a "
+                            "trigger was dropped (push a commit to re-fire). Never merge "
+                            "an un-CI'd PR. If you are intentionally merging with no CI, "
+                            "append a trailing '# ci-override' (logged).",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    print(
+                        f"NOTE: No CI checks on #{pr_num} — merging via # ci-override "
                         "(consciously accepted).",
                         file=sys.stderr,
                     )
@@ -3816,6 +3883,12 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     ci_state, ci_bad = _pr_ci_status(pr_num, repo=repo)
     print(f"ci             : {ci_state}{' (' + ', '.join(ci_bad[:6]) + ')' if ci_bad else ''}")
     if ci_state in ("red", "pending"):
+        failures += 1
+    elif ci_state == "absent" and _scheduled_gate_applies(repo):
+        # Mirror the enforcement arm so the report and gate never disagree: a readable
+        # empty check set on the canonical repo blocks (CI never ran — likely a
+        # conflicting branch or a dropped pull_request trigger).
+        print("  ↳ BLOCK — no CI checks have run (empty check set); pull_request CI never fired.")
         failures += 1
     # Order mirrors the gate: base-invariant → freshness → finding scans, so a
     # review published mid-run can't pass freshness with its P1s unscanned.
