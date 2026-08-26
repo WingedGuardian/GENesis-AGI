@@ -57,6 +57,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A dead subsystem scheduler no longer reads "healthy" on the dashboard.** When
+  a background subsystem's scheduler/loop stops firing entirely (total cessation),
+  its heartbeat pulse goes silent — but nothing turned that into a signal, so the
+  Ego tile (and the rollup badge) could show green while the egos were dead, and no
+  alert was raised. Now the Errors view raises a `subsystem_stale:<name>` alert when
+  the ego (→ critical), inbox, or dashboard (→ warning) scheduler goes overdue past
+  its threshold, and the Ego tile flips to error ("scheduler stopped — no heartbeat
+  in Nh"), failing loud (`unknown`) if the signal can't be read. The alert is
+  pause-aware — a deliberately paused Genesis no longer false-alarms — and never
+  fires on a merely idle or freshly-booted install. This complements the existing
+  "running-but-failing" job alarms, which cannot see a job that has stopped running
+  at all. (Surplus already surfaces a wedged/dead loop via its own dashboard tile;
+  outreach total-cessation is tracked separately, since its heartbeat only runs once
+  a messaging channel is configured.)
 - **Worktree sessions now run the main-tree hook scripts, not their branch-frozen
   copies.** The `genesis-hook` launcher resolved each hook from the *current*
   worktree, so a git-tracked hook (security gates included) ran whatever version
@@ -78,7 +92,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   executable/source file even under `docs/` (e.g. `docs/conf.py`) still blocks,
   and the PR-level review-body gate is unchanged. Applies to `git_push_guard`'s
   inline-findings scan on both the `--check-pr` and merge paths.
-
 - **The dashboard Surplus health tile no longer reads green while the surplus
   scheduler is wedged.** Its verdict previously came from an activity proxy that
   shows "idle" for a stalled scheduler, so a stuck surplus loop appeared healthy —
