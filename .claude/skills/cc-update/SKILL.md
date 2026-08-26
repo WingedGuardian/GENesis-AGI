@@ -21,24 +21,62 @@ yourself hunting for where the pin lives or how the host updates, STOP and read 
   `scripts/lib/cc_version.sh`.
 
 ## The process in one breath (details live in the doc)
+0. **Intake — never from scratch.** Start from accumulated knowledge, not a blank grep: query
+   memory (`memory_recall`) + the **pre-eval cache** (recon observations of type
+   `cc_update_perversion`, filled continuously by the daily pre-eval job — the verdict for the
+   target version may already be waiting) + this doc's §Known Issues / §Version History + the FULL
+   changelog `(old, new]` range + `npm view … engines.node` + a quick community/informal sweep
+   (Reddit/forums) for regressions the changelog omits.
 1. **Impact eval** — `recon_cc_update_check(old, new)` MCP (backed by
-   `src/genesis/recon/cc_update_analyzer.py`). Note anything hooks / MCP / CLI-flags /
-   subagents / permissions-relevant.
-2. **Bump the pin** — `CC_VERSION` in `scripts/lib/cc_version.sh`. Bump `NODE_MAJOR` in the same
-   file **only if** the new CC raises its `engines.node` floor — the `cc-node-lockstep` CI job
+   `src/genesis/recon/cc_update_analyzer.py`; PR-A extends it to evaluate the WHOLE `(old, new]`
+   range rather than only the newest release). Treat the analyzer as a **triage summary, not a
+   substitute** — step 0's manual read of the intermediate changelogs stays authoritative for
+   anything load-bearing. Triage every hooks / MCP / CLI-flag / subagent / permissions delta.
+   **Rule: a changelog claim that "we depend on X" only gates the bump if verified against LIVE
+   usage** — the TodoWrite lesson: a removed feature Genesis measured 0 uses of is hygiene, not a
+   blocker.
+2. **Local-first gate (EXPLICIT — stronger than a normal PR).** Before ANY public pin change, align
+   the **CONTAINER ONLY** to the candidate: `source scripts/lib/cc_version.sh && CC_VERSION=<candidate>
+   cc_ensure_local` (`cc_ensure_local` is a shell function in that lib — source it first or it's
+   command-not-found; it's container-only, so the host stays at the pin). Verify a FRESH
+   `claude --version`, run the post-deploy validation (step 7) on the candidate, then **SOAK 2–3
+   days** under real use. Rollback is one command: `source scripts/lib/cc_version.sh &&
+   CC_VERSION=<pin> cc_ensure_local`. Do NOT run `update.sh` during the soak — it `unset`s any
+   inherited `CC_VERSION` and re-aligns the container to the pin, reverting the candidate. Proceed
+   to the public pin only after soak + explicit user sign-off.
+   - **Mid-soak drift (CC ships ~daily, so `latest` WILL move during the soak):** re-target to a
+     newer release mid-cycle ONLY if it fixes something touching our workflow / soak safety / a known
+     issue (e.g. 2.1.245→246 fixed a background-retention sweep that reaped user-created
+     `.claude/worktrees/`). Otherwise finish the soak on the pinned target and roll the delta into
+     the next cycle — never silently chase-latest.
+3. **Bump the pin** — `CC_VERSION` in `scripts/lib/cc_version.sh`. Bump `NODE_MAJOR` **only if** the
+   new CC raises its `engines.node` floor — the `cc-node-lockstep` CI job
    (`scripts/check_cc_node_lockstep.py`) fails the PR otherwise.
-3. **Update the doc** — `docs/reference/cc-compatibility.md`: §Current CC Version + a
-   Version-History row + any new caveats (checklist step 8).
-4. **PR → CI green** (incl. `cc-node-lockstep`) → private-data scan → **explicit user approval**
-   → squash-merge. Then `git pull --rebase origin main`.
-5. **Host-Deploy Gate** — `scripts/lib/cc_version.sh` is host-deployed. In the SAME session after
-   merge, run `scripts/update.sh` from `~/genesis`: it aligns the **container**
-   (`cc_ensure_local`) AND the **host VM** (guardian `update-cc` op) to the pin, idempotently.
-   Between updates the nightly `genesis-cc-align.timer` closes drift.
-6. **Verify E2E** — container + host `claude --version` == pin (host via the gateway `version` op /
-   `~/.genesis/host_gateway_state.json`); guardian tick healthy; a targeted CC integration smoke
-   (CCInvoker / a headless `claude -p`). The running foreground session keeps its OLD binary until
-   its next launch — verify a FRESH process, not this one.
+4. **Update the doc** — `docs/reference/cc-compatibility.md`: §Current CC Version + a Version-History
+   row + any new caveats (checklist step 8).
+5. **PR → CI green** (incl. `cc-node-lockstep`) → private-data scan → **explicit user approval** →
+   squash-merge. Then `git pull --rebase origin main`.
+6. **Host-Deploy Gate** — in the SAME session after merge, run `scripts/update.sh` from `~/genesis`:
+   it aligns the **container** (`cc_ensure_local`) AND the **host VM** (guardian `update-cc` op) to
+   the pin, idempotently. Deploys exceed the Bash tool timeout — run it as a **background task**, not
+   foreground. Between updates the nightly `genesis-cc-align.timer` closes drift.
+7. **Post-deploy validation (SAME session) — critical paths AND known/tabled issues, not just a
+   smoke.** Container + host `claude --version` == pin (host via the gateway `version` op /
+   `~/.genesis/host_gateway_state.json`); guardian tick healthy; a CCInvoker / headless `claude -p`
+   smoke on a **FRESH** process (this foreground session keeps its OLD binary until relaunch);
+   **re-check this doc's §Known Issues + any tabled CC bugs against the new version**; and verify each
+   behavior the impact eval flagged (e.g. an MCP arg-typing or `-p` result-shape change) on the live
+   path, not just that the flag still parses.
+8. **Leverage + capture** — for each newly-available capability Genesis would want, file the
+   detection→behavior follow-up (below). Store what was learned to memory + this doc + the KB so the
+   next update stays execute-not-rediscover.
+
+## Model-alias drift is watched automatically
+`--model opus` (and every alias) silently re-points to a new full model id when Anthropic bumps the
+family (measured: `opus` → `claude-opus-5` at a bump). The CCInvoker drift detector (`on_model_drift`,
+state at `~/.genesis/cc_model_resolution.json`) fires a one-shot ALERT on any alias→id change, so a
+bump that swaps the model behind an alias is never silent. This is a deliberate *float + alert*
+posture (accept the newer model, but know about it), NOT a version pin.
 
 ## Durable facts (don't re-derive; verify against the doc if a memory contradicts this)
 - **Both container and host install CC via npm-global — there is NO native-installer path**

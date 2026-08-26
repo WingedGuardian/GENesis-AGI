@@ -59,6 +59,48 @@ host (or container) can be rolled back to an older known-good version the same w
 (`update-cc <older>`) if a release regresses — exactly what the 2.1.90→2.1.87
 rollback needed.
 
+### Local-first gate — private soak before the public pin (EXPLICIT, stronger than a normal PR)
+
+`origin` is the **public** repo, so merging the pin *is* the release. That makes the public pin PR
+the wrong place to discover a regression. The standardized flow puts an explicit **local-first
+gate** ahead of it:
+
+1. **Align the container ONLY** to the candidate version — `CC_VERSION=<candidate> cc_ensure_local`
+   (source `scripts/lib/cc_version.sh` first). `cc_ensure_local` is **container-only** (the host VM
+   is synced separately by `update.sh`), so the host stays on the pin — a live rollback path if the
+   candidate misbehaves. Verify a **fresh** `claude --version` (this foreground session keeps its
+   old binary until relaunch).
+2. **Validate** the candidate with the post-deploy checklist (critical paths + §Known Issues +
+   any behavior the impact eval flagged).
+3. **Soak 2–3 days** under real use on the private box. **Do NOT run `update.sh` during the soak** —
+   it re-aligns the container back to the pin and reverts the candidate. Rollback at any time is one
+   command (self-contained): `source scripts/lib/cc_version.sh && CC_VERSION=<pin> cc_ensure_local`.
+4. **Public pin only after soak + explicit user sign-off** — then the normal pin PR (§Updating).
+
+**Mid-soak drift.** CC ships ~daily, so `latest` *will* move during the soak. Re-target to a newer
+release mid-cycle **only if** it fixes something touching our workflow / soak safety / a known issue
+(e.g. 2.1.245→246 fixed a background-retention sweep that reaped user-created `.claude/worktrees/`).
+Otherwise finish the soak on the pinned target and roll the delta into the next cycle — never
+silently chase-latest.
+
+### Continuous pre-eval — fill the funnel before the bump
+
+A gated daily cron (`SurplusScheduler`, `src/genesis/recon/cc_version_preeval.py`) lists CC versions
+published since a cursor and pre-computes each one's impact analysis, storing it as a
+`cc_update_perversion` observation (distinct from live `type="finding"` recon findings, and kept out
+of user-facing surfaces). So at intake the target version's verdict is often already cached — check
+there before re-running `recon_cc_update_check`. Gated by the `cc_version_preeval` settings domain
+(`off|live`, `max_versions_per_run` caps the paid fan-out) + env kill `GENESIS_CC_PREEVAL_DISABLED=1`.
+It anchors its first run to the *installed* version, so it looks forward, never back over history.
+
+### Model-alias drift detection — the `opus` → `opus-5` class
+
+`--model opus` (and every alias) silently re-points to a new full model id when Anthropic bumps the
+family (measured: `opus` → `claude-opus-5`). This is NOT a downgrade, so the tier-based downgrade
+detector is blind to it. The CCInvoker drift detector (`on_model_drift`; watermark at
+`~/.genesis/cc_model_resolution.json`) fires a one-shot ALERT on any alias→id change. Posture is
+deliberate **float + alert** (accept the newer model, but never be surprised by the swap), not a pin.
+
 ### One-canonical-copy policy (`cc_shadow_scan`)
 
 The pin machinery only manages ONE copy of Claude Code per machine. Any second
