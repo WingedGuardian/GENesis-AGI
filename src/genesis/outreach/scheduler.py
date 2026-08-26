@@ -773,6 +773,10 @@ class OutreachScheduler:
                         channel=channel,
                         thread_id=row.get("thread_id"),
                         validated_recipient=row.get("validated_recipient"),
+                        # Preserve the BULK/campaign flag through the queue so a
+                        # QUEUED cold-marketing send classifies BULK at the
+                        # autonomy gate (a legacy row lacking the column → False).
+                        labeled_surplus=bool(row.get("labeled_surplus")),
                         # The queue stores already-final agent messages
                         # (outreach_send bridge path). Deliver them EXACTLY —
                         # the LLM drafter must never re-word a stored message.

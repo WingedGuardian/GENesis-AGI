@@ -91,6 +91,28 @@ async def _grant_standard(db):
         )
 
 
+async def _grant_bulk(db):
+    for event in (CellEvent.CLASSIFY, CellEvent.APPROVE):
+        await cg.apply_event(
+            db,
+            origin_class="first_party",
+            domain="email",
+            verb="send",
+            risk_class="bulk",
+            event=event,
+            updated_at=_TS,
+        )
+
+
+async def _add_prospect(db, *, email, opted_out=False, status="active"):
+    from genesis.db.crud import marketing_prospects as mp
+
+    pid = f"prospect-{email}"
+    await mp.create(db, id=pid, email=email, status=status, created_at=_TS, updated_at=_TS)
+    if opted_out:
+        await mp.mark_opted_out(db, pid, opted_out_at=_TS)
+
+
 # --------------------------------------------------------------------------- #
 
 
@@ -262,6 +284,139 @@ async def test_granted_reply_unknown_sender_trips_guard(db):
     )
     assert decision.allow is False  # held — ambiguous scope is not waved through
     assert (await cg.get_cell(db, "email", "send", "standard"))["state"] == "ask"
+
+
+# --------------------------------------------------------------------------- #
+# Cold marketing (BULK) — labeled_surplus path + the marketing scope guard
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_labeled_surplus_classifies_bulk_cell_key(db):
+    # (d) labeled_surplus=True → the classifier cell key is exactly
+    # ("email","send","bulk").  Cold + ungranted → HELD on the bulk cell.
+    gate = _gate(db)
+    req = _req(validated_recipient="prospect@example.com", thread_id=None, labeled_surplus=True)
+    decision = await gate.check(
+        request=req,
+        recipient="prospect@example.com",
+        message_text="cold pitch",
+    )
+    assert decision.allow is False  # bulk cell ungranted (ASK) → held
+    pend = await pes.get_by_request(db, decision.request_id)
+    assert (pend["cell_domain"], pend["cell_verb"], pend["cell_risk_class"]) == (
+        "email",
+        "send",
+        "bulk",
+    )
+
+
+@pytest.mark.asyncio
+async def test_bulk_cold_ungranted_is_held(db):
+    # (a) a bulk send with a validated_recipient + no inbound → HELD; a
+    # pending_email_sends row is written (adapter is never reached at the gate).
+    gate = _gate(db)
+    req = _req(validated_recipient="prospect@example.com", thread_id=None, labeled_surplus=True)
+    decision = await gate.check(
+        request=req,
+        recipient="prospect@example.com",
+        message_text="hi",
+    )
+    assert decision.allow is False
+    assert await pes.get_by_request(db, decision.request_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_granted_bulk_unknown_recipient_demotes_and_holds(db):
+    # NEW guard: a GRANTED bulk cell whose recipient is NOT a curated prospect
+    # → scope drift → hold THIS send + demote GRANTED→ASK.
+    await _grant_bulk(db)
+    await _add_prospect(db, email="known@example.com")  # active
+    gate = _gate(db)
+    req = _req(validated_recipient="stranger@example.com", thread_id=None, labeled_surplus=True)
+    decision = await gate.check(
+        request=req,
+        recipient="stranger@example.com",
+        message_text="hi",
+    )
+    assert decision.allow is False
+    cell = await cg.get_cell(db, "email", "send", "bulk")
+    assert cell["state"] == "ask"  # demoted
+    assert cell["corrections"] == 1
+
+
+@pytest.mark.asyncio
+async def test_granted_bulk_opted_out_recipient_demotes_and_holds(db):
+    # A curated-but-opted-out prospect is NOT in the active set → trip + demote
+    # (fresh cell so the demote-then-regrant transition never runs).
+    await _grant_bulk(db)
+    await _add_prospect(db, email="gone@example.com", opted_out=True)
+    gate = _gate(db)
+    req = _req(validated_recipient="gone@example.com", thread_id=None, labeled_surplus=True)
+    decision = await gate.check(
+        request=req,
+        recipient="gone@example.com",
+        message_text="hi",
+    )
+    assert decision.allow is False
+    assert (await cg.get_cell(db, "email", "send", "bulk"))["state"] == "ask"
+
+
+@pytest.mark.asyncio
+async def test_granted_bulk_recipient_in_active_set_allowed(db):
+    # A GRANTED bulk cell whose recipient IS an active prospect + under the rate
+    # limit → the guard falls through to allow (autonomous send).
+    await _grant_bulk(db)
+    await _add_prospect(db, email="known@example.com")
+    gate = _gate(db)
+    req = _req(validated_recipient="known@example.com", thread_id=None, labeled_surplus=True)
+    decision = await gate.check(
+        request=req,
+        recipient="known@example.com",
+        message_text="hi",
+    )
+    assert decision.allow is True
+    assert decision.reason == "granted"
+    assert await pes.list_held(db) == []
+
+
+@pytest.mark.asyncio
+async def test_granted_bulk_contacted_recipient_still_allowed(db):
+    # Authorization is CURATED + NOT opted-out, DECOUPLED from send-lifecycle status.
+    # A prospect already stamped 'contacted' (a legitimate follow-up touch) is STILL
+    # authorized — the guard must NOT trip on non-'active' status, which would demote
+    # the GRANTED cell the instant a prior send stamped the prospect contacted.
+    # (RED on the pre-fix guard, which used an active-status membership predicate.)
+    await _grant_bulk(db)
+    await _add_prospect(db, email="repeat@example.com", status="contacted")
+    gate = _gate(db)
+    req = _req(validated_recipient="repeat@example.com", thread_id=None, labeled_surplus=True)
+    decision = await gate.check(
+        request=req,
+        recipient="repeat@example.com",
+        message_text="hi",
+    )
+    assert decision.allow is True
+    assert decision.reason == "granted"
+    assert (await cg.get_cell(db, "email", "send", "bulk"))["state"] == "granted"  # NOT demoted
+    assert await pes.list_held(db) == []
+
+
+@pytest.mark.asyncio
+async def test_granted_bulk_recipient_case_insensitive(db):
+    # Recipient case/whitespace must not defeat authorization OR opt-out suppression:
+    # the store normalizes to lowercase, so a mixed-case send resolves the same row.
+    await _grant_bulk(db)
+    await _add_prospect(db, email="Known@Example.com")  # stored lowercased
+    gate = _gate(db)
+    req = _req(validated_recipient="KNOWN@example.com", thread_id=None, labeled_surplus=True)
+    decision = await gate.check(
+        request=req,
+        recipient="KNOWN@example.com",
+        message_text="hi",
+    )
+    assert decision.allow is True
+    assert decision.reason == "granted"
 
 
 @pytest.mark.asyncio

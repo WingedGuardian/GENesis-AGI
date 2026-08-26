@@ -1,0 +1,26 @@
+# Autonomous COLD marketing-outreach substrate — operator lever.
+# Semantics: src/genesis/outreach/marketing_config.py
+#
+# Gates the `marketing_send` MCP tool, which stages a cold marketing email to a
+# recipient resolved IN CODE from the owner-curated `marketing_prospects` store
+# (never from the LLM, never a raw address). Every staged send still converges on
+# the WS-8 email autonomy gate, whose BULK capability cell ships at ASK (holds
+# EVERYTHING for owner approval). This lever is the OUTER off-switch.
+#
+# mode: off | observe | live
+#   off     — the tool refuses to stage any marketing send. SHIPPED DEFAULT (the
+#             cold-send substrate is inert until the owner opts in).
+#   observe — the tool resolves + validates the recipient, but the email autonomy
+#             gate still authorizes each send (BULK cell at ASK → held).
+#   live    — the owner has affirmatively enabled autonomous cold outreach (the
+#             gate still authorizes each send while the BULK cell is ungranted).
+#
+# An INVALID mode degrades to `off` (least authority — never a silent grant of
+# more send capability). Env kill switch: GENESIS_MARKETING_OUTREACH_DISABLED=1
+# forces off regardless of this file.
+#
+# Prospects are owner-curated rows in the private `marketing_prospects` DB table,
+# NEVER in this file or the public repo. A fresh clone has an empty store and the
+# tool cleanly refuses.
+enabled: true
+mode: off

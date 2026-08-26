@@ -189,6 +189,35 @@ class EmailAutonomyGate:
             if not await self._recipient_in_thread(thread_id, recipient):
                 return "recipient_mismatch"
 
+        # g2 (primary for BULK cold marketing): the recipient MUST be an active,
+        # non-opted-out prospect in the owner-curated marketing_prospects store.
+        # This is the sole autonomous net once the BULK cell is GRANTED — it binds
+        # every autonomous cold send to the owner's vetted, opt-out-respecting set,
+        # resolved deterministically in CODE (never the LLM).  Fail-closed: an
+        # unknown / opted-out / blank recipient trips (hold + demote), so a
+        # granted bulk cell can never fan out to an address the owner didn't curate.
+        if risk == RiskClass.BULK.value:
+            from genesis.db.crud import marketing_prospects as mp
+
+            # Authorization = CURATED (row exists) AND NOT opted-out, DECOUPLED from
+            # the send-lifecycle status (active/contacted/replied). A contacted
+            # prospect is STILL an authorized recipient (a follow-up touch); only
+            # opt-out revokes authorization. An "active"-status predicate here would
+            # demote the GRANTED cell the instant a send stamps a prospect
+            # 'contacted'. Fail-closed: blank / not-curated / opted-out → trip
+            # (hold + demote). NOTE: the BULK cell is keyed by risk_class only; the
+            # only labeled_surplus EMAIL path today is marketing, so the cell is
+            # marketing-scoped in practice. If another labeled_surplus email path is
+            # ever added, give it its own discriminator so a grant here can't
+            # authorize its (non-prospect) recipients.
+            if not recipient:
+                return "recipient_not_curated"
+            row = await mp.get_by_email(self._db, recipient)
+            if row is None:
+                return "recipient_not_curated"
+            if row.get("opted_out"):
+                return "opted_out"
+
         # g3 (primary): a burst of autonomous sends for one cell = a runaway loop.
         since = (datetime.now(UTC) - _RATE_LIMIT_WINDOW).isoformat()
         count = await aes.count_for_cell_since(

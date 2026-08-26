@@ -11,6 +11,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Gated autonomous cold marketing outreach (inert by default).** Genesis can
+  now stage cold marketing emails to an owner-curated prospect list via the new
+  `marketing_send` tool. The recipient is resolved in code from a private
+  `marketing_prospects` store (by id — the tool never accepts a raw address),
+  respects permanent opt-outs, and every send still holds at the email
+  authorization gate for your approval. It ships OFF: nothing sends until you set
+  the `marketing_outreach` lever to `observe`/`live` (kill switch:
+  `GENESIS_MARKETING_OUTREACH_DISABLED=1`), and even then each cold send waits for
+  your explicit approval. Manage prospects and opt-outs in the
+  `marketing_prospects` table.
+
 - **Session-start surface for age-stale open PRs.** The repo-pulse worker now
   also caches the open-PR set each boundary, and a SessionStart hook lists the
   ones idle past a threshold (default 7 days) as one passive inline line —

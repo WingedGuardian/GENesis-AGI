@@ -96,6 +96,34 @@ async def test_approved_hold_is_sent(db):
 
 
 @pytest.mark.asyncio
+async def test_approved_bulk_hold_sends_and_increments_owner_success(db):
+    # (e) approve→drain for a BULK (cold marketing) hold: deliver_approved sends
+    # once and the BULK cell's successes increments with origin_class="owner".
+    rid = await _approval(db, status="approved")
+    await pes.create(
+        db,
+        id="pb",
+        request_id=rid,
+        validated_recipient="prospect@example.com",
+        category="notification",
+        message="cold pitch",
+        held_at=_TS,
+        cell_domain="email",
+        cell_verb="send",
+        cell_risk_class="bulk",
+    )
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == [("pb", "hi")]  # sent once
+    assert (await pes.get_by_id(db, "pb"))["status"] == "sent"
+    # The watcher records the success with origin_class="owner" (cell-agnostic,
+    # hardcoded) — for a BULK cell the counter must increment just like standard.
+    cell = await cg.get_cell(db, "email", "send", "bulk")
+    assert cell["successes"] == 1
+
+
+@pytest.mark.asyncio
 async def test_rejected_hold_records_correction(db):
     rid = await _approval(db, status="rejected")
     await _hold(db, pid="p1", rid=rid)

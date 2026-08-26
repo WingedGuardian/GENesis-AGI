@@ -152,6 +152,22 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         # overlay-file edit, never a UI round-trip.
         hidden_fields=frozenset({"require_approval"}),
     ),
+    "marketing_outreach": SettingsDomain(
+        name="marketing_outreach",
+        description=(
+            "Autonomous COLD marketing-outreach substrate — master `enabled` + "
+            "`mode` off/observe/live. Gates the `marketing_send` tool, which "
+            "stages a cold email to a recipient resolved IN CODE from the "
+            "owner-curated marketing_prospects store (never the LLM). off "
+            "(default, shipped) refuses to stage any send; every staged send "
+            "still holds at the WS-8 email autonomy gate (BULK cell at ASK). "
+            "Invalid mode degrades to off (least authority). Read live per tool "
+            "call — no restart. Kill switch: GENESIS_MARKETING_OUTREACH_DISABLED=1."
+        ),
+        config_filename="marketing_outreach.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per tool call by marketing_config
+    ),
     "memory_integrity": SettingsDomain(
         name="memory_integrity",
         description=(
@@ -1340,6 +1356,23 @@ def _validate_contributor_worklog(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_marketing_outreach(changes: dict) -> list[str]:
+    """Validate marketing-outreach lever changes (see
+    genesis.outreach.marketing_config)."""
+    from genesis.outreach.marketing_config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled" and not isinstance(value, bool):
+            errors.append("'enabled' must be a boolean")
+        elif key == "mode" and value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
 def _validate_pr_watch(changes: dict) -> list[str]:
     """Validate pr-watch lever changes (see
     genesis.session_awareness.pr_watch_config)."""
@@ -1653,6 +1686,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "ws2_ledger": _validate_ws2_ledger,
     "repo_pulse": _validate_repo_pulse,
     "contributor_worklog": _validate_contributor_worklog,
+    "marketing_outreach": _validate_marketing_outreach,
     "pr_watch": _validate_pr_watch,
     "skill_evolution_gate": _validate_skill_evolution_gate,
     "cc_roster": _validate_cc_roster,
