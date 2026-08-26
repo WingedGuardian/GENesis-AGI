@@ -32,7 +32,7 @@ def _inline_guard() -> str:
         for e in entries:
             for h in e.get("hooks", []):
                 cmd = h.get("command", "")
-                if "run_in_background" in cmd and "worktree" in cmd and "case " in cmd:
+                if "git reset --hard" in cmd and "worktree" in cmd and "case " in cmd:
                     return cmd
     raise AssertionError("inline mega-guard not found in .claude/settings.json")
 

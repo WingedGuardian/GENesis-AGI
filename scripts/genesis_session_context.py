@@ -629,20 +629,24 @@ def main() -> None:
             lines = ["## Genesis Capabilities\n"]
             for cname, cinfo in caps.items():
                 cstatus = cinfo.get("status", "unknown")
-                cdesc = cinfo.get("description", cname)
+                cdesc = cinfo.get("description") or ""
+                # Drop the description when it's absent or merely repeats the
+                # capability name: a registry entry with no real description
+                # renders as "reflex: reflex" (or, namespaced, "module:architect:
+                # architect") — pure noise. The name still lists.
+                _cname_tail = cname.split(":")[-1]
+                desc_part = f": {cdesc}" if cdesc and cdesc not in (cname, _cname_tail) else ""
                 if cstatus == "active":
-                    lines.append(f"- **{cname}**: {cdesc}")
+                    lines.append(f"- **{cname}**{desc_part}")
                 else:
                     cerr = cinfo.get("error", "")
                     suffix = f" — Error: {cerr}" if cerr else ""
-                    lines.append(f"- **{cname}** [{cstatus}]: {cdesc}{suffix}")
+                    lines.append(f"- **{cname}** [{cstatus}]{desc_part}{suffix}")
+            # The full MCP tool list is injected separately by CC; a hardcoded
+            # partial list here is redundant + goes stale, so only the Skill
+            # Library pointer (not injected elsewhere) is kept.
             lines.append(
-                "\n**MCP Tools:** memory_recall/memory_store, "
-                "health_status/health_errors/health_alerts, "
-                "session_config, "
-                "outreach_queue/outreach_digest, recon tools, "
-                "bookmark_shelve/bookmark_unshelve.\n\n"
-                "**Skill Library:** Browse `src/genesis/skills/` or "
+                "\n**Skill Library:** Browse `src/genesis/skills/` or "
                 "`~/.genesis/skill-library/` for specialized skills "
                 "(research, outreach, browser automation, etc.). "
                 "The skill injection hook nudges you when one matches."

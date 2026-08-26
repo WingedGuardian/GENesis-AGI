@@ -823,10 +823,14 @@ findings below, a gated `gh pr merge`:
   Claude review (a `/schedule` cloud routine) posts as the repo OWNER's account and
   must carry a marker `<!-- genesis-scheduled-review: head=<full-40-hex-sha> kind=<name> -->`
   naming the exact head it reviewed AND which routine it is (`kind`). The gate blocks
-  unless an owner-authored marker for EVERY kind in `_REQUIRED_SCHEDULED_REVIEW_KINDS`
-  (currently `code-review` + `leaks`) names the PR's current head — so if any required
-  routine never ran, ran on a stale commit, or was rate-limited, the merge blocks
-  (naming the missing kinds). If a routine is pending or rate-limited, wait for it, or
+  unless an owner-authored marker for EVERY effective required kind
+  (`_required_scheduled_review_kinds()` — DEFAULT `code-review` + `leaks`; the leak/secret
+  scanner is irreducible and always required; an install may relax the OPTIONAL kinds to
+  ADVISORY via `merge_gate.required_scheduled_reviews: [<kinds>]` in local `genesis.yaml`)
+  names the PR's current head — so if any required routine never ran, ran on a stale
+  commit, or was rate-limited, the merge blocks (naming the missing kinds). An ADVISORY
+  routine still posts its review on the PR to be read/addressed, but its absence does not
+  block. If a required routine is pending or rate-limited, wait for it, or
   append `# scheduled-review-override` to merge anyway (the conscious "merge without the
   scheduled reviews" case). The marker means "ran **clean**", not merely "ran": a
   review whose body carries a blocking finding (`[P1]`/`HARD BLOCK`/`### ERROR`, unless a
@@ -835,6 +839,12 @@ findings below, a gated `gh pr merge`:
 - requires the PR base to equal the repo's default branch (retarget guard);
 - blocks unless mergeability is a definite `MERGEABLE` (a failed/unknown read
   does not merge).
+- **the CI gate** blocks red/pending checks; and — on the canonical public repo,
+  where CI always runs — an `absent` CI state (a readable EMPTY check set = CI
+  never ran, the tell of a conflicting branch or a dropped `pull_request` trigger)
+  also blocks, so an un-CI'd PR can't merge. An UNREADABLE CI read (`unknown`)
+  fails OPEN, and off the canonical repo `absent` fails open too (a repo may
+  legitimately have no CI). Waive with `# ci-override` (never `--admin`).
 - **Override sigils are split by boundary** so one waiver can't silently disarm
   an unrelated gate: `# review-override` waives ONLY the finding scans
   (review-body + inline P1s); `# stale-review-override` waives ONLY the

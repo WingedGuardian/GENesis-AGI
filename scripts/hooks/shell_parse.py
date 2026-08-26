@@ -12,6 +12,9 @@ naive approaches fail on, e.g.:
   push`` (MUST match),
 * a nested script ``bash -c 'git commit -n …'`` (the inner command MUST be
   seen),
+* a leading redirect ``git 2>/dev/null push`` / ``git 2>&1 commit`` whose
+  operator must NOT be mistaken for the subcommand (the push/commit gates MUST
+  still match — a leaking redirect once let these slip),
 * an approval comment ``# review-override`` that belongs to ONE command segment
   and must not authorize the next.
 
@@ -91,6 +94,16 @@ _WRAPPER_SPEC = {
 _WRAPPERS = set(_WRAPPER_SPEC)
 # Interpreters that run a script string passed after -c; recurse into it.
 _NESTED = {"bash", "sh", "dash", "zsh", "ksh", "ash"}
+# Shell tokens that can front a SIMPLE COMMAND within a segment (after
+# split_segments has already cut on ; | & && || newline). Stripping them at
+# command position lets analyze() resolve the real exe THROUGH a control
+# structure or group — `if …; then git clean -f; fi`, `while …; do …`,
+# `! git clean`, `{ git clean -f; }` — so a gate that keys on `seg.exe == git`
+# is not silently skipped. EXCLUDES `for/case/select/in` (they front a WORD, not
+# a command: `for x in a b`) and all block CLOSERS (`fi done esac } )` — never
+# precede a command). Group opener `(` (bare and GLUED, `(git`) is handled
+# structurally in _strip_wrappers, not via this set.
+_CMD_POSITION_WORDS = frozenset({"!", "if", "elif", "while", "until", "then", "do", "else", "{"})
 # git global options that consume the FOLLOWING token as their value.
 _GIT_OPTS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"}
 # git-commit short flags that consume the REST of their short-bundle as a value
@@ -109,6 +122,37 @@ class Segment:
     depth: int = 0  # 0 = top level, >0 = inside a sh -c script
 
 
+def _redirect_operator_len(command: str, i: int) -> int | None:
+    """Length of a shell REDIRECT operator starting at ``command[i]``, else None.
+
+    The closed bash redirect grammar (operator only — a leading fd digit is
+    already buffered and the following target is consumed by the caller):
+    ``>`` ``>>`` ``>&`` ``>|`` ``<`` ``<<`` ``<<<`` ``<&`` ``&>`` ``&>>``.
+    A bare ``&`` (background) and a bare ``|`` (pipe) are NOT redirects — they
+    stay control operators. Process substitution ``>(…)``/``<(…)`` is
+    deliberately NOT treated as a redirect (see ``_substitutions``' documented
+    gap); ``>(`` returns length 1 here so the ``(`` is handled normally.
+    """
+    n = len(command)
+    c = command[i]
+    if c == "&":  # &> / &>> only — a lone '&' is the background control operator
+        if i + 1 < n and command[i + 1] == ">":
+            return 3 if (i + 2 < n and command[i + 2] == ">") else 2
+        return None
+    if c == ">":
+        nxt = command[i + 1] if i + 1 < n else ""
+        return 2 if nxt in (">", "&", "|") else 1
+    if c == "<":
+        if command[i + 1 : i + 3] == "<<":  # <<<
+            return 3
+        nxt = command[i + 1] if i + 1 < n else ""
+        return 2 if nxt in ("<", "&") else 1
+    return None
+
+
+_TARGET_STOP = (" ", "\t", "\n", ";", "|", "&", "<", ">", "(", ")")
+
+
 def split_segments(command: str) -> list[str]:
     """Split a command line into executed segments on shell operators.
 
@@ -116,6 +160,20 @@ def split_segments(command: str) -> list[str]:
     ``&&``, ``||``, ``;``, ``|``, ``&`` and newlines. A ``#`` comment (opened
     outside quotes) runs to end-of-line and is retained in the segment text so
     override detection can see it.
+
+    Redirect-aware: a redirection (``2>/dev/null``, ``> out.log``, ``2>&1``,
+    ``&>log``, ``>| f``, ``< in``, ``<<<here``) is consumed — operator AND target
+    — and kept OUT of the segment text, so a redirect neither leaks a phantom
+    positional into argv nor mis-splits on an embedded ``&``/``|`` (``2>&1`` used
+    to split on the ``&``, hiding a following ``git push`` in a bogus segment and
+    slipping the push gate). Only a PLAIN-filename target is stripped; a target that
+    can carry a command expansion (any ``$`` or backtick — ``2>$(rm x)``,
+    ``2>"$(rm x)"``, ``<<<"$(…)"``, ``2>$VAR``, ``<(…)``, ``>(…)``) is LEFT in the
+    text so the canonical ``_substitutions`` still sees any nested command (a
+    substitution used as a redirect target EXECUTES). Such a target's token then
+    stays in argv — a documented residual for this exotic form (these gates are
+    friction, not a sandbox); a bare ``2>/dev/null`` is a plain filename and IS
+    stripped, so the common push-gate fail-open stays closed.
     """
     segs: list[str] = []
     buf: list[str] = []
@@ -144,6 +202,76 @@ def split_segments(command: str) -> list[str]:
             buf = []
             i += 2
             continue
+        op_len = _redirect_operator_len(command, i)
+        if op_len is not None:
+            # Drop a standalone leading fd digit-run (the '2' of ` 2>`), but NOT a
+            # digit that ends a word (`push2>x` keeps 'push2' — never a fail-open
+            # onto a bare 'push'); '&>' never carries an fd prefix.
+            if c != "&":
+                k = len(buf)
+                while k > 0 and buf[k - 1].isdigit():
+                    k -= 1
+                if k < len(buf) and (k == 0 or buf[k - 1].isspace()):
+                    del buf[k:]
+            j = i + op_len
+            while j < n and command[j] in (" ", "\t"):  # gap before the target
+                j += 1
+            t = command[j] if j < n else ""
+            tnext = command[j + 1] if j + 1 < n else ""
+            # A process substitution as the target (`<(…)`, `>(…)`) begins with a
+            # metachar the plain consumer would stop on — leave it in the text (it
+            # executes, like any substitution); consume only the operator.
+            if t in ("<", ">") and tnext == "(":
+                buf.append(" ")
+                i = j
+                continue
+            j0 = j
+            if j < n and t not in _TARGET_STOP:
+                # Measure ONE complete shell word (the closed bash word grammar): a
+                # run of characters ended only by an UNQUOTED, UNESCAPED delimiter.
+                # A backslash escapes the next char (incl. a space); single/double
+                # quotes open a span that suppresses delimiters (with `\` active only
+                # inside double quotes), and adjacent quoted/plain runs concatenate
+                # into one word. Scanning the whole word — not stopping at the first
+                # escaped/quoted space — is what keeps `git 2>err\ log push` /
+                # `git 2>pre"a b"post push` from hiding the push/commit subcommand.
+                wq: str | None = None  # in-word quote state
+                while j < n:
+                    ch = command[j]
+                    if wq is not None:
+                        if wq == '"' and ch == "\\" and j + 1 < n:
+                            j += 2
+                            continue
+                        if ch == wq:
+                            wq = None
+                        j += 1
+                        continue
+                    if ch == "\\" and j + 1 < n:  # unquoted backslash escapes next char
+                        j += 2
+                        continue
+                    if ch in ("'", '"'):  # a quote span begins (or concatenates)
+                        wq = ch
+                        j += 1
+                        continue
+                    if ch in _TARGET_STOP:  # unquoted delimiter ends the word
+                        break
+                    j += 1
+            # Strip ONLY a plain-filename target. A target that can carry a command
+            # expansion — a ``$`` (``$(…)`` / bare ``$VAR``) or a backtick, in any
+            # quoting — is LEFT in the segment text (rewind and let normal processing
+            # re-scan it): this delegates ALL expansion/quoting semantics to the one
+            # canonical ``_substitutions`` parser (which expands ``$(…)`` unquoted and
+            # in double quotes so a nested command stays visible to the destructive
+            # guard, and correctly does NOT expand inside single quotes) instead of
+            # re-deciding them here. Only cost: such a target's token stays in argv —
+            # the pre-existing, documented residual for this exotic form.
+            if "$" in command[j0:j] or "`" in command[j0:j]:
+                buf.append(" ")
+                i = j0  # rewind — normal processing + _substitutions handle the target
+                continue
+            buf.append(" ")  # plain filename target — operator + target both dropped
+            i = j
+            continue
         if c in (";", "|", "&", "\n"):
             segs.append("".join(buf))
             buf = []
@@ -153,6 +281,78 @@ def split_segments(command: str) -> list[str]:
         i += 1
     segs.append("".join(buf))
     return [s.strip() for s in segs if s.strip()]
+
+
+def has_top_level_pipe(command: str) -> bool:
+    """Whether *command* contains a real top-level shell PIPE (``a | b``).
+
+    Quote-, redirect-, and substitution-aware: a ``|`` inside a quoted string (a jq
+    program, ``grep -F '|'``), a ``||`` control operator, a ``>|`` redirect operator,
+    or a command substitution ``$( … )`` / ``` `…` ``` (whose output is CAPTURED, not
+    streamed to the swallowed background stdout — ``RESULT=$(cmd | filter)``) is NOT a
+    background pipe. A bare subshell ``(cmd | x)`` DOES stream to the background stdout,
+    so its ``|`` still counts. Used by the run_in_background guard: a piped background
+    command's stdout is swallowed, so ONLY a genuine streamed pipe should block it.
+
+    Residual (accepted for a CONVENIENCE guard — friction, not a sandbox): the quote
+    model still mirrors ``split_segments``, so a quote that is backslash-escaped OUTSIDE
+    quotes (``printf %s \\"foo | cat``), a stray quote char in a ``#`` comment or a
+    ``<<EOF`` heredoc body, or a ``|`` in a ``case`` pattern can MISread — OVER-reading
+    (``case`` ``|`` looks like a pipe) or UNDER-reading (a swallowed quote hides a later
+    pipe). Never a security bypass either way (an over-read is a reworked command, an
+    under-read re-exposes the empty-output footgun this guard usually prevents); closing
+    these fully is the unbounded quote-parsing tail shared with ``split_segments``.
+    """
+    i, n = 0, len(command)
+    quote: str | None = None
+    subst_depth = 0  # inside $( … ): its output is CAPTURED, not streamed to bg stdout
+    in_backtick = False
+    while i < n:
+        c = command[i]
+        if quote:
+            if quote == '"' and c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if in_backtick:  # `…` substitution — output captured, so any `|` inside is not a bg pipe
+            if c == "`":
+                in_backtick = False
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c
+            i += 1
+            continue
+        if c == "`":
+            in_backtick = True
+            i += 1
+            continue
+        if (
+            c == "$" and i + 1 < n and command[i + 1] == "("
+        ):  # $( … ) opens a capturing substitution
+            subst_depth += 1
+            i += 2
+            continue
+        if c == ")" and subst_depth > 0:
+            subst_depth -= 1
+            i += 1
+            continue
+        if command[i : i + 2] in ("&&", "||"):  # control operators, not a pipe
+            i += 2
+            continue
+        op_len = _redirect_operator_len(command, i)
+        if op_len is not None:  # a redirect operator (incl. ``>|``) — skip it whole
+            i += op_len
+            continue
+        # A `|` inside $()/backtick is captured (not a bg pipe); a bare subshell `(…)`
+        # streams to the background stdout, so its `|` DOES count (subst_depth stays 0).
+        if c == "|" and subst_depth == 0:
+            return True
+        i += 1
+    return False
 
 
 def _strip_trailing_comment(seg: str) -> str:
@@ -279,15 +479,63 @@ def _basename(token: str) -> str:
 
 
 def _strip_wrappers(argv: list[str]) -> list[str]:
-    """Drop leading env-assignments (VAR=x) and wrapper commands (sudo/env/…).
+    """Drop leading shell command-position tokens, env-assignments (VAR=x), and
+    wrapper commands (sudo/env/…) so the returned argv[0] is the ACTUAL executed
+    command, and peel the matching subshell-close `)` off the revealed argv.
 
-    Returns the argv of the actual command. ``env`` / ``sudo`` may be followed
-    by their own ``VAR=x`` assignments and flags before the real command.
+    Command-position tokens (`then`/`do`/`!`/`(`/`{` …) can wrap a command inside
+    a control structure or subshell; a leading `(` may be GLUED to the command
+    (`(git`). Reserved words are stripped UNCONDITIONALLY at the front so the real
+    command is revealed through any control wrapper (`time ! git push`,
+    `if git push; then …`, `until git push; do …` all resolve to `git push`). A
+    leading `(` may nest (`( (cmd) )` spaced); its matching trailing `)` closers
+    (as many as `(` openers consumed) are peeled off the operand(s) carrying the
+    close.
+
+    Accepted SAFE-DIRECTION residual: a reserved word that is genuinely a command
+    NAME rather than a control keyword (`command if git push` — `command` runs an
+    executable literally named `if`) is still stripped, so analyze() over-resolves
+    to `git push` and the push gate fires on a push bash would not actually run.
+    That is an OVER-gate (a spurious block of an exotic, near-never-typed form),
+    never a MISS — the monotonic-safe direction. Modelling wrapper-vs-keyword
+    precisely was tried (round-2 `wrapper_consumed`) and REMOVED: it turned the
+    over-gate into a real false-negative (`time ! git push` → exe `!` → push gate
+    MISS), which is the unsafe direction. #1457 round-3.
+
+    Redirection syntax is deliberately NOT touched here: this resolver feeds
+    flag/value parsers (`git_subcommand`, `gh_pr_subcommand`, `commit_skips_hooks`)
+    and dropping a token would shift positions and let a value-flag swallow the
+    real gated token (a fail-closed-gate bypass — #1457 round-2). A consumer that
+    reads POSITIONALS skips redirections LOCALLY, inside its own walk and AFTER its
+    own flag/value handling (full_suite_guard, protected_paths, destructive each do)
+    — never as a pre-pass, which would recreate the same desync.
+
+    Safe-direction / MONOTONIC for security: the arithmetic, command-position and
+    `(` branches fire ONLY when argv[0] is `((`-prefixed / a control token /
+    `(`-prefixed, so a normal command (argv[0] ∈ {git, gh, rm, …}) resolves to the
+    same exe and the same argv and is returned byte-for-byte unchanged — the strip
+    can REVEAL a hidden command but never hide a caught one. `((…))` is bash
+    ARITHMETIC evaluation, which runs NO external command, so its outer segment
+    resolves to nothing (a command hidden in a `$(…)` inside it still surfaces via
+    analyze()'s separate substitution path).
     """
+    argv = list(argv)  # local copy — we may rebind a glued `(token` / strip closers
+    if argv and argv[0].startswith("(("):
+        return []  # `((…))` arithmetic evaluation — no external command runs
     i = 0
-    n = len(argv)
-    while i < n:
+    open_parens = 0
+    while i < len(argv):
         tok = argv[i]
+        if tok.startswith("("):  # subshell opener, bare `( git` or glued `(git`
+            open_parens += 1
+            if tok == "(":
+                i += 1
+            else:
+                argv[i] = tok[1:]  # "(git" -> "git"; reprocess (token strictly shrinks)
+            continue
+        if tok in _CMD_POSITION_WORDS:
+            i += 1  # reserved word / brace-group opener at command position
+            continue
         if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
             i += 1  # leading VAR=value assignment
             continue
@@ -297,7 +545,7 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         argflags, positional = spec
         i += 1
         # consume the wrapper's own value-flags and leading positional args
-        while i < n:
+        while i < len(argv):
             t = argv[i]
             if t == "--":
                 i += 1
@@ -316,7 +564,27 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
                 i += 1
                 continue
             break  # this bare word is the wrapped command
-    return argv[i:]
+    result = list(argv[i:])  # redirections are NOT stripped here (see docstring)
+    if open_parens and result:
+        # Peel matching trailing `)` closers off the operand(s) carrying the
+        # subshell close — up to the number of `(` openers consumed, scanning from
+        # the end (a redirection can follow the closer: `(rm -rf /x) 2>/dev/null`).
+        # A redirect target that itself ends in `)` (`(cmd) > 'log)'`) is a rare
+        # form a POSITIONAL consumer resolves safe-direction via its own local
+        # redirection skip (protected_paths/destructive `_REDIR_TOKEN`).
+        remaining = open_parens
+        j = len(result) - 1
+        while remaining > 0 and j >= 0:
+            if result[j] == ")":
+                del result[j]
+                remaining -= 1
+                j -= 1
+            elif result[j].endswith(")"):
+                result[j] = result[j][:-1]
+                remaining -= 1  # stay on j — the token may carry another glued `)`
+            else:
+                j -= 1
+    return result
 
 
 def analyze(command: str) -> list[Segment]:
@@ -351,6 +619,44 @@ def analyze(command: str) -> list[Segment]:
                     )
                 )
     return out
+
+
+def is_pytest_invocation(seg: Segment) -> bool:
+    """Whether a parsed Segment IS a pytest run (not a mere textual mention).
+
+    True for the ``pytest`` entrypoint (``pytest …``, ``/venv/bin/pytest …``) or a
+    python interpreter invoked with ``-m pytest``. Because ``analyze`` splits
+    quote-aware, a ``|pytest`` inside a quoted argument — e.g. ``grep 'a|pytest' f``
+    — is NOT a pytest segment here, unlike a raw-regex scan of the command string.
+    """
+    if seg.exe == "pytest":
+        return True
+    if seg.exe.startswith("python"):
+        argv = seg.argv
+        i = 1
+        while i < len(argv):
+            tok = argv[i]
+            if tok == "-m":  # `python -m pytest …`
+                return i + 1 < len(argv) and argv[i + 1] == "pytest"
+            if tok in ("-c", "-W", "-X"):  # flags that consume the next token
+                i += 2
+                continue
+            if tok.startswith("-"):
+                i += 1
+                continue
+            # First non-flag = the program python runs. Only a pytest console-script
+            # entrypoint (a /path/.../pytest) is a pytest run; `python script.py …`
+            # is NOT, even if `-m pytest` appears later as the SCRIPT's own args.
+            return "/" in tok and _basename(tok) == "pytest"
+    return False
+
+
+def command_runs_pytest(command: str) -> bool:
+    """Whether any executed segment of ``command`` is a pytest run (quote-aware)."""
+    try:
+        return any(is_pytest_invocation(s) for s in analyze(command))
+    except Exception:
+        return False  # parse failure → fail open (a convenience check, never a gate)
 
 
 def _substitutions(text: str) -> list[str]:

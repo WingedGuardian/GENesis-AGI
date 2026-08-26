@@ -50,17 +50,21 @@ post a comment (issue comment) or PR review whose body contains a marker
 ``<!-- genesis-scheduled-review: head=<full-40-hex-sha> kind=<name> -->`` naming the exact
 head it reviewed AND which routine it was (``kind``). The merge gate
 (``_check_scheduled_claude_reviewed_head``) blocks unless an owner-authored marker for
-EVERY kind in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` (currently code-review + leaks) names
+EVERY effective required kind (``_required_scheduled_review_kinds()`` — DEFAULT
+code-review + leaks, with the leak scanner irreducible; an install may relax the optional
+kinds to advisory via ``merge_gate.required_scheduled_reviews`` in genesis.yaml) names
 the PR's CURRENT head — so if any required routine never ran, ran on a stale commit, or
-was rate-limited, the merge is blocked (naming the missing kinds). SCOPE: this gate
+was rate-limited, the merge is blocked (naming the missing kinds). An ADVISORY routine
+(one relaxed out of the required set locally) still posts its review on the PR to be read
+and addressed, but its absence does not block. SCOPE: this gate
 enforces ONLY when the merge targets the configured PUBLIC repo — the declared
 ``github.user``/``github.public_repo`` in ``~/.genesis/config/genesis.yaml``
 (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any OTHER repo
 (a private fork, the voice repo, backups) no-ops, since the required ``/schedule``
 routines run only on the public repo. Deployment note: on the public repo the required
 routines ARE configured (the deploy precondition); a clone that runs on its own public
-repo without a producer uses `# scheduled-review-override` (or removes/edits
-`_REQUIRED_SCHEDULED_REVIEW_KINDS`) — the override valve is the escape by design, not an
+repo without a producer uses `# scheduled-review-override` (or relaxes the optional kinds
+via ``merge_gate.required_scheduled_reviews``) — the override valve is the escape by design, not an
 opt-in flag. Fail-closed on scope uncertainty: if the canonical repo is undeterminable
 the gate ENGAGES rather than silently disarming.
 A DISMISSED or PENDING (draft) review no longer vouches (its marker is ignored), mirroring
@@ -122,6 +126,19 @@ from shell_parse import (  # noqa: E402
     has_trailing_override,
     split_segments,
 )
+
+# Local push allowlist (offline re-push cache). SOFT dependency, guarded exactly
+# like the review_state import above: a module-LOAD exception must degrade to
+# None (→ the pure live-ls-remote republish path, i.e. today's behavior), NEVER
+# propagate — a raising import exits 1, which CC treats as non-blocking, silently
+# disabling EVERY fail-closed gate in this file. push_allowlist itself is
+# fail-open by contract (its calls never raise); None here only covers an
+# import-time breakage (absent module, SyntaxError). It can only ever RELAX a
+# re-push of a branch already confirmed on the remote — never a first push.
+try:
+    import push_allowlist  # noqa: E402 — scripts/hooks is on sys.path[0]
+except Exception:  # noqa: BLE001 — see the review_state guard's rationale (108-114)
+    push_allowlist = None
 
 # Sentinel: the effective cwd cannot be confidently resolved (a cd into a
 # variable/command-substitution, a subshell, or a target nested at depth>0).
@@ -679,10 +696,19 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
                         (see _ci_identity + success_latest) — strict identity,
                         terminal completedAt comparison only, fail-closed.
       * ``"pending"`` — a check is still queued/running (and none are red)
-      * ``"unknown"`` — could not determine (API error, no checks, or an
-                        unrecognized payload shape) → callers FAIL OPEN, because
-                        blocking a merge on our own inability to read CI would be
-                        worse than the gap this gate closes.
+      * ``"absent"``  — a READABLE but genuinely EMPTY rollup (``[]``): zero checks
+                        exist, i.e. CI has NOT run. A DEFINITE fact, not a read
+                        failure — so the merge arm fail-CLOSES on it ON THE CANONICAL
+                        REPO (where CI always runs), waivable by ``# ci-override``.
+                        Off the canonical repo (which may legitimately have no CI) the
+                        caller lets it pass. This is the state that catches a
+                        conflicting branch / dropped ``pull_request`` trigger, which
+                        would otherwise merge un-CI'd.
+      * ``"unknown"`` — could NOT determine: an API error, empty/no output, an
+                        unparseable payload, or a non-empty payload with no CI-shaped
+                        entries. Callers FAIL OPEN, because blocking a merge on our own
+                        inability to read CI would be worse than the gap this closes.
+                        (Contrast with ``"absent"``: unreadable ≠ definitely-zero.)
 
     Tests inject via the ``_TEST_GH_CI_ROLLUP`` env var (a JSON array like
     ``gh pr view --json statusCheckRollup``) so no network is needed.
@@ -711,12 +737,23 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
             raw = result.stdout.strip()
         except Exception:
             return "unknown", []
+    if not raw:
+        # No output to read (empty stdout / unset seam): we cannot tell zero-checks
+        # from a silent read failure → fail-OPEN "unknown", never "absent".
+        return "unknown", []
     try:
-        checks = json.loads(raw) if raw else []
+        checks = json.loads(raw)
     except Exception:
         return "unknown", []
-    if not isinstance(checks, list) or not checks:
+    if not isinstance(checks, list):
         return "unknown", []
+    if not checks:
+        # A READABLE, genuinely-empty rollup: zero checks exist = CI has NOT run.
+        # Distinct from "unknown" (a read we could not complete) — this is a definite
+        # fact, so the canonical-repo merge arm fail-CLOSES on it (see main()): merging
+        # an empty-check PR is an un-CI'd merge. gh emits `[]` here when pull_request CI
+        # never fired (e.g. a conflicting branch suppresses the whole suite).
+        return "absent", []
 
     # First pass: for each strict identity (name, workflowName), the latest
     # `completedAt` among its SUCCESS CheckRuns on this head. A CANCELLED entry is
@@ -798,6 +835,15 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         return "pending", sorted(set(pending))
     if not saw_recognized:
         return "unknown", []  # payload had no CI-shaped entries
+    # KNOWN RESIDUAL (deferred, Codex #1484 P2): "green" here means every check that
+    # IS present concluded success — it does NOT assert the REQUIRED CI workflow ran.
+    # A partial rollup (e.g. only a green CodeQL, the CI suite absent) reads green.
+    # The "absent" branch above only catches a FULLY-empty rollup (the conflicting-
+    # branch symptom, where CI+CodeQL are both pull_request-gated and neither builds).
+    # Closing the partial case robustly needs a config-driven "required CI check
+    # identity" (a required-CI analogue of _required_scheduled_review_kinds) so it
+    # does NOT false-block an install whose CI is legitimately path-filtered/skipped
+    # for a docs-only PR. Tracked as a follow-up; not bundled here.
     return "green", []
 
 
@@ -842,8 +888,72 @@ _INLINE_REVIEW_BOTS = {
     "chatgpt-codex-connector[bot]",
     "github-advanced-security[bot]",
 }
+# A reply "engages" (silences) an inline P1 finding ONLY when authored by someone with
+# repository authority — otherwise any GitHub account (a throwaway, or the PR author on
+# their own PR) could post a one-word reply and clear a real P1 (PR #1434 security
+# review, LOW-a). GitHub's author_association on a PR review comment; these three denote
+# push/triage authority. A reply from NONE / FIRST_TIME_CONTRIBUTOR / CONTRIBUTOR does
+# NOT count as acknowledgement.
+_MAINTAINER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 # Badge/markup prefix stripped when rendering a finding's title line.
 _INLINE_MARKUP_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}")
+
+# ── Documentation-path allowlist for review findings (ledger 54eb3752) ───────
+# A P1 inline finding on a DOCUMENTATION file is not a code defect and must not
+# block a merge (a CHANGELOG typo, a README wording nit). This is a FAIL-CLOSED
+# ALLOWLIST — a path is exempted only when it is provably prose; everything else
+# blocks. Prose is: (1) a known doc-named file (CHANGELOG/README/LICENSE/NOTICE/…)
+# with a doc/text/empty extension, at any depth; (2) any UNAMBIGUOUS documentation
+# extension (.md/.rst/.markdown/.adoc) UNDER a top-level ``docs/``; or (3) any
+# ``*.rst`` anywhere. A random top-level ``NOTES.md``, ANY source/config/executable
+# file even under ``docs/`` (``docs/conf.py``, ``docs/build.rs``, ``docs/config.yaml``,
+# ``docs/Makefile``), a missing/empty path, or a path bearing a control character is
+# NON-doc and STILL BLOCKS — the gate never opens for a code path merely mislabeled.
+# ``.txt`` is deliberately NOT a blanket doc extension: it is ambiguous (a build/dep
+# manifest — ``docs/requirements.txt``, ``docs/CMakeLists.txt`` — carries it too, and
+# this repo classifies such files as config), so ``.txt`` is prose ONLY on a known
+# doc-named stem (``LICENSE.txt``, ``README.txt``). Only the inline endpoint carries
+# a per-file path; the review-BODY gate is PR-level and stays unfiltered. (A denylist
+# of code extensions was rejected in review: it can't enumerate every source/config
+# type — an allowlist fails closed on the unknown.)
+_DOC_EXTS = {"md", "markdown", "rst", "adoc"}
+# Extensions permitted on a KNOWN doc-named stem only (rule 1). ``.txt``/empty are
+# safe here because the STEM already pins the file as prose (LICENSE, README).
+_DOC_STEM_EXTS = _DOC_EXTS | {"txt", ""}
+_DOC_STEMS = {
+    "changelog",
+    "readme",
+    "license",
+    "notice",
+    "copying",
+    "authors",
+    "contributing",
+}
+
+
+def _is_doc_path(path: str) -> bool:
+    """Whether a review finding's file *path* is documentation whose findings do
+    NOT block a merge. FAIL-CLOSED allowlist (see the section comment): anything
+    not provably prose — a source/config/manifest file under ``docs/`` (incl. a
+    ``.txt`` build manifest), a random top-level ``*.md``, a missing path, or a
+    control-char-bearing path — blocks."""
+    # Reject the COMPLETE control-character range (Unicode Cc): C0 (<0x20), DEL
+    # (0x7F), and C1 (0x80-0x9F, incl. NEL 0x85 which ``gh --jq`` emits literally).
+    if not path or any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in path):
+        return False  # empty or control-char-bearing → block (fail-closed)
+    base = path.rsplit("/", 1)[-1]
+    stem, dot, ext = base.rpartition(".")
+    ext = ext.lower() if dot else ""
+    stem_l = (stem if dot else base).lower()
+    # (1) A known doc-named file with a doc/text/empty extension, at any depth.
+    if stem_l in _DOC_STEMS and ext in _DOC_STEM_EXTS:
+        return True
+    # (2) A pure documentation format (reStructuredText) anywhere.
+    if ext == "rst":
+        return True
+    # (3) An unambiguous documentation extension under a top-level docs/ directory.
+    return ext in _DOC_EXTS and path.startswith("docs/")
+
 
 # ── Direct-sqlite-write detection ────────────────────────────────────────────
 # Robust bare-keyword match (the historical approach). A SINGLE statement keyword
@@ -888,24 +998,141 @@ def _is_sqlite_write(cmd: str) -> bool:
 
 def _inline_title(body: str) -> str:
     """First readable line of an inline finding body."""
-    first = _INLINE_MARKUP_RE.sub("", body).strip().splitlines()
+    # split("\n") not splitlines(): a NEL (U+0085) inside the body must not shift
+    # which line is shown as the title (consistent with the JSONL parser).
+    first = _INLINE_MARKUP_RE.sub("", body).strip().split("\n")
     return (first[0].strip() if first else "")[:120]
 
 
-def _scan_unreadable(strict: bool, what: str) -> tuple[bool, str]:
+def _scan_unreadable(what: str) -> tuple[bool, str]:
     """Return value for a finding scan that could NOT be read — a gh error,
     timeout, or malformed JSON — as distinct from a scan that ran and found
     nothing (an empty result / Codex quota, which stays clean either way).
 
-    Enforcement (``strict=False``, the default) fails OPEN: a transient gh error
-    must not wedge merges, and the freshness gate already requires a review to
-    EXIST at the head. Report mode (``strict=True``) fails CLOSED so the canonical
-    ``--check-pr`` report never presents an UNREADABLE scan as "ok" / emits a
-    false "all gates pass" (Codex P2, PR #1366).
+    ALWAYS fails CLOSED (blocks): an unreadable or incomplete scan is treated as
+    "not clean, retry", NEVER as a silent pass. This closes the CRITICAL fail-open
+    (PR #1434 security review): a comment-flood, a budget-starved scan, or GitHub
+    secondary rate-limiting on a burst of sequential gh calls could terminate the
+    scan early (page cap / drained merge deadline / API error). The old fail-OPEN
+    merge path then returned "clean" and the merge sailed through with an UNSEEN
+    newest finding. The freshness gate (``_check_codex_reviewed_head``) reads a
+    DIFFERENT surface (the Reviews API) and does not catch it. Fail-closed makes the
+    completeness of the read irrelevant to safety — an unreadable scan blocks, and
+    ``# review-override`` remains the conscious escape hatch for a transient gh error.
     """
-    if strict:
-        return True, f"could not read {what} — review status UNREADABLE (retry), not clean."
-    return False, ""
+    return True, f"could not read {what} — review status UNREADABLE (retry), not clean."
+
+
+# Page size for the comment-fetch loop. MUST be the pagination signal's basis: a
+# page returning fewer than this many rows is the last page. It must exceed any
+# test's fixed comment count so a mocked `return_value` (same rows every call)
+# terminates after one page instead of looping forever.
+_COMMENTS_PER_PAGE = 100
+# Backstop against an unbounded loop (a real PR never approaches this; a mocked
+# return_value of exactly _COMMENTS_PER_PAGE rows would otherwise never terminate).
+_MAX_COMMENT_PAGES = 100
+
+
+def _fetch_comments_paged(
+    endpoint: str,
+    pr_num: str,
+    repo: str | None,
+    jq: str,
+) -> tuple[list[dict] | None, bool]:
+    """Fetch ALL pages of a PR comments endpoint as parsed JSON objects.
+
+    Pages through ``gh api repos/<repo>/<endpoint> -X GET -f per_page=100 -f page=N
+    --jq <jq>`` (query params via ``-f``; the endpoint token keeps its ``…/comments``
+    suffix so the char-router's ``endswith("/comments")`` still matches). ``gh --jq``
+    emits one compact JSON object per line — JSONL — across the page. Pages are fetched
+    in the endpoint's default ASCENDING (oldest-first) order — both callers accumulate
+    ALL pages, so order does not affect the verdict, and ascending means a comment
+    appended during the scan lands on the last page (reached) rather than shifting a
+    never-revisited first page under descending paging.
+
+    Returns ``(objects, complete)``:
+      - ``(None, False)``  — the FIRST page could not be read (gh error/exception):
+        the caller has NO data → treat as UNREADABLE.
+      - ``(accumulated, False)`` — a LATER page failed: the caller keeps what it saw
+        (so a blocking finding on an earlier page still stands) but knows the read is
+        INCOMPLETE and cannot confirm the ABSENCE of a newer finding.
+      - ``(accumulated, True)`` — every page read (a page with < per_page rows, or an
+        empty page, is the last).
+
+    NEL-safe: splits on ``"\\n"`` only — NOT ``str.splitlines()``, which also breaks on
+    U+0085 (NEL) that ``gh --jq`` emits literally inside a JSON string. One NEL-bearing
+    comment would otherwise fragment the JSONL, fail ``json.loads``, and be SILENTLY
+    dropped — a real finding missing from an otherwise-complete read, which fail-closed
+    cannot catch (the read looks complete). Non-dict lines are dropped (Codex P2 — a
+    bare string/number line never masquerades as a comment).
+
+    Each page uses ``_gh_timeout(8)`` AND the loop checks the shared merge deadline
+    BETWEEN pages, so it self-bounds under the wall-clock in BOTH failure modes: a
+    slow/hung gh call fails fast at the floored per-call timeout, AND a flood of pages
+    that each SUCCEED fast cannot keep spawning calls past the budget. Either way the
+    partial read is returned as incomplete → the caller fails CLOSED.
+    """
+    acc: list[dict] = []
+    page = 1
+    while page <= _MAX_COMMENT_PAGES:
+        # Respect the shared merge deadline BETWEEN pages, not only via each call's
+        # timeout (HIGH, PR #1434 security review). A comment-flood — thousands of
+        # pre-seeded comments, and reads are NOT write-rate-limited — makes every page
+        # SUCCEED fast; the per-call timeout alone never stops the loop, so it would keep
+        # spawning gh calls past the 45s budget and blow the hook's ~60s SIGKILL ceiling.
+        # A hook killed mid-gate "fails toward tool runs" (see main's budget note) — an
+        # EXTERNAL fail-open the in-function fail-closed logic can't see. Out of budget →
+        # return what we have as INCOMPLETE (page 1 → None) → the caller blocks.
+        if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+            return (None if page == 1 else acc), False
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/{endpoint}",
+                    "-X",
+                    "GET",
+                    "-f",
+                    f"per_page={_COMMENTS_PER_PAGE}",
+                    "-f",
+                    f"page={page}",
+                    "--jq",
+                    jq,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),  # merge-path budget (see main): self-bounding
+            )
+        except Exception:
+            return (None if page == 1 else acc), False  # page-1 fail = no data
+        if result.returncode != 0:
+            return (None if page == 1 else acc), False
+        # NEL-safe split; count RAW non-empty lines for the pagination signal (a
+        # dropped malformed line must not prematurely signal "last page").
+        lines = [ln for ln in result.stdout.split("\n") if ln.strip()]
+        parsed_ok = 0
+        for ln in lines:
+            try:
+                obj = json.loads(ln)
+            except Exception:
+                continue
+            parsed_ok += 1
+            if isinstance(obj, dict):
+                acc.append(obj)
+        # A NON-EMPTY page whose every line failed to parse as JSON is a MALFORMED
+        # response (not a genuine "zero comments" page) — treat as unreadable rather than
+        # letting a garbage body masquerade as a clean short page that ends the scan (LOW,
+        # PR #1434 defense-in-depth: preserves the pre-diff whole-body JSONDecodeError guard
+        # for the per-line model). returncode==0 with an unparseable body is unusual (gh
+        # --jq normally exits non-zero), so this is belt-and-suspenders.
+        if lines and parsed_ok == 0:
+            return (None if page == 1 else acc), False
+        if len(lines) < _COMMENTS_PER_PAGE:
+            return acc, True  # short/empty page → last page
+        page += 1
+    # Hit the page backstop — treat as incomplete (cannot confirm we saw everything).
+    return acc, False
 
 
 def _check_inline_review_findings(
@@ -913,46 +1140,48 @@ def _check_inline_review_findings(
     *,
     force: bool = False,
     repo: str | None = None,
-    strict: bool = False,
 ) -> tuple[bool, str]:
     """Scan INLINE review comments for P1/P2 badge findings.
 
-    Returns (should_block, message). P1 findings block unless their
-    thread has a reply (engagement = read) or the merge carries
-    '# review-override'. P2 findings never block but are printed to
-    stderr one per line — the session must consciously accept them.
-    On an UNREADABLE scan (gh error/timeout/malformed): enforcement fails OPEN;
-    ``strict`` (report mode) fails CLOSED — see ``_scan_unreadable``.
+    Returns (should_block, message). P1 findings block unless their thread has a
+    MAINTAINER reply (engagement = a reviewer read it) or the merge carries
+    '# review-override'. P2 findings never block but are printed to stderr one per
+    line — the session must consciously accept them. An UNREADABLE or INCOMPLETE scan
+    (gh error/timeout/malformed/clipped budget) ALWAYS blocks (fail-closed — see
+    ``_scan_unreadable``); '# review-override' is the conscious escape hatch.
     """
     if force:
         return False, ""  # override NOTE already printed by the body gate
-    try:
-        # --paginate: findings beyond the first REST page (30 comments)
-        # must still gate. With a per-element jq filter, gh emits one
-        # compact JSON object per line across ALL pages.
-        result = subprocess.run(
-            [
-                "gh",
-                "api",
-                f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/comments",
-                "--paginate",
-                "--jq",
-                ".[] | {id: .id, reply_to: .in_reply_to_id, "
-                "login: .user.login, type: .user.type, body: .body}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_gh_timeout(8),  # merge-path budget (see main): advisory scan, fail-open
-        )
-        if result.returncode != 0:
-            return _scan_unreadable(strict, "inline review comments")
-        raw = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
-    except Exception:
-        return _scan_unreadable(strict, "inline review comments")
+    # Paginate via the shared helper (findings beyond the first REST page must still
+    # gate); it accumulates ALL pages as parsed dicts, NEL-safe. ``raw is None`` = the
+    # first page was unreadable; ``complete`` False = a later page failed. Fetch in the
+    # endpoint's default ASCENDING (oldest-first) order: a P1 appended DURING the scan
+    # lands on the last page, which sequential ascending pagination reaches — descending
+    # (newest-first) page-number paging would never revisit page 1 to see it on a >100-
+    # comment PR. ``assoc`` = author_association, for the maintainer-reply engagement check.
+    raw, complete = _fetch_comments_paged(
+        f"pulls/{pr_num}/comments",
+        pr_num,
+        repo,
+        ".[] | {id: .id, reply_to: .in_reply_to_id, login: .user.login, "
+        "type: .user.type, assoc: .author_association, path: .path, body: .body}",
+    )
+    if raw is None:
+        return _scan_unreadable("inline review comments")
 
-    replied_to = {c.get("reply_to") for c in raw if c.get("reply_to")}
+    # Build replied_to over ALL accumulated pages BEFORE classifying, so a P1 on an
+    # early page acknowledged by a reply on a later page is treated as engaged (never
+    # per-page — that would false-block a genuinely-acked finding). Count ONLY replies
+    # from a MAINTAINER (author_association in _MAINTAINER_ASSOCIATIONS): a non-authority
+    # reply must not silence a real P1 (LOW-a).
+    replied_to = {
+        c.get("reply_to")
+        for c in raw
+        if c.get("reply_to") and c.get("assoc") in _MAINTAINER_ASSOCIATIONS
+    }
     p1: list[str] = []
     p2: list[str] = []
+    doc_skipped: list[str] = []  # P1s on doc paths — surfaced, never blocking
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
         body = c.get("body") or ""
@@ -963,10 +1192,24 @@ def _check_inline_review_findings(
         if _INLINE_P1_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — treated as acknowledged
+            if _is_doc_path(c.get("path") or ""):
+                # A P1 on a documentation file (ledger 54eb3752) is surfaced but
+                # does NOT block; a code file (incl. code under docs/) still does.
+                doc_skipped.append(_inline_title(body))
+                continue
             p1.append(_inline_title(body))
         elif _INLINE_P2_RE.search(body):
             p2.append(_inline_title(body))
 
+    if doc_skipped:
+        print(
+            f"NOTE: PR #{pr_num} — {len(doc_skipped)} inline [P1] finding(s) on "
+            f"documentation paths (CHANGELOG/README/LICENSE/NOTICE/docs/**/*.rst) "
+            f"NOT blocking:",
+            file=sys.stderr,
+        )
+        for title in doc_skipped[:5]:
+            print(f"  [doc P1] {title}", file=sys.stderr)
     if p2:
         print(
             f"WARNING: PR #{pr_num} has {len(p2)} inline [P2] review "
@@ -982,21 +1225,28 @@ def _check_inline_review_findings(
             f"Fix and reply in-thread, or append '# review-override' "
             f"to the merge command to acknowledge and proceed."
         )
+    # No unresolved P1 among what we read. If the read is INCOMPLETE (a later page
+    # failed), a P1 could exist on an unread page — fail per _scan_unreadable rather
+    # than report a clean scan.
+    if not complete:
+        return _scan_unreadable("inline review comments (incomplete read)")
     return False, ""
 
 
 def _check_pr_review_findings(
-    pr_num: str, *, force: bool = False, repo: str | None = None, strict: bool = False
+    pr_num: str, *, force: bool = False, repo: str | None = None
 ) -> tuple[bool, str]:
     """Check PR comments for unresolved automated review findings.
 
     Returns (should_block, message).
 
-    On an UNREADABLE scan (gh error/timeout/malformed JSON), enforcement fails
-    OPEN — the hook must never become a single point of failure for merges — while
-    ``strict`` (report mode) fails CLOSED so ``--check-pr`` never reports a failed
-    scan as clean (see ``_scan_unreadable``). An empty result (no comments / Codex
-    quota) is clean either way.
+    An UNREADABLE or INCOMPLETE scan (gh error/timeout/malformed JSON, or a clipped
+    budget) ALWAYS blocks (fail-closed — see ``_scan_unreadable``): the hook must never
+    silently pass a merge past a scan it could not complete, since the newest finding
+    may sit on the page it failed to read. An empty result that was read COMPLETELY (no
+    comments / Codex quota) is clean; the freshness gate separately requires a CURRENT
+    review to EXIST. '# review-override' is the conscious escape hatch for a transient
+    gh error.
     """
     if force:
         print(
@@ -1005,79 +1255,73 @@ def _check_pr_review_findings(
         )
         return False, ""
 
-    try:
-        # Fetch comments as JSON array with author info
-        result = subprocess.run(
-            [
-                "gh",
-                "api",
-                f"repos/{repo or ':owner/:repo'}/issues/{pr_num}/comments",
-                "--jq",
-                "[.[] | {login: .user.login, type: .user.type, body: .body}]",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_gh_timeout(8),  # merge-path budget (see main): advisory scan, fail-open
-        )
-        if result.returncode != 0:
-            return _scan_unreadable(strict, "review-body comments")  # gh error
-    except Exception:
-        return _scan_unreadable(strict, "review-body comments")
+    # Paginate via the shared helper (a review-body finding beyond the first REST
+    # page must still gate). ``comments is None`` = the first page was unreadable;
+    # ``complete`` False = a later page failed.
+    comments, complete = _fetch_comments_paged(
+        f"issues/{pr_num}/comments",
+        pr_num,
+        repo,
+        # Only login + body are read below (the verdict-bearing walk keys on the
+        # recognized-bot login, not user.type — unlike the inline scanner which still
+        # projects type for its Bot-vs-User check).
+        ".[] | {login: .user.login, body: .body}",
+    )
+    if comments is None:
+        return _scan_unreadable("review-body comments")  # first page unreadable
 
-    output = result.stdout.strip()
-    if not output or output == "[]":
-        return False, ""  # No comments at all — allow (quota-exhausted case)
-
-    # Parse JSON array of comments
-    try:
-        raw_comments = json.loads(output)
-    except json.JSONDecodeError:
-        return _scan_unreadable(strict, "review-body comments")  # malformed JSON
-
-    # GitHub API can return "body": null for deleted comments —
-    # use `or ""` to coerce None to empty string (get's default only
-    # fires when the key is absent, not when the value is None).
-    comments: list[tuple[str, str, str]] = [
-        (c.get("login") or "", c.get("type") or "", c.get("body") or "") for c in raw_comments
-    ]
-
-    if not comments:
-        return False, ""
-
-    # Walk comments in reverse (most recent first). The last review
-    # comment determines the state — if findings were addressed and a
-    # re-review posted, the newer clean review wins.
-    for login, user_type, body in reversed(comments):
-        # Only check bot comments (automated reviews)
-        if user_type != "Bot" and login not in _REVIEW_BOTS:
+    # Walk comments in reverse (most recent first). Only a VERDICT-BEARING comment
+    # from a recognized review bot sets the state: one matching a BLOCKING marker
+    # (→ block) or a CLEAN marker (→ clean). Any other comment — a CI/status bot
+    # notice (e.g. github-actions), bot chit-chat, or an unrecognized author — is
+    # SKIPPED, never treated as the "newest clean review".
+    #
+    # This closes the fail-open (Codex P1) where the old terminal clause
+    # ``if is_clean or not blocking_matches: return clean`` let ANY marker-less
+    # comment from a Bot-typed account (Dependabot, or github-actions — which is IN
+    # _REVIEW_BOTS) end the walk clean, silently clearing an earlier ERROR. Requiring
+    # a recognized verdict marker closes BOTH the unrecognized-bot and the
+    # recognized-but-non-verdict (status-comment) masking paths.
+    for c in reversed(comments):
+        login = c.get("login") or ""
+        body = c.get("body") or ""  # GitHub returns null body for deleted comments
+        # Only recognized review bots set the verdict.
+        if login not in _REVIEW_BOTS:
             continue
-
-        # Skip Codex quota-exhausted messages (not a real review)
+        # Codex quota-exhausted messages are not a review.
         if "reached your Codex usage limits" in body and not any(
             p.search(body) for p in _BLOCKING_PATTERNS
         ):
             continue
 
-        # Check if this review is clean
         is_clean = any(p.search(body) for p in _CLEAN_PATTERNS)
-
-        # Check for blocking findings
         blocking_matches = [p.pattern for p in _BLOCKING_PATTERNS if p.search(body)]
 
         if blocking_matches and not is_clean:
-            # Found unresolved findings in the most recent review
+            # A seen finding stands even on an incomplete read (fail-closed on an
+            # observed blocking result — Codex P1: a later-page failure must not
+            # erase an already-observed finding).
             return True, (
                 f"Automated review has unresolved findings.\n"
                 f"Matched patterns: {', '.join(blocking_matches[:3])}\n"
                 f"Fix the findings, or append '# review-override' to "
                 f"the merge command to acknowledge and proceed."
             )
+        if is_clean:
+            # An explicit clean verdict ends the walk — but trust it only on a
+            # COMPLETE read. On an incomplete read the pages we have are the
+            # EARLIEST, so a newer finding could sit on an unread page.
+            if complete:
+                return False, ""
+            return _scan_unreadable("review-body comments (incomplete read)")
+        # Neither blocking nor clean → not a verdict comment → keep walking.
 
-        if is_clean or not blocking_matches:
-            # Most recent review is clean or has no blocking findings
-            return False, ""
-
-    # No bot review comments found — allow (no review posted)
+    # No verdict-bearing finding among the comments we read. On an INCOMPLETE read a
+    # newer finding could exist on an unread page — fail per _scan_unreadable rather
+    # than report clean. An empty/complete result is clean: the freshness gate
+    # (_check_codex_reviewed_head) separately requires a CURRENT review to EXIST.
+    if not complete:
+        return _scan_unreadable("review-body comments (incomplete read)")
     return False, ""
 
 
@@ -1652,7 +1896,7 @@ def _check_codex_reviewed_head(
 # conscious "merge without a scheduled review" case — it didn't run / is rate-limited).
 # A scheduled-review marker is an HTML comment ``<!-- genesis-scheduled-review:
 # head=<40hex> kind=<name> -->``. Each SCHEDULED routine stamps its own ``kind`` so
-# the gate can require that EVERY routine in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` ran
+# the gate can require that EVERY routine in ``_required_scheduled_review_kinds()`` ran
 # on the current head — a single routine's marker no longer satisfies the gate on its
 # own. head/kind are parsed from the marker BLOCK (order-tolerant) and BOTH must be
 # present in the SAME marker to count.
@@ -1666,10 +1910,90 @@ _SCHEDULED_REVIEW_BLOCK_RE = re.compile(
 _SCHEDULED_REVIEW_HEAD_RE = re.compile(r"\bhead=([0-9a-f]{40})(?=\s|\Z)")
 _SCHEDULED_REVIEW_KIND_RE = re.compile(r"\bkind=([a-z0-9][a-z0-9._-]*)(?=\s|\Z)")
 
-# Every scheduled routine whose completion the merge gate requires, by ``kind``. A PR
-# merges only when a valid owner-authored marker for EACH of these names the current
-# head. Change this tuple to add/remove required routines.
-_REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
+# Default scheduled-review kinds the merge gate REQUIRES at head. A PR merges only when
+# a valid owner-authored marker for EACH effective required kind names the current head.
+# The DEFAULT is the full set (shipped to every install, unchanged); an install may relax
+# the OPTIONAL kinds locally — see _required_scheduled_review_kinds() for the lever.
+_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
+# The leak/secret scanner is IRREDUCIBLE: always required, never removable by config. A
+# secret reaching a public repo is irreversible, so no local policy may waive it.
+_IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
+# Every kind an install is ALLOWED to name in config. A configured kind outside this set
+# (a typo, a wrong type, a stale routine name) can never be satisfied by a real marker, so
+# the whole config is treated as invalid and we fail closed to the default rather than let
+# it either wedge merges forever or silently narrow the required set.
+_KNOWN_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
+
+
+def _validate_configured_kinds(items: object) -> list[str] | None:
+    """Lowercase + validate a configured kind list. Returns the cleaned list (possibly
+    empty, meaning "only the irreducible kinds"), or None if ANYTHING is off — not a list,
+    a non-string element, a blank element, or an unknown kind. None makes the caller fail
+    CLOSED to the full default rather than honor a malformed/ambiguous relaxation."""
+    if not isinstance(items, list):
+        return None
+    out: list[str] = []
+    for k in items:
+        if not isinstance(k, str):
+            return None  # wrong type (e.g. [123]) -> invalid -> default
+        kk = k.strip().lower()  # normalize to the lowercase marker grammar
+        if not kk or kk not in _KNOWN_SCHEDULED_REVIEW_KINDS:
+            return None  # blank ([" "]) or unknown ([foo]) -> invalid -> default
+        out.append(kk)
+    return out
+
+
+def _required_scheduled_review_kinds() -> tuple[str, ...]:
+    """The scheduled-review kinds the merge gate REQUIRES at head, as a tuple.
+
+    Default is the full set (``code-review`` + ``leaks``) — shipped unchanged to every
+    install. An install MAY relax the OPTIONAL kinds (e.g. make the structural
+    code-review ADVISORY, so its absence no longer blocks — its review still posts on the
+    PR to be read/addressed if it ran) via LOCAL config, keeping install policy out of the
+    public default:
+
+        # ~/.genesis/config/genesis.yaml
+        merge_gate:
+          required_scheduled_reviews: [leaks]
+
+    The leak/secret scanner (``_IRREDUCIBLE_...``) is ALWAYS unioned in and CANNOT be
+    dropped by config. Fail-CLOSED toward MORE review: a missing key / unreadable file /
+    parse error / duplicate key / wrong-type / blank / unknown kind ALL fall back to the
+    full default set, never to fewer kinds. Configured kinds are validated against
+    ``_KNOWN_SCHEDULED_REVIEW_KINDS`` and lowercased to the marker grammar. Test seam:
+    ``_TEST_REQUIRED_SCHEDULED_REVIEWS`` (comma-separated) overrides the config file.
+    """
+    raw = os.environ.get("_TEST_REQUIRED_SCHEDULED_REVIEWS")
+    configured: list[str] | None = None
+    if raw is not None:
+        # Test seam: comma-list; empties dropped so "" means "only the irreducible kinds".
+        configured = _validate_configured_kinds([k.strip() for k in raw.split(",") if k.strip()])
+    else:
+        try:
+            import yaml  # lazy: keep the hook import-light; the genesis venv has pyyaml
+
+            path = os.path.expanduser("~/.genesis/config/genesis.yaml")
+            with open(path) as fh:
+                text = fh.read()
+            # yaml.safe_load silently keeps the LAST value for a repeated key, so a
+            # badly-merged file (two merge_gate: or required_scheduled_reviews: lines)
+            # could quietly narrow the required set. Catch the realistic cases with a
+            # line scan (the repo's idiom — no unsafe custom Loader) and fail closed.
+            if (
+                len(re.findall(r"(?m)^merge_gate\s*:", text)) > 1
+                or len(re.findall(r"(?m)^\s*required_scheduled_reviews\s*:", text)) > 1
+            ):
+                raise ValueError("duplicate merge_gate/required_scheduled_reviews key")
+            cfg = yaml.safe_load(text) or {}
+            configured = _validate_configured_kinds(
+                (cfg.get("merge_gate") or {}).get("required_scheduled_reviews")
+            )
+        except Exception:
+            configured = None  # fail-closed: fall back to the full default set below
+    kinds = configured if configured is not None else list(_DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS)
+    # leaks (and any irreducible kind) is always required, even if config omits it.
+    merged = list(dict.fromkeys([*kinds, *_IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS]))
+    return tuple(merged)
 
 
 def _canonical_public_repo() -> str | None:
@@ -1854,21 +2178,18 @@ def _check_scheduled_claude_reviewed_head(
     repo: str | None = None,
     *,
     force: bool = False,
-    strict: bool = False,
 ) -> str | None:
     """Block a merge unless EVERY required scheduled Claude review (by the repo OWNER)
     has run on the PR's CURRENT head. Returns ``None`` when a valid owner marker for
-    each kind in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` names ``head_sha`` exactly (full
+    each kind in ``_required_scheduled_review_kinds()`` names ``head_sha`` exactly (full
     40-char), else a BLOCK MESSAGE naming the MISSING kinds.
 
-    Fail-CLOSED in BOTH modes — this gate never passes on absence of positive
-    evidence: if the head cannot be read, or the comment/review fetch errors
-    (``_scheduled_review_markers`` → None), the merge is BLOCKED. A read that simply
-    does not carry every required kind at this head (a routine didn't run, ran on a
-    stale commit, or was rate-limited) also blocks. ``strict`` is accepted for interface
-    parity with the finding scanners (``check_pr_report`` passes it); the block/pass
-    decision is identical in both modes precisely BECAUSE enforcement already fails
-    closed, so the report can never issue a false all-clear here.
+    Fail-CLOSED — this gate never passes on absence of positive evidence: if the head
+    cannot be read, or the comment/review fetch errors (``_scheduled_review_markers`` →
+    None), the merge is BLOCKED. A read that simply does not carry every required kind
+    at this head (a routine didn't run, ran on a stale commit, or was rate-limited) also
+    blocks. The merge path and the report path share this single fail-closed decision,
+    so the report can never issue a false all-clear here.
 
     SCOPE: this gate enforces ONLY for a merge targeting the configured PUBLIC repo
     (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any other
@@ -1903,12 +2224,13 @@ def _check_scheduled_claude_reviewed_head(
             f"Retry, or append '# scheduled-review-override' to merge anyway."
         )
     kinds_here = markers.get(head, set())
-    missing = [k for k in _REQUIRED_SCHEDULED_REVIEW_KINDS if k not in kinds_here]
+    required = _required_scheduled_review_kinds()
+    missing = [k for k in required if k not in kinds_here]
     if not missing:
         return None
     return (
         f"scheduled Claude review(s) missing at head {head[:12]}: {', '.join(missing)} "
-        f"(required: {', '.join(_REQUIRED_SCHEDULED_REVIEW_KINDS)}; present: "
+        f"(required: {', '.join(required)}; present: "
         f"{', '.join(sorted(kinds_here)) or 'none'}).\n"
         f"Each routine posts a comment/review carrying "
         f"'<!-- genesis-scheduled-review: head=<sha> kind=<name> -->' once it runs on THIS "
@@ -3005,14 +3327,39 @@ def main() -> int:
                     and cur
                     and cur not in ("main", "master")
                     and _push_targets_current_branch(push_segs[0], cur, push_remote, cwd=pcwd)
-                    and _push_is_republish(push_remote, cur, pcwd)
                 ):
+                    # This push plainly updates the current branch `cur`, so it
+                    # qualifies for the first-push-only relaxation IF `cur` is
+                    # already on the remote. Decide that via the LOCAL allowlist
+                    # first (offline — immune to the transient ls-remote failure
+                    # that otherwise fail-closes _push_is_republish to a re-prompt),
+                    # then fall back to the live ls-remote leg. On an ls-remote HIT,
+                    # RECORD the confirmed-on-remote fact so later re-pushes decide
+                    # offline. SECURITY: the allowlist is written ONLY here, ONLY on
+                    # an ls-remote HIT (which proves `cur` is on the remote → its
+                    # first push was already approved), so it can never authorize a
+                    # genuine first push; a broken/absent push_allowlist degrades to
+                    # the pure ls-remote path (import guarded to None above).
+                    urls = _remote_push_urls(push_remote, cwd=pcwd) if push_remote else set()
                     # Deferred (NOT an inline return) so any hard-block in a compound
                     # command still takes precedence — see push_allow_reason above.
-                    push_allow_reason = (
-                        f"re-push to '{cur}' (already on the remote — approved on "
-                        f"its first push); only the first push of a branch/PR prompts."
-                    )
+                    if push_allowlist is not None and push_allowlist.is_recorded(urls, cur):
+                        push_allow_reason = (
+                            f"re-push to '{cur}' (recorded as already on the remote — "
+                            f"approved on its first push); only the first push prompts."
+                        )
+                    elif _push_is_republish(push_remote, cur, pcwd):
+                        if push_allowlist is not None and urls:
+                            push_allowlist.record(urls, cur)
+                        push_allow_reason = (
+                            f"re-push to '{cur}' (already on the remote — approved on "
+                            f"its first push); only the first push of a branch/PR prompts."
+                        )
+                    else:
+                        ask_reason = (
+                            f"git push needs your approval before publishing externally "
+                            f"(target: {branch or 'default'})."
+                        )
                 else:
                     ask_reason = (
                         f"git push needs your approval before publishing externally "
@@ -3167,6 +3514,13 @@ def main() -> int:
                         f"BLOCKED: PR #{pr_num} has merge conflicts. Resolve before merging.",
                         file=sys.stderr,
                     )
+                    print(
+                        "A conflicting branch ALSO suppresses all pull_request CI (GitHub "
+                        "cannot build the merge ref), so no CI runs until you merge the "
+                        "base branch (usually main) into your PR branch — that resolves "
+                        "both at once.",
+                        file=sys.stderr,
+                    )
                     return 2
                 if mergeable != "MERGEABLE":
                     # Allowlist (fail-CLOSED): anything that is not a definite
@@ -3181,7 +3535,10 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     print(
-                        "GitHub may still be computing it, or the query failed. Wait and retry.",
+                        "GitHub may still be computing it, or the query failed. Wait and "
+                        "retry. A conflicting or still-computing branch also suppresses "
+                        "pull_request CI, so if CI never appears check "
+                        f"`gh pr view {pr_num} --json mergeable` first.",
                         file=sys.stderr,
                     )
                     return 2
@@ -3193,8 +3550,12 @@ def main() -> int:
                 # past a red `test` job — exactly how main was broken on
                 # 2026-07-28. Block red/pending CI unless a conscious, separate
                 # `# ci-override` is appended (never waived by --admin or
-                # # review-override). Fail-OPEN on "unknown" so a transient API
-                # hiccup can't wedge merges.
+                # # review-override). Fail-OPEN on "unknown" (a read we could not
+                # complete) so a transient API hiccup can't wedge merges — but
+                # fail-CLOSED on "absent" (a readable EMPTY check set = CI never ran)
+                # ON THE CANONICAL REPO (where CI always runs), so a conflicting branch
+                # or dropped pull_request trigger can't slip an un-CI'd merge through
+                # (handled just below).
                 ci_state, ci_bad = _pr_ci_status(pr_num, repo=merge_repo)
                 ci_override = has_trailing_override(merge_seg.raw, "ci-override")
                 if ci_state in ("red", "pending") and not ci_override:
@@ -3216,6 +3577,30 @@ def main() -> int:
                     print(
                         f"NOTE: CI {ci_state.upper()} on #{pr_num} "
                         f"({', '.join(ci_bad[:6])}) — merging via # ci-override "
+                        "(consciously accepted).",
+                        file=sys.stderr,
+                    )
+                # "absent" = a readable EMPTY check set (CI never ran). On the canonical
+                # public repo CI ALWAYS runs, so an empty set is anomalous → fail-CLOSED
+                # (a conflicting branch / dropped pull_request trigger would otherwise
+                # merge un-CI'd). Off the canonical repo (may legitimately have no CI)
+                # this stays fail-OPEN. Waived by the same conscious `# ci-override`.
+                # Scoped via the canonical-repo test (shared with the scheduled gate).
+                elif ci_state == "absent" and _scheduled_gate_applies(merge_repo):
+                    if not ci_override:
+                        print(
+                            f"BLOCKED: No CI checks have run on PR #{pr_num} (an empty "
+                            "check set). On the canonical repo CI always runs, so "
+                            "pull_request CI never fired — most often the branch was "
+                            "CONFLICTING (merge origin/main into it to resolve BOTH) or a "
+                            "trigger was dropped (push a commit to re-fire). Never merge "
+                            "an un-CI'd PR. If you are intentionally merging with no CI, "
+                            "append a trailing '# ci-override' (logged).",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    print(
+                        f"NOTE: No CI checks on #{pr_num} — merging via # ci-override "
                         "(consciously accepted).",
                         file=sys.stderr,
                     )
@@ -3277,11 +3662,12 @@ def main() -> int:
                 # rejected if the head moved), making check→merge atomic. Only
                 # engaged when the freshness check ran (not # stale-review-override).
                 # Placed IMMEDIATELY after the freshness gate — BEFORE the two
-                # advisory network scanners below — so a hook wall-clock SIGKILL
-                # during a slow scan can never skip the binding enforcement (it
-                # needs only argv + verified_head, no gh call): a clipped scanner
-                # nets its own fail-open outcome, but a clipped BINDING would have
-                # re-opened the unbound-merge race this block exists to close.
+                # network scanners below — so a hook wall-clock SIGKILL during a slow
+                # scan can never skip the binding enforcement (it needs only argv +
+                # verified_head, no gh call). The scanners now fail CLOSED on a clipped
+                # budget, but a SIGKILL kills the whole hook (which "fails toward tool
+                # runs"), so the binding — the one gate that closes the unbound-merge
+                # TOCTOU race — must run first, while budget is guaranteed.
                 if verified_head:
                     bind_msg = _require_match_head(
                         merge_seg.argv, pr_num, verified_head, merge_repo, "Codex-verified"
@@ -3299,8 +3685,10 @@ def main() -> int:
                     repo=merge_repo,
                 )
                 if should_block:
+                    # Blocks on EITHER an unresolved finding OR an unreadable/incomplete
+                    # scan (fail-closed) — review_msg states which.
                     print(
-                        f"BLOCKED: PR #{pr_num} has unresolved review findings.",
+                        f"BLOCKED: PR #{pr_num} — review-body gate did not pass.",
                         file=sys.stderr,
                     )
                     print(review_msg, file=sys.stderr)
@@ -3315,20 +3703,20 @@ def main() -> int:
                 )
                 if should_block:
                     print(
-                        f"BLOCKED: PR #{pr_num} has unresolved INLINE review findings.",
+                        f"BLOCKED: PR #{pr_num} — inline review gate did not pass.",
                         file=sys.stderr,
                     )
                     print(inline_msg, file=sys.stderr)
                     return 2
 
-                # Scheduled Claude review at HEAD — its OWN always-fail-closed gate with
-                # its OWN sigil (# scheduled-review-override waives ONLY this gate; independent
-                # of # stale-review-override). Deliberately placed LAST — after the review-body
-                # + inline finding scanners, which fail OPEN on a clipped budget. This gate
-                # fails CLOSED, so if the shared merge-gate deadline is exhausted here it BLOCKS
-                # (safe); running it before the scanners could instead starve THEM into their
-                # 1s floor → fail-open → a merge with unresolved findings slipping through. Uses
-                # verified_head from the Codex gate (None under # stale-review-override → re-read).
+                # Scheduled Claude review at HEAD — its OWN fail-closed gate with its OWN
+                # sigil (# scheduled-review-override waives ONLY this gate; independent of
+                # # stale-review-override). Placed LAST, but ordering is no longer
+                # safety-critical: the review-body + inline scanners now ALSO fail CLOSED
+                # on a clipped budget (PR #1434 removed their fail-open), so a drained
+                # merge-gate deadline BLOCKS at whichever gate hits its 1s floor first —
+                # never a silent pass. Uses verified_head from the Codex gate (None under
+                # # stale-review-override → re-read).
                 sched_override = has_trailing_override(merge_seg.raw, "scheduled-review-override")
                 # Provision-or-surface: the scheduled gate no-ops off the configured
                 # public repo (by design). A SILENT no-op would hide a drifted
@@ -3474,16 +3862,15 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     REST endpoint — `chatgpt-codex-connector` vs `…[bot]` — matched nothing,
     and the empty result was reported as "Codex clean" while 5 P2 findings sat
     unread). Report and enforcement share these functions, so a bug in one is a
-    bug in both. The ONE deliberate divergence: the report runs the finding scans
-    in ``strict`` mode, so an UNREADABLE scan (gh error) shows as a failure here
-    rather than fail-open as enforcement does — the report must never issue a
-    false all-clear.
+    bug in both. Both run the finding scans FAIL-CLOSED — an UNREADABLE or INCOMPLETE
+    scan (gh error / clipped budget) shows as a failure here and BLOCKS a merge there;
+    neither ever issues a false all-clear (PR #1434 removed the old merge-path fail-open).
 
     Prints one line per gate; returns 0 when every gate would pass, 1 otherwise.
     (Same CHECKS as enforcement, but the internal ORDER may differ — e.g. the merge
-    arm runs the scheduled gate LAST, after the finding scanners, for budget reasons;
-    the report is order-independent because every scan here is strict=True, so a clipped
-    scan is a failure line rather than a fail-open pass regardless of position.)
+    arm runs the scheduled gate LAST, after the finding scanners; the report is
+    order-independent because every scan fails CLOSED, so a clipped scan is a failure
+    line regardless of position.)
     """
     failures = 0
     mergeable = _check_mergeable(pr_num, repo=repo)
@@ -3496,6 +3883,12 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     ci_state, ci_bad = _pr_ci_status(pr_num, repo=repo)
     print(f"ci             : {ci_state}{' (' + ', '.join(ci_bad[:6]) + ')' if ci_bad else ''}")
     if ci_state in ("red", "pending"):
+        failures += 1
+    elif ci_state == "absent" and _scheduled_gate_applies(repo):
+        # Mirror the enforcement arm so the report and gate never disagree: a readable
+        # empty check set on the canonical repo blocks (CI never ran — likely a
+        # conflicting branch or a dropped pull_request trigger).
+        print("  ↳ BLOCK — no CI checks have run (empty check set); pull_request CI never fired.")
         failures += 1
     # Order mirrors the gate: base-invariant → freshness → finding scans, so a
     # review published mid-run can't pass freshness with its P1s unscanned.
@@ -3536,9 +3929,8 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     print(f"codex-at-head  : {label}")
     failures += 1 if blocked else 0
     # Scheduled Claude review at HEAD — the SAME always-fail-closed gate the merge arm
-    # enforces (shared function, strict mode). It reads the head itself (no head in
-    # hand here). A missing/stale/unreadable scheduled review is a FAILURE line, never a
-    # false all-clear — the report must not diverge from enforcement.
+    # enforces (shared function). A missing/stale/unreadable scheduled review is a
+    # FAILURE line, never a false all-clear — the report must not diverge from enforcement.
     # Pass the Codex-verified head (as the enforcement path does) so the report is a
     # COHERENT snapshot: if the head moved mid-report, the scheduled check binds to the
     # same head the printed merge-with command does, not an independently re-read newer one.
@@ -3547,17 +3939,17 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     if not _scheduled_gate_applies(repo):
         print("scheduled-claude: n/a (scoped to the public repo only)")
     else:
-        sched_msg = _check_scheduled_claude_reviewed_head(pr_num, verified_head, repo, strict=True)
+        sched_msg = _check_scheduled_claude_reviewed_head(pr_num, verified_head, repo)
         print(
             f"scheduled-claude: {'BLOCK — ' + sched_msg.splitlines()[0] if sched_msg else 'ok (at head)'}"
         )
         failures += 1 if sched_msg else 0
-    # strict=True: a scan that could not be READ (gh error/malformed) must show as
-    # a failure here, never as "ok" — the report must not issue a false all-clear.
-    blocked, msg = _check_pr_review_findings(pr_num, repo=repo, strict=True)
+    # Fail-closed (the only mode now): a scan that could not be READ (gh error/malformed)
+    # shows as a failure here, never as "ok" — the report must not issue a false all-clear.
+    blocked, msg = _check_pr_review_findings(pr_num, repo=repo)
     print(f"review-body    : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok'}")
     failures += 1 if blocked else 0
-    blocked, msg = _check_inline_review_findings(pr_num, repo=repo, strict=True)
+    blocked, msg = _check_inline_review_findings(pr_num, repo=repo)
     print(
         f"inline-findings: {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (P2s, if any, printed above)'}"
     )

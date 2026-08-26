@@ -456,67 +456,10 @@ class TestBashHookRmRf:
         assert result.returncode == 0, result.stderr
 
 
-# ---------------------------------------------------------------------------
-# Bash hook: piped background command (empty-output trap)
-# ---------------------------------------------------------------------------
-
-
-class TestBashHookBackgroundPipe:
-    """Block a real pipe in a run_in_background command (produces empty output).
-
-    Regression: the check was `grep -qF "|"`, which also matched the `|` inside
-    a logical-OR `||` — so a backgrounded `a || b` was falsely blocked once
-    #1227 revived the guard. The fix strips `||` before testing for a pipe.
-    """
-
-    def test_logical_or_background_allowed(self, bash_hook_command: str) -> None:
-        """`grep ... || echo` with run_in_background=true -> allowed (no pipe)."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "grep -q foo file || echo none", "run_in_background": True},
-        )
-        assert result.returncode == 0, result.stderr
-
-    def test_logical_or_foreground_allowed(self, bash_hook_command: str) -> None:
-        """`a || b` foreground -> allowed (the guard only fires on background)."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "a || b", "run_in_background": False},
-        )
-        assert result.returncode == 0
-
-    def test_real_pipe_background_blocked(self, bash_hook_command: str) -> None:
-        """A genuine pipe with run_in_background=true -> BLOCKED (empty output)."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "cat x | grep y", "run_in_background": True},
-        )
-        assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
-
-    def test_pipe_both_streams_background_blocked(self, bash_hook_command: str) -> None:
-        """`|&` (pipe stdout+stderr) with run_in_background=true -> BLOCKED."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "make |& tee log", "run_in_background": True},
-        )
-        assert result.returncode == 2
-
-    def test_logical_or_then_pipe_background_blocked(self, bash_hook_command: str) -> None:
-        """`a || b | c` background -> BLOCKED (a real pipe survives the || strip)."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "a || b | c", "run_in_background": True},
-        )
-        assert result.returncode == 2
-
-    def test_real_pipe_foreground_allowed(self, bash_hook_command: str) -> None:
-        """A pipe in the FOREGROUND is fine — the trap is background-only."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "cat x | grep y", "run_in_background": False},
-        )
-        assert result.returncode == 0
+# NOTE: the run_in_background pipe check moved OUT of the inline mega-guard into a
+# dedicated Python hook (scripts/hooks/background_pipe_guard.py, quote/redirect-aware
+# via shell_parse.has_top_level_pipe) — see tests/test_hooks/test_background_pipe_guard.py.
+# The inline guard no longer reads run_in_background.
 
 
 # ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from genesis.cc import rate_limit_park, roster
@@ -30,10 +30,14 @@ from genesis.cc.types import (
     ChannelType,
     EffortLevel,
     StreamEvent,
+    is_owner_attended_channel,
     origin_delivery_supported,
+    session_origin_for_channel,
+    task_detected_origin,
 )
 from genesis.db.crud import cc_sessions
 from genesis.observability.call_site_recorder import record_last_run
+from genesis.util import tz
 
 if TYPE_CHECKING:
     from genesis.cc.contingency import CCContingencyDispatcher
@@ -165,8 +169,19 @@ class ConversationLoop:
         channel: ChannelType,
         thread_id: str | None = None,
         chat_id: str | None = None,
+        intent_text: str | None = None,
     ) -> str:
-        """Process a user message and return the response text."""
+        """Process a user message and return the response text.
+
+        ``intent_text`` (WS-3): the OWNER-authored text to scan for slash intents
+        (/task, /model, /effort, /resume) when *text* is a composite the caller
+        built (e.g. a Telegram quote-reply = quoted bot message + owner reply).
+        Quoted bot text can relay external content (inbox digests, recon
+        findings), so scanning it would let that content forge an owner-authorized
+        /task or flip the model. When set, control tokens + task-intent content
+        come ONLY from ``intent_text`` while *text* stays the LLM prompt (so the
+        quoted context is preserved). ``None`` → scan *text* itself (unchanged).
+        """
         try:
             from genesis.runtime import GenesisRuntime
             rt = GenesisRuntime.instance()
@@ -175,11 +190,18 @@ class ConversationLoop:
         except Exception:
             pass  # Don't let idle tracking break conversation
 
-        # Inline failure detection: scan user input for correction patterns
-        self._fire_user_correction_scan(text)
+        scan_text = intent_text if intent_text is not None else text
+        # Inline failure detection: scan owner-authored input for correction patterns
+        self._fire_user_correction_scan(scan_text)
 
-        intent = self._intent_parser.parse(text)
-        prompt_text = intent.cleaned_text or intent.raw_text
+        intent = self._intent_parser.parse(scan_text)
+        if intent_text is not None:
+            # Composite: keep full context for the LLM; task content is owner-only.
+            prompt_text = text
+            task_content = intent.cleaned_text or intent_text
+        else:
+            prompt_text = intent.cleaned_text or intent.raw_text
+            task_content = prompt_text
 
         if intent.task_requested:
             try:
@@ -192,9 +214,14 @@ class ConversationLoop:
                     id=str(_uuid.uuid4()),
                     source="conversation_intent",
                     type="task_detected",
-                    content=prompt_text,
+                    # WS-3: owner-authored content only (never the quoted composite)
+                    content=task_content,
                     priority="medium",
                     created_at=datetime.now(UTC).isoformat(),
+                    # WS-3: source is channel-agnostic (conversation_intent), so
+                    # stamp origin by channel — owner-attended (terminal/Telegram)
+                    # carries dispatch authority; gateway channels → external.
+                    origin_class=task_detected_origin(channel),
                     skip_if_duplicate=True,
                 )
             except Exception:
@@ -273,9 +300,16 @@ class ConversationLoop:
                 skip_permissions=True,
                 append_system_prompt=True,
                 roster_eligible=True,
-                # WS-3 B4: owner-attended interactive conversation — spare it
-                # from the gate-4 pushed-surfaces enforce drop.
-                supervised=True,
+                # WS-3 B4/gate-4: spare the pushed-surfaces enforce drop ONLY for
+                # owner-attended channels (terminal/Telegram). A gateway
+                # conversation (web/OpenClaw, WhatsApp, voice) is NOT owner-
+                # authenticated, so it stays unsupervised — fail-closed toward
+                # dropping wrapped-external pushed content, never injecting it.
+                supervised=is_owner_attended_channel(channel),
+                # WS-3 gate-4 producer half: gateway → external_untrusted so the
+                # session's own memory/observation_write calls are stamped
+                # untrusted (owner-attended → None → first_party coalesce).
+                origin=session_origin_for_channel(channel),
                 # Owner-attended interactive session: keep the full user-scoped
                 # MCP toolset. Opt OUT of secure-by-default strict scoping
                 # (see CCInvocation.strict_mcp_config).
@@ -421,11 +455,14 @@ class ConversationLoop:
         thread_id: str | None = None,
         session_key: str | None = None,
         chat_id: str | None = None,
+        intent_text: str | None = None,
     ) -> str:
         """Like handle_message but uses streaming for live progress.
 
         ``session_key`` (opaque) is stamped on the CC invocation so a caller's
         interrupt (Telegram /stop) targets this session's subprocess (cc-loop-01).
+        ``intent_text`` (WS-3): owner-authored text to scan for slash intents when
+        *text* is a composite (quote-reply) — see :meth:`handle_message`.
         """
         try:
             from genesis.runtime import GenesisRuntime
@@ -435,11 +472,18 @@ class ConversationLoop:
         except Exception:
             pass  # Don't let idle tracking break conversation
 
-        # Inline failure detection: scan user input for correction patterns
-        self._fire_user_correction_scan(text)
+        scan_text = intent_text if intent_text is not None else text
+        # Inline failure detection: scan owner-authored input for correction patterns
+        self._fire_user_correction_scan(scan_text)
 
-        intent = self._intent_parser.parse(text)
-        prompt_text = intent.cleaned_text or intent.raw_text
+        intent = self._intent_parser.parse(scan_text)
+        if intent_text is not None:
+            # Composite: keep full context for the LLM; task content is owner-only.
+            prompt_text = text
+            task_content = intent.cleaned_text or intent_text
+        else:
+            prompt_text = intent.cleaned_text or intent.raw_text
+            task_content = prompt_text
 
         if intent.task_requested:
             try:
@@ -452,9 +496,14 @@ class ConversationLoop:
                     id=str(_uuid.uuid4()),
                     source="conversation_intent",
                     type="task_detected",
-                    content=prompt_text,
+                    # WS-3: owner-authored content only (never the quoted composite)
+                    content=task_content,
                     priority="medium",
                     created_at=datetime.now(UTC).isoformat(),
+                    # WS-3: source is channel-agnostic (conversation_intent), so
+                    # stamp origin by channel — owner-attended (terminal/Telegram)
+                    # carries dispatch authority; gateway channels → external.
+                    origin_class=task_detected_origin(channel),
                     skip_if_duplicate=True,
                 )
             except Exception:
@@ -594,9 +643,16 @@ class ConversationLoop:
                 append_system_prompt=True,
                 session_key=session_key,
                 roster_eligible=True,
-                # WS-3 B4: owner-attended interactive conversation — spare it
-                # from the gate-4 pushed-surfaces enforce drop.
-                supervised=True,
+                # WS-3 B4/gate-4: spare the pushed-surfaces enforce drop ONLY for
+                # owner-attended channels (terminal/Telegram). A gateway
+                # conversation (web/OpenClaw, WhatsApp, voice) is NOT owner-
+                # authenticated, so it stays unsupervised — fail-closed toward
+                # dropping wrapped-external pushed content, never injecting it.
+                supervised=is_owner_attended_channel(channel),
+                # WS-3 gate-4 producer half: gateway → external_untrusted so the
+                # session's own memory/observation_write calls are stamped
+                # untrusted (owner-attended → None → first_party coalesce).
+                origin=session_origin_for_channel(channel),
                 # Owner-attended interactive session: keep the full user-scoped
                 # MCP toolset. Opt OUT of secure-by-default strict scoping
                 # (see CCInvocation.strict_mcp_config).
@@ -876,8 +932,11 @@ class ConversationLoop:
             append_system_prompt=True,
             session_key=session_key,  # cc-loop-01: keep /stop working on retry
             roster_eligible=True,  # fresh retry stays roster-routable (no resume)
-            # WS-3 B4: owner-attended interactive conversation (fresh retry).
-            supervised=True,
+            # WS-3 B4/gate-4 (fresh retry): supervised ONLY for owner-attended
+            # channels (terminal/Telegram); gateway conversations stay
+            # unsupervised. Mirrors the primary invocation sites above.
+            supervised=is_owner_attended_channel(channel),
+            origin=session_origin_for_channel(channel),  # WS-3 gate-4 producer half
             # Owner-attended interactive session: keep the full user-scoped MCP
             # toolset. Opt OUT of secure-by-default strict scoping
             # (see CCInvocation.strict_mcp_config).
@@ -1562,11 +1621,19 @@ class ConversationLoop:
         except Exception:
             logger.debug("User correction scan failed", exc_info=True)
 
-    def _should_reset(self, session: dict) -> bool:
+    def _should_reset(self, session: dict, *, now: datetime | None = None) -> bool:
         """Check if session is from a previous day boundary.
+
+        The boundary is local-midnight (``day_boundary_hour`` in the user's
+        timezone), not UTC-midnight — otherwise the daily reset fires at the
+        UTC-midnight instant instead of local midnight on any UTC-offset install
+        (see :func:`genesis.util.tz.local_day_boundary`).
 
         Supergroup topic sessions (thread_id set) are persistent — they
         only compact when CC context limits are hit, never by day boundary.
+
+        *now* is injectable for deterministic tests; defaults to the current
+        instant.
         """
         # Supergroup topic sessions are persistent — no daily reset
         if session.get("thread_id"):
@@ -1577,10 +1644,5 @@ class ConversationLoop:
         started_dt = datetime.fromisoformat(started)
         if started_dt.tzinfo is None:
             started_dt = started_dt.replace(tzinfo=UTC)
-        now = datetime.now(UTC)
-        boundary = now.replace(
-            hour=self._day_boundary_hour, minute=0, second=0, microsecond=0,
-        )
-        if now < boundary:
-            boundary -= timedelta(days=1)
+        boundary = tz.local_day_boundary(self._day_boundary_hour, now=now)
         return started_dt < boundary

@@ -67,8 +67,16 @@ def _pin_canonical_public_repo(monkeypatch):
     public repo to the corpus's merge target (``REPO``) via the ``_TEST_CANONICAL_
     PUBLIC_REPO`` seam, so EVERY case deterministically ENGAGES the scheduled gate
     on every host. The off-public-repo NO-OP is exercised by its own case, which
-    overrides this seam to a different repo."""
+    overrides this seam to a different repo.
+
+    Also pin ``_TEST_REQUIRED_SCHEDULED_REVIEWS`` to the DEFAULT policy
+    (code-review + leaks): the required-kinds are now config-driven from the same
+    ``genesis.yaml``, so without this pin the corpus (which asserts the default
+    both-required behavior) would read the host's real local override and go
+    non-deterministic. The relaxed/advisory path is covered by its own unit tests
+    in test_git_push_guard_codex_freshness.py."""
     monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", REPO)
+    monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "code-review,leaks")
     yield
 
 
@@ -129,9 +137,11 @@ _INLINE_P1_LINE = json.dumps(
         "body": "![P1 Badge](x) something is broken",
     }
 )
-# A review-BODY comment carrying a blocking [P1] marker (issues/N/comments; JSON array).
+# A review-BODY comment carrying a blocking [P1] marker (issues/N/comments). The code
+# now fetches this endpoint with `--paginate --jq '.[] | {…}'`, so gh emits one compact
+# JSON object per line (JSONL), NOT a JSON array — mirror that here.
 _REVIEW_BODY_P1 = json.dumps(
-    [{"login": "chatgpt-codex-connector[bot]", "type": "Bot", "body": "[P1] real defect"}]
+    {"login": "chatgpt-codex-connector[bot]", "type": "Bot", "body": "[P1] real defect"}
 )
 # An inline P2 badge comment — warns but does NOT block.
 _INLINE_P2_LINE = json.dumps(
@@ -159,7 +169,7 @@ def _router(
     mergeable: str = "MERGEABLE",
     mergeable_rc: int = 0,
     inline_lines: str = "",
-    review_array: str = "[]",
+    review_lines: str = "",
     calls: list | None = None,
 ):
     """A ``subprocess.run`` stand-in for the three un-seamed gh calls on the merge
@@ -192,10 +202,10 @@ def _router(
         if any("/pulls/" in a and a.endswith("/comments") for a in parts):
             _rec("inline")
             return _proc(0, inline_lines)
-        # gh api repos/<repo>/issues/<pr>/comments → REVIEW-BODY findings (json array)
+        # gh api repos/<repo>/issues/<pr>/comments → REVIEW-BODY findings (one json obj/line)
         if any("/issues/" in a and a.endswith("/comments") for a in parts):
             _rec("review-body")
-            return _proc(0, review_array)
+            return _proc(0, review_lines)
         return _proc(0, "")
 
     return run
@@ -301,6 +311,14 @@ _CASES: list[tuple[str, object, int, str]] = [
         "merge conflicts",
     ),
     (
+        # Part B diagnostics: the CONFLICTING block must NAME the CI consequence —
+        # a conflicting branch suppresses pull_request CI until the base branch is merged in.
+        "mergeable_CONFLICTING_explains_ci_suppression",
+        lambda mp: _run(mp, _merge_cmd(), router=_router(mergeable="CONFLICTING")),
+        2,
+        "pull_request CI",
+    ),
+    (
         "mergeable_novel_state_blocks",
         lambda mp: _run(mp, _merge_cmd(), router=_router(mergeable="SOME_FUTURE_STATE")),
         2,
@@ -363,7 +381,7 @@ _CASES: list[tuple[str, object, int, str]] = [
         "inline_P1_finding_blocks",
         lambda mp: _run(mp, _merge_cmd(), router=_router(inline_lines=_INLINE_P1_LINE)),
         2,
-        "INLINE review findings",
+        "inline review gate did not pass",
     ),
     # ── ORDERING: freshness runs BEFORE the finding scans. With BOTH a missing
     #    review AND a would-be inline P1, the block message must be the FRESHNESS
@@ -407,9 +425,9 @@ _CASES: list[tuple[str, object, int, str]] = [
     #    BEFORE the inline scan — a reorder the extraction could make undetected) ──
     (
         "review_body_P1_finding_blocks",
-        lambda mp: _run(mp, _merge_cmd(), router=_router(review_array=_REVIEW_BODY_P1)),
+        lambda mp: _run(mp, _merge_cmd(), router=_router(review_lines=_REVIEW_BODY_P1)),
         2,
-        "unresolved review findings",
+        "review-body gate did not pass",
     ),
     # ── override-sigil INDEPENDENCE (F3 — highest-risk gap: the extraction's
     #    unified force-plumbing must NOT collapse the two sigils into one) ──
@@ -427,7 +445,7 @@ _CASES: list[tuple[str, object, int, str]] = [
         lambda mp: _run(
             mp,
             _merge_cmd(trailer="# review-override"),
-            router=_router(review_array=_REVIEW_BODY_P1),
+            router=_router(review_lines=_REVIEW_BODY_P1),
         ),
         0,
         "",
@@ -467,19 +485,21 @@ _CASES: list[tuple[str, object, int, str]] = [
             mp,
             _merge_cmd(match=None, trailer="# stale-review-override"),
             reviews="",
-            router=_router(review_array=_REVIEW_BODY_P1),
+            router=_router(review_lines=_REVIEW_BODY_P1),
         ),
         2,
-        "unresolved review findings",
+        "review-body gate did not pass",
     ),
-    # (Codex-P2) CI-unknown is a deliberately fail-OPEN gate — empty/malformed CI reads
-    # must ALLOW, so the unified UNKNOWN->BLOCK aggregation can't regress them. NOTE: CI
-    # is not the ONLY fail-open path — the review-body and inline finding SCANS also fail
-    # open on an unreadable read (git_push_guard.py _scan_unreadable, non-strict). That
-    # scanner-unreadable path is a distinct axis carried to Slice 3 (PrFacts decision
-    # level, follow-up 086bd8e3), not exercised here.
+    # (Codex-P2) CI-"unknown" is a deliberately fail-OPEN gate — a read we could NOT
+    # complete (empty stdout / malformed JSON) must ALLOW, so a transient API hiccup
+    # can't wedge merges. This is DISTINCT from "absent" (a readable empty rollup =
+    # zero checks = CI genuinely did not run), which fail-CLOSES on the canonical repo
+    # (below). NOTE: CI is not the ONLY fail-open path — the review-body and inline
+    # finding SCANS also fail open on an unreadable read (git_push_guard.py
+    # _scan_unreadable, non-strict). That scanner-unreadable path is a distinct axis
+    # carried to Slice 3 (PrFacts decision level, follow-up 086bd8e3), not exercised here.
     (
-        "ci_empty_unknown_fails_open_allows",
+        "ci_empty_string_unknown_fails_open_allows",
         lambda mp: _run(mp, _merge_cmd(), ci=""),
         0,
         "",
@@ -487,6 +507,32 @@ _CASES: list[tuple[str, object, int, str]] = [
     (
         "ci_malformed_unknown_fails_open_allows",
         lambda mp: _run(mp, _merge_cmd(), ci="not-json"),
+        0,
+        "",
+    ),
+    # ── CI "absent" (readable empty rollup) — CI never ran. On the CANONICAL repo
+    # (where CI always runs) this fail-CLOSES: a conflicting branch or a dropped
+    # pull_request trigger leaves an empty check set, and merging it would be an
+    # UN-CI'd merge. Waivable by the same conscious `# ci-override`. Off the canonical
+    # repo (a repo that may legitimately have no CI) it stays fail-OPEN. ──
+    (
+        "ci_absent_on_canonical_blocks",
+        lambda mp: _run(mp, _merge_cmd(), ci="[]"),
+        2,
+        "No CI checks",
+    ),
+    (
+        "ci_absent_with_ci_override_continues",
+        lambda mp: _run(mp, _merge_cmd(trailer="# ci-override"), ci="[]"),
+        0,
+        "consciously accepted",
+    ),
+    (
+        "ci_absent_off_canonical_fails_open_allows",
+        lambda mp: (
+            mp.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/some-other-public-repo"),
+            _run(mp, _merge_cmd(), ci="[]"),
+        )[1],
         0,
         "",
     ),
@@ -543,7 +589,7 @@ _CASES: list[tuple[str, object, int, str]] = [
             router=_router(inline_lines=_INLINE_P1_LINE),
         ),
         2,
-        "INLINE review findings",
+        "inline review gate did not pass",
     ),
     # (Codex-P1 3788128908) `# ci-override` is scoped to the CI gate ALONE — it must not
     # act as a global force. The existing `ci_red_with_ci_override_continues` case has
@@ -561,7 +607,7 @@ _CASES: list[tuple[str, object, int, str]] = [
             router=_router(inline_lines=_INLINE_P1_LINE),
         ),
         2,
-        "INLINE review findings",
+        "inline review gate did not pass",
     ),
     (
         "ci_override_does_NOT_waive_review_body_findings_blocks",
@@ -569,10 +615,10 @@ _CASES: list[tuple[str, object, int, str]] = [
             mp,
             _merge_cmd(trailer="# ci-override"),
             ci=_ci("FAILURE"),
-            router=_router(review_array=_REVIEW_BODY_P1),
+            router=_router(review_lines=_REVIEW_BODY_P1),
         ),
         2,
-        "unresolved review findings",
+        "review-body gate did not pass",
     ),
     (
         # ci_override must not waive FRESHNESS either (freshness reads stale_override, not
@@ -872,7 +918,7 @@ def test_findings_not_fetched_when_freshness_blocks(monkeypatch):
         monkeypatch,
         _merge_cmd(),
         reviews="",  # no current review → freshness blocks
-        router=_router(inline_lines=_INLINE_P1_LINE, review_array=_REVIEW_BODY_P1, calls=calls),
+        router=_router(inline_lines=_INLINE_P1_LINE, review_lines=_REVIEW_BODY_P1, calls=calls),
     )
     assert rc == 2
     labels = [label for label, _argv in calls]
@@ -934,7 +980,7 @@ def test_e3_stale_override_gates_positional_pr_not_flag_value(monkeypatch):
             return _proc(0, _INLINE_P1_LINE if hit else "")
         if any("/issues/" in a and a.endswith("/comments") for a in parts):
             calls.append(("review-body", tuple(parts)))
-            return _proc(0, "[]")
+            return _proc(0, "")  # no review-body comments (JSONL: empty output)
         return _proc(0, "")
 
     cmd = "gh pr merge --subject 123 5 --repo owner/repo --squash --admin  # stale-review-override"
@@ -959,10 +1005,10 @@ def _report_env(monkeypatch, *, scheduled: str, head: str = HEAD):
     monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
     monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
     monkeypatch.setattr(
-        _mod, "_check_pr_review_findings", lambda n, repo=None, strict=False: (False, "")
+        _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
     )
     monkeypatch.setattr(
-        _mod, "_check_inline_review_findings", lambda n, repo=None, strict=False: (False, "")
+        _mod, "_check_inline_review_findings", lambda n, repo=None, force=False: (False, "")
     )
 
 
@@ -987,6 +1033,33 @@ def test_check_pr_report_scheduled_absent_fails_verdict(monkeypatch, capsys):
     sched_line = next(ln for ln in out.splitlines() if ln.startswith("scheduled-claude"))
     assert "BLOCK" in sched_line
     assert rc == 1
+
+
+def test_check_pr_report_ci_absent_fails_verdict_on_canonical(monkeypatch, capsys):
+    """A readable-empty CI rollup ("absent") on the canonical repo is a FAILURE line and
+    flips the report's verdict — the report must not say "all gates pass" while the
+    enforcement arm would block an un-CI'd merge (report/gate never disagree)."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("absent", []))
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", REPO)
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    ci_line = next(ln for ln in out.splitlines() if ln.startswith("ci "))
+    assert "absent" in ci_line
+    assert "no ci checks" in out.lower()  # the BLOCK hint line
+    assert rc == 1
+
+
+def test_check_pr_report_ci_absent_off_canonical_does_not_fail(monkeypatch, capsys):
+    """Off the canonical repo, "absent" stays fail-OPEN — the report does NOT count it
+    as a failure (a repo that legitimately has no CI must not be false-blocked)."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("absent", []))
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/some-other-public-repo")
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    assert "no ci checks" not in out.lower()
+    assert rc == 0
 
 
 def test_check_pr_report_no_merge_with_when_scheduled_blocks(monkeypatch, capsys):

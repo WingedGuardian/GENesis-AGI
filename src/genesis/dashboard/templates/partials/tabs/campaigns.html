@@ -14,7 +14,13 @@
           Pause/resume, run one now, or edit cadence, model, effort, daily cap and jitter.
         </div>
 
-        <template x-if="$store.genesisDashboard.campaignsList.length === 0">
+        <template x-if="$store.genesisDashboard.panelState('campaigns') === 'loading'">
+          <div style="color: var(--color-text-secondary); padding: 1rem 0;">Loading…</div>
+        </template>
+        <template x-if="$store.genesisDashboard.panelState('campaigns') === 'error'">
+          <div style="color: #f0ad4e; padding: 1rem 0;">Couldn't load campaigns — will keep retrying.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.campaignsList.length === 0 && !['loading','error'].includes($store.genesisDashboard.panelState('campaigns'))">
           <div style="color: var(--color-text-secondary); padding: 1rem 0;">No campaigns.</div>
         </template>
 

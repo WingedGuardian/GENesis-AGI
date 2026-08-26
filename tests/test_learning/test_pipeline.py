@@ -228,6 +228,83 @@ class TestTriagePipeline:
 # tests/test_ledger/test_grader.py::TestAutonomyFeed.
 
 
+class TestObservationOriginStamping:
+    """WS-3 (Codex PR #1431 finding C): retrospective/cc_debrief observations
+    inherit the ANALYZED session's channel trust, so an inbox/mail session's
+    learnings can't launder external content into L1/reflection as first-party."""
+
+    def _origins(self, ow, source):
+        return [
+            c[1].get("origin_class")
+            for c in ow.write.call_args_list
+            if c[1].get("source") == source
+        ]
+
+    @pytest.mark.asyncio
+    async def test_owner_channel_stamps_first_party(self, db):
+        ow = MagicMock()
+        ow.write = AsyncMock(return_value="obs-1")
+        pipeline = build_triage_pipeline(
+            db=db,
+            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
+            outcome_classifier=_make_outcome_classifier(),
+            delta_assessor=_make_delta_assessor(),
+            observation_writer=ow,
+        )
+        text = "resp\n## Learnings\n- one\n- two"
+        await pipeline(FakeCCOutput(text=text), "q", "terminal")
+        assert self._origins(ow, "retrospective") == ["first_party"]
+        assert self._origins(ow, "cc_debrief") == ["first_party", "first_party"]
+
+    @pytest.mark.asyncio
+    async def test_inbox_channel_stamps_external(self, db):
+        ow = MagicMock()
+        ow.write = AsyncMock(return_value="obs-1")
+        pipeline = build_triage_pipeline(
+            db=db,
+            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
+            outcome_classifier=_make_outcome_classifier(),
+            delta_assessor=_make_delta_assessor(),
+            observation_writer=ow,
+        )
+        text = "resp\n## Learnings\n- one"
+        await pipeline(FakeCCOutput(text=text), "q", "inbox")
+        assert self._origins(ow, "retrospective") == ["external_untrusted"]
+        assert self._origins(ow, "cc_debrief") == ["external_untrusted"]
+
+    @pytest.mark.asyncio
+    async def test_attribution_writes_inherit_channel_origin(self, db):
+        """route_learning_signals writes (source=retrospective) also carry the
+        analyzed channel origin — delta.evidence characterizes the session."""
+        da = MagicMock()
+        da.assess = AsyncMock(
+            return_value=RequestDeliveryDelta(
+                classification=DeltaClassification.MISINTERPRETATION,
+                scope_evolution=ScopeEvolution(
+                    original_request="r",
+                    final_delivery="d",
+                    scope_communicated=False,
+                ),
+                attributions=[DiscoveryAttribution.USER_MODEL_GAP],
+                evidence="the user prefers X",
+            )
+        )
+        ow = MagicMock()
+        ow.write = AsyncMock(return_value="obs-1")
+        pipeline = build_triage_pipeline(
+            db=db,
+            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
+            outcome_classifier=_make_outcome_classifier(OutcomeClass.APPROACH_FAILURE),
+            delta_assessor=da,
+            observation_writer=ow,
+        )
+        await pipeline(FakeCCOutput(), "q", "web")
+        # every retrospective write (the depth marker + the user_model_gap
+        # attribution) carries external_untrusted for a gateway (web) session.
+        origins = self._origins(ow, "retrospective")
+        assert origins and all(o == "external_untrusted" for o in origins)
+
+
 class TestSteeringRuleExtraction:
     """Steering rule extraction respects channel boundaries."""
 

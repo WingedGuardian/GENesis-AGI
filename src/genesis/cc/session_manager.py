@@ -9,8 +9,15 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from genesis.cc.types import CCModel, ChannelType, EffortLevel, SessionType
+from genesis.cc.types import (
+    CCModel,
+    ChannelType,
+    EffortLevel,
+    SessionType,
+    session_origin_for_channel,
+)
 from genesis.db.crud import cc_sessions
+from genesis.util import tz
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +95,13 @@ class SessionManager:
             source_tag="foreground",
             thread_id=thread_id,
             chat_id=chat_id,
+            # WS-3 durable gateway origin: a gateway conversation (web/OpenClaw,
+            # WhatsApp, voice) stamps external_untrusted so reflection_window_origin
+            # (which reads cc_sessions.origin_class) does not treat a reflection
+            # overlapping it as first_party and launder its user_model_delta.
+            # Owner-attended (terminal/Telegram) → None (foreground stays NULL,
+            # read as first_party — unchanged).
+            origin_class=session_origin_for_channel(channel),
         )
         return await cc_sessions.get_by_id(self._db, sess_id)
 
@@ -179,22 +193,21 @@ class SessionManager:
         now = datetime.now(UTC).isoformat()
         await cc_sessions.update_activity(self._db, session_id, last_activity_at=now)
 
-    async def check_morning_reset(self, *, user_id: str) -> bool:
+    async def check_morning_reset(self, *, user_id: str, now: datetime | None = None) -> bool:
         """Check if sessions from a previous day boundary should be reset.
 
         Returns True if there are completed/expired sessions from before
         the current day boundary (suggesting a new day has started).
+
+        The boundary is local-midnight (``day_boundary_hour`` in the user's
+        timezone) serialized in UTC — matching the ``+00:00`` timestamps stored
+        in ``cc_sessions`` so the ``query_stale`` string ``<`` comparison stays
+        lexicographically correct (see :func:`genesis.util.tz.local_day_boundary`).
+
+        *now* is injectable for deterministic tests; defaults to the current
+        instant.
         """
-        now = datetime.now(UTC)
-        boundary = now.replace(
-            hour=self._day_boundary_hour,
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
-        if now < boundary:
-            boundary -= timedelta(days=1)
-        boundary_iso = boundary.isoformat()
+        boundary_iso = tz.local_day_boundary(self._day_boundary_hour, now=now).isoformat()
 
         # Check if there are sessions that completed before today's boundary
         rows = await cc_sessions.query_stale(self._db, older_than=boundary_iso)

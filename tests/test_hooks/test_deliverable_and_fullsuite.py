@@ -1,9 +1,8 @@
-"""Tests for the two small C-item guard fixes (PR-Guards):
+"""Tests for deliverable_gate_guard: a marker stuck at rendered_unverified past
+24h is treated as abandoned (allow with a warning) instead of wedging Stop forever.
 
-* deliverable_gate_guard: a marker stuck at rendered_unverified past 24h is
-  treated as abandoned (allow with a warning) instead of wedging Stop forever.
-* full_suite_guard: a -k/-m selector run is a targeted subset, not the full
-  suite (cosmetic false-positive fix).
+(full_suite_guard's selector/targeting tests moved to test_full_suite_guard.py when
+that hook was rewritten to block whole-directory runs.)
 """
 
 from __future__ import annotations
@@ -26,7 +25,6 @@ def _load(name: str):
 
 
 _dgg = _load("deliverable_gate_guard")
-_fsg = _load("full_suite_guard")
 
 
 # --- deliverable_gate_guard staleness escape ---
@@ -66,47 +64,3 @@ class TestDeliverableStaleness:
     def test_other_session_marker_never_blocks(self, tmp_path):
         _write_marker(tmp_path, "sess1", "rendered_unverified", age_seconds=60)
         assert _dgg._decide({"session_id": "sess2"}, tmp_path) == 0
-
-
-# --- full_suite_guard -k/-m selector ---
-
-
-class TestFullSuiteSelector:
-    def test_bare_pytest_is_full_suite(self):
-        assert _fsg._is_full_suite("pytest") is True
-
-    def test_pytest_v_is_full_suite(self):
-        assert _fsg._is_full_suite("pytest -v") is True
-
-    def test_k_selector_not_full_suite(self):
-        assert _fsg._is_full_suite("pytest -k test_foo") is False
-
-    def test_k_selector_quoted_expr(self):
-        assert _fsg._is_full_suite('pytest -k "test_foo or test_bar"') is False
-
-    def test_m_selector_not_full_suite(self):
-        assert _fsg._is_full_suite("pytest -m slow") is False
-
-    def test_k_equals_form(self):
-        assert _fsg._is_full_suite("pytest -k=test_foo") is False
-
-    def test_keyword_long_form(self):
-        assert _fsg._is_full_suite("pytest --keyword=test_foo") is False
-
-    def test_path_still_recognized(self):
-        assert _fsg._is_full_suite("pytest tests/test_x.py") is False
-
-    def test_glued_k_selector(self):
-        """Glued short form `-kfoo` is a selector, not the full suite (NOTE 4)."""
-        assert _fsg._is_full_suite("pytest -kfoo") is False
-
-    def test_glued_m_selector(self):
-        assert _fsg._is_full_suite("pytest -mslow") is False
-
-    def test_k_without_value_is_full_suite(self):
-        """A dangling -k with no value is not a real selection."""
-        assert _fsg._is_full_suite("pytest -k") is True
-
-    def test_tb_flag_alone_is_full_suite(self):
-        """--tb=short with no path/selector is still the full suite."""
-        assert _fsg._is_full_suite("pytest --tb=short") is True

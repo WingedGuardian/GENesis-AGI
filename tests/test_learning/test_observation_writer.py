@@ -85,6 +85,45 @@ class TestObservationWriter:
         assert obs_id
 
     @pytest.mark.asyncio
+    async def test_explicit_origin_class_stamped_on_observation(self, db):
+        """WS-3: an explicit origin_class wins at the observations chokepoint."""
+        writer = ObservationWriter()
+        obs_id = await writer.write(
+            db, source="cc_debrief", type="learning", content="x", priority="low",
+            origin_class="external_untrusted",
+        )
+        cursor = await db.execute("SELECT origin_class FROM observations WHERE id = ?", (obs_id,))
+        assert dict(await cursor.fetchone())["origin_class"] == "external_untrusted"
+
+    @pytest.mark.asyncio
+    async def test_origin_class_forwarded_to_memory_store(self, db):
+        """WS-3: the dual-write memory copy gets the SAME explicit origin (so the
+        two stores can't diverge — the pre-existing memory-side first_party hole)."""
+        store = AsyncMock()
+        store.store.return_value = "mem-1"
+        writer = ObservationWriter(memory_store=store)
+        await writer.write(
+            db, source="cc_debrief", type="learning", content="x", priority="low",
+            origin_class="external_untrusted",
+        )
+        assert store.store.call_args[1]["origin_class"] == "external_untrusted"
+
+    @pytest.mark.asyncio
+    async def test_no_origin_class_is_noop_for_both_stores(self, db):
+        """Default origin_class=None forwards None to both stores → unchanged
+        source-derived behaviour for every existing caller."""
+        store = AsyncMock()
+        store.store.return_value = "mem-1"
+        writer = ObservationWriter(memory_store=store)
+        obs_id = await writer.write(
+            db, source="retrospective", type="learning", content="x", priority="low",
+        )
+        assert store.store.call_args[1]["origin_class"] is None
+        # retrospective is NOT allowlisted → source-derive yields NULL (fail-closed).
+        cursor = await db.execute("SELECT origin_class FROM observations WHERE id = ?", (obs_id,))
+        assert dict(await cursor.fetchone())["origin_class"] is None
+
+    @pytest.mark.asyncio
     async def test_skip_embed_types_not_stored_in_memory(self, db):
         """Low-value observation types skip the MemoryStore embed."""
         from genesis.learning.observation_writer import _SKIP_EMBED_TYPES

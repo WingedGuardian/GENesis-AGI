@@ -255,15 +255,41 @@ verified: d71d1d39 2026-08-18
   rows are left for the 14-day TTL, never discarded. The autonomy-dispatcher `task_detected`
   pickup applies the same trust check (`immunity.is_trusted_for_privileged_write`) SKIP-ONLY
   — it refuses dispatch without resolving/hiding the row (the path is inert today; producer
-  stamping is in the follow-up). **PARTIAL — the broader
-  observation-content-INJECTION surface is still OPEN** (tracked follow-up): the digest types
-  the judge writes (`user_signal`/`architecture_insight`) are surfaced UNFILTERED into LLM
-  context by consumers this change did NOT touch — `essential_knowledge._recent_decisions`
-  (raw SQL → the always-loaded L1 file), `reflection.gather_evaluation_context` (14-day
-  lookback → deep-reflection prompt → can launder into a `first_party`-stamped delta), and
-  several ego/sentinel raw-`FROM observations` reads. The robust fix is to exclude/wrap
-  external-origin content (`is_blockable`, keeping NULL) at the surfacing points, with a
-  coverage guardrail that also catches raw-SQL consumers.
+  stamping is in the follow-up).
+  **WS-3 observation write-provenance + laundering-critical read exclusions (PR-1, built
+  2026-08-22):** origin is now definite at the WRITE boundary — the CRUD chokepoint
+  (`db/crud/observations.py` `create()`/`upsert()` → `derive_observation_origin`) classifies
+  EVERY caller (explicit arg → session env → source map → **NULL fail-closed**), so the
+  observation `source` space (uncurated, ~200 live values) is NON-load-bearing for security: a
+  missed/novel external writer degrades to NULL → excluded, never trusted. Channel-attended
+  `task_detected` writes stamp `owner`/`external_untrusted` via `cc.types.task_detected_origin`;
+  the two stdlib-only raw-INSERT hooks (`proactive_memory_hook` pivot writer,
+  `emit_bugfix_audit`) stamp origin inline. Migration 0085 backfills historical rows. On the
+  READ side, the LAUNDERING-CRITICAL surfaces now EXCLUDE external/unknown-origin content
+  (fail-closed: `origin_class IN ('owner','first_party')`, NULL excluded) —
+  `essential_knowledge._recent_decisions` + `_active_session_pivots` (the always-loaded L1
+  file), `reflection.gather_evaluation_context` (×4) + `_recent_observations` +
+  `gather_for_calibration`, and `perception.context._build_memory_hits` + `_build_light_chain`
+  (the deep-reflection/perception prompt pipeline) — severing the external→reflection→
+  `first_party`-stamped-delta laundering path, with a deep-reflection prompt-rule belt and a
+  write-side coverage guardrail (`tests/test_security/test_observation_surface_coverage.py`)
+  that fails CI on any raw `INSERT INTO observations` bypass. The gate-4 pushed-surfaces
+  `supervised` exemption is now channel-aware (owner-attended only). Session-origin coverage
+  is durable across the gateway class: `get_or_create_foreground` (web/OpenClaw) and
+  `register_voice_session` (voice) stamp `external_untrusted` on the `cc_sessions` row, so
+  `reflection_window_origin` cannot read a NULL as first-party and launder an overlapping
+  reflection's `user_model_delta` (0085 also grandfathers pre-deploy gateway/voice rows). The
+  learning triage pipeline's per-session `retrospective`/`cc_debrief` observations are stamped
+  with the analyzed conversation's channel origin (`cc.types.observation_origin_for_channel`),
+  forwarded to BOTH the observations row and its memory-store copy — an inbox/mail session's
+  debrief learnings can no longer surface first-party; and the coverage guardrail now follows
+  the indirect `ObservationWriter.write` path + module-constant sources. On Telegram
+  quote-replies, slash-command/task intent is parsed from the owner's own reply only (not the
+  quoted composite), closing the `/task`+`/model`+`/effort`+`/resume` forge via quoted bot
+  text. **STILL PARTIAL (PR-2, tracked follow-up):** the read-side breadth — the ~28 ego/sentinel/guardian/surplus/dashboard/
+  MCP reads that should WRAP (not exclude) external content in a shared `render_safe` renderer,
+  plus a read-side discovery guardrail and the boundary-marker zero-width normalization on the
+  wrap path.
   **Out of scope (tracked follow-up):** `cc/direct_session` (its `research` profile runs a
   DOCUMENTED deep-research `Workflow` — blocking the class there would break that path) and
   the autonomy-executor sessions; those legitimately spawn/orchestrate and need a
@@ -399,7 +425,7 @@ gated — that contract is one-directional.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 2f0239cb 2026-08-07
+verified: d8204a0c 2026-08-25
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -421,14 +447,22 @@ verified: 2f0239cb 2026-08-07
   curator-drafted issue via the fail-closed `contribution/sanitize.py scan_prose`
   (title+body+labels — every string that egresses), then HOLDS it: the
   `approval_requests` row FIRST, then `pending_issue_posts` (mirroring the email
-  gate). Each hold is per-item owner-approved on the dashboard (excluded from
-  `approve_all_pending`, like email). The `contributor_issue_watcher` drain
+  gate). By default each hold is per-item owner-approved on the dashboard (excluded
+  from `approve_all_pending`, like email). **Autonomous posture (opt-in,
+  `require_approval: false`):** the propose tool resolves its OWN approval
+  server-side (`resolved_by="genesis:contributor-worklog"`, fail-CLOSED — only an
+  explicit boolean false disables the human gate; default true so a fresh clone
+  never auto-posts), so the curator posts without a human — Genesis is the vetting
+  authority (scan_prose + the rate cap). The `contributor_issue_watcher` drain
   (every 5 min, learning scheduler) resolves approved holds under the
   `contributor_worklog` mode lever (`autonomy/contributor_worklog_config.py`,
   default `propose_only`): `live` → `gh issue create` (shadow-gated door
   `observe_github_issue_create`, `mark_posted` BEFORE `mark_consumed` +
-  pre-post `gh issue list` dedup for idempotency); `propose_only` → dry-run
-  terminal (never posts). Terminal rows pruned >30d via
+  pre-post `gh issue list` dedup for idempotency), rate-limited by
+  `max_posts_per_day` (rolling-24h `count_posted_since`, per-row before the create
+  so N approved rows in one tick are bounded; cautious-rollout brake); `propose_only`
+  → dry-run terminal (never posts). The STOP is `mode: off` / the env kill (freezes
+  the drain, incl. approved held rows). Terminal rows pruned >30d via
   `scripts/prune_contributor_issue_posts.py`; held rows never pruned. The
   curator campaigns are LOCAL user data (uncommitted).
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +

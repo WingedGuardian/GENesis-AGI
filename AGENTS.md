@@ -25,6 +25,13 @@ not to confirm:
   and does not break existing behavior; a finding whose "fix" regresses something is
   itself a finding. Verify claims against the code — a stated mechanism can be wrong
   even when the concern is real.
+- **Historical/removed behavior quoted in comments is not a current bug.** A fix's
+  comments and commit messages routinely *quote the old vulnerable pattern* to justify
+  the change ("this closes the fail-open where `strict=False` let it through"; "NEL-safe:
+  splits on `\n`, NOT `splitlines()`"). Before flagging a concern, confirm the pattern
+  exists in the **current code** — grep the code, not the prose. A symbol or clause that
+  appears ONLY inside a comment describing what was removed is a FALSE POSITIVE, not a
+  P1/P2; flagging it re-opens a closed loop round after round.
 - **Calibrate severity to the code's DECLARED threat model — do not harden low-stakes
   code ad infinitum.** Adversarial rigor above stays FULL for high-consequence surfaces
   (auth, credentials, financial, data-loss, external input, approval gates). But a

@@ -59,6 +59,20 @@ async def test_register_persists_satellite_id():
         await db.close()
 
 
+async def test_register_voice_session_stamps_external_origin():
+    """WS-3 (Codex PR #1431 finding A): voice is a gateway channel (far-field,
+    multi-speaker STT) — its session must be stamped external_untrusted so a
+    reflection overlapping it does not launder the delta to first_party. NULL
+    would read as first_party (the hole this closes)."""
+    db = await _fresh_db()
+    try:
+        await ccs.register_voice_session(db, id="sid-v", started_at="2026-08-11T00:00:00+00:00")
+        cur = await db.execute("SELECT origin_class FROM cc_sessions WHERE id='sid-v'")
+        assert (await cur.fetchone())["origin_class"] == "external_untrusted"
+    finally:
+        await db.close()
+
+
 async def test_register_without_satellite_id_is_null():
     db = await _fresh_db()
     try:
