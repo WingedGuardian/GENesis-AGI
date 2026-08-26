@@ -200,6 +200,18 @@ class TestCrud:
         assert {r["id"] for r in held} == {"p1", "p2"}
 
     @pytest.mark.asyncio
+    async def test_dedup_repo_match_is_case_insensitive(self, db):
+        # FIX 4 completion: the proposer stores the repo lowercased
+        # (contributor_issue.py: repo=repo.lower()) but calls list_dedup_active
+        # with the RAW config slug (e.g. "WingedGuardian/GENesis-AGI"). A
+        # case-sensitive match here silently misses every existing held/posted
+        # row → max_held backpressure bypassed + duplicate proposals. The query
+        # must be COLLATE NOCASE, matching posted_index_for_repo.
+        await pip.create(db, **{**_ROW, "repo": "wingedguardian/genesis-agi"})
+        active = await pip.list_dedup_active(db, "WingedGuardian/GENesis-AGI")
+        assert [r["id"] for r in active] == ["p1"]
+
+    @pytest.mark.asyncio
     async def test_mark_posted_once(self, db):
         await pip.create(db, **_ROW)
         assert (

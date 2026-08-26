@@ -126,10 +126,15 @@ async def list_dedup_active(db: aiosqlite.Connection, repo: str) -> list[dict]:
     does NOT block — a dry-run hold is re-proposed under 'live' mode to actually
     post it; ``rejected``/``expired`` also don't block (an item may be
     re-drafted). Returns id/title/source_ref/status for the caller to normalize
-    and compare (bounded small by the ``max_held`` backpressure knob)."""
+    and compare (bounded small by the ``max_held`` backpressure knob).
+
+    The ``repo`` comparison is ``COLLATE NOCASE`` (mirroring
+    ``posted_index_for_repo``): the proposer stores the repo lowercased while the
+    dedup call passes the raw config slug, so a case-sensitive match would miss
+    every existing row and silently bypass ``max_held`` backpressure."""
     cursor = await db.execute(
         "SELECT id, title, source_ref, status FROM pending_issue_posts "
-        "WHERE repo = ? AND status IN ('held', 'posted')",
+        "WHERE repo = ? COLLATE NOCASE AND status IN ('held', 'posted')",
         (repo,),
     )
     return [dict(r) for r in await cursor.fetchall()]
