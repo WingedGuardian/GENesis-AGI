@@ -174,19 +174,69 @@ class _ParsedSegment(NamedTuple):
     redirects: tuple[str, ...]
 
 
+def _command_sub_end(command: str, i: int, n: int) -> int:
+    """Index just past the matching ``)`` of a ``$(…)`` command substitution that
+    opens at ``command[i:i+2] == "$("``.
+
+    QUOTE-, ESCAPE-, and NESTING-aware: a ``)`` inside a single/double-quoted span,
+    or backslash-escaped, is DATA — it does NOT close the substitution; a nested
+    ``$(…)``/``(…)`` bumps the paren depth; a ``` `…` ``` backtick span is skipped
+    whole. This bounds the sub at its TRUE close so a following control operator
+    (``&& rm``) can never be swallowed into a redirect target (the Codex-P1
+    regression a paren-only balancer caused). Fail-open: an UNTERMINATED sub returns
+    ``n`` (consume to EOL) — it never raises (the module's no-crash contract).
+
+    Shared by ``_redirect_target_end`` (target boundary) and ``_substitutions``
+    (body extraction) so the two agree on where a ``$()`` ends — one scanner, not
+    two divergent paren-counters.
+    """
+    depth, j = 1, i + 2
+    q: str | None = None  # in-body quote state
+    while j < n:
+        ch = command[j]
+        if q is not None:
+            if q == '"' and ch == "\\" and j + 1 < n:  # \ escapes only inside "…"
+                j += 2
+                continue
+            if ch == q:
+                q = None
+            j += 1
+            continue
+        if ch == "\\" and j + 1 < n:  # unquoted backslash escapes the next char
+            j += 2
+            continue
+        if ch in ("'", '"'):  # a quoted span begins — its inner ) is data
+            q = ch
+            j += 1
+            continue
+        if ch == "`":  # nested backtick span — skip to its close (or EOL)
+            close = command.find("`", j + 1)
+            j = close + 1 if close != -1 else n
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return n  # unterminated — fail-open to EOL, never raise
+
+
 def _redirect_target_end(command: str, j0: int, n: int) -> int:
     """Index just past ONE complete redirect-target word starting at ``command[j0]``.
 
     Bash word grammar for a redirect target: a run ended only by an UNQUOTED,
     UNESCAPED metacharacter (whitespace or one of ``; | & < > ( )``). A backslash
     escapes the next char; single/double quotes open a span that suppresses
-    metacharacters (``\\`` active only inside double quotes); a paren-balanced
-    ``$(…)`` command substitution and a ``` `…` ``` backtick substitution are PART of
-    the word (their inner ``(``/``)`` and spaces do NOT end it). This is BOUNDARY
-    detection only — expansion SEMANTICS stay with the canonical ``_substitutions``
-    parser. It generalises the earlier quote-aware scanner (which stopped at a bare
-    ``(``) so an UNQUOTED ``2>$(rm x)`` is measured as one word and excised from argv
-    whole, not just its leading ``$``.
+    metacharacters (``\\`` active only inside double quotes); a ``$(…)`` command
+    substitution (bounded QUOTE/ESCAPE/NESTING-aware via ``_command_sub_end`` — a
+    ``)`` inside a quoted operand does NOT close it) and a ``` `…` ``` backtick
+    substitution are PART of the word (their inner ``(``/``)`` and spaces do NOT end
+    it). This is BOUNDARY detection only — expansion SEMANTICS stay with the
+    canonical ``_substitutions`` parser. It generalises the earlier quote-aware
+    scanner (which stopped at a bare ``(``) so an UNQUOTED ``2>$(rm x)`` is measured
+    as one word and excised from argv whole, not just its leading ``$``.
     """
     j = j0
     wq: str | None = None  # in-word quote state
@@ -208,14 +258,7 @@ def _redirect_target_end(command: str, j0: int, n: int) -> int:
             j += 1
             continue
         if ch == "$" and j + 1 < n and command[j + 1] == "(":  # $(…) command sub
-            depth, j = 1, j + 2
-            while j < n and depth > 0:
-                cj = command[j]
-                if cj == "(":
-                    depth += 1
-                elif cj == ")":
-                    depth -= 1
-                j += 1
+            j = _command_sub_end(command, j, n)  # quote/escape/nesting-aware close
             continue
         if ch == "`":  # `…` backtick sub — to the matching backtick (or EOL)
             close = command.find("`", j + 1)
@@ -668,11 +711,15 @@ def _substitutions(text: str) -> list[str]:
     """Command-substitution bodies — ``$(…)`` and ``` `…` ``` — which also run.
 
     Only single-quoted spans block substitution (``$()`` still expands inside
-    double quotes). Nested ``$()`` is balanced by paren depth. Best-effort:
-    exotic forms (process substitution ``<(…)``, ANSI-C ``$'…'`` scripts, ``env
-    -S`` string-splitting, shell aliases/functions) are NOT parsed — this guard
-    is an approval/friction layer, not a sandbox, and fails toward over-matching
-    on the common forms rather than pretending to cover every shell construct.
+    double quotes). A ``$()`` body is bounded QUOTE/ESCAPE/NESTING-aware via the
+    shared ``_command_sub_end`` — a ``)`` inside a quoted operand of the body is
+    DATA, so the body is extracted to its TRUE close (the same scanner the redirect-
+    target boundary uses, so the two never disagree on where a ``$()`` ends).
+    Best-effort: exotic forms (process substitution ``<(…)``, ANSI-C ``$'…'``
+    scripts, ``env -S`` string-splitting, shell aliases/functions) are NOT parsed —
+    this guard is an approval/friction layer, not a sandbox, and fails toward
+    over-matching on the common forms rather than pretending to cover every shell
+    construct.
     """
     subs: list[str] = []
     i, n = 0, len(text)
@@ -689,16 +736,9 @@ def _substitutions(text: str) -> list[str]:
             i += 1
             continue
         if c == "$" and i + 1 < n and text[i + 1] == "(":
-            depth, j = 1, i + 2
-            start = j
-            while j < n and depth > 0:
-                if text[j] == "(":
-                    depth += 1
-                elif text[j] == ")":
-                    depth -= 1
-                j += 1
-            subs.append(text[start : j - 1])
-            i = j
+            end = _command_sub_end(text, i, n)  # index past matching ')'
+            subs.append(text[i + 2 : end - 1])  # body between $( and )
+            i = end
             continue
         if c == "`":
             j = text.find("`", i + 1)

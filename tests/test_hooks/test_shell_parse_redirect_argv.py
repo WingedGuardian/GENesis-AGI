@@ -201,3 +201,50 @@ def test_dual_buffer_no_desync_under_fd_expansion_adjacency():
     assert sp.git_subcommand(seg.argv) == "push"
     assert {"a", "b", "c", "d"} <= {s.exe for s in sp.analyze(cmd)}
     assert [s.raw for s in sp.analyze(cmd) if s.depth == 0] == sp.split_segments(cmd)
+
+
+# ── Codex P1 (2026-08-26): quote-aware $() target boundary ────────────────────
+# The $()/backtick target balancer must respect quotes/escapes: a `)` inside a
+# single/double-quoted span (or escaped) inside the $() body is DATA, not the
+# close. The quote-blind balancer closed the $() early, then the outer word-scan
+# treated the trailing quote as an opener and SWALLOWED a following `&& rm`/`&&
+# git push`/`commit -n` into the redirect target — analyze() emitted no segment
+# for the following command, blinding the destructive/push/commit guards. Each
+# case must keep the following command a SEPARATE, visible depth-0 segment.
+# (cmd, following exe, its git subcommand or None, commit_skips_hooks)
+QUOTED_PAREN_FOLLOWING_CMD = [
+    ("echo ok 2>$(printf ')') && rm /x/y", "rm", None, False),  # Codex single-quote form
+    ('echo ok 2>$(echo ")") && rm /x/y', "rm", None, False),  # double-quote form
+    ("echo ok 2>$(printf ')') && git push origin main --force", "git", "push", False),
+    ("echo ok 2>$(printf ')') && git commit --no-verify", "git", "commit", True),
+]
+
+
+@pytest.mark.parametrize("cmd,exe,sub,skips", QUOTED_PAREN_FOLLOWING_CMD)
+def test_quoted_paren_target_does_not_swallow_following_command(cmd, exe, sub, skips):
+    segs = sp.analyze(cmd)
+    hit = next((s for s in segs if s.depth == 0 and s.exe == exe), None)
+    assert hit is not None, (
+        f"{exe!r} segment swallowed by redirect target: {[(s.exe, s.argv) for s in segs]}"
+    )
+    if sub is not None:
+        assert sp.git_subcommand(hit.argv) == sub
+        assert sp.commit_skips_hooks(hit.argv) is skips
+
+
+def test_rm_inside_quoted_paren_sub_still_surfaces():
+    """The already-safe direction stays safe: an rm INSIDE a $() whose operand
+    carries a quoted `)` still surfaces via _substitutions, and the trailing
+    subcommand still reads correctly."""
+    cmd = 'git 2>$(rm ")" /x) push'
+    segs = sp.analyze(cmd)
+    assert "rm" in {s.exe for s in segs}
+    git_seg = next(s for s in segs if s.exe == "git")
+    assert sp.git_subcommand(git_seg.argv) == "push"
+
+
+def test_quoted_paren_target_golden_raw_still_resplittable():
+    """raw invariant holds through the quoted-paren target: depth-0 Segment.raw ==
+    a fresh split_segments (the cwd/occurrence consumers depend on it)."""
+    for cmd, *_ in QUOTED_PAREN_FOLLOWING_CMD:
+        assert [s.raw for s in sp.analyze(cmd) if s.depth == 0] == sp.split_segments(cmd), cmd
