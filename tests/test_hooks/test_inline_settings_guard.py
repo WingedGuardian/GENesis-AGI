@@ -4,11 +4,13 @@ PR-Guards removed the force-push and worktree-remove arms from this inline blob
 (they are duplicated by the tracked project guards git_push_guard.py and
 worktree_cwd_guard.py, and the force-push arm carried a whole-command substring
 FP: `git push origin main && rm -f x` false-matched). The 2026-08 git-discard
-consolidation then removed reset --hard / clean -f too: they now have a tracked
-python-guard backstop (git_discard_guard.py — precise, with a `# discard-override`
-escape and NEW git checkout/restore coverage), wired in the Bash matcher and
-delegated to by bash_safety_hook.sh. Only nohup / genesis-serve-worktree stay in
-this inline blob (no dedicated python guard yet).
+consolidation then moved `git clean` blocking OUT to a tracked python guard
+(git_discard_guard.py — precise, with a `# discard-override` escape and git
+checkout/restore/rm/mv snapshot coverage), wired in the Bash matcher and delegated
+to by bash_safety_hook.sh. The `git reset --hard` arm STAYS inline as a coarse,
+dependency-free SPEED-BUMP (reset is snapshot-recoverable, so its inline block is
+best-effort, not a boundary); only nohup / genesis-serve-worktree and that reset
+speed-bump remain in this inline blob.
 
 The test extracts the inline command straight from the tracked settings.json and
 runs it, so it fails if the FP-prone arm is ever reintroduced.

@@ -27,7 +27,9 @@ complement), which a false-ALLOW cannot penetrate — see ``_clean_violation``.
 The ``# discard-override`` sigil is its escape.
 
 The SECURITY property this hook provides is RECOVERABILITY. For every
-``checkout`` / ``restore`` / ``switch`` / ``reset`` segment it runs
+tracked-work-overwriting verb — ``checkout`` / ``restore`` / ``switch`` /
+``reset``, plus ``rm`` / ``mv`` and the plumbing ``checkout-index`` /
+``read-tree`` (which delete or rewrite tracked files from the worktree) — it runs
 ``git stash create`` FIRST — capturing worktree + index without mutating
 anything (no ref, no stash-list entry, no tree change) — and logs the snapshot
 sha. If the command then overwrites work, recovery is
@@ -41,9 +43,14 @@ verb present), turning "silent unrecoverable loss" into "recoverable".
 
 For the recoverable verbs this hook is advisory and NEVER exits non-zero: a bug
 in the snapshot path must fail OPEN (let the command run). The ONLY non-zero
-exit is the ``git clean`` block above; if even that path raises, it degrades to
-the dependency-free shell floor rather than crashing or false-blocking a
-recoverable verb.
+exit is the ``git clean`` block above, and it fails CLOSED: if the precise parse
+raises on a command that mentions ``clean``, ``main`` blocks UNCONDITIONALLY and
+asks the user to simplify (no bespoke coarse re-parse — that hand-rolled floor is
+the exact trap that drew a review CRITICAL), so a parser bug can never silently
+ALLOW a destructive clean — critically on the DIRECT ``settings.json`` wiring,
+which has no shell floor behind it. The snapshot recovery note is
+delivered to the model via ``hookSpecificOutput.additionalContext`` (stdout),
+because Claude Code discards an exit-0 hook's stderr.
 
 DOCUMENTED RESIDUALS (honest claim — the snapshot is a best-effort net):
   * ``git stash create`` excludes UNTRACKED files: a ``clean`` deletion or a
@@ -81,6 +88,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 # Self-locate so sibling hook modules resolve whether run as a script or imported.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -89,10 +97,34 @@ from shell_parse import analyze, has_trailing_override  # noqa: E402
 
 # Substrings that gate the parse path; absent all of them the command cannot be
 # a worktree-overwriting git op, so we return instantly. `clean` is included
-# because it is the ONE verb this guard still BLOCKS (see _clean_violation).
-_TRIGGER_SUBSTRINGS = ("checkout", "restore", "reset", "switch", "clean")
-# Verbs whose worktree effect `git stash create` can (best-effort) recover.
-_SNAPSHOT_VERBS = frozenset({"checkout", "restore", "switch", "reset"})
+# because it is the ONE verb this guard still BLOCKS (see _clean_violation). The
+# short `rm`/`mv` substrings widen this gate only for git-CONTAINING commands
+# (main() already returns on `"git" not in cmd`), so the extra analyze() cost is
+# bounded to git usage; correctness never rests on the substring — the exact VERB
+# token is re-checked in _record_snapshots. `checkout-index` rides `checkout`.
+_TRIGGER_SUBSTRINGS = (
+    "checkout",
+    "restore",
+    "reset",
+    "switch",
+    "clean",
+    "rm",
+    "mv",
+    "read-tree",
+)
+# Verbs whose worktree effect `git stash create` can (best-effort) recover — the
+# CLASS of tracked-work-overwriting/deleting operations, not just the original
+# four: `rm` (deletes tracked files from the worktree), `mv` (overwrites the
+# destination), and the plumbing `checkout-index`/`read-tree -u` (rewrite the
+# worktree from the index/a tree). The snapshot captures the pre-command TRACKED
+# state (recover with `git checkout <sha> -- <path>` or `git stash apply --index`).
+# Same untracked-files residual as elsewhere: `git mv -f tracked dest` where DEST
+# was an UNTRACKED file destroys that dest unrecoverably (stash create excludes
+# untracked) — the documented residual, not closed here. `clean` is deliberately
+# EXCLUDED (all-untracked → zero snapshot value — it stays the one BLOCK).
+_SNAPSHOT_VERBS = frozenset(
+    {"checkout", "restore", "switch", "reset", "rm", "mv", "checkout-index", "read-tree"}
+)
 # The sanctioned escape for the clean block: `git clean -f  # discard-override`.
 _OVERRIDE_SIGIL = "discard-override"
 # `git clean` is the ONE unrecoverable verb — `git stash create` cannot capture
@@ -110,10 +142,17 @@ _OVERRIDE_SIGIL = "discard-override"
 # escape.
 _CLEAN_DRY_RUN_TOKENS = frozenset({"-n", "--dry-run", "-nd", "-dn", "-d", "-x", "-X"})
 _CLEAN_DRY_RUN_REQUIRED = frozenset({"-n", "--dry-run", "-nd", "-dn"})
-# Bound the snapshot subprocess so a hung/huge repo can never wedge the tool
+# Bound a SINGLE snapshot subprocess so a hung/huge repo can never wedge the tool
 # call (blocks live in the shell layer, so the worst a timeout costs is the
 # advisory recovery note). Fits the tightest 5s user-level hook budget.
 _GIT_TIMEOUT_S = 3
+# WHOLE-PAYLOAD ceiling across ALL repos a compound touches — a per-repo timeout
+# alone lets N slow repos spend N × _GIT_TIMEOUT_S and blow the 10s hook cap in
+# .claude/settings.json (Codex round-5 P2). Each snapshot gets min(_GIT_TIMEOUT_S,
+# remaining); once the budget is spent, later repos are skipped and the skip is
+# SURFACED in a recovery note (never a silent cap). < the 10s hook cap, with
+# margin for launcher/parse.
+_TOTAL_SNAPSHOT_BUDGET_S = 8.0
 # Self-trim the snapshot JSONL when it grows past this (no external consumer /
 # rotation exists); keep the most recent half.
 _SNAPSHOT_LOG_MAX_BYTES = 1_000_000
@@ -146,15 +185,16 @@ def _segment_cwd(seg, payload: dict) -> str | None:
     return base
 
 
-def _snapshot_worktree(cwd: str) -> str | None:
+def _snapshot_worktree(cwd: str, timeout: float = _GIT_TIMEOUT_S) -> str | None:
     """``git stash create`` — capture worktree+index WITHOUT mutating anything.
-    Returns the snapshot sha, or None (clean tree / non-repo / any error)."""
+    Returns the snapshot sha, or None (clean tree / non-repo / any error).
+    ``timeout`` is clamped by the caller to the remaining whole-payload budget."""
     try:
         proc = subprocess.run(
             ["git", "-C", cwd, "stash", "create", "git-discard-guard snapshot"],
             capture_output=True,
             text=True,
-            timeout=_GIT_TIMEOUT_S,
+            timeout=timeout,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -224,6 +264,32 @@ def _tokens_after_subcommand(argv: list[str], sub: str) -> list[str]:
     return argv[idx + 1 :]
 
 
+_CLEAN_BLOCK_MSG = (
+    "[git-discard-guard] BLOCKED: `git clean` permanently deletes "
+    "untracked files, which the recovery snapshot CANNOT restore "
+    "(`git stash create` excludes untracked). Only the exact dry-run "
+    "form is allowed (-n / --dry-run, optionally with -d/-x/-X); "
+    "anything else — force flags, path arguments, exclude patterns — "
+    "needs `# discard-override`. Preview first with `git clean -nd`."
+)
+
+
+# Shown when the precise parser CRASHES on a command that mentions `clean`. We
+# deliberately do NOT re-implement a coarse clean detector on the crash path —
+# a bespoke dependency-free floor is a hand-rolled shell parser inside a security
+# gate (the exact trap that drew a review CRITICAL + a deadlock), with an
+# unbounded finding tail. Instead the crash fails CLOSED unconditionally and asks
+# the user to simplify so the precise, override/dry-run-aware parser can run.
+_CLEAN_PARSE_FAILED_MSG = (
+    "[git-discard-guard] BLOCKED: could not safely parse this command, and it "
+    "mentions `clean`. `git clean` permanently deletes untracked files that no "
+    "snapshot can recover, so an UNPARSEABLE clean fails CLOSED. This is almost "
+    "always a pathological command shape (e.g. deeply nested `$(...)`). Run the "
+    "`git clean` on its OWN line and the guard will parse it precisely — dry-run "
+    "forms are allowed, and `# discard-override` works on the parsed path."
+)
+
+
 def _clean_violation(cmd: str) -> str | None:
     """The ONE block this otherwise snapshot-only guard still makes: a
     non-dry-run ``git clean``. Returns a block message if any ``git`` segment
@@ -246,24 +312,25 @@ def _clean_violation(cmd: str) -> str | None:
             bool(set(tail) & _CLEAN_DRY_RUN_REQUIRED) and set(tail) <= _CLEAN_DRY_RUN_TOKENS
         )
         if not is_exact_dry_run:
-            return (
-                "[git-discard-guard] BLOCKED: `git clean` permanently deletes "
-                "untracked files, which the recovery snapshot CANNOT restore "
-                "(`git stash create` excludes untracked). Only the exact dry-run "
-                "form is allowed (-n / --dry-run, optionally with -d/-x/-X); "
-                "anything else — force flags, path arguments, exclude patterns — "
-                "needs `# discard-override`. Preview first with `git clean -nd`."
-            )
+            return _CLEAN_BLOCK_MSG
     return None
 
 
-def _record_snapshots(cmd: str, payload: dict) -> None:
+def _record_snapshots(cmd: str, payload: dict) -> list[str]:
     """Best-effort recovery net. NEVER blocks, never raises past its own
-    boundary; one snapshot per distinct resolved cwd. The logged row is
-    METADATA ONLY (ts, cwd, sha) — deliberately NOT the command: the Bash
-    payload can carry credentials (`curl -H 'Authorization: …' && git checkout`)
-    and this log is durable."""
+    boundary; one snapshot per distinct resolved cwd. Returns the human-facing
+    recovery notes (the caller delivers them via additionalContext — see
+    _emit_additional_context). The logged row is METADATA ONLY (ts, cwd, sha) —
+    deliberately NOT the command: the Bash payload can carry credentials
+    (`curl -H 'Authorization: …' && git checkout`) and this log is durable.
+
+    Bounded by ONE whole-payload time budget (_TOTAL_SNAPSHOT_BUDGET_S) across
+    every repo, so a compound touching many slow repos can't blow the hook cap;
+    a budget-forced skip is SURFACED in a note, never silent."""
+    notes: list[str] = []
     seen_cwds: set[str] = set()
+    deadline = time.monotonic() + _TOTAL_SNAPSHOT_BUDGET_S
+    budget_hit = False
     for seg in analyze(cmd):
         if seg.exe != "git":
             continue
@@ -277,7 +344,13 @@ def _record_snapshots(cmd: str, payload: dict) -> None:
         if not cwd or cwd in seen_cwds or not os.path.isdir(cwd):
             continue
         seen_cwds.add(cwd)
-        sha = _snapshot_worktree(cwd)
+        # One shared budget across all repos: clamp this snapshot to what's left,
+        # and stop (surfacing the skip) once too little remains to be useful.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.5:
+            budget_hit = True
+            break
+        sha = _snapshot_worktree(cwd, timeout=min(_GIT_TIMEOUT_S, remaining))
         if not sha:
             continue
         row = {
@@ -288,39 +361,96 @@ def _record_snapshots(cmd: str, payload: dict) -> None:
         log_path = _snapshot_log_path()
         with contextlib.suppress(OSError):
             log_path = _write_log_row(row) or log_path
-        print(
+        notes.append(
             f"[git-discard-guard] snapshotted the worktree at {cwd} as "
             f"{sha[:12]} (tracked changes only — `git stash create` does not "
             f"capture untracked files). IF that is the repo this command "
             f"discarded work in, recover with: git stash apply --index {sha}  "
             f"(--index restores the staged/unstaged split; drop it if the apply "
-            f"conflicts. log: {log_path})",
-            file=sys.stderr,
+            f"conflicts). For a DELETED/overwritten file (rm/mv), pull it straight "
+            f"from the snapshot: git checkout {sha[:12]} -- <path>. (log: {log_path})"
         )
+    if budget_hit:
+        notes.append(
+            "[git-discard-guard] NOTE: hit the ~"
+            f"{_TOTAL_SNAPSHOT_BUDGET_S:.0f}s snapshot budget — one or more later "
+            "repos in this compound were NOT snapshotted. Run a single git "
+            "command per repo if you need its recovery point."
+        )
+    return notes
+
+
+def _emit_additional_context(notes: list[str]) -> None:
+    """Deliver recovery notes to the MODEL. A snapshot path exits 0, and Claude
+    Code DISCARDS stderr from an exit-0 PreToolUse hook (behavioral_linter.py
+    documents the same constraint), so the note must ride
+    hookSpecificOutput.additionalContext on STDOUT — the channel actually
+    delivered on exit 0. (Via the bash_safety_hook.sh wiring this stdout is
+    redirected to that script's stderr and dropped; the DIRECT settings.json
+    hook wiring — which `exec`s python so stdout passes straight through —
+    delivers the real one. Double-wiring means at most a harmless duplicate.)"""
+    if not notes:
+        return
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "additionalContext": "\n".join(notes),
+                }
+            }
+        )
+    )
 
 
 def main() -> int:
     """Block a non-dry-run ``git clean`` (the one unrecoverable verb); for every
     other trigger verb, snapshot-and-allow. Returns 2 ONLY for a clean
-    violation; 0 otherwise. Any unexpected error falls through to 0 (fail OPEN)
-    — the precise clean block is backstopped by the dependency-free shell floor,
-    so a parser bug here degrades to that layer, never to a crash or a false
-    block on a recoverable verb."""
+    violation; 0 otherwise.
+
+    Fail directions are SPLIT by consequence (Codex round-5 P1): the clean BLOCK
+    fails CLOSED — if the precise parse raises, a dependency-free token check
+    still blocks a bare-`clean` command (over-block, `# discard-override`
+    escapes), so a parser bug can never become a silent ALLOW on the direct
+    settings.json wiring (which has no shell-floor behind it). The snapshot net
+    is ADVISORY and fails OPEN — any error there just means no recovery point,
+    never a block on a recoverable verb. An unreadable payload also fails OPEN."""
     try:
         payload = read_payload()
         cmd = field(payload, "command")
-        if not cmd or "git" not in cmd:
-            return 0
-        if not any(s in cmd for s in _TRIGGER_SUBSTRINGS):
-            return 0
-        # clean is UNRECOVERABLE by the snapshot net → the one fail-CLOSED verb.
-        block_msg = _clean_violation(cmd)
-        if block_msg:
-            print(block_msg, file=sys.stderr)
-            return 2
-        _record_snapshots(cmd, payload)
     except Exception:
-        pass  # advisory paths fail OPEN; a clean-parse bug degrades to the shell floor
+        return 0  # unreadable payload — nothing to act on; fail OPEN
+    if not cmd or "git" not in cmd:
+        return 0
+    if not any(s in cmd for s in _TRIGGER_SUBSTRINGS):
+        return 0
+
+    # Phase 1 — the clean BLOCK (UNRECOVERABLE → fail CLOSED).
+    if "clean" in cmd:
+        try:
+            block_msg = _clean_violation(cmd)
+        except Exception:
+            # ROBUST-BY-CONSTRUCTION crash path: we are already inside
+            # `"clean" in cmd`, so the command the parser choked on mentions clean
+            # and we cannot prove it safe. Rather than re-parse it with a bespoke
+            # coarse detector (the hand-rolled-parser trap that drew a CRITICAL),
+            # fail CLOSED unconditionally and tell the user to simplify. Over-blocks
+            # a clean-MENTIONING non-clean (e.g. `git checkout clean-branch`) ONLY
+            # on this rare crash path — the accepted safe direction.
+            block_msg = _CLEAN_PARSE_FAILED_MSG
+        if block_msg:
+            # Keep the block even if stderr is unwritable (a closed fd would raise
+            # and, on the direct wiring, downgrade exit 1 to non-blocking).
+            with contextlib.suppress(OSError):
+                print(block_msg, file=sys.stderr)
+            return 2
+
+    # Phase 2 — the snapshot recovery net (ADVISORY → fail OPEN).
+    try:
+        notes = _record_snapshots(cmd, payload)
+        _emit_additional_context(notes)
+    except Exception:
+        pass
     return 0
 
 

@@ -102,6 +102,78 @@ def test_main_fails_open_on_garbage(monkeypatch):
     assert _gd.main() == 0
 
 
+# ── fail-CLOSED on a parser CRASH (Codex round-5 P1 + the security CRITICAL).
+#    ROBUST-BY-CONSTRUCTION: no bespoke coarse re-parse on the crash path (that
+#    hand-rolled floor drew a cross-segment-decoy bypass). We are already inside
+#    `"clean" in cmd`, so a crash on a clean-MENTIONING command fails CLOSED
+#    unconditionally and asks the user to simplify. The direct settings.json wiring
+#    has no shell floor behind it, so the guard must self-block here.
+def test_clean_parse_crash_blocks(monkeypatch):
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": "git clean -f"}, "cwd": "/tmp"}
+    )
+    monkeypatch.setattr(
+        _gd, "_clean_violation", lambda cmd: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    assert _gd.main() == 2  # NOT a silent allow
+
+
+def test_clean_parse_crash_overblocks_clean_mentioning_command(monkeypatch):
+    # Accepted safe-direction over-block: on the RARE crash path we cannot tell a
+    # real `git clean` from a `clean`-mentioning checkout, so a crashed
+    # `git checkout clean-branch` blocks too (message tells the user to simplify).
+    monkeypatch.setattr(
+        _gd,
+        "read_payload",
+        lambda: {"tool_input": {"command": "git checkout clean-branch"}, "cwd": "/tmp"},
+    )
+    monkeypatch.setattr(
+        _gd, "_clean_violation", lambda cmd: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    assert _gd.main() == 2
+
+
+def test_clean_parse_crash_no_clean_substring_fails_open(monkeypatch):
+    # A crash on a command with NO `clean` substring never reaches Phase 1's block
+    # — only the snapshot path (which swallows its own errors) → allow.
+    monkeypatch.setattr(
+        _gd,
+        "read_payload",
+        lambda: {"tool_input": {"command": "git checkout main"}, "cwd": "/tmp"},
+    )
+    # analyze() would be called by the snapshot path; force it to raise there too.
+    monkeypatch.setattr(_gd, "analyze", lambda cmd: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert _gd.main() == 0
+
+
+def test_clean_override_escapes_on_normal_path(monkeypatch):
+    # On the NORMAL (parsed) path — the common case — `# discard-override` escapes
+    # the clean block via the precise _clean_violation (no crash involved). On the
+    # crash path the override does NOT escape by design; the user simplifies.
+    monkeypatch.setattr(
+        _gd,
+        "read_payload",
+        lambda: {
+            "tool_input": {"command": "git clean -f  # discard-override"},
+            "cwd": "/tmp",
+        },
+    )
+    assert _gd.main() == 0
+
+
+def test_clean_bypass_via_deep_nest_and_cross_segment_decoy_blocks(monkeypatch):
+    # End-to-end regression for the security CRITICAL: a deeply-nested $(...)
+    # crashes analyze() for REAL (no monkeypatch), and an unrelated cross-segment
+    # decoy carries `#...discard-override`. main() must STILL block — the crash
+    # fails closed unconditionally, so no decoy can disarm it.
+    nest = "$(" * 3000 + "true" + ")" * 3000
+    cmd = f"git clean -f {nest} && echo notes#42-discard-override-guide.md"
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": "/tmp"}
+    )
+    assert _gd.main() == 2  # NOT a silent allow
+
+
 # ── the ONE block: a non-dry-run `git clean` (unrecoverable verb) ─────────────
 @pytest.mark.parametrize(
     "cmd",
@@ -250,6 +322,101 @@ def test_clean_verb_never_snapshots(repo, snap_log):
     assert _rows(snap_log) == []
 
 
+# ── widened snapshot-verb CLASS: rm/mv/checkout-index/read-tree also overwrite
+#    or delete TRACKED work and are recoverable via the stash-create snapshot
+#    (Codex round-5 P1 — these were silent-loss vectors with no snapshot).
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git rm -f tracked.py",
+        "git rm -rf tracked.py",
+        "git mv -f tracked.py other.py",
+        "git checkout-index -f -a",
+        "git read-tree --reset -u HEAD",
+    ],
+)
+def test_widened_verbs_are_snapshotted(cmd, repo, snap_log):
+    (repo / "tracked.py").write_text("dirty\n")
+    _gd._record_snapshots(cmd, {"cwd": str(repo)})
+    assert len(_rows(snap_log)) == 1
+
+
+def test_widened_verbs_reach_snapshot_through_main(repo, snap_log, monkeypatch):
+    # The trigger-substring gate in main() must let `git rm`/`git mv` through to
+    # the snapshot path (regression guard: `rm`/`mv`/`read-tree` added to
+    # _TRIGGER_SUBSTRINGS, else main() returns before snapshotting).
+    (repo / "tracked.py").write_text("dirty\n")
+    monkeypatch.setattr(
+        _gd,
+        "read_payload",
+        lambda: {"tool_input": {"command": "git rm -f tracked.py"}, "cwd": str(repo)},
+    )
+    assert _gd.main() == 0
+    assert len(_rows(snap_log)) == 1
+
+
+def test_git_rm_f_is_recoverable(repo, snap_log):
+    # End-to-end recovery for the highest-value widened verb: `git rm -f` deletes
+    # a modified tracked file. The snapshot commit PRESERVES the bytes — the
+    # security property. (For a staged deletion, `stash apply --index` hits a
+    # modify/delete conflict, so the reliable restore is `git checkout <sha> --
+    # <path>`, which pulls the file straight from the snapshot tree; the recovery
+    # note's `--index` hedge — "drop it if the apply conflicts" — points here.)
+    (repo / "tracked.py").write_text("precious\n")
+    _gd._record_snapshots("git rm -f tracked.py", {"cwd": str(repo)})
+    sha = _rows(snap_log)[0]["sha"]
+    _git(repo, "rm", "-f", "tracked.py")
+    assert not (repo / "tracked.py").exists()
+    _git(repo, "checkout", sha, "--", "tracked.py")
+    assert (repo / "tracked.py").read_text() == "precious\n"
+
+
+def test_snapshot_budget_skips_later_repos_and_surfaces(repo, tmp_path, snap_log, monkeypatch):
+    # A whole-payload deadline bounds the total time; when it's spent, later repos
+    # are skipped AND the skip is surfaced in a note (never a silent cap).
+    r2 = tmp_path / "r2"
+    r2.mkdir()
+    _git(r2, "init", "-q", "-b", "main")
+    (r2 / "f.py").write_text("x\n")
+    _git(r2, "add", "-A")
+    _git(r2, "commit", "-qm", "init")
+    (repo / "tracked.py").write_text("dirty\n")
+    (r2 / "f.py").write_text("dirty2\n")
+    monkeypatch.setattr(_gd, "_TOTAL_SNAPSHOT_BUDGET_S", 0.0)  # budget already spent
+    notes = _gd._record_snapshots(
+        f"git -C {repo} checkout -- tracked.py && git -C {r2} checkout -- f.py",
+        {"cwd": str(tmp_path)},
+    )
+    assert any("snapshot budget" in n for n in notes)
+    assert _rows(snap_log) == []  # nothing snapshotted under a zero budget
+
+
+def test_snapshot_budget_partial_first_snapshots_second_skipped(
+    repo, tmp_path, snap_log, monkeypatch
+):
+    # The real shape: repo 1 fits the budget and IS snapshotted; the clock then
+    # advances past the deadline so repo 2 is skipped and surfaced. Deterministic
+    # via a controlled time.monotonic sequence (deadline calc, repo1 remaining,
+    # repo2 remaining) — budget default 8, third tick 7.6 → repo2 remaining 0.4.
+    r2 = tmp_path / "r2"
+    r2.mkdir()
+    _git(r2, "init", "-q", "-b", "main")
+    (r2 / "f.py").write_text("x\n")
+    _git(r2, "add", "-A")
+    _git(r2, "commit", "-qm", "init")
+    (repo / "tracked.py").write_text("dirty\n")
+    (r2 / "f.py").write_text("dirty2\n")
+    ticks = iter([0.0, 0.0, 7.6])
+    monkeypatch.setattr(_gd.time, "monotonic", lambda: next(ticks, 7.6))
+    notes = _gd._record_snapshots(
+        f"git -C {repo} checkout -- tracked.py && git -C {r2} checkout -- f.py",
+        {"cwd": str(tmp_path)},
+    )
+    rows = _rows(snap_log)
+    assert len(rows) == 1 and rows[0]["cwd"] == str(repo)  # repo 1 snapshotted
+    assert any("snapshot budget" in n for n in notes)  # repo 2 skip surfaced
+
+
 # ── the log is safe: metadata only, own-user only ────────────────────────────
 def test_log_row_has_no_command(repo, snap_log):
     # the Bash payload can carry credentials — the row must NOT echo it.
@@ -290,9 +457,38 @@ def test_log_trim_keeps_newest_half(repo, tmp_path, monkeypatch):
     assert len(rows) < 50  # the trim actually fired
 
 
-def test_stderr_recovery_note(repo, snap_log, capsys):
+def test_recovery_note_returned(repo, snap_log):
     (repo / "tracked.py").write_text("dirty\n")
-    _gd._record_snapshots("git checkout -- tracked.py", {"cwd": str(repo)})
-    err = capsys.readouterr().err
-    assert "git stash apply --index" in err
-    assert _rows(snap_log)[0]["sha"][:12] in err
+    notes = _gd._record_snapshots("git checkout -- tracked.py", {"cwd": str(repo)})
+    assert notes and "git stash apply --index" in notes[0]
+
+
+def test_recovery_note_delivered_via_additional_context(repo, snap_log, monkeypatch, capsys):
+    # Codex round-5 P2: a snapshot exits 0, and Claude Code discards an exit-0
+    # hook's stderr — so the recovery note MUST ride
+    # hookSpecificOutput.additionalContext on STDOUT, else the model never sees
+    # the sha. Assert main() emits valid additionalContext JSON on stdout.
+    (repo / "tracked.py").write_text("dirty\n")
+    monkeypatch.setattr(
+        _gd,
+        "read_payload",
+        lambda: {"tool_input": {"command": "git checkout -- tracked.py"}, "cwd": str(repo)},
+    )
+    assert _gd.main() == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    ctx = payload["hookSpecificOutput"]["additionalContext"]
+    assert payload["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+    assert "git stash apply --index" in ctx
+
+
+def test_no_additional_context_when_nothing_snapshotted(repo, snap_log, monkeypatch, capsys):
+    # A clean tree yields no snapshot → no note → NO stdout JSON (an empty
+    # additionalContext would be noise the model must parse for nothing).
+    monkeypatch.setattr(
+        _gd,
+        "read_payload",
+        lambda: {"tool_input": {"command": "git checkout feature"}, "cwd": str(repo)},
+    )
+    assert _gd.main() == 0
+    assert capsys.readouterr().out == ""

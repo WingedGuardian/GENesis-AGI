@@ -169,8 +169,9 @@ esac
 #       Checked BEFORE the softer push/PR warnings below (a "git push" warning
 #       exits 0 and would short-circuit a block).
 #   (2) git_discard_guard.py — the PRECISE, quote-aware authority (invoked just
-#       below): it SNAPSHOTS checkout/restore/switch/reset (advisory) and BLOCKS
-#       a non-dry-run `git clean` (clean is UNrecoverable — `stash create` cannot
+#       below): it SNAPSHOTS checkout/restore/switch/reset/rm/mv/checkout-index/
+#       read-tree (advisory) and BLOCKS a non-dry-run `git clean` (clean is
+#       UNrecoverable — `stash create` cannot
 #       capture untracked files — so it keeps a real closed-set block, honoring
 #       `# discard-override`). A coarse dependency-free clean block survives ONLY
 #       as a python-LESS fallback there (the guard is stdlib-only, so that
@@ -183,8 +184,8 @@ case "$CMD" in
         exit 2;;
 esac
 # git_discard_guard.py — the PRECISE, quote-aware authority for both jobs:
-#   * SNAPSHOT (advisory, exit 0) for checkout/restore/switch/reset — leaves a
-#     recovery sha; a crash/miss never blocks.
+#   * SNAPSHOT (advisory, exit 0) for checkout/restore/switch/reset/rm/mv/
+#     checkout-index/read-tree — leaves a recovery sha; a crash/miss never blocks.
 #   * BLOCK (exit 2) for a non-dry-run `git clean` — clean is UNrecoverable
 #     (`git stash create` can't capture untracked files), so it keeps a real,
 #     closed-set block that honors `# discard-override`.
@@ -196,7 +197,7 @@ esac
 # merely mentions clean. The broad `*git*clean*` etc. pre-filter is just a cheap
 # gate; the guard re-filters precisely by verb/argv.
 case "$CMD" in
-    *git*checkout*|*git*restore*|*git*reset*|*git*switch*|*git*clean*)
+    *git*checkout*|*git*restore*|*git*reset*|*git*switch*|*git*clean*|*git*rm*|*git*mv*|*git*read-tree*)
         _py=$(command -v python3 2>/dev/null || true)
         _handled=0
         if [ -n "$_py" ] && [ -f "$SCRIPT_DIR/hooks/git_discard_guard.py" ]; then
