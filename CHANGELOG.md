@@ -18,9 +18,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   respects permanent opt-outs, and every send still holds at the email
   authorization gate for your approval. It ships OFF: nothing sends until you set
   the `marketing_outreach` lever to `observe`/`live` (kill switch:
-  `GENESIS_MARKETING_OUTREACH_DISABLED=1`), and even then each cold send waits for
-  your explicit approval. Manage prospects and opt-outs in the
-  `marketing_prospects` table.
+  `GENESIS_MARKETING_OUTREACH_DISABLED=1`). Autonomous cold sending requires BOTH
+  affirmatively setting the lever to `live` AND the BULK capability cell earning a
+  grant through your approvals — in `observe` (or `off`) every cold send holds for
+  your explicit approval even after the cell is granted. Manage prospects and
+  opt-outs in the `marketing_prospects` table.
 
 - **Session-start surface for age-stale open PRs.** The repo-pulse worker now
   also caches the open-PR set each boundary, and a SessionStart hook lists the

@@ -113,6 +113,14 @@ async def _add_prospect(db, *, email, opted_out=False, status="active"):
         await mp.mark_opted_out(db, pid, opted_out_at=_TS)
 
 
+@pytest.fixture
+def marketing_live(monkeypatch):
+    """Force the marketing lever to ``live`` — the posture under which a GRANTED
+    BULK cell may autonomously send. The gate reads ``effective_mode()`` via a
+    local import, so patching the module attribute takes effect at call time."""
+    monkeypatch.setattr("genesis.outreach.marketing_config.effective_mode", lambda: "live")
+
+
 # --------------------------------------------------------------------------- #
 
 
@@ -363,9 +371,10 @@ async def test_granted_bulk_opted_out_recipient_demotes_and_holds(db):
 
 
 @pytest.mark.asyncio
-async def test_granted_bulk_recipient_in_active_set_allowed(db):
+async def test_granted_bulk_recipient_in_active_set_allowed(db, marketing_live):
     # A GRANTED bulk cell whose recipient IS an active prospect + under the rate
-    # limit → the guard falls through to allow (autonomous send).
+    # limit → the guard falls through to allow (autonomous send). Requires the
+    # marketing lever at `live` — the affirmative autonomous-cold-outreach posture.
     await _grant_bulk(db)
     await _add_prospect(db, email="known@example.com")
     gate = _gate(db)
@@ -381,7 +390,7 @@ async def test_granted_bulk_recipient_in_active_set_allowed(db):
 
 
 @pytest.mark.asyncio
-async def test_granted_bulk_contacted_recipient_still_allowed(db):
+async def test_granted_bulk_contacted_recipient_still_allowed(db, marketing_live):
     # Authorization is CURATED + NOT opted-out, DECOUPLED from send-lifecycle status.
     # A prospect already stamped 'contacted' (a legitimate follow-up touch) is STILL
     # authorized — the guard must NOT trip on non-'active' status, which would demote
@@ -403,7 +412,7 @@ async def test_granted_bulk_contacted_recipient_still_allowed(db):
 
 
 @pytest.mark.asyncio
-async def test_granted_bulk_recipient_case_insensitive(db):
+async def test_granted_bulk_recipient_case_insensitive(db, marketing_live):
     # Recipient case/whitespace must not defeat authorization OR opt-out suppression:
     # the store normalizes to lowercase, so a mixed-case send resolves the same row.
     await _grant_bulk(db)
@@ -417,6 +426,31 @@ async def test_granted_bulk_recipient_case_insensitive(db):
     )
     assert decision.allow is True
     assert decision.reason == "granted"
+
+
+@pytest.mark.parametrize("mode", ["observe", "off"])
+@pytest.mark.asyncio
+async def test_granted_bulk_non_live_mode_holds_without_demote(db, monkeypatch, mode):
+    # Codex round-2 P1: a GRANTED BULK cell must NOT autonomously send while the
+    # marketing lever is `observe` (or `off`) — only `live` affirmatively enables
+    # autonomous cold outreach (marketing_config: observe = lower authority). The
+    # send HOLDS for owner approval, and critically the cell is NOT demoted
+    # (a non-live posture is a legitimate owner choice, not scope drift) — so
+    # flipping to `live` later resumes autonomy without a re-grant.
+    monkeypatch.setattr("genesis.outreach.marketing_config.effective_mode", lambda: mode)
+    await _grant_bulk(db)
+    await _add_prospect(db, email="known@example.com")  # active, curated
+    gate = _gate(db)
+    req = _req(validated_recipient="known@example.com", thread_id=None, labeled_surplus=True)
+    decision = await gate.check(
+        request=req,
+        recipient="known@example.com",
+        message_text="hi",
+    )
+    assert decision.allow is False  # held, not autonomously sent
+    assert await pes.get_by_request(db, decision.request_id) is not None  # held row written
+    # NOT demoted: observe is a posture, not a scope violation.
+    assert (await cg.get_cell(db, "email", "send", "bulk"))["state"] == "granted"
 
 
 @pytest.mark.asyncio
