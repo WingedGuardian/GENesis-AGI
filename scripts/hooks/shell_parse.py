@@ -400,6 +400,7 @@ _KNOWN_SIGILS = (
     "ci-override",
     "stale-review-override",
     "scheduled-review-override",
+    "discard-override",
 )
 
 

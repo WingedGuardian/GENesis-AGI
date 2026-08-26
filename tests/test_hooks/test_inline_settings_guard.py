@@ -3,9 +3,14 @@
 PR-Guards removed the force-push and worktree-remove arms from this inline blob
 (they are duplicated by the tracked project guards git_push_guard.py and
 worktree_cwd_guard.py, and the force-push arm carried a whole-command substring
-FP: `git push origin main && rm -f x` false-matched). reset --hard / clean -f /
-nohup stay here because they have NO tracked python-guard backstop (only this
-blob + the install-local bash_safety_hook.sh).
+FP: `git push origin main && rm -f x` false-matched). The 2026-08 git-discard
+consolidation then moved `git clean` blocking OUT to a tracked python guard
+(git_discard_guard.py — precise, with a `# discard-override` escape and git
+checkout/restore/rm/mv snapshot coverage), wired in the Bash matcher and delegated
+to by bash_safety_hook.sh. The `git reset --hard` arm STAYS inline as a coarse,
+dependency-free SPEED-BUMP (reset is snapshot-recoverable, so its inline block is
+best-effort, not a boundary); only nohup / genesis-serve-worktree and that reset
+speed-bump remain in this inline blob.
 
 The test extracts the inline command straight from the tracked settings.json and
 runs it, so it fails if the FP-prone arm is ever reintroduced.
@@ -16,6 +21,8 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+
+import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SETTINGS = _REPO_ROOT / ".claude" / "settings.json"
@@ -54,12 +61,6 @@ def test_guard_is_syntactically_valid():
 class TestKeptArms:
     """These have no tracked python backstop — they MUST stay in the inline blob."""
 
-    def test_reset_hard_blocks(self):
-        assert _run("git reset --hard HEAD~1").returncode == 2
-
-    def test_clean_f_blocks(self):
-        assert _run("git clean -fd").returncode == 2
-
     def test_nohup_runtime_blocks(self):
         assert _run("nohup python -m genesis serve &").returncode == 2
 
@@ -84,6 +85,38 @@ class TestRemovedArms:
         # worktree_cwd_guard.py (tracked project hook) blocks ALL `git worktree
         # remove`; the inline --force arm was redundant.
         assert _run("git worktree remove --force /tmp/wt").returncode == 0
+
+
+class TestInlineDiscardFloor:
+    """The inline blob keeps ONLY the reset --hard speed-bump (2026-08-24
+    recoverability redesign). reset is recoverable (the snapshot net undoes it),
+    so a crude substring block is a fine dependency-free nudge. `git clean` is NO
+    LONGER handled here — it is UNrecoverable and needs a precise, quote-aware
+    block that a naive inline regex can't give (it would false-block
+    `git checkout clean-branch`, `git commit -m "clean up"`), so it moved to the
+    tracked guard git_discard_guard.py (bash_safety global + project hook), like
+    force-push/worktree-remove before it. The inline blob must NOT block clean."""
+
+    def test_reset_hard_inline_blocked(self):
+        assert _run("git reset --hard HEAD~1").returncode == 2
+
+    def test_reset_soft_allowed(self):
+        assert _run("git reset --soft HEAD~1").returncode == 0
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git clean -f",
+            "git clean --force",
+            "git clean -fd",
+            "git clean",
+            "git clean -nd",
+            "git checkout clean-branch",  # would false-block under a naive match
+            'git commit -m "clean up"',
+        ],
+    )
+    def test_clean_not_inline_blocked(self, cmd):
+        assert _run(cmd).returncode == 0
 
 
 class TestUnrelatedAllowed:
