@@ -1,8 +1,16 @@
 """CC Update Analyzer — fetch changelog, classify impact, alert if needed.
 
-Triggered when CCVersionCollector detects a version change. Two paths:
-1. Deep reflection context includes version_change observation, calls recon MCP tool
-2. Recon MCP tool `recon_cc_update_check` triggers directly
+Entry points (all on-demand or scheduled — NEVER a hot signal tick):
+1. Recon MCP tool ``recon_cc_update_check(old, new)`` — the on-demand path;
+   analyses a range and ALERTS on action_needed/breaking.
+2. The daily CC pre-eval job — composes this analyzer's fetch + LLM classify to
+   cache a per-version verdict BEFORE a version is adopted (no alert).
+3. Deep-reflection context surfaces the ``version_change`` observation and can
+   call the recon MCP tool.
+
+``CCVersionCollector`` deliberately does NOT call this: it is detect-and-record
+only, because driving a variable-cost multi-LLM analysis from a signal tick was
+a reliability bug in every form (see that class's docstring).
 """
 
 from __future__ import annotations

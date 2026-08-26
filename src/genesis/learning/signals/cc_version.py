@@ -9,15 +9,10 @@ import re
 import shutil
 import uuid
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
 
 import aiosqlite
 
 from genesis.awareness.types import SignalReading
-from genesis.util.tasks import tracked_task
-
-if TYPE_CHECKING:
-    from genesis.routing.router import Router
 
 logger = logging.getLogger(__name__)
 
@@ -25,30 +20,35 @@ logger = logging.getLogger(__name__)
 class CCVersionCollector:
     """Detects CC version changes by comparing against last-known version.
 
-    When a version change is detected:
-    - Runs CCUpdateAnalyzer to fetch changelog and classify impact
-    - Stores analysis as a recon finding BEFORE returning the signal
+    DETECT-AND-RECORD ONLY — this collector deliberately does NO impact
+    analysis. When a version change is detected it:
+    - Stores a ``version_change`` observation and advances the baseline
     - Emits signal value=1.0 (triggers depth escalation in awareness loop)
 
-    On first run or no change: emits 0.0.
+    On first run or no change: emits 0.0, and (when unchanged) checks the npm
+    registry for an available newer version (``cc_version_available``).
+
+    **Why no impact analysis here.** Running ``CCUpdateAnalyzer`` from this
+    collector was removed deliberately: analysis is a variable-cost,
+    multi-LLM-call operation, and every way of driving it from a signal tick
+    was a reliability bug — awaited inline it blocks the awareness tick and a
+    fixed caller deadline cancels it (storing NO finding on exactly the large
+    multi-release jump it exists for), while dispatched as a background task it
+    is lost on shutdown (the baseline has already advanced, so it never
+    retries). CC updates on this system are DELIBERATE (the auto-updater is
+    disabled — the pin is the only mover), so impact analysis belongs to paths
+    that are idempotent and retryable, not to a hot detection tick:
+    - ``recon_cc_update_check`` MCP — on-demand analysis (alerts), and
+    - the daily pre-eval job — proactively caches per-version verdicts BEFORE
+      a version is adopted,
+    with the cc-update skill's mandatory full-changelog read at bump time.
+    Detection stays here because it must be cheap and always succeed.
     """
 
     signal_name = "cc_version_changed"
 
-    def __init__(
-        self,
-        db: aiosqlite.Connection,
-        router: Router | None = None,
-        pipeline_getter: object | None = None,
-        memory_store_getter: object | None = None,
-    ) -> None:
+    def __init__(self, db: aiosqlite.Connection) -> None:
         self._db = db
-        self._router = router
-        # Accept callables that return dependencies (lazy resolution).
-        # This avoids init ordering issues — outreach/memory may not be
-        # ready yet when the learning subsystem is constructed.
-        self._pipeline_getter = pipeline_getter
-        self._memory_store_getter = memory_store_getter
 
     async def collect(self) -> SignalReading:
         now = datetime.now(UTC).isoformat()
@@ -87,25 +87,10 @@ class CCVersionCollector:
                     "Failed to store CC version change %s -> %s",
                     last_known, current, exc_info=True,
                 )
-            # Impact analysis is best-effort ENRICHMENT, dispatched OFF the signal
-            # loop. The version-change observation is already persisted above; and
-            # analyze() is now map-reduce (up to _MAX_CHUNKS rate-gated LLM calls),
-            # so awaiting it inline would both (a) block the whole awareness signal
-            # tick for the analysis duration and (b) force a fixed caller deadline
-            # that — on an install whose only keyed free provider is RPM-limited —
-            # cancels the analysis and stores NO finding on the exact large-jump
-            # case it exists for. A tracked background task removes both: the tick
-            # returns immediately and the finding lands when analysis completes.
-            # _analyze_update catches + logs its own failures at WARNING (incl. the
-            # 600s timeout); tracked_task's done-callback is only the backstop for an
-            # unexpected escape. Retention is NOT provided by tracked_task (it keeps
-            # no registry) — the coroutine stays alive via its await-chain (each
-            # awaited fetch/LLM/DB future back-references the task); keep its first
-            # step an awaited loop future, or GC-mid-run risk returns.
-            tracked_task(
-                self._analyze_update(last_known, current),
-                name="cc-version-impact-analysis",
-            )
+            # NO impact analysis here, by design — see the class docstring. The
+            # version_change observation above is the durable record; analysis
+            # belongs to the idempotent/retryable paths (recon_cc_update_check
+            # MCP, the daily pre-eval job), never to this detection tick.
             logger.info("CC version changed: %s -> %s", last_known, current)
             return SignalReading(
                 name=self.signal_name,
@@ -281,39 +266,3 @@ class CCVersionCollector:
             return tuple(int(x) for x in m.group().split(".")) if m else ()
 
         return _parse(candidate) > _parse(baseline)
-
-    async def _analyze_update(self, old: str, new: str) -> None:
-        """Run CCUpdateAnalyzer to fetch changelog and classify impact.
-
-        Best-effort: if analysis fails or times out, the version change
-        observation is already stored and the signal still fires.
-        """
-        try:
-            from genesis.recon.cc_update_analyzer import CCUpdateAnalyzer
-
-            pipeline = self._pipeline_getter() if callable(self._pipeline_getter) else None
-            memory_store = self._memory_store_getter() if callable(self._memory_store_getter) else None
-            analyzer = CCUpdateAnalyzer(
-                db=self._db, router=self._router,
-                pipeline=pipeline, memory_store=memory_store,
-            )
-            # 600s SAFETY bound — this runs in a tracked background task (see
-            # collect()), NOT on the signal-tick critical path, so a generous cap is
-            # free: it bounds only a genuinely-hung analyze (wedged gather / stuck
-            # subprocess) while never cancelling legitimate work. analyze() is now
-            # map-reduce — up to _MAX_CHUNKS rate-gated LLM calls — whose worst
-            # realistic wall-clock (all chunks serialized on a single 4-RPM provider:
-            # ~_MAX_CHUNKS*15s + fetch) is well under 600s, and 600s is well under the
-            # 900s watchdog. Per-call router timeouts already bound each individual
-            # call. The old inline 30s made the big multi-release jump the FAILURE
-            # case (deadline cancelled it before the finding stored); off-path + 600s
-            # removes that class entirely.
-            result = await asyncio.wait_for(analyzer.analyze(old, new), timeout=600)
-            logger.info(
-                "CC update analysis complete: %s → %s [%s]",
-                old, new, result.get("impact", "unknown"),
-            )
-        except TimeoutError:
-            logger.warning("CC update analysis timed out for %s → %s", old, new)
-        except Exception:
-            logger.warning("CC update analysis failed", exc_info=True)
