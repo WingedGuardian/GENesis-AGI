@@ -35,6 +35,11 @@ class Subsystem(StrEnum):
     OBSERVABILITY = "observability"
     GUARDIAN = "guardian"
     SENTINEL = "sentinel"
+    # The GenesisRuntime itself — pause/resume events (runtime/_pause_state.py).
+    # Was referenced there without being defined, so the emit raised AttributeError
+    # and was swallowed → pause/resume events were never recorded. Defining it
+    # restores that intended historical-visibility record.
+    RUNTIME = "runtime"
 
 
 class ProbeStatus(StrEnum):

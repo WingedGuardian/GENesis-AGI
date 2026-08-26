@@ -8,6 +8,7 @@ fuzzy prompt, and the fail-closed echo-numbers-only verdict parse.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 from genesis.session_awareness import repo_pulse as rp
 
@@ -422,3 +423,100 @@ def test_closes_malformed_refs_dropped_not_crash():
     # sibling in the same list still matches.
     pr = _pr_closes(refs=["not-a-dict", None, _iref(42)])
     assert len(_closed([pr], {42: FOLLOWUP}, [_fu()])) == 1
+
+
+# ── Open-PR lane (session-manager PR-4c): stalled-selection + formatting ─────
+
+NOW = datetime(2026, 8, 21, tzinfo=UTC)
+
+
+def _openpr(number, days_idle, *, is_bot=False, login="human", draft=False):
+    updated = (NOW - timedelta(days=days_idle)).isoformat()
+    return {
+        "number": number,
+        "title": f"pr {number}",
+        "url": f"https://x/pull/{number}",
+        "isDraft": draft,
+        "mergeable": "MERGEABLE",
+        "updatedAt": updated,
+        "author": {"login": login, "is_bot": is_bot},
+    }
+
+
+def test_select_stalled_filters_by_age_with_injected_now():
+    prs = [_openpr(1, 12), _openpr(2, 3), _openpr(3, 8)]
+    out = rp.select_stalled_open_prs(prs, now=NOW, stale_days=7)
+    # only #1 (12d) and #3 (8d) are stale; #2 (3d) excluded
+    assert [p["number"] for p in out] == [1, 3]  # stalest first
+    assert out[0]["stale_days"] == 12 and out[1]["stale_days"] == 8
+
+
+def test_select_stalled_skips_unparseable_updated_at():
+    prs = [{"number": 9, "updatedAt": "not-a-date", "author": {}}, _openpr(1, 10)]
+    out = rp.select_stalled_open_prs(prs, now=NOW, stale_days=7)
+    assert [p["number"] for p in out] == [1]
+
+
+def test_select_stalled_bot_detection():
+    prs = [
+        _openpr(1, 10, is_bot=True, login="dependabot[bot]"),
+        _openpr(2, 10, is_bot=False, login="app/dependabot"),  # suffix miss, flag off
+        _openpr(3, 10, is_bot=False, login="dependabot[bot]"),  # suffix catches
+    ]
+    out = {p["number"]: p for p in rp.select_stalled_open_prs(prs, now=NOW, stale_days=7)}
+    assert out[1]["is_bot"] is True
+    assert out[2]["is_bot"] is False
+    assert out[3]["is_bot"] is True
+
+
+def test_select_stalled_drops_malformed_rows():
+    prs = ["x", {"no_number": 1}, {"number": "5", "updatedAt": NOW.isoformat()}, _openpr(1, 10)]
+    out = rp.select_stalled_open_prs(prs, now=NOW, stale_days=7)
+    assert [p["number"] for p in out] == [1]
+
+
+def test_format_open_pr_clause_tags():
+    assert rp.format_open_pr_clause({"number": 7, "stale_days": 12}) == "#7 (12d)"
+    dep = {"number": 8, "stale_days": 12, "is_bot": True, "author_login": "dependabot[bot]"}
+    assert rp.format_open_pr_clause(dep) == "#8 (12d, dependabot)"
+    draft = {"number": 9, "stale_days": 4, "is_draft": True}
+    assert rp.format_open_pr_clause(draft) == "#9 (4d, draft)"
+    bot = {"number": 10, "stale_days": 5, "is_bot": True, "author_login": "some-bot[bot]"}
+    assert rp.format_open_pr_clause(bot) == "#10 (5d, bot)"
+
+
+def test_format_open_pr_injection_empty_and_shape():
+    assert rp.format_open_pr_injection([], 7) == ""
+    text = rp.format_open_pr_injection(["#1 (12d)", "#2 (9d, dependabot)"], 7)
+    assert text.startswith("[Open PRs] 2 open PRs idle ≥7d — ")
+    assert "#1 (12d)" in text and "ready to merge" not in text.lower()
+
+
+def test_format_open_pr_injection_counts_overflow_in_header():
+    text = rp.format_open_pr_injection(["#1 (12d)", "+4 more"], 7)
+    # true total = 1 shown + 4 overflow = 5
+    assert text.startswith("[Open PRs] 5 open PRs idle ≥7d — ")
+
+
+def test_open_pr_paths_are_home_anchored():
+    assert rp.open_prs_cache_path().name == "open_prs.json"
+    assert rp.open_prs_seen_path().name == "open_prs_seen.json"
+    assert rp.open_prs_cache_path().parent == rp.open_prs_seen_path().parent
+    assert rp.open_prs_cache_path().parent.name == "repo_pulse"
+
+
+def test_open_pr_paths_honor_genesis_home(monkeypatch, tmp_path):
+    """A relocated install (GENESIS_HOME set) must anchor the cache/seen sidecars
+    under it — matching genesis.env.genesis_home() and the worker's _pulse_root —
+    not a bare Path.home(), or writer (worker) and reader (hook) split apart."""
+    relocated = tmp_path / "relocated_home"
+    monkeypatch.setenv("GENESIS_HOME", str(relocated))
+    assert rp.open_prs_cache_path() == relocated / "repo_pulse" / "open_prs.json"
+    assert rp.open_prs_seen_path() == relocated / "repo_pulse" / "open_prs_seen.json"
+
+
+def test_format_open_pr_injection_capped_shows_floor():
+    text = rp.format_open_pr_injection(["#1 (12d)", "#2 (9d)"], 7, capped=True)
+    assert text.startswith("[Open PRs] ≥2 open PRs idle ≥7d — ")
+    # uncapped stays an exact count
+    assert rp.format_open_pr_injection(["#1 (12d)"], 7).startswith("[Open PRs] 1 open PR idle")

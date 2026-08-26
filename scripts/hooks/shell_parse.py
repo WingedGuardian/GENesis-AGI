@@ -283,6 +283,78 @@ def split_segments(command: str) -> list[str]:
     return [s.strip() for s in segs if s.strip()]
 
 
+def has_top_level_pipe(command: str) -> bool:
+    """Whether *command* contains a real top-level shell PIPE (``a | b``).
+
+    Quote-, redirect-, and substitution-aware: a ``|`` inside a quoted string (a jq
+    program, ``grep -F '|'``), a ``||`` control operator, a ``>|`` redirect operator,
+    or a command substitution ``$( … )`` / ``` `…` ``` (whose output is CAPTURED, not
+    streamed to the swallowed background stdout — ``RESULT=$(cmd | filter)``) is NOT a
+    background pipe. A bare subshell ``(cmd | x)`` DOES stream to the background stdout,
+    so its ``|`` still counts. Used by the run_in_background guard: a piped background
+    command's stdout is swallowed, so ONLY a genuine streamed pipe should block it.
+
+    Residual (accepted for a CONVENIENCE guard — friction, not a sandbox): the quote
+    model still mirrors ``split_segments``, so a quote that is backslash-escaped OUTSIDE
+    quotes (``printf %s \\"foo | cat``), a stray quote char in a ``#`` comment or a
+    ``<<EOF`` heredoc body, or a ``|`` in a ``case`` pattern can MISread — OVER-reading
+    (``case`` ``|`` looks like a pipe) or UNDER-reading (a swallowed quote hides a later
+    pipe). Never a security bypass either way (an over-read is a reworked command, an
+    under-read re-exposes the empty-output footgun this guard usually prevents); closing
+    these fully is the unbounded quote-parsing tail shared with ``split_segments``.
+    """
+    i, n = 0, len(command)
+    quote: str | None = None
+    subst_depth = 0  # inside $( … ): its output is CAPTURED, not streamed to bg stdout
+    in_backtick = False
+    while i < n:
+        c = command[i]
+        if quote:
+            if quote == '"' and c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if in_backtick:  # `…` substitution — output captured, so any `|` inside is not a bg pipe
+            if c == "`":
+                in_backtick = False
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c
+            i += 1
+            continue
+        if c == "`":
+            in_backtick = True
+            i += 1
+            continue
+        if (
+            c == "$" and i + 1 < n and command[i + 1] == "("
+        ):  # $( … ) opens a capturing substitution
+            subst_depth += 1
+            i += 2
+            continue
+        if c == ")" and subst_depth > 0:
+            subst_depth -= 1
+            i += 1
+            continue
+        if command[i : i + 2] in ("&&", "||"):  # control operators, not a pipe
+            i += 2
+            continue
+        op_len = _redirect_operator_len(command, i)
+        if op_len is not None:  # a redirect operator (incl. ``>|``) — skip it whole
+            i += op_len
+            continue
+        # A `|` inside $()/backtick is captured (not a bg pipe); a bare subshell `(…)`
+        # streams to the background stdout, so its `|` DOES count (subst_depth stays 0).
+        if c == "|" and subst_depth == 0:
+            return True
+        i += 1
+    return False
+
+
 def _strip_trailing_comment(seg: str) -> str:
     """Remove an unquoted ``#`` comment (whitespace-preceded or at start) to EOL."""
     out: list[str] = []

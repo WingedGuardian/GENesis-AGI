@@ -311,6 +311,14 @@ _CASES: list[tuple[str, object, int, str]] = [
         "merge conflicts",
     ),
     (
+        # Part B diagnostics: the CONFLICTING block must NAME the CI consequence —
+        # a conflicting branch suppresses pull_request CI until the base branch is merged in.
+        "mergeable_CONFLICTING_explains_ci_suppression",
+        lambda mp: _run(mp, _merge_cmd(), router=_router(mergeable="CONFLICTING")),
+        2,
+        "pull_request CI",
+    ),
+    (
         "mergeable_novel_state_blocks",
         lambda mp: _run(mp, _merge_cmd(), router=_router(mergeable="SOME_FUTURE_STATE")),
         2,
@@ -482,14 +490,16 @@ _CASES: list[tuple[str, object, int, str]] = [
         2,
         "review-body gate did not pass",
     ),
-    # (Codex-P2) CI-unknown is a deliberately fail-OPEN gate — empty/malformed CI reads
-    # must ALLOW, so the unified UNKNOWN->BLOCK aggregation can't regress them. NOTE: CI
-    # is not the ONLY fail-open path — the review-body and inline finding SCANS also fail
-    # open on an unreadable read (git_push_guard.py _scan_unreadable, non-strict). That
-    # scanner-unreadable path is a distinct axis carried to Slice 3 (PrFacts decision
-    # level, follow-up 086bd8e3), not exercised here.
+    # (Codex-P2) CI-"unknown" is a deliberately fail-OPEN gate — a read we could NOT
+    # complete (empty stdout / malformed JSON) must ALLOW, so a transient API hiccup
+    # can't wedge merges. This is DISTINCT from "absent" (a readable empty rollup =
+    # zero checks = CI genuinely did not run), which fail-CLOSES on the canonical repo
+    # (below). NOTE: CI is not the ONLY fail-open path — the review-body and inline
+    # finding SCANS also fail open on an unreadable read (git_push_guard.py
+    # _scan_unreadable, non-strict). That scanner-unreadable path is a distinct axis
+    # carried to Slice 3 (PrFacts decision level, follow-up 086bd8e3), not exercised here.
     (
-        "ci_empty_unknown_fails_open_allows",
+        "ci_empty_string_unknown_fails_open_allows",
         lambda mp: _run(mp, _merge_cmd(), ci=""),
         0,
         "",
@@ -497,6 +507,32 @@ _CASES: list[tuple[str, object, int, str]] = [
     (
         "ci_malformed_unknown_fails_open_allows",
         lambda mp: _run(mp, _merge_cmd(), ci="not-json"),
+        0,
+        "",
+    ),
+    # ── CI "absent" (readable empty rollup) — CI never ran. On the CANONICAL repo
+    # (where CI always runs) this fail-CLOSES: a conflicting branch or a dropped
+    # pull_request trigger leaves an empty check set, and merging it would be an
+    # UN-CI'd merge. Waivable by the same conscious `# ci-override`. Off the canonical
+    # repo (a repo that may legitimately have no CI) it stays fail-OPEN. ──
+    (
+        "ci_absent_on_canonical_blocks",
+        lambda mp: _run(mp, _merge_cmd(), ci="[]"),
+        2,
+        "No CI checks",
+    ),
+    (
+        "ci_absent_with_ci_override_continues",
+        lambda mp: _run(mp, _merge_cmd(trailer="# ci-override"), ci="[]"),
+        0,
+        "consciously accepted",
+    ),
+    (
+        "ci_absent_off_canonical_fails_open_allows",
+        lambda mp: (
+            mp.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/some-other-public-repo"),
+            _run(mp, _merge_cmd(), ci="[]"),
+        )[1],
         0,
         "",
     ),
@@ -997,6 +1033,33 @@ def test_check_pr_report_scheduled_absent_fails_verdict(monkeypatch, capsys):
     sched_line = next(ln for ln in out.splitlines() if ln.startswith("scheduled-claude"))
     assert "BLOCK" in sched_line
     assert rc == 1
+
+
+def test_check_pr_report_ci_absent_fails_verdict_on_canonical(monkeypatch, capsys):
+    """A readable-empty CI rollup ("absent") on the canonical repo is a FAILURE line and
+    flips the report's verdict — the report must not say "all gates pass" while the
+    enforcement arm would block an un-CI'd merge (report/gate never disagree)."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("absent", []))
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", REPO)
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    ci_line = next(ln for ln in out.splitlines() if ln.startswith("ci "))
+    assert "absent" in ci_line
+    assert "no ci checks" in out.lower()  # the BLOCK hint line
+    assert rc == 1
+
+
+def test_check_pr_report_ci_absent_off_canonical_does_not_fail(monkeypatch, capsys):
+    """Off the canonical repo, "absent" stays fail-OPEN — the report does NOT count it
+    as a failure (a repo that legitimately has no CI must not be false-blocked)."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("absent", []))
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/some-other-public-repo")
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    assert "no ci checks" not in out.lower()
+    assert rc == 0
 
 
 def test_check_pr_report_no_merge_with_when_scheduled_blocks(monkeypatch, capsys):

@@ -24,8 +24,14 @@ Two tiers, two postures:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
+from datetime import datetime
+from pathlib import Path
+
+from genesis.env import genesis_home
+from genesis.session_awareness.pr_watch import _parse_ts
 
 PULSE_MODEL = "claude-haiku-4-5-20251001"  # arbiter/extractor smoke-tested contract
 # 240s (was 120): live E2E measured 67s/122s/84s per call with TTFT alone
@@ -388,3 +394,110 @@ def _parse_match(match: object, n_items: int, n_prs: int) -> dict | None:
         "confidence": round(float(confidence), 4),
         "reason": reason.strip()[:300],
     }
+
+
+# ── Open-PR lane (session-manager PR-4c): age-stale open-PR surface ──────────
+# The worker fetches the open-PR set into a home-anchored cache; the SessionStart
+# hook reads it, computes staleness client-side, and surfaces the age-stale ones
+# passively inline. Pure functions (no I/O) live here; the cache/seen PATHS are
+# home-anchored so the worker (writer) and hook (reader) agree without threading
+# the worker's state root through the hook.
+
+
+def _pulse_home() -> Path:
+    """Repo-pulse state dir (matches the worker's ``_pulse_root``). Anchored on
+    the canonical ``genesis_home()`` — which honors ``GENESIS_HOME`` — so a
+    relocated install keeps its runtime state together and the worker (writer)
+    and hook (reader) resolve the SAME directory (a bare ``Path.home()`` would
+    split them apart whenever ``GENESIS_HOME`` is set)."""
+    return genesis_home() / "repo_pulse"
+
+
+def open_prs_cache_path() -> Path:
+    """Worker-owned raw open-PR snapshot (fetch cache)."""
+    return _pulse_home() / "open_prs.json"
+
+
+def open_prs_seen_path() -> Path:
+    """Hook-owned seen-map for the open-PR surface (self-pruning sidecar)."""
+    return _pulse_home() / "open_prs_seen.json"
+
+
+def _is_bot_author(author: dict) -> bool:
+    """Whether a PR author is a bot — trust gh's ``is_bot`` flag, fall back to a
+    ``[bot]`` login suffix (dependabot/renovate)."""
+    if not isinstance(author, dict):
+        return False
+    if author.get("is_bot"):
+        return True
+    return str(author.get("login") or "").endswith("[bot]")
+
+
+def select_stalled_open_prs(prs: list[dict], *, now: datetime, stale_days: int) -> list[dict]:
+    """Annotate open PRs with ``stale_days`` (``updatedAt`` vs the INJECTED
+    ``now`` — no wall-clock read) and keep those idle for >= ``stale_days``,
+    stalest first. A row with an unparseable ``updatedAt`` is skipped (can't age
+    it). Purely age + list-fields — NO CI/review inference (honest to what
+    ``gh pr list`` returns)."""
+    out: list[dict] = []
+    for pr in prs:
+        if not isinstance(pr, dict) or not isinstance(pr.get("number"), int):
+            continue
+        updated = _parse_ts(pr.get("updatedAt"))
+        if updated is None:
+            continue
+        age_days = (now - updated).total_seconds() / 86400.0
+        if age_days < stale_days:
+            continue
+        author = pr.get("author") if isinstance(pr.get("author"), dict) else {}
+        out.append(
+            {
+                "number": pr["number"],
+                "title": str(pr.get("title") or ""),
+                "url": str(pr.get("url") or ""),
+                "stale_days": int(age_days),
+                "is_draft": bool(pr.get("isDraft")),
+                "mergeable": pr.get("mergeable"),
+                "is_bot": _is_bot_author(author),
+                "author_login": str(author.get("login") or ""),
+            }
+        )
+    out.sort(key=lambda p: p["stale_days"], reverse=True)
+    return out
+
+
+def format_open_pr_clause(pr: dict) -> str:
+    """One open PR → a short clause, e.g. ``#1379 (12d, dependabot, draft)``.
+    NEVER prints CI state or 'ready to merge' — age + coarse tags only."""
+    tags: list[str] = []
+    if pr.get("is_bot"):
+        login = str(pr.get("author_login") or "").lower()
+        tags.append("dependabot" if "dependabot" in login else "bot")
+    if pr.get("is_draft"):
+        tags.append("draft")
+    suffix = f", {', '.join(tags)}" if tags else ""
+    return f"#{pr['number']} ({pr['stale_days']}d{suffix})"
+
+
+def format_open_pr_injection(lines: list[str], stale_days: int, *, capped: bool = False) -> str:
+    """The single inline line for the open-PR surface. Empty -> ''. The header
+    count is the TRUE total (shown clauses + any '+N more' overflow). When ``capped``
+    (the worker's fetch hit its limit, so the open set is only partially known) the
+    count is rendered as a floor (``≥N``) — an honest lower bound, never a silent
+    exact count. NEVER says 'ready to merge' — a visibility nudge, not a merge signal."""
+    if not lines:
+        return ""
+    shown = [ln for ln in lines if not ln.startswith("+")]
+    overflow = 0
+    for ln in lines:
+        if ln.startswith("+") and ln.endswith(" more"):
+            with contextlib.suppress(ValueError):
+                overflow = int(ln[1 : -len(" more")])
+    total = len(shown) + overflow
+    noun = "PR" if total == 1 else "PRs"
+    count = f"≥{total}" if capped else str(total)
+    return (
+        f"[Open PRs] {count} open {noun} idle ≥{stale_days}d — "
+        + " · ".join(lines)
+        + '. Ask "show PRs" to review.'
+    )
