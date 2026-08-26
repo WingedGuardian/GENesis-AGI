@@ -7,6 +7,10 @@ Configuration precedence (highest to lowest):
   1. Environment variable (e.g. OLLAMA_URL)
   2. ~/.genesis/config/genesis.yaml  (local install config)
   3. Hardcoded default (safe for a fresh clone)
+
+Exception: ``user_timezone()`` deliberately inverts this to FILE-first
+(genesis.yaml -> USER_TIMEZONE env fallback -> UTC) because timezone is the one
+setting with a live, dashboard-owned mutation surface; see its docstring.
 """
 
 from __future__ import annotations
