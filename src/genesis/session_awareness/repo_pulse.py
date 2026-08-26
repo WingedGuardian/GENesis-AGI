@@ -30,6 +30,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from genesis.env import genesis_home
 from genesis.session_awareness.pr_watch import _parse_ts
 
 PULSE_MODEL = "claude-haiku-4-5-20251001"  # arbiter/extractor smoke-tested contract
@@ -334,8 +335,12 @@ def _parse_match(match: object, n_items: int, n_prs: int) -> dict | None:
 
 
 def _pulse_home() -> Path:
-    """Home-anchored repo-pulse state dir (matches the worker's ``_pulse_root``)."""
-    return Path.home() / ".genesis" / "repo_pulse"
+    """Repo-pulse state dir (matches the worker's ``_pulse_root``). Anchored on
+    the canonical ``genesis_home()`` — which honors ``GENESIS_HOME`` — so a
+    relocated install keeps its runtime state together and the worker (writer)
+    and hook (reader) resolve the SAME directory (a bare ``Path.home()`` would
+    split them apart whenever ``GENESIS_HOME`` is set)."""
+    return genesis_home() / "repo_pulse"
 
 
 def open_prs_cache_path() -> Path:

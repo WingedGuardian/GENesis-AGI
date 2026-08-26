@@ -416,6 +416,16 @@ def test_open_pr_paths_are_home_anchored():
     assert rp.open_prs_cache_path().parent.name == "repo_pulse"
 
 
+def test_open_pr_paths_honor_genesis_home(monkeypatch, tmp_path):
+    """A relocated install (GENESIS_HOME set) must anchor the cache/seen sidecars
+    under it — matching genesis.env.genesis_home() and the worker's _pulse_root —
+    not a bare Path.home(), or writer (worker) and reader (hook) split apart."""
+    relocated = tmp_path / "relocated_home"
+    monkeypatch.setenv("GENESIS_HOME", str(relocated))
+    assert rp.open_prs_cache_path() == relocated / "repo_pulse" / "open_prs.json"
+    assert rp.open_prs_seen_path() == relocated / "repo_pulse" / "open_prs_seen.json"
+
+
 def test_format_open_pr_injection_capped_shows_floor():
     text = rp.format_open_pr_injection(["#1 (12d)", "#2 (9d)"], 7, capped=True)
     assert text.startswith("[Open PRs] ≥2 open PRs idle ≥7d — ")

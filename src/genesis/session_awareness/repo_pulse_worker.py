@@ -42,7 +42,7 @@ from pathlib import Path
 from genesis.db.crud import follow_ups as followups_crud
 from genesis.db.crud import repo_pulse as pulse_crud
 from genesis.db.crud.session_charters import ledger_all, ledger_update
-from genesis.env import genesis_db_path
+from genesis.env import genesis_db_path, genesis_home
 from genesis.session_awareness.headless import run_headless_json
 from genesis.session_awareness.repo_pulse import (
     PROMPT_VERSION,
@@ -71,7 +71,10 @@ STALE_PROPOSAL_DAYS = 30
 
 
 def _pulse_root() -> Path:
-    return Path.home() / ".genesis" / "repo_pulse"
+    # genesis_home() (honors GENESIS_HOME), NOT a bare Path.home(), so a relocated
+    # install persists the lock/cursor + the open-PR cache/seen sidecars together —
+    # and the reader hook (repo_pulse._pulse_home) resolves the SAME directory.
+    return genesis_home() / "repo_pulse"
 
 
 def _now_dt() -> datetime:

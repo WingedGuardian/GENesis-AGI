@@ -30,8 +30,12 @@ _MAX_CACHE_AGE_S = 86400  # 1 day
 
 
 def main() -> None:
-    # Cheapest gates first — before importing genesis modules.
-    if os.environ.get("GENESIS_REPO_PULSE_DISABLED", "").lower() in ("1", "true", "yes"):
+    # Cheapest gates first — before importing genesis modules. Match the EXACT
+    # "1" the other two consumers honor (repo_pulse_worker.py, genesis_session_
+    # context.py) and the value the yaml documents (GENESIS_REPO_PULSE_DISABLED=1);
+    # a looser truthy set here would let `=true` silence THIS surface while the
+    # detached worker kept doing gh/DB work — a partial, misleading kill switch.
+    if os.environ.get("GENESIS_REPO_PULSE_DISABLED") == "1":
         return
     # Genesis-dispatched (background) sessions must not consume the human's
     # surface — leave the seen-map untouched so the next FOREGROUND session sees it.

@@ -50,13 +50,24 @@ def _write_cache(home: Path, prs, *, age_hours=0, repo="o/r", capped=False) -> N
     )
 
 
-def _run(home: Path, *, disabled=False, cc_session=False) -> str:
+def _run(
+    home: Path,
+    *,
+    disabled=False,
+    disabled_raw: str | None = None,
+    genesis_home: Path | None = None,
+    cc_session=False,
+) -> str:
     env = os.environ.copy()
     env["HOME"] = str(home)
     env["PYTHONPATH"] = str(_SRC)
     env.pop("GENESIS_REPO_ROOT", None)
     env.pop("GENESIS_HOME", None)
-    if disabled:
+    if genesis_home is not None:
+        env["GENESIS_HOME"] = str(genesis_home)
+    if disabled_raw is not None:
+        env["GENESIS_REPO_PULSE_DISABLED"] = disabled_raw
+    elif disabled:
         env["GENESIS_REPO_PULSE_DISABLED"] = "1"
     else:
         env.pop("GENESIS_REPO_PULSE_DISABLED", None)
@@ -108,6 +119,44 @@ def test_env_kill_switch_silences(tmp_path):
     home = tmp_path / "home"
     _write_cache(home, [_openpr(1379, 12)])
     assert _run(home, disabled=True).strip() == ""
+
+
+def test_env_kill_switch_only_exact_one(tmp_path):
+    """The kill switch honors ONLY the exact "1" — the value the worker and
+    genesis_session_context honor and the yaml documents. A looser truthy set
+    here would silence THIS surface while the worker kept running: a partial,
+    misleading kill switch. So `=true`/`=yes` must NOT suppress."""
+    home = tmp_path / "home"
+    _write_cache(home, [_openpr(1379, 12)])
+    for raw in ("true", "yes", "TRUE", "on", "0", "2"):
+        assert "[Open PRs]" in _run(home, disabled_raw=raw), f"{raw!r} wrongly suppressed"
+    # the documented value still silences it
+    assert _run(home, disabled_raw="1").strip() == ""
+
+
+def test_honors_genesis_home(tmp_path):
+    """A relocated install (GENESIS_HOME set) reads the cache from under it, not
+    $HOME/.genesis — the worker writes there too, so the surface must follow."""
+    home = tmp_path / "home"  # deliberately EMPTY (no cache here)
+    ghome = tmp_path / "relocated"
+    cache = ghome / "repo_pulse" / "open_prs.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    computed = datetime.now(UTC).isoformat()
+    cache.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "computed_at": computed,
+                "repo": "o/r",
+                "prs": [_openpr(1379, 12)],
+                "limit_hit": False,
+            }
+        )
+    )
+    out = _run(home, genesis_home=ghome)
+    assert "#1379 (12d)" in out
+    # and the seen-map is written under GENESIS_HOME too (not $HOME)
+    assert (ghome / "repo_pulse" / "open_prs_seen.json").exists()
 
 
 def test_dispatched_session_silent_and_leaves_seen_untouched(tmp_path):

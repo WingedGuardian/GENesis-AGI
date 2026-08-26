@@ -147,6 +147,9 @@ async def test_list_open_prs_requests_open_state_and_fields():
     assert {p["number"] for p in out["prs"]} == {1, 2}
     pr_argv = run.calls[1]
     assert "--state" in pr_argv and pr_argv[pr_argv.index("--state") + 1] == "open"
+    # Stalest-first: a capped window must keep the aged PRs (the lane's target),
+    # never gh's default newest-first order that would drop them.
+    assert "--search" in pr_argv and pr_argv[pr_argv.index("--search") + 1] == "sort:updated-asc"
     joined = " ".join(pr_argv)
     assert "updatedAt" in joined and "author" in joined and "isDraft" in joined
     # age-based ONLY: never queries CI/review state

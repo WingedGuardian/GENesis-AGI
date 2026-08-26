@@ -53,11 +53,22 @@ inject_confidence_floor: 0.7
 # ~/.genesis/repo_pulse/open_prs.json each non-debounced boundary, and the
 # SessionStart hook (surface_open_prs.py) shows the age-stale ones as one line.
 # It is visibility-only — NO CI/review state, never "ready to merge", no
-# Telegram, no follow-up rows, no auto-merge. GENESIS_REPO_PULSE_DISABLED and
-# `enabled: false` both stop it (the hook and the worker respectively).
+# Telegram, no follow-up rows, no auto-merge.
+#
+# What stops this lane, by lever:
+#   GENESIS_REPO_PULSE_DISABLED=1 — hook-level kill of the SessionStart surface.
+#   open_pr_enabled: false        — disables ONLY this lane; the merged-PR lanes
+#                                   keep running (the lane-specific knob).
+#   enabled: false / mode: off    — FULL-worker stops: the worker exits before
+#                                   any lane runs, so the open-PR cache stops
+#                                   refreshing too (and the surface goes quiet
+#                                   once the cache ages past its freshness TTL).
+# So `open_pr_enabled` is independent of the fuzzy/exact MERGED tiers, but not of
+# the master/mode switches. There is no "merged-off but open-PR-on" combination
+# in v1 — `mode: off` is a full stop, not a merged-only lever.
 
-# Master switch for the open-PR lane specifically (independent of the fuzzy/
-# exact merged-PR tiers above).
+# Lane-specific master switch (separate from the fuzzy/exact merged-PR tiers
+# above; the enabled/mode full-worker stops still apply on top).
 open_pr_enabled: true
 
 # A PR whose last update (updatedAt) is at least this many days ago is "stale"

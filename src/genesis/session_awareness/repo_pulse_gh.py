@@ -161,11 +161,21 @@ async def list_open_prs(
 ) -> dict:
     """Enumerate OPEN PRs for the age-stale SessionStart surface.
 
-    Returns ``{"repo", "prs", "limit_hit"}`` (prs in gh's default order — the
-    hook computes ``stale_days`` client-side, so no sort dependency here), or
-    ``{"error": ...}`` without raising. Rows missing an int ``number`` are
+    Returns ``{"repo", "prs", "limit_hit"}`` (fetched STALEST-first — see below),
+    or ``{"error": ...}`` without raising. Rows missing an int ``number`` are
     dropped (gh contract violation, not a crash). Slug resolves LIVE (same
     stale-config hardening as ``list_merged_prs``).
+
+    ``--search "sort:updated-asc"`` fetches least-recently-updated FIRST, so a
+    capped window (``len(prs) == limit`` on a repo with >``limit`` open PRs) keeps
+    the STALEST end — the lane's whole target — rather than gh's default
+    newest-first order, which would silently drop exactly the aged PRs this
+    surface exists to raise (and could hide them indefinitely). Any PR omitted by
+    the cap is then strictly newer than every fetched one, so it cannot be stale;
+    the client-side ``stale_days`` filter over this window is complete for the
+    stale set (the ``≥N`` count floor stays honest when >``limit`` PRs are stale).
+    Unlike merged enumeration (GitHub search cannot sort by mergedAt asc), open
+    PRs sort by ``updatedAt`` fine — verified live against gh 2.x.
     """
     run = runner or _default_runner
     if repo is None:
@@ -181,6 +191,8 @@ async def list_open_prs(
             repo,
             "--state",
             "open",
+            "--search",
+            "sort:updated-asc",
             "--json",
             OPEN_PR_FIELDS,
             "--limit",

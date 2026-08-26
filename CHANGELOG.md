@@ -21,6 +21,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   forever). Levers under the `repo_pulse` settings domain (`open_pr_enabled`,
   `open_pr_stale_days`, `max_open_prs`, `open_pr_resurface_days`,
   `open_pr_max_surface`); `GENESIS_REPO_PULSE_DISABLED` / `enabled: false` stop it.
+  Robustness (review round): the fetch now sorts `sort:updated-asc` so a capped
+  window (>`max_open_prs` open PRs) keeps the STALEST end — the lane's target —
+  instead of gh's newest-first default that would drop aged PRs indefinitely; the
+  cache/seen sidecars anchor on `genesis_home()` (honors `GENESIS_HOME`) so a
+  relocated install keeps writer + reader in sync; and the hook's
+  `GENESIS_REPO_PULSE_DISABLED` gate matches the exact `1` the worker honors (a
+  looser truthy set would half-disable the subsystem). `mode: off` / `enabled:
+  false` are full-worker stops (all lanes); `open_pr_enabled` is the lane-only knob.
 
 - **The Contributor Work-Log can post curated newcomer issues autonomously
   (opt-in).** A new `require_approval: false` lever lets the curator's

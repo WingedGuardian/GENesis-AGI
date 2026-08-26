@@ -49,6 +49,16 @@ def pulse_root(tmp_path, monkeypatch) -> Path:
     return root
 
 
+def test_pulse_root_honors_genesis_home(monkeypatch, tmp_path):
+    """The worker's state root must anchor on genesis_home() (honors GENESIS_HOME)
+    — the SAME resolver the reader hook uses — so a relocated install keeps the
+    lock/cursor + open-PR cache together instead of writing to a bare Path.home()
+    the hook would never read."""
+    relocated = tmp_path / "relocated_home"
+    monkeypatch.setenv("GENESIS_HOME", str(relocated))
+    assert rpw._pulse_root() == relocated / "repo_pulse"
+
+
 @pytest.fixture
 def live_mode(monkeypatch):
     monkeypatch.setattr(rpw, "effective_mode", lambda: "live")
