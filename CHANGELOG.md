@@ -57,6 +57,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The run_in_background pipe guard no longer false-blocks a `|` inside a quoted
+  argument.** The old inline check (`${CMD//||/ }` then `grep -qF "|"`) blocked any
+  literal `|`, so backgrounding `gh api … --jq '.[] | .x'` or `grep -F '|' file`
+  was wrongly rejected. It's now a small Python hook (`background_pipe_guard.py`)
+  using the canonical quote/redirect-aware parser (`shell_parse.has_top_level_pipe`),
+  so only a genuine top-level pipe — whose backgrounded stdout really is swallowed —
+  blocks; a `|` in quotes, a `||`, or a `>|` redirect does not. (Convenience guard:
+  a `|` inside a heredoc body or `case` pattern is a documented residual that may
+  still over-block — never a security bypass.)
+
 - **A dead subsystem scheduler no longer reads "healthy" on the dashboard.** When
   a background subsystem's scheduler/loop stops firing entirely (total cessation),
   its heartbeat pulse goes silent — but nothing turned that into a signal, so the
@@ -71,6 +81,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   at all. (Surplus already surfaces a wedged/dead loop via its own dashboard tile;
   outreach total-cessation is tracked separately, since its heartbeat only runs once
   a messaging channel is configured.)
+
 - **Worktree sessions now run the main-tree hook scripts, not their branch-frozen
   copies.** The `genesis-hook` launcher resolved each hook from the *current*
   worktree, so a git-tracked hook (security gates included) ran whatever version
