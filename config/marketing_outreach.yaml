@@ -23,4 +23,4 @@
 # NEVER in this file or the public repo. A fresh clone has an empty store and the
 # tool cleanly refuses.
 enabled: true
-mode: off
+mode: "off"

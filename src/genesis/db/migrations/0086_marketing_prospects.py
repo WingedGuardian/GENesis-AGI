@@ -37,7 +37,7 @@ _TABLE_DDL = """
 """
 
 _INDEX_DDL = (
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_marketing_prospects_email ON marketing_prospects(email)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_marketing_prospects_email ON marketing_prospects(email COLLATE NOCASE)",
     "CREATE INDEX IF NOT EXISTS idx_marketing_prospects_active "
     "ON marketing_prospects(status, opted_out)",
 )

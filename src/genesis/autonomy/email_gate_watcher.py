@@ -34,6 +34,22 @@ from genesis.outreach.types import OutreachStatus
 logger = logging.getLogger(__name__)
 
 
+async def _bulk_recipient_authorized(db: object, recipient: str | None) -> bool:
+    """True iff ``recipient`` is a CURATED, non-opted-out ``marketing_prospects``
+    row — the EXACT predicate the email gate's g2 BULK scope guard applies
+    (``email_gate.py`` ``_scope_guard_trip``). Fail-closed: a blank / not-curated
+    / opted-out recipient is NOT authorized. Status (active/contacted/replied) is
+    deliberately DECOUPLED — only opt-out revokes authorization, matching g2."""
+    if not recipient:
+        return False
+    from genesis.db.crud import marketing_prospects as mp
+
+    row = await mp.get_by_email(db, recipient)
+    if row is None:
+        return False
+    return not row.get("opted_out")
+
+
 def _subject(context: str | None) -> str:
     if not context:
         return ""
@@ -75,6 +91,29 @@ async def drain_pending_email_sends(rt: object) -> int:
                 resolved += 1
                 logger.info(
                     "Reconciled held email %s (approval already consumed) — not re-sent",
+                    row["id"],
+                )
+                continue
+            # Opt-out re-check at approved-send time (BULK / cold-marketing only).
+            # deliver_approved runs below the gate (gate_cleared=True), which
+            # bypasses the g2 BULK scope guard — so a prospect who opted out AFTER
+            # the hold was enqueued but BEFORE the owner approved would otherwise
+            # still be delivered. Re-apply g2's EXACT predicate (curated,
+            # non-opted-out marketing_prospects row) immediately before delivery;
+            # fail-closed. Non-BULK rows are untouched (behavior preserved).
+            if row["cell_risk_class"] == "bulk" and not await _bulk_recipient_authorized(
+                db, row["validated_recipient"]
+            ):
+                # Not owner rejection — a deterministic guard (like the IGNORED
+                # terminal path): mark the hold rejected + consume the approval so
+                # it can't busy-loop or linger as a ghost approved/unconsumed row.
+                # No correction (a guard trip is not owner competence signal).
+                if await pes.mark_rejected(db, row["id"], rejected_at=now):
+                    await approval_crud.mark_consumed(db, row["request_id"], consumed_at=now)
+                    resolved += 1
+                logger.warning(
+                    "Held BULK email %s recipient no longer authorized "
+                    "(opted-out/uncurated) — not delivered, marked rejected",
                     row["id"],
                 )
                 continue

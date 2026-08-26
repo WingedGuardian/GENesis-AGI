@@ -129,6 +129,7 @@ async def outreach_send(
                 deliver_after=preferred_timing,
                 thread_id=thread_id,
                 validated_recipient=validated_recipient,
+                labeled_surplus=labeled_surplus,
             )
             return json.dumps({
                 "status": "queued",

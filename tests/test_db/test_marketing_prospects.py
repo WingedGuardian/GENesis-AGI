@@ -87,6 +87,27 @@ async def test_mark_contacted(db):
 
 
 @pytest.mark.asyncio
+async def test_unique_email_index_is_case_insensitive(db):
+    # Defense-in-depth: even a DIRECT DB insert that bypasses _normalize_email
+    # must not let Target@x.com and target@x.com coexist (one opted-out, one not
+    # → opt-out defeated). The UNIQUE index is COLLATE NOCASE, so case-only
+    # variants collide at the index level.
+    await db.execute(
+        "INSERT INTO marketing_prospects (id, email, status, opted_out, "
+        "created_at, updated_at) VALUES ('a', 'Target@x.com', 'active', 0, ?, ?)",
+        (_TS, _TS),
+    )
+    await db.commit()
+    with pytest.raises(aiosqlite.IntegrityError):
+        await db.execute(
+            "INSERT INTO marketing_prospects (id, email, status, opted_out, "
+            "created_at, updated_at) VALUES ('b', 'target@x.com', 'active', 0, ?, ?)",
+            (_TS, _TS),
+        )
+        await db.commit()
+
+
+@pytest.mark.asyncio
 async def test_mark_opted_out_is_permanent_suppression(db):
     await mp.create(db, id="p1", email="a@example.com", created_at=_TS, updated_at=_TS)
     ok = await mp.mark_opted_out(db, "p1", opted_out_at="2026-08-25T02:00:00")

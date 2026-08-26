@@ -99,6 +99,11 @@ async def test_approved_hold_is_sent(db):
 async def test_approved_bulk_hold_sends_and_increments_owner_success(db):
     # (e) approve→drain for a BULK (cold marketing) hold: deliver_approved sends
     # once and the BULK cell's successes increments with origin_class="owner".
+    # The recipient must still be a curated, non-opted-out prospect at send time
+    # (the approved-send-time opt-out re-check reuses g2's predicate).
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
     rid = await _approval(db, status="approved")
     await pes.create(
         db,
@@ -121,6 +126,62 @@ async def test_approved_bulk_hold_sends_and_increments_owner_success(db):
     # hardcoded) — for a BULK cell the counter must increment just like standard.
     cell = await cg.get_cell(db, "email", "send", "bulk")
     assert cell["successes"] == 1
+
+
+@pytest.mark.asyncio
+async def test_approved_bulk_hold_opted_out_after_hold_not_delivered(db):
+    # Opt-out re-check at approved-send time: a prospect who opts out AFTER the
+    # bulk hold is enqueued but BEFORE the owner approves must NOT be delivered on
+    # the gate_cleared resume path (the g2 scope guard is bypassed there). The
+    # watcher re-applies the SAME predicate g2 uses immediately before delivery.
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    await mp.mark_opted_out(db, "prospect", opted_out_at=_TS)  # opts out AFTER hold
+    rid = await _approval(db, status="approved")
+    await pes.create(
+        db,
+        id="pb",
+        request_id=rid,
+        validated_recipient="prospect@example.com",
+        category="notification",
+        message="cold pitch",
+        held_at=_TS,
+        cell_domain="email",
+        cell_verb="send",
+        cell_risk_class="bulk",
+    )
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == []  # NOT delivered — opt-out re-check blocked it
+    assert (await pes.get_by_id(db, "pb"))["status"] == "rejected"  # terminal
+    # No delivery ⇒ no owner success recorded for the BULK cell.
+    assert await cg.get_cell(db, "email", "send", "bulk") is None
+
+
+@pytest.mark.asyncio
+async def test_approved_bulk_hold_not_curated_after_hold_not_delivered(db):
+    # Companion: recipient removed from (or never present in) the curated set at
+    # approve time → not authorized → not delivered, marked rejected.
+    rid = await _approval(db, status="approved")
+    await pes.create(
+        db,
+        id="pb",
+        request_id=rid,
+        validated_recipient="ghost@example.com",
+        category="notification",
+        message="cold pitch",
+        held_at=_TS,
+        cell_domain="email",
+        cell_verb="send",
+        cell_risk_class="bulk",
+    )
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == []
+    assert (await pes.get_by_id(db, "pb"))["status"] == "rejected"
 
 
 @pytest.mark.asyncio

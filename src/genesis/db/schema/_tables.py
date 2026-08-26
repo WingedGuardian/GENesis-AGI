@@ -2445,7 +2445,7 @@ INDEXES = [
     "ON autonomous_email_sends(cell_domain, cell_verb, cell_risk_class, sent_at)",
     "CREATE INDEX IF NOT EXISTS idx_autonomous_email_sends_sent ON autonomous_email_sends(sent_at)",
     # Marketing cold-send prospect inventory — email lookup + active-set scan
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_marketing_prospects_email ON marketing_prospects(email)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_marketing_prospects_email ON marketing_prospects(email COLLATE NOCASE)",
     "CREATE INDEX IF NOT EXISTS idx_marketing_prospects_active "
     "ON marketing_prospects(status, opted_out)",
     # task states (Phase 9)
