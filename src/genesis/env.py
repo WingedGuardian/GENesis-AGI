@@ -546,15 +546,27 @@ def models_md_synthesis_enabled() -> bool:
 def user_timezone() -> str:
     """User's local timezone (IANA format).
 
-    Precedence: USER_TIMEZONE env var → local config timezone → UTC.
+    Precedence: genesis.yaml ``timezone`` → USER_TIMEZONE env var → UTC.
     Used by tz.py and any subsystem that formats timestamps for display.
+
+    genesis.yaml is authoritative because timezone is the one setting with a
+    live, dashboard-owned mutation surface: the Configuration-tab dropdown
+    writes the file and ``tz.reload()`` picks it up without a restart. The
+    ``USER_TIMEZONE`` env var is a DEPRECATED fallback, consulted only when the
+    file has no ``timezone`` key (e.g. a standard install that never ran
+    setup-local-config). This deliberately diverges from the env-first house
+    convention (``github_user`` etc.) for that reason; a one-time seed migration
+    (``db/migrations/0086``) copies a real env value into the file before this
+    precedence took effect, so the flip preserves behavior on existing installs.
     """
-    env_val = os.environ.get("USER_TIMEZONE")
-    if env_val:
-        return env_val.strip()
     local_val = _local_config().get("timezone")
-    if local_val:
-        return str(local_val).strip()
+    if local_val is not None:
+        stripped = str(local_val).strip()
+        if stripped:  # a blank file value falls through to the env fallback
+            return stripped
+    env_val = os.environ.get("USER_TIMEZONE")
+    if env_val and env_val.strip():
+        return env_val.strip()
     return "UTC"
 
 

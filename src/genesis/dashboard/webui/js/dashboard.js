@@ -279,7 +279,9 @@
         settingsData: {},         // domain_name → config object
         settingsEditing: null,    // domain being edited
         settingsViewing: null,    // readonly domain being viewed
-        systemTimezone: null,     // from /api/genesis/settings/timezone
+        systemTimezone: null,     // current tz from /api/genesis/settings/timezone
+        timezoneOptions: [],      // IANA zone list for the dropdown (from same GET)
+        timezoneSaving: false,    // true while a timezone POST is in flight
         settingsSaving: false,
         settingsRestartMessage: null,
 
@@ -2249,11 +2251,44 @@
             const resp = await fetchApi("/api/genesis/settings");
             if (resp && resp.ok) { this.settingsDomains = await resp.json(); }
           } catch (e) { console.warn("Settings index failed:", e); }
-          // Also fetch the system timezone
+          // Also fetch the current timezone + the dropdown option list.
           try {
             const tzResp = await fetchApi("/api/genesis/settings/timezone");
-            if (tzResp && tzResp.ok) { this.systemTimezone = (await tzResp.json()).timezone; }
+            if (tzResp && tzResp.ok) {
+              const d = await tzResp.json();
+              this.systemTimezone = d.timezone;
+              this.timezoneOptions = Array.isArray(d.options) ? d.options : [];
+            }
           } catch (e) { /* ignore */ }
+        },
+        async saveTimezone(tz) {
+          // Write the chosen zone to genesis.yaml (the authoritative source) via
+          // the settings/timezone endpoint. Display updates immediately; scheduled
+          // jobs re-time on the next restart (hence the restart prompt).
+          if (!tz || tz === this.systemTimezone) { return; }
+          this.timezoneSaving = true;
+          try {
+            const resp = await fetchApi("/api/genesis/settings/timezone", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ timezone: tz }),
+            });
+            if (resp && resp.ok) {
+              const d = await resp.json();
+              this.systemTimezone = d.timezone || tz;
+              this.settingsRestartMessage =
+                "Timezone set to " + this.systemTimezone +
+                " — display updates now; restart Genesis to re-time scheduled jobs.";
+            } else {
+              const err = resp ? await resp.json().catch(() => ({})) : {};
+              alert("Timezone update failed: " + (err.error || "Unknown error"));
+            }
+          } catch (e) {
+            console.warn("saveTimezone failed:", e);
+            alert("Timezone update failed: network error");
+          } finally {
+            this.timezoneSaving = false;
+          }
         },
         async fetchSettingsData(domain) {
           try {

@@ -17,9 +17,11 @@ network:
   # Env var override: LM_STUDIO_URL
   lm_studio_url: "http://localhost:1234/v1"
 
-# Your local timezone in IANA format.
+# Your local timezone in IANA format. This is the AUTHORITATIVE runtime source
+# for display + scheduling, and is editable live from the dashboard Configuration
+# tab (no restart for display; scheduled jobs re-time on the next restart).
 # Find yours at https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
-# Env var override: USER_TIMEZONE
+# (The USER_TIMEZONE env var is only a deprecated fallback used when this is unset.)
 timezone: "UTC"
 
 # GitHub configuration — used by the contribution pipeline and docs.
