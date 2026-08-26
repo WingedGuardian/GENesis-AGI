@@ -40,6 +40,16 @@
                 ]
             },
             {
+                "matcher": "startup|resume",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook surface_open_prs.py",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
                 "matcher": "startup|resume|clear",
                 "hooks": [
                     {

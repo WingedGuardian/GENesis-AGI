@@ -160,3 +160,29 @@ def test_base_config_file_is_valid_live():
     base = Path(__file__).parents[2] / "config" / "repo_pulse.yaml"
     cfg = yaml.safe_load(base.read_text())
     assert cfg == rpc.DEFAULTS
+
+
+# ── Open-PR lane knobs (session-manager PR-4c) ──────────────────────────────
+
+
+def test_open_pr_knob_defaults():
+    cfg = dict(rpc.DEFAULTS)
+    assert cfg["open_pr_enabled"] is True
+    assert rpc.knob_int(cfg, "open_pr_stale_days") == 7
+    assert rpc.knob_int(cfg, "max_open_prs") == 50
+    assert rpc.knob_int(cfg, "open_pr_resurface_days") == 7
+    assert rpc.knob_int(cfg, "open_pr_max_surface") == 5
+
+
+def test_validator_accepts_open_pr_knobs():
+    assert _validate_repo_pulse({"open_pr_enabled": True}) == []
+    assert _validate_repo_pulse({"open_pr_enabled": False}) == []
+    assert _validate_repo_pulse({"open_pr_stale_days": 3, "max_open_prs": 100}) == []
+    assert _validate_repo_pulse({"open_pr_resurface_days": 5, "open_pr_max_surface": 3}) == []
+
+
+def test_validator_rejects_bad_open_pr_knobs():
+    assert _validate_repo_pulse({"open_pr_enabled": "yes"})  # bool required
+    assert _validate_repo_pulse({"open_pr_stale_days": True})  # bool is not a valid int
+    assert _validate_repo_pulse({"max_open_prs": 0})  # must be positive
+    assert _validate_repo_pulse({"open_pr_max_surface": -1})
