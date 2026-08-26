@@ -1581,6 +1581,12 @@ class UserEgoContextBuilder:
             '      "urgency": "low|normal|high"\n'
             "    }\n"
             "  ],\n"
+            '  "questions": [\n'
+            "    {\n"
+            '      "content": "a direct question when you need the user\'s input or a decision — sent without approval; the reply comes back to you as a signal, and you\'ll see an observation if delivery or reply fails",\n'
+            '      "urgency": "low|normal|high"\n'
+            "    }\n"
+            "  ],\n"
             '  "focus_summary": "one-line: what you are focused on for the user",\n'
             '  "resolved_follow_ups": [{"id": "follow_up_id", "resolution": "why resolved"}],\n'
             '  "resolved_directives": [{"id": "directive_id", "resolution": "what you decided"}],\n'

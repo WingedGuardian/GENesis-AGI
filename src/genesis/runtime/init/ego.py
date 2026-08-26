@@ -179,6 +179,10 @@ async def init(rt: GenesisRuntime) -> None:
         )
         rt._ego_cadence_manager = user_ego_cadence
 
+        # Questions channel: a captured user reply routes back to THIS ego
+        # as a reactive signal on its next cycle.
+        user_ego_session.set_reply_signal_sink(user_ego_cadence.push_reactive_event)
+
         await user_ego_cadence.start()
         logger.info(
             "User ego initialized (cadence=%dm, model=%s, effort=%s)",
@@ -257,6 +261,9 @@ async def init(rt: GenesisRuntime) -> None:
             autonomy_manager=getattr(rt, "_autonomy_manager", None),
         )
         rt._genesis_ego_cadence_manager = genesis_ego_cadence
+
+        # Questions channel reply → reactive signal (same wiring as user ego).
+        genesis_ego_session.set_reply_signal_sink(genesis_ego_cadence.push_reactive_event)
 
         await genesis_ego_cadence.start()
         logger.info(

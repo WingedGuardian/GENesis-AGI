@@ -41,6 +41,10 @@ _DEDUP_WINDOWS: dict[str, int] = {
     "surplus_insight": 24,
     "surplus_opportunity": 24,
     "content_review": 1,  # Short window — distinct content pieces may share topics
+    # Ego questions: a re-ask after the 2h reply timeout is a REMINDER (same
+    # rationale as the approval-reminder class below) — the 24h default would
+    # silently DENY it while the first delivery's history row is still warm.
+    "ego_question": 4,
     "cli_approval": 0,  # Never dedup — every approval request must be delivered
     # Provisioning approvals + outcomes — same "must always deliver" class as
     # cli_approval (#143). A synchronous, user-initiated grow approval that

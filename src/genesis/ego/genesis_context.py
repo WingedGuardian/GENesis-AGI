@@ -878,6 +878,12 @@ class GenesisEgoContextBuilder:
             '      "urgency": "low|normal|high"\n'
             "    }\n"
             "  ],\n"
+            '  "questions": [\n'
+            "    {\n"
+            '      "content": "a direct question when you need the user\'s input or a decision — sent without approval; the reply comes back to you as a signal, and you\'ll see an observation if delivery or reply fails",\n'
+            '      "urgency": "low|normal|high"\n'
+            "    }\n"
+            "  ],\n"
             '  "escalations": [\n'
             "    {\n"
             '      "content": "issue description the user ego should see",\n'

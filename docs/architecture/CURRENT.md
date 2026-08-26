@@ -699,7 +699,7 @@ them.
 ```yaml subsystem-map
 entry: ego-self-model
 modules: [ego, identity, deliberation]
-verified: 94be12b3 2026-08-06
+verified: f7bca63d 2026-08-26
 ```
 
 - **Two egos, both LIVE**: user ego (CEO, Opus, MCP profile `user_reflection`)
@@ -707,6 +707,16 @@ verified: 94be12b3 2026-08-06
   (~108K). `EgoCadenceManager`: adaptive proactive cycles, morning-report cron,
   30-min mechanical sweep, goal-staleness scans. Review cadence + budget
   controls before adding call sites.
+- **Questions channel (`questions[]` in both output contracts)**: the ego can
+  ASK the user directly — no approval gate (asking is NOTIFY_USER-class).
+  `_process_questions` → ONE sequential background task → outreach
+  `submit_and_wait` (NOTIFICATION category, governance applies); reply →
+  `origin_class="owner"` observation + reactive signal to the ASKING ego
+  (`set_reply_signal_sink` → cadence `push_reactive_event`); timeout/
+  undelivered → first-party observation. Reply waiter is in-memory — restart
+  mid-wait orphans the question (accepted; late reply falls to triage).
+  Sequential delivery is load-bearing: two concurrent waiters in one chat
+  make standalone replies unresolvable (`resolve_scoped_pending`).
 - **`capability_aggregator.py` → `capability_map` table** = per-domain
   self-confidence from up to 6 sources (inverse-confidence weighted; the
   Outcome-Bus feed is flag-gated OFF). This is the naming-trap twin of this
