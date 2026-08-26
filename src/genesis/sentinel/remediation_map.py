@@ -271,6 +271,29 @@ UNMAPPED_BY_DESIGN: dict[str, str] = {
         "IS restartable). It stays a user-visible WARNING health alert for a "
         "human to fix at the source; the firefighter is never woken for it."
     ),
+    "subsystem_stale:": (
+        "A heartbeat-emitting subsystem (ego/inbox/dashboard — surplus and "
+        "outreach are deliberately excluded: surplus is covered by its own "
+        "dashboard tile, outreach's pulse is config-gated) stopped pulsing — total "
+        "cessation of its scheduler/loop. The cause is heterogeneous and NOT "
+        "reliably restart-fixable: the motivating case was an ego cadence DEADLOCK "
+        "(a pending-approval pre-flight, fixed in code by #1422), where a "
+        "container.services restart would not clear it and could restart-loop "
+        "(contrast awareness:tick_overdue / job_stale:, which are genuine "
+        "restartable wedges). So it stays a user-visible health alert (ego "
+        "CRITICAL, the rest WARNING) + a red ego tile for a human to diagnose the "
+        "specific cause; the firefighter is never woken for it. (This is a "
+        "surfacing signal — PR-C adds no autonomous remediation authority.)"
+    ),
+    "subsystem_heartbeat_unknown:": (
+        "A heartbeat-emitting subsystem's last pulse row is UNREADABLE (corrupt "
+        "timestamp or a materially-future one from a backward clock jump) — so its "
+        "liveness cannot be confirmed. Surface-only (WARNING), never restart-fixable "
+        "by the firefighter: a corrupt row / clock skew is a data-integrity anomaly, "
+        "not a wedged service. Auto-resolves when a fresh parseable pulse lands. "
+        "Distinct from subsystem_stale: (which asserts a probable DEATH) — this "
+        "asserts only that we cannot tell."
+    ),
 }
 
 

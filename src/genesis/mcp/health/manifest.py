@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -12,6 +12,7 @@ import aiosqlite
 from genesis.env import db_busy_timeout_ms
 from genesis.mcp.health import mcp  # noqa: E402
 from genesis.mcp.health.constants import JOB_STALE_GAP_DAYS
+from genesis.observability.liveness import FUTURE_SKEW_TOLERANCE_MINUTES, parse_iso_utc
 
 logger = logging.getLogger(__name__)
 
@@ -148,83 +149,292 @@ async def _impl_bootstrap_manifest() -> dict:
         }
 
 
-async def _impl_subsystem_heartbeats() -> dict:
+# (expected_interval_s, overdue_threshold_s) per heartbeat-emitting subsystem.
+# ONE source of truth for the subsystem_heartbeats display tool, the
+# ``subsystem_stale:<name>`` pulse-staleness alert (errors.py), and the ego
+# dashboard tile (routes/ego.py) — so those surfaces can never disagree.
+# ``expected_interval_s`` is currently informational; ``overdue_s`` drives the
+# verdict.
+HEARTBEAT_EXPECTED = {
+    "awareness": (300, 360),      # 5 min tick, error at 6 min
+    "surplus": (300, 600),
+    # inbox checks every 30 min (inbox/types.py check_interval_seconds=1800).
+    # overdue=4× (7200s) so one slow/skipped check doesn't false-fire; a 2×
+    # (3600s) threshold was too tight. (Assumes the default interval; a custom
+    # check_interval_seconds should scale this — derive-from-config is a nicety.)
+    "inbox": (1800, 7200),
+    # Reflections only fire when signals warrant; calm periods can be quiet
+    # for hours. An idle alive-pulse (awareness loop) keeps this fresh during
+    # legitimate idle, so overdue=4h (matches ego) avoids false "dark" alarms.
+    # A real reflection outage surfaces faster via the awareness heartbeat
+    # (6 min), the cc resilience axis, and the deferred-work backlog.
+    "reflection": (600, 14400),
+    "outreach": (86400, 172800),
+    "dashboard": (120, 600),      # 60s daemon-thread pulse; overdue at 10× (was 4×)
+    "ego": (300, 14400),          # 5-min liveness pulse (ego_heartbeat job), overdue at 4h
+}
+
+# Subsystems whose heartbeat is emitted only AFTER their loop's
+# ``if paused: return`` guard — so a deliberately-paused Genesis stops their
+# pulse and they would false-read as dead. VERIFIED emit-after-pause sites:
+# surplus (surplus/scheduler.py:823-853) and inbox (inbox/monitor.py:2120-2154).
+# ego (dedicated ``ego_heartbeat`` job) and dashboard (dedicated daemon thread)
+# pulse THROUGH pause, so they are NOT here — an overdue-while-paused for them is
+# a genuine scheduler death that must still surface. See compute_heartbeat_staleness.
+_PAUSE_GATED_HEARTBEATS = frozenset({"surplus", "inbox"})
+
+# How many recent heartbeat rows to scan for the newest USABLE pulse. >1 so a few
+# unparseable / materially-future rows (which sort FIRST under the events table's
+# TEXT ``ORDER BY timestamp DESC`` — a "2099-.." or "not-a-date" value) can't hide
+# the valid pulses beneath them and pin a LIMIT-1 read on a bad row forever (#9). A
+# window with NO valid non-future row → ``unknown`` (corrupt) or ``no_heartbeat``
+# (empty), never a spurious verdict off the bad row. Residual (bounded, surfaced,
+# not silent): if MORE than this many future/unparseable rows sort ahead of the
+# newest valid pulse it reads ``unknown`` until they age out — needs sustained
+# future-timestamp corruption, which the keep-latest GC otherwise bounds.
+_HEARTBEAT_SCAN_LIMIT = 25
+
+# Path of the cross-process pause file (single source of truth for pause; the
+# standalone health MCP has no bootstrapped GenesisRuntime, so peek() is None there).
+_PAUSE_FILE = Path.home() / ".genesis" / "paused.json"
+
+
+def _read_global_paused() -> bool:
+    """Global pause state, read cross-process-safe from the persisted pause file.
+
+    Pause is persisted to ``~/.genesis/paused.json`` (present with ``paused:true``
+    when paused, ABSENT when not — see runtime/_pause_state.py) — the source of
+    truth EVERY process sees, including the standalone health MCP, whose
+    ``StandaloneHealthDataService`` has no bootstrapped GenesisRuntime (so a
+    runtime-singleton read would always return not-paused there and false-alarm a
+    paused subsystem). Absent file / read error → not-paused, so a read failure
+    surfaces the alert (fail-loud) rather than masking a real death."""
+    try:
+        if not _PAUSE_FILE.exists():
+            return False
+        import json
+
+        return bool(json.loads(_PAUSE_FILE.read_text()).get("paused", False))
+    except Exception:
+        logger.debug("global pause read failed; treating as not-paused", exc_info=True)
+        return False
+
+
+def _subsystem_enabled(name: str) -> bool:
+    """Best-effort: is this subsystem configured to run?
+
+    A subsystem DISABLED after it had already pulsed keeps a retained final heartbeat
+    that would otherwise age into a PERMANENT cessation alert (a disabled ego → a
+    permanent CRITICAL) — its stale pulse is intentional, not a death. Defaults True
+    (fail toward surfacing); only subsystems with a real disable switch are checked.
+    (Generalizing to inbox/dashboard + the never-started case is the bootstrap-manifest
+    follow-up.)"""
+    try:
+        if name == "ego":
+            from genesis.ego.config import load_ego_config
+
+            return bool(load_ego_config().enabled)
+    except Exception:
+        logger.debug("subsystem-enabled read failed for %s", name, exc_info=True)
+    return True
+
+
+def _newest_valid_ts(candidates_newest_first, *, now: datetime) -> tuple[str | None, bool]:
+    """Pick the newest USABLE heartbeat ISO from an ordered (newest-first) iterable.
+
+    Returns ``(iso, saw_any)``: *iso* is the candidate with the newest PARSED UTC
+    instant that is no more than the skew tolerance in the future — compared BY
+    INSTANT (via the shared ``parse_iso_utc``, which normalizes naive values), NOT by
+    the caller's textual order, since a textual ``ORDER BY`` is not chronological when
+    rows carry different UTC offsets (e.g. ``15:00+00:00`` sorts ahead of the actually-
+    later ``11:30-04:00``). *saw_any* is True iff any candidate string was seen at all
+    (used to tell a corrupt-but-present pulse — ``unknown`` — from a fresh install —
+    ``no_heartbeat``). A materially-future or unparseable candidate is never chosen."""
+    bound = now + timedelta(minutes=FUTURE_SKEW_TOLERANCE_MINUTES)
+    saw_any = False
+    best_iso: str | None = None
+    best_dt: datetime | None = None
+    for iso in candidates_newest_first:
+        if not iso:
+            continue
+        saw_any = True
+        dt = parse_iso_utc(iso)
+        if dt is not None and dt <= bound and (best_dt is None or dt > best_dt):
+            best_iso, best_dt = iso, dt
+    return best_iso, saw_any
+
+
+async def _post_resume_grace_active(db, *, name: str, now: datetime, interval_s: int) -> bool:
+    """True if Genesis resumed from a pause within this subsystem's expected interval
+    (+ a scheduler-timing buffer).
+
+    A pause-gated subsystem's pulse legitimately stops during a pause and does not
+    refresh until its next cycle AFTER resume — so an overdue pulse in that window is a
+    bounded post-resume transient, NOT a death (``observability/liveness.py`` documents
+    that any PUSH alert built on a pulse must anchor to a resume/boot grace). Reads the
+    latest durable ``runtime``/``resume`` event, so it works cross-process (the standalone
+    health MCP sees the same events table). No resume on record → no grace."""
+    if db is None:
+        return False
+    try:
+        from genesis.db.crud import events as events_crud
+
+        rows = await events_crud.query(
+            db, subsystem="runtime", event_type="resume", limit=_HEARTBEAT_SCAN_LIMIT
+        )
+        # Same textual-ORDER-BY trap #240 fixes for heartbeats: pick the newest resume
+        # by PARSED instant, not textual order (resume ts are UTC today, but don't rely
+        # on that invariant here either).
+        resume_iso, _ = _newest_valid_ts([r.get("timestamp") for r in rows], now=now)
+        resume_dt = parse_iso_utc(resume_iso) if resume_iso else None
+        if resume_dt is None:
+            return False
+        grace_s = interval_s + 120  # one expected interval + scheduler-timing slack
+        return 0 <= (now - resume_dt).total_seconds() < grace_s
+    except (aiosqlite.Error, ImportError, AttributeError, TimeoutError):
+        logger.debug("post-resume grace check failed for %s", name, exc_info=True)
+        return False
+
+
+async def compute_heartbeat_staleness(
+    name: str, db=None, raise_on_error: bool = False, paused: bool | None = None
+) -> dict:
+    """Staleness verdict for ONE heartbeat-emitting subsystem.
+
+    Reads the latest durable ``heartbeat`` event for *name* AND the in-memory
+    event-bus ring, uses the FRESHEST of the two, and compares its age to the
+    subsystem's overdue threshold in :data:`HEARTBEAT_EXPECTED`. Returns the same
+    per-subsystem shape :func:`_impl_subsystem_heartbeats` yields:
+    ``{status: alive|overdue|paused|no_heartbeat|unknown, last_seen, age_seconds?}``.
+
+    *db* defaults to the health service's connection; a caller with its own
+    runtime connection (e.g. the ego dashboard route) passes it explicitly.
+
+    *raise_on_error*: by default a caught query error is ERROR-logged and the
+    verdict degrades to ``no_heartbeat`` (best-effort, as the display/alert paths
+    want). A caller that renders a POSITIVE health assertion (the ego tile) passes
+    ``True`` so the read failure RE-RAISES and it can fail loud (surface unknown)
+    rather than paint a healthy tile over a broken read. (Truly unexpected
+    exception types always propagate — matching the original display behavior of
+    surfacing ``is_error`` rather than silently dropping a real bug.)
+
+    *paused*: for a :data:`_PAUSE_GATED_HEARTBEATS` subsystem (surplus/inbox,
+    whose pulse stops behind their loop's ``if paused: return``), a would-be
+    ``overdue`` verdict while Genesis is globally paused is downgraded to
+    ``paused`` — a deliberately-paused subsystem is not a dead one. ``None`` (the
+    default) reads the live global pause flag; callers may pass an explicit bool
+    (tests, or a caller that already read it). Non-pause-gated subsystems
+    (ego/dashboard) pulse THROUGH pause, so an ``overdue`` for them is a real
+    death and is never downgraded.
+
+    An unknown *name* (not in the threshold table) → ``no_heartbeat``; never raises
+    for that reason.
+    """
     import genesis.mcp.health_mcp as health_mcp_mod
 
-    _service = health_mcp_mod._service
+    entry = HEARTBEAT_EXPECTED.get(name)
+    if entry is None:
+        return {"status": "no_heartbeat", "last_seen": None}
+    _interval_s, overdue_s = entry
+
+    if db is None:
+        _service = health_mcp_mod._service
+        db = _service._db if _service else None
     _event_bus = health_mcp_mod._event_bus
 
-    # (expected_interval_s, overdue_threshold_s)
-    expected = {
-        "awareness": (300, 360),      # 5 min tick, error at 6 min
-        "surplus": (300, 600),
-        "inbox": (1800, 3600),
-        # Reflections only fire when signals warrant; calm periods can be quiet
-        # for hours. An idle alive-pulse (awareness loop) keeps this fresh during
-        # legitimate idle, so overdue=4h (matches ego) avoids false "dark" alarms.
-        # A real reflection outage surfaces faster via the awareness heartbeat
-        # (6 min), the cc resilience axis, and the deferred-work backlog.
-        "reflection": (600, 14400),
-        "outreach": (86400, 172800),
-        "dashboard": (120, 240),
-        "ego": (300, 14400),          # 5-min liveness pulse (ego_heartbeat job), overdue at 4h
+    _now = datetime.now(UTC)
+
+    # Durable candidates: a WINDOW of the newest heartbeat rows (not just LIMIT 1).
+    # A corrupt / materially-future timestamp sorts FIRST under the events table's
+    # TEXT ``ORDER BY timestamp DESC``, so a single-row read could pin the verdict on
+    # a bad row forever; scanning a window lets ``_newest_valid_ts`` skip past the bad
+    # rows to the newest genuinely-usable pulse (#9). A window with only future /
+    # unparseable rows → unknown (surfaced, per the liveness contract), never silent.
+    db_candidates: list[str | None] = []
+    if db is not None:
+        try:
+            from genesis.db.crud import events as events_crud
+
+            rows = await events_crud.query(
+                db,
+                subsystem=name,
+                event_type="heartbeat",
+                limit=_HEARTBEAT_SCAN_LIMIT,
+            )
+            db_candidates = [r.get("timestamp") for r in rows]
+        except (aiosqlite.Error, ImportError, AttributeError, TimeoutError):
+            # Narrow catch: DB query failure (aiosqlite.Error, TimeoutError),
+            # broken import chain (ImportError), or malformed row shape
+            # (AttributeError). Log at ERROR — a heartbeat probe failure against a
+            # wired DB is an operational failure. A POSITIVE-assertion caller
+            # (the ego tile) sets raise_on_error so this fails loud (unknown)
+            # instead of a spurious healthy tile; the display/alert callers
+            # degrade to no_heartbeat (absence, logged). Unexpected exception
+            # types still bubble on purpose (FastMCP is_error over a silent drop).
+            logger.error(
+                "Heartbeat timestamp query failed for subsystem %s", name, exc_info=True
+            )
+            if raise_on_error:
+                raise
+
+    # In-memory ring: a fresher not-yet-persisted pulse (the DB write is async),
+    # newest-first.
+    ring_candidates: list[str | None] = []
+    if _event_bus is not None and hasattr(_event_bus, "_ring"):
+        for event in reversed(_event_bus._ring):
+            sub_val = (
+                event.subsystem.value
+                if hasattr(event.subsystem, "value")
+                else str(event.subsystem)
+            )
+            if sub_val == name and event.event_type == "heartbeat":
+                ring_candidates.append(event.timestamp)
+
+    # Newest USABLE pulse across both sources — freshest wins (P2-2), naive values
+    # normalized (fixes mixed-awareness TypeError), materially-future / unparseable
+    # skipped. saw_* records whether a candidate string existed at all, so a
+    # corrupt-but-present pulse (unknown) is told from a fresh install (no_heartbeat).
+    db_ts, saw_db = _newest_valid_ts(db_candidates, now=_now)
+    ring_ts, saw_ring = _newest_valid_ts(ring_candidates, now=_now)
+    last_ts = None
+    last_dt: datetime | None = None
+    for cand in (db_ts, ring_ts):
+        if cand is None:
+            continue
+        cand_dt = parse_iso_utc(cand)
+        if cand_dt is not None and (last_dt is None or cand_dt > last_dt):
+            last_ts, last_dt = cand, cand_dt
+
+    if last_ts is None or last_dt is None:
+        # No usable pulse. A candidate WAS present but unusable → unknown (can't
+        # confirm liveness); nothing at all → no_heartbeat (fresh-install empty-state).
+        status = "unknown" if (saw_db or saw_ring) else "no_heartbeat"
+        return {"status": status, "last_seen": None}
+
+    age_s = (_now - last_dt).total_seconds()
+
+    if age_s <= overdue_s:
+        return {"status": "alive", "last_seen": last_ts, "age_seconds": round(age_s, 1)}
+
+    # Overdue. For a pause-gated subsystem, a globally-paused Genesis is NOT a
+    # dead one — its pulse legitimately stops on pause. Downgrade to a non-overdue
+    # "paused" verdict so no consumer (alert / morning report / tile) reads it as
+    # death. ego/dashboard pulse through pause, so they are never downgraded.
+    if name in _PAUSE_GATED_HEARTBEATS:
+        is_paused = paused if paused is not None else _read_global_paused()
+        if is_paused:
+            return {"status": "paused", "last_seen": last_ts, "age_seconds": round(age_s, 1)}
+        # Just resumed from a >threshold pause: the pulse hasn't had a cycle to refresh
+        # yet → bounded transient, not a death. Non-alerting "resuming" verdict.
+        if await _post_resume_grace_active(db, name=name, now=_now, interval_s=_interval_s):
+            return {"status": "resuming", "last_seen": last_ts, "age_seconds": round(age_s, 1)}
+    return {"status": "overdue", "last_seen": last_ts, "age_seconds": round(age_s, 1)}
+
+
+async def _impl_subsystem_heartbeats() -> dict:
+    return {
+        name: await compute_heartbeat_staleness(name) for name in HEARTBEAT_EXPECTED
     }
-
-    result = {}
-    now = datetime.now(UTC)
-
-    for name, (_interval_s, overdue_s) in expected.items():
-        last_ts = None
-
-        if _service and _service._db:
-            try:
-                from genesis.db.crud import events as events_crud
-
-                rows = await events_crud.query(
-                    _service._db,
-                    subsystem=name,
-                    event_type="heartbeat",
-                    limit=1,
-                )
-                if rows:
-                    last_ts = rows[0].get("timestamp")
-            except (aiosqlite.Error, ImportError, AttributeError, TimeoutError):
-                # Narrow catch: DB query failure (aiosqlite.Error,
-                # TimeoutError), broken import chain for events_crud
-                # (ImportError), or malformed row shape on access
-                # (AttributeError). Log at ERROR per observability
-                # rules — a heartbeat probe failure against a wired
-                # service is an operational failure, not tracing
-                # noise. Unexpected exception types bubble up on
-                # purpose: we'd rather see ``is_error=True`` on the
-                # FastMCP result than silently drop a real bug.
-                logger.error(
-                    "Heartbeat timestamp query failed for subsystem %s",
-                    name, exc_info=True,
-                )
-
-        if not last_ts and _event_bus and hasattr(_event_bus, "_ring"):
-            for event in reversed(_event_bus._ring):
-                sub_val = event.subsystem.value if hasattr(event.subsystem, "value") else str(event.subsystem)
-                if sub_val == name and event.event_type == "heartbeat":
-                    last_ts = event.timestamp
-                    break
-
-        if last_ts is None:
-            result[name] = {"status": "no_heartbeat", "last_seen": None}
-        else:
-            try:
-                age_s = (now - datetime.fromisoformat(last_ts)).total_seconds()
-                overdue = age_s > overdue_s
-                result[name] = {
-                    "status": "overdue" if overdue else "alive",
-                    "last_seen": last_ts,
-                    "age_seconds": round(age_s, 1),
-                }
-            except (ValueError, TypeError):
-                result[name] = {"status": "unknown", "last_seen": last_ts}
-
-    return result
 
 
 async def _impl_job_health() -> dict:

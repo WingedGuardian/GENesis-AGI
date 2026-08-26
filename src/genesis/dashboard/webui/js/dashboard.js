@@ -3771,6 +3771,23 @@
           const ge = ego.egos?.genesis_ego;
           const ueCad = ue?.cadence;
           const geCad = ge?.cadence;
+          // Total-cessation (scheduler death): the ego_heartbeat pulse went stale.
+          // The MOST authoritative ego signal — evaluate it BEFORE the auxiliary
+          // per-ego liveness/gated collectors below, so a CONFIRMED dead scheduler
+          // still turns the tile red even when an unrelated collector is degraded
+          // (otherwise a confirmed death gets masked as "unknown"). Fail-LOUD on a
+          // broken read (unknown), then flag a genuinely dead scheduler as error.
+          // Blind spot the per-ego intent-lag `stalled` below cannot see — on total
+          // cessation both ego timestamps freeze together, the lag never opens, and
+          // the tile would otherwise read green (the 3-day-dead-ego-shows-healthy
+          // bug). Scheduler-level: shared across both ego managers (see routes/ego.py).
+          if (ego.ego_heartbeat_error) {
+            return { state: "unknown", reason: "ego heartbeat data unavailable (read error)" };
+          }
+          if (ego.ego_heartbeat_stale) {
+            const hrs = ego.ego_heartbeat_age_s ? Math.round(ego.ego_heartbeat_age_s / 3600) : "?";
+            return { state: "error", reason: `ego scheduler stopped — no heartbeat in ${hrs}h` };
+          }
           // Fail-LOUD, not fail-green: if the liveness/gated read itself errored,
           // `stalled` defaulted to false — surfacing that as healthy would
           // recreate the exact false-green this instrumentation exists to kill.

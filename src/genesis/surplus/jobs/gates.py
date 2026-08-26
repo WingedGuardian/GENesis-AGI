@@ -267,7 +267,13 @@ async def _run_maintenance_gc(db: aiosqlite.Connection) -> None:
     except Exception:
         logger.warning("GC: FTS/metadata tripwire failed", exc_info=True)
 
-    # GC: rotate heartbeat events older than 7 days
+    # GC: rotate heartbeat events older than 7 days, but KEEP the most-recent
+    # pulse per subsystem — the pulse-staleness detector (compute_heartbeat_
+    # staleness) reads "the last pulse" to tell a scheduler dead > the window
+    # from one that never pulsed. Pruning the sole old pulse would revert a
+    # long-dead subsystem to a false ``no_heartbeat``/green (the exact lie the
+    # subsystem_stale alert + ego tile exist to kill). One retained row per
+    # subsystem is negligible volume.
     try:
         from genesis.db.crud import events as events_crud
 
@@ -276,6 +282,7 @@ async def _run_maintenance_gc(db: aiosqlite.Connection) -> None:
             db,
             older_than=hb_cutoff,
             event_type="heartbeat",
+            keep_latest_per_subsystem=True,
         )
         if hb_purged:
             logger.info("Pruned %d heartbeat events older than 7d", hb_purged)
