@@ -36,6 +36,7 @@ import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.request import pathname2url
 
 # Load secrets.env so USER_TIMEZONE and other env vars are available
 # before any genesis module imports (which may read os.environ at import time).
@@ -157,6 +158,20 @@ def _check_shelve_hint(prompt: str) -> None:
         sys.stdout.flush()
 
 
+def _ro_uri(db_path: Path) -> str:
+    """A WAL-aware read-only SQLite URI for ``db_path``, percent-encoding the path.
+
+    ``sqlite3.connect(f"file:{path}?mode=ro", uri=True)`` silently opens the WRONG
+    (empty) database if the filesystem path contains a URI-special char: a ``?`` or
+    ``#`` truncates the path there (verified — SQLite then reads a different file and
+    the query hits "no such table"), so the read fails closed to ``None`` on an install
+    whose repo path contains one. ``pathname2url`` percent-encodes the path (``?``→%3F,
+    ``#``→%23, space→%20, ``%``→%25); SQLite decodes it back, so the real DB opens.
+    Idempotent on an ordinary path (no special chars → unchanged).
+    """
+    return f"file:{pathname2url(str(db_path))}?mode=ro"
+
+
 def _emit_charter_tag(session_id: str) -> None:
     """One-line drift tag: [Charter: <mission|origin snippet> | open: N].
 
@@ -174,7 +189,7 @@ def _emit_charter_tag(session_id: str) -> None:
         db = (Path(root) if root else Path.home() / "genesis") / "data" / "genesis.db"
         if not db.exists():
             return
-        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.5)
+        conn = sqlite3.connect(_ro_uri(db), uri=True, timeout=0.5)
         try:
             conn.execute("PRAGMA busy_timeout=300")
             row = conn.execute(
@@ -249,7 +264,7 @@ def _last_successful_deploy(db_path: Path) -> tuple[str, str] | None:
     if not db_path.exists():
         return None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)
+        conn = sqlite3.connect(_ro_uri(db_path), uri=True, timeout=0.5)
         try:
             conn.execute("PRAGMA busy_timeout=300")
             row = conn.execute(
@@ -301,13 +316,21 @@ def _staleness_throttled(session_id: str, now: datetime) -> bool:
 
     Best-effort: an unreadable/absent/garbled marker → not throttled (emit),
     consistent with the fail-open posture (better a repeat nudge than a missed
-    stale-code warning)."""
+    stale-code warning). A marker timestamp in the FUTURE (clock stepped back, or a
+    hand-edited file) is likewise treated as NOT throttled: a negative elapsed is
+    always < cooldown, which would otherwise wedge the nudge OFF until wall-clock
+    catches up + a full cooldown — suppressing a genuine stale-code warning."""
     marker = _GENESIS_DIR / "sessions" / session_id / "staleness_last_nudge"
     try:
         last = datetime.fromisoformat(marker.read_text().strip())
-    except (OSError, ValueError):
+        elapsed = (now - last).total_seconds()
+    except (OSError, ValueError, TypeError):
+        # unreadable / garbled / tz-naive (aware-minus-naive raises TypeError) →
+        # not throttled (emit), fail-open toward surfacing the stale-code warning.
         return False
-    return (now - last).total_seconds() < _STALENESS_COOLDOWN_S
+    if elapsed < 0:
+        return False  # future marker → do not suppress; emit
+    return elapsed < _STALENESS_COOLDOWN_S
 
 
 def _record_staleness_nudge(session_id: str, now: datetime) -> bool:

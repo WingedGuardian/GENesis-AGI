@@ -117,6 +117,32 @@ def test_last_deploy_missing_table(tmp_path):
     assert _ua._last_successful_deploy(root / "data" / "genesis.db") is None
 
 
+def test_ro_uri_encodes_special_chars_and_is_idempotent():
+    from urllib.parse import unquote, urlsplit
+
+    # An ordinary path is not over-encoded and round-trips. Accept both pathname2url
+    # spellings — 3.12 "file:/abs" and 3.14 "file:///abs" (empty authority) — since both
+    # are valid SQLite URIs that decode to the same path.
+    clean = "/home/u/genesis/data/genesis.db"
+    uri = _ua._ro_uri(Path(clean))
+    assert uri.startswith("file:") and uri.endswith("?mode=ro")
+    assert unquote(urlsplit(uri[: -len("?mode=ro")]).path) == clean
+    weird = _ua._ro_uri(Path("/a?b/c#d/genesis.db"))
+    assert weird.endswith("?mode=ro")
+    path_part = weird[len("file:") : -len("?mode=ro")]
+    # the ? and # that would truncate a raw file: URI must be percent-escaped
+    assert "?" not in path_part and "#" not in path_part
+    assert "%3F" in path_part.upper() and "%23" in path_part.upper()
+
+
+def test_last_deploy_reads_db_under_special_char_path(tmp_path):
+    # a repo path containing ? / # would truncate a raw `file:{path}?mode=ro` URI and
+    # silently read the WRONG (empty) db → None. The encoded URI opens the real db.
+    root = _make_update_db(tmp_path / "a?b#c", [("success", DEPLOY_COMMIT, DEPLOY_AT)])
+    got = _ua._last_successful_deploy(root / "data" / "genesis.db")
+    assert got == (DEPLOY_AT, DEPLOY_COMMIT)
+
+
 # ── throttle marker ─────────────────────────────────────────────────────────
 
 
@@ -128,6 +154,27 @@ def test_throttle_absent_then_recorded(monkeypatch, tmp_path):
     # well past the cooldown → not throttled
     later = NOW + timedelta(seconds=_ua._STALENESS_COOLDOWN_S + 60)
     assert _ua._staleness_throttled(SID, later) is False
+
+
+def test_throttle_future_marker_not_throttled(monkeypatch, tmp_path):
+    # a marker timestamp in the FUTURE (clock stepped back / hand-edited) must NOT
+    # suppress the nudge: a negative elapsed is always < cooldown and would otherwise
+    # wedge the stale-code warning OFF. (Old `(now-last) < cooldown` returned True here.)
+    monkeypatch.setattr(_ua, "_GENESIS_DIR", tmp_path)
+    marker = tmp_path / "sessions" / SID / "staleness_last_nudge"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text((NOW + timedelta(hours=5)).isoformat())
+    assert _ua._staleness_throttled(SID, NOW) is False
+
+
+def test_throttle_naive_marker_not_throttled(monkeypatch, tmp_path):
+    # a tz-NAIVE marker: aware `now` - naive `last` raises TypeError, which must
+    # fail-open to NOT throttled rather than propagate and suppress the nudge.
+    monkeypatch.setattr(_ua, "_GENESIS_DIR", tmp_path)
+    marker = tmp_path / "sessions" / SID / "staleness_last_nudge"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("2026-08-25T12:00:00")  # no tzinfo
+    assert _ua._staleness_throttled(SID, NOW) is False
 
 
 def test_record_returns_false_when_unwritable(monkeypatch, tmp_path):
