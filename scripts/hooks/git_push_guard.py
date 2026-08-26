@@ -835,6 +835,15 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         return "pending", sorted(set(pending))
     if not saw_recognized:
         return "unknown", []  # payload had no CI-shaped entries
+    # KNOWN RESIDUAL (deferred, Codex #1484 P2): "green" here means every check that
+    # IS present concluded success — it does NOT assert the REQUIRED CI workflow ran.
+    # A partial rollup (e.g. only a green CodeQL, the CI suite absent) reads green.
+    # The "absent" branch above only catches a FULLY-empty rollup (the conflicting-
+    # branch symptom, where CI+CodeQL are both pull_request-gated and neither builds).
+    # Closing the partial case robustly needs a config-driven "required CI check
+    # identity" (a required-CI analogue of _required_scheduled_review_kinds) so it
+    # does NOT false-block an install whose CI is legitimately path-filtered/skipped
+    # for a docs-only PR. Tracked as a follow-up; not bundled here.
     return "green", []
 
 
