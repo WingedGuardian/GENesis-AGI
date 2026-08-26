@@ -164,7 +164,10 @@ async def test_autonomous_pins_repo_to_default(db, live, monkeypatch):
     )
     assert res["status"] == "held"
     assert res["repo"] == _REPO  # pinned, not attacker/other-repo
-    assert (await pip.get_by_id(db, res["pending_id"]))["repo"] == _REPO
+    # FIX 4 stores the repo in canonical lowercase (gh is case-insensitive; the
+    # close-loop reads join COLLATE NOCASE). The pin still holds — the destination
+    # is this install's configured repo, never the attacker's.
+    assert (await pip.get_by_id(db, res["pending_id"]))["repo"] == _REPO.lower()
 
 
 @pytest.mark.asyncio
