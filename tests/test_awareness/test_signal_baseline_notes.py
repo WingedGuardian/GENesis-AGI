@@ -199,3 +199,22 @@ async def test_critical_failure_healthy_note_unchanged_no_probe_names():
     r = await CriticalFailureCollector([_probe("qdrant_primary", ProbeStatus.HEALTHY)]).collect()
     assert r.value == 0.0
     assert "qdrant_primary" not in (r.baseline_note or "").lower()
+
+
+async def test_critical_failure_mixed_down_and_degraded_names_both():
+    # Codex P2-a: any DOWN forces value=1.0, but a probe that is DEGRADED at the SAME
+    # tick contributed to the infra state and must NOT be dropped from the note — the
+    # 1.0 branch names the FULL failing set (all DOWN + all co-occurring DEGRADED).
+    r = await CriticalFailureCollector(
+        [
+            _probe("db_primary", ProbeStatus.DOWN, timed_out=False),
+            _probe("ollama_local", ProbeStatus.DEGRADED),
+            _probe("qdrant_primary", ProbeStatus.HEALTHY),
+        ]
+    ).collect()
+    assert r.value == 1.0
+    note = (r.baseline_note or "").lower()
+    assert "db_primary" in note, note  # the DOWN probe
+    assert "ollama_local" in note, note  # the co-occurring DEGRADED probe (was dropped)
+    assert "qdrant_primary" not in note, note  # healthy probe not named
+    assert "metadata" not in note, note
