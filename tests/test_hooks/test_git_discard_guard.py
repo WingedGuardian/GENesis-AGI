@@ -205,6 +205,96 @@ def test_clean_non_dry_run_blocks(cmd, monkeypatch):
     assert _gd.main() == 2
 
 
+# ── submodule-RECURSIVE overwrite: unrecoverable by the superproject snapshot, so
+#    it BLOCKS like clean (Codex P1 3839052534 — no false recovery promise) ─────────
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git restore --recurse-submodules sm",
+        "git checkout --recurse-submodules -- sm",
+        "git switch --recurse-submodules main",
+        "git checkout --recurse-submodules main",
+        "git -c submodule.recurse=true restore sm",
+        "git -c submodule.recurse=1 checkout -- sm",
+        "git -c submodule.recurse restore sm",  # bare config → git treats as true
+        "git -c submodule.recurse=true reset --hard",
+        "git -c Submodule.Recurse=true checkout -- sm",  # config keys are case-INSENSITIVE
+        "git -c submodule.recurse=yes restore sm",  # non-false value → ON
+        "git -c submodule.recurse=true read-tree -u -m HEAD",  # read-tree recurses too
+        "git checkout --recurse-submodules=true main",  # flag =truthy
+    ],
+)
+def test_submodule_recursive_verbs_block(cmd, monkeypatch):
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": "/tmp"}
+    )
+    assert _gd.main() == 2
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git restore --no-recurse-submodules sm",  # explicit OFF → not blocked
+        "git -c submodule.recurse=false restore sm",  # explicit false → not blocked
+        "git -c submodule.recurse=off checkout -- sm",
+        "git restore --recurse-submodules=no sm",  # flag =OFF value → SAFE, not blocked
+        "git checkout --recurse-submodules=false main",  # flag =false → not blocked
+        "git restore --recurse-submodules=0 sm",
+        "git restore sm",  # no recursion at all
+        "git checkout main",
+        "git pull --recurse-submodules",  # not a snapshot verb → out of scope
+        "git submodule update --recurse-submodules",  # not a snapshot verb
+    ],
+)
+def test_submodule_non_recursive_or_out_of_scope_not_blocked(cmd, repo, monkeypatch, snap_log):
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": str(repo)}
+    )
+    assert _gd.main() == 0
+
+
+def test_submodule_recursive_override_escapes(monkeypatch):
+    monkeypatch.setattr(
+        _gd,
+        "read_payload",
+        lambda: {
+            "tool_input": {"command": "git restore --recurse-submodules sm  # discard-override"},
+            "cwd": "/tmp",
+        },
+    )
+    assert _gd.main() == 0
+
+
+def test_submodule_block_fails_open_on_parser_crash(monkeypatch):
+    # UNLIKE clean, the submodule block fails OPEN on a parser crash — a snapshot
+    # verb is normally recoverable, so we must not over-block every crashed checkout.
+    monkeypatch.setattr(
+        _gd,
+        "read_payload",
+        lambda: {
+            "tool_input": {"command": "git checkout --recurse-submodules sm"},
+            "cwd": "/tmp",
+        },
+    )
+    monkeypatch.setattr(
+        _gd, "_submodule_recurse_violation", lambda cmd: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    assert _gd.main() == 0  # documented residual: crash + submodule not caught
+
+
+def test_argv_recurses_submodules_helper():
+    assert _gd._argv_recurses_submodules(["git", "restore", "--recurse-submodules", "sm"])
+    assert _gd._argv_recurses_submodules(["git", "-c", "submodule.recurse=true", "restore"])
+    assert _gd._argv_recurses_submodules(["git", "-c", "submodule.recurse", "restore"])
+    assert _gd._argv_recurses_submodules(["git", "-c", "Submodule.Recurse=true", "restore"])  # case
+    assert _gd._argv_recurses_submodules(["git", "restore", "--recurse-submodules=true"])
+    assert not _gd._argv_recurses_submodules(["git", "restore", "--no-recurse-submodules"])
+    assert not _gd._argv_recurses_submodules(["git", "-c", "submodule.recurse=false", "restore"])
+    assert not _gd._argv_recurses_submodules(["git", "restore", "--recurse-submodules=no"])  # =OFF
+    assert not _gd._argv_recurses_submodules(["git", "restore", "--recurse-submodules=0"])
+    assert not _gd._argv_recurses_submodules(["git", "restore", "sm"])
+
+
 @pytest.mark.parametrize(
     "cmd",
     [

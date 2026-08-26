@@ -10,8 +10,8 @@ DESIGN — recoverability, not classification (2026-08-24, after the review loop
 ==============================================================================
 The job of DECIDING "is this command destructive?" from its argv is an OPEN-set
 parser problem (flags, ``=value``, single-letter abbreviations, backslash-newline
-continuations, ``--recurse-submodules``, global value-flags, config-form
-recursion): every review round surfaces the next spelling, and a block is
+continuations, global value-flags): every review round surfaces the next
+spelling, and a block is
 inherently a completeness claim, so every gap is a silent-loss hole. For the
 RECOVERABLE verbs (checkout/restore/switch/reset) that job is therefore NOT done
 here — a snapshot makes classification unnecessary. It survives only as the
@@ -19,12 +19,23 @@ crude, dependency-free substring blocks in ``.claude/settings.json`` and
 ``scripts/bash_safety_hook.sh`` (``git reset --hard``), an honest best-effort
 SPEED-BUMP, not a security boundary.
 
-``git clean`` is the EXCEPTION and the one place this hook still BLOCKS (exit 2):
-``git stash create`` cannot capture untracked files — exactly what ``clean``
-deletes — so the snapshot net gives clean ZERO protection. The block is a
-CLOSED SET on the SAFE side (allow only the exact dry-run forms; block the open
+``git clean`` is the EXCEPTION and the primary place this hook still BLOCKS
+(exit 2): ``git stash create`` cannot capture untracked files — exactly what
+``clean`` deletes — so the snapshot net gives clean ZERO protection. The block is
+a CLOSED SET on the SAFE side (allow only the exact dry-run forms; block the open
 complement), which a false-ALLOW cannot penetrate — see ``_clean_violation``.
 The ``# discard-override`` sigil is its escape.
+
+A submodule-RECURSIVE checkout/restore/switch/reset/read-tree (``--recurse-submodules``
+or a truthy ``-c submodule.recurse``) is the SECOND block, for the same reason: a
+superproject ``git stash create`` does not capture submodule worktrees, so
+recursing into them is unrecoverable and a superproject snapshot there is a FALSE
+recovery promise. Same ``# discard-override`` escape — see
+``_submodule_recurse_violation``. NOTE this is NOT the same guarantee as clean's
+block: clean is closed on the SAFE side (a false-ALLOW is impossible); this block
+is closed only on the BLOCK side and still leaks a false-recovery-promise on the
+safe side for recursion enabled by PERSISTENT config (no CLI token — a documented,
+subprocess-free residual), so the snapshot note is hedged for recurse-capable verbs.
 
 The SECURITY property this hook provides is RECOVERABILITY. For every
 tracked-work-overwriting verb — ``checkout`` / ``restore`` / ``switch`` /
@@ -59,7 +70,16 @@ DOCUMENTED RESIDUALS (honest claim — the snapshot is a best-effort net):
     tabled north-star follow-up.)
   * ``assume-unchanged`` / ``skip-worktree`` modifications and an UNMERGED
     (conflict) worktree are invisible to / error out of ``stash create``.
-  * Submodule contents are not captured by a superproject ``stash create``.
+  * Submodule contents are not captured by a superproject ``stash create`` — so a
+    submodule-RECURSIVE checkout/restore/switch/reset/read-tree requested ON THE
+    COMMAND LINE (``--recurse-submodules`` / ``-c submodule.recurse=true``) is
+    BLOCKED (not snapshotted; see ``_submodule_recurse_violation``) rather than given
+    a false recovery promise. TWO residuals remain, both requiring a subprocess this
+    argv-only block avoids: (a) recursion enabled by PERSISTENT config
+    (``.git/config`` / global / ``GIT_CONFIG_*``, no CLI token) is not detected and
+    still recurses+overwrites — NOT blocked; and (b) a NON-recursive verb touching a
+    submodule path is only superproject-snapshotted. For both, the snapshot note is
+    HEDGED (it states submodule worktrees are not captured) so the promise is honest.
   * cwd resolution is deliberately simple (payload cwd + a leading ``git -C``);
     a cd-chain / exotic repo selector may snapshot the wrong repo or none.
   * The snapshot is taken at the PreToolUse boundary, BEFORE the Bash payload
@@ -127,6 +147,19 @@ _SNAPSHOT_VERBS = frozenset(
 )
 # The sanctioned escape for the clean block: `git clean -f  # discard-override`.
 _OVERRIDE_SIGIL = "discard-override"
+# Verbs that can recurse into submodule worktrees via `--recurse-submodules` or a
+# truthy `-c submodule.recurse`. A superproject `git stash create` does NOT capture
+# submodule worktrees, so a submodule-recursive restore/checkout/switch/reset is
+# UNRECOVERABLE by the snapshot — the same condition as clean — and a superproject
+# snapshot there would be a FALSE recovery promise. So it BLOCKS (honoring the
+# override), rather than snapshot-and-allow. (git reset has no --recurse-submodules
+# flag, but submodule.recurse config still recurses its --hard, so it is included;
+# read-tree likewise supports --[no-]recurse-submodules and is a snapshot verb.)
+_SUBMODULE_RECURSE_VERBS = frozenset({"checkout", "restore", "switch", "reset", "read-tree"})
+# git-config truthiness: a `submodule.recurse` set to one of these is OFF (no
+# recursion → the superproject snapshot suffices → not blocked). Bare
+# `submodule.recurse` (no value) and any other value are treated as ON.
+_SUBMODULE_RECURSE_FALSE = frozenset({"false", "0", "no", "off"})
 # `git clean` is the ONE unrecoverable verb — `git stash create` cannot capture
 # untracked files, which is exactly what clean deletes, so the snapshot net
 # gives clean ZERO protection and it must keep a real block. The block is a
@@ -316,6 +349,72 @@ def _clean_violation(cmd: str) -> str | None:
     return None
 
 
+_SUBMODULE_BLOCK_MSG = (
+    "[git-discard-guard] BLOCKED: a submodule-RECURSIVE checkout/restore/switch/"
+    "reset (`--recurse-submodules` or `-c submodule.recurse=true`) resets nested "
+    "submodule worktrees, and `git stash create` does NOT capture submodule "
+    "contents — so the recovery snapshot gives them ZERO protection (an edit inside "
+    "a dirty submodule would be lost unrecoverably). Commit/stash the submodule "
+    "first, drop `--recurse-submodules`, or append `# discard-override` to proceed."
+)
+
+
+def _argv_recurses_submodules(argv: list[str]) -> bool:
+    """True if this git argv enables submodule recursion — via the
+    ``--recurse-submodules`` flag (bare or ``=value``) or a truthy
+    ``-c submodule.recurse`` config. Value-range aware: bare forms are ON (git's
+    default is true when bare); an explicit false/0/no/off value is OFF — for BOTH
+    the flag ``=value`` and the config ``=value`` (they must agree, else
+    ``--recurse-submodules=no`` false-blocks a safe command). The CLI flag is matched
+    case-sensitively (git flags are); the ``-c`` config KEY is matched
+    case-INSENSITIVELY (git config keys are — ``-c Submodule.Recurse=true`` recurses).
+    ``--no-recurse-submodules`` is correctly not matched.
+
+    RESIDUALS (documented, the guard's stance on the argv tar pit): an ABBREVIATED
+    flag spelling (``--recurse-sub``) is not matched; and recursion enabled by
+    PERSISTENT config (``.git/config`` / global / ``GIT_CONFIG_*``, no CLI token) is
+    invisible to this pure-argv check — that case is NOT blocked and still gets a
+    superproject-only snapshot (see the DOCUMENTED RESIDUALS + the hedged snapshot
+    note). Catching it would need a subprocess, which this block avoids by design."""
+    for tok in argv[1:]:
+        # CLI flag — git flags are case-SENSITIVE; the =value form honors the false-set.
+        if tok == "--recurse-submodules":
+            return True
+        if tok.startswith("--recurse-submodules="):
+            if tok.split("=", 1)[1].strip().lower() not in _SUBMODULE_RECURSE_FALSE:
+                return True
+            continue  # explicit OFF value → not recursion
+        # -c config KEY — git config keys are case-INSENSITIVE.
+        low = tok.lower()
+        if low == "submodule.recurse":
+            return True  # bare `-c submodule.recurse` → git treats as true
+        if low.startswith("submodule.recurse=") and (
+            low.split("=", 1)[1].strip() not in _SUBMODULE_RECURSE_FALSE
+        ):
+            return True
+    return False
+
+
+def _submodule_recurse_violation(cmd: str) -> str | None:
+    """Block a submodule-RECURSIVE snapshot-verb command (see
+    _SUBMODULE_RECURSE_VERBS): the superproject snapshot cannot recover submodule
+    worktrees, so recursing into them is unrecoverable (like clean) and a
+    superproject snapshot is a false recovery promise. Closed-set: literal
+    snapshot-verb membership AND a recursing token; honors ``# discard-override``
+    per segment. Returns a block message or None. Pure argv (no subprocess)."""
+    for seg in analyze(cmd):
+        if seg.exe != "git":
+            continue
+        if not (set(seg.argv[1:]) & _SUBMODULE_RECURSE_VERBS):
+            continue
+        if not _argv_recurses_submodules(seg.argv):
+            continue
+        if has_trailing_override(seg.raw, _OVERRIDE_SIGIL):
+            continue
+        return _SUBMODULE_BLOCK_MSG
+    return None
+
+
 def _record_snapshots(cmd: str, payload: dict) -> list[str]:
     """Best-effort recovery net. NEVER blocks, never raises past its own
     boundary; one snapshot per distinct resolved cwd. Returns the human-facing
@@ -363,8 +462,10 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
             log_path = _write_log_row(row) or log_path
         notes.append(
             f"[git-discard-guard] snapshotted the worktree at {cwd} as "
-            f"{sha[:12]} (tracked changes only — `git stash create` does not "
-            f"capture untracked files). IF that is the repo this command "
+            f"{sha[:12]} (tracked changes only — `git stash create` does NOT "
+            f"capture untracked files OR submodule worktree contents; a "
+            f"submodule-recursive discard enabled by PERSISTENT config is NOT "
+            f"recoverable from this snapshot). IF that is the repo this command "
             f"discarded work in, recover with: git stash apply --index {sha}  "
             f"(--index restores the staged/unstaged split; drop it if the apply "
             f"conflicts). For a DELETED/overwritten file (rm/mv), pull it straight "
@@ -444,6 +545,22 @@ def main() -> int:
             with contextlib.suppress(OSError):
                 print(block_msg, file=sys.stderr)
             return 2
+
+    # Phase 1b — submodule-RECURSIVE overwrite is UNRECOVERABLE by the superproject
+    # snapshot (stash create can't capture submodule worktrees), so it BLOCKS like
+    # clean rather than emit a false recovery promise. Fails OPEN on a parser crash
+    # (UNLIKE clean): a snapshot verb is normally recoverable, so we must not
+    # over-block every crashed checkout — the rare crash+submodule case is a
+    # documented residual. Cheap `recurse` gate avoids analyze() on ordinary cmds
+    # (lowered — the config KEY is case-insensitive, so `Submodule.Recurse` must
+    # still pass this gate).
+    if "recurse" in cmd.lower():
+        with contextlib.suppress(Exception):
+            sub_msg = _submodule_recurse_violation(cmd)
+            if sub_msg:
+                with contextlib.suppress(OSError):
+                    print(sub_msg, file=sys.stderr)
+                return 2
 
     # Phase 2 — the snapshot recovery net (ADVISORY → fail OPEN).
     try:
