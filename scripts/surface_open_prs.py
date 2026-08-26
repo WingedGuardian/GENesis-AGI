@@ -66,9 +66,14 @@ def main() -> None:
             return  # malformed cache — nothing to compute or prune against
 
         now = datetime.now(UTC)
-        # Freshness TTL: never surface (or prune against) a dead worker's stale snapshot.
+        # Freshness TTL: never surface (or prune against) a dead worker's stale
+        # snapshot. Derive the allowance from the debounce cadence (2x, floored at
+        # 1 day) so a large `min_interval_minutes` (>=1440) can't expire the cache
+        # BEFORE the worker is even allowed to refresh it — which would otherwise
+        # suppress the surface for the whole debounce window (Codex P2).
+        ttl_s = max(_MAX_CACHE_AGE_S, pulse_cfg.knob_int(cfg, "min_interval_minutes") * 60 * 2)
         computed = pr_watch._parse_ts(data.get("computed_at"))
-        if computed is None or (now - computed).total_seconds() > _MAX_CACHE_AGE_S:
+        if computed is None or (now - computed).total_seconds() > ttl_s:
             return
 
         stale_days = pulse_cfg.knob_int(cfg, "open_pr_stale_days")

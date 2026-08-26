@@ -105,6 +105,32 @@ def test_stale_cache_not_surfaced(tmp_path):
     assert _run(home).strip() == ""
 
 
+def _write_local_overlay(home: Path, text: str) -> None:
+    cfg = home / ".genesis" / "config" / "repo_pulse.local.yaml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(text)
+
+
+def test_ttl_scales_with_large_debounce(tmp_path):
+    """When min_interval_minutes >= 1440 the worker can only refresh at most
+    daily, so a fixed 1-day TTL would suppress the surface for the whole debounce
+    window. The TTL derives from the debounce (2x), so a 30h-old cache under a
+    2-day debounce is STILL surfaced (old fixed-86400 TTL would suppress it)."""
+    home = tmp_path / "home"
+    _write_local_overlay(home, "min_interval_minutes: 2880\n")  # 2 days
+    _write_cache(home, [_openpr(1379, 12)], age_hours=30)  # >1 day, < 2*2day TTL
+    assert "#1379 (12d)" in _run(home)
+
+
+def test_ttl_default_debounce_still_caps_at_one_day(tmp_path):
+    """With the default 30-min debounce the 1-day floor still governs: a 48h-old
+    cache stays suppressed (the derived TTL never drops BELOW the 1-day floor)."""
+    home = tmp_path / "home"
+    _write_local_overlay(home, "min_interval_minutes: 30\n")
+    _write_cache(home, [_openpr(1379, 12)], age_hours=48)
+    assert _run(home).strip() == ""
+
+
 def test_no_stale_prs_silent(tmp_path):
     home = tmp_path / "home"
     _write_cache(home, [_openpr(1, 2), _openpr(2, 3)])  # all recent

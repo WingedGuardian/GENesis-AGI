@@ -29,6 +29,9 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `GENESIS_REPO_PULSE_DISABLED` gate matches the exact `1` the worker honors (a
   looser truthy set would half-disable the subsystem). `mode: off` / `enabled:
   false` are full-worker stops (all lanes); `open_pr_enabled` is the lane-only knob.
+  The surface's freshness TTL now derives from `min_interval_minutes` (2×, 1-day
+  floor) so a large debounce (≥1 day) can't expire the cache before the worker is
+  allowed to refresh it and silently suppress the surface for the whole window.
 
 - **The Contributor Work-Log can post curated newcomer issues autonomously
   (opt-in).** A new `require_approval: false` lever lets the curator's
