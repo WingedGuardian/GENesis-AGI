@@ -44,6 +44,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   a `|` inside a heredoc body or `case` pattern is a documented residual that may
   still over-block — never a security bypass.)
 
+- **Worktree sessions now run the main-tree hook scripts, not their branch-frozen
+  copies.** The `genesis-hook` launcher resolved each hook from the *current*
+  worktree, so a git-tracked hook (security gates included) ran whatever version
+  its branch had frozen — a worktree could silently enforce an outdated/weaker
+  gate until it rebased (measured: 60 of 70 worktrees ran a stale, warn-only
+  `full_suite_guard`). The launcher now resolves the hook script from the main
+  worktree (reusing the `git rev-parse --git-common-dir` plumbing already used for
+  the venv), so every session runs the current hook + policy. Escape hatch:
+  `GENESIS_HOOK_DEV_LOCAL=1` runs the worktree's own copy for testing a hook change
+  live. Forward-looking: a worktree benefits once it carries the fixed launcher
+  (new or rebased); pre-fix branches keep running their frozen launcher until they
+  rebase, and the stale count decays as the reaper reaps and branches rebase.
+
 - **The merge gate no longer blocks on a review finding that lands on a
   documentation file.** An inline `[P1]` finding anchored to a doc path
   (`CHANGELOG`, `README`, `LICENSE`/`NOTICE`, `docs/**`, `*.rst`) is now surfaced
