@@ -1673,8 +1673,18 @@ class TestPrCiStatus:
         self._set(monkeypatch, [{"context": "legacy-ci", "state": "FAILURE"}])
         assert guard_module._pr_ci_status("1") == ("red", ["legacy-ci"])
 
-    def test_empty_is_unknown(self, guard_module, monkeypatch):
+    def test_empty_rollup_is_absent(self, guard_module, monkeypatch):
+        # A READABLE, genuinely-empty rollup ("[]") = zero checks = CI has not run.
+        # This is DISTINCT from "unknown" (could not read): it is a definite fact,
+        # so it is "absent" — the canonical-repo merge arm fail-CLOSES on it.
         monkeypatch.setenv("_TEST_GH_CI_ROLLUP", "[]")
+        assert guard_module._pr_ci_status("1") == ("absent", [])
+
+    def test_no_output_is_unknown(self, guard_module, monkeypatch):
+        # An EMPTY string (gh produced no output) is NOT a readable empty list — we
+        # cannot tell zero-checks from a silent read failure, so it stays fail-open
+        # "unknown", never "absent".
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", "")
         assert guard_module._pr_ci_status("1") == ("unknown", [])
 
     def test_garbage_is_unknown(self, guard_module, monkeypatch):
@@ -1683,6 +1693,8 @@ class TestPrCiStatus:
 
     def test_non_ci_payload_is_unknown_fail_open(self, guard_module, monkeypatch):
         # e.g. a review-comment mock other tests inject — must not be read as red.
+        # A NON-empty payload with no CI-shaped entries stays "unknown" (we saw
+        # something but recognized no CI verdict) — NOT "absent" (which is zero checks).
         self._set(monkeypatch, [{"login": "codex", "body": "FAILURE somewhere"}])
         assert guard_module._pr_ci_status("1") == ("unknown", [])
 

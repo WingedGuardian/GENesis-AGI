@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Code intelligence session reminder — lists available tool layers.
 #
-# Fires on SessionStart (startup/resume/clear/compact).
+# Fires on SessionStart (startup/resume/clear).
 # Informational only, points to the full decision guide.
 
 cat << 'REMINDER'

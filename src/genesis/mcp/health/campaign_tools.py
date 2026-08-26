@@ -160,11 +160,20 @@ async def _impl_campaign_list(status_filter: str | None = None) -> dict:
         campaigns = await crud.list_campaigns(db, status_filter=status_filter)
         items = []
         for c in campaigns:
+            # last_run_at only advances on SUBSTANTIVE runs, so an idle-skipping
+            # campaign (skips every cadence via a pre-check) reads as stalled.
+            # Surface last_tick (most recent tick of any outcome) so "active,
+            # idle-skipping" is distinguishable from "dead". Newest-first.
+            latest = await crud.list_runs(db, c["id"], limit=1)
+            tick = latest[0] if latest else None
             items.append({
                 "name": c["name"],
                 "status": c["status"],
                 "cadence": c["cron_cadence"],
                 "last_run": c.get("last_run_at"),
+                "last_tick": tick["started_at"] if tick else None,
+                "last_tick_outcome": tick["outcome"] if tick else None,
+                "last_skip_reason": tick.get("skip_reason") if tick else None,
                 "total_runs": c["total_runs"],
                 "total_cost": f"${c['total_cost_usd']:.2f}",
                 "model": c["model"],
@@ -201,6 +210,11 @@ async def _impl_campaign_status(name: str) -> dict:
         # Filter internal keys from state display
         visible_state = {k: v for k, v in state.items() if not k.startswith("_")}
 
+        # last_run_at only advances on SUBSTANTIVE runs; last_tick is the most
+        # recent tick of ANY outcome (runs is newest-first) so an idle-skipping
+        # campaign is legible as "active, skipping" rather than stalled.
+        tick = runs[0] if runs else None
+
         return {
             "name": campaign["name"],
             "status": campaign["status"],
@@ -211,6 +225,9 @@ async def _impl_campaign_status(name: str) -> dict:
             "max_daily_cost": f"${campaign['max_daily_cost_usd']:.2f}",
             "state": visible_state,
             "last_run": campaign.get("last_run_at"),
+            "last_tick": tick["started_at"] if tick else None,
+            "last_tick_outcome": tick["outcome"] if tick else None,
+            "last_skip_reason": tick.get("skip_reason") if tick else None,
             "total_runs": campaign["total_runs"],
             "total_cost": f"${campaign['total_cost_usd']:.2f}",
             "recent_runs": [

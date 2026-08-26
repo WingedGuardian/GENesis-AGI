@@ -356,6 +356,7 @@
 
         // Polling interval IDs
         _healthInterval: null,
+        _backupInterval: null,
         _activityInterval: null,
 
         _sessionsInterval: null,
@@ -681,10 +682,23 @@
             this.fetchEgoStatus();
             this.fetchObservationsSummary();
           }, 15000);
+
+          // Fire-and-forget: drives the page-top backup banner on every tab. Must
+          // NOT gate initial paint — /backup/status shells out to git + systemctl,
+          // and backupBanner() is null-safe until backupStatus resolves (the banner
+          // just appears once it does). The banner reads the server-computed
+          // backup_health only — it does NOT depend on backupConfig, so there is no
+          // status/config fetch race and no need to fetch the config here.
+          this.fetchBackupStatus();
+          // Backup state changes slowly (6h cadence) and the route shells out to
+          // systemctl, so poll on a slow, separate cadence — catches an unattended
+          // scheduled-backup failure without a reload, at negligible cost.
+          this._backupInterval = setInterval(() => this.fetchBackupStatus(), 180000);
         },
 
         cleanup() {
           if (this._healthInterval) clearInterval(this._healthInterval);
+          if (this._backupInterval) clearInterval(this._backupInterval);
           for (const tab of ["overview", "chat", "internals", "config", "work", "observations", "traces", "autonomy"]) {
             this._stopTabIntervals(tab);
           }
@@ -1957,6 +1971,19 @@
           // start) — the timer won't fire, so "Active" would misreport. Say so.
           if (!active) return { text: 'Scheduled, but the timer is not running', color: '#ffb74d' };
           return { text: 'Active', color: '#81c784' };
+        },
+        // Page-top banner: render the server-computed backup_health verdict. ALL
+        // health logic (precedence, staleness math, tier/backend resolution) lives
+        // server-side in routes/backup.py::_backup_health — the client only maps
+        // state → colour. Returns a styled {text,color,bg,border} for a warn/critical
+        // state, or null when healthy or backupStatus has not loaded yet.
+        backupBanner() {
+          const bh = this.backupStatus && this.backupStatus.backup_health;
+          if (!bh || bh.state === 'ok') return null;
+          const s = bh.state === 'critical'
+            ? { color: '#d9534f', bg: 'rgba(217,83,79,0.15)', border: '#d9534f' }
+            : { color: '#f0ad4e', bg: 'rgba(240,173,78,0.15)', border: '#f0ad4e' };
+          return { ...s, text: bh.reason };
         },
         // "every 6 hours · last 12:10 PM ✓ · next 6:10 PM" — the at-a-glance line.
         backupScheduleLine() {
@@ -3771,6 +3798,23 @@
           const ge = ego.egos?.genesis_ego;
           const ueCad = ue?.cadence;
           const geCad = ge?.cadence;
+          // Total-cessation (scheduler death): the ego_heartbeat pulse went stale.
+          // The MOST authoritative ego signal — evaluate it BEFORE the auxiliary
+          // per-ego liveness/gated collectors below, so a CONFIRMED dead scheduler
+          // still turns the tile red even when an unrelated collector is degraded
+          // (otherwise a confirmed death gets masked as "unknown"). Fail-LOUD on a
+          // broken read (unknown), then flag a genuinely dead scheduler as error.
+          // Blind spot the per-ego intent-lag `stalled` below cannot see — on total
+          // cessation both ego timestamps freeze together, the lag never opens, and
+          // the tile would otherwise read green (the 3-day-dead-ego-shows-healthy
+          // bug). Scheduler-level: shared across both ego managers (see routes/ego.py).
+          if (ego.ego_heartbeat_error) {
+            return { state: "unknown", reason: "ego heartbeat data unavailable (read error)" };
+          }
+          if (ego.ego_heartbeat_stale) {
+            const hrs = ego.ego_heartbeat_age_s ? Math.round(ego.ego_heartbeat_age_s / 3600) : "?";
+            return { state: "error", reason: `ego scheduler stopped — no heartbeat in ${hrs}h` };
+          }
           // Fail-LOUD, not fail-green: if the liveness/gated read itself errored,
           // `stalled` defaulted to false — surfacing that as healthy would
           // recreate the exact false-green this instrumentation exists to kill.

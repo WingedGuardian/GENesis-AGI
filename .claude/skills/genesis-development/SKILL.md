@@ -839,6 +839,12 @@ findings below, a gated `gh pr merge`:
 - requires the PR base to equal the repo's default branch (retarget guard);
 - blocks unless mergeability is a definite `MERGEABLE` (a failed/unknown read
   does not merge).
+- **the CI gate** blocks red/pending checks; and — on the canonical public repo,
+  where CI always runs — an `absent` CI state (a readable EMPTY check set = CI
+  never ran, the tell of a conflicting branch or a dropped `pull_request` trigger)
+  also blocks, so an un-CI'd PR can't merge. An UNREADABLE CI read (`unknown`)
+  fails OPEN, and off the canonical repo `absent` fails open too (a repo may
+  legitimately have no CI). Waive with `# ci-override` (never `--admin`).
 - **Override sigils are split by boundary** so one waiver can't silently disarm
   an unrelated gate: `# review-override` waives ONLY the finding scans
   (review-body + inline P1s); `# stale-review-override` waives ONLY the

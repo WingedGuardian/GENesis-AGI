@@ -364,7 +364,9 @@ class JobHealthCollector:
 
     Reads runtime.job_health for scheduled jobs with consecutive_failures > 0.
     Value = max(consecutive_failures) / threshold, clamped to 1.0.
-    Metadata includes list of failed job names and quarantine status.
+    When firing, the baseline_note NAMES the failing jobs — that is the field the
+    tick serializer + reflection prompt formatter retain (metadata is dropped by
+    both), so the reflection can say WHICH job is failing rather than guessing.
     """
 
     signal_name = "scheduled_job_health"
@@ -402,12 +404,17 @@ class JobHealthCollector:
         # Normalize: threshold = 0.5, 2x threshold = 1.0
         value = min(1.0, max_failures / (self._threshold * 2))
 
+        failing = ", ".join(sorted(failed_jobs))
         return SignalReading(
             name=self.signal_name,
             value=round(value, 3),
             source="runtime",
             collected_at=datetime.now(UTC).isoformat(),
-            baseline_note="0.0=all jobs healthy. Brief spikes normal after restart",
+            baseline_note=(
+                f"Jobs failing (>= {self._threshold} consecutive failures): "
+                f"{failing} (worst {max_failures}). 0.0=all jobs healthy; brief "
+                "spikes normal after restart."
+            ),
         )
 
 

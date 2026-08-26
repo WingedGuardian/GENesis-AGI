@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # store_cc_token.sh — intake a `claude setup-token` OAuth token used as a
-# FALLBACK CC credential, by two consumers, when a primary `claude login` dies.
+# FALLBACK CC credential, by several consumers, when a primary `claude login` dies.
 #
 # The token (a 1-year `claude setup-token`, used via CLAUDE_CODE_OAUTH_TOKEN —
 # NOT an ANTHROPIC_API_KEY) is stored 0600 to a DEDICATED container file and
 # synced to the host shared mount by the credential-bridge awareness tick. It is
 # a SHARED fallback, read by consumers on BOTH the host (the Guardian recovery
 # brain, via guardian/diagnosis.py) AND the container itself (its own CC sessions,
-# foreground + background, via cc/login_health.py) — each injecting it only as a
-# fallback when its own login is down (see those modules for the exact activation
-# gate); a HEALTHY login is never overridden. It is NOT host-Guardian-only. The
+# foreground + background, via cc/login_health.py, AND interactive cc-slot.sh panes
+# via cc/login_gate.py) — each injecting it only as a fallback when its own login is
+# down (see those modules for the exact activation gate); a HEALTHY login is never
+# overridden, EXCEPT the interactive-slot `GENESIS_CC_SLOT_OAUTH=always` lever, which
+# deliberately injects over a live login. It is NOT host-Guardian-only. The
 # authoritative, CI-enforced consumer list lives in
 # docs/architecture/shared-artifacts.md (checked by
 # scripts/check_shared_artifact_consumers.py) — update THAT when a consumer changes.
