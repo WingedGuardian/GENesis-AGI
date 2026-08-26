@@ -356,6 +356,7 @@
 
         // Polling interval IDs
         _healthInterval: null,
+        _backupInterval: null,
         _activityInterval: null,
 
         _sessionsInterval: null,
@@ -681,10 +682,23 @@
             this.fetchEgoStatus();
             this.fetchObservationsSummary();
           }, 15000);
+
+          // Fire-and-forget: drives the page-top backup banner on every tab. Must
+          // NOT gate initial paint — /backup/status shells out to git + systemctl,
+          // and backupBanner() is null-safe until backupStatus resolves (the banner
+          // just appears once it does). The banner reads the server-computed
+          // backup_health only — it does NOT depend on backupConfig, so there is no
+          // status/config fetch race and no need to fetch the config here.
+          this.fetchBackupStatus();
+          // Backup state changes slowly (6h cadence) and the route shells out to
+          // systemctl, so poll on a slow, separate cadence — catches an unattended
+          // scheduled-backup failure without a reload, at negligible cost.
+          this._backupInterval = setInterval(() => this.fetchBackupStatus(), 180000);
         },
 
         cleanup() {
           if (this._healthInterval) clearInterval(this._healthInterval);
+          if (this._backupInterval) clearInterval(this._backupInterval);
           for (const tab of ["overview", "chat", "internals", "config", "work", "observations", "traces", "autonomy"]) {
             this._stopTabIntervals(tab);
           }
@@ -1957,6 +1971,19 @@
           // start) — the timer won't fire, so "Active" would misreport. Say so.
           if (!active) return { text: 'Scheduled, but the timer is not running', color: '#ffb74d' };
           return { text: 'Active', color: '#81c784' };
+        },
+        // Page-top banner: render the server-computed backup_health verdict. ALL
+        // health logic (precedence, staleness math, tier/backend resolution) lives
+        // server-side in routes/backup.py::_backup_health — the client only maps
+        // state → colour. Returns a styled {text,color,bg,border} for a warn/critical
+        // state, or null when healthy or backupStatus has not loaded yet.
+        backupBanner() {
+          const bh = this.backupStatus && this.backupStatus.backup_health;
+          if (!bh || bh.state === 'ok') return null;
+          const s = bh.state === 'critical'
+            ? { color: '#d9534f', bg: 'rgba(217,83,79,0.15)', border: '#d9534f' }
+            : { color: '#f0ad4e', bg: 'rgba(240,173,78,0.15)', border: '#f0ad4e' };
+          return { ...s, text: bh.reason };
         },
         // "every 6 hours · last 12:10 PM ✓ · next 6:10 PM" — the at-a-glance line.
         backupScheduleLine() {
