@@ -260,6 +260,103 @@ async def test_staleness_not_paused_still_overdue(db):
     assert hb["status"] == "overdue"
 
 
+# ── #240 newest-by-parsed-instant (mixed UTC offsets) ────────────────────────
+
+
+def test_newest_valid_ts_picks_by_instant_not_text():
+    """Textual ORDER BY is not chronological across UTC offsets — pick the newest
+    PARSED instant, not the textually-first row (#240)."""
+    from genesis.mcp.health.manifest import _newest_valid_ts
+
+    now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)
+    a = "2026-08-25T15:00:00+00:00"  # 15:00 UTC — sorts textually AFTER b ("15" > "11")
+    b = "2026-08-25T11:30:00-04:00"  # 15:30 UTC — chronologically LATER, sorts first-text
+    # In textual-DESC order the query returns `a` first; the newer instant is `b`.
+    iso, saw = _newest_valid_ts([a, b], now=now)
+    assert iso == b
+    assert saw is True
+
+
+# ── #372 post-resume grace (pause-gated) ─────────────────────────────────────
+
+
+async def _seed_resume(db, age_seconds: float) -> None:
+    from genesis.db.crud import events as events_crud
+
+    await events_crud.insert(
+        db,
+        subsystem="runtime",
+        severity="info",
+        event_type="resume",
+        message="Resumed",
+        timestamp=_iso_ago(age_seconds),
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_resume_grace_suppresses_pause_gated_overdue(db):
+    """Just after resuming from a >threshold pause, a pause-gated subsystem's stale
+    pulse hasn't refreshed yet → 'resuming' (non-alerting), not 'overdue' (#372)."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    await _seed_heartbeat(db, "inbox", age_seconds=3 * 3600)  # > 7200 threshold
+    await _seed_resume(db, age_seconds=60)  # resumed 1 min ago
+    hb = await compute_heartbeat_staleness("inbox", db=db, paused=False)
+    assert hb["status"] == "resuming"
+
+
+@pytest.mark.asyncio
+async def test_overdue_fires_after_resume_grace_expires(db):
+    """Once the post-resume grace (interval + buffer) has elapsed with STILL no fresh
+    pulse, it is a genuine stall → overdue (#372 does not mask a real death)."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    await _seed_heartbeat(db, "inbox", age_seconds=3 * 3600)
+    await _seed_resume(db, age_seconds=3600)  # resumed 1h ago (> inbox 1800+120 grace)
+    hb = await compute_heartbeat_staleness("inbox", db=db, paused=False)
+    assert hb["status"] == "overdue"
+
+
+@pytest.mark.asyncio
+async def test_no_resume_event_no_grace(db):
+    """With no resume on record, a pause-gated overdue is a normal stall → overdue."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    await _seed_heartbeat(db, "inbox", age_seconds=3 * 3600)
+    hb = await compute_heartbeat_staleness("inbox", db=db, paused=False)
+    assert hb["status"] == "overdue"
+
+
+# ── #973 disabled-subsystem suppression ──────────────────────────────────────
+
+
+def test_subsystem_enabled_defaults_true_and_reads_ego_config():
+    """_subsystem_enabled defaults True (fail toward surfacing) and honors ego's
+    disable switch (#973)."""
+    from types import SimpleNamespace as _NS
+
+    from genesis.mcp.health import manifest as _m
+
+    assert _m._subsystem_enabled("inbox") is True  # no disable switch → True
+    with patch("genesis.ego.config.load_ego_config", return_value=_NS(enabled=False)):
+        assert _m._subsystem_enabled("ego") is False
+    with patch("genesis.ego.config.load_ego_config", return_value=_NS(enabled=True)):
+        assert _m._subsystem_enabled("ego") is True
+
+
+@pytest.mark.asyncio
+async def test_disabled_ego_suppresses_cessation_alert(db):
+    """A DISABLED ego with a retained stale pulse must NOT raise a (permanent)
+    subsystem_stale:ego CRITICAL — the stale pulse is intentional, not a death (#973)."""
+    await _seed_heartbeat(db, "ego", age_seconds=5 * 3600)
+    with patch(
+        "genesis.mcp.health.manifest._subsystem_enabled",
+        side_effect=lambda n: n != "ego",
+    ):
+        alerts = await _run_alerts_with_db(db)
+    assert not [a for a in _stale(alerts) if a["id"] == "subsystem_stale:ego"]
+
+
 # ── loosened thresholds (near-zero false-reds) ───────────────────────────────
 
 

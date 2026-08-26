@@ -967,7 +967,10 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
     # fresh, never-bootstrapped install.)
     _stale_read_failed: list[str] = []
     try:
-        from genesis.mcp.health.manifest import compute_heartbeat_staleness
+        from genesis.mcp.health.manifest import (
+            _subsystem_enabled,
+            compute_heartbeat_staleness,
+        )
 
         _stale_db = _service._db if _service else None
         for _hb_name in ("ego", "inbox", "dashboard"):
@@ -1008,7 +1011,11 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
                 current_ids.add(alert_id)
                 continue
             if _status != "overdue":
-                # alive / paused / no_heartbeat (empty-state) → no alert
+                # alive / paused / resuming / no_heartbeat (empty-state) → no alert
+                continue
+            if not _subsystem_enabled(_hb_name):
+                # Intentionally DISABLED after having pulsed → its retained stale pulse
+                # is deliberate, not a death; suppress the (else permanent) alert.
                 continue
             _age = int(_hb.get("age_seconds") or 0)
             _last_seen = str(_hb.get("last_seen") or "")[:19]

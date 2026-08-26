@@ -220,25 +220,80 @@ def _read_global_paused() -> bool:
         return False
 
 
+def _subsystem_enabled(name: str) -> bool:
+    """Best-effort: is this subsystem configured to run?
+
+    A subsystem DISABLED after it had already pulsed keeps a retained final heartbeat
+    that would otherwise age into a PERMANENT cessation alert (a disabled ego → a
+    permanent CRITICAL) — its stale pulse is intentional, not a death. Defaults True
+    (fail toward surfacing); only subsystems with a real disable switch are checked.
+    (Generalizing to inbox/dashboard + the never-started case is the bootstrap-manifest
+    follow-up.)"""
+    try:
+        if name == "ego":
+            from genesis.ego.config import load_ego_config
+
+            return bool(load_ego_config().enabled)
+    except Exception:
+        logger.debug("subsystem-enabled read failed for %s", name, exc_info=True)
+    return True
+
+
 def _newest_valid_ts(candidates_newest_first, *, now: datetime) -> tuple[str | None, bool]:
     """Pick the newest USABLE heartbeat ISO from an ordered (newest-first) iterable.
 
-    Returns ``(iso, saw_any)``: *iso* is the newest candidate that parses to an aware
-    UTC datetime no more than the skew tolerance in the future (the shared
-    ``parse_iso_utc`` normalizes naive values, fixing mixed-awareness TypeErrors);
-    *saw_any* is True iff any candidate string was seen at all (used to tell a
-    corrupt-but-present pulse — ``unknown`` — from a fresh install — ``no_heartbeat``).
-    A materially-future or unparseable candidate is skipped, never chosen."""
+    Returns ``(iso, saw_any)``: *iso* is the candidate with the newest PARSED UTC
+    instant that is no more than the skew tolerance in the future — compared BY
+    INSTANT (via the shared ``parse_iso_utc``, which normalizes naive values), NOT by
+    the caller's textual order, since a textual ``ORDER BY`` is not chronological when
+    rows carry different UTC offsets (e.g. ``15:00+00:00`` sorts ahead of the actually-
+    later ``11:30-04:00``). *saw_any* is True iff any candidate string was seen at all
+    (used to tell a corrupt-but-present pulse — ``unknown`` — from a fresh install —
+    ``no_heartbeat``). A materially-future or unparseable candidate is never chosen."""
     bound = now + timedelta(minutes=FUTURE_SKEW_TOLERANCE_MINUTES)
     saw_any = False
+    best_iso: str | None = None
+    best_dt: datetime | None = None
     for iso in candidates_newest_first:
         if not iso:
             continue
         saw_any = True
         dt = parse_iso_utc(iso)
-        if dt is not None and dt <= bound:
-            return iso, saw_any
-    return None, saw_any
+        if dt is not None and dt <= bound and (best_dt is None or dt > best_dt):
+            best_iso, best_dt = iso, dt
+    return best_iso, saw_any
+
+
+async def _post_resume_grace_active(db, *, name: str, now: datetime, interval_s: int) -> bool:
+    """True if Genesis resumed from a pause within this subsystem's expected interval
+    (+ a scheduler-timing buffer).
+
+    A pause-gated subsystem's pulse legitimately stops during a pause and does not
+    refresh until its next cycle AFTER resume — so an overdue pulse in that window is a
+    bounded post-resume transient, NOT a death (``observability/liveness.py`` documents
+    that any PUSH alert built on a pulse must anchor to a resume/boot grace). Reads the
+    latest durable ``runtime``/``resume`` event, so it works cross-process (the standalone
+    health MCP sees the same events table). No resume on record → no grace."""
+    if db is None:
+        return False
+    try:
+        from genesis.db.crud import events as events_crud
+
+        rows = await events_crud.query(
+            db, subsystem="runtime", event_type="resume", limit=_HEARTBEAT_SCAN_LIMIT
+        )
+        # Same textual-ORDER-BY trap #240 fixes for heartbeats: pick the newest resume
+        # by PARSED instant, not textual order (resume ts are UTC today, but don't rely
+        # on that invariant here either).
+        resume_iso, _ = _newest_valid_ts([r.get("timestamp") for r in rows], now=now)
+        resume_dt = parse_iso_utc(resume_iso) if resume_iso else None
+        if resume_dt is None:
+            return False
+        grace_s = interval_s + 120  # one expected interval + scheduler-timing slack
+        return 0 <= (now - resume_dt).total_seconds() < grace_s
+    except (aiosqlite.Error, ImportError, AttributeError, TimeoutError):
+        logger.debug("post-resume grace check failed for %s", name, exc_info=True)
+        return False
 
 
 async def compute_heartbeat_staleness(
@@ -369,6 +424,10 @@ async def compute_heartbeat_staleness(
         is_paused = paused if paused is not None else _read_global_paused()
         if is_paused:
             return {"status": "paused", "last_seen": last_ts, "age_seconds": round(age_s, 1)}
+        # Just resumed from a >threshold pause: the pulse hasn't had a cycle to refresh
+        # yet → bounded transient, not a death. Non-alerting "resuming" verdict.
+        if await _post_resume_grace_active(db, name=name, now=_now, interval_s=_interval_s):
+            return {"status": "resuming", "last_seen": last_ts, "age_seconds": round(age_s, 1)}
     return {"status": "overdue", "last_seen": last_ts, "age_seconds": round(age_s, 1)}
 
 
