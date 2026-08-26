@@ -40,9 +40,8 @@ async def _seed_proposal(db, *, ego_source: str | None, pid: str = PROPOSAL_ID):
 class TestRecordDispatchFollowthrough:
     @pytest.mark.asyncio
     async def test_creates_intention_for_owning_ego(self, db):
-        from genesis.ego.dispatch_followthrough import record_dispatch_followthrough
-
         from genesis.db.crud import ego_intentions
+        from genesis.ego.dispatch_followthrough import record_dispatch_followthrough
 
         await _seed_proposal(db, ego_source="user_ego_cycle")
         iid = await record_dispatch_followthrough(
@@ -69,9 +68,8 @@ class TestRecordDispatchFollowthrough:
 
     @pytest.mark.asyncio
     async def test_null_ego_source_falls_back_to_genesis(self, db):
-        from genesis.ego.dispatch_followthrough import record_dispatch_followthrough
-
         from genesis.db.crud import ego_intentions
+        from genesis.ego.dispatch_followthrough import record_dispatch_followthrough
 
         await _seed_proposal(db, ego_source=None)
         iid = await record_dispatch_followthrough(
@@ -88,9 +86,8 @@ class TestRecordDispatchFollowthrough:
 
     @pytest.mark.asyncio
     async def test_failed_dispatch_gets_high_priority(self, db):
-        from genesis.ego.dispatch_followthrough import record_dispatch_followthrough
-
         from genesis.db.crud import ego_intentions
+        from genesis.ego.dispatch_followthrough import record_dispatch_followthrough
 
         await _seed_proposal(db, ego_source="genesis_ego_cycle")
         await record_dispatch_followthrough(
@@ -106,9 +103,8 @@ class TestRecordDispatchFollowthrough:
 
     @pytest.mark.asyncio
     async def test_dedup_second_dispatch_same_proposal(self, db):
-        from genesis.ego.dispatch_followthrough import record_dispatch_followthrough
-
         from genesis.db.crud import ego_intentions
+        from genesis.ego.dispatch_followthrough import record_dispatch_followthrough
 
         await _seed_proposal(db, ego_source="user_ego_cycle")
         first = await record_dispatch_followthrough(
@@ -149,9 +145,8 @@ class TestRecordDispatchFollowthrough:
     @pytest.mark.asyncio
     async def test_created_even_when_llm_cap_full(self, db):
         """The keystone must not silently drop when the ego's board is busy."""
-        from genesis.ego.dispatch_followthrough import record_dispatch_followthrough
-
         from genesis.db.crud import ego_intentions
+        from genesis.ego.dispatch_followthrough import record_dispatch_followthrough
 
         await _seed_proposal(db, ego_source="user_ego_cycle")
         for i in range(ego_intentions.MAX_ACTIVE_PER_SOURCE):
