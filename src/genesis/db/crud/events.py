@@ -155,12 +155,31 @@ async def prune(
     *,
     older_than: str,
     event_type: str | None = None,
+    keep_latest_per_subsystem: bool = False,
 ) -> int:
     """Delete events older than the given ISO timestamp. Returns count deleted.
 
     If *event_type* is provided, only events of that type are pruned.
+
+    *keep_latest_per_subsystem* (heartbeat GC): retain the single most-recent row
+    per subsystem even when it is older than the cutoff, so a liveness consumer
+    that reads "the last pulse" (``compute_heartbeat_staleness``) can still tell a
+    subsystem dead longer than the retention window from one that never pulsed.
+    Without it, a scheduler dead > the window loses its sole pulse and silently
+    reverts to ``no_heartbeat`` (false green). Requires *event_type* (the caller
+    is the per-type heartbeat GC); ignored otherwise.
     """
-    if event_type is not None:
+    if event_type is not None and keep_latest_per_subsystem:
+        # Delete old rows EXCEPT the newest per subsystem (a row is kept when its
+        # timestamp equals the per-subsystem max — strict ``<`` so ties are kept).
+        cursor = await db.execute(
+            "DELETE FROM events WHERE event_type = ? AND timestamp < ? "
+            "AND timestamp < (SELECT MAX(e2.timestamp) FROM events e2 "
+            "WHERE e2.event_type = events.event_type "
+            "AND e2.subsystem = events.subsystem)",
+            (event_type, older_than),
+        )
+    elif event_type is not None:
         cursor = await db.execute(
             "DELETE FROM events WHERE event_type = ? AND timestamp < ?",
             (event_type, older_than),

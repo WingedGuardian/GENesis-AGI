@@ -123,6 +123,60 @@ def test_knobs_reject_garbage_toward_defaults(config_dirs):
     assert cwc.knob_int(cfg, "max_held") == cwc.DEFAULTS["max_held"]
 
 
+def test_max_posts_per_day_knob(config_dirs):
+    """The rate cap reads through knob_int: honored when a valid positive int,
+    else coerced to the safe default — a bad value can NEVER uncap the poster."""
+    base, _ = config_dirs
+    base.write_text("max_posts_per_day: 5\n")
+    assert cwc.knob_int(cwc.load_config(), "max_posts_per_day") == 5
+    for bad in ("max_posts_per_day: 0", "max_posts_per_day: -1", "max_posts_per_day: true"):
+        base.write_text(bad + "\n")
+        assert (
+            cwc.knob_int(cwc.load_config(), "max_posts_per_day")
+            == cwc.DEFAULTS["max_posts_per_day"]
+        )
+
+
+# ── require_approval (fail-CLOSED: only an explicit boolean False disables) ──
+
+
+def test_require_approval_defaults_true(config_dirs):
+    """A fresh clone with no config keeps the human gate ON — never auto-posts."""
+    assert cwc.require_approval() is True
+
+
+def test_require_approval_explicit_false_disables(config_dirs):
+    base, _ = config_dirs
+    base.write_text("require_approval: false\n")
+    assert cwc.require_approval() is False
+
+
+def test_require_approval_fail_closed_on_garbage(config_dirs):
+    """Only an explicit boolean False disables the gate. A typo, a non-bool int,
+    or a stray string all keep human approval ON (fail-closed) — a public-repo
+    post must never go un-gated by a config accident."""
+    base, _ = config_dirs
+    for val in ("require_approval: maybe", "require_approval: 0", "require_approval: 'false'"):
+        base.write_text(val + "\n")
+        assert cwc.require_approval() is True, val
+
+
+def test_require_approval_overlay_disables(config_dirs):
+    """This install's overlay is how autonomous posting is opted into."""
+    base, overlay = config_dirs
+    base.write_text("mode: live\n")  # base keeps the default (approval required)
+    overlay.write_text("require_approval: false\n")
+    assert cwc.require_approval() is False
+
+
+def test_require_approval_read_live_no_cache(config_dirs):
+    base, _ = config_dirs
+    base.write_text("require_approval: false\n")
+    assert cwc.require_approval() is False
+    base.write_text("require_approval: true\n")
+    assert cwc.require_approval() is True  # next call re-reads
+
+
 # ── constants (imported by the MCP tool, drain, and approve-all exclusion) ─
 
 
@@ -155,12 +209,27 @@ def test_domain_registered():
     assert "contributor_worklog" in _DOMAIN_VALIDATORS
 
 
+def test_require_approval_is_hidden_and_not_writable():
+    """SECURITY guard (not cosmetic): `require_approval` must be BOTH stripped from the
+    settings GET (`hidden_fields`, so a whole-config dashboard PUT can't echo it back)
+    AND rejected by the validator (so no unconfirmed settings_update/PUT can disable the
+    approval gate). Disabling it is an overlay-FILE-only act. A refactor that treats
+    hidden_fields as UI-cosmetic — or re-adds the key to the writable set — fails here."""
+    d = _DOMAIN_REGISTRY["contributor_worklog"]
+    assert "require_approval" in d.hidden_fields  # GET-strip
+    assert _validate_contributor_worklog(
+        {"require_approval": False}
+    )  # PUT-reject (non-empty errors)
+    assert _validate_contributor_worklog({"require_approval": True})
+
+
 def test_validator_accepts_valid_changes():
     assert _validate_contributor_worklog({"enabled": False}) == []
     assert _validate_contributor_worklog({"mode": "off"}) == []
     assert _validate_contributor_worklog({"mode": "propose_only"}) == []
     assert _validate_contributor_worklog({"mode": "live"}) == []
     assert _validate_contributor_worklog({"retention_days": 60, "max_held": 5}) == []
+    assert _validate_contributor_worklog({"max_posts_per_day": 3}) == []
 
 
 def test_validator_rejects_bad_values():
@@ -169,6 +238,16 @@ def test_validator_rejects_bad_values():
     assert _validate_contributor_worklog({"retention_days": 0})
     assert _validate_contributor_worklog({"max_held": True})
     assert _validate_contributor_worklog({"bogus": 1})
+    assert _validate_contributor_worklog({"max_posts_per_day": 0})  # positive int only
+    assert _validate_contributor_worklog({"max_posts_per_day": True})
+
+
+def test_validator_rejects_require_approval_overlay_only():
+    """`require_approval` is NOT settings-writable — disabling an approval gate on
+    public posting must be a deliberate overlay-file edit, not an unconfirmed
+    settings_update()/dashboard call. Both values are rejected as an unknown key."""
+    assert _validate_contributor_worklog({"require_approval": False})
+    assert _validate_contributor_worklog({"require_approval": True})
 
 
 def test_base_config_file_matches_defaults():

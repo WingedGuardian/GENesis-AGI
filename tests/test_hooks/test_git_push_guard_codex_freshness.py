@@ -43,7 +43,9 @@ STALE = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 def _hermetic_codex_comments(monkeypatch):
     """Default: NO Codex issue-comments, so the clean-comment freshness fallback in
     ``_check_codex_reviewed_head`` is network-free unless a test opts in. Tests override
-    with their own ``monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", …)`` (later wins)."""
+    with their own ``monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", …)`` (later wins).
+    (The required-CI-workflow seam pin these green rollup fixtures rely on is the
+    shared autouse fixture in tests/test_hooks/conftest.py.)"""
     monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
 
 
@@ -58,8 +60,7 @@ def _scheduled_marker(head=HEAD, *, login="owner", author_association="OWNER"):
     satisfied and these freshness/binding cases exercise their own target
     (author_association=OWNER satisfies the trust check regardless of derived repo owner)."""
     markers = "\n".join(
-        f"<!-- genesis-scheduled-review: head={head} kind={k} -->"
-        for k in ("code-review", "leaks")
+        f"<!-- genesis-scheduled-review: head={head} kind={k} -->" for k in ("code-review", "leaks")
     )
     body = "Scheduled review complete.\n" + markers
     return json.dumps({"login": login, "author_association": author_association, "body": body})
@@ -551,7 +552,8 @@ class TestMainLevelIntegration:
         monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
         monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", "main")
         monkeypatch.setenv(
-            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "t", "conclusion": "SUCCESS"}])
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps([{"name": "t", "workflowName": "CI", "conclusion": "SUCCESS"}]),
         )
         # A valid OWNER scheduled-review marker AT head, so the scheduled-review merge
         # gate is satisfied and these cases keep exercising the freshness/binding wiring
@@ -660,7 +662,8 @@ class TestStaleSigilDoesNotWaiveScanners:
         monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
         monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", "main")
         monkeypatch.setenv(
-            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "t", "conclusion": "SUCCESS"}])
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps([{"name": "t", "workflowName": "CI", "conclusion": "SUCCESS"}]),
         )
         # Scheduled review satisfied at head → the stale-override merge reaches the
         # finding scanner this test is about (not the new scheduled gate).
@@ -688,7 +691,7 @@ class TestStaleSigilDoesNotWaiveScanners:
         )
         rc = _mod.main()
         assert rc == 2  # freshness waived, but the P1 findings gate still blocks
-        assert "unresolved review findings" in capsys.readouterr().err
+        assert "review-body gate did not pass" in capsys.readouterr().err
 
 
 class TestCheckPrRepoArg:
@@ -737,10 +740,10 @@ class TestCheckPrReportFreshnessLabel:
         monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
         monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
         monkeypatch.setattr(
-            _mod, "_check_pr_review_findings", lambda n, repo=None, strict=False: (False, "")
+            _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
         )
         monkeypatch.setattr(
-            _mod, "_check_inline_review_findings", lambda n, repo=None, strict=False: (False, "")
+            _mod, "_check_inline_review_findings", lambda n, repo=None, force=False: (False, "")
         )
         _mod.check_pr_report("5")
         return capsys.readouterr().out
@@ -801,13 +804,15 @@ class TestReportFreshnessUnreadable:
         monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
         monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
         monkeypatch.setattr(
-            _mod, "_check_pr_review_findings", lambda n, repo=None, strict=False: (False, "")
+            _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
         )
         monkeypatch.setattr(
-            _mod, "_check_inline_review_findings", lambda n, repo=None, strict=False: (False, "")
+            _mod, "_check_inline_review_findings", lambda n, repo=None, force=False: (False, "")
         )
         # freshness gate passes (allowed), but the relabel re-reads fail (None)
-        monkeypatch.setattr(_mod, "_check_codex_reviewed_head", lambda n, repo=None: (False, "", HEAD))
+        monkeypatch.setattr(
+            _mod, "_check_codex_reviewed_head", lambda n, repo=None: (False, "", HEAD)
+        )
         monkeypatch.setattr(_mod, "_latest_codex_reviewed_sha", lambda n, repo=None: None)
         monkeypatch.setattr(_mod, "_pr_head_sha", lambda n, repo=None: None)
         _mod.check_pr_report("5")
@@ -821,11 +826,19 @@ class TestCleanCommentParsing:
 
     @pytest.mark.parametrize(
         "flavour",
-        ["Swish!", "You're on a roll.", "Keep them coming!", ":rocket:", "What shall we delve into next?"],
+        [
+            "Swish!",
+            "You're on a roll.",
+            "Keep them coming!",
+            ":rocket:",
+            "What shall we delve into next?",
+        ],
     )
     def test_parses_all_flavour_variants(self, monkeypatch, flavour):
         # Anchor is the STABLE prefix "Didn't find any major issues", not the flavour.
-        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl("0cd13afeb5", flavour=flavour))
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl("0cd13afeb5", flavour=flavour)
+        )
         assert _mod._latest_codex_clean_comment_sha("1") == "0cd13afeb5"
 
     def test_latest_clean_comment_wins(self, monkeypatch):
@@ -840,8 +853,11 @@ class TestCleanCommentParsing:
 
     def test_clean_marker_without_sha_is_none(self, monkeypatch):
         body = json.dumps(
-            {"login": "chatgpt-codex-connector[bot]", "type": "Bot",
-             "body": "Codex Review: Didn't find any major issues. Swish!"}
+            {
+                "login": "chatgpt-codex-connector[bot]",
+                "type": "Bot",
+                "body": "Codex Review: Didn't find any major issues. Swish!",
+            }
         )
         monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", body)
         assert _mod._latest_codex_clean_comment_sha("1") is None  # fail-closed
@@ -849,15 +865,19 @@ class TestCleanCommentParsing:
     def test_sha_without_clean_marker_is_none(self, monkeypatch):
         # A FINDINGS comment carries a Reviewed-commit line but no clean marker.
         body = json.dumps(
-            {"login": "chatgpt-codex-connector[bot]", "type": "Bot",
-             "body": "### Codex Review\n[P1] a real bug\n\n**Reviewed commit:** `0cd13afeb5`"}
+            {
+                "login": "chatgpt-codex-connector[bot]",
+                "type": "Bot",
+                "body": "### Codex Review\n[P1] a real bug\n\n**Reviewed commit:** `0cd13afeb5`",
+            }
         )
         monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", body)
         assert _mod._latest_codex_clean_comment_sha("1") is None
 
     def test_non_codex_author_ignored(self, monkeypatch):
         monkeypatch.setenv(
-            "_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl("0cd13afeb5", login="attacker", user_type="User")
+            "_TEST_GH_CODEX_COMMENTS",
+            _clean_comment_jsonl("0cd13afeb5", login="attacker", user_type="User"),
         )
         assert _mod._latest_codex_clean_comment_sha("1") is None
 
@@ -904,8 +924,13 @@ class TestCleanCommentFreshness:
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
         monkeypatch.setenv(
             "_TEST_GH_CODEX_COMMENTS",
-            json.dumps({"login": "chatgpt-codex-connector[bot]", "type": "Bot",
-                        "body": "Codex Review: Didn't find any major issues. Swish!"}),
+            json.dumps(
+                {
+                    "login": "chatgpt-codex-connector[bot]",
+                    "type": "Bot",
+                    "body": "Codex Review: Didn't find any major issues. Swish!",
+                }
+            ),
         )
         block, _, _ = _mod._check_codex_reviewed_head("1")
         assert block is True  # fail-closed: marker alone never vouches
@@ -915,8 +940,13 @@ class TestCleanCommentFreshness:
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
         monkeypatch.setenv(
             "_TEST_GH_CODEX_COMMENTS",
-            json.dumps({"login": "chatgpt-codex-connector[bot]", "type": "Bot",
-                        "body": f"### Codex Review\n[P1] bug\n\n**Reviewed commit:** `{HEAD[:10]}`"}),
+            json.dumps(
+                {
+                    "login": "chatgpt-codex-connector[bot]",
+                    "type": "Bot",
+                    "body": f"### Codex Review\n[P1] bug\n\n**Reviewed commit:** `{HEAD[:10]}`",
+                }
+            ),
         )
         block, _, _ = _mod._check_codex_reviewed_head("1")
         assert block is True
@@ -947,8 +977,130 @@ class TestCleanCommentFreshness:
         monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
         monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
         monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
-        monkeypatch.setattr(_mod, "_check_pr_review_findings", lambda n, repo=None, strict=False: (False, ""))
-        monkeypatch.setattr(_mod, "_check_inline_review_findings", lambda n, repo=None, strict=False: (False, ""))
+        monkeypatch.setattr(
+            _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
+        )
+        monkeypatch.setattr(
+            _mod, "_check_inline_review_findings", lambda n, repo=None, force=False: (False, "")
+        )
         _mod.check_pr_report("1")
         out = capsys.readouterr().out
         assert "clean comment at head" in out
+
+
+class TestRequiredScheduledReviewKinds:
+    """The config lever: default = both required; leaks is irreducible; local config
+    (or the _TEST_ seam) may relax the OPTIONAL kinds to advisory. Fails CLOSED (to the
+    full default set) on any unreadable/malformed config."""
+
+    def test_default_is_both_when_unconfigured(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))  # no genesis.yaml -> default
+        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+
+    def test_env_seam_relaxes_to_leaks_only(self, monkeypatch):
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "leaks")
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
+
+    def test_leaks_is_irreducible(self, monkeypatch):
+        # config omits leaks -> still forced in (secret scanner never removable)
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "code-review")
+        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+
+    def test_empty_config_is_leaks_only(self, monkeypatch):
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "")
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
+
+    def test_kinds_are_lowercased(self, monkeypatch):
+        # mis-cased config must normalize to the lowercase marker grammar, else it
+        # names a kind no real marker can satisfy and silently wedges the gate.
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "Code-Review,LEAKS")
+        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+
+    def test_env_unknown_kind_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "bogus")
+        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+
+    @staticmethod
+    def _write_cfg(tmp_path, monkeypatch, body):
+        monkeypatch.delenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", raising=False)
+        cfgdir = tmp_path / ".genesis" / "config"
+        cfgdir.mkdir(parents=True)
+        (cfgdir / "genesis.yaml").write_text(body)
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+    def test_config_wrong_type_element_fails_closed(self, monkeypatch, tmp_path):
+        self._write_cfg(tmp_path, monkeypatch, "merge_gate:\n  required_scheduled_reviews: [123]\n")
+        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+
+    def test_config_blank_element_fails_closed(self, monkeypatch, tmp_path):
+        self._write_cfg(tmp_path, monkeypatch, "merge_gate:\n  required_scheduled_reviews: [' ']\n")
+        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+
+    def test_config_unknown_kind_fails_closed(self, monkeypatch, tmp_path):
+        self._write_cfg(tmp_path, monkeypatch, "merge_gate:\n  required_scheduled_reviews: [foo]\n")
+        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+
+    def test_config_empty_list_is_leaks_only(self, monkeypatch, tmp_path):
+        self._write_cfg(tmp_path, monkeypatch, "merge_gate:\n  required_scheduled_reviews: []\n")
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
+
+    def test_duplicate_key_fails_closed(self, monkeypatch, tmp_path):
+        # A badly-merged file with two merge_gate blocks whose last says [leaks] must
+        # NOT silently drop code-review; duplicate keys fail closed to the default.
+        body = (
+            "merge_gate:\n  required_scheduled_reviews: [code-review, leaks]\n"
+            "merge_gate:\n  required_scheduled_reviews: [leaks]\n"
+        )
+        self._write_cfg(tmp_path, monkeypatch, body)
+        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+
+    def test_reads_config_file(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", raising=False)
+        cfgdir = tmp_path / ".genesis" / "config"
+        cfgdir.mkdir(parents=True)
+        (cfgdir / "genesis.yaml").write_text("merge_gate:\n  required_scheduled_reviews: [leaks]\n")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert _mod._required_scheduled_review_kinds() == ("leaks",)
+
+    def test_malformed_config_fails_closed_to_default(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", raising=False)
+        cfgdir = tmp_path / ".genesis" / "config"
+        cfgdir.mkdir(parents=True)
+        (cfgdir / "genesis.yaml").write_text("merge_gate: [unterminated\n")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert _mod._required_scheduled_review_kinds() == ("code-review", "leaks")
+
+
+class TestScheduledGateUsesRequiredKinds:
+    """The gate consumes _required_scheduled_review_kinds(): a relaxed (advisory)
+    code-review no longer blocks, the default still requires it, and leaks blocks even
+    when config tries to omit it."""
+
+    @staticmethod
+    def _marker(*kinds, head=HEAD):
+        body = "scheduled review done.\n" + "\n".join(
+            f"<!-- genesis-scheduled-review: head={head} kind={k} -->" for k in kinds
+        )
+        return json.dumps({"login": "owner", "author_association": "OWNER", "body": body})
+
+    def _setup(self, monkeypatch, present_kinds, required_env):
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", self._marker(*present_kinds))
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", required_env)
+
+    def test_relaxed_leaks_only_passes_without_code_review(self, monkeypatch):
+        self._setup(monkeypatch, ["leaks"], "leaks")
+        assert (
+            _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub") is None
+        )
+
+    def test_default_blocks_when_code_review_missing(self, monkeypatch):
+        self._setup(monkeypatch, ["leaks"], "code-review,leaks")
+        msg = _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
+        assert msg and "code-review" in msg
+
+    def test_leaks_irreducible_blocks_even_if_config_omits_it(self, monkeypatch):
+        self._setup(monkeypatch, ["code-review"], "code-review")  # config omits leaks
+        msg = _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
+        assert msg and "leaks" in msg

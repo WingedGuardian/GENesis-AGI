@@ -18,9 +18,12 @@ logger = logging.getLogger(__name__)
 class ApprovalManager:
     """Gate mechanism for actions that require explicit human approval.
 
-    Key invariant: **no auto-approve path exists.**  Timeout always means
-    reject/expire.  Irreversible actions use ``timeout_seconds=None`` (wait
-    forever) and therefore never auto-expire.
+    Key invariant: **timeout never auto-approves.**  A timed-out request always
+    resolves to reject/expire; irreversible actions use ``timeout_seconds=None``
+    (wait forever) and therefore never auto-expire. (A caller MAY resolve a request
+    ``approved`` explicitly server-side — see :meth:`resolve` — but only a
+    deliberate, fail-closed-gated writer does so; timeout itself is never an
+    approval.)
     """
 
     def __init__(
@@ -97,6 +100,14 @@ class ApprovalManager:
         """Resolve a pending request (approved/rejected/expired/cancelled).
 
         Returns ``False`` if the request was not found or was not pending.
+
+        Human resolutions pass a channel ``resolved_by`` (``telegram:``/
+        ``dashboard``/…). An AUTONOMOUS server-side approval is allowed too, but
+        only behind a deliberate fail-closed gate: ``mcp/health/contributor_issue``
+        calls this with ``resolved_by="genesis:contributor-worklog"`` when the
+        ``contributor_worklog.require_approval`` lever is explicitly ``False``.
+        ``genesis:*`` resolutions classify as ``system`` (never human-earned
+        authority) — see ``db/crud/approval_requests.classify_resolver``.
         """
         now_iso = datetime.now(UTC).isoformat()
 

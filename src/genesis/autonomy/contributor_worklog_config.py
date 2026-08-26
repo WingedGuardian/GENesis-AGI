@@ -24,6 +24,16 @@ drain) — folded into :func:`effective_mode` here rather than a separate
 hook, because both consumers read config directly (repo_pulse's hook could
 not, hence its split lever).
 
+Autonomous posting (opt-in): :func:`require_approval` (default ``True``, fail-
+CLOSED) governs whether a proposed issue needs an explicit human approval before
+the drain may post it. A fresh clone keeps the human gate; only a deliberate
+``require_approval: false`` overlay lets the curator post autonomously (still
+behind ``scan_prose`` + the ``mode`` lever). ``max_posts_per_day`` (knob_int) caps
+the POST rate for a cautious rollout — excess approved holds wait for the next
+window. The emergency STOP is ``mode: off`` / the env kill (freezes the drain,
+including already-approved held rows); ``require_approval`` is a posture flag, not
+the brake.
+
 Dependency rule: stdlib + yaml + genesis.env + genesis._config_overlay only.
 ``approval_gate`` / the MCP tool / the drain import the constants + mode from
 here, never the reverse (one-way).
@@ -73,11 +83,17 @@ DEFAULTS: dict[str, Any] = {
     "mode": "propose_only",  # ship posture: propose + approve, but NEVER auto-post
     "retention_days": 30,  # terminal rows (posted/rejected/expired/dry_run) pruned after this
     "max_held": 25,  # backpressure: the tool refuses new proposals past this many holds
+    "require_approval": True,  # SHIP-SAFE: a fresh clone keeps the human per-item gate; only
+    # THIS install's overlay flips it False to let the curator post autonomously (see
+    # require_approval() — fail-closed: only an explicit boolean False disables the gate).
+    "max_posts_per_day": 2,  # cautious-rollout cap: max autonomous posts per rolling 24h window
+    # (knob_int-coerced, so a mistyped/0/negative value can never UNCAP the poster).
 }
 
 _INT_KNOBS = (
     "retention_days",
     "max_held",
+    "max_posts_per_day",
 )
 
 
@@ -139,6 +155,26 @@ def effective_mode() -> str:
         logger.warning("contributor_worklog has invalid mode %r — degrading to propose_only", mode)
         return "propose_only"
     return mode
+
+
+def require_approval() -> bool:
+    """Whether a proposed issue draft needs an explicit human approval before the
+    poster drain may post it — read live (no cache), like :func:`effective_mode`.
+
+    FAIL-CLOSED (the security-critical direction): only an EXPLICIT boolean
+    ``False`` disables the human gate. A missing key, ``None``, a typo, or any
+    non-``False`` value keeps the gate ON — a public-repo post must never go
+    un-gated by a config accident. So the DEFAULT (``True``) means a fresh clone
+    always requires human approval; only a deliberate ``require_approval: false``
+    in this install's overlay enables autonomous (Genesis-vetted) posting.
+
+    NOTE: this is a POSTURE flag, not the emergency stop. Flipping it back to
+    ``True`` re-gates only NEW proposals — a row already auto-approved and still
+    ``held`` will still post. The true stop is ``mode: off`` / the env kill
+    switch, which freezes the drain (and thus every held row). See
+    :func:`effective_mode`.
+    """
+    return load_config().get("require_approval", True) is not False
 
 
 def knob_int(cfg: dict[str, Any], key: str) -> int:

@@ -24,7 +24,7 @@
 
         configFiles: [],
         // providerActivity moved to operationalVitals
-        errorSummary: { groups: [], active_alerts: [], totals: { events: 0, dead_letters: 0, deferred_failures: 0 } },
+        errorSummary: { groups: [], active_alerts: [], totals: { events: 0, dead_letters: 0, deferred_failures: 0 }, partial: false, sources_failed: [] },
         budgets: [],
         // providerHealthSummary removed — provider data now in health.api_keys
         routingConfig: null,
@@ -356,6 +356,7 @@
 
         // Polling interval IDs
         _healthInterval: null,
+        _backupInterval: null,
         _activityInterval: null,
 
         _sessionsInterval: null,
@@ -681,10 +682,23 @@
             this.fetchEgoStatus();
             this.fetchObservationsSummary();
           }, 15000);
+
+          // Fire-and-forget: drives the page-top backup banner on every tab. Must
+          // NOT gate initial paint — /backup/status shells out to git + systemctl,
+          // and backupBanner() is null-safe until backupStatus resolves (the banner
+          // just appears once it does). The banner reads the server-computed
+          // backup_health only — it does NOT depend on backupConfig, so there is no
+          // status/config fetch race and no need to fetch the config here.
+          this.fetchBackupStatus();
+          // Backup state changes slowly (6h cadence) and the route shells out to
+          // systemctl, so poll on a slow, separate cadence — catches an unattended
+          // scheduled-backup failure without a reload, at negligible cost.
+          this._backupInterval = setInterval(() => this.fetchBackupStatus(), 180000);
         },
 
         cleanup() {
           if (this._healthInterval) clearInterval(this._healthInterval);
+          if (this._backupInterval) clearInterval(this._backupInterval);
           for (const tab of ["overview", "chat", "internals", "config", "work", "observations", "traces", "autonomy"]) {
             this._stopTabIntervals(tab);
           }
@@ -1006,7 +1020,11 @@
               const resp = await fetchApi("/api/genesis/files/upload", { method: "POST", body: form });
               if (resp && resp.ok) {
                 const data = await resp.json();
-                uploaded.push(data.filename);
+                // Only count a real string relpath: keeps uploaded.length honest for
+                // the success message AND guarantees uploaded.every(...) below never
+                // dereferences a non-string (defense-in-depth, matching the uploadRoot
+                // typeof guard on the next line — the backend always returns a string).
+                if (typeof data.filename === "string") uploaded.push(data.filename);
                 lastDir = data.path.substring(0, data.path.lastIndexOf("/"));
                 if (uploadRoot === null && typeof data.filename === "string") {
                   uploadRoot = data.path.slice(0, data.path.length - data.filename.length).replace(/\/$/, "");
@@ -1027,8 +1045,28 @@
             this.fileUpload.success = uploaded.length === 1
               ? `Uploaded ${uploaded[0]} → ${dest}`
               : `Uploaded ${uploaded.length} files → ${dest} (${uploaded.join(", ")})`;
-            // Stay put — refresh the current directory in place (no jump to uploads).
-            if (this.fileBrowser.path) { this.fetchFiles(this.fileBrowser.path); }
+            // Navigate the browser to WHERE the upload landed (was: stay put). For a
+            // folder upload, jump INTO the new top-level folder (uploadRoot/<name>),
+            // not its parent; a single loose file → its own directory; multiple loose
+            // files → the uploads root. Fall back to refreshing the current dir.
+            let navTarget;
+            if (droppedFolder) {
+              // Derive the folder from the SERVER-sanitized relpath (uploaded[] hold
+              // data.filename), NOT the raw client path: the backend rewrites unsafe
+              // chars (e.g. "Q3 (final)" → "Q3 _final_"), so navigating to the raw name
+              // would 404 and silently no-op — the very "can't see where it went" bug.
+              // Enter the top-level folder only when EVERY successful upload shares it
+              // (a single-folder drop). A multi-root drop — several folders, or a folder
+              // plus loose files — has no single destination, so land on the uploads
+              // root rather than hiding the rest of the upload inside one folder.
+              const seg = (uploaded[0] || "").split("/")[0];
+              const allShare = !!seg && uploaded.every((p) => p.includes("/") && p.split("/")[0] === seg);
+              navTarget = allShare ? `${uploadRoot}/${seg}` : uploadRoot;
+            } else {
+              navTarget = uploaded.length === 1 ? lastDir : uploadRoot;
+            }
+            if (navTarget) { this.fetchFiles(navTarget); }
+            else if (this.fileBrowser.path) { this.fetchFiles(this.fileBrowser.path); }
           }
           if (failures.length) {
             this.fileUpload.error = `${failures.length} failed — ${failures.join("; ")}`;
@@ -1933,6 +1971,19 @@
           // start) — the timer won't fire, so "Active" would misreport. Say so.
           if (!active) return { text: 'Scheduled, but the timer is not running', color: '#ffb74d' };
           return { text: 'Active', color: '#81c784' };
+        },
+        // Page-top banner: render the server-computed backup_health verdict. ALL
+        // health logic (precedence, staleness math, tier/backend resolution) lives
+        // server-side in routes/backup.py::_backup_health — the client only maps
+        // state → colour. Returns a styled {text,color,bg,border} for a warn/critical
+        // state, or null when healthy or backupStatus has not loaded yet.
+        backupBanner() {
+          const bh = this.backupStatus && this.backupStatus.backup_health;
+          if (!bh || bh.state === 'ok') return null;
+          const s = bh.state === 'critical'
+            ? { color: '#d9534f', bg: 'rgba(217,83,79,0.15)', border: '#d9534f' }
+            : { color: '#f0ad4e', bg: 'rgba(240,173,78,0.15)', border: '#f0ad4e' };
+          return { ...s, text: bh.reason };
         },
         // "every 6 hours · last 12:10 PM ✓ · next 6:10 PM" — the at-a-glance line.
         backupScheduleLine() {
@@ -3670,6 +3721,13 @@
           if (Array.isArray(queues.errors) && queues.errors.length > 0) {
             return { state: "unknown", reason: "some queue counters could not be collected" };
           }
+          // Queue honesty is DEPTH-based by design; a drain-liveness verdict is
+          // intentionally omitted. A dead drainer only harms once work backs up, and
+          // the depth checks above (dead_letters / deferred_recovery / deferred_stuck
+          // / deferred_processing / pending_embeddings) already catch exactly that.
+          // The only durable "drain job" pulse (deferred_work_prune) is a daily 45-day
+          // GC, not the drainer — keying liveness on it would measure the wrong thing
+          // with a ~4-day threshold, buying a false-red vector for zero coverage gain.
           const worklist = queues.deferred_worklist || 0;
           return { state: "healthy", reason: worklist > 0 ? `queues clear — ${worklist} worklist item(s) in flight` : "queues are clear" };
         },
@@ -3702,7 +3760,24 @@
 
         surplusSemantic() {
           const surplus = this.health.surplus;
-          if (!surplus || surplus.status === "unknown") return { state: "unknown", reason: "surplus scheduler data unavailable" };
+          if (!surplus) return { state: "unknown", reason: "surplus scheduler data unavailable" };
+          // Liveness (from the AUTHORITATIVE pulse) precedes the auxiliary activity
+          // `status`: the independent idle/activity probe can throw (status="unknown")
+          // while the pulse still CONFIRMS a stall — that confirmed stall must surface
+          // as an error, not be masked as merely unknown by an early status guard.
+          // Fail-LOUD (mirror egoSemantic): a liveness read error, or a scheduler that
+          // never recorded a completed cycle (crashed before its first pulse — NOT
+          // owned by the job_never_succeeded alarm), is unknown, never green.
+          if (surplus.liveness_error) return { state: "unknown", reason: "surplus liveness unavailable (read error or no completed cycle on record)" };
+          // Truthful wedged-detector: surplus_dispatch pulses success every ~5 min,
+          // so a stale last_success (past the conservative threshold, and not paused)
+          // means the dispatch loop stopped firing — a genuine fault the idle-proxy
+          // `status` hides (a wedged scheduler reads "idle" → green). Computed
+          // server-side from job_health (observability.liveness).
+          if (surplus.stalled) return { state: "error", reason: `surplus scheduler stalled — ${surplus.stall_reason || "no recent dispatch"}` };
+          // Only now defer to the auxiliary activity probe: liveness was readable and
+          // not stalled, so an unknown activity status is genuinely just unknown.
+          if (surplus.status === "unknown") return { state: "unknown", reason: "surplus scheduler data unavailable" };
           const failed = surplus.tasks_failed_24h || 0;
           const completed = surplus.tasks_completed_24h || 0;
           if (failed > 0 && completed > 0 && failed / (completed + failed) > 0.2) {
@@ -3723,6 +3798,23 @@
           const ge = ego.egos?.genesis_ego;
           const ueCad = ue?.cadence;
           const geCad = ge?.cadence;
+          // Total-cessation (scheduler death): the ego_heartbeat pulse went stale.
+          // The MOST authoritative ego signal — evaluate it BEFORE the auxiliary
+          // per-ego liveness/gated collectors below, so a CONFIRMED dead scheduler
+          // still turns the tile red even when an unrelated collector is degraded
+          // (otherwise a confirmed death gets masked as "unknown"). Fail-LOUD on a
+          // broken read (unknown), then flag a genuinely dead scheduler as error.
+          // Blind spot the per-ego intent-lag `stalled` below cannot see — on total
+          // cessation both ego timestamps freeze together, the lag never opens, and
+          // the tile would otherwise read green (the 3-day-dead-ego-shows-healthy
+          // bug). Scheduler-level: shared across both ego managers (see routes/ego.py).
+          if (ego.ego_heartbeat_error) {
+            return { state: "unknown", reason: "ego heartbeat data unavailable (read error)" };
+          }
+          if (ego.ego_heartbeat_stale) {
+            const hrs = ego.ego_heartbeat_age_s ? Math.round(ego.ego_heartbeat_age_s / 3600) : "?";
+            return { state: "error", reason: `ego scheduler stopped — no heartbeat in ${hrs}h` };
+          }
           // Fail-LOUD, not fail-green: if the liveness/gated read itself errored,
           // `stalled` defaulted to false — surfacing that as healthy would
           // recreate the exact false-green this instrumentation exists to kill.
@@ -4366,6 +4458,10 @@
           }
           if (activeGroups > 0) {
             items.push({ level: "warning", title: `${activeGroups} active error group${activeGroups === 1 ? "" : "s"}`, detail: "grouped warnings/errors across events, dead letters, or deferred work", href: "/genesis/errors" });
+          }
+          if (this.errorSummary.partial) {
+            const failed = (this.errorSummary.sources_failed || []).join(", ");
+            items.push({ level: "warning", title: "Error data incomplete", detail: `some error sources did not load (${failed}); counts may understate reality`, href: "/genesis/errors" });
           }
           if ((this.health.queues?.dead_letters || 0) > 0) {
             items.push({ level: "critical", title: `${this.health.queues.dead_letters} dead letters`, detail: "requests exhausted all fallback providers; open the errors view to inspect", href: "/genesis/errors" });

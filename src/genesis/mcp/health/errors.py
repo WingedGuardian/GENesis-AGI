@@ -939,6 +939,139 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
             # operational fault, not an expected-absent-table case, so ERROR.
             logger.error("Never-succeeded job alert check failed", exc_info=True)
 
+    # ── Stopped-firing subsystems (total-cessation) ──────────────────
+    # Each subsystem below pulses a durable ``heartbeat`` event whose emission is
+    # independent of pause (ego: dedicated ego_heartbeat job; dashboard: dedicated
+    # daemon thread) or is downgraded to "paused" while paused (inbox, whose pulse
+    # stops behind ``if paused: return`` — handled in compute_heartbeat_staleness).
+    # When that pulse goes overdue past its per-subsystem threshold the
+    # scheduler/loop has stopped — a SILENT death the failure-gap alarms above
+    # cannot see (those need a RUNNING-but-failing job; a stopped job never
+    # advances last_run either). Complements job_stale/job_never_succeeded.
+    # SET = ego (CRITICAL — the dead-ego-scheduler failure this batch began with)
+    # + inbox + dashboard (WARNING). EXCLUDED: surplus — PR-B's shipped tile
+    # already flips red on a wedged/dead surplus via its finer job_health signal,
+    # and surplus's event-heartbeat is load-fragile (loop-END emit gaps under a
+    # 15-30min dispatch); outreach — its pulse is config-gated (never fires on a
+    # Telegram-less install; a once-Telegram-then-removed install would fire a
+    # permanent unresolvable alert), so it is a false-alarm trap (follow-up: give
+    # outreach a dedicated pause-independent heartbeat). reflection — its pulse is
+    # the awareness loop, not reflection-engine liveness; awareness — has the more
+    # precise ``awareness:tick_overdue`` above. Coverage cap: the ~90 non-pulse
+    # scheduled jobs get ONLY the failure-gap signals above. The shared
+    # ``compute_heartbeat_staleness`` reads the same signal the ego dashboard tile
+    # does, so alert and tile agree on the OVERDUE verdict. (They diverge by design
+    # on ``no_heartbeat``: the tile applies a boot-grace and flips to error past it,
+    # while the alert path treats no-pulse-ever as empty-state — a once-run subsystem
+    # always retains a pulse via keep_latest GC, so this only differs on a truly
+    # fresh, never-bootstrapped install.)
+    _stale_read_failed: list[str] = []
+    try:
+        from genesis.mcp.health.manifest import (
+            _subsystem_enabled,
+            compute_heartbeat_staleness,
+        )
+
+        _stale_db = _service._db if _service else None
+        for _hb_name in ("ego", "inbox", "dashboard"):
+            try:
+                # raise_on_error=True → a read failure fails LOUD (handled below by
+                # preserving any open alert), never a silent green that lets
+                # reconcile auto-resolve a genuinely-open subsystem_stale alert.
+                _hb = await compute_heartbeat_staleness(_hb_name, db=_stale_db, raise_on_error=True)
+            except Exception:
+                logger.error(
+                    "Pulse-staleness read failed for subsystem %s", _hb_name, exc_info=True
+                )
+                _stale_read_failed.append(_hb_name)
+                continue
+            _status = _hb.get("status")
+            if _status == "unknown":
+                # Unreadable pulse (corrupt / materially-future timestamp) → liveness
+                # cannot be confirmed. Surface LOUDLY as a WARNING (honest: "can't
+                # tell", NOT "died" — distinct id from subsystem_stale) instead of a
+                # silent skip; auto-resolves when a fresh parseable pulse lands.
+                logger.error(
+                    "Subsystem %s heartbeat unreadable (unknown) — liveness unconfirmable",
+                    _hb_name,
+                )
+                _unk_last = str(_hb.get("last_seen") or "")[:40]
+                alert_id = f"subsystem_heartbeat_unknown:{_hb_name}"
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "WARNING",
+                        "message": (
+                            f"Subsystem '{_hb_name}' heartbeat is unreadable (corrupt "
+                            f"or clock-skewed timestamp '{_unk_last}') — liveness "
+                            f"cannot be confirmed"
+                        ),
+                    }
+                )
+                current_ids.add(alert_id)
+                continue
+            if _status != "overdue":
+                # alive / paused / resuming / no_heartbeat (empty-state) → no alert
+                continue
+            if not _subsystem_enabled(_hb_name):
+                # Intentionally DISABLED after having pulsed → its retained stale pulse
+                # is deliberate, not a death; suppress the (else permanent) alert.
+                continue
+            _age = int(_hb.get("age_seconds") or 0)
+            _last_seen = str(_hb.get("last_seen") or "")[:19]
+            alert_id = f"subsystem_stale:{_hb_name}"
+            alerts.append(
+                {
+                    "id": alert_id,
+                    "severity": "CRITICAL" if _hb_name == "ego" else "WARNING",
+                    "message": (
+                        f"Subsystem '{_hb_name}' heartbeat overdue — no pulse in "
+                        f"{_age}s (last seen {_last_seen}); its scheduler/loop may "
+                        f"have died"
+                    ),
+                }
+            )
+            current_ids.add(alert_id)
+
+        # Fail-open guard (P2-4): a subsystem whose staleness read FAILED this tick
+        # is in an unknown state — we must NOT let the reconcile writer auto-resolve
+        # a genuinely-open subsystem_stale alert for it on a transient read blip.
+        # The reconcile writer (awareness/loop.py:158-168) builds its active-set
+        # from this ``alerts`` LIST (it does not consult current_ids), so RE-EMIT
+        # the already-open alert (reconstructed from its open row) — keeping it both
+        # open and displayed — for only the SPECIFIC failed subsystems (ones that
+        # read fine resolve/alert normally).
+        if _stale_read_failed and _service and _service._db:
+            try:
+                from genesis.db.crud import alert_events as _ae
+
+                _open_rows = {r.get("alert_id", ""): r for r in await _ae.list_open(_service._db)}
+                # Preserve BOTH alert families this block can emit for the subsystem
+                # (subsystem_stale: overdue, subsystem_heartbeat_unknown: unreadable) —
+                # otherwise the omitted family flaps (auto-resolved by the reconciler
+                # on the failed tick, re-opened on the next successful one).
+                for _n in _stale_read_failed:
+                    for _aid in (f"subsystem_stale:{_n}", f"subsystem_heartbeat_unknown:{_n}"):
+                        _row = _open_rows.get(_aid)
+                        if _row is not None:
+                            alerts.append(
+                                {
+                                    "id": _aid,
+                                    "severity": _row.get("severity", "WARNING"),
+                                    "message": _row.get("message", ""),
+                                }
+                            )
+                            current_ids.add(_aid)  # lockstep, for alert-history dedup
+            except Exception:
+                logger.error(
+                    "Preserving open subsystem-heartbeat alerts on read failure failed",
+                    exc_info=True,
+                )
+    except Exception:
+        # Own try/except so a pulse-staleness read failure can't blind the other
+        # alert blocks; ERROR-logged (never a silent green).
+        logger.error("Subsystem pulse-staleness alert check failed", exc_info=True)
+
     # ── Genesis update available ─────────────────────────────────────
     if _service and _service._db:
         try:

@@ -920,6 +920,11 @@ class MorningReportGenerator:
         section entirely. This is not a standing checklist.
         """
         lines: list[str] = []
+        # Subsystems already surfaced via a ``subsystem_stale:<name>`` alert in the
+        # health-alerts block below — the heartbeat-staleness block must not list
+        # them a SECOND time (P2-6 dedup). Populated from the alerts actually
+        # emitted, so it stays correct if the alert set changes.
+        stale_alert_names: set[str] = set()
 
         # Health alerts (call sites down, queue depth, resilience warnings)
         try:
@@ -941,15 +946,22 @@ class MorningReportGenerator:
                         f"- **{severity}**: {a.get('message', 'Unknown')} "
                         f"(id: {alert_id})"
                     )
+                    if alert_id.startswith("subsystem_stale:"):
+                        stale_alert_names.add(alert_id.split(":", 1)[1])
         except Exception:
             logger.warning("Failed to query health alerts for morning report", exc_info=True)
 
-        # Subsystem heartbeat staleness (detects silent deaths)
+        # Subsystem heartbeat staleness (detects silent deaths). Covers subsystems
+        # NOT already alerted above (e.g. surplus/outreach have a heartbeat but no
+        # subsystem_stale alert) — the alerted ones are skipped to avoid a duplicate
+        # line. A "paused" verdict is legitimately quiet (not overdue) → skipped.
         try:
             from genesis.mcp.health.manifest import _impl_subsystem_heartbeats
 
             heartbeats = await _impl_subsystem_heartbeats()
             for name, info in heartbeats.items():
+                if name in stale_alert_names:
+                    continue  # already surfaced via its subsystem_stale alert above
                 if info.get("status") == "overdue":
                     age = info.get("age_seconds", 0)
                     age_h = age / 3600 if age else 0
