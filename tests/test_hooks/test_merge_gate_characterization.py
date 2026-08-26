@@ -77,6 +77,9 @@ def _pin_canonical_public_repo(monkeypatch):
     in test_git_push_guard_codex_freshness.py."""
     monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", REPO)
     monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "code-review,leaks")
+    # (The required-CI-workflow identity pin — _TEST_REQUIRED_CI_WORKFLOWS=CI,
+    # matching the _ci() fixture's workflowName — is the shared autouse fixture in
+    # tests/test_hooks/conftest.py.)
     yield
 
 
@@ -124,8 +127,12 @@ def _scheduled_marker(
 
 
 def _ci(conclusion: str = "SUCCESS") -> str:
-    """_TEST_GH_CI_ROLLUP shape — a JSON array of check-runs."""
-    return json.dumps([{"name": "test", "conclusion": conclusion, "status": "COMPLETED"}])
+    """_TEST_GH_CI_ROLLUP shape — a JSON array of check-runs. Carries the canonical
+    ``workflowName`` ("CI", matching the pinned required-identity policy) so the
+    default green rollup satisfies the required-workflow check like a real CI run."""
+    return json.dumps(
+        [{"name": "test", "workflowName": "CI", "conclusion": conclusion, "status": "COMPLETED"}]
+    )
 
 
 _INLINE_P1_LINE = json.dumps(
@@ -532,6 +539,71 @@ _CASES: list[tuple[str, object, int, str]] = [
         lambda mp: (
             mp.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/some-other-public-repo"),
             _run(mp, _merge_cmd(), ci="[]"),
+        )[1],
+        0,
+        "",
+    ),
+    # ── CI "incomplete" (partial rollup) — the #1484-P2 residual, now enforced: the
+    # checks that ARE present are green, but a REQUIRED workflow (default "CI", from
+    # merge_gate.required_ci_workflows) never contributed a verdict — e.g. a lone green
+    # CodeQL after a workflow-specific trigger drop. Canonical-scoped like "absent",
+    # waivable by the same conscious `# ci-override`. ──
+    (
+        "ci_incomplete_missing_required_workflow_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            ci=json.dumps(
+                [
+                    {
+                        "name": "Analyze (python)",
+                        "workflowName": "CodeQL",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                    }
+                ]
+            ),
+        ),
+        2,
+        "required CI workflow",
+    ),
+    (
+        "ci_incomplete_with_ci_override_continues",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(trailer="# ci-override"),
+            ci=json.dumps(
+                [
+                    {
+                        "name": "Analyze (python)",
+                        "workflowName": "CodeQL",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                    }
+                ]
+            ),
+        ),
+        0,
+        "consciously accepted",
+    ),
+    (
+        "ci_incomplete_off_canonical_fails_open_allows",
+        lambda mp: (
+            mp.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/some-other-public-repo"),
+            _run(
+                mp,
+                _merge_cmd(),
+                ci=json.dumps(
+                    [
+                        {
+                            "name": "Analyze (python)",
+                            "workflowName": "CodeQL",
+                            "conclusion": "SUCCESS",
+                            "status": "COMPLETED",
+                        }
+                    ]
+                ),
+            ),
         )[1],
         0,
         "",
@@ -1059,6 +1131,34 @@ def test_check_pr_report_ci_absent_off_canonical_does_not_fail(monkeypatch, caps
     rc = _mod.check_pr_report("100", repo=REPO)
     out = capsys.readouterr().out
     assert "no ci checks" not in out.lower()
+    assert rc == 0
+
+
+def test_check_pr_report_ci_incomplete_fails_verdict_on_canonical(monkeypatch, capsys):
+    """A partial rollup missing a required workflow ("incomplete") on the canonical repo
+    is a FAILURE line and flips the report's verdict — the report must not say green
+    while the enforcement arm would block (report/gate never disagree)."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("incomplete", ["CI"]))
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", REPO)
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    ci_line = next(ln for ln in out.splitlines() if ln.startswith("ci "))
+    assert "incomplete" in ci_line
+    assert "CI" in ci_line  # the missing workflow is named via problem_checks
+    assert "required ci workflow" in out.lower()  # the BLOCK hint line
+    assert rc == 1
+
+
+def test_check_pr_report_ci_incomplete_off_canonical_does_not_fail(monkeypatch, capsys):
+    """Off the canonical repo, "incomplete" stays fail-OPEN — another repo's CI may
+    legitimately be named differently (or not exist), so the report must not count it."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("incomplete", ["CI"]))
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/some-other-public-repo")
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    assert "required ci workflow" not in out.lower()
     assert rc == 0
 
 

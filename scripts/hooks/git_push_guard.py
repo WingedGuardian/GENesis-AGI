@@ -40,8 +40,12 @@ waiver cannot silently disarm an unrelated gate: ``# review-override`` waives th
 FINDING scans (review-body + inline P1s), ``# stale-review-override`` waives the
 review-CONTEXT gates (Codex-at-head freshness + base-is-default),
 ``# scheduled-review-override`` waives the SCHEDULED-Claude-review-at-head gate, and
-``# ci-override`` waives the CI gate. A session that genuinely needs several
-appends several (one trailing comment may carry multiple sigils).
+``# ci-override`` waives the CI gate — red/pending everywhere, plus (canonical repo
+only) "absent" (empty rollup: CI never ran) and "incomplete" (partial rollup: a
+REQUIRED workflow — ``merge_gate.required_ci_workflows`` in genesis.yaml, default
+``CI`` — contributed no verdict; see ``_required_ci_workflows``). A session that
+genuinely needs several appends several (one trailing comment may carry multiple
+sigils).
 
 Scheduled Claude review markers
 -------------------------------
@@ -704,6 +708,15 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
                         caller lets it pass. This is the state that catches a
                         conflicting branch / dropped ``pull_request`` trigger, which
                         would otherwise merge un-CI'd.
+      * ``"incomplete"`` — the rollup is NON-empty and nothing is red/pending, but a
+                        REQUIRED workflow (rollup ``workflowName``; config-driven via
+                        ``merge_gate.required_ci_workflows``, default ``CI`` — see
+                        _required_ci_workflows) never contributed a verdict. Closes the
+                        #1484-P2 partial-rollup residual: e.g. a lone green CodeQL with
+                        the CI suite absent (a workflow-specific trigger drop) must not
+                        read green. ``problem_checks`` carries the MISSING workflow
+                        names. Enforced like ``"absent"``: canonical repo only,
+                        waivable by ``# ci-override``.
       * ``"unknown"`` — could NOT determine: an API error, empty/no output, an
                         unparseable payload, or a non-empty payload with no CI-shaped
                         entries. Callers FAIL OPEN, because blocking a merge on our own
@@ -779,6 +792,12 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
     red: list[str] = []
     pending: list[str] = []
     saw_recognized = False
+    # Workflows that contributed a VERDICT on this head (casefolded ``workflowName``),
+    # for the required-identity check below. SKIPPED/NEUTRAL entries deliberately do
+    # NOT contribute — a fully-skipped required suite tested nothing. Legacy
+    # StatusContexts (no workflowName) contribute "" and can never satisfy a named
+    # required workflow (fail-closed on the Actions-only canonical repo).
+    workflows_ran: set[str] = set()
     for c in checks:
         if not isinstance(c, dict):
             continue
@@ -786,6 +805,7 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         conclusion = c.get("conclusion")  # CheckRun
         status = c.get("status")  # CheckRun: QUEUED/IN_PROGRESS/COMPLETED/PENDING/…
         state = c.get("state")  # StatusContext: SUCCESS/FAILURE/PENDING/ERROR
+        wf_key = (c.get("workflowName") or "").strip().casefold()
         if conclusion in _CI_SKIP_CONCLUSIONS:
             saw_recognized = True
             continue
@@ -803,12 +823,28 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
                 # NO same-identity success at-or-after it (e.g. SUCCESS-then-cancel
                 # on an unchanged head) falls through and stays red.
                 saw_recognized = True
+                # A superseded duplicate implies a same-identity SUCCESS exists on
+                # this head, so the workflow demonstrably ran.
+                workflows_ran.add(wf_key)
                 continue
         if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
             saw_recognized = True
             red.append(name)
         elif conclusion in _CI_GREEN or state in _CI_GREEN:
+            # The ONLY branch (besides the superseded-cancel drop above, which implies
+            # a green sibling) that feeds workflows_ran: the required-identity check
+            # runs only when nothing is red/pending (those return first, and already
+            # block), so only PASSING verdicts can vouch that a required workflow ran.
+            # A COMPLETED run with a null conclusion (the benign ignore below) carries
+            # no verdict and deliberately does NOT vouch — fail-closed. Vouching is
+            # additionally gated on a CheckRun-shaped pass (``conclusion``): a
+            # StatusContext-shaped green (``state``) can't carry a real Actions
+            # workflowName, so an entry gluing state=SUCCESS to a workflowName key
+            # must not satisfy the required identity by construction (not merely by
+            # gh's current output shape).
             saw_recognized = True
+            if conclusion in _CI_GREEN:
+                workflows_ran.add(wf_key)
         elif status in _CI_TERMINAL_STATUSES:
             saw_recognized = True
             if conclusion is not None:
@@ -835,15 +871,19 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         return "pending", sorted(set(pending))
     if not saw_recognized:
         return "unknown", []  # payload had no CI-shaped entries
-    # KNOWN RESIDUAL (deferred, Codex #1484 P2): "green" here means every check that
-    # IS present concluded success — it does NOT assert the REQUIRED CI workflow ran.
-    # A partial rollup (e.g. only a green CodeQL, the CI suite absent) reads green.
-    # The "absent" branch above only catches a FULLY-empty rollup (the conflicting-
-    # branch symptom, where CI+CodeQL are both pull_request-gated and neither builds).
-    # Closing the partial case robustly needs a config-driven "required CI check
-    # identity" (a required-CI analogue of _required_scheduled_review_kinds) so it
-    # does NOT false-block an install whose CI is legitimately path-filtered/skipped
-    # for a docs-only PR. Tracked as a follow-up; not bundled here.
+    # Required-workflow identity (closes the #1484-P2 partial-rollup residual): every
+    # present check passed, but "green" must ALSO assert that each REQUIRED workflow
+    # (default "CI"; config lever merge_gate.required_ci_workflows for an install whose
+    # suite is named differently) actually contributed a passing verdict. Otherwise a
+    # workflow-specific trigger drop — e.g. a lone green CodeQL, the CI suite absent —
+    # reads green and merges an untested PR. (The "absent" branch above only catches a
+    # FULLY-empty rollup.) Canonical-scoping and the # ci-override valve are applied by
+    # the CALLERS, exactly as for "absent", so a non-canonical repo is never blocked
+    # by this identity policy.
+    required = _required_ci_workflows()
+    missing = sorted(w for w in required if w.strip().casefold() not in workflows_ran)
+    if missing:
+        return "incomplete", missing
     return "green", []
 
 
@@ -1994,6 +2034,106 @@ def _required_scheduled_review_kinds() -> tuple[str, ...]:
     # leaks (and any irreducible kind) is always required, even if config omits it.
     merged = list(dict.fromkeys([*kinds, *_IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS]))
     return tuple(merged)
+
+
+# The GitHub Actions workflow name(s) whose PRESENCE in a PR's check rollup the CI
+# gate requires before trusting "green" (the required-CI analogue of the scheduled-
+# review kinds above). Default = the canonical repo's ci.yml `name: CI`. Unlike the
+# scheduled kinds there is NO irreducible floor and NO known-set whitelist: the
+# identity is install-specific free text (a fork's suite may be named anything), so
+# config must be able to REPLACE the set — but never to EMPTY it (see the validator).
+_DEFAULT_REQUIRED_CI_WORKFLOWS = ("CI",)
+
+
+def _validate_configured_workflows(items: object) -> list[str] | None:
+    """Validate a configured required-CI-workflow list. Returns the cleaned list
+    (stripped, deduped, case PRESERVED for display; matching is case-insensitive), or
+    None if ANYTHING is off — not a list, an EMPTY list, a non-string element, or a
+    blank element. None makes the caller fail CLOSED to the default. An empty list is
+    deliberately invalid: it would DISABLE the identity check entirely, and the
+    per-merge escape for a consciously CI-less merge is ``# ci-override``, not config
+    (non-canonical repos are already exempt via _scheduled_gate_applies)."""
+    if not isinstance(items, list) or not items:
+        return None
+    out: list[str] = []
+    for w in items:
+        if not isinstance(w, str):
+            return None  # wrong type (e.g. [123]) -> invalid -> default
+        ww = w.strip()
+        if not ww:
+            return None  # blank ([" "]) -> invalid -> default
+        out.append(ww)
+    return list(dict.fromkeys(out))
+
+
+def _required_ci_workflows() -> tuple[str, ...]:
+    """The GitHub Actions workflow names (rollup ``workflowName``) the CI gate REQUIRES
+    to have contributed a passing verdict before ``_pr_ci_status`` returns "green".
+
+    Default: ``("CI",)`` — the canonical repo's ci.yml workflow, which has NO paths
+    filters and therefore always runs on a PR to main. An install whose required suite
+    is named differently configures it locally (keeping install policy out of the
+    public default):
+
+        # ~/.genesis/config/genesis.yaml
+        merge_gate:
+          required_ci_workflows: [My Suite]
+
+    Fail-CLOSED toward the default: a missing key / unreadable file / parse error /
+    duplicate key / wrong type / EMPTY list / blank element ALL fall back to the full
+    default — there is no config value that disables the check. Because free-text
+    config can also EXPAND the required set (unlike the whitelist-relaxed scheduled
+    kinds, whose default is maximal), a fallback here can silently NARROW a stricter
+    declared policy — so when the key is visibly present but its value was discarded,
+    a NOTE is printed naming the substitution (the fallback itself is unchanged).
+    Test seam: ``_TEST_REQUIRED_CI_WORKFLOWS`` (comma-separated) overrides the config
+    file; a blank seam parses to an empty (=invalid) list and also yields the
+    default."""
+    raw = os.environ.get("_TEST_REQUIRED_CI_WORKFLOWS")
+    configured: list[str] | None = None
+    key_seen_in_file = False
+    if raw is not None:
+        configured = _validate_configured_workflows(
+            [w.strip() for w in raw.split(",") if w.strip()]
+        )
+    else:
+        try:
+            import yaml  # lazy: keep the hook import-light; the genesis venv has pyyaml
+
+            path = os.path.expanduser("~/.genesis/config/genesis.yaml")
+            with open(path) as fh:
+                text = fh.read()
+            # A textual sighting of the KEY LINE (not a comment/prose mention): if the
+            # value is then discarded (dup key, parse error, invalid shape), the
+            # operator DECLARED a policy we are about to substitute — that must not be
+            # silent. A key-absent file (the normal install) stays silent. Checked
+            # BEFORE the parse so a yaml error can't skip it.
+            key_seen_in_file = bool(re.search(r"(?m)^\s*required_ci_workflows\s*:", text))
+            # Same duplicate-key hazard as the scheduled kinds: yaml.safe_load keeps
+            # the LAST value silently, so a badly-merged file could swap the required
+            # identity. Line-scan the realistic cases and fail closed.
+            if (
+                len(re.findall(r"(?m)^merge_gate\s*:", text)) > 1
+                or len(re.findall(r"(?m)^\s*required_ci_workflows\s*:", text)) > 1
+            ):
+                raise ValueError("duplicate merge_gate/required_ci_workflows key")
+            cfg = yaml.safe_load(text) or {}
+            value = (cfg.get("merge_gate") or {}).get("required_ci_workflows")
+            configured = _validate_configured_workflows(value)
+        except Exception:
+            configured = None  # fail-closed: fall back to the default set below
+    if configured is None:
+        if key_seen_in_file:
+            print(
+                "NOTE: merge_gate.required_ci_workflows in ~/.genesis/config/"
+                "genesis.yaml is present but unreadable/invalid (duplicate key, "
+                "wrong type, empty list, or blank element) — enforcing the DEFAULT "
+                f"required set {_DEFAULT_REQUIRED_CI_WORKFLOWS} instead of your "
+                "configured value. Fix the config to restore your declared policy.",
+                file=sys.stderr,
+            )
+        return _DEFAULT_REQUIRED_CI_WORKFLOWS
+    return tuple(configured)
 
 
 def _canonical_public_repo() -> str | None:
@@ -3604,6 +3744,32 @@ def main() -> int:
                         "(consciously accepted).",
                         file=sys.stderr,
                     )
+                # "incomplete" = a NON-empty rollup whose present checks are green, but
+                # a REQUIRED workflow (default "CI") contributed no verdict — e.g. a
+                # lone green CodeQL after a workflow-specific trigger drop (#1484-P2).
+                # Same scoping + valve as "absent": canonical repo only, # ci-override.
+                elif ci_state == "incomplete" and _scheduled_gate_applies(merge_repo):
+                    if not ci_override:
+                        print(
+                            f"BLOCKED: required CI workflow(s) missing from PR "
+                            f"#{pr_num}'s check rollup: {', '.join(ci_bad[:6])}. The "
+                            "checks that ARE present are green, but the required "
+                            "workflow never ran — most often a workflow-specific "
+                            "trigger drop (push a commit or re-run the workflow to "
+                            "re-fire) or a fully-skipped suite. The required set comes "
+                            "from merge_gate.required_ci_workflows in "
+                            "~/.genesis/config/genesis.yaml (default: CI). If you are "
+                            "intentionally merging without it, append a trailing "
+                            "'# ci-override' (logged).",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    print(
+                        f"NOTE: required CI workflow(s) missing on #{pr_num} "
+                        f"({', '.join(ci_bad[:6])}) — merging via # ci-override "
+                        "(consciously accepted).",
+                        file=sys.stderr,
+                    )
 
                 force_override = merge_seg.override
                 # The review-CONTEXT waiver (freshness + base gates) is a SEPARATE
@@ -3889,6 +4055,14 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         # empty check set on the canonical repo blocks (CI never ran — likely a
         # conflicting branch or a dropped pull_request trigger).
         print("  ↳ BLOCK — no CI checks have run (empty check set); pull_request CI never fired.")
+        failures += 1
+    elif ci_state == "incomplete" and _scheduled_gate_applies(repo):
+        # Mirror the enforcement arm: a partial rollup missing a required workflow
+        # (merge_gate.required_ci_workflows, default CI) blocks on the canonical repo.
+        print(
+            "  ↳ BLOCK — required CI workflow(s) missing from the check rollup "
+            f"({', '.join(ci_bad[:6])}); the required suite never ran."
+        )
         failures += 1
     # Order mirrors the gate: base-invariant → freshness → finding scans, so a
     # review published mid-run can't pass freshness with its P1s unscanned.

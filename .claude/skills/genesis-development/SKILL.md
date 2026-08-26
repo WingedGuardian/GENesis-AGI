@@ -842,9 +842,16 @@ findings below, a gated `gh pr merge`:
 - **the CI gate** blocks red/pending checks; and — on the canonical public repo,
   where CI always runs — an `absent` CI state (a readable EMPTY check set = CI
   never ran, the tell of a conflicting branch or a dropped `pull_request` trigger)
-  also blocks, so an un-CI'd PR can't merge. An UNREADABLE CI read (`unknown`)
-  fails OPEN, and off the canonical repo `absent` fails open too (a repo may
-  legitimately have no CI). Waive with `# ci-override` (never `--admin`).
+  also blocks, so an un-CI'd PR can't merge. Likewise `incomplete` (a NON-empty
+  rollup whose present checks are green but a REQUIRED workflow contributed no
+  verdict — e.g. a lone green CodeQL after a workflow-specific trigger drop, or a
+  fully-SKIPPED suite): the required identity is the rollup `workflowName`, config
+  driven via `merge_gate.required_ci_workflows: [<names>]` in local `genesis.yaml`
+  (default `CI`; fail-closed to the default on any malformed/empty config — there
+  is no disable value). An UNREADABLE CI read (`unknown`) fails OPEN, and off the
+  canonical repo `absent`/`incomplete` fail open too (another repo may
+  legitimately have no CI, or a differently-named suite). Waive with
+  `# ci-override` (never `--admin`).
 - **Override sigils are split by boundary** so one waiver can't silently disarm
   an unrelated gate: `# review-override` waives ONLY the finding scans
   (review-body + inline P1s); `# stale-review-override` waives ONLY the
@@ -882,15 +889,28 @@ The review-findings gate specifically:
    A **404 from that endpoint means WRONG SLUG or PR number, never "no
    findings"** — a clean PR returns `[]`. The merge-gate hook only blocks
    ERROR/[P1]/HARD BLOCK, so unread P2s pass silently (2026-07-10: 8 real
-   P2s on the entity-layer PRs were merged past this exact way).
+   P2s on the entity-layer PRs were merged past this exact way). And the two
+   channels are INDEPENDENT: Codex can post a quota/usage-limit message as an
+   ISSUE comment while a later `@codex review` trigger delivers real inline
+   findings anyway — a quota message is evidence about that channel at that
+   moment, never proof Codex "can't review". After time passes, re-trigger and
+   check the INLINE endpoint before concluding quota-limited (2026-08-26: #1484's
+   real P2 arrived inline while the issue-comment channel still showed only the
+   earlier quota message).
 8. **A CONFLICTING PR silently suppresses the whole CI suite.** When a PR
    has a merge conflict with main, GitHub cannot build the merge ref, so
    `pull_request`-triggered workflows (the entire ci.yml suite) never run —
    while CodeQL still passes on the head SHA, making the check list LOOK
    green. A thin check list (only Analyze/CodeQL) means CHECK
-   `gh pr view N --json mergeable` — `CONFLICTING` needs a rebase before any
-   CI verdict exists at all (2026-07-16: #1089 sat conflict-suppressed
-   through three pushes; main had moved under it via concurrent sessions).
+   `gh pr view N --json mergeable` — `CONFLICTING` needs the base branch merged
+   in before any CI verdict exists at all (2026-07-16: #1089 sat
+   conflict-suppressed through three pushes; main had moved under it via
+   concurrent sessions). Since #1484 the merge gate ENFORCES this class
+   mechanically on the canonical repo: a fully-empty rollup reads `ci: absent`
+   and blocks, and a thin/partial rollup missing the required CI workflow reads
+   `ci: incomplete` and blocks (see the CI-gate bullet above) — the trap text
+   stays because the DIAGNOSIS (check `mergeable` first) is still the fastest
+   route to the cause.
 
 ## Reference Router
 
