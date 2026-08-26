@@ -11,6 +11,28 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Session-start surface for age-stale open PRs.** The repo-pulse worker now
+  also caches the open-PR set each boundary, and a SessionStart hook lists the
+  ones idle past a threshold (default 7 days) as one passive inline line —
+  `[Open PRs] 3 open PRs idle ≥7d — #1379 (12d) · #1223 (12d, dependabot) …`.
+  Visibility only: no CI/review state, never "ready to merge", no Telegram, no
+  follow-up rows, no auto-merge. Age-based by design (no `reviewDecision`/status
+  reducer — those carry no signal for owner PRs that sit at `REVIEW_REQUIRED`
+  forever). Levers under the `repo_pulse` settings domain (`open_pr_enabled`,
+  `open_pr_stale_days`, `max_open_prs`, `open_pr_resurface_days`,
+  `open_pr_max_surface`); `GENESIS_REPO_PULSE_DISABLED` / `enabled: false` stop it.
+  Robustness (review round): the fetch now sorts `sort:updated-asc` so a capped
+  window (>`max_open_prs` open PRs) keeps the STALEST end — the lane's target —
+  instead of gh's newest-first default that would drop aged PRs indefinitely; the
+  cache/seen sidecars anchor on `genesis_home()` (honors `GENESIS_HOME`) so a
+  relocated install keeps writer + reader in sync; and the hook's
+  `GENESIS_REPO_PULSE_DISABLED` gate matches the exact `1` the worker honors (a
+  looser truthy set would half-disable the subsystem). `mode: off` / `enabled:
+  false` are full-worker stops (all lanes); `open_pr_enabled` is the lane-only knob.
+  The surface's freshness TTL now derives from `min_interval_minutes` (2×, 1-day
+  floor) so a large debounce (≥1 day) can't expire the cache before the worker is
+  allowed to refresh it and silently suppress the surface for the whole window.
+
 - **The Contributor Work-Log can post curated newcomer issues autonomously
   (opt-in).** A new `require_approval: false` lever lets the curator's
   privacy-vetted issues post without a per-item approval prompt — Genesis is the
@@ -21,6 +43,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   halts posting — re-checked immediately before each create — and freezes the queue.
   Ships SAFE — `require_approval` defaults true, and it is overlay-file-only (not a
   one-call settings/dashboard toggle), so a fresh install always requires human approval.
+
 - **A per-prompt nudge when a session's memory MCP is running stale code.** Each
   Claude Code session's MCP subprocesses snapshot their code at spawn and never
   reload, so a deploy landing mid-session leaves recall — and its current security
