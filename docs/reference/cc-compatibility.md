@@ -85,6 +85,12 @@ silently chase-latest.
 
 ### Continuous pre-eval — fill the funnel before the bump
 
+> **Status: NOT YET MERGED.** This job lands with the `feat/cc-version-preeval` branch; it is absent
+> from `main`, so no install runs it today. Until it merges, treat every "the verdict may already be
+> cached" line below as describing the target state — the MANDATORY full-changelog-read gate
+> (§CC Update Evaluation Checklist step 0) is what actually covers a bump, and it never depended on
+> this cache.
+
 A gated daily cron (`SurplusScheduler`, `src/genesis/recon/cc_version_preeval.py`) lists CC versions
 published since a cursor and pre-computes each one's impact analysis, storing it as a
 `cc_update_perversion` observation (distinct from live `type="finding"` recon findings, and kept out
@@ -242,7 +248,38 @@ hook payload shape must re-run that test** (checklist item below).
 
 When a new CC version is released, run through this:
 
-1. **Changelog review:** What changed? New features, breaking changes, deprecations?
+0. **FULL CHANGELOG READ — MANDATORY GATE, NO EXCEPTIONS.** Read EVERY release entry
+   in `(pinned, target]` **in full** before any triage. No pin bump proceeds without it.
+   - **Fetch it fresh — nothing in Genesis maintains a changelog cache:**
+     `curl -fsSL https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md -o ~/tmp/cc_changelog.md`
+     (that path is a scratch copy, NOT a recon-pulled cache). **Before reading,
+     confirm the file's first `## ` heading equals the target version** — a stale
+     copy silently satisfies this gate while the whole new range goes unread.
+   - Scale: `(2.1.218, 2.1.246]` measured **25 releases / ~88KB**. The load-bearing
+     item can sit anywhere, **including deep inside the newest release**.
+   - **`recon_cc_update_check` and the `cc_update_perversion` pre-eval rows are
+     TRIAGE SUMMARIES — never a substitute for this read.** They prioritise; they
+     do not discharge the gate.
+   - **Mark the gate done as a durable row**, not a chat line: `session_ledger_add`
+     with `"CC changelog gate: read (2.1.X, 2.1.Y] in full from <source>, <date>"`,
+     and carry that string into the PR body and the §Version History row (step 8).
+     A Version-History row without it means the gate was not run — blocking at review.
+   - **Delegation is allowed only with the same context and rigor** — brief the
+     sub-agent with the Genesis impact-surface list (see §Delegating the full
+     changelog read in `.claude/skills/cc-update/SKILL.md`), then adversarially
+     spot-check its load-bearing findings against ground truth before trusting them.
+   - *Origin (2026-08-26):* a session re-targeted 2.1.245→246 on the headline delta
+     and let the changelog-*reading* analyzer stand in for actually reading the
+     changelog. The cause was **mechanical, not merely human**: the analyzer fetches
+     only the newest 5 GitHub releases, keeps just the `new` version's body, and
+     truncates it at 1000 chars — v2.1.246's body is ~9.3KB, so it saw roughly the
+     first 8 of ~60 bullets and could not have surfaced the rest. The later full read
+     found real 246 items the triage missed: subagent `maxTurns` now returns partial
+     output; `-p --continue`/`--resume` plan-mode resume; and a `--strict-mcp-config`
+     startup-hang fix that lands directly on Guardian Diagnosis.
+1. **Triage what the read surfaced:** classify each entry from step 0 as
+   RISK / GAIN / LEVERAGE, with its release number. `recon_cc_update_check` assists
+   here — it is not the source.
 2. **8-lens evaluation:** Check each change against: programmatic integration,
    hooks/permissions, MCP/tools, interactive CLI experience, performance/stability,
    security/trust, platform/environment, model/API. (See `_ANALYSIS_PROMPT` in
