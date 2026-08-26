@@ -89,8 +89,15 @@ class CriticalFailureCollector:
         else:
             value = 0.0
 
-        down_names = ", ".join(
-            r.name for r in results if r.status == ProbeStatus.DOWN
+        confirmed_down = ", ".join(
+            r.name
+            for r in results
+            if r.status == ProbeStatus.DOWN and not r.timed_out
+        )
+        timed_out_down = ", ".join(
+            r.name
+            for r in results
+            if r.status == ProbeStatus.DOWN and r.timed_out
         )
         degraded_names = ", ".join(
             r.name for r in results if r.status == ProbeStatus.DEGRADED
@@ -100,33 +107,44 @@ class CriticalFailureCollector:
             suppressed = self._starvation_suppressed(results)
             if suppressed is not None:
                 return suppressed
-            # A DOWN forces 1.0, but a probe DEGRADED at the same tick contributed to
-            # the infra state — name the FULL failing set (all DOWN + co-occurring
-            # DEGRADED), not just the DOWN subset (Codex P2-a).
+            # A DOWN forces 1.0. Name the full failing set, but keep three DISTINCT
+            # groups: a hard-error DOWN is a confirmed outage; a probe that merely
+            # TIMED OUT is NOT the same claim — when a hard-error DOWN co-occurs with a
+            # timeout, starvation suppression short-circuits without evaluating loop
+            # health, so the timed-out probe's health is indeterminate. Lumping it into
+            # "DOWN" would misground the reflection (Codex P2). A co-occurring DEGRADED
+            # probe is also named so the mixed case never drops a contributing probe.
             return self._reading(
                 value,
-                baseline_note=self._genuine_note(down_names, degraded_names),
+                baseline_note=self._genuine_note(
+                    confirmed_down, timed_out_down, degraded_names
+                ),
             )
 
         if value == 0.5:
             return self._reading(
-                value, baseline_note=self._genuine_note("", degraded_names)
+                value, baseline_note=self._genuine_note("", "", degraded_names)
             )
 
         return self._reading(value)
 
-    def _genuine_note(self, down_names: str, degraded_names: str) -> str:
+    def _genuine_note(
+        self, down_names: str, timed_out_names: str, degraded_names: str
+    ) -> str:
         """Name the specific probe(s) that failed, ahead of the default explainer.
 
         The failing-probe identity goes in ``baseline_note`` — the only field the tick
         serializer AND the reflection prompt formatter retain (``metadata`` is dropped
         by both) — so a reflection can state WHICH service failed instead of guessing
-        "(DB, Qdrant, or Ollama)". Both a DOWN group and a co-occurring DEGRADED group
-        are named when present, so the mixed case never drops a contributing probe.
+        "(DB, Qdrant, or Ollama)". Three distinct groups are named when present so no
+        contributing probe is dropped AND a confirmed (hard-error) DOWN is never
+        conflated with a mere probe TIMEOUT (whose health may be indeterminate).
         """
         groups = []
         if down_names:
             groups.append(f"DOWN: {down_names}")
+        if timed_out_names:
+            groups.append(f"TIMED OUT: {timed_out_names}")
         if degraded_names:
             groups.append(f"DEGRADED: {degraded_names}")
         return f"Probe(s) {'; '.join(groups)}. {_DEFAULT_NOTE}"

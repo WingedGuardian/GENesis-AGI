@@ -201,6 +201,25 @@ async def test_critical_failure_healthy_note_unchanged_no_probe_names():
     assert "qdrant_primary" not in (r.baseline_note or "").lower()
 
 
+async def test_critical_failure_timed_out_probe_not_lumped_as_confirmed_down():
+    # Codex P2: a hard-error DOWN keeps 1.0 and short-circuits starvation suppression
+    # (mixed batch → returns before evaluating loop health), so a co-occurring
+    # TIMED-OUT probe's health is INDETERMINATE. It must be labeled as timed-out /
+    # unverified, not asserted as a confirmed DOWN in the reflection note.
+    r = await CriticalFailureCollector(
+        [
+            _probe("db_primary", ProbeStatus.DOWN, timed_out=False),  # hard error = confirmed
+            _probe("qdrant_primary", ProbeStatus.DOWN, timed_out=True),  # timeout = indeterminate
+        ]
+    ).collect()
+    assert r.value == 1.0
+    note = (r.baseline_note or "").lower()
+    assert "db_primary" in note and "qdrant_primary" in note  # both still named
+    assert "down: db_primary" in note, note  # confirmed group names db only
+    assert "down: db_primary, qdrant_primary" not in note, note  # qdrant NOT lumped in
+    assert "timed out" in note or "unverified" in note, note  # qdrant flagged as indeterminate
+
+
 async def test_critical_failure_mixed_down_and_degraded_names_both():
     # Codex P2-a: any DOWN forces value=1.0, but a probe that is DEGRADED at the SAME
     # tick contributed to the infra state and must NOT be dropped from the note — the
