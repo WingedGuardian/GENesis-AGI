@@ -125,6 +125,14 @@ async def test_conditional_no_inject_when_token_stale(_isolated, monkeypatch):
     assert await login_gate._decide() is None
 
 
+def test_conditional_notice_directs_restart_not_just_login():
+    # After a conditional inject, CLAUDE_CODE_OAUTH_TOKEN overrides /login for the
+    # process lifetime, so /login alone can't restore connectors — the notice MUST
+    # tell the user to restart the slot (parity with the always notice).
+    assert "restart" in login_gate._NOTICE_CONDITIONAL
+    assert "restart" in login_gate._NOTICE_ALWAYS
+
+
 # --- off / unknown lever (fail-closed) --------------------------------------
 
 
@@ -177,21 +185,24 @@ async def test_always_injects_regardless_of_live_login(_isolated, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_always_refuses_stale_token(_isolated, monkeypatch):
+async def test_always_refuses_stale_token(_isolated, monkeypatch, capsys):
     config_dir, token_file = _isolated
     _write_creds(config_dir, refresh_expires_ms=_future())
     _write_token(token_file, present=True, age_days=400)
     monkeypatch.setenv("GENESIS_CC_SLOT_OAUTH", "always")
     assert await login_gate._decide() is None
+    # always mode must EXPLAIN why it did not inject (parity with other branches).
+    assert "past its ~1-year life" in capsys.readouterr().err
 
 
 @pytest.mark.asyncio
-async def test_always_no_inject_when_no_token(_isolated, monkeypatch):
+async def test_always_no_inject_when_no_token(_isolated, monkeypatch, capsys):
     config_dir, token_file = _isolated
     _write_creds(config_dir, refresh_expires_ms=_future())
     _write_token(token_file, present=False)
     monkeypatch.setenv("GENESIS_CC_SLOT_OAUTH", "always")
     assert await login_gate._decide() is None
+    assert "no setup-token is stored" in capsys.readouterr().err
 
 
 # --- main() exit codes + notice on stdout + fail-closed ---------------------

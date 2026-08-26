@@ -39,7 +39,7 @@ accessed directly by filename *and* transitively via
 ```yaml shared-artifact
 artifact: cc_oauth_token.env
 documented_in: scripts/store_cc_token.sh
-match_literals: [cc_oauth_token.env, load_cc_oauth_token]
+match_literals: [cc_oauth_token.env, load_cc_oauth_token, read_fallback_token]
 readers:
   - src/genesis/cc/login_health.py
   - src/genesis/cc/login_gate.py

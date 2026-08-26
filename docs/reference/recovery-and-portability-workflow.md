@@ -107,12 +107,16 @@ Two mechanisms make this observable and survivable without host access:
    script warns if the source is group/other-readable). The credential-bridge awareness tick
    syncs it to the host shared mount
    (`~/.local/state/genesis-guardian/shared/guardian/cc_oauth_token.env`). It is
-   a **shared fallback** read by two consumers, each of which injects it via
+   a **shared fallback** read by several consumers, each of which injects it via
    `CLAUDE_CODE_OAUTH_TOKEN` **only** when its own login is confirmed dead: the
    **host** Guardian recovery brain (`diagnosis.py`, gated on a pre-flight
-   `claude auth status`) and the **container's own** CC sessions
-   (`cc/login_health.py`, wired at `cc/invoker.py`). A healthy login is never
-   overridden. Remove it with `scripts/store_cc_token.sh --remove`. The
+   `claude auth status`), the **container's own** CC sessions
+   (`cc/login_health.py`, wired at `cc/invoker.py`), and **interactive slots**
+   (`cc/login_gate.py`, wired at `scripts/cc-slot.sh`). A healthy login is never
+   overridden — except the interactive-slot `GENESIS_CC_SLOT_OAUTH=always` lever,
+   which deliberately injects over a live login (losing Remote Control / claude.ai
+   connectors until it is set back to `conditional` and the slot restarts). Remove
+   it with `scripts/store_cc_token.sh --remove`. The
    authoritative consumer list is CI-enforced in
    `docs/architecture/shared-artifacts.md`.
 

@@ -69,7 +69,8 @@ _COMPETING_AUTH_ENV = (
 
 _NOTICE_CONDITIONAL = (
     "Genesis: primary CC login is dead — running on the stored setup-token. "
-    "Remote Control and claude.ai connectors are OFF until you /login. "
+    "Remote Control and claude.ai connectors are OFF; run /login, then restart "
+    "this slot to use them (the setup-token overrides /login in this session). "
     "Local MCP servers still work."
 )
 _NOTICE_ALWAYS = (
@@ -126,7 +127,23 @@ async def _decide() -> str | None:
 
     if mode == "always":
         token = login_health.read_fallback_token()
-        if token is None or login_health.fallback_token_is_stale():
+        if token is None:
+            print(
+                "Genesis: GENESIS_CC_SLOT_OAUTH=always but no setup-token is "
+                "stored (~/.genesis/cc_oauth_token.env) — starting on the normal "
+                "login. Provision it: `claude setup-token` + scripts/store_cc_token.sh.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+        if login_health.fallback_token_is_stale():
+            print(
+                "Genesis: GENESIS_CC_SLOT_OAUTH=always but the stored setup-token "
+                "is past its ~1-year life — not injecting a known-dead credential. "
+                "Refresh it: `claude setup-token` + scripts/store_cc_token.sh.",
+                file=sys.stderr,
+                flush=True,
+            )
             return None
         return _NOTICE_ALWAYS
 

@@ -7,14 +7,18 @@ Background sessions ride the same credentials, so a lapsed login silently
 kills autonomy. (Discovered 2026-08-18: nothing anywhere read
 ``refreshTokenExpiresAt``.)
 
-Two consumers:
+Three consumers:
 
 - the awareness check ``_check_cc_login_expiry`` (warns days ahead via the
   standard critical-observation → Telegram path);
 - the invoker's fallback injection: when the login is HARD-expired and a live
   ``claude auth status`` probe CONFIRMS logged-out, CC invocations (foreground turns and
 background dispatches alike) get ``CLAUDE_CODE_OAUTH_TOKEN`` from the operator's stored 1-year setup-token
-  (``~/.genesis/cc_oauth_token.env``, written by ``scripts/store_cc_token.sh``).
+  (``~/.genesis/cc_oauth_token.env``, written by ``scripts/store_cc_token.sh``);
+- the interactive-slot gate ``cc/login_gate.py`` (a faithful mirror of the
+  invoker's fallback contract) — reuses ``fallback_env_if_login_dead`` /
+  ``read_fallback_token`` / ``fallback_token_is_stale`` to decide whether a
+  ``scripts/cc-slot.sh`` pane should inject the setup-token.
 
 The injection mirrors the host guardian's honest boundary
 (``guardian/diagnosis.py``): the env token OVERRIDES a stored login, so it is
@@ -117,11 +121,15 @@ def read_fallback_token() -> str | None:
 
 
 def fallback_token_created_at() -> datetime | None:
-    """The setup-token's stored creation time (UTC), or None when unknown.
+    """The setup-token's stored INTAKE time (UTC), or None when unknown.
 
-    Reads ``GENESIS_CC_TOKEN_CREATED_AT`` (unix seconds) written alongside the
-    token by ``store_cc_token.sh``. A missing/unparseable value is "unknown",
-    never an error.
+    Reads ``GENESIS_CC_TOKEN_CREATED_AT`` (unix seconds) — the moment
+    ``store_cc_token.sh`` STORED the token (``date +%s`` at intake), NOT the
+    token's issuance time. The token is an opaque ``sk-ant-oat`` bearer string
+    with no client-readable ``iat``/``exp``, so intake is the only timestamp we
+    have; it equals issuance for the documented ``claude setup-token | store``
+    pipe, but the ``--file`` deferred path can make it LATER than issuance. A
+    missing/unparseable value is "unknown", never an error.
     """
     try:
         for line in _TOKEN_FILE.read_text().splitlines():
@@ -135,12 +143,17 @@ def fallback_token_created_at() -> datetime | None:
 
 
 def fallback_token_is_stale(*, now: datetime | None = None) -> bool:
-    """True ONLY when the setup-token is PROVABLY past its ~1-year lifetime.
+    """True when the setup-token is past a COARSE ~1-year age keyed on INTAKE time.
 
-    Fail-safe direction: an unknown/unparseable creation time returns False
-    (don't block a possibly-valid token) — only a creation time we can read AND
-    that is older than the lifetime blocks injection. This mirrors the probe's
-    "ambiguity never acts" stance.
+    This is a safety net, not an exact-expiry check: the token is opaque
+    (``sk-ant-oat``, no readable ``exp``), so age is measured from the stored
+    INTAKE timestamp (see ``fallback_token_created_at``), which approximates —
+    but for the ``--file`` deferred path may UNDER-state — the real token age.
+    Fail-safe direction: an unknown/unparseable intake time returns False (don't
+    block a possibly-valid token) — only an intake time we can read AND that is
+    older than the lifetime blocks injection. This mirrors the probe's
+    "ambiguity never acts" stance; the primary gate remains the live login-dead
+    detection in ``fallback_env_if_login_dead``, not this coarse age bound.
     """
     created = fallback_token_created_at()
     if created is None:
