@@ -215,6 +215,13 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             "ON repo_pulse_annotations(tier, target_kind, item_id, pr_number)"
         )
 
+    # B2b dispatch follow-through: who created an intention — 'ego' (LLM,
+    # counts against MAX_ACTIVE_PER_SOURCE) or 'system' (mechanical dispatch
+    # follow-through, bypasses the cap). Mirrored in migration 0086.
+    await _try_alter(db,
+        "ALTER TABLE ego_intentions ADD COLUMN origin TEXT NOT NULL DEFAULT 'ego'",
+        "ego_intentions.origin")
+
     # Phase 9: thread_id on cc_sessions (for forum topic multi-session)
     await _try_alter(db,
         "ALTER TABLE cc_sessions ADD COLUMN thread_id TEXT",

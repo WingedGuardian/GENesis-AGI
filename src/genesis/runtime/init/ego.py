@@ -367,6 +367,34 @@ async def init(rt: GenesisRuntime) -> None:
                                 "Failed to record goal progress",
                                 exc_info=True,
                             )
+
+                        # B2b follow-through: force the OWNING ego to review
+                        # this dispatch outcome on its next cycle (step-2,
+                        # retry, or close). Every terminal dispatch gets one;
+                        # dedup + cap bypass live in the helper/CRUD.
+                        try:
+                            from genesis.ego.dispatch_followthrough import (
+                                record_dispatch_followthrough,
+                            )
+
+                            _err = (_meta.get("error") or "").strip()
+                            _out = _err or (_meta.get("output_text") or "")
+                            _iid = await record_dispatch_followthrough(
+                                rt._db,
+                                proposal_id=caller_ctx.split("ego_proposal:")[-1],
+                                session_id=session_id,
+                                status=status,
+                                outcome=_out,
+                                failed=bool(_err) or status != "completed",
+                            )
+                            if _iid:
+                                # create() defers the commit to the caller.
+                                await rt._db.commit()
+                        except Exception:
+                            logger.warning(
+                                "Failed to create dispatch follow-through",
+                                exc_info=True,
+                            )
                 except Exception:
                     logger.warning(
                         "Failed to record ego dispatch outcome",
