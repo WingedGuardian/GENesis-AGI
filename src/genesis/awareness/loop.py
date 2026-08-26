@@ -1743,24 +1743,47 @@ async def _check_git_health_deep(db) -> None:
     if db is None:
         return
     failures = ", ".join(report.failures)
+    # Truthful alert: surface the ACTUAL fsck stderr rather than a fixed
+    # "objects missing/corrupt → REVERT_CODE disabled" narrative. Both halves of
+    # that old text were false in practice: the failure may be any fsck problem
+    # (not necessarily object corruption), and the deep verdict does NOT gate
+    # REVERT_CODE — the guardian preflight uses a live cheap probe
+    # (guardian/git_watch.py::container_git_supports_revert), never this file.
+    # Collapse duplicate stderr lines and cap at 5 so a repeated error can't wall
+    # off the message.
+    stderr = (report.details.get("fsck_stderr") or "").strip()
+    detail_lines: list[str] = []
+    for line in stderr.splitlines():
+        line = line.strip()
+        if line and line not in detail_lines:
+            detail_lines.append(line)
+        if len(detail_lines) >= 5:
+            break
+    detail = ("\n" + "\n".join(detail_lines)) if detail_lines else ""
     try:
         created = await observations.create(
             db,
             id=str(uuid.uuid4()),
             source="git_health_monitor",
             type="infrastructure_alert",
-            # Slot tag + DB-level dedup (the only cross-process guard; see
-            # the cheap-probe counterpart above). NOTE deliberately NO extra
-            # alert cooldown here: the 24h run-interval already bounds this
-            # path to one alert per process-day, and probe sensitivity must
-            # stay unchanged — recovery hygiene, not detection damping.
+            # Slot tag + an explicit STABLE content_hash → DB-level dedup keys on
+            # the failure-CLASS, not the (now run-varying) stderr body. create()
+            # otherwise hashes `content`; since the body embeds live fsck stderr,
+            # two failures with differing stderr would NOT dedup and would pile up
+            # stale criticals — the exact accumulation the self-heal guards against.
+            # NO extra alert cooldown: the 24h run-interval bounds this to ~one
+            # alert per process-day, and the category-scoped self-heal clears the
+            # whole git_deep slot on recovery (resolve_by_source_and_type, above).
             category="git_deep",
             skip_if_duplicate=True,
+            content_hash=hashlib.sha256(
+                f"git_deep:{','.join(sorted(report.failures))}".encode()
+            ).hexdigest(),
             content=(
-                f"`git fsck --full` reported problems ({failures}) — objects are "
-                "missing or corrupt (incl. zeroed-but-present blobs), which disables "
-                "the guardian's REVERT_CODE lever. Diagnose and repair the local git "
-                "in ~/genesis — see docs/reference/recovery-and-portability-workflow.md."
+                f"`git fsck --full --no-reflogs` reported problems ({failures}) "
+                f"in ~/genesis.{detail}\n"
+                "Investigate with `scripts/git_repair.py` — see "
+                "docs/reference/recovery-and-portability-workflow.md."
             ),
             priority="critical",
             created_at=datetime.now(UTC).isoformat(),

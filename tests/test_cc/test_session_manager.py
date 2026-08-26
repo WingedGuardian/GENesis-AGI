@@ -278,3 +278,47 @@ async def test_foreground_gateway_origin_external(db, manager):
     )
     row = await cc_sessions.get_by_id(db, sess["id"])
     assert row["origin_class"] == "external_untrusted"
+
+
+async def test_check_morning_reset_uses_local_utc_boundary(db, manager, monkeypatch):
+    """Boundary is LOCAL midnight, serialized in UTC so the query_stale string
+    comparison against stored +00:00 timestamps stays lexicographically correct.
+    """
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    import genesis.util.tz as tz_module
+
+    # Fixed UTC-4 offset (Etc/GMT+4) — no real location, install-generic.
+    monkeypatch.setattr(tz_module, "_USER_TZ", ZoneInfo("Etc/GMT+4"))
+
+    # now = 2026-08-24 12:00 UTC (08:00 at UTC-4). Local midnight = 2026-08-24 04:00 UTC.
+    now = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
+
+    # Background session last-active 02:00 UTC — before the local boundary → stale.
+    await cc_sessions.create(
+        db,
+        id="stale-bg",
+        session_type="background_task",
+        model="sonnet",
+        status="active",
+        started_at="2026-08-24T02:00:00+00:00",
+        last_activity_at="2026-08-24T02:00:00+00:00",
+        source_tag="background",
+    )
+    assert await manager.check_morning_reset(user_id="u1", now=now) is True
+
+    # After the stale one is retired, a session last-active 06:00 UTC (after the
+    # local boundary) is not stale yet today.
+    await cc_sessions.update_status(db, "stale-bg", status="completed")
+    await cc_sessions.create(
+        db,
+        id="fresh-bg",
+        session_type="background_task",
+        model="sonnet",
+        status="active",
+        started_at="2026-08-24T06:00:00+00:00",
+        last_activity_at="2026-08-24T06:00:00+00:00",
+        source_tag="background",
+    )
+    assert await manager.check_morning_reset(user_id="u1", now=now) is False

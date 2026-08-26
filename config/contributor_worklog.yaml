@@ -33,3 +33,28 @@ retention_days: 30
 # this many rows are still `held` (awaiting owner review). Keeps the approval
 # queue bounded so drafts don't pile up faster than they're reviewed.
 max_held: 25
+
+# Per-item human approval before the drain may post an issue.
+#   true  — (default, SHIP-SAFE) every proposed issue waits for an explicit owner
+#           approval on the dashboard; a fresh clone NEVER auto-posts to its public
+#           repo. Leave this true unless you deliberately want autonomous posting.
+#   false — autonomous (Genesis-vetted) posting: `contributor_issue_propose`
+#           resolves its own approval server-side, so an approved hold posts on the
+#           next `live` drain (no human in the loop). scan_prose (the fail-closed
+#           privacy scan) still runs, and `max_posts_per_day` still caps the rate.
+# FAIL-CLOSED: only an explicit boolean `false` disables the gate — a typo, a
+# missing key, or any other value keeps human approval ON. This is a POSTURE flag,
+# NOT the stop switch: the stop is `mode: off` / GENESIS_CONTRIBUTOR_WORKLOG_DISABLED
+# (which freezes the drain, including already-approved held rows).
+# OVERLAY-ONLY: this key is deliberately NOT accepted by settings_update() or the
+# dashboard — disabling an approval gate on irreversible public posting must be a
+# conscious edit of the gitignored ~/.genesis/config/contributor_worklog.local.yaml
+# overlay, never a single unconfirmed API/dashboard call.
+require_approval: true
+
+# Cautious-rollout rate cap: the maximum number of issues the drain will actually
+# POST to GitHub per rolling 24h window (dry-runs don't count). Excess approved
+# holds wait for the next window. Bounds blast radius so a bad batch surfaces one
+# issue at a time, not all at once. Coerced to a safe positive default if
+# mistyped / 0 / negative (the cap can never be removed by a bad value).
+max_posts_per_day: 2
