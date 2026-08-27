@@ -90,6 +90,59 @@ Deliberate multi-copy setups: `CC_SHADOW_SCAN=0` opts out.
 CC "not installed", so a PATH-blind install is aligned in place instead of
 reinstalled forever.
 
+### Which copy is INSTALLED vs which copy is RUNNING
+
+These are different questions and need different checks.
+
+`cc_shadow_scan` answers **installed**: it probes `command -v claude` plus
+`CC_PROBE_DIRS` for extra on-disk copies and removes the stale ones.
+
+`scripts/check_cc_running_versions.sh` answers **running**: for every live CC
+process it resolves `stat -L /proc/<pid>/exe` — procfs keeps that inode
+reference alive even after npm unlinks the file — and compares it against the
+inode of the binary on disk today.
+
+A box can pass the first and fail the second. Measured here on 2026-08-27:
+exactly one canonical binary installed, at the intended version, while **four of
+ten live CC processes were still executing the replaced predecessor**. A
+long-running process keeps its original mapping until it restarts, and
+`claude --version` cannot reveal this — it spawns a *fresh child*, which reads
+the new on-disk binary and truthfully reports the new version while the session
+asking the question is not running it.
+
+This matters most during a local-first soak, where the whole point is that real
+interactive use exercises the candidate. Run the sweep at soak start and again
+at soak end. It exits 1 when any process is stale, and 2 when it cannot
+determine — a node-wrapped install (`node .../cli.js`) resolves `exe` to the
+Node interpreter, whose inode says nothing about which CC revision is loaded, so
+the script refuses to answer rather than reporting a false all-clear.
+
+### The pin PR's own gate: `cc-pin-receipts`
+
+`scripts/check_cc_pin_receipts.py` (CI job `cc-pin-receipts`) fails a PR that
+moves `CC_VERSION` **forward** without both gate receipts as PR-body trailers,
+in the same style as the repo's existing `Ledger:` / `Follow-up:` trailers:
+
+```
+CC-Gate-Changelog: read (2.1.218, 2.1.246] in full from <source>, <date>
+CC-Gate-Soak: <candidate> on container <start>..<end>, check_cc_running_versions.sh clean, signed off <who>
+```
+
+Scope, stated plainly: it stops **omission, not forgery**. Nothing in CI can
+tell whether a soak actually happened — and this repo has already settled that
+question, which is why `review-depth-check` is advisory by design. What this
+converts is *forgetting* into *consciously writing something untrue*. It is the
+same kind of check, and the same strength, as
+`scripts/check_hook_versions_complete.sh`.
+
+It compares the **parsed pin value**, not whether the file changed, so the many
+PRs that edit `cc_version.sh` for other reasons are unaffected. **Downgrades are
+auto-exempt** — a rollback returns to a version that already ran here, and the
+downgrade path is this project's incident-recovery route (the reason a managed
+`requiredMinimumVersion` floor was rejected above). No override syntax to
+remember under incident pressure. Anything it cannot determine — shallow clone,
+no base SHA, no PR body — SKIPs loudly rather than blocking every PR.
+
 ---
 
 ## Integration Surface — Genesis Components That Use CC

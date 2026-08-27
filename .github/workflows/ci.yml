@@ -408,6 +408,33 @@ jobs:
       - name: CC↔Node pin-lockstep guard
         run: python scripts/check_cc_node_lockstep.py
 
+  cc-pin-receipts:
+    # A PR that moves the CC pin FORWARD must carry both gate receipts in its
+    # body (full changelog read + local-first soak). Merging the pin publishes
+    # it — `origin` is the public repo — so the pin PR is the wrong place to
+    # discover a skipped gate. Needs full history (fetch-depth: 0) to read the
+    # pin as of the base commit; a shallow clone SKIPS loudly rather than
+    # blocking every PR. Downgrades are auto-exempt: the rollback path is the
+    # project's incident-recovery route. Compares the PARSED PIN VALUE, so the
+    # many PRs that edit cc_version.sh without touching the pin are unaffected.
+    # This stops omission, not forgery — see the script docstring, and the
+    # review-depth-check note below on why forgeable artifacts are not teeth.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: CC pin-receipt guard
+        env:
+          # Passed via env, never interpolated into `run` — the body is
+          # attacker-controlled text (same handling as PR_BASE_SHA below).
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: python scripts/check_cc_pin_receipts.py
+
   review-depth-check:
     # Advisory review-DEPTH visibility: recompute substantiality on the PR range
     # (base...HEAD, so it needs full history — fetch-depth: 0) and emit a LOUD
