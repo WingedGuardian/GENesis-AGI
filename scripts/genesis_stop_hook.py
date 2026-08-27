@@ -77,23 +77,25 @@ def main() -> None:
         hook_input = {}
 
     session_id = hook_input.get("session_id", "")
-    # Becomes a path component in the session-state read below.
-    if not is_safe_session_id(session_id):
+    if not session_id:
         return
 
-    # Read last user message from session-scoped buffer
-    session_dir = _GENESIS_DIR / "sessions" / session_id
-    messages_file = session_dir / "messages.jsonl"
-
+    # Read last user message from session-scoped buffer. The id is a PATH
+    # COMPONENT only here, so an unsafe id skips this read — it must NOT skip
+    # the giving-up-pattern check below, which is session-independent (it needs
+    # only the assistant message from the hook payload).
     last_user_msg = ""
-    if messages_file.exists():
-        try:
-            lines = messages_file.read_text().strip().splitlines()
-            if lines:
-                last = json.loads(lines[-1])
-                last_user_msg = last.get("text", "")
-        except (json.JSONDecodeError, OSError):
-            pass
+    if is_safe_session_id(session_id):
+        session_dir = _GENESIS_DIR / "sessions" / session_id
+        messages_file = session_dir / "messages.jsonl"
+        if messages_file.exists():
+            try:
+                lines = messages_file.read_text().strip().splitlines()
+                if lines:
+                    last = json.loads(lines[-1])
+                    last_user_msg = last.get("text", "")
+            except (json.JSONDecodeError, OSError):
+                pass
 
     # Check for giving-up patterns in the assistant's response.
     # This runs regardless of whether user messages exist — it only

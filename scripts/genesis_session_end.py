@@ -113,9 +113,6 @@ def main() -> None:
         hook_input = {}
 
     session_id = hook_input.get("session_id", "")
-    # Becomes a path component in the session-state read below.
-    if not is_safe_session_id(session_id):
-        session_id = ""
     transcript_path = hook_input.get("transcript_path", "")
     reason = hook_input.get("reason", "other")
 
@@ -124,13 +121,19 @@ def main() -> None:
 
     now = datetime.now(UTC).isoformat()
 
-    # Read message buffer from session-scoped state (written by UserPromptSubmit)
-    session_dir = _GENESIS_DIR / "sessions" / session_id
-    messages_file = session_dir / "messages.jsonl"
+    # Read message buffer from session-scoped state (written by UserPromptSubmit).
+    # The id is a PATH COMPONENT only here, so an unsafe id skips this read — it
+    # must NOT skip the path-independent writes below (last-session metadata uses
+    # the id as JSON data, not as a path).
     messages: list[dict] = []
     topic_hint = ""
 
-    if messages_file.exists():
+    messages_file = (
+        _GENESIS_DIR / "sessions" / session_id / "messages.jsonl"
+        if is_safe_session_id(session_id)
+        else None
+    )
+    if messages_file is not None and messages_file.exists():
         try:
             lines = messages_file.read_text().strip().splitlines()
             import contextlib

@@ -14,6 +14,10 @@ nothing touches the real ``~/.genesis``.
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -106,3 +110,64 @@ class TestHooksDoNotEscapeSessionDir:
         # RESOLVE both sides — PurePath.parents does NOT collapse "..", so a
         # lexical containment check here would pass vacuously.
         assert base in p.resolve().parents, f"escaped to {p.resolve()}"
+
+
+class TestUnsafeIdSkipsOnlyThePathRead:
+    """An unsafe id must skip the session-SCOPED read, not the whole hook.
+
+    Both of these hooks do path-INDEPENDENT work after reading the id
+    (`genesis_stop_hook` runs its giving-up / review-state checks from the hook
+    payload alone; `genesis_session_end` writes last-session metadata that uses
+    the id as JSON data, not as a path). An earlier revision of this guard
+    returned early on an unsafe id and silently disabled that work.
+    """
+
+    def _run(self, script: str, payload: dict, home: Path):
+        (home / ".genesis").mkdir(parents=True, exist_ok=True)
+        (home / ".genesis" / "cc_context_enabled").touch()
+        env = {**os.environ, "HOME": str(home)}
+        env.pop("GENESIS_CC_SESSION", None)
+        return subprocess.run(
+            [sys.executable, str(_SCRIPTS / script)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+    def test_session_end_still_writes_metadata_with_unsafe_id(self, tmp_path):
+        self._run(
+            "genesis_session_end.py",
+            {"session_id": "../../escaped", "reason": "clear"},
+            tmp_path,
+        )
+        assert (tmp_path / ".genesis" / "last_foreground_session.json").exists(), (
+            "path-independent last-session write was skipped for an unsafe id"
+        )
+        assert not (tmp_path / "escaped").exists()
+
+    def test_session_end_writes_metadata_with_safe_id(self, tmp_path):
+        self._run(
+            "genesis_session_end.py",
+            {"session_id": REAL_IDS[0], "reason": "clear"},
+            tmp_path,
+        )
+        assert (tmp_path / ".genesis" / "last_foreground_session.json").exists()
+
+    def test_stop_hook_still_runs_payload_only_checks_with_unsafe_id(self, tmp_path):
+        """The giving-up check needs only the assistant message; an unsafe id
+        must not suppress it."""
+        payload = {
+            "session_id": "../../escaped",
+            "last_assistant_message": "You'll need to run the migration yourself.",
+        }
+        unsafe = self._run("genesis_stop_hook.py", payload, tmp_path)
+        safe = self._run(
+            "genesis_stop_hook.py", {**payload, "session_id": REAL_IDS[0]}, tmp_path
+        )
+        # Whatever the payload-only checks emit, an unsafe id must not change it.
+        assert unsafe.stdout == safe.stdout, (
+            "unsafe session id changed payload-only hook behaviour"
+        )
+        assert not (tmp_path / "escaped").exists()
