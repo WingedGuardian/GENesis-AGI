@@ -60,11 +60,14 @@ class TestRecordDispatchFollowthrough:
         assert row["proposal_id"] == PROPOSAL_ID
         assert row["max_cycles"] == 3
         assert row["priority"] == "normal"
-        # Content carries what the ego needs to judge follow-through.
+        # Content carries what the ego needs to judge follow-through — status +
+        # the ego's own (first-party) proposal summary — but NOT the raw session
+        # outcome (that would launder external_untrusted content into the
+        # privileged mandatory-review block; see test_outcome_text_not_laundered).
         assert PROPOSAL_ID[:8] in row["content"]
         assert "completed" in row["content"]
-        assert "PR opened and merged" in row["content"]
         assert "Ship the ingestion retry fix" in row["content"]
+        assert "PR opened and merged" not in row["content"]
 
     @pytest.mark.asyncio
     async def test_null_ego_source_falls_back_to_genesis(self, db):
@@ -165,3 +168,70 @@ class TestRecordDispatchFollowthrough:
             failed=False,
         )
         assert iid is not None
+
+    @pytest.mark.asyncio
+    async def test_outcome_text_not_laundered_into_content(self, db):
+        """The raw dispatch outcome must NEVER reach the intention content — it
+        lands in the ego's privileged mandatory-review block, and a research/
+        interact dispatch's output is external_untrusted (Codex #1496 P2)."""
+        from genesis.db.crud import ego_intentions
+        from genesis.ego.dispatch_followthrough import record_dispatch_followthrough
+
+        await _seed_proposal(db, ego_source="user_ego_cycle")
+        await record_dispatch_followthrough(
+            db,
+            proposal_id=PROPOSAL_ID,
+            session_id="sess1234abcd",
+            status="completed",
+            outcome="OUTCOME_SENTINEL_XYZ web-sourced text",
+            failed=False,
+        )
+        row = (await ego_intentions.list_active(db, "user_ego_cycle"))[0]
+        assert "OUTCOME_SENTINEL_XYZ" not in row["content"]
+
+    @pytest.mark.asyncio
+    async def test_verification_failed_proposal_gets_high_priority(self, db):
+        """A dispatch whose SESSION completed but whose proposal was marked failed
+        (post-dispatch verification) must be treated as failed → high priority,
+        even though the caller's session-derived flag says failed=False (#1496 P2)."""
+        from genesis.db.crud import ego_intentions
+        from genesis.ego.dispatch_followthrough import record_dispatch_followthrough
+
+        # Proposal marked failed by verification, but the session "completed".
+        await db.execute(
+            """INSERT INTO ego_proposals
+               (id, action_type, content, status, created_at, ego_source)
+               VALUES (?, 'implement', 'Ship X', 'failed', ?, 'genesis_ego_cycle')""",
+            (PROPOSAL_ID, datetime.now(UTC).isoformat()),
+        )
+        await db.commit()
+        await record_dispatch_followthrough(
+            db,
+            proposal_id=PROPOSAL_ID,
+            session_id="sess1234abcd",
+            status="completed",
+            outcome="",
+            failed=False,
+        )
+        row = (await ego_intentions.list_active(db, "genesis_ego_cycle"))[0]
+        assert row["priority"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_parked_dispatch_skips_followthrough(self, db):
+        """A rate/quota-parked dispatch is NOT terminal — no follow-through now;
+        the resumed session's on_end fires the real one (Codex #1496 P2)."""
+        from genesis.db.crud import ego_intentions
+        from genesis.ego.dispatch_followthrough import record_dispatch_followthrough
+
+        await _seed_proposal(db, ego_source="user_ego_cycle")
+        iid = await record_dispatch_followthrough(
+            db,
+            proposal_id=PROPOSAL_ID,
+            session_id="sess1234abcd",
+            status="failed",
+            outcome="rate_limited: parked for resume",
+            failed=True,
+            parked=True,
+        )
+        assert iid is None
+        assert await ego_intentions.list_active(db, "user_ego_cycle") == []

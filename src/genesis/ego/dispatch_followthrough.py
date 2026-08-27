@@ -35,13 +35,28 @@ async def record_dispatch_followthrough(
     status: str,
     outcome: str = "",
     failed: bool = False,
+    parked: bool = False,
 ) -> str | None:
     """Create a follow-through intention for a terminal dispatch.
 
-    Returns the intention id, or None when skipped (unknown proposal, or an
-    active follow-through for this proposal already exists — dedup so a
-    re-dispatched proposal never piles rows). Caller commits.
+    Returns the intention id, or None when skipped: a rate/quota-PARKED
+    dispatch (not terminal — the resume fires the real follow-through), an
+    unknown proposal, or an active follow-through for this proposal already
+    existing (dedup so a re-dispatched proposal never piles rows). Caller commits.
     """
+    if parked:
+        # A rate/quota-parked dispatch is NOT terminal — creating a
+        # follow-through now would post a premature "failed" review. KNOWN GAP
+        # (follow-up 837f8b63): the resume does NOT currently re-fire it — the
+        # resume rewrites caller_context to `rate_limit_resume:<park_id>`,
+        # severing the `ego_proposal:` linkage the on_end hook gates on — so the
+        # parked class is uncovered until that reconnection lands.
+        # behavioral-lint: ignore no-hide-problems
+        logger.info(
+            "Dispatch follow-through withheld — proposal %s parked for resume",
+            proposal_id[:8],
+        )
+        return None
     proposal = await ego_crud.get_proposal(db, proposal_id)
     if proposal is None:
         logger.warning(
@@ -59,14 +74,35 @@ async def record_dispatch_followthrough(
         )
         return None
 
+    # Derive failure from the proposal's AUTHORITATIVE status too. A dispatch
+    # whose SESSION completed but whose deliverables failed post-dispatch
+    # verification is marked failed on the PROPOSAL
+    # (mark_proposal_verification_failed) — invisible to the caller's
+    # session-derived `failed` flag. Either signal means failed.
+    failed = failed or (proposal.get("status") or "").lower() == "failed"
+
     prop_summary = (proposal.get("content") or "").replace("\n", " ").strip()[:80]
-    outcome_summary = (outcome or "").replace("\n", " ").strip()[:120]
+    # The raw session OUTCOME text is intentionally NOT embedded in this content.
+    # This content lands in the owning ego's mandatory-review block — an
+    # authoritative, privileged context — and a research/interact dispatch's
+    # output is external_untrusted (it can echo web/browser content). Embedding
+    # it here would launder indirect prompt injection into a trusted instruction.
+    # status + the ego's own (first-party) proposal summary anchor the review;
+    # the ego reads the full outcome via the execution_outcome observation + the
+    # recallable dispatch memory.
     content = (
         f"Review dispatch outcome for proposal {proposal_id[:8]} "
         f"[{status}]: {prop_summary}"
-        + (f" — {outcome_summary}" if outcome_summary else "")
-        + ". Decide follow-through: step-2, retry, or close."
+        ". Decide follow-through: step-2, retry, or close."
     )
+    if outcome:
+        # Preview only in the (non-privileged) application log — never the
+        # ego-facing content above.
+        logger.debug(
+            "Follow-through for %s — outcome preview: %s",
+            proposal_id[:8],
+            outcome.replace("\n", " ").strip()[:80],
+        )
 
     iid = await ego_intentions.create(
         db,
