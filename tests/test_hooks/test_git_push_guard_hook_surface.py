@@ -419,11 +419,14 @@ class TestBaseBoundEvidence:
 
 
 class TestBaseRefEncoding:
-    """Round-2 P2: the base ref becomes an API path component in _pr_base_sha, so
-    it must be URL-encoded (safe='/' preserves hierarchical branch slashes)."""
+    """Codex #10: _pr_base_sha resolves the live base tip via GraphQL
+    ``ref(qualifiedName:"refs/heads/<branch>")`` with the branch as a RAW-STRING
+    variable — NOT a REST ``commits/{ref}`` URL. That closes both the heads/-vs-tag
+    ambiguity AND the URL-structural-char (`#`/`?`/`%`) truncation class at once,
+    because the branch name never enters a URL path."""
 
-    def _capture(self, monkeypatch, ref):
-        monkeypatch.delenv("_TEST_GH_BASE_OID", raising=False)  # force the ref path
+    def _capture(self, monkeypatch, ref, repo="o/r"):
+        monkeypatch.delenv("_TEST_GH_BASE_OID", raising=False)  # force the resolve path
         monkeypatch.setenv("_TEST_GH_BASE_REF", ref)
         captured = {}
 
@@ -437,18 +440,85 @@ class TestBaseRefEncoding:
             return _R()
 
         monkeypatch.setattr(_mod.subprocess, "run", fake_run)
-        sha = _mod._pr_base_sha("1")
-        url = next(a for a in captured["argv"] if "commits/" in a)
-        return url, sha
+        sha = _mod._pr_base_sha("1", repo=repo)
+        return captured.get("argv"), sha
 
-    def test_hierarchical_branch_slash_preserved(self, monkeypatch):
-        url, sha = self._capture(monkeypatch, "release/2.0")
-        assert url.endswith("commits/release/2.0")
+    def _ref_arg(self, argv):
+        # the raw-string GraphQL variable `-f ref=refs/heads/<branch>`
+        return next(a for a in argv if a.startswith("ref=refs/heads/"))
+
+    def test_uses_graphql_not_rest_commits(self, monkeypatch):
+        # RED anchor: old REST code produced a `commits/<ref>` path; the GraphQL
+        # path must carry NO `commits/` at all.
+        argv, sha = self._capture(monkeypatch, "main")
+        assert "graphql" in argv
+        assert not any("commits/" in str(a) for a in argv)
         assert sha == "a" * 40
 
-    def test_special_char_ref_encoded(self, monkeypatch):
-        # a '#' in a ref must not inject a fragment into the API path
-        url, _ = self._capture(monkeypatch, "feat/x#y")
-        path = url.split("commits/", 1)[1]
-        assert path == "feat/x%23y"
-        assert "#" not in path
+    def test_ref_qualified_as_heads_slash_preserved(self, monkeypatch):
+        argv, sha = self._capture(monkeypatch, "release/2.0")
+        assert self._ref_arg(argv) == "ref=refs/heads/release/2.0"
+        assert sha == "a" * 40
+
+    def test_hash_char_ref_passed_raw_not_encoded(self, monkeypatch):
+        # a '#' rides verbatim in a GraphQL string variable — no URL, so no %23
+        # encoding and no fragment truncation (the round-2/round-4 class).
+        argv, _ = self._capture(monkeypatch, "feat/x#y")
+        assert self._ref_arg(argv) == "ref=refs/heads/feat/x#y"
+
+    def test_heads_named_branch_disambiguated(self, monkeypatch):
+        # a branch literally named 'heads/release' qualifies to refs/heads/heads/release
+        # — it can never resolve refs/heads/release or a same-named tag.
+        argv, _ = self._capture(monkeypatch, "heads/release")
+        assert self._ref_arg(argv) == "ref=refs/heads/heads/release"
+
+    def test_uses_raw_field_flag_not_typed(self, monkeypatch):
+        # -f (raw string), never -F (type-coerces / reads @file): a numeric or
+        # @-leading branch name must stay a literal GraphQL String.
+        argv, _ = self._capture(monkeypatch, "123")
+        assert "-f" in argv
+        assert "-F" not in argv
+
+    def test_null_target_fails_closed(self, monkeypatch):
+        # GraphQL ref:null (missing branch) → jq emits "null" → None (fail-closed).
+        monkeypatch.delenv("_TEST_GH_BASE_OID", raising=False)
+        monkeypatch.setenv("_TEST_GH_BASE_REF", "gone")
+
+        def fake_run(argv, *a, **k):
+            class _R:
+                returncode = 0
+                stdout = "null\n"
+
+            return _R()
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        assert _mod._pr_base_sha("1", repo="o/r") is None
+
+    def test_repo_none_resolves_slug_from_cwd(self, monkeypatch):
+        # repo=None → derive owner/name from the cwd's base repo (GraphQL has no
+        # :owner/:repo placeholder); a resolvable slug builds the query.
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "o/r")
+        argv, sha = self._capture(monkeypatch, "main", repo=None)
+        assert "owner=o" in argv
+        assert "name=r" in argv
+        assert sha == "a" * 40
+
+    def test_repo_none_unresolvable_fails_closed(self, monkeypatch):
+        # repo=None and an unresolvable cwd slug → None, with NO GraphQL call made.
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "")  # empty → _derive returns None
+        monkeypatch.delenv("_TEST_GH_BASE_OID", raising=False)
+        monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+        called = {"n": 0}
+
+        def fake_run(argv, *a, **k):
+            called["n"] += 1
+
+            class _R:
+                returncode = 0
+                stdout = "x"
+
+            return _R()
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        assert _mod._pr_base_sha("1", repo=None) is None
+        assert called["n"] == 0  # slug unresolved → no GraphQL attempted

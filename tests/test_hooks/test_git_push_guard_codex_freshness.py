@@ -150,12 +150,34 @@ class TestFreshnessGate:
         assert block is False and head == HEAD
 
     def test_force_returns_no_verified_head(self, monkeypatch):
-        # Forced (# review-override) skips verification → no head to bind →
-        # the match-head requirement disengages too.
+        # Forced (# stale-review-override) on a NON-hook PR skips verification → no
+        # head to bind → the match-head requirement disengages too. (The benign
+        # non-hook default from _hermetic_pr_files makes the hook-surface evidence
+        # gate a no-op, so the force path returns allowed + unbound.)
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD))
         block, _, head = _mod._check_codex_reviewed_head("1", force=True)
         assert block is False and head is None
+
+    def test_force_hook_surface_fresh_review_still_demands_evidence(self, monkeypatch, tmp_path):
+        # SECURITY LOCK — Codex #9 dispositioned FALSE-POSITIVE (2026-08-26). A fresh
+        # at-head Codex review must NOT skip the hook-surface evidence gate: the same
+        # # stale-review-override ALSO waives _check_base_is_default, and the evidence
+        # identity binds the BASE tip — which a head-only review provably cannot vouch
+        # for (a hook PR retargeted to a non-default base). So a hook-surface forced
+        # merge WITH a current review but NO recorded evidence still BLOCKS. Regression
+        # guard: a reverted "skip evidence when fresh" attempt opened a base-binding
+        # bypass; on that buggy code this test would have returned block=False.
+        monkeypatch.setenv("GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR", str(tmp_path))  # no evidence file
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            '{"filename": "scripts/hooks/git_push_guard.py", "previous_filename": null}',
+        )
+        monkeypatch.setenv("_TEST_GH_BASE_OID", STALE)  # hermetic base tip (no network)
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD))  # FRESH review at head
+        block, _, head = _mod._check_codex_reviewed_head("1", force=True)
+        assert block is True and head is None
 
 
 class TestMergeMatchHead:

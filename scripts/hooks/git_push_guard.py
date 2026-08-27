@@ -106,7 +106,6 @@ import shlex
 import subprocess
 import sys
 import time
-import urllib.parse
 
 # Self-locate so `from hook_input import …` resolves both when CC runs this as a
 # script (sys.path[0] is this dir) AND when it is imported as a module for tests
@@ -1427,30 +1426,64 @@ def _pr_base_sha(pr_num: str, repo: str | None = None) -> str | None:
     2026-08-23 against live PRs — three pre-merge PRs still reported the old
     tip while a post-merge control reported the new one). The evidence binding
     exists precisely for the base-advanced case, so it must read the branch
-    ref's current tip: resolve ``baseRefName`` (existing helper + seam), then
-    ``commits/{ref}``. Consumed by the hook-surface override evidence identity
-    (see _hook_surface_override_check). Tests inject via ``_TEST_GH_BASE_OID``.
+    ref's current tip.
+
+    Resolution is via GraphQL ``repository.ref(qualifiedName:"refs/heads/<branch>")``
+    with the branch passed as a raw-string VARIABLE — NOT the REST ``commits/{ref}``
+    endpoint (Codex #10). Interpolating a branch name into a URL path is ambiguous
+    and fragile in two ways the REST path could not fully close: (1) an UNqualified
+    ``commits/<name>`` resolves a same-named TAG or a branch literally named
+    ``heads/x`` to the WRONG ref (a wrong-tip evidence binding that stays valid
+    after the real base moves); (2) a name that is structural in a URL (``#``
+    fragment, ``?`` query, ``%`` escape) truncates the request. A fully-qualified
+    ``refs/heads/<branch>`` passed as a GraphQL variable is unambiguous (heads vs
+    tags) AND carries no URL-path interpolation at all, closing both classes at once.
+    A branch ref's ``target`` is always a Commit, so ``.target.oid`` is its live tip.
+
+    Consumed by the hook-surface override evidence identity (see
+    _hook_surface_override_check). Tests inject via ``_TEST_GH_BASE_OID``.
     """
     raw = os.environ.get("_TEST_GH_BASE_OID")
     if raw is None:
         ref = _pr_base_ref(pr_num, repo=repo)
         if not ref or any(c.isspace() for c in ref):
             return None
-        # URL-encode the ref before it becomes an API path component (Codex P2,
-        # round 2): a base branch name can carry characters that are structural in
-        # a URL path (`#` fragment, `?` query, `%`), and the ref is network-sourced
-        # (gh's baseRefName), so encode defensively. safe="/" preserves the slash
-        # in hierarchical branch names (`release/2.0`), which the commits/{ref}
-        # endpoint resolves directly.
-        ref_enc = urllib.parse.quote(ref, safe="/")
+        # GraphQL needs an explicit owner/name (no REST ``:owner/:repo`` placeholder).
+        # Resolve the slug from the passed repo, else the cwd's base repo; fail-closed
+        # if it can't be resolved or split. A non-str ``repo`` (an unresolved-repo
+        # sentinel) fails CLOSED here — never fall through to a cwd guess, and never
+        # reach _normalize_repo's ``str``-typed body with a non-str (would TypeError
+        # OUTSIDE the subprocess try). Belt-and-suspenders: callers already fail-closed
+        # on the sentinel before this runs.
+        if repo is not None and not isinstance(repo, str):
+            return None
+        slug = _normalize_repo(repo) if repo else _derive_repo_from_cwd(os.getcwd())
+        if not slug or "/" not in slug:
+            return None
+        owner, name = slug.split("/", 1)
+        query = (
+            "query($owner:String!,$name:String!,$ref:String!){"
+            "repository(owner:$owner,name:$name){ref(qualifiedName:$ref){target{oid}}}}"
+        )
         try:
             result = subprocess.run(
                 [
                     "gh",
                     "api",
-                    f"repos/{repo or ':owner/:repo'}/commits/{ref_enc}",
+                    "graphql",
+                    # -f (raw string), NOT -F: -F type-coerces and reads @file, which
+                    # would mangle a numeric-looking or @-leading branch name. -f keeps
+                    # every value a literal GraphQL String.
+                    "-f",
+                    f"query={query}",
+                    "-f",
+                    f"owner={owner}",
+                    "-f",
+                    f"name={name}",
+                    "-f",
+                    f"ref=refs/heads/{ref}",
                     "--jq",
-                    ".sha",
+                    ".data.repository.ref.target.oid",
                 ],
                 capture_output=True,
                 text=True,
@@ -1458,11 +1491,15 @@ def _pr_base_sha(pr_num: str, repo: str | None = None) -> str | None:
                 # stale-review-override path; fail direction is closed there.
                 timeout=_gh_timeout(6),
             )
+            # A missing branch → ``ref: null`` → jq emits the literal "null"; a GraphQL
+            # error → data null → same. Both, and any non-zero exit, fail closed below.
             raw = result.stdout if result.returncode == 0 else ""
         except Exception:
             return None
     sha = (raw or "").strip()
-    return sha or None
+    if not sha or sha == "null":
+        return None
+    return sha
 
 
 def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
@@ -1853,6 +1890,7 @@ _HOOK_SURFACE_FILES = frozenset(
         "scripts/review_enforcement_commit.py",
         "scripts/review_enforcement_prompt.py",
         "scripts/review_invalidate_on_commit.py",
+        "scripts/surface_open_prs.py",
         "scripts/surface_pr_updates.py",
         # Hook-owned DECISION CONFIGURATION (Codex P2, round 1): these files
         # determine what the wired hooks enforce, and the ordinary
@@ -2205,7 +2243,10 @@ def _check_codex_reviewed_head(
     only on positive evidence. ``force`` (a ``# stale-review-override`` on the
     merge segment — deliberately NOT ``# review-override``, which waives the P1
     finding scans; the two boundaries are independent) is the conscious escape
-    (e.g. a genuine Codex outage).
+    (e.g. a genuine Codex outage). On the HOOK SURFACE ``force`` additionally
+    requires recorded fallback-review evidence regardless of head-freshness — the
+    same sigil waives ``_check_base_is_default`` and the evidence identity binds the
+    BASE, which a head-only review cannot vouch for (see Codex #9 disposition below).
 
     Returns ``(should_block, message, verified_head)`` — ``verified_head`` is the
     full head oid this check verified/classified against (when not blocked and
@@ -2220,6 +2261,17 @@ def _check_codex_reviewed_head(
         # evidence for the exact head is additionally required (fail-closed).
         # verified_head stays None on the pass path: the force path keeps its
         # documented "conscious unbound merge" contract (no --match-head bind).
+        #
+        # NOTE (Codex #9, dispositioned FALSE-POSITIVE 2026-08-26): #9 proposed
+        # skipping this evidence demand when a current at-head Codex review already
+        # exists. That is UNSAFE and was reverted: this force path is reached via
+        # # stale-review-override, which ALSO waives _check_base_is_default, and
+        # _hook_surface_override_check's evidence identity binds the BASE tip — which
+        # a head-only Codex review provably cannot vouch for (see _check_base_is_default's
+        # docstring: "GitHub's review object records no base, so freshness alone cannot
+        # see it"). Skipping evidence on a fresh review would let a hook-surface PR
+        # RETARGETED to a non-default base merge with no base-bound review. A fresh
+        # head-review is NOT a substitute for base-bound evidence here.
         blocked, msg = _hook_surface_override_check(pr_num, repo=repo)
         if blocked:
             return True, msg, None
