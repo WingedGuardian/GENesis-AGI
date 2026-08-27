@@ -5,12 +5,15 @@ Two surfaces, one shared signal (``compute_heartbeat_staleness``):
     heartbeat-emitting subsystem's last durable ``heartbeat`` event is older
     than its per-subsystem overdue threshold (its scheduler/loop stopped — a
     silent death the failure-gap job alarms cannot see). The alert set is
-    ``ego`` (CRITICAL) + ``inbox`` + ``dashboard`` (WARNING). **surplus** is
+    ``ego`` (CRITICAL) + ``inbox`` + ``dashboard`` + ``outreach`` (WARNING).
+    Outreach now has a DEDICATED, channel-independent heartbeat daemon
+    (``outreach/heartbeat.py``, pulses only while its scheduler is running) +
+    an enable-gate (``_outreach_enabled`` = Telegram configured), so it is
+    monitored without the old false-alarm trap (a Telegram-less install is
+    ``_subsystem_enabled('outreach') == False`` → benign). **surplus** stays
     dropped (PR-B's shipped tile already flips red on a wedged/dead surplus via
-    its job_health signal) and **outreach** is dropped (its pulse is
-    config-gated — never fires on a Telegram-less install). reflection/awareness
-    stay excluded (reflection's pulse tracks the awareness loop; awareness has
-    ``awareness:tick_overdue``).
+    its job_health signal). reflection/awareness stay excluded (reflection's
+    pulse tracks the awareness loop; awareness has ``awareness:tick_overdue``).
   - ``compute_heartbeat_staleness`` — the pure per-subsystem verdict the alert
     AND the ego dashboard tile both read, so the two can never disagree. It is
     pause-aware for the pause-gated subsystems ({surplus, inbox}, whose pulse
@@ -418,6 +421,99 @@ async def test_disabled_ego_suppresses_cessation_alert(db):
     assert not [a for a in _stale(alerts) if a["id"] == "subsystem_stale:ego"]
 
 
+@pytest.mark.asyncio
+async def test_enabled_outreach_cessation_alerts_warning(db):
+    """An ENABLED outreach whose dedicated heartbeat stopped (pulse 50h old, past the
+    48h overdue threshold) → subsystem_stale:outreach WARNING. Proves outreach is now
+    in the alert set (previously excluded as a false-alarm trap)."""
+    await _seed_heartbeat(db, "outreach", age_seconds=50 * 3600)
+    with patch(
+        "genesis.mcp.health.manifest._subsystem_enabled",
+        side_effect=lambda n: n == "outreach",
+    ):
+        alerts = await _run_alerts_with_db(db)
+    stale = _stale(alerts)
+    assert any(a["id"] == "subsystem_stale:outreach" for a in stale), stale
+    o = next(a for a in stale if a["id"] == "subsystem_stale:outreach")
+    assert o["severity"] == "WARNING"
+    assert "outreach" in o["message"]
+
+
+@pytest.mark.asyncio
+async def test_disabled_outreach_suppresses_cessation_alert(db):
+    """A Telegram-less install (outreach not enabled) must NOT raise
+    subsystem_stale:outreach even with a stale retained pulse — the absent/stopped
+    scheduler is intentional, not a death. Mirrors the disabled-ego guard."""
+    await _seed_heartbeat(db, "outreach", age_seconds=50 * 3600)
+    with patch(
+        "genesis.mcp.health.manifest._subsystem_enabled",
+        side_effect=lambda n: n != "outreach",
+    ):
+        alerts = await _run_alerts_with_db(db)
+    assert not [a for a in _stale(alerts) if a["id"] == "subsystem_stale:outreach"]
+
+
+def test_subsystem_enabled_reads_outreach_telegram_config(tmp_path):
+    """_subsystem_enabled('outreach') gates on whether Telegram is configured (the
+    same side-effect-free loader the bridge + onboarding-readiness use): no/placeholder
+    token → not enabled (dashboard-only install, benign); a valid token + numeric
+    allowed-user → enabled (outreach is supposed to run → monitor it)."""
+    from genesis.mcp.health import manifest as _m
+
+    not_configured = tmp_path / "secrets_none.env"
+    not_configured.write_text("TELEGRAM_BOT_TOKEN=\n")
+    with patch("genesis.env.secrets_path", return_value=not_configured):
+        assert _m._subsystem_enabled("outreach") is False
+
+    configured = tmp_path / "secrets_ok.env"
+    configured.write_text("TELEGRAM_BOT_TOKEN=123456:ABCDEF\nTELEGRAM_ALLOWED_USERS=42\n")
+    with patch("genesis.env.secrets_path", return_value=configured):
+        assert _m._subsystem_enabled("outreach") is True
+
+    # Fail CLOSED (→ benign) when the secrets file is absent — never manufacture a
+    # permanent outreach cessation alert from a read error.
+    missing = tmp_path / "does_not_exist.env"
+    with patch("genesis.env.secrets_path", return_value=missing):
+        assert _m._subsystem_enabled("outreach") is False
+
+
+@pytest.mark.asyncio
+async def test_enabled_outreach_no_pulse_is_benign_not_never_started(db):
+    """BLOCKER regression: outreach IS a bootstrap-manifest entry (records 'ok' =
+    scheduler CONSTRUCTED, not running). A Telegram-configured install whose scheduler
+    never .start()s (revoked token / Telegram unreachable at boot) has manifest 'ok' +
+    ZERO pulses past grace — that must be a BENIGN no_heartbeat, NOT a permanent
+    subsystem_never_started:outreach. Outreach's pulse only begins after channel
+    registration, so 'ok' ≠ 'should be pulsing' (the _CONDITIONAL_PULSE_SUBSYSTEMS
+    exemption). Without the exemption this returns never_started → RED."""
+    from genesis.mcp.health import manifest as _m
+
+    mf = _manifest({"outreach": "ok"}, persisted_age_s=3600)  # ≫ ~180s grace
+    with (
+        patch.object(_m, "_read_persisted_manifest", return_value=mf),
+        patch.object(_m, "_subsystem_enabled", side_effect=lambda n: n == "outreach"),
+    ):
+        verdict = await _m.compute_heartbeat_staleness("outreach", db=db, paused=False)
+    assert verdict["status"] == "no_heartbeat", verdict
+
+
+@pytest.mark.asyncio
+async def test_outreach_init_failure_still_never_started(db):
+    """The conditional-pulse exemption covers ONLY the ok-but-silent case: a genuine
+    outreach init FAILURE (manifest 'failed:'/'degraded' — the scheduler could not even
+    be constructed) still surfaces as never_started (init-failed)."""
+    from genesis.mcp.health import manifest as _m
+
+    mf = _manifest({"outreach": "failed: boom"}, persisted_age_s=3600)
+    with (
+        patch.object(_m, "_read_persisted_manifest", return_value=mf),
+        patch.object(_m, "_subsystem_enabled", side_effect=lambda n: n == "outreach"),
+    ):
+        verdict = await _m.compute_heartbeat_staleness("outreach", db=db, paused=False)
+    assert verdict["status"] == "never_started", verdict
+    assert verdict.get("reason") == "init-failed"
+
+
 # ── loosened thresholds (near-zero false-reds) ───────────────────────────────
 
 
@@ -483,6 +579,11 @@ async def _run_alerts_with_db(db, *, paused: bool = False):
         # subsystem_stale:inbox tests don't depend on the repo's inbox_monitor.yaml.
         # A test wanting a disabled inbox overrides this or patches _subsystem_enabled.
         patch("genesis.mcp.health.manifest._inbox_enabled", return_value=True),
+        # Hermetic default: treat outreach as NOT enabled (Telegram-less) so existing
+        # tests don't depend on this box's secrets.env / raise a spurious
+        # subsystem_stale:outreach. A test wanting outreach monitored overrides this
+        # or patches _subsystem_enabled.
+        patch("genesis.mcp.health.manifest._outreach_enabled", return_value=False),
     ):
         from genesis.mcp.health.errors import _impl_health_alerts
 
@@ -553,13 +654,9 @@ async def test_surplus_dropped_from_alert_set(db):
     assert not [a for a in _stale(alerts) if a["id"] == "subsystem_stale:surplus"]
 
 
-@pytest.mark.asyncio
-async def test_outreach_dropped_from_alert_set(db):
-    """outreach is DROPPED (config-gated pulse → false-alarm trap) — even a
-    3-day-old outreach heartbeat emits NO subsystem_stale:outreach."""
-    await _seed_heartbeat(db, "outreach", age_seconds=3 * 86400)  # ≫ 172800 threshold
-    alerts = await _run_alerts_with_db(db)
-    assert not [a for a in _stale(alerts) if a["id"] == "subsystem_stale:outreach"]
+# NOTE: outreach is no longer "dropped" — it is now in the alert set, enable-gated on
+# Telegram config. The enabled→WARNING and disabled→suppressed cases are covered by
+# test_enabled_outreach_cessation_alerts_warning + test_disabled_outreach_suppresses_cessation_alert.
 
 
 @pytest.mark.asyncio
