@@ -301,6 +301,22 @@ def test_reclaim_leading_zero_choice_rejected_no_spawn(tmp_path):
     assert killed == ""
 
 
+def test_reclaim_oversized_choice_rejected_no_wrong_kill(tmp_path):
+    # Codex P2: an oversized decimal (2^64) slipped the regex, errored the bounds
+    # check, and WRAPPED $((10#choice-1)) to -1 → killed the LAST session. Must be
+    # rejected outright (invalid, exit 1, nothing killed/spawned).
+    code, out, spawned, killed = _run_pty(
+        tmp_path,
+        action="RECLAIM\nAt the emergency limit.\ncap_full",
+        session_names=["cc-1", "cc-2", "cc-3", "cc-5", "cc-6"],
+        feed=b"18446744073709551616\n",
+    )
+    assert not spawned
+    assert code == 1
+    assert "invalid selection" in out.lower()
+    assert killed == ""  # crucially: did NOT wrap-index and kill cc-6
+
+
 def test_manual_door_failopen_over_cap_denies_no_reclaim(tmp_path):
     # Dashboard/"manual" door is the normal method held to the cap: even in
     # fail-open it must NOT get the destructive reclaim flow — a plain DENY.

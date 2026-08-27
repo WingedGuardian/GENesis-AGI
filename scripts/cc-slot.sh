@@ -170,11 +170,15 @@ _cap_reclaim() {
         echo "Cancelled — reattach an existing session (tmux attach -t ${SESSION_PREFIX}-<N>)." >&2
         exit 1
     fi
-    # Reject leading zeros (^[1-9][0-9]*$, same as SLOT above): bash reads a
-    # leading-zero numeral as OCTAL, so "08"/"09" would raise a "value too great
-    # for base" arithmetic error that silently unwinds past this gate and spawns
-    # anyway — defeating the cap. 10# forces base-10 defensively in the index.
-    if ! [[ "$choice" =~ ^[1-9][0-9]*$ ]] || [ "$choice" -gt "${#rows[@]}" ]; then
+    # Validate the choice fully BEFORE any arithmetic. Reject: leading zeros
+    # (^[1-9][0-9]*$ — bash reads a leading-zero numeral as OCTAL → "08" errors),
+    # AND an over-long digit string (the `-le 3` bound short-circuits before the
+    # `-gt` comparison, so an oversized value like 2^64 can't raise an arithmetic
+    # error that unwinds past the check and then WRAP the index to a valid slot,
+    # killing the wrong session). The row list is always << 1000, so ≤3 digits
+    # covers every real selection. 10# forces base-10 in the index defensively.
+    if ! [[ "$choice" =~ ^[1-9][0-9]*$ ]] || [ "${#choice}" -gt 3 ] \
+       || [ "$choice" -gt "${#rows[@]}" ]; then
         echo "Invalid selection — cancelled." >&2
         exit 1
     fi
