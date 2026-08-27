@@ -35,6 +35,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from fnmatch import fnmatch
@@ -464,6 +465,23 @@ def _check_fingerprints(
     return hits
 
 
+def _resolve_detect_secrets() -> str | None:
+    """Resolve the detect-secrets executable regardless of the process PATH.
+
+    detect-secrets is a declared CORE dependency, installed into the SAME venv as the
+    running interpreter. But the sanitizer can run in a process whose PATH lacks that
+    venv's bin — e.g. a Claude-Code-spawned MCP child inherits CC's PATH, not the
+    server unit's ``PATH=<venv>/bin:...`` — so a bare ``shutil.which`` returns None
+    and the floor fail-closed BLOCKS every contribution even though the binary IS
+    installed. Prefer the interpreter-relative path (``sys.executable``'s bin dir),
+    then fall back to PATH.
+    """
+    candidate = Path(sys.executable).parent / "detect-secrets"
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    return shutil.which("detect-secrets")
+
+
 def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
     """Run `detect-secrets scan --string` on every added line.
 
@@ -473,8 +491,13 @@ def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
     without secret-scanning. bootstrap.sh installs detect-secrets as
     part of the Genesis venv; a missing binary means the install is
     broken and the user must repair it before contributing.
+
+    Resolution is PATH-independent (see ``_resolve_detect_secrets``): the tool can
+    run in a process whose PATH lacks the venv bin, and a bare PATH lookup there
+    would fail-closed-BLOCK every contribution despite the binary being installed.
     """
-    if shutil.which("detect-secrets") is None:
+    ds_bin = _resolve_detect_secrets()
+    if ds_bin is None:
         return True, [
             Finding(
                 kind=FindingKind.SECRET,
@@ -503,7 +526,7 @@ def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
             continue
         try:
             proc = subprocess.run(
-                ["detect-secrets", "scan", "--string", text],
+                [ds_bin, "scan", "--string", text],
                 capture_output=True,
                 text=True,
                 timeout=5,

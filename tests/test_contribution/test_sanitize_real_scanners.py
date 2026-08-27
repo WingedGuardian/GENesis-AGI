@@ -18,6 +18,7 @@ optional external binary → skipif-guarded.
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -50,6 +51,44 @@ def test_detect_secrets_real_binary_flags_suffixed_true():
     assert any(h.kind == FindingKind.SECRET and h.severity == Severity.BLOCK for h in hits), (
         "detect-secrets must BLOCK on the github token (real output is 'True  (unverified)')"
     )
+
+
+@pytest.mark.skipif(
+    shutil.which("detect-secrets") is None,
+    reason="detect-secrets not installed in the test env",
+)
+def test_detect_secrets_floor_survives_path_without_venv_bin(monkeypatch):
+    """Regression (2026-08-27): the required secret-scan floor fail-closed BLOCKED
+    with detail='missing_binary' whenever the running process's PATH lacked the venv
+    bin — e.g. a CC-spawned MCP child inherits CC's PATH, not the server unit's
+    ``PATH=<venv>/bin:...`` — even though detect-secrets is a declared core dependency
+    installed next to ``sys.executable``. A bare ``shutil.which('detect-secrets')``
+    returned None and blocked EVERY contribution proposal on every install.
+
+    With PATH stripped so bare resolution fails, the floor must STILL resolve
+    detect-secrets (via the interpreter's bin dir) and actually scan — blocking the
+    token, never emitting ``missing_binary``.
+    """
+    monkeypatch.setenv("PATH", "/nonexistent-dir")
+    assert shutil.which("detect-secrets") is None  # precondition: bare PATH now fails
+
+    ran, hits = sanitize._run_detect_secrets(sanitize.parse_diff(_SECRET_DIFF))
+    assert ran
+    assert not any((h.detail or "") == "missing_binary" for h in hits), (
+        "floor must resolve detect-secrets via the venv, not bare PATH"
+    )
+    assert any(h.kind == FindingKind.SECRET and h.severity == Severity.BLOCK for h in hits), (
+        "the floor must still catch the github token with the venv-relative resolve"
+    )
+
+
+def test_resolve_detect_secrets_prefers_interpreter_bin(monkeypatch):
+    """The resolver returns an executable even when PATH is empty (installed as a
+    core dep next to sys.executable)."""
+    monkeypatch.setenv("PATH", "")
+    resolved = sanitize._resolve_detect_secrets()
+    assert resolved is not None
+    assert Path(resolved).is_file() and os.access(resolved, os.X_OK)
 
 
 @pytest.mark.skipif(
@@ -214,7 +253,6 @@ def test_gitleaks_config_error_warns_not_silent_clean(monkeypatch):
     deliberately broken pinned config."""
     if shutil.which("gitleaks") is None:
         pytest.skip("gitleaks not installed")
-    import os
     import tempfile
 
     fd, bad = tempfile.mkstemp(suffix=".gitleaks.toml")
