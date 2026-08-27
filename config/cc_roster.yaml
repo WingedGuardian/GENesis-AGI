@@ -35,3 +35,13 @@ models:
     model_id: glm-5.2
     failover_order: 1
     validated: "2026-06-29"
+  # Kimi Code membership endpoint (api.kimi.com/coding) — bills the Kimi
+  # subscription quota, NOT per-token. Fallback for Claude Max rate limits.
+  # Lower membership tier → kimi-for-coding @ 256K context (k3/k3[1m] need
+  # higher tiers). Gauntlet 3/3 PASS 2026-08-27 (run 733e25c317cd).
+  kimi:
+    anthropic_base_url: "https://api.kimi.com/coding/"
+    auth_env: KIMI_API_KEY
+    model_id: kimi-for-coding
+    failover_order: 2
+    validated: "2026-08-27"

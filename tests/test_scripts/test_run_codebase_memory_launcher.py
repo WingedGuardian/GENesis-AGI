@@ -195,6 +195,61 @@ def test_unparseable_memmax_warns_and_runs_uncapped(tmp_path):
     assert "ULIMIT_V:unlimited" in blog.read_text()
 
 
+# ── binary resolution without $HOME (env-scrubbed MCP clients) ────────────
+
+
+def _fake_named_binary(tmp_path: Path) -> tuple[Path, Path]:
+    """A fake server actually named ``codebase-memory-mcp`` in its own dir,
+    so PATH resolution (``command -v``) can find it. Returns (bindir, log)."""
+    log = tmp_path / "binary.log"
+    bindir = tmp_path / "realbin"
+    bindir.mkdir(exist_ok=True)
+    _write_exec(
+        bindir / "codebase-memory-mcp",
+        "#!/usr/bin/env bash\n"
+        f'echo "ARGS:$*" >> "{log}"\n'
+        f'echo "ULIMIT_V:$(ulimit -v)" >> "{log}"\n',
+    )
+    return bindir, log
+
+
+def test_scrubbed_env_resolves_via_path(tmp_path):
+    # Kimi Code spawns MCP servers with HOME empty and no
+    # CODEBASE_MEMORY_MCP_BIN; the launcher must fall through to a PATH
+    # lookup instead of dying with "not installed" (seen by the client as a
+    # bare EPIPE). No systemd-run on PATH either → ulimit fallback.
+    bindir, blog = _fake_named_binary(tmp_path)
+    minbin = _minimal_path(tmp_path)
+    res = subprocess.run(
+        ["bash", str(_LAUNCHER)],
+        env={"PATH": f"{bindir}:{minbin}", "HOME": ""},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert res.returncode == 0, res.stderr
+    assert "ULIMIT_V:2097152" in blog.read_text()
+
+
+def test_home_default_preferred_when_home_set(tmp_path):
+    # With HOME set (Claude Code), the $HOME/.local/bin default still wins;
+    # PATH alone would NOT find the binary here (minbin has no fake).
+    home = tmp_path / "home"
+    (home / ".local" / "bin").mkdir(parents=True)
+    log = tmp_path / "binary.log"
+    _write_exec(
+        home / ".local" / "bin" / "codebase-memory-mcp",
+        "#!/usr/bin/env bash\n"
+        f'echo "ULIMIT_V:$(ulimit -v)" >> "{log}"\n',
+    )
+    minbin = _minimal_path(tmp_path)
+    res = subprocess.run(
+        ["bash", str(_LAUNCHER)],
+        env={"PATH": str(minbin), "HOME": str(home)},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert res.returncode == 0, res.stderr
+    assert "ULIMIT_V:2097152" in log.read_text()
+
+
 # ── real-cgroup smoke (local only; skipped where no user manager) ─────────
 
 

@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import signal
+import subprocess
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -72,9 +73,31 @@ def _build_scope_args() -> list[str]:
     a heavy CC build from OOM-ing the box while auto-scaling up on larger
     installs and down on the 8 GiB floor — no hardcoded ceiling to re-tune.
 
-    Returns an empty list if systemd-run is unavailable (graceful degradation).
+    Returns an empty list if systemd-run is unavailable (graceful degradation)
+    OR has no reachable user manager. The probe matters: ``which`` alone is not
+    enough — env-scrubbed spawners (a Kimi Code session's Bash tool, CI) have
+    the binary but no DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR, and
+    ``systemd-run --user`` then dies instantly with "Failed to connect to bus",
+    taking the CC subprocess down with it at 0.0s (gauntlet infra-skips,
+    2026-08-27). Same probe-then-commit pattern as .claude/mcp/run-codebase-memory.
+    The probe result is cached for the process lifetime via _get_scope_args.
     """
     if not shutil.which("systemd-run"):
+        return []
+    try:
+        probe = subprocess.run(
+            ["systemd-run", "--user", "--scope", "--quiet", "--", "/bin/true"],
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if probe.returncode != 0:
+        logger.warning(
+            "systemd-run --user probe failed (no user manager?) — CC subprocesses "
+            "will run WITHOUT the cgroup scope (no MemoryHigh/MemoryMax isolation): %s",
+            probe.stderr.decode(errors="replace").strip()[:200],
+        )
         return []
     return [
         "systemd-run",

@@ -37,11 +37,16 @@ CLAUDE = "claude"
 
 #: Env slots that select the model for a routed Claude Code subprocess. ALL are set
 #: (not just ANTHROPIC_MODEL) so CC's background/sub-agent calls also use the peer.
+#: FABLE + SUBAGENT included: CC 2.1.x routes sub-agents/background tasks through
+#: those slots, and an unset slot makes the peer endpoint reject the request with
+#: a model-not-found (it only knows its own model ids).
 _ROSTER_MODEL_ENV_VARS = (
     "ANTHROPIC_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
 )
 
 

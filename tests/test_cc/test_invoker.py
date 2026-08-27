@@ -233,6 +233,55 @@ def test_build_env_strips_parent_anthropic_base_url(invoker):
         assert "ANTHROPIC_BASE_URL" not in env
 
 
+def test_scope_args_empty_when_probe_fails(monkeypatch):
+    """Env-scrubbed spawners (Kimi Code Bash tool, CI) have the systemd-run
+    binary but no reachable user manager — the probe must fail closed to
+    'no scope wrap' instead of letting systemd-run kill the CC subprocess
+    at 0.0s with 'Failed to connect to bus' (gauntlet infra-skips, 2026-08-27)."""
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+
+    def _probe_fails(*args, **kwargs):
+        return real_subprocess.CompletedProcess(args[0], 1, b"", b"Failed to connect to bus")
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_fails)
+    assert inv_mod._build_scope_args() == []
+
+
+def test_scope_args_empty_when_probe_raises(monkeypatch):
+    """Probe timeout / spawn failure also degrades to no wrap, never raises."""
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+
+    def _probe_times_out(*args, **kwargs):
+        raise real_subprocess.TimeoutExpired(cmd="systemd-run", timeout=15)
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_times_out)
+    assert inv_mod._build_scope_args() == []
+
+
+def test_scope_args_built_when_probe_succeeds(monkeypatch):
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+
+    def _probe_ok(*args, **kwargs):
+        return real_subprocess.CompletedProcess(args[0], 0, b"", b"")
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_ok)
+    out = inv_mod._build_scope_args()
+    assert out[:3] == ["systemd-run", "--user", "--scope"]
+    assert "MemoryMax=75%" in out
+
+
 def test_build_env_applies_env_overrides_last(invoker):
     """env_overrides wins over keys the invoker itself computes.
 
