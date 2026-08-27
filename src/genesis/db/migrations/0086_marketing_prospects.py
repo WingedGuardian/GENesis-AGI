@@ -41,6 +41,11 @@ _INDEX_DDL = (
 )
 
 
+async def _has_table(db: aiosqlite.Connection, table: str) -> bool:
+    cursor = await db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,))
+    return await cursor.fetchone() is not None
+
+
 async def _has_column(db: aiosqlite.Connection, table: str, column: str) -> bool:
     cursor = await db.execute(f"PRAGMA table_info({table})")
     return any(row[1] == column for row in await cursor.fetchall())
@@ -52,14 +57,22 @@ async def up(db: aiosqlite.Connection) -> None:
     for stmt in _INDEX_DDL:
         await db.execute(stmt)
 
-    # Thread labeled_surplus through the pending_outreach queue. The _has_column
-    # PRAGMA guard gives idempotency (the column may already exist on a re-run or a
-    # fresh DB built from _tables.py), so the ALTER runs at most once. Any ALTER
-    # error is allowed to PROPAGATE: a transient SQLITE_LOCKED reaches the runner's
-    # retry-on-lock loop (a suppressed lock error here would instead record 0086 as
+    # Thread labeled_surplus through the pending_outreach queue — but ONLY when that
+    # table already exists. pending_outreach is created by create_all_tables
+    # (db/schema/_tables.py), NOT by any migration, and in production create_all_tables
+    # runs BEFORE the migration runner — so this ALTER only ever fires on a legacy DB
+    # whose pending_outreach predates labeled_surplus. When the runner is exercised in
+    # ISOLATION (no create_all_tables — e.g. the migration-runner test harness), the
+    # table is legitimately absent and there is nothing to thread: skip rather than
+    # fail on "no such table". The _has_column guard gives idempotency (fresh installs
+    # already carry the column). Crucially this is NOT a blanket error suppress — a
+    # real ALTER failure still PROPAGATES: a transient SQLITE_LOCKED reaches the
+    # runner's retry-on-lock loop (a swallowed lock would instead record 0086 as
     # applied WITHOUT the column, breaking every subsequent pending_outreach enqueue),
-    # and a genuine failure fails the migration loudly rather than half-applying it.
-    if not await _has_column(db, "pending_outreach", "labeled_surplus"):
+    # and a genuine schema failure fails the migration loudly.
+    if await _has_table(db, "pending_outreach") and not await _has_column(
+        db, "pending_outreach", "labeled_surplus"
+    ):
         await db.execute(
             "ALTER TABLE pending_outreach ADD COLUMN labeled_surplus INTEGER NOT NULL DEFAULT 0"
         )
