@@ -1324,60 +1324,30 @@ fi
 # recovery `claude -p` is single-brain and never nests, so host-setup.sh deliberately
 # does NOT set the nesting default.) See docs/reference/cc-compatibility.md.
 _settings_file="$HOME/.claude/settings.json"
-# The two auto-updater keys are owned by cc_ensure_updater_suppressed
-# (scripts/lib/cc_version.sh, sourced above) — the SAME function the align path
-# re-runs on every install/bootstrap/update, so setup and steady-state can't drift
-# apart. It creates the file when absent and never clobbers an unparseable one.
-if ! cc_ensure_updater_suppressed "$_settings_file"; then
-    echo "    WARNING: Could not set auto-updater suppression in $_settings_file"
-    echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\"}}"
-    SETUP_WARNINGS=1
-fi
-# Subagent-nesting default is container-only and set-if-absent (a deliberate
-# operator override — 0 to disable, or higher — is preserved), so it stays here
-# rather than in the shared updater-suppression function.
-if python3 - "$_settings_file" <<'PYEOF' 2>/dev/null
-import json, os, stat, sys, tempfile
-# Mirrors cc_ensure_updater_suppressed's write contract: follow symlinks (dotfiles
-# setups) and preserve the original mode — a rename installs a FRESH inode, which
-# would silently widen a 0600 credential-bearing settings.json to 0644.
-path = os.path.realpath(sys.argv[1])
-try:
-    with open(path) as f:
-        data = json.load(f)
-except Exception:
-    sys.exit(2)
-if not isinstance(data, dict):
-    sys.exit(2)
-env = data.setdefault("env", {})
-if not isinstance(env, dict):
-    sys.exit(2)
-if "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH" not in env:
-    env["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] = "2"
-    try:
-        mode = stat.S_IMODE(os.stat(path).st_mode)
-    except FileNotFoundError:
-        mode = 0o600
-    fd, tmp = tempfile.mkstemp(
-        dir=os.path.dirname(path) or ".", prefix=".settings.", suffix=".tmp",
-    )
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    except BaseException:
-        os.unlink(tmp)
-        raise
-PYEOF
-then
-    # Report ONLY what this block verified. The suppression outcome is reported by
-    # its own branch above — claiming it here would print a success line on the
-    # exact path where suppression just failed.
-    echo "    + Subagent-nesting default set in $_settings_file"
+# Both concerns land in ONE call, and therefore in ONE atomic write:
+#   * the two auto-updater keys are ENFORCED to "1" (cc_ensure_updater_suppressed,
+#     scripts/lib/cc_version.sh — the SAME function the align path and the
+#     genesis-cc-settings-align timer re-run, so setup and steady state cannot
+#     drift apart);
+#   * the container-only subagent-nesting default is SET IF ABSENT, so a
+#     deliberate operator override (0 to disable, or higher) is preserved.
+# One call so BOTH policies share a single write contract (mode/xattr carry-over,
+# compare-and-swap, fsync) instead of this file keeping a second, weaker copy of
+# it. Note what this does NOT claim: on a fresh install the file is still touched
+# twice overall, because cc_ensure_local (earlier in this script) already creates
+# it with the suppression keys before this line adds the nesting default. Those
+# two writes are sequential within one process, so they do not race each other —
+# the lost-update hazard the CAS addresses is a CONCURRENT writer (CC itself
+# rewrites settings.json), not this ordering.
+# (The host VM's recovery `claude -p` is single-brain and never nests, so
+# host-setup.sh deliberately passes no nesting default.)
+if cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2"; then
+    echo "    + CC auto-updater suppression + subagent-nesting default verified in $_settings_file"
 else
-    echo "    WARNING: Could not set the subagent-nesting default in $_settings_file"
-    echo "    Add manually:  {\"env\": {\"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
+    echo "    WARNING: Could not write CC settings in $_settings_file"
+    echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\","
+    echo "                            \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
+    SETUP_WARNINGS=1
 fi
 
 # Login guidance (interactive only)

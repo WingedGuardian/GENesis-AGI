@@ -426,14 +426,59 @@ by one shared function, **`cc_ensure_updater_suppressed`** (`scripts/lib/cc_vers
   `bootstrap.sh`, and `update.sh` run. Deliberately ahead of the pin/npm checks, because
   the common path is "already at pin", which returns early, and that steady state is
   exactly when settings drift would otherwise go unnoticed.
-- **The nightly `genesis-cc-align.timer` reconciles the container too** — `cc_align_host.sh`
-  calls it before its guardian gates, so the box self-heals daily instead of waiting for
-  an operator-triggered update. (Without that line the ONLY re-assert on either machine
-  was a manual `update.sh`/`bootstrap.sh`/`install.sh`.)
+- **A dedicated daily timer makes it RECURRING** — `genesis-cc-settings-align.timer`
+  (`scripts/cc_settings_align.sh`). Container-side, its own unit, deliberately NOT folded
+  into `genesis-cc-align.timer`: that one is **host-only by contract** and its unit is
+  hardened on that basis, so a container-side filesystem write there would invalidate both
+  the contract and the sandbox rationale. A dedicated unit also means its status carries
+  exactly one meaning — "suppression verified or not" — with no other work to conflate it
+  with, so it can fail loudly without muddying an unrelated outcome.
+  This matters because the align path only helps a box that RUNS an align: measured on a
+  live install, `update.sh` had not run for **14 days**, which is precisely the window in
+  which a drifted settings file stays silently unprotected.
 - **A non-ok outcome reaches health, not just the log** — the function sets
-  `CC_SUPPRESSION_STATE` (`ok` / `repaired` / `failed`), and `update.sh` folds anything
-  other than `ok` into `HOST_CC_DEGRADED` → `update_history` → deploy health, the same
-  channel a container/host *version* sync failure uses.
+  `CC_SUPPRESSION_STATE` (`ok` / `repaired` / `failed` / `contended`), `update.sh` folds
+  anything other than `ok` into `HOST_CC_DEGRADED` → `update_history` → deploy health (the
+  same channel a *version* sync failure uses), and the **service**
+  (`genesis-cc-settings-align.service`, driven by the timer of the same name) exits
+  non-zero so the unit enters `failed` — visible in
+  `systemctl --user status genesis-cc-settings-align.service`. Every path that did not
+  positively verify suppression exits non-zero, including the structural ones (no lock,
+  library missing, function renamed away): a run that checked nothing must never report
+  success, or the unit becomes a green light for an unguarded updater.
+- **The write is a compare-and-swap, not a blind replace.** `settings.json` is rewritten by
+  OTHER processes — CC itself persists it on a `/config` change or a permission grant
+  (MEASURED: modified mid-session while several CC sessions were live). `os.replace` is
+  atomic for *readers* but is not a CAS, so a stale in-memory copy would silently revert a
+  concurrent writer. The helper re-checks file identity immediately before the rename and
+  retries the whole read-modify instead of clobbering, with a short randomized backoff so
+  the three attempts do not all land inside one contended window. Ownership, mode and
+  xattrs are carried across (a fresh inode would otherwise widen a credential-bearing
+  file), and the write is `fsync`ed before the rename.
+
+  **POSIX ACLs are carried, not refused.** `shutil.copystat` reproduces
+  `system.posix_acl_access` on the replacement inode for the file's owner (MEASURED on
+  ext4/CPython 3.12; setting that xattr does not require privilege). An earlier revision
+  refused to write at all when an ACL was present, assuming a rename could not preserve
+  one — a false premise with a severe cost: a *default* ACL on `$HOME` or `~/.claude`
+  (routine on NFS and corporate images) gives every file created inside one, so the
+  reconciler would never write, suppression would never be established, and the timer would
+  fail daily forever with no self-heal. The carry is now VERIFIED after the copy and the
+  write abandoned only if it genuinely did not survive.
+
+  The replacement also gets a fresh mtime (`os.utime`) rather than the source's. `copystat`
+  carries times too, which would restore the pre-write timestamp and hide the repair from
+  every mtime+size change detector — measured: a same-length value correction left size and
+  mtime byte-identical. A file this thing rewrote must look rewritten, not least because
+  the remediation advice below starts with comparing timestamps.
+  **Residual, stated honestly:** the few syscalls between the final check and the rename are
+  irreducible without a lock the other writers do not take. A single run therefore cannot
+  prove persistence — a **repeat `repaired` across timer ticks** is the real "something on
+  this machine keeps rewriting settings.json" signal, and the timer gives that signal a
+  receiver: it remembers the previous outcome and **fails the unit on the second
+  consecutive repair**. Without that the signal existed only as identical journal lines in
+  a unit that stayed green, precisely during the long gaps between deploys when
+  `update.sh` (the other consumer of the state) is not running at all.
 
 It is idempotent and silent when correct, and **loud when it repairs drift**
 (`! CC auto-updater suppression was MISSING in … — restored: …` on stderr, so it shows
@@ -454,9 +499,10 @@ the 2.1.87 script pin, and again mid-session when the container auto-updated fro
 to 2.1.160.
 
 **Known coverage gap (the HOST's `settings.json` only):** the container is reconciled on
-every align *and* nightly (above). The host's user-level file is written by `host-setup.sh`
-at setup, and the nightly timer re-aligns the host's CC *version* through the guardian
-gateway but cannot reach the host's `settings.json` — there is no gateway op for it. So
+every align *and* daily via `genesis-cc-settings-align.timer` (above). The host's
+user-level file is written by `host-setup.sh` at setup, and `genesis-cc-align.timer`
+re-aligns the host's CC *version* through the guardian gateway but cannot reach the host's
+`settings.json` — there is no gateway op for it. So
 host *version* drift self-heals nightly, host *settings* drift does not: re-run
 `host-setup.sh`, or check the file by hand, if the host is ever suspected of
 self-updating.

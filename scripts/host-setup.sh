@@ -1333,10 +1333,37 @@ else
     echo "  WARNING: Could not set auto-updater suppression in $_host_settings_file"
     echo "  Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\"}}"
 fi
-# Under sudo the file above may be created as root — hand it back to the operator
-# so their CC can rewrite it (chown the file too, not just the directory).
-if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-    chown "$_host_user:" "$_host_settings_file" 2>/dev/null || true
+# Under sudo a file this run CREATED belongs to root — hand it back to the
+# operator so their CC can rewrite it.
+#
+# Guarded on `repaired`, i.e. ONLY when this run actually wrote. `ok` means the
+# file was already correct and untouched; `failed`/`contended` mean nothing was
+# written. In both of those a chown would be re-asserting ownership on a file
+# this script did not modify.
+#
+# On the `repaired` path the chown is usually redundant — for a PRE-EXISTING
+# file the write path carries uid/gid across the replacement inode itself — and
+# it is kept for the case that redundancy does not cover: a file this run
+# CREATED, which under sudo belongs to root and would otherwise be unwritable by
+# the operator's own CC.
+#
+# Skipped for a symlink: the reconciler follows the link and writes the real
+# target, so a blanket chown would reach into a dotfiles checkout and change
+# ownership there.
+#
+# A FAILED chown is reported rather than swallowed — the failure mode is a
+# root-owned ~/.claude/settings.json that the operator's CC then cannot write,
+# which is worse than the drift this whole block exists to prevent, and silence
+# is how it would go unnoticed.
+if [ "${CC_SUPPRESSION_STATE:-ok}" = "repaired" ] &&
+   [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] &&
+   [ ! -L "$_host_settings_file" ]; then
+    if ! chown "$_host_user:" "$_host_settings_file" 2>/dev/null; then
+        echo "  WARNING: could not chown $_host_settings_file to $_host_user —" \
+             "it may be root-owned, which will stop the operator's Claude Code from"
+        echo "           writing its own settings. Fix with:" \
+             "sudo chown $_host_user: $_host_settings_file"
+    fi
 fi
 
 # ── Shared user-level CLAUDE.md on the host (D16) ──────────────

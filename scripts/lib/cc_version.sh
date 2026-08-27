@@ -66,28 +66,104 @@ CC_PROBE_DIRS="${CC_PROBE_DIRS:-/usr/local/bin:/usr/bin:$HOME/.npm-global/bin}"
 # shellcheck disable=SC2120,SC2034
 cc_ensure_updater_suppressed() {
     local settings_file="${1:-$HOME/.claude/settings.json}"
+    shift || true
+    # Any remaining args are KEY=VALUE **set-if-absent** defaults applied in the
+    # SAME atomic write (install.sh passes the subagent-nesting default). Two
+    # policies, one read-modify-write: the suppression keys are ENFORCED to an
+    # exact value, the defaults are only filled in when the key is missing, so a
+    # deliberate operator override survives. They are merged here rather than
+    # applied by a second block because a second full-file RMW on a
+    # credential-bearing file doubles the lost-update window for no benefit and
+    # duplicates the write contract (mode/xattr carry-over, CAS, fsync).
+    local -a extra_defaults=("$@")
     # Outcome for callers that surface health (update.sh folds a non-ok value into
     # HOST_CC_DEGRADED -> update_history -> deploy health). `ok` | `repaired` |
-    # `failed`. A stderr line alone is not a signal — it dies in a long deploy log.
+    # `failed` | `contended`. A stderr line alone is not a signal — it dies in a
+    # long deploy log.
     CC_SUPPRESSION_STATE=ok
 
-    if ! command -v python3 >/dev/null 2>&1; then
-        # NOTE: the create path this replaced used a pure-bash heredoc, so a
-        # python3-less machine could still get a correct file on a FRESH install.
-        # Both live callers guarantee python3 (install.sh is a Python installer;
-        # host-setup.sh apt-installs python3 before this runs), so there is no
-        # live trigger — but keep that ordering in mind before moving either call.
+    # Create the directory BEFORE the python3 gate: install.sh used to do this
+    # unconditionally, and moving it behind the gate meant a python3-less box got
+    # neither the directory nor the file (where the old bash heredoc had at least
+    # produced a correct one). Report a real failure rather than swallowing it —
+    # an unwritable $HOME surfaced later as "could not read/merge", which names
+    # the wrong cause entirely.
+    local settings_dir
+    settings_dir="$(dirname "$settings_file")"
+    if ! mkdir -p "$settings_dir" 2>/dev/null && [ ! -d "$settings_dir" ]; then
         CC_SUPPRESSION_STATE=failed
-        echo "  WARNING: cc_ensure_updater_suppressed: python3 not found — cannot verify" \
-             "auto-updater suppression in $settings_file (CC may self-update past the pin)" >&2
+        echo "  WARNING: cc_ensure_updater_suppressed: cannot create $settings_dir" \
+             "(is \$HOME writable?) — CC auto-updater suppression not verified" >&2
         return 1
     fi
 
-    mkdir -p "$(dirname "$settings_file")" 2>/dev/null || true
+    if ! command -v python3 >/dev/null 2>&1; then
+        # python3 is NOT guaranteed on every caller's machine. install.sh is a
+        # Python installer so the container always has it, and cc_settings_align.sh
+        # gets it from the unit's PATH — but host-setup.sh installs python3 with
+        # `incus exec <container>`, i.e. INSIDE the container. The HOST itself only
+        # gets incus and nodejs, so a minimal host VM can reach here with no python3.
+        #
+        # The code this replaced wrote the file with a pure-bash heredoc, so such a
+        # host still ended up correctly suppressed. Losing that would be a real
+        # regression and a permanent one: per §Auto-Updater Suppression the HOST's
+        # settings.json has no recurring self-heal, so the miss persists until
+        # someone re-runs host-setup.sh by hand.
+        #
+        # So: CREATE is still possible without a JSON parser (we know the exact
+        # contents). MERGING into an existing file is not — guessing at JSON with
+        # shell would risk destroying operator settings, which is worse than the
+        # drift. Create when absent; report and leave alone when present.
+        if [ ! -e "$settings_file" ]; then
+            local _umask_prev
+            _umask_prev="$(umask)"
+            umask 077                     # secrets-adjacent: never world-readable
+            if printf '%s\n' \
+                '{' \
+                '  "env": {' \
+                '    "DISABLE_AUTOUPDATER": "1",' \
+                '    "DISABLE_UPDATES": "1"' \
+                '  }' \
+                '}' > "$settings_file" 2>/dev/null; then
+                umask "$_umask_prev"
+                CC_SUPPRESSION_STATE=repaired
+                echo "  ! CC auto-updater suppression was MISSING in $settings_file —" \
+                     "created it without python3 (both keys set)" >&2
+                # This branch writes ONLY the two suppression keys. Any
+                # set-if-absent defaults the caller passed are silently absent,
+                # and a caller that prints "suppression + <default> verified"
+                # would be stating something untrue. Say so here.
+                if [ "${#extra_defaults[@]}" -gt 0 ]; then
+                    echo "    (no python3: the set-if-absent default(s)" \
+                         "${extra_defaults[*]} were NOT applied — re-run once" \
+                         "python3 is available)" >&2
+                fi
+                return 0
+            fi
+            umask "$_umask_prev"
+        fi
+        CC_SUPPRESSION_STATE=failed
+        echo "  WARNING: cc_ensure_updater_suppressed: python3 not found and $settings_file" \
+             "already exists — cannot merge safely, left untouched. Add" \
+             "DISABLE_AUTOUPDATER=1 and DISABLE_UPDATES=1 by hand, or CC may" \
+             "self-update past the pin" >&2
+        return 1
+    fi
 
-    local out
-    if ! out="$(python3 - "$settings_file" <<'PYEOF' 2>/dev/null
-import json, os, stat, sys, tempfile
+    local out rc
+    # TWO separate shell hazards here, both load-bearing:
+    #  1. `local out` MUST stay on its own line — `local out="$(...)"` would make
+    #     $? the exit status of `local`, not of the command substitution.
+    #  2. the assignment must be `|| rc=$?`, NOT a bare statement: an assignment
+    #     whose value is a command substitution inherits that substitution's exit
+    #     status and TRIPS ERREXIT. install.sh/bootstrap.sh/host-setup.sh all run
+    #     `set -euo pipefail`, so a bare call would abort the installer outright on
+    #     an unparseable settings.json — the very case this function is documented
+    #     to survive. Every present call site happens to neutralise errexit; this
+    #     makes the function honest regardless of how the next one is written.
+    rc=0
+    out="$(python3 - "$settings_file" "${extra_defaults[@]}" <<'PYEOF'
+import json, os, random, shutil, sys, tempfile, time
 
 # Resolve symlinks FIRST: a dotfiles-managed settings.json is common, and
 # write-by-rename onto the link would replace it with a regular file — forking
@@ -95,53 +171,224 @@ import json, os, stat, sys, tempfile
 # permanently and silently. Follow the link and rewrite the real target.
 path = os.path.realpath(sys.argv[1])
 REQUIRED = {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}
+# argv[2:] are KEY=VALUE defaults applied ONLY when the key is absent, so a
+# deliberate operator override is preserved. Malformed entries are ignored rather
+# than failing the suppression this function primarily exists to guarantee.
+DEFAULTS = {}
+for _arg in sys.argv[2:]:
+    if "=" in _arg:
+        _k, _v = _arg.split("=", 1)
+        if _k:
+            DEFAULTS[_k] = _v
+ATTEMPTS = 3
 
-if os.path.exists(path):
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except Exception:
-        sys.exit(2)          # unparseable — report, never clobber
-    if not isinstance(data, dict):
-        sys.exit(2)
-else:
-    data = {}
 
-env = data.setdefault("env", {})
-if not isinstance(env, dict):
+def fail(reason):
+    # One clean line, never a traceback: the caller surfaces this verbatim, and
+    # "could not read/merge" collapsed a full disk, a permission error and a
+    # corrupt file into one indistinguishable message.
+    print(reason, file=sys.stderr)
     sys.exit(2)
 
-repaired = [k for k, v in REQUIRED.items() if env.get(k) != v]
-if repaired:
+
+def _exhausted(reason):
+    # Exit 3, not 2. Retry exhaustion IS contention — a competing writer, just
+    # detected by running out of attempts rather than by losing one race. Both
+    # must report `contended`; labelling this one `failed` gives a single root
+    # cause two names and defeats the point of having the state.
+    print(reason, file=sys.stderr)
+    sys.exit(3)
+
+
+def identity():
+    """The file identity we compare-and-swap against (None when absent)."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        # EACCES on the parent dir, ELOOP on a symlink cycle — same family as the
+        # write errors above; report cleanly rather than surfacing a traceback.
+        fail("cannot stat settings.json (%s) — left untouched" % exc.strerror)
+    return (st.st_ino, st.st_mtime_ns, st.st_size), st
+
+
+for _attempt in range(ATTEMPTS):
+    before, st_before = identity()
+    if before is not None:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except UnicodeDecodeError:
+            fail("settings.json is not valid UTF-8 — left untouched")
+        except ValueError:
+            fail("settings.json is not valid JSON — left untouched")
+        except OSError as exc:
+            fail("settings.json unreadable (%s) — left untouched" % exc.strerror)
+        if not isinstance(data, dict):
+            fail("settings.json is not a JSON object — left untouched")
+    else:
+        data = {}
+
+    env = data.setdefault("env", {})
+    if not isinstance(env, dict):
+        fail('settings.json "env" is not an object — left untouched')
+
+    repaired = [k for k, v in REQUIRED.items() if env.get(k) != v]
+    missing_defaults = [k for k in DEFAULTS if k not in env]
+    if not repaired and not missing_defaults:
+        sys.exit(0)          # already correct — no write, nothing to report
+
     for k in repaired:
         env[k] = REQUIRED[k]
-    # Atomic replace, but write-by-rename discards the ORIGINAL inode's metadata,
-    # so carry the mode across explicitly. settings.json's `env` block is where
-    # operators put provider API keys: a 0600 file silently returning as 0644
-    # (umask default on a fresh inode) would widen a credential store. mkstemp
-    # also creates 0600 up front — no world-readable window mid-write — and uses
-    # a unique name, so two concurrent aligns can't collide on a fixed `.tmp`.
+    for k in missing_defaults:
+        env[k] = DEFAULTS[k]
+
     try:
-        mode = stat.S_IMODE(os.stat(path).st_mode)
-    except FileNotFoundError:
-        mode = 0o600         # brand-new file: secrets-adjacent, start private
-    fd, tmp = tempfile.mkstemp(
-        dir=os.path.dirname(path) or ".", prefix=".settings.", suffix=".tmp",
-    )
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(path) or ".", prefix=".settings.", suffix=".tmp",
+        )
+    except OSError as exc:
+        # ENOSPC / EROFS / EACCES land here. Without this the operator got a raw
+        # Python traceback under a message that said "left untouched (reason
+        # above)" — pointing at a stack trace instead of the real cause, which is
+        # exactly the collapse this function's error handling exists to avoid.
+        # EROFS is not hypothetical: the unit template documents a settings.json
+        # symlinked outside %h under ProtectSystem=strict.
+        fail("cannot create a temp file beside settings.json (%s) — left untouched"
+             % exc.strerror)
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-        os.chmod(tmp, mode)
+            f.flush()
+            os.fsync(f.fileno())     # rename is atomic, but not durable on its own
+        if before is not None:
+            # copystat carries mode + times + xattrs; chown carries ownership when
+            # permitted (the host leg runs under sudo, where it is). mkstemp already
+            # created the temp 0600, so a failure here never WIDENS access.
+            try:
+                shutil.copystat(path, tmp)
+            except OSError:
+                pass
+            # A rewrite must LOOK rewritten. copystat also carries the source's
+            # TIMES, which would restore the pre-write mtime and hide the repair
+            # from every mtime+size change detector (rsync's quick check, `find
+            # -newer`, any mtime-keyed cache) — measured: a same-length value
+            # correction left size AND mtime_ns byte-identical. That directly
+            # undercuts this feature's own remediation advice, since "find the
+            # writer that keeps rewriting this file" starts with timestamps.
+            try:
+                os.utime(tmp, None)
+            except OSError:
+                pass
+            # POSIX ACLs live in system.posix_acl_access. copystat DOES carry it
+            # for the file's owner — measured on ext4/CPython 3.12: os.setxattr
+            # of that name succeeds unprivileged, and copystat reproduces it on
+            # the replacement inode. An earlier revision REFUSED to write at all
+            # when an ACL was present, on the assumption it could not be carried.
+            # That was false, and the cost was severe: a default ACL on $HOME or
+            # ~/.claude (setfacl -d, routine on NFS and corporate images) makes
+            # every file created inside carry one, so the reconciler would never
+            # write, suppression would never be established, and the timer would
+            # fail daily forever with no self-heal — the exact state this exists
+            # to prevent, made permanent. Verify instead of refusing.
+            try:
+                if ("system.posix_acl_access" in os.listxattr(path)
+                        and "system.posix_acl_access" not in os.listxattr(tmp)):
+                    os.unlink(tmp)
+                    fail("settings.json carries a POSIX ACL this process could not "
+                         "carry across — left untouched; set the two keys by hand")
+            except OSError:
+                pass         # filesystem without xattr support: nothing to preserve
+            try:
+                os.chown(tmp, st_before.st_uid, st_before.st_gid)
+            except OSError:
+                pass
+        else:
+            os.chmod(tmp, 0o600)     # brand-new file: secrets-adjacent, start private
+
+        # COMPARE-AND-SWAP. os.replace is atomic for READERS but provides no CAS,
+        # so a concurrent writer's change would be silently reverted by our stale
+        # in-memory copy. CC itself rewrites this file (a /config change, a
+        # permission grant), and this function now runs on every align AND on a
+        # timer, so the window recurs. Re-check identity as late as possible and
+        # retry the whole read-modify rather than clobber.
+        # Residual: the few syscalls between this check and the rename are still
+        # unguarded — irreducible without a lock the other writers do not take.
+        after, _ = identity()
+        if after != before:
+            os.unlink(tmp)
+            # Back off before re-reading. Three bare retries complete in
+            # microseconds, so against a writer that takes milliseconds all
+            # three land inside the same contended window and the bounded
+            # retry is effectively a single attempt.
+            time.sleep(0.01 + random.random() * 0.02)
+            continue
         os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)   # never leave a stray temp holding the contents
+        except OSError:
+            pass
+        fail("could not write settings.json (%s) — left untouched" % exc.strerror)
     except BaseException:
-        os.unlink(tmp)       # never leave a stray temp holding the contents
+        try:
+            os.unlink(tmp)   # e.g. KeyboardInterrupt / SIGTERM mid-write
+        except OSError:
+            pass
         raise
-    print(" ".join(sorted(repaired)))
+
+    # Verify the EFFECT, not just the action: re-read and confirm the keys are
+    # actually present before claiming a repair.
+    #
+    # SCOPE, honestly: this catches only a clobber that lands between the rename
+    # and this read. It cannot prove PERSISTENCE — MEASURED against a writer
+    # rewriting this file every ~4ms, the repair landed, passed this check, and was
+    # overwritten afterwards anyway. No single-shot check can do better, because a
+    # competing writer takes no lock of ours. Persistence is only observable over
+    # TIME: a REPEAT `repaired` on the next timer tick is the real "something on
+    # this machine keeps rewriting settings.json" signal. This check exists so that
+    # `repaired` means "verified correct after writing" rather than merely "wrote
+    # bytes" — a narrower claim, but a true one.
+    try:
+        with open(path, encoding="utf-8") as f:
+            final = json.load(f)
+        still = [k for k, v in REQUIRED.items()
+                 if (final.get("env") or {}).get(k) != v]
+    except (OSError, ValueError):
+        still = list(REQUIRED)
+    if still:
+        print("repair did not stick — %s missing again immediately, so something on "
+              "this machine is actively rewriting settings.json" % " ".join(sorted(still)),
+              file=sys.stderr)
+        sys.exit(3)
+
+    print(" ".join(sorted(repaired)))   # empty when only defaults were filled in
+    sys.exit(0)
+
+_exhausted("settings.json kept changing under us (%d attempts) — left untouched rather "
+     "than revert a concurrent writer" % ATTEMPTS)
 PYEOF
-    )"; then
+    )" || rc=$?
+
+    if [ "$rc" -eq 3 ]; then
+        # Wrote successfully, then something overwrote it before we could confirm.
+        # NOT "repaired": the effective state is still unsuppressed. Rare by
+        # construction (the window is a few syscalls), so seeing it at all is a
+        # strong hint at an aggressive writer — but its ABSENCE proves nothing, and
+        # a repeat `repaired` across ticks remains the durable signal.
+        CC_SUPPRESSION_STATE=contended
+        echo "  ! CC auto-updater suppression in $settings_file was repaired but did NOT" \
+             "stick (reason above) — CC may self-update past the pin; find the writer" >&2
+        return 1
+    fi
+    if [ "$rc" -ne 0 ]; then
+        # The specific cause was already printed to stderr by the helper above
+        # (unparseable / not UTF-8 / unreadable / ACL / kept-changing). Do not restate
+        # it as one catch-all line — that is how a full disk read as corruption.
         CC_SUPPRESSION_STATE=failed
-        echo "  WARNING: cc_ensure_updater_suppressed: could not read/merge $settings_file" \
-             "(left untouched) — verify DISABLE_AUTOUPDATER=1 and DISABLE_UPDATES=1 by hand," \
+        echo "  WARNING: cc_ensure_updater_suppressed: $settings_file left untouched" \
+             "(reason above) — verify DISABLE_AUTOUPDATER=1 and DISABLE_UPDATES=1 by hand," \
              "or CC may self-update past the pin" >&2
         return 1
     fi

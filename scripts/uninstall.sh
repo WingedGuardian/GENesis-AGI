@@ -417,10 +417,21 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         for unit in genesis-watchdog.timer genesis-watchdog.service \
                     genesis-disk-hygiene.timer genesis-disk-hygiene.service \
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
+                    genesis-cc-settings-align.timer genesis-cc-settings-align.service \
                     genesis-server.service genesis-bridge.service \
                     qdrant.service; do
             safe_disable_service "$unit"
         done
+
+        # Persistent= timers keep a stamp file under
+        # ~/.local/share/systemd/timers/. Removing the unit file does NOT remove
+        # it, and systemd.timer(5) says to run this BEFORE uninstalling a timer
+        # unit — otherwise a reinstall inherits a stale "last run" and can
+        # immediately replay a run it should not.
+        systemctl --user clean --what=state \
+            genesis-cc-settings-align.timer genesis-cc-align.timer \
+            genesis-disk-hygiene.timer genesis-watchdog.timer \
+            genesis-cc-tmp-align.timer 2>/dev/null || true
 
         # Wait for genesis-server port to close
         for _i in $(seq 1 10); do
@@ -485,10 +496,12 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             container_exec "
                 systemctl --user stop genesis-watchdog.timer genesis-watchdog.service 2>/dev/null || true;
                 systemctl --user stop genesis-cc-tmp-align.timer genesis-cc-tmp-align.service 2>/dev/null || true;
+                systemctl --user stop genesis-cc-settings-align.timer genesis-cc-settings-align.service 2>/dev/null || true;
                 systemctl --user stop genesis-server.service genesis-bridge.service qdrant.service 2>/dev/null || true;
                 systemctl --user disable genesis-server.service genesis-bridge.service \
                     genesis-watchdog.timer genesis-watchdog.service \
-                    genesis-cc-tmp-align.timer genesis-cc-tmp-align.service qdrant.service 2>/dev/null || true
+                    genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
+                    genesis-cc-settings-align.timer genesis-cc-settings-align.service qdrant.service 2>/dev/null || true
             "
             ok "Stopped Genesis services"
 
