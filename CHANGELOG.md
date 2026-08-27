@@ -78,6 +78,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Campaign names stored before the control-character fix are now cleaned at
+  startup.** Names have been sanitized at the write boundary since the previous
+  release, so nothing new lands malformed, but rows written earlier were never
+  repaired. The cleanup now runs during campaign initialization, before the
+  scheduler registers its jobs — the ordering matters, because each campaign's
+  scheduled job is keyed by its name, and renaming afterwards would leave the
+  running job pointing at a name that no longer exists. A campaign whose cleaned
+  name would collide with another campaign's is left untouched and logged rather
+  than merged.
+
 - **Heartbeat GC no longer lets a clock-skewed future row starve a subsystem's
   liveness signal.** The `keep_latest_per_subsystem` heartbeat GC
   (`db/crud/events.py::prune`) kept the row equal to the per-subsystem
@@ -195,6 +205,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   gate; the other repointed sites stay on free flash.
 
 ### Security
+
+- **Invisible-character stripping now covers Unicode's whole format category, not
+  a hand-picked 13 of it.** Campaign names and awareness-signal text are normalized
+  before they reach a line-parsed prompt, to stop injected text forging or concealing
+  a line. That normalizer enumerated 13 of Unicode's 170 `Cf` format characters,
+  silently omitting concealment characters from the very families it did cover —
+  most pointedly U+061C ARABIC LETTER MARK, sibling of the already-stripped
+  LRM/RLM, plus SOFT HYPHEN, WORD JOINER and the invisible U+E0000 tag block. The
+  set is now derived from Python's Unicode database, with a test that regenerates
+  it and fails if the two ever diverge. Zero-width joiner and non-joiner are
+  deliberately preserved: they are format characters too, but stripping them would
+  break every emoji sequence (👨‍👩‍👧 → three separate people) and corrupt Persian and
+  Indic words, where they are orthographically required.
 
 - **Hook-surface PRs can no longer merge without a current GitHub Codex review.**
   The merge gate's review-freshness check now treats any unreviewed delta touching

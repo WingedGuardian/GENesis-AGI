@@ -77,3 +77,105 @@ def test_output_has_no_splitlines_boundary():
     payload = "x" + chr(0x2028) + "y\nz" + chr(0x0B) + "w"
     out = strip_control_chars(payload)
     assert len(out.splitlines()) == 1, out
+
+
+# ── Category-based coverage (Cf) ──────────────────────────────────────────
+# The hand-enumerated set above covered 13 of Unicode's 170 Cf codepoints,
+# leaving concealment characters from the SAME families uncovered — most
+# pointedly U+061C ARABIC LETTER MARK, a bidi mark whose siblings LRM/RLM were
+# already stripped. These lock the category-based rule.
+
+
+def test_arabic_letter_mark_removed():
+    # U+061C is a bidi mark of the same family as LRM/RLM (already covered);
+    # omitting it left the Trojan-source defence incomplete on its own axis.
+    assert strip_control_chars("a" + chr(0x061C) + "b") == "a b"
+
+
+def test_uncovered_invisible_format_controls_removed():
+    for cp in (
+        0x00AD,  # SOFT HYPHEN — invisible, renders as nothing mid-word
+        0x180E,  # MONGOLIAN VOWEL SEPARATOR
+        0x2060,  # WORD JOINER
+        0x2061,  # FUNCTION APPLICATION (invisible operator)
+        0x206A,  # INHIBIT SYMMETRIC SWAPPING
+        0x206F,  # NOMINAL DIGIT SHAPES
+        0xFFF9,  # INTERLINEAR ANNOTATION ANCHOR
+        0xE0001,  # LANGUAGE TAG (the invisible tag block)
+        0xE0041,  # TAG LATIN CAPITAL LETTER A
+    ):
+        assert strip_control_chars("a" + chr(cp) + "b") == "a b", hex(cp)
+
+
+# ── The two Cf characters that MUST survive ───────────────────────────────
+# ZWJ and ZWNJ are category Cf but are load-bearing for legitimate text, so a
+# naive whole-category strip corrupts real content. Nothing in the suite covered
+# this before — a category rewrite would have shipped green while silently
+# mangling emoji and Persian/Indic words.
+
+
+def test_zwj_emoji_sequences_preserved():
+    family = "\U0001f468‍\U0001f469‍\U0001f467"  # 👨‍👩‍👧
+    assert strip_control_chars(family) == family
+    woman_technologist = "\U0001f469‍\U0001f4bb"  # 👩‍💻
+    assert strip_control_chars(woman_technologist) == woman_technologist
+    rainbow_flag = "\U0001f3f3️‍\U0001f308"  # 🏳️‍🌈
+    assert strip_control_chars(rainbow_flag) == rainbow_flag
+
+
+def test_zwnj_in_multilingual_text_preserved():
+    # ZWNJ is orthographically REQUIRED here — stripping it changes the word,
+    # not just its rendering.
+    persian = "می‌رود"  # می‌رود
+    assert strip_control_chars(persian) == persian
+    devanagari = "क्‌ष"  # conjunct suppression
+    assert strip_control_chars(devanagari) == devanagari
+
+
+def test_zwj_zwnj_survive_alongside_stripped_controls():
+    # A run mixing a stripped control with a preserved joiner must strip only
+    # the former (and must not merge the emoji into the collapsed space).
+    src = "\U0001f468‍\U0001f469" + chr(0x061C) + "ok"
+    assert strip_control_chars(src) == "\U0001f468‍\U0001f469 ok"
+
+
+def test_cf_ranges_match_unicodedata():
+    """The stripped set IS Unicode's Cf category minus the two joiners.
+
+    This is the drift guard: the previous hand-enumeration covered 13 of 170 Cf
+    codepoints, and nothing detected the gap. Regenerating from ``unicodedata``
+    here means a Python/UCD bump that adds a format character fails this test
+    instead of silently reopening the hole.
+    """
+    import unicodedata
+
+    from genesis.security.sanitizer import _CONTROL_RUN_RE
+
+    KEEP = {0x200C, 0x200D}  # ZWNJ, ZWJ — load-bearing for real text
+    missing, wrongly_stripped = [], []
+    for cp in range(0x110000):
+        ch = chr(cp)
+        if unicodedata.category(ch) != "Cf":
+            continue
+        stripped = bool(_CONTROL_RUN_RE.match(ch))
+        if cp in KEEP and stripped:
+            wrongly_stripped.append(hex(cp))
+        elif cp not in KEEP and not stripped:
+            missing.append(hex(cp))
+    assert not missing, f"Cf codepoints not stripped: {missing}"
+    assert not wrongly_stripped, f"joiners must survive: {wrongly_stripped}"
+
+
+def test_old_hand_enumerated_set_still_covered():
+    """Monotonicity: every character the previous set stripped is still stripped."""
+    from genesis.security.sanitizer import _CONTROL_RUN_RE
+
+    previously = (
+        list(range(0x00, 0x20))
+        + list(range(0x7F, 0xA0))
+        + [0x2028, 0x2029, 0x200B, 0x200E, 0x200F, 0xFEFF]
+        + list(range(0x202A, 0x202F))
+        + list(range(0x2066, 0x206A))
+    )
+    for cp in previously:
+        assert _CONTROL_RUN_RE.match(chr(cp)), f"regressed: {hex(cp)}"
