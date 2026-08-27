@@ -256,11 +256,24 @@
                     @click="$store.genesisDashboard.settingsRestartMessage = null">Dismiss</button>
           </div>
         </template>
-        <!-- System timezone display -->
-        <div style="font-size:0.72rem; color:var(--color-text-secondary); margin-bottom:0.75rem; display:flex; align-items:center; gap:0.4rem;">
+        <!-- Display & schedule timezone (writes genesis.yaml — the authoritative
+             source; NOT the container OS clock). Dropdown avoids IANA-string typos. -->
+        <div style="font-size:0.72rem; color:var(--color-text-secondary); margin-bottom:0.75rem; display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap;">
           <span class="material-symbols-outlined" style="font-size:0.9rem;">schedule</span>
-          System timezone: <strong x-text="$store.genesisDashboard.systemTimezone || 'loading...'" style="color:var(--color-text);"></strong>
-          <span style="font-size:0.65rem;">(all schedules use this timezone)</span>
+          <label for="tz-select" style="white-space:nowrap; color:var(--color-text);">Display &amp; schedule timezone:</label>
+          <select id="tz-select" style="font-size:0.75rem; padding:3px 6px; max-width:280px;"
+                  :value="$store.genesisDashboard.systemTimezone"
+                  :disabled="$store.genesisDashboard.timezoneSaving || !$store.genesisDashboard.timezoneOptions.length"
+                  @change="$store.genesisDashboard.saveTimezone($event.target.value)">
+            <template x-if="!$store.genesisDashboard.timezoneOptions.length">
+              <option :value="$store.genesisDashboard.systemTimezone || ''"
+                      x-text="$store.genesisDashboard.systemTimezone || 'loading…'"></option>
+            </template>
+            <template x-for="tz in $store.genesisDashboard.timezoneOptions" :key="tz">
+              <option :value="tz" :selected="tz === $store.genesisDashboard.systemTimezone" x-text="tz"></option>
+            </template>
+          </select>
+          <span style="font-size:0.65rem;">(display updates now; most scheduled jobs re-time after a Genesis restart)</span>
         </div>
         <template x-if="!$store.genesisDashboard.settingsDomains">
           <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
