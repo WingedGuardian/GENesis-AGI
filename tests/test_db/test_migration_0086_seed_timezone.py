@@ -43,6 +43,10 @@ def _home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.delenv("USER_TIMEZONE", raising=False)
     # Keep the best-effort cache refresh from touching the tz singleton.
     monkeypatch.setattr("genesis.util.tz.reload", lambda: None)
+    # Hermetic secrets source: the seed now falls back to reading secrets.env when
+    # the env is unset (the update.sh CLI path). Point it at a nonexistent file so
+    # tests never read this box's real secrets.env; secrets-read tests override it.
+    monkeypatch.setattr("genesis.env.secrets_path", lambda: tmp_path / "no_secrets.env")
     return tmp_path
 
 
@@ -112,3 +116,34 @@ def test_up_applies_seed(tmp_path, monkeypatch):
     monkeypatch.setenv("USER_TIMEZONE", "Europe/Paris")
     asyncio.run(_MOD.up(None))
     assert _read_tz(tmp_path) == "Europe/Paris"
+
+
+def test_reads_timezone_from_secrets_when_env_absent(tmp_path, monkeypatch):
+    # P1 (Codex): the update.sh CLI path runs migrations WITHOUT loading secrets.env,
+    # so os.environ lacks USER_TIMEZONE — the seed must read the file directly, else
+    # the flip silently re-times an upgraded install to UTC.
+    _write_cfg(tmp_path, {"timezone": "UTC"})
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("FOO=bar\nUSER_TIMEZONE=Europe/Paris\nBAZ=1\n")
+    monkeypatch.delenv("USER_TIMEZONE", raising=False)  # env genuinely absent
+    monkeypatch.setattr("genesis.env.secrets_path", lambda: secrets)
+    _MOD._seed_timezone_into_config()
+    assert _read_tz(tmp_path) == "Europe/Paris"
+
+
+def test_typo_file_zone_does_not_block_seed(tmp_path, monkeypatch):
+    # P2 (Codex): a non-UTC TYPO in the file must not be treated as authoritative
+    # and shadow a valid env zone.
+    _write_cfg(tmp_path, {"timezone": "Amrica/Chicago"})  # deliberate typo
+    monkeypatch.setenv("USER_TIMEZONE", "Europe/Paris")
+    _MOD._seed_timezone_into_config()
+    assert _read_tz(tmp_path) == "Europe/Paris"
+
+
+def test_invalid_env_zone_not_seeded(tmp_path, monkeypatch):
+    # P2 (Codex): a broken USER_TIMEZONE resolved to UTC pre-flip anyway — don't
+    # write a bad value into the now-authoritative file.
+    _write_cfg(tmp_path, {"timezone": "UTC"})
+    monkeypatch.setenv("USER_TIMEZONE", "Not/AZone")
+    _MOD._seed_timezone_into_config()
+    assert _read_tz(tmp_path) == "UTC"

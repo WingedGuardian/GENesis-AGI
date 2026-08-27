@@ -46,16 +46,63 @@ import aiosqlite
 logger = logging.getLogger(__name__)
 
 
+def _read_env_timezone() -> str:
+    """The pre-flip effective ``USER_TIMEZONE`` — process env if present, else
+    parsed directly from secrets.env.
+
+    The server-startup migration path has secrets loaded into ``os.environ``
+    (``load_dotenv`` in runtime/init/secrets runs BEFORE migrations). But the
+    ``update.sh`` upgrade path runs ``python -m genesis.db.migrations --apply``
+    WITHOUT loading secrets.env, so ``os.environ`` lacks USER_TIMEZONE there —
+    read the file directly so the seed captures the real zone on BOTH paths (else
+    the flip silently re-times an upgraded install to UTC).
+    """
+    val = (os.environ.get("USER_TIMEZONE") or "").strip()
+    if val:
+        return val
+    try:
+        from genesis.env import secrets_path  # stable path resolver (SECRETS_PATH / repo_root)
+
+        path = secrets_path()
+        if path.is_file():
+            for raw in path.read_text().splitlines():
+                line = raw.strip()
+                if line.startswith("USER_TIMEZONE="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        logger.debug("tz-seed: could not read USER_TIMEZONE from secrets.env", exc_info=True)
+    return ""
+
+
+def _is_valid_zone(name: str) -> bool:
+    """True iff ``name`` resolves as an IANA zone (guards against typos)."""
+    if not name:
+        return False
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        ZoneInfo(name)
+        return True
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        return False
+
+
 def _seed_timezone_into_config() -> None:
-    """Adopt ``USER_TIMEZONE`` env into ``genesis.yaml`` when the file is UTC/absent.
+    """Adopt the effective ``USER_TIMEZONE`` into ``genesis.yaml`` when the file's
+    timezone is UTC / absent / an invalid typo.
 
     Uses the SAME path ``genesis.env._local_config`` reads
     (``Path.home()/.genesis/config/genesis.yaml``) so the seed lands where the
-    resolver looks. Fully self-contained; the caller guards against exceptions.
+    resolver looks. Self-contained; the caller guards against exceptions.
     """
-    env_tz = (os.environ.get("USER_TIMEZONE") or "").strip()
+    env_tz = _read_env_timezone()
     if not env_tz or env_tz.upper() == "UTC":
         return  # nothing real to seed
+    if not _is_valid_zone(env_tz):
+        # A broken USER_TIMEZONE resolved to UTC pre-flip anyway (ZoneInfo failure
+        # → UTC); do not write a bad value into the now-authoritative file.
+        logger.warning("tz-seed: USER_TIMEZONE=%r is not a valid IANA zone — not seeding", env_tz)
+        return
 
     import yaml  # noqa: PLC0415 — lazy import, yaml is always available
 
@@ -76,10 +123,13 @@ def _seed_timezone_into_config() -> None:
             existing = loaded
 
     file_tz = str(existing.get("timezone", "") or "").strip()
-    if file_tz and file_tz.upper() != "UTC":
-        return  # file already holds a real zone — authoritative, leave it
+    # Leave the file alone ONLY when it already holds a real, VALID non-UTC zone.
+    # A non-UTC TYPO must not shadow a valid env zone → fall through and fix it.
+    if file_tz and file_tz.upper() != "UTC" and _is_valid_zone(file_tz):
+        return
 
-    # File is absent-key or UTC-sentinel while env is a real zone → adopt env.
+    # File is absent-key / UTC-sentinel / an invalid typo while env is a real,
+    # valid zone → adopt env.
     existing["timezone"] = env_tz
     cfg_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(dir=str(cfg_path.parent), suffix=".yaml.tmp")
@@ -112,13 +162,19 @@ def _seed_timezone_into_config() -> None:
 
 
 async def up(db: aiosqlite.Connection) -> None:  # noqa: ARG001 — file migration, no DB use
-    # STRICTLY FAIL-OPEN: init/db.py aborts server startup if a migration raises.
+    # FAIL-OPEN: init/db.py aborts server startup if a migration raises, and a
+    # timezone seed must never brick a boot. The tradeoff (chosen over Codex's
+    # "keep pending for retry", which would require raising → aborting startup):
+    # a swallowed WRITE failure means the flip leaves this install on UTC until
+    # the tz is set via the dashboard Timezone control or genesis.yaml — so it is
+    # logged at ERROR (actionable), not silently.
     try:
         _seed_timezone_into_config()
     except Exception:
-        logger.warning(
-            "tz-seed migration hit an error — leaving genesis.yaml unchanged; the "
-            "USER_TIMEZONE env fallback still resolves the zone at runtime.",
+        logger.error(
+            "tz-seed migration FAILED to write genesis.yaml — timezone may resolve "
+            "to UTC after this upgrade. Set it via the dashboard Timezone control "
+            "(Configuration tab) or add `timezone:` to ~/.genesis/config/genesis.yaml.",
             exc_info=True,
         )
 

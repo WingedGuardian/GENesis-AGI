@@ -220,11 +220,15 @@ def harvest(
             pat = _ip_prefix_pattern(_host_from_url(url))
             if pat:
                 out.append((pat, f"private subnet ({key})"))
-        for tz in {
+        # Deterministic order (env then file) with dedup — a set would iterate in
+        # hash-dependent order and break harvest()'s stable-order contract.
+        _tz_seen: set[str] = set()
+        for tz in (
             (os.environ.get("USER_TIMEZONE") or "").strip(),
             str(cfg.get("timezone", "") or "").strip(),
-        }:
-            if tz and tz.upper() != "UTC":
+        ):
+            if tz and tz.upper() != "UTC" and tz not in _tz_seen:
+                _tz_seen.add(tz)
                 out.append((_bounded(tz), "install timezone"))
         gh = cfg.get("github", {}) if isinstance(cfg, dict) else {}
         user = str(gh.get("user", "") or "").strip()

@@ -2278,7 +2278,7 @@
               this.systemTimezone = d.timezone || tz;
               this.settingsRestartMessage =
                 "Timezone set to " + this.systemTimezone +
-                " — display updates now; restart Genesis to re-time scheduled jobs.";
+                " — display updates now; most scheduled jobs re-time after a Genesis restart.";
             } else {
               const err = resp ? await resp.json().catch(() => ({})) : {};
               alert("Timezone update failed: " + (err.error || "Unknown error"));

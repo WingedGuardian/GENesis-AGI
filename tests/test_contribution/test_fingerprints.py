@@ -140,6 +140,16 @@ def test_harvest_blocks_file_tz_when_env_unset(tmp_path):
     assert r"\bEurope/Berlin\b" in pats
 
 
+def test_harvest_tz_union_deterministic_order(tmp_path, monkeypatch):
+    # P3 (Codex): when env and file differ, the two tz patterns must emit in a
+    # STABLE order (env then file) — a set would iterate hash-dependently and
+    # break harvest()'s stable-order contract.
+    home = _fake_home(tmp_path, genesis_cfg={"timezone": "Europe/Berlin"})
+    monkeypatch.setenv("USER_TIMEZONE", "Asia/Tokyo")
+    tz_pats = [p for p, c in _harvest(home) if c == "install timezone"]
+    assert tz_pats == [r"\bAsia/Tokyo\b", r"\bEurope/Berlin\b"]
+
+
 def test_harvest_tz_union_no_utc_and_dedups(tmp_path, monkeypatch):
     # UTC on either side is never emitted; when both agree the pattern dedups.
     home = _fake_home(tmp_path, genesis_cfg={"timezone": "UTC"})

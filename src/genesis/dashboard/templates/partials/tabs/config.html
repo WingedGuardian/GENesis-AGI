@@ -273,7 +273,7 @@
               <option :value="tz" :selected="tz === $store.genesisDashboard.systemTimezone" x-text="tz"></option>
             </template>
           </select>
-          <span style="font-size:0.65rem;">(display + scheduled jobs; restart to re-time schedules)</span>
+          <span style="font-size:0.65rem;">(display updates now; most scheduled jobs re-time after a Genesis restart)</span>
         </div>
         <template x-if="!$store.genesisDashboard.settingsDomains">
           <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
