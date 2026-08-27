@@ -186,8 +186,10 @@ _PAUSE_GATED_HEARTBEATS = frozenset({"surplus", "inbox"})
 # The complete set of statuses ``compute_heartbeat_staleness`` can return. Every
 # consumer that switches on the status string (the alert loop in errors.py, the ego
 # dashboard tile/route, morning_report, the subsystem_heartbeats MCP tool) must handle
-# ALL of these. Locked by test_heartbeat_status_set_is_closed so a new status can't
-# ship while a consumer silently mis-renders it.
+# ALL of these. Locked by test_heartbeat_status_set_is_closed: the test pins this set to
+# a literal, so adding a status forces a deliberate edit here + in the test — a prompt to
+# audit the consumers. (It is a forcing function, not a proof that every consumer branches
+# on each member.)
 _HEARTBEAT_STATUSES = frozenset(
     {"alive", "overdue", "paused", "resuming", "no_heartbeat", "unknown", "never_started"}
 )
@@ -354,27 +356,19 @@ def _never_started_verdict(
     using the persisted bootstrap manifest (``_read_persisted_manifest``).
 
     Fails BENIGN (``no_heartbeat``) whenever never_started cannot be confidently
-    established — a deliberately-disabled/unconfigured subsystem, a globally-paused
-    pause-gated subsystem, an absent/unreadable manifest, a subsystem absent from the
-    manifest, an unparseable boot timestamp, or a still-within-grace ``ok`` — so a fresh
-    install is never spuriously alarmed. The boot manifest is written cross-process by
-    ``runtime/_capabilities.py`` (this MCP process does not bootstrap), so this is the
-    only liveness-independent signal that tells "failed to start" from "freshly
-    installed, never run"."""
+    established — a deliberately-disabled/unconfigured subsystem, an absent/unreadable
+    manifest, a subsystem absent from the manifest, an unparseable boot timestamp, a
+    still-within-grace ``ok``, or a paused pause-gated subsystem whose ONLY silence is a
+    stopped pulse (``ok``) — so a fresh install is never spuriously alarmed. A genuine
+    init fault (``failed:``/``degraded``) alarms even while paused, since pause cannot
+    cause it. The boot manifest is written cross-process by ``runtime/_capabilities.py``
+    (this MCP process does not bootstrap), so this is the only liveness-independent
+    signal that tells "failed to start" from "freshly installed, never run"."""
     benign = {"status": "no_heartbeat", "last_seen": None}
     # Deliberately-off / unconfigured (ego config, or inbox with no yaml / disabled) —
     # its absent pulse is intentional, not a death.
     if not _subsystem_enabled(name):
         return benign
-    # A pause-gated subsystem (surplus/inbox) emits its pulse only AFTER its loop's
-    # ``if paused: return`` guard, so a globally-paused Genesis legitimately has ZERO
-    # pulses for it — that silence is intentional, not a failed/never-started death.
-    # Mirrors the overdue-branch pause downgrade in compute_heartbeat_staleness.
-    # (ego/dashboard pulse THROUGH pause, so they are never suppressed here.)
-    if name in _PAUSE_GATED_HEARTBEATS:
-        is_paused = paused if paused is not None else _read_global_paused()
-        if is_paused:
-            return benign
     mf = _read_persisted_manifest()
     if not mf:
         return benign  # no manifest at all (missing/unreadable) → protect fresh installs
@@ -382,12 +376,23 @@ def _never_started_verdict(
     if not isinstance(st, str):
         return benign  # subsystem absent from the manifest → fresh / unknown
     # init raised or short-circuited: recorded as "failed: <msg>" (prefix) or "degraded".
-    # For an ENABLED subsystem (gated above) that is a genuine failed start → alarm now.
+    # A real init fault is INDEPENDENT of pause — pause is a runtime toggle applied AFTER
+    # bootstrap, so it cannot cause an init failure — so surface it even while paused
+    # (suppressing it would silence a genuinely-broken start behind an operator pause).
     if st.startswith("failed") or st == "degraded":
         return {"status": "never_started", "last_seen": None, "reason": "init-failed"}
-    # Registered ok but has never pulsed: a death only once past a boot grace (its
-    # first pulse may legitimately still be pending just after boot).
+    # Registered ok but has never pulsed: a death only once past a boot grace (its first
+    # pulse may legitimately still be pending just after boot).
     if st == "ok":
+        # ONLY the ok-but-silent pulse is excused by pause: a pause-gated subsystem
+        # (surplus/inbox) emits its pulse after its loop's ``if paused: return`` guard,
+        # so a globally-paused Genesis legitimately has zero pulses for it — intentional
+        # silence, not a never-started death. Mirrors the overdue-branch pause downgrade.
+        # (ego/dashboard pulse THROUGH pause, so they are never suppressed.)
+        if name in _PAUSE_GATED_HEARTBEATS:
+            is_paused = paused if paused is not None else _read_global_paused()
+            if is_paused:
+                return benign
         persisted_at = parse_iso_utc(mf.get("persisted_at"))
         if persisted_at is None:
             return benign  # can't establish the grace clock → benign

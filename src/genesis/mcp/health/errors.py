@@ -1018,6 +1018,11 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
                 # has already gated this on _subsystem_enabled, so a disabled/
                 # unconfigured subsystem never reaches here. ego CRITICAL, else WARNING;
                 # auto-resolves when the subsystem finally pulses (verdict → alive).
+                # Coverage: only ego + inbox can reach this — both are bootstrap init
+                # steps recorded in the manifest. `dashboard` is in this loop for the
+                # stale/unknown paths only; it is a daemon thread, NOT a manifest entry,
+                # so its verdict is always benign here. A never-started dashboard needs
+                # its own signal (a manifest entry for the thread) — a separate follow-up.
                 _ns_failed = _hb.get("reason") == "init-failed"
                 _detail = (
                     "failed to initialize at bootstrap"

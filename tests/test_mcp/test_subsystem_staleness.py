@@ -49,15 +49,20 @@ async def _seed_heartbeat(db, subsystem: str, age_seconds: float) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _no_real_bootstrap_manifest():
+def _no_real_bootstrap_manifest(tmp_path):
     """Hermetic default: no persisted bootstrap manifest.
 
     ``compute_heartbeat_staleness`` reads ``~/.genesis/bootstrap_manifest.json``
-    (via ``_read_persisted_manifest``) to compute the never_started verdict. This
-    box HAS that file from its running server; CI does not. Patch it to None by
-    default so every test sees the fresh-install empty state (benign) unless it
-    explicitly injects a manifest — install-agnostic + no cross-test leakage."""
-    with patch("genesis.mcp.health.manifest._read_persisted_manifest", return_value=None):
+    (via ``_read_persisted_manifest`` → ``_MANIFEST_FILE``) to compute the
+    never_started verdict. This box HAS that file from its running server; CI does
+    not. Point ``_MANIFEST_FILE`` at an ABSENT path so the REAL reader returns None
+    (fresh-install empty state, benign) unless a test explicitly injects a manifest
+    — install-agnostic + no cross-test leakage. Patching the file path (not the
+    reader) keeps the real read+parse chain live for the integration test."""
+    from genesis.mcp.health import manifest as _m
+
+    absent = tmp_path / "no_such_bootstrap_manifest.json"  # intentionally does not exist
+    with patch.object(_m, "_MANIFEST_FILE", absent):
         yield
 
 
@@ -1006,6 +1011,22 @@ async def test_not_paused_inbox_ok_silent_still_never_started(db):
 
 
 @pytest.mark.asyncio
+async def test_paused_inbox_degraded_still_never_started(db):
+    """Pause excuses only a stopped PULSE, never a real init fault. A paused inbox whose
+    manifest shows 'degraded' (init failed/short-circuited) must STILL surface
+    never_started/init-failed — pause is applied after boot and cannot cause it."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    with (
+        _patch_manifest({"inbox": "degraded"}),
+        patch("genesis.mcp.health.manifest._inbox_enabled", return_value=True),
+    ):
+        hb = await compute_heartbeat_staleness("inbox", db=db, paused=True)
+    assert hb["status"] == "never_started"
+    assert hb.get("reason") == "init-failed"
+
+
+@pytest.mark.asyncio
 async def test_pulse_present_overrides_never_started(db):
     """never_started only fires with NO usable pulse — a recent pulse → alive even if
     the manifest says degraded."""
@@ -1016,6 +1037,48 @@ async def test_pulse_present_overrides_never_started(db):
     ):
         hb = await _compute("inbox", db)
     assert hb["status"] == "alive"
+
+
+@pytest.mark.asyncio
+async def test_never_started_integration_real_manifest_file(db, tmp_path):
+    """E2E through the REAL _read_persisted_manifest file read (NOT mocked): a real
+    bootstrap_manifest.json on disk with ego=ok + an old persisted_at and no pulse →
+    never_started/started-silent. Proves the file → JSON parse → verdict chain end to
+    end (the unit tests inject the manifest dict; this exercises the actual reader,
+    confirming the on-disk key shape {manifest, persisted_at} matches the verdict)."""
+    import json as _json
+
+    from genesis.mcp.health import manifest as _m
+
+    manifest_file = tmp_path / "bootstrap_manifest.json"
+    manifest_file.write_text(
+        _json.dumps({"manifest": {"ego": "ok"}, "persisted_at": _iso_ago(_GRACE_EGO_S + 120)})
+    )
+    with patch.object(_m, "_MANIFEST_FILE", manifest_file):  # real reader, real file
+        hb = await _m.compute_heartbeat_staleness("ego", db=db, paused=False)
+    assert hb["status"] == "never_started"
+    assert hb.get("reason") == "started-silent"
+
+
+@pytest.mark.asyncio
+async def test_never_started_integration_real_manifest_degraded_inbox(db, tmp_path):
+    """E2E real-file read: inbox recorded 'degraded' (the real failed/short-circuited
+    init shape) + enabled → never_started/init-failed, straight off disk."""
+    import json as _json
+
+    from genesis.mcp.health import manifest as _m
+
+    manifest_file = tmp_path / "bootstrap_manifest.json"
+    manifest_file.write_text(
+        _json.dumps({"manifest": {"inbox": "degraded"}, "persisted_at": _iso_ago(100)})
+    )
+    with (
+        patch.object(_m, "_MANIFEST_FILE", manifest_file),
+        patch("genesis.mcp.health.manifest._inbox_enabled", return_value=True),
+    ):
+        hb = await _m.compute_heartbeat_staleness("inbox", db=db, paused=False)
+    assert hb["status"] == "never_started"
+    assert hb.get("reason") == "init-failed"
 
 
 @pytest.mark.asyncio
