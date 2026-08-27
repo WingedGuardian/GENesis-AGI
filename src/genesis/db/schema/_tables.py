@@ -790,7 +790,8 @@ TABLES = {
             issue_url           TEXT,
             posted_at           TEXT,
             rejected_at         TEXT,
-            dry_run_at          TEXT
+            dry_run_at          TEXT,
+            adopted             INTEGER NOT NULL DEFAULT 0
         )
     """,
     # WS-8 PR-D autonomous-send ledger — one row per email sent autonomously

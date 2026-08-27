@@ -18,7 +18,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   Scoped to default-branch merges and same-repo references; idempotent, and
   fails closed on any ambiguity (empty/unresolvable state no-ops; a genuine read
   failure fails the run and preserves the cursor to re-cover). Gated by the same
-  `repo_pulse` lever.
+  `repo_pulse` lever. Hardened: the originating follow-up id is resolved to its
+  canonical form at proposal time (a prefix/tagged/uppercase handle resolves to
+  the full id; an ambiguous or unknown handle is rejected rather than stored as a
+  ref the join can never match); and only issues Genesis actually CREATED are
+  treated as authoritative close-links — an issue Genesis merely ADOPTED that a
+  different account authored (a coincidental same-title issue) is recorded as
+  adopted and excluded from the join, so a PR closing it never falsely resolves a
+  follow-up (a crash-recovery adopt of an issue Genesis itself authored stays
+  authoritative).
 - **Session-start surface for age-stale open PRs.** The repo-pulse worker now
   also caches the open-PR set each boundary, and a SessionStart hook lists the
   ones idle past a threshold (default 7 days) as one passive inline line —

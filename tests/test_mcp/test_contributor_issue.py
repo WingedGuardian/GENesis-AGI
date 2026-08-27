@@ -90,6 +90,68 @@ async def test_held_creates_row_and_approval(db, live):
     assert ctx["cell"] == ["github", "issue_create", "bulk"]
 
 
+# ── source_follow_up_id resolution (close-loop ref integrity) ──────────────
+
+
+async def _seed_follow_up(db, fid):
+    from genesis.db.crud import follow_ups as fu
+
+    await fu.create(db, content="c", source="test", strategy="surplus_task", id=fid)
+
+
+@pytest.mark.asyncio
+async def test_source_follow_up_prefix_resolves_to_canonical(db, live):
+    # A tagged/prefix handle must be normalized to the canonical full id at propose
+    # time, else the close-loop join (which keys canonical full ids) silently misses.
+    canonical = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"  # 32-hex follow_up id
+    await _seed_follow_up(db, canonical)
+    res = await _propose(
+        db,
+        title="Harden the retry loop",
+        body="Add a bounded retry to the widget fetcher.",
+        source="follow_up",
+        source_follow_up_id="a1b2c3d4e5f6",  # a UNIQUE 12-char prefix
+    )
+    assert res["status"] == "held"
+    row = await pip.get_by_id(db, res["pending_id"])
+    assert row["source_ref"] == canonical  # stored the canonical id, not the prefix
+    ctx = json.loads((await ar.get_by_id(db, res["request_id"]))["context"])
+    assert ctx["source_follow_up_id"] == canonical
+
+
+@pytest.mark.asyncio
+async def test_source_follow_up_ambiguous_prefix_rejected(db, live):
+    # A prefix matching >1 follow_up must be rejected, never guessed — persisting a
+    # ref the close-loop can't uniquely match is worse than refusing the proposal.
+    await _seed_follow_up(db, "deadbeef" + "00" * 12)  # 32 hex, shared prefix
+    await _seed_follow_up(db, "deadbeef" + "11" * 12)
+    res = await _propose(
+        db,
+        title="Ambiguous ref",
+        body="This proposal cites an ambiguous follow_up prefix.",
+        source="follow_up",
+        source_follow_up_id="deadbeef",  # matches BOTH
+    )
+    assert res["status"] == "error"
+    assert "ambiguous" in res["reason"]
+    assert await pip.list_held(db) == []  # nothing persisted
+
+
+@pytest.mark.asyncio
+async def test_source_follow_up_unknown_prefix_rejected(db, live):
+    # A prefix-shaped ref that matches no follow_up is rejected (not stored verbatim).
+    res = await _propose(
+        db,
+        title="Unknown ref",
+        body="This proposal cites a follow_up prefix that does not exist.",
+        source="follow_up",
+        source_follow_up_id="cafef00d",  # prefix-shaped hex, no match
+    )
+    assert res["status"] == "error"
+    assert "not_found" in res["reason"]
+    assert await pip.list_held(db) == []
+
+
 @pytest.mark.asyncio
 async def test_propose_only_message_hints_dry_run(db, monkeypatch):
     monkeypatch.setattr(ci, "effective_mode", lambda: "propose_only")

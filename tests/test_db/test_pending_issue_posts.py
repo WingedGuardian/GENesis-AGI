@@ -22,6 +22,7 @@ from genesis.db.crud import pending_issue_posts as pip
 from genesis.db.schema._tables import TABLES
 
 MIGRATION = importlib.import_module("genesis.db.migrations.0079_pending_issue_posts")
+MIGRATION_0087 = importlib.import_module("genesis.db.migrations.0087_pending_issue_posts_adopted")
 
 _ROW = {
     "id": "p1",
@@ -47,6 +48,9 @@ async def db(tmp_path):
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
         await MIGRATION.up(conn)
+        # 0087 adds the create-vs-adopt provenance column onto the 0079 table (mirrors
+        # the real migration chain, which posted_index_for_repo's adopted filter needs).
+        await MIGRATION_0087.up(conn)
         # follow_ups: the close-loop-aware prune reads it (NOT-EXISTS open-follow_up
         # guard). In production it always exists (migration 0004, early); create the
         # canonical table here so the prune subquery resolves.
@@ -295,6 +299,20 @@ class TestCrud:
         assert (await pip.get_by_id(db, "p"))["status"] == "posted"
 
     @pytest.mark.asyncio
+    async def test_prune_reaps_adopted_posted_row_even_with_open_followup(self, db):
+        # An ADOPTED posted row is excluded from posted_index_for_repo, so it can never
+        # resolve a follow_up — the open-follow_up retention protection does NOT apply.
+        # It prunes on the normal age schedule instead of lingering uselessly.
+        await _seed_followup(db, id="fu-open2", status="pending")
+        await pip.create(db, **{**_ROW, "id": "ad", "request_id": "r-ad", "source_ref": "fu-open2"})
+        await pip.mark_posted(
+            db, "ad", issue_number=8, issue_url="u", posted_at="2026-01-01T00:00:00", adopted=True
+        )
+        deleted = await pip.prune_terminal(db, older_than_days=30, now="2026-08-07T00:00:00")
+        assert deleted == 1  # adopted → not protected → pruned
+        assert await pip.get_by_id(db, "ad") is None
+
+    @pytest.mark.asyncio
     async def test_prune_reaps_posted_row_of_resolved_followup(self, db):
         # A 'posted' row whose follow_up is RESOLVED (not open) is prunable — the
         # close-loop will never act on it again.
@@ -446,6 +464,28 @@ class TestPostedIndexForRepo:
         await pip.create(db, **row)
         await pip.mark_posted(db, "cb", issue_number=201, issue_url="u", posted_at=_TS)
         assert await pip.posted_index_for_repo(db, self._REPO) == {}
+
+    @pytest.mark.asyncio
+    async def test_adopted_rows_excluded_from_close_loop(self, db):
+        # An issue Genesis ADOPTED but did not author (an external coincidental-title
+        # issue) must NOT feed the close-loop join: a PR closing it should never
+        # auto-resolve the follow_up. A Genesis-CREATED issue (adopted default False)
+        # still indexes normally.
+        adopted_row = {
+            **_ROW,
+            "id": "ad",
+            "request_id": "req-ad",
+            "repo": self._REPO,
+            "source": "follow_up",
+            "source_ref": "fu-9",
+        }
+        await pip.create(db, **adopted_row)
+        await pip.mark_posted(
+            db, "ad", issue_number=301, issue_url="u", posted_at=_TS, adopted=True
+        )
+        await self._make(db, id="cr", source_ref="fu-10", status="posted", issue_number=302)
+        idx = await pip.posted_index_for_repo(db, self._REPO)
+        assert idx == {302: "fu-10"}  # adopted #301 excluded; created #302 kept
 
     @pytest.mark.asyncio
     async def test_repo_match_is_case_insensitive(self, db):

@@ -88,15 +88,25 @@ async def mark_posted(
     issue_number: int,
     issue_url: str,
     posted_at: str,
+    adopted: bool = False,
 ) -> bool:
     """Transition held → posted, recording the created issue. Returns False if
     the row already left 'held' (double-post guard: only one caller can flip a
-    given hold)."""
+    given hold).
+
+    ``adopted`` records provenance for the WS-A close-loop. ``False`` (default) =
+    Genesis CREATED this issue — an authoritative close-link, so a PR closing it may
+    auto-resolve the originating follow_up. ``True`` = Genesis merely ADOPTED a
+    pre-existing open issue it did NOT author (an external coincidental-title issue),
+    so its later closure must NOT auto-resolve the follow_up. Only created
+    (``adopted=0``) rows feed ``posted_index_for_repo`` (a Genesis crash-recovery
+    adopt of an issue Genesis itself authored is classified ``adopted=0`` by the
+    drain — it is still authoritative)."""
     cursor = await db.execute(
         "UPDATE pending_issue_posts "
-        "SET status = 'posted', issue_number = ?, issue_url = ?, posted_at = ? "
+        "SET status = 'posted', issue_number = ?, issue_url = ?, posted_at = ?, adopted = ? "
         "WHERE id = ? AND status = 'held'",
-        (issue_number, issue_url, posted_at, id),
+        (issue_number, issue_url, posted_at, int(adopted), id),
     )
     await db.commit()
     return cursor.rowcount > 0
@@ -154,6 +164,13 @@ async def posted_index_for_repo(db: aiosqlite.Connection, repo: str) -> dict[int
     issue_number would be a data anomaly, so the FIRST row (by rowid) wins rather
     than corrupting the map.
 
+    ``adopted = 0`` excludes issues Genesis ADOPTED but did not author (external
+    coincidental-title issues): a PR closing such an issue must not auto-resolve the
+    follow_up. Genesis-CREATED issues (including a crash-recovery adopt of an issue
+    Genesis authored, classified adopted=0 by the drain) remain authoritative. Legacy
+    rows posted before this column existed default to 0 (treated as created) — an
+    accepted, bounded residue since adoption is rare and the column is net-new.
+
     The ``repo`` comparison is ``COLLATE NOCASE``: the stored repo is
     config-derived while the caller's repo is gh-canonical (``gh repo view``), and
     a casing divergence would otherwise silently no-op the whole close-loop.
@@ -164,6 +181,7 @@ async def posted_index_for_repo(db: aiosqlite.Connection, repo: str) -> dict[int
         "WHERE repo = ? COLLATE NOCASE AND status = 'posted' "
         "AND source = 'follow_up' "
         "AND issue_number IS NOT NULL AND source_ref IS NOT NULL "
+        "AND adopted = 0 "
         "ORDER BY rowid",
         (repo,),
     )
@@ -224,13 +242,16 @@ async def prune_terminal(db: aiosqlite.Connection, *, older_than_days: int = 30,
     the close-loop resolves against (``get_open_followups`` / ``absorb_followup``):
     ``kind='follow_up' AND status IN ('pending', 'in_progress')``. A ``'posted'``
     row with ``source_ref`` NULL (codebase) OR whose follow_up is resolved/tabled
-    stays prunable; non-posted terminal rows are always prunable."""
+    stays prunable; non-posted terminal rows are always prunable. An ``adopted``
+    posted row is ALSO prunable on the normal schedule — it is excluded from
+    ``posted_index_for_repo``, so it can never resolve a follow_up and retaining it
+    past its age would only waste storage (the ``adopted = 0`` guard below)."""
     cutoff = _iso_days_before(now, older_than_days)
     cursor = await db.execute(
         "DELETE FROM pending_issue_posts "
         "WHERE status IN ('posted', 'rejected', 'expired', 'dry_run') "
         "AND COALESCE(posted_at, rejected_at, dry_run_at, held_at) < ? "
-        "AND NOT (status = 'posted' AND source_ref IS NOT NULL AND EXISTS ("
+        "AND NOT (status = 'posted' AND adopted = 0 AND source_ref IS NOT NULL AND EXISTS ("
         "  SELECT 1 FROM follow_ups f "
         "  WHERE f.id = pending_issue_posts.source_ref "
         "  AND f.kind = 'follow_up' "

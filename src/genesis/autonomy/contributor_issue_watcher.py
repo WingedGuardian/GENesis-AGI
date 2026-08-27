@@ -50,6 +50,7 @@ from genesis.autonomy.contributor_worklog_config import (
 )
 from genesis.db.crud import approval_requests as approval_crud
 from genesis.db.crud import pending_issue_posts as pip
+from genesis.env import github_user
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +119,7 @@ def _find_open_issue_by_title(repo: str, title_norm: str) -> tuple[bool, dict | 
             "--state",
             "open",
             "--json",
-            "number,title,url,createdAt",
+            "number,title,url,createdAt,author",
             "--limit",
             "200",
         ]
@@ -235,8 +236,25 @@ async def _resolve_approved(
         # string `posted_at >= since` comparison in count_posted_since is format-uniform
         # (no Z-vs-+00:00 footgun); a malformed value falls back to ``now`` (fail-safe).
         adopt_ts = _normalize_ts(existing.get("createdAt")) or now
+        # Create-vs-adopt provenance for the close-loop. An adopted issue is an
+        # authoritative close-link ONLY when Genesis itself authored it (a
+        # crash-recovery adopt of an issue we created seconds ago). An issue authored
+        # by anyone else — an external coincidental-title issue — must NOT let its
+        # later closure auto-resolve the follow_up. Fail-safe: treat as adopted (not
+        # authoritative) UNLESS we can positively confirm our own account authored it,
+        # so an unknown author or unset owner never yields a false auto-resolve.
+        issue_author = (existing.get("author") or {}).get("login") or ""
+        gh_owner = github_user() or ""
+        adopted = not (
+            issue_author and gh_owner and issue_author.strip().lower() == gh_owner.strip().lower()
+        )
         if await pip.mark_posted(
-            rt_db, row["id"], issue_number=num, issue_url=existing.get("url"), posted_at=adopt_ts
+            rt_db,
+            row["id"],
+            issue_number=num,
+            issue_url=existing.get("url"),
+            posted_at=adopt_ts,
+            adopted=adopted,
         ):
             await approval_crud.mark_consumed(rt_db, row["request_id"], consumed_at=now)
             logger.info(

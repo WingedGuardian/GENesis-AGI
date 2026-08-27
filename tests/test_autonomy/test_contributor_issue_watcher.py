@@ -232,6 +232,65 @@ async def test_live_adopts_existing_open_issue_no_repost(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_adopt_genesis_authored_issue_is_authoritative(db, monkeypatch):
+    """Crash-recovery: adopting an open issue GENESIS itself authored (our own gh
+    account, case-insensitive) stays authoritative (adopted=0) so its later closure
+    can still resolve the follow_up."""
+    _mode(monkeypatch, "live")
+    monkeypatch.setattr(ciw, "github_user", lambda: "WingedGuardian")
+    existing = json.dumps(
+        [
+            {
+                "number": 7,
+                "title": "add a NEWCOMER task",
+                "url": f"https://github.com/{_REPO}/issues/7",
+                "author": {"login": "wingedguardian"},  # our account (case-insensitive)
+            }
+        ]
+    )
+    gh = _FakeGh(list_out=existing)
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    pid, rid, mgr = await _seed_held(db, title="Add a newcomer task", mode="live")
+    await mgr.resolve(rid, status="approved")
+
+    n = await ciw.drain_pending_issue_posts(_RT(db))
+    assert n == 1
+    assert not gh.created()
+    row = await pip.get_by_id(db, pid)
+    assert row["status"] == "posted"
+    assert row["adopted"] == 0  # authoritative — Genesis authored it
+
+
+@pytest.mark.asyncio
+async def test_adopt_external_authored_issue_is_not_authoritative(db, monkeypatch):
+    """Adopting a coincidental-title issue authored by SOMEONE ELSE marks it
+    adopted=1 so its closure never auto-resolves Genesis's follow_up. Fail-safe:
+    a missing author (see the base adopt test) is also treated as adopted=1."""
+    _mode(monkeypatch, "live")
+    monkeypatch.setattr(ciw, "github_user", lambda: "WingedGuardian")
+    existing = json.dumps(
+        [
+            {
+                "number": 7,
+                "title": "add a NEWCOMER task",
+                "url": f"https://github.com/{_REPO}/issues/7",
+                "author": {"login": "randomContributor"},
+            }
+        ]
+    )
+    gh = _FakeGh(list_out=existing)
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    pid, rid, mgr = await _seed_held(db, title="Add a newcomer task", mode="live")
+    await mgr.resolve(rid, status="approved")
+
+    n = await ciw.drain_pending_issue_posts(_RT(db))
+    assert n == 1
+    row = await pip.get_by_id(db, pid)
+    assert row["status"] == "posted"
+    assert row["adopted"] == 1  # not authoritative — external author
+
+
+@pytest.mark.asyncio
 async def test_live_dedup_list_failure_does_not_post(db, monkeypatch):
     """If the open-issue dedup LIST fails, we must NOT post (can't verify dup) —
     the row stays held and retries next cycle."""
