@@ -41,33 +41,47 @@ def strip_boundary_markers(text: str) -> str:
 # or hide injected text ("Trojan-source" concealment). Distinct from
 # ContentSanitizer/wrap_content, which delimits a BLOCK of untrusted content; this
 # normalizes a short SCALAR that flows verbatim into a line-parsed prompt.
-# The Cf (format) ranges below are DERIVED from Python's Unicode database rather
-# than hand-picked — the previous hand-enumeration covered only 13 of Unicode's
-# 170 Cf codepoints, silently omitting concealment characters from the very
-# families it did cover (most pointedly U+061C ARABIC LETTER MARK, sibling of the
-# already-stripped LRM/RLM, plus SOFT HYPHEN, WORD JOINER and the U+E0000 tag
-# block). ``test_cf_ranges_match_unicodedata`` regenerates this set from
-# ``unicodedata`` and fails if the two ever diverge, so a Python/UCD bump cannot
-# silently reopen the gap.
+# Which Cf (format) characters to strip is DERIVED from Python's Unicode database,
+# not hand-picked — the previous hand-enumeration covered only 13 of Unicode's 170
+# Cf codepoints, silently omitting concealment characters from the very families it
+# did cover. ``test_cf_strip_set_matches_the_rule`` regenerates this set from
+# ``unicodedata`` and fails if the two diverge, so a Python/UCD bump cannot quietly
+# reopen the gap.
 #
-# U+200C ZWNJ and U+200D ZWJ are Cf but are deliberately NOT stripped: ZWJ builds
-# every emoji ZWJ sequence (stripping it turns 👨‍👩‍👧 into three separate people)
-# and ZWNJ is orthographically required in Persian and Indic scripts (stripping it
-# changes the WORD, not just its rendering). Removal has to be context-aware; a
-# whole-category strip corrupts legitimate content.
-_CF_STRIPPED = (
-    r"\u00ad\u0600-\u0605\u061c\u06dd\u070f\u0890-\u0891\u08e2"
-    r"\u180e\u200b\u200e-\u200f\u202a-\u202e\u2060-\u2064"
-    r"\u2066-\u206f\ufeff\ufff9-\ufffb\U000110bd\U000110cd"
-    r"\U00013430-\U0001343f\U0001bca0-\U0001bca3"
-    r"\U0001d173-\U0001d17a\U000e0001\U000e0020-\U000e007f"
+# THE RULE — strip a Cf codepoint iff it is INVISIBLE, i.e. one of:
+#   * bidi class BN (boundary-neutral: the zero-width / ignorable family — ZWSP,
+#     SOFT HYPHEN, WORD JOINER, the U+E0000 tag block, …),
+#   * an explicit bidi override/isolate (LRE RLE LRO RLO PDF LRI RLI FSI PDI) —
+#     the "Trojan source" reordering family,
+#   * an invisible direction mark (LRM, RLM, ALM) — strong bidi class but
+#     zero-width, so class alone does not catch them,
+#   * an interlinear annotation control (U+FFF9-FFFB), which Unicode excludes from
+#     plain-text interchange.
+#
+# Everything else in Cf is RENDERED script content and is kept. That matters: the
+# Arabic number/ayah signs (U+0600-0605, U+06DD, U+08E2, U+0890-0891), SYRIAC
+# ABBREVIATION MARK, the Kaithi number signs and the Egyptian hieroglyph joiners
+# are all Cf, but they are visible marks in legitimate text — stripping them would
+# corrupt the very content this function exists to pass through unharmed.
+# U+200C ZWNJ and U+200D ZWJ are BN, and are the two deliberate exceptions: ZWJ
+# builds every emoji ZWJ sequence and ZWNJ is orthographically required in Persian
+# and Indic scripts.
+#
+# NOTE the resulting scope: no Cf character is a ``str.splitlines()`` boundary, so
+# LINE FORGING is closed entirely by the C0/C1 + U+2028/U+2029 ranges below. The Cf
+# set exists to close CONCEALMENT and visual REORDERING.
+_CF_INVISIBLE = (
+    r"\u00ad\u061c\u180e\u200b\u200e-\u200f\u202a-\u202e"
+    r"\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb"
+    r"\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0001"
+    r"\U000e0020-\U000e007f"
 )
 
 _CONTROL_RUN_RE = re.compile(
     "["
     r"\x00-\x1f\x7f-\x9f"  # C0 + C1 control chars (incl. tab/newline/CR, NEL)
     r"\u2028\u2029"  # LINE / PARAGRAPH SEPARATOR (str.splitlines boundaries)
-    + _CF_STRIPPED  # every Cf format control EXCEPT ZWJ/ZWNJ (see above)
+    + _CF_INVISIBLE  # the INVISIBLE Cf subset only (see the rule above)
     + "]+"
 )
 

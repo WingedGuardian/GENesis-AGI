@@ -130,3 +130,70 @@ async def test_whitespace_only_name_is_left_as_is(db):
     assert await heal_campaign_names(db) == 0
     rows = {r["id"]: r["name"] for r in await crud.list_campaigns(db)}
     assert rows["c-ws"] == "   "
+
+
+async def test_job_health_row_follows_the_rename(db):
+    """job_health.job_name is the PRIMARY KEY and the runner derives it as
+    ``campaign_{name}``, so a rename would orphan the campaign's durable success/
+    failure history and leave a dead row behind."""
+    from genesis.campaigns.name_heal import heal_campaign_names
+
+    await _insert_raw(db, "c-jh", "weekly\ndigest")
+    await db.execute(
+        "INSERT INTO job_health (job_name, total_runs, total_successes, "
+        "total_failures, consecutive_failures, updated_at) VALUES (?,?,?,?,?,?)",
+        ("campaign_weekly\ndigest", 7, 5, 2, 0, "2026-08-27T00:00:00Z"),
+    )
+    await db.commit()
+
+    assert await heal_campaign_names(db) == 1
+
+    cur = await db.execute(
+        "SELECT total_runs FROM job_health WHERE job_name = ?",
+        ("campaign_weekly digest",),
+    )
+    row = await cur.fetchone()
+    assert row is not None, "job_health row did not follow the rename"
+    assert row[0] == 7, "history lost in the migration"
+
+    cur = await db.execute(
+        "SELECT 1 FROM job_health WHERE job_name = ?", ("campaign_weekly\ndigest",)
+    )
+    assert await cur.fetchone() is None, "stale row left under the old name"
+
+
+async def test_job_health_collision_leaves_both_rows(db):
+    """If a row already exists under the healed name, do not clobber live history."""
+    from genesis.campaigns.name_heal import heal_campaign_names
+
+    await _insert_raw(db, "c-jh2", "alpha\tbeta")
+    for jn, runs in (("campaign_alpha\tbeta", 3), ("campaign_alpha beta", 99)):
+        await db.execute(
+            "INSERT INTO job_health (job_name, total_runs, total_successes, "
+            "total_failures, consecutive_failures, updated_at) VALUES (?,?,?,?,?,?)",
+            (jn, runs, 0, 0, 0, "2026-08-27T00:00:00Z"),
+        )
+    await db.commit()
+
+    assert await heal_campaign_names(db) == 1
+    cur = await db.execute(
+        "SELECT total_runs FROM job_health WHERE job_name = ?", ("campaign_alpha beta",)
+    )
+    assert (await cur.fetchone())[0] == 99, "existing history was clobbered"
+
+
+async def test_empty_after_strip_is_rejected_at_the_crud_boundary(db):
+    """A name of only format characters must not create an unaddressable campaign."""
+    import pytest
+
+    from genesis.db.crud import campaigns as crud
+
+    with pytest.raises(ValueError, match="empty after control-character removal"):
+        await crud.create_campaign(
+            db,
+            id="c-empty-new",
+            name="​⁠",
+            strategy_doc_path="/tmp/s.md",
+            cron_cadence="0 */8 * * *",
+            created_at="2026-08-27T00:00:00Z",
+        )

@@ -139,31 +139,77 @@ def test_zwj_zwnj_survive_alongside_stripped_controls():
     assert strip_control_chars(src) == "\U0001f468‍\U0001f469 ok"
 
 
-def test_cf_ranges_match_unicodedata():
-    """The stripped set IS Unicode's Cf category minus the two joiners.
+def test_cf_strip_set_matches_the_rule():
+    """The stripped Cf set IS the INVISIBLE subset, derived from the UCD.
 
-    This is the drift guard: the previous hand-enumeration covered 13 of 170 Cf
-    codepoints, and nothing detected the gap. Regenerating from ``unicodedata``
-    here means a Python/UCD bump that adds a format character fails this test
-    instead of silently reopening the hole.
+    This is the drift guard. The rule: strip a Cf codepoint iff it is bidi class
+    BN, an explicit bidi override/isolate, an invisible direction mark
+    (LRM/RLM/ALM), or an interlinear annotation control — minus ZWJ/ZWNJ.
+    Everything else in Cf is RENDERED script content (Arabic number signs, Syriac
+    abbreviation, Kaithi, Egyptian hieroglyph joiners) and must survive.
+
+    Regenerating from ``unicodedata`` means a Python/UCD bump that adds a format
+    character fails here instead of silently reopening the hole — or silently
+    starting to corrupt a script.
     """
     import unicodedata
 
     from genesis.security.sanitizer import _CONTROL_RUN_RE
 
-    KEEP = {0x200C, 0x200D}  # ZWNJ, ZWJ — load-bearing for real text
-    missing, wrongly_stripped = [], []
+    KEEP = {0x200C, 0x200D}
+    MARKS = {0x200E, 0x200F, 0x061C}
+    ANNOTATION = set(range(0xFFF9, 0xFFFC))
+    CONTROLS = {"LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI"}
+
+    missing, over = [], []
     for cp in range(0x110000):
         ch = chr(cp)
         if unicodedata.category(ch) != "Cf":
             continue
+        bidi = unicodedata.bidirectional(ch)
+        invisible = (
+            bidi == "BN" or bidi in CONTROLS or cp in MARKS or cp in ANNOTATION
+        )
+        should_strip = invisible and cp not in KEEP
         stripped = bool(_CONTROL_RUN_RE.match(ch))
-        if cp in KEEP and stripped:
-            wrongly_stripped.append(hex(cp))
-        elif cp not in KEEP and not stripped:
+        if should_strip and not stripped:
             missing.append(hex(cp))
-    assert not missing, f"Cf codepoints not stripped: {missing}"
-    assert not wrongly_stripped, f"joiners must survive: {wrongly_stripped}"
+        elif not should_strip and stripped:
+            over.append(hex(cp))
+    assert not missing, f"invisible Cf not stripped: {missing}"
+    assert not over, f"rendered/kept Cf wrongly stripped: {over}"
+
+
+def test_rendered_script_marks_survive():
+    """Cf characters that are VISIBLE script content must pass through.
+
+    Codex round 2 caught this: an all-Cf strip corrupts legitimate Arabic,
+    Syriac, Kaithi and Egyptian text.
+    """
+    for cp in (
+        0x0600,  # ARABIC NUMBER SIGN
+        0x0605,  # ARABIC NUMBER MARK ABOVE
+        0x06DD,  # ARABIC END OF AYAH
+        0x070F,  # SYRIAC ABBREVIATION MARK
+        0x0890,  # ARABIC POUND MARK ABOVE
+        0x08E2,  # ARABIC DISPUTED END OF AYAH
+        0x110BD,  # KAITHI NUMBER SIGN
+        0x13430,  # EGYPTIAN HIEROGLYPH VERTICAL JOINER
+    ):
+        src = "a" + chr(cp) + "b"
+        assert strip_control_chars(src) == src, hex(cp)
+
+
+def test_no_cf_character_can_forge_a_line():
+    """Scope check: line forging is closed by the C0/C1 + U+2028/2029 ranges, not
+    by the Cf set — no Cf codepoint is a str.splitlines() boundary. This is why
+    keeping the rendered Cf marks costs nothing on the line-forging axis."""
+    import unicodedata
+
+    for cp in range(0x110000):
+        ch = chr(cp)
+        if unicodedata.category(ch) == "Cf":
+            assert len(("a" + ch + "b").splitlines()) == 1, hex(cp)
 
 
 def test_old_hand_enumerated_set_still_covered():

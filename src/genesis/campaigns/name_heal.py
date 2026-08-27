@@ -69,9 +69,44 @@ async def heal_campaign_names(db: Any) -> int:
         except Exception:
             logger.exception("Campaign %s: name heal failed", row.get("id"))
             continue
+        await _migrate_job_health(db, name, clean)
         taken.discard(name)
         taken.add(clean)
         healed += 1
         logger.info("Campaign %s: name normalized", row.get("id"))
 
     return healed
+
+
+async def _migrate_job_health(db: Any, old_name: str, new_name: str) -> None:
+    """Carry a campaign's durable job-health row across a rename.
+
+    ``job_health.job_name`` is the PRIMARY KEY and the runner derives it as
+    ``campaign_{name}`` (``campaigns/runner.py``), so a rename would otherwise
+    orphan the row: the campaign's success/failure history and its
+    ``job_never_succeeded`` state would silently reset, and a dead row would
+    linger under the old name.
+
+    Best-effort and non-fatal — a heal that cannot carry the history must still
+    leave the (correctly renamed) campaign running. If a row already exists under
+    the new name, the old one is left alone rather than clobbering live history.
+    """
+    old_job, new_job = f"campaign_{old_name}", f"campaign_{new_name}"
+    try:
+        cur = await db.execute(
+            "SELECT 1 FROM job_health WHERE job_name = ?", (new_job,)
+        )
+        if await cur.fetchone():
+            logger.warning(
+                "job_health row already exists for %s — leaving %s in place",
+                new_job,
+                old_job,
+            )
+            return
+        await db.execute(
+            "UPDATE job_health SET job_name = ? WHERE job_name = ?",
+            (new_job, old_job),
+        )
+        await db.commit()
+    except Exception:
+        logger.exception("job_health migration failed for campaign rename")

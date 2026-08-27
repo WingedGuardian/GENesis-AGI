@@ -84,6 +84,11 @@ async def _impl_campaign_create(
     from genesis.security.sanitizer import strip_control_chars
 
     name = strip_control_chars(name)
+    if not name:
+        return {
+            "error": "Campaign name is empty after control-character removal. "
+            "Provide a name with at least one visible character."
+        }
 
     # Validate the session profile against the live registry BEFORE persisting.
     # An unknown profile would pass here but raise ValueError at DirectSession

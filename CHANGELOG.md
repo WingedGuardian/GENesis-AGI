@@ -206,18 +206,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Security
 
-- **Invisible-character stripping now covers Unicode's whole format category, not
-  a hand-picked 13 of it.** Campaign names and awareness-signal text are normalized
-  before they reach a line-parsed prompt, to stop injected text forging or concealing
-  a line. That normalizer enumerated 13 of Unicode's 170 `Cf` format characters,
-  silently omitting concealment characters from the very families it did cover —
-  most pointedly U+061C ARABIC LETTER MARK, sibling of the already-stripped
-  LRM/RLM, plus SOFT HYPHEN, WORD JOINER and the invisible U+E0000 tag block. The
-  set is now derived from Python's Unicode database, with a test that regenerates
-  it and fails if the two ever diverge. Zero-width joiner and non-joiner are
-  deliberately preserved: they are format characters too, but stripping them would
-  break every emoji sequence (👨‍👩‍👧 → three separate people) and corrupt Persian and
-  Indic words, where they are orthographically required.
+- **Invisible-character stripping now covers every invisible Unicode format
+  character, not a hand-picked 13 of them.** Campaign names and awareness-signal
+  text are normalized before they reach a line-parsed prompt, to stop injected text
+  forging or concealing a line. That normalizer enumerated 13 of Unicode's 170 `Cf`
+  format characters, silently omitting concealment characters from the very families
+  it did cover — most pointedly U+061C ARABIC LETTER MARK, sibling of the
+  already-stripped LRM/RLM, plus SOFT HYPHEN, WORD JOINER and the invisible U+E0000
+  tag block. The set is now derived from Python's Unicode database by an explicit
+  rule (strip a format character only when it is genuinely invisible — zero-width,
+  a bidi override, an invisible direction mark, or an annotation control), with a
+  test that regenerates it and fails if the two ever diverge.
+
+  Format characters that are *visible* content are deliberately preserved, so the
+  wider net does not corrupt real text: the Arabic number and end-of-ayah signs,
+  Syriac abbreviation mark, Kaithi number signs and Egyptian hieroglyph joiners all
+  pass through, as do zero-width joiner and non-joiner — stripping those would break
+  every emoji sequence (👨‍👩‍👧 → three separate people) and change Persian and Indic
+  words, where the non-joiner is orthographically required.
+
+- **A campaign name made only of invisible characters is now rejected instead of
+  being created with an empty name.**
 
 - **Hook-surface PRs can no longer merge without a current GitHub Codex review.**
   The merge gate's review-freshness check now treats any unreviewed delta touching
