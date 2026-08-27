@@ -313,7 +313,7 @@ async def settings_timezone():
         return jsonify({"timezone": user_timezone(), "options": _TIMEZONE_OPTIONS})
 
     payload = request.get_json(silent=True) or {}
-    new_tz = payload.get("timezone", "").strip()
+    new_tz = (payload.get("timezone") or "").strip()  # tolerate {"timezone": null}
     if not new_tz:
         return jsonify({"error": "timezone is required"}), 400
 

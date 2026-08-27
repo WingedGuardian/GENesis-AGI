@@ -226,3 +226,17 @@ class TestUserTimezonePrecedence:
 
         _invalidate_local_config()
         assert user_timezone() == "UTC"
+
+    @pytest.mark.parametrize("scalar", ["no", "false", "0"])
+    def test_falsy_yaml_scalar_falls_through_to_env(
+        self, scalar: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # YAML footgun: `timezone: no` -> False, `0` -> int. These are NOT valid
+        # zones and must fall through to the env fallback, not shadow it with
+        # "False"/"0" (which would crash CronTrigger consumers).
+        self._write_cfg(tmp_path, timezone=scalar)
+        monkeypatch.setenv("USER_TIMEZONE", "Europe/Paris")
+        from genesis.env import _invalidate_local_config, user_timezone
+
+        _invalidate_local_config()
+        assert user_timezone() == "Europe/Paris"

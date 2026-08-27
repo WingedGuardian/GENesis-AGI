@@ -4,7 +4,9 @@
 # Run scripts/setup-local-config.sh to generate this interactively.
 #
 # This file is machine-specific — NEVER commit it to git.
-# All values here can also be set via environment variables (env var wins).
+# All values here can also be set via environment variables (env var wins) —
+# EXCEPT `timezone`, which is file-first (this value wins; USER_TIMEZONE env is
+# only a deprecated fallback). See the `timezone:` note below.
 # ─────────────────────────────────────────────────────────────────────────────
 
 network:

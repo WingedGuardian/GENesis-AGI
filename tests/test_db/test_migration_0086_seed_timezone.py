@@ -131,6 +131,27 @@ def test_reads_timezone_from_secrets_when_env_absent(tmp_path, monkeypatch):
     assert _read_tz(tmp_path) == "Europe/Paris"
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "USER_TIMEZONE=Europe/Paris # home comment",  # inline comment
+        "export USER_TIMEZONE=Europe/Paris",  # dotenv export prefix
+        'USER_TIMEZONE="Europe/Paris"  # quoted + comment',  # quoted value
+    ],
+)
+def test_secrets_parser_handles_export_and_comments(line, tmp_path, monkeypatch):
+    # LOW (Kimi): the manual secrets parser must tolerate the same shapes dotenv
+    # does (export prefix, inline # comment, quotes) or the seed skips a valid zone
+    # on the update.sh CLI path and the flip re-times to UTC.
+    _write_cfg(tmp_path, {"timezone": "UTC"})
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text(f"FOO=bar\n{line}\n")
+    monkeypatch.delenv("USER_TIMEZONE", raising=False)
+    monkeypatch.setattr("genesis.env.secrets_path", lambda: secrets)
+    _MOD._seed_timezone_into_config()
+    assert _read_tz(tmp_path) == "Europe/Paris"
+
+
 def test_typo_file_zone_does_not_block_seed(tmp_path, monkeypatch):
     # P2 (Codex): a non-UTC TYPO in the file must not be treated as authoritative
     # and shadow a valid env zone.

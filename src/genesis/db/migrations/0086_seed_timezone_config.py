@@ -19,8 +19,12 @@ dashboard-set UTC (a per-boot startup check would).
 
 STRICTLY FAIL-OPEN: ``runtime/init/db.py`` aborts server startup if a migration
 raises, so the whole body is guarded — a ``genesis.yaml`` write hiccup must never
-wedge boot. The ``USER_TIMEZONE`` env fallback still resolves the zone at runtime
-in the (rare) write-failure case.
+wedge boot. The tradeoff (over raising to retry, which would brick startup): if the
+write fails on an install whose file holds the ``timezone: UTC`` sentinel, the flip
+leaves that install resolving to UTC (the file value wins; the env fallback only
+fires when the key is ABSENT, not when it is UTC) — so the failure is logged at
+ERROR with a remediation hint, not silently. A too-rare write hiccup is the price
+of never bricking a boot for a timezone.
 
 Self-contained per the migration convention (see 0077/0085): the read/write logic
 is inlined and frozen, not imported from evolving runtime code, so the effect is
@@ -67,8 +71,18 @@ def _read_env_timezone() -> str:
         if path.is_file():
             for raw in path.read_text().splitlines():
                 line = raw.strip()
+                if line.startswith("export "):  # dotenv tolerates an export prefix
+                    line = line[len("export ") :].lstrip()
                 if line.startswith("USER_TIMEZONE="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+                    value = line.split("=", 1)[1].strip()
+                    if value[:1] in ("'", '"'):  # quoted → take the quoted span verbatim
+                        q = value[0]
+                        end = value.find(q, 1)
+                        return value[1:end] if end != -1 else value[1:]
+                    # unquoted → strip a trailing ` # comment` (IANA zones have no
+                    # spaces or '#', so the first whitespace/'#' ends the value)
+                    tokens = value.split("#", 1)[0].split()
+                    return tokens[0] if tokens else ""
     except Exception:
         logger.debug("tz-seed: could not read USER_TIMEZONE from secrets.env", exc_info=True)
     return ""

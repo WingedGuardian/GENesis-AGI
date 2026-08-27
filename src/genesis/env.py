@@ -564,10 +564,12 @@ def user_timezone() -> str:
     precedence took effect, so the flip preserves behavior on existing installs.
     """
     local_val = _local_config().get("timezone")
-    if local_val is not None:
-        stripped = str(local_val).strip()
-        if stripped:  # a blank file value falls through to the env fallback
-            return stripped
+    # A valid IANA zone is always a non-empty string. Accept ONLY that — a blank
+    # string, or a non-string YAML scalar (``timezone: no`` → False, ``0`` → int),
+    # is treated as unset and falls through to the env fallback rather than
+    # shadowing it with "False"/"0" (which would crash CronTrigger consumers).
+    if isinstance(local_val, str) and local_val.strip():
+        return local_val.strip()
     env_val = os.environ.get("USER_TIMEZONE")
     if env_val and env_val.strip():
         return env_val.strip()
