@@ -1010,6 +1010,39 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
                 )
                 current_ids.add(alert_id)
                 continue
+            if _status == "never_started":
+                # Registered/expected but failed to start or never pulsed once (#10) —
+                # a dead liveness signal that no_heartbeat (empty-state) would hide.
+                # Distinct id from subsystem_stale (a once-live scheduler that DIED)
+                # and heartbeat_unknown (corrupt pulse). compute_heartbeat_staleness
+                # has already gated this on _subsystem_enabled, so a disabled/
+                # unconfigured subsystem never reaches here. ego CRITICAL, else WARNING;
+                # auto-resolves when the subsystem finally pulses (verdict → alive).
+                # Coverage: only ego + inbox can reach this — both are bootstrap init
+                # steps recorded in the manifest. `dashboard` is in this loop for the
+                # stale/unknown paths only; it is a daemon thread, NOT a manifest entry,
+                # so its verdict is always benign here. A never-started dashboard needs
+                # its own signal (a manifest entry for the thread) — a separate follow-up.
+                _ns_failed = _hb.get("reason") == "init-failed"
+                _detail = (
+                    "failed to initialize at bootstrap"
+                    if _ns_failed
+                    else "started but has never emitted a heartbeat"
+                )
+                alert_id = f"subsystem_never_started:{_hb_name}"
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "CRITICAL" if _hb_name == "ego" else "WARNING",
+                        "message": (
+                            f"Subsystem '{_hb_name}' is not running — it {_detail} "
+                            f"(never started); a restart-safe config/code fault, not a "
+                            f"transient stall"
+                        ),
+                    }
+                )
+                current_ids.add(alert_id)
+                continue
             if _status != "overdue":
                 # alive / paused / resuming / no_heartbeat (empty-state) → no alert
                 continue
@@ -1046,12 +1079,18 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
                 from genesis.db.crud import alert_events as _ae
 
                 _open_rows = {r.get("alert_id", ""): r for r in await _ae.list_open(_service._db)}
-                # Preserve BOTH alert families this block can emit for the subsystem
-                # (subsystem_stale: overdue, subsystem_heartbeat_unknown: unreadable) —
-                # otherwise the omitted family flaps (auto-resolved by the reconciler
-                # on the failed tick, re-opened on the next successful one).
+                # Preserve EVERY alert family this per-subsystem block can emit
+                # (subsystem_stale: overdue, subsystem_heartbeat_unknown: unreadable,
+                # subsystem_never_started: failed/silent start) — otherwise the omitted
+                # family flaps (auto-resolved by the reconciler on the failed tick,
+                # re-opened on the next successful one). Keep in lockstep with the
+                # branches above that append to ``alerts``/``current_ids``.
                 for _n in _stale_read_failed:
-                    for _aid in (f"subsystem_stale:{_n}", f"subsystem_heartbeat_unknown:{_n}"):
+                    for _aid in (
+                        f"subsystem_stale:{_n}",
+                        f"subsystem_heartbeat_unknown:{_n}",
+                        f"subsystem_never_started:{_n}",
+                    ):
                         _row = _open_rows.get(_aid)
                         if _row is not None:
                             alerts.append(

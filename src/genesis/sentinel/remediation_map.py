@@ -294,6 +294,19 @@ UNMAPPED_BY_DESIGN: dict[str, str] = {
         "Distinct from subsystem_stale: (which asserts a probable DEATH) — this "
         "asserts only that we cannot tell."
     ),
+    "subsystem_never_started:": (
+        "A heartbeat-emitting subsystem (ego/inbox) that its persisted bootstrap "
+        "manifest shows FAILED TO INITIALIZE, or that registered ok but has never "
+        "emitted a single pulse past a boot grace (#10) — it is not running at all. "
+        "By construction NOT restart-remediable: a never-started subsystem is a "
+        "config/code defect (a raised init, a missing prerequisite), and a "
+        "container.services restart would either reproduce the same failure or "
+        "restart-loop (contrast job_stale:, a recoverable wedge). Gated on "
+        "_subsystem_enabled, so a deliberately-disabled/unconfigured subsystem never "
+        "raises it. Surface-only (ego CRITICAL, else WARNING) + a red ego tile for a "
+        "human to fix at the source; auto-resolves when the subsystem finally pulses. "
+        "Distinct from subsystem_stale: (a once-live scheduler that DIED)."
+    ),
 }
 
 
