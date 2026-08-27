@@ -82,6 +82,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   outreach total-cessation is tracked separately, since its heartbeat only runs once
   a messaging channel is configured.)
 
+- **A subsystem that never started no longer reads "healthy" either.** The
+  total-cessation alert above catches a scheduler that ran and then *died*; a
+  subsystem that *failed to start* (its bootstrap init raised, or it registered but
+  never emitted a single pulse) has no heartbeat at all — which looked identical to
+  a fresh, never-run install, so it stayed silent. Now the health check cross-
+  references the persisted bootstrap manifest: an enabled ego (→ critical) or inbox
+  (→ warning) that the manifest shows failed to initialize, or that registered but
+  never pulsed past a boot grace, raises a distinct `subsystem_never_started:<name>`
+  alert and flips the Ego tile to error. It fails benign in every ambiguous case —
+  a fresh install, a deliberately disabled or unconfigured subsystem, or an
+  unreadable manifest never false-alarm — so the only new signal is a genuinely
+  broken start. (Covers ego + inbox; a never-started dashboard thread is out of
+  scope — it isn't a bootstrap-manifest entry.)
+
 - **Worktree sessions now run the main-tree hook scripts, not their branch-frozen
   copies.** The `genesis-hook` launcher resolved each hook from the *current*
   worktree, so a git-tracked hook (security gates included) ran whatever version

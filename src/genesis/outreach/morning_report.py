@@ -946,7 +946,13 @@ class MorningReportGenerator:
                         f"- **{severity}**: {a.get('message', 'Unknown')} "
                         f"(id: {alert_id})"
                     )
-                    if alert_id.startswith("subsystem_stale:"):
+                    if alert_id.startswith(
+                        ("subsystem_stale:", "subsystem_never_started:")
+                    ):
+                        # never_started is rendered HERE (via the alert), and its
+                        # heartbeat status ("never_started") is not "overdue" so the
+                        # block below skips it anyway — capture the name regardless so
+                        # the dedup set stays complete if that block ever widens.
                         stale_alert_names.add(alert_id.split(":", 1)[1])
         except Exception:
             logger.warning("Failed to query health alerts for morning report", exc_info=True)
