@@ -22,6 +22,26 @@ This module centralizes that parsing so ``git_push_guard``,
 ``review_enforcement_commit``, and the destructive/path guards agree. Stdlib
 only; fail-open (a segment that won't tokenize degrades to a naive split rather
 than raising) — a guard must never crash the tool.
+
+Quote scanning is CENTRALIZED in one primitive (``_quote_span_end``): every
+hand-rolled walker below calls it, so all four bash quote openers — ``'…'``,
+``"…"``, ANSI-C ``$'…'`` (``\\'`` does NOT close), locale ``$"…"`` — are modelled
+once, and the ANSI-C form can no longer hide a gated action from segmentation.
+
+SCOPE IS CONSCIOUSLY BOUNDED — this is an ACCIDENT-PREVENTION parser, not an
+adversarial sandbox (a Bash-STRING guard can never be one: a deliberate evader
+already has ``python -c 'subprocess…'`` and ``eval``, which no such guard sees).
+So it closes the ACCIDENT-PLAUSIBLE lexical forms (the quote openers above,
+backslash line-continuation, ``\\'`` outside quotes) and treats the rest as
+ACCEPTED RESIDUE, per the standing 2026-08-12 decision (``review_enforcement_commit``
+~lines 686-697): DELIBERATE / dynamic construction — ``eval``, shell aliases,
+``python -c``, ``$(printf …)`` dynamic strings — and the LARGER structural gap of
+heredoc bodies (``<<``/``<<-``) and escaped-backtick nesting. A future review
+finding of one of THOSE is a ``tabled`` residue record, NOT another one-off patch
+here (that is the non-converging hand-rolled-lexer tail —
+``feedback_no_handrolled_shell_parsing_for_guards``). Do NOT re-open the class by
+symptom-patching a residue form; the fix for the residue is architectural
+(canonical parser) or a conscious threat-model change, not an incremental scanner.
 """
 
 from __future__ import annotations
@@ -174,6 +194,51 @@ class _ParsedSegment(NamedTuple):
     redirects: tuple[str, ...]
 
 
+def _quote_span_end(command: str, i: int, n: int) -> int:
+    """Index just PAST the closing quote of the span that OPENS at ``command[i]``.
+
+    The single shared quote-scanner for every hand-rolled walker in this module, so
+    the four bash quote openers live in ONE place (this logic was duplicated across
+    seven scanners, each blind to ANSI-C ``$'…'``):
+
+    - ``'…'``   POSIX single quote — NOTHING escapes; closes on the next ``'``.
+    - ``"…"``   double quote — ``\\`` escapes the next char; closes on an unescaped ``"``.
+    - ``$'…'``  ANSI-C quote — ``\\`` escapes (so ``\\'`` does NOT close); closes on ``'``.
+    - ``$"…"``  locale quote — parses exactly like ``"…"``.
+
+    ``command[i]`` MUST be ``'``/``"`` or begin ``$'``/``$"`` — callers gate on that.
+
+    Two load-bearing contract points: it NEVER raises — an UNTERMINATED span fails
+    open to ``n`` (consume to EOL), matching the module's no-crash guarantee; and it
+    ALWAYS returns an index STRICTLY greater than ``i``. analyze()'s substitution /
+    ``bash -c`` recursion is unbounded, so a non-advancing return would HANG the tool
+    — a worse failure than the mis-parse this closes.
+    """
+    if command[i] == "$":  # two-char opener: $' (ANSI-C) or $" (locale)
+        qchar = command[i + 1]
+        escapes = True  # both $'…' and $"…" honor backslash escaping
+        j = i + 2
+    else:
+        qchar = command[i]
+        escapes = qchar == '"'  # \ is active only inside "…" (inert inside '…')
+        j = i + 1
+    while j < n:
+        c = command[j]
+        if escapes and c == "\\" and j + 1 < n:
+            j += 2
+            continue
+        if c == qchar:
+            return j + 1
+        j += 1
+    return n  # unterminated → fail-open to EOL, never raise
+
+
+def _is_quote_opener(command: str, i: int, n: int) -> bool:
+    """True when ``command[i]`` opens a quote span: bare ``'``/``"`` or ``$'``/``$"``."""
+    c = command[i]
+    return c in ("'", '"') or (c == "$" and i + 1 < n and command[i + 1] in ("'", '"'))
+
+
 def _command_sub_end(command: str, i: int, n: int) -> int:
     """Index just past the matching ``)`` of a ``$(…)`` command substitution that
     opens at ``command[i:i+2] == "$("``.
@@ -191,23 +256,13 @@ def _command_sub_end(command: str, i: int, n: int) -> int:
     two divergent paren-counters.
     """
     depth, j = 1, i + 2
-    q: str | None = None  # in-body quote state
     while j < n:
         ch = command[j]
-        if q is not None:
-            if q == '"' and ch == "\\" and j + 1 < n:  # \ escapes only inside "…"
-                j += 2
-                continue
-            if ch == q:
-                q = None
-            j += 1
-            continue
         if ch == "\\" and j + 1 < n:  # unquoted backslash escapes the next char
             j += 2
             continue
-        if ch in ("'", '"'):  # a quoted span begins — its inner ) is data
-            q = ch
-            j += 1
+        if _is_quote_opener(command, j, n):  # ', ", $', $" span — its inner ) is data
+            j = _quote_span_end(command, j, n)
             continue
         if ch == "`":  # nested backtick span — skip to its close (or EOL)
             close = command.find("`", j + 1)
@@ -239,26 +294,16 @@ def _redirect_target_end(command: str, j0: int, n: int) -> int:
     as one word and excised from argv whole, not just its leading ``$``.
     """
     j = j0
-    wq: str | None = None  # in-word quote state
     while j < n:
         ch = command[j]
-        if wq is not None:
-            if wq == '"' and ch == "\\" and j + 1 < n:
-                j += 2
-                continue
-            if ch == wq:
-                wq = None
-            j += 1
-            continue
         if ch == "\\" and j + 1 < n:  # unquoted backslash escapes the next char
             j += 2
             continue
-        if ch in ("'", '"'):  # a quote span begins (or concatenates)
-            wq = ch
-            j += 1
-            continue
         if ch == "$" and j + 1 < n and command[j + 1] == "(":  # $(…) command sub
             j = _command_sub_end(command, j, n)  # quote/escape/nesting-aware close
+            continue
+        if _is_quote_opener(command, j, n):  # ', ", $', $" span suppresses metachars
+            j = _quote_span_end(command, j, n)
             continue
         if ch == "`":  # `…` backtick sub — to the matching backtick (or EOL)
             close = command.find("`", j + 1)
@@ -268,6 +313,12 @@ def _redirect_target_end(command: str, j0: int, n: int) -> int:
             break
         j += 1
     return j
+
+
+# A ``#`` starts a bash comment ONLY at the start of a word — preceded by nothing
+# (start of input) or by an unquoted whitespace / command-separator / subshell-open.
+# A ``#`` glued into a word (``foo#bar``, ``--format=%h#``) is literal, NOT a comment.
+_COMMENT_PRECEDERS = frozenset(" \t\n;|&(")
 
 
 def parse_segments(command: str) -> list[_ParsedSegment]:
@@ -288,41 +339,79 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
     split closes). Process substitution ``<(…)``/``>(…)`` stays in BOTH (documented gap).
     ``raw`` stays byte-identical to the historical ``split_segments`` output for every
     ordinary command (the cwd/occurrence consumers match ``Segment.raw`` against a fresh
-    re-split; locked by a golden test over a broad corpus). ONE intentional difference
-    from the pre-#1455 scanner: a ``$(…)``/backtick target that contains an UNQUOTED
-    control operator (``;`` ``&&`` ``||`` ``|``) is now paren-balanced into ONE segment
-    instead of mis-split on that operator — which CLOSES an additional fail-open (HEAD
-    mis-split ``git 2>$(a; b) push`` into ``git  $(a`` + ``b) push`` so ``git_subcommand``
-    never saw the ``push``); the nested ``a``/``b`` still surface via ``_substitutions``.
-    So ``raw`` is byte-identical EXCEPT it is strictly SAFER on this class — never the
-    other direction (locked by the ``$(;)``/``$(&&)``/``$(|)`` cases in the redirect-argv
-    test's EXPLOITS).
+    re-split — self-consistent regardless — locked by a golden test over a broad corpus).
+    The intentional differences are ALL correctness fixes in the SAFE direction (a segment
+    that used to mis-split now stays whole so a following gated token can't hide):
+
+      1. A ``$(…)``/backtick target with an UNQUOTED control operator (``;`` ``&&`` ``||``
+         ``|``) is paren-balanced into ONE segment (pre-#1455 mis-split ``git 2>$(a; b)
+         push`` so ``git_subcommand`` never saw ``push``); the nested ``a``/``b`` still
+         surface via ``_substitutions``.
+      2. ANSI-C ``$'…'`` spans are honored (``\\'`` no longer mis-closes and re-exposes an
+         in-string ``;``/``&&``/``#`` as a real separator/comment).
+      3. A ``\\<newline>`` line-continuation is DROPPED (bash joins the lines); other
+         unquoted-``\\`` escapes (``\\;`` ``\\&`` ``\\'``) are kept as one inert unit so an
+         escaped separator/quote no longer splits or opens a span.
+      4. A word-start ``#`` comment runs to end-of-line: a quote char or separator INSIDE
+         the comment (a contraction ``# don't``, a ``# a ; b``) is inert, so it can no
+         longer swallow the newline / mis-split and hide the next command.
+
+    Never the other (fail-open) direction — locked by the redirect-argv EXPLOITS corpus
+    and ``test_shell_parse_quote_class`` (ANSI-C, line-continuation, comment-swallow).
     """
     pairs: list[tuple[str, str, list[str]]] = []
     raw_buf: list[str] = []
     argv_buf: list[str] = []
     redirs: list[str] = []
     i, n = 0, len(command)
-    quote: str | None = None
+    # Paren-type stack: True = a `$(` EXPANSION-open, False = a bare `(` GROUP-open.
+    # A `)` closing a bare GROUP is a comment word-boundary (`(cmd)#comment` IS a real
+    # bash comment); a `)` closing an EXPANSION is word-continuation (`$(cmd)#note` is
+    # literal). The single-char lookback below can't tell the two apart — both end in
+    # `)` — so we track which the most recent `)` closed in ``last_close_was_group``.
+    pstack: list[bool] = []
+    last_close_was_group = False
     while i < n:
         c = command[i]
-        if quote:
-            raw_buf.append(c)
-            argv_buf.append(c)
-            if quote == '"' and c == "\\" and i + 1 < n:
-                raw_buf.append(command[i + 1])
-                argv_buf.append(command[i + 1])
+        if c == "\\" and i + 1 < n:
+            if command[i + 1] == "\n":
+                # Line-continuation: bash REMOVES `\<newline>` entirely (the two lines
+                # join), so drop both chars — otherwise a real `git \<newline>push`
+                # keeps a stray newline and shlex fails to see the subcommand.
                 i += 2
                 continue
-            if c == quote:
-                quote = None
-            i += 1
+            # Any other unquoted backslash escapes the next char: an escaped separator
+            # (\; \& \|) or an escaped quote (\' \") is INERT — kept verbatim so it
+            # neither splits the segment nor opens a quote span.
+            raw_buf.append(command[i : i + 2])
+            argv_buf.append(command[i : i + 2])
+            i += 2
             continue
-        if c in ("'", '"'):
-            quote = c
-            raw_buf.append(c)
-            argv_buf.append(c)
-            i += 1
+        if _is_quote_opener(command, i, n):
+            # ', ", $' (ANSI-C), $" (locale) — copy the whole span verbatim (its inner
+            # operators/#/quotes are data). One shared scanner: no naive `'`-only model.
+            end = _quote_span_end(command, i, n)
+            raw_buf.append(command[i:end])
+            argv_buf.append(command[i:end])
+            i = end
+            continue
+        if c == "#" and (
+            i == 0
+            or command[i - 1] in _COMMENT_PRECEDERS
+            # a `)` that closed a bare subshell GROUP is a word boundary → comment;
+            # a `)` that closed a `$(` EXPANSION is word-continuation → NOT a comment.
+            or (command[i - 1] == ")" and last_close_was_group)
+        ):
+            # An unquoted, word-start `#` is a comment to END OF LINE (bash). Copy it
+            # verbatim but WITHOUT quote-scanning it — a quote char inside the comment
+            # (a contraction: `# don't`) is INERT and must not open a span that swallows
+            # the newline separator and hides the next command. The `\n` still splits
+            # (handled below); an EOF-terminated comment ends the final segment.
+            nl = command.find("\n", i)
+            end = nl if nl != -1 else n
+            raw_buf.append(command[i:end])
+            argv_buf.append(command[i:end])
+            i = end
             continue
         two = command[i : i + 2]
         if two in ("&&", "||"):
@@ -380,6 +469,10 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
             continue
         raw_buf.append(c)
         argv_buf.append(c)
+        if c == "(":  # bare `(` = group-open; `$(` = expansion-open (prev char is `$`)
+            pstack.append(i > 0 and command[i - 1] == "$")
+        elif c == ")":
+            last_close_was_group = bool(pstack) and not pstack.pop()
         i += 1
     pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
     return [
@@ -417,27 +510,20 @@ def has_top_level_pipe(command: str) -> bool:
     these fully is the unbounded quote-parsing tail shared with ``split_segments``.
     """
     i, n = 0, len(command)
-    quote: str | None = None
     subst_depth = 0  # inside $( … ): its output is CAPTURED, not streamed to bg stdout
     in_backtick = False
     while i < n:
         c = command[i]
-        if quote:
-            if quote == '"' and c == "\\" and i + 1 < n:
-                i += 2
-                continue
-            if c == quote:
-                quote = None
-            i += 1
-            continue
         if in_backtick:  # `…` substitution — output captured, so any `|` inside is not a bg pipe
             if c == "`":
                 in_backtick = False
             i += 1
             continue
-        if c in ("'", '"'):
-            quote = c
-            i += 1
+        if c == "\\" and i + 1 < n:  # unquoted backslash escapes the next char
+            i += 2
+            continue
+        if _is_quote_opener(command, i, n):  # ', ", $', $" — any `|` inside is data
+            i = _quote_span_end(command, i, n)
             continue
         if c == "`":
             in_backtick = True
@@ -471,27 +557,20 @@ def has_top_level_pipe(command: str) -> bool:
 def _strip_trailing_comment(seg: str) -> str:
     """Remove an unquoted ``#`` comment (whitespace-preceded or at start) to EOL."""
     out: list[str] = []
-    quote: str | None = None
     prev_ws = True  # start-of-string counts as preceding whitespace
     i, n = 0, len(seg)
     while i < n:
         c = seg[i]
-        if quote:
-            out.append(c)
-            if quote == '"' and c == "\\" and i + 1 < n:
-                out.append(seg[i + 1])
-                i += 2
-                continue
-            if c == quote:
-                quote = None
+        if c == "\\" and i + 1 < n:  # unquoted backslash escapes the next char (incl. #)
+            out.append(seg[i : i + 2])
             prev_ws = False
-            i += 1
+            i += 2
             continue
-        if c in ("'", '"'):
-            quote = c
-            out.append(c)
+        if _is_quote_opener(seg, i, n):  # ', ", $', $" — copy verbatim; a # inside is data
+            end = _quote_span_end(seg, i, n)
+            out.append(seg[i:end])
             prev_ws = False
-            i += 1
+            i = end
             continue
         if c == "#" and prev_ws:
             break  # comment to end of segment
@@ -540,24 +619,17 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     able to coexist without letting an incidental or negated prose mention waive
     the gate.
     """
-    quote: str | None = None
     prev_ws = True
     i, n = 0, len(seg)
     while i < n:
         c = seg[i]
-        if quote:
-            if quote == '"' and c == "\\" and i + 1 < n:
-                i += 2
-                continue
-            if c == quote:
-                quote = None
+        if c == "\\" and i + 1 < n:  # unquoted backslash escapes the next char
             prev_ws = False
-            i += 1
+            i += 2
             continue
-        if c in ("'", '"'):
-            quote = c
+        if _is_quote_opener(seg, i, n):  # ', ", $', $" — a # inside is data, not a comment
+            i = _quote_span_end(seg, i, n)
             prev_ws = False
-            i += 1
             continue
         if c == "#" and prev_ws:
             for tok in seg[i + 1 :].split():
@@ -783,30 +855,27 @@ def command_runs_pytest(command: str) -> bool:
 def _substitutions(text: str) -> list[str]:
     """Command-substitution bodies — ``$(…)`` and ``` `…` ``` — which also run.
 
-    Only single-quoted spans block substitution (``$()`` still expands inside
-    double quotes). A ``$()`` body is bounded QUOTE/ESCAPE/NESTING-aware via the
-    shared ``_command_sub_end`` — a ``)`` inside a quoted operand of the body is
-    DATA, so the body is extracted to its TRUE close (the same scanner the redirect-
-    target boundary uses, so the two never disagree on where a ``$()`` ends).
-    Best-effort: exotic forms (process substitution ``<(…)``, ANSI-C ``$'…'``
-    scripts, ``env -S`` string-splitting, shell aliases/functions) are NOT parsed —
-    this guard is an approval/friction layer, not a sandbox, and fails toward
-    over-matching on the common forms rather than pretending to cover every shell
-    construct.
+    Single-quoted AND ANSI-C ``$'…'`` spans block substitution (both are skipped
+    whole via the shared ``_quote_span_end``, so a ``\\'`` inside ``$'…'`` no longer
+    mis-closes and re-exposes a following ``$()``); ``$()`` still expands inside
+    double / locale (``$"…"``) quotes, which stay transparent. A ``$()`` body is
+    bounded QUOTE/ESCAPE/NESTING-aware via the shared ``_command_sub_end`` — a ``)``
+    inside a quoted operand of the body is DATA, so the body is extracted to its TRUE
+    close (the same scanner the redirect-target boundary uses, so the two never
+    disagree on where a ``$()`` ends). Best-effort residue (accepted, see module
+    docstring): process substitution ``<(…)``, ``env -S`` string-splitting, shell
+    aliases/functions, and ANSI-C escape DECODING (span boundaries are honored, but
+    the escapes inside are not decoded) — this is an approval/friction layer, not a
+    sandbox, and fails toward over-matching on the common forms.
     """
     subs: list[str] = []
     i, n = 0, len(text)
-    in_sq = False
     while i < n:
         c = text[i]
-        if in_sq:
-            if c == "'":
-                in_sq = False
-            i += 1
-            continue
-        if c == "'":
-            in_sq = True
-            i += 1
+        # A single-quoted or ANSI-C ($'…') span SUPPRESSES substitution — skip it whole.
+        # Double / locale quotes ("…", $"…") stay TRANSPARENT: $() still expands inside.
+        if c == "'" or (c == "$" and i + 1 < n and text[i + 1] == "'"):
+            i = _quote_span_end(text, i, n)
             continue
         if c == "$" and i + 1 < n and text[i + 1] == "(":
             end = _command_sub_end(text, i, n)  # index past matching ')'
