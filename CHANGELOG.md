@@ -11,6 +11,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Outreach total-cessation monitoring, without the old false-alarm trap.**
+  Outreach is now in the `subsystem_stale` alert set (WARNING) alongside
+  ego/inbox/dashboard. Previously it was excluded because its heartbeat was
+  *emergent* — a side-effect of an outreach job succeeding — and the outreach
+  scheduler only starts once a messaging channel (Telegram) registers, so a
+  Telegram-less install never pulsed and naively adding it would fire a permanent
+  unresolvable alert. Two pieces close that trap: (1) a dedicated,
+  channel-independent heartbeat daemon (`outreach/heartbeat.py`) that pulses **only
+  while the outreach scheduler is actually running** (`is_running`) — so a
+  never-started/stopped scheduler goes stale instead of reading a false `alive`; and
+  (2) an enable-gate (`_subsystem_enabled('outreach')` = Telegram configured, via the
+  same side-effect-free `build_bridge_config` loader onboarding-readiness uses) so a
+  dashboard-only install is benign. Documented boundary: a Telegram-configured install
+  whose scheduler *never once started* (registration failed) emits no pulse and stays
+  a benign `no_heartbeat` — outreach IS a bootstrap-manifest entry (`ok` = scheduler
+  *constructed*, not running), so it is explicitly exempted from the started-silent
+  `never_started` inference (a constructed-but-not-started scheduler is benign; a genuine
+  init *failure* still surfaces); a *wedged-but-alive* loop is job_health's domain. The
+  new `subsystem_stale:outreach` id is handled generically by the existing consumers
+  (morning-report dedup by prefix, the Sentinel `subsystem_stale:` disposition).
+
 - **Session-start surface for age-stale open PRs.** The repo-pulse worker now
   also caches the open-PR set each boundary, and a SessionStart hook lists the
   ones idle past a threshold (default 7 days) as one passive inline line —
