@@ -162,7 +162,10 @@ def decide(
     effective_cap = safe_cap + emergency
 
     # OOM circuit-breaker: enough live RAM to safely START one more session?
-    ram_ok = mem_available_mb >= config.oom_floor_mb
+    # The threshold must cover a FULL per-session footprint (a fresh session
+    # grows toward per_session_mb; starting one with less free than that can OOM
+    # a swapless box), plus the operator's absolute floor — whichever is larger.
+    ram_ok = mem_available_mb >= max(config.per_session_mb, config.oom_floor_mb)
 
     if not is_operator:
         # Normal method (dashboard/magic-link/public): held to SAFE_CAP.
@@ -256,6 +259,41 @@ def read_meminfo(path: str = "/proc/meminfo") -> tuple[int, int]:
     return total, avail
 
 
+def _cpu_count() -> int:
+    """Process-aware CPU count — respects the cpuset/CPU affinity (like `nproc`),
+    NOT os.cpu_count() which returns HOST cores inside a container and would
+    inflate the clamp. (It does not read a cpu.max bandwidth quota, but memory is
+    the binding constraint here, and this only ever CLAMPS the RAM-derived cap.)"""
+    try:
+        return len(os.sched_getaffinity(0)) or 1
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def effective_memory() -> tuple[int, int]:
+    """(total_mb, available_mb), each capped by the container's cgroup memory
+    limit. procfs can expose HOST values inside a container — a 16GiB container
+    on a 32GiB host would otherwise be sized for 32GiB and trigger a cgroup OOM.
+    Reuses genesis.runtime.cgroup; degrades to procfs-only if cgroup is absent."""
+    total_mb, avail_mb = read_meminfo()
+    try:
+        from genesis.runtime import cgroup
+
+        cg_max = cgroup.read_container_memory_max()  # bytes, or None if unlimited
+        cg_cur = cgroup.read_container_memory_current() if cg_max else None
+        cg_file = cgroup.read_container_memory_reclaimable() if cg_max else None
+    except Exception:  # noqa: BLE001 — cgroup unreadable → procfs values stand
+        cg_max = cg_cur = cg_file = None
+    if cg_max:
+        total_mb = min(total_mb, cg_max // (1024 * 1024))
+        if cg_cur is not None:
+            # Available = limit − usage + reclaimable page cache (current counts
+            # cache as used; add it back so this matches MemAvailable's meaning).
+            cg_avail = max(0, cg_max - cg_cur + (cg_file or 0))
+            avail_mb = min(avail_mb, cg_avail // (1024 * 1024))
+    return total_mb, avail_mb
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="session_cap")
     parser.add_argument(
@@ -266,12 +304,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         args = parser.parse_args(argv)
-        mem_total, mem_available = read_meminfo()
+        mem_total, mem_available = effective_memory()
         decision = decide(
             mem_total_mb=mem_total,
             mem_available_mb=mem_available,
             existing=args.existing,
-            cpu_count=os.cpu_count() or 1,
+            cpu_count=_cpu_count(),
             ssh_connection=os.environ.get("SSH_CONNECTION"),
             config=CapConfig.from_env(),
         )

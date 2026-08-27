@@ -86,8 +86,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   misreporting "3/2 active") while other apps' memory use silently ate slots too.
   The cap is now a stable function of the box's TOTAL RAM (a new pure, unit-tested
   `genesis.cc.session_cap` helper), so it scales per install, does not shrink as
-  sessions run, and ignores unrelated apps. Live free RAM is used only as an OOM
-  circuit-breaker. A direct LAN/Tailscale SSH login (the operator) gets an
+  sessions run, and ignores unrelated apps. It is **container-aware** — it uses the
+  cgroup memory limit and CPU affinity, not host `/proc` values, so a container that
+  sees host RAM is sized for its real limit (not the host). Live free RAM is used
+  only as an OOM circuit-breaker, and a new session only starts when there is room
+  for a full session (never over-committing a swapless box). A direct LAN/Tailscale SSH login (the operator) gets an
   emergency slot above the safe cap and is never hard-denied — when the box is
   full or memory is tight it offers to reattach or end a chosen session to make
   room (the ended session's transcript persists, resume with `claude --resume`).

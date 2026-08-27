@@ -174,3 +174,88 @@ def test_config_from_env_reads_overrides():
         1000,
         2,
     )
+
+
+# ── OOM floor must cover a full per-session footprint (Codex P1) ──────────────
+def test_operator_below_one_full_session_reclaims_not_allows():
+    # avail (2000) is above the old 1536 floor but BELOW one session (3072) → a
+    # started session could grow past all free RAM → RECLAIM, never ALLOW.
+    d = _d(1, TS, avail=2000)
+    assert d.action == "RECLAIM"
+    assert d.reason == "oom_floor"
+
+
+def test_normal_below_one_full_session_denies():
+    d = _d(1, None, avail=2000)
+    assert d.action == "DENY"
+    assert d.reason == "oom_floor"
+
+
+def test_allow_needs_room_for_a_full_session():
+    # Exactly one session's worth free (3072) → ALLOW; one MB less → not ram_ok.
+    assert _d(1, TS, avail=3072).action == "ALLOW"
+    assert _d(1, TS, avail=3071).action == "RECLAIM"
+
+
+# ── Container/cgroup-aware memory (Codex P1: procfs may show HOST values) ─────
+def test_effective_memory_caps_by_cgroup(monkeypatch):
+    import genesis.cc.session_cap as m
+    from genesis.runtime import cgroup
+
+    monkeypatch.setattr(m, "read_meminfo", lambda *a, **k: (32768, 30000))  # host-inflated
+    monkeypatch.setattr(cgroup, "read_container_memory_max", lambda: 16 * 1024**3)  # 16 GiB
+    monkeypatch.setattr(
+        cgroup, "read_container_memory_current", lambda: 10 * 1024**3
+    )  # 10 GiB used
+    monkeypatch.setattr(
+        cgroup, "read_container_memory_reclaimable", lambda: 2 * 1024**3
+    )  # 2 GiB cache
+    total, avail = m.effective_memory()
+    assert total == 16384  # capped to the cgroup limit, not host 32768
+    # available = limit(16) - usage(10) + reclaimable cache(2) = 8 GiB, not host 30000
+    assert avail == 8 * 1024
+
+
+def test_effective_memory_procfs_only_when_no_cgroup(monkeypatch):
+    import genesis.cc.session_cap as m
+    from genesis.runtime import cgroup
+
+    monkeypatch.setattr(m, "read_meminfo", lambda *a, **k: (8192, 4000))
+    monkeypatch.setattr(cgroup, "read_container_memory_max", lambda: None)  # unlimited/unreadable
+    assert m.effective_memory() == (8192, 4000)
+
+
+# ── cgroup v1 fallback (older hosts lack the v2 unified paths) ────────────────
+def test_cgroup_v1_memory_max_fallback(monkeypatch):
+    from genesis.runtime import cgroup
+
+    # v2 memory.max absent → read v1 memory.limit_in_bytes.
+    monkeypatch.setattr(
+        cgroup,
+        "_read_text",
+        lambda p: "16000000000" if p.endswith("memory/memory.limit_in_bytes") else None,
+    )
+    assert cgroup.read_container_memory_max() == 16000000000
+
+
+def test_cgroup_v1_unlimited_sentinel_is_none(monkeypatch):
+    from genesis.runtime import cgroup
+
+    monkeypatch.setattr(
+        cgroup,
+        "_read_text",
+        lambda p: "9223372036854771712" if "limit_in_bytes" in p else None,
+    )
+    assert cgroup.read_container_memory_max() is None  # sentinel → unlimited
+
+
+def test_cgroup_v1_reclaimable_fallback(monkeypatch):
+    from genesis.runtime import cgroup
+
+    def fake(path):
+        if path.endswith("memory/memory.stat"):  # v1 stat
+            return "total_inactive_file 1000\ntotal_active_file 500\nrss 200"
+        return None  # no v2 stat
+
+    monkeypatch.setattr(cgroup, "_read_text", fake)
+    assert cgroup.read_container_memory_reclaimable() == 1500

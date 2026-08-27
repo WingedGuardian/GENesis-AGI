@@ -105,7 +105,7 @@ case "$sub" in
       esac
     done <<< "$FAKE_NAMES"
     exit 0 ;;
-  kill-session) printf '%s\\n' "$target" >> "{kill_file}"; exit 0 ;;
+  kill-session) if [ "${{KILL_RC:-0}}" = "0" ]; then printf '%s\\n' "$target" >> "{kill_file}"; fi; exit "${{KILL_RC:-0}}" ;;
   new-session) touch "{spawn_marker}"; exit 0 ;;
 esac
 exit 0
@@ -149,13 +149,25 @@ def _run(
     return proc, spawn_marker.exists(), killed
 
 
-def _run_pty(tmp_path, *, action, session_names, feed, exists=False, rc=0, mode="genesis-3-4"):
+def _run_pty(
+    tmp_path,
+    *,
+    action,
+    session_names,
+    feed,
+    exists=False,
+    rc=0,
+    mode="genesis-3-4",
+    kill_fails=False,
+):
     """Run cc-slot.sh under a pty so the interactive reclaim `read </dev/tty` works."""
     import pty
 
     env, spawn_marker, kill_file = _setup(
         tmp_path, action=action, exists=exists, session_names=session_names, rc=rc
     )
+    if kill_fails:
+        env["KILL_RC"] = "1"
     pid, fd = pty.fork()
     if pid == 0:  # child: becomes the pty session leader
         try:
@@ -214,7 +226,15 @@ def test_reattach_bypasses_gate_and_spawns(tmp_path):
 
 
 def test_python_unavailable_fails_open_and_spawns(tmp_path):
-    proc, spawned, _ = _run(tmp_path, action="", rc=1, session_names=[])
+    # Low per/floor so the "room for a full session" check passes regardless of
+    # the CI runner's free RAM — we're testing the fail-open dispatch, not sizing.
+    proc, spawned, _ = _run(
+        tmp_path,
+        action="",
+        rc=1,
+        session_names=[],
+        extra_env={"GENESIS_CC_PER_SESSION_MB": "128", "GENESIS_CC_OOM_FLOOR_MB": "128"},
+    )
     assert spawned, proc.stderr
     assert proc.returncode == 0
     assert "static fallback" in proc.stderr
@@ -297,3 +317,19 @@ def test_manual_door_failopen_over_cap_denies_no_reclaim(tmp_path):
     assert proc.returncode == 1
     assert killed == ""
     assert "cap reached" in proc.stderr.lower()
+
+
+def test_reclaim_kill_failure_aborts_no_spawn(tmp_path):
+    # Codex P2: if `tmux kill-session` fails, NO memory was freed — must NOT spawn
+    # a new session on top (that over-commits the box). pty-driven with kill_fails.
+    code, out, spawned, killed = _run_pty(
+        tmp_path,
+        action="RECLAIM\nAt the emergency limit (5/4+1).\ncap_full",
+        session_names=["cc-1", "cc-2", "cc-3", "cc-5", "cc-6"],
+        feed=b"1\n",
+        kill_fails=True,
+    )
+    assert not spawned
+    assert code == 1
+    assert killed == ""  # nothing recorded — the kill failed
+    assert "failed to end" in out.lower()
