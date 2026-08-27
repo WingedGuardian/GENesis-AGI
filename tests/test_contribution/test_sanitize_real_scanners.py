@@ -39,7 +39,9 @@ _SECRET_DIFF = (
 )
 
 
-@pytest.mark.skipif(shutil.which("detect-secrets") is None, reason="detect-secrets not installed")
+@pytest.mark.skipif(
+    sanitize._resolve_detect_secrets() is None, reason="detect-secrets not installed"
+)
 def test_detect_secrets_real_binary_flags_suffixed_true():
     """The REAL detect-secrets '<plugin> : True  (suffix)' output must parse as a hit.
 
@@ -54,7 +56,7 @@ def test_detect_secrets_real_binary_flags_suffixed_true():
 
 
 @pytest.mark.skipif(
-    shutil.which("detect-secrets") is None,
+    sanitize._resolve_detect_secrets() is None,
     reason="detect-secrets not installed in the test env",
 )
 def test_detect_secrets_floor_survives_path_without_venv_bin(monkeypatch):
@@ -120,7 +122,9 @@ def test_gitleaks_loads_repo_config_for_genesis_rules():
     ), "the genesis-aws-account-id rule (only in .gitleaks.toml) must fire with -c"
 
 
-@pytest.mark.skipif(shutil.which("detect-secrets") is None, reason="detect-secrets not installed")
+@pytest.mark.skipif(
+    sanitize._resolve_detect_secrets() is None, reason="detect-secrets not installed"
+)
 def test_scan_diff_end_to_end_blocks_secret():
     """Full scan_diff over a secret-bearing diff must NOT be ok (the floor blocks it)."""
     result = sanitize.scan_diff(_SECRET_DIFF)
@@ -289,7 +293,9 @@ def test_gitleaks_allowlist_path_cannot_hide_secret():
     )
 
 
-@pytest.mark.skipif(shutil.which("detect-secrets") is None, reason="detect-secrets not installed")
+@pytest.mark.skipif(
+    sanitize._resolve_detect_secrets() is None, reason="detect-secrets not installed"
+)
 def test_detect_secrets_output_format_canary():
     """Canary against detect-secrets output-format DRIFT — the exact failure mode
     this PR fixed (a suffix on the verdict token silently voided the parser). If a

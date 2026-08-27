@@ -72,6 +72,9 @@ def _no_external_scanners(monkeypatch):
 
     monkeypatch.setattr(sanitize.shutil, "which", mock_which)
     monkeypatch.setattr(sanitize.subprocess, "run", mock_run)
+    # Floor now resolves the binary PATH-independently (absolute venv path), which
+    # would bypass the mock_run guard — pin it to the bare name so the stub holds.
+    monkeypatch.setattr(sanitize, "_resolve_detect_secrets", lambda: "detect-secrets")
 
 
 def _harvest(home, **kw):

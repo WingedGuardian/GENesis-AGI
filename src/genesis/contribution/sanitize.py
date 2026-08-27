@@ -532,11 +532,21 @@ def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
                 timeout=5,
                 check=False,
             )
-        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        except Exception as exc:  # noqa: BLE001 — REQUIRED fail-closed floor: ANY scan failure BLOCKs
             # Fail CLOSED: the REQUIRED secret-scan floor could not run on this
-            # line, so we cannot assert it is secret-free — BLOCK rather than
-            # let an unscanned line pass (the old `continue` was a fail-OPEN hole
-            # through a fail-CLOSED component).
+            # line, so we cannot assert it is secret-free — BLOCK rather than let
+            # an unscanned line pass (the old `continue` was a fail-OPEN hole
+            # through a fail-CLOSED component). Deliberately broad, NOT an
+            # enumerated subtype list — the floor's contract is "any inability to
+            # scan == BLOCK", so timeouts, E2BIG/resource errors (OSError, e.g. a
+            # >128 KB line over MAX_ARG_STRLEN), a NUL byte in the line (ValueError
+            # from execve/text-decode), permission errors, etc. ALL fail closed.
+            # Enumerating subtypes one at a time is whack-a-mole (this is the 2nd
+            # such miss). KeyboardInterrupt/SystemExit are not Exception subclasses
+            # → still propagate; the Finding message carries type(exc).__name__ for
+            # operator triage. (STDIN-feeding to remove the 128 KB argv blind spot
+            # entirely — so oversized lines get scanned rather than BLOCKed — is a
+            # separate hardening follow-up.)
             hits.append(
                 Finding(
                     kind=FindingKind.SECRET,
