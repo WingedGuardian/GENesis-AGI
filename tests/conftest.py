@@ -204,25 +204,6 @@ def _isolate_genesis_db_path(tmp_path):
     mp.undo()
 
 
-@pytest.fixture(autouse=True)
-def _isolate_secrets_path(tmp_path):
-    """Point ``secrets_path()`` at a nonexistent tmp file so tests never read the
-    install's real ``secrets.env``.
-
-    Matters for any code that reads secrets outside the loaded process env — e.g.
-    migration ``0086`` reads ``USER_TIMEZONE`` from ``secrets.env`` when the env is
-    unset (the ``update.sh`` CLI path). ``test_migrations_runner`` runs real
-    migrations with the real filesystem, so without this a run against a UTC/absent
-    home ``genesis.yaml`` would rewrite real user config. Own MonkeyPatch (like the
-    siblings) so a mid-test ``monkeypatch.undo()`` can't revert this isolation.
-    """
-    mp = pytest.MonkeyPatch()
-    mp.setenv("SECRETS_PATH", str(tmp_path / "isolated-secrets.env"))
-    mp.delenv("USER_TIMEZONE", raising=False)
-    yield
-    mp.undo()
-
-
 # ── Safety: isolate tests from the install's config overlays ──
 @pytest.fixture(autouse=True)
 def _isolate_user_config_dir(tmp_path):
