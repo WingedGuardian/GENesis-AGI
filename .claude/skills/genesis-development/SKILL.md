@@ -74,13 +74,20 @@ is raw subprocess calls with no external watchdog (e.g., deterministic
 executor steps), where a hung process blocks shared resources (executor
 semaphore) with no other recovery mechanism.
 
-**The Bash TOOL's own timeout is separate — and defaults to 120s.** An inner
-`timeout N …` INSIDE the command does NOT extend it: the tool wrapper SIGTERMs the
-whole call at its own `timeout` param (default 120000ms → exit 143). To allow
-longer, set the Bash tool's `timeout` PARAMETER explicitly. For long or unbounded
-work — above all deploys (`scripts/update.sh`, `bootstrap.sh`, `host-setup.sh`:
-container align + guardian redeploy + host `update-node`/`update-cc`, run
-sequentially — can exceed even 900s) — run via **`run_in_background: true`**
+**The Bash TOOL's own timeout is separate — default 120000ms, HARD CEILING
+600000ms (10 min).** An inner `timeout N …` INSIDE the command does NOT extend it:
+the tool wrapper SIGTERMs the whole call at its own `timeout` param (default
+120000ms → exit 143). To allow longer, set that `timeout` PARAMETER explicitly —
+**but you cannot exceed 600000ms.** A larger value does not buy more time; the
+call still dies at 10 minutes (MEASURED 2026-08-27: `timeout: 1600000` was killed
+at exactly `10m 0s`). Anything that might run past ten minutes therefore has only
+ONE correct form — `run_in_background: true`. Treat "raise the timeout" as a fix
+that tops out, not one that scales.
+
+For long or unbounded work — above all deploys (`scripts/update.sh`,
+`bootstrap.sh`, `host-setup.sh`: container align + guardian redeploy + host
+`update-node`/`update-cc`, run sequentially — routinely exceed 600s and so CANNOT
+be done in the foreground at any timeout value) — run via **`run_in_background: true`**
 (harness-tracked, notifies on completion, no timeout ceiling), NEVER a foreground
 timeout or `nohup … &` (detached but untracked → no completion signal, so you end
 up hand-polling anyway). `update.sh` has SIGTERM/INT rollback traps, so a mid-run
