@@ -57,6 +57,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Heartbeat GC no longer lets a clock-skewed future row starve a subsystem's
+  liveness signal.** The `keep_latest_per_subsystem` heartbeat GC
+  (`db/crud/events.py::prune`) kept the row equal to the per-subsystem
+  `MAX(timestamp)`. Because `timestamp` is ISO **text**, a corrupt/clock-skewed
+  future row (e.g. `2099-…`) sorts as that MAX and survived the retention window
+  forever, while genuine pulses aged out and were deleted — leaving
+  `compute_heartbeat_staleness` with only the future row, which it rejects as
+  materially-future, degrading the verdict to a permanent `unknown` (a false
+  "can't tell" for a subsystem that may be perfectly healthy or truthfully
+  stale). The GC now uses two distinct future bounds: (a) it deletes only
+  *implausibly*-far-future rows (> 1 day ahead — corrupt beyond any clock-skew
+  recovery), and (b) it anchors the "keep newest" on the newest row within the
+  read-side display tolerance (`observability.liveness.FUTURE_SKEW_TOLERANCE_MINUTES`),
+  so the preserved pulse is one the staleness read accepts (`alive`/`overdue`). The
+  wide destructive horizon is deliberate: a *modestly*-future row ages into validity
+  instead of being destroyed, and a **backward** clock skew at GC time cannot delete
+  genuinely-recent pulses. A write-time clamp was considered and rejected: the only
+  production trigger is host clock skew, against which a clamp is ineffective (at
+  write time `now()` *is* the skewed value), so the retention layer — re-evaluated at
+  GC time — is the layer that actually closes the hole.
+
 - **The run_in_background pipe guard no longer false-blocks a `|` inside a quoted
   argument.** The old inline check (`${CMD//||/ }` then `grep -qF "|"`) blocked any
   literal `|`, so backgrounding `gh api … --jq '.[] | .x'` or `grep -F '|' file`
