@@ -18,6 +18,17 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _hermetic_pr_files(monkeypatch):
+    """Hermetic default for the hook-surface override gate's changed-files read:
+    without this, force-path tests hit a LIVE `gh api pulls/N/files` call —
+    green locally (gh authenticated; PR "1" of the cwd repo answers) and red in
+    CI (call fails -> fail-closed block). Tests override per-case."""
+    monkeypatch.setenv(
+        "_TEST_GH_PR_FILES", '{"filename": "src/benign.py", "previous_filename": null}'
+    )
+
 _WORKTREE = Path(__file__).resolve().parent.parent.parent
 _HOOKS_DIR = _WORKTREE / "scripts" / "hooks"
 _spec = importlib.util.spec_from_file_location("git_push_guard", _HOOKS_DIR / "git_push_guard.py")
@@ -139,12 +150,34 @@ class TestFreshnessGate:
         assert block is False and head == HEAD
 
     def test_force_returns_no_verified_head(self, monkeypatch):
-        # Forced (# review-override) skips verification → no head to bind →
-        # the match-head requirement disengages too.
+        # Forced (# stale-review-override) on a NON-hook PR skips verification → no
+        # head to bind → the match-head requirement disengages too. (The benign
+        # non-hook default from _hermetic_pr_files makes the hook-surface evidence
+        # gate a no-op, so the force path returns allowed + unbound.)
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD))
         block, _, head = _mod._check_codex_reviewed_head("1", force=True)
         assert block is False and head is None
+
+    def test_force_hook_surface_fresh_review_still_demands_evidence(self, monkeypatch, tmp_path):
+        # SECURITY LOCK — Codex #9 dispositioned FALSE-POSITIVE (2026-08-26). A fresh
+        # at-head Codex review must NOT skip the hook-surface evidence gate: the same
+        # # stale-review-override ALSO waives _check_base_is_default, and the evidence
+        # identity binds the BASE tip — which a head-only review provably cannot vouch
+        # for (a hook PR retargeted to a non-default base). So a hook-surface forced
+        # merge WITH a current review but NO recorded evidence still BLOCKS. Regression
+        # guard: a reverted "skip evidence when fresh" attempt opened a base-binding
+        # bypass; on that buggy code this test would have returned block=False.
+        monkeypatch.setenv("GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR", str(tmp_path))  # no evidence file
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            '{"filename": "scripts/hooks/git_push_guard.py", "previous_filename": null}',
+        )
+        monkeypatch.setenv("_TEST_GH_BASE_OID", STALE)  # hermetic base tip (no network)
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD))  # FRESH review at head
+        block, _, head = _mod._check_codex_reviewed_head("1", force=True)
+        assert block is True and head is None
 
 
 class TestMergeMatchHead:
@@ -451,6 +484,31 @@ class TestPostReviewDeltaClassify:
 
     def test_ahead_trivial_is_inline(self, monkeypatch):
         assert self._lvl(monkeypatch, _compare_json("ahead", [_code_file(additions=3)])) == "inline"
+
+    def test_malformed_filename_fails_closed_not_trivial(self, monkeypatch):
+        # Codex P2 (round 5): a compare record with a missing/null/empty `filename`
+        # must FAIL CLOSED (unclassifiable → None → block), never be silently skipped
+        # so an empty delta reads as review-trivial. Pre-fix, classify_compare_
+        # substantiality([{filename: None}]) returns "inline" (verified) → a hook-surface
+        # delta could merge on a stale review. Fail closed instead.
+        assert self._lvl(monkeypatch, _compare_json("ahead", [{"filename": None}])) is None
+        assert self._lvl(monkeypatch, _compare_json("ahead", [{"filename": ""}])) is None
+        assert self._lvl(monkeypatch, _compare_json("ahead", [{}])) is None  # key absent
+
+    def test_malformed_previous_filename_fails_closed(self, monkeypatch):
+        # A present-but-non-string `previous_filename` is also fail-closed (a rename
+        # record we cannot fully read must not be assumed trivial).
+        payload = _compare_json("ahead", [{"filename": "src/a.py", "previous_filename": 123}])
+        assert self._lvl(monkeypatch, payload) is None
+
+    def test_malformed_record_never_reads_as_inline_even_with_a_hook_file(self, monkeypatch):
+        # The exact fail-open Codex named: a malformed record alongside real files must
+        # never let the delta classify "inline". Fails closed (None) on the bad record
+        # before triviality is granted.
+        payload = _compare_json(
+            "ahead", [{"filename": None}, {"filename": "scripts/hooks/git_push_guard.py"}]
+        )
+        assert self._lvl(monkeypatch, payload) != "inline"
 
     def test_diverged_substantial_still_classifies(self, monkeypatch):
         # A rebase/force-push rewrite must NOT be assumed trivial.

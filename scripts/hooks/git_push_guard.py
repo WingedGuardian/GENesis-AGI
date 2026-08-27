@@ -47,6 +47,14 @@ REQUIRED workflow — ``merge_gate.required_ci_workflows`` in genesis.yaml, defa
 genuinely needs several appends several (one trailing comment may carry multiple
 sigils).
 
+Hook-surface merge teeth (2026-08-23): a PR whose diff touches the
+ENFORCEMENT-HOOK surface (``_HOOK_SURFACE_PREFIXES``/``_HOOK_SURFACE_FILES`` —
+the code these gates themselves run on) gets stricter freshness handling: its
+stale-review delta is never "review-trivial", and ``# stale-review-override``
+alone cannot merge it — recorded fallback-review evidence keyed to the exact
+head sha is additionally required (``_hook_surface_override_check``; the block
+message documents the user-authorized fallback procedure).
+
 Scheduled Claude review markers
 -------------------------------
 A "scheduled Claude review" runs on the repo OWNER's GitHub account (NOT a bot) and must
@@ -1410,6 +1418,96 @@ def _pr_head_sha(pr_num: str, repo: str | None = None) -> str | None:
     return sha or None
 
 
+def _pr_base_sha(pr_num: str, repo: str | None = None) -> str | None:
+    """The LIVE tip oid of the PR's base branch, or None on any error.
+
+    Deliberately NOT ``pulls/N → .base.sha``: that field is a SNAPSHOT taken at
+    PR creation/retarget and does not advance with the base branch (measured
+    2026-08-23 against live PRs — three pre-merge PRs still reported the old
+    tip while a post-merge control reported the new one). The evidence binding
+    exists precisely for the base-advanced case, so it must read the branch
+    ref's current tip.
+
+    Resolution is via GraphQL ``repository.ref(qualifiedName:"refs/heads/<branch>")``
+    with the branch passed as a raw-string VARIABLE — NOT the REST ``commits/{ref}``
+    endpoint (Codex #10). Interpolating a branch name into a URL path is ambiguous
+    and fragile in two ways the REST path could not fully close: (1) an UNqualified
+    ``commits/<name>`` resolves a same-named TAG or a branch literally named
+    ``heads/x`` to the WRONG ref (a wrong-tip evidence binding that stays valid
+    after the real base moves); (2) a name that is structural in a URL (``#``
+    fragment, ``?`` query, ``%`` escape) truncates the request. A fully-qualified
+    ``refs/heads/<branch>`` passed as a GraphQL variable is unambiguous (heads vs
+    tags) AND carries no URL-path interpolation at all, closing both classes at once.
+    A branch ref's ``target`` is always a Commit, so ``.target.oid`` is its live tip.
+
+    Consumed by the hook-surface override evidence identity (see
+    _hook_surface_override_check). Tests inject via ``_TEST_GH_BASE_OID``.
+    """
+    raw = os.environ.get("_TEST_GH_BASE_OID")
+    if raw is None:
+        ref = _pr_base_ref(pr_num, repo=repo)
+        # Reject only an ASCII control char or a plain ASCII space — Git's own ref
+        # rules (git check-ref-format) forbid exactly those, and they'd be garbage in
+        # a base branch name. Do NOT reject every Python str.isspace() code point
+        # (Codex P2, round 5): non-ASCII whitespace (e.g. U+00A0) is a LEGAL Git branch
+        # character, and rejecting it would falsely block the authorized
+        # fallback-evidence path for a legitimately-named branch.
+        if not ref or any(ord(c) < 0x20 or ord(c) == 0x7F or c == " " for c in ref):
+            return None
+        # GraphQL needs an explicit owner/name (no REST ``:owner/:repo`` placeholder).
+        # Resolve the slug from the passed repo, else the cwd's base repo; fail-closed
+        # if it can't be resolved or split. A non-str ``repo`` (an unresolved-repo
+        # sentinel) fails CLOSED here — never fall through to a cwd guess, and never
+        # reach _normalize_repo's ``str``-typed body with a non-str (would TypeError
+        # OUTSIDE the subprocess try). Belt-and-suspenders: callers already fail-closed
+        # on the sentinel before this runs.
+        if repo is not None and not isinstance(repo, str):
+            return None
+        slug = _normalize_repo(repo) if repo else _derive_repo_from_cwd(os.getcwd())
+        if not slug or "/" not in slug:
+            return None
+        owner, name = slug.split("/", 1)
+        query = (
+            "query($owner:String!,$name:String!,$ref:String!){"
+            "repository(owner:$owner,name:$name){ref(qualifiedName:$ref){target{oid}}}}"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    "graphql",
+                    # -f (raw string), NOT -F: -F type-coerces and reads @file, which
+                    # would mangle a numeric-looking or @-leading branch name. -f keeps
+                    # every value a literal GraphQL String.
+                    "-f",
+                    f"query={query}",
+                    "-f",
+                    f"owner={owner}",
+                    "-f",
+                    f"name={name}",
+                    "-f",
+                    f"ref=refs/heads/{ref}",
+                    "--jq",
+                    ".data.repository.ref.target.oid",
+                ],
+                capture_output=True,
+                text=True,
+                # Merge-path budget (see main()): runs ONLY on the rare
+                # stale-review-override path; fail direction is closed there.
+                timeout=_gh_timeout(6),
+            )
+            # A missing branch → ``ref: null`` → jq emits the literal "null"; a GraphQL
+            # error → data null → same. Both, and any non-zero exit, fail closed below.
+            raw = result.stdout if result.returncode == 0 else ""
+        except Exception:
+            return None
+    sha = (raw or "").strip()
+    if not sha or sha == "null":
+        return None
+    return sha
+
+
 def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
     """EVERY Codex review record ``{commit_id, state}`` on the PR, oldest-first,
     or None on any API/parse error (distinct from ``[]`` = query succeeded, no
@@ -1739,6 +1837,303 @@ def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str
     return latest
 
 
+# ── Hook-surface merge teeth (2026-08-23, user decision) ─────────────────────
+# The ENFORCEMENT-HOOK surface is the code the merge/push/commit gates themselves
+# run on: an unreviewed change here disarms every other gate, so it gets stricter
+# review teeth than ordinary code. Two rules, both scoped to these paths:
+#   1. A stale-review delta touching this surface is NEVER "review-trivial"
+#      (_classify_post_review_delta): a "small single-file touch-up" to a guard
+#      is exactly the change that must not skip re-review.
+#   2. `# stale-review-override` alone cannot merge a hook-surface PR without a
+#      current GitHub Codex review — it additionally requires recorded
+#      fallback-review evidence keyed to the EXACT head sha
+#      (_hook_surface_override_check). The GitHub Codex review is the required
+#      evidence class (user decision, 2026-08-23); the fallback procedure
+#      (user-authorized local codex / Claude Code adversarial review) is the
+#      documented exception path, not a self-serve bypass.
+# WHY this exists (the origin story — keep it, it is the anti-rationalization):
+# on PR #1432 a hand-rolled findings query returned empty and was reported as
+# "review-clean" while 13 real Codex findings (10 P1) sat on the PR; only this
+# file's merge gate caught it. The lesson: the human-facing claim and the gate
+# MUST run the same code path, and the gate's own code must never merge
+# unreviewed. Tests: tests/test_hooks/test_git_push_guard_hook_surface.py.
+# config/behavioral_rules/ rides as a prefix: behavioral_linter.py loads every
+# YAML under it (decision config = enforcement surface, see the note in
+# _HOOK_SURFACE_FILES).
+_HOOK_SURFACE_PREFIXES = ("scripts/hooks/", ".claude/hooks/", "config/behavioral_rules/")
+# EVERY hook wired in .claude/settings.json is fence surface — not only the
+# blocking gates: any script auto-executing inside sessions is enforcement-
+# adjacent (architect SHOULD-FIX 2026-08-23: the named-list-as-sample trap this
+# PR itself documents — review_enforcement_commit.py et al. lived outside the
+# original 4-file fence). Over-fencing costs only stricter review; a guardrail
+# test (test_git_push_guard_hook_surface.py) parses settings.json and FAILS CI
+# if a wired hook ever falls outside this fence, so the set is self-maintaining.
+_HOOK_SURFACE_FILES = frozenset(
+    {
+        "scripts/bash_safety_hook.sh",  # the global Bash chokepoint
+        "scripts/review_scope.py",  # substantiality classifier (feeds THIS gate)
+        "scripts/review_state.py",  # escalation counter + review markers
+        ".claude/settings.json",  # hook wiring (inline blob + matchers)
+        # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
+        # resolves bare names as scripts/<name>); scripts/hooks/* wirings are
+        # covered by the prefix above.
+        "scripts/behavioral_linter.py",
+        "scripts/check_stale_pending.py",
+        "scripts/content_safety_hook.py",
+        "scripts/contribution_offer_hook.py",
+        "scripts/edit_failure_sensor.py",
+        "scripts/file_context_hook.py",
+        "scripts/file_modification_audit_hook.py",
+        "scripts/genesis_precompact.py",
+        "scripts/genesis_session_context.py",
+        "scripts/genesis_session_end.py",
+        "scripts/genesis_stop_hook.py",
+        "scripts/genesis_urgent_alerts.py",
+        "scripts/plan_bookmark_hook.py",
+        "scripts/pretool_check.py",
+        "scripts/proactive_memory_hook.py",
+        "scripts/procedure_advisor.py",
+        "scripts/review_enforcement_commit.py",
+        "scripts/review_enforcement_prompt.py",
+        "scripts/review_invalidate_on_commit.py",
+        "scripts/surface_open_prs.py",
+        "scripts/surface_pr_updates.py",
+        # Hook-owned DECISION CONFIGURATION (Codex P2, round 1): these files
+        # determine what the wired hooks enforce, and the ordinary
+        # substantiality classifier treats YAML as docs/config (review-trivial)
+        # — so a rewrite that removes blocking patterns could merge on a stale
+        # review. Config that drives enforcement is enforcement surface.
+        "config/protected_paths.yaml",  # pretool_check.py
+        "config/repo_topology.yaml",  # repo_routing_guard.py
+    }
+)
+
+
+def _is_hook_surface_path(path: str) -> bool:
+    """True iff ``path`` (repo-relative, as GitHub reports it) is enforcement-hook
+    surface. Prefix matches are real path segments (``scripts/hooks/x``), never
+    substrings (``scripts/hooks_readme.md`` does not match)."""
+    return path in _HOOK_SURFACE_FILES or any(path.startswith(p) for p in _HOOK_SURFACE_PREFIXES)
+
+
+# A real fallback review (reviewer + findings + dispositions) is substantive; this
+# floor rejects a rubber-stamp / stray/boilerplate file at the evidence path (Codex
+# P2 round 2). Note the filename already binds repo+PR+base+head, so the content
+# check's marginal value is specifically catching a stale body copied to a correctly
+# named file. Anti-autopilot floor, NOT tamper-proof — the teeth are the human merge
+# + cloud reviewer (same threat model as review_state's evidence check).
+_MIN_OVERRIDE_EVIDENCE_CHARS = 200
+# Bound the read on the merge-gate hot path (the floor is 200 chars; any real review
+# fits easily) so an oversized file in the evidence dir can't be slurped into memory.
+_MAX_OVERRIDE_EVIDENCE_READ = 65536
+
+
+def _override_evidence_dir() -> str:
+    """Directory holding fallback-review evidence files
+    (``<repo>__<pr>__<base-tip-12>__<head-sha>.txt``).
+
+    ``GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR`` overrides (config knob + test seam);
+    default lives outside the repo so evidence survives worktree removal and is
+    never committed."""
+    return os.environ.get("GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR") or os.path.expanduser(
+        "~/.genesis/override_review_evidence"
+    )
+
+
+def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
+    """Every filename the PR touches (including rename SOURCES via
+    ``previous_filename`` — a guard renamed OUT of scripts/hooks/ is a hook
+    change), or None on any API/parse error. GitHub caps ``pulls/N/files`` at
+    3000 entries; at the cap a hook file may sit beyond it → None (the caller
+    fails closed). Tests inject via ``_TEST_GH_PR_FILES`` (one JSON object per
+    line: ``{filename, previous_filename}``; the literal ``__error__`` simulates
+    an API error)."""
+    raw = os.environ.get("_TEST_GH_PR_FILES")
+    if raw == "__error__":
+        return None
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/files",
+                    "--paginate",
+                    "--jq",
+                    ".[] | {filename: .filename, previous_filename: .previous_filename}",
+                ],
+                capture_output=True,
+                text=True,
+                # Merge-path timeout budget (see main()): this runs ONLY on the
+                # rare `# stale-review-override` path, so one paginated read
+                # stays inside the hook's wall-clock.
+                timeout=_gh_timeout(8),
+            )
+            if result.returncode != 0:
+                return None
+            raw = result.stdout
+        except Exception:
+            return None
+    files: list[str] = []
+    rows = 0
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            return None  # malformed page → cannot vouch for the full file set
+        if not isinstance(obj, dict):
+            return None
+        rows += 1
+        # Strict record shape (Codex P2, round 1): a null/empty/non-string
+        # filename means the record did NOT parse into a usable path — treating
+        # it as parsed could hide a hook file behind a degenerate row. Require
+        # a nonempty string filename; previous_filename may be None (no rename)
+        # or a nonempty string. Anything else → None → caller fails closed.
+        fname = obj.get("filename")
+        if not isinstance(fname, str) or not fname:
+            return None
+        files.append(fname)
+        prev = obj.get("previous_filename")
+        if prev is not None:
+            if not isinstance(prev, str) or not prev:
+                return None
+            files.append(prev)
+    if rows >= 3000:
+        # The cap applies to API ROWS, not the expanded path list (renames
+        # contribute two paths per row — Codex P2, round 1): at the documented
+        # 3000-entry endpoint cap a hook file may be hidden beyond it.
+        return None
+    return files
+
+
+def _hook_surface_override_check(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
+    """Gate the ``# stale-review-override`` escape on hook-surface PRs.
+
+    Returns ``(should_block, message)``. Fail direction is CLOSED throughout:
+    an unreadable diff or head sha blocks — this path exists precisely because
+    the normal review evidence is absent, so uncertainty must not widen the
+    escape. Non-hook-surface PRs pass untouched (the sigil keeps its normal
+    meaning there)."""
+    files = _pr_changed_files(pr_num, repo=repo)
+    if files is None:
+        return (
+            True,
+            (
+                f"could not read PR #{pr_num}'s changed files to scope the "
+                f"stale-review-override (hook-surface PRs need fallback-review "
+                f"evidence). Retry when GitHub answers — this read failing "
+                f"closed is deliberate."
+            ),
+        )
+    touched = sorted({f for f in files if _is_hook_surface_path(f)})
+    if not touched:
+        return False, ""
+    head = _pr_head_sha(pr_num, repo=repo)
+    if not head:
+        return (
+            True,
+            (
+                f"PR #{pr_num} touches the enforcement-hook surface "
+                f"({', '.join(touched[:4])}) but its head sha could not be read, "
+                f"so fallback-review evidence cannot be verified. Retry."
+            ),
+        )
+    head = head.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        # A network-sourced string becomes a path component below — validate the
+        # exact oid shape (mirrors _SCHEDULED_REVIEW_HEAD_RE) so garbage blocks
+        # EXPLICITLY instead of via an accidental unmatchable filename.
+        return (
+            True,
+            (
+                f"PR #{pr_num}'s head sha read back malformed ({head[:24]!r}) — "
+                f"cannot key fallback-review evidence. Retry."
+            ),
+        )
+    # Evidence identity = repo + PR + BASE + head (Codex P2s, rounds 1+2): a
+    # commit sha alone does not identify the PR/base whose FULL diff the
+    # fallback review covered — the same head can appear on another PR or in a
+    # fork, and (round 2) a retarget or advancing default branch changes the
+    # effective diff while head stays put; the sigil this path serves also
+    # waives _check_base_is_default, so base must be bound HERE. The bound value
+    # is the base branch's LIVE tip (never pulls/N.base.sha — a creation-time
+    # snapshot; see _pr_base_sha): binding to the live tip over-expires (any
+    # base move → re-record) — the safe direction on this rare, user-authorized
+    # path. Fail-closed on an unreadable base.
+    base = _pr_base_sha(pr_num, repo=repo)
+    if not base or not re.fullmatch(r"[0-9a-f]{40}", base.strip().lower()):
+        return (
+            True,
+            (
+                f"PR #{pr_num}'s BASE sha could not be read (or was malformed) — "
+                f"fallback-review evidence is base-bound and cannot be verified. "
+                f"Retry."
+            ),
+        )
+    base = base.strip().lower()
+    repo_slug = (_normalize_repo(repo) or "local").replace("/", "_")
+    evidence_path = os.path.join(
+        _override_evidence_dir(), f"{repo_slug}__{pr_num}__{base[:12]}__{head}.txt"
+    )
+    try:
+        with open(evidence_path, encoding="utf-8", errors="replace") as _ef:
+            evidence_text = _ef.read(_MAX_OVERRIDE_EVIDENCE_READ)
+    except OSError:
+        evidence_text = ""
+    # Validate the CONTENT, not just presence (Codex P2, round 2): a stray or
+    # rubber-stamp file at the right path must not waive the gate. Require a
+    # substantive review that NAMES the exact head it vouches for — the 12-hex
+    # head prefix must appear in the body (the procedure below instructs this),
+    # and the body must clear a minimum length. Fail-closed on a short/unbound file.
+    has_evidence = (
+        len(evidence_text.strip()) >= _MIN_OVERRIDE_EVIDENCE_CHARS
+        and head[:12] in evidence_text.lower()
+    )
+    if has_evidence:
+        # Residual TOCTOU, accepted as part of the force path's documented
+        # "conscious unbound merge" contract: a push landing between this head
+        # read and the merge would merge a head the evidence does not name. The
+        # window is seconds, re-running re-reads the head, and binding here
+        # would force --match-head-commit onto override merges — declined.
+        print(
+            f"NOTE: hook-surface override on PR #{pr_num} backed by fallback-review "
+            f"evidence at {evidence_path} (head {head[:12]}).",
+            file=sys.stderr,
+        )
+        return False, ""
+    return (
+        True,
+        (
+            f"'# stale-review-override' is NOT sufficient by itself here: PR "
+            f"#{pr_num}'s diff touches the ENFORCEMENT-HOOK surface "
+            f"({', '.join(touched[:4])}{', …' if len(touched) > 4 else ''}) — the "
+            f"code the merge/push gates themselves run on. Merging it without a "
+            f"current GitHub Codex review additionally requires recorded "
+            f"fallback-review evidence for the EXACT head {head[:12]}.\n"
+            f"Procedure (requires the user's explicit authorization — never "
+            f"self-serve):\n"
+            f"  1. Get the user's go-ahead for the override.\n"
+            f"  2. Run a fallback adversarial review of the full PR diff: local "
+            f"`codex exec` when quota allows, else a Claude Code adversarial "
+            f"review (genesis-architect).\n"
+            f"  3. Record reviewer + findings + dispositions — and reference the "
+            f"head sha {head[:12]} in the body — in:\n"
+            f"       {evidence_path}\n"
+            f"  4. Re-run this merge (same sigil). A new push changes the head "
+            f"sha, and a base-branch change (retarget OR base advancing) "
+            f"re-keys too — re-review and re-record.\n"
+            f"WHY: 2026-08-23 — an unreviewed merge on this surface disarms every "
+            f"other gate; the GitHub Codex review is the required evidence class "
+            f"(user decision), and this file's own history (#1432: 13 findings "
+            f"invisible to a hand-rolled query) is the proof the gate must not "
+            f"trust the author's claim of cleanliness."
+        ),
+    )
+
+
 def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | None) -> str | None:
     """Substantiality of what HEAD adds OVER the Codex-reviewed SHA, via the compare API.
 
@@ -1809,6 +2204,29 @@ def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | No
         return None
     if len(files) >= 300:
         return "substantial"  # compare file cap hit → can't rule out substantial code
+    # Hook-surface teeth rule 1: a delta touching the enforcement-hook surface is
+    # NEVER review-trivial, no matter how small — see the block above
+    # _is_hook_surface_path for the why. Rename sources count (previous_filename):
+    # a guard renamed/moved out of scripts/hooks/ IS a hook change.
+    for f in files:
+        if not isinstance(f, dict):
+            return None
+        # A record MUST carry a readable string ``filename`` — a missing/null/empty
+        # one means we cannot confirm this path is NOT a hook-surface file, so fail
+        # CLOSED (unclassifiable → the caller blocks a stale review) rather than skip
+        # it (Codex P2, round 5: a malformed compare record must not let a hook-surface
+        # delta read as review-trivial; ``gh --jq`` still builds an object when the
+        # upstream field is absent, so this shape is reachable). ``previous_filename``
+        # is optional, but when present must likewise be a non-empty string.
+        fn = f.get("filename")
+        if not isinstance(fn, str) or not fn:
+            return None
+        prev = f.get("previous_filename")
+        if prev is not None and (not isinstance(prev, str) or not prev):
+            return None
+        for val in (fn, prev):
+            if val and _is_hook_surface_path(val):
+                return "substantial"
     try:
         # review_scope lives in scripts/ (parent of scripts/hooks/). Lazy import ON
         # PURPOSE: an import failure must degrade THIS classification to None (the
@@ -1843,7 +2261,10 @@ def _check_codex_reviewed_head(
     only on positive evidence. ``force`` (a ``# stale-review-override`` on the
     merge segment — deliberately NOT ``# review-override``, which waives the P1
     finding scans; the two boundaries are independent) is the conscious escape
-    (e.g. a genuine Codex outage).
+    (e.g. a genuine Codex outage). On the HOOK SURFACE ``force`` additionally
+    requires recorded fallback-review evidence regardless of head-freshness — the
+    same sigil waives ``_check_base_is_default`` and the evidence identity binds the
+    BASE, which a head-only review cannot vouch for (see Codex #9 disposition below).
 
     Returns ``(should_block, message, verified_head)`` — ``verified_head`` is the
     full head oid this check verified/classified against (when not blocked and
@@ -1853,6 +2274,25 @@ def _check_codex_reviewed_head(
     cannot smuggle an unreviewed head through (TOCTOU — Codex P1, PR #1366).
     """
     if force:
+        # Hook-surface teeth rule 2: the sigil alone is not enough when the PR
+        # touches the enforcement-hook surface — recorded fallback-review
+        # evidence for the exact head is additionally required (fail-closed).
+        # verified_head stays None on the pass path: the force path keeps its
+        # documented "conscious unbound merge" contract (no --match-head bind).
+        #
+        # NOTE (Codex #9, dispositioned FALSE-POSITIVE 2026-08-26): #9 proposed
+        # skipping this evidence demand when a current at-head Codex review already
+        # exists. That is UNSAFE and was reverted: this force path is reached via
+        # # stale-review-override, which ALSO waives _check_base_is_default, and
+        # _hook_surface_override_check's evidence identity binds the BASE tip — which
+        # a head-only Codex review provably cannot vouch for (see _check_base_is_default's
+        # docstring: "GitHub's review object records no base, so freshness alone cannot
+        # see it"). Skipping evidence on a fresh review would let a hook-surface PR
+        # RETARGETED to a non-default base merge with no base-bound review. A fresh
+        # head-review is NOT a substitute for base-bound evidence here.
+        blocked, msg = _hook_surface_override_check(pr_num, repo=repo)
+        if blocked:
+            return True, msg, None
         return False, "", None
     head = _pr_head_sha(pr_num, repo=repo)
     if not head:
@@ -3638,7 +4078,9 @@ def main() -> int:
                 # pre-gate repo/PR resolution above (6s each) — carries a tight
                 # per-call timeout (6-8s): pre-gates + fail-closed gates
                 # (derive 6 + resolve 6 + mergeable 8 + ci 8 + base 6+6 +
-                # freshness 6+8 + delta 8 = 62s absolute worst) each reach
+                # freshness 6+8 + delta 8 = 62s absolute worst; the FORCE
+                # branch swaps freshness+delta for its hook-surface evidence
+                # reads, files 8 + head 6 = strictly less) each reach
                 # their own block/allow decision at or inside the budget, and
                 # any ONE of them timing out fail-closes IMMEDIATELY (the
                 # additive worst case needs every call slow-but-successful);

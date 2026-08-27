@@ -140,6 +140,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Security
 
+- **Hook-surface PRs can no longer merge without a current GitHub Codex review.**
+  The merge gate's review-freshness check now treats any unreviewed delta touching
+  the enforcement-hook surface (`scripts/hooks/**`, the global bash safety hook,
+  the review-scope/state modules, hook wiring in `.claude/settings.json`,
+  `.claude/hooks/**`) as substantial — a small touch-up to a guard can no longer
+  slip through the review-trivial narrowing. The `# stale-review-override` escape
+  additionally requires recorded fallback-review evidence keyed to the PR's exact
+  head sha on this surface (fail-closed on unreadable diff or head), with the
+  block message documenting the authorized fallback procedure. Rationale: the hook
+  surface is the code the gates themselves run on — an unreviewed merge there
+  disarms every other gate. The genesis-development skill now also mandates
+  `git_push_guard.py --check-pr <N>` (the merge gate's own code path) as the only
+  way to report a PR's review-findings status.
+
 - **A leading shell redirect can no longer slip the push/commit approval gates.**
   The shared command parser now recognizes shell redirections (`2>/dev/null`,
   `> out.log`, `2>&1`, `&>log`, `>| f`, `< in`, `<<<`) and consumes the operator

@@ -333,6 +333,30 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   canonical-parser lesson (regex→yaml, #1393). Loci today:
   `scripts/hooks/shell_parse.py` + `scripts/hooks/git_push_guard.py`.
 
+  **The boundary of the class — read this BEFORE you reason yourself out of it.**
+  The tar pit is NOT "who tokenizes the string." Delegating tokenization to
+  `shell_parse` and asking git for repo state does NOT exempt a guard: if the
+  guard's CORRECTNESS depends on modeling what a git command WILL DO — which
+  flags force, which operands are paths vs refs, which modes destroy, which
+  repo is targeted — it is argv→EFFECT mapping, and that mapping is the same
+  unbounded open-set surface as raw string parsing. This was reasoned around
+  once already (2026-08-23, PR #1432): the guard used the canonical tokenizer
+  and probed live git state, the author concluded "so it's not hand-rolling,"
+  and Codex returned **13 real findings (10 P1) — every one of them living in
+  the argv→effect layer**. The first architect finding of that shape (a
+  separated global value-flag bypass) was the CLASS signal and got
+  instance-patched; the next round found the rest of the class. n=1 IS the
+  signal: any reviewer finding that exposes a semantic-modeling gap in a guard
+  means STOP and re-architect — never patch the named instance.
+
+  **Decision test (verbatim, apply before shipping any guard):** could a git
+  flag you've never heard of change your guard's verdict? If yes, your claim
+  is open-set — redesign to closed-set token claims (exact-form whitelists /
+  literal token blocks) or to RECOVERABILITY (snapshot-then-allow, where a
+  miss degrades to the status quo instead of a broken guarantee). Do not ship
+  the open-set version and plan to harden it later; the review loop IS the
+  hardening loop, one bug per round, and it does not converge.
+
 ### Iterative-Refinement Discipline
 
 AI refinement cycles degrade code they were asked to "improve" — validation
@@ -498,6 +522,41 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   hand-rolled-parsing hunting, not a lint/secrets scan — and writes the evidence marker. This is
   the review that catches Round-1 bugs before Codex does; `/audit-changes` is only a light
   self-check.
+- **PR review-findings status = `python3 scripts/hooks/git_push_guard.py --check-pr <N>`
+  — ONLY.** This runs the SAME code path as the merge gate (strict fail-closed: a
+  failed scan is never reported clean). NEVER hand-roll a `gh api pulls/N/comments`
+  query to decide whether a PR is review-clean: a wrong filter's EMPTY result reads
+  exactly like "clean". Origin (2026-08-23, #1431/#1432): Codex authors BOTH its inline
+  findings AND its review-summary body as `chatgpt-codex-connector[bot]` — the REST
+  `user.login`, WITH the `[bot]` suffix. A hand-rolled filter keyed on a DIFFERENT login
+  (the GraphQL app login, which is not the REST login) matched nothing, and 13 real
+  findings (10 P1) were reported to the user as "review-clean" until the merge gate
+  blocked. An empty result from your own query is "my query found nothing", never "no
+  findings exist". Freshness is a SEPARATE gate, and it is NOT a blanket
+  reviewed-SHA-equals-HEAD rule: for a hook-surface or otherwise non-trivial delta a
+  current Codex review must COVER head (reviews-API `commit_id == head`, or a clean Codex
+  re-review comment naming head), but a trivial NON-hook delta may still merge on a stale
+  review — `--check-pr` reports that as `codex-at-head : ok (STALE review of <sha>, delta
+  since is trivial)`, a pass, not a block.
+- **Hook-surface PRs merge only with a current GitHub Codex review — mechanical.**
+  A PR touching the enforcement-hook surface (the guard code itself) gets no
+  stale-review leniency: the merge gate (1) never classifies its post-review delta as
+  "review-trivial", and (2) refuses `# stale-review-override` — regardless of Codex
+  head-freshness — unless recorded fallback-review evidence exists for the EXACT
+  base+head (`~/.genesis/override_review_evidence/<repo>__<pr>__<base12>__<sha>.txt`).
+  A current at-head Codex review does NOT substitute for that evidence: the same sigil
+  also waives `_check_base_is_default`, and the evidence identity binds the BASE tip,
+  which a head-only review cannot vouch for (a hook-surface PR retargeted to a
+  non-default base must be re-reviewed in that base's context). The surface is defined
+  authoritatively by `_HOOK_SURFACE_PREFIXES` + `_HOOK_SURFACE_FILES` in
+  `scripts/hooks/git_push_guard.py` (hook dirs, the global bash safety hook, the
+  review-scope/state modules, hook wiring in `.claude/settings.json`, and the tracked
+  configs the hooks read) — read those constants, kept exhaustive by the
+  `TestWiredHooksFenceGuardrail` test, rather than any hand-copied list. The override
+  procedure requires the user's explicit authorization, then a fallback adversarial
+  review (local `codex exec` when quota allows, else genesis-architect), evidence
+  recorded naming the head, then the merge re-run — the gate's block message walks
+  through it.
 - **One reviewer at a time — NEVER run two review agents simultaneously.** Run
   one reviewer (e.g. Codex), apply/verify its findings, then run the next
   reviewer (e.g. Claude) on the *fixed* code — sequential, never in parallel.
