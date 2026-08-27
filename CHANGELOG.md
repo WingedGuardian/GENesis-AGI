@@ -22,7 +22,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   affirmatively setting the lever to `live` AND the BULK capability cell earning a
   grant through your approvals — in `observe` (or `off`) every cold send holds for
   your explicit approval even after the cell is granted. Manage prospects and
-  opt-outs in the `marketing_prospects` table.
+  opt-outs in the `marketing_prospects` table. Hardened: the `marketing_send`
+  actuator is reachable only from the `campaign` session profile (every other
+  profile — including the untrusted-inbound `mail`/`community-responder` perimeter
+  — denies it, so an injected inbound message can't reach it); arming `live` is
+  overlay-file-only and cannot be set through `settings_update` (a model can't
+  self-elevate past the observe gate); a held send to a permanently opted-out
+  prospect is refused before delivery regardless of how the pitch classified (a
+  money-pattern body that lands as FINANCIAL no longer bypasses the bulk-only
+  opt-out check); and the `pending_outreach.labeled_surplus` migration no longer
+  swallows ALTER errors (a transient lock is retried, a real failure fails loud).
 
 - **Session-start surface for age-stale open PRs.** The repo-pulse worker now
   also caches the open-PR set each boundary, and a SessionStart hook lists the

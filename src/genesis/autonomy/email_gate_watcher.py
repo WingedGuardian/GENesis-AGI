@@ -50,6 +50,25 @@ async def _bulk_recipient_authorized(db: object, recipient: str | None) -> bool:
     return not row.get("opted_out")
 
 
+async def _recipient_opted_out(db: object, recipient: str | None) -> bool:
+    """True iff ``recipient`` matches a ``marketing_prospects`` row that has OPTED
+    OUT — a NARROW predicate that applies to a held send of ANY capability class.
+
+    Distinct from ``_bulk_recipient_authorized`` (which fail-CLOSES on an
+    *uncurated* recipient): this returns True ONLY for a KNOWN, opted-out prospect,
+    so it never blocks a legitimate non-marketing send to someone who simply isn't
+    in the prospect store. Blank recipient / no row / not-opted-out → False (nothing
+    to refuse)."""
+    if not recipient:
+        return False
+    from genesis.db.crud import marketing_prospects as mp
+
+    row = await mp.get_by_email(db, recipient)
+    if row is None:
+        return False
+    return bool(row.get("opted_out"))
+
+
 def _subject(context: str | None) -> str:
     if not context:
         return ""
@@ -92,6 +111,30 @@ async def drain_pending_email_sends(rt: object) -> int:
                 logger.info(
                     "Reconciled held email %s (approval already consumed) — not re-sent",
                     row["id"],
+                )
+                continue
+            # Absolute opt-out re-check (ALL classes). A marketing pitch whose body
+            # trips the FINANCIAL money-pattern classifier lands as a FINANCIAL (not
+            # BULK) hold, so the bulk-gated re-check just below would skip it — yet an
+            # opted-out prospect must NEVER receive an autonomous send regardless of
+            # how the pitch classified. Refuse any held send to a KNOWN opted-out
+            # prospect, deliver-side, fail-safe. Narrow by construction: only a
+            # curated-and-opted-out row trips this, so a genuine non-marketing send to
+            # a non-prospect is untouched. Accepted residue (STOPGAP, tracked in the
+            # deferred dedup/provenance PR2, follow-up 17261bc9): a held STANDARD reply
+            # to someone who is ALSO an opted-out marketing prospect is refused too —
+            # rare (granted-cell replies auto-allow and never reach this branch) and
+            # fail-safe. The durable fix is a send-provenance flag separating a
+            # marketing send from an ordinary reply.
+            if await _recipient_opted_out(db, row["validated_recipient"]):
+                if await pes.mark_rejected(db, row["id"], rejected_at=now):
+                    await approval_crud.mark_consumed(db, row["request_id"], consumed_at=now)
+                    resolved += 1
+                logger.warning(
+                    "Held email %s recipient is an opted-out marketing prospect — "
+                    "not delivered, marked rejected (class=%s)",
+                    row["id"],
+                    row["cell_risk_class"],
                 )
                 continue
             # Opt-out re-check at approved-send time (BULK / cold-marketing only).

@@ -17,8 +17,6 @@ Idempotent (``IF NOT EXISTS`` / guarded ALTER). Fresh installs get the same DDL 
 
 from __future__ import annotations
 
-import contextlib
-
 import aiosqlite
 
 _TABLE_DDL = """
@@ -54,13 +52,17 @@ async def up(db: aiosqlite.Connection) -> None:
     for stmt in _INDEX_DDL:
         await db.execute(stmt)
 
-    # Thread labeled_surplus through the pending_outreach queue (guarded — the
-    # column may already exist on a re-run or a fresh DB built from _tables.py).
+    # Thread labeled_surplus through the pending_outreach queue. The _has_column
+    # PRAGMA guard gives idempotency (the column may already exist on a re-run or a
+    # fresh DB built from _tables.py), so the ALTER runs at most once. Any ALTER
+    # error is allowed to PROPAGATE: a transient SQLITE_LOCKED reaches the runner's
+    # retry-on-lock loop (a suppressed lock error here would instead record 0086 as
+    # applied WITHOUT the column, breaking every subsequent pending_outreach enqueue),
+    # and a genuine failure fails the migration loudly rather than half-applying it.
     if not await _has_column(db, "pending_outreach", "labeled_surplus"):
-        with contextlib.suppress(aiosqlite.OperationalError):
-            await db.execute(
-                "ALTER TABLE pending_outreach ADD COLUMN labeled_surplus INTEGER NOT NULL DEFAULT 0"
-            )
+        await db.execute(
+            "ALTER TABLE pending_outreach ADD COLUMN labeled_surplus INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 async def down(db: aiosqlite.Connection) -> None:

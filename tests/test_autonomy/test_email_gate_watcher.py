@@ -185,6 +185,64 @@ async def test_approved_bulk_hold_not_curated_after_hold_not_delivered(db):
 
 
 @pytest.mark.asyncio
+async def test_approved_financial_hold_opted_out_prospect_not_delivered(db):
+    # ABSOLUTE opt-out re-check (any class). A cold marketing pitch whose body trips
+    # the FINANCIAL money-pattern classifier is stored cell_risk_class="financial"
+    # (NOT "bulk"), so the bulk-gated re-check would skip it — but an opted-out
+    # prospect must never receive an autonomous send. The absolute _recipient_opted_out
+    # guard refuses it regardless of class.
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    await mp.mark_opted_out(db, "prospect", opted_out_at=_TS)
+    rid = await _approval(db, status="approved")
+    await pes.create(
+        db,
+        id="pf",
+        request_id=rid,
+        validated_recipient="prospect@example.com",
+        category="notification",
+        message="invoice attached — please remit payment",  # money pattern → FINANCIAL
+        held_at=_TS,
+        cell_domain="email",
+        cell_verb="send",
+        cell_risk_class="financial",  # NOT bulk — the gap the absolute check closes
+    )
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == []  # refused despite non-bulk class
+    assert (await pes.get_by_id(db, "pf"))["status"] == "rejected"  # terminal
+    assert await cg.get_cell(db, "email", "send", "financial") is None  # no success
+
+
+@pytest.mark.asyncio
+async def test_approved_financial_hold_non_prospect_still_delivered(db):
+    # Residue boundary: the absolute opt-out check is NARROW — it only trips on a
+    # KNOWN opted-out prospect. A legitimate FINANCIAL email to someone who is NOT
+    # in the prospect store is delivered normally (the helper returns False on a
+    # missing row, so a non-marketing send is never collateral-blocked).
+    rid = await _approval(db, status="approved")
+    await pes.create(
+        db,
+        id="pf",
+        request_id=rid,
+        validated_recipient="vendor@example.com",  # not a prospect
+        category="notification",
+        message="invoice attached — please remit payment",
+        held_at=_TS,
+        cell_domain="email",
+        cell_verb="send",
+        cell_risk_class="financial",
+    )
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == [("pf", "hi")]  # delivered — not blocked
+    assert (await pes.get_by_id(db, "pf"))["status"] == "sent"
+
+
+@pytest.mark.asyncio
 async def test_rejected_hold_records_correction(db):
     rid = await _approval(db, status="rejected")
     await _hold(db, pid="p1", rid=rid)
