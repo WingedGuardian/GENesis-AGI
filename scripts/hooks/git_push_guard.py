@@ -1446,7 +1446,13 @@ def _pr_base_sha(pr_num: str, repo: str | None = None) -> str | None:
     raw = os.environ.get("_TEST_GH_BASE_OID")
     if raw is None:
         ref = _pr_base_ref(pr_num, repo=repo)
-        if not ref or any(c.isspace() for c in ref):
+        # Reject only an ASCII control char or a plain ASCII space — Git's own ref
+        # rules (git check-ref-format) forbid exactly those, and they'd be garbage in
+        # a base branch name. Do NOT reject every Python str.isspace() code point
+        # (Codex P2, round 5): non-ASCII whitespace (e.g. U+00A0) is a LEGAL Git branch
+        # character, and rejecting it would falsely block the authorized
+        # fallback-evidence path for a legitimately-named branch.
+        if not ref or any(ord(c) < 0x20 or ord(c) == 0x7F or c == " " for c in ref):
             return None
         # GraphQL needs an explicit owner/name (no REST ``:owner/:repo`` placeholder).
         # Resolve the slug from the passed repo, else the cwd's base repo; fail-closed
@@ -2205,9 +2211,21 @@ def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | No
     for f in files:
         if not isinstance(f, dict):
             return None
-        for key in ("filename", "previous_filename"):
-            val = f.get(key)
-            if val and _is_hook_surface_path(str(val)):
+        # A record MUST carry a readable string ``filename`` — a missing/null/empty
+        # one means we cannot confirm this path is NOT a hook-surface file, so fail
+        # CLOSED (unclassifiable → the caller blocks a stale review) rather than skip
+        # it (Codex P2, round 5: a malformed compare record must not let a hook-surface
+        # delta read as review-trivial; ``gh --jq`` still builds an object when the
+        # upstream field is absent, so this shape is reachable). ``previous_filename``
+        # is optional, but when present must likewise be a non-empty string.
+        fn = f.get("filename")
+        if not isinstance(fn, str) or not fn:
+            return None
+        prev = f.get("previous_filename")
+        if prev is not None and (not isinstance(prev, str) or not prev):
+            return None
+        for val in (fn, prev):
+            if val and _is_hook_surface_path(val):
                 return "substantial"
     try:
         # review_scope lives in scripts/ (parent of scripts/hooks/). Lazy import ON

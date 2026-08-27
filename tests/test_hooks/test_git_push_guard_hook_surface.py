@@ -522,3 +522,37 @@ class TestBaseRefEncoding:
         monkeypatch.setattr(_mod.subprocess, "run", fake_run)
         assert _mod._pr_base_sha("1", repo=None) is None
         assert called["n"] == 0  # slug unresolved → no GraphQL attempted
+
+    def test_non_ascii_whitespace_ref_is_accepted(self, monkeypatch):
+        # Codex P2 (round 5): U+00A0 (non-breaking space) is a LEGAL Git branch char —
+        # it must NOT be rejected (str.isspace() over-rejects it; that would falsely
+        # block the authorized evidence path). It rides through to the GraphQL variable.
+        argv, sha = self._capture(monkeypatch, "release 1")
+        assert self._ref_arg(argv) == "ref=refs/heads/release 1"
+        assert sha == "a" * 40
+
+    def _capture_no_call(self, monkeypatch, ref):
+        monkeypatch.delenv("_TEST_GH_BASE_OID", raising=False)
+        monkeypatch.setenv("_TEST_GH_BASE_REF", ref)
+        called = {"n": 0}
+
+        def fake_run(argv, *a, **k):
+            called["n"] += 1
+
+            class _R:
+                returncode = 0
+                stdout = "x"
+
+            return _R()
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        result = _mod._pr_base_sha("1", repo="o/r")
+        return result, called["n"]
+
+    def test_ascii_space_ref_rejected(self, monkeypatch):
+        # A plain ASCII space IS forbidden by Git's ref rules → fail closed, no call.
+        assert self._capture_no_call(monkeypatch, "release 1") == (None, 0)
+
+    def test_control_char_ref_rejected(self, monkeypatch):
+        # An ASCII control char is forbidden by Git's ref rules → fail closed, no call.
+        assert self._capture_no_call(monkeypatch, "rel\x01ease") == (None, 0)

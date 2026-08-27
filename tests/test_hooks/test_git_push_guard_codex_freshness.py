@@ -485,6 +485,31 @@ class TestPostReviewDeltaClassify:
     def test_ahead_trivial_is_inline(self, monkeypatch):
         assert self._lvl(monkeypatch, _compare_json("ahead", [_code_file(additions=3)])) == "inline"
 
+    def test_malformed_filename_fails_closed_not_trivial(self, monkeypatch):
+        # Codex P2 (round 5): a compare record with a missing/null/empty `filename`
+        # must FAIL CLOSED (unclassifiable → None → block), never be silently skipped
+        # so an empty delta reads as review-trivial. Pre-fix, classify_compare_
+        # substantiality([{filename: None}]) returns "inline" (verified) → a hook-surface
+        # delta could merge on a stale review. Fail closed instead.
+        assert self._lvl(monkeypatch, _compare_json("ahead", [{"filename": None}])) is None
+        assert self._lvl(monkeypatch, _compare_json("ahead", [{"filename": ""}])) is None
+        assert self._lvl(monkeypatch, _compare_json("ahead", [{}])) is None  # key absent
+
+    def test_malformed_previous_filename_fails_closed(self, monkeypatch):
+        # A present-but-non-string `previous_filename` is also fail-closed (a rename
+        # record we cannot fully read must not be assumed trivial).
+        payload = _compare_json("ahead", [{"filename": "src/a.py", "previous_filename": 123}])
+        assert self._lvl(monkeypatch, payload) is None
+
+    def test_malformed_record_never_reads_as_inline_even_with_a_hook_file(self, monkeypatch):
+        # The exact fail-open Codex named: a malformed record alongside real files must
+        # never let the delta classify "inline". Fails closed (None) on the bad record
+        # before triviality is granted.
+        payload = _compare_json(
+            "ahead", [{"filename": None}, {"filename": "scripts/hooks/git_push_guard.py"}]
+        )
+        assert self._lvl(monkeypatch, payload) != "inline"
+
     def test_diverged_substantial_still_classifies(self, monkeypatch):
         # A rebase/force-push rewrite must NOT be assumed trivial.
         assert self._lvl(monkeypatch, _compare_json("diverged", [_code_file()])) == "substantial"
