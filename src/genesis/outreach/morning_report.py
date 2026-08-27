@@ -920,10 +920,11 @@ class MorningReportGenerator:
         section entirely. This is not a standing checklist.
         """
         lines: list[str] = []
-        # Subsystems already surfaced via a ``subsystem_stale:<name>`` alert in the
-        # health-alerts block below — the heartbeat-staleness block must not list
-        # them a SECOND time (P2-6 dedup). Populated from the alerts actually
-        # emitted, so it stays correct if the alert set changes.
+        # Subsystems already surfaced via a ``subsystem_stale:<name>`` or
+        # ``subsystem_never_started:<name>`` alert in the health-alerts block below —
+        # the heartbeat-staleness block must not list them a SECOND time (P2-6 dedup).
+        # Populated from the alerts actually emitted, so it stays correct if the alert
+        # set changes.
         stale_alert_names: set[str] = set()
 
         # Health alerts (call sites down, queue depth, resilience warnings)
