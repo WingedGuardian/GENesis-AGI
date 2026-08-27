@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+# (sourced fragment, not an executable script — no shebang)
 # Genesis — shared venv/package-install helpers.
 # Sourced by install.sh and bootstrap.sh; not executable on its own.
 
@@ -21,8 +23,15 @@ editable_install_guarded() {
     # in a linked worktree. Checked against repo_dir explicitly (git -C), not
     # the caller's cwd — the installer may be invoked from anywhere.
     local git_common git_dir
-    git_common="$(git -C "$repo_dir" rev-parse --git-common-dir 2>/dev/null)"
-    git_dir="$(git -C "$repo_dir" rev-parse --git-dir 2>/dev/null)"
+    # Guarded: `git rev-parse` exits 128 when repo_dir is not a repo OR under
+    # git's safe.directory "dubious ownership" refusal — realistic when the
+    # installer runs as a different user than the repo owner. A bare assignment
+    # would abort under the callers' `set -e`, returning 128 rather than this
+    # function's documented 0/1/2 contract; both callers mis-map that to
+    # "pip install completed but Genesis is not importable". Empty vars fall
+    # through to the same not-a-worktree path as before.
+    git_common="$(git -C "$repo_dir" rev-parse --git-common-dir 2>/dev/null)" || git_common=""
+    git_dir="$(git -C "$repo_dir" rev-parse --git-dir 2>/dev/null)" || git_dir=""
     if [ -n "$git_common" ] && [ -n "$git_dir" ] && [ "$git_common" != "$git_dir" ]; then
         echo "    BLOCKED: pip install -e from a worktree redirects ALL system imports."
         echo "    Use PYTHONPATH=$repo_dir/src instead, or run from the main checkout."

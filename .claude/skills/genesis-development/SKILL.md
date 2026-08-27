@@ -357,6 +357,32 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   the open-set version and plan to harden it later; the review loop IS the
   hardening loop, one bug per round, and it does not converge.
 
+- **`out=$(cmd)` under `set -e` swallows the failure path — and NO linter catches
+  it.** An assignment whose value is a command substitution INHERITS that
+  substitution's exit status, so under `set -euo pipefail` a bare
+  `out=$(cmd)` followed by `rc=$?` **never reaches the `rc=$?`** when `cmd`
+  fails: errexit fires first. Any error handling keyed on `rc` is dead code on
+  exactly the path it was written for. Two properties make this vicious: it is
+  invisible (the function just stops, printing nothing), and it hides behind
+  call sites — `f || echo …` / `if ! f` disable errexit INSIDE the function, so
+  the bug stays latent until someone writes the first bare call.
+  **shellcheck 0.9.0 does not flag it at any severity, including `-o all`**
+  (SC2155 is the *different* `local x=$(cmd)` declare-and-assign case; measured
+  2026-08-27 — no other linter was tested, and a future shellcheck could add it).
+  Always write `rc=0; out=$(cmd) || rc=$?` — but **declare `local` on its own
+  line first**: `local out=$(cmd) || rc=$?` NEVER fires, because `local` is a
+  command and the compound takes `local`'s status (0), not the substitution's.
+  MEASURED: the split form yields `rc=100`, the inline form yields `rc=0` and the
+  caller proceeds as if the command succeeded — strictly WORSE than the bug this
+  entry describes, since it converts a loud abort into a silent false success.
+  The same applies inside the error handler: with `set -o pipefail`, `x=$(… | grep -v … | tail -1)` aborts when
+  `grep` matches nothing, so a `${x:-fallback}` default written for that very
+  case never runs — guard it with `|| x=""`.
+  Origin: `scripts/lib/cc_version.sh` (caught only by adversarial review), then
+  three instances found in one `scripts/bootstrap.sh` function whose whole
+  diagnostic block was unreachable. Pinned by
+  `tests/test_scripts/test_bootstrap_guards.py::test_install_pkg_*`.
+
 ### Iterative-Refinement Discipline
 
 AI refinement cycles degrade code they were asked to "improve" — validation
