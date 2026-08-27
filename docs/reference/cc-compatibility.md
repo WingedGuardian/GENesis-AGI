@@ -15,7 +15,7 @@
 
 ## Current CC Version
 
-**Pinned:** Claude Code **2.1.218** (bumped 2026-07-22 from 2.1.201; a 17-release, fixes-dominated delta that `recon_cc_update_check` classified **informational** — see Version History for the evaluation). Deployment path: merge the pin, then one `scripts/update.sh` run aligns the container via `cc_ensure_local` and syncs the host via the guardian `update-cc` op (the standardized single-command pipeline — the `cc-update` skill routes here). Node floor unchanged (`>=22`; 2.1.218 declares `engines.node >=22.0.0`, verified against the npm registry). Prior state: 2.1.201 on both machines, deployed + verified 2026-07-04/05 (#897). **Both** container and host install Claude Code **via npm-global** (`npm install -g @anthropic-ai/claude-code@<version>` — the container auto-detects its npm prefix; the host uses `sudo npm install -g`, resolving `/usr/bin/claude` → `/usr/lib/node_modules/@anthropic-ai/claude-code`). **There is no native-installer path** (re-verified live on the host 2026-07-22).
+**Pinned:** Claude Code **2.1.218** (bumped 2026-07-22 from 2.1.201; a 17-release, fixes-dominated delta that `recon_cc_update_check` classified **informational** — see Version History for the evaluation). Deployment path: the gated sequence in §Updating Claude Code — evaluate (incl. the mandatory full-changelog read) → soak the candidate on the container → **then** merge the pin, after which one `scripts/update.sh` run aligns the container via `cc_ensure_local` and syncs the host via the guardian `update-cc` op. The merge-then-`update.sh` half is the *deployment* mechanism, not the whole procedure: a bump that starts there has skipped the gates. The `cc-update` skill routes to §Updating. Node floor unchanged (`>=22`; 2.1.218 declares `engines.node >=22.0.0`, verified against the npm registry). Prior state: 2.1.201 on both machines, deployed + verified 2026-07-04/05 (#897). **Both** container and host install Claude Code **via npm-global** (`npm install -g @anthropic-ai/claude-code@<version>` — the container auto-detects its npm prefix; the host uses `sudo npm install -g`, resolving `/usr/bin/claude` → `/usr/lib/node_modules/@anthropic-ai/claude-code`). **There is no native-installer path** (re-verified live on the host 2026-07-22).
 **Pin (single source of truth):** `CC_VERSION` in `scripts/lib/cc_version.sh`, which
 also exports the shared **`cc_ensure_local`** aligner. Sourced by `scripts/install.sh`,
 `scripts/host-setup.sh`, `scripts/bootstrap.sh`, and `scripts/update.sh`. Bump it in one
@@ -31,19 +31,122 @@ Code" below).
 
 ## Updating Claude Code (host + container)
 
-One pin, both machines, no drift:
+One pin, both machines, no drift. **`origin` is the PUBLIC repo, so merging the pin *is* the
+release** — which makes the pin PR the wrong place to discover a regression. The sequence below
+is therefore the WHOLE procedure, gates first: **editing the pin is step 6, not step 1.** A bump
+that starts at step 6 has skipped both mandatory gates and is a process violation.
 
-1. Edit `CC_VERSION` in `scripts/lib/cc_version.sh` (one line). If the new CC
-   version raises its `engines.node` floor, bump `NODE_MAJOR` in the same file
-   in lockstep — the `cc-node-lockstep` CI job (`scripts/check_cc_node_lockstep.py`)
-   fails the PR if `NODE_MAJOR` is below the pinned CC's required Node major, so
-   this can't be forgotten (it fails open on a transient npm-registry error).
-2. Merge to `main`.
-3. Run `scripts/update.sh`. It updates the container, redeploys the Guardian
-   (carrying the new gateway script), then queries the host's CC version and —
-   **only if it differs from the pin** — dispatches `update-cc <pin>` to the
-   Guardian gateway on the host. The dispatch is idempotent (acts only on drift)
-   and non-fatal (a failed host update leaves the previous working CC in place).
+**The two mandatory gates are:** (1) the **full changelog read** over `(pinned, target]` — step 1 /
+checklist step 0; and (2) the **local-first soak** of the candidate on the container — steps 3–5.
+Neither is waivable; both are recorded (a durable ledger row, and the §Version History row).
+
+**Pick the target first.** `npm view @anthropic-ai/claude-code version` gives `latest`; use an
+explicit older version if you are deliberately not chasing latest. Every step below is defined over
+`(pinned, target]`, so nothing can start until `target` is fixed — and re-picking it later restarts
+the procedure (step 5).
+
+1. **Evaluate — run the EVALUATION half of §CC Update Evaluation Checklist: its steps 0–6.**
+   (Checklist steps 7–8 are *post-update* by their own wording — "run integration tests after
+   update", "update this document with findings" — so they belong at steps 9–10 here, not now.)
+   Checklist **step 0 is the MANDATORY full-changelog-read gate**: every release entry in
+   `(pinned, target]`, read in full, recorded as a durable row. No pin bump proceeds without it.
+   The analyzer's verdict is TRIAGE — it prioritises, it does not discharge the gate.
+2. **Deploy current `main` FIRST — before the soak, never during it.** Run `scripts/update.sh`
+   (background task) so the box is on current code *before* the candidate goes on. Two reasons:
+   a long gap between deploys means step 8 would otherwise land weeks of Genesis change **and**
+   the CC bump in one shot, leaving you unable to attribute a regression to either; and the soak
+   is only meaningful as evidence about CC if the code underneath it isn't stale.
+   **Checkable skip condition:** compare the newest `update_history` row (`update_history_recent`
+   MCP, or the dashboard) against `git log -1 origin/main` — skip this step only if the last
+   successful deploy is NEWER than the `main` commits you would otherwise be bundling into step 8.
+   "It feels recent" is not the test; a 2-week gap is easy to accumulate and invisible without
+   looking. (`update.sh` re-aligns the container to the repo pin, which is exactly right *here* —
+   it is the same property that makes it destructive mid-soak at step 5.)
+3. **Align the CONTAINER ONLY to the candidate.** Set the candidate ONCE as a standalone
+   assignment, then run both functions under it:
+
+   ```bash
+   source scripts/lib/cc_version.sh   # NOTE: this sets CC_VERSION to the repo PIN (cc_version.sh:20)
+   CC_VERSION=<candidate>             # standalone assignment, AFTER the source
+   cc_ensure_local
+   cc_shadow_scan
+   ```
+
+   > ⚠️ **Do NOT write `CC_VERSION=<candidate> cc_ensure_local` and then a bare `cc_shadow_scan`.**
+   > A variable-assignment *prefix* on a **function** call does not persist past that call
+   > (measured: the prefix value is visible inside the function and reverts immediately after), and
+   > `source` has already set `CC_VERSION` to the repo pin. The scan would therefore run with the
+   > OLD pin while the container is on the candidate. That is not a harmless no-op: if any copy is
+   > still at the old pin, `cc_shadow_scan` crowns **that** one canonical and `_cc_remove_shadow`
+   > (`cc_version.sh:251`) **deletes the freshly-installed candidate** — silently reverting the soak
+   > and removing the machine's primary `claude`. If no copy matches, it prints "REFUSING to remove
+   > anything" (`cc_version.sh:209`) and returns 0, so a broken invocation also *looks* successful.
+
+   `cc_shadow_scan` matters here because a second nvm/native/user-prefix copy on a different
+   interactive PATH has bitten this project repeatedly — without it the whole soak can exercise a
+   stale shadow binary while the same-shell version check passes. (`update.sh:477-488` pairs the
+   two the same way, but `unset`s `CC_VERSION` first so both run on the pin.)
+   `cc_ensure_local` is **container-only**, so the host stays on the pin — a live rollback path.
+   Verify a **FRESH** `claude --version` (this foreground session keeps its old binary until
+   relaunch).
+   - **Check the candidate's Node floor BEFORE aligning** —
+     `npm view @anthropic-ai/claude-code@<candidate> engines.node` against the container's
+     `node -v`. **If the floor rises above the container's Node, STOP: there is no container-side
+     Node transition tool today.** Every `NODE_MAJOR` consumer is either a CI assertion
+     (`check_cc_node_lockstep.py`) or a dispatch to the **host** via the guardian `update-node` op
+     (`update.sh:441`, `cc_align_host.sh`); the only container-side Node installer
+     (`install.sh:473-477` `_node_version_ok`) gates on a hardcoded `>= 20` and never reads
+     `NODE_MAJOR`. Treat a rising floor as prerequisite work, not something to improvise here.
+   - **A failed align is NOT a clean no-op.** `cc_ensure_local` runs `npm install -g` and only
+     *then* verifies `claude --version` (`cc_version.sh:132-149`), so an incompatible candidate has
+     **already replaced the working CC**; the verify merely downgrades the outcome to a warning and
+     `return 1`. Recover immediately with the step-5 rollback:
+     `source scripts/lib/cc_version.sh && CC_VERSION=<pin> cc_ensure_local`.
+4. **Validate the candidate — pre-soak expectations differ from post-merge.** During the soak the
+   correct state is **container == candidate, host == old pin** (NOT the step-9 "both == pin"
+   check, which cannot pass yet). Run the critical paths, this doc's §Known Issues, and every
+   behavior the impact eval flagged. Note that any Guardian-path check exercises the **host's old
+   binary**, so candidate-specific Guardian behavior needs a container-side exercise instead.
+5. **Soak 2–3 days** under real use. **Do NOT run `update.sh` during the soak** — it `unset`s any
+   inherited `CC_VERSION` and re-aligns the container to the repo pin, reverting the candidate.
+   Rollback at any time is one command:
+   `source scripts/lib/cc_version.sh && CC_VERSION=<pin> cc_ensure_local`.
+   - **Mid-soak drift.** CC ships ~daily, so `latest` *will* move. Re-target mid-cycle **only if**
+     the newer release fixes something touching our workflow / soak safety / a known issue (e.g.
+     2.1.245→246 fixed a background-retention sweep that reaped user-created `.claude/worktrees/`).
+     Otherwise finish the soak on the current target and roll the delta into the next cycle —
+     never silently chase-latest.
+   - **A re-target RESTARTS this procedure from step 1 for the new target.** The prior durable
+     changelog-gate row no longer covers the range, step-4 validation was run against a different
+     binary, and the soak clock resets. Continuing the original schedule would publish a target
+     that received only hours of real use — defeating the gate precisely for the
+     workflow-affecting releases that justify re-targeting in the first place.
+6. **Only after a clean soak + explicit user sign-off: bump the pin** — edit `CC_VERSION` in
+   `scripts/lib/cc_version.sh` (one line). If the new CC version raises its `engines.node` floor,
+   bump `NODE_MAJOR` in the same file in lockstep — the `cc-node-lockstep` CI job
+   (`scripts/check_cc_node_lockstep.py`) fails the PR if `NODE_MAJOR` is below the pinned CC's
+   required Node major, so this can't be forgotten (it fails open on a transient npm-registry
+   error). Add the §Version History row, including the changelog-gate clause from step 1.
+7. **PR → CI green** (incl. `cc-node-lockstep`) → **privacy scan** (`origin` is public — run the
+   pre-push privacy scanners over the diff) → **explicit user approval** → **squash-merge**. Then
+   `git pull --rebase origin main`.
+8. **Run `scripts/update.sh`** (a background task — deploys exceed the Bash tool timeout). It
+   updates the container, redeploys the Guardian (carrying the new gateway script), then queries
+   the host's CC version and — **only if it differs from the pin** — dispatches `update-cc <pin>`
+   to the Guardian gateway on the host. The dispatch is idempotent (acts only on drift) and
+   non-fatal (a failed host update leaves the previous working CC in place).
+   Between updates the nightly `genesis-cc-align.timer` closes **host** drift only —
+   `scripts/cc_align_host.sh` calls `cc_align_host_sync` and never `cc_ensure_local`, so container
+   drift does **not** self-heal nightly. The useful corollary: that timer will not silently revert
+   a container candidate during the step-5 soak.
+9. **Post-deploy validation in the SAME session.** Container **and** host `claude --version` ==
+   pin (host via the gateway `version` op / `~/.genesis/host_gateway_state.json`); guardian tick
+   healthy; a headless `claude -p` smoke on a **FRESH** process; re-check §Known Issues and any
+   tabled CC bugs against the new version; and verify each behavior the impact eval flagged on the
+   live path, not just that the flag still parses.
+10. **Leverage + capture.** For each newly-available capability Genesis would want, file the
+    detection→behavior follow-up. Store what was learned to memory + this doc + the KB so the next
+    update executes rather than rediscovers.
 
 The host install runs through the gateway's `update-cc <semver>` op
 (`scripts/guardian-gateway.sh`): it validates the argument as a bare semver,
@@ -58,54 +161,6 @@ To move the host by hand:
 host (or container) can be rolled back to an older known-good version the same way
 (`update-cc <older>`) if a release regresses — exactly what the 2.1.90→2.1.87
 rollback needed.
-
-### Local-first gate — private soak before the public pin (EXPLICIT, stronger than a normal PR)
-
-`origin` is the **public** repo, so merging the pin *is* the release. That makes the public pin PR
-the wrong place to discover a regression. The standardized flow puts an explicit **local-first
-gate** ahead of it:
-
-1. **Align the container ONLY** to the candidate version — `CC_VERSION=<candidate> cc_ensure_local`
-   (source `scripts/lib/cc_version.sh` first). `cc_ensure_local` is **container-only** (the host VM
-   is synced separately by `update.sh`), so the host stays on the pin — a live rollback path if the
-   candidate misbehaves. Verify a **fresh** `claude --version` (this foreground session keeps its
-   old binary until relaunch).
-2. **Validate** the candidate with the post-deploy checklist (critical paths + §Known Issues +
-   any behavior the impact eval flagged).
-3. **Soak 2–3 days** under real use on the private box. **Do NOT run `update.sh` during the soak** —
-   it re-aligns the container back to the pin and reverts the candidate. Rollback at any time is one
-   command (self-contained): `source scripts/lib/cc_version.sh && CC_VERSION=<pin> cc_ensure_local`.
-4. **Public pin only after soak + explicit user sign-off** — then the normal pin PR (§Updating).
-
-**Mid-soak drift.** CC ships ~daily, so `latest` *will* move during the soak. Re-target to a newer
-release mid-cycle **only if** it fixes something touching our workflow / soak safety / a known issue
-(e.g. 2.1.245→246 fixed a background-retention sweep that reaped user-created `.claude/worktrees/`).
-Otherwise finish the soak on the pinned target and roll the delta into the next cycle — never
-silently chase-latest.
-
-### Continuous pre-eval — fill the funnel before the bump
-
-> **Status: NOT YET MERGED.** This job lands with the `feat/cc-version-preeval` branch; it is absent
-> from `main`, so no install runs it today. Until it merges, treat every "the verdict may already be
-> cached" line below as describing the target state — the MANDATORY full-changelog-read gate
-> (§CC Update Evaluation Checklist step 0) is what actually covers a bump, and it never depended on
-> this cache.
-
-A gated daily cron (`SurplusScheduler`, `src/genesis/recon/cc_version_preeval.py`) lists CC versions
-published since a cursor and pre-computes each one's impact analysis, storing it as a
-`cc_update_perversion` observation (distinct from live `type="finding"` recon findings, and kept out
-of user-facing surfaces). So at intake the target version's verdict is often already cached — check
-there before re-running `recon_cc_update_check`. Gated by the `cc_version_preeval` settings domain
-(`off|live`, `max_versions_per_run` caps the paid fan-out) + env kill `GENESIS_CC_PREEVAL_DISABLED=1`.
-It anchors its first run to the *installed* version, so it looks forward, never back over history.
-
-### Model-alias drift detection — the `opus` → `opus-5` class
-
-`--model opus` (and every alias) silently re-points to a new full model id when Anthropic bumps the
-family (measured: `opus` → `claude-opus-5`). This is NOT a downgrade, so the tier-based downgrade
-detector is blind to it. The CCInvoker drift detector (`on_model_drift`; watermark at
-`~/.genesis/cc_model_resolution.json`) fires a one-shot ALERT on any alias→id change. Posture is
-deliberate **float + alert** (accept the newer model, but never be surprised by the swap), not a pin.
 
 ### One-canonical-copy policy (`cc_shadow_scan`)
 
@@ -252,22 +307,42 @@ When a new CC version is released, run through this:
    in `(pinned, target]` **in full** before any triage. No pin bump proceeds without it.
    - **Fetch it fresh — nothing in Genesis maintains a changelog cache:**
      `curl -fsSL https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md -o ~/tmp/cc_changelog.md`
-     (that path is a scratch copy, NOT a recon-pulled cache). **Before reading,
-     confirm the file's first `## ` heading equals the target version** — a stale
-     copy silently satisfies this gate while the whole new range goes unread.
+     (that path is a scratch copy, NOT a recon-pulled cache; `mkdir -p ~/tmp` first —
+     `curl -f` will not create it). **Before reading, confirm the file CONTAINS a
+     `## <target>` heading** (`grep -c '^## <target>$'`). That one check is what a stale
+     copy fails. Do NOT *also* require the FIRST heading to equal the target: under the
+     mid-soak rule (§Updating step 5) you may deliberately finish on a target that
+     `latest` has already passed, and equality would then be unsatisfiable by any
+     re-fetch. ("First heading ≥ target" is not worth checking either — the upstream file
+     is newest-first, so a present target heading already implies it.)
+   - **Escape hatch: a target released hours ago may not be in `main`'s CHANGELOG.md yet** —
+     the one case where no re-fetch can satisfy the check. Cover the missing tail from the
+     GitHub release bodies (`gh release view v<target> --repo anthropics/claude-code`) and
+     record in the durable row which source covered which releases. Do not silently proceed
+     on a file that lacks the target.
    - Scale: `(2.1.218, 2.1.246]` measured **25 releases / ~88KB**. The load-bearing
      item can sit anywhere, **including deep inside the newest release**.
-   - **`recon_cc_update_check` and the `cc_update_perversion` pre-eval rows are
-     TRIAGE SUMMARIES — never a substitute for this read.** They prioritise; they
-     do not discharge the gate.
-   - **Mark the gate done as a durable row**, not a chat line: `session_ledger_add`
-     with `"CC changelog gate: read (2.1.X, 2.1.Y] in full from <source>, <date>"`,
-     and carry that string into the PR body and the §Version History row (step 8).
-     A Version-History row without it means the gate was not run — blocking at review.
+   - **`recon_cc_update_check` is a TRIAGE SUMMARY — never a substitute for this
+     read.** It prioritises; it does not discharge the gate.
+   - **Mark the gate done as a durable row**, not a chat line:
+     `session_ledger_add(session_id=<this session>, text=…)` — `session_id` is REQUIRED — with `"CC changelog gate: read (2.1.X, 2.1.Y] in full from <source>, <date>"`,
+     and carry that string into the PR body and the §Version History row added at
+     §Updating **step 6** (before the PR, not after it).
+     For rows added **from 2026-08-26 onward**, a Version-History row without that
+     clause means the gate was not run — treat it as blocking at review. Older rows
+     predate the gate and are not retroactively in scope.
    - **Delegation is allowed only with the same context and rigor** — brief the
      sub-agent with the Genesis impact-surface list (see §Delegating the full
      changelog read in `.claude/skills/cc-update/SKILL.md`), then adversarially
      spot-check its load-bearing findings against ground truth before trusting them.
+   - **Verify COVERAGE, not just accuracy.** Spot-checking what the delegate returned
+     can only catch wrong findings — it cannot detect releases it never read. A
+     subagent that hits its turn limit now returns **partial** output without failing
+     (CC 2.1.246), so a silent early stop looks exactly like a clean short report.
+     Before marking the gate done: enumerate every `## ` release heading in
+     `(pinned, target]` from the file itself, and reconcile that list against an
+     explicit per-release acknowledgement from the delegate. An unreconciled release
+     means the gate is NOT done, however good the findings look.
    - *Origin (2026-08-26):* a session re-targeted 2.1.245→246 on the headline delta
      and let the changelog-*reading* analyzer stand in for actually reading the
      changelog. The cause was **mechanical, not merely human**: the analyzer fetches
@@ -440,7 +515,9 @@ routine `scripts/update.sh` that carries a repo delta re-renders the units autom
 --user restart genesis-server` (and `genesis-bridge` if used) to apply the new PATH — a
 `daemon-reload` alone does not re-read `Environment=` for a running unit. Note that a
 **no-delta** `update.sh` run (`Already up to date`) early-exits after the CC-pin sync
-**without** re-rendering the units (`scripts/update.sh` lines 959-996), so it does not fix a
+**without** re-rendering the units (see `scripts/update.sh`'s no-delta early-exit paths — the
+"Already up to date" and "Nothing to do" branches; line numbers deliberately omitted, they drift),
+so it does not fix a
 standalone stale path on its own — use bootstrap directly for that.
 
 **Host VM (verified 2026-06-15):** The host installs Claude Code the **same way as
