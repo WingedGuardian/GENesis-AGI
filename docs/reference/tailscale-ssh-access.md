@@ -33,6 +33,31 @@ ssh <host>-lobby    # the session picker → pick any live slot
 Windows one-click: make a shortcut whose target is `wt.exe ssh <host>-lobby`
 (or `ssh.exe <host>-lobby`) and pin it to the taskbar.
 
+## The session cap and the operator emergency slot
+
+New slots are capped by the box's **capacity**, derived from its TOTAL RAM —
+`SAFE_CAP = (MemTotal − reserve) / per_session`, clamped to the CPU count. The cap
+is stable: it does NOT shrink as sessions run, and background apps (other coding
+tools, daemons) don't consume it. It scales per install — a bigger box allows more
+slots, a small box fewer (never below 1). Live free RAM is used only as an
+OOM circuit-breaker, never as the cap.
+
+- **Reattaching** to an existing slot (`ssh <host>-N` to a slot that already
+  exists, or the lobby picker) is ALWAYS allowed — it starts nothing new.
+- **A direct LAN/Tailscale SSH login is treated as the operator** and gets an
+  emergency slot **above** the safe cap, and is **never hard-denied**: when the
+  box is at the limit or RAM is genuinely tight, the login drops to an interactive
+  prompt — reattach an existing slot, or pick one to END (freeing its slot/memory;
+  its transcript persists, resume later with `claude --resume`). You choose what to
+  reclaim; the OOM-killer never does.
+- Other doors (the dashboard web terminal / "normal method") are held to the safe
+  cap.
+
+Tune the model per box in `~/.genesis/cc-slot.env` (all optional):
+`GENESIS_CC_SYSTEM_RESERVE_MB`, `GENESIS_CC_PER_SESSION_MB`,
+`GENESIS_CC_OOM_FLOOR_MB`, `GENESIS_CC_EMERGENCY_SLOTS`. The gate fails **open** —
+if it can't run, a static MemTotal-based fallback still lets you in.
+
 ## Why the aliases are keyed on the Tailscale IP, not the MagicDNS name
 
 `generate-ssh-config.sh` writes each `HostName` as the host's **stable Tailscale

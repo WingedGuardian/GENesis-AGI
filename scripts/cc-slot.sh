@@ -85,23 +85,146 @@ SESSION_NAME="${SESSION_PREFIX}-${SLOT}"
 # Handle nested tmux
 unset TMUX
 
-# --- Dynamic session cap (RAM + CPU aware) ---
-RESERVED_MB=4096        # OS + Genesis runtime + background work headroom
-PER_SESSION_MB=900      # Measured: ~800MB (claude + 4 MCP servers) + buffer
-CPU_CAP=$(nproc)        # Never exceed core count (thrashing)
+# Load operator config levers (~/.genesis/cc-slot.env) BEFORE the capacity gate,
+# so its GENESIS_CC_* tunables actually take effect there (an SSH RemoteCommand
+# does NOT source .bashrc). This file is also home to the permission-mode lever
+# (GENESIS_CC_PERMISSION_MODE) and the OAuth-durability lever
+# (GENESIS_CC_SLOT_OAUTH), both consumed later. `|| echo` keeps a malformed file
+# from aborting the login under `set -e`.
+if [ -f "${HOME}/.genesis/cc-slot.env" ]; then
+    . "${HOME}/.genesis/cc-slot.env" \
+        || echo "cc-slot: warning: ~/.genesis/cc-slot.env sourced with errors (continuing)" >&2
+fi
+# A sourced var is a shell var, NOT exported — EXPORT the cap levers so the Python
+# gate subprocess inherits them. Only export those actually set (an empty export
+# would still read as unset → default, but keep the env clean).
+for _lever in GENESIS_CC_SYSTEM_RESERVE_MB GENESIS_CC_PER_SESSION_MB \
+              GENESIS_CC_OOM_FLOOR_MB GENESIS_CC_EMERGENCY_SLOTS; do
+    [ -n "${!_lever:-}" ] && export "$_lever"
+done
+unset _lever
 
-avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
-avail_mb=$((avail_kb / 1024))
-ram_cap=$(( (avail_mb - RESERVED_MB) / PER_SESSION_MB ))
+# --- Session cap (capacity model; decision delegated to genesis.cc.session_cap) ---
+# The launcher only GATHERS inputs and EXECUTES the returned action; the pure,
+# unit-tested Python gate decides (SAFE_CAP from MemTotal — stable, does NOT
+# collapse as sessions run, unlike the old MemAvailable/900 formula that locked
+# the operator out at "3/2"). Reattach to an existing slot bypasses this entirely.
+# The gate NEVER hard-locks the operator out: ALLOW → proceed; DENY → message+exit
+# (dashboard/"normal method" over cap); RECLAIM → interactive pick-a-session-to-end
+# (LAN/tailscale operator). It fails OPEN — a Python error falls back to a
+# MemTotal-based STATIC cap (never the collapsing free-RAM formula), so a broken
+# venv can never strand the operator. Config levers (~/.genesis/cc-slot.env):
+# GENESIS_CC_SYSTEM_RESERVE_MB / _PER_SESSION_MB / _OOM_FLOOR_MB / _EMERGENCY_SLOTS.
 
-# Floor: 1 (never lock out); Ceiling: nproc
-max_sessions=$ram_cap
-[[ $max_sessions -lt 1 ]] && max_sessions=1
-[[ $max_sessions -gt $CPU_CAP ]] && max_sessions=$CPU_CAP
+# List live numeric cc-N slots to stderr (shared by DENY + fail-open paths).
+_cap_list_slots() {
+    echo "Active sessions (reattach: tmux attach -t <name>):" >&2
+    tmux list-sessions \
+        -F '  #{session_name}  (#{?session_attached,ATTACHED,detached}, idle since #{t:session_activity})' \
+        2>/dev/null | grep -E "^  ${SESSION_PREFIX}-[0-9]+ " >&2 || true
+}
 
-# Numeric slots only: retired cc-manual-<ts>-<pid> sessions from the old
-# wrapper (and any other cc-* stray) must not consume cap headroom — manual
-# allocation can only ever probe/create cc-<N>.
+# Interactive reclaim (operator origin, or the fail-open path with a TTY): offer
+# to END a session to make room, or cancel and reattach. Returns 0 to proceed
+# with the launch; exits on cancel / invalid / no-TTY.
+_cap_reclaim() {
+    local msg="$1" reason="${2:-}" choice victim row nm att act state i=1
+    local -a rows
+    mapfile -t rows < <(tmux list-sessions \
+        -F '#{session_name}|#{session_attached}|#{t:session_activity}' 2>/dev/null \
+        | grep -E "^${SESSION_PREFIX}-[0-9]+\|" || true)
+    echo "" >&2
+    echo "!  ${msg}" >&2
+    if [ "${#rows[@]}" -eq 0 ]; then
+        # No cc-N session to trade. Under a genuine OOM-floor breach, REFUSE the
+        # new session — the swapless box is already below the safety floor from
+        # NON-cc memory pressure, and spawning a ~3GB session risks an OOM that
+        # takes down every session. This is the OOM circuit-breaker doing its
+        # job, NOT the old collapse bug (which denied while sessions ran fine).
+        # For a soft cap with nothing to reclaim, proceeding is harmless.
+        if [ "$reason" = "oom_floor" ]; then
+            echo "RAM is below the safety floor and no cc session exists to reclaim —" >&2
+            echo "free non-cc memory and retry, or reattach an existing session." >&2
+            exit 1
+        fi
+        echo "(no cc-N session to reclaim; proceeding.)" >&2
+        return 0
+    fi
+    echo "" >&2
+    for row in "${rows[@]}"; do
+        IFS='|' read -r nm att act <<<"$row"
+        state="detached"; [ "${att:-0}" -ge 1 ] && state="ATTACHED"
+        echo "  [$i] ${nm}  ${state}  (idle since ${act})" >&2
+        i=$((i + 1))
+    done
+    echo "" >&2
+    if [ ! -t 0 ]; then
+        echo "No interactive terminal here — reattach a session" >&2
+        echo "(tmux attach -t ${SESSION_PREFIX}-<N>), or re-run 'ssh <host>-<N>' with a TTY to end one." >&2
+        exit 1
+    fi
+    echo "Enter a number to END that session (frees memory + its slot; the transcript" >&2
+    echo "persists — resume later with 'claude --resume'). Press Enter to cancel:" >&2
+    IFS= read -r -p "> " choice </dev/tty || choice=""
+    if [ -z "$choice" ]; then
+        echo "Cancelled — reattach an existing session (tmux attach -t ${SESSION_PREFIX}-<N>)." >&2
+        exit 1
+    fi
+    # Reject leading zeros (^[1-9][0-9]*$, same as SLOT above): bash reads a
+    # leading-zero numeral as OCTAL, so "08"/"09" would raise a "value too great
+    # for base" arithmetic error that silently unwinds past this gate and spawns
+    # anyway — defeating the cap. 10# forces base-10 defensively in the index.
+    if ! [[ "$choice" =~ ^[1-9][0-9]*$ ]] || [ "$choice" -gt "${#rows[@]}" ]; then
+        echo "Invalid selection — cancelled." >&2
+        exit 1
+    fi
+    IFS='|' read -r victim _ _ <<<"${rows[$((10#$choice - 1))]}"
+    echo "Ending ${victim} to free room for ${SESSION_NAME}…" >&2
+    tmux kill-session -t "=${victim}" 2>/dev/null || true
+    return 0
+}
+
+# Pure-bash fallback when the Python gate cannot run (broken venv / timeout).
+# STATIC MemTotal cap — NEVER the collapsing free-RAM formula — + a hard OOM
+# floor. Leans permissive so a Python outage never locks the operator out.
+_cap_fail_open() {
+    local total_mb avail_mb reserve per floor cpus safe reason
+    total_mb=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024 ))
+    avail_mb=$(( $(awk '/^MemAvailable:/{print $2}' /proc/meminfo) / 1024 ))
+    # Validate the operator-set levers BEFORE using them in $(( )): a non-numeric
+    # override (e.g. "3072mb", or a leading-zero octal) would raise an arithmetic
+    # error that silently unwinds this function → the fallback becomes a no-op and
+    # the session spawns with NO cap. Mirror CapConfig.from_env's guard: bad → default.
+    reserve=${GENESIS_CC_SYSTEM_RESERVE_MB:-4096}; [[ "$reserve" =~ ^[1-9][0-9]*$ ]] || reserve=4096
+    per=${GENESIS_CC_PER_SESSION_MB:-3072};        [[ "$per"     =~ ^[1-9][0-9]*$ ]] || per=3072
+    floor=${GENESIS_CC_OOM_FLOOR_MB:-1536};        [[ "$floor"   =~ ^[0-9]+$ ]]      || floor=1536
+    cpus=$(nproc 2>/dev/null || echo 1); [[ "$cpus" =~ ^[1-9][0-9]*$ ]] || cpus=1
+    safe=$(( (total_mb - reserve) / per )); [ "$safe" -lt 1 ] && safe=1
+    [ "$safe" -gt "$cpus" ] && safe=$cpus   # mirror the Python gate's nproc clamp (thrash guard)
+    # Leans permissive: allows up to safe+1 (the fallback can't call the Python
+    # origin classifier, and never-lock-the-operator-out wins here) — the OOM floor
+    # below still guards the box. Looser than the real gate BY DESIGN, and only
+    # reachable when the Python gate is down (broken venv).
+    if [ "$existing" -lt $((safe + 1)) ] && [ "$avail_mb" -ge "$floor" ]; then
+        echo "cc-slot: capacity gate unavailable — static fallback allows this slot (${existing}/${safe})." >&2
+        return 0
+    fi
+    if [ "$avail_mb" -lt "$floor" ]; then reason="oom_floor"; else reason="cap_full"; fi
+    # The interactive reclaim (which can kill a session) is an OPERATOR affordance.
+    # The dashboard/"manual" door is the "normal method" held to the cap — do NOT
+    # widen the session-kill flow to it, even in fail-open. It gets a plain DENY.
+    if [ "$MODE_ARG" = "manual" ]; then
+        echo "ERROR: Session cap reached (${existing}/${safe}) [capacity gate unavailable]." >&2
+        _cap_list_slots
+        exit 1
+    fi
+    _cap_reclaim "Capacity gate unavailable; static limit ${existing}/${safe}, ${avail_mb}MB free." "$reason"
+    return 0
+}
+
+# Numeric slots only: retired cc-manual-<ts>-<pid> sessions from the old wrapper
+# (and any other cc-* stray) must not consume cap headroom — manual allocation
+# can only ever probe/create cc-<N>.
 existing=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
            | grep -cE "^${SESSION_PREFIX}-[0-9]+$" || true)
 
@@ -111,19 +234,28 @@ if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
     _SESSION_EXISTS=1  # bypass cap check; also skips the OAuth gate below —
                        # attach does NOT re-run the pane command, so any token
                        # injection would be moot (and would waste a probe).
-elif [[ $existing -ge $max_sessions ]]; then
-    echo "ERROR: Session cap reached (${existing}/${max_sessions} active)." >&2
-    echo "RAM: ${avail_mb}MB available, ${RESERVED_MB}MB reserved, ${PER_SESSION_MB}MB/session" >&2
-    echo "" >&2
-    echo "Active sessions:" >&2
-    tmux list-sessions -F '  #{session_name}  (last activity: #{t:session_activity})' \
-        2>/dev/null | grep "^  ${SESSION_PREFIX}-" >&2
-    echo "" >&2
-    echo "Kill an idle session: tmux kill-session -t ${SESSION_PREFIX}-<N>" >&2
-    exit 1
+else
+    # New session → consult the capacity gate (SSH_CONNECTION classifies origin
+    # inside the Python helper). `timeout` bounds a hung import; trailing
+    # `|| true` keeps a non-zero exit from aborting under `set -e`.
+    _cap_py="${GENESIS_ROOT}/.venv/bin/python"
+    _cap_out=""
+    if [ -x "$_cap_py" ]; then
+        _cap_out=$(timeout 15 "$_cap_py" -m genesis.cc.session_cap --existing "$existing" 2>/dev/null || true)
+    fi
+    # Protocol: line 1 = action, line 2 = human message, line 3 = machine reason.
+    _cap_action=$(printf '%s\n' "$_cap_out" | sed -n '1p')
+    _cap_msg=$(printf '%s\n' "$_cap_out" | sed -n '2p')
+    _cap_reason=$(printf '%s\n' "$_cap_out" | sed -n '3p')
+    case "$_cap_action" in
+        ALLOW)   [ -n "$_cap_msg" ] && echo "cc-slot: ${_cap_msg}" >&2 || true ;;
+        DENY)    echo "ERROR: ${_cap_msg}" >&2; _cap_list_slots; exit 1 ;;
+        RECLAIM) _cap_reclaim "$_cap_msg" "$_cap_reason" ;;
+        *)       _cap_fail_open ;;   # empty/unexpected → Python gate unavailable
+    esac
 fi
 
-echo "→ Slot ${SLOT} (session: ${SESSION_NAME}, cap: ${existing}/${max_sessions})" >&2
+echo "→ Slot ${SLOT} (session: ${SESSION_NAME})" >&2
 
 # Redirect CC temp to dedicated directory (keeps /tmp clean)
 export TMPDIR="$HOME/.genesis/cc-tmp"
@@ -147,13 +279,8 @@ export CLAUDE_CODE_TMPDIR="$HOME/.genesis/cc-tmp"
 # dies (see the OAuth block below).
 # Headless/autonomous CC sessions (CCInvoker -p) keep bypass separately — no
 # human is present to answer a prompt.
-if [ -f "${HOME}/.genesis/cc-slot.env" ]; then
-    # Don't let a malformed override file kill the session under `set -e` (the
-    # sourced file is the final command of an && chain, so a non-zero exit would
-    # abort the script and drop the SSH session with no diagnostic).
-    . "${HOME}/.genesis/cc-slot.env" \
-        || echo "cc-slot: warning: ~/.genesis/cc-slot.env sourced with errors (continuing)" >&2
-fi
+# (~/.genesis/cc-slot.env is already sourced near the top, before the capacity
+# gate, so these levers are populated here.)
 case "${GENESIS_CC_PERMISSION_MODE:-auto}" in
     bypass|dangerous|skip) CC_PERM_FLAG="--dangerously-skip-permissions" ;;
     *)                     CC_PERM_FLAG="--permission-mode auto" ;;
