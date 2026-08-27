@@ -2800,7 +2800,12 @@ class EgoSession:
         for q in questions:
             if not isinstance(q, dict):
                 continue
-            content = (q.get("content") or "").strip()
+            raw = q.get("content")
+            # The output parser accepts any JSON value here — a non-string
+            # (dict/number/list) would blow up .strip(); skip it rather than raise.
+            if not isinstance(raw, str):
+                continue
+            content = raw.strip()
             # Strip one layer of matched wrapping quotes (same LLM quirk as
             # notifications).
             if len(content) >= 2 and (content[0], content[-1]) in (
@@ -2876,7 +2881,16 @@ class EgoSession:
                 verbatim=True,
             )
             result, reply = await self._outreach_pipeline.submit_and_wait(
-                request, timeout_s=DEFAULT_REPLY_TIMEOUT_S,
+                request,
+                timeout_s=DEFAULT_REPLY_TIMEOUT_S,
+                # Quote-reply-only: the question is delivered into the owner's
+                # general DM, where an unrelated standalone message would
+                # otherwise be silently consumed as the answer (resolve_scoped_
+                # pending resolves the single pending waiter for ANY bare text in
+                # that chat). Requiring an explicit Telegram quote-reply also
+                # removes cross-cycle waiter ambiguity, so questions no longer
+                # need serialized delivery for correctness.
+                standalone_resolvable=False,
             )
             if result.status.value != "delivered":
                 # Not a silent drop: the contract promises delivery, so the
@@ -2906,23 +2920,42 @@ class EgoSession:
                 return
 
             if reply:
-                # origin_class="owner": the waiter resolves only the owner's
-                # Telegram reply (quote-reply or the delivered chat's own
-                # thread context) — stamped explicitly at the write site,
-                # never allowlisted, because the content embeds user text.
-                await obs_crud.create(
-                    self._db,
-                    id=str(uuid.uuid4()),
-                    source="ego_question",
-                    type="user_reply",
-                    origin_class="owner",
-                    content=(
-                        f"Ego asked: {content}\nUser replied: {reply}"
-                    ),
-                    priority="high" if urgency == "high" else "medium",
-                    category="ego_question",
-                    created_at=datetime.now(UTC).isoformat(),
-                )
+                # origin_class="owner": the waiter resolves ONLY the owner's
+                # explicit Telegram quote-reply (standalone_resolvable=False
+                # above) — stamped explicitly at the write site, never
+                # allowlisted, because the content embeds user text. This
+                # observation is the DURABLE channel the asking ego reads the
+                # answer from (see UserEgoContextBuilder._ego_question_section /
+                # the genesis observations section).
+                try:
+                    await obs_crud.create(
+                        self._db,
+                        id=str(uuid.uuid4()),
+                        source="ego_question",
+                        type="user_reply",
+                        origin_class="owner",
+                        content=(
+                            f"Ego asked: {content}\nUser replied: {reply}"
+                        ),
+                        priority="high" if urgency == "high" else "medium",
+                        category="ego_question",
+                        created_at=datetime.now(UTC).isoformat(),
+                    )
+                except Exception:
+                    # The durable record failed (e.g. SQLite briefly
+                    # unavailable). The reactive signal below still fires, but its
+                    # summary is NOT rendered into the ego prompt (FocusResult
+                    # carries no summary field) — so on this rare path the answer
+                    # would otherwise be lost entirely. Log the FULL reply so it
+                    # is at least recoverable from the operational log, and the
+                    # ego is still woken (it can re-ask if it can't find it).
+                    logger.warning(
+                        "Failed to persist ego_question reply observation for "
+                        "%r — captured reply (recoverable here): %r",
+                        content[:120],
+                        reply[:500],
+                        exc_info=True,
+                    )
                 sink = self._reply_signal_sink
                 if sink is not None:
                     try:

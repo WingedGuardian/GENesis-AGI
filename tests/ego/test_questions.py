@@ -168,7 +168,7 @@ class TestProcessQuestions:
         in_flight = 0
         max_in_flight = 0
 
-        async def _tracked_wait(request, timeout_s=None):
+        async def _tracked_wait(request, timeout_s=None, standalone_resolvable=True):
             nonlocal in_flight, max_in_flight
             in_flight += 1
             max_in_flight = max(max_in_flight, in_flight)
@@ -249,3 +249,107 @@ class TestOutputContracts:
 
         text = GenesisEgoContextBuilder._output_contract_section()
         assert '"questions"' in text
+
+
+class TestQuestionHardening:
+    """Codex #1499 remediation — DM-capture, non-string content, obs-fail."""
+
+    @pytest.mark.asyncio
+    async def test_delivery_is_quote_reply_only(self, session):
+        """Questions go into the owner's general DM — a bare unrelated message
+        must NOT be consumed as the answer, so the waiter is quote-reply-only
+        (standalone_resolvable=False)."""
+        with patch("genesis.db.crud.observations.create", new=AsyncMock()):
+            await session._process_questions([{"content": "Q?", "urgency": "normal"}])
+            await _drain_question_tasks(session)
+        kwargs = session._outreach_pipeline.submit_and_wait.call_args.kwargs
+        assert kwargs.get("standalone_resolvable") is False
+
+    @pytest.mark.asyncio
+    async def test_non_string_content_skipped_without_crash(self, session):
+        """A non-string content value (malformed JSON) must be skipped, never
+        crash _process_questions on .strip()."""
+        with patch("genesis.db.crud.observations.create", new=AsyncMock()):
+            await session._process_questions(
+                [
+                    {"content": {"nested": 1}, "urgency": "normal"},
+                    {"content": ["a", "b"], "urgency": "low"},
+                    {"content": 42, "urgency": "high"},
+                ]
+            )
+            await _drain_question_tasks(session)
+        session._outreach_pipeline.submit_and_wait.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reply_signal_fires_even_if_observation_write_fails(self, session):
+        """A durable-write failure must not swallow the captured answer — the
+        reactive signal to the asking ego still fires."""
+        session._outreach_pipeline.submit_and_wait = AsyncMock(
+            return_value=(_delivered(), "the answer")
+        )
+        signals: list[dict] = []
+        session.set_reply_signal_sink(signals.append)
+        failing_obs = AsyncMock(side_effect=RuntimeError("db down"))
+        with patch("genesis.db.crud.observations.create", new=failing_obs):
+            await session._process_questions([{"content": "Q?", "urgency": "high"}])
+            await _drain_question_tasks(session)
+        assert len(signals) == 1
+        assert "the answer" in signals[0]["summary"]
+
+
+def test_ego_question_never_deduped():
+    """topic is content[:100]; ANY non-zero window suppresses a distinct question
+    sharing a 100-char prefix (and a re-ask reminder). Must be 0 (Codex #1499)."""
+    from genesis.outreach.governance import _DEDUP_WINDOWS
+
+    assert _DEDUP_WINDOWS["ego_question"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ego_question_section_surfaces_answer():
+    """The asking USER ego must SEE the answer to a question it asked — the
+    reactive signal alone doesn't render into the prompt, so the ego_question
+    observation reader is the durable channel (Codex #1499 P1)."""
+    from datetime import UTC, datetime
+
+    import aiosqlite
+
+    from genesis.db.schema import TABLES
+    from genesis.ego.user_context import UserEgoContextBuilder
+
+    async with aiosqlite.connect(":memory:") as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute(TABLES["observations"])
+        await db.commit()
+        await db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, content, priority, category, created_at, resolved) "
+            "VALUES ('o1','ego_question','user_reply',?,?,'ego_question',?,0)",
+            (
+                "Ego asked: Retire the old digest?\nUser replied: Yes, retire it.",
+                "medium",
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        await db.commit()
+
+        builder = object.__new__(UserEgoContextBuilder)
+        builder._db = db
+        section = await builder._ego_question_section()
+
+    assert "Answers To Your Questions" in section
+    assert "Yes, retire it." in section
+
+
+def test_ego_qa_is_an_always_section():
+    """The answer-delivery section must be ALWAYS-rendered: a reply arrives AS a
+    reactive signal → a reactive cycle, and the reactive profile trims most
+    sections. Resting the delivery guarantee on the section_map's .get default
+    would break silently the moment ego_qa entered a trim profile (Codex #1499
+    NOTE-A)."""
+    from genesis.ego import focus
+
+    assert "ego_qa" in focus._ALL_SECTIONS
+    assert "ego_qa" in focus._ALWAYS_SECTIONS
+    # And it resolves to "always" (never trimmed) in the reactive profile.
+    assert focus.FOCUS_CONTEXT_WEIGHTS["reactive"]["ego_qa"] == "always"

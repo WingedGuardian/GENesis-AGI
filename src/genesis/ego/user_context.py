@@ -149,6 +149,7 @@ class UserEgoContextBuilder:
             ("proposal_history", self._proposal_history_section),
             ("proposal_board", self._proposal_board_section),
             ("execution_outcomes", self._execution_outcomes_section),
+            ("ego_qa", self._ego_question_section),
             ("goal_progress", self._goal_progress_section),
             ("goal_deep_dive", self._goal_deep_dive_section),
             ("capability_performance", self._capability_performance_section),
@@ -1203,6 +1204,56 @@ class UserEgoContextBuilder:
             ts = (created_at or "?")[:16]
             lines.append(f"- [{ts}] [{priority}] {short}")
 
+        lines.append("")
+        return "\n".join(lines)
+
+    async def _ego_question_section(self, *, depth: str = "deep") -> str:
+        """Answers to questions THIS ego asked the user via the B3 questions
+        channel (last 24h).
+
+        Without this, the asking user ego never SEES the answer: the reply comes
+        back as a reactive signal that only WAKES the cycle (its summary is not
+        rendered into the focused prompt), and the durable answer lives only in
+        an ego_question observation the user-ego context otherwise never reads.
+        Surfaces every outcome — user_reply (the answer), no_reply/timeout, and
+        not_delivered — so the ego can act on the answer or decide to re-ask.
+        (Both egos may see these; questions are role-shared, not a security
+        boundary. The genesis ego already surfaces them via its observations
+        section.)
+        """
+        try:
+            # Short window (4h ≈ 2-3 cycles): the reply also arrives as a
+            # reactive signal that wakes the asking ego on the SAME cycle — this
+            # durable section is the backup for that one cycle, not a standing
+            # to-do. A long window would re-inject the same answer ~16× over 24h,
+            # inviting duplicate action. (These observations are shared with the
+            # genesis reader and carry no asker identity, so a per-asker
+            # resolve-on-read would steal the other ego's answer — the bounded
+            # window avoids that coupling.)
+            cursor = await self._db.execute(
+                "SELECT content, created_at FROM observations "
+                "WHERE source = 'ego_question' AND resolved = 0 "
+                "AND created_at >= datetime('now', '-4 hours') "
+                "ORDER BY created_at DESC LIMIT 8"
+            )
+            rows = await cursor.fetchall()
+        except Exception:
+            logger.error("Failed to query ego question outcomes", exc_info=True)
+            # Fail-soft: a query error must not blank the whole context.
+            return ""
+
+        if not rows:
+            return ""  # rare — omit the section entirely rather than add noise
+
+        header = "## Answers To Your Questions (24h)\n"
+        if depth == "light":
+            return f"{header}{len(rows)} update(s).\n"
+
+        lines = [header, f"**{len(rows)} update(s)**:\n"]
+        for content, created_at in rows:
+            short = (content or "")[:400].replace("\n", " · ")
+            ts = (created_at or "?")[:16]
+            lines.append(f"- [{ts}] {short}")
         lines.append("")
         return "\n".join(lines)
 

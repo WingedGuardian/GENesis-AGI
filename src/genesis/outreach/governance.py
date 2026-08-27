@@ -41,10 +41,12 @@ _DEDUP_WINDOWS: dict[str, int] = {
     "surplus_insight": 24,
     "surplus_opportunity": 24,
     "content_review": 1,  # Short window — distinct content pieces may share topics
-    # Ego questions: a re-ask after the 2h reply timeout is a REMINDER (same
-    # rationale as the approval-reminder class below) — the 24h default would
-    # silently DENY it while the first delivery's history row is still warm.
-    "ego_question": 4,
+    # Ego questions — never dedup (same must-deliver class as cli_approval).
+    # topic is content[:100], so ANY non-zero window would (a) suppress a DISTINCT
+    # question sharing a 100-char prefix, and (b) deny a re-ask reminder after the
+    # 2h reply timeout while the first delivery's history row is still warm.
+    # Volume is bounded by the per-cycle question cap + the ego's own judgment.
+    "ego_question": 0,
     "cli_approval": 0,  # Never dedup — every approval request must be delivered
     # Provisioning approvals + outcomes — same "must always deliver" class as
     # cli_approval (#143). A synchronous, user-initiated grow approval that

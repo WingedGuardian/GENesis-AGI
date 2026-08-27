@@ -329,8 +329,18 @@ class OutreachPipeline:
         request: OutreachRequest,
         *,
         timeout_s: float = DEFAULT_REPLY_TIMEOUT_S,
+        standalone_resolvable: bool = True,
     ) -> tuple[OutreachResult, str | None]:
-        """Submit outreach and wait for user reply. Returns (result, reply_text)."""
+        """Submit outreach and wait for user reply. Returns (result, reply_text).
+
+        When ``standalone_resolvable`` is False, the waiter is NOT given a
+        chat+topic context, so a bare (non-quote-reply) message in that chat can
+        never resolve it — only an explicit Telegram quote-reply does (via the
+        delivery_id key). Use this for prompts delivered into a general-purpose
+        conversation (e.g. the owner's DM) where unrelated messages would
+        otherwise be silently consumed as the answer. Approvals keep the default
+        (True) because they live in a dedicated topic with no unrelated traffic.
+        """
         if not self._reply_waiter:
             logger.warning("submit_and_wait called without reply_waiter — falling back to submit")
             result = await self.submit(request)
@@ -358,7 +368,8 @@ class OutreachPipeline:
             # (observed live 2026-07-16; every reply degraded to
             # implicit_activity).
             self._reply_waiter.register(result.delivery_id)
-            self._attach_waiter_context(result, result.delivery_id)
+            if standalone_resolvable:
+                self._attach_waiter_context(result, result.delivery_id)
             reply = await self._reply_waiter.wait_for_reply(
                 result.delivery_id, timeout_s=timeout_s,
             )
