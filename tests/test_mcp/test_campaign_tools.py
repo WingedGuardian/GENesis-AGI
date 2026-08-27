@@ -236,6 +236,39 @@ class TestCampaignCreateValidation:
             ct_mod._runner = old_runner
 
     @pytest.mark.asyncio
+    async def test_create_strips_name_and_uniqueness_uses_stripped(self, _test_db):
+        """Entry-strip: the uniqueness pre-check and the stored value AGREE, so two
+        names differing only in control chars cannot both be created — the second is
+        rejected cleanly instead of hitting a UNIQUE-constraint crash on the stripped
+        stored value."""
+        old_db, old_runner = ct_mod._db, ct_mod._runner
+        try:
+            ct_mod._db = _test_db
+            ct_mod._runner = None
+            r1 = await ct_mod._impl_campaign_create(
+                name="dup\ncampaign",
+                strategy_doc_path="/tmp/s.md",
+                cron_cadence="0 */8 * * *",
+            )
+            assert "error" not in r1, r1
+            assert r1["name"] == "dup campaign"  # stored value is stripped
+            cursor = await _test_db.execute(
+                "SELECT COUNT(*) AS n FROM campaigns WHERE name = ?", ("dup campaign",)
+            )
+            assert (await cursor.fetchone())["n"] == 1
+            # A second name that collapses to the SAME stripped value is rejected
+            # cleanly (the pre-check now runs on the stripped name).
+            r2 = await ct_mod._impl_campaign_create(
+                name="dup\tcampaign",
+                strategy_doc_path="/tmp/s.md",
+                cron_cadence="0 */8 * * *",
+            )
+            assert "error" in r2 and "already exists" in r2["error"], r2
+        finally:
+            ct_mod._db = old_db
+            ct_mod._runner = old_runner
+
+    @pytest.mark.asyncio
     async def test_create_accepts_valid_profile(self, _test_db):
         """A valid profile passes validation and flows through to creation."""
         from unittest.mock import AsyncMock
