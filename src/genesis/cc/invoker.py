@@ -75,11 +75,12 @@ def _build_scope_args() -> list[str]:
 
     Returns an empty list if systemd-run is unavailable (graceful degradation)
     OR has no reachable user manager. The probe matters: ``which`` alone is not
-    enough — env-scrubbed spawners (a Kimi Code session's Bash tool, CI) have
-    the binary but no DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR, and
-    ``systemd-run --user`` then dies instantly with "Failed to connect to bus",
-    taking the CC subprocess down with it at 0.0s (gauntlet infra-skips,
-    2026-08-27). Same probe-then-commit pattern as .claude/mcp/run-codebase-memory.
+    enough — an env-scrubbed spawner (some agent CLIs' shell tooling, CI
+    runners, a stripped systemd context) has the binary but no
+    DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR, and ``systemd-run --user`` then
+    dies instantly with "Failed to connect to bus", taking the CC subprocess
+    down with it at 0.0s. Measured on a live install.
+    Same probe-then-commit pattern as .claude/mcp/run-codebase-memory.
     The probe result is cached for the process lifetime via _get_scope_args.
     """
     if not shutil.which("systemd-run"):
