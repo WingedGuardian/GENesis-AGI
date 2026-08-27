@@ -15,11 +15,6 @@ import os
 import sys
 from pathlib import Path
 
-# The shared hook-input helper lives in scripts/hooks/; this script runs from
-# scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
-sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
-from hook_input import is_safe_session_id  # noqa: E402
-
 # Max files to track per session (most recent first)
 _MAX_FILES = 20
 # Project root prefix for filtering — only track project files
@@ -61,7 +56,7 @@ def _process(data: dict) -> None:
         return
 
     # Validate session_id is a safe path component (CC uses UUIDs)
-    if not is_safe_session_id(session_id):
+    if "/" in session_id or "\\" in session_id or ".." in session_id:
         return
 
     # Write to session state directory

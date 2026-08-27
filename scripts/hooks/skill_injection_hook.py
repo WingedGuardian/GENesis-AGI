@@ -13,9 +13,6 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hook_input import is_safe_session_id  # noqa: E402
-
 # Skill injection fires for ALL sessions (foreground + dispatched).
 # Background sessions need skill nudges just as much — without them,
 # dispatched sessions have tools but no knowledge of how to use them.
@@ -102,7 +99,7 @@ def _load_catalog() -> dict:
 
 def _session_nudges_path(session_id: str) -> Path | None:
     """Return the path for session nudge tracking, or None if invalid."""
-    if not is_safe_session_id(session_id):
+    if not session_id or "/" in session_id or ".." in session_id:
         return None
     return Path.home() / ".genesis" / "sessions" / session_id / "skill_nudges.json"
 

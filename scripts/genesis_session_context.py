@@ -29,11 +29,6 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-# The shared hook-input helper lives in scripts/hooks/; this script runs from
-# scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
-sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
-from hook_input import is_safe_session_id  # noqa: E402
-
 # Load secrets.env so USER_TIMEZONE and other env vars are available
 # before any genesis module imports (which may read os.environ at import time).
 _SECRETS_PATH = Path(__file__).resolve().parent.parent / "secrets.env"
@@ -1065,15 +1060,18 @@ def _charter_emission_block(
     window — but NOT on clear: /clear is an explicit fresh start, and
     re-asserting the old origin would fight the user.
 
-    Returns "" when there is no charter, the session_id is missing/unsafe,
-    or nothing is readable (fail-open — charter is advisory).
+    Returns "" when there is no charter or nothing is readable (fail-open —
+    charter is advisory). An id that is unsafe as a PATH COMPONENT still gets its
+    canonical DB-backed charter; only the legacy file fallback is skipped.
     """
     if not session_id or source == "clear":
         return ""
-    if not is_safe_session_id(session_id):
-        return ""
+    # The DB lookup binds session_id as a SQL PARAMETER, so it is safe for any id;
+    # only the legacy charter.json fallback interpolates it into a PATH. Guarding
+    # above both would drop a canonical, DB-backed charter (and its ledger) for an
+    # id that merely fails the path rule.
     charter, ledger = _load_charter_db(session_id, db_path)
-    if charter is None:
+    if charter is None and "/" not in session_id and ".." not in session_id:
         charter = _load_charter_file(session_id, sessions_dir)
         ledger = []
     if charter is None:

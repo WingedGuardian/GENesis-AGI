@@ -57,23 +57,32 @@ result = tool_response(payload)          # PostToolUse result
 sid = session_id(payload)                # session id, validated as a path component
 ```
 
-**Building a path from the session id?** `session_id()` already refuses an
-unsafe value, but if you read the id from the payload yourself, validate it with
-`is_safe_session_id()` before it becomes a path component — several hooks
-`mkdir(parents=True)` under `~/.genesis/sessions/<id>/`, so a `/` or `..` in the
-id CREATES directories outside the session tree:
+**Building a path from the session id?** Use `session_path()` — never join the
+id yourself. Several hooks `mkdir(parents=True)` under
+`~/.genesis/sessions/<id>/`, so a `/` or `..` in the id CREATES directories
+outside the session tree:
 
 ```python
-from hook_input import is_safe_session_id
+from hook_input import session_path
 
-if not is_safe_session_id(sid):
-    return                               # or return None/[] — fail toward doing nothing
+p = session_path(_GENESIS_DIR / "sessions", sid, "messages.jsonl")
+if p is not None and p.exists():
+    ...                                  # skip ONLY the file operation
 ```
 
-Do NOT hand-roll the check (`"/" in sid or ".." in sid`). That idiom existed in
-three divergent shapes across the hooks and was simply omitted at eight sites;
-one copy also used `^…$`, which accepts a trailing newline. One helper, one
-behavior.
+**Skip exactly the filesystem operation, nothing else.** The id is dangerous
+only as a path component — never as a bound SQL parameter, a JSON value or a
+dict key. A hook that treats a rejected id as "return early" disables unrelated
+work: DB-backed charter lookups, payload-only checks, and canonical writes all
+keep working for an id that merely fails the path rule.
+
+`is_safe_session_id()` exists for the rare non-path case, but prefer
+`session_path()`: returning the path (or `None`) removes the "what do I skip?"
+decision that a bare bool invites.
+
+Scope note: these helpers cover hooks under `scripts/`. Code in `src/genesis/`
+cannot import them today and carries its own checks — do not assume a session id
+reaching `src/` has been validated.
 
 Scripts in `scripts/` (not `scripts/hooks/`) reach the helper with a one-line
 bootstrap: `sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks"))`.

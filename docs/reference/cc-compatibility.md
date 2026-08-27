@@ -159,12 +159,24 @@ so a broken contract can't silently fail open again.
 `session_id` is a special case: a dozen hooks interpolate it into a filesystem
 path (`~/.genesis/sessions/<id>/`), and several `mkdir(parents=True)` — so an id
 carrying `/` or `..` would not merely read the wrong file, it would CREATE
-directories outside the session tree. `is_safe_session_id()` is the single
-source of truth for that check (allow-list `\A[A-Za-z0-9_-]{1,128}\Z`,
-deliberately wider than the observed hex-UUID format so a future CC id shape
-does not break every hook at once), and `session_id()` refuses to return a value
-that fails it. Use the helper — do not re-derive the check; it was previously
-hand-copied in three divergent shapes and omitted at eight sites.
+directories outside the session tree. `is_safe_session_id()` is the source of truth for
+hooks under `scripts/` (allow-list `\A[A-Za-z0-9_-]{1,128}\Z`, deliberately
+wider than the hex-UUID shape CC usually emits — the observed id set already
+contains other shapes), and `session_id()` refuses to return a value that fails
+it.
+
+It is NOT yet repo-wide: the helper lives in `scripts/hooks/`, which
+`src/genesis/**` can only reach through a `sys.path` insert, so several `src/`
+sites (and a handful of hooks) still carry their own hand-written check. Moving
+the validator to an importable home and adding a CI scan that fails on a new raw
+`sessions/<id>` join is tracked separately — until then, treat this as the hook
+contract, not a repo-wide invariant.
+
+Build session paths with `session_path(base, sid, *parts)` rather than joining
+the id yourself: it returns `None` for an unsafe id, so the caller skips exactly
+the filesystem operation. That matters because the id is dangerous ONLY as a
+path component — a rejection must not gate DB lookups (the id is a bound
+parameter there), payload-only logic, or canonical writes.
 `tests/test_scripts/test_hook_input_contract.py` feeds each guard a real payload
 and statically forbids any hook from reading a dead payload env var. See
 `.claude/hooks/README.md` for the authoring rule. **A CC bump that changes the

@@ -36,7 +36,7 @@ from pathlib import Path
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
-from hook_input import is_safe_session_id  # noqa: E402
+from hook_input import session_path  # noqa: E402
 
 _FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _GENESIS_DIR = Path.home() / ".genesis"
@@ -85,17 +85,17 @@ def main() -> None:
     # the giving-up-pattern check below, which is session-independent (it needs
     # only the assistant message from the hook payload).
     last_user_msg = ""
-    if is_safe_session_id(session_id):
-        session_dir = _GENESIS_DIR / "sessions" / session_id
-        messages_file = session_dir / "messages.jsonl"
-        if messages_file.exists():
-            try:
-                lines = messages_file.read_text().strip().splitlines()
-                if lines:
-                    last = json.loads(lines[-1])
-                    last_user_msg = last.get("text", "")
-            except (json.JSONDecodeError, OSError):
-                pass
+    messages_file = session_path(
+        _GENESIS_DIR / "sessions", session_id, "messages.jsonl"
+    )
+    if messages_file is not None and messages_file.exists():
+        try:
+            lines = messages_file.read_text().strip().splitlines()
+            if lines:
+                last = json.loads(lines[-1])
+                last_user_msg = last.get("text", "")
+        except (json.JSONDecodeError, OSError):
+            pass
 
     # Check for giving-up patterns in the assistant's response.
     # This runs regardless of whether user messages exist — it only

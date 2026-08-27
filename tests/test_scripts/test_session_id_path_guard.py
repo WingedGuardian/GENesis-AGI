@@ -84,6 +84,17 @@ class TestSessionIdAccessorRejectsUnsafe:
         monkeypatch.setenv("CLAUDE_SESSION_ID", "a/b")
         assert hook_input.session_id({}) == "unknown"
 
+    def test_present_unsafe_payload_id_does_not_fall_back_to_env(self, monkeypatch):
+        """A PRESENT payload id is authoritative. Falling through to a stale
+        CLAUDE_SESSION_ID would answer with a DIFFERENT session's id, and the
+        caller would then read or create that session's sentinels."""
+        monkeypatch.setenv("CLAUDE_SESSION_ID", "aaaaaaaa-0000-4000-8000-000000000099")
+        assert hook_input.session_id({"session_id": "../../evil"}) == "unknown"
+
+    def test_absent_payload_id_still_uses_the_env_fallback(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_SESSION_ID", REAL_IDS[1])
+        assert hook_input.session_id({}) == REAL_IDS[1]
+
 
 class TestHooksDoNotEscapeSessionDir:
     """The load-bearing RED: these sites build a path from the raw id today."""
@@ -103,13 +114,15 @@ class TestHooksDoNotEscapeSessionDir:
     def test_proactive_trail_path_does_not_escape(self, tmp_path, monkeypatch):
         mod = _load("proactive_memory_hook", "proactive_memory_hook.py")
         monkeypatch.setattr(mod, "_TRAIL_DIR", tmp_path / "sessions")
-        p = mod._trail_path("../../escaped")
-        if p is None:
-            return  # rejected outright is also correct
         base = (tmp_path / "sessions").resolve()
-        # RESOLVE both sides — PurePath.parents does NOT collapse "..", so a
-        # lexical containment check here would pass vacuously.
-        assert base in p.resolve().parents, f"escaped to {p.resolve()}"
+        # Traversal id -> refused outright.
+        assert mod._trail_path("../../escaped") is None
+        # A SAFE id must STILL produce a contained path. Without this half, the
+        # test passes vacuously the moment the guard starts returning None.
+        good = mod._trail_path(REAL_IDS[0])
+        assert good is not None, "a safe id must still yield a trail path"
+        # RESOLVE both sides — PurePath.parents does NOT collapse "..".
+        assert base in good.resolve().parents, f"escaped to {good.resolve()}"
 
 
 class TestUnsafeIdSkipsOnlyThePathRead:
@@ -171,3 +184,116 @@ class TestUnsafeIdSkipsOnlyThePathRead:
             "unsafe session id changed payload-only hook behaviour"
         )
         assert not (tmp_path / "escaped").exists()
+
+
+class TestSessionPathHelper:
+    """The path-returning API. A bool invites each caller to decide what to skip
+    on rejection, and that decision is an open set — the id is only ever unsafe
+    as a PATH COMPONENT, never as a bound SQL parameter or a JSON value."""
+
+    def test_safe_id_builds_the_path(self, tmp_path):
+        p = hook_input.session_path(tmp_path, REAL_IDS[0], "messages.jsonl")
+        assert p == tmp_path / REAL_IDS[0] / "messages.jsonl"
+
+    @pytest.mark.parametrize("sid", TRAVERSALS)
+    def test_unsafe_id_returns_none(self, tmp_path, sid):
+        assert hook_input.session_path(tmp_path, sid, "messages.jsonl") is None
+
+    def test_result_never_escapes_the_base(self, tmp_path):
+        built = 0
+        for sid in TRAVERSALS + REAL_IDS:
+            p = hook_input.session_path(tmp_path, sid)
+            if p is None:
+                continue
+            built += 1
+            assert tmp_path.resolve() in p.resolve().parents, f"escaped to {p}"
+        assert built == len(REAL_IDS), (
+            "every safe id must still build a path — otherwise this loop asserts "
+            "nothing and passes vacuously"
+        )
+
+
+class TestRejectionDoesNotDisableNonPathWork:
+    """Round-3 class: a path-safety rejection must not gate work that never
+    touches the filesystem."""
+
+    def _run(self, script: str, payload: dict, home: Path):
+        (home / ".genesis").mkdir(parents=True, exist_ok=True)
+        (home / ".genesis" / "cc_context_enabled").touch()
+        env = {**os.environ, "HOME": str(home)}
+        env.pop("GENESIS_CC_SESSION", None)
+        return subprocess.run(
+            [sys.executable, str(_SCRIPTS / script)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+    def test_urgent_alerts_still_emits_context_for_a_rejected_id(self, tmp_path):
+        """BEHAVIOURAL, not a source-text scan: an earlier revision asserted that
+        a particular blanking statement was absent from main(), which would still
+        pass against an early `if not is_safe_session_id(...): return` — the far
+        likelier regression shape. Drive the real entry point instead.
+
+        _emit_temporal_context guards its own file read via _session_dir, and
+        _emit_charter_tag uses the id only as a bound SQL parameter, so neither
+        may be skipped for an id that merely fails the path rule."""
+        payload = {"prompt": "hi", "hook_event_name": "UserPromptSubmit"}
+        safe = self._run(
+            "genesis_urgent_alerts.py", {**payload, "session_id": REAL_IDS[0]}, tmp_path
+        )
+        unsafe_home = tmp_path / "u"
+        unsafe = self._run(
+            "genesis_urgent_alerts.py",
+            {**payload, "session_id": "../../escaped"},
+            unsafe_home,
+        )
+        assert safe.stdout.strip(), "control produced no output — test proves nothing"
+        assert "[Clock:" in unsafe.stdout, (
+            "payload-only temporal context was suppressed for a rejected id"
+        )
+        assert not (unsafe_home / "escaped").exists()
+
+    def test_trail_workflow_aborts_when_it_cannot_persist(self, tmp_path, monkeypatch):
+        """Without a safe trail path _save_trail discards every update, so each
+        turn would look like the FIRST pivot and record a false observation."""
+        mod = _load("proactive_memory_hook", "proactive_memory_hook.py")
+        monkeypatch.setattr(mod, "_TRAIL_DIR", tmp_path / "sessions")
+        assert mod._update_and_format_trail("../../escaped", ["alpha"], "alpha beta") is None
+
+
+class TestCharterBlockKeepsDbLookupUnguarded:
+    """The path guard must sit below the bound-SQL lookup.
+
+    ``_load_charter_db`` binds the id as a SQL PARAMETER, so it is safe for ANY
+    id; only ``_load_charter_file`` interpolates it into a path. A guard above
+    both would drop a canonical, DB-backed charter (and its ledger) for an id
+    that merely fails the path rule — the same class that consumed review rounds
+    2 and 3.
+    """
+
+    def test_db_charter_survives_a_path_unsafe_id(self, tmp_path, monkeypatch):
+        mod = _load("genesis_session_context", "genesis_session_context.py")
+        called = {}
+
+        def fake_db(sid, db_path=None):
+            called["db"] = sid
+            return {"origin_prompt": "the origin", "origin_ts": "2026-08-27"}, []
+
+        def fake_file(sid, sessions_dir=None):
+            called["file"] = sid
+            return None
+
+        monkeypatch.setattr(mod, "_load_charter_db", fake_db)
+        monkeypatch.setattr(mod, "_load_charter_file", fake_file)
+        out = mod._charter_emission_block(
+            "../../escaped",
+            "resume",
+            sessions_dir=tmp_path / "sessions",
+            db_path=tmp_path / "db.sqlite",
+        )
+        assert called.get("db") == "../../escaped", "DB lookup was skipped"
+        assert "file" not in called, "path-based fallback must NOT run for an unsafe id"
+        assert "Session Charter" in out, "canonical charter was suppressed"

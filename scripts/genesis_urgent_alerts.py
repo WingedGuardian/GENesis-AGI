@@ -41,7 +41,7 @@ from urllib.request import pathname2url
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
-from hook_input import is_safe_session_id  # noqa: E402
+from hook_input import session_path  # noqa: E402
 
 # Load secrets.env so USER_TIMEZONE and other env vars are available
 # before any genesis module imports (which may read os.environ at import time).
@@ -103,9 +103,7 @@ def _session_dir(session_id: str) -> Path | None:
     the call sites ``mkdir(parents=True)``, so an escape would CREATE directories.
     One chokepoint rather than four hand-copied checks (see hook_input).
     """
-    if not is_safe_session_id(session_id):
-        return None
-    return _GENESIS_DIR / "sessions" / session_id
+    return session_path(_GENESIS_DIR / "sessions", session_id)
 
 
 def _emit_temporal_context(session_id: str, now: datetime) -> None:
@@ -444,10 +442,6 @@ def main() -> None:
         hook_input = {}
 
     session_id = hook_input.get("session_id", "")
-    # session_id becomes a path component below (two sites mkdir) — reject an
-    # unsafe value at the single entry point rather than at each use.
-    if not is_safe_session_id(session_id):
-        session_id = ""
     prompt = hook_input.get("prompt", "")
     now = datetime.now(UTC)
 

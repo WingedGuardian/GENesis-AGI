@@ -27,7 +27,7 @@ from pathlib import Path
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
-from hook_input import is_safe_session_id  # noqa: E402
+from hook_input import session_path  # noqa: E402
 
 _FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _GENESIS_DIR = Path.home() / ".genesis"
@@ -128,10 +128,8 @@ def main() -> None:
     messages: list[dict] = []
     topic_hint = ""
 
-    messages_file = (
-        _GENESIS_DIR / "sessions" / session_id / "messages.jsonl"
-        if is_safe_session_id(session_id)
-        else None
+    messages_file = session_path(
+        _GENESIS_DIR / "sessions", session_id, "messages.jsonl"
     )
     if messages_file is not None and messages_file.exists():
         try:

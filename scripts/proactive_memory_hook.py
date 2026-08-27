@@ -39,7 +39,7 @@ from pathlib import Path
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
-from hook_input import is_safe_session_id  # noqa: E402
+from hook_input import session_path  # noqa: E402
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_DIR / "src"
@@ -292,9 +292,7 @@ def _trail_path(session_id: str) -> Path | None:
     ``session_id`` is a path component here, so an id carrying ``/`` or ``..``
     would escape the sessions dir (mirrors ``_ws_path``/``_load_recent_files``).
     """
-    if not is_safe_session_id(session_id):
-        return None
-    return _TRAIL_DIR / session_id / "intent_trail.json"
+    return session_path(_TRAIL_DIR, session_id, "intent_trail.json")
 
 
 def _load_trail(session_id: str) -> dict:
@@ -446,6 +444,13 @@ def _update_and_format_trail(
     if not session_id:
         return None
 
+    # The trail workflow is persistence-backed end to end: without a safe trail
+    # path _save_trail discards every update, so EVERY turn would look like the
+    # first pivot and record a false conversation_pivot observation. Abort the
+    # workflow rather than run it against a trail that can never be saved.
+    if _trail_path(session_id) is None:
+        return None
+
     # Skip harness-injected turns (task notifications, system reminders,
     # slash-command metadata, local-command output) — they are not user
     # messages and would pollute the pivot trail and L1 "Active Work".
@@ -509,7 +514,7 @@ def _ws_path(session_id: str) -> Path | None:
     Session IDs arrive via hook stdin — refuse anything that could
     escape the sessions dir (mirrors _load_recent_files).
     """
-    if not is_safe_session_id(session_id):
+    if not session_id or "/" in session_id or ".." in session_id:
         return None
     return _TRAIL_DIR / session_id / _WS_FILENAME
 
@@ -775,7 +780,7 @@ def _keywords_from_files(file_paths: list[str]) -> list[str]:
 
 def _load_recent_files(session_id: str) -> list[str]:
     """Load recently-touched files for this session from PostToolUse state."""
-    if not is_safe_session_id(session_id):
+    if not session_id or "/" in session_id or ".." in session_id:
         return []
     state_file = Path(os.path.expanduser("~/.genesis/sessions")) / session_id / "recent_files.json"
     if not state_file.exists():
@@ -1312,11 +1317,10 @@ def _extract_genesis_summary(session_id: str) -> str | None:
 
     Returns None if file doesn't exist or is empty.
     """
-    if not is_safe_session_id(session_id):
-        return None
-
-    obs_path = Path.home() / ".genesis" / "sessions" / session_id / "tool_observations.jsonl"
-    if not obs_path.exists():
+    obs_path = session_path(
+        Path.home() / ".genesis" / "sessions", session_id, "tool_observations.jsonl"
+    )
+    if obs_path is None or not obs_path.exists():
         return None
 
     try:

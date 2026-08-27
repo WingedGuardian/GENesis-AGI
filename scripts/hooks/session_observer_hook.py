@@ -24,7 +24,6 @@ if os.environ.get("GENESIS_CC_SESSION") == "1":
 
 # Self-locate so secret_scrub resolves whether run as a script or imported.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import is_safe_session_id  # noqa: E402
 from secret_scrub import (  # noqa: E402
     command_touches_secret,
     is_secret_path,
@@ -170,7 +169,7 @@ def _process(data: dict) -> None:
         return
 
     # Validate session_id as safe path component
-    if not is_safe_session_id(session_id):
+    if "/" in session_id or "\\" in session_id or ".." in session_id:
         return
 
     tool_input = data.get("tool_input") or {}
