@@ -547,6 +547,20 @@ def models_md_synthesis_enabled() -> bool:
     return True
 
 
+def _valid_zone(name: str) -> bool:
+    """True iff ``name`` resolves as an IANA zone (guards against typos)."""
+    try:
+        from zoneinfo import (  # noqa: PLC0415 — lazy; zoneinfo is stdlib
+            ZoneInfo,
+            ZoneInfoNotFoundError,
+        )
+
+        ZoneInfo(name)
+        return True
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        return False
+
+
 def user_timezone() -> str:
     """User's local timezone (IANA format).
 
@@ -563,16 +577,25 @@ def user_timezone() -> str:
     (``db/migrations/0086``) copies a real env value into the file before this
     precedence took effect, so the flip preserves behavior on existing installs.
     """
+    # A valid IANA zone is always a non-empty string that ``ZoneInfo`` accepts.
+    # Accept ONLY that at each layer — a blank string, a non-string YAML scalar
+    # (``timezone: no`` → False, ``0`` → int), or a TYPO (e.g. ``Amrica/Chicago``
+    # written by a setup-local-config free-form prompt) is treated as unset and
+    # falls through, rather than being returned and crashing the CronTrigger /
+    # ZoneInfo consumers that trust this function's output.
     local_val = _local_config().get("timezone")
-    # A valid IANA zone is always a non-empty string. Accept ONLY that — a blank
-    # string, or a non-string YAML scalar (``timezone: no`` → False, ``0`` → int),
-    # is treated as unset and falls through to the env fallback rather than
-    # shadowing it with "False"/"0" (which would crash CronTrigger consumers).
     if isinstance(local_val, str) and local_val.strip():
-        return local_val.strip()
-    env_val = os.environ.get("USER_TIMEZONE")
-    if env_val and env_val.strip():
-        return env_val.strip()
+        candidate = local_val.strip()
+        if _valid_zone(candidate):
+            return candidate
+        logger.warning(
+            "genesis.yaml timezone %r is not a valid IANA zone — falling back; "
+            "set a valid zone via the dashboard Timezone control.",
+            candidate,
+        )
+    env_val = (os.environ.get("USER_TIMEZONE") or "").strip()
+    if env_val and _valid_zone(env_val):
+        return env_val
     return "UTC"
 
 

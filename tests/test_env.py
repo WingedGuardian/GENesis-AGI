@@ -240,3 +240,25 @@ class TestUserTimezonePrecedence:
 
         _invalidate_local_config()
         assert user_timezone() == "Europe/Paris"
+
+    def test_invalid_file_zone_falls_through_to_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # A typo written to genesis.yaml (e.g. by setup-local-config's free-form
+        # prompt) must not be returned unvalidated and crash CronTrigger consumers.
+        self._write_cfg(tmp_path, timezone="Amrica/Chicago")  # typo (invalid)
+        monkeypatch.setenv("USER_TIMEZONE", "Europe/Paris")
+        from genesis.env import _invalidate_local_config, user_timezone
+
+        _invalidate_local_config()
+        assert user_timezone() == "Europe/Paris"
+
+    def test_invalid_file_and_invalid_env_is_utc(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._write_cfg(tmp_path, timezone="Amrica/Chicago")
+        monkeypatch.setenv("USER_TIMEZONE", "Not/AZone")
+        from genesis.env import _invalidate_local_config, user_timezone
+
+        _invalidate_local_config()
+        assert user_timezone() == "UTC"
