@@ -1118,6 +1118,16 @@ class DirectSessionRunner:
             return
         proposal_id = request.caller_context.split(":", 1)[1]
         advisories: list[str] = []
+        # WS-3: a dispatch outcome inherits the SESSION's provenance. A
+        # research/interact/etc. dispatch is external_untrusted — its output can
+        # echo web/browser content, and these outcome memories are now
+        # default-recallable (source_subsystem dropped), so an unstamped one
+        # would default to first_party and bypass recall-time external-content
+        # handling (a laundered indirect prompt injection). Stamp it with the
+        # SAME origin the session's own memories carry (see _PROFILE_ORIGIN use
+        # at session launch). memory_class="fact" pins these as operational
+        # facts so a summary echoing MUST/NEVER isn't misfiled as a rule.
+        dispatch_origin = _PROFILE_ORIGIN.get(request.profile)
         try:
             from genesis.db.crud.ego import (
                 mark_proposal_verification_failed,
@@ -1154,6 +1164,8 @@ class DirectSessionRunner:
                                 source="ego_dispatch_verification",
                                 tags=["ego", "verification_failure"],
                                 memory_type="episodic",
+                                memory_class="fact",
+                                origin_class=dispatch_origin,
                                 wing="autonomy",
                                 room="ego",
                             )
@@ -1207,6 +1219,8 @@ class DirectSessionRunner:
                         source="ego_dispatch_outcome",
                         tags=["ego", outcome_tag],
                         memory_type="episodic",
+                        memory_class="fact",
+                        origin_class=dispatch_origin,
                         wing="autonomy",
                         room="ego",
                     )
