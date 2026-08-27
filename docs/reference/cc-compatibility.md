@@ -155,6 +155,16 @@ Genesis hooks read input through `scripts/hooks/hook_input.py`
 (`read_payload()` / `field()` / `tool_response()` / `session_id()`), which reads
 stdin, extracts the `tool_input`-nested fields, and warns on a malformed payload
 so a broken contract can't silently fail open again.
+
+`session_id` is a special case: a dozen hooks interpolate it into a filesystem
+path (`~/.genesis/sessions/<id>/`), and several `mkdir(parents=True)` — so an id
+carrying `/` or `..` would not merely read the wrong file, it would CREATE
+directories outside the session tree. `is_safe_session_id()` is the single
+source of truth for that check (allow-list `\A[A-Za-z0-9_-]{1,128}\Z`,
+deliberately wider than the observed hex-UUID format so a future CC id shape
+does not break every hook at once), and `session_id()` refuses to return a value
+that fails it. Use the helper — do not re-derive the check; it was previously
+hand-copied in three divergent shapes and omitted at eight sites.
 `tests/test_scripts/test_hook_input_contract.py` feeds each guard a real payload
 and statically forbids any hook from reading a dead payload env var. See
 `.claude/hooks/README.md` for the authoring rule. **A CC bump that changes the

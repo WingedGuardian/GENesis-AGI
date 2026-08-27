@@ -38,6 +38,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.request import pathname2url
 
+# The shared hook-input helper lives in scripts/hooks/; this script runs from
+# scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_input import is_safe_session_id  # noqa: E402
+
 # Load secrets.env so USER_TIMEZONE and other env vars are available
 # before any genesis module imports (which may read os.environ at import time).
 _SECRETS_PATH = Path(__file__).resolve().parent.parent / "secrets.env"
@@ -90,16 +95,29 @@ def _format_day_time(iso: str) -> str:
         return "unknown"
 
 
+def _session_dir(session_id: str) -> Path | None:
+    """The per-session state dir, or None when the id is not a safe path component.
+
+    Every path in this module that interpolates ``session_id`` goes through here,
+    so a traversal id (``../..``) cannot escape ``~/.genesis/sessions/`` — two of
+    the call sites ``mkdir(parents=True)``, so an escape would CREATE directories.
+    One chokepoint rather than four hand-copied checks (see hook_input).
+    """
+    if not is_safe_session_id(session_id):
+        return None
+    return _GENESIS_DIR / "sessions" / session_id
+
+
 def _emit_temporal_context(session_id: str, now: datetime) -> None:
     """Emit absolute timestamp context line."""
     session_start_iso = _get_session_start()
     started = _format_day_time(session_start_iso)
 
     # Read last prompt time from session-scoped state
-    session_dir = _GENESIS_DIR / "sessions" / session_id
-    last_prompt_file = session_dir / "last_prompt_time"
+    session_dir = _session_dir(session_id)
+    last_prompt_file = session_dir / "last_prompt_time" if session_dir else None
     last_msg = ""
-    if last_prompt_file.exists():
+    if last_prompt_file is not None and last_prompt_file.exists():
         with contextlib.suppress(OSError):
             last_msg = _format_day_time(last_prompt_file.read_text().strip())
 
@@ -119,7 +137,9 @@ def _emit_temporal_context(session_id: str, now: datetime) -> None:
 
 def _buffer_message(session_id: str, prompt: str, now: datetime) -> None:
     """Append user message to session-scoped rolling buffer."""
-    session_dir = _GENESIS_DIR / "sessions" / session_id
+    session_dir = _session_dir(session_id)
+    if session_dir is None:
+        return
     session_dir.mkdir(parents=True, exist_ok=True)
 
     messages_file = session_dir / "messages.jsonl"
@@ -320,7 +340,10 @@ def _staleness_throttled(session_id: str, now: datetime) -> bool:
     hand-edited file) is likewise treated as NOT throttled: a negative elapsed is
     always < cooldown, which would otherwise wedge the nudge OFF until wall-clock
     catches up + a full cooldown — suppressing a genuine stale-code warning."""
-    marker = _GENESIS_DIR / "sessions" / session_id / "staleness_last_nudge"
+    sdir = _session_dir(session_id)
+    if sdir is None:
+        return False
+    marker = sdir / "staleness_last_nudge"
     try:
         last = datetime.fromisoformat(marker.read_text().strip())
         elapsed = (now - last).total_seconds()
@@ -341,7 +364,10 @@ def _record_staleness_nudge(session_id: str, now: datetime) -> bool:
     ``_staleness_throttled`` reads as "not throttled" (fail-open toward emitting).
     Returning False lets the caller SUPPRESS instead of spam, so a broken
     filesystem degrades to silence, not a per-prompt banner."""
-    marker = _GENESIS_DIR / "sessions" / session_id / "staleness_last_nudge"
+    sdir = _session_dir(session_id)
+    if sdir is None:
+        return False
+    marker = sdir / "staleness_last_nudge"
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(now.isoformat())
@@ -418,6 +444,10 @@ def main() -> None:
         hook_input = {}
 
     session_id = hook_input.get("session_id", "")
+    # session_id becomes a path component below (two sites mkdir) — reject an
+    # unsafe value at the single entry point rather than at each use.
+    if not is_safe_session_id(session_id):
+        session_id = ""
     prompt = hook_input.get("prompt", "")
     now = datetime.now(UTC)
 

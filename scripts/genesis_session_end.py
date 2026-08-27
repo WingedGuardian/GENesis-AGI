@@ -24,6 +24,11 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+# The shared hook-input helper lives in scripts/hooks/; this script runs from
+# scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_input import is_safe_session_id  # noqa: E402
+
 _FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _GENESIS_DIR = Path.home() / ".genesis"
 _LAST_SESSION_FILE = _GENESIS_DIR / "last_foreground_session.json"
@@ -108,6 +113,9 @@ def main() -> None:
         hook_input = {}
 
     session_id = hook_input.get("session_id", "")
+    # Becomes a path component in the session-state read below.
+    if not is_safe_session_id(session_id):
+        session_id = ""
     transcript_path = hook_input.get("transcript_path", "")
     reason = hook_input.get("reason", "other")
 

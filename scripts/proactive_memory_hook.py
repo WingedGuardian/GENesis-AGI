@@ -36,6 +36,11 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+# The shared hook-input helper lives in scripts/hooks/; this script runs from
+# scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_input import is_safe_session_id  # noqa: E402
+
 REPO_DIR = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_DIR / "src"
 if str(SRC_DIR) not in sys.path:
@@ -281,14 +286,22 @@ _MAX_TRAIL_DISPLAY = 50  # Show up to this many pivots — the full session arc 
 _GENESIS_PREFIX = str(Path.home() / "genesis") + "/"
 
 
-def _trail_path(session_id: str) -> Path:
-    """Path to the intent trail file for a session."""
+def _trail_path(session_id: str) -> Path | None:
+    """Path to the intent trail file for a session, or None if the id is unsafe.
+
+    ``session_id`` is a path component here, so an id carrying ``/`` or ``..``
+    would escape the sessions dir (mirrors ``_ws_path``/``_load_recent_files``).
+    """
+    if not is_safe_session_id(session_id):
+        return None
     return _TRAIL_DIR / session_id / "intent_trail.json"
 
 
 def _load_trail(session_id: str) -> dict:
     """Load intent trail from disk. Returns empty structure if missing."""
     path = _trail_path(session_id)
+    if path is None:
+        return {"session_id": session_id, "pivots": [], "last_keywords": [], "msg_count": 0}
     try:
         if path.exists():
             return json.loads(path.read_text())
@@ -300,6 +313,8 @@ def _load_trail(session_id: str) -> dict:
 def _save_trail(session_id: str, trail: dict) -> None:
     """Atomic write of intent trail to disk."""
     path = _trail_path(session_id)
+    if path is None:
+        return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
@@ -494,7 +509,7 @@ def _ws_path(session_id: str) -> Path | None:
     Session IDs arrive via hook stdin — refuse anything that could
     escape the sessions dir (mirrors _load_recent_files).
     """
-    if not session_id or "/" in session_id or ".." in session_id:
+    if not is_safe_session_id(session_id):
         return None
     return _TRAIL_DIR / session_id / _WS_FILENAME
 
@@ -760,7 +775,7 @@ def _keywords_from_files(file_paths: list[str]) -> list[str]:
 
 def _load_recent_files(session_id: str) -> list[str]:
     """Load recently-touched files for this session from PostToolUse state."""
-    if not session_id or "/" in session_id or ".." in session_id:
+    if not is_safe_session_id(session_id):
         return []
     state_file = Path(os.path.expanduser("~/.genesis/sessions")) / session_id / "recent_files.json"
     if not state_file.exists():
@@ -1297,7 +1312,7 @@ def _extract_genesis_summary(session_id: str) -> str | None:
 
     Returns None if file doesn't exist or is empty.
     """
-    if not session_id:
+    if not is_safe_session_id(session_id):
         return None
 
     obs_path = Path.home() / ".genesis" / "sessions" / session_id / "tool_observations.jsonl"

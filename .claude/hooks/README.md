@@ -54,8 +54,26 @@ from hook_input import read_payload, field, tool_response, session_id  # scripts
 payload = read_payload()                 # full payload dict ({} on failure)
 cmd = field(payload, "command")          # tool_input.command (also handles Write's file_path, etc.)
 result = tool_response(payload)          # PostToolUse result
-sid = session_id(payload)                # session id (for per-session sentinels)
+sid = session_id(payload)                # session id, validated as a path component
 ```
+
+**Building a path from the session id?** `session_id()` already refuses an
+unsafe value, but if you read the id from the payload yourself, validate it with
+`is_safe_session_id()` before it becomes a path component — several hooks
+`mkdir(parents=True)` under `~/.genesis/sessions/<id>/`, so a `/` or `..` in the
+id CREATES directories outside the session tree:
+
+```python
+from hook_input import is_safe_session_id
+
+if not is_safe_session_id(sid):
+    return                               # or return None/[] — fail toward doing nothing
+```
+
+Do NOT hand-roll the check (`"/" in sid or ".." in sid`). That idiom existed in
+three divergent shapes across the hooks and was simply omitted at eight sites;
+one copy also used `^…$`, which accepts a trailing newline. One helper, one
+behavior.
 
 Scripts in `scripts/` (not `scripts/hooks/`) reach the helper with a one-line
 bootstrap: `sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks"))`.

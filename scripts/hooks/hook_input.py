@@ -113,19 +113,61 @@ def tool_response(payload: dict) -> dict:
     return _loads(os.environ.get(_LEGACY_RESULT_ENV, ""))
 
 
+# A CC session id becomes a filesystem PATH COMPONENT in a dozen hooks (the
+# per-session state dir ``~/.genesis/sessions/<id>/``), and two of those sites
+# ``mkdir(parents=True)`` — so an id carrying ``/`` or ``..`` does not merely
+# read the wrong file, it CREATES directories outside the session tree.
+#
+# The allow-list is deliberately WIDER than the observed format (2026-08-27: all
+# 1,514 ids in ~/.claude/projects/*/ plus the ``cc_sessions`` table were lowercase
+# hex UUIDs; re-derive with a charset scan over those two sources) so a
+# future CC id format does not break every hook at once — while still rejecting
+# ``/``, ``\\``, ``.``, NUL and control characters.
+#
+# ``\A…\Z`` rather than ``^…$``: ``$`` also matches BEFORE a trailing newline,
+# so ``^[A-Za-z0-9_-]+$`` accepts ``"abc\n"`` — itself a valid path component,
+# which would silently create a stray directory.
+_SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
+
+
+def is_safe_session_id(value: object) -> bool:
+    """Whether *value* is safe to interpolate as ONE filesystem path component.
+
+    The single source of truth for this check. Hooks previously hand-copied it
+    in three different shapes (``"/" in sid``, plus-``"\\"``, and a regex) and
+    omitted it entirely in four files; use this instead of re-deriving it.
+
+    Non-strings and the empty string are unsafe (an empty component would
+    collapse a per-session path onto its parent).
+    """
+    return isinstance(value, str) and bool(_SESSION_ID_RE.match(value))
+
+
 def session_id(payload: dict, default: str = "unknown") -> str:
-    """The CC session id.
+    """The CC session id, validated as a filesystem-safe path component.
 
     New shape carries it as a top-level ``session_id``; the legacy contract
     used the ``CLAUDE_SESSION_ID`` env var. Falls back to ``default`` so a
     per-session sentinel never silently collapses to one global key.
+
+    An id that fails :func:`is_safe_session_id` is REJECTED (never returned),
+    because callers interpolate the result into a path. A present-but-invalid
+    id is anomalous — the one case that warns — while a merely absent id is
+    normal and silent.
     """
     if isinstance(payload, dict):
         sid = payload.get("session_id")
-        if isinstance(sid, str) and sid:
+        if is_safe_session_id(sid):
             return sid
+        if isinstance(sid, str) and sid:
+            print(
+                "WARNING: rejecting unsafe session_id (not a safe path component)",
+                file=sys.stderr,
+            )
     env_sid = os.environ.get("CLAUDE_SESSION_ID", "")
-    return env_sid or default
+    if is_safe_session_id(env_sid):
+        return env_sid
+    return default
 
 
 def run_guard(main_fn, name: str) -> None:

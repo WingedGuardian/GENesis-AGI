@@ -29,6 +29,11 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+# The shared hook-input helper lives in scripts/hooks/; this script runs from
+# scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_input import is_safe_session_id  # noqa: E402
+
 # Load secrets.env so USER_TIMEZONE and other env vars are available
 # before any genesis module imports (which may read os.environ at import time).
 _SECRETS_PATH = Path(__file__).resolve().parent.parent / "secrets.env"
@@ -1065,7 +1070,7 @@ def _charter_emission_block(
     """
     if not session_id or source == "clear":
         return ""
-    if "/" in session_id or ".." in session_id:
+    if not is_safe_session_id(session_id):
         return ""
     charter, ledger = _load_charter_db(session_id, db_path)
     if charter is None:
