@@ -17,7 +17,7 @@
 # Install the tool first:
 #   curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui
 
-# Locate the binary WITHOUT depending on $HOME: some MCP clients (Kimi Code)
+# Locate the binary WITHOUT depending on $HOME: some MCP clients
 # spawn servers with a scrubbed environment (no HOME/USER/XDG_RUNTIME_DIR),
 # where ${HOME}/.local/bin/... would collapse to /.local/bin/... and fail the
 # -x check below (the client then reports a bare "write EPIPE"). Resolution

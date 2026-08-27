@@ -234,10 +234,10 @@ def test_build_env_strips_parent_anthropic_base_url(invoker):
 
 
 def test_scope_args_empty_when_probe_fails(monkeypatch):
-    """Env-scrubbed spawners (Kimi Code Bash tool, CI) have the systemd-run
-    binary but no reachable user manager — the probe must fail closed to
-    'no scope wrap' instead of letting systemd-run kill the CC subprocess
-    at 0.0s with 'Failed to connect to bus' (gauntlet infra-skips, 2026-08-27)."""
+    """An env-scrubbed spawner (some agent CLIs' shell tooling, CI runners) has
+    the systemd-run binary but no reachable user manager — the probe must fail
+    closed to 'no scope wrap' instead of letting systemd-run kill the CC
+    subprocess at 0.0s with 'Failed to connect to bus'."""
     import subprocess as real_subprocess
 
     import genesis.cc.invoker as inv_mod

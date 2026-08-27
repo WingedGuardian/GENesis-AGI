@@ -214,7 +214,7 @@ def _fake_named_binary(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def test_scrubbed_env_resolves_via_path(tmp_path):
-    # Kimi Code spawns MCP servers with HOME empty and no
+    # Some MCP clients spawn servers with HOME empty and no
     # CODEBASE_MEMORY_MCP_BIN; the launcher must fall through to a PATH
     # lookup instead of dying with "not installed" (seen by the client as a
     # bare EPIPE). No systemd-run on PATH either → ulimit fallback.
