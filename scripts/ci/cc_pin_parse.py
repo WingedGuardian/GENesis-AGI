@@ -35,6 +35,21 @@ line, and every match is collected rather than the first. Then:
   * none         -> ``None``
   * more than one-> ``None``
 
+RECOGNISING THE PIN FORM IS NOT KNOWING WHAT THE FILE MEANS. ``cc_version.sh``
+is sourced, not read, so a line the pin pattern does not recognise can still
+change the value. A file may leave the pin untouched and reassign below it::
+
+    CC_VERSION="${CC_VERSION:-2.1.218}"
+    if [ -z "${CC_ALIGN_LEGACY:-}" ]; then
+      CC_VERSION="2.1.999"
+    fi
+
+Reading only the pin form gives 2.1.218 for a file bash resolves as 2.1.999 —
+a forward move to an un-vetted version that reads as "unchanged" and is asked
+for no receipts. So the count that decides is over EVERY assignment to the
+variable (``_ANY_ASSIGNMENT``), in any shape, taken before any value is read.
+More than one means the file's value is not something this parser can state.
+
 Returning ``None`` for a duplicate is deliberate, and it is NOT what bash does
 (bash takes the last). A second effective assignment in a one-line pin file is
 not a thing anyone does by accident, so the honest report is "I cannot tell you
@@ -59,6 +74,31 @@ import re
 #: ``_strip_comments`` has already removed those lines.
 _ASSIGNMENT = r'^[^\S\n]*{var}=[^\S\n]*"?\$\{{{var}:-{value}\}}"?'
 
+#: ANY assignment to the variable, in any shape — not just the pin form above.
+#: This exists because recognising only the pin form is not the same as knowing
+#: what the file MEANS. A file can leave the pin line untouched and reassign the
+#: variable further down::
+#:
+#:     CC_VERSION="${CC_VERSION:-2.1.218}"     <- the only line _ASSIGNMENT sees
+#:     if [ -z "${CC_ALIGN_LEGACY:-}" ]; then
+#:       CC_VERSION="2.1.999"                  <- what bash actually resolves
+#:     fi
+#:
+#: Matching only the pin form reports 2.1.218 for a file bash resolves as
+#: 2.1.999 — a forward move to an un-vetted version that reads as "unchanged"
+#: and is asked for no receipts. Counting EVERY assignment closes that: two
+#: means the file's value is not a thing this parser can state.
+#:
+#: Deliberately over-broad. Over-detection costs a block (safe: a human reads
+#: the file); under-detection costs a bypass. This is a DETECTOR, not a shell
+#: parser — it never has to decide which assignment wins, only whether more
+#: than one exists.
+_ANY_ASSIGNMENT = (
+    r"^[^\S\n]*"
+    r"(?:(?:export|readonly|local|declare|typeset)[^\S\n]+(?:-\w+[^\S\n]+)*)?"
+    r"{var}="
+)
+
 _SEMVER = r"([0-9]+\.[0-9]+\.[0-9]+)"
 _INTEGER = r"([0-9]+)"
 
@@ -76,11 +116,19 @@ def _strip_comments(text: str) -> str:
 
 
 def _parse(text: str, var: str, value_pattern: str) -> str | None:
+    body = _strip_comments(text)
+
+    # Refuse BEFORE reading a value: if the variable is assigned more than once
+    # in any shape, the pin line is not the file's answer and extracting it
+    # would state a version bash does not resolve to.
+    if len(re.findall(_ANY_ASSIGNMENT.format(var=re.escape(var)), body, re.MULTILINE)) != 1:
+        return None
+
     pattern = re.compile(
         _ASSIGNMENT.format(var=re.escape(var), value=value_pattern),
         re.MULTILINE,
     )
-    matches = pattern.findall(_strip_comments(text))
+    matches = pattern.findall(body)
     if len(matches) != 1:
         return None  # 0 = not found; >1 = ambiguous. Both are "cannot tell".
     return matches[0]

@@ -130,6 +130,64 @@ def test_duplicate_assignment_is_unparseable_not_last_wins() -> None:
     assert pin.parse_cc_version(text) is None
 
 
+_REASSIGN = (
+    "#!/usr/bin/env bash\n"
+    'CC_VERSION="${CC_VERSION:-2.1.218}"\n'
+    'NODE_MAJOR="${NODE_MAJOR:-22}"\n'
+    "\n"
+    'if [ -z "${CC_ALIGN_LEGACY:-}" ]; then\n'
+    '  CC_VERSION="2.1.999"\n'
+    "fi\n"
+)
+
+
+def test_a_later_plain_reassignment_is_unparseable(tmp_path: Path) -> None:
+    """The pin line is untouched; a plain assignment below it changes the value.
+
+    Recognising the pin form is not the same as knowing what the file MEANS —
+    cc_version.sh is SOURCED, so a line the pin pattern does not match still
+    decides the result. Reading only the pin form reported 2.1.218 for a file
+    bash resolves as 2.1.999: a forward move to an un-vetted version that reads
+    as "unchanged" and is asked for no receipts.
+
+    Asserted against real bash, so this pins the DIVERGENCE, not a typed-in
+    expectation.
+    """
+    bash_answer = _bash_resolves(_REASSIGN, "CC_VERSION", tmp_path)
+
+    assert bash_answer == "2.1.999", "fixture no longer reproduces the reassignment"
+    assert pin.parse_cc_version(_REASSIGN) is None, (
+        "the parser must refuse, not report the pin line — reporting 2.1.218 here "
+        "is a forward bump that reads as unchanged"
+    )
+
+
+def test_reassignment_refusal_does_not_fire_on_the_real_pin_file() -> None:
+    """Over-detection costs a block, so prove it does not block the shipped file.
+
+    `_ANY_ASSIGNMENT` is deliberately broad (export/readonly/local/declare/
+    typeset prefixes). The live cc_version.sh dereferences CC_VERSION in several
+    helpers (`local pin="${CC_VERSION:-}"`), which must NOT count as assignments
+    to it.
+    """
+    text = _PIN_FILE.read_text()
+
+    assert pin.parse_cc_version(text) is not None
+    assert pin.parse_node_major(text) is not None
+
+
+def test_export_prefixed_reassignment_is_also_counted() -> None:
+    """The shape of the second assignment must not be the way around the check."""
+    for second in (
+        'export CC_VERSION="2.1.999"',
+        'readonly CC_VERSION="2.1.999"',
+        'declare -g CC_VERSION="2.1.999"',
+    ):
+        text = f'CC_VERSION="${{CC_VERSION:-2.1.218}}"\n{second}\n'
+
+        assert pin.parse_cc_version(text) is None, f"{second!r} evaded the check"
+
+
 def test_absent_is_none() -> None:
     assert pin.parse_cc_version('NODE_MAJOR="${NODE_MAJOR:-22}"\n') is None
     assert pin.parse_node_major('CC_VERSION="${CC_VERSION:-2.1.1}"\n') is None
