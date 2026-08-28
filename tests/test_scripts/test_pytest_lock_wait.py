@@ -496,67 +496,36 @@ class TestPinnedToTheLockModule:
             assert _mod._format_age(seconds) == pytest_lock._format_age(seconds)
 
 
-#: PreToolUse/Bash hooks that decide pytest CONCURRENCY — whether a run may
-#: proceed *now*. Must stay empty: that decision belongs to the lock alone, and
-#: a second oracle for it drifted from the lock five times across three review
-#: rounds. Hooks deciding a DIFFERENT axis are fine and are listed as known-good
-#: below, so this guard fails on a NEW entrant rather than on the status quo.
-_CONCURRENCY_DECIDERS = {"concurrent_test_guard"}
+def test_the_deleted_concurrency_oracle_stays_gone():
+    """The second oracle was deleted, not patched — keep it deleted.
 
-#: Every PreToolUse/Bash hook as of this change, enumerated from the registry
-#: rather than guessed. None of these decides pytest concurrency;
-#: ``full_suite_guard`` refuses pytest on a DIFFERENT axis (scope:
-#: whole-directory vs targeted, with its own ``# full-suite-ok`` override and
-#: its own exit status), which is fine — two layers deciding different questions
-#: never drift. A NEW entrant trips this list so someone confirms which axis it
-#: is on before it silently becomes the second oracle again.
-_KNOWN_PRETOOLUSE_BASH = {
-    "fi'",  # an inline bash guard, not a script
-    "background_pipe_guard",
-    "destructive_command_guard",
-    "git_discard_guard",
-    "worktree_cwd_guard",
-    "protected_paths_guard",
-    "credential_surface_hook",
-    "git_push_guard",
-    "pre_push_privacy_review",
-    "repo_routing_guard",
-    "full_suite_guard",
-    "review_enforcement_commit",
-    "cc-deploy-timeout-guard",
-}
+    This is a NARROW guard, deliberately, and it is worth saying why. The class
+    invariant is "no PreToolUse hook decides pytest CONCURRENCY", and that is not
+    statically checkable. Three designs were tried:
 
+      1. name-scoped (this one) — true, quiet, but does not cover the class;
+      2. enumerate every PreToolUse/Bash hook against a hand-listed baseline —
+         class-scoped, but fired in CI the moment someone added an unrelated
+         `$?`-after-a-pipeline advisory;
+      3. flag any such hook whose SOURCE mentions pytest — also class-scoped, and
+         also wrong: `worktree_cwd_guard` and an inline guard both mention pytest
+         in comments and help text while deciding nothing about it.
 
-def test_no_hook_decides_pytest_concurrency():
-    """The second oracle was deleted, not patched — enumerate the CLASS.
-
-    An earlier version of this test asserted only that the deleted file's NAME
-    was absent from the registry. That is name-scoped protection for a
-    class-scoped claim: it passed happily with a different pytest-refusing hook
-    registered on the very same event and matcher. Enumerate every
-    PreToolUse/Bash hook instead, so a new concurrency decider fails here.
+    A guard that cries wolf gets deleted by the next person to hit it, so the
+    class invariant lives where invariants that cannot be tested belong: stated
+    in `genesis.util.pytest_lock`'s docstring and in
+    `.claude/docs/testing-patterns.md`, both of which name the one hook that
+    legitimately refuses pytest on a different axis (`full_suite_guard`: SCOPE,
+    not timing). This test only pins the specific regression — that the deleted
+    file and its registration do not come back.
     """
     assert not (_WORKTREE / "scripts" / "hooks" / "concurrent_test_guard.py").exists()
 
     import json
 
     settings = json.loads((_WORKTREE / ".claude" / "settings.json").read_text())
-    seen = []
-    for group in settings.get("hooks", {}).get("PreToolUse", []):
-        if group.get("matcher") != "Bash":
-            continue
-        for hook in group.get("hooks", []):
-            stem = Path(str(hook.get("command", "")).split()[-1]).stem
-            seen.append(stem)
-            assert stem not in _CONCURRENCY_DECIDERS, (
-                f"{stem} re-opens the second-oracle class the lock replaced"
-            )
-
-    unexpected = [s for s in seen if s and s not in _KNOWN_PRETOOLUSE_BASH]
-    assert not unexpected, (
-        f"new PreToolUse/Bash hook(s) {unexpected} — confirm none of them "
-        "decides pytest CONCURRENCY, then add to _KNOWN_PRETOOLUSE_BASH"
-    )
+    registered = json.dumps(settings.get("hooks", {}))
+    assert "concurrent_test_guard" not in registered
 
 
 def test_scan_reports_pid_command_and_age(tmp_path):
