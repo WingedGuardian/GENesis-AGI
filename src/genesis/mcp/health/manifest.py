@@ -169,7 +169,7 @@ HEARTBEAT_EXPECTED = {
     # A real reflection outage surfaces faster via the awareness heartbeat
     # (6 min), the cc resilience axis, and the deferred-work backlog.
     "reflection": (600, 14400),
-    "outreach": (86400, 172800),
+    "outreach": (120, 600),       # 60s daemon-thread pulse (outreach/heartbeat.py); overdue at 10×
     "dashboard": (120, 600),      # 60s daemon-thread pulse; overdue at 10× (was 4×)
     "ego": (300, 14400),          # 5-min liveness pulse (ego_heartbeat job), overdue at 4h
 }
@@ -182,6 +182,17 @@ HEARTBEAT_EXPECTED = {
 # pulse THROUGH pause, so they are NOT here — an overdue-while-paused for them is
 # a genuine scheduler death that must still surface. See compute_heartbeat_staleness.
 _PAUSE_GATED_HEARTBEATS = frozenset({"surplus", "inbox"})
+
+# Subsystems whose heartbeat only begins after a RUNTIME precondition (not just a
+# successful init), so a bootstrap-manifest ``"ok"`` (init constructed the object)
+# does NOT imply the subsystem should be pulsing yet. For these, an ``ok``-but-never-
+# pulsed state is a benign non-death — the started-silent never_started inference is
+# INVALID (their died-after-running case is caught by ``subsystem_stale`` via the
+# dedicated heartbeat instead). A genuine init FAILURE (``failed:``/``degraded``) still
+# surfaces as never_started. Currently: outreach — its scheduler is constructed at boot
+# but only ``.start()``s once a messaging channel registers, which may never happen even
+# on a Telegram-configured install (revoked token, Telegram unreachable at boot).
+_CONDITIONAL_PULSE_SUBSYSTEMS = frozenset({"outreach"})
 
 # The complete set of statuses ``compute_heartbeat_staleness`` can return. Every
 # consumer that switches on the status string (the alert loop in errors.py, the ego
@@ -251,14 +262,55 @@ def _inbox_enabled() -> bool:
     return bool(load_inbox_config(config_path).enabled)
 
 
+def _outreach_enabled() -> bool:
+    """Is a messaging channel (Telegram) configured — i.e. is outreach *supposed* to run?
+
+    The outreach scheduler only ``.start()``s once a messaging channel registers
+    (``runtime/_job_health.py`` → only Telegram registers), so a Telegram-less
+    (dashboard-only) install legitimately never runs outreach and must NOT alarm.
+    Uses the SAME side-effect-free loader the bridge + onboarding-readiness T2 signal
+    use (``channels.bridge_config.build_bridge_config`` over the parsed secrets), so
+    the "would Telegram start?" answer can't drift between them.
+
+    Fails CLOSED (→ False, benign) on any read/parse error — the conservative direction
+    for a false-alarm-prone subsystem (the OPPOSITE of ``_subsystem_enabled``'s default
+    True), so a missing/malformed secrets file never manufactures a permanent outreach
+    cessation alert on an install that isn't even running outreach."""
+    try:
+        import os
+
+        from genesis.channels.bridge_config import (
+            build_bridge_config,
+            parse_secrets_env_text,
+        )
+        from genesis.env import secrets_path
+
+        path = str(secrets_path())
+        if not os.path.exists(path):
+            return False
+        with open(path) as f:
+            return build_bridge_config(parse_secrets_env_text(f.read())) is not None
+    except Exception as exc:
+        # Log the exception TYPE only, never exc_info/message: a malformed non-token
+        # field in secrets.env (DAY_BOUNDARY_HOUR, or a TELEGRAM_ALLOWED_USERS entry
+        # that passes .isdigit() but not int()) can embed its raw value in the
+        # exception text — keep it out of the log. Broad catch is deliberate (fail
+        # CLOSED → False for EVERY error, so nothing bubbles to _subsystem_enabled's
+        # default-True). The token itself never reaches here (build_bridge_config
+        # returns None cleanly on a missing/placeholder token, no raise).
+        logger.debug("outreach-enabled read failed (%s); treating as not-enabled", type(exc).__name__)
+        return False
+
+
 def _subsystem_enabled(name: str) -> bool:
     """Best-effort: is this subsystem configured to run?
 
     A subsystem DISABLED (or unconfigured) must not raise a cessation/never-started
     alert: a disabled subsystem's stopped or absent pulse is intentional, not a death.
-    Covers ego (``ego`` config ``.enabled``) and inbox (``inbox_monitor.yaml`` present +
-    ``.enabled``); every other name defaults True (fail toward surfacing — only
-    subsystems with a real disable switch are checked)."""
+    Covers ego (``ego`` config ``.enabled``), inbox (``inbox_monitor.yaml`` present +
+    ``.enabled``), and outreach (a messaging channel / Telegram configured); every other
+    name defaults True (fail toward surfacing — only subsystems with a real disable
+    switch are checked)."""
     try:
         if name == "ego":
             from genesis.ego.config import load_ego_config
@@ -266,6 +318,8 @@ def _subsystem_enabled(name: str) -> bool:
             return bool(load_ego_config().enabled)
         if name == "inbox":
             return _inbox_enabled()
+        if name == "outreach":
+            return _outreach_enabled()
     except Exception:
         logger.debug("subsystem-enabled read failed for %s", name, exc_info=True)
     return True
@@ -393,6 +447,15 @@ def _never_started_verdict(
             is_paused = paused if paused is not None else _read_global_paused()
             if is_paused:
                 return benign
+        # Conditional-pulse subsystems (outreach): manifest "ok" means the object was
+        # constructed, NOT that it should be pulsing — its pulse only begins after a
+        # runtime precondition (channel registration) that may never occur. So an
+        # ok-but-never-pulsed state is benign, not a started-silent death (which would
+        # reintroduce a permanent unresolvable alert on a Telegram-configured install
+        # whose scheduler never starts). A genuine init FAILURE for it still alarms via
+        # the ``failed:``/``degraded`` branch above.
+        if name in _CONDITIONAL_PULSE_SUBSYSTEMS:
+            return benign
         persisted_at = parse_iso_utc(mf.get("persisted_at"))
         if persisted_at is None:
             return benign  # can't establish the grace clock → benign
