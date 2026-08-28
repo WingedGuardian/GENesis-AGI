@@ -6,9 +6,19 @@ tail -2`` followed by ``echo $?`` reports *tail* succeeding while the unit faile
 hook: the command "works" and the reading is garbage. (Origin 2026-08-27: that
 exact shape reported a passing verification for a systemd unit that had failed.)
 
-Suppressed when the command shows the author already knows: ``set -o pipefail``
+Suppressed when the command shows the author already knows: an ENABLING
+``set -o pipefail`` (or a cluster ending in ``o``, as in ``set -euo pipefail``)
 makes ``$?`` the right thing to read, and ``PIPESTATUS`` IS the remedy this hook
-recommends — advising against it would punish the correct fix.
+recommends — advising against it would punish the correct fix. The pipefail check
+matches the enabling form specifically: ``set +o pipefail`` contains the same
+substring while DISABLING it, so a substring test exempted the command that most
+needs the advice.
+
+A pipe inside ``$( … )`` counts here, unlike in the sibling background-output
+guard. Bash defines an assignment-only command's status as the status of the
+command substitution, so ``RESULT=$(false | true); echo $?`` yields 0 — false's
+failure invisible. Both spellings of the status parameter are recognised,
+``$?`` and ``${?}``.
 
 ADVISORY, never blocking: ``$?`` after a pipeline is legitimate under pipefail or
 when you genuinely care about the last stage, so a block would cost more than the
@@ -40,6 +50,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 
 # Self-locate so hook_input/shell_parse resolve whether run as a script or imported.
@@ -57,15 +68,40 @@ _ADVICE = (
 )
 
 
+#: Bash spells the status parameter two ways. Checking only the bare form let
+#: `false | true; rc=${?}` through — the braced spelling is not exotic, it is what
+#: anyone writing `${?}` beside other `${...}` expansions produces.
+_STATUS_READ = re.compile(r"\$\?|\$\{\?\}")
+
+#: `pipefail` ENABLED, in either spelling: `set -o pipefail` or a cluster ending in
+#: `o`, as in `set -euo pipefail`.
+_PIPEFAIL_ON = re.compile(r"\bset\s+-[A-Za-z]*o[A-Za-z]*\s+pipefail\b")
+#: …and explicitly turned OFF again.
+_PIPEFAIL_OFF = re.compile(r"\bset\s+\+[A-Za-z]*o[A-Za-z]*\s+pipefail\b")
+
+
 def _advisory(command: str) -> str | None:
     """The nudge for *command*, or None when there is nothing to say."""
-    if "$?" not in command:
+    if not _STATUS_READ.search(command):
         return None
-    # The author already handled it: pipefail makes `$?` correct, and PIPESTATUS is
-    # this hook's own recommended remedy.
-    if "pipefail" in command or "PIPESTATUS" in command:
+
+    # The author already handled it. Both suppressions used to be raw substring
+    # tests, which is wrong in the unsafe direction: `set +o pipefail` CONTAINS
+    # "pipefail" while disabling the very thing that would make `$?` correct, so
+    # `set +o pipefail; false | true; echo "$?"` was silently exempted. Require an
+    # ENABLING form that is not subsequently switched off.
+    if _PIPEFAIL_ON.search(command) and not _PIPEFAIL_OFF.search(command):
         return None
-    if not has_top_level_pipe(command):
+    # PIPESTATUS stays a plain substring: it is this hook's own recommended remedy
+    # and has no disabling spelling, so naming it at all is evidence of awareness.
+    if "PIPESTATUS" in command:
+        return None
+
+    # count_substitutions=True, unlike the background-output guard. Bash defines an
+    # assignment-only command's status as the status of the command substitution, so
+    # `rc=$(prog | tail); echo $?` reads the FILTER's status — the exact footgun this
+    # guard exists to flag, and invisible while `$( … )` is skipped.
+    if not has_top_level_pipe(command, count_substitutions=True):
         return None
     return _ADVICE
 

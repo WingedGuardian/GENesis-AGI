@@ -57,6 +57,39 @@ class TestFiresOnTheRealTrap:
     def test_fires_regardless_of_which_filter(self):
         assert _advice("prog | jq .x; echo $?") != ""
 
+    def test_braced_status_parameter(self):
+        """`${?}` is the same read, spelled the way anyone writing it beside other
+        `${...}` expansions produces. Checking only the bare `$?` let it through."""
+        assert _advice("false | true; rc=${?}; echo $rc") != ""
+        assert _advice('systemd-run --wait x | tail -2; echo "${?}"') != ""
+
+    def test_pipe_inside_a_command_substitution(self):
+        """This case previously asserted SILENCE, on the reasoning that a
+        substitution's output is captured so the outer `$?` is "the assignment's".
+
+        That reasoning is backwards. Bash defines an assignment-only command's
+        status as the status of the command substitution, which for a pipeline is
+        the LAST component's. MEASURED:
+
+            $ RESULT=$(false | true); echo $?
+            0          # false's failure is invisible
+            $ set -o pipefail; RESULT=$(false | true); echo $?
+            1          # ...which is exactly what the advice recommends
+
+        So the old test pinned the defect as the specification, and the guard was
+        silent on a real instance of the trap it exists to flag. The exclusion is
+        correct for the sibling background-output guard — where captured output is
+        genuinely not swallowed — which is why the shared scanner now takes it as
+        a parameter rather than one consumer's assumption.
+        """
+        assert _advice('RESULT=$(cmd | filter); echo "$?"') != ""
+
+    def test_pipefail_switched_back_off_is_not_a_suppression(self):
+        """`set +o pipefail` CONTAINS the substring "pipefail" while disabling the
+        very thing that would make `$?` correct, so a raw substring check exempted
+        the command that most needs the advice."""
+        assert _advice('set +o pipefail; false | true; echo "$?"') != ""
+
 
 class TestSuppressedWhenTheAuthorAlreadyHandledIt:
     """Both of these were BLOCKERs in the first draft: the guard fired on the one
@@ -97,15 +130,6 @@ class TestStaysSilent:
 
     def test_literal_pipe_argument(self):
         assert _advice('grep -F "|" file; echo "$?"') == ""
-
-    def test_command_substitution_captures_rather_than_pipes(self):
-        """`$(cmd | filter)` is captured, so the outer `$?` is the assignment's.
-
-        Deliberately includes a `$?` read: without it the command would be silent
-        for the trivial reason that there is no `$?` at all, and the test could
-        not fail even if the capture logic regressed.
-        """
-        assert _advice('RESULT=$(cmd | filter); echo "$?"') == ""
 
     def test_ordinary_environment_variables_never_trigger(self):
         """The measured 19%-false-positive class. These MUST stay silent — an
