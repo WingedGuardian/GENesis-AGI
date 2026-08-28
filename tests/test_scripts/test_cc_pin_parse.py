@@ -176,16 +176,53 @@ def test_reassignment_refusal_does_not_fire_on_the_real_pin_file() -> None:
     assert pin.parse_node_major(text) is not None
 
 
-def test_export_prefixed_reassignment_is_also_counted() -> None:
-    """The shape of the second assignment must not be the way around the check."""
-    for second in (
-        'export CC_VERSION="2.1.999"',
-        'readonly CC_VERSION="2.1.999"',
-        'declare -g CC_VERSION="2.1.999"',
-    ):
-        text = f'CC_VERSION="${{CC_VERSION:-2.1.218}}"\n{second}\n'
+#: Every shape MEASURED as resolving to 2.1.999 under bash while the pin line
+#: still reads 2.1.218. The anchored first attempt closed only the first one —
+#: the one it had a test for. That is why this list is a parametrization and not
+#: a single case.
+_REASSIGNMENT_SHAPES = [
+    'CC_VERSION="2.1.999"',
+    'export CC_VERSION="2.1.999"',
+    'readonly CC_VERSION="2.1.999"',
+    'declare -g CC_VERSION="2.1.999"',
+    '[ -n "${X:-}" ] || CC_VERSION="2.1.999"',
+    'if true; then CC_VERSION="2.1.999"; fi',
+    "true && CC_VERSION=2.1.999",
+    'printf -v CC_VERSION "2.1.999"',
+    'read -r CC_VERSION <<< "2.1.999"',
+    "eval CC_VERSION=2.1.999",
+]
 
-        assert pin.parse_cc_version(text) is None, f"{second!r} evaded the check"
+
+@pytest.mark.parametrize("second", _REASSIGNMENT_SHAPES)
+def test_every_reassignment_shape_is_counted(second: str, tmp_path: Path) -> None:
+    """The SHAPE of the second assignment must not be the way around the check.
+
+    Each case is checked against real bash first, so the test cannot quietly
+    degrade into asserting that the parser refuses files bash does not actually
+    change. If bash stops resolving 2.1.999 for a shape, that case fails loudly
+    rather than passing for the wrong reason.
+    """
+    text = f'CC_VERSION="${{CC_VERSION:-2.1.218}}"\n{second}\n'
+
+    assert _bash_resolves(text, "CC_VERSION", tmp_path) == "2.1.999", (
+        f"fixture no longer reproduces a reassignment for {second!r}"
+    )
+    assert pin.parse_cc_version(text) is None, f"{second!r} evaded the check"
+
+
+def test_similar_variable_names_are_not_miscounted() -> None:
+    """The other failure direction: over-detection costs a BLOCK.
+
+    `MY_CC_VERSION=` / `OLD_CC_VERSION=` must not read as a second assignment to
+    CC_VERSION, and `"${CC_VERSION:-…}"` is `CC_VERSION:-`, not `CC_VERSION=`.
+    """
+    pinline = 'CC_VERSION="${CC_VERSION:-2.1.218}"\n'
+
+    for decoy in ("MY_CC_VERSION=1", "OLD_CC_VERSION=1", 'NOTE_CC_VERSION="x"'):
+        assert pin.parse_cc_version(pinline + decoy + "\n") == "2.1.218", (
+            f"{decoy!r} was miscounted as an assignment to CC_VERSION"
+        )
 
 
 def test_absent_is_none() -> None:
