@@ -19,6 +19,11 @@ import aiosqlite
 
 from genesis.db.crud.capability_map import MIN_SAMPLE_SIZE
 
+# The ego_proposals lookback. Shared deliberately: source #1 (journal) excludes
+# proposals inside this window because source #2 counts them, and if the two
+# values drifted the overlap would silently return as a double-count.
+_PROPOSAL_WINDOW_DAYS = 30
+
 logger = logging.getLogger(__name__)
 
 
@@ -41,7 +46,15 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
     # events, not user decisions on proposal quality.
     try:
         from genesis.db.crud import intervention_journal as journal_crud
-        aggs = await journal_crud.aggregate_by_type(db)
+        # Exclude proposals the ego_proposals source below will count. Creating
+        # a proposal batch writes BOTH an ego_proposals row and a journal row per
+        # proposal (ego/session.py), so without this one observation counts twice
+        # — two proposals reach total_weight 4 and clear the three-sample floor
+        # while representing two observations. The journal still contributes
+        # everything OLDER than the window, which the other source cannot see.
+        aggs = await journal_crud.aggregate_by_type(
+            db, exclude_proposals_within_days=_PROPOSAL_WINDOW_DAYS
+        )
         for row in aggs:
             domain = row["action_type"]
             # Only count terminal user-decision states in denominator
@@ -65,9 +78,10 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
                       SUM(CASE WHEN status IN ('approved', 'executed') THEN 1 ELSE 0 END) as success,
                       SUM(CASE WHEN status IN ('rejected', 'failed') THEN 1 ELSE 0 END) as rejected
                FROM ego_proposals
-               WHERE created_at >= datetime('now', '-30 days')
+               WHERE created_at >= datetime('now', ?)
                  AND status IN ('approved', 'executed', 'rejected', 'failed')
-               GROUP BY action_type"""
+               GROUP BY action_type""",
+            (f"-{_PROPOSAL_WINDOW_DAYS} days",),
         )
         for action_type, success, rejected in await cur.fetchall():
             total = success + rejected

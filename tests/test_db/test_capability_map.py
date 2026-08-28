@@ -422,20 +422,32 @@ class TestProductionTimestampFormat:
 
     @pytest.mark.asyncio
     async def test_boundary_is_exact_at_fourteen_days(self, db):
-        """`>=` not `>`: exactly 14 days behind the anchor is still shown."""
-        from datetime import UTC, datetime, timedelta
+        """`>=` not `>`: exactly 14 days behind the anchor is still shown.
 
-        now = datetime.now(UTC)
+        The offset is derived from the ANCHOR ROW's persisted timestamp, not
+        from a `now` captured beforehand. `upsert` stamps its own time, so a
+        pre-captured `now` is fractionally EARLIER than the anchor and the row
+        lands slightly more than 14 days behind it — which SQLite's Julian-day
+        precision sometimes preserves, failing the assertion at random rather
+        than testing the boundary.
+        """
+        from datetime import datetime, timedelta
+
         await cap_crud.upsert(db, domain="anchor", confidence=0.5, sample_size=5)
         await cap_crud.upsert(db, domain="exactly14", confidence=0.5, sample_size=5)
+
+        anchor = await cap_crud.get_by_domain(db, "anchor")
+        anchor_at = datetime.fromisoformat(anchor["updated_at"])
         await db.execute(
             "UPDATE capability_map SET updated_at = ? WHERE domain = 'exactly14'",
-            ((now - timedelta(days=14)).isoformat(),),
+            ((anchor_at - timedelta(days=14)).isoformat(),),
         )
         await db.commit()
 
         domains = {e["domain"] for e in await cap_crud.get_prompt_rows(db)}
-        assert "exactly14" in domains
+        assert "exactly14" in domains, (
+            "the inclusive 14-day boundary excluded a row exactly on it"
+        )
 
 
 class TestConfidenceTieBreak:
@@ -636,6 +648,56 @@ class TestMalformedAnchorDuringOutage:
         await self._insert(db, "fresh", now.isoformat())
         await self._insert(db, "stale", (now - timedelta(days=90)).isoformat())
         await self._insert(db, "corrupt", "zzzz-not-a-time")
+
+        domains = {e["domain"] for e in await cap_crud.get_prompt_rows(db)}
+        assert "fresh" in domains
+        assert "stale" not in domains, "the window stopped excluding stale rows"
+
+
+class TestFutureRowDuringDeadJob:
+    """Two failure modes the code handles separately, combined.
+
+    A future-dated row is parseable, so it wins MAX(); the outer MIN() then
+    clamps the anchor to wall-clock now. With every OTHER row uniformly old —
+    a dead refresh job — they all fall outside now-14d, leaving the prompts and
+    the weakness scanner with nothing but the corrupt future row. Each guard is
+    correct alone; together they defeat the dead-refresh guarantee.
+    """
+
+    @staticmethod
+    async def _insert(db, domain, updated_at, *, confidence=0.7, sample_size=9):
+        await db.execute(
+            "INSERT INTO capability_map (id, domain, confidence, sample_size, "
+            "trend, evidence_summary, updated_at) "
+            "VALUES (?, ?, ?, ?, 'stable', '', ?)",
+            (f"id-{domain}", domain, confidence, sample_size, updated_at),
+        )
+        await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_future_row_plus_dead_job_hides_nothing(self, db):
+        from datetime import UTC, datetime, timedelta
+
+        now = datetime.now(UTC)
+        old = (now - timedelta(days=120)).isoformat()
+        for i in range(3):
+            await self._insert(db, f"aged{i}", old)
+        await self._insert(db, "skewed", (now + timedelta(days=30)).isoformat())
+
+        domains = {e["domain"] for e in await cap_crud.get_prompt_rows(db)}
+        assert {"aged0", "aged1", "aged2"} <= domains, (
+            "a future-dated row plus a dead refresh job hid every valid row"
+        )
+
+    @pytest.mark.asyncio
+    async def test_future_row_does_not_widen_a_healthy_window(self, db):
+        """The anchor must ignore the future row, not adopt it."""
+        from datetime import UTC, datetime, timedelta
+
+        now = datetime.now(UTC)
+        await self._insert(db, "fresh", now.isoformat())
+        await self._insert(db, "stale", (now - timedelta(days=90)).isoformat())
+        await self._insert(db, "skewed", (now + timedelta(days=30)).isoformat())
 
         domains = {e["domain"] for e in await cap_crud.get_prompt_rows(db)}
         assert "fresh" in domains

@@ -417,3 +417,85 @@ class TestMinimumSampleFloor:
         combined = next((r for r in results if r["domain"] == "combined"), None)
         assert combined is not None
         assert combined["sample_size"] == 3
+
+
+class TestProposalJournalDoubleCount:
+    """One proposal must not count as two observations.
+
+    Creating a proposal batch writes an `ego_proposals` row AND a matching
+    `intervention_journal` row for each proposal (ego/session.py). The
+    aggregator reads both tables under the same action_type, so a single
+    proposal contributes twice — two resolved proposals reach total_weight 4 and
+    clear the three-sample floor while representing only two observations. That
+    is exactly the thin domain the floor exists to suppress.
+    """
+
+    def _patch_flag(self, monkeypatch, enabled=False):
+        from genesis.ego.types import EgoConfig
+        monkeypatch.setattr(
+            "genesis.ego.config.load_ego_config",
+            lambda *a, **k: EgoConfig(outcome_bus_capability_feed=enabled),
+        )
+
+    @pytest.mark.asyncio
+    async def test_two_proposals_do_not_clear_the_floor(self, db, monkeypatch):
+        from datetime import UTC, datetime
+
+        self._patch_flag(monkeypatch)
+        now = datetime.now(UTC).isoformat()
+        # Two proposals, each ALSO journalled — the real write pattern.
+        for i, status in enumerate(("approved", "rejected")):
+            pid = f"p{i}"
+            await db.execute(
+                "INSERT INTO ego_proposals (id, action_type, content, status, "
+                "created_at) VALUES (?, 'thin_domain', 'x', ?, ?)",
+                (pid, status, now),
+            )
+            await db.execute(
+                "INSERT INTO intervention_journal (id, ego_source, proposal_id, "
+                "action_type, action_summary, outcome_status, confidence, "
+                "created_at, resolved_at) "
+                "VALUES (?, 'user_ego', ?, 'thin_domain', 'x', ?, 0.8, ?, ?)",
+                (f"j{i}", pid, status, now, now),
+            )
+        await db.commit()
+
+        results = await compute_capability_map(db)
+        assert not any(r["domain"] == "thin_domain" for r in results), (
+            "two proposals cleared the three-sample floor by being counted twice"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_old_journalled_proposal_still_counts_once(self, db, monkeypatch):
+        """Deduplication must not silently drop the journal's long history.
+
+        The journal has no time window and the proposals source has 30 days, so
+        a proposal older than the window is represented ONLY by the journal. It
+        must still contribute.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        self._patch_flag(monkeypatch)
+        old = (datetime.now(UTC) - timedelta(days=200)).isoformat()
+        for i in range(3):
+            pid = f"old{i}"
+            await db.execute(
+                "INSERT INTO ego_proposals (id, action_type, content, status, "
+                "created_at) VALUES (?, 'historic', 'x', 'approved', ?)",
+                (pid, old),
+            )
+            await db.execute(
+                "INSERT INTO intervention_journal (id, ego_source, proposal_id, "
+                "action_type, action_summary, outcome_status, confidence, "
+                "created_at, resolved_at) "
+                "VALUES (?, 'user_ego', ?, 'historic', 'x', 'approved', 0.8, ?, ?)",
+                (f"jo{i}", pid, old, old),
+            )
+        await db.commit()
+
+        results = await compute_capability_map(db)
+        historic = next((r for r in results if r["domain"] == "historic"), None)
+        assert historic is not None, "the journal's long history was dropped"
+        assert historic["sample_size"] == 3, (
+            f"expected 3 distinct observations, got {historic['sample_size']}"
+        )

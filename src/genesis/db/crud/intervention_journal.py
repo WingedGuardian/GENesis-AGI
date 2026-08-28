@@ -116,11 +116,23 @@ async def unresolved_count(db: aiosqlite.Connection) -> int:
     return row[0] if row else 0
 
 
-async def aggregate_by_type(db: aiosqlite.Connection) -> list[dict]:
+async def aggregate_by_type(
+    db: aiosqlite.Connection,
+    *,
+    exclude_proposals_within_days: int | None = None,
+) -> list[dict]:
     """Aggregate outcomes by action_type for capability map input.
 
     Returns rows with: action_type, total, approved, rejected, executed,
     failed, avg_confidence.
+
+    ``exclude_proposals_within_days`` omits rows whose proposal is ALSO counted
+    by a caller reading ``ego_proposals`` over the same window. Creating a
+    proposal batch writes an ego_proposals row and a journal row for each
+    proposal, so a caller aggregating both tables counts one observation twice;
+    passing its own window here makes the journal contribute only the history
+    the other source cannot see. Defaults to None — no exclusion — so callers
+    that read this table alone are unaffected.
     """
     cur = await db.execute(
         """SELECT
@@ -132,9 +144,22 @@ async def aggregate_by_type(db: aiosqlite.Connection) -> list[dict]:
                SUM(CASE WHEN outcome_status = 'failed' THEN 1 ELSE 0 END) as failed,
                ROUND(AVG(confidence), 2) as avg_confidence
            FROM intervention_journal
-           WHERE outcome_status != 'pending'
+           WHERE outcome_status != 'pending'"""
+        + (
+            """
+             AND (proposal_id IS NULL OR proposal_id NOT IN (
+                   SELECT id FROM ego_proposals
+                   WHERE created_at >= datetime('now', ?)
+                     AND status IN ('approved','executed','rejected','failed')))"""
+            if exclude_proposals_within_days is not None
+            else ""
+        )
+        + """
            GROUP BY action_type
-           ORDER BY total DESC"""
+           ORDER BY total DESC""",
+        ()
+        if exclude_proposals_within_days is None
+        else (f"-{int(exclude_proposals_within_days)} days",),
     )
     rows = await cur.fetchall()
     cols = [d[0] for d in cur.description]

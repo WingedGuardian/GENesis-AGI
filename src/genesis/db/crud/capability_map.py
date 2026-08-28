@@ -127,13 +127,21 @@ async def upsert(
 # is precisely the failure the clamp exists to prevent. Degrade to wall-clock
 # instead.
 #
-# Note the order: ``MAX(julianday(...))``, NOT ``julianday(MAX(...))``. ``MAX``
-# over the raw column is a LEXICAL max over text, so a malformed value
-# ('zzzz-...') outranks every ISO timestamp, parses to NULL, and COALESCE then
-# substitutes wall-clock — hiding every uniformly-old row and collapsing the
-# dead-refresh guarantee in exactly the corruption case COALESCE was added to
-# tolerate. Aggregating over PARSED values skips unparseable rows instead of
-# letting one of them decide the window.
+# The anchor is the newest row that is both PARSEABLE and NOT IN THE FUTURE,
+# and each half of that is load-bearing:
+#
+#   · ``MAX(julianday(...))``, not ``julianday(MAX(...))``. ``MAX`` over the raw
+#     column is a LEXICAL max over text, so a malformed value ('zzzz-...')
+#     outranks every ISO timestamp and parses to NULL. Aggregating over PARSED
+#     values skips unparseable rows instead of letting one decide the window.
+#   · ``WHERE julianday(updated_at) <= julianday('now')`` — excluded BEFORE the
+#     max, not clamped after. A future-dated row is perfectly parseable, so it
+#     wins the max; clamping the result to now then leaves a uniformly-old table
+#     entirely outside the window. Filtering first means a skewed row is ignored
+#     rather than promoted to anchor.
+#
+# Both failure modes are individually survivable and together were not: each
+# guard was correct alone, and the combination still hid every valid row.
 #
 # (A PARTIAL refresh outage is still not covered: one source failing while the
 # others keep writing holds the anchor at now, and that source's domains do age
@@ -193,9 +201,9 @@ def _recency_clause(stale_after_days: int | None) -> tuple[str, list]:
     # separated — a lexical compare between those two shapes is meaningless.
     return (
         " AND julianday(updated_at) >= "
-        "MIN(COALESCE("
-        "(SELECT MAX(julianday(updated_at)) FROM capability_map), "
-        "julianday('now')), julianday('now')) - ?",
+        "COALESCE((SELECT MAX(julianday(updated_at)) FROM capability_map "
+        "          WHERE julianday(updated_at) <= julianday('now')), "
+        "         julianday('now')) - ?",
         [int(stale_after_days)],
     )
 
