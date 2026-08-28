@@ -31,15 +31,38 @@ Code" below).
 
 ## Updating Claude Code (host + container)
 
-One pin, both machines, no drift:
+One pin, both machines, no drift.
 
-1. Edit `CC_VERSION` in `scripts/lib/cc_version.sh` (one line). If the new CC
+**Two gates come first, and both are mandatory.** `origin` is the public repo,
+so merging the pin *is* the release — the pin PR is the wrong place to discover
+that a gate was skipped. Each one is recorded as a PR-body receipt (see
+[the pin PR's own gate](#the-pin-prs-own-gate-cc-pin-receipts) for the exact
+trailers, which the merge gate checks):
+
+1. **Read the changelog in full over `(pinned, target]`** — every release in the
+   range, not just the newest. A bump that crosses several releases crosses
+   every behaviour change in all of them.
+   → `CC-Gate-Changelog:`
+2. **Soak the candidate locally first.** Align this machine to the candidate and
+   use it for real interactive work before the pin moves. At the end of the
+   soak, verify which binary your live sessions are *actually executing* — npm
+   replaces the package underneath a running process, which keeps its original
+   mapping until it restarts, and `claude --version` cannot reveal this because
+   it spawns a fresh child that reads the new binary on disk. Measured on a live
+   install: one canonical binary at the intended version, while a majority of
+   live sessions were still executing the replaced predecessor, so the soak had
+   accumulated days of "real use" on the old release.
+   → `CC-Gate-Soak:`
+
+Then:
+
+3. Edit `CC_VERSION` in `scripts/lib/cc_version.sh` (one line). If the new CC
    version raises its `engines.node` floor, bump `NODE_MAJOR` in the same file
    in lockstep — the `cc-node-lockstep` CI job (`scripts/check_cc_node_lockstep.py`)
    fails the PR if `NODE_MAJOR` is below the pinned CC's required Node major, so
    this can't be forgotten (it fails open on a transient npm-registry error).
-2. Merge to `main`.
-3. Run `scripts/update.sh`. It updates the container, redeploys the Guardian
+4. Merge to `main`, receipts in the PR body.
+5. Run `scripts/update.sh`. It updates the container, redeploys the Guardian
    (carrying the new gateway script), then queries the host's CC version and —
    **only if it differs from the pin** — dispatches `update-cc <pin>` to the
    Guardian gateway on the host. The dispatch is idempotent (acts only on drift)
@@ -90,78 +113,57 @@ Deliberate multi-copy setups: `CC_SHADOW_SCAN=0` opts out.
 CC "not installed", so a PATH-blind install is aligned in place instead of
 reinstalled forever.
 
-### Which copy is INSTALLED vs which copy is RUNNING
-
-These are different questions and need different checks.
-
-`cc_shadow_scan` answers **installed**: it probes `command -v claude` plus
-`CC_PROBE_DIRS` for extra on-disk copies and removes the stale ones.
-
-`scripts/check_cc_running_versions.sh` answers **running**: for every live CC
-process it resolves `stat -L /proc/<pid>/exe` — procfs keeps that reference
-alive even after npm unlinks the file — and compares its **device + inode**
-against the binary on disk today. (Device matters: an inode number is unique
-only within a filesystem, so a user-prefix install and a system npm install on
-separate mounts can collide numerically.)
-
-It refuses to answer when canonical identity is ambiguous. `command -v claude`
-is PATH precedence, not identity — the reason `cc_shadow_scan` never trusts it
-either — so the sweep cross-checks `CC_PROBE_DIRS` and exits *undetermined* if a
-second copy sits there at a different version. With a stale shadow winning PATH
-the sweep would otherwise report the wrong half of the sessions as stale, which
-is worse than no answer. A CC process whose `/proc/<pid>/exe` cannot be read is
-likewise undetermined, never counted as clean.
-
-A box can pass the first and fail the second. Measured on a live install:
-exactly one canonical binary installed, at the intended version, while **a
-majority of live CC processes were still executing the replaced predecessor**. A
-long-running process keeps its original mapping until it restarts, and
-`claude --version` cannot reveal this — it spawns a *fresh child*, which reads
-the new on-disk binary and truthfully reports the new version while the session
-asking the question is not running it.
-
-This matters most during a local-first soak, where the whole point is that real
-interactive use exercises the candidate. Run the sweep at soak start and again
-at soak end. It exits 1 when any process is stale, and 2 when it cannot
-determine — a node-wrapped install (`node .../cli.js`) resolves `exe` to the
-Node interpreter, whose inode says nothing about which CC revision is loaded, so
-the script refuses to answer rather than reporting a false all-clear.
-
 ### The pin PR's own gate: `cc-pin-receipts`
 
-`scripts/check_cc_pin_receipts.py` (CI job `cc-pin-receipts`) fails a PR that
-moves `CC_VERSION` **forward** without both gate receipts as PR-body trailers,
-in the same style as the repo's existing `Ledger:` / `Follow-up:` trailers:
+A change moving `CC_VERSION` **forward** must carry both gate receipts as
+PR-body trailers, in the same style as the repo's existing `Ledger:` /
+`Follow-up:` trailers:
 
 ```
-CC-Gate-Changelog: read (2.1.218, 2.1.246] in full from <source>, <date>
-CC-Gate-Soak: <candidate> on container <start>..<end>, check_cc_running_versions.sh clean, signed off <who>
+CC-Gate-Changelog: read (<from>, <to>] in full from <source>, <date>
+CC-Gate-Soak: <candidate> on <where> <start>..<end>, running-binary sweep <result>, signed off <who>
 ```
 
-Scope, stated plainly: it stops **omission, not forgery**. Nothing in CI can
-tell whether a soak actually happened — and this repo has already settled that
-question, which is why `review-depth-check` is advisory by design. What this
-converts is *forgetting* into *consciously writing something untrue*. It is the
-same kind of check, and the same strength, as
-`scripts/check_hook_versions_complete.sh`.
+Write them in the PR body itself. Receipts inside an HTML comment or a code
+fence do **not** count — they satisfy a text search while being invisible to the
+person merging, and the only enforcement this has is a human reading a claim
+someone chose to make. Ordinary markdown is fine: list bullets, `- [x]` task
+boxes, blockquotes and bold all work.
 
-It compares the **parsed pin value**, not whether the file changed, so the many
-It is a **separate workflow from `ci.yml` on purpose.** The check reads the PR
-BODY, which stays mutable after a run finishes, and GitHub's default
-`pull_request` activity types (`opened`, `synchronize`, `reopened`) do not
-observe an edit. Without `edited`, receipts could be added after a red run with
-no re-check — or removed after a green one, leaving a passing status that
-describes a body which no longer exists. Activity types are per-workflow, so
-putting `edited` on `ci.yml` would re-run the whole suite on every description
-tweak. It anchors on the merge ref's first parent (`HEAD^1`) rather than
-`base.sha`, which lags `main`, for the same reason the leak scan does.
+**The merge gate is the authority; CI is advisory.** The check reads the PR
+BODY, which stays mutable after any CI run finishes, so a CI status describing
+it is a claim about the past. It therefore runs at merge time
+(`scripts/hooks/git_push_guard.py --check-pr`), comparing the pin at the PR head
+against the pin on `origin/main` — which at that moment is exactly what the pin
+is about to land on. The `cc-pin-receipts` job in `ci.yml` runs the same checker
+with `--advisory`: it annotates a missing receipt early and always exits 0.
 
-PRs that edit `cc_version.sh` for other reasons are unaffected. **Downgrades are
+That split is deliberate, and reversing it breaks the gate. A completed check
+run is immutable, and the merge gate treats a stale FAILURE as red on purpose —
+it forces `gh pr merge --admin` and is the sole CI enforcement for the merges it
+allows, so a later SUCCESS clearing an earlier FAILURE would make re-running a
+job until green sufficient to merge. A *blocking* status over a mutable input
+therefore could not be cleared by fixing that input: the author would have to
+push a commit purely to get a fresh head. Running from main's copy of the
+checker also means a PR cannot edit the code that gates it.
+
+Scope, stated plainly: it stops **omission, not forgery**. Nothing here can tell
+whether a soak actually happened — this repo already settled that question,
+which is why `review-depth-check` is advisory by design. What it converts is
+*forgetting* into *consciously writing something untrue*. Same kind of check,
+and the same strength, as `scripts/check_hook_versions_complete.sh`.
+
+It compares the **parsed pin value**, not whether the file changed, so PRs that
+edit `cc_version.sh` for other reasons are unaffected. **Downgrades are
 auto-exempt** — a rollback returns to a version that already ran here, and the
 downgrade path is this project's incident-recovery route (the reason a managed
 `requiredMinimumVersion` floor was rejected above). No override syntax to
-remember under incident pressure. Anything it cannot determine — shallow clone,
-no base SHA, no PR body — SKIPs loudly rather than blocking every PR.
+remember under incident pressure.
+
+What it will **not** do is guess. A pin it cannot read — absent, assigned more
+than once, not canonical semver, or not valid UTF-8 — **blocks**. "I cannot tell
+what this file pins" is not a reason to publish a release; it is the state a
+human needs to look at.
 
 ---
 
