@@ -5,9 +5,18 @@ from __future__ import annotations
 import contextlib
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
+
+# A heartbeat is always stamped at emit with ``now()``; a timestamp more than this
+# far in the FUTURE cannot arise from legitimate clock skew and is treated as
+# corrupt-beyond-recovery by the keep-latest GC (deleted outright). Kept far wider
+# than the read-side display tolerance (``FUTURE_SKEW_TOLERANCE_MINUTES``) so a
+# modestly skewed-but-recoverable pulse ages into validity instead of being
+# destroyed — and so a BACKWARD clock skew at GC time can't delete genuinely-recent
+# pulses.
+_HEARTBEAT_FUTURE_CORRUPT_DAYS = 1
 
 
 def _safe_details_json(details: dict | None) -> str | None:
@@ -172,12 +181,42 @@ async def prune(
     if event_type is not None and keep_latest_per_subsystem:
         # Delete old rows EXCEPT the newest per subsystem (a row is kept when its
         # timestamp equals the per-subsystem max — strict ``<`` so ties are kept).
+        #
+        # Future-row hardening: ``timestamp`` is ISO TEXT and every heartbeat is
+        # stamped ``datetime.now(UTC).isoformat()`` at emit (uniform ``+00:00``, so
+        # lexical order == chronological order FOR THIS event_type; a future producer
+        # emitting ``Z``/naive/non-UTC would break that invariant — flag on change).
+        # A clock-skewed/corrupt future row (e.g. ``2099-…``) would otherwise be the
+        # lexical MAX and survive forever as the keep-anchor while genuine pulses age
+        # out — degrading ``compute_heartbeat_staleness`` to a permanent ``unknown``.
+        # TWO DISTINCT future bounds (destructive vs. non-destructive):
+        #  (a) delete only rows IMPLAUSIBLY far future (> corrupt horizon) — corrupt
+        #      beyond any clock-skew recovery. A modestly-future row is left to age
+        #      into validity, and this wide bound also protects genuinely-recent
+        #      pulses from a BACKWARD clock skew at GC time.
+        #  (b) anchor the keep on the newest row within the read-side display
+        #      tolerance, so the pulse we preserve is one the staleness read accepts.
+        # ``FUTURE_SKEW_TOLERANCE_MINUTES`` mirrors observability.liveness (single
+        # source of truth; imported locally — this infrequent GC path shouldn't couple
+        # a foundational CRUD module to observability at import time).
+        from genesis.observability.liveness import FUTURE_SKEW_TOLERANCE_MINUTES
+
+        now_dt = datetime.now(UTC)
+        future_delete_bound = (
+            now_dt + timedelta(days=_HEARTBEAT_FUTURE_CORRUPT_DAYS)
+        ).isoformat()
+        future_anchor_bound = (
+            now_dt + timedelta(minutes=FUTURE_SKEW_TOLERANCE_MINUTES)
+        ).isoformat()
         cursor = await db.execute(
-            "DELETE FROM events WHERE event_type = ? AND timestamp < ? "
+            "DELETE FROM events WHERE event_type = ? AND ("
+            "timestamp > ? "  # (a) implausibly-future rows: corrupt → delete outright
+            "OR (timestamp < ? "  # (b) below-cutoff AND below the newest valid anchor
             "AND timestamp < (SELECT MAX(e2.timestamp) FROM events e2 "
             "WHERE e2.event_type = events.event_type "
-            "AND e2.subsystem = events.subsystem)",
-            (event_type, older_than),
+            "AND e2.subsystem = events.subsystem "
+            "AND e2.timestamp <= ?)))",
+            (event_type, future_delete_bound, older_than, future_anchor_bound),
         )
     elif event_type is not None:
         cursor = await db.execute(

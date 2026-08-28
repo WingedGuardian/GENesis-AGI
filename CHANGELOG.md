@@ -11,6 +11,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Outreach total-cessation monitoring, without the old false-alarm trap.**
+  Outreach is now in the `subsystem_stale` alert set (WARNING) alongside
+  ego/inbox/dashboard. Previously it was excluded because its heartbeat was
+  *emergent* — a side-effect of an outreach job succeeding — and the outreach
+  scheduler only starts once a messaging channel (Telegram) registers, so a
+  Telegram-less install never pulsed and naively adding it would fire a permanent
+  unresolvable alert. Two pieces close that trap: (1) a dedicated,
+  channel-independent heartbeat daemon (`outreach/heartbeat.py`) that pulses **only
+  while the outreach scheduler is actually running** (`is_running`) — so a
+  never-started/stopped scheduler goes stale instead of reading a false `alive`; and
+  (2) an enable-gate (`_subsystem_enabled('outreach')` = Telegram configured, via the
+  same side-effect-free `build_bridge_config` loader onboarding-readiness uses) so a
+  dashboard-only install is benign. Documented boundary: a Telegram-configured install
+  whose scheduler *never once started* (registration failed) emits no pulse and stays
+  a benign `no_heartbeat` — outreach IS a bootstrap-manifest entry (`ok` = scheduler
+  *constructed*, not running), so it is explicitly exempted from the started-silent
+  `never_started` inference (a constructed-but-not-started scheduler is benign; a genuine
+  init *failure* still surfaces); a *wedged-but-alive* loop is job_health's domain. The
+  new `subsystem_stale:outreach` id is handled generically by the existing consumers
+  (morning-report dedup by prefix, the Sentinel `subsystem_stale:` disposition).
+
 - **Session-start surface for age-stale open PRs.** The repo-pulse worker now
   also caches the open-PR set each boundary, and a SessionStart hook lists the
   ones idle past a threshold (default 7 days) as one passive inline line —
@@ -56,6 +77,53 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   nothing.
 
 ### Fixed
+
+- **SSH slot cap no longer collapses below the running session count.** The
+  interactive-slot launcher (`scripts/cc-slot.sh`) sized its cap from
+  *instantaneous free RAM* (`(MemAvailable − reserve) / per_session`), so each
+  running session lowered free RAM and thus lowered the cap *below* the number
+  already running — locking the operator out of a new session (and even
+  misreporting "3/2 active") while other apps' memory use silently ate slots too.
+  The cap is now a stable function of the box's TOTAL RAM (a new pure, unit-tested
+  `genesis.cc.session_cap` helper), so it scales per install, does not shrink as
+  sessions run, and ignores unrelated apps. It is **container-aware** — it uses the
+  cgroup memory limit and CPU affinity, not host `/proc` values, so a container that
+  sees host RAM is sized for its real limit (not the host). Live free RAM is used
+  only as an OOM circuit-breaker, and a new session only starts when there is room
+  for a full session (never over-committing a swapless box). Any interactive SSH
+  login (a slot hostname or a plain shell running `claude`, from a LAN/Tailscale IP)
+  is the operator and gets an emergency slot above the safe cap; the cap itself
+  never turns it away — when the box is full or memory is tight it offers to reattach
+  or end a chosen session to make room (the ended session's transcript persists,
+  resume with `claude --resume`), and an ATTACHED session needs an explicit confirm
+  before it's ended. Two honest corners still decline: a non-interactive login
+  (no terminal to prompt on) is guided to reattach, and a genuine OOM-floor breach
+  with no slot to trade is refused rather than risking an OOM. The dashboard web
+  terminal / local console (no `SSH_CONNECTION`) is held to the safe cap. Reattaching
+  always works. Tunable via `~/.genesis/cc-slot.env`
+  (`GENESIS_CC_SYSTEM_RESERVE_MB` / `_PER_SESSION_MB` / `_OOM_FLOOR_MB` /
+  `_EMERGENCY_SLOTS`); the gate fails open so it can never strand you. See
+  `docs/reference/tailscale-ssh-access.md`.
+- **Heartbeat GC no longer lets a clock-skewed future row starve a subsystem's
+  liveness signal.** The `keep_latest_per_subsystem` heartbeat GC
+  (`db/crud/events.py::prune`) kept the row equal to the per-subsystem
+  `MAX(timestamp)`. Because `timestamp` is ISO **text**, a corrupt/clock-skewed
+  future row (e.g. `2099-…`) sorts as that MAX and survived the retention window
+  forever, while genuine pulses aged out and were deleted — leaving
+  `compute_heartbeat_staleness` with only the future row, which it rejects as
+  materially-future, degrading the verdict to a permanent `unknown` (a false
+  "can't tell" for a subsystem that may be perfectly healthy or truthfully
+  stale). The GC now uses two distinct future bounds: (a) it deletes only
+  *implausibly*-far-future rows (> 1 day ahead — corrupt beyond any clock-skew
+  recovery), and (b) it anchors the "keep newest" on the newest row within the
+  read-side display tolerance (`observability.liveness.FUTURE_SKEW_TOLERANCE_MINUTES`),
+  so the preserved pulse is one the staleness read accepts (`alive`/`overdue`). The
+  wide destructive horizon is deliberate: a *modestly*-future row ages into validity
+  instead of being destroyed, and a **backward** clock skew at GC time cannot delete
+  genuinely-recent pulses. A write-time clamp was considered and rejected: the only
+  production trigger is host clock skew, against which a clamp is ineffective (at
+  write time `now()` *is* the skewed value), so the retention layer — re-evaluated at
+  GC time — is the layer that actually closes the hole.
 
 - **The run_in_background pipe guard no longer false-blocks a `|` inside a quoted
   argument.** The old inline check (`${CMD//||/ }` then `grep -qF "|"`) blocked any
