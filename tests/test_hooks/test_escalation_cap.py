@@ -492,3 +492,65 @@ def test_gate_fails_open_on_infinity_round(repo, home):
     rf.write_text('{"branch": "' + branch + '", "round": 1e999, "last_hash": "x"}')
     res = _run_hook('git commit -m "wip"', repo, home)
     assert res.returncode == 0, res.stdout + res.stderr
+
+
+# ── A merge must NOT be able to silence the counter ───────────────────────
+
+
+def _fabricate_merge_sentinel(repo: Path) -> None:
+    """One file write. No git command, no real merge."""
+    (repo / ".git" / "MERGE_HEAD").write_text("garbage-not-a-sha\n")
+
+
+def test_a_forged_merge_sentinel_cannot_freeze_the_counter(repo, _isolate_rounds):
+    """The counter must not trust unauthenticated on-disk state.
+
+    An earlier attempt at this exempted rounds whenever a merge sentinel was
+    present. Those sentinels are plain files: `echo x > .git/MERGE_HEAD` needs
+    no git command, and `git merge --no-commit` leaves one indefinitely with no
+    forgery at all. Measured against that version, a single write froze the
+    counter across three further distinct defect rounds — letting the exact
+    actor this gate constrains disable the anti-runaway cap permanently.
+
+    The exemption was abandoned for that reason. The gate now only MENTIONS a
+    merge in its denial text; it never lets one decide the verdict.
+    """
+    _stage(repo, "base = 1\nfix_one = True\n")
+    assert review_state.bump_review_round(str(repo)) == 1
+
+    _fabricate_merge_sentinel(repo)
+
+    _stage(repo, "base = 1\nfix_two = True\n")
+    assert review_state.bump_review_round(str(repo)) == 2, (
+        "a forged merge sentinel suppressed a real defect-bearing round"
+    )
+    _stage(repo, "base = 1\nfix_three = True\n")
+    assert review_state.bump_review_round(str(repo)) == 3, (
+        "the escalation cap can be silenced by writing a file"
+    )
+
+
+def test_a_real_merge_also_does_not_suppress_rounds(repo, _isolate_rounds):
+    """Not even a genuine merge exempts a round — by design.
+
+    A real conflicted merge is indistinguishable from a forged sentinel to any
+    check cheap enough to run in a hook, so the counter treats neither as
+    special. The cost is one ack on a merge commit; the alternative was a gate
+    that could be turned off silently.
+    """
+    _stage(repo, "base = 1\nfix_one = True\n")
+    assert review_state.bump_review_round(str(repo)) == 1
+
+    _git(repo, "checkout", "-q", "main")
+    (repo / "f.py").write_text("base = 1\nupstream = True\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "upstream")
+    _git(repo, "checkout", "-q", "feature/x")
+    (repo / "f.py").write_text("base = 1\nmine = True\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "mine")
+    subprocess.run(["git", "merge", "main"], cwd=repo, capture_output=True, text=True)
+    (repo / "f.py").write_text("base = 1\nmine = True\nupstream = True\n")
+    _git(repo, "add", "-A")
+
+    assert review_state.bump_review_round(str(repo)) == 2
