@@ -53,15 +53,33 @@ later restarts the procedure (step 5).
 > **The analyzer is a TRIAGE SUMMARY, never a substitute.** It prioritises; it does not discharge
 > the gate.
 >
-> **Mark the gate done as a DURABLE row, not a chat line:**
-> `session_ledger_add(session_id=<this session>, text=…)` — `session_id` is REQUIRED, the call
-> hard-fails without it — with
-> `"CC changelog gate: read (2.1.X, 2.1.Y] in full from <source>, <date>"`, and carry the same
-> string into the PR body and the §Version History row added at step 6. The ledger row is
-> **session-scoped**, so across a 2–3 day soak the session that opens the PR is not the one that
-> ran the gate — the PR-body + Version-History carry-over is what actually makes it checkable
-> later. For rows added from 2026-08-26 onward, a Version-History row with no "changelog read"
-> clause means the gate was not run — treat that as blocking at review.
+> **Record it as a DURABLE row, not a chat line — opened BEFORE, closed AFTER.**
+> `session_ledger_add` always creates an **open** row, and its own return message says it
+> "will re-inject into every post-compaction window until closed"
+> (`session_charter_tools.py::_impl_session_ledger_add`). So a row added *after* declaring the
+> gate done is a permanent false open item in charter counts, compaction injections and
+> repo-pulse matching. Open it, do the read, then close it:
+>
+> ```
+> resp = session_ledger_add(session_id=<this session>,
+>                           text="CC changelog gate: reading (2.1.X, 2.1.Y] from <source>")
+> # resp is a DICT — the id is resp["id"], not resp itself.
+> # session_id is required, but a missing one returns {"error": …} rather than raising:
+> # CHECK the response, or you will proceed believing a row exists that does not.
+> …the read…
+> session_ledger_update(item_id=resp["id"], status="done",
+>                       evidence="read in full from <source>, <date>; <N> releases covered")
+> ```
+>
+> The row is **session-scoped**, so across a 2–3 day soak the session that opens the PR is not the
+> one that ran the gate. What makes the gate checkable later is the carry-over: a
+> `CC-Gate-Changelog:` trailer in the PR body plus the §Version History clause — see
+> **§Gate receipts** in `docs/reference/cc-compatibility.md` for both receipts and what their
+> absence means. The pin-receipt check blocks a pin-forward PR that is missing either — at MERGE
+> time, where the body that actually merges is the one read. The `cc-pin-receipts`
+> CI job runs the same checker advisorily and never fails a build.
+> For rows added from 2026-08-26 onward, a Version-History row with no "changelog read" clause
+> means the gate was not run — treat that as blocking at merge.
 >
 > **Delegation is allowed — with the SAME context and rigor, never a naive "summarize this."** Brief
 > the sub-agent with §Delegating the full changelog read below, then **adversarially spot-check its
@@ -84,19 +102,43 @@ later restarts the procedure (step 5).
    newest 5 GitHub releases, matches the **target** version's tag, and truncates that body at 1000
    chars — so on a multi-release jump it sees a fraction of ONE release, or **NOTHING at all once the
    TARGET's own tag ages out of the newest 5**. That is likely mid-soak: step 5 holds a candidate for
-   2-3 days while CC ships ~daily, and when it happens the LLM is handed the literal string
-   "No changelog available" and still returns a confident-looking verdict. (A whole-`(old, new]`
+   2-3 days while CC ships ~daily. **When that happens the LLM is never called at all** —
+   `_fetch_changelog` returns `""`, and `analyze` gates the LLM path on
+   `if self._router and changelog`, so it falls through to a hand-built dict with
+   `details="Changelog not available"`. The confident-looking `informational` verdict in that case
+   is a **deterministic fallback, not a judgement** — do not read it as "the analyzer looked and
+   found nothing".
+   **Two traps in reading that verdict.** (a) `_fetch_changelog` returns `""` from *five* distinct
+   paths — a non-zero `gh` exit, a timeout, a bare `except`, a non-list payload, and the
+   tag-not-in-newest-5 case. An expired `gh` auth produces a byte-identical
+   `details="Changelog not available"`, so confirm `gh auth status` before concluding the tag aged
+   out. (b) There is a SECOND non-judgement path: when the LLM *was* called and failed, the keyword
+   heuristic also returns `informational` with real changelog text. Tell them apart by the
+   `" (LLM analysis unavailable)"` suffix on `summary` — without that suffix and with a non-empty
+   `details`, the verdict is a genuine LLM read. (A whole-`(old, new]`
    map-reduce rewrite exists on an **unmerged** branch — *unmerged as of 2026-08-26; grep the file
    before relying on it*. It would still omit the oldest chunks on a very large range, so **the GATE
    does not retire** either way.) Triage every hooks / MCP / CLI-flag / subagent / permissions delta.
    **Rule: a changelog claim that "we depend on X" only gates the bump if verified against LIVE
    usage** — the TodoWrite lesson: a removed feature Genesis measured 0 uses of is hygiene, not a
    blocker.
+   - **Take the PRE-align model-alias sample HERE, in step 1.** It belongs to the *first* never
+     skippable step, not to step 2 — step 2 has a legitimate skip condition, and a sample nested
+     under it silently disappears exactly when that skip fires, leaving the step-4 "after" reading
+     with nothing to compare against. It cannot move later either: step 3 replaces the CLI, so this
+     is the last point at which the old binary is still installed. See §Model-alias drift below for
+     the invocation; the post-align half is step 4.
 2. **Deploy current `main` FIRST** — `scripts/update.sh` as a **background task**, BEFORE aligning
    the candidate, so the soak runs on current code. Otherwise step 8 lands accumulated Genesis change
-   AND the CC bump together and you cannot attribute a regression to either. Skip only if the newest
-   `update_history` row (`update_history_recent` MCP) is newer than the `main` commits you would
-   otherwise be bundling.
+   AND the CC bump together and you cannot attribute a regression to either.
+   **Checkable skip condition — three parts, all required:** `git fetch origin` first (an unfetched
+   `origin/main` is stale and produces a false "already current"); take the newest
+   `update_history_recent` row **whose `status == "success"`** — the tool deliberately returns every
+   attempt including `failure` and `rolled_back` (`update_history.py:98-113`), and a failed attempt's
+   later timestamp otherwise reads as evidence of a deployment that never happened; then confirm that
+   row's `new_commit` is an ancestor-or-equal of the fetched `origin/main` head — mechanically,
+   `git merge-base --is-ancestor "$(git rev-parse origin/main)" <new_commit>` exits 0. Skip only if
+   all three hold.
 3. **Align the CONTAINER ONLY to the candidate.**
    ```bash
    source scripts/lib/cc_version.sh   # NOTE: this sets CC_VERSION to the repo PIN
@@ -109,7 +151,10 @@ later restarts the procedure (step 5).
    on the OLD pin while the container is on the candidate — and if any copy sits at the old pin it
    crowns that one canonical and **deletes the freshly-installed candidate**
    (`cc_version.sh:251`). Full rationale: doc §Updating step 3.
-   Verify a **FRESH** `claude --version` (this session keeps its old binary until relaunch).
+   `claude --version` is NOT sufficient here: it spawns a **fresh child**, which reads the new
+   on-disk binary and truthfully reports the candidate while the session asking the question is
+   still executing the old one. Run `scripts/check_cc_running_versions.sh` instead — it compares
+   each live process's actual mapped binary against the one on disk.
    **Check the Node floor first** — `npm view @anthropic-ai/claude-code@<candidate> engines.node`
    vs `node -v`. If it rises above the container's Node, **STOP**: no container-side Node transition
    tool exists today (`install.sh:473-477` hardcodes `>= 20` and never reads `NODE_MAJOR`), and a
@@ -120,10 +165,30 @@ later restarts the procedure (step 5).
    the pin, which cannot hold yet. Run the critical paths, the doc's §Known Issues, and each behavior the
    impact eval flagged; any Guardian-path check exercises the **host's old** binary, so
    candidate-specific Guardian behavior needs a container-side exercise.
-   - **Measure model-alias drift HERE — nothing else will.** One `claude -p --output-format json`
-     before and one after the align; compare the resolved id under `modelUsage`. See §Model-alias
-     drift below.
-5. **Soak 2–3 days** under real use. Rollback is one command: `source scripts/lib/cc_version.sh &&
+   - **Run `scripts/check_cc_running_versions.sh` BEFORE validating, not just before the soak.**
+     Same trap as step 3 and step 5: validation performed inside a session still mapped to the
+     replaced binary is evidence about the OLD release, and it is the evidence the whole changelog
+     gate feeds into. The check belongs at every point that produces evidence about the candidate —
+     steps 3, 4, 5 and 9 — not only at the soak boundary.
+   - **Take the POST-align model-alias sample here** and compare it against the pre-align one from
+     step 2 — nothing else in the system will catch an alias remap. See §Model-alias drift below
+     for the invocation and for which `modelUsage` entry to read (it is not the first one).
+5. **Soak 2–3 days** under real use — but **the clock does not start until every interactive
+   session is actually ON the candidate.** A long-running CC process keeps its original binary
+   mapping until it restarts; npm replaces the package underneath it. So relaunch the foreground
+   sessions, then prove it rather than assuming it:
+   ```bash
+   scripts/check_cc_running_versions.sh    # exit 0 required before the clock starts
+   ```
+   Re-run it at soak END too — sessions started mid-soak are fine, but one that predates the align
+   and was never relaunched has been contributing evidence about the OLD release the whole time.
+   *Origin (measured on a live install):* a soak was declared started and ran its full length with
+   **a majority of live CC processes — and most interactive sessions — still executing the replaced
+   predecessor**. `cc_shadow_scan` was clean throughout (it scans on-disk copies, not running
+   processes) and `claude --version` reported the candidate the whole time, because it spawns a
+   fresh child. Nothing in the procedure would have caught it.
+
+   Rollback is one command: `source scripts/lib/cc_version.sh &&
    CC_VERSION=<pin> cc_ensure_local`. Do NOT run `update.sh` during the soak — it `unset`s any
    inherited `CC_VERSION` and re-aligns the container to the pin, reverting the candidate. Proceed
    to the public pin only after soak + explicit user sign-off.
@@ -141,8 +206,14 @@ later restarts the procedure (step 5).
    `scripts/check_cc_node_lockstep.py`, fails the PR otherwise). In the same PR update
    `docs/reference/cc-compatibility.md`: §Current CC Version, a §Version History row **carrying the
    changelog-gate clause from step 1**, and any new caveats.
-7. **PR → CI green** (incl. `cc-node-lockstep`) → **privacy scan** → **explicit user approval** →
-   squash-merge. Then `git pull --rebase origin main`.
+7. **PR → CI green** (incl. `cc-node-lockstep`) → **privacy scan** →
+   **explicit user approval** → squash-merge. Then `git pull --rebase origin main`.
+   Both gate receipts go in the PR body as trailers — the merge gate blocks a pin-forward PR
+   without them (a pin that moves *backward* is exempt; rollback is the incident-recovery path):
+   ```
+   CC-Gate-Changelog: read (2.1.X, 2.1.Y] in full from <source>, <date>
+   CC-Gate-Soak: <candidate> on container <start>..<end>, check_cc_running_versions.sh clean, sign-off recorded
+   ```
 8. **Host-Deploy Gate** — in the SAME session after merge, run `scripts/update.sh` from `~/genesis`
    as a **background task** (deploys exceed the Bash tool timeout): it aligns the **container**
    (`cc_ensure_local`) AND the **host VM** (guardian `update-cc` op) to the pin, idempotently.
@@ -241,11 +312,45 @@ family — **measured live: `opus` resolved `claude-opus-4-8` → `claude-opus-5
 with no warning anywhere. This is NOT a downgrade, so the tier-based downgrade detector is blind to
 it, and **no drift detector exists on `main` today** — there is nothing to alert you.
 
-So make it an explicit step-4 validation item: run one `claude -p --output-format json` before and
-after the candidate align and compare the resolved id under `modelUsage` (note `model_used` is a Genesis-side `CCOutput`
-attribute, NOT a field of the raw `claude -p` JSON), not just
-that the alias still works. The posture is deliberate *float* (accept the newer model), but floating
-without checking means the model behind every CCInvoker and experiment call can change unnoticed.
+So take **two samples, and mind where each one goes**: the PRE-align sample is a **step 2** item
+(the last moment the old binary is still installed — step 4 runs *after* step 3 replaced it, so a
+"before" reading is impossible there), and the POST-align sample is a step-4 item.
+
+```bash
+claude -p --model <alias> --output-format json 'ok'   # <alias> = opus | sonnet | haiku
+```
+
+**Pass `--model <alias>` explicitly.** Production supplies it — `CCInvoker._build_args` appends
+`["--model", str(inv.model)]` — so omitting it samples whatever default the environment resolves,
+which is not the mapping under test. (Cite symbols, not line numbers: this file's line numbers
+differ between refs, and a stale number sends the reader to unrelated code.)
+
+**`modelUsage` can list MORE THAN ONE model, and dict order is not tier order.** CC's auxiliary
+haiku calls (titles/topics) appear alongside the main model; taking the first key false-positived
+downgrade detection on a sonnet session that listed `{haiku, sonnet-5}` (2026-07-09), which is why
+`CCInvoker._parse_result_dict` selects the max by `_TIER_RANK` rather than the first key
+(`tests/test_cc/test_invoker.py::test_parse_result_dict_ignores_auxiliary_model_for_downgrade`).
+For drift the failure direction is a **miss**, not a false alarm: compare the auxiliary entry on
+both sides and it looks stable while the main model has been remapped.
+
+⚠️ **Do not simply copy "take the highest tier" — that ranking BREAKS on the exact case you are
+looking for.** `CCModel.from_full_name` returns `None` for any id containing no known tier keyword,
+and `_TIER_RANK.get(None, -1)` ranks it **below haiku**. So if the alias remaps to a model family
+Genesis does not yet recognise — precisely alias drift — the max-by-tier pick silently returns the
+auxiliary haiku, and the very code cited above reports the wrong model. You cannot rank an id you
+have never seen, and neither can it.
+
+So read it this way instead: **compare the SETS**. List every key of `modelUsage` before and after.
+If a key present after is absent before, that is your answer regardless of tier — investigate it,
+and if its family is unrecognised, that is itself a finding (Genesis's downgrade detection is blind
+to that id until `CCModel` learns it). Only fall back to the tier ranking when both sides contain
+exactly the same recognised families.
+
+(Note `model_used` is a Genesis-side `CCOutput` attribute, NOT a field of the raw `claude -p` JSON.)
+
+
+The posture is deliberate *float* (accept the newer model), but floating without checking means the
+model behind every CCInvoker and experiment call can change unnoticed.
 
 ## Durable facts (don't re-derive; verify against the doc if a memory contradicts this)
 - **Both container and host install CC via npm-global — there is NO native-installer path**

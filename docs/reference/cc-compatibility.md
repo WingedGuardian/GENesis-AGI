@@ -38,7 +38,44 @@ that starts at step 6 has skipped both mandatory gates and is a process violatio
 
 **The two mandatory gates are:** (1) the **full changelog read** over `(pinned, target]` — step 1 /
 checklist step 0; and (2) the **local-first soak** of the candidate on the container — steps 3–5.
-Neither is waivable; both are recorded (a durable ledger row, and the §Version History row).
+Neither is waivable.
+
+### Gate receipts — what "recorded" actually means
+
+A gate that is only asserted is not a gate. Each one has a named receipt, a defined place to write
+it, and a defined meaning when it is absent. **A missing receipt is read as "not run"** — not as
+"probably fine, they just forgot to write it down".
+
+| Gate | Receipt (PR-body trailer) | Also recorded in | Absent ⇒ |
+|---|---|---|---|
+| Full changelog read (step 1) | `CC-Gate-Changelog: read (X, Y] in full from <source>, <date>` | a **closed** ledger row, plus a "changelog read" clause in the new row's **Action Taken** cell | blocking at merge |
+| Candidate validation + soak (steps 3–5) | `CC-Gate-Soak: <candidate> on container <start>..<end>, check_cc_running_versions.sh clean, sign-off recorded` | the same row's **Action Taken** cell | blocking at merge |
+
+Both clauses go in **Action Taken** — §Version History has no dedicated column for them and is not
+gaining one (~40 historical rows would all need a blank cell). Action Taken is already the prose
+column, and existing rows narrate outcomes there.
+
+`<source>` in the changelog receipt must be an upstream URL or a bare filename
+(`CHANGELOG.md`, `gh release view`) — **never a local path**. The scratch copy the checklist tells
+you to fetch lives under a home directory, and PR bodies are public.
+
+Both trailers follow the repo's existing `Ledger:` / `Follow-up:` PR-body convention, and the
+`cc-pin-receipts` check (`scripts/check_cc_pin_receipts.py`) blocks a pin-forward PR that is missing
+either. Downgrades are exempt by construction — a rollback returns to a version
+that already ran here, and the downgrade path is this project's incident-recovery
+route.
+
+Be clear-eyed about what that buys: the receipts prove the gates were not **forgotten**. Nothing in
+CI can prove they were actually *run* — a receipt is as forgeable as any other self-attestation,
+which is why `review-depth-check` is advisory by design. The soak receipt names
+`check_cc_running_versions.sh` specifically because that one *is* checkable after the fact: it
+reports which live processes were really on the candidate, and a soak whose sessions were not is
+evidence about the previous release.
+
+*Why the soak needed its own receipt (2026-08-27):* every concrete recording requirement here used
+to attach to the changelog read alone. A pin PR could therefore satisfy every reviewable receipt
+while skipping steps 3–5 entirely — so the "unwaivable" local-first gate was not, in fact,
+checkable before merging the public pin.
 
 **Pick the target first.** `npm view @anthropic-ai/claude-code version` gives `latest`; use an
 explicit older version if you are deliberately not chasing latest. Every step below is defined over
@@ -51,17 +88,33 @@ the procedure (step 5).
    Checklist **step 0 is the MANDATORY full-changelog-read gate**: every release entry in
    `(pinned, target]`, read in full, recorded as a durable row. No pin bump proceeds without it.
    The analyzer's verdict is TRIAGE — it prioritises, it does not discharge the gate.
+   - **Take the PRE-align model-alias sample HERE, in step 1** — while the old binary is still
+     installed. Not in step 2: that step has a legitimate skip condition, and a sample nested under
+     it vanishes silently exactly when the skip fires, leaving step 4's "after" reading with nothing
+     to compare against. It cannot move later either — step 3 replaces the CLI. See §Model-alias
+     drift in the `cc-update` skill for the invocation and which `modelUsage` entry to read.
 2. **Deploy current `main` FIRST — before the soak, never during it.** Run `scripts/update.sh`
    (background task) so the box is on current code *before* the candidate goes on. Two reasons:
    a long gap between deploys means step 8 would otherwise land weeks of Genesis change **and**
    the CC bump in one shot, leaving you unable to attribute a regression to either; and the soak
    is only meaningful as evidence about CC if the code underneath it isn't stale.
-   **Checkable skip condition:** compare the newest `update_history` row (`update_history_recent`
-   MCP, or the dashboard) against `git log -1 origin/main` — skip this step only if the last
-   successful deploy is NEWER than the `main` commits you would otherwise be bundling into step 8.
-   "It feels recent" is not the test; a 2-week gap is easy to accumulate and invisible without
-   looking. (`update.sh` re-aligns the container to the repo pin, which is exactly right *here* —
-   it is the same property that makes it destructive mid-soak at step 5.)
+   **Checkable skip condition — three parts, all required:**
+   1. `git fetch origin` **first.** `origin/main` is a remote-tracking ref that only moves when you
+      fetch; comparing against a stale one produces a false "already current".
+   2. Take the newest `update_history_recent` row **whose `status == "success"`**. The tool returns
+      every attempt — `success`, `failure`, `rolled_back` alike (`update_history.py:98-113`) — so an
+      unfiltered "newest row" can be a failed or rolled-back attempt whose later timestamp reads as
+      evidence of a deployment that never landed.
+   3. Confirm that row's `new_commit` contains the freshly-fetched `origin/main` head — i.e. the
+      head is an ancestor of (or equal to) the deployed commit. Mechanically:
+      `git merge-base --is-ancestor "$(git rev-parse origin/main)" <new_commit>` exits 0.
+      Timestamps are not the test; "newer" is not a containment relation.
+
+   Skip only if all three hold. "It feels recent" is not the test; a 2-week gap is easy to
+   accumulate and invisible without looking. (`update.sh` re-aligns the container to the repo pin,
+   which is exactly right *here* — it is the same property that makes it destructive mid-soak at
+   step 5.) If the MCP server is unavailable, the same rows are readable from the dashboard's
+   deploy history, or directly from the `update_history` table.
 3. **Align the CONTAINER ONLY to the candidate.** Set the candidate ONCE as a standalone
    assignment, then run both functions under it:
 
@@ -87,8 +140,12 @@ the procedure (step 5).
    stale shadow binary while the same-shell version check passes. (`update.sh:477-488` pairs the
    two the same way, but `unset`s `CC_VERSION` first so both run on the pin.)
    `cc_ensure_local` is **container-only**, so the host stays on the pin — a live rollback path.
-   Verify a **FRESH** `claude --version` (this foreground session keeps its old binary until
-   relaunch).
+
+   **Do not verify with `claude --version` alone — it cannot answer this question.** It spawns a
+   *fresh child*, which reads the new on-disk binary and truthfully reports the candidate while the
+   session that asked is still executing the old one. Run
+   `scripts/check_cc_running_versions.sh` (the running-binary sweep), which
+   compares each live process's actual mapped binary against the one on disk.
    - **Check the candidate's Node floor BEFORE aligning** —
      `npm view @anthropic-ai/claude-code@<candidate> engines.node` against the container's
      `node -v`. **If the floor rises above the container's Node, STOP: there is no container-side
@@ -107,7 +164,26 @@ the procedure (step 5).
    check, which cannot pass yet). Run the critical paths, this doc's §Known Issues, and every
    behavior the impact eval flagged. Note that any Guardian-path check exercises the **host's old
    binary**, so candidate-specific Guardian behavior needs a container-side exercise instead.
-5. **Soak 2–3 days** under real use. **Do NOT run `update.sh` during the soak** — it `unset`s any
+   - **Run `scripts/check_cc_running_versions.sh` FIRST.** Validation performed inside a session
+     still mapped to the replaced binary is evidence about the OLD release — and it is the evidence
+     the changelog gate feeds into. The check belongs at every point that produces evidence about
+     the candidate (steps 3, 4, 5 and 9), not only at the soak boundary.
+   - **Take the POST-align model-alias sample** and compare it against the pre-align one from step
+     1. Nothing else in the system detects an alias remap: it is not a downgrade, so the tier-based
+     downgrade detector is blind to it.
+5. **Soak 2–3 days** under real use — and **the clock does not start until every interactive
+   session is actually running the candidate.** Relaunch the foreground sessions, then prove it:
+   `scripts/check_cc_running_versions.sh` must exit 0 before the clock starts, and again at soak
+   end. A process that predates the align keeps its original binary mapping until it restarts, so
+   it contributes evidence about the OLD release for the entire soak.
+
+   *This is not hypothetical (measured on a live install):* a soak ran its full length with **a
+   majority of live CC processes — and most interactive sessions — still executing the replaced
+   predecessor**. `cc_shadow_scan` was clean the whole time — it scans on-disk copies, not running
+   processes — and `claude --version` reported the candidate throughout.
+   Record the sweep result in the `CC-Gate-Soak` receipt.
+
+   **Do NOT run `update.sh` during the soak** — it `unset`s any
    inherited `CC_VERSION` and re-aligns the container to the repo pin, reverting the candidate.
    Rollback at any time is one command:
    `source scripts/lib/cc_version.sh && CC_VERSION=<pin> cc_ensure_local`.
@@ -127,9 +203,15 @@ the procedure (step 5).
    (`scripts/check_cc_node_lockstep.py`) fails the PR if `NODE_MAJOR` is below the pinned CC's
    required Node major, so this can't be forgotten (it fails open on a transient npm-registry
    error). Add the §Version History row, including the changelog-gate clause from step 1.
-7. **PR → CI green** (incl. `cc-node-lockstep`) → **privacy scan** (`origin` is public — run the
-   pre-push privacy scanners over the diff) → **explicit user approval** → **squash-merge**. Then
-   `git pull --rebase origin main`.
+7. **PR → CI green** (incl. `cc-node-lockstep`) → **privacy scan** (`origin`
+   is public — run the pre-push privacy scanners over the diff) → **explicit user approval** →
+   **squash-merge**. Then `git pull --rebase origin main`.
+   **Put both gate receipts in the PR body** (§Gate receipts above) — the merge gate blocks the
+   PR without them:
+   ```
+   CC-Gate-Changelog: read (2.1.218, 2.1.246] in full from CHANGELOG.md, 2026-08-27
+   CC-Gate-Soak: 2.1.246 on container 2026-08-25..2026-08-27, check_cc_running_versions.sh clean, sign-off recorded
+   ```
 8. **Run `scripts/update.sh`** (a background task — deploys exceed the Bash tool timeout). It
    updates the container, redeploys the Guardian (carrying the new gateway script), then queries
    the host's CC version and — **only if it differs from the pin** — dispatches `update-cc <pin>`
@@ -144,6 +226,9 @@ the procedure (step 5).
    healthy; a headless `claude -p` smoke on a **FRESH** process; re-check §Known Issues and any
    tabled CC bugs against the new version; and verify each behavior the impact eval flagged on the
    live path, not just that the flag still parses.
+   Run `scripts/check_cc_running_versions.sh` here too: after `update.sh` replaces the binary,
+   every session open across the deploy is still mapped to the previous one, so post-deploy
+   validation done in an un-relaunched session re-checks the version you just moved away from.
 10. **Leverage + capture.** For each newly-available capability Genesis would want, file the
     detection→behavior follow-up. Store what was learned to memory + this doc + the KB so the next
     update executes rather than rediscovers.
@@ -193,7 +278,7 @@ Deliberate multi-copy setups: `CC_SHADOW_SCAN=0` opts out.
 CC "not installed", so a PATH-blind install is aligned in place instead of
 reinstalled forever.
 
----
+
 
 ## Integration Surface — Genesis Components That Use CC
 
@@ -329,7 +414,7 @@ When a new CC version is released, run through this:
      and carry that string into the PR body and the §Version History row added at
      §Updating **step 6** (before the PR, not after it).
      For rows added **from 2026-08-26 onward**, a Version-History row without that
-     clause means the gate was not run — treat it as blocking at review. Older rows
+     clause means the gate was not run — treat it as blocking at merge. Older rows
      predate the gate and are not retroactively in scope.
    - **Delegation is allowed only with the same context and rigor** — brief the
      sub-agent with the Genesis impact-surface list (see §Delegating the full
