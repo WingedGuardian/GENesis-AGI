@@ -216,13 +216,24 @@ the procedure (step 5).
    updates the container, redeploys the Guardian (carrying the new gateway script), then queries
    the host's CC version and — **only if it differs from the pin** — dispatches `update-cc <pin>`
    to the Guardian gateway on the host. The dispatch is idempotent (acts only on drift) and
-   non-fatal (a failed host update leaves the previous working CC in place).
+   non-fatal **to the deploy** — but "non-fatal" is not "harmless", and it does NOT mean the
+   host still has a working CC. The gateway runs `npm install -g` **before** it verifies
+   (`guardian-gateway.sh`, the `update-cc` op), so the two failure states differ:
+   if the install itself fails, the previous package is untouched; if the install succeeds
+   and the version check then fails, the old package is **already replaced and there is no
+   rollback**. That second state leaves the Guardian's `claude -p` recovery brain without a
+   working CLI while the deploy reports success, so treat a failed host update as an
+   incident to resolve in the same session — verify the host directly (step 9) rather than
+   assuming the previous version survived.
    Between updates the nightly `genesis-cc-align.timer` closes **host** drift only —
    `scripts/cc_align_host.sh` calls `cc_align_host_sync` and never `cc_ensure_local`, so container
    drift does **not** self-heal nightly. The useful corollary: that timer will not silently revert
    a container candidate during the step-5 soak.
 9. **Post-deploy validation in the SAME session.** Container **and** host `claude --version` ==
-   pin (host via the gateway `version` op / `~/.genesis/host_gateway_state.json`); guardian tick
+   pin (host via a FRESH gateway `version` op — **not** `~/.genesis/host_gateway_state.json`,
+   which `cc_align_host_sync` writes from its PRE-alignment probe and never refreshes after
+   dispatching `update-cc`, so it still reports the OLD version until the nightly timer runs);
+   guardian tick
    healthy; a headless `claude -p` smoke on a **FRESH** process; re-check §Known Issues and any
    tabled CC bugs against the new version; and verify each behavior the impact eval flagged on the
    live path, not just that the flag still parses.
@@ -402,8 +413,16 @@ When a new CC version is released, run through this:
      is newest-first, so a present target heading already implies it.)
    - **Escape hatch: a target released hours ago may not be in `main`'s CHANGELOG.md yet** —
      the one case where no re-fetch can satisfy the check. Cover the missing tail from the
-     GitHub release bodies (`gh release view v<target> --repo anthropics/claude-code`) and
-     record in the durable row which source covered which releases. Do not silently proceed
+     GitHub release bodies — but **enumerate it first**: `gh release view` reads ONE release,
+     so `gh release view v<target>` alone under-reads whenever more than one release in
+     `(pinned, target]` is absent from the file, and the gate then closes over releases
+     nobody read. List what is actually missing and fetch each one:
+     ```bash
+     gh release list --repo anthropics/claude-code --limit 60 --json tagName -q '.[].tagName'
+     # keep the tags in (pinned, target] that have no `## <version>` heading in the file,
+     # then for EACH:  gh release view <tag> --repo anthropics/claude-code
+     ```
+     Record in the durable row which source covered which releases. Do not silently proceed
      on a file that lacks the target.
    - Scale: `(2.1.218, 2.1.246]` measured **25 releases / ~88KB**. The load-bearing
      item can sit anywhere, **including deep inside the newest release**.

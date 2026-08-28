@@ -44,8 +44,12 @@ later restarts the procedure (step 5).
 > already passed, and equality could never be satisfied by any re-fetch.
 >
 > **If the target released hours ago its heading may not be in `main`'s CHANGELOG.md yet** — the
-> one case no re-fetch fixes. Cover the tail from `gh release view v<target> --repo
-> anthropics/claude-code` and say in the durable row which source covered which releases.
+> one case no re-fetch fixes. Cover the tail from the GitHub release bodies, but **enumerate what
+> is missing first**: `gh release view` reads ONE release, so `gh release view v<target>` alone
+> under-reads whenever more than one release in `(pinned, target]` is absent, and the gate closes
+> over releases nobody read. `gh release list --repo anthropics/claude-code --limit 60 --json
+> tagName -q '.[].tagName'`, keep the tags in range with no `## <version>` heading in the file, then
+> `gh release view <tag>` for EACH. Say in the durable row which source covered which releases.
 >
 > Scale: `(2.1.218, 2.1.246]` measured 25 releases / ~88KB. The load-bearing item can sit anywhere,
 > **including deep inside the newest release**.
@@ -222,7 +226,9 @@ later restarts the procedure (step 5).
    (usefully) will **not** silently revert a container candidate mid-soak.
 9. **Post-deploy validation (SAME session) — critical paths AND known/tabled issues, not just a
    smoke.** Container + host `claude --version` == pin (host via the gateway `version` op /
-   `~/.genesis/host_gateway_state.json`); guardian tick healthy; a CCInvoker / headless `claude -p`
+   a FRESH gateway `version` op — **not** `~/.genesis/host_gateway_state.json`, which is written
+   from the PRE-alignment probe and not refreshed after `update-cc`, so it reports the OLD
+   version until the nightly timer runs); guardian tick healthy; a CCInvoker / headless `claude -p`
    smoke on a **FRESH** process (this foreground session keeps its OLD binary until relaunch);
    **re-check the doc's §Known Issues + any tabled CC bugs against the new version**; and verify each
    behavior the impact eval flagged (e.g. an MCP arg-typing or `-p` result-shape change) on the live
@@ -312,9 +318,11 @@ family — **measured live: `opus` resolved `claude-opus-4-8` → `claude-opus-5
 with no warning anywhere. This is NOT a downgrade, so the tier-based downgrade detector is blind to
 it, and **no drift detector exists on `main` today** — there is nothing to alert you.
 
-So take **two samples, and mind where each one goes**: the PRE-align sample is a **step 2** item
-(the last moment the old binary is still installed — step 4 runs *after* step 3 replaced it, so a
-"before" reading is impossible there), and the POST-align sample is a step-4 item.
+So take **two samples, and mind where each one goes**: the PRE-align sample is a **step 1** item
+(step 3 replaces the CLI, so step 4 is too late for a "before" reading), and the POST-align sample
+is a step-4 item. It belongs in step 1 specifically, **not step 2** — step 2 carries an explicit
+skip condition, and a reader who skips it would keep only the post-align value, leaving alias
+remapping undetectable because there is nothing to compare against.
 
 ```bash
 claude -p --model <alias> --output-format json 'ok'   # <alias> = opus | sonnet | haiku
