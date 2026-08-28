@@ -187,15 +187,26 @@ class TestBoxLockProbe:
         lock_holder(lock_file)
         assert _mod.box_lock_held() is True
 
-    def test_probe_does_not_steal_the_lock(self, lock_file, lock_holder):
+    def test_repeated_probes_of_a_held_lock_stay_consistent(
+        self, lock_file, lock_holder
+    ):
+        """The probe must be repeatable, not one-shot."""
         lock_holder(lock_file)
         assert _mod.box_lock_held() is True
         assert _mod.box_lock_held() is True
 
-    def test_probe_leaves_a_free_lock_free(self, lock_file):
+    def test_repeated_probes_of_a_free_lock_stay_free(self, lock_file):
+        """The probe must not WEDGE a free lock by holding what it took.
+
+        Named for the observable contract rather than the mechanism: these
+        assertions also hold with the explicit LOCK_UN removed, because closing
+        the fd releases the flock anyway. That is fine — the contract is what
+        callers depend on — but the earlier name claimed to isolate the unlock,
+        which it cannot.
+        """
         lock_file.write_text("")
         assert _mod.box_lock_held() is False
-        assert _mod.box_lock_held() is False  # proves the first released
+        assert _mod.box_lock_held() is False
 
     def test_lock_frees_when_the_holder_dies(self, lock_file, lock_holder):
         proc = lock_holder(lock_file)
@@ -470,19 +481,42 @@ class TestPinnedToTheLockModule:
         assert result.returncode == 0, result.stderr
 
     def test_lock_path_default_matches(self, tmp_path, monkeypatch):
+        """Pin the DEFAULT paths — the ones that can actually drift.
+
+        Two earlier versions of this test were vacuous. The first compared path
+        COMPONENTS of a hand-typed literal that expanduser resolved
+        independently of the monkeypatched home, so the two sides were
+        different files. The second set the shared PATH_ENV override — which
+        BOTH layers read first — so both trivially equalled the override target
+        and the duplicated defaults could diverge freely underneath it.
+
+        The defaults are what duplication puts at risk, so measure those: unset
+        the override, point HOME at a tmp dir (both `Path.home()` and
+        `os.path.expanduser` honour it), and re-import the CLI so its
+        module-level constant recomputes.
+        """
         sys.path.insert(0, str(_WORKTREE / "src"))
         from genesis.util import pytest_lock
 
-        # Compare the values the two layers ACTUALLY use, via the shared
-        # override, and re-import the CLI so its module-level constant is
-        # recomputed. The previous version compared two path COMPONENTS of a
-        # hand-typed literal that os.path.expanduser resolved independently of
-        # the monkeypatched home — so the two sides were different files and
-        # changing the CLI's default would not have failed it.
+        monkeypatch.delenv(pytest_lock.PATH_ENV, raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / ".genesis").mkdir()
+
+        spec = importlib.util.spec_from_file_location("cli_repin", _SCRIPT)
+        reloaded = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reloaded)
+
+        assert Path(reloaded.LOCK_PATH) == pytest_lock.default_lock_path()
+
+    def test_lock_path_override_is_honoured_by_both(self, tmp_path, monkeypatch):
+        """The override path, kept as its own case rather than conflated."""
+        sys.path.insert(0, str(_WORKTREE / "src"))
+        from genesis.util import pytest_lock
+
         target = tmp_path / "pinned.lock"
         monkeypatch.setenv(pytest_lock.PATH_ENV, str(target))
 
-        spec = importlib.util.spec_from_file_location("cli_repin", _SCRIPT)
+        spec = importlib.util.spec_from_file_location("cli_repin2", _SCRIPT)
         reloaded = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(reloaded)
 

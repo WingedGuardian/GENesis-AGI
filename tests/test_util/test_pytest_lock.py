@@ -292,7 +292,11 @@ class TestWaitMode:
         elapsed = time.monotonic() - started
 
         assert lock.blocked is True
-        assert "waited 0s" in lock.message or "waited" in lock.message
+        # Distinguishes the TIMEOUT message from the plain contention one;
+        # the previous form was `"waited 0s" in m or "waited" in m`, where the
+        # second disjunct subsumes the first and proves only that a word appears.
+        assert "waited" in lock.message
+        assert "still held" in lock.message
         assert "pid 4242" in lock.message
         assert elapsed < 30, "wait must honour its timeout, not the poll interval"
 
@@ -635,3 +639,118 @@ class TestCancellableWait:
         started = time.monotonic()
         acquire(lock_path=path, wait=True, timeout=60, cancel=cancel)
         assert time.monotonic() - started < 20
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires /proc (Linux)")
+class TestConftestWiring:
+    """Drive a REAL pytest against a held lock, through this repo's own conftest.
+
+    Everything else here tests the lock module in isolation. The wiring in
+    ``tests/conftest.py`` — acquire in ``pytest_configure``, refuse with
+    ``pytest.exit(msg, returncode=EXIT_LOCK_HELD)``, exempt the
+    introspection-only modes, release in ``pytest_unconfigure`` — is the single
+    most user-facing behaviour of the whole change, and none of it was pinned:
+    the only assertion on the refusal path was that the CONSTANT equals 200,
+    which stays green if the conftest forgets ``pytest.exit`` entirely, passes
+    the wrong keyword, or exempts the wrong option names.
+
+    These spawn a real interpreter (a few seconds each) because that is the only
+    way to exercise a pytest plugin hook honestly — the refusal happens at
+    configure time, before collection, so the child never reaches a test.
+    """
+
+    @staticmethod
+    def _run(args: list[str], lock_path: Path, extra_env: dict | None = None):
+        worktree = Path(__file__).resolve().parent.parent.parent
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(worktree / "src")
+        env["GENESIS_PYTEST_LOCK_PATH"] = str(lock_path)
+        # The OUTER session holds the lock and exports the flag; a child that
+        # inherited it would treat itself as an inner run and skip acquisition,
+        # which is exactly the path under test.
+        env.pop(pytest_lock.HELD_ENV, None)
+        for leaked in (pytest_lock.DISABLE_ENV, pytest_lock.WAIT_ENV,
+                       pytest_lock.WAIT_TIMEOUT_ENV):
+            env.pop(leaked, None)
+        env.update(extra_env or {})
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", *args],
+            cwd=worktree, env=env, capture_output=True, text=True, timeout=300,
+        )
+
+    #: A single fast test to aim the child at. It is never reached under
+    #: contention — the refusal happens before collection.
+    TARGET = ["tests/test_util/test_pytest_lock.py", "-q", "-k", "test_release_is_idempotent"]
+
+    def test_a_contended_run_is_refused_with_the_distinct_status(
+        self, tmp_path, holder
+    ):
+        path = tmp_path / "pytest.lock"
+        holder(path, record="4242\n0\npytest tests/test_memory/test_drift.py")
+
+        result = self._run(self.TARGET, path)
+        out = result.stdout + result.stderr
+
+        assert result.returncode == pytest_lock.EXIT_LOCK_HELD, (
+            f"expected {pytest_lock.EXIT_LOCK_HELD}, got {result.returncode}: {out[:400]}"
+        )
+        assert "BLOCKED" in out
+        assert "pid 4242" in out, "the refusal must name the holder"
+        assert pytest_lock.WAIT_COMMAND in out, "the refusal must say how to wait"
+        assert "Traceback (most recent call last)" not in out, (
+            "pytest.exit leaked a traceback instead of exiting cleanly"
+        )
+
+    def test_an_uncontended_run_proceeds_and_releases(self, tmp_path):
+        path = tmp_path / "pytest.lock"
+        result = self._run(self.TARGET, path)
+
+        assert result.returncode == 0, (result.stdout + result.stderr)[-500:]
+        # pytest_unconfigure must have released, or the next run would be refused.
+        second = self._run(self.TARGET, path)
+        assert second.returncode == 0, "the lock was not released at unconfigure"
+
+    @pytest.mark.parametrize(
+        "mode", [["--help"], ["--markers"], ["--version"], ["--fixtures", "-q"]]
+    )
+    def test_introspection_modes_are_never_refused(self, tmp_path, holder, mode):
+        """They run no tests, so there is nothing to govern — and pytest
+        configures some of them OUTSIDE its session wrapper, where a refusal
+        surfaces as a traceback or, for --fixtures, as a silent exit 0."""
+        path = tmp_path / "pytest.lock"
+        holder(path)
+
+        result = self._run(mode, path)
+        out = result.stdout + result.stderr
+
+        assert result.returncode == 0, f"{mode} was refused: {out[:400]}"
+        assert "Traceback (most recent call last)" not in out
+
+    def test_the_disable_lever_really_lets_a_contended_run_through(
+        self, tmp_path, holder
+    ):
+        """The refusal message prescribes this; if it did not work, the
+        documented recovery path would be a lie."""
+        path = tmp_path / "pytest.lock"
+        holder(path)
+
+        result = self._run(
+            self.TARGET, path, extra_env={pytest_lock.DISABLE_ENV: "0"}
+        )
+        assert result.returncode == 0, (result.stdout + result.stderr)[-500:]
+
+    def test_the_wait_lever_queues_then_runs(self, tmp_path, holder):
+        """A background caller should queue rather than fail."""
+        path = tmp_path / "pytest.lock"
+        holder(path, linger=6.0)  # releases by exiting
+
+        started = time.monotonic()
+        result = self._run(
+            self.TARGET,
+            path,
+            extra_env={pytest_lock.WAIT_ENV: "1", pytest_lock.WAIT_TIMEOUT_ENV: "120"},
+        )
+        waited = time.monotonic() - started
+
+        assert result.returncode == 0, (result.stdout + result.stderr)[-500:]
+        assert waited > 2.0, f"returned in {waited:.1f}s — it did not actually queue"
