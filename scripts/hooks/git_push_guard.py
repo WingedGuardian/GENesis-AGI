@@ -152,6 +152,31 @@ _GATED_MENTION = re.compile(
     r"(?:^|\s)(?:--force(?:-with-lease)?|--no-verify|--admin)(?:\s|=|$)|\b(?:push|merge)\b"
 )
 
+# `gh pr create` is the FOURTH gated operation (it can push or fork the branch —
+# see _pr_create_would_publish), and it was missing from the mention set above.
+# MEASURED: an ANSI-C-hidden `gh pr create` on an unpushed branch was ALLOWED
+# while the plain form correctly asked — the same fail-open this net exists to
+# close, for an op the first cut omitted.
+#
+# It is a CONJUNCTION rather than a `create` alternative in the regex because
+# `create` alone is an ordinary English word. Measured over 11,488 real commands
+# (328 un-tokenizable): a bare `\bcreate\b` alternative adds 6 new prompts, all
+# benign here-doc Python; requiring `gh` as well adds ZERO while still catching
+# the bypass. Two literal token tests combined in code — deliberately NOT a
+# lookaround, which is positional: `(?=.*\bgh\b)\bcreate\b` reads FORWARD from
+# `create`, and in `gh pr create` the `gh` is BEHIND it, so that pattern matches
+# nothing and would have measured 0 false positives by never firing at all.
+_GH_MENTION = re.compile(r"\bgh\b")
+_CREATE_MENTION = re.compile(r"\bcreate\b")
+
+
+def _mentions_gated_op(command: str) -> bool:
+    """Whether the RAW text names any gated operation, on the blind path only."""
+    if _GATED_MENTION.search(command):
+        return True
+    return bool(_GH_MENTION.search(command) and _CREATE_MENTION.search(command))
+
+
 # Local push allowlist (offline re-push cache). SOFT dependency, guarded exactly
 # like the review_state import above: a module-LOAD exception must degrade to
 # None (→ the pure live-ls-remote republish path, i.e. today's behavior), NEVER
@@ -4178,11 +4203,15 @@ def main() -> int:
         # above) so every hard block below — sqlite writes, --no-verify, the
         # dispatched publish denies, the escalation cap — still takes precedence.
         # Returning here would DOWNGRADE those to a prompt (measured).
+        # The segment check covers ALL FOUR gated ops, not the three the first
+        # cut listed: create_segs belongs here for the same reason as the others
+        # — if the parser DID resolve a `gh pr create`, the real create gate below
+        # sees it and the net must stand down rather than double-prompt.
         blind_spot_reason: str | None = None
         if (
-            not (push_segs or merge_pr_segs or merge_git_segs)
+            not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
             and untokenizable(cmd)
-            and _GATED_MENTION.search(cmd)
+            and _mentions_gated_op(cmd)
         ):
             if _is_dispatched():
                 # No human is present to answer a prompt, and an unverifiable
@@ -4199,7 +4228,8 @@ def main() -> int:
             blind_spot_reason = (
                 "This command could not be parsed safely (e.g. ANSI-C $'...' "
                 "quoting) and mentions a gated operation (push / merge / "
-                "--force / --no-verify / --admin), so the guard cannot verify "
+                "gh pr create / --force / --no-verify / --admin), so the guard "
+                "cannot verify "
                 "what it would actually run. Approve only if you are sure. To "
                 "avoid the prompt, rewrite it in a directly-parseable form "
                 "(plain quotes, or -F <file>)."

@@ -63,7 +63,49 @@ def _decision(r: subprocess.CompletedProcess) -> str:
     return "block" if r.returncode == 2 else "allow"
 
 
+_TEST_SLUG = "testowner/testrepo"
+
+
+def _unpushed_repo(tmp_path: Path, monkeypatch) -> str:
+    """A repo whose branch is NOT on its remote, so `gh pr create` IS gated.
+
+    Two conditions BOTH have to hold, and missing either makes the bypass test
+    vacuous — control and variant both return `allow`, which is indistinguishable
+    from "the op was never gated here":
+
+    1. The publish gates are scoped to the canonical public repo, so the remote
+       must resolve to it. Pinned via the `_TEST_CANONICAL_PUBLIC_REPO` seam and
+       a matching remote URL — never this install's real slug, which would be an
+       install-specific value in a tracked test and would not survive on a clone.
+    2. `_pr_create_would_publish` only gates a create that might push or fork.
+       An unpushed branch on an unreachable host makes the `ls-remote` check
+       uncertain, which the guard treats as gated by contract.
+
+    The host is `.invalid` (RFC 2606), so the DNS lookup fails immediately —
+    no real network dependency in the test.
+    """
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", _TEST_SLUG)
+    run = lambda *a: subprocess.run(a, cwd=tmp_path, capture_output=True, text=True)  # noqa: E731
+    run("git", "init", "-q", "-b", "feature-x")
+    run("git", "config", "user.email", "t@example.invalid")
+    run("git", "config", "user.name", "t")
+    (tmp_path / "f.txt").write_text("hi")
+    run("git", "add", "f.txt")
+    run("git", "commit", "-qm", "init")
+    run("git", "remote", "add", "origin", f"https://example.invalid/{_TEST_SLUG}.git")
+    return str(tmp_path)
+
+
 def _run(script: Path, cmd: str, cwd: str | None = None) -> subprocess.CompletedProcess:
+    """Run a guard against *cmd*.
+
+    ``cwd`` is applied to BOTH the payload and the child's working directory.
+    They must agree: gates that read repo state (branch, remote, pushed-ness)
+    use the process cwd, so a payload-only cwd silently evaluated them against
+    whatever directory pytest happened to run from — this worktree, whose branch
+    IS pushed. That made a `gh pr create` control report "already on the remote"
+    and look un-gated, when the guard was correct and the harness was lying.
+    """
     payload: dict = {"tool_name": "Bash", "tool_input": {"command": cmd}}
     if cwd is not None:
         payload["cwd"] = cwd
@@ -74,6 +116,7 @@ def _run(script: Path, cmd: str, cwd: str | None = None) -> subprocess.Completed
         text=True,
         timeout=30,
         env=dict(os.environ),
+        cwd=cwd,
     )
 
 
@@ -161,6 +204,46 @@ class TestPushGuardNet:
 # ══════════════════════════════════════════════════════════════════════════
 # review_enforcement_commit — the net flips the ANSI-C commit bypass to BLOCK
 # ══════════════════════════════════════════════════════════════════════════
+class TestGhPrCreateIsCovered:
+    """`gh pr create` is the FOURTH gated op; the first cut of the net omitted it.
+
+    Found by an independent adversarial review of the diff, then reproduced:
+    an ANSI-C-hidden create on an unpushed branch was ALLOWED while the plain
+    form asked. Same fail-open the net exists to close, for an op left out of
+    the mention set and out of the segment check.
+    """
+
+    def test_plain_create_is_gated_baseline(self, tmp_path, monkeypatch):
+        """CONTROL — without this the bypass test below proves nothing.
+
+        If the baseline does not gate, variant and control are both `allow` and
+        a 'bypass' result is indistinguishable from 'this op was never gated
+        here'. This is the check that caught the first, meaningless version of
+        the reproduction.
+        """
+        cwd = _unpushed_repo(tmp_path, monkeypatch)
+        r = _run(_PUSH_GUARD, "gh pr create --title x --body y", cwd=cwd)
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
+
+    def test_hidden_create_reaches_a_human(self, tmp_path, monkeypatch):
+        """VERIFY-RED: allowed before the fix (mention set lacked any create term)."""
+        cwd = _unpushed_repo(tmp_path, monkeypatch)
+        r = _run(_PUSH_GUARD, f"{ANSIC}gh pr create --title x --body y", cwd=cwd)
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
+
+    def test_create_alone_does_not_trip_the_net(self, tmp_path):
+        """The mention test is `gh` AND `create`, not the word `create`.
+
+        MEASURED over 11,488 real commands (328 un-tokenizable): a bare
+        `\\bcreate\\b` alternative adds 6 new prompts, all benign here-doc
+        Python; the conjunction adds zero. This pins the narrower predicate so a
+        later 'simplification' to a single alternation has to fail here first.
+        """
+        cmd = "python3 - <<'PY'\nx = \"it's\"  # create a thing\nprint(x)\nPY"
+        r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
+        assert _decision(r) == "allow", r.stdout + r.stderr
+
+
 class TestCommitGuardNet:
     def test_ansic_commit_no_verify_blocked(self, tmp_path):
         r = _run(_COMMIT_GUARD, ANSIC + f"{GIT} {COMMIT} {NV}", cwd=str(tmp_path))
@@ -256,18 +339,75 @@ class TestAcceptanceCorpus:
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
         assert _decision(r) != "block", r.stdout + r.stderr
 
-    def test_line_continuation_is_documented_residue(self, tmp_path):
-        """DOCUMENTED RESIDUE (not closed by this PR).
+    @pytest.mark.parametrize(
+        "label,cmd_tpl",
+        [
+            # Two DISTINCT parse signatures, which is the point of enumerating
+            # rather than spot-checking one form:
+            #   'space + backslash'    -> segments as ['\\', None]
+            #   'no space + backslash' -> segments as [None, None]  (exe is 'git\')
+            # A fix keying on the " \" TOKEN shape closes the first two and
+            # leaves the third silently open. The durable fix is continuation
+            # JOINING before segmentation, not token recognition after it.
+            ("space_backslash", "{GIT} \\\n{PUSH} origin main {FORCE}"),
+            ("space_backslash_then_space", "{GIT} \\\n {PUSH} origin main {FORCE}"),
+            ("no_space_backslash", "{GIT}\\\n {PUSH} origin main {FORCE}"),
+        ],
+    )
+    def test_line_continuation_is_documented_residue(self, tmp_path, label, cmd_tpl):
+        """DOCUMENTED RESIDUE (not closed by this PR) — the WHOLE class, not one form.
 
         A `\\`-newline continuation tokenizes cleanly, so the tokenizability
         probe never fires — analyze() mis-attributing it is the SEPARATE
         mis-segmentation class (follow-up `737cdea8`). Locked here so the
-        boundary is explicit and a future fix flips this test deliberately
-        rather than silently.
+        boundary is explicit and a future fix flips these deliberately rather
+        than silently.
+
+        This is the one residue class measured to BOTH mis-parse and really
+        execute: bash joins the continuation before reading the command, so the
+        push actually runs. The `$( )` shapes mis-parse but never execute, which
+        makes them parser defects rather than gate bypasses.
+
+        NOT residue, asserted as the control in the sibling test below: a
+        continuation AFTER the subcommand (`git push \\<NL>origin`) still
+        resolves to `push`, because the subcommand was already read.
         """
-        cmd = f"{GIT} \\\n {PUSH} origin main {FORCE}"
+        cmd = cmd_tpl.format(GIT=GIT, PUSH=PUSH, FORCE=FORCE)
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        assert _decision(r) != "block", r.stdout + r.stderr
+        assert _decision(r) != "block", f"{label}: {r.stdout + r.stderr}"
+
+    def test_continuation_after_subcommand_downgrades_the_verdict(self, tmp_path):
+        """A THIRD severity in the same class — measured, and worse than it reads.
+
+        `git push \\<NL>origin main {FORCE}` was assumed harmless by two
+        independent readings, on the reasoning that `push` still resolves. It
+        does — but the FLAG is severed into the next segment:
+
+            seg[0] argv=['git', 'push', '\\\\']          <- subcommand, no flag
+            seg[1] argv=['origin', 'main', '--force']    <- flag, no exe
+
+        So the guard sees an ORDINARY push and emits `ask` instead of the hard
+        block a force-push warrants, and the prompt reads "git push needs your
+        approval before publishing externally" — it never mentions the force.
+        Bash, having joined the continuation before reading the command, really
+        does force-push. Consent is obtained under a description that omits the
+        dangerous flag, which is a worse failure than a silent allow: a silent
+        allow leaves no record of the operator agreeing to anything.
+
+        PRE-EXISTING, not introduced here — measured identical on the base
+        branch (base: ask, this branch: ask; plain force-push blocks on both,
+        which validates the comparison). Locked so the eventual segmentation fix
+        has to address flag ATTRIBUTION, not just subcommand resolution.
+        """
+        cmd = f"{GIT} {PUSH} \\\norigin main {FORCE}"
+        r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
+        decision = _decision(r)
+        assert decision == "ask", r.stdout + r.stderr
+        # The point of the finding: the approval text omits the force flag.
+        assert FORCE not in r.stdout, (
+            "prompt now names the force flag — the downgrade may be fixed; "
+            "re-derive this test rather than loosening it"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════
