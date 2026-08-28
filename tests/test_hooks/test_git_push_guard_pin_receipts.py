@@ -44,20 +44,18 @@ RECEIPTS = (
 def gate(monkeypatch):
     """_check_pin_receipts with head-pin and body injected, base pinned to 2.1.218.
 
-    The BASE side is stubbed rather than injected because the real gate reads it
-    from `git show origin/main:` — deliberately local, since at merge time
-    origin/main is exactly what the pin is about to land on.
+    BOTH sides go through the same API-backed seam now. The base was previously
+    stubbed at the `git show origin/main:` call, which is what made it possible for
+    the base read to be bound to the wrong repository and to a hardcoded branch —
+    so the fixture no longer patches subprocess at all, and any live call would be
+    a visible failure rather than a silently-satisfied stub.
     """
     monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
-
-    class _Result:
-        returncode = 0
-        stdout = PIN_BASE
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+    monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", PIN_BASE)
 
     def _fake_run(cmd, *a, **kw):
-        if cmd[:2] == ["git", "show"]:
-            return _Result()
-        raise AssertionError(f"unexpected subprocess call: {cmd}")
+        raise AssertionError(f"unexpected subprocess call — a seam should have answered: {cmd}")
 
     monkeypatch.setattr(_mod.subprocess, "run", _fake_run)
 
@@ -150,6 +148,8 @@ def test_an_unreadable_body_does_not_wall_off_the_merge(monkeypatch):
     """Distinct from an EMPTY body, which is a real state that determines the
     answer by itself and must BLOCK on a forward bump."""
     monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+    monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", PIN_BASE)
     monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", PIN_FORWARD)
     monkeypatch.delenv("_TEST_GH_PR_BODY", raising=False)
     monkeypatch.setattr(_mod, "_pr_body_text", lambda *a, **k: None)
@@ -171,6 +171,8 @@ def test_a_BLANK_pin_read_is_plumbing_and_must_not_block(monkeypatch, blank):
     so blank is plumbing and plumbing must not block.
     """
     monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+    monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", PIN_BASE)
     monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", blank)
     monkeypatch.setenv("_TEST_GH_PR_BODY", "")
 
@@ -216,3 +218,85 @@ def test_no_override_sigil_waives_this_gate():
     assert "override" not in window.split("return 2")[0], (
         "an override was wired into the pin-receipt gate"
     )
+
+
+# ── ABSENCE is content, not plumbing ──────────────────────────────────────
+# The distinction this section pins: a file the API says is NOT THERE (404) is a
+# fact about the PR, and the checker's own policy is that an unreadable pin BLOCKS.
+# An earlier revision returned the same None for a 404 and for a transport error,
+# so a PR that DELETED the pin file took the plumbing path and merged unexamined —
+# a fail-open on the one gate that is the sole enforcement for a public release.
+
+
+def test_a_deleted_pin_file_at_head_BLOCKS(monkeypatch):
+    """A PR that removes scripts/lib/cc_version.sh must not sail through.
+
+    Without a pin at head there is no way to establish whether the PR moves it
+    forward, which is precisely the condition the gate exists to refuse.
+    """
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+    monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", PIN_BASE)
+    monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", _mod._PIN_SEAM_ABSENT)
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "a PR that deletes the pin file")
+
+    blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
+
+    assert blocked is True, "a deleted pin file must BLOCK, not report NOT-verified"
+    assert "ABSENT at the PR head" in msg
+
+
+def test_a_missing_pin_file_on_the_BASE_blocks(monkeypatch):
+    """No base pin means no comparison, so a forward move cannot be ruled out."""
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+    monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", _mod._PIN_SEAM_ABSENT)
+    monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", PIN_FORWARD)
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "")
+
+    blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
+
+    assert blocked is True
+    assert "ABSENT on the base branch" in msg
+
+
+def test_an_unreadable_base_ref_is_plumbing_and_must_not_block(monkeypatch):
+    """The counterpart: not knowing WHICH branch to compare against is plumbing."""
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "")
+    monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", PIN_FORWARD)
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "")
+
+    blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
+
+    assert blocked is False
+    assert "NOT verified" in msg
+
+
+def test_the_base_is_read_at_the_PRs_own_ref_not_a_hardcoded_branch(monkeypatch):
+    """Regression guard for a wrong-base comparison.
+
+    The base used to be read with a local `git show origin/main:` — bound neither
+    to the repository being merged into nor to the PR's actual base branch. From a
+    checkout whose `origin` is a fork sitting on a HIGHER pin, a genuine forward
+    bump reads as a downgrade and is exempted. Both sides now go through the same
+    API path at the PR's own base ref; this asserts the ref is actually consulted.
+    """
+    seen = {}
+    real = _mod._pin_file_at_ref
+
+    def _spy(ref, repo, *, seam):
+        seen[seam] = ref
+        return real(ref, repo, seam=seam)
+
+    monkeypatch.setattr(_mod, "_pin_file_at_ref", _spy)
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "release-2.x")
+    monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", PIN_BASE)
+    monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", PIN_BASE)
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "")
+
+    _mod._check_pin_receipts("999", repo="owner/repo")
+
+    assert seen["_TEST_GH_BASE_PIN_FILE"] == "release-2.x", "base not read at the PR's base ref"
+    assert seen["_TEST_GH_HEAD_PIN_FILE"] == HEAD, "head not read at the PR head sha"

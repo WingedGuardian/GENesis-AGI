@@ -2918,35 +2918,60 @@ def _load_pin_receipt_checker():
         return None
 
 
-def _pin_file_at_head(pr_num: str, head_sha: str, repo: str | None) -> str | None:
-    """The pin file's contents at the PR head, read through the API.
+#: `_pin_file_at_ref` outcomes. ABSENT is a fact about the PR's CONTENT (the API
+#: answered, and the file is not there at that ref); UNREADABLE is a fact about the
+#: PLUMBING (no slug, timeout, auth, transport). They take OPPOSITE fail directions,
+#: so collapsing them — as an earlier revision did by returning None for both — let a
+#: PR that DELETES the pin file take the plumbing path and merge unblocked, which
+#: contradicts the checker's own stated policy that an unreadable pin BLOCKS.
+_PIN_OK = "ok"
+_PIN_ABSENT = "absent"
+_PIN_UNREADABLE = "unreadable"
+#: Test-seam sentinel for ABSENT (mirrors `_TEST_GH_PR_FILES`'s `__error__`).
+_PIN_SEAM_ABSENT = "__absent__"
 
-    NOT from the local checkout: the gate runs from the main worktree, which is
-    on main, so the PR's own version of the file is not on disk here. That is
-    also the property that makes this gate un-editable by the PR — only the
-    DATA comes from the PR, never the code reading it.
+
+def _pin_file_at_ref(ref: str, repo: str | None, *, seam: str) -> tuple[str | None, str]:
+    """``(contents, outcome)`` for the pin file at ``ref``, read through the API.
+
+    Used for BOTH sides of the comparison — one code path, so the head and base
+    reads cannot drift apart in their fail direction (they did: the base side used
+    a hardcoded local ``git show origin/main``, which is neither bound to the repo
+    being merged into nor to the PR's actual base branch. On a checkout whose
+    ``origin`` is a fork, a genuine forward bump could read as a DOWNGRADE and be
+    exempted).
+
+    NOT from the local checkout: the gate runs from the main worktree, which is on
+    main, so the PR's version of the file is not on disk here. That is also the
+    property making this gate un-editable by the PR — only the DATA comes from the
+    PR, never the code reading it.
     """
-    raw = os.environ.get("_TEST_GH_HEAD_PIN_FILE")
+    raw = os.environ.get(seam)
     if raw is not None:
-        # Through the SAME emptiness rule as the live path below — a seam that
-        # skips it would let a test see behaviour production cannot produce.
-        return raw if raw.strip() else None
-    # Resolution order matters. `_canonical_public_repo()` reads install config
-    # and is legitimately absent on an install that never set `github.*` — the
-    # merge gate treats that as "uncertain, enforce", so falling back to the repo
-    # the process is actually in keeps the gate WORKING rather than silently
+        # The seam mirrors the live path's THREE outcomes, so a test cannot see
+        # behaviour production is incapable of producing. Absence needs its own
+        # sentinel rather than "empty string": empty is what a stubbed or truncated
+        # response looks like, and production reads absence as a 404, never as a
+        # successful read of nothing.
+        if raw == _PIN_SEAM_ABSENT:
+            return None, _PIN_ABSENT
+        return (raw, _PIN_OK) if raw.strip() else (None, _PIN_UNREADABLE)
+    # Resolution order matters. `_canonical_public_repo()` reads install config and
+    # is legitimately absent on an install that never set `github.*` — the merge
+    # gate treats that as "uncertain, enforce", so falling back to the repo the
+    # process is actually in keeps the gate WORKING rather than silently
     # unverifying on every such install (measured: it returned None here).
     slug = (_normalize_repo(repo) if repo else None) or _canonical_public_repo()
     if not slug:
         slug = _derive_repo_from_cwd(os.getcwd())
     if not slug:
-        return None
+        return None, _PIN_UNREADABLE
     try:
         result = subprocess.run(
             [
                 "gh",
                 "api",
-                f"repos/{slug}/contents/{_PIN_FILE_PATH}?ref={head_sha}",
+                f"repos/{slug}/contents/{_PIN_FILE_PATH}?ref={ref}",
                 "-H",
                 "Accept: application/vnd.github.raw",
             ],
@@ -2955,15 +2980,32 @@ def _pin_file_at_head(pr_num: str, head_sha: str, repo: str | None) -> str | Non
             timeout=_gh_timeout(6),
         )
     except Exception:
-        return None
-    # EMPTY is plumbing, not content. A zero exit with no body means the read did
-    # not produce the file (wrong ref, path absent there, a stubbed response) —
-    # treating that as "a pin I cannot parse" would BLOCK, and a gate that blocks
-    # whenever a read comes back blank walls off every merge. A real
-    # cc_version.sh is never empty.
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    return result.stdout
+        return None, _PIN_UNREADABLE
+    if result.returncode == 0:
+        # A zero exit with NO body is not absence — the API reports a missing file
+        # as 404, never as a successful read of nothing. Blank here means a stubbed,
+        # truncated or otherwise non-answering response, i.e. PLUMBING. Calling it
+        # absence would block every merge whose read came back blank for any reason.
+        return (result.stdout, _PIN_OK) if result.stdout.strip() else (None, _PIN_UNREADABLE)
+    # Non-zero: separate "no such FILE" from everything else. A 404 alone cannot
+    # carry that, because GitHub returns 404 for a missing file, a missing repo AND
+    # an unresolvable ref — it will not distinguish them, deliberately, so as not to
+    # leak whether a private repo exists. MEASURED against the live API:
+    #   bad ref      -> gh: No commit found for the ref <sha> (HTTP 404)
+    #   missing file -> gh: Not Found (HTTP 404)
+    #   bad repo     -> gh: Not Found (HTTP 404)
+    # Only the first is self-identifying, and it is PLUMBING. The other two share
+    # one message — but this gate is reached only after the head sha and base ref
+    # were read successfully FROM THE SAME REPO, so the repo is known good by then
+    # and a bare Not Found is the path being absent.
+    # Matching "404" alone (an earlier revision) classified a bad ref as a deleted
+    # file and blocked six merge-gate cases whose refs are synthetic.
+    stderr = (result.stderr or "").lower()
+    if "no commit found for the ref" in stderr:
+        return None, _PIN_UNREADABLE
+    if "not found" in stderr:
+        return None, _PIN_ABSENT
+    return None, _PIN_UNREADABLE
 
 
 def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
@@ -2992,19 +3034,28 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
     the past; read at merge time there is no window to edit it afterwards. The
     CI job runs the same checker with ``--advisory`` purely for early feedback.
 
-    Base is ``origin/main`` from the LOCAL checkout, which at merge time is
-    exactly what the pin is about to land on — so no merge-ref anchoring is
-    involved and there is no ``HEAD^1`` question to get wrong. Head comes through
-    the API, so the code doing the reading is always main's copy.
+    BOTH sides are read through the API, against the repo actually being merged
+    into and the PR's OWN base branch. An earlier revision read the base with a
+    local ``git show origin/main`` — not bound to the merge target and hardcoding
+    the branch name — so from a checkout whose ``origin`` is a fork (or whose
+    ``origin/main`` is simply unfetched) the comparison ran against the wrong base,
+    and a fork sitting on a HIGHER pin turned a genuine forward bump into a
+    "downgrade" that the gate exempts. Head still comes through the API, so the
+    code doing the reading is always main's copy.
 
-    FAIL DIRECTION, split deliberately:
+    FAIL DIRECTION, split deliberately — and the split is between CONTENT and
+    PLUMBING, not between "worked" and "didn't":
       * The pin moved forward and a receipt is missing, or the pin cannot be READ
-        at either side -> BLOCK. Both are facts about the PR's content, and
-        publishing a release nobody can characterise is the thing to prevent.
-      * The gate's own PLUMBING failed (no checker module, gh unreadable, no
-        head sha) -> NOTE, do not block. Walling off every merge over a check
-        that only ever guards a pin bump would be a worse failure than the one
-        it prevents, and the surrounding gates already block on an unreadable PR.
+        at either side, or the file is ABSENT at either side -> BLOCK. All are
+        facts about the PR's content, and publishing a release nobody can
+        characterise is the thing to prevent. Absence matters on its own: a PR that
+        DELETES the pin file has no readable pin, which the checker's policy says
+        must block — routing that through the plumbing path would let the deletion
+        merge unexamined.
+      * The gate's own PLUMBING failed (no checker module, unreadable head sha or
+        base ref, auth/transport error) -> NOTE, do not block. Walling off every
+        merge over a check that only ever guards a pin bump would be a worse
+        failure than the one it prevents.
     """
     checker = _load_pin_receipt_checker()
     if checker is None:
@@ -3014,35 +3065,40 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
     if not head_sha:
         return False, "NOTE: PR head unreadable — pin receipts NOT verified."
 
-    head_text = _pin_file_at_head(pr_num, head_sha, repo)
+    base_ref = _pr_base_ref(pr_num, repo=repo)
+    if not base_ref:
+        return False, "NOTE: PR base ref unreadable — pin receipts NOT verified."
+
+    head_text, head_state = _pin_file_at_ref(head_sha, repo, seam="_TEST_GH_HEAD_PIN_FILE")
+    if head_state == _PIN_ABSENT:
+        return True, (
+            f"BLOCKED: {_PIN_FILE_PATH} is ABSENT at the PR head ({head_sha[:12]}). The pin "
+            f"cannot be read, so whether this PR moves it forward cannot be established — "
+            f"and a PR that removes the pin file is exactly the case this gate must not "
+            f"wave through. Restore it, or merge with the gate's own escape if the removal "
+            f"is intended."
+        )
     if head_text is None:
         return (
             False,
             f"NOTE: could not read {_PIN_FILE_PATH} at the PR head — receipts NOT verified.",
         )
 
-    try:
-        base_text = subprocess.run(
-            ["git", "show", f"origin/main:{_PIN_FILE_PATH}"],
-            capture_output=True,
-            text=True,
-            timeout=15,
+    base_text, base_state = _pin_file_at_ref(base_ref, repo, seam="_TEST_GH_BASE_PIN_FILE")
+    if base_state == _PIN_ABSENT:
+        return True, (
+            f"BLOCKED: {_PIN_FILE_PATH} is ABSENT on the base branch ({base_ref}). There is "
+            f"no pin to compare against, so a forward move cannot be ruled out."
         )
-    except Exception:
-        return False, "NOTE: could not read the base pin — receipts NOT verified."
-    if base_text.returncode != 0 or not base_text.stdout.strip():
-        # Same reasoning as the head read: blank is plumbing, not a pin nobody
-        # can parse. origin/main may simply not be fetched in this checkout.
-        return False, f"NOTE: {_PIN_FILE_PATH} unreadable on origin/main — receipts NOT verified."
+    if base_text is None:
+        return False, (f"NOTE: {_PIN_FILE_PATH} unreadable on {base_ref} — receipts NOT verified.")
 
     body = _pr_body_text(pr_num, repo)
     if body is None:
         return False, "NOTE: PR body unreadable — pin receipts NOT verified."
 
     try:
-        verdict = checker.evaluate(
-            base_pin_text=base_text.stdout, head_pin_text=head_text, body=body
-        )
+        verdict = checker.evaluate(base_pin_text=base_text, head_pin_text=head_text, body=body)
     except Exception as exc:  # noqa: BLE001 — plumbing, not policy
         return False, f"NOTE: pin-receipt check errored ({type(exc).__name__}) — NOT verified."
 
