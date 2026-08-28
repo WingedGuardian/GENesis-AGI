@@ -93,10 +93,30 @@ _ASSIGNMENT = r'^[^\S\n]*{var}=[^\S\n]*"?\$\{{{var}:-{value}\}}"?'
 #: the file); under-detection costs a bypass. This is a DETECTOR, not a shell
 #: parser — it never has to decide which assignment wins, only whether more
 #: than one exists.
+#:
+#: NOT ANCHORED, and that is the whole point. An anchored version of this check
+#: shipped first and closed exactly one shape — the one it had a test for. Bash
+#: executes assignments after ``;``, ``||`` and ``&&``, and inside one-line
+#: ``if``/``case`` bodies, none of which start a line. MEASURED, every one of
+#: these left the guard reporting the untouched pin line while bash resolved
+#: 2.1.999::
+#:
+#:     [ -n "${X:-}" ] || CC_VERSION="2.1.999"
+#:     if true; then CC_VERSION="2.1.999"; fi
+#:     true && CC_VERSION=2.1.999
+#:     printf -v CC_VERSION "2.1.999"
+#:     read -r CC_VERSION <<< "2.1.999"
+#:     eval CC_VERSION=2.1.999
+#:
+#: The lookbehind keeps ``MY_CC_VERSION=`` and ``OLD_CC_VERSION=`` from counting.
+#: ``"${CC_VERSION:-…}"`` is not miscounted either: that text is ``CC_VERSION:-``,
+#: not ``CC_VERSION=``. The last three alternatives cover the builtins that
+#: assign without an ``=`` at all.
 _ANY_ASSIGNMENT = (
-    r"^[^\S\n]*"
-    r"(?:(?:export|readonly|local|declare|typeset)[^\S\n]+(?:-\w+[^\S\n]+)*)?"
-    r"{var}="
+    r"(?<![\w.-]){var}="
+    r"|printf[^\n]*-v[^\S\n]+{var}\b"
+    r"|read[^\n]*[^\S\n]{var}\b"
+    r"|eval\b[^\n]*{var}"
 )
 
 _SEMVER = r"([0-9]+\.[0-9]+\.[0-9]+)"
