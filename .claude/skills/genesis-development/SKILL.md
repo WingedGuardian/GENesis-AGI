@@ -889,11 +889,29 @@ findings below, a gated `gh pr merge`:
   names the PR's current head — so if any required routine never ran, ran on a stale
   commit, or was rate-limited, the merge blocks (naming the missing kinds). An ADVISORY
   routine still posts its review on the PR to be read/addressed, but its absence does not
-  block. If a required routine is pending or rate-limited, wait for it, or
-  append `# scheduled-review-override` to merge anyway (the conscious "merge without the
-  scheduled reviews" case). The marker means "ran **clean**", not merely "ran": a
+  block. A missing marker has **three causes needing different actions**, and the block
+  message now names which one you are in — do not guess:
+  (1) *no marker at any head* — nothing has run; on a freshly-opened PR a routine may
+  still be in flight, so **waiting is correct**;
+  (2) *a marker at an EARLIER head* — a routine ran, then a push moved the head. Routines
+  are generally not re-run on a push, so waiting is unlikely to help: re-review the
+  current head and post the marker by hand;
+  (3) *a marker AT this head that was REFUSED* — see the clean-verdict rule below.
+  Or append `# scheduled-review-override` to merge anyway (the conscious "merge without
+  the scheduled reviews" case). Head match is EXACT — no ancestor walk, no delta
+  tolerance, unlike the Codex freshness gate, which grants relief on a provably trivial
+  delta. That asymmetry is deliberate: the Codex classifier judges code-review
+  substantiality by file type and size, and an inferential leak lands in exactly the small
+  doc edit it would wave through. The marker means "ran **clean**", not merely "ran": a
   review whose body carries a blocking finding (`[P1]`/`HARD BLOCK`/`### ERROR`, unless a
   clean verdict overrides) is rejected, and DISMISSED/PENDING(draft) reviews don't count.
+  **ALWAYS end a genuinely-clean scheduled review with an explicit verdict line**
+  (`VERDICT: PASS`, or `PII/Secrets/Wording: CLEAN`). The blocking patterns are plain
+  substrings with no negation awareness, so prose like "not a hard block" or "no hard
+  blocks found" TRIPS them — measured on two 2026-08-28 PRs whose markers both contained
+  that phrase in negated prose; the one that also carried a clean-verdict line was
+  accepted and the one without it was silently refused. Without the verdict line a clean
+  review can be rejected on wording alone;
   Fail-closed: an unreadable comments/reviews fetch BLOCKS (never a false all-clear);
 - requires the PR base to equal the repo's default branch (retarget guard);
 - blocks unless mergeability is a definite `MERGEABLE` (a failed/unknown read
