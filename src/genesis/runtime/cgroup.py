@@ -110,17 +110,23 @@ def read_container_memory_current() -> int | None:
 
 
 def read_container_memory_reclaimable() -> int | None:
-    """Reclaimable page cache (bytes) from cgroup memory.stat — v2 then v1.
+    """Reclaimable file-backed page cache (bytes) from cgroup memory.stat — v2 then v1.
 
     memory.current counts page cache as "used", so max-current UNDER-states
     available. Adding back the reclaimable file cache mirrors what /proc
-    MemAvailable means (usable without swapping). `file` slightly over-states
-    strictly-reclaimable memory (it includes dirty/mlocked file pages), but the
-    caller clamps the result with `min(procfs_MemAvailable, …)`, so it can only
-    make the estimate MORE conservative, never dangerously optimistic."""
-    v2 = _read_stat("/sys/fs/cgroup/memory.stat")  # v2: `file` = total page cache
-    if "file" in v2:
-        return v2["file"]
+    MemAvailable means (usable without swapping). We sum the file LRU lists
+    (`inactive_file` + `active_file`) rather than the type-based `file` counter:
+    on cgroup v2, `file` also includes tmpfs/shmem pages, which sit on the ANON
+    LRU and are NOT reclaimable for a new anonymous allocation — counting them
+    would over-state available and could let the gate ALLOW a session the
+    container cannot actually hold (kernel cgroup-v2 memory.stat semantics:
+    inactive_file + active_file == page cache minus tmpfs). The file LRU still
+    contains dirty pages (writeback-then-reclaim, not instant), but the caller
+    additionally clamps with `min(procfs_MemAvailable, …)`, so the estimate stays
+    conservative. v1's `total_*_file` counters are already list-based."""
+    v2 = _read_stat("/sys/fs/cgroup/memory.stat")  # v2: file LRU lists (exclude shmem)
+    if "inactive_file" in v2 or "active_file" in v2:
+        return v2.get("inactive_file", 0) + v2.get("active_file", 0)
     v1 = _read_stat("/sys/fs/cgroup/memory/memory.stat")  # v1: active+inactive file
     if "total_inactive_file" in v1 or "total_active_file" in v1:
         return v1.get("total_inactive_file", 0) + v1.get("total_active_file", 0)

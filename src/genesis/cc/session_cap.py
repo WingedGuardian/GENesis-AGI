@@ -16,11 +16,15 @@ The model here is CAPACITY, not free-RAM:
 - Live free RAM (MemAvailable) is consulted ONLY as a low OOM circuit-breaker —
   a floor to refuse a NEW session when the swapless box is genuinely near
   exhaustion — never as the cap.
-- Origin-aware: a direct LAN/tailscale SSH login (the operator "let me in" path,
-  distinct from the dashboard/magic-link "normal method") gets an emergency slot
-  ABOVE the safe cap and is NEVER hard-denied — when the box is full/tight it is
-  offered an interactive RECLAIM (pick a session to end, or reattach), so the
-  operator always has a path in without the OOM-killer choosing the casualty.
+- Origin-aware: ANY interactive SSH login (the operator "let me in" path — a slot
+  hostname OR a plain shell that runs `claude`, keyed on SSH_CONNECTION, distinct
+  from the dashboard/local-console "normal method") gets an emergency slot ABOVE
+  the safe cap. `decide()` NEVER returns DENY for an operator — when the box is
+  full/tight it returns RECLAIM (pick a session to end, or reattach), so the
+  operator always has a path in without the OOM-killer choosing the casualty. (The
+  interactive reclaim in cc-slot.sh can still decline in two honest corners the
+  pure gate can't see: no controlling TTY to prompt on, or an OOM-floor breach with
+  no slot to trade — both guide the user to reattach rather than risk an OOM.)
 
 Contract (mirrors `genesis.cc.login_gate`): `main()` reads /proc/meminfo, cpu
 count, `SSH_CONNECTION`, and the `GENESIS_CC_*` config levers, takes the current
@@ -40,7 +44,16 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import os
+import re
 from dataclasses import dataclass
+
+# Lever grammars — kept BYTE-IDENTICAL to the bash fallback's validation in
+# scripts/cc-slot.sh so the same ~/.genesis/cc-slot.env yields the same cap on
+# the Python path and the degraded static path. Positive levers: no leading zero
+# (bash reads that as octal), 1–7 digits (bash arithmetic can't overflow a
+# ≤9,999,999 value). Emergency: 0–99 (0 disables the emergency slot).
+_LEVER_POSITIVE = re.compile(r"[1-9][0-9]{0,6}")
+_LEVER_EMERGENCY = re.compile(r"0|[1-9][0-9]?")
 
 # --- Config levers (documented, tunable via ~/.genesis/cc-slot.env) -----------
 # Explicit, honest defaults measured on the reference 18GB swapless box
@@ -76,36 +89,31 @@ class CapConfig:
     def from_env(cls, environ: dict | None = None) -> CapConfig:
         env = os.environ if environ is None else environ
 
-        def _int(name: str, default: int) -> int:
+        def _lever(name: str, default: int, pattern: re.Pattern) -> int:
+            # Accept ONLY the exact bash grammar (fullmatch) — a value the bash
+            # fallback would reject (e.g. "3072mb", "+3072", "2_000", a leading
+            # zero, or an oversized string) falls back to the default here too,
+            # so the two paths never disagree on a config file.
             raw = env.get(name)
-            if raw is None or str(raw).strip() == "":
+            if raw is None:
                 return default
-            try:
-                val = int(str(raw).strip())
-            except ValueError:
-                return default
-            # Guard against a nonsensical override that would break the model
-            # (e.g. per_session 0 → division error). Fall back to the default.
-            return val if val > 0 else default
+            s = str(raw).strip()
+            return int(s) if pattern.fullmatch(s) else default
 
         return cls(
-            system_reserve_mb=_int("GENESIS_CC_SYSTEM_RESERVE_MB", _DEF_SYSTEM_RESERVE_MB),
-            per_session_mb=_int("GENESIS_CC_PER_SESSION_MB", _DEF_PER_SESSION_MB),
-            oom_floor_mb=_int("GENESIS_CC_OOM_FLOOR_MB", _DEF_OOM_FLOOR_MB),
-            # emergency_slots may legitimately be 0 (disable the emergency lever),
-            # so it uses a >=0 guard rather than the >0 guard above.
-            emergency_slots=max(0, _emergency_from_env(env)),
+            system_reserve_mb=_lever(
+                "GENESIS_CC_SYSTEM_RESERVE_MB", _DEF_SYSTEM_RESERVE_MB, _LEVER_POSITIVE
+            ),
+            per_session_mb=_lever(
+                "GENESIS_CC_PER_SESSION_MB", _DEF_PER_SESSION_MB, _LEVER_POSITIVE
+            ),
+            oom_floor_mb=_lever("GENESIS_CC_OOM_FLOOR_MB", _DEF_OOM_FLOOR_MB, _LEVER_POSITIVE),
+            # emergency_slots may legitimately be 0 (disable the emergency lever) —
+            # the emergency grammar admits 0; anything malformed → the default.
+            emergency_slots=_lever(
+                "GENESIS_CC_EMERGENCY_SLOTS", _DEF_EMERGENCY_SLOTS, _LEVER_EMERGENCY
+            ),
         )
-
-
-def _emergency_from_env(env: dict) -> int:
-    raw = env.get("GENESIS_CC_EMERGENCY_SLOTS")
-    if raw is None or str(raw).strip() == "":
-        return _DEF_EMERGENCY_SLOTS
-    try:
-        return int(str(raw).strip())
-    except ValueError:
-        return _DEF_EMERGENCY_SLOTS
 
 
 @dataclass(frozen=True)
@@ -121,10 +129,12 @@ class Decision:
 def classify_origin(ssh_connection: str | None) -> str:
     """Classify the SSH client origin from $SSH_CONNECTION.
 
-    Returns tailscale/lan for the OPERATOR-at-console (emergency-eligible),
-    public for a non-private remote, and none for no SSH (dashboard/manual/local
-    "normal method"). Unparseable → public (safe: no emergency, still reattachable
-    and still fail-open in the bash caller).
+    Returns tailscale/lan for the OPERATOR (any interactive SSH login from a
+    private/tailscale IP — a slot hostname OR a plain shell that then runs
+    `claude`), public for a non-private remote, and none when there is no
+    SSH_CONNECTION at all (the dashboard web terminal / local console — the
+    "normal method" held to the plain cap). Unparseable → public (safe: no
+    emergency, still reattachable and still fail-open in the bash caller).
     """
     if not ssh_connection or not ssh_connection.strip():
         return "none"
@@ -133,6 +143,11 @@ def classify_origin(ssh_connection: str | None) -> str:
         ip = ipaddress.ip_address(client)
     except ValueError:
         return "public"
+    # A dual-stack sshd can report an IPv4-mapped v6 client (::ffff:a.b.c.d);
+    # unwrap it so a mapped tailscale/LAN operator is not misread as "public"
+    # (ip.is_private is False on the mapped v6 form, and it misses _TAILSCALE_V4).
+    if getattr(ip, "ipv4_mapped", None) is not None:
+        ip = ip.ipv4_mapped
     if ip in _TAILSCALE_V4:
         return "tailscale"
     # ULA (fc00::/7, incl. tailscale's v6 range) + RFC1918 + loopback → operator.
@@ -165,7 +180,8 @@ def decide(
     # The threshold must cover a FULL per-session footprint (a fresh session
     # grows toward per_session_mb; starting one with less free than that can OOM
     # a swapless box), plus the operator's absolute floor — whichever is larger.
-    ram_ok = mem_available_mb >= max(config.per_session_mb, config.oom_floor_mb)
+    need_mb = max(config.per_session_mb, config.oom_floor_mb)
+    ram_ok = mem_available_mb >= need_mb
 
     if not is_operator:
         # Normal method (dashboard/magic-link/public): held to SAFE_CAP.
@@ -186,7 +202,7 @@ def decide(
                 effective_cap,
                 origin,
                 "oom_floor",
-                f"RAM low ({mem_available_mb}MB free, need >= {config.oom_floor_mb}MB "
+                f"RAM low ({mem_available_mb}MB free, need >= {need_mb}MB "
                 f"to start safely). Reattach an existing session or free memory.",
             )
         return Decision(
@@ -228,7 +244,7 @@ def decide(
             effective_cap,
             origin,
             "oom_floor",
-            f"RAM tight ({mem_available_mb}MB free, need >= {config.oom_floor_mb}MB). "
+            f"RAM tight ({mem_available_mb}MB free, need >= {need_mb}MB). "
             f"Reattach a session, or reclaim one to free memory and start fresh.",
         )
     return Decision(
@@ -270,12 +286,21 @@ def _cpu_count() -> int:
         return os.cpu_count() or 1
 
 
-def effective_memory() -> tuple[int, int]:
-    """(total_mb, available_mb), each capped by the container's cgroup memory
-    limit. procfs can expose HOST values inside a container — a 16GiB container
-    on a 32GiB host would otherwise be sized for 32GiB and trigger a cgroup OOM.
-    Reuses genesis.runtime.cgroup; degrades to procfs-only if cgroup is absent."""
+def effective_memory() -> tuple[int, int, bool]:
+    """(total_mb, available_mb, available_known), each capped by the container's
+    cgroup memory limit. procfs can expose HOST values inside a container — a
+    16GiB container on a 32GiB host would otherwise be sized for 32GiB and trigger
+    a cgroup OOM. Reuses genesis.runtime.cgroup; degrades to procfs-only if cgroup
+    is absent.
+
+    ``available_known`` is False in exactly one case: a FINITE cgroup limit was
+    found but current usage could not be read. procfs MemAvailable is then
+    untrustworthy (it may describe HOST headroom, not the container's), so the
+    caller must substitute a conservative estimate rather than trust it — otherwise
+    a partial cgroup read would let the gate ALLOW a session the container cannot
+    hold. total is still clamped to the limit; only availability is unknown."""
     total_mb, avail_mb = read_meminfo()
+    available_known = True
     try:
         from genesis.runtime import cgroup
 
@@ -291,7 +316,10 @@ def effective_memory() -> tuple[int, int]:
             # cache as used; add it back so this matches MemAvailable's meaning).
             cg_avail = max(0, cg_max - cg_cur + (cg_file or 0))
             avail_mb = min(avail_mb, cg_avail // (1024 * 1024))
-    return total_mb, avail_mb
+        else:
+            # Finite limit but usage unreadable → procfs avail cannot be trusted.
+            available_known = False
+    return total_mb, avail_mb, available_known
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -304,14 +332,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         args = parser.parse_args(argv)
-        mem_total, mem_available = effective_memory()
+        config = CapConfig.from_env()
+        mem_total, mem_available, available_known = effective_memory()
+        if not available_known:
+            # cgroup limit known but usage unreadable (see effective_memory):
+            # estimate free RAM from the capacity model itself rather than trust
+            # host procfs — free ≈ total − reserve − (running sessions × per).
+            # Conservative (leans toward RECLAIM when loaded), never a hard lockout
+            # at 0 sessions. User decision 2026-08-27.
+            mem_available = max(
+                0,
+                mem_total - config.system_reserve_mb - args.existing * config.per_session_mb,
+            )
         decision = decide(
             mem_total_mb=mem_total,
             mem_available_mb=mem_available,
             existing=args.existing,
             cpu_count=_cpu_count(),
             ssh_connection=os.environ.get("SSH_CONNECTION"),
-            config=CapConfig.from_env(),
+            config=config,
         )
     except Exception:  # noqa: BLE001 — fail-OPEN: any error → cc-slot.sh static fallback
         return 1

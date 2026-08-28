@@ -90,11 +90,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   cgroup memory limit and CPU affinity, not host `/proc` values, so a container that
   sees host RAM is sized for its real limit (not the host). Live free RAM is used
   only as an OOM circuit-breaker, and a new session only starts when there is room
-  for a full session (never over-committing a swapless box). A direct LAN/Tailscale SSH login (the operator) gets an
-  emergency slot above the safe cap and is never hard-denied — when the box is
-  full or memory is tight it offers to reattach or end a chosen session to make
-  room (the ended session's transcript persists, resume with `claude --resume`).
-  Reattaching always works. Tunable via `~/.genesis/cc-slot.env`
+  for a full session (never over-committing a swapless box). Any interactive SSH
+  login (a slot hostname or a plain shell running `claude`, from a LAN/Tailscale IP)
+  is the operator and gets an emergency slot above the safe cap; the cap itself
+  never turns it away — when the box is full or memory is tight it offers to reattach
+  or end a chosen session to make room (the ended session's transcript persists,
+  resume with `claude --resume`), and an ATTACHED session needs an explicit confirm
+  before it's ended. Two honest corners still decline: a non-interactive login
+  (no terminal to prompt on) is guided to reattach, and a genuine OOM-floor breach
+  with no slot to trade is refused rather than risking an OOM. The dashboard web
+  terminal / local console (no `SSH_CONNECTION`) is held to the safe cap. Reattaching
+  always works. Tunable via `~/.genesis/cc-slot.env`
   (`GENESIS_CC_SYSTEM_RESERVE_MB` / `_PER_SESSION_MB` / `_OOM_FLOOR_MB` /
   `_EMERGENCY_SLOTS`); the gate fails open so it can never strand you. See
   `docs/reference/tailscale-ssh-access.md`.

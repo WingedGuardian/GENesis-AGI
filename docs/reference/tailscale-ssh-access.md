@@ -44,14 +44,20 @@ OOM circuit-breaker, never as the cap.
 
 - **Reattaching** to an existing slot (`ssh <host>-N` to a slot that already
   exists, or the lobby picker) is ALWAYS allowed — it starts nothing new.
-- **A direct LAN/Tailscale SSH login is treated as the operator** and gets an
-  emergency slot **above** the safe cap, and is **never hard-denied**: when the
-  box is at the limit or RAM is genuinely tight, the login drops to an interactive
-  prompt — reattach an existing slot, or pick one to END (freeing its slot/memory;
-  its transcript persists, resume later with `claude --resume`). You choose what to
-  reclaim; the OOM-killer never does.
-- Other doors (the dashboard web terminal / "normal method") are held to the safe
-  cap.
+- **Any interactive SSH login is treated as the operator** — a slot hostname OR a
+  plain shell you then run `claude` in, from a LAN/Tailscale IP. It gets an
+  emergency slot **above** the safe cap and is **never turned away by the cap
+  itself**: when the box is at the limit or RAM is genuinely tight, the login drops
+  to an interactive prompt — reattach an existing slot, or pick one to END (freeing
+  its slot/memory; its transcript persists, resume later with `claude --resume`).
+  You choose what to reclaim; the OOM-killer never does. (Two honest corners still
+  decline: a **non-interactive** login with no terminal can't show the prompt, so
+  it's guided to reattach; and if RAM is below the OOM floor with **no slot to
+  trade**, the login is refused rather than risk an OOM on the swapless box. A
+  fully ungated way in always remains — a plain `ssh <box>` shell that doesn't run
+  the slot launcher.)
+- Other doors (the dashboard web terminal / local console — the "normal method",
+  no `SSH_CONNECTION`) are held to the safe cap with a plain refusal over it.
 
 Tune the model per box in `~/.genesis/cc-slot.env` (all optional):
 `GENESIS_CC_SYSTEM_RESERVE_MB`, `GENESIS_CC_PER_SESSION_MB`,

@@ -153,10 +153,59 @@ def test_classify_origin_none_when_no_ssh():
     assert classify_origin("   ") == "none"
 
 
+@pytest.mark.parametrize(
+    "client,expected",
+    [
+        ("::ffff:100.100.100.100", "tailscale"),  # IPv4-mapped CGNAT → operator
+        ("::ffff:192.0.2.10", "lan"),  # IPv4-mapped RFC5737 (is_private) → operator
+        ("::ffff:8.8.8.8", "public"),  # IPv4-mapped public → non-operator
+    ],
+)
+def test_classify_origin_unwraps_ipv4_mapped(client, expected):
+    # A dual-stack sshd can report ::ffff:a.b.c.d; without unwrapping, is_private
+    # is False on the mapped v6 form and a tailscale/LAN operator is misread public.
+    assert classify_origin(f"{client} 51000 100.100.0.1 22") == expected
+
+
 # ── Config env parsing (guards against nonsensical overrides) ─────────────────
 def test_config_from_env_guards_zero_per_session():
     cfg = CapConfig.from_env({"GENESIS_CC_PER_SESSION_MB": "0"})
     assert cfg.per_session_mb == 3072  # zero rejected → default (no ZeroDivision)
+
+
+# Reserve's default (4096) differs from every override below, so a reject is
+# unambiguous (no false pass from a default that happens to equal the input).
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("6000", 6000),  # plain digits → accepted
+        (" 6000 ", 6000),  # surrounding whitespace stripped → accepted
+        ("+6000", 4096),  # sign rejected → default
+        ("6000mb", 4096),  # unit suffix rejected → default
+        ("6_000", 4096),  # python int() underscore rejected → default
+        ("06000", 4096),  # leading zero (bash octal hazard) rejected → default
+        ("0x10", 4096),  # hex rejected → default
+        ("-5", 4096),  # negative rejected → default
+        ("99999999", 4096),  # 8 digits (bash-overflow guard, >7) rejected → default
+    ],
+)
+def test_config_from_env_matches_bash_grammar(raw, expected):
+    # F8: python accepts ONLY the bash fallback's grammar so the same cc-slot.env
+    # yields the same cap on the primary and the degraded static path.
+    assert CapConfig.from_env({"GENESIS_CC_SYSTEM_RESERVE_MB": raw}).system_reserve_mb == expected
+
+
+def test_config_from_env_emergency_grammar():
+    # 0 explicitly disables; malformed/oversized → default (1), matching bash.
+    assert CapConfig.from_env({"GENESIS_CC_EMERGENCY_SLOTS": "0"}).emergency_slots == 0
+    assert CapConfig.from_env({"GENESIS_CC_EMERGENCY_SLOTS": "2"}).emergency_slots == 2
+    assert CapConfig.from_env({"GENESIS_CC_EMERGENCY_SLOTS": "-1"}).emergency_slots == 1  # default
+    assert (
+        CapConfig.from_env({"GENESIS_CC_EMERGENCY_SLOTS": "100"}).emergency_slots == 1
+    )  # >99 → default
+    assert (
+        CapConfig.from_env({"GENESIS_CC_EMERGENCY_SLOTS": "07"}).emergency_slots == 1
+    )  # leading zero → default
 
 
 def test_config_from_env_reads_overrides():
@@ -191,6 +240,18 @@ def test_normal_below_one_full_session_denies():
     assert d.reason == "oom_floor"
 
 
+def test_oom_message_reports_the_real_threshold_not_just_floor():
+    # F6: with defaults the effective threshold is max(per=3072, floor=1536)=3072;
+    # the message must print 3072, not the bare oom_floor (1536) — 2000MB free is
+    # denied precisely because it's under 3072, so the number the operator reads
+    # has to match the gate that fired.
+    d_norm = _d(1, None, avail=2000)  # normal → DENY
+    d_op = _d(1, TS, avail=2000)  # operator → RECLAIM
+    assert "need >= 3072MB" in d_norm.message
+    assert "need >= 3072MB" in d_op.message
+    assert "1536" not in d_norm.message and "1536" not in d_op.message
+
+
 def test_allow_needs_room_for_a_full_session():
     # Exactly one session's worth free (3072) → ALLOW; one MB less → not ram_ok.
     assert _d(1, TS, avail=3072).action == "ALLOW"
@@ -210,10 +271,11 @@ def test_effective_memory_caps_by_cgroup(monkeypatch):
     monkeypatch.setattr(
         cgroup, "read_container_memory_reclaimable", lambda: 2 * 1024**3
     )  # 2 GiB cache
-    total, avail = m.effective_memory()
+    total, avail, known = m.effective_memory()
     assert total == 16384  # capped to the cgroup limit, not host 32768
     # available = limit(16) - usage(10) + reclaimable cache(2) = 8 GiB, not host 30000
     assert avail == 8 * 1024
+    assert known is True
 
 
 def test_effective_memory_procfs_only_when_no_cgroup(monkeypatch):
@@ -222,7 +284,56 @@ def test_effective_memory_procfs_only_when_no_cgroup(monkeypatch):
 
     monkeypatch.setattr(m, "read_meminfo", lambda *a, **k: (8192, 4000))
     monkeypatch.setattr(cgroup, "read_container_memory_max", lambda: None)  # unlimited/unreadable
-    assert m.effective_memory() == (8192, 4000)
+    assert m.effective_memory() == (8192, 4000, True)
+
+
+def test_effective_memory_unknown_when_usage_unreadable(monkeypatch):
+    # Codex P2: a FINITE cgroup limit but unreadable memory.current must NOT leave
+    # host procfs MemAvailable standing (it may describe host headroom → over-allow).
+    # total is still clamped to the limit; availability is flagged unknown so main()
+    # substitutes the conservative model estimate.
+    import genesis.cc.session_cap as m
+    from genesis.runtime import cgroup
+
+    monkeypatch.setattr(m, "read_meminfo", lambda *a, **k: (32768, 30000))  # host-inflated
+    monkeypatch.setattr(cgroup, "read_container_memory_max", lambda: 16 * 1024**3)
+    monkeypatch.setattr(cgroup, "read_container_memory_current", lambda: None)  # unreadable
+    monkeypatch.setattr(cgroup, "read_container_memory_reclaimable", lambda: None)
+    total, avail, known = m.effective_memory()
+    assert total == 16384  # limit still applied
+    assert avail == 30000  # raw value passes through …
+    assert known is False  # … but flagged untrustworthy (main() will not use it)
+
+
+def test_main_degrades_available_to_model_estimate_when_usage_unknown(monkeypatch, capsys):
+    # End-to-end: usage-unknown → main() computes free from the capacity model
+    # (total − reserve − existing×per), not host procfs, and the gate acts on THAT.
+    # 16384 − 4096 − 3×3072 = 3072 → exactly one session's room → operator ALLOW.
+    import genesis.cc.session_cap as m
+
+    monkeypatch.setattr(m, "effective_memory", lambda: (16384, 30000, False))
+    monkeypatch.setattr(m, "_cpu_count", lambda: 6)
+    monkeypatch.setenv("SSH_CONNECTION", TS)
+    rc = m.main(["--existing", "3"])
+    assert rc == 0
+    assert capsys.readouterr().out.splitlines()[0] == "ALLOW"
+
+
+def test_effective_memory_v2_reclaimable_excludes_shmem(monkeypatch):
+    # F5: v2 reclaimable = inactive_file + active_file (file LRU), NOT the `file`
+    # type-counter (which also counts tmpfs/shmem on the anon LRU → over-states).
+    from genesis.runtime import cgroup
+
+    monkeypatch.setattr(
+        cgroup,
+        "_read_text",
+        lambda p: (
+            "file 5000\ninactive_file 2000\nactive_file 1800\nshmem 1200"
+            if p == "/sys/fs/cgroup/memory.stat"
+            else None
+        ),
+    )
+    assert cgroup.read_container_memory_reclaimable() == 3800  # 2000+1800, not 5000
 
 
 # ── cgroup v1 fallback (older hosts lack the v2 unified paths) ────────────────

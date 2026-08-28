@@ -109,10 +109,12 @@ unset _lever
 # unit-tested Python gate decides (SAFE_CAP from MemTotal — stable, does NOT
 # collapse as sessions run, unlike the old MemAvailable/900 formula that locked
 # the operator out at "3/2"). Reattach to an existing slot bypasses this entirely.
-# The gate NEVER hard-locks the operator out: ALLOW → proceed; DENY → message+exit
-# (dashboard/"normal method" over cap); RECLAIM → interactive pick-a-session-to-end
-# (LAN/tailscale operator). It fails OPEN — a Python error falls back to a
-# MemTotal-based STATIC cap (never the collapsing free-RAM formula), so a broken
+# The gate never turns an operator away by the CAP: ALLOW → proceed; DENY →
+# message+exit (dashboard/"normal method" — no SSH_CONNECTION — over cap); RECLAIM →
+# interactive pick-a-session-to-end (any SSH login). RECLAIM can still decline in two
+# honest corners (no controlling TTY, or an OOM-floor breach with nothing to trade) —
+# both guide to reattach, never risk an OOM. It fails OPEN — a Python error falls back
+# to a MemTotal-based STATIC cap (never the collapsing free-RAM formula), so a broken
 # venv can never strand the operator. Config levers (~/.genesis/cc-slot.env):
 # GENESIS_CC_SYSTEM_RESERVE_MB / _PER_SESSION_MB / _OOM_FLOOR_MB / _EMERGENCY_SLOTS.
 
@@ -128,11 +130,23 @@ _cap_list_slots() {
 # to END a session to make room, or cancel and reattach. Returns 0 to proceed
 # with the launch; exits on cancel / invalid / no-TTY.
 _cap_reclaim() {
-    local msg="$1" reason="${2:-}" choice victim row nm att act state i=1
-    local -a rows
-    mapfile -t rows < <(tmux list-sessions \
-        -F '#{session_name}|#{session_attached}|#{t:session_activity}' 2>/dev/null \
-        | grep -E "^${SESSION_PREFIX}-[0-9]+\|" || true)
+    local msg="$1" reason="${2:-}" choice victim victim_att _confirm row nm att act state meta i=1
+    local -a names rows
+    # Build the reclaim list from FULLY-anchored bare cc-N names (`grep -xE`, the
+    # same full-line match the `existing` count uses), then query each session's
+    # attach/activity BY EXACT NAME. Never split a single combined
+    # `name|attached|activity` line: a session whose NAME embeds `|` (e.g. one an
+    # attacker crafts as `cc-9|0|x`) would desync the field split and forge the
+    # attach flag, defeating the attached-victim confirm and redirecting the kill.
+    # A crafted `|`-name can't equal a real cc-N and is excluded by the anchor here;
+    # the per-name `=`-exact query then can't shift field boundaries.
+    mapfile -t names < <(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+        | grep -xE "${SESSION_PREFIX}-[0-9]+" || true)
+    rows=()
+    for nm in "${names[@]}"; do
+        meta=$(tmux display-message -p -t "=${nm}" '#{session_attached}|#{t:session_activity}' 2>/dev/null || true)
+        rows+=("${nm}|${meta}")
+    done
     echo "" >&2
     echo "!  ${msg}" >&2
     if [ "${#rows[@]}" -eq 0 ]; then
@@ -182,7 +196,20 @@ _cap_reclaim() {
         echo "Invalid selection — cancelled." >&2
         exit 1
     fi
-    IFS='|' read -r victim _ _ <<<"${rows[$((10#$choice - 1))]}"
+    IFS='|' read -r victim victim_att _ <<<"${rows[$((10#$choice - 1))]}"
+    # An ATTACHED session may have someone actively working in it — require an
+    # explicit y/N before killing it (a detached slot needs no second prompt).
+    if [ "${victim_att:-0}" -ge 1 ]; then
+        echo "!  ${victim} is ATTACHED — someone may be using it. End it anyway? [y/N]" >&2
+        IFS= read -r -p "> " _confirm </dev/tty || _confirm=""
+        case "$_confirm" in
+            y | Y | yes | YES) ;;
+            *)
+                echo "Cancelled — no session ended (reattach: tmux attach -t ${victim})." >&2
+                exit 1
+                ;;
+        esac
+    fi
     echo "Ending ${victim} to free room for ${SESSION_NAME}…" >&2
     # If the kill fails, NO memory was freed — do not spawn a new session on top
     # (that would over-commit the box, the very thing reclaim exists to prevent).
@@ -198,70 +225,124 @@ _cap_reclaim() {
 # STATIC MemTotal cap — NEVER the collapsing free-RAM formula — + a hard OOM
 # floor. Leans permissive so a Python outage never locks the operator out.
 _cap_fail_open() {
-    local total_mb avail_mb reserve per floor cpus safe reason cg_max cg_cur cg_file head_mb need
-    total_mb=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024 ))
-    avail_mb=$(( $(awk '/^MemAvailable:/{print $2}' /proc/meminfo) / 1024 ))
-    # Cap by the container's cgroup memory limit — procfs can expose HOST values
-    # inside a container, which would size the cap for the host and trigger a
-    # cgroup OOM (mirrors the Python gate's effective_memory()). cgroup v2 only in
-    # this fail-open path (Python handles v1); a v1 host with the gate down falls
-    # back to procfs — the rare degraded case.
+    local mt ma total_mb avail_mb avail_known reserve per floor emerg cpus safe need
+    local cg_max cg_cur cg_if cg_af cg_file head_mb is_op limit reason
+
+    # Validate the operator levers BEFORE any arithmetic, with the SAME grammar as
+    # the Python gate's CapConfig.from_env (so one ~/.genesis/cc-slot.env yields the
+    # same cap on both paths). Positive levers: no leading zero (bash reads that as
+    # OCTAL), 1-7 digits — an oversized value like 2^64 would otherwise WRAP to 0 in
+    # $(( )) and divide-by-zero, aborting the login. Emergency: 0-99 (0 disables).
+    # Anything malformed/oversized → the default.
+    # `read -r <<<` strips surrounding whitespace exactly like Python's str.strip()
+    # in CapConfig.from_env — so a padded value (e.g. "8192 ") is honored IDENTICALLY
+    # on both paths, not accepted by the gate and silently defaulted here.
+    read -r reserve <<<"${GENESIS_CC_SYSTEM_RESERVE_MB:-4096}"; [[ "$reserve" =~ ^[1-9][0-9]{0,6}$ ]] || reserve=4096
+    read -r per     <<<"${GENESIS_CC_PER_SESSION_MB:-3072}";    [[ "$per"     =~ ^[1-9][0-9]{0,6}$ ]] || per=3072
+    read -r floor   <<<"${GENESIS_CC_OOM_FLOOR_MB:-1536}";      [[ "$floor"   =~ ^[1-9][0-9]{0,6}$ ]] || floor=1536
+    read -r emerg   <<<"${GENESIS_CC_EMERGENCY_SLOTS:-1}";      [[ "$emerg"   =~ ^(0|[1-9][0-9]?)$ ]] || emerg=1
+    cpus=$(nproc 2>/dev/null || echo 1);                        [[ "$cpus"    =~ ^[1-9][0-9]{0,3}$ ]] || cpus=1
+
+    # MemTotal / MemAvailable — validate each INDEPENDENTLY (an empty awk result
+    # would break $(( )) under set -e, and an unreadable field must degrade only its
+    # OWN gate, never both). MemTotal is required to size the cap; MemAvailable only
+    # feeds the OOM floor, so a missing MemAvailable → skip the RAM gate, keep count.
+    mt=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+    if ! [[ "$mt" =~ ^[0-9]+$ ]]; then
+        echo "cc-slot: cannot read MemTotal — capacity gate unavailable, allowing this slot." >&2
+        return 0
+    fi
+    total_mb=$(( mt / 1024 ))
+    ma=$(awk '/^MemAvailable:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+    if [[ "$ma" =~ ^[0-9]+$ ]]; then avail_mb=$(( ma / 1024 )); avail_known=1; else avail_mb=0; avail_known=0; fi
+
+    # Cap by the container's cgroup v2 memory limit — procfs can expose HOST values
+    # inside a container, which would size the cap for the host and trigger a cgroup
+    # OOM (mirrors effective_memory()). v2 only here (Python handles v1); a v1 host
+    # with the gate down uses procfs — the rare degraded case.
     if [ -r /sys/fs/cgroup/memory.max ]; then
         cg_max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
         if [[ "$cg_max" =~ ^[0-9]+$ ]]; then
             [ $(( cg_max / 1048576 )) -lt "$total_mb" ] && total_mb=$(( cg_max / 1048576 ))
             cg_cur=$(cat /sys/fs/cgroup/memory.current 2>/dev/null)
             if [[ "$cg_cur" =~ ^[0-9]+$ ]]; then
-                # Add back reclaimable page cache (memory.stat `file`) — current
-                # counts cache as used, so max-current alone understates available
-                # and would wrongly DENY. Matches effective_memory()'s add-back.
-                cg_file=$(awk '/^file /{print $2; exit}' /sys/fs/cgroup/memory.stat 2>/dev/null)
-                [[ "$cg_file" =~ ^[0-9]+$ ]] || cg_file=0
+                # Reclaimable = file LRU (inactive_file + active_file), NOT the `file`
+                # counter — `file` also counts tmpfs/shmem, which live on the ANON LRU
+                # and are NOT reclaimable for a new session (would over-state available
+                # → wrongly ALLOW). Mirrors read_container_memory_reclaimable().
+                cg_if=$(awk '/^inactive_file /{print $2; exit}' /sys/fs/cgroup/memory.stat 2>/dev/null); [[ "$cg_if" =~ ^[0-9]+$ ]] || cg_if=0
+                cg_af=$(awk '/^active_file /{print $2; exit}' /sys/fs/cgroup/memory.stat 2>/dev/null);   [[ "$cg_af" =~ ^[0-9]+$ ]] || cg_af=0
+                cg_file=$(( cg_if + cg_af ))
                 head_mb=$(( (cg_max - cg_cur + cg_file) / 1048576 )); [ "$head_mb" -lt 0 ] && head_mb=0
-                [ "$head_mb" -lt "$avail_mb" ] && avail_mb=$head_mb
+                if [ "$avail_known" = 1 ]; then
+                    [ "$head_mb" -lt "$avail_mb" ] && avail_mb=$head_mb
+                else
+                    avail_mb=$head_mb; avail_known=1
+                fi
+            else
+                # cgroup limit known but usage unreadable → procfs MemAvailable may be
+                # HOST headroom (over-allow on a swapless container). Estimate free from
+                # the capacity model instead (mirror the Python degrade): total − reserve
+                # − existing×per. Never trust host free RAM here. (User decision 2026-08-27.)
+                avail_mb=$(( total_mb - reserve - existing * per )); [ "$avail_mb" -lt 0 ] && avail_mb=0
+                avail_known=1
             fi
         fi
     fi
-    # Validate the operator-set levers BEFORE using them in $(( )): a non-numeric
-    # override (e.g. "3072mb", a leading-zero octal, or a zero floor that disables
-    # the guard) would break the arithmetic or the OOM floor. Mirror
-    # CapConfig.from_env's guard: bad/zero → default.
-    reserve=${GENESIS_CC_SYSTEM_RESERVE_MB:-4096}; [[ "$reserve" =~ ^[1-9][0-9]*$ ]] || reserve=4096
-    per=${GENESIS_CC_PER_SESSION_MB:-3072};        [[ "$per"     =~ ^[1-9][0-9]*$ ]] || per=3072
-    floor=${GENESIS_CC_OOM_FLOOR_MB:-1536};        [[ "$floor"   =~ ^[1-9][0-9]*$ ]] || floor=1536
-    cpus=$(nproc 2>/dev/null || echo 1); [[ "$cpus" =~ ^[1-9][0-9]*$ ]] || cpus=1
+
     safe=$(( (total_mb - reserve) / per )); [ "$safe" -lt 1 ] && safe=1
     [ "$safe" -gt "$cpus" ] && safe=$cpus   # nproc clamp (process-aware; thrash guard)
     # Room to START one more session must cover a FULL per-session footprint (a
     # session grows toward `per`), plus the absolute floor — whichever is larger.
     need=$per; [ "$floor" -gt "$need" ] && need=$floor
-    # Leans permissive on COUNT (allows up to safe+1 for any origin — the fallback
-    # can't classify SSH origin, and never-lock-the-operator-out wins) but the OOM
-    # guard below is strict. Looser than the real gate BY DESIGN; only reachable
-    # when the Python gate is down (broken venv).
-    if [ "$existing" -lt $((safe + 1)) ] && [ "$avail_mb" -ge "$need" ]; then
-        echo "cc-slot: capacity gate unavailable — static fallback allows this slot (${existing}/${safe})." >&2
+
+    # Origin: ANY SSH login ($SSH_CONNECTION set) is the OPERATOR — emergency slot +
+    # interactive reclaim, never a hard deny (user policy 2026-08-27: SSH = operator).
+    # No SSH_CONNECTION is the "normal method" (dashboard web terminal / local
+    # console) — held to `safe`, plain deny. This static path can't classify the
+    # client IP without a hand-rolled parser (the Codex tar-pit), so it keys on SSH
+    # PRESENCE; documented fail-open-only divergence: a public-IP SSH gets the
+    # operator affordance here, whereas the Python gate would DENY it.
+    if [ -n "${SSH_CONNECTION:-}" ]; then is_op=1; limit=$(( safe + emerg )); else is_op=0; limit=$safe; fi
+
+    # ALLOW iff under the origin's limit AND (RAM unknown OR enough headroom).
+    if [ "$existing" -lt "$limit" ] && { [ "$avail_known" = 0 ] || [ "$avail_mb" -ge "$need" ]; }; then
+        if [ "$avail_known" = 0 ]; then
+            echo "cc-slot: capacity gate unavailable, MemAvailable unreadable — count-cap only ($(( existing + 1 ))/${safe})." >&2
+        else
+            echo "cc-slot: capacity gate unavailable — static fallback allows this slot ($(( existing + 1 ))/${safe})." >&2
+        fi
         return 0
     fi
-    if [ "$avail_mb" -lt "$need" ]; then reason="oom_floor"; else reason="cap_full"; fi
-    # The interactive reclaim (which can kill a session) is an OPERATOR affordance.
-    # The dashboard/"manual" door is the "normal method" held to the cap — do NOT
-    # widen the session-kill flow to it, even in fail-open. It gets a plain DENY.
-    # (This gates on the door, not SSH origin — so a rare public-IP SSH slot login
-    # under fail-open still reaches reclaim; the Python gate would DENY it. No
-    # escalation: the caller is already SSH-authenticated, and it's fail-open-only.)
-    if [ "$MODE_ARG" = "manual" ]; then
-        echo "ERROR: Session cap reached (${existing}/${safe}) [capacity gate unavailable]." >&2
-        _cap_list_slots
-        exit 1
+
+    # Not allowed → classify reason (RAM tight vs at-limit).
+    if [ "$avail_known" = 1 ] && [ "$avail_mb" -lt "$need" ]; then reason="oom_floor"; else reason="cap_full"; fi
+
+    if [ "$is_op" = 1 ]; then
+        # Operator (SSH): never a hard no — interactive reclaim (pick a session to end).
+        if [ "$reason" = "oom_floor" ]; then
+            _cap_reclaim "Capacity gate unavailable; RAM low (${avail_mb}MB free, need >= ${need}MB)." "$reason"
+        else
+            _cap_reclaim "Capacity gate unavailable; at the limit (${existing}/${safe}+${emerg})." "$reason"
+        fi
+        return 0
     fi
-    _cap_reclaim "Capacity gate unavailable; static limit ${existing}/${safe}, ${avail_mb}MB free." "$reason"
-    return 0
+    # Normal method (dashboard/local console): plain deny, message matches the reason.
+    if [ "$reason" = "oom_floor" ]; then
+        echo "ERROR: RAM low (${avail_mb}MB free, need >= ${need}MB) [capacity gate unavailable]." >&2
+    else
+        echo "ERROR: Session cap reached (${existing}/${safe}) [capacity gate unavailable]." >&2
+    fi
+    _cap_list_slots
+    exit 1
 }
 
 # Numeric slots only: retired cc-manual-<ts>-<pid> sessions from the old wrapper
 # (and any other cc-* stray) must not consume cap headroom — manual allocation
-# can only ever probe/create cc-<N>.
+# can only ever probe/create cc-<N>. This count is a point-in-time snapshot: two
+# logins racing at the same instant can both read the same `existing` and both
+# spawn (a benign, pre-existing over-count of at most the concurrency — the cap is
+# a resource governor, not a lock; the OOM floor still guards actual exhaustion).
 existing=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
            | grep -cE "^${SESSION_PREFIX}-[0-9]+$" || true)
 
