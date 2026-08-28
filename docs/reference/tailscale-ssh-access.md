@@ -33,6 +33,37 @@ ssh <host>-lobby    # the session picker → pick any live slot
 Windows one-click: make a shortcut whose target is `wt.exe ssh <host>-lobby`
 (or `ssh.exe <host>-lobby`) and pin it to the taskbar.
 
+## The session cap and the operator emergency slot
+
+New slots are capped by the box's **capacity**, derived from its TOTAL RAM —
+`SAFE_CAP = (MemTotal − reserve) / per_session`, clamped to the CPU count. The cap
+is stable: it does NOT shrink as sessions run, and background apps (other coding
+tools, daemons) don't consume it. It scales per install — a bigger box allows more
+slots, a small box fewer (never below 1). Live free RAM is used only as an
+OOM circuit-breaker, never as the cap.
+
+- **Reattaching** to an existing slot (`ssh <host>-N` to a slot that already
+  exists, or the lobby picker) is ALWAYS allowed — it starts nothing new.
+- **Any interactive SSH login is treated as the operator** — a slot hostname OR a
+  plain shell you then run `claude` in, from a LAN/Tailscale IP. It gets an
+  emergency slot **above** the safe cap and is **never turned away by the cap
+  itself**: when the box is at the limit or RAM is genuinely tight, the login drops
+  to an interactive prompt — reattach an existing slot, or pick one to END (freeing
+  its slot/memory; its transcript persists, resume later with `claude --resume`).
+  You choose what to reclaim; the OOM-killer never does. (Two honest corners still
+  decline: a **non-interactive** login with no terminal can't show the prompt, so
+  it's guided to reattach; and if RAM is below the OOM floor with **no slot to
+  trade**, the login is refused rather than risk an OOM on the swapless box. A
+  fully ungated way in always remains — a plain `ssh <box>` shell that doesn't run
+  the slot launcher.)
+- Other doors (the dashboard web terminal / local console — the "normal method",
+  no `SSH_CONNECTION`) are held to the safe cap with a plain refusal over it.
+
+Tune the model per box in `~/.genesis/cc-slot.env` (all optional):
+`GENESIS_CC_SYSTEM_RESERVE_MB`, `GENESIS_CC_PER_SESSION_MB`,
+`GENESIS_CC_OOM_FLOOR_MB`, `GENESIS_CC_EMERGENCY_SLOTS`. The gate fails **open** —
+if it can't run, a static MemTotal-based fallback still lets you in.
+
 ## Why the aliases are keyed on the Tailscale IP, not the MagicDNS name
 
 `generate-ssh-config.sh` writes each `HostName` as the host's **stable Tailscale

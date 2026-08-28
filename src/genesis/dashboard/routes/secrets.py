@@ -113,9 +113,20 @@ def _parse_example_file() -> list[SecretKeyDef]:
     return keys
 
 
+# Keys the generic secrets editor must NOT surface or write. Timezone is managed
+# by the dedicated dashboard control (POST /api/genesis/settings/timezone →
+# genesis.yaml, the authoritative source): USER_TIMEZONE is a deprecated fallback
+# and GENESIS_TIMEZONE is install-time OS-clock plumbing with no Python reader —
+# a free-text field for either is a footgun that silently no-ops. Excluded from
+# BOTH the rendered registry (GET) and _KNOWN_KEYS (so PUT rejects them too).
+# secrets.env content is untouched (install seeding still writes them directly).
+_HIDDEN_KEYS: frozenset[str] = frozenset({"USER_TIMEZONE", "GENESIS_TIMEZONE"})
+
 # Parse once at import time — defensive to avoid crashing all dashboard routes
 try:
-    _KEY_REGISTRY: list[SecretKeyDef] = _parse_example_file()
+    _KEY_REGISTRY: list[SecretKeyDef] = [
+        k for k in _parse_example_file() if k.key not in _HIDDEN_KEYS
+    ]
 except Exception:
     logger.error("Failed to parse secrets.env.example", exc_info=True)
     _KEY_REGISTRY = []

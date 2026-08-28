@@ -54,6 +54,12 @@ DEFAULTS: dict[str, Any] = {
     "max_items": 40,  # open ledger rows fed to the fuzzy judge
     "max_proposals_per_run": 10,  # fuzzy annotations stored per run
     "inject_confidence_floor": 0.7,  # proposals below this never surface
+    # Open-PR lane (session-manager PR-4c): age-stale open-PR surface.
+    "open_pr_enabled": True,  # master switch for the open-PR lane (bool)
+    "open_pr_stale_days": 7,  # a PR idle >= this many days is "stale"
+    "max_open_prs": 50,  # gh --limit for the open-PR fetch
+    "open_pr_resurface_days": 7,  # keep surfacing a still-stale PR for this many days after first shown, then go quiet
+    "open_pr_max_surface": 5,  # max PRs shown inline per session
 }
 
 _INT_KNOBS = (
@@ -62,6 +68,10 @@ _INT_KNOBS = (
     "max_prs",
     "max_items",
     "max_proposals_per_run",
+    "open_pr_stale_days",
+    "max_open_prs",
+    "open_pr_resurface_days",
+    "open_pr_max_surface",
 )
 
 

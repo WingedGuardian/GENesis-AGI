@@ -11,6 +11,49 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Outreach total-cessation monitoring, without the old false-alarm trap.**
+  Outreach is now in the `subsystem_stale` alert set (WARNING) alongside
+  ego/inbox/dashboard. Previously it was excluded because its heartbeat was
+  *emergent* — a side-effect of an outreach job succeeding — and the outreach
+  scheduler only starts once a messaging channel (Telegram) registers, so a
+  Telegram-less install never pulsed and naively adding it would fire a permanent
+  unresolvable alert. Two pieces close that trap: (1) a dedicated,
+  channel-independent heartbeat daemon (`outreach/heartbeat.py`) that pulses **only
+  while the outreach scheduler is actually running** (`is_running`) — so a
+  never-started/stopped scheduler goes stale instead of reading a false `alive`; and
+  (2) an enable-gate (`_subsystem_enabled('outreach')` = Telegram configured, via the
+  same side-effect-free `build_bridge_config` loader onboarding-readiness uses) so a
+  dashboard-only install is benign. Documented boundary: a Telegram-configured install
+  whose scheduler *never once started* (registration failed) emits no pulse and stays
+  a benign `no_heartbeat` — outreach IS a bootstrap-manifest entry (`ok` = scheduler
+  *constructed*, not running), so it is explicitly exempted from the started-silent
+  `never_started` inference (a constructed-but-not-started scheduler is benign; a genuine
+  init *failure* still surfaces); a *wedged-but-alive* loop is job_health's domain. The
+  new `subsystem_stale:outreach` id is handled generically by the existing consumers
+  (morning-report dedup by prefix, the Sentinel `subsystem_stale:` disposition).
+
+- **Session-start surface for age-stale open PRs.** The repo-pulse worker now
+  also caches the open-PR set each boundary, and a SessionStart hook lists the
+  ones idle past a threshold (default 7 days) as one passive inline line —
+  `[Open PRs] 3 open PRs idle ≥7d — #1379 (12d) · #1223 (12d, dependabot) …`.
+  Visibility only: no CI/review state, never "ready to merge", no Telegram, no
+  follow-up rows, no auto-merge. Age-based by design (no `reviewDecision`/status
+  reducer — those carry no signal for owner PRs that sit at `REVIEW_REQUIRED`
+  forever). Levers under the `repo_pulse` settings domain (`open_pr_enabled`,
+  `open_pr_stale_days`, `max_open_prs`, `open_pr_resurface_days`,
+  `open_pr_max_surface`); `GENESIS_REPO_PULSE_DISABLED` / `enabled: false` stop it.
+  Robustness (review round): the fetch now sorts `sort:updated-asc` so a capped
+  window (>`max_open_prs` open PRs) keeps the STALEST end — the lane's target —
+  instead of gh's newest-first default that would drop aged PRs indefinitely; the
+  cache/seen sidecars anchor on `genesis_home()` (honors `GENESIS_HOME`) so a
+  relocated install keeps writer + reader in sync; and the hook's
+  `GENESIS_REPO_PULSE_DISABLED` gate matches the exact `1` the worker honors (a
+  looser truthy set would half-disable the subsystem). `mode: off` / `enabled:
+  false` are full-worker stops (all lanes); `open_pr_enabled` is the lane-only knob.
+  The surface's freshness TTL now derives from `min_interval_minutes` (2×, 1-day
+  floor) so a large debounce (≥1 day) can't expire the cache before the worker is
+  allowed to refresh it and silently suppress the surface for the whole window.
+
 - **The Contributor Work-Log can post curated newcomer issues autonomously
   (opt-in).** A new `require_approval: false` lever lets the curator's
   privacy-vetted issues post without a per-item approval prompt — Genesis is the
@@ -21,6 +64,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   halts posting — re-checked immediately before each create — and freezes the queue.
   Ships SAFE — `require_approval` defaults true, and it is overlay-file-only (not a
   one-call settings/dashboard toggle), so a fresh install always requires human approval.
+
 - **A per-prompt nudge when a session's memory MCP is running stale code.** Each
   Claude Code session's MCP subprocesses snapshot their code at spawn and never
   reload, so a deploy landing mid-session leaves recall — and its current security
@@ -34,6 +78,105 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **SSH slot cap no longer collapses below the running session count.** The
+  interactive-slot launcher (`scripts/cc-slot.sh`) sized its cap from
+  *instantaneous free RAM* (`(MemAvailable − reserve) / per_session`), so each
+  running session lowered free RAM and thus lowered the cap *below* the number
+  already running — locking the operator out of a new session (and even
+  misreporting "3/2 active") while other apps' memory use silently ate slots too.
+  The cap is now a stable function of the box's TOTAL RAM (a new pure, unit-tested
+  `genesis.cc.session_cap` helper), so it scales per install, does not shrink as
+  sessions run, and ignores unrelated apps. It is **container-aware** — it uses the
+  cgroup memory limit and CPU affinity, not host `/proc` values, so a container that
+  sees host RAM is sized for its real limit (not the host). Live free RAM is used
+  only as an OOM circuit-breaker, and a new session only starts when there is room
+  for a full session (never over-committing a swapless box). Any interactive SSH
+  login (a slot hostname or a plain shell running `claude`, from a LAN/Tailscale IP)
+  is the operator and gets an emergency slot above the safe cap; the cap itself
+  never turns it away — when the box is full or memory is tight it offers to reattach
+  or end a chosen session to make room (the ended session's transcript persists,
+  resume with `claude --resume`), and an ATTACHED session needs an explicit confirm
+  before it's ended. Two honest corners still decline: a non-interactive login
+  (no terminal to prompt on) is guided to reattach, and a genuine OOM-floor breach
+  with no slot to trade is refused rather than risking an OOM. The dashboard web
+  terminal / local console (no `SSH_CONNECTION`) is held to the safe cap. Reattaching
+  always works. Tunable via `~/.genesis/cc-slot.env`
+  (`GENESIS_CC_SYSTEM_RESERVE_MB` / `_PER_SESSION_MB` / `_OOM_FLOOR_MB` /
+  `_EMERGENCY_SLOTS`); the gate fails open so it can never strand you. See
+  `docs/reference/tailscale-ssh-access.md`.
+- **Heartbeat GC no longer lets a clock-skewed future row starve a subsystem's
+  liveness signal.** The `keep_latest_per_subsystem` heartbeat GC
+  (`db/crud/events.py::prune`) kept the row equal to the per-subsystem
+  `MAX(timestamp)`. Because `timestamp` is ISO **text**, a corrupt/clock-skewed
+  future row (e.g. `2099-…`) sorts as that MAX and survived the retention window
+  forever, while genuine pulses aged out and were deleted — leaving
+  `compute_heartbeat_staleness` with only the future row, which it rejects as
+  materially-future, degrading the verdict to a permanent `unknown` (a false
+  "can't tell" for a subsystem that may be perfectly healthy or truthfully
+  stale). The GC now uses two distinct future bounds: (a) it deletes only
+  *implausibly*-far-future rows (> 1 day ahead — corrupt beyond any clock-skew
+  recovery), and (b) it anchors the "keep newest" on the newest row within the
+  read-side display tolerance (`observability.liveness.FUTURE_SKEW_TOLERANCE_MINUTES`),
+  so the preserved pulse is one the staleness read accepts (`alive`/`overdue`). The
+  wide destructive horizon is deliberate: a *modestly*-future row ages into validity
+  instead of being destroyed, and a **backward** clock skew at GC time cannot delete
+  genuinely-recent pulses. A write-time clamp was considered and rejected: the only
+  production trigger is host clock skew, against which a clamp is ineffective (at
+  write time `now()` *is* the skewed value), so the retention layer — re-evaluated at
+  GC time — is the layer that actually closes the hole.
+
+- **The run_in_background pipe guard no longer false-blocks a `|` inside a quoted
+  argument.** The old inline check (`${CMD//||/ }` then `grep -qF "|"`) blocked any
+  literal `|`, so backgrounding `gh api … --jq '.[] | .x'` or `grep -F '|' file`
+  was wrongly rejected. It's now a small Python hook (`background_pipe_guard.py`)
+  using the canonical quote/redirect-aware parser (`shell_parse.has_top_level_pipe`),
+  so only a genuine top-level pipe — whose backgrounded stdout really is swallowed —
+  blocks; a `|` in quotes, a `||`, or a `>|` redirect does not. (Convenience guard:
+  a `|` inside a heredoc body or `case` pattern is a documented residual that may
+  still over-block — never a security bypass.)
+
+- **A dead subsystem scheduler no longer reads "healthy" on the dashboard.** When
+  a background subsystem's scheduler/loop stops firing entirely (total cessation),
+  its heartbeat pulse goes silent — but nothing turned that into a signal, so the
+  Ego tile (and the rollup badge) could show green while the egos were dead, and no
+  alert was raised. Now the Errors view raises a `subsystem_stale:<name>` alert when
+  the ego (→ critical), inbox, or dashboard (→ warning) scheduler goes overdue past
+  its threshold, and the Ego tile flips to error ("scheduler stopped — no heartbeat
+  in Nh"), failing loud (`unknown`) if the signal can't be read. The alert is
+  pause-aware — a deliberately paused Genesis no longer false-alarms — and never
+  fires on a merely idle or freshly-booted install. This complements the existing
+  "running-but-failing" job alarms, which cannot see a job that has stopped running
+  at all. (Surplus already surfaces a wedged/dead loop via its own dashboard tile;
+  outreach total-cessation is tracked separately, since its heartbeat only runs once
+  a messaging channel is configured.)
+
+- **A subsystem that never started no longer reads "healthy" either.** The
+  total-cessation alert above catches a scheduler that ran and then *died*; a
+  subsystem that *failed to start* (its bootstrap init raised, or it registered but
+  never emitted a single pulse) has no heartbeat at all — which looked identical to
+  a fresh, never-run install, so it stayed silent. Now the health check cross-
+  references the persisted bootstrap manifest: an enabled ego (→ critical) or inbox
+  (→ warning) that the manifest shows failed to initialize, or that registered but
+  never pulsed past a boot grace, raises a distinct `subsystem_never_started:<name>`
+  alert and flips the Ego tile to error. It fails benign in every ambiguous case —
+  a fresh install, a deliberately disabled or unconfigured subsystem, or an
+  unreadable manifest never false-alarm — so the only new signal is a genuinely
+  broken start. (Covers ego + inbox; a never-started dashboard thread is out of
+  scope — it isn't a bootstrap-manifest entry.)
+
+- **Worktree sessions now run the main-tree hook scripts, not their branch-frozen
+  copies.** The `genesis-hook` launcher resolved each hook from the *current*
+  worktree, so a git-tracked hook (security gates included) ran whatever version
+  its branch had frozen — a worktree could silently enforce an outdated/weaker
+  gate until it rebased (measured: 60 of 70 worktrees ran a stale, warn-only
+  `full_suite_guard`). The launcher now resolves the hook script from the main
+  worktree (reusing the `git rev-parse --git-common-dir` plumbing already used for
+  the venv), so every session runs the current hook + policy. Escape hatch:
+  `GENESIS_HOOK_DEV_LOCAL=1` runs the worktree's own copy for testing a hook change
+  live. Forward-looking: a worktree benefits once it carries the fixed launcher
+  (new or rebased); pre-fix branches keep running their frozen launcher until they
+  rebase, and the stale count decays as the reaper reaps and branches rebase.
+
 - **The merge gate no longer blocks on a review finding that lands on a
   documentation file.** An inline `[P1]` finding anchored to a doc path
   (`CHANGELOG`, `README`, `LICENSE`/`NOTICE`, `docs/**`, `*.rst`) is now surfaced
@@ -42,7 +185,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   executable/source file even under `docs/` (e.g. `docs/conf.py`) still blocks,
   and the PR-level review-body gate is unchanged. Applies to `git_push_guard`'s
   inline-findings scan on both the `--check-pr` and merge paths.
-
 - **The dashboard Surplus health tile no longer reads green while the surplus
   scheduler is wedged.** Its verdict previously came from an activity proxy that
   shows "idle" for a stalled scheduler, so a stuck surplus loop appeared healthy —
@@ -79,6 +221,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   gate; the other repointed sites stay on free flash.
 
 ### Security
+
+- **Hook-surface PRs can no longer merge without a current GitHub Codex review.**
+  The merge gate's review-freshness check now treats any unreviewed delta touching
+  the enforcement-hook surface (`scripts/hooks/**`, the global bash safety hook,
+  the review-scope/state modules, hook wiring in `.claude/settings.json`,
+  `.claude/hooks/**`) as substantial — a small touch-up to a guard can no longer
+  slip through the review-trivial narrowing. The `# stale-review-override` escape
+  additionally requires recorded fallback-review evidence keyed to the PR's exact
+  head sha on this surface (fail-closed on unreadable diff or head), with the
+  block message documenting the authorized fallback procedure. Rationale: the hook
+  surface is the code the gates themselves run on — an unreviewed merge there
+  disarms every other gate. The genesis-development skill now also mandates
+  `git_push_guard.py --check-pr <N>` (the merge gate's own code path) as the only
+  way to report a PR's review-findings status.
 
 - **A leading shell redirect can no longer slip the push/commit approval gates.**
   The shared command parser now recognizes shell redirections (`2>/dev/null`,
@@ -272,6 +428,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Page-top backup-health banner (server-authoritative).** The dashboard now
+  surfaces a page-top banner when backups need attention — unconfigured, never run,
+  last run failed, timer stopped, overdue, replication incomplete, or an unreadable
+  status record — and stays hidden when healthy. The health verdict
+  (`{state, code, reason}`) is computed once on the server in
+  `routes/backup.py::_backup_health` and added to `/api/genesis/backup/status`; the
+  client only renders it. Computing it server-side removes the client-side
+  fetch-coordination and clock-skew failure modes entirely, keys "configured" and
+  the off-site-incomplete check on current signals (a real `.git` clone, the
+  resolved Tier-2 backend) rather than a stale status record, treats a malformed
+  status record as unreadable instead of healthy, and does not false-flag a valid
+  custom schedule as overdue. The failure reason rendered on the (unauthenticated)
+  status route is sanitized to strip home-directory paths.
 - **One-click "lobby" terminal door — reattach the whole CC fleet after a client
   reboot.** `generate-ssh-config.sh` now emits a dedicated `Host <host>-lobby`
   block (placed ahead of the numeric-slot wildcard, since ssh takes the first

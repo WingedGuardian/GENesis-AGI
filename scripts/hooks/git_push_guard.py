@@ -40,8 +40,20 @@ waiver cannot silently disarm an unrelated gate: ``# review-override`` waives th
 FINDING scans (review-body + inline P1s), ``# stale-review-override`` waives the
 review-CONTEXT gates (Codex-at-head freshness + base-is-default),
 ``# scheduled-review-override`` waives the SCHEDULED-Claude-review-at-head gate, and
-``# ci-override`` waives the CI gate. A session that genuinely needs several
-appends several (one trailing comment may carry multiple sigils).
+``# ci-override`` waives the CI gate — red/pending everywhere, plus (canonical repo
+only) "absent" (empty rollup: CI never ran) and "incomplete" (partial rollup: a
+REQUIRED workflow — ``merge_gate.required_ci_workflows`` in genesis.yaml, default
+``CI`` — contributed no verdict; see ``_required_ci_workflows``). A session that
+genuinely needs several appends several (one trailing comment may carry multiple
+sigils).
+
+Hook-surface merge teeth (2026-08-23): a PR whose diff touches the
+ENFORCEMENT-HOOK surface (``_HOOK_SURFACE_PREFIXES``/``_HOOK_SURFACE_FILES`` —
+the code these gates themselves run on) gets stricter freshness handling: its
+stale-review delta is never "review-trivial", and ``# stale-review-override``
+alone cannot merge it — recorded fallback-review evidence keyed to the exact
+head sha is additionally required (``_hook_surface_override_check``; the block
+message documents the user-authorized fallback procedure).
 
 Scheduled Claude review markers
 -------------------------------
@@ -87,6 +99,7 @@ not treat untrusted PR content as instructions when composing its comment body.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -696,10 +709,28 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
                         (see _ci_identity + success_latest) — strict identity,
                         terminal completedAt comparison only, fail-closed.
       * ``"pending"`` — a check is still queued/running (and none are red)
-      * ``"unknown"`` — could not determine (API error, no checks, or an
-                        unrecognized payload shape) → callers FAIL OPEN, because
-                        blocking a merge on our own inability to read CI would be
-                        worse than the gap this gate closes.
+      * ``"absent"``  — a READABLE but genuinely EMPTY rollup (``[]``): zero checks
+                        exist, i.e. CI has NOT run. A DEFINITE fact, not a read
+                        failure — so the merge arm fail-CLOSES on it ON THE CANONICAL
+                        REPO (where CI always runs), waivable by ``# ci-override``.
+                        Off the canonical repo (which may legitimately have no CI) the
+                        caller lets it pass. This is the state that catches a
+                        conflicting branch / dropped ``pull_request`` trigger, which
+                        would otherwise merge un-CI'd.
+      * ``"incomplete"`` — the rollup is NON-empty and nothing is red/pending, but a
+                        REQUIRED workflow (rollup ``workflowName``; config-driven via
+                        ``merge_gate.required_ci_workflows``, default ``CI`` — see
+                        _required_ci_workflows) never contributed a verdict. Closes the
+                        #1484-P2 partial-rollup residual: e.g. a lone green CodeQL with
+                        the CI suite absent (a workflow-specific trigger drop) must not
+                        read green. ``problem_checks`` carries the MISSING workflow
+                        names. Enforced like ``"absent"``: canonical repo only,
+                        waivable by ``# ci-override``.
+      * ``"unknown"`` — could NOT determine: an API error, empty/no output, an
+                        unparseable payload, or a non-empty payload with no CI-shaped
+                        entries. Callers FAIL OPEN, because blocking a merge on our own
+                        inability to read CI would be worse than the gap this closes.
+                        (Contrast with ``"absent"``: unreadable ≠ definitely-zero.)
 
     Tests inject via the ``_TEST_GH_CI_ROLLUP`` env var (a JSON array like
     ``gh pr view --json statusCheckRollup``) so no network is needed.
@@ -728,12 +759,23 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
             raw = result.stdout.strip()
         except Exception:
             return "unknown", []
+    if not raw:
+        # No output to read (empty stdout / unset seam): we cannot tell zero-checks
+        # from a silent read failure → fail-OPEN "unknown", never "absent".
+        return "unknown", []
     try:
-        checks = json.loads(raw) if raw else []
+        checks = json.loads(raw)
     except Exception:
         return "unknown", []
-    if not isinstance(checks, list) or not checks:
+    if not isinstance(checks, list):
         return "unknown", []
+    if not checks:
+        # A READABLE, genuinely-empty rollup: zero checks exist = CI has NOT run.
+        # Distinct from "unknown" (a read we could not complete) — this is a definite
+        # fact, so the canonical-repo merge arm fail-CLOSES on it (see main()): merging
+        # an empty-check PR is an un-CI'd merge. gh emits `[]` here when pull_request CI
+        # never fired (e.g. a conflicting branch suppresses the whole suite).
+        return "absent", []
 
     # First pass: for each strict identity (name, workflowName), the latest
     # `completedAt` among its SUCCESS CheckRuns on this head. A CANCELLED entry is
@@ -759,6 +801,12 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
     red: list[str] = []
     pending: list[str] = []
     saw_recognized = False
+    # Workflows that contributed a VERDICT on this head (casefolded ``workflowName``),
+    # for the required-identity check below. SKIPPED/NEUTRAL entries deliberately do
+    # NOT contribute — a fully-skipped required suite tested nothing. Legacy
+    # StatusContexts (no workflowName) contribute "" and can never satisfy a named
+    # required workflow (fail-closed on the Actions-only canonical repo).
+    workflows_ran: set[str] = set()
     for c in checks:
         if not isinstance(c, dict):
             continue
@@ -766,6 +814,7 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         conclusion = c.get("conclusion")  # CheckRun
         status = c.get("status")  # CheckRun: QUEUED/IN_PROGRESS/COMPLETED/PENDING/…
         state = c.get("state")  # StatusContext: SUCCESS/FAILURE/PENDING/ERROR
+        wf_key = (c.get("workflowName") or "").strip().casefold()
         if conclusion in _CI_SKIP_CONCLUSIONS:
             saw_recognized = True
             continue
@@ -783,12 +832,28 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
                 # NO same-identity success at-or-after it (e.g. SUCCESS-then-cancel
                 # on an unchanged head) falls through and stays red.
                 saw_recognized = True
+                # A superseded duplicate implies a same-identity SUCCESS exists on
+                # this head, so the workflow demonstrably ran.
+                workflows_ran.add(wf_key)
                 continue
         if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
             saw_recognized = True
             red.append(name)
         elif conclusion in _CI_GREEN or state in _CI_GREEN:
+            # The ONLY branch (besides the superseded-cancel drop above, which implies
+            # a green sibling) that feeds workflows_ran: the required-identity check
+            # runs only when nothing is red/pending (those return first, and already
+            # block), so only PASSING verdicts can vouch that a required workflow ran.
+            # A COMPLETED run with a null conclusion (the benign ignore below) carries
+            # no verdict and deliberately does NOT vouch — fail-closed. Vouching is
+            # additionally gated on a CheckRun-shaped pass (``conclusion``): a
+            # StatusContext-shaped green (``state``) can't carry a real Actions
+            # workflowName, so an entry gluing state=SUCCESS to a workflowName key
+            # must not satisfy the required identity by construction (not merely by
+            # gh's current output shape).
             saw_recognized = True
+            if conclusion in _CI_GREEN:
+                workflows_ran.add(wf_key)
         elif status in _CI_TERMINAL_STATUSES:
             saw_recognized = True
             if conclusion is not None:
@@ -815,6 +880,19 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         return "pending", sorted(set(pending))
     if not saw_recognized:
         return "unknown", []  # payload had no CI-shaped entries
+    # Required-workflow identity (closes the #1484-P2 partial-rollup residual): every
+    # present check passed, but "green" must ALSO assert that each REQUIRED workflow
+    # (default "CI"; config lever merge_gate.required_ci_workflows for an install whose
+    # suite is named differently) actually contributed a passing verdict. Otherwise a
+    # workflow-specific trigger drop — e.g. a lone green CodeQL, the CI suite absent —
+    # reads green and merges an untested PR. (The "absent" branch above only catches a
+    # FULLY-empty rollup.) Canonical-scoping and the # ci-override valve are applied by
+    # the CALLERS, exactly as for "absent", so a non-canonical repo is never blocked
+    # by this identity policy.
+    required = _required_ci_workflows()
+    missing = sorted(w for w in required if w.strip().casefold() not in workflows_ran)
+    if missing:
+        return "incomplete", missing
     return "green", []
 
 
@@ -1341,6 +1419,96 @@ def _pr_head_sha(pr_num: str, repo: str | None = None) -> str | None:
     return sha or None
 
 
+def _pr_base_sha(pr_num: str, repo: str | None = None) -> str | None:
+    """The LIVE tip oid of the PR's base branch, or None on any error.
+
+    Deliberately NOT ``pulls/N → .base.sha``: that field is a SNAPSHOT taken at
+    PR creation/retarget and does not advance with the base branch (measured
+    2026-08-23 against live PRs — three pre-merge PRs still reported the old
+    tip while a post-merge control reported the new one). The evidence binding
+    exists precisely for the base-advanced case, so it must read the branch
+    ref's current tip.
+
+    Resolution is via GraphQL ``repository.ref(qualifiedName:"refs/heads/<branch>")``
+    with the branch passed as a raw-string VARIABLE — NOT the REST ``commits/{ref}``
+    endpoint (Codex #10). Interpolating a branch name into a URL path is ambiguous
+    and fragile in two ways the REST path could not fully close: (1) an UNqualified
+    ``commits/<name>`` resolves a same-named TAG or a branch literally named
+    ``heads/x`` to the WRONG ref (a wrong-tip evidence binding that stays valid
+    after the real base moves); (2) a name that is structural in a URL (``#``
+    fragment, ``?`` query, ``%`` escape) truncates the request. A fully-qualified
+    ``refs/heads/<branch>`` passed as a GraphQL variable is unambiguous (heads vs
+    tags) AND carries no URL-path interpolation at all, closing both classes at once.
+    A branch ref's ``target`` is always a Commit, so ``.target.oid`` is its live tip.
+
+    Consumed by the hook-surface override evidence identity (see
+    _hook_surface_override_check). Tests inject via ``_TEST_GH_BASE_OID``.
+    """
+    raw = os.environ.get("_TEST_GH_BASE_OID")
+    if raw is None:
+        ref = _pr_base_ref(pr_num, repo=repo)
+        # Reject only an ASCII control char or a plain ASCII space — Git's own ref
+        # rules (git check-ref-format) forbid exactly those, and they'd be garbage in
+        # a base branch name. Do NOT reject every Python str.isspace() code point
+        # (Codex P2, round 5): non-ASCII whitespace (e.g. U+00A0) is a LEGAL Git branch
+        # character, and rejecting it would falsely block the authorized
+        # fallback-evidence path for a legitimately-named branch.
+        if not ref or any(ord(c) < 0x20 or ord(c) == 0x7F or c == " " for c in ref):
+            return None
+        # GraphQL needs an explicit owner/name (no REST ``:owner/:repo`` placeholder).
+        # Resolve the slug from the passed repo, else the cwd's base repo; fail-closed
+        # if it can't be resolved or split. A non-str ``repo`` (an unresolved-repo
+        # sentinel) fails CLOSED here — never fall through to a cwd guess, and never
+        # reach _normalize_repo's ``str``-typed body with a non-str (would TypeError
+        # OUTSIDE the subprocess try). Belt-and-suspenders: callers already fail-closed
+        # on the sentinel before this runs.
+        if repo is not None and not isinstance(repo, str):
+            return None
+        slug = _normalize_repo(repo) if repo else _derive_repo_from_cwd(os.getcwd())
+        if not slug or "/" not in slug:
+            return None
+        owner, name = slug.split("/", 1)
+        query = (
+            "query($owner:String!,$name:String!,$ref:String!){"
+            "repository(owner:$owner,name:$name){ref(qualifiedName:$ref){target{oid}}}}"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    "graphql",
+                    # -f (raw string), NOT -F: -F type-coerces and reads @file, which
+                    # would mangle a numeric-looking or @-leading branch name. -f keeps
+                    # every value a literal GraphQL String.
+                    "-f",
+                    f"query={query}",
+                    "-f",
+                    f"owner={owner}",
+                    "-f",
+                    f"name={name}",
+                    "-f",
+                    f"ref=refs/heads/{ref}",
+                    "--jq",
+                    ".data.repository.ref.target.oid",
+                ],
+                capture_output=True,
+                text=True,
+                # Merge-path budget (see main()): runs ONLY on the rare
+                # stale-review-override path; fail direction is closed there.
+                timeout=_gh_timeout(6),
+            )
+            # A missing branch → ``ref: null`` → jq emits the literal "null"; a GraphQL
+            # error → data null → same. Both, and any non-zero exit, fail closed below.
+            raw = result.stdout if result.returncode == 0 else ""
+        except Exception:
+            return None
+    sha = (raw or "").strip()
+    if not sha or sha == "null":
+        return None
+    return sha
+
+
 def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
     """EVERY Codex review record ``{commit_id, state}`` on the PR, oldest-first,
     or None on any API/parse error (distinct from ``[]`` = query succeeded, no
@@ -1670,6 +1838,303 @@ def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str
     return latest
 
 
+# ── Hook-surface merge teeth (2026-08-23, user decision) ─────────────────────
+# The ENFORCEMENT-HOOK surface is the code the merge/push/commit gates themselves
+# run on: an unreviewed change here disarms every other gate, so it gets stricter
+# review teeth than ordinary code. Two rules, both scoped to these paths:
+#   1. A stale-review delta touching this surface is NEVER "review-trivial"
+#      (_classify_post_review_delta): a "small single-file touch-up" to a guard
+#      is exactly the change that must not skip re-review.
+#   2. `# stale-review-override` alone cannot merge a hook-surface PR without a
+#      current GitHub Codex review — it additionally requires recorded
+#      fallback-review evidence keyed to the EXACT head sha
+#      (_hook_surface_override_check). The GitHub Codex review is the required
+#      evidence class (user decision, 2026-08-23); the fallback procedure
+#      (user-authorized local codex / Claude Code adversarial review) is the
+#      documented exception path, not a self-serve bypass.
+# WHY this exists (the origin story — keep it, it is the anti-rationalization):
+# on PR #1432 a hand-rolled findings query returned empty and was reported as
+# "review-clean" while 13 real Codex findings (10 P1) sat on the PR; only this
+# file's merge gate caught it. The lesson: the human-facing claim and the gate
+# MUST run the same code path, and the gate's own code must never merge
+# unreviewed. Tests: tests/test_hooks/test_git_push_guard_hook_surface.py.
+# config/behavioral_rules/ rides as a prefix: behavioral_linter.py loads every
+# YAML under it (decision config = enforcement surface, see the note in
+# _HOOK_SURFACE_FILES).
+_HOOK_SURFACE_PREFIXES = ("scripts/hooks/", ".claude/hooks/", "config/behavioral_rules/")
+# EVERY hook wired in .claude/settings.json is fence surface — not only the
+# blocking gates: any script auto-executing inside sessions is enforcement-
+# adjacent (architect SHOULD-FIX 2026-08-23: the named-list-as-sample trap this
+# PR itself documents — review_enforcement_commit.py et al. lived outside the
+# original 4-file fence). Over-fencing costs only stricter review; a guardrail
+# test (test_git_push_guard_hook_surface.py) parses settings.json and FAILS CI
+# if a wired hook ever falls outside this fence, so the set is self-maintaining.
+_HOOK_SURFACE_FILES = frozenset(
+    {
+        "scripts/bash_safety_hook.sh",  # the global Bash chokepoint
+        "scripts/review_scope.py",  # substantiality classifier (feeds THIS gate)
+        "scripts/review_state.py",  # escalation counter + review markers
+        ".claude/settings.json",  # hook wiring (inline blob + matchers)
+        # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
+        # resolves bare names as scripts/<name>); scripts/hooks/* wirings are
+        # covered by the prefix above.
+        "scripts/behavioral_linter.py",
+        "scripts/check_stale_pending.py",
+        "scripts/content_safety_hook.py",
+        "scripts/contribution_offer_hook.py",
+        "scripts/edit_failure_sensor.py",
+        "scripts/file_context_hook.py",
+        "scripts/file_modification_audit_hook.py",
+        "scripts/genesis_precompact.py",
+        "scripts/genesis_session_context.py",
+        "scripts/genesis_session_end.py",
+        "scripts/genesis_stop_hook.py",
+        "scripts/genesis_urgent_alerts.py",
+        "scripts/plan_bookmark_hook.py",
+        "scripts/pretool_check.py",
+        "scripts/proactive_memory_hook.py",
+        "scripts/procedure_advisor.py",
+        "scripts/review_enforcement_commit.py",
+        "scripts/review_enforcement_prompt.py",
+        "scripts/review_invalidate_on_commit.py",
+        "scripts/surface_open_prs.py",
+        "scripts/surface_pr_updates.py",
+        # Hook-owned DECISION CONFIGURATION (Codex P2, round 1): these files
+        # determine what the wired hooks enforce, and the ordinary
+        # substantiality classifier treats YAML as docs/config (review-trivial)
+        # — so a rewrite that removes blocking patterns could merge on a stale
+        # review. Config that drives enforcement is enforcement surface.
+        "config/protected_paths.yaml",  # pretool_check.py
+        "config/repo_topology.yaml",  # repo_routing_guard.py
+    }
+)
+
+
+def _is_hook_surface_path(path: str) -> bool:
+    """True iff ``path`` (repo-relative, as GitHub reports it) is enforcement-hook
+    surface. Prefix matches are real path segments (``scripts/hooks/x``), never
+    substrings (``scripts/hooks_readme.md`` does not match)."""
+    return path in _HOOK_SURFACE_FILES or any(path.startswith(p) for p in _HOOK_SURFACE_PREFIXES)
+
+
+# A real fallback review (reviewer + findings + dispositions) is substantive; this
+# floor rejects a rubber-stamp / stray/boilerplate file at the evidence path (Codex
+# P2 round 2). Note the filename already binds repo+PR+base+head, so the content
+# check's marginal value is specifically catching a stale body copied to a correctly
+# named file. Anti-autopilot floor, NOT tamper-proof — the teeth are the human merge
+# + cloud reviewer (same threat model as review_state's evidence check).
+_MIN_OVERRIDE_EVIDENCE_CHARS = 200
+# Bound the read on the merge-gate hot path (the floor is 200 chars; any real review
+# fits easily) so an oversized file in the evidence dir can't be slurped into memory.
+_MAX_OVERRIDE_EVIDENCE_READ = 65536
+
+
+def _override_evidence_dir() -> str:
+    """Directory holding fallback-review evidence files
+    (``<repo>__<pr>__<base-tip-12>__<head-sha>.txt``).
+
+    ``GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR`` overrides (config knob + test seam);
+    default lives outside the repo so evidence survives worktree removal and is
+    never committed."""
+    return os.environ.get("GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR") or os.path.expanduser(
+        "~/.genesis/override_review_evidence"
+    )
+
+
+def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
+    """Every filename the PR touches (including rename SOURCES via
+    ``previous_filename`` — a guard renamed OUT of scripts/hooks/ is a hook
+    change), or None on any API/parse error. GitHub caps ``pulls/N/files`` at
+    3000 entries; at the cap a hook file may sit beyond it → None (the caller
+    fails closed). Tests inject via ``_TEST_GH_PR_FILES`` (one JSON object per
+    line: ``{filename, previous_filename}``; the literal ``__error__`` simulates
+    an API error)."""
+    raw = os.environ.get("_TEST_GH_PR_FILES")
+    if raw == "__error__":
+        return None
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/files",
+                    "--paginate",
+                    "--jq",
+                    ".[] | {filename: .filename, previous_filename: .previous_filename}",
+                ],
+                capture_output=True,
+                text=True,
+                # Merge-path timeout budget (see main()): this runs ONLY on the
+                # rare `# stale-review-override` path, so one paginated read
+                # stays inside the hook's wall-clock.
+                timeout=_gh_timeout(8),
+            )
+            if result.returncode != 0:
+                return None
+            raw = result.stdout
+        except Exception:
+            return None
+    files: list[str] = []
+    rows = 0
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            return None  # malformed page → cannot vouch for the full file set
+        if not isinstance(obj, dict):
+            return None
+        rows += 1
+        # Strict record shape (Codex P2, round 1): a null/empty/non-string
+        # filename means the record did NOT parse into a usable path — treating
+        # it as parsed could hide a hook file behind a degenerate row. Require
+        # a nonempty string filename; previous_filename may be None (no rename)
+        # or a nonempty string. Anything else → None → caller fails closed.
+        fname = obj.get("filename")
+        if not isinstance(fname, str) or not fname:
+            return None
+        files.append(fname)
+        prev = obj.get("previous_filename")
+        if prev is not None:
+            if not isinstance(prev, str) or not prev:
+                return None
+            files.append(prev)
+    if rows >= 3000:
+        # The cap applies to API ROWS, not the expanded path list (renames
+        # contribute two paths per row — Codex P2, round 1): at the documented
+        # 3000-entry endpoint cap a hook file may be hidden beyond it.
+        return None
+    return files
+
+
+def _hook_surface_override_check(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
+    """Gate the ``# stale-review-override`` escape on hook-surface PRs.
+
+    Returns ``(should_block, message)``. Fail direction is CLOSED throughout:
+    an unreadable diff or head sha blocks — this path exists precisely because
+    the normal review evidence is absent, so uncertainty must not widen the
+    escape. Non-hook-surface PRs pass untouched (the sigil keeps its normal
+    meaning there)."""
+    files = _pr_changed_files(pr_num, repo=repo)
+    if files is None:
+        return (
+            True,
+            (
+                f"could not read PR #{pr_num}'s changed files to scope the "
+                f"stale-review-override (hook-surface PRs need fallback-review "
+                f"evidence). Retry when GitHub answers — this read failing "
+                f"closed is deliberate."
+            ),
+        )
+    touched = sorted({f for f in files if _is_hook_surface_path(f)})
+    if not touched:
+        return False, ""
+    head = _pr_head_sha(pr_num, repo=repo)
+    if not head:
+        return (
+            True,
+            (
+                f"PR #{pr_num} touches the enforcement-hook surface "
+                f"({', '.join(touched[:4])}) but its head sha could not be read, "
+                f"so fallback-review evidence cannot be verified. Retry."
+            ),
+        )
+    head = head.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        # A network-sourced string becomes a path component below — validate the
+        # exact oid shape (mirrors _SCHEDULED_REVIEW_HEAD_RE) so garbage blocks
+        # EXPLICITLY instead of via an accidental unmatchable filename.
+        return (
+            True,
+            (
+                f"PR #{pr_num}'s head sha read back malformed ({head[:24]!r}) — "
+                f"cannot key fallback-review evidence. Retry."
+            ),
+        )
+    # Evidence identity = repo + PR + BASE + head (Codex P2s, rounds 1+2): a
+    # commit sha alone does not identify the PR/base whose FULL diff the
+    # fallback review covered — the same head can appear on another PR or in a
+    # fork, and (round 2) a retarget or advancing default branch changes the
+    # effective diff while head stays put; the sigil this path serves also
+    # waives _check_base_is_default, so base must be bound HERE. The bound value
+    # is the base branch's LIVE tip (never pulls/N.base.sha — a creation-time
+    # snapshot; see _pr_base_sha): binding to the live tip over-expires (any
+    # base move → re-record) — the safe direction on this rare, user-authorized
+    # path. Fail-closed on an unreadable base.
+    base = _pr_base_sha(pr_num, repo=repo)
+    if not base or not re.fullmatch(r"[0-9a-f]{40}", base.strip().lower()):
+        return (
+            True,
+            (
+                f"PR #{pr_num}'s BASE sha could not be read (or was malformed) — "
+                f"fallback-review evidence is base-bound and cannot be verified. "
+                f"Retry."
+            ),
+        )
+    base = base.strip().lower()
+    repo_slug = (_normalize_repo(repo) or "local").replace("/", "_")
+    evidence_path = os.path.join(
+        _override_evidence_dir(), f"{repo_slug}__{pr_num}__{base[:12]}__{head}.txt"
+    )
+    try:
+        with open(evidence_path, encoding="utf-8", errors="replace") as _ef:
+            evidence_text = _ef.read(_MAX_OVERRIDE_EVIDENCE_READ)
+    except OSError:
+        evidence_text = ""
+    # Validate the CONTENT, not just presence (Codex P2, round 2): a stray or
+    # rubber-stamp file at the right path must not waive the gate. Require a
+    # substantive review that NAMES the exact head it vouches for — the 12-hex
+    # head prefix must appear in the body (the procedure below instructs this),
+    # and the body must clear a minimum length. Fail-closed on a short/unbound file.
+    has_evidence = (
+        len(evidence_text.strip()) >= _MIN_OVERRIDE_EVIDENCE_CHARS
+        and head[:12] in evidence_text.lower()
+    )
+    if has_evidence:
+        # Residual TOCTOU, accepted as part of the force path's documented
+        # "conscious unbound merge" contract: a push landing between this head
+        # read and the merge would merge a head the evidence does not name. The
+        # window is seconds, re-running re-reads the head, and binding here
+        # would force --match-head-commit onto override merges — declined.
+        print(
+            f"NOTE: hook-surface override on PR #{pr_num} backed by fallback-review "
+            f"evidence at {evidence_path} (head {head[:12]}).",
+            file=sys.stderr,
+        )
+        return False, ""
+    return (
+        True,
+        (
+            f"'# stale-review-override' is NOT sufficient by itself here: PR "
+            f"#{pr_num}'s diff touches the ENFORCEMENT-HOOK surface "
+            f"({', '.join(touched[:4])}{', …' if len(touched) > 4 else ''}) — the "
+            f"code the merge/push gates themselves run on. Merging it without a "
+            f"current GitHub Codex review additionally requires recorded "
+            f"fallback-review evidence for the EXACT head {head[:12]}.\n"
+            f"Procedure (requires the user's explicit authorization — never "
+            f"self-serve):\n"
+            f"  1. Get the user's go-ahead for the override.\n"
+            f"  2. Run a fallback adversarial review of the full PR diff: local "
+            f"`codex exec` when quota allows, else a Claude Code adversarial "
+            f"review (genesis-architect).\n"
+            f"  3. Record reviewer + findings + dispositions — and reference the "
+            f"head sha {head[:12]} in the body — in:\n"
+            f"       {evidence_path}\n"
+            f"  4. Re-run this merge (same sigil). A new push changes the head "
+            f"sha, and a base-branch change (retarget OR base advancing) "
+            f"re-keys too — re-review and re-record.\n"
+            f"WHY: 2026-08-23 — an unreviewed merge on this surface disarms every "
+            f"other gate; the GitHub Codex review is the required evidence class "
+            f"(user decision), and this file's own history (#1432: 13 findings "
+            f"invisible to a hand-rolled query) is the proof the gate must not "
+            f"trust the author's claim of cleanliness."
+        ),
+    )
+
+
 def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | None) -> str | None:
     """Substantiality of what HEAD adds OVER the Codex-reviewed SHA, via the compare API.
 
@@ -1740,6 +2205,29 @@ def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | No
         return None
     if len(files) >= 300:
         return "substantial"  # compare file cap hit → can't rule out substantial code
+    # Hook-surface teeth rule 1: a delta touching the enforcement-hook surface is
+    # NEVER review-trivial, no matter how small — see the block above
+    # _is_hook_surface_path for the why. Rename sources count (previous_filename):
+    # a guard renamed/moved out of scripts/hooks/ IS a hook change.
+    for f in files:
+        if not isinstance(f, dict):
+            return None
+        # A record MUST carry a readable string ``filename`` — a missing/null/empty
+        # one means we cannot confirm this path is NOT a hook-surface file, so fail
+        # CLOSED (unclassifiable → the caller blocks a stale review) rather than skip
+        # it (Codex P2, round 5: a malformed compare record must not let a hook-surface
+        # delta read as review-trivial; ``gh --jq`` still builds an object when the
+        # upstream field is absent, so this shape is reachable). ``previous_filename``
+        # is optional, but when present must likewise be a non-empty string.
+        fn = f.get("filename")
+        if not isinstance(fn, str) or not fn:
+            return None
+        prev = f.get("previous_filename")
+        if prev is not None and (not isinstance(prev, str) or not prev):
+            return None
+        for val in (fn, prev):
+            if val and _is_hook_surface_path(val):
+                return "substantial"
     try:
         # review_scope lives in scripts/ (parent of scripts/hooks/). Lazy import ON
         # PURPOSE: an import failure must degrade THIS classification to None (the
@@ -1774,7 +2262,10 @@ def _check_codex_reviewed_head(
     only on positive evidence. ``force`` (a ``# stale-review-override`` on the
     merge segment — deliberately NOT ``# review-override``, which waives the P1
     finding scans; the two boundaries are independent) is the conscious escape
-    (e.g. a genuine Codex outage).
+    (e.g. a genuine Codex outage). On the HOOK SURFACE ``force`` additionally
+    requires recorded fallback-review evidence regardless of head-freshness — the
+    same sigil waives ``_check_base_is_default`` and the evidence identity binds the
+    BASE, which a head-only review cannot vouch for (see Codex #9 disposition below).
 
     Returns ``(should_block, message, verified_head)`` — ``verified_head`` is the
     full head oid this check verified/classified against (when not blocked and
@@ -1784,6 +2275,25 @@ def _check_codex_reviewed_head(
     cannot smuggle an unreviewed head through (TOCTOU — Codex P1, PR #1366).
     """
     if force:
+        # Hook-surface teeth rule 2: the sigil alone is not enough when the PR
+        # touches the enforcement-hook surface — recorded fallback-review
+        # evidence for the exact head is additionally required (fail-closed).
+        # verified_head stays None on the pass path: the force path keeps its
+        # documented "conscious unbound merge" contract (no --match-head bind).
+        #
+        # NOTE (Codex #9, dispositioned FALSE-POSITIVE 2026-08-26): #9 proposed
+        # skipping this evidence demand when a current at-head Codex review already
+        # exists. That is UNSAFE and was reverted: this force path is reached via
+        # # stale-review-override, which ALSO waives _check_base_is_default, and
+        # _hook_surface_override_check's evidence identity binds the BASE tip — which
+        # a head-only Codex review provably cannot vouch for (see _check_base_is_default's
+        # docstring: "GitHub's review object records no base, so freshness alone cannot
+        # see it"). Skipping evidence on a fresh review would let a hook-surface PR
+        # RETARGETED to a non-default base merge with no base-bound review. A fresh
+        # head-review is NOT a substitute for base-bound evidence here.
+        blocked, msg = _hook_surface_override_check(pr_num, repo=repo)
+        if blocked:
+            return True, msg, None
         return False, "", None
     head = _pr_head_sha(pr_num, repo=repo)
     if not head:
@@ -1818,7 +2328,15 @@ def _check_codex_reviewed_head(
                 f"Codex reviews on PR-open — it does NOT auto-review a later fix-commit; "
                 f"comment '@codex review' on the PR to review the current head (then wait), "
                 f"or append '# stale-review-override' to merge without a current Codex "
-                f"review (e.g. Codex is down)."
+                f"review (e.g. Codex is genuinely down).\n"
+                f"NOTE: the GitHub reviewer and the `codex exec` CLI are separate SURFACES; do "
+                f"not infer one from the other. OBSERVED once (2026-08-27): the CLI reported "
+                f"a two-week usage lockout while the GitHub reviewer, asked minutes later, "
+                f"returned a full review on the same commit. Whether that is separate "
+                f"metering, a plan-tier difference or a CLI-side fault was NOT established "
+                f"— so treat each surface as independently available until proven otherwise: "
+                f"post '@codex review' and check for a review at head BEFORE concluding "
+                f"Codex is unavailable."
             ),
             None,
         )
@@ -1849,6 +2367,15 @@ def _check_codex_reviewed_head(
                 f"Comment '@codex review' on the PR to re-review the current head (Codex "
                 f"does NOT auto-review fix-commits), then wait; or append "
                 f"'# stale-review-override' to merge anyway.\n"
+                f"NOTE: the GitHub reviewer and the `codex exec` CLI are separate SURFACES; do "
+                f"not infer one from the other. OBSERVED once (2026-08-27): the CLI reported "
+                f"a two-week usage lockout while the GitHub reviewer, asked minutes later, "
+                f"returned a full review on the same commit. Whether that is separate "
+                f"metering, a plan-tier difference or a CLI-side fault was NOT established "
+                f"— so treat each surface as independently available until proven otherwise: "
+                f"post '@codex review' and check for a review at head BEFORE concluding "
+                f"Codex is unavailable."
+                f"\n"
                 f"  (inspect the unreviewed commits: git log {reviewed[:12]}..{head[:12]} "
                 f"--oneline)"
             ),
@@ -1965,6 +2492,106 @@ def _required_scheduled_review_kinds() -> tuple[str, ...]:
     # leaks (and any irreducible kind) is always required, even if config omits it.
     merged = list(dict.fromkeys([*kinds, *_IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS]))
     return tuple(merged)
+
+
+# The GitHub Actions workflow name(s) whose PRESENCE in a PR's check rollup the CI
+# gate requires before trusting "green" (the required-CI analogue of the scheduled-
+# review kinds above). Default = the canonical repo's ci.yml `name: CI`. Unlike the
+# scheduled kinds there is NO irreducible floor and NO known-set whitelist: the
+# identity is install-specific free text (a fork's suite may be named anything), so
+# config must be able to REPLACE the set — but never to EMPTY it (see the validator).
+_DEFAULT_REQUIRED_CI_WORKFLOWS = ("CI",)
+
+
+def _validate_configured_workflows(items: object) -> list[str] | None:
+    """Validate a configured required-CI-workflow list. Returns the cleaned list
+    (stripped, deduped, case PRESERVED for display; matching is case-insensitive), or
+    None if ANYTHING is off — not a list, an EMPTY list, a non-string element, or a
+    blank element. None makes the caller fail CLOSED to the default. An empty list is
+    deliberately invalid: it would DISABLE the identity check entirely, and the
+    per-merge escape for a consciously CI-less merge is ``# ci-override``, not config
+    (non-canonical repos are already exempt via _scheduled_gate_applies)."""
+    if not isinstance(items, list) or not items:
+        return None
+    out: list[str] = []
+    for w in items:
+        if not isinstance(w, str):
+            return None  # wrong type (e.g. [123]) -> invalid -> default
+        ww = w.strip()
+        if not ww:
+            return None  # blank ([" "]) -> invalid -> default
+        out.append(ww)
+    return list(dict.fromkeys(out))
+
+
+def _required_ci_workflows() -> tuple[str, ...]:
+    """The GitHub Actions workflow names (rollup ``workflowName``) the CI gate REQUIRES
+    to have contributed a passing verdict before ``_pr_ci_status`` returns "green".
+
+    Default: ``("CI",)`` — the canonical repo's ci.yml workflow, which has NO paths
+    filters and therefore always runs on a PR to main. An install whose required suite
+    is named differently configures it locally (keeping install policy out of the
+    public default):
+
+        # ~/.genesis/config/genesis.yaml
+        merge_gate:
+          required_ci_workflows: [My Suite]
+
+    Fail-CLOSED toward the default: a missing key / unreadable file / parse error /
+    duplicate key / wrong type / EMPTY list / blank element ALL fall back to the full
+    default — there is no config value that disables the check. Because free-text
+    config can also EXPAND the required set (unlike the whitelist-relaxed scheduled
+    kinds, whose default is maximal), a fallback here can silently NARROW a stricter
+    declared policy — so when the key is visibly present but its value was discarded,
+    a NOTE is printed naming the substitution (the fallback itself is unchanged).
+    Test seam: ``_TEST_REQUIRED_CI_WORKFLOWS`` (comma-separated) overrides the config
+    file; a blank seam parses to an empty (=invalid) list and also yields the
+    default."""
+    raw = os.environ.get("_TEST_REQUIRED_CI_WORKFLOWS")
+    configured: list[str] | None = None
+    key_seen_in_file = False
+    if raw is not None:
+        configured = _validate_configured_workflows(
+            [w.strip() for w in raw.split(",") if w.strip()]
+        )
+    else:
+        try:
+            import yaml  # lazy: keep the hook import-light; the genesis venv has pyyaml
+
+            path = os.path.expanduser("~/.genesis/config/genesis.yaml")
+            with open(path) as fh:
+                text = fh.read()
+            # A textual sighting of the KEY LINE (not a comment/prose mention): if the
+            # value is then discarded (dup key, parse error, invalid shape), the
+            # operator DECLARED a policy we are about to substitute — that must not be
+            # silent. A key-absent file (the normal install) stays silent. Checked
+            # BEFORE the parse so a yaml error can't skip it.
+            key_seen_in_file = bool(re.search(r"(?m)^\s*required_ci_workflows\s*:", text))
+            # Same duplicate-key hazard as the scheduled kinds: yaml.safe_load keeps
+            # the LAST value silently, so a badly-merged file could swap the required
+            # identity. Line-scan the realistic cases and fail closed.
+            if (
+                len(re.findall(r"(?m)^merge_gate\s*:", text)) > 1
+                or len(re.findall(r"(?m)^\s*required_ci_workflows\s*:", text)) > 1
+            ):
+                raise ValueError("duplicate merge_gate/required_ci_workflows key")
+            cfg = yaml.safe_load(text) or {}
+            value = (cfg.get("merge_gate") or {}).get("required_ci_workflows")
+            configured = _validate_configured_workflows(value)
+        except Exception:
+            configured = None  # fail-closed: fall back to the default set below
+    if configured is None:
+        if key_seen_in_file:
+            print(
+                "NOTE: merge_gate.required_ci_workflows in ~/.genesis/config/"
+                "genesis.yaml is present but unreadable/invalid (duplicate key, "
+                "wrong type, empty list, or blank element) — enforcing the DEFAULT "
+                f"required set {_DEFAULT_REQUIRED_CI_WORKFLOWS} instead of your "
+                "configured value. Fix the config to restore your declared policy.",
+                file=sys.stderr,
+            )
+        return _DEFAULT_REQUIRED_CI_WORKFLOWS
+    return tuple(configured)
 
 
 def _canonical_public_repo() -> str | None:
@@ -2087,10 +2714,16 @@ def _scheduled_review_rows(pr_num: str, repo: str | None = None) -> list[dict] |
     return rows
 
 
-def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str, set[str]] | None:
-    """Map of ``head-sha -> {kinds}`` from valid owner-authored scheduled-review markers
-    on the PR, or ``None`` on an UNREADABLE fetch (the caller fail-closes on both None
-    and an empty map — None only distinguishes "could not read" from "read, no marker").
+def _scheduled_review_marker_scan(
+    pr_num: str, repo: str | None = None
+) -> tuple[dict[str, set[str]], dict[str, set[str]]] | None:
+    """``(accepted, rejected_not_clean)`` maps of ``head-sha -> {kinds}`` for the PR's
+    owner-authored scheduled-review markers, or ``None`` on an UNREADABLE fetch.
+
+    Both maps come from ONE pass so they cannot drift apart. ``accepted`` is what the
+    gate honours; ``rejected_not_clean`` is markers that parsed fine and named a head,
+    but whose body read as carrying a blocking finding. Only the DIAGNOSTIC message
+    consumes the second map — it never widens what satisfies the gate.
 
     A marker is trusted only when its author is the repo OWNER: ``login == owner`` OR
     ``author_association == "OWNER"`` (belt-and-suspenders — the marker itself is the
@@ -2107,7 +2740,8 @@ def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str,
     except Exception:
         owner_repo = repo
     owner = (owner_repo.split("/")[0] if owner_repo else "").lower() or None
-    by_head: dict[str, set[str]] = {}
+    accepted: dict[str, set[str]] = {}
+    rejected: dict[str, set[str]] = {}
     for row in rows:
         login = (row.get("login") or "").lower()
         assoc = (row.get("author_association") or "").upper()
@@ -2126,10 +2760,16 @@ def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str,
         # gate. Owner-authored review bodies are never seen by _check_pr_review_findings
         # (bots only), so without this a scheduled reviewer that explicitly BLOCKED would
         # still stamp its marker and slip the merge through.
-        if any(p.search(body) for p in _BLOCKING_PATTERNS) and not any(
+        #
+        # Such a marker is RECORDED (not dropped on the floor) so the block message can
+        # tell "you posted one and it was rejected" apart from "nobody posted anything" —
+        # measured 2026-08-28: those two produced the identical `present: none` line, and
+        # the only signal distinguishing an accepted marker from a rejected one was
+        # whether its prose happened to contain a _CLEAN_PATTERNS phrase.
+        not_clean = any(p.search(body) for p in _BLOCKING_PATTERNS) and not any(
             c.search(body) for c in _CLEAN_PATTERNS
-        ):
-            continue
+        )
+        target = rejected if not_clean else accepted
         # Defense-in-depth follow-up: for rows from /pulls/N/reviews we could ALSO
         # cross-check GitHub's authoritative `commit_id` vs the marker sha (issue comments
         # carry none). Deferred (LOW): the marker sha is matched EXACTLY vs the authoritative
@@ -2139,8 +2779,8 @@ def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str,
             kind_m = _SCHEDULED_REVIEW_KIND_RE.search(block)
             if not head_m or not kind_m:
                 continue  # a marker must name both a head AND a kind to count
-            by_head.setdefault(head_m.group(1).lower(), set()).add(kind_m.group(1).lower())
-    return by_head
+            target.setdefault(head_m.group(1).lower(), set()).add(kind_m.group(1).lower())
+    return accepted, rejected
 
 
 def _check_scheduled_claude_reviewed_head(
@@ -2156,11 +2796,56 @@ def _check_scheduled_claude_reviewed_head(
     40-char), else a BLOCK MESSAGE naming the MISSING kinds.
 
     Fail-CLOSED — this gate never passes on absence of positive evidence: if the head
-    cannot be read, or the comment/review fetch errors (``_scheduled_review_markers`` →
+    cannot be read, or the comment/review fetch errors (``_scheduled_review_marker_scan`` →
     None), the merge is BLOCKED. A read that simply does not carry every required kind
     at this head (a routine didn't run, ran on a stale commit, or was rate-limited) also
     blocks. The merge path and the report path share this single fail-closed decision,
     so the report can never issue a false all-clear here.
+
+    WHY THE BLOCK MESSAGE PARTITIONS. A missing marker has THREE causes calling for
+    DIFFERENT operator actions, all distinguishable from what was already read. The
+    missing kinds are PARTITIONED across those causes and EVERY non-empty group is
+    reported — this is not a precedence chain that picks one winner:
+      * REFUSED at this head — a marker is present on the current commit but read as
+        carrying a blocking finding. Neither waiting nor re-reviewing helps; the body's
+        wording (or a real finding) is the cause. It is also the cause most easily
+        mistaken for "nobody posted anything", since the gate's `present:` line shows
+        the same `none` either way.
+      * ELSEWHERE — a marker for that kind sits on some OTHER head, ACCEPTED OR REFUSED.
+        A routine ran, then a push moved the head. Routines are not generally re-run on a
+        push, so waiting is unlikely to help; re-review the current head and post it.
+      * ABSENT — no marker for that kind at any head. Nothing has run for it, so on a
+        freshly-opened PR a routine may still be in flight and waiting IS the right move.
+
+    Two design rules earned by successive review rounds, both of the SAME shape — a
+    decision made from only part of what had been read. Keep them:
+      1. Scope every group to ``missing``. A marker for an already-satisfied kind explains
+         nothing about this block, and prescribing a remedy for it sends the operator to
+         fix something that is not broken (it also let the message contradict its own
+         ``present:`` line one row above).
+      2. PARTITION rather than prioritise. Different kinds routinely fail for different
+         reasons — a refused ``code-review`` beside an absent ``leaks`` — and choosing a
+         single winning cause explained one kind while the other silently got no guidance
+         at all. Precedence exists only WITHIN a kind (refused-here beats elsewhere).
+
+    An earlier draft collapsed everything into an unconditional "waiting will not clear
+    this", which was wrong for the ABSENT case and pushed the operator toward
+    ``# scheduled-review-override`` — i.e. toward waiving the IRREDUCIBLE leak gate — in
+    the one situation where patience was the correct answer.
+
+    The message deliberately reports only what it OBSERVED (which heads carry markers)
+    and hedges the schedule ("generally not re-run"). The routines live OUTSIDE this repo
+    and this gate cannot see their triggers, so an unconditional claim about when they
+    fire would be asserting a guarantee the code cannot back — and would become actively
+    misleading on an install that also runs them on ``synchronize``.
+
+    Head match is EXACT — there is no ancestor walk and no delta tolerance here, unlike
+    the Codex freshness gate, which grants relief on a provably trivial delta via
+    ``_classify_post_review_delta``. That asymmetry is deliberate for now: that
+    classifier judges CODE-REVIEW substantiality by file type and size, and an
+    inferential leak (household/schedule/habit detail, not a token a regex can catch)
+    arrives in exactly the small doc edit it would wave through. A leak-specific
+    tolerance is tracked separately; do not reuse the code-review classifier for it.
 
     SCOPE: this gate enforces ONLY for a merge targeting the configured PUBLIC repo
     (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any other
@@ -2187,7 +2872,8 @@ def _check_scheduled_claude_reviewed_head(
             f"reviews (GitHub query failed).\n"
             f"Retry, or append '# scheduled-review-override' to merge anyway."
         )
-    markers = _scheduled_review_markers(pr_num, repo=repo)
+    scan = _scheduled_review_marker_scan(pr_num, repo=repo)
+    markers, rejected = (None, {}) if scan is None else scan
     if markers is None:
         return (
             f"could not read PR #{pr_num}'s comments/reviews to verify the scheduled Claude "
@@ -2199,14 +2885,73 @@ def _check_scheduled_claude_reviewed_head(
     missing = [k for k in required if k not in kinds_here]
     if not missing:
         return None
+    # WHY the marker is missing decides whether waiting is useful, and the two causes are
+    # DISTINGUISHABLE from what was actually read — so report the observed state instead
+    # of asserting a routine schedule this repo cannot see (the routines live outside it).
+    # Every branch below is scoped to the MISSING kinds. A marker for a kind that is
+    # already satisfied says nothing about why this merge is blocked, and prescribing a
+    # remedy for it sends the operator to fix something that is not broken.
+    # PARTITION the missing kinds by cause and report EVERY group — never pick one cause
+    # for the whole block. Different kinds routinely fail for different reasons (a refused
+    # code-review alongside an absent leaks), and collapsing to a single winner explains
+    # one kind while the other silently gets no guidance at all. THREE successive review
+    # findings on this function were that same shape — a branch deciding from part of what
+    # had been read — so this is the general form rather than a fourth point patch: a total
+    # partition needs no precedence BETWEEN groups, only within a single kind.
+    missing_set = set(missing)
+    refused_kinds = rejected.get(head, set()) & missing_set
+    # A marker for a missing kind on some OTHER head — ACCEPTED OR REFUSED. Both prove a
+    # routine ran on a different commit; counting only accepted ones sent a
+    # refused-at-a-stale-head PR down the "nothing has run, wait for it" path.
+    heads_by_kind: dict[str, set[str]] = {}
+    for by_head in (markers, rejected):
+        for other_head, kinds in by_head.items():
+            if other_head == head:
+                continue
+            for kind in kinds & missing_set:
+                heads_by_kind.setdefault(kind, set()).add(other_head[:12])
+    # Within a KIND, refused-at-this-head wins: it is the most specific cause, and the only
+    # one whose remedy is neither waiting nor re-reviewing.
+    elsewhere_kinds = {k for k in missing_set - refused_kinds if k in heads_by_kind}
+    absent_kinds = missing_set - refused_kinds - elsewhere_kinds
+
+    parts: list[str] = []
+    if refused_kinds:
+        parts.append(
+            f"{', '.join(sorted(refused_kinds))} — a marker IS present at THIS head, but it "
+            f"was REFUSED because its body reads as carrying a blocking finding (matching "
+            f"one of [P1] / HARD BLOCK / an '### ERROR' heading) with no explicit clean "
+            f"verdict to override it. A marker must mean it ran CLEAN, not merely that it "
+            f"ran. If the review really was clean, its prose tripped the check — re-post it "
+            f"ending with an explicit verdict line, exactly 'VERDICT: PASS' or "
+            f"'PII/Secrets/Wording: CLEAN'. If the finding is real, fix it first."
+        )
+    if elsewhere_kinds:
+        seen = sorted({h for k in elsewhere_kinds for h in heads_by_kind[k]})
+        shown = ", ".join(seen[:3]) + (f" (+{len(seen) - 3} more)" if len(seen) > 3 else "")
+        parts.append(
+            f"{', '.join(sorted(elsewhere_kinds))} — a marker is present for a DIFFERENT "
+            f"head ({shown}), so a routine HAS run on this PR, just not on the current "
+            f"commit. Routines are generally not re-run when a later push moves the head, "
+            f"so waiting is unlikely to clear this on its own: re-run against the current "
+            f"head and post the marker yourself."
+        )
+    if absent_kinds:
+        parts.append(
+            f"{', '.join(sorted(absent_kinds))} — no marker at ANY head on this PR yet. If "
+            f"it was just opened, a routine may still be in flight, and waiting IS the right "
+            f"move. If it has been open a while, re-run against the current head and post "
+            f"the marker yourself."
+        )
     return (
         f"scheduled Claude review(s) missing at head {head[:12]}: {', '.join(missing)} "
         f"(required: {', '.join(required)}; present: "
         f"{', '.join(sorted(kinds_here)) or 'none'}).\n"
-        f"Each routine posts a comment/review carrying "
-        f"'<!-- genesis-scheduled-review: head=<sha> kind=<name> -->' once it runs on THIS "
-        f"exact commit — wait for the missing routine(s) to run on the current head, or "
-        f"append '# scheduled-review-override' to merge without them."
+        + "".join(f"  * {p}\n" for p in parts)
+        + "A marker is a comment/review by the repo OWNER carrying "
+        f"'<!-- genesis-scheduled-review: head={head} kind=<name> -->' — the FULL 40-hex "
+        "head, exactly as written here.\n"
+        "Or append '# scheduled-review-override' to merge without the missing review(s)."
     )
 
 
@@ -2278,6 +3023,250 @@ def _repo_default_branch(repo: str | None = None) -> str | None:
             return None
     name = (raw or "").strip()
     return name or None
+
+
+#: The pin file the receipt gate compares. Kept here (not imported) so a missing
+#: checker module degrades to a NOTE rather than an import error at hook load.
+_PIN_FILE_PATH = "scripts/lib/cc_version.sh"
+
+
+def _load_pin_receipt_checker():
+    """Import scripts/check_cc_pin_receipts.py, or None if unavailable.
+
+    Lazy and failure-tolerant on purpose: the checker is a sibling script, not a
+    package, and a hook that cannot import it must not stop being a merge gate
+    for everything else.
+    """
+    import importlib.util
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    path = os.path.join(repo_root, "scripts", "check_cc_pin_receipts.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_cc_pin_receipts", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # Registered before exec: @dataclass resolves its module from sys.modules.
+        sys.modules["_cc_pin_receipts"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+#: `_pin_file_at_ref` outcomes. ABSENT is a fact about the PR's CONTENT (the API
+#: answered, and the file is not there at that ref); UNREADABLE is a fact about the
+#: PLUMBING (no slug, timeout, auth, transport). They take OPPOSITE fail directions,
+#: so collapsing them — as an earlier revision did by returning None for both — let a
+#: PR that DELETES the pin file take the plumbing path and merge unblocked, which
+#: contradicts the checker's own stated policy that an unreadable pin BLOCKS.
+_PIN_OK = "ok"
+_PIN_ABSENT = "absent"
+_PIN_UNREADABLE = "unreadable"
+#: Test-seam sentinels for the two NON-content outcomes (mirroring
+#: `_TEST_GH_PR_FILES`'s `__error__`). Any other seam value — including the EMPTY
+#: STRING — is content, because with the JSON contents form an empty file is a real,
+#: distinct state from both absence and an unreadable response.
+_PIN_SEAM_ABSENT = "__absent__"
+_PIN_SEAM_UNREADABLE = "__unreadable__"
+
+
+def _pin_file_at_ref(ref: str, repo: str | None, *, seam: str) -> tuple[str | None, str]:
+    """``(contents, outcome)`` for the pin file at ``ref``, read through the API.
+
+    Used for BOTH sides of the comparison — one code path, so the head and base
+    reads cannot drift apart in their fail direction (they did: the base side used
+    a hardcoded local ``git show origin/main``, which is neither bound to the repo
+    being merged into nor to the PR's actual base branch. On a checkout whose
+    ``origin`` is a fork, a genuine forward bump could read as a DOWNGRADE and be
+    exempted).
+
+    NOT from the local checkout: the gate runs from the main worktree, which is on
+    main, so the PR's version of the file is not on disk here. That is also the
+    property making this gate un-editable by the PR — only the DATA comes from the
+    PR, never the code reading it.
+    """
+    raw = os.environ.get(seam)
+    if raw is not None:
+        # The seam mirrors the live path's THREE outcomes, so a test cannot see
+        # behaviour production is incapable of producing. Both non-content outcomes
+        # need their own sentinel, because with the JSON form an EMPTY STRING is a
+        # legitimate third thing — a file that exists and is empty — and collapsing
+        # it into either sentinel would hide the very distinction this seam exists
+        # to exercise.
+        if raw == _PIN_SEAM_ABSENT:
+            return None, _PIN_ABSENT
+        if raw == _PIN_SEAM_UNREADABLE:
+            return None, _PIN_UNREADABLE
+        return raw, _PIN_OK
+    # Resolution order matters. `_canonical_public_repo()` reads install config and
+    # is legitimately absent on an install that never set `github.*` — the merge
+    # gate treats that as "uncertain, enforce", so falling back to the repo the
+    # process is actually in keeps the gate WORKING rather than silently
+    # unverifying on every such install (measured: it returned None here).
+    slug = (_normalize_repo(repo) if repo else None) or _canonical_public_repo()
+    if not slug:
+        slug = _derive_repo_from_cwd(os.getcwd())
+    if not slug:
+        return None, _PIN_UNREADABLE
+    try:
+        result = subprocess.run(
+            # The JSON representation, NOT `Accept: raw`. Raw returns bytes, and bytes
+            # cannot distinguish "the file is not there" from "the file is empty" from
+            # "the response was truncated" — all three arrive as an empty body, which
+            # forced the previous revision to GUESS from gh's stderr wording. The JSON
+            # form answers directly: `type` and `size` are facts about the tree, and a
+            # missing path is a 404. MEASURED: a present file returns
+            # {"name":…, "size":21747, "type":"file"}; an absent path returns 404.
+            ["gh", "api", f"repos/{slug}/contents/{_PIN_FILE_PATH}?ref={ref}"],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+    except Exception:
+        return None, _PIN_UNREADABLE
+    if result.returncode == 0:
+        try:
+            payload = json.loads(result.stdout or "")
+        except Exception:
+            # A zero exit whose body is not JSON is a stub or a truncated response —
+            # plumbing. This is the shape a test router's no-op reply takes, and it
+            # must not read as a fact about the tree.
+            return None, _PIN_UNREADABLE
+        if not isinstance(payload, dict):
+            # A directory lists as an ARRAY. Either way the pin file is not at this
+            # path, which is a fact about the PR's content.
+            return None, _PIN_ABSENT
+        if payload.get("type") != "file":
+            return None, _PIN_ABSENT  # a submodule or symlink-to-dir is not the pin
+        if payload.get("encoding") != "base64":
+            # >1MB blobs come back with encoding "none" and no content. Not absence —
+            # the file is there and we simply cannot read it this way.
+            return None, _PIN_UNREADABLE
+        try:
+            text = base64.b64decode(payload.get("content") or "").decode("utf-8", "replace")
+        except Exception:
+            return None, _PIN_UNREADABLE
+        # An EMPTY file is returned as content, deliberately, not as a state of its
+        # own. It exists, so it is not absent — and an empty pin is an UNPARSEABLE
+        # pin, which the checker's own policy already blocks. Classifying it here
+        # would duplicate that policy in the wiring, which is how the previous
+        # revision came to block a DELETED pin file while waving through one
+        # truncated to nothing: the same condition, enforced two different ways.
+        return text, _PIN_OK
+    # Non-zero. With the JSON form the only ambiguity left is which THING was not
+    # found, and gh names the ref case explicitly. MEASURED against the live API:
+    #   bad ref      -> gh: No commit found for the ref <sha> (HTTP 404)
+    #   missing file -> gh: Not Found (HTTP 404)
+    #   bad repo     -> gh: Not Found (HTTP 404)
+    # A bad ref is PLUMBING. Missing-file and missing-repo share one message — GitHub
+    # will not separate them, so as not to leak whether a private repo exists — but
+    # this gate is reached only after the head sha and base ref were read SUCCESSFULLY
+    # from that same repo, so the repo is known good by then and a bare Not Found is
+    # the path being absent.
+    stderr = (result.stderr or "").lower()
+    if "no commit found for the ref" in stderr:
+        return None, _PIN_UNREADABLE
+    if "not found" in stderr:
+        return None, _PIN_ABSENT
+    return None, _PIN_UNREADABLE
+
+
+def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
+    """The PR body. ``None`` means unreadable — distinct from an EMPTY body,
+    which is a real state that determines the answer by itself."""
+    raw = os.environ.get("_TEST_GH_PR_BODY")
+    if raw is not None:
+        return raw
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", pr_num, *_repo_args(repo), "--json", "body", "--jq", ".body"],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+    except Exception:
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
+    """Block a PR that moves the Claude Code pin FORWARD without its gate receipts.
+
+    THIS is the authority for the receipt gates, not a CI status. The body is
+    mutable after any CI run finishes, so a status describing it is a claim about
+    the past; read at merge time there is no window to edit it afterwards. The
+    CI job runs the same checker with ``--advisory`` purely for early feedback.
+
+    BOTH sides are read through the API, against the repo actually being merged
+    into and the PR's OWN base branch. An earlier revision read the base with a
+    local ``git show origin/main`` — not bound to the merge target and hardcoding
+    the branch name — so from a checkout whose ``origin`` is a fork (or whose
+    ``origin/main`` is simply unfetched) the comparison ran against the wrong base,
+    and a fork sitting on a HIGHER pin turned a genuine forward bump into a
+    "downgrade" that the gate exempts. Head still comes through the API, so the
+    code doing the reading is always main's copy.
+
+    FAIL DIRECTION, split deliberately — and the split is between CONTENT and
+    PLUMBING, not between "worked" and "didn't":
+      * The pin moved forward and a receipt is missing, or the pin cannot be READ
+        at either side, or the file is ABSENT at either side -> BLOCK. All are
+        facts about the PR's content, and publishing a release nobody can
+        characterise is the thing to prevent. Absence matters on its own: a PR that
+        DELETES the pin file has no readable pin, which the checker's policy says
+        must block — routing that through the plumbing path would let the deletion
+        merge unexamined.
+      * The gate's own PLUMBING failed (no checker module, unreadable head sha or
+        base ref, auth/transport error) -> NOTE, do not block. Walling off every
+        merge over a check that only ever guards a pin bump would be a worse
+        failure than the one it prevents.
+    """
+    checker = _load_pin_receipt_checker()
+    if checker is None:
+        return False, "NOTE: pin-receipt checker not importable — receipts NOT verified."
+
+    head_sha = _pr_head_sha(pr_num, repo=repo)
+    if not head_sha:
+        return False, "NOTE: PR head unreadable — pin receipts NOT verified."
+
+    base_ref = _pr_base_ref(pr_num, repo=repo)
+    if not base_ref:
+        return False, "NOTE: PR base ref unreadable — pin receipts NOT verified."
+
+    head_text, head_state = _pin_file_at_ref(head_sha, repo, seam="_TEST_GH_HEAD_PIN_FILE")
+    if head_state == _PIN_ABSENT:
+        return True, (
+            f"BLOCKED: {_PIN_FILE_PATH} is ABSENT at the PR head ({head_sha[:12]}). The pin "
+            f"cannot be read, so whether this PR moves it forward cannot be established — "
+            f"and a PR that removes the pin file is exactly the case this gate must not "
+            f"wave through. Restore it, or merge with the gate's own escape if the removal "
+            f"is intended."
+        )
+    if head_text is None:
+        return (
+            False,
+            f"NOTE: could not read {_PIN_FILE_PATH} at the PR head — receipts NOT verified.",
+        )
+
+    base_text, base_state = _pin_file_at_ref(base_ref, repo, seam="_TEST_GH_BASE_PIN_FILE")
+    if base_state == _PIN_ABSENT:
+        return True, (
+            f"BLOCKED: {_PIN_FILE_PATH} is ABSENT on the base branch ({base_ref}). There is "
+            f"no pin to compare against, so a forward move cannot be ruled out."
+        )
+    if base_text is None:
+        return False, (f"NOTE: {_PIN_FILE_PATH} unreadable on {base_ref} — receipts NOT verified.")
+
+    body = _pr_body_text(pr_num, repo)
+    if body is None:
+        return False, "NOTE: PR body unreadable — pin receipts NOT verified."
+
+    try:
+        verdict = checker.evaluate(base_pin_text=base_text, head_pin_text=head_text, body=body)
+    except Exception as exc:  # noqa: BLE001 — plumbing, not policy
+        return False, f"NOTE: pin-receipt check errored ({type(exc).__name__}) — NOT verified."
+
+    return verdict.blocked, verdict.message
 
 
 def _check_base_is_default(
@@ -3469,7 +4458,9 @@ def main() -> int:
                 # pre-gate repo/PR resolution above (6s each) — carries a tight
                 # per-call timeout (6-8s): pre-gates + fail-closed gates
                 # (derive 6 + resolve 6 + mergeable 8 + ci 8 + base 6+6 +
-                # freshness 6+8 + delta 8 = 62s absolute worst) each reach
+                # freshness 6+8 + delta 8 = 62s absolute worst; the FORCE
+                # branch swaps freshness+delta for its hook-surface evidence
+                # reads, files 8 + head 6 = strictly less) each reach
                 # their own block/allow decision at or inside the budget, and
                 # any ONE of them timing out fail-closes IMMEDIATELY (the
                 # additive worst case needs every call slow-but-successful);
@@ -3483,6 +4474,13 @@ def main() -> int:
                 if mergeable == "CONFLICTING":
                     print(
                         f"BLOCKED: PR #{pr_num} has merge conflicts. Resolve before merging.",
+                        file=sys.stderr,
+                    )
+                    print(
+                        "A conflicting branch ALSO suppresses all pull_request CI (GitHub "
+                        "cannot build the merge ref), so no CI runs until you merge the "
+                        "base branch (usually main) into your PR branch — that resolves "
+                        "both at once.",
                         file=sys.stderr,
                     )
                     return 2
@@ -3499,7 +4497,10 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     print(
-                        "GitHub may still be computing it, or the query failed. Wait and retry.",
+                        "GitHub may still be computing it, or the query failed. Wait and "
+                        "retry. A conflicting or still-computing branch also suppresses "
+                        "pull_request CI, so if CI never appears check "
+                        f"`gh pr view {pr_num} --json mergeable` first.",
                         file=sys.stderr,
                     )
                     return 2
@@ -3511,8 +4512,12 @@ def main() -> int:
                 # past a red `test` job — exactly how main was broken on
                 # 2026-07-28. Block red/pending CI unless a conscious, separate
                 # `# ci-override` is appended (never waived by --admin or
-                # # review-override). Fail-OPEN on "unknown" so a transient API
-                # hiccup can't wedge merges.
+                # # review-override). Fail-OPEN on "unknown" (a read we could not
+                # complete) so a transient API hiccup can't wedge merges — but
+                # fail-CLOSED on "absent" (a readable EMPTY check set = CI never ran)
+                # ON THE CANONICAL REPO (where CI always runs), so a conflicting branch
+                # or dropped pull_request trigger can't slip an un-CI'd merge through
+                # (handled just below).
                 ci_state, ci_bad = _pr_ci_status(pr_num, repo=merge_repo)
                 ci_override = has_trailing_override(merge_seg.raw, "ci-override")
                 if ci_state in ("red", "pending") and not ci_override:
@@ -3533,6 +4538,56 @@ def main() -> int:
                 if ci_state in ("red", "pending"):
                     print(
                         f"NOTE: CI {ci_state.upper()} on #{pr_num} "
+                        f"({', '.join(ci_bad[:6])}) — merging via # ci-override "
+                        "(consciously accepted).",
+                        file=sys.stderr,
+                    )
+                # "absent" = a readable EMPTY check set (CI never ran). On the canonical
+                # public repo CI ALWAYS runs, so an empty set is anomalous → fail-CLOSED
+                # (a conflicting branch / dropped pull_request trigger would otherwise
+                # merge un-CI'd). Off the canonical repo (may legitimately have no CI)
+                # this stays fail-OPEN. Waived by the same conscious `# ci-override`.
+                # Scoped via the canonical-repo test (shared with the scheduled gate).
+                elif ci_state == "absent" and _scheduled_gate_applies(merge_repo):
+                    if not ci_override:
+                        print(
+                            f"BLOCKED: No CI checks have run on PR #{pr_num} (an empty "
+                            "check set). On the canonical repo CI always runs, so "
+                            "pull_request CI never fired — most often the branch was "
+                            "CONFLICTING (merge origin/main into it to resolve BOTH) or a "
+                            "trigger was dropped (push a commit to re-fire). Never merge "
+                            "an un-CI'd PR. If you are intentionally merging with no CI, "
+                            "append a trailing '# ci-override' (logged).",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    print(
+                        f"NOTE: No CI checks on #{pr_num} — merging via # ci-override "
+                        "(consciously accepted).",
+                        file=sys.stderr,
+                    )
+                # "incomplete" = a NON-empty rollup whose present checks are green, but
+                # a REQUIRED workflow (default "CI") contributed no verdict — e.g. a
+                # lone green CodeQL after a workflow-specific trigger drop (#1484-P2).
+                # Same scoping + valve as "absent": canonical repo only, # ci-override.
+                elif ci_state == "incomplete" and _scheduled_gate_applies(merge_repo):
+                    if not ci_override:
+                        print(
+                            f"BLOCKED: required CI workflow(s) missing from PR "
+                            f"#{pr_num}'s check rollup: {', '.join(ci_bad[:6])}. The "
+                            "checks that ARE present are green, but the required "
+                            "workflow never ran — most often a workflow-specific "
+                            "trigger drop (push a commit or re-run the workflow to "
+                            "re-fire) or a fully-skipped suite. The required set comes "
+                            "from merge_gate.required_ci_workflows in "
+                            "~/.genesis/config/genesis.yaml (default: CI). If you are "
+                            "intentionally merging without it, append a trailing "
+                            "'# ci-override' (logged).",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    print(
+                        f"NOTE: required CI workflow(s) missing on #{pr_num} "
                         f"({', '.join(ci_bad[:6])}) — merging via # ci-override "
                         "(consciously accepted).",
                         file=sys.stderr,
@@ -3564,6 +4619,30 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     print(base_msg, file=sys.stderr)
+                    return 2
+
+                # Pin receipts. This is the AUTHORITY for the two release gates
+                # (changelog read, local-first soak), deliberately not a CI
+                # status: the PR body stays mutable after a check run finishes,
+                # so only a merge-time read describes the body that merges. It
+                # also runs main's copy of the checker, so a PR cannot edit the
+                # code that gates it.
+                #
+                # NO override sigil, deliberately. Every sigil here waives exactly
+                # ONE gate so a waiver cannot silently disarm an unrelated one, so
+                # reusing # review-override (which waives the FINDING scans) would
+                # be exactly that. And a dedicated sigil would be an escape from a
+                # demand that takes seconds to satisfy honestly: if a gate really
+                # was not run, the action is to run it, not to wave it through.
+                # Incident recovery is already covered — a BACKWARD pin is exempt
+                # by construction, with no syntax to recall under pressure.
+                should_block, receipts_msg = _check_pin_receipts(pr_num, repo=merge_repo)
+                if should_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — CC pin moves forward without its gate receipts.",
+                        file=sys.stderr,
+                    )
+                    print(receipts_msg, file=sys.stderr)
                     return 2
 
                 # Codex must have reviewed the CURRENT head (existence + freshness)
@@ -3817,10 +4896,35 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     print(f"ci             : {ci_state}{' (' + ', '.join(ci_bad[:6]) + ')' if ci_bad else ''}")
     if ci_state in ("red", "pending"):
         failures += 1
+    elif ci_state == "absent" and _scheduled_gate_applies(repo):
+        # Mirror the enforcement arm so the report and gate never disagree: a readable
+        # empty check set on the canonical repo blocks (CI never ran — likely a
+        # conflicting branch or a dropped pull_request trigger).
+        print("  ↳ BLOCK — no CI checks have run (empty check set); pull_request CI never fired.")
+        failures += 1
+    elif ci_state == "incomplete" and _scheduled_gate_applies(repo):
+        # Mirror the enforcement arm: a partial rollup missing a required workflow
+        # (merge_gate.required_ci_workflows, default CI) blocks on the canonical repo.
+        print(
+            "  ↳ BLOCK — required CI workflow(s) missing from the check rollup "
+            f"({', '.join(ci_bad[:6])}); the required suite never ran."
+        )
+        failures += 1
     # Order mirrors the gate: base-invariant → freshness → finding scans, so a
     # review published mid-run can't pass freshness with its P1s unscanned.
     blocked, msg = _check_base_is_default(pr_num, repo=repo)
     print(f"base-branch    : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (default)'}")
+    failures += 1 if blocked else 0
+    # Pin receipts: authoritative HERE, not in CI — the PR body is mutable after
+    # a check run completes, so only a merge-time read describes the body that
+    # actually merges.
+    blocked, msg = _check_pin_receipts(pr_num, repo=repo)
+    print(
+        f"pin-receipts   : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}"
+    )
+    if blocked:
+        for line in msg.splitlines()[1:]:
+            print(f"  {line}")
     failures += 1 if blocked else 0
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     if blocked:

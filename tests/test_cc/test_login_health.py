@@ -32,6 +32,9 @@ def _ms(dt: datetime) -> int:
 @pytest.fixture(autouse=True)
 def _isolated_config(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    # Point the token file at tmp so the staleness check (fallback_token_is_stale)
+    # never reads the real ~/.genesis token — hermetic + no wall-clock time-bomb.
+    monkeypatch.setattr(login_health, "_TOKEN_FILE", tmp_path / "cc_oauth_token.env")
     login_health.reset_probe_cache()
     return tmp_path
 
@@ -125,6 +128,48 @@ async def test_no_token_file_no_injection(tmp_path):
     env = await login_health.fallback_env_if_login_dead(
         probe=confirmed_out,
         token_reader=lambda: None,
+    )
+    assert env is None
+
+
+def _write_token_file(tmp_path, *, created_age_days: float | None) -> None:
+    lines = ["CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-x"]
+    if created_age_days is not None:
+        created = int((datetime.now(UTC) - timedelta(days=created_age_days)).timestamp())
+        lines.append(f"GENESIS_CC_TOKEN_CREATED_AT={created}")
+    (tmp_path / "cc_oauth_token.env").write_text("\n".join(lines) + "\n")
+
+
+def test_fallback_token_created_at_and_staleness(tmp_path):
+    # Fresh token → readable created_at, not stale.
+    _write_token_file(tmp_path, created_age_days=10)
+    assert login_health.fallback_token_created_at() is not None
+    assert login_health.fallback_token_is_stale() is False
+    # Past ~1yr → stale.
+    _write_token_file(tmp_path, created_age_days=400)
+    assert login_health.fallback_token_is_stale() is True
+    # Unknown created_at (field absent) → NOT stale (never block on ambiguity).
+    _write_token_file(tmp_path, created_age_days=None)
+    assert login_health.fallback_token_created_at() is None
+    assert login_health.fallback_token_is_stale() is False
+
+
+@pytest.mark.asyncio
+async def test_no_injection_when_token_is_stale(tmp_path):
+    """Login dead + confirmed logged-out + token present, but the setup-token is
+    itself past its ~1-year life → do NOT inject a known-dead credential."""
+    _write_creds(
+        tmp_path,
+        refresh_expires_ms=_ms(datetime.now(UTC) - timedelta(hours=1)),
+    )
+
+    async def confirmed_out():
+        return True
+
+    env = await login_health.fallback_env_if_login_dead(
+        probe=confirmed_out,
+        token_reader=lambda: "tok-x",
+        token_is_stale=lambda: True,
     )
     assert env is None
 

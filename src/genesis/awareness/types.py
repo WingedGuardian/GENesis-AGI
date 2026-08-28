@@ -95,6 +95,30 @@ class SignalReading:
     baseline_note: str | None = None  # human-readable "what's normal" for LLM context
     metadata: dict | None = None  # optional diagnostic metadata (latency values, stale jobs, etc.)
 
+    def __post_init__(self) -> None:
+        # The free-text fields are rendered VERBATIM, one line per signal, into the
+        # reflection prompt (awareness/signal_format.py) AND the user-ego prompt
+        # (ego/user_context.py reloads the raw note from awareness_ticks.signals_json)
+        # under a "these are the ONLY signals you may cite" instruction. A newline (or
+        # Unicode line separator, or bidi override) forges or conceals an authoritative
+        # signal line. Normalizing here — the single construction choke point every
+        # reader flows through — closes that LINE-FORGING class for every render path
+        # (present and future) and keeps the stored DB row clean. No-op on already-
+        # single-line values.
+        #
+        # Scope: this does NOT resist semantic injection via purely-printable text on a
+        # signal's own legitimate line (e.g. a crafted campaign-derived job name); that
+        # is defended at the input boundary (campaign-name validation), not here.
+        # `metadata` is intentionally NOT sanitized — no render path surfaces it (the
+        # tick serializer and signal_format both drop it), a contract locked by
+        # tests/test_awareness/test_signal_format.py::test_metadata_not_rendered.
+        from genesis.security.sanitizer import strip_control_chars
+
+        object.__setattr__(self, "name", strip_control_chars(self.name))
+        object.__setattr__(self, "source", strip_control_chars(self.source))
+        if self.baseline_note is not None:
+            object.__setattr__(self, "baseline_note", strip_control_chars(self.baseline_note))
+
 
 @dataclass(frozen=True)
 class DepthScore:

@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+# (sourced fragment, not an executable script — no shebang)
 # Genesis — user-level CLAUDE.md sentinel-block helpers.
 # Sourced by update.sh (in-container) and host-setup.sh (host-side); not
 # executable on its own. Single source of truth for the network-identity

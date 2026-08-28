@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from genesis.security.sanitizer import strip_control_chars
+
 
 async def create_campaign(
     db: Any,
@@ -22,6 +24,12 @@ async def create_campaign(
     max_daily_cost_usd: float = 1.0,
 ) -> str:
     """Insert a new campaign. Returns the campaign ID."""
+    # Hygiene, not validation: the stored name is the single source the job_id
+    # (f"campaign_{name}"), log lines, the job_health.job_name column, and the
+    # reflection note all derive from — an accidental control char garbles all of
+    # them. Strip (never reject) so the stored name is single-line; any printable
+    # name is preserved untouched.
+    name = strip_control_chars(name)
     await db.execute(
         """INSERT INTO campaigns
            (id, name, strategy_doc_path, cron_cadence, model, effort,
@@ -94,6 +102,10 @@ async def update_campaign(db: Any, campaign_id: str, **fields: Any) -> None:
     """Update arbitrary fields on a campaign row."""
     if not fields:
         return
+    # Same hygiene as create_campaign: a rename must not smuggle a control char
+    # into the stored name (see create_campaign).
+    if "name" in fields and isinstance(fields["name"], str):
+        fields["name"] = strip_control_chars(fields["name"])
     set_clause = ", ".join(f"{k} = ?" for k in fields)
     values = list(fields.values()) + [campaign_id]
     await db.execute(

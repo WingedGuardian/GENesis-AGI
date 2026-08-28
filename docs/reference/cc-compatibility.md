@@ -289,6 +289,114 @@ Deliberate multi-copy setups: `CC_SHADOW_SCAN=0` opts out.
 CC "not installed", so a PATH-blind install is aligned in place instead of
 reinstalled forever.
 
+### The pin PR's own gate: `cc-pin-receipts`
+
+A change moving `CC_VERSION` **forward** must carry both gate receipts as
+PR-body trailers, in the same style as the repo's existing `Ledger:` /
+`Follow-up:` trailers:
+
+```
+CC-Gate-Changelog: read (<from>, <to>] in full from <source>, <date>
+CC-Gate-Soak: <candidate> on <where> <start>..<end>, running-binary sweep <result>, signed off <who>
+```
+
+Write them in the PR body itself. Receipts inside an HTML comment or a code
+fence do **not** count — they satisfy a text search while being invisible to the
+person merging, and the only enforcement this has is a human reading a claim
+someone chose to make. Ordinary markdown is fine: list bullets, `- [x]` task
+boxes, blockquotes and bold all work.
+
+**The merge gate is the authority; CI is advisory.** The check reads the PR
+BODY, which stays mutable after any CI run finishes, so a CI status describing
+it is a claim about the past. It therefore runs at merge time
+(`scripts/hooks/git_push_guard.py --check-pr`), comparing the pin at the PR head
+against the pin on `origin/main` — which at that moment is exactly what the pin
+is about to land on. The `cc-pin-receipts` job in `ci.yml` runs the same checker
+with `--advisory`: it annotates a missing receipt early and always exits 0.
+
+That split is deliberate, and reversing it breaks the gate. A completed check
+run is immutable, and the merge gate treats a stale FAILURE as red on purpose —
+it forces `gh pr merge --admin` and is the sole CI enforcement for the merges it
+allows, so a later SUCCESS clearing an earlier FAILURE would make re-running a
+job until green sufficient to merge. A *blocking* status over a mutable input
+therefore could not be cleared by fixing that input: the author would have to
+push a commit purely to get a fresh head. Running from main's copy of the
+checker also means a PR cannot edit the code that gates it.
+
+Scope, stated plainly: it stops **omission, not forgery**. Nothing here can tell
+whether a soak actually happened — this repo already settled that question,
+which is why `review-depth-check` is advisory by design. What it converts is
+*forgetting* into *consciously writing something untrue*. Same kind of check,
+and the same strength, as `scripts/check_hook_versions_complete.sh`.
+
+It compares the **parsed pin value**, not whether the file changed, so PRs that
+edit `cc_version.sh` for other reasons are unaffected. **Downgrades are
+auto-exempt** — a rollback returns to a version that already ran here, and the
+downgrade path is this project's incident-recovery route (the reason a managed
+`requiredMinimumVersion` floor was rejected above). No override syntax to
+remember under incident pressure.
+
+What it will **not** do is guess. A pin it cannot read — absent, assigned more
+than once, not canonical semver, or not valid UTF-8 — **blocks**. "I cannot tell
+what this file pins" is not a reason to publish a release; it is the state a
+human needs to look at.
+
+---
+
+### Which copy is INSTALLED vs which copy is RUNNING
+
+Different questions, different checks, and a box can pass one while failing the
+other.
+
+`cc_shadow_scan` answers **installed**: it probes `command -v claude` plus
+`CC_PROBE_DIRS` for extra on-disk copies and removes the stale ones.
+
+`scripts/check_cc_running_versions.sh` answers **running**: for every live CC
+process it resolves `stat -L /proc/<pid>/exe` — procfs keeps that reference
+valid even after npm unlinks the file — and compares its **device + inode**
+against the binary on disk today. Device matters: an inode number is unique only
+within a filesystem, so copies on separate mounts can collide numerically.
+
+Measured on a live install: exactly one canonical binary, at the intended
+version, while **a majority of live CC sessions were still executing the
+replaced predecessor**. A long-running process keeps its original mapping until
+it restarts, and `claude --version` cannot reveal this — it spawns a *fresh
+child*, which reads the new on-disk binary and truthfully reports the new
+version while the session asking the question is not running it.
+
+This matters most during a local-first soak, whose whole premise is that real
+interactive use exercises the candidate. Run the sweep at soak start and again
+at soak end.
+
+**The rule it is built around**, because a check that produces release evidence
+has one failure that matters more than the others:
+
+> Any process the sweep cannot POSITIVELY PROVE is not-Claude-Code must not
+> contribute to a clean verdict.
+
+Positive proof is cheap: a readable executable whose basename is not a Claude
+Code name, or an unreadable executable whose command line's `argv[0]` is not
+one. Only when neither can be read is a process genuinely unclassifiable, and
+that refuses the clean verdict rather than being skipped. Measured on a live
+box, that bucket holds 0 of 109 processes — the rule costs nothing in practice
+and never launders a false all-clear.
+
+Classification is a **closed set of names**, never a path guess. An earlier
+design classified by whether the executable lived under an enumerated install
+root; it fails on the only case that matters, because npm's replace renames the
+old package aside and then deletes it, so a stale process's path points at a
+directory that no longer exists. A root set enumerated from the install cannot
+contain a directory the installer deleted, so exactly the stale processes would
+have been classified "not CC", ignored, and reported clean.
+
+Exit codes: **0** every live CC process runs the on-disk binary; **1** at least
+one runs a different binary — either a replaced one, or an installed copy that
+is not the PATH-canonical one (each named, so `cc_shadow_scan` can resolve it);
+**2** cannot determine, so no clean verdict is claimed. A node-wrapped install
+resolves `exe` to the interpreter, whose inode says nothing about which CC
+revision is loaded, so it reports undetermined rather than a false all-clear.
+The same is true under a `hidepid` procfs, where other users' processes are not
+enumerable at all and the denominator itself would be unverified.
 
 
 ## Integration Surface — Genesis Components That Use CC
