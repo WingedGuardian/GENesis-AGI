@@ -92,6 +92,62 @@ reinstalled forever.
 
 ---
 
+### Which copy is INSTALLED vs which copy is RUNNING
+
+Different questions, different checks, and a box can pass one while failing the
+other.
+
+`cc_shadow_scan` answers **installed**: it probes `command -v claude` plus
+`CC_PROBE_DIRS` for extra on-disk copies and removes the stale ones.
+
+`scripts/check_cc_running_versions.sh` answers **running**: for every live CC
+process it resolves `stat -L /proc/<pid>/exe` — procfs keeps that reference
+valid even after npm unlinks the file — and compares its **device + inode**
+against the binary on disk today. Device matters: an inode number is unique only
+within a filesystem, so copies on separate mounts can collide numerically.
+
+Measured on a live install: exactly one canonical binary, at the intended
+version, while **a majority of live CC sessions were still executing the
+replaced predecessor**. A long-running process keeps its original mapping until
+it restarts, and `claude --version` cannot reveal this — it spawns a *fresh
+child*, which reads the new on-disk binary and truthfully reports the new
+version while the session asking the question is not running it.
+
+This matters most during a local-first soak, whose whole premise is that real
+interactive use exercises the candidate. Run the sweep at soak start and again
+at soak end.
+
+**The rule it is built around**, because a check that produces release evidence
+has one failure that matters more than the others:
+
+> Any process the sweep cannot POSITIVELY PROVE is not-Claude-Code must not
+> contribute to a clean verdict.
+
+Positive proof is cheap: a readable executable whose basename is not a Claude
+Code name, or an unreadable executable whose command line's `argv[0]` is not
+one. Only when neither can be read is a process genuinely unclassifiable, and
+that refuses the clean verdict rather than being skipped. Measured on a live
+box, that bucket holds 0 of 109 processes — the rule costs nothing in practice
+and never launders a false all-clear.
+
+Classification is a **closed set of names**, never a path guess. An earlier
+design classified by whether the executable lived under an enumerated install
+root; it fails on the only case that matters, because npm's replace renames the
+old package aside and then deletes it, so a stale process's path points at a
+directory that no longer exists. A root set enumerated from the install cannot
+contain a directory the installer deleted, so exactly the stale processes would
+have been classified "not CC", ignored, and reported clean.
+
+Exit codes: **0** every live CC process runs the on-disk binary; **1** at least
+one runs a different binary — either a replaced one, or an installed copy that
+is not the PATH-canonical one (each named, so `cc_shadow_scan` can resolve it);
+**2** cannot determine, so no clean verdict is claimed. A node-wrapped install
+resolves `exe` to the interpreter, whose inode says nothing about which CC
+revision is loaded, so it reports undetermined rather than a false all-clear.
+The same is true under a `hidepid` procfs, where other users' processes are not
+enumerable at all and the denominator itself would be unverified.
+
+
 ## Integration Surface — Genesis Components That Use CC
 
 | Genesis Component | CC Feature Used | Files | Notes |
