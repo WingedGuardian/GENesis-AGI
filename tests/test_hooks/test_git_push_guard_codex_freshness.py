@@ -1191,13 +1191,13 @@ class TestScheduledGateBlockMessageBranchesOnCause:
     def test_stale_marker_says_waiting_is_unlikely_to_help(self, monkeypatch):
         msg = self._block_msg(monkeypatch, self._marker_at(OTHER_HEAD)).lower()
         assert "unlikely to clear this" in msg
-        assert "re-run the missing review" in msg
+        assert "re-run against the current head" in msg
 
     def test_stale_marker_does_not_tell_the_operator_to_wait(self, monkeypatch):
         """The failure this branch exists to prevent: advice-to-wait on a pushed head."""
         msg = self._block_msg(monkeypatch, self._marker_at(OTHER_HEAD)).lower()
         assert "may still be in flight" not in msg
-        assert "wait for it" not in msg
+        assert "waiting is the right move" not in msg
 
     def test_stale_marker_names_the_head_that_was_actually_reviewed(self, monkeypatch):
         """Evidence, not assertion — the operator sees which commit DID get reviewed."""
@@ -1208,7 +1208,7 @@ class TestScheduledGateBlockMessageBranchesOnCause:
     def test_no_marker_anywhere_says_waiting_may_be_correct(self, monkeypatch):
         msg = self._block_msg(monkeypatch, "").lower()
         assert "may still be in flight" in msg
-        assert "wait for it" in msg
+        assert "waiting is the right move" in msg
 
     def test_no_marker_anywhere_does_not_claim_waiting_is_futile(self, monkeypatch):
         """Regression guard for the overcorrection this class documents."""
@@ -1245,8 +1245,8 @@ class TestScheduledGateBlockMessageBranchesOnCause:
         the identical comment, when the body's WORDING is what refused it."""
         msg = self._block_msg(monkeypatch, self._marker_at(HEAD, self.REFUSED_PROSE)).lower()
         assert "may still be in flight" not in msg
-        assert "wait for it" not in msg
-        assert "already present for a different head" not in msg
+        assert "waiting is the right move" not in msg
+        assert "present for a different head" not in msg
 
     def test_a_clean_verdict_line_makes_the_same_marker_pass(self, monkeypatch):
         """The remedy the message prescribes must actually work — end to end."""
@@ -1281,7 +1281,7 @@ class TestScheduledGateBlockMessageBranchesOnCause:
         """
         msg = self._block_msg(monkeypatch, self._marker_at(OTHER_HEAD, self.REFUSED_PROSE))
         assert OTHER_HEAD[:12] in msg
-        assert "DIFFERENT head" in msg
+        assert "a marker is present for a DIFFERENT head" in msg
         assert "may still be in flight" not in msg.lower()
 
     def test_partial_acceptance_does_not_contradict_the_present_line(self, monkeypatch):
@@ -1296,7 +1296,7 @@ class TestScheduledGateBlockMessageBranchesOnCause:
         msg = _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
         assert msg and "present: code-review" in msg
         assert "at ANY head" in msg, "the no-marker branch is still the right one here"
-        assert "No marker for leaks" in msg, "must be scoped to the MISSING kind"
+        assert "leaks — no marker at ANY head" in msg, "must be scoped to the MISSING kind"
 
     def test_refused_marker_for_an_already_satisfied_kind_does_not_hijack_the_message(
         self, monkeypatch
@@ -1319,7 +1319,54 @@ class TestScheduledGateBlockMessageBranchesOnCause:
         msg = _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
         assert msg and "code-review" in msg
         assert "REFUSED" not in msg, "the refused kind is already satisfied — not the cause"
-        assert "No marker for code-review" in msg
+        assert "code-review — no marker at ANY head" in msg
+
+    def test_mixed_causes_report_every_missing_kind_not_just_one(self, monkeypatch):
+        """Two missing kinds failing for DIFFERENT reasons must BOTH get guidance.
+
+        The regression this guards: picking a single winning cause for the whole block
+        explained one kind and left the other with no guidance at all. Three successive
+        review findings on this function were that same shape (a decision made from part
+        of what had been read), which is why the causes are now a total PARTITION over
+        the missing kinds rather than a precedence chain.
+        """
+        comments = "\n".join(
+            [
+                self._marker_kind(HEAD, "code-review", self.REFUSED_PROSE),
+                self._marker_kind(OTHER_HEAD, "leaks"),
+            ]
+        )
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", comments)
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "code-review,leaks")
+        msg = _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
+        assert msg
+        # code-review: refused AT this head -> the verdict-line remedy.
+        assert "code-review — a marker IS present at THIS head" in msg
+        assert "VERDICT: PASS" in msg
+        # leaks: present at an EARLIER head -> the re-review remedy, naming that head.
+        assert "leaks — a marker is present for a DIFFERENT head" in msg
+        assert OTHER_HEAD[:12] in msg
+        # Neither kind may be silently dropped.
+        assert msg.count("  * ") == 2, "one bullet per cause group, both present"
+
+    def test_three_way_split_reports_all_three_causes(self, monkeypatch):
+        """The full partition: refused here, present elsewhere, and absent — at once."""
+        third = "2" * 40
+        comments = "\n".join(
+            [
+                self._marker_kind(HEAD, "code-review", self.REFUSED_PROSE),
+                self._marker_kind(third, "leaks"),
+            ]
+        )
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", comments)
+        # A third required kind nothing has ever posted for.
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "code-review,leaks")
+        msg = _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
+        assert msg and msg.count("  * ") == 2
+        assert "code-review — a marker IS present at THIS head" in msg
+        assert "leaks — a marker is present for a DIFFERENT head" in msg
 
     # -- shared: what ALL branches must still carry -----------------------------
     @pytest.mark.parametrize("which", ["stale", "empty", "refused"])

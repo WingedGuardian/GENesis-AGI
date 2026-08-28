@@ -2784,25 +2784,36 @@ def _check_scheduled_claude_reviewed_head(
     blocks. The merge path and the report path share this single fail-closed decision,
     so the report can never issue a false all-clear here.
 
-    WHY THE BLOCK MESSAGE BRANCHES. A missing marker has THREE causes calling for
-    DIFFERENT operator actions, all distinguishable from what was already read. Every
-    branch is scoped to the MISSING kinds — a marker for an already-satisfied kind
-    explains nothing about this block, and prescribing a remedy for it sends the operator
-    to fix something that is not broken:
-      * a marker for a missing kind AT THIS head that was REFUSED as not-clean → neither
-        waiting nor re-reviewing helps; the body's wording (or a real finding) is the
-        cause. Reported FIRST: its remedy is unique, and it is the cause most easily
-        mistaken for "nobody posted anything".
-      * a marker for a missing kind at some OTHER head, ACCEPTED OR REFUSED → a routine
-        ran, then a push moved the head. Routines are not generally re-run on a push, so
-        waiting is unlikely to help; re-review the current head and post the marker.
-      * no marker for the missing kind(s) at any head → nothing has run for them. On a
-        freshly-opened PR a routine may still be in flight, and waiting IS the right move.
+    WHY THE BLOCK MESSAGE PARTITIONS. A missing marker has THREE causes calling for
+    DIFFERENT operator actions, all distinguishable from what was already read. The
+    missing kinds are PARTITIONED across those causes and EVERY non-empty group is
+    reported — this is not a precedence chain that picks one winner:
+      * REFUSED at this head — a marker is present on the current commit but read as
+        carrying a blocking finding. Neither waiting nor re-reviewing helps; the body's
+        wording (or a real finding) is the cause. It is also the cause most easily
+        mistaken for "nobody posted anything", since the gate's `present:` line shows
+        the same `none` either way.
+      * ELSEWHERE — a marker for that kind sits on some OTHER head, ACCEPTED OR REFUSED.
+        A routine ran, then a push moved the head. Routines are not generally re-run on a
+        push, so waiting is unlikely to help; re-review the current head and post it.
+      * ABSENT — no marker for that kind at any head. Nothing has run for it, so on a
+        freshly-opened PR a routine may still be in flight and waiting IS the right move.
+
+    Two design rules earned by successive review rounds, both of the SAME shape — a
+    decision made from only part of what had been read. Keep them:
+      1. Scope every group to ``missing``. A marker for an already-satisfied kind explains
+         nothing about this block, and prescribing a remedy for it sends the operator to
+         fix something that is not broken (it also let the message contradict its own
+         ``present:`` line one row above).
+      2. PARTITION rather than prioritise. Different kinds routinely fail for different
+         reasons — a refused ``code-review`` beside an absent ``leaks`` — and choosing a
+         single winning cause explained one kind while the other silently got no guidance
+         at all. Precedence exists only WITHIN a kind (refused-here beats elsewhere).
+
     An earlier draft collapsed everything into an unconditional "waiting will not clear
-    this", which was wrong for the third case and pushed the operator toward
+    this", which was wrong for the ABSENT case and pushed the operator toward
     ``# scheduled-review-override`` — i.e. toward waiving the IRREDUCIBLE leak gate — in
-    the one situation where patience was the correct answer. Keep the branches, and keep
-    them scoped to ``missing``.
+    the one situation where patience was the correct answer.
 
     The message deliberately reports only what it OBSERVED (which heads carry markers)
     and hedges the schedule ("generally not re-run"). The routines live OUTSIDE this repo
@@ -2862,64 +2873,67 @@ def _check_scheduled_claude_reviewed_head(
     # Every branch below is scoped to the MISSING kinds. A marker for a kind that is
     # already satisfied says nothing about why this merge is blocked, and prescribing a
     # remedy for it sends the operator to fix something that is not broken.
+    # PARTITION the missing kinds by cause and report EVERY group — never pick one cause
+    # for the whole block. Different kinds routinely fail for different reasons (a refused
+    # code-review alongside an absent leaks), and collapsing to a single winner explains
+    # one kind while the other silently gets no guidance at all. THREE successive review
+    # findings on this function were that same shape — a branch deciding from part of what
+    # had been read — so this is the general form rather than a fourth point patch: a total
+    # partition needs no precedence BETWEEN groups, only within a single kind.
     missing_set = set(missing)
-    refused_here = sorted(rejected.get(head, set()) & missing_set)
-    # Any marker for a missing kind on some OTHER head — ACCEPTED OR REFUSED. Both prove a
-    # routine ran on a different commit, which is the whole content of this branch; only
-    # counting accepted ones sent a refused-at-a-stale-head PR down the "nothing has run,
-    # wait for it" path, i.e. straight back into the wrong-advice bug.
-    other_heads = sorted(
-        {
-            h[:12]
-            for by_head in (markers, rejected)
-            for h, kinds in by_head.items()
-            if h != head and (kinds & missing_set)
-        }
-    )
-    shown = ", ".join(other_heads[:3]) + (
-        f" (+{len(other_heads) - 3} more)" if len(other_heads) > 3 else ""
-    )
-    if refused_here:
-        # A marker IS present on this exact head — it was refused for reading as not-clean.
-        # Reported first: it is the only cause whose remedy is neither waiting nor
-        # re-reviewing, and the one most easily mistaken for "nobody posted anything".
-        cause = (
-            f"A marker for {', '.join(refused_here)} IS present at THIS head, but it was "
-            f"REFUSED because its body reads as carrying a blocking finding "
-            f"(matches one of [P1] / HARD BLOCK / an '### ERROR' heading) without an "
-            f"explicit clean verdict to override it. A marker must mean it ran clean, not "
-            f"merely that it ran. If the review really was clean, the prose tripped the "
-            f"check — re-post it ending with an explicit verdict line, exactly "
-            f"'VERDICT: PASS' or 'PII/Secrets/Wording: CLEAN'. If the finding is real, fix "
-            f"it first."
+    refused_kinds = rejected.get(head, set()) & missing_set
+    # A marker for a missing kind on some OTHER head — ACCEPTED OR REFUSED. Both prove a
+    # routine ran on a different commit; counting only accepted ones sent a
+    # refused-at-a-stale-head PR down the "nothing has run, wait for it" path.
+    heads_by_kind: dict[str, set[str]] = {}
+    for by_head in (markers, rejected):
+        for other_head, kinds in by_head.items():
+            if other_head == head:
+                continue
+            for kind in kinds & missing_set:
+                heads_by_kind.setdefault(kind, set()).add(other_head[:12])
+    # Within a KIND, refused-at-this-head wins: it is the most specific cause, and the only
+    # one whose remedy is neither waiting nor re-reviewing.
+    elsewhere_kinds = {k for k in missing_set - refused_kinds if k in heads_by_kind}
+    absent_kinds = missing_set - refused_kinds - elsewhere_kinds
+
+    parts: list[str] = []
+    if refused_kinds:
+        parts.append(
+            f"{', '.join(sorted(refused_kinds))} — a marker IS present at THIS head, but it "
+            f"was REFUSED because its body reads as carrying a blocking finding (matching "
+            f"one of [P1] / HARD BLOCK / an '### ERROR' heading) with no explicit clean "
+            f"verdict to override it. A marker must mean it ran CLEAN, not merely that it "
+            f"ran. If the review really was clean, its prose tripped the check — re-post it "
+            f"ending with an explicit verdict line, exactly 'VERDICT: PASS' or "
+            f"'PII/Secrets/Wording: CLEAN'. If the finding is real, fix it first."
         )
-    elif other_heads:
-        cause = (
-            f"A marker for the missing kind(s) is present for a DIFFERENT head ({shown}), "
-            f"so a routine HAS run on this PR — just not on the current commit. Routines "
-            f"are generally not re-run when a later push moves the head, so waiting is "
-            f"unlikely to clear this on its own: re-run the missing review(s) against the "
-            f"current head and post the marker yourself."
+    if elsewhere_kinds:
+        seen = sorted({h for k in elsewhere_kinds for h in heads_by_kind[k]})
+        shown = ", ".join(seen[:3]) + (f" (+{len(seen) - 3} more)" if len(seen) > 3 else "")
+        parts.append(
+            f"{', '.join(sorted(elsewhere_kinds))} — a marker is present for a DIFFERENT "
+            f"head ({shown}), so a routine HAS run on this PR, just not on the current "
+            f"commit. Routines are generally not re-run when a later push moves the head, "
+            f"so waiting is unlikely to clear this on its own: re-run against the current "
+            f"head and post the marker yourself."
         )
-    else:
-        # Scoped to the missing kinds on purpose: with more than one required kind, a
-        # blanket "no marker at ANY head" contradicts the `present:` list on the line above
-        # whenever another kind is already satisfied.
-        cause = (
-            f"No marker for {', '.join(missing)} is present at ANY head on this PR yet. If "
-            f"it was just opened, a routine may still be in flight — wait for it. If it "
-            f"has been open a while, re-run the missing review(s) against the current head "
-            f"and post the marker yourself."
+    if absent_kinds:
+        parts.append(
+            f"{', '.join(sorted(absent_kinds))} — no marker at ANY head on this PR yet. If "
+            f"it was just opened, a routine may still be in flight, and waiting IS the right "
+            f"move. If it has been open a while, re-run against the current head and post "
+            f"the marker yourself."
         )
     return (
         f"scheduled Claude review(s) missing at head {head[:12]}: {', '.join(missing)} "
         f"(required: {', '.join(required)}; present: "
         f"{', '.join(sorted(kinds_here)) or 'none'}).\n"
-        f"{cause}\n"
-        f"A marker is a comment/review by the repo OWNER carrying "
+        + "".join(f"  * {p}\n" for p in parts)
+        + "A marker is a comment/review by the repo OWNER carrying "
         f"'<!-- genesis-scheduled-review: head={head} kind=<name> -->' — the FULL 40-hex "
-        f"head, exactly as written here.\n"
-        f"Or append '# scheduled-review-override' to merge without the missing review(s)."
+        "head, exactly as written here.\n"
+        "Or append '# scheduled-review-override' to merge without the missing review(s)."
     )
 
 
