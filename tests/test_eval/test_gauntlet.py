@@ -6,6 +6,7 @@ real on trivial in-test fixtures. Regression + file-lock logic is unit-tested.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -722,3 +723,153 @@ class TestGauntletTakesTheBoxLock:
         finally:
             holder.kill()
             holder.wait(timeout=5)
+
+
+    @pytest.mark.asyncio
+    async def test_cancellation_does_not_strand_the_box_lock(
+        self, tmp_path, monkeypatch
+    ):
+        """Cancelling the AWAIT does not stop the worker thread.
+
+        It keeps waiting, eventually takes the flock, and returns a BoxLock
+        nobody holds a reference to. In a long-lived server process that fd and
+        GENESIS_PYTEST_LOCK_HELD would leak and the box lock would stay held
+        until restart, blocking every test run on the machine — the exact
+        outcome this whole change exists to prevent.
+        """
+        import asyncio
+
+        from genesis.eval import gauntlet
+        from genesis.util import pytest_lock
+
+        lock_path = tmp_path / "pytest.lock"
+        monkeypatch.setenv(pytest_lock.PATH_ENV, str(lock_path))
+        monkeypatch.delenv(pytest_lock.HELD_ENV, raising=False)
+        monkeypatch.setattr(pytest_lock, "_POLL_SECONDS", 0.05)
+        monkeypatch.setattr(gauntlet, "_LOCK_WAIT_S", 30.0)
+
+        holder_src = (
+            "import fcntl,os,sys,time\n"
+            "fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "open(sys.argv[2],'w').write('r')\n"
+            "time.sleep(float(sys.argv[3]))\n"
+        )
+        ready = tmp_path / "cancel-ready"
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_src, str(lock_path), str(ready), "2.0"]
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and not ready.exists():
+                await asyncio.sleep(0.02)
+            assert ready.exists(), "external holder never started"
+
+            async def _never_reached(workdir, basetemp):
+                raise AssertionError("scoring must not run after cancellation")
+
+            monkeypatch.setattr(gauntlet, "_run_pytest_locked", _never_reached)
+
+            task = asyncio.create_task(
+                gauntlet._run_pytest(tmp_path / "wd", tmp_path / "bt")
+            )
+            await asyncio.sleep(0.2)  # let it reach the contended wait
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            # The external holder exits ~2s in; the orphaned worker then wins the
+            # lock. Keep the loop alive so the late-release callback can run.
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                if _lock_is_free(lock_path):
+                    break
+
+            assert _lock_is_free(lock_path), (
+                "the box lock is still held after cancellation — the worker "
+                "acquired it and nothing released it"
+            )
+            assert os.environ.get(pytest_lock.HELD_ENV) is None, (
+                "GENESIS_PYTEST_LOCK_HELD leaked into the server process"
+            )
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+            holder.wait(timeout=5)
+
+
+def _lock_is_free(path) -> bool:
+    """Probe from a separate process: flock is per open-file-description, so an
+    in-process probe could not distinguish our own stray handle."""
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl,os,sys\n"
+            "fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR)\n"
+            "try:\n"
+            "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "    print('free')\n"
+            "except OSError:\n"
+            "    print('held')\n",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return probe.stdout.strip() == "free"
+
+
+def test_gauntlet_lock_wait_stays_under_asyncios_executor_join_timeout():
+    """A wait longer than asyncio's join timeout can orphan the box lock.
+
+    On interpreter shutdown asyncio waits THREAD_JOIN_TIMEOUT for executor
+    threads, then ABANDONS them and closes the loop — after which a future's
+    completion callback is silently dropped. A worker still waiting past that
+    point would go on to win the flock with nothing left to release it, and hold
+    the box lock while the process hangs at exit: a fail-CLOSED outcome from a
+    component whose first constraint is "fail OPEN, always".
+
+    Asserted against asyncio's own constant rather than a copied number, so a
+    CPython change moves the bound with it.
+    """
+    import asyncio.constants
+
+    from genesis.eval import gauntlet
+
+    assert gauntlet._LOCK_WAIT_S < asyncio.constants.THREAD_JOIN_TIMEOUT, (
+        f"_LOCK_WAIT_S={gauntlet._LOCK_WAIT_S} >= "
+        f"THREAD_JOIN_TIMEOUT={asyncio.constants.THREAD_JOIN_TIMEOUT}: a shutdown "
+        "mid-wait would orphan the worker and strand the box lock"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gauntlet_does_not_publish_held_env_to_the_server_process(
+    tmp_path, monkeypatch
+):
+    """The server spawns unrelated children with dict(os.environ); the held flag
+    must reach only the scoring subprocess, not everything the server starts."""
+
+    from genesis.eval import gauntlet
+    from genesis.util import pytest_lock
+
+    lock_path = tmp_path / "pytest.lock"
+    monkeypatch.setenv(pytest_lock.PATH_ENV, str(lock_path))
+    monkeypatch.delenv(pytest_lock.HELD_ENV, raising=False)
+
+    seen_in_process = []
+
+    async def _probe(workdir, basetemp):
+        seen_in_process.append(os.environ.get(pytest_lock.HELD_ENV))
+        return 0, "ok"
+
+    monkeypatch.setattr(gauntlet, "_run_pytest_locked", _probe)
+    await gauntlet._run_pytest(tmp_path / "wd", tmp_path / "bt")
+
+    assert seen_in_process == [None], (
+        "the gauntlet published GENESIS_PYTEST_LOCK_HELD into the server's own "
+        "environment — every CC session dispatched during the hold would "
+        "inherit it and skip the lock for its whole life"
+    )

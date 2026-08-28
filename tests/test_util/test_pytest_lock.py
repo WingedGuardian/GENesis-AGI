@@ -244,8 +244,11 @@ class TestContentionMessage:
         # The whole point of the change: a blocked caller is TOLD how to wait,
         # rather than improvising a `pgrep` loop that matches itself.
         assert pytest_lock.WAIT_COMMAND in message
-        # ...and warned that chaining it is rejected by the guard.
-        assert "&&" in message
+        # The prescribed command must be ABSOLUTE: the lock governs runs from
+        # any working directory, and a repo-relative path resolves wrong the
+        # moment pytest is launched from a subdirectory.
+        script = pytest_lock.WAIT_COMMAND.split()[-1]
+        assert script.startswith("/"), f"relative wait command: {script}"
         assert pytest_lock.DISABLE_ENV in message  # the deliberate-override hatch
 
     def test_reports_holder_age(self, tmp_path, holder):
@@ -397,11 +400,19 @@ class TestTimeoutSanitising:
         monkeypatch.setenv(pytest_lock.WAIT_TIMEOUT_ENV, "inf")
         monkeypatch.setenv(pytest_lock.WAIT_ENV, "1")
         monkeypatch.setattr(pytest_lock, "_POLL_SECONDS", 0.05)
+        # Shrink the fallback so a SANITISED `inf` produces a bounded wait we
+        # can assert on. Without this the test either passes `timeout=` (which
+        # short-circuits the env entirely, making it vacuous) or waits out the
+        # 7200s default by outliving the holder.
+        monkeypatch.setattr(pytest_lock, "DEFAULT_WAIT_TIMEOUT", 0.5)
         path = tmp_path / "pytest.lock"
         holder(path)
 
         started = time.monotonic()
-        lock = acquire(lock_path=path, timeout=0.5)
+        # No explicit timeout= : passing one short-circuits _env_timeout()
+        # entirely, so the env var under test would never be read and this would
+        # pass even with the sanitiser removed.
+        lock = acquire(lock_path=path)
         assert lock.blocked is True
         assert time.monotonic() - started < 30
 
@@ -490,9 +501,12 @@ class TestContextManager:
 
 
 class TestHolderRecordIsNeverEmpty:
-    def test_record_is_written_without_a_truncate_window(self, tmp_path):
-        """pwrite-then-truncate, so a contender never reads an empty file
-        mid-rewrite (truncate-then-write leaves exactly that window)."""
+    def test_stale_tail_is_truncated(self, tmp_path):
+        """A shorter new record must not leave the old record's tail behind.
+
+        Named for what it actually proves: the final file state is identical
+        under truncate-then-write, so this cannot detect the write WINDOW it was
+        once named for — only that the truncate happened at all."""
         path = tmp_path / "pytest.lock"
         path.write_bytes(b"x" * 4096)  # pre-existing longer content
         lock = acquire(lock_path=path)
@@ -539,4 +553,85 @@ class TestLockFileHardening:
         link.symlink_to(real)
 
         lock = acquire(lock_path=link)
-        assert lock.blocked is False  # fail open, never a hard error
+        try:
+            # `blocked is False` alone is VACUOUS: it is also the value on the
+            # success path, so the assertion held with O_NOFOLLOW removed
+            # (measured). The distinguishing fact is that the symlink was NOT
+            # opened — fail open means "run the tests", not "follow the link".
+            assert lock.acquired is False, "O_NOFOLLOW did not prevent the open"
+            assert lock.blocked is False, "must fail open, never a hard error"
+        finally:
+            lock.release()
+
+
+class TestExportEnvOptOut:
+    """A long-lived process must not publish HELD_ENV to its whole environment.
+
+    genesis-server dispatches Claude-Code sessions with ``env = dict(os.environ)``
+    (cc/invoker.py). A session started while the gauntlet holds the lock would
+    inherit the flag and silently no-op the lock for its entire multi-hour life —
+    running unserialized against interactive suites, which is exactly the thrash
+    the lock exists to prevent, and it cannot self-correct because the recorded
+    pid is a live process.
+    """
+
+    def test_export_env_false_keeps_the_flag_out_of_the_environment(self, tmp_path):
+        lock = acquire(lock_path=tmp_path / "pytest.lock", export_env=False)
+        try:
+            assert lock.acquired is True, "must still hold the lock"
+            assert os.environ.get(pytest_lock.HELD_ENV) is None, (
+                "HELD_ENV leaked into the process environment, so every child "
+                "spawned during this hold would skip the lock"
+            )
+        finally:
+            lock.release()
+
+    def test_export_env_true_still_publishes_for_normal_callers(self, tmp_path):
+        """A pytest run's children ARE its own, so the default must still export."""
+        lock = acquire(lock_path=tmp_path / "pytest.lock")
+        try:
+            assert os.environ[pytest_lock.HELD_ENV] == str(os.getpid())
+        finally:
+            lock.release()
+
+    def test_release_after_opt_out_does_not_clear_someone_elses_flag(self, tmp_path):
+        """release() must not pop a flag this lock never set."""
+        os.environ[pytest_lock.HELD_ENV] = "99999"
+        try:
+            lock = acquire(lock_path=tmp_path / "pytest.lock", export_env=False)
+            lock.release()
+            assert os.environ.get(pytest_lock.HELD_ENV) == "99999"
+        finally:
+            os.environ.pop(pytest_lock.HELD_ENV, None)
+
+
+class TestCancellableWait:
+    def test_cancel_event_aborts_a_blocking_wait_promptly(self, tmp_path, holder):
+        """Threads are not interruptible: without this the worker runs its FULL
+        timeout after the caller has given up, then takes a lock nobody wants."""
+        import threading
+
+        path = tmp_path / "pytest.lock"
+        holder(path)
+        cancel = threading.Event()
+        threading.Timer(0.3, cancel.set).start()
+
+        started = time.monotonic()
+        lock = acquire(lock_path=path, wait=True, timeout=60, cancel=cancel)
+        elapsed = time.monotonic() - started
+
+        assert lock.acquired is False
+        assert lock.blocked is False, "an aborted wait is not a refusal"
+        assert elapsed < 20, f"cancel ignored — waited {elapsed:.1f}s of 60"
+
+    def test_cancel_already_set_returns_without_waiting(self, tmp_path, holder):
+        import threading
+
+        path = tmp_path / "pytest.lock"
+        holder(path)
+        cancel = threading.Event()
+        cancel.set()
+
+        started = time.monotonic()
+        acquire(lock_path=path, wait=True, timeout=60, cancel=cancel)
+        assert time.monotonic() - started < 20

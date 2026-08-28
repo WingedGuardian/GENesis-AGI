@@ -122,9 +122,8 @@ def pytest_configure(config):
     # below, so every exit path from this function is already governed.
     #
     # This is the choke point every run of THIS repo's suite shares, whatever
-    # launched it and from whichever worktree: the CC concurrent-test guard
-    # sees Bash-tool invocations only, so cron jobs, plain SSH shells and
-    # background sessions reach pytest without ever passing it. (The gauntlet
+    # launched it and from whichever worktree — nothing else sits on the path of
+    # a cron job, a plain SSH shell or a background session. (The gauntlet
     # scores FOREIGN fixture projects with their own rootdir, so this conftest
     # never loads for it — it acquires the same lock itself.) Non-blocking and
     # fail-open by contract, so a fault here can never stop the suite from
@@ -157,9 +156,9 @@ def pytest_configure(config):
     # Scope the leaf per-process. pytest CLEARS an explicit basetemp at session
     # start and roots tmp_path directly under it (no pytest-of-<user> numbered
     # rotation), so two concurrent runs sharing one path would rmtree each other's
-    # live temp. The CC concurrent-test guard only covers Bash-tool pytest —
-    # autonomy/gauntlet subprocesses bypass it — so the per-pid leaf is what keeps
-    # simultaneous runs isolated.
+    # live temp. The box lock now serializes runs that load this conftest, but a
+    # deliberate override (GENESIS_PYTEST_LOCK=0) or a foreign-rootdir run can
+    # still overlap, so the per-pid leaf remains what keeps their temp isolated.
     pytest_base = os.path.join(big_tmp_dir(), "pytest")
     # Reap dead-PID leaves from prior abnormal exits BEFORE creating ours, so the
     # ~/tmp/pytest dir can't accumulate (the daily hygiene job only prunes direct

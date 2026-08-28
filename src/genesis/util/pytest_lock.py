@@ -2,17 +2,27 @@
 
 Concurrent test suites thrash this swapless box — they contend for the same
 CPUs and RAM as the live Genesis services and repeatedly OOM-killed a run
-mid-suite. A PreToolUse hook (``scripts/hooks/concurrent_test_guard.py``)
-refuses a *Claude-Code Bash* pytest call while another suite runs, but it can
-only see commands routed through that tool. Cron jobs, plain SSH shells,
-background sessions and sibling worktrees all reach pytest without passing it,
-which is why ``tests/conftest.py`` previously worked around a *symptom* of the
-overlap (per-pid ``basetemp`` leaves) rather than the overlap itself.
+mid-suite. ``tests/conftest.py`` previously worked around a *symptom* of the
+overlap (per-pid ``basetemp`` leaves) rather than the overlap itself, because
+nothing serialized the runs: cron jobs, plain SSH shells, background sessions
+and sibling worktrees all reach pytest independently.
 
-This module is the actual mutual exclusion, and it is the single source of
-truth: the hook and its ``--wait`` mode both PROBE this lock rather than
-guessing from process command lines, so the layer that blocks and the layer
-that waits cannot disagree.
+This module is the actual mutual exclusion, and it is the only layer that
+decides CONCURRENCY — whether a run may proceed *now*. An earlier design also
+had a PreToolUse hook decide that from its own reading of the command line; two
+layers interpreting different things drifted apart five separate times (the hook
+refused the very overrides this module's message prescribes, read an env prefix
+on an unrelated shell segment as an opt-out, and disagreed about unrecognised
+values and about the lock path). That layer is gone, and
+``scripts/pytest_lock_wait.py`` replaced it with a pure CLI that only asks this
+lock "free yet?".
+
+A DIFFERENT axis is still decided elsewhere, deliberately:
+``scripts/hooks/full_suite_guard.py`` is a PreToolUse hook that refuses a
+whole-directory run (scope, not timing) with its own ``# full-suite-ok``
+override and its own exit status. That is not the drift class — the two never
+decide the same question — but if anything ever starts deciding CONCURRENCY
+outside this module, that class is reopened.
 
 Two kinds of caller acquire it:
 
@@ -48,9 +58,10 @@ Design constraints, in priority order:
 Why not :class:`genesis.util.process_lock.ProcessLock`: its ``__enter__`` calls
 ``sys.exit()`` on contention (wrong for a caller that wants to queue or report)
 and its ``__exit__`` unlinks the lock file (racy — see constraint 3). Its
-``is_locked`` probe is the right shape, and the hook's probe matches it
-deliberately; the hook cannot import ``genesis`` at all, so it carries its own
-copy, pinned by a test.
+``is_locked`` probe is the right shape, and the probe in
+``scripts/pytest_lock_wait.py`` matches it deliberately: that CLI must run
+without ``genesis`` importable (from a bare checkout, from cron, from any
+shell), so it carries its own copy.
 
 Environment levers:
 
@@ -72,11 +83,15 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
+import logging
 import math
 import os
 import sys
+import threading
 import time
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Distinct exit status for "another pytest holds the box lock", mirroring
 # ``process_lock.EXIT_ALREADY_RUNNING`` so the two read the same way in logs.
@@ -112,9 +127,28 @@ PATH_ENV = "GENESIS_PYTEST_LOCK_PATH"
 _FALSEY = {"0", "off", "false", "no", "n"}
 _TRUTHY = {"1", "on", "true", "yes", "y"}
 
-#: How a blocked caller is told to wait. Duplicated in the hook (which cannot
-#: import ``genesis``) and pinned equal by a test.
-WAIT_COMMAND = "python3 scripts/hooks/concurrent_test_guard.py --wait"
+def _wait_command() -> str:
+    """The command a blocked caller should run, as an ABSOLUTE path.
+
+    A repo-relative path is wrong the moment pytest is launched from a
+    subdirectory — ``cd tests && pytest …`` would resolve it to
+    ``tests/scripts/…`` and fail with file-not-found. The lock governs runs from
+    any working directory, so the advice has to as well. Falls back to the
+    relative form only when the script cannot be located (an installed package
+    without the repo alongside it), which is better than advertising a path that
+    is definitely wrong.
+    """
+    try:
+        script = Path(__file__).resolve().parents[3] / "scripts" / "pytest_lock_wait.py"
+        if script.is_file():
+            return f"python3 {script}"
+    except (OSError, IndexError):
+        pass
+    return "python3 scripts/pytest_lock_wait.py"
+
+
+#: How a blocked caller is told to wait.
+WAIT_COMMAND = _wait_command()
 
 
 def _env_flag(name: str, default: bool, on_unknown: bool | None = None) -> bool:
@@ -280,6 +314,8 @@ def acquire(
     lock_path: Path | None = None,
     wait: bool | None = None,
     timeout: float | None = None,
+    export_env: bool = True,
+    cancel: threading.Event | None = None,
 ) -> BoxLock:
     """Attempt the box-wide pytest lock. Never raises.
 
@@ -290,13 +326,35 @@ def acquire(
             ``GENESIS_PYTEST_LOCK_WAIT`` env flag (off).
         timeout: bound on that wait; defaults to ``GENESIS_PYTEST_LOCK_WAIT_TIMEOUT``
             or ``DEFAULT_WAIT_TIMEOUT``. Clamped to ``MAX_WAIT_TIMEOUT``.
+        export_env: publish ``HELD_ENV`` into ``os.environ`` so CHILD processes
+            inherit it. Correct for a pytest run, whose children are its own —
+            but WRONG for a long-lived process that spawns unrelated children:
+            genesis-server dispatches Claude-Code sessions with
+            ``env = dict(os.environ)``, so a session started during a gauntlet's
+            hold would inherit the flag and silently disable the lock for its
+            whole multi-hour life. Such callers pass False and set the variable
+            on the one child that needs it.
+        cancel: an event that aborts a blocking wait promptly. Without it a
+            cancelled caller cannot stop the worker: threads are not
+            interruptible, so the wait would run to its full timeout and take
+            the lock nobody is waiting for any more.
 
     Returns:
         A :class:`BoxLock`. Check ``.blocked``; call ``.release()`` when done.
     """
     try:
-        return _acquire_inner(lock_path=lock_path, wait=wait, timeout=timeout)
-    except Exception:  # noqa: BLE001 — fail-open is the whole contract
+        return _acquire_inner(
+            lock_path=lock_path,
+            wait=wait,
+            timeout=timeout,
+            export_env=export_env,
+            cancel=cancel,
+        )
+    except Exception:
+        # Fail-open is the contract, but silence is not: a governor that fails
+        # open on every run forever with no signal is indistinguishable from one
+        # that works.
+        logger.warning("pytest box lock unavailable — running unserialized", exc_info=True)
         return BoxLock()
 
 
@@ -305,6 +363,8 @@ def _acquire_inner(
     lock_path: Path | None,
     wait: bool | None,
     timeout: float | None,
+    export_env: bool = True,
+    cancel: threading.Event | None = None,
 ) -> BoxLock:
     # Unrecognised → treat as DISABLED (fail open): a mistyped escape hatch must
     # not leave the governor armed. See _env_flag.
@@ -357,14 +417,24 @@ def _acquire_inner(
                     message=_timeout_message(holder, timeout),
                 )
             # Clamp to the deadline: a 5s wait must report at 5s, not overshoot
-            # by a whole poll interval.
-            time.sleep(min(_POLL_SECONDS, remaining))
+            # by a whole poll interval. Waiting on the cancel event rather than
+            # sleeping makes the abort prompt — a thread cannot be interrupted,
+            # so a plain sleep would run the full timeout out after the caller
+            # has already given up, and then take a lock nobody wants.
+            nap = min(_POLL_SECONDS, remaining)
+            if cancel is not None:
+                if cancel.wait(nap):
+                    os.close(fd)
+                    return BoxLock()
+            else:
+                time.sleep(nap)
             continue
         break
 
     _write_holder_record(fd)
-    os.environ[HELD_ENV] = str(os.getpid())
-    return BoxLock(fd=fd, path=path, owns_held_env=True)
+    if export_env:
+        os.environ[HELD_ENV] = str(os.getpid())
+    return BoxLock(fd=fd, path=path, owns_held_env=export_env)
 
 
 def _sanitize_timeout(value: float) -> float:
@@ -394,12 +464,9 @@ def _contention_message(holder: str) -> str:
         f"  holder: {holder}\n"
         "Concurrent suites contend for the CPU and RAM of the live Genesis "
         "services on a swapless box, and take far longer than running in turn.\n"
-        "Wait for it to finish — run this as its OWN command, NOT chained "
-        "before your pytest with '&&':\n"
+        "Wait for it to finish:\n"
         f"  {WAIT_COMMAND}\n"
-        "then re-run your pytest. (Chaining is rejected: the concurrent-test "
-        "guard sees the pytest in the same command and blocks the whole thing, "
-        "so the wait never runs.)\n"
+        "then re-run your pytest.\n"
         f"Deliberate concurrent run: {DISABLE_ENV}=0 pytest ...\n"
         f"Queue instead of failing (background jobs): {WAIT_ENV}=1 pytest ..."
     )
