@@ -103,8 +103,47 @@ def _reap_stale_pytest_basetemps(pytest_base: str) -> None:
             pass
 
 
+def _is_introspection_only(config) -> bool:
+    """Modes that print and exit without running tests (--help/--fixtures/--markers).
+
+    Kept as a predicate rather than inlined so the exemption set is one
+    reviewable list; see the caller for why these must not be blocked.
+    """
+    opt = config.option
+    return any(
+        getattr(opt, name, False)
+        for name in ("help", "showfixtures", "show_fixtures_per_test", "markers", "version")
+    )
+
+
 def pytest_configure(config):
+    # ── Box-wide serialization ─────────────────────────────────────────────
+    # Acquire BEFORE anything else, and before the basetemp early-return
+    # below, so every exit path from this function is already governed.
+    #
+    # This is the choke point every run of THIS repo's suite shares, whatever
+    # launched it and from whichever worktree: the CC concurrent-test guard
+    # sees Bash-tool invocations only, so cron jobs, plain SSH shells and
+    # background sessions reach pytest without ever passing it. (The gauntlet
+    # scores FOREIGN fixture projects with their own rootdir, so this conftest
+    # never loads for it — it acquires the same lock itself.) Non-blocking and
+    # fail-open by contract, so a fault here can never stop the suite from
+    # running — see genesis.util.pytest_lock.
+    from genesis.util import pytest_lock
     from genesis.util.tmp import big_tmp_dir, should_redirect_pytest_basetemp
+
+    lock = pytest_lock.acquire()
+    config._genesis_pytest_lock = lock
+    if lock.blocked and not _is_introspection_only(config):
+        pytest.exit(lock.message, returncode=pytest_lock.EXIT_LOCK_HELD)
+    elif lock.blocked:
+        # Introspection modes run _do_configure() OUTSIDE wrap_session, so an
+        # Exit raised here escapes as a pluggy traceback (MEASURED: --help and
+        # --markers exit 1 with a traceback; --fixtures discards the status and
+        # exits 0, so a blocked call looks like it SUCCEEDED and listed
+        # nothing). They also collect nothing and run no tests, so there is no
+        # resource to govern — let them through.
+        lock.release()
 
     # Decide FIRST (pure, no I/O) — only touch the filesystem when we actually
     # redirect, so the no-op / CI / explicit-`--basetemp` path never creates
@@ -143,6 +182,13 @@ def pytest_unconfigure(config):
     target = getattr(config, "_genesis_basetemp_cleanup", None)
     if target:
         shutil.rmtree(target, ignore_errors=True)
+
+    # Release the box-wide lock LAST, so it spans the whole session including
+    # this cleanup. (flock also drops on process death, so a crash cannot wedge
+    # the box — this is the orderly path, not the only one.)
+    lock = getattr(config, "_genesis_pytest_lock", None)
+    if lock is not None:
+        lock.release()
 
 
 # ── Safety: prevent tests from polluting production circuit breaker state ──

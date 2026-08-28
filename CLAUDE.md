@@ -79,6 +79,7 @@ post-deploy stale-code guard blocks the one similarity-refine MCP tool
 source ~/genesis/.venv/bin/activate               # Required for all Python work
 cd ~/genesis && ruff check .                      # Lint all Python
 pytest tests/test_memory/test_drift.py -v         # Targeted tests (ALWAYS specify file)
+python3 scripts/hooks/concurrent_test_guard.py --wait   # Another run holds the test lock? wait
 gh pr checks <PR-number>                          # CI results (replaces local full suite)
 curl -s http://localhost:6333/collections | jq .  # Verify Qdrant
 systemctl --user restart genesis-server           # Restart server (NEVER nohup)

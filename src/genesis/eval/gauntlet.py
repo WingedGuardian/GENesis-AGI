@@ -58,6 +58,7 @@ from genesis.eval.types import (
     ScorerType,
     TaskCategory,
 )
+from genesis.util import pytest_lock
 from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 if TYPE_CHECKING:
@@ -69,6 +70,12 @@ _FIXTURES_DIR = Path(__file__).resolve().parent / "gauntlet_fixtures"
 # Throwaway workdirs + the isolated CC Bash sandbox live under ~/tmp (NOT /tmp,
 # NOT ~/.genesis/cc-tmp — see CLAUDE.md temp rules).
 _GAUNTLET_ROOT = Path.home() / "tmp" / "gauntlet"
+
+# How long a scheduled scoring run waits for the box-wide test lock before
+# giving up and running anyway. Bounded well below the lock's own 2h default:
+# an interactive suite is minutes, so 15 minutes covers the realistic case,
+# while a longer wait would silently postpone a scheduled eval for hours.
+_LOCK_WAIT_S = 900.0
 
 # The PROTECTED surface: files the model must not touch. Editing tests or the
 # pytest config to fake a green run is a cheat → FAIL. Any add/modify/delete of
@@ -206,7 +213,42 @@ async def _run_pytest(workdir: Path, basetemp: Path) -> tuple[int, str]:
     ``tests/conftest.py`` redirect never loads for it (see
     ``genesis.util.tmp.should_redirect_pytest_basetemp``); without an explicit
     basetemp its tmp would default to ``$TMPDIR`` (watchgod-policed cc-tmp).
+
+    That same "own rootdir" fact is why the box-wide test lock is taken HERE
+    explicitly: the genesis ``tests/conftest.py`` that normally acquires it
+    never loads for a foreign fixture, so without this the gauntlet would be
+    the one pytest launcher on the box that is entirely ungoverned — while
+    still occupying it for up to ``_PYTEST_TIMEOUT_S`` per fixture. It QUEUES
+    (``wait=True``) rather than failing: a background eval should give way to
+    an interactive run and then proceed, not abort. The lock is taken per
+    fixture, not per gauntlet, so an interactive run only ever waits out one
+    fixture rather than the whole scoring pass. Fail-open by contract — if the
+    lock is unavailable for any reason, scoring still runs.
     """
+    # OFF-THREAD, always. ``pytest_lock.acquire(wait=True)`` is synchronous and
+    # sleeps in a loop; this coroutine is driven by the learning
+    # AsyncIOScheduler, which shares genesis-server's event loop. Calling it
+    # directly would freeze the whole server — Telegram, MCP, every other
+    # scheduled job — for as long as the lock stayed held.
+    lock = await asyncio.to_thread(
+        pytest_lock.acquire, wait=True, timeout=_LOCK_WAIT_S
+    )
+    try:
+        if lock.blocked:
+            # Fail OPEN, deliberately: a scheduled eval silently skipped is
+            # worse than a brief overlap, and running unserialized is exactly
+            # the pre-existing behaviour. Say so rather than doing it quietly.
+            logger.warning(
+                "gauntlet: box test lock still held after %ss — scoring anyway "
+                "(unserialized)", _LOCK_WAIT_S,
+            )
+        return await _run_pytest_locked(workdir, basetemp)
+    finally:
+        lock.release()
+
+
+async def _run_pytest_locked(workdir: Path, basetemp: Path) -> tuple[int, str]:
+    """The scoring subprocess itself; the caller holds the box test lock."""
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
         "--basetemp", str(basetemp),
