@@ -31,15 +31,38 @@ Code" below).
 
 ## Updating Claude Code (host + container)
 
-One pin, both machines, no drift:
+One pin, both machines, no drift.
 
-1. Edit `CC_VERSION` in `scripts/lib/cc_version.sh` (one line). If the new CC
+**Two gates come first, and both are mandatory.** `origin` is the public repo,
+so merging the pin *is* the release — the pin PR is the wrong place to discover
+that a gate was skipped. Each one is recorded as a PR-body receipt (see
+[the pin PR's own gate](#the-pin-prs-own-gate-cc-pin-receipts) for the exact
+trailers, which the merge gate checks):
+
+1. **Read the changelog in full over `(pinned, target]`** — every release in the
+   range, not just the newest. A bump that crosses several releases crosses
+   every behaviour change in all of them.
+   → `CC-Gate-Changelog:`
+2. **Soak the candidate locally first.** Align this machine to the candidate and
+   use it for real interactive work before the pin moves. At the end of the
+   soak, verify which binary your live sessions are *actually executing* — npm
+   replaces the package underneath a running process, which keeps its original
+   mapping until it restarts, and `claude --version` cannot reveal this because
+   it spawns a fresh child that reads the new binary on disk. Measured on a live
+   install: one canonical binary at the intended version, while a majority of
+   live sessions were still executing the replaced predecessor, so the soak had
+   accumulated days of "real use" on the old release.
+   → `CC-Gate-Soak:`
+
+Then:
+
+3. Edit `CC_VERSION` in `scripts/lib/cc_version.sh` (one line). If the new CC
    version raises its `engines.node` floor, bump `NODE_MAJOR` in the same file
    in lockstep — the `cc-node-lockstep` CI job (`scripts/check_cc_node_lockstep.py`)
    fails the PR if `NODE_MAJOR` is below the pinned CC's required Node major, so
    this can't be forgotten (it fails open on a transient npm-registry error).
-2. Merge to `main`.
-3. Run `scripts/update.sh`. It updates the container, redeploys the Guardian
+4. Merge to `main`, receipts in the PR body.
+5. Run `scripts/update.sh`. It updates the container, redeploys the Guardian
    (carrying the new gateway script), then queries the host's CC version and —
    **only if it differs from the pin** — dispatches `update-cc <pin>` to the
    Guardian gateway on the host. The dispatch is idempotent (acts only on drift)
@@ -89,6 +112,58 @@ Deliberate multi-copy setups: `CC_SHADOW_SCAN=0` opts out.
 `cc_ensure_local` also probes known prefixes (`CC_PROBE_DIRS`) before declaring
 CC "not installed", so a PATH-blind install is aligned in place instead of
 reinstalled forever.
+
+### The pin PR's own gate: `cc-pin-receipts`
+
+A change moving `CC_VERSION` **forward** must carry both gate receipts as
+PR-body trailers, in the same style as the repo's existing `Ledger:` /
+`Follow-up:` trailers:
+
+```
+CC-Gate-Changelog: read (<from>, <to>] in full from <source>, <date>
+CC-Gate-Soak: <candidate> on <where> <start>..<end>, running-binary sweep <result>, signed off <who>
+```
+
+Write them in the PR body itself. Receipts inside an HTML comment or a code
+fence do **not** count — they satisfy a text search while being invisible to the
+person merging, and the only enforcement this has is a human reading a claim
+someone chose to make. Ordinary markdown is fine: list bullets, `- [x]` task
+boxes, blockquotes and bold all work.
+
+**The merge gate is the authority; CI is advisory.** The check reads the PR
+BODY, which stays mutable after any CI run finishes, so a CI status describing
+it is a claim about the past. It therefore runs at merge time
+(`scripts/hooks/git_push_guard.py --check-pr`), comparing the pin at the PR head
+against the pin on `origin/main` — which at that moment is exactly what the pin
+is about to land on. The `cc-pin-receipts` job in `ci.yml` runs the same checker
+with `--advisory`: it annotates a missing receipt early and always exits 0.
+
+That split is deliberate, and reversing it breaks the gate. A completed check
+run is immutable, and the merge gate treats a stale FAILURE as red on purpose —
+it forces `gh pr merge --admin` and is the sole CI enforcement for the merges it
+allows, so a later SUCCESS clearing an earlier FAILURE would make re-running a
+job until green sufficient to merge. A *blocking* status over a mutable input
+therefore could not be cleared by fixing that input: the author would have to
+push a commit purely to get a fresh head. Running from main's copy of the
+checker also means a PR cannot edit the code that gates it.
+
+Scope, stated plainly: it stops **omission, not forgery**. Nothing here can tell
+whether a soak actually happened — this repo already settled that question,
+which is why `review-depth-check` is advisory by design. What it converts is
+*forgetting* into *consciously writing something untrue*. Same kind of check,
+and the same strength, as `scripts/check_hook_versions_complete.sh`.
+
+It compares the **parsed pin value**, not whether the file changed, so PRs that
+edit `cc_version.sh` for other reasons are unaffected. **Downgrades are
+auto-exempt** — a rollback returns to a version that already ran here, and the
+downgrade path is this project's incident-recovery route (the reason a managed
+`requiredMinimumVersion` floor was rejected above). No override syntax to
+remember under incident pressure.
+
+What it will **not** do is guess. A pin it cannot read — absent, assigned more
+than once, not canonical semver, or not valid UTF-8 — **blocks**. "I cannot tell
+what this file pins" is not a reason to publish a release; it is the state a
+human needs to look at.
 
 ---
 
