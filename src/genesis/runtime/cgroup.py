@@ -51,15 +51,86 @@ def detect_root_device() -> str | None:
         return None
 
 
-def read_container_memory_max() -> int | None:
-    """Read the container's memory.max from the root cgroup."""
+# cgroup v1 "unlimited" sentinel (PAGE_COUNTER_MAX, page-aligned). memory.
+# limit_in_bytes reports a value at/above this when no limit is set.
+_CGROUP_V1_UNLIMITED = 0x7FFFFFFFFFFFF000
+
+
+def _read_text(path: str) -> str | None:
+    """Read a cgroup file (seam so the v1/v2 fallbacks are unit-testable)."""
     try:
-        raw = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def _read_int(path: str) -> int | None:
+    raw = _read_text(path)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _read_stat(path: str) -> dict[str, int]:
+    raw = _read_text(path)
+    stats: dict[str, int] = {}
+    if raw:
+        for line in raw.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1].lstrip("-").isdigit():
+                stats[parts[0]] = int(parts[1])
+    return stats
+
+
+def read_container_memory_max() -> int | None:
+    """Container memory limit in bytes (cgroup v2, then v1). None = unlimited/unknown."""
+    raw = _read_text("/sys/fs/cgroup/memory.max")  # v2 unified
+    if raw is not None:
         if raw == "max":
             return None
-        return int(raw)
-    except (OSError, ValueError):
-        return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+    v1 = _read_int("/sys/fs/cgroup/memory/memory.limit_in_bytes")  # v1 fallback
+    if v1 is not None and 0 < v1 < _CGROUP_V1_UNLIMITED:
+        return v1
+    return None
+
+
+def read_container_memory_current() -> int | None:
+    """Container current memory usage (bytes) — cgroup v2, then v1."""
+    cur = _read_int("/sys/fs/cgroup/memory.current")  # v2
+    if cur is not None:
+        return cur
+    return _read_int("/sys/fs/cgroup/memory/memory.usage_in_bytes")  # v1
+
+
+def read_container_memory_reclaimable() -> int | None:
+    """Reclaimable file-backed page cache (bytes) from cgroup memory.stat — v2 then v1.
+
+    memory.current counts page cache as "used", so max-current UNDER-states
+    available. Adding back the reclaimable file cache mirrors what /proc
+    MemAvailable means (usable without swapping). We sum the file LRU lists
+    (`inactive_file` + `active_file`) rather than the type-based `file` counter:
+    on cgroup v2, `file` also includes tmpfs/shmem pages, which sit on the ANON
+    LRU and are NOT reclaimable for a new anonymous allocation — counting them
+    would over-state available and could let the gate ALLOW a session the
+    container cannot actually hold (kernel cgroup-v2 memory.stat semantics:
+    inactive_file + active_file == page cache minus tmpfs). The file LRU still
+    contains dirty pages (writeback-then-reclaim, not instant), but the caller
+    additionally clamps with `min(procfs_MemAvailable, …)`, so the estimate stays
+    conservative. v1's `total_*_file` counters are already list-based."""
+    v2 = _read_stat("/sys/fs/cgroup/memory.stat")  # v2: file LRU lists (exclude shmem)
+    if "inactive_file" in v2 or "active_file" in v2:
+        return v2.get("inactive_file", 0) + v2.get("active_file", 0)
+    v1 = _read_stat("/sys/fs/cgroup/memory/memory.stat")  # v1: active+inactive file
+    if "total_inactive_file" in v1 or "total_active_file" in v1:
+        return v1.get("total_inactive_file", 0) + v1.get("total_active_file", 0)
+    return None
 
 
 def cgroup_status() -> dict:
