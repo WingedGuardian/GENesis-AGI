@@ -210,6 +210,18 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   alarm), enumerate the expectation table as failing tests BEFORE implementing
   — it forces the spec question to surface at design time instead of review
   round 4.
+- **Corpus replay cannot find a false-POSITIVE class — generate the matrix.**
+  Replaying real recorded inputs proves only that shapes you have ALREADY run
+  still behave; it is structurally blind to a shape you have never typed. A
+  guard change measured "0 false positives across 18k real commands" and still
+  hard-blocked `git status # don't commit yet`, because that corpus contained no
+  comment-apostrophe case that ALSO lacked a parsed segment. For any classifier
+  or guard, enumerate the CROSS PRODUCT of the axes that actually drive the
+  decision — {operation} × {quoted, commented, here-doc, bare} × {evidence
+  present, absent} — and assert the invariant per cell, so an untested cell fails
+  loudly instead of silently. Keep the corpus replay as the realism check; the
+  generated matrix is the coverage check. Skip a cell only with an explicit
+  reason recorded in the skip, since a silent skip and a hole look identical.
 - **Anti-patterns (binding):** never assert on a mock's behavior when the real
   code path can run; never add test-only methods/branches to production
   classes; fakes implement the real contract (real method names, real return
@@ -363,6 +375,44 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   miss degrades to the status quo instead of a broken guarantee). Do not ship
   the open-set version and plan to harden it later; the review loop IS the
   hardening loop, one bug per round, and it does not converge.
+
+  **Two corollaries, each bought with a non-converging review loop.**
+
+  **(a) NEVER normalize the command text before a blind-spot probe.** A probe
+  whose whole job is "notice that this text is unparseable" must read the RAW
+  command. Preprocessing it can only ever DELETE the evidence the probe exists
+  to find. MEASURED: a here-doc-body stripper — added in good faith, to stop
+  multi-line scripts from prompting — turned an ORDINARY shape into a silent
+  ALLOW on two independent guards: a quoted here-doc whose body contained an
+  apostrophe, followed by a real gated git command. Bash ran the command
+  (verified with a shimmed `git`), the apostrophe shifted `analyze()`'s
+  segmentation so the real segment was lost, and the stripper deleted the very
+  line carrying the flag the guard keys on. The same stripper also modelled
+  bash comments as whitespace-preceded only, so a `;#` opener let it delete
+  executed code. It then turned out not to be load-bearing at all: every case
+  cited to justify it was one where the parser already resolved the operation,
+  so its branch never ran. The fix was a DELETION, and it closed both defects
+  at once. When a guard loop will not converge, look for the component that
+  MODELS shell semantics and remove it — refining it is the loop.
+
+  **(b) When the parse is unreliable, ASK — do not BLOCK.** A hard block forces
+  a surgically precise trigger, and precision is exactly what an unreliable
+  parse cannot deliver. Measured over five review rounds: every narrowing
+  conjunct became a new way to STARVE the trigger (an over-strip that ate the
+  evidence; a decoy segment that stood the net down), while every widening
+  hard-blocked benign shapes (`git status # don't commit yet` was refused).
+  Emitting a PreToolUse `ask` inverts the cost of being wrong — a false
+  positive is one confirmation, a miss is the pre-existing status quo — which
+  is what lets the trigger stay broad instead of clever. Measured prompt rate
+  after widening: 0.43% of ~19k real commands.
+
+  Corollaries of the corollaries, each measured: a net that returns inline
+  PRE-EMPTS every gate below it (a hard block with no other backstop was
+  observed downgrading to a prompt) — set a reason and DEFER it to the tail
+  where the other decisions are resolved. An `ask` needs a dispatched-session
+  deny leg, because no human is there to answer it. And the invariant pair
+  "never silently allowed" + "never hard blocked" is satisfied BY a block→ask
+  downgrade, so pin the verdict EXACTLY wherever a hard block is the contract.
 
 - **`out=$(cmd)` under `set -e` swallows the failure path — and NO linter catches
   it.** An assignment whose value is a command substitution INHERITS that
