@@ -2889,6 +2889,166 @@ def _repo_default_branch(repo: str | None = None) -> str | None:
     return name or None
 
 
+#: The pin file the receipt gate compares. Kept here (not imported) so a missing
+#: checker module degrades to a NOTE rather than an import error at hook load.
+_PIN_FILE_PATH = "scripts/lib/cc_version.sh"
+
+
+def _load_pin_receipt_checker():
+    """Import scripts/check_cc_pin_receipts.py, or None if unavailable.
+
+    Lazy and failure-tolerant on purpose: the checker is a sibling script, not a
+    package, and a hook that cannot import it must not stop being a merge gate
+    for everything else.
+    """
+    import importlib.util
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    path = os.path.join(repo_root, "scripts", "check_cc_pin_receipts.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_cc_pin_receipts", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # Registered before exec: @dataclass resolves its module from sys.modules.
+        sys.modules["_cc_pin_receipts"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+def _pin_file_at_head(pr_num: str, head_sha: str, repo: str | None) -> str | None:
+    """The pin file's contents at the PR head, read through the API.
+
+    NOT from the local checkout: the gate runs from the main worktree, which is
+    on main, so the PR's own version of the file is not on disk here. That is
+    also the property that makes this gate un-editable by the PR — only the
+    DATA comes from the PR, never the code reading it.
+    """
+    raw = os.environ.get("_TEST_GH_HEAD_PIN_FILE")
+    if raw is not None:
+        # Through the SAME emptiness rule as the live path below — a seam that
+        # skips it would let a test see behaviour production cannot produce.
+        return raw if raw.strip() else None
+    # Resolution order matters. `_canonical_public_repo()` reads install config
+    # and is legitimately absent on an install that never set `github.*` — the
+    # merge gate treats that as "uncertain, enforce", so falling back to the repo
+    # the process is actually in keeps the gate WORKING rather than silently
+    # unverifying on every such install (measured: it returned None here).
+    slug = (_normalize_repo(repo) if repo else None) or _canonical_public_repo()
+    if not slug:
+        slug = _derive_repo_from_cwd(os.getcwd())
+    if not slug:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/{slug}/contents/{_PIN_FILE_PATH}?ref={head_sha}",
+                "-H",
+                "Accept: application/vnd.github.raw",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+    except Exception:
+        return None
+    # EMPTY is plumbing, not content. A zero exit with no body means the read did
+    # not produce the file (wrong ref, path absent there, a stubbed response) —
+    # treating that as "a pin I cannot parse" would BLOCK, and a gate that blocks
+    # whenever a read comes back blank walls off every merge. A real
+    # cc_version.sh is never empty.
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return result.stdout
+
+
+def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
+    """The PR body. ``None`` means unreadable — distinct from an EMPTY body,
+    which is a real state that determines the answer by itself."""
+    raw = os.environ.get("_TEST_GH_PR_BODY")
+    if raw is not None:
+        return raw
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", pr_num, *_repo_args(repo), "--json", "body", "--jq", ".body"],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+    except Exception:
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
+    """Block a PR that moves the Claude Code pin FORWARD without its gate receipts.
+
+    THIS is the authority for the receipt gates, not a CI status. The body is
+    mutable after any CI run finishes, so a status describing it is a claim about
+    the past; read at merge time there is no window to edit it afterwards. The
+    CI job runs the same checker with ``--advisory`` purely for early feedback.
+
+    Base is ``origin/main`` from the LOCAL checkout, which at merge time is
+    exactly what the pin is about to land on — so no merge-ref anchoring is
+    involved and there is no ``HEAD^1`` question to get wrong. Head comes through
+    the API, so the code doing the reading is always main's copy.
+
+    FAIL DIRECTION, split deliberately:
+      * The pin moved forward and a receipt is missing, or the pin cannot be READ
+        at either side -> BLOCK. Both are facts about the PR's content, and
+        publishing a release nobody can characterise is the thing to prevent.
+      * The gate's own PLUMBING failed (no checker module, gh unreadable, no
+        head sha) -> NOTE, do not block. Walling off every merge over a check
+        that only ever guards a pin bump would be a worse failure than the one
+        it prevents, and the surrounding gates already block on an unreadable PR.
+    """
+    checker = _load_pin_receipt_checker()
+    if checker is None:
+        return False, "NOTE: pin-receipt checker not importable — receipts NOT verified."
+
+    head_sha = _pr_head_sha(pr_num, repo=repo)
+    if not head_sha:
+        return False, "NOTE: PR head unreadable — pin receipts NOT verified."
+
+    head_text = _pin_file_at_head(pr_num, head_sha, repo)
+    if head_text is None:
+        return (
+            False,
+            f"NOTE: could not read {_PIN_FILE_PATH} at the PR head — receipts NOT verified.",
+        )
+
+    try:
+        base_text = subprocess.run(
+            ["git", "show", f"origin/main:{_PIN_FILE_PATH}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:
+        return False, "NOTE: could not read the base pin — receipts NOT verified."
+    if base_text.returncode != 0 or not base_text.stdout.strip():
+        # Same reasoning as the head read: blank is plumbing, not a pin nobody
+        # can parse. origin/main may simply not be fetched in this checkout.
+        return False, f"NOTE: {_PIN_FILE_PATH} unreadable on origin/main — receipts NOT verified."
+
+    body = _pr_body_text(pr_num, repo)
+    if body is None:
+        return False, "NOTE: PR body unreadable — pin receipts NOT verified."
+
+    try:
+        verdict = checker.evaluate(
+            base_pin_text=base_text.stdout, head_pin_text=head_text, body=body
+        )
+    except Exception as exc:  # noqa: BLE001 — plumbing, not policy
+        return False, f"NOTE: pin-receipt check errored ({type(exc).__name__}) — NOT verified."
+
+    return verdict.blocked, verdict.message
+
+
 def _check_base_is_default(
     pr_num: str, *, force: bool = False, repo: str | None = None
 ) -> tuple[bool, str]:
@@ -4241,6 +4401,30 @@ def main() -> int:
                     print(base_msg, file=sys.stderr)
                     return 2
 
+                # Pin receipts. This is the AUTHORITY for the two release gates
+                # (changelog read, local-first soak), deliberately not a CI
+                # status: the PR body stays mutable after a check run finishes,
+                # so only a merge-time read describes the body that merges. It
+                # also runs main's copy of the checker, so a PR cannot edit the
+                # code that gates it.
+                #
+                # NO override sigil, deliberately. Every sigil here waives exactly
+                # ONE gate so a waiver cannot silently disarm an unrelated one, so
+                # reusing # review-override (which waives the FINDING scans) would
+                # be exactly that. And a dedicated sigil would be an escape from a
+                # demand that takes seconds to satisfy honestly: if a gate really
+                # was not run, the action is to run it, not to wave it through.
+                # Incident recovery is already covered — a BACKWARD pin is exempt
+                # by construction, with no syntax to recall under pressure.
+                should_block, receipts_msg = _check_pin_receipts(pr_num, repo=merge_repo)
+                if should_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — CC pin moves forward without its gate receipts.",
+                        file=sys.stderr,
+                    )
+                    print(receipts_msg, file=sys.stderr)
+                    return 2
+
                 # Codex must have reviewed the CURRENT head (existence + freshness)
                 # — not merely have no open findings. This runs BEFORE the finding
                 # scans below: a review published between the scans and this check
@@ -4510,6 +4694,17 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     # review published mid-run can't pass freshness with its P1s unscanned.
     blocked, msg = _check_base_is_default(pr_num, repo=repo)
     print(f"base-branch    : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (default)'}")
+    failures += 1 if blocked else 0
+    # Pin receipts: authoritative HERE, not in CI — the PR body is mutable after
+    # a check run completes, so only a merge-time read describes the body that
+    # actually merges.
+    blocked, msg = _check_pin_receipts(pr_num, repo=repo)
+    print(
+        f"pin-receipts   : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}"
+    )
+    if blocked:
+        for line in msg.splitlines()[1:]:
+            print(f"  {line}")
     failures += 1 if blocked else 0
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     if blocked:
