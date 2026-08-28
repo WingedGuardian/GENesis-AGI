@@ -84,6 +84,11 @@ def _clean_env(monkeypatch):
         pytest_lock.WAIT_ENV,
         pytest_lock.WAIT_TIMEOUT_ENV,
         pytest_lock.HELD_ENV,
+        # PATH_ENV too: it is a DOCUMENTED lever, so the suite can legitimately
+        # be run with it set — and TestOffAnInstall's whole premise is that no
+        # override is in play. Without this those tests fail spuriously for a
+        # reason that looks like a product bug.
+        pytest_lock.PATH_ENV,
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -710,8 +715,13 @@ class TestConftestWiring:
         second = self._run(self.TARGET, path)
         assert second.returncode == 0, "the lock was not released at unconfigure"
 
+    # No ``--version`` case here, deliberately: MEASURED, a single ``--version``
+    # is short-circuited inside pytest before this conftest loads, so such a case
+    # passes even with the entire exemption deleted — it would prove nothing.
+    # ``-V`` is not an introspection mode at all (it runs the whole suite); that
+    # is pinned separately by test_dash_V_is_not_treated_as_introspection.
     @pytest.mark.parametrize(
-        "mode", [["--help"], ["--markers"], ["--version"], ["--fixtures", "-q"]]
+        "mode", [["--help"], ["--markers"], ["--fixtures", "-q"]]
     )
     def test_introspection_modes_are_never_refused(self, tmp_path, holder, mode):
         """They run no tests, so there is nothing to govern — and pytest
@@ -725,6 +735,26 @@ class TestConftestWiring:
 
         assert result.returncode == 0, f"{mode} was refused: {out[:400]}"
         assert "Traceback (most recent call last)" not in out
+
+    def test_dash_V_is_not_treated_as_introspection(self, tmp_path, holder):
+        """``-V`` RUNS THE SUITE, so it must be governed like any other run.
+
+        pytest exempts a single ``--version`` itself, before this conftest is
+        reached; but ``-V`` reaches ``pytest_configure`` and then falls through
+        to a normal session. Treating it as "introspection" would hand a full,
+        unserialized suite a free pass past the lock. This is fast precisely
+        because the refusal lands at configure time, before collection.
+        """
+        path = tmp_path / "pytest.lock"
+        holder(path)
+
+        result = self._run(["-V"], path)
+        out = result.stdout + result.stderr
+
+        assert result.returncode == pytest_lock.EXIT_LOCK_HELD, (
+            f"-V was exempted from the lock, so it would have run the whole "
+            f"suite unserialized: rc={result.returncode} {out[:300]}"
+        )
 
     def test_the_disable_lever_really_lets_a_contended_run_through(
         self, tmp_path, holder
@@ -754,3 +784,94 @@ class TestConftestWiring:
 
         assert result.returncode == 0, (result.stdout + result.stderr)[-500:]
         assert waited > 2.0, f"returned in {waited:.1f}s — it did not actually queue"
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires /proc (Linux)")
+class TestPostAcquisitionIsTotal:
+    """Once the flock is WON, nothing may strand the fd.
+
+    Between winning the flock and returning the BoxLock there are three
+    statements (holder record, env export, BoxLock construction). If ANY of them
+    raises, ``acquire``'s blanket ``except Exception`` hands the caller a
+    permissive BoxLock — correct, it fails open — but the fd still holds the
+    flock and no BoxLock owns it, so nothing can ever release it. The caller
+    runs; every OTHER process on the box is refused by a lock that cannot be
+    released, and with no holder record written the refusal cannot even name it.
+    That is the fail-open contract inverted for everyone else, invisibly, for the
+    lifetime of the process — and in the gauntlet's case that process is the
+    long-lived server.
+
+    ``ProcessLock`` is immune only because its record is ``str(os.getpid())``,
+    which cannot fail to encode. This module writes argv to make contention
+    nameable, so its write is genuinely fallible: a non-UTF-8 byte in a filename
+    (surrogateescape) raises UnicodeEncodeError, which is not an OSError.
+    """
+
+    @staticmethod
+    def _held_by_another_process(path: Path) -> bool:
+        """Probe from a CHILD — flock is per-open-file-description, so a probe
+        inside this process would see its own fd as free and prove nothing."""
+        code = (
+            "import fcntl,os,sys\n"
+            "fd=os.open(sys.argv[1],os.O_RDWR)\n"
+            "try:\n"
+            "    fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+            "except OSError:\n"
+            "    print('HELD')\n"
+            "else:\n"
+            "    fcntl.flock(fd,fcntl.LOCK_UN); print('FREE')\n"
+            "finally:\n"
+            "    os.close(fd)\n"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", code, str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        return "HELD" in out.stdout
+
+    def test_unencodable_argv_does_not_strand_the_lock(self, tmp_path, monkeypatch):
+        """The reported instance: argv carrying a surrogateescape byte."""
+        path = tmp_path / "pytest.lock"
+        # Exactly what os.fsdecode does to a b'\xff' byte in a real argv.
+        monkeypatch.setattr(
+            sys, "argv", ["pytest", os.fsdecode(b"tests/\xff.py")]
+        )
+
+        lock = acquire(lock_path=path, export_env=False)
+        try:
+            assert lock.blocked is False, "must still fail open for the caller"
+        finally:
+            lock.release()
+
+        assert not self._held_by_another_process(path), (
+            "the flock is still held by a stranded fd no BoxLock owns — "
+            "every other run on this box is now refused until the process exits"
+        )
+
+    def test_any_post_flock_failure_releases_the_fd(self, tmp_path, monkeypatch):
+        """The CLASS, not just the reported instance.
+
+        The holder record is only the first of three statements after the flock
+        is won. Fail a DIFFERENT one — the env export — and the fd must still be
+        released. A fix that only widens _write_holder_record's except clause
+        passes the test above and fails this one.
+        """
+        path = tmp_path / "pytest.lock"
+
+        class _Boom(dict):
+            def __setitem__(self, key, value):
+                if key == pytest_lock.HELD_ENV:
+                    raise RuntimeError("environ write failed")
+                super().__setitem__(key, value)
+
+        monkeypatch.setattr(pytest_lock.os, "environ", _Boom(os.environ))
+
+        lock = acquire(lock_path=path, export_env=True)
+        try:
+            assert lock.blocked is False, "must still fail open for the caller"
+        finally:
+            lock.release()
+
+        assert not self._held_by_another_process(path), (
+            "a post-flock failure outside _write_holder_record stranded the fd"
+        )

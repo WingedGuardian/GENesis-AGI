@@ -27,8 +27,10 @@ outside this module, that class is reopened.
 Two kinds of caller acquire it:
 
 * ``tests/conftest.py::pytest_configure`` — covers every run of *this* repo's
-  suite, from any launcher and any worktree, because nothing reaches those
-  tests without loading that conftest.
+  suite, from any launcher and any worktree, because loading that conftest is
+  how those tests are reached. ``--noconftest`` skips it and so escapes the
+  lock; that is a deliberate non-goal rather than a hole, since this governs
+  resources and is explicitly not a security boundary (constraint 1).
 * ``genesis.eval.gauntlet`` — acquires explicitly, because it scores *foreign*
   fixture projects: it runs pytest with a ``cwd`` under ``~/tmp/gauntlet``, so
   those projects have their own rootdir and this repo's conftest never loads
@@ -170,9 +172,13 @@ def _env_flag(name: str, default: bool, on_unknown: bool | None = None) -> bool:
     if token in _FALSEY or token == "":
         return False
     resolved = default if on_unknown is None else on_unknown
+    # State the VALUE the flag took, never "set"/"unset": for the disable
+    # lever, resolving to False means DISABLED, whereas *unset* means armed —
+    # so the old wording told an operator reaching for the escape hatch the
+    # exact opposite of what had happened.
     print(
-        f"[pytest_lock] {name}={raw!r} not understood — treating it as "
-        f"{'set' if resolved else 'unset'}.",
+        f"[pytest_lock] {name}={raw!r} not understood — resolving it to "
+        f"{'true' if resolved else 'false'}.",
         file=sys.stderr,
     )
     return resolved
@@ -298,14 +304,20 @@ def _write_holder_record(fd: int) -> None:
     contender reads nothing. (A torn record is handled anyway — the decision
     never depends on the parse — but a needless window is still a window.)
     Best-effort: failing to describe ourselves must not cost us the lock we
-    already hold.
+    already hold — so this suppresses Exception, not just OSError. ``argv`` is
+    attacker-agnostic but not encodable-agnostic: a non-UTF-8 byte in a filename
+    arrives via surrogateescape and makes ``.encode()`` raise UnicodeEncodeError,
+    which is a ValueError. The caller's fail-open then hid a stranded flock (see
+    the total region in ``_acquire_inner``).
     """
     try:
         argv = " ".join(sys.argv)[:500]  # bounded — argv can be enormous
-        record = f"{os.getpid()}\n{time.time()}\n{argv}\n".encode()
+        record = f"{os.getpid()}\n{time.time()}\n{argv}\n".encode(
+            errors="replace"
+        )
         os.pwrite(fd, record, 0)
         os.ftruncate(fd, len(record))
-    except OSError:
+    except Exception:
         pass
 
 
@@ -431,10 +443,31 @@ def _acquire_inner(
             continue
         break
 
-    _write_holder_record(fd)
-    if export_env:
-        os.environ[HELD_ENV] = str(os.getpid())
-    return BoxLock(fd=fd, path=path, owns_held_env=export_env)
+    # TOTAL from here down. The flock is WON but no BoxLock owns ``fd`` yet,
+    # so ANY exception in this region strands it: acquire()'s blanket handler
+    # hands the caller a permissive lock (fail-open, correct for them) while the
+    # flock stays held by an fd nothing can release. Every OTHER run on the box
+    # is then refused — by a holder that never wrote its record, so the refusal
+    # cannot even name it — for the lifetime of this process. In the gauntlet's
+    # case that process is the long-lived server. That is constraint 1 inverted
+    # for everyone except the caller, and invisible; it is worse than the
+    # overlap the lock exists to prevent.
+    #
+    # ProcessLock has no equivalent hazard only because its record is
+    # ``str(os.getpid())`` — digits, which cannot fail to encode. This module
+    # deliberately writes argv so contention can NAME the holder, and that
+    # choice is what makes the write fallible (a surrogateescape byte from a
+    # non-UTF-8 filename raises UnicodeEncodeError, which is not an OSError).
+    # So the guard belongs on the whole region, not on any one statement.
+    try:
+        _write_holder_record(fd)
+        if export_env:
+            os.environ[HELD_ENV] = str(os.getpid())
+        return BoxLock(fd=fd, path=path, owns_held_env=export_env)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise
 
 
 def _sanitize_timeout(value: float) -> float:

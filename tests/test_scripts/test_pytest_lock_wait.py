@@ -583,3 +583,73 @@ def test_scan_reports_pid_command_and_age(tmp_path):
     finally:
         proc.kill()
         proc.wait(timeout=5)
+
+
+class TestOneParserNotTwo:
+    """The classifier must answer with ONE option model.
+
+    This file used to scan a python argv twice — once for ``-m`` and once for a
+    console-script path — with option models that differed. They disagreed in
+    BOTH directions, and both shapes are pinned here so a future edit cannot
+    reintroduce a second oracle. Same drift class that cost this change its
+    second layer; the difference is that here it fits in one function.
+    """
+
+    def test_dash_c_argument_is_not_a_console_script(self):
+        """``-c`` runs a COMMAND; everything after it is that command's argv.
+
+        The old second scanner skipped -c's value and then read the next token
+        as a script path, so a wait loop could sit out its whole timeout against
+        a process that never ran pytest.
+        """
+        assert not _mod.argv_is_pytest(
+            ["python", "-c", "pass", "/venv/bin/pytest"]
+        )
+
+    def test_stdin_program_is_not_a_console_script(self):
+        """``-`` is the same shape as ``-c``: the program arrives on stdin."""
+        assert not _mod.argv_is_pytest(["python", "-", "/venv/bin/pytest"])
+
+    def test_long_option_value_is_not_mistaken_for_the_script(self):
+        """The false NEGATIVE direction: a real run that went unnamed.
+
+        ``--check-hash-based-pycs`` takes a value. The old second scanner walked
+        its characters looking for clustered short options, found the ``c``,
+        treated the flag as self-contained, and then read its VALUE as the first
+        non-flag token — missing the genuine pytest run right after it.
+        """
+        assert _mod.argv_is_pytest(
+            ["python", "--check-hash-based-pycs", "default", "/venv/bin/pytest"]
+        )
+
+    def test_double_dash_still_finds_the_script(self):
+        assert _mod.argv_is_pytest(["python", "--", "/venv/bin/pytest"])
+
+    def test_the_two_entry_points_cannot_disagree(self):
+        """Both public questions resolve through the same parser.
+
+        Not a tautology: it fails if either grows its own scanning loop again.
+        """
+        argv = ["python", "-um", "pytest", "tests/x.py"]
+        assert _mod._python_module_arg(argv) == "pytest"
+        assert _mod.argv_is_pytest(argv)
+        target = _mod._python_target(argv)
+        assert target == ("module", "pytest")
+
+    def test_module_spellings_still_resolve(self):
+        for argv in (
+            ["python", "-m", "pytest"],
+            ["python", "-mpytest"],
+            ["python", "-um", "pytest"],
+            ["python", "-X", "faulthandler", "-m", "pytest"],
+        ):
+            assert _mod.argv_is_pytest(argv), argv
+
+    def test_non_runs_still_excluded(self):
+        for argv in (
+            ["grep", "pytest", "x.py"],
+            ["python", "pytest"],           # local file, no slash
+            ["python", "script.py", "-m", "pytest"],
+            ["python", "-m", "pytest_cov"],
+        ):
+            assert not _mod.argv_is_pytest(argv), argv

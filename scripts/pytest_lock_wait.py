@@ -69,8 +69,22 @@ _PROGRESS_SECONDS = 30.0
 _PY_VALUE_OPTS = frozenset("cmWXQ")
 
 
-def _python_module_arg(argv: list[str]) -> str | None:
-    """The value of a python interpreter's ``-m``, honouring shell clustering.
+def _python_target(argv: list[str]) -> tuple[str, str] | None:
+    """What a python interpreter argv actually runs.
+
+    ``("module", name)`` for ``-m name`` in any spelling; ``("command", "")``
+    for ``-c`` or ``-`` (what follows is that command's ARGUMENTS, never a
+    script to run); ``("script", path)`` for the first non-option token.
+    ``None`` when the argv runs nothing identifiable.
+
+    ONE parser, deliberately. This file previously scanned the same argv twice
+    with two slightly different option models, and they disagreed in BOTH
+    directions: ``python -c pass /venv/bin/pytest`` read the -c command's
+    argument as a console script (false positive), while
+    ``python --check-hash-based-pycs default /venv/bin/pytest`` read the long
+    option's value as the script and missed a real run (false negative). Two
+    oracles for one question is the same drift class that cost this change its
+    second layer; one parser cannot disagree with itself.
 
     ``-m pytest``, ``-mpytest`` and ``-um pytest`` are the SAME invocation to
     the interpreter; a matcher that only understands the first silently misses a
@@ -80,7 +94,10 @@ def _python_module_arg(argv: list[str]) -> str | None:
     while i < len(argv):
         tok = argv[i]
         if tok == "--":
-            return None
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            return ("script", nxt) if nxt else None
+        if tok == "-":
+            return ("command", "")  # program on stdin
         if tok.startswith("--"):
             if tok == "--check-hash-based-pycs":  # the one long opt with a value
                 i += 2
@@ -94,15 +111,24 @@ def _python_module_arg(argv: list[str]) -> str | None:
                 rest = tok[pos + 1 :]
                 value = rest if rest else (argv[i + 1] if i + 1 < len(argv) else "")
                 if ch == "m":
-                    return value
+                    return ("module", value)
+                if ch == "c":
+                    return ("command", "")
                 i += 1 if rest else 2
                 break
             else:
                 i += 1  # pure boolean cluster
                 continue
             continue
-        return None  # first non-flag token: the script, not a -m module
+        return ("script", tok)  # first non-flag token: the script
     return None
+
+
+def _python_module_arg(argv: list[str]) -> str | None:
+    """The value of a python interpreter's ``-m``, or None. Thin over
+    :func:`_python_target` so there is exactly one option model."""
+    target = _python_target(argv)
+    return target[1] if target and target[0] == "module" else None
 
 
 def argv_is_pytest(argv: list[str]) -> bool:
@@ -121,25 +147,17 @@ def argv_is_pytest(argv: list[str]) -> bool:
         return True
     if not base.startswith("python"):
         return False
-    if _python_module_arg(argv) == "pytest":
-        return True
-    i = 1
-    while i < len(argv):
-        tok = argv[i]
-        if tok.startswith("-") and len(tok) > 1:
-            consumed = False
-            for pos, ch in enumerate(tok[1:], start=1):
-                if ch in _PY_VALUE_OPTS:
-                    i += 1 if tok[pos + 1 :] else 2
-                    consumed = True
-                    break
-            if not consumed:
-                i += 1
-            continue
-        # Require a slash so a bare `python pytest` (a local file named pytest,
-        # not a suite) is not misread as a run.
-        return "/" in tok and os.path.basename(tok) == "pytest"
-    return False
+    target = _python_target(argv)
+    if target is None:
+        return False
+    kind, value = target
+    if kind == "module":
+        return value == "pytest"
+    if kind == "command":
+        return False  # -c/-: the rest is that command's argv, not a script
+    # Require a slash so a bare `python pytest` (a local file named pytest,
+    # not a suite) is not misread as a run.
+    return "/" in value and os.path.basename(value) == "pytest"
 
 
 def scan_pytest_processes() -> list[tuple[int, str, float]]:
@@ -308,7 +326,12 @@ def wait_for_clear(timeout: float, out=None) -> int:
     """
     out = out or sys.stderr
     started = time.monotonic()
-    deadline = started + _sanitize_timeout(timeout)
+    # Bound ONCE and report the bounded value: the message path used the raw
+    # parameter, so an in-process caller passing inf (main() sanitises, direct
+    # callers do not) crashed _format_age with OverflowError — in the one branch
+    # whose job is to explain a timeout.
+    bounded = _sanitize_timeout(timeout)
+    deadline = started + bounded
 
     def _on_term(_signum, _frame):
         print(
@@ -365,7 +388,7 @@ def wait_for_clear(timeout: float, out=None) -> int:
             print(f"Clear after {_format_age(time.monotonic() - started)}.", file=out)
             return 0
         print(
-            f"TIMEOUT: still busy after {_format_age(timeout)}.\n"
+            f"TIMEOUT: still busy after {_format_age(bounded)}.\n"
             f"{detail}\n"
             "The holder may be wedged — check it before overriding.",
             file=out,

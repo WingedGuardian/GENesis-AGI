@@ -523,6 +523,30 @@ class TestRunPytestBounded:
 
 
 class TestGauntletTakesTheBoxLock:
+    @pytest.fixture(autouse=True)
+    def _no_ambient_lock_levers(self, monkeypatch):
+        """No ambient lock env may reach the code under test.
+
+        Every test here asserts on whether the box lock is HELD, so any lever
+        that disables or redirects acquisition makes the assertions meaningless.
+        The disable lever is the one that bites: running this file with
+        ``GENESIS_PYTEST_LOCK=0`` — the documented way to run tests while another
+        suite holds the box lock — turns every ``acquire`` into a permissive
+        no-op, and five tests then fail as though the gauntlet had stopped
+        locking. Same class as ``_clean_env`` in tests/test_util/test_pytest_lock.py.
+
+        PATH_ENV is deliberately NOT cleared here: each test sets it to its own
+        tmp lock, which is what keeps them off the real box lock.
+        """
+        from genesis.util import pytest_lock
+
+        for name in (
+            pytest_lock.DISABLE_ENV,
+            pytest_lock.WAIT_ENV,
+            pytest_lock.WAIT_TIMEOUT_ENV,
+        ):
+            monkeypatch.delenv(name, raising=False)
+
     @pytest.mark.asyncio
     async def test_run_pytest_holds_the_lock_for_the_subprocess(self, tmp_path, monkeypatch):
         """The lock must be HELD while the scoring subprocess runs — not merely

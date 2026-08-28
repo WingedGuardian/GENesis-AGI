@@ -108,11 +108,28 @@ def _is_introspection_only(config) -> bool:
 
     Kept as a predicate rather than inlined so the exemption set is one
     reviewable list; see the caller for why these must not be blocked.
+
+    ``version`` is deliberately NOT in that list, which is not obvious — MEASURED
+    against the installed pytest, no spelling of it both reaches this hook AND
+    prints-and-exits:
+
+    * ``--version`` — ``Config.main()`` short-circuits it (it matches the literal
+      token at count 1) before the infrastructure starts, so we never run.
+    * ``--version --version`` / ``-VV`` — ``helpconfig.pytest_cmdline_main``
+      returns at ``version > 1``, before ``_do_configure()``. Again never run.
+    * ``-V`` — neither branch fires (``Config.main`` matches the *string*
+      ``--version``; ``version == 1`` is not ``> 1``), so it falls through to
+      ``wrap_session`` and runs the WHOLE SUITE.
+
+    Exempting ``version`` therefore bought nothing for the first two and, for
+    ``-V``, would wave a full unserialized suite straight past the lock — the
+    opposite of the point. It reads like a harmless entry, which is why the
+    measurement is written down rather than left to the next reader's intuition.
     """
     opt = config.option
     return any(
         getattr(opt, name, False)
-        for name in ("help", "showfixtures", "show_fixtures_per_test", "markers", "version")
+        for name in ("help", "showfixtures", "show_fixtures_per_test", "markers")
     )
 
 
