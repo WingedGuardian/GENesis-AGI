@@ -78,6 +78,95 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The ego's self-model stopped presenting stale, thin and arbitrarily-ranked
+  rows as present-tense capability.** `capability_map` feeds three ego-prompt
+  sections and the capability-improvement scanner. Measurements below come from
+  two live installs, distinguished as **A** (627 rows) and **B** (2102 rows) —
+  they differ because the flag-gated Outcome-Bus feed is on for A only.
+
+  *Thin rows.* Sources 5 and 6 already refused to emit a signal below 3 samples;
+  the journal / proposals / autonomy / procedural sources had no floor. Since
+  `procedural_memory.task_type` is a per-item slug rather than a category, that
+  left the large majority of the map as one-procedure "domains" — 596 of 597 on
+  A, 2066 of 2067 on B. On B they reached the ego: two single-procedure rows sat
+  in the rendered top-15, outranking a domain with n=70. The floor now applies
+  to the COMBINED sample size in `compute_capability_map`, and again on read, so
+  rows written before it existed are not still surfaced.
+
+  *Stale rows.* `updated_at` records when the AGGREGATOR last wrote a row, not
+  the age of its evidence. Only 3 of the 6 sources are time-windowed
+  (ego_proposals / cc_sessions / outcome_events, 30d); intervention_journal,
+  autonomy_state and procedural_memory are not, so domains fed only by those
+  never age — correct for present-tense state such as lifetime counters and
+  currently-stored procedures, and a documented wart for the journal's
+  historical events. The honest uniform reading is "the aggregator stopped
+  vouching for this row N days ago". For windowed-source domains the effect was
+  real and measured **on B**: a 43-day-old `1.0` at #2 in the rendered
+  self-model, and a **93-day-old** `0.0` row at the top of `get_weakest`,
+  steering the improvement scanner at a domain with no qualifying evidence since
+  May. Prompt-facing reads now exclude rows more than 14 days behind the
+  freshest. **On A the window excludes nothing** — maximum observed lag there is
+  6 days.
+
+  *Arbitrary ranking.* Confidence is a ratio, so well-exercised domains pile up
+  at exactly `1.0` — 19 such rows on A, more than filling a 15-row table. With
+  no secondary sort key SQLite returned an arbitrary 15, and an `n=3` row
+  displaced one with `n=3276`. Both bars are powerless here because every tied
+  row clears them; on A the top-15 was byte-identical before and after
+  filtering. The prompt read and `get_weakest` now break ties on
+  `sample_size DESC`, which is what actually changes A's rendered table
+  (`code_index` n=94 and `model_eval` n=44 replace four n=3 rows). Confidence
+  remains the primary key, so a very-high-n domain scoring slightly below `1.0`
+  can still fall outside the top-15; reworking the primary ranking is out of
+  scope here.
+
+  *Anchor safety.* The window anchors on `MIN(MAX(updated_at), now)`. Anchoring
+  on the freshest row rather than wall-clock means a totally dead refresh job
+  ages the table uniformly and hides **nothing**, instead of blanking the
+  self-model the moment the scheduler breaks. The clamp covers the opposite
+  direction: `MAX()` is unbounded above, so without it a single row stamped
+  ahead of real time defined the window for every other row and hid all of them
+  silently — and self-perpetuatingly, since nothing rewrites a domain that has
+  stopped being emitted. A partial refresh outage remains uncovered and is
+  tracked separately.
+
+  *Reads split by intent.* `get_all` and `get_by_domain` stay raw accessors;
+  `get_prompt_rows` and `get_weakest` carry the policy, so a future non-prompt
+  consumer cannot inherit ego-prompt filtering by accident. A new `count_all`
+  lets a renderer tell "the map is empty" apart from "every row was filtered" —
+  two states that must not produce the same sentence, since each is a false
+  claim in the other's situation. All three renderers now distinguish them and
+  name the real row count when rows were withheld.
+
+  *Anchor totality.* SQLite's scalar `min()` returns NULL if any argument is
+  NULL, and `julianday()` returns NULL for a value it cannot parse — so a single
+  unparseable `updated_at` would have made the whole predicate NULL and hidden
+  every row, silently. `COALESCE` degrades that to wall-clock instead: the same
+  failure the clamp exists to prevent, reached by a different input.
+
+  Three consequences are deliberate. **(1)** The light-depth "avg confidence"
+  figure moves sharply — `0.06 → 0.94` on A. The old number was not a capability
+  average at all: dominated by hundreds of zero-confidence one-sample rows, it
+  reported roughly "what share of stored procedure slugs carry confidence".
+  That branch renders no table, so it now states both figures as the qualifying
+  subset rather than as whole-map facts — left unqualified it read "31 domains
+  tracked (avg 94%)" over a 627-domain map averaging 6%.
+  **(2)** "N domains tracked" drops for the same reason (`627 → 31` on A,
+  `2102 → 19` on B); the renderers show a top-15/top-12, so those tables stay
+  full. **(3)** The focused-deficiency line reads `get_by_domain` — deliberately
+  unfiltered, since a capability-improvement cycle targets a domain *because* it
+  is weak — and is resolved BEFORE the empty-table check, so it survives even
+  when every row is filtered out. It now also stamps the row's last-vouched
+  date, because an unlabelled unfiltered row is exactly the present-tense claim
+  on old evidence this work removes elsewhere. All three renderers' empty states
+  now say rows were filtered rather than claiming no data exists; the base
+  builder additionally stopped rendering a query failure as an empty map.
+
+  Nothing is deleted: rows below either bar stay in the table and stop being
+  RENDERED as present-tense capability. They are still read deliberately — by
+  `get_by_domain` for the focused-deficiency line, and by `count_all` to say how
+  many were withheld — and they simply stop being refreshed.
+
 - **Heartbeat GC no longer lets a clock-skewed future row starve a subsystem's
   liveness signal.** The `keep_latest_per_subsystem` heartbeat GC
   (`db/crud/events.py::prune`) kept the row equal to the per-subsystem

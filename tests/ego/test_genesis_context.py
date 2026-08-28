@@ -834,3 +834,335 @@ class TestCapabilityPerformanceFocusedDeficiency:
         builder._focus_id = None
         section = await builder._capability_performance_section()
         assert "Focused deficiency" not in section
+
+    async def test_stale_focus_row_still_surfaced(self, cap_db):
+        """The deficiency line must survive the bars get_prompt_rows applies.
+
+        A capability_improvement cycle targets a domain BECAUSE it is weak, and
+        a weak domain is exactly the kind that stops being refreshed. If the
+        focus row is looked up by scanning get_all's output, the window hides it
+        and the advisory silently loses the deficiency it exists to name — so
+        the lookup goes through get_by_domain, which is never filtered.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        # A fresh row anchors the window; the focus row sits far behind it.
+        await self._insert(cap_db, "fresh_domain", 0.90)
+        await cap_db.execute(
+            "INSERT INTO capability_map "
+            "(id, domain, confidence, sample_size, trend, evidence_summary, "
+            " updated_at) VALUES (?, ?, ?, ?, ?, ?, datetime(?, '-93 days'))",
+            ("stale_weakling", "stale_weakling", 0.05, 6, "declining",
+             "stale-weakling-evidence", datetime.now(UTC).isoformat()),
+        )
+        await cap_db.commit()
+
+        builder = GenesisEgoContextBuilder(db=cap_db)
+        builder._focus_id = "stale_weakling"
+        section = await builder._capability_performance_section()
+
+        # Hidden from the table (it is stale)...
+        assert "| stale_weakling |" not in section
+        # ...but still named as the focused deficiency.
+        assert "Focused deficiency — stale_weakling" in section
+        assert "stale-weakling-evidence" in section
+        # ...and DATED. This is the one row shown unfiltered, so without a
+        # last-vouched stamp it is the row most likely to read as a
+        # present-tense claim on months-old evidence. A mutation blanking the
+        # stamp previously survived the whole suite.
+        _expected = (datetime.now(UTC) - timedelta(days=93)).strftime("%Y-%m-%d")
+        assert f"last vouched {_expected}" in section
+
+    async def test_focus_survives_an_entirely_filtered_table(self, cap_db):
+        """The S2 case: every row filtered out, focus line must still render.
+
+        This is the severe form of the bug the get_by_domain switch exists to
+        prevent. With the empty-check ahead of the focus lookup the section
+        returned "no data" and dropped the deficiency line — precisely when the
+        cycle was running to address that deficiency.
+        """
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).isoformat()
+        # Only thin rows (below the sample floor) — the prompt read returns [].
+        for i in range(3):
+            await cap_db.execute(
+                "INSERT INTO capability_map "
+                "(id, domain, confidence, sample_size, trend, evidence_summary, "
+                " updated_at) VALUES (?, ?, ?, 1, 'stable', ?, ?)",
+                (f"thin{i}", f"thin{i}", 0.95, f"thin{i}-evidence", now),
+            )
+        await cap_db.commit()
+
+        builder = GenesisEgoContextBuilder(db=cap_db)
+        builder._focus_id = "thin1"
+        section = await builder._capability_performance_section()
+
+        assert "Focused deficiency — thin1" in section
+        # And the empty state must not claim the table is empty when it is not.
+        assert "No performance data yet" not in section
+
+    async def test_filtered_empty_state_does_not_claim_no_data(self, cap_db):
+        """A fully-filtered table is not the same as an untracked one."""
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).isoformat()
+        await cap_db.execute(
+            "INSERT INTO capability_map "
+            "(id, domain, confidence, sample_size, trend, evidence_summary, "
+            " updated_at) VALUES ('t', 't', 0.9, 1, 'stable', 'e', ?)",
+            (now,),
+        )
+        await cap_db.commit()
+
+        builder = GenesisEgoContextBuilder(db=cap_db)
+        builder._focus_id = None
+        section = await builder._capability_performance_section()
+
+        assert "No qualifying capability rows" in section
+        assert "| t |" not in section
+
+
+class TestAllRenderersUseTheFilteredRead:
+    """All three prompt renderers must read get_prompt_rows, not get_all.
+
+    Pinned because a mutation reverting any single call site left the whole
+    suite green: the switch was unconstrained in two of three places. Each
+    renderer is also checked for an honest empty state — a table full of
+    filtered-out rows is not "no data", and telling the ego it has no track
+    record when the table holds thousands of rows is the exact class of false
+    self-claim this work exists to remove.
+    """
+
+    @pytest.fixture
+    async def thin_db(self):
+        """A table that is FULL but entirely below the sample floor."""
+        from datetime import UTC, datetime
+
+        from genesis.db.schema import TABLES
+
+        async with aiosqlite.connect(":memory:") as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute(TABLES["capability_map"])
+            now = datetime.now(UTC).isoformat()
+            for i in range(50):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.95, 1, 'stable', 'e', ?)",
+                    (f"thin{i}", f"thin{i}", now),
+                )
+            await conn.commit()
+            yield conn
+
+    async def test_genesis_context_does_not_claim_no_data(self, thin_db):
+        builder = GenesisEgoContextBuilder(db=thin_db)
+        builder._focus_id = None
+        out = await builder._capability_performance_section()
+        assert "No qualifying capability rows" in out
+        assert "| thin0 |" not in out
+
+    async def test_user_context_does_not_claim_no_track_record(self, thin_db):
+        from genesis.ego.user_context import UserEgoContextBuilder
+
+        out = await UserEgoContextBuilder(db=thin_db)._capability_performance_section()
+        assert "No performance data yet" not in out
+        assert "No qualifying track record" in out
+
+    async def test_base_context_does_not_tell_the_ego_to_run_aggregation(
+        self, thin_db
+    ):
+        """The old text advised an action that cannot help after the write floor."""
+        from genesis.ego.context import EgoContextBuilder
+
+        out = await EgoContextBuilder(db=thin_db)._self_model_section()
+        assert "run aggregation to populate" not in out
+        assert "No qualifying capability rows" in out
+
+
+class TestRenderStateMatrix:
+    """Every renderer x every result state must render something TRUE.
+
+    Written as a matrix rather than as cases, because the defects this replaces
+    were all the same shape: one cell of the surface was fixed and its siblings
+    were left asserting the old, now-false thing. Enumerating the cells makes an
+    unfixed sibling a test failure instead of a review finding.
+
+    States a prompt read can land in:
+      error     - the query raised
+      empty     - the map genuinely holds nothing
+      filtered  - the map is FULL but every row failed a bar
+      rows      - qualifying rows exist
+    """
+
+    STATES = ("error", "empty", "filtered", "rows")
+
+    @staticmethod
+    async def _make_db(state):
+        from datetime import UTC, datetime
+
+        from genesis.db.schema import TABLES
+
+        conn = await aiosqlite.connect(":memory:")
+        conn.row_factory = aiosqlite.Row
+        await conn.execute(TABLES["capability_map"])
+        now = datetime.now(UTC).isoformat()
+        if state == "filtered":
+            for i in range(40):  # present, but all below the sample floor
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.95, 1, 'stable', 'e', ?)",
+                    (f"t{i}", f"t{i}", now),
+                )
+        elif state == "rows":
+            for i in range(3):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.8, 25, 'stable', 'e', ?)",
+                    (f"r{i}", f"real{i}", now),
+                )
+        await conn.commit()
+        if state == "error":
+            await conn.close()  # every query on it now raises
+        return conn
+
+    async def _render(self, which, state, focus=None):
+        db = await self._make_db(state)
+        try:
+            if which == "genesis":
+                b = GenesisEgoContextBuilder(db=db)
+                b._focus_id = focus
+                return await b._capability_performance_section()
+            if which == "user":
+                from genesis.ego.user_context import UserEgoContextBuilder
+                return await UserEgoContextBuilder(db=db)._capability_performance_section()
+            from genesis.ego.context import EgoContextBuilder
+            return await EgoContextBuilder(db=db)._self_model_section()
+        finally:
+            if state != "error":
+                await db.close()
+
+    # Parametrised over the CROSS PRODUCT of the axes, not each axis in turn.
+    # Enumerating the state axis with `focus` pinned to None covered every state
+    # and still missed the cell that exists only when `entries` is empty AND a
+    # focus row is present — a cell reachable only where two conditions hold at
+    # once. Separate enumerations do not reach the product.
+    @pytest.mark.parametrize("which", ["genesis", "user", "base"])
+    @pytest.mark.parametrize("state", STATES)
+    @pytest.mark.parametrize("focus", [None, "t0"])
+    async def test_cell_renders_a_true_claim(self, which, state, focus):
+        out = await self._render(which, state, focus=focus)
+        assert out.strip(), f"{which}/{state} rendered nothing"
+
+        if state == "error":
+            assert "query error" in out, f"{which}: a failure must not read as data"
+        elif state == "empty":
+            assert "map is empty" in out, f"{which}: genuinely-empty must say so"
+            assert "present;" not in out, (
+                f"{which}: must not imply rows were withheld when none exist"
+            )
+        elif state == "filtered":
+            # Must NOT claim emptiness, and must say how many rows are really
+            # there — including when a focus row is also being rendered, which
+            # is the cell that previously went silent.
+            assert "map is empty" not in out, (
+                f"{which}: 40 rows present — claiming empty is false"
+            )
+            assert "40 " in out, (
+                f"{which}/focus={focus}: should name the real row count"
+            )
+        else:
+            assert "real0" in out, f"{which}: qualifying rows must render"
+
+    @pytest.mark.parametrize("state", STATES)
+    async def test_light_depth_never_states_a_whole_map_figure(self, state):
+        """The light branch renders no table, so its numbers must be qualified."""
+        from genesis.ego.user_context import UserEgoContextBuilder
+
+        db = await self._make_db(state)
+        try:
+            out = await UserEgoContextBuilder(db=db)._capability_performance_section(
+                depth="light"
+            )
+        finally:
+            if state != "error":
+                await db.close()
+        assert "domains tracked" not in out, (
+            "unqualified whole-map phrasing reintroduced"
+        )
+        if state == "rows":
+            assert "qualifying evidence" in out
+
+
+class TestCountFailureDoesNotAbortTheCycle:
+    """The count on the failure branch must not itself be able to fail loudly.
+
+    All three renderers wrap the main read in try/except and degrade to one
+    italic line. The row count added alongside it runs on that same degraded
+    branch — and nothing between a context section and `assemble_context`
+    catches per-section exceptions, so an unguarded second query turns a
+    graceful degradation into an aborted ego cycle.
+
+    A whole-DB failure fixture cannot reach this: it makes the FIRST read raise,
+    so the count is never called. The failure has to be per-call.
+    """
+
+    class _FailSecondRead:
+        """Wraps a connection; the Nth execute onward raises."""
+
+        def __init__(self, conn, fail_from=2):
+            self._conn = conn
+            self._calls = 0
+            self._fail_from = fail_from
+
+        async def execute(self, *a, **k):
+            self._calls += 1
+            if self._calls >= self._fail_from:
+                raise aiosqlite.OperationalError("database is locked")
+            return await self._conn.execute(*a, **k)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    @pytest.fixture
+    async def thin_db(self):
+        from datetime import UTC, datetime
+
+        from genesis.db.schema import TABLES
+
+        async with aiosqlite.connect(":memory:") as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute(TABLES["capability_map"])
+            now = datetime.now(UTC).isoformat()
+            for i in range(5):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.95, 1, 'stable', 'e', ?)",
+                    (f"thin{i}", f"thin{i}", now),
+                )
+            await conn.commit()
+            yield conn
+
+    async def test_genesis_section_survives_a_failing_count(self, thin_db):
+        wrapped = self._FailSecondRead(thin_db)
+        b = GenesisEgoContextBuilder(db=wrapped)
+        b._focus_id = None
+        out = await b._capability_performance_section()  # must not raise
+        assert "count unavailable" in out
+
+    async def test_user_section_survives_a_failing_count(self, thin_db):
+        from genesis.ego.user_context import UserEgoContextBuilder
+
+        wrapped = self._FailSecondRead(thin_db)
+        out = await UserEgoContextBuilder(db=wrapped)._capability_performance_section()
+        assert "count unavailable" in out
+
+    async def test_base_section_survives_a_failing_count(self, thin_db):
+        from genesis.ego.context import EgoContextBuilder
+
+        wrapped = self._FailSecondRead(thin_db)
+        out = await EgoContextBuilder(db=wrapped)._self_model_section()
+        assert "count unavailable" in out

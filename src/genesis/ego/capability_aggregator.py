@@ -5,6 +5,10 @@ memory, and CC sessions to compute per-domain confidence scores. An optional
 6th source — Outcome Bus tier-1 execution ground truth (``source='surplus'``) —
 is folded in only when the ``outcome_bus_capability_feed`` ego flag is enabled
 (default OFF, the LC3-B go-live gate).
+
+Domains below ``MIN_SAMPLE_SIZE`` combined samples are not emitted: the map is
+rendered into ego prompts confidence-first, so a one-sample domain would present
+itself as a peer of one backed by dozens.
 """
 
 from __future__ import annotations
@@ -12,6 +16,8 @@ from __future__ import annotations
 import logging
 
 import aiosqlite
+
+from genesis.db.crud.capability_map import MIN_SAMPLE_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +30,9 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
     6th source (Outcome Bus tier-1 ground truth) is gated behind the
     ``outcome_bus_capability_feed`` ego flag (default OFF); while disabled the
     output is identical to the original 5-source computation.
+
+    A domain is emitted only once its COMBINED evidence reaches
+    :data:`MIN_SAMPLE_SIZE`; below that it is noise rather than a capability.
     """
     domains: dict[str, _DomainAccumulator] = {}
 
@@ -221,7 +230,13 @@ class _DomainAccumulator:
             return None
 
         total_weight = sum(n for _, _, n in self.signals)
-        if total_weight == 0:
+        # Too little evidence to be a domain. Applied to the COMBINED weight,
+        # so thin evidence spread across sources still counts and no single
+        # source can be used to slip under the floor. Subsumes the old ``== 0``
+        # guard. The threshold is shared with the read side (one definition, in
+        # the CRUD module) — if the two drifted apart, reads would either hide
+        # rows the aggregator still writes or surface rows it refuses to.
+        if total_weight < MIN_SAMPLE_SIZE:
             return None
 
         # Inverse confidence weighting (Verified Autonomy L1): surfaces the

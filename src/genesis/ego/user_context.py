@@ -1453,8 +1453,9 @@ class UserEgoContextBuilder:
 
         try:
             from genesis.db.crud import capability_map as cap_crud
+            from genesis.ego import _capability_render as _cap_render
 
-            entries = await cap_crud.get_all(self._db)
+            entries = await cap_crud.get_prompt_rows(self._db)
         except Exception:
             logger.warning("Failed to query capability performance", exc_info=True)
             lines.append(
@@ -1463,14 +1464,34 @@ class UserEgoContextBuilder:
             return "\n".join(lines)
 
         if not entries:
-            lines.append("*No performance data yet.*\n")
+            # Two DIFFERENT states reach here and must not produce the same
+            # sentence: a genuinely empty map, and a full map whose every row
+            # failed a bar. Each message is a false claim in the other's
+            # situation, so the count decides which is rendered.
+            total = await _cap_render.safe_count(self._db)
+            lines.append(_cap_render.empty_state_note(
+                total,
+                empty="*No track record yet — the map is empty.*\n",
+                filtered="*No qualifying track record ({total} domains present; "
+                         "stale or thin rows are not shown).*\n",
+                unknown="*No qualifying track record (count unavailable — "
+                        "see logs).*\n",
+            ))
             return "\n".join(lines)
 
         if depth == "light":
+            # Both figures are computed over the QUALIFYING subset, not the whole
+            # map — this branch renders no table, so an unqualified "N domains
+            # tracked (avg X%)" would state a filtered statistic as a
+            # whole-map fact. Measured on a live install that read "31 domains
+            # tracked (avg 94%)" over a 627-domain map averaging 6%.
             avg_conf = sum(e.get("confidence", 0) for e in entries) / len(entries)
+            _plural = "domain" if len(entries) == 1 else "domains"
             return (
                 f"## Your Track Record\n"
-                f"{len(entries)} domains tracked (avg confidence: {avg_conf:.0%}).\n"
+                f"{len(entries)} {_plural} with current, qualifying evidence "
+                f"(avg confidence: {avg_conf:.0%}); stale and thin rows are not "
+                f"counted.\n"
             )
 
         _TREND_ICONS = {"improving": "+", "declining": "-", "stable": "="}

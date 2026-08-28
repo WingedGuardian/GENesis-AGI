@@ -442,13 +442,32 @@ class EgoContextBuilder:
 
         try:
             from genesis.db.crud import capability_map as cap_crud
-            entries = await cap_crud.get_all(self._db)
+            from genesis.ego import _capability_render as _cap_render
+            entries = await cap_crud.get_prompt_rows(self._db)
         except Exception:
-            lines.append("*No capability data available yet.*\n")
+            # Distinguish a FAILURE from an empty map, and log it — rendering a
+            # query error as "no data yet" hides the error from both the ego and
+            # the operator.
+            logger.warning("Failed to query capability map", exc_info=True)
+            lines.append(
+                "*Capability data unavailable (query error — see logs).*\n"
+            )
             return "\n".join(lines)
 
         if not entries:
-            lines.append("*Capability map is empty — run aggregation to populate.*\n")
+            # Two DIFFERENT states reach here and must not produce the same
+            # sentence: a genuinely empty map, and a full map whose every row
+            # failed a bar. Each message is a false claim in the other's
+            # situation, so the count decides which is rendered.
+            total = await _cap_render.safe_count(self._db)
+            lines.append(_cap_render.empty_state_note(
+                total,
+                empty="*No capability data yet — the map is empty.*\n",
+                filtered="*No qualifying capability rows ({total} present; "
+                         "stale or thin rows are not shown).*\n",
+                unknown="*No qualifying capability rows (count unavailable — "
+                        "see logs).*\n",
+            ))
             return "\n".join(lines)
 
         lines.append("| Domain | Confidence | Trend | Evidence |")

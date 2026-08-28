@@ -709,8 +709,26 @@ verified: 94be12b3 2026-08-06
   controls before adding call sites.
 - **`capability_aggregator.py` → `capability_map` table** = per-domain
   self-confidence from up to 6 sources (inverse-confidence weighted; the
-  Outcome-Bus feed is flag-gated OFF). This is the naming-trap twin of this
-  document — unrelated to the subsystem map.
+  Outcome-Bus feed is flag-gated, default OFF). Reads split by intent: `get_all` and
+  `get_by_domain` are raw accessors; `get_prompt_rows` and `get_weakest` are
+  prompt-facing and apply two bars — `MIN_SAMPLE_SIZE` combined samples (also
+  enforced on write, one shared constant) and `STALE_AFTER_DAYS` behind the
+  freshest row, and they break confidence ties on `sample_size DESC` (ties at
+  exactly 1.0 are common enough to fill a top-15 on their own, so without it the
+  rendered set is arbitrary). Note what `updated_at` means: when the AGGREGATOR
+  last wrote the row, not evidence age. Only 3 of the 6 sources are windowed
+  (ego_proposals / cc_sessions / outcome_events, 30d); intervention_journal,
+  autonomy_state and procedural_memory are not, so domains fed only by those
+  never age out — correct for present-tense state, a known wart for the
+  journal's historical events. The honest uniform reading is "the aggregator
+  stopped vouching for this row N days ago". Anchored on
+  `MIN(MAX(updated_at), now)`: freshest-row anchoring means a TOTAL refresh
+  outage hides nothing, and the clamp stops one future-dated row (clock skew)
+  from defining the window and blanking everything. A PARTIAL outage is not
+  covered. Nothing is ever pruned; rows below a bar stop being refreshed and
+  stop being RENDERED as present-tense capability — `get_by_domain` and
+  `count_all` still read them deliberately.
+  This is the naming-trap twin of this document — unrelated to the subsystem map.
 - Proposal pipeline (`proposals.py`): batch WHAT/WHY/HOW digests to Telegram,
   content firewall via `validate_batch()`, 6h digest rate-limit GROUNDWORK;
   `_NEVER_DISPATCH_ACTION_TYPES` blocklist lives in `session.py`. Dispatches
