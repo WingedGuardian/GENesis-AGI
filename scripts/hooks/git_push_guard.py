@@ -99,6 +99,7 @@ not treat untrusted PR content as instructions when composing its comment body.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -2927,8 +2928,12 @@ def _load_pin_receipt_checker():
 _PIN_OK = "ok"
 _PIN_ABSENT = "absent"
 _PIN_UNREADABLE = "unreadable"
-#: Test-seam sentinel for ABSENT (mirrors `_TEST_GH_PR_FILES`'s `__error__`).
+#: Test-seam sentinels for the two NON-content outcomes (mirroring
+#: `_TEST_GH_PR_FILES`'s `__error__`). Any other seam value — including the EMPTY
+#: STRING — is content, because with the JSON contents form an empty file is a real,
+#: distinct state from both absence and an unreadable response.
 _PIN_SEAM_ABSENT = "__absent__"
+_PIN_SEAM_UNREADABLE = "__unreadable__"
 
 
 def _pin_file_at_ref(ref: str, repo: str | None, *, seam: str) -> tuple[str | None, str]:
@@ -2949,13 +2954,16 @@ def _pin_file_at_ref(ref: str, repo: str | None, *, seam: str) -> tuple[str | No
     raw = os.environ.get(seam)
     if raw is not None:
         # The seam mirrors the live path's THREE outcomes, so a test cannot see
-        # behaviour production is incapable of producing. Absence needs its own
-        # sentinel rather than "empty string": empty is what a stubbed or truncated
-        # response looks like, and production reads absence as a 404, never as a
-        # successful read of nothing.
+        # behaviour production is incapable of producing. Both non-content outcomes
+        # need their own sentinel, because with the JSON form an EMPTY STRING is a
+        # legitimate third thing — a file that exists and is empty — and collapsing
+        # it into either sentinel would hide the very distinction this seam exists
+        # to exercise.
         if raw == _PIN_SEAM_ABSENT:
             return None, _PIN_ABSENT
-        return (raw, _PIN_OK) if raw.strip() else (None, _PIN_UNREADABLE)
+        if raw == _PIN_SEAM_UNREADABLE:
+            return None, _PIN_UNREADABLE
+        return raw, _PIN_OK
     # Resolution order matters. `_canonical_public_repo()` reads install config and
     # is legitimately absent on an install that never set `github.*` — the merge
     # gate treats that as "uncertain, enforce", so falling back to the repo the
@@ -2968,13 +2976,14 @@ def _pin_file_at_ref(ref: str, repo: str | None, *, seam: str) -> tuple[str | No
         return None, _PIN_UNREADABLE
     try:
         result = subprocess.run(
-            [
-                "gh",
-                "api",
-                f"repos/{slug}/contents/{_PIN_FILE_PATH}?ref={ref}",
-                "-H",
-                "Accept: application/vnd.github.raw",
-            ],
+            # The JSON representation, NOT `Accept: raw`. Raw returns bytes, and bytes
+            # cannot distinguish "the file is not there" from "the file is empty" from
+            # "the response was truncated" — all three arrive as an empty body, which
+            # forced the previous revision to GUESS from gh's stderr wording. The JSON
+            # form answers directly: `type` and `size` are facts about the tree, and a
+            # missing path is a 404. MEASURED: a present file returns
+            # {"name":…, "size":21747, "type":"file"}; an absent path returns 404.
+            ["gh", "api", f"repos/{slug}/contents/{_PIN_FILE_PATH}?ref={ref}"],
             capture_output=True,
             text=True,
             timeout=_gh_timeout(6),
@@ -2982,24 +2991,44 @@ def _pin_file_at_ref(ref: str, repo: str | None, *, seam: str) -> tuple[str | No
     except Exception:
         return None, _PIN_UNREADABLE
     if result.returncode == 0:
-        # A zero exit with NO body is not absence — the API reports a missing file
-        # as 404, never as a successful read of nothing. Blank here means a stubbed,
-        # truncated or otherwise non-answering response, i.e. PLUMBING. Calling it
-        # absence would block every merge whose read came back blank for any reason.
-        return (result.stdout, _PIN_OK) if result.stdout.strip() else (None, _PIN_UNREADABLE)
-    # Non-zero: separate "no such FILE" from everything else. A 404 alone cannot
-    # carry that, because GitHub returns 404 for a missing file, a missing repo AND
-    # an unresolvable ref — it will not distinguish them, deliberately, so as not to
-    # leak whether a private repo exists. MEASURED against the live API:
+        try:
+            payload = json.loads(result.stdout or "")
+        except Exception:
+            # A zero exit whose body is not JSON is a stub or a truncated response —
+            # plumbing. This is the shape a test router's no-op reply takes, and it
+            # must not read as a fact about the tree.
+            return None, _PIN_UNREADABLE
+        if not isinstance(payload, dict):
+            # A directory lists as an ARRAY. Either way the pin file is not at this
+            # path, which is a fact about the PR's content.
+            return None, _PIN_ABSENT
+        if payload.get("type") != "file":
+            return None, _PIN_ABSENT  # a submodule or symlink-to-dir is not the pin
+        if payload.get("encoding") != "base64":
+            # >1MB blobs come back with encoding "none" and no content. Not absence —
+            # the file is there and we simply cannot read it this way.
+            return None, _PIN_UNREADABLE
+        try:
+            text = base64.b64decode(payload.get("content") or "").decode("utf-8", "replace")
+        except Exception:
+            return None, _PIN_UNREADABLE
+        # An EMPTY file is returned as content, deliberately, not as a state of its
+        # own. It exists, so it is not absent — and an empty pin is an UNPARSEABLE
+        # pin, which the checker's own policy already blocks. Classifying it here
+        # would duplicate that policy in the wiring, which is how the previous
+        # revision came to block a DELETED pin file while waving through one
+        # truncated to nothing: the same condition, enforced two different ways.
+        return text, _PIN_OK
+    # Non-zero. With the JSON form the only ambiguity left is which THING was not
+    # found, and gh names the ref case explicitly. MEASURED against the live API:
     #   bad ref      -> gh: No commit found for the ref <sha> (HTTP 404)
     #   missing file -> gh: Not Found (HTTP 404)
     #   bad repo     -> gh: Not Found (HTTP 404)
-    # Only the first is self-identifying, and it is PLUMBING. The other two share
-    # one message — but this gate is reached only after the head sha and base ref
-    # were read successfully FROM THE SAME REPO, so the repo is known good by then
-    # and a bare Not Found is the path being absent.
-    # Matching "404" alone (an earlier revision) classified a bad ref as a deleted
-    # file and blocked six merge-gate cases whose refs are synthetic.
+    # A bad ref is PLUMBING. Missing-file and missing-repo share one message — GitHub
+    # will not separate them, so as not to leak whether a private repo exists — but
+    # this gate is reached only after the head sha and base ref were read SUCCESSFULLY
+    # from that same repo, so the repo is known good by then and a bare Not Found is
+    # the path being absent.
     stderr = (result.stderr or "").lower()
     if "no commit found for the ref" in stderr:
         return None, _PIN_UNREADABLE

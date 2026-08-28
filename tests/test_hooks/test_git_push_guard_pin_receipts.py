@@ -160,26 +160,44 @@ def test_an_unreadable_body_does_not_wall_off_the_merge(monkeypatch):
     assert "NOT verified" in msg
 
 
-@pytest.mark.parametrize("blank", ["", "   \n"])
-def test_a_BLANK_pin_read_is_plumbing_and_must_not_block(monkeypatch, blank):
-    """MEASURED regression: this walled off 50 merge-gate cases at once.
+def test_an_unreadable_pin_read_is_plumbing_and_must_not_block(monkeypatch):
+    """MEASURED regression: this once walled off 50 merge-gate cases at once.
 
-    A zero exit with no body means the read did not produce the file — a wrong
-    ref, a path absent there, a stubbed response. Feeding that to the checker
-    made it an unparseable pin, which BLOCKS by design, so the gate blocked every
-    merge whenever a read came back blank. A real cc_version.sh is never empty,
-    so blank is plumbing and plumbing must not block.
+    A read that produces no usable answer — a stub, a truncated body, a transport
+    failure — is PLUMBING, and plumbing must not block: a gate that refuses every
+    merge whenever a read comes back unusable is worse than the one thing it guards.
     """
     monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
     monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
     monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", PIN_BASE)
-    monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", blank)
+    monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", _mod._PIN_SEAM_UNREADABLE)
     monkeypatch.setenv("_TEST_GH_PR_BODY", "")
 
     blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
 
-    assert blocked is False, "a blank read must not wall off the merge"
+    assert blocked is False, "an unusable read must not wall off the merge"
     assert "NOT verified" in msg
+
+
+@pytest.mark.parametrize("emptied", ["", "   \n"])
+def test_a_pin_file_TRUNCATED_to_nothing_is_content_and_BLOCKS(monkeypatch, emptied):
+    """The counterpart, and the distinction the JSON contents form buys.
+
+    An empty file is not an empty READ. It exists, so it is not absent; and an empty
+    pin is an UNPARSEABLE pin, which the checker's own policy blocks. Deciding that
+    here would duplicate the policy in the wiring — which is exactly how an earlier
+    revision came to block a DELETED pin file while waving through one truncated to
+    nothing. Same condition, two enforcements, one of them a fail-open.
+    """
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+    monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", PIN_BASE)
+    monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", emptied)
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "")
+
+    blocked, _ = _mod._check_pin_receipts("999", repo="owner/repo")
+
+    assert blocked is True, "an emptied pin file must block, like a deleted one"
 
 
 def test_an_empty_body_is_a_content_fact_not_a_plumbing_failure(gate):
