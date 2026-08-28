@@ -586,126 +586,26 @@ def _argv(seg: str) -> list[str]:
         return core.split()
 
 
-def strip_heredoc_bodies(command: str) -> str:
-    """Remove here-document BODIES (stdin data), keeping every EXECUTED line intact.
+def untokenizable(command: str) -> bool:
+    """True when ``shlex`` cannot cleanly tokenize the command.
 
-    A here-doc body is stdin DATA, never executed argv, so it must not influence
-    tokenizability or gate decisions. But the line OPENING a here-doc still carries
-    executed code after ``<<WORD`` — ``cat <<EOF && git push`` RUNS the push — so
-    that line is KEPT; only the body lines that follow, up to and including the
-    closing delimiter line, are dropped.
+    This is the blind-spot signal a guard consults when it is about to conclude
+    "no gated segment found". ``_argv`` degrades to a naive split on the SAME
+    ``ValueError`` silently, so ``analyze()`` can never self-report that its
+    result is untrustworthy — an ANSI-C ``$'…\'…'`` span, or merely an
+    apostrophe inside a here-doc body, is enough to shift segmentation off and
+    drop a real, executing command from the parse.
 
-    QUOTE/COMMENT-AWARE and biased to UNDER-strip. A ``<<WORD`` is honored as a real
-    opener ONLY at genuine top level — NOT inside a ``'…'`` / ``"…"`` / ``$'…'`` span
-    or a ``#`` comment (quote state is tracked as the scan advances, across lines).
-    This is the load-bearing SECURITY property: a quote-BLIND stripper is forgeable —
-    prepend ``echo "x <<EOF"`` (a quoted non-opener) and append ``EOF`` and it deletes
-    the executed line between them (a fail-OPEN bypass, CVE-shaped). The failure
-    direction here is fail-CLOSED: when the scan is uncertain it does NOT honor the
-    opener → the body stays → the command reads as LESS tokenizable → the caller
-    over-blocks, never under-blocks. ``$'…'`` is modeled as a single-quote span
-    (shell_parse's existing ANSI-C approximation); the only way to desync this scan
-    from bash is the very ``\\'`` construct that ALSO makes shlex raise, so an
-    over-strip it causes stays un-tokenizable and is still caught. Handles ``<<-``,
-    quoted delimiters, ``<<<`` here-strings (never a here-doc), and a missing closer
-    (body to EOF). NOT a full bash parser — a conservative body remover whose only
-    consumer is the tokenizability probe.
+    Deliberately reads the WHOLE raw command, with no here-doc normalization.
+    An earlier version stripped here-doc bodies first to suppress prompts on
+    multi-line scripts; that MEASURABLY disarmed the signal on an ordinary shape
+    (a quoted here-doc whose body contains an apostrophe, followed by a real
+    gated git command — bash runs it, the stripped text tokenizes cleanly, and
+    the guard fell silent). Normalizing the text before the probe can only ever
+    delete the evidence the probe exists to find, so it does not happen here.
     """
-    n = len(command)
-    out: list[str] = []
-    i = 0
-    quote: str | None = None  # "'" / '"' ; an ANSI-C $'…' is modeled as "'"
-    while i < n:
-        c = command[i]
-        if quote is not None:
-            out.append(c)
-            if quote == '"' and c == "\\" and i + 1 < n:  # \\ escapes inside "…" only
-                out.append(command[i + 1])
-                i += 2
-                continue
-            if c == quote:
-                quote = None
-            i += 1
-            continue
-        if c == "#" and (not out or out[-1] in " \t\n"):
-            # a `#` at a word boundary opens a comment to EOL — its `<<WORD` is data
-            while i < n and command[i] != "\n":
-                out.append(command[i])
-                i += 1
-            continue
-        if c in ("'", '"'):
-            quote = c
-            out.append(c)
-            i += 1
-            continue
-        if c == "$" and i + 1 < n and command[i + 1] == "'":
-            quote = "'"  # ANSI-C $'…' — a single-quote span (conservative)
-            out.append("$'")
-            i += 2
-            continue
-        if command[i : i + 3] == "<<<":
-            # here-STRING operator (a single-line word, no body) — consume all
-            # three `<` so the `<<` here-doc branch cannot re-fire on chars 2-3.
-            out.append("<<<")
-            i += 3
-            continue
-        if command[i : i + 2] == "<<":
-            j = i + 2
-            if j < n and command[j] == "-":
-                j += 1
-            while j < n and command[j] in " \t":
-                j += 1
-            dq = None
-            if j < n and command[j] in ("'", '"'):
-                dq = command[j]
-                j += 1
-            k = j
-            while k < n and (command[k].isalnum() or command[k] == "_"):
-                k += 1
-            word = command[j:k]
-            if word:
-                out.append(command[i:k])  # keep the `<<[-]['"]WORD` opener text
-                if dq and k < n and command[k] == dq:
-                    out.append(command[k])
-                    k += 1
-                i = k
-                # keep the rest of the opener line (its executed trailer, verbatim —
-                # not re-scanned: a trailer's own quote/opener left unstripped only
-                # UNDER-strips → safe)
-                while i < n and command[i] != "\n":
-                    out.append(command[i])
-                    i += 1
-                if i < n:
-                    out.append("\n")
-                    i += 1
-                # drop body lines up to and INCLUDING the closing delimiter line
-                while i < n:
-                    le = command.find("\n", i)
-                    le = n if le == -1 else le
-                    if command[i:le].strip() == word:
-                        i = le + 1 if le < n else n
-                        break
-                    i = le + 1 if le < n else n
-                continue
-        out.append(c)
-        i += 1
-    return "".join(out)
-
-
-def untokenizable(command: str, *, strip_heredocs: bool = False) -> bool:
-    """True when ``shlex`` cannot cleanly tokenize the command — the blind-spot
-    signal a security guard fails CLOSED on.
-
-    ``_argv`` degrades to a naive split on this same ``ValueError`` SILENTLY, so
-    ``analyze()`` alone can never surface a genuine blind spot (e.g. an ANSI-C
-    ``$'…\\'…'`` whose escaped quote mis-closes a ``$()`` and swallows a trailing
-    ``&& git push``). With ``strip_heredocs=True`` the check first drops here-doc
-    BODIES (legit multi-line data shlex can't parse but which carries no executed
-    command), so only an executed-code blind spot trips it.
-    """
-    text = strip_heredoc_bodies(command) if strip_heredocs else command
     try:
-        shlex.split(text.replace("\\\n", " "))
+        shlex.split(command.replace("\\\n", " "))
         return False
     except ValueError:
         return True

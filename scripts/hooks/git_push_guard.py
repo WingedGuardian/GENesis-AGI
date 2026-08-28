@@ -137,17 +137,19 @@ from shell_parse import (  # noqa: E402
     git_subcommand,
     has_trailing_override,
     split_segments,
-    strip_heredoc_bodies,
     untokenizable,
 )
 
-# Literal danger-flags that mark a HARD-blocked op (force push, hook bypass,
-# admin-merge to public main). Consulted ONLY on the un-tokenizable path, where
-# analyze() has gone blind — a closed-set literal claim, so a flag this list does
-# not name simply degrades to the status-quo (the net only ADDS a block, never
-# flips one to allow). Long forms only: `-f`/`-n` short forms are too noisy to
-# match on a raw string and are left to the (tracked) hardening follow-up.
-_FORCE_NV_ADMIN = re.compile(r"(?:^|\s)(?:--force(?:-with-lease)?|--no-verify|--admin)(?:\s|=|$)")
+# Mentions of a GATED operation, consulted ONLY on the un-parseable path where
+# analyze() has gone blind. Deliberately BROAD — both the gated verbs and the
+# destructive flags — because the outcome there is an approval PROMPT, not a
+# block: an over-match costs one confirmation, while an under-match silently
+# runs an unverified publish. (An earlier flag-only, hard-block version had to be
+# surgically precise, and precision is exactly what an unreliable parse cannot
+# deliver — every narrowing conjunct became a new way to starve the trigger.)
+_GATED_MENTION = re.compile(
+    r"(?:^|\s)(?:--force(?:-with-lease)?|--no-verify|--admin)(?:\s|=|$)|\b(?:push|merge)\b"
+)
 
 # Local push allowlist (offline re-push cache). SOFT dependency, guarded exactly
 # like the review_state import above: a module-LOAD exception must degrade to
@@ -3775,40 +3777,53 @@ def main() -> int:
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
 
-        # ── Fail-closed blind-spot net ─────────────────────────────
-        # analyze()/_argv degrade to a naive split SILENTLY on a command shlex
-        # can't tokenize (e.g. an ANSI-C `$'…\'…'` whose escaped quote mis-closes
-        # a `$()` and swallows a trailing `&& git push --force` into a redirect
-        # target — a live bypass). Fire on the DISCREPANCY: the raw text names a
-        # hard-blocked flag, the command is un-tokenizable (so the parse cannot be
-        # trusted), and yet analyze() surfaced NO gated segment to gate. That
-        # three-way conjunction is what makes this precise — requiring the missing
-        # segment lets every command analyze() DID parse (a legit `--force` push, a
-        # `$'…'` message, an apostrophe in a trailing `#` comment) flow to the real
-        # gates below instead of being refused here. Mirrors protected_paths_guard's
-        # tokenizability probe; here-doc bodies are stripped first (data, not argv).
-        if not (push_segs or merge_pr_segs or merge_git_segs):
-            _stripped = strip_heredoc_bodies(cmd)
-            # The flag search runs on the ORIGINAL text (OR the stripped one), never
-            # on the stripped text ALONE: an ANSI-C desync can land a `<<WORD` inside
-            # the falsely-unquoted window, and the stripper then deletes the very
-            # lines carrying `--force` — starving the match and silently standing the
-            # net down (a reproduced fail-OPEN). Stripping may only ever REMOVE the
-            # evidence this net keys on, so it must not be the sole source of it;
-            # here-doc bodies remain stripped for the TOKENIZABILITY probe, which is
-            # where they earn their keep (a legit heredoc must not read as a blind spot).
-            if untokenizable(_stripped) and (
-                _FORCE_NV_ADMIN.search(cmd) or _FORCE_NV_ADMIN.search(_stripped)
-            ):
+        # ── Blind-spot net: unverifiable near a gated op → ask a human ──────
+        # analyze()/_argv degrade to a naive split SILENTLY, so an empty segment
+        # list is NOT evidence that no gated command is present: an ANSI-C
+        # `$'…\'…'` span, or an apostrophe in a here-doc body, is enough to drop
+        # a real, executing `git push --force` from the parse (reproduced on both
+        # guards). When the raw text names a gated op, the command will not
+        # tokenize, and the parse surfaced NO matching segment, the verdict is
+        # "unknown" — which earns a human decision, not a silent allow.
+        #
+        # ASK rather than BLOCK is load-bearing. A refusal has to be surgically
+        # precise about which unparseable commands are real, and precision is
+        # exactly what an unreliable parse cannot deliver — every narrowing
+        # conjunct became a new way to starve the trigger, while over-blocking
+        # broke benign shapes. Asking inverts the costs: a false positive is one
+        # confirmation, a miss is the pre-existing status quo. That is what lets
+        # the predicate stay broad.
+        #
+        # The reason is DEFERRED to the tail (like ask_reason / push_allow_reason
+        # above) so every hard block below — sqlite writes, --no-verify, the
+        # dispatched publish denies, the escalation cap — still takes precedence.
+        # Returning here would DOWNGRADE those to a prompt (measured).
+        blind_spot_reason: str | None = None
+        if (
+            not (push_segs or merge_pr_segs or merge_git_segs)
+            and untokenizable(cmd)
+            and _GATED_MENTION.search(cmd)
+        ):
+            if _is_dispatched():
+                # No human is present to answer a prompt, and an unverifiable
+                # gated command must not proceed unattended. Mirrors the
+                # dispatched deny legs on the push / pr-create asks below.
                 print(
-                    "BLOCKED: this command is not safely tokenizable (e.g. ANSI-C "
-                    "$'...' quoting) yet names a hard-blocked flag "
-                    "(--force/--no-verify/--admin) the guard cannot verify. Rewrite "
-                    "it in a simple, directly-parseable form (plain single/double "
-                    "quotes, or a -F <file>) and re-run.",
+                    "BLOCKED: this command cannot be parsed safely (e.g. "
+                    "ANSI-C $'...' quoting) and names a gated operation. "
+                    "Autonomous sessions cannot proceed on an unverifiable "
+                    "command — rewrite it in a directly-parseable form.",
                     file=sys.stderr,
                 )
                 return 2
+            blind_spot_reason = (
+                "This command could not be parsed safely (e.g. ANSI-C $'...' "
+                "quoting) and mentions a gated operation (push / merge / "
+                "--force / --no-verify / --admin), so the guard cannot verify "
+                "what it would actually run. Approve only if you are sure. To "
+                "avoid the prompt, rewrite it in a directly-parseable form "
+                "(plain quotes, or -F <file>)."
+            )
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
         # command carrying more than one would collapse into ONE ask/gate
@@ -4445,6 +4460,8 @@ def main() -> int:
         # Reached only if no hard-block above returned. Dispatched sessions
         # were already denied inline; here, an interactive human session gets a
         # native approve/deny dialog for its push / PR-create.
+        if ask_reason is None and blind_spot_reason is not None:
+            ask_reason = blind_spot_reason
         if ask_reason is not None:
             return _ask(ask_reason)
 

@@ -190,8 +190,8 @@ def main() -> int:
 
     # Explicit tokenizability probe (shared with the push/commit guards):
     # shell_parse._argv silently degrades to a naive split on shlex errors, so
-    # analyze() alone can never signal one. strip_heredocs=False preserves this
-    # guard's exact prior behavior (it never stripped here-docs).
+    # analyze() alone can never signal one. Byte-equivalent to the inline probe
+    # this replaced (whole-command shlex, line-continuations folded).
     if untokenizable(cmd):
         reason = _legacy_substring_block(cmd, dirs)
         return _block(reason) if reason else 0

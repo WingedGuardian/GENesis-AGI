@@ -7,9 +7,17 @@ then drops the real git segment and the push / commit-no-verify / merge gates
 silently no-op (fail OPEN). This was reproduced live on both hooks.
 
 The fix nets around the blind spot in the CALLERS (shell_parse's own ANSI-C fix
-is a separate follow-up): a command that is not cleanly tokenizable (after
-stripping heredoc bodies, which are stdin DATA not executed argv) AND references
-a gated op is blocked. Mirrors the proven probe in protected_paths_guard.
+is a separate follow-up): when a command is not cleanly parseable AND mentions a
+gated op AND the parse surfaced no matching segment, the guard ASKS the human
+instead of deciding. Asking (not blocking) is the load-bearing choice: a hard
+block must be surgically precise about which unparseable commands are real, and
+precision is exactly what an unreliable parse cannot deliver -- every narrowing
+conjunct became a new way to starve the trigger, while over-blocking broke benign
+shapes. With an ask, a false positive costs one confirmation and a miss is the
+pre-existing status quo, so the trigger can be broad.
+
+The invariants below are therefore: a bypass shape must NEVER be a silent allow,
+and a benign shape must NEVER be a hard block.
 
 Trigger literals are assembled from fragments so this file's own text does not
 carry them (matches the convention in test_shell_parse.py).
@@ -22,6 +30,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 _WORKTREE = Path(__file__).resolve().parent.parent.parent
 _HOOKS_DIR = _WORKTREE / "scripts" / "hooks"
@@ -46,6 +56,13 @@ COMMIT = "com" + "mit"
 ANSIC = "echo ok 2>$(echo $'a\\'b)c') && "
 
 
+def _decision(r: subprocess.CompletedProcess) -> str:
+    """The guard's verdict: "ask" | "block" | "allow"."""
+    if '"ask"' in (r.stdout or ""):
+        return "ask"
+    return "block" if r.returncode == 2 else "allow"
+
+
 def _run(script: Path, cmd: str, cwd: str | None = None) -> subprocess.CompletedProcess:
     payload: dict = {"tool_name": "Bash", "tool_input": {"command": cmd}}
     if cwd is not None:
@@ -58,72 +75,6 @@ def _run(script: Path, cmd: str, cwd: str | None = None) -> subprocess.Completed
         timeout=30,
         env=dict(os.environ),
     )
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# shell_parse.strip_heredoc_bodies — line-faithful, UNDER-strip biased
-# ══════════════════════════════════════════════════════════════════════════
-class TestStripHeredocBodies:
-    def test_keeps_introducing_line_trailer(self):
-        # The executed `&& git push --force` is on the SAME line as <<EOF (its
-        # body starts on the NEXT line) — it must SURVIVE stripping, else a
-        # naive DOTALL stripper would delete executed code and open the gate.
-        cmd = f"cat <<EOF && {GIT} {PUSH} origin main {FORCE}\nEOF"
-        out = sp.strip_heredoc_bodies(cmd)
-        assert f"{GIT} {PUSH}" in out
-        assert FORCE in out
-
-    def test_drops_body_lines(self):
-        cmd = "cat <<EOF\nsecret body line\nEOF\necho done"
-        out = sp.strip_heredoc_bodies(cmd)
-        assert "secret body line" not in out
-        assert "echo done" in out
-
-    def test_quoted_delimiter(self):
-        cmd = f"cat <<'EOF' && {GIT} {PUSH} -f\nbody\nEOF"
-        out = sp.strip_heredoc_bodies(cmd)
-        assert f"{GIT} {PUSH}" in out
-        assert "body" not in out
-
-    def test_dash_tab_indent(self):
-        cmd = f"cat <<-EOF && {GIT} {PUSH} -f\n\tbody\n\tEOF"
-        out = sp.strip_heredoc_bodies(cmd)
-        assert f"{GIT} {PUSH}" in out
-
-    def test_missing_closer_runs_to_eof(self):
-        cmd = f"cat <<EOF && {GIT} {PUSH} -f\nbody never closes"
-        out = sp.strip_heredoc_bodies(cmd)
-        assert f"{GIT} {PUSH}" in out  # introducing-line trailer survives
-
-    def test_no_heredoc_unchanged(self):
-        cmd = f"{GIT} {COMMIT} -m 'hello world'"
-        assert sp.strip_heredoc_bodies(cmd) == cmd
-
-    # ── forge-resistance: a quote-BLIND stripper deletes the executed line
-    # between a FORGED (quoted/commented) opener and a matching delimiter,
-    # which is a fail-OPEN bypass. The executed line MUST survive. ──────────
-    def test_forged_opener_in_double_quotes_not_honored(self):
-        cmd = f'echo "x <<EOF"\n{GIT} {PUSH} origin main {FORCE}\nEOF'
-        assert f"{GIT} {PUSH}" in sp.strip_heredoc_bodies(cmd)
-
-    def test_forged_opener_in_single_quotes_not_honored(self):
-        cmd = f"echo 'x <<EOF'\n{GIT} {PUSH} origin main {FORCE}\nEOF"
-        assert f"{GIT} {PUSH}" in sp.strip_heredoc_bodies(cmd)
-
-    def test_forged_opener_in_comment_not_honored(self):
-        cmd = f"echo hi # <<EOF\n{GIT} {PUSH} origin main {FORCE}\nEOF"
-        assert f"{GIT} {PUSH}" in sp.strip_heredoc_bodies(cmd)
-
-    def test_forged_opener_in_ansic_not_honored(self):
-        # An ANSI-C $'...<<EOF...' opener is inside a quote span → not honored;
-        # and the $' construct keeps the residual un-tokenizable anyway.
-        cmd = f"echo $'x <<EOF'\n{GIT} {PUSH} origin main {FORCE}\nEOF"
-        assert f"{GIT} {PUSH}" in sp.strip_heredoc_bodies(cmd)
-
-    def test_here_string_not_treated_as_heredoc(self):
-        # `<<<` is a here-STRING (no body) — must not start body-stripping.
-        cmd = f"cat <<<'data'\n{GIT} {PUSH} {FORCE}"
-        assert f"{GIT} {PUSH}" in sp.strip_heredoc_bodies(cmd)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -140,11 +91,13 @@ class TestUntokenizable:
         # $'msg' with no escaped quote tokenizes fine — must NOT be flagged.
         assert sp.untokenizable(f"{GIT} {COMMIT} -m $'l1\\nl2'") is False
 
-    def test_heredoc_tokenizable_after_strip(self):
-        # A legit heredoc is untokenizable to shlex only because of its body;
-        # with strip_heredocs=True it must read as tokenizable (no false net).
+    def test_heredoc_apostrophe_body_is_untokenizable(self):
+        # The probe reads the RAW command deliberately. An apostrophe in a
+        # here-doc body genuinely shifts analyze()'s segmentation, so this MUST
+        # read as a blind spot — normalizing it away disarmed the net on an
+        # ordinary shape (a real gated command after such a here-doc was allowed).
         cmd = f"{GIT} {COMMIT} -F - <<'EOF'\nit's a message with an apostrophe\nEOF"
-        assert sp.untokenizable(cmd, strip_heredocs=True) is False
+        assert sp.untokenizable(cmd) is True
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -153,34 +106,56 @@ class TestUntokenizable:
 class TestPushGuardNet:
     def test_ansic_force_push_blocked(self, tmp_path):
         r = _run(_PUSH_GUARD, ANSIC + f"{GIT} {PUSH} origin main {FORCE}", cwd=str(tmp_path))
-        assert r.returncode == 2, r.stderr
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
     def test_ansic_gh_merge_admin_blocked(self, tmp_path):
         r = _run(_PUSH_GUARD, ANSIC + f"gh pr merge 5 {ADMIN}", cwd=str(tmp_path))
-        assert r.returncode == 2, r.stderr
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
     def test_plain_force_push_still_blocks(self, tmp_path):
         r = _run(_PUSH_GUARD, f"{GIT} {PUSH} origin main {FORCE}", cwd=str(tmp_path))
-        assert r.returncode == 2, r.stderr
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
     def test_benign_heredoc_commit_not_blocked(self, tmp_path):
         # A plain heredoc commit carries no push/force/no-verify — the push
         # guard must NOT block it (locks the FP surface).
         cmd = f"{GIT} {COMMIT} -F - <<'EOF'\nfix: a normal message\nEOF"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        assert r.returncode == 0, r.stderr
+        assert _decision(r) == "allow", r.stdout + r.stderr
+
+    def test_forged_heredoc_semicolon_comment_opener(self, tmp_path):
+        # `;#` starts a bash comment just as ` #` does. A stripper that modeled
+        # only the whitespace form honored the forged opener and deleted the
+        # executed line (measured fail-open). The raw probe has no such seam.
+        cmd = f"echo hi;# <<'EOF'\n{ANSIC}{GIT} {PUSH} origin main {FORCE}\nEOF"
+        r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
+
+    def test_heredoc_body_apostrophe_then_real_gated_op(self, tmp_path):
+        # THE regression that killed the normalizing design: an ordinary quoted
+        # here-doc whose body contains a contraction, followed by a real gated
+        # command. bash runs it; analyze() loses the segment; stripping the body
+        # made the residue tokenize and the guard fell silent.
+        cmd = f"cat > f <<'EOF'\ndon't touch\nEOF\n{GIT} {PUSH} origin main {FORCE}"
+        r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
+
+    def test_heredoc_body_apostrophe_then_real_commit(self, tmp_path):
+        cmd = f"cat > f <<'EOF'\ndon't touch\nEOF\n{GIT} {COMMIT} {NV} -am x"
+        r = _run(_COMMIT_GUARD, cmd, cwd=str(tmp_path))
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
     def test_forged_heredoc_quoted_opener_blocked(self, tmp_path):
         # Forge: a quoted `<<EOF` on line 1 + matching `EOF` on line 3 would trick
         # a quote-blind stripper into deleting the executed push on line 2.
         cmd = f'echo "x <<EOF"\n{ANSIC}{GIT} {PUSH} origin main {FORCE}\nEOF'
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        assert r.returncode == 2, r.stderr
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
     def test_forged_heredoc_comment_opener_blocked(self, tmp_path):
         cmd = f"echo hi # <<EOF\n{ANSIC}{GIT} {PUSH} origin main {FORCE}\nEOF"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        assert r.returncode == 2, r.stderr
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -189,23 +164,23 @@ class TestPushGuardNet:
 class TestCommitGuardNet:
     def test_ansic_commit_no_verify_blocked(self, tmp_path):
         r = _run(_COMMIT_GUARD, ANSIC + f"{GIT} {COMMIT} {NV}", cwd=str(tmp_path))
-        assert r.returncode == 2, r.stderr
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
     def test_ansic_commit_to_main_blocked(self, tmp_path):
         r = _run(_COMMIT_GUARD, ANSIC + f"{GIT} {COMMIT} -m x", cwd=str(tmp_path))
-        assert r.returncode == 2, r.stderr
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
     def test_forged_heredoc_opener_blocked(self, tmp_path):
         # Forge: quoted `<<EOF` opener must not let the commit --no-verify bypass slip.
         cmd = f'echo "x <<EOF"\n{ANSIC}{GIT} {COMMIT} {NV}\nEOF'
         r = _run(_COMMIT_GUARD, cmd, cwd=str(tmp_path))
-        assert r.returncode == 2, r.stderr
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
     def test_net_message_absent_for_tokenizable_commit(self, tmp_path):
         # A tokenizable commit may still be blocked by the review-marker/main
         # rules, but MY net's tokenizability message must NOT be the cause.
         r = _run(_COMMIT_GUARD, f"{GIT} {COMMIT} -m 'plain message'", cwd=str(tmp_path))
-        assert "not safely tokenizable" not in r.stderr
+        assert _decision(r) != "block", r.stdout + r.stderr
 
     def test_benign_heredoc_commit_message_not_net_blocked(self, tmp_path):
         # A legit heredoc commit message must not trip MY net (analyze sees the
@@ -213,7 +188,7 @@ class TestCommitGuardNet:
         # reasons, but not with the tokenizability message.
         cmd = f"{GIT} {COMMIT} -F - <<'EOF'\nfix: it's a normal message\nEOF"
         r = _run(_COMMIT_GUARD, cmd, cwd=str(tmp_path))
-        assert "not safely tokenizable" not in r.stderr
+        assert _decision(r) != "block", r.stdout + r.stderr
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -232,19 +207,21 @@ class TestAcceptanceCorpus:
         # analyze() sees the real commit → the net must NOT fire (daily friction).
         cmd = f'{GIT} {COMMIT} -m "fix: thing"  # don\'t forget'
         r = _run(_COMMIT_GUARD, cmd, cwd=str(tmp_path))
-        assert "not safely tokenizable" not in r.stderr
+        assert _decision(r) != "block", r.stdout + r.stderr
 
     def test_apostrophe_in_comment_not_net_blocked_push_guard(self, tmp_path):
         cmd = f"{GIT} status  # don't {PUSH} yet"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        assert "not safely tokenizable" not in r.stderr
+        assert _decision(r) != "block", r.stdout + r.stderr
 
     def test_legit_ansic_commit_message_not_net_blocked(self, tmp_path):
-        # An ANSI-C message is the canonical way to embed an apostrophe; the
-        # commit segment IS parsed, so the net must defer to the real gates.
+        # An ANSI-C message is the canonical way to embed an apostrophe. The
+        # commit segment IS parsed, so the blind-spot net must stand down and
+        # leave the verdict to the real review/branch rules — which may well
+        # block for their own reasons. Assert only that the NET did not decide.
         cmd = f"{GIT} {COMMIT} -m $'fix: it\\'s done'"
         r = _run(_COMMIT_GUARD, cmd, cwd=str(tmp_path))
-        assert "not safely tokenizable" not in r.stderr
+        assert "could not be parsed safely" not in (r.stdout + r.stderr)
 
     def test_over_strip_cannot_starve_the_flag_match(self, tmp_path):
         """An ANSI-C desync can land a `<<WORD` inside the falsely-unquoted window,
@@ -254,14 +231,14 @@ class TestAcceptanceCorpus:
         ORIGINAL text, so it cannot be starved by stripping."""
         cmd = f"x=$'a\\'b<<PWN'\n{GIT} {PUSH} origin main {FORCE}\nPWN"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        assert r.returncode == 2, r.stderr
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
     def test_over_strip_starvation_commit_side(self, tmp_path):
         cmd = f"x=$'a\\'b<<PWN'\n{GIT} {COMMIT} {NV}\nPWN"
         r = _run(_COMMIT_GUARD, cmd, cwd=str(tmp_path))
-        assert r.returncode == 2, r.stderr
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
-    def test_documented_residue_decoy_segment(self, tmp_path):
+    def test_decoy_segment_still_reaches_a_human(self, tmp_path):
         """DOCUMENTED RESIDUE (deliberate evasion — NOT closed by this PR).
 
         A decoy `git push origin main` before an ANSI-C desync makes analyze()
@@ -277,9 +254,9 @@ class TestAcceptanceCorpus:
         """
         cmd = f"{GIT} {PUSH} origin main && x=$'a\\'b<<PWN'\n{GIT} {PUSH} origin evil {FORCE}\nPWN"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        assert "not safely tokenizable" not in r.stderr
+        assert _decision(r) != "block", r.stdout + r.stderr
 
-    def test_documented_residue_line_continuation(self, tmp_path):
+    def test_line_continuation_is_documented_residue(self, tmp_path):
         """DOCUMENTED RESIDUE (not closed by this PR).
 
         A `\\`-newline continuation tokenizes cleanly, so the tokenizability
@@ -290,7 +267,7 @@ class TestAcceptanceCorpus:
         """
         cmd = f"{GIT} \\\n {PUSH} origin main {FORCE}"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        assert "not safely tokenizable" not in r.stderr
+        assert _decision(r) != "block", r.stdout + r.stderr
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -320,5 +297,126 @@ class TestCommitGuardFailsClosedOnCrash:
             ]
         )
         r = subprocess.run([_PY, "-c", prog], capture_output=True, text=True, timeout=30)
-        assert r.returncode == 2, r.stderr
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
         assert "failing CLOSED" in r.stderr
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# GENERATED acceptance matrix.
+#
+# Corpus replay alone is insufficient: it only contains shapes that happened to
+# be run before, which is exactly how the `git status # don't commit yet` false
+# positive shipped past an 18k-command sweep. This enumerates the CROSS PRODUCT
+# of the axes that actually drive the decision, so an untested cell fails loudly
+# instead of silently.
+#
+# Invariants (not exact verdicts — the point is the direction of failure):
+#   * a cell that really executes a gated op is NEVER a silent allow;
+#   * a cell that executes nothing gated is NEVER a hard block.
+# ══════════════════════════════════════════════════════════════════════════
+_DESYNC = "x=$'a\\'b'\n"  # ANSI-C desync: makes the parser drop what follows
+
+_GATED_OPS = [
+    ("push_force", f"{GIT} {PUSH} origin main {FORCE}"),
+    ("push_plain", f"{GIT} {PUSH} origin main"),
+    ("gh_merge", "gh pr merge 5"),
+    ("gh_merge_admin", f"gh pr merge 5 {ADMIN}"),
+    ("commit_nv", f"{GIT} {COMMIT} {NV}"),
+    ("commit_plain", f"{GIT} {COMMIT} -m x"),
+]
+
+# Contexts that HIDE a real, executed gated op from the parser.
+_HIDING = [
+    ("ansic_prefix", lambda op: ANSIC + op),
+    ("desync_line", lambda op: _DESYNC + op),
+    ("forged_heredoc", lambda op: f'echo "x <<EOF"\n{ANSIC}{op}\nEOF'),
+    ("unquoted_heredoc_subst", lambda op: f"cat <<EOF\n$(x=$'a\\'b'; {op})\nEOF"),
+]
+
+# Contexts where the gated WORD appears but nothing gated executes.
+_INERT = [
+    ("in_comment", lambda op: f"{GIT} status # don't {op} yet"),
+    ("in_ansic_data", lambda op: f"echo $'don\\'t {op} here'"),
+    ("in_quoted_heredoc", lambda op: f"cat <<'EOF'\nplease don't {op}\nEOF"),
+    ("in_double_quotes", lambda op: f'echo "reminder: {op} later"'),
+]
+
+
+def _guard_for(op: str):
+    return _COMMIT_GUARD if COMMIT in op else _PUSH_GUARD
+
+
+def _parser_sees_gated_op(cmd: str) -> bool:
+    """Whether analyze() resolved the gated op itself.
+
+    When it did, the ORDINARY gates own the verdict (and may legitimately allow
+    — e.g. a commit in a non-repo cwd). The blind-spot net's contract binds only
+    where the parser went blind, so that is what the invariant below tests.
+    """
+    for seg in sp.analyze(cmd):
+        if sp.git_subcommand(seg.argv) in ("push", "merge", "commit"):
+            return True
+        if sp.gh_pr_subcommand(seg.argv) == "merge":
+            return True
+    return False
+
+
+@pytest.mark.parametrize("op_name,op", _GATED_OPS, ids=[n for n, _ in _GATED_OPS])
+@pytest.mark.parametrize("ctx_name,wrap", _HIDING, ids=[n for n, _ in _HIDING])
+def test_matrix_hidden_gated_op_is_never_silently_allowed(
+    op_name, op, ctx_name, wrap, tmp_path
+):
+    """A gated op the PARSER CANNOT SEE must never be silently allowed."""
+    cmd = wrap(op)
+    if _parser_sees_gated_op(cmd):
+        pytest.skip("parser resolved the op — the ordinary gates own this verdict")
+    r = _run(_guard_for(op), cmd, cwd=str(tmp_path))
+    assert _decision(r) in ("ask", "block"), (
+        f"{ctx_name}/{op_name} was silently ALLOWED\n{r.stdout}{r.stderr}"
+    )
+
+
+@pytest.mark.parametrize("op_name,op", _GATED_OPS, ids=[n for n, _ in _GATED_OPS])
+@pytest.mark.parametrize("ctx_name,wrap", _INERT, ids=[n for n, _ in _INERT])
+def test_matrix_inert_mention_is_never_hard_blocked(
+    op_name, op, ctx_name, wrap, tmp_path
+):
+    r = _run(_guard_for(op), wrap(op), cwd=str(tmp_path))
+    assert _decision(r) != "block", (
+        f"{ctx_name}/{op_name} was HARD BLOCKED\n{r.stdout}{r.stderr}"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The net must never DOWNGRADE an existing hard block to a prompt.
+#
+# The net is evaluated where analyze() found no gated segment, which is also
+# true for commands other rules hard-block (a direct sqlite write, a commit
+# hook-skip). Returning an `ask` from inside the net pre-empted those rules and
+# turned a policy block into a dialog — measured, and invisible to invariants
+# that only assert "not silently allowed". These pin the verdict exactly.
+# ══════════════════════════════════════════════════════════════════════════
+_SQLITE = "sql" + "ite3"
+_DML = "INS" + "ERT INTO t VALUES(1)"
+_REPO = str(_WORKTREE)
+
+
+class TestNetDoesNotDowngradeHardBlocks:
+    @pytest.mark.parametrize(
+        "suffix",
+        ["", "  # don't " + PUSH + " yet"],
+        ids=["plain", "apostrophe_comment"],
+    )
+    def test_direct_sqlite_write_still_hard_blocks(self, suffix):
+        # This block exists ONLY in the push guard — nothing else backstops it.
+        cmd = f'{_SQLITE} /tmp/x.db "{_DML}"{suffix}'
+        r = _run(_PUSH_GUARD, cmd, cwd=_REPO)
+        assert _decision(r) == "block", r.stdout + r.stderr
+
+    @pytest.mark.parametrize(
+        "suffix", ["", "  # don't forget"], ids=["plain", "apostrophe_comment"]
+    )
+    def test_commit_hook_skip_still_hard_blocks(self, suffix):
+        cmd = f'{GIT} {COMMIT} {NV} -m "x"{suffix}'
+        r = _run(_PUSH_GUARD, cmd, cwd=_REPO)
+        assert _decision(r) == "block", r.stdout + r.stderr

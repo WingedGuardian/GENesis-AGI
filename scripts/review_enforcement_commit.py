@@ -14,6 +14,7 @@ Exit codes:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -610,29 +611,45 @@ def main() -> None:
     # string (a reply body, an echo). Confirm a REAL executed commit segment
     # before applying the branch/review rules, else allow.
     if not any(git_subcommand(s.argv) == "commit" for s in segs):
-        # ── Fail-closed blind-spot net ──────────────────────────────────────
+        # ── Blind-spot net: unverifiable → ASK the human ────────────────────
         # "No commit segment" is a trustworthy verdict only when the command was
         # PARSEABLE. analyze() mis-parses an ANSI-C `$'…\'…'` command and DROPS
         # the real commit segment, so this very early-out is what lets a
         # commit-to-main / --no-verify / unreviewed commit sail through (a live,
         # reproduced bypass). When the word "commit" appears (guaranteed past the
-        # _COMMIT_PATTERN early-out above) but the command is un-tokenizable, the
-        # empty parse is not evidence of absence → refuse instead of allowing.
-        # Here-doc bodies are stripped first (stdin data, never executed argv), so
-        # a legit `git commit -F - <<'EOF'` heredoc does not trip this.
-        # Wrapped LOCALLY: this module's __main__ calls main() with NO run_guard,
-        # so an uncaught helper error would exit 1 — which CC treats as
-        # NON-blocking (fail OPEN). Any probe exception therefore fails CLOSED.
+        # _COMMIT_PATTERN early-out above) but the command is un-parseable, the
+        # empty parse is not evidence of absence.
+        #
+        # The outcome is an approval PROMPT, not a refusal. A hard block here has
+        # to be surgically precise about which un-parseable commands are real
+        # commits — and precision is exactly what an unreliable parse cannot
+        # deliver: every narrowing conjunct became a new way to starve the trigger,
+        # while over-blocking broke benign shapes (`git status # don't commit yet`).
+        # Asking inverts those costs: a false positive is one confirmation, a miss
+        # is the pre-existing status quo. Bodies of QUOTED here-docs are dropped
+        # first (bash expands nothing in them), so a legit `git commit -F - <<'EOF'`
+        # does not prompt.
         try:
-            if untokenizable(command, strip_heredocs=True):
-                _deny(
-                    "BLOCKED: this command is not safely tokenizable (e.g. ANSI-C "
-                    "$'...' quoting) and mentions a commit the guard cannot verify. "
-                    "Rewrite with plain single/double quotes or `git commit -F "
-                    "<file>` and re-run."
+            if untokenizable(command):
+                if os.environ.get("GENESIS_CC_SESSION"):
+                    # No human present to answer a prompt in a dispatched session.
+                    _deny(
+                        "BLOCKED: this command cannot be parsed safely (e.g. "
+                        "ANSI-C $'...' quoting) and mentions a commit. Autonomous "
+                        "sessions cannot proceed on an unverifiable command."
+                    )
+                _ask(
+                    "This command could not be parsed safely (e.g. ANSI-C $'...' "
+                    "quoting) and mentions a commit, so review enforcement cannot "
+                    "verify what it would actually run. Approve only if you are "
+                    "sure. To avoid the prompt, rewrite it in a directly-parseable "
+                    "form (plain quotes, or `git commit -F <file>`)."
                 )
-        except Exception:  # noqa: BLE001 — fail CLOSED; a guard must never crash open
-            _deny("BLOCKED: the commit-guard tokenizability probe failed — refusing (fail closed).")
+        except Exception:  # noqa: BLE001 — never crash into a silent allow
+            _ask(
+                "The commit-guard parseability probe failed, so this command could "
+                "not be verified. Approve only if you are sure."
+            )
         sys.exit(0)
 
     # Rule 0: Block --no-verify / -n on ANY executed commit segment — it
@@ -1038,6 +1055,29 @@ def _deny(message: str) -> None:
     """Output denial message and block the tool via exit code 2."""
     print(message, file=sys.stderr)
     sys.exit(2)
+
+
+def _ask(reason: str) -> None:
+    """Emit a PreToolUse ``ask`` decision — a native approve/deny dialog.
+
+    For the UNVERIFIABLE path only: a command the parser cannot resolve is not
+    evidence of wrongdoing, so it earns a human decision rather than a refusal.
+    Claude Code runs the tool only on explicit approval, which the agent cannot
+    self-satisfy. Mirrors ``git_push_guard._ask``. Exits 0 with the decision on
+    stdout (the hook JSON carries the verdict; the exit code must NOT be 2).
+    """
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "ask",
+                    "permissionDecisionReason": reason,
+                }
+            }
+        )
+    )
+    sys.exit(0)
 
 
 if __name__ == "__main__":
