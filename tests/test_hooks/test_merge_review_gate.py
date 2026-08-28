@@ -2129,6 +2129,11 @@ class TestCiGateEndToEnd:
             "_check_scheduled_claude_reviewed_head",
             lambda n, head=None, repo=None, force=False, strict=False: None,
         )
+        # The pin-receipt gate is downstream too. Without this it runs for real
+        # against the cwd repo's PR — whose tree predates scripts/lib/cc_version.sh,
+        # so the read is a genuine 404 and the gate correctly BLOCKS, which has
+        # nothing to do with the invariant under test here.
+        monkeypatch.setattr(guard_module, "_check_pin_receipts", lambda n, repo=None: (False, ""))
 
     def test_red_ci_blocks_exit_2(self, guard_module, monkeypatch, capsys):
         monkeypatch.setenv(
@@ -2335,6 +2340,11 @@ class TestMergeableAllowlist:
             "_check_scheduled_claude_reviewed_head",
             lambda n, head=None, repo=None, force=False, strict=False: None,
         )
+        # The pin-receipt gate is downstream too. Without this it runs for real
+        # against the cwd repo's PR — whose tree predates scripts/lib/cc_version.sh,
+        # so the read is a genuine 404 and the gate correctly BLOCKS, which has
+        # nothing to do with the invariant under test here.
+        monkeypatch.setattr(guard_module, "_check_pin_receipts", lambda n, repo=None: (False, ""))
 
     @pytest.mark.parametrize("bad", [None, "", "UNKNOWN", "SOMETHING_NEW"])
     def test_non_mergeable_blocks(self, guard_module, monkeypatch, bad):
@@ -2411,6 +2421,11 @@ class TestRepoDerivationGate:
             "_check_scheduled_claude_reviewed_head",
             lambda n, head=None, repo=None, force=False, strict=False: None,
         )
+        # The pin-receipt gate is downstream too. Without this it runs for real
+        # against the cwd repo's PR — whose tree predates scripts/lib/cc_version.sh,
+        # so the read is a genuine 404 and the gate correctly BLOCKS, which has
+        # nothing to do with the invariant under test here.
+        monkeypatch.setattr(guard_module, "_check_pin_receipts", lambda n, repo=None: (False, ""))
 
     def test_derived_repo_threads_into_gates(self, guard_module, monkeypatch):
         seen = {}
@@ -2622,6 +2637,9 @@ class TestGateOrdering:
                 None,
             )[1],
         )
+        # Downstream of the ordering under test, and it would otherwise run live
+        # against a PR whose tree predates scripts/lib/cc_version.sh (a real 404).
+        monkeypatch.setattr(guard_module, "_check_pin_receipts", lambda n, repo=None: (False, ""))
         monkeypatch.setattr(
             guard_module,
             "_check_pr_review_findings",

@@ -396,7 +396,7 @@ def split_segments(command: str) -> list[str]:
     return [p.raw for p in parse_segments(command)]
 
 
-def has_top_level_pipe(command: str) -> bool:
+def has_top_level_pipe(command: str, *, count_substitutions: bool = False) -> bool:
     """Whether *command* contains a real top-level shell PIPE (``a | b``).
 
     Quote-, redirect-, and substitution-aware: a ``|`` inside a quoted string (a jq
@@ -415,6 +415,16 @@ def has_top_level_pipe(command: str) -> bool:
     pipe). Never a security bypass either way (an over-read is a reworked command, an
     under-read re-exposes the empty-output footgun this guard usually prevents); closing
     these fully is the unbounded quote-parsing tail shared with ``split_segments``.
+
+    ``count_substitutions`` inverts the ``$( … )`` rule, and exists because the two
+    consumers need OPPOSITE answers about the same syntax. The background-output guard
+    (default, ``False``) is right to skip them: ``RESULT=$(cmd | filter)`` captures its
+    output, so nothing is swallowed. The pipe-STATUS guard needs ``True``: bash defines
+    an assignment-only command's status as the status of the command substitution, so
+    ``rc=$(prog | tail); echo $?`` reads the FILTER's status — exactly the footgun that
+    guard exists to flag, and invisible while substitutions are skipped. Kept as one
+    scanner with a flag rather than a second copy: two hand-rolled shell scanners drift,
+    and this file's whole purpose is that there is one.
     """
     i, n = 0, len(command)
     quote: str | None = None
@@ -430,7 +440,7 @@ def has_top_level_pipe(command: str) -> bool:
                 quote = None
             i += 1
             continue
-        if in_backtick:  # `…` substitution — output captured, so any `|` inside is not a bg pipe
+        if in_backtick and not count_substitutions:  # `…` output captured: not a bg pipe
             if c == "`":
                 in_backtick = False
             i += 1
@@ -440,13 +450,14 @@ def has_top_level_pipe(command: str) -> bool:
             i += 1
             continue
         if c == "`":
-            in_backtick = True
+            in_backtick = not in_backtick
             i += 1
             continue
         if (
             c == "$" and i + 1 < n and command[i + 1] == "("
         ):  # $( … ) opens a capturing substitution
-            subst_depth += 1
+            if not count_substitutions:
+                subst_depth += 1
             i += 2
             continue
         if c == ")" and subst_depth > 0:

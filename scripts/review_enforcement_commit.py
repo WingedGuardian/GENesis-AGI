@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
@@ -595,6 +596,44 @@ def _worktree_root(cwd: str) -> str:
     return os.path.realpath(cwd)
 
 
+def _merge_note(cwd: str | None) -> str:
+    """A hint appended to a cap/mode-switch denial when a merge is mid-flight.
+
+    ADVISORY TEXT ONLY. Deliberately NOT wired into the verdict or the round
+    counter: those sentinels are unauthenticated files that any actor with shell
+    access can create (``echo x > .git/MERGE_HEAD``), and `git merge --no-commit`
+    leaves one indefinitely without any forgery at all. Keying an EXEMPTION off
+    them would let the actor this gate exists to constrain silence it
+    permanently with one write — measured: a forged sentinel froze the counter
+    across three further distinct defect rounds. Telling the author what the
+    gate can see is safe; letting that state decide the verdict is not.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=cwd, capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            return ""
+        raw = out.stdout.strip()
+        git_dir = Path(raw) if Path(raw).is_absolute() else Path(cwd or ".") / raw
+        merging = any(
+            (git_dir / n).exists()
+            for n in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")
+        ) or (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists()
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return ""
+    if not merging:
+        return ""
+    return (
+        "\n\nNOTE: a merge/rebase appears to be in progress. The round counter "
+        "keys on the staged diff, so pulling upstream in to resolve a conflict "
+        "reads as another round even though it adds no authored code. If this "
+        "commit IS only that merge, say so in the ack rather than treating it "
+        "as a real round."
+    )
+
+
 def main() -> None:
     # Parse tool input
     payload = read_payload()
@@ -863,6 +902,7 @@ def main() -> None:
                 "acknowledge that decision with a trailing shell comment (outside any "
                 "quotes):\n"
                 '  git commit -m "your message"  # escalation-ack'
+                + _merge_note(cwd)
             )
             return
         # Acked = a fresh decision to continue → reset the round budget so the next
@@ -906,6 +946,7 @@ def main() -> None:
                 "Then acknowledge you did the audit (not another blind patch) with a "
                 "trailing shell comment (outside any quotes):\n"
                 '  git commit -m "your message"  # audit-ack'
+                + _merge_note(cwd)
             )
             return
 
