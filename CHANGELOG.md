@@ -78,6 +78,32 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **SSH slot cap no longer collapses below the running session count.** The
+  interactive-slot launcher (`scripts/cc-slot.sh`) sized its cap from
+  *instantaneous free RAM* (`(MemAvailable − reserve) / per_session`), so each
+  running session lowered free RAM and thus lowered the cap *below* the number
+  already running — locking the operator out of a new session (and even
+  misreporting "3/2 active") while other apps' memory use silently ate slots too.
+  The cap is now a stable function of the box's TOTAL RAM (a new pure, unit-tested
+  `genesis.cc.session_cap` helper), so it scales per install, does not shrink as
+  sessions run, and ignores unrelated apps. It is **container-aware** — it uses the
+  cgroup memory limit and CPU affinity, not host `/proc` values, so a container that
+  sees host RAM is sized for its real limit (not the host). Live free RAM is used
+  only as an OOM circuit-breaker, and a new session only starts when there is room
+  for a full session (never over-committing a swapless box). Any interactive SSH
+  login (a slot hostname or a plain shell running `claude`, from a LAN/Tailscale IP)
+  is the operator and gets an emergency slot above the safe cap; the cap itself
+  never turns it away — when the box is full or memory is tight it offers to reattach
+  or end a chosen session to make room (the ended session's transcript persists,
+  resume with `claude --resume`), and an ATTACHED session needs an explicit confirm
+  before it's ended. Two honest corners still decline: a non-interactive login
+  (no terminal to prompt on) is guided to reattach, and a genuine OOM-floor breach
+  with no slot to trade is refused rather than risking an OOM. The dashboard web
+  terminal / local console (no `SSH_CONNECTION`) is held to the safe cap. Reattaching
+  always works. Tunable via `~/.genesis/cc-slot.env`
+  (`GENESIS_CC_SYSTEM_RESERVE_MB` / `_PER_SESSION_MB` / `_OOM_FLOOR_MB` /
+  `_EMERGENCY_SLOTS`); the gate fails open so it can never strand you. See
+  `docs/reference/tailscale-ssh-access.md`.
 - **Heartbeat GC no longer lets a clock-skewed future row starve a subsystem's
   liveness signal.** The `keep_latest_per_subsystem` heartbeat GC
   (`db/crud/events.py::prune`) kept the row equal to the per-subsystem

@@ -74,13 +74,20 @@ is raw subprocess calls with no external watchdog (e.g., deterministic
 executor steps), where a hung process blocks shared resources (executor
 semaphore) with no other recovery mechanism.
 
-**The Bash TOOL's own timeout is separate — and defaults to 120s.** An inner
-`timeout N …` INSIDE the command does NOT extend it: the tool wrapper SIGTERMs the
-whole call at its own `timeout` param (default 120000ms → exit 143). To allow
-longer, set the Bash tool's `timeout` PARAMETER explicitly. For long or unbounded
-work — above all deploys (`scripts/update.sh`, `bootstrap.sh`, `host-setup.sh`:
-container align + guardian redeploy + host `update-node`/`update-cc`, run
-sequentially — can exceed even 900s) — run via **`run_in_background: true`**
+**The Bash TOOL's own timeout is separate — default 120000ms, HARD CEILING
+600000ms (10 min).** An inner `timeout N …` INSIDE the command does NOT extend it:
+the tool wrapper SIGTERMs the whole call at its own `timeout` param (default
+120000ms → exit 143). To allow longer, set that `timeout` PARAMETER explicitly —
+**but you cannot exceed 600000ms.** A larger value does not buy more time; the
+call still dies at 10 minutes (MEASURED 2026-08-27: `timeout: 1600000` was killed
+at exactly `10m 0s`). Anything that might run past ten minutes therefore has only
+ONE correct form — `run_in_background: true`. Treat "raise the timeout" as a fix
+that tops out, not one that scales.
+
+For long or unbounded work — above all deploys (`scripts/update.sh`,
+`bootstrap.sh`, `host-setup.sh`: container align + guardian redeploy + host
+`update-node`/`update-cc`, run sequentially — routinely exceed 600s and so CANNOT
+be done in the foreground at any timeout value) — run via **`run_in_background: true`**
 (harness-tracked, notifies on completion, no timeout ceiling), NEVER a foreground
 timeout or `nohup … &` (detached but untracked → no completion signal, so you end
 up hand-polling anyway). `update.sh` has SIGTERM/INT rollback traps, so a mid-run
@@ -429,6 +436,32 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   the open-set version and plan to harden it later; the review loop IS the
   hardening loop, one bug per round, and it does not converge.
 
+- **`out=$(cmd)` under `set -e` swallows the failure path — and NO linter catches
+  it.** An assignment whose value is a command substitution INHERITS that
+  substitution's exit status, so under `set -euo pipefail` a bare
+  `out=$(cmd)` followed by `rc=$?` **never reaches the `rc=$?`** when `cmd`
+  fails: errexit fires first. Any error handling keyed on `rc` is dead code on
+  exactly the path it was written for. Two properties make this vicious: it is
+  invisible (the function just stops, printing nothing), and it hides behind
+  call sites — `f || echo …` / `if ! f` disable errexit INSIDE the function, so
+  the bug stays latent until someone writes the first bare call.
+  **shellcheck 0.9.0 does not flag it at any severity, including `-o all`**
+  (SC2155 is the *different* `local x=$(cmd)` declare-and-assign case; measured
+  2026-08-27 — no other linter was tested, and a future shellcheck could add it).
+  Always write `rc=0; out=$(cmd) || rc=$?` — but **declare `local` on its own
+  line first**: `local out=$(cmd) || rc=$?` NEVER fires, because `local` is a
+  command and the compound takes `local`'s status (0), not the substitution's.
+  MEASURED: the split form yields `rc=100`, the inline form yields `rc=0` and the
+  caller proceeds as if the command succeeded — strictly WORSE than the bug this
+  entry describes, since it converts a loud abort into a silent false success.
+  The same applies inside the error handler: with `set -o pipefail`, `x=$(… | grep -v … | tail -1)` aborts when
+  `grep` matches nothing, so a `${x:-fallback}` default written for that very
+  case never runs — guard it with `|| x=""`.
+  Origin: `scripts/lib/cc_version.sh` (caught only by adversarial review), then
+  three instances found in one `scripts/bootstrap.sh` function whose whole
+  diagnostic block was unreachable. Pinned by
+  `tests/test_scripts/test_bootstrap_guards.py::test_install_pkg_*`.
+
 ### Iterative-Refinement Discipline
 
 AI refinement cycles degrade code they were asked to "improve" — validation
@@ -516,13 +549,20 @@ Choose the review level proportional to the change:
 | Docs / text / comments | **None** | Markdown prose, inline comments |
 | Simple mechanical | **None** | Variable rename, typo fix, import reorder |
 | Small focused fix | **Code-reviewer agent inline** | Single-function bug fix, config tweak |
-| Substantial change | **Code-reviewer inline + /review** | Multi-file refactor, new MCP tool, wiring |
+| Substantial change | **Code-reviewer inline + `/deep-review`** | Multi-file refactor, new MCP tool, wiring |
 | Prompt / LLM behavior | **Both + extra scrutiny** | System prompts, skill instructions, routing |
 
 Decision criteria when ambiguous: "If the change could break a runtime
-path not covered by its own unit test, it needs /review. If it only
+path not covered by its own unit test, it needs `/deep-review`. If it only
 touches things with clear, isolated test coverage, code-reviewer inline
 is sufficient."
+
+**There is no `/review` command.** Older text here (and the commit gate's own
+deny message) says "Run /review" — measured, `.claude/commands/` ships
+`deep-review.md` and `audit-changes.md`, and there is no user-level commands
+directory. The real options are **`/deep-review`** (dispatches the adversarial
+pass AND writes the evidence marker) and the built-in `/code-review`.
+`/audit-changes` is a light self-check, not a substitute for either.
 
 The enforcement hooks (`review_enforcement_prompt.py`,
 `review_enforcement_commit.py`) still fire on every change — they are
@@ -553,14 +593,41 @@ P1/P2/P3, or the CODE_AUDITOR JSON contract) + `file:line` engagement + substanc
 so run the real recall-tuned audit (`genesis-architect` / `CODE_AUDITOR.md`); do not
 hand-write a soft prompt.
 
-**Honest enforcement model — where the teeth actually are.** The local hook is
-ADVISORY anti-autopilot friction, NOT tamper-proof: on a single-user-authored repo
-the same actor can edit the hook or hand-write the marker. The enforcing teeth live
-where the author has no control at commit time — the **independent cloud reviewer
-(Codex)** + a **required human approval**, gated by **branch protection**, plus the
-CI `review-depth-check` that recomputes substantiality and flags it loudly on the PR
-(advisory, exit-0-always). The local gate's job is to interrupt autopilot; the real
-gate is external. Do not mistake a green local hook for clearance.
+**Honest enforcement model — VERIFY IT, do not assume it.** This section used to
+claim the enforcing teeth were "the independent cloud reviewer + a required human
+approval, gated by **branch protection**", and that the local hook was merely
+advisory friction. **Measured on a live deploy (2026-08-27), that was false in
+both halves**, and the correction matters because it inverts which layer you can
+actually rely on:
+
+- `GET /repos/{owner}/{repo}/branches/main/protection` → **404, not protected**.
+  The protection the claim rested on did not exist. A *ruleset* did — a different
+  API, invisible to the branch-protection endpoint.
+- That ruleset required **one status check** (`test`), not the ten other blocking
+  CI jobs. Lint, leak-detector and the rest were never server-side required.
+- It carried `bypass_actors: [{actor_type: RepositoryRole, actor_id: 5 (admin),
+  bypass_mode: always}]`. **A bypass entry voids the rule for that actor.** The
+  sole author is the repo admin, and the merge command this skill mandates
+  carries `--admin`.
+
+⇒ For the actor who merges, the server-side backstop was **void**, and the local
+`git_push_guard.py` merge gate was the *only* real enforcement — precisely the
+layer the old text told you to discount.
+
+**Two rules follow.**
+
+1. **Never state where the teeth are without querying it.** Both endpoints, every
+   time: `branches/main/protection` AND `rulesets` (then the ruleset by id, since
+   the list view omits `bypass_actors` and `rules`). A rule with a matching bypass
+   actor is decoration for that actor. A "required" check list is meaningless
+   until you have compared it against the jobs that actually block.
+2. **Do not weaken a local gate on the theory that something external catches it.**
+   That reasoning is only as good as the configuration you just verified, and
+   configuration drifts silently — nothing announces a ruleset edit.
+
+The local gate's job is still to interrupt autopilot, and it is still editable by
+the same author. But "editable in principle" is not "backed up in practice."
+Where a real external backstop exists, name it and cite the query that proved it.
 
 **Close every review with a verdict.** End each review with an explicit
 `Ready to merge: Yes | No | With fixes` + a one-line reason, alongside the
@@ -673,8 +740,29 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      cost), name the cap explicitly ("we've hit the 3-round escalation cap"),
      and get a FRESH decision: keep hardening, switch to a robust-by-
      construction redesign, narrow scope, or shelve.
-  These three are backstopped by a **machine layer**, so the cap holds even if a
-  session's own discipline lapses: `review_state.py` keeps a per-branch counter of
+  These three are backstopped by a **machine layer** with **two tiers, not one**.
+  The tier you hit FIRST is the one most sessions do not know exists:
+
+  | Round | Gate | Demands | Sigil | Resets counter? |
+  |---|---|---|---|---|
+  | 2 (`cap-1`) | **MODE-SWITCH block** | Stop patching the named instance. Dispatch a FRESH-CONTEXT adversarial subagent over the ENTIRE diff; READ authoritative docs/source for any domain semantics; fix the whole enumerated CLASS in one commit. | `# audit-ack` | **No** |
+  | 3 (`cap`) | **HARD STOP** | The full round-ledger stop above. | `# escalation-ack` | **Yes** |
+
+  The round-2 block is not the round-3 cap arriving early — it is a different
+  instruction. It says the *approach* is wrong (you are fixing instances, not the
+  class), where the cap says *stop and re-decide*. Acking round 2 without actually
+  doing the fresh-context audit is how a session arrives at round 3 having learned
+  nothing. `# audit-ack` attests that the audit HAPPENED; it is not a "continue"
+  button.
+
+  There is a separate depth tier that can fire at ANY round: a **substantial**
+  change (≥50 reviewable lines OR >1 code file OR auth/api/migrations OR any
+  prompt/agent/skill surface) whose marked review is not adversarial is blocked
+  with `# depth-ack`. A `mark` that lands with no `file:line` engagement prints a
+  WARNING and will be rejected by that gate — re-write the evidence with concrete
+  anchors rather than acking past it.
+
+  Backing all of it: `review_state.py` keeps a per-branch counter of
   CONSECUTIVE defect-bearing review rounds, and the commit gate
   (`review_enforcement_commit.py`) HARD-BLOCKS the commit at `ESCALATION_ROUND_CAP`
   (3) unless the command carries a deliberate trailing `# escalation-ack`. The
@@ -735,6 +823,85 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   approval gate) is a STOP-and-discuss, never an auto-fix. Chasing a reviewer's
   green checkmark with a change you believe is wrong is a discipline failure.
   No performative agreement — state the verified fix, or the reasoned pushback.
+
+## The Gate Machinery — the sequence, and why it bites
+
+Ten enforcement layers sit between a change and `main`. Learning them by hitting
+them costs a session real time, every time. The canonical sequence:
+
+```bash
+python3 scripts/review_state.py evidence-path     # -> ~/.genesis/review_evidence/<key>.txt
+# ... write the adversarial audit to exactly that path ...
+git add <files>                                   # STAGE FIRST — mark hashes --cached
+python3 scripts/review_state.py mark [--clean]    # --clean only if NO new BLOCKER/P1/P2
+git commit -F <msg-file>                          # bare, not piped (see below)
+git push                                          # approve the dialog on a branch's first push
+gh pr create ...
+gh pr comment <N> --body "@codex review"          # after EVERY subsequent push
+python3 scripts/hooks/git_push_guard.py --check-pr <N>
+gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --check-pr
+```
+
+**Ordering and lifetime rules that are not obvious:**
+
+- **Stage → mark → commit.** `mark` hashes `git diff --cached`. Re-staging or
+  amending after marking invalidates it, and the check fails CLOSED.
+- **Evidence expires in 30 minutes.** The audit file must be recent when you
+  `mark`, and the marker itself expires on the same clock. A long detour between
+  audit and commit means re-marking.
+- **`evidence-path` and `mark` key off the PROCESS cwd**, not a flag. Run them
+  from the same worktree as the commit or the key diverges silently.
+- **A successful commit WIPES the marker.** The next commit needs a fresh review;
+  this is deliberate, not a bug.
+- **`--match-head-commit` is mechanically required**, not a nicety — the merge
+  arm blocks outright when a verified head exists and the flag is absent. Copy
+  the whole command from `--check-pr` output rather than reconstructing it.
+
+**Traps with a real cost, each one measured:**
+
+- **A BLOCKED Bash call runs NOTHING** — including earlier `&&` segments and
+  heredocs. If `mark && commit` is blocked, the `mark` did not happen either.
+  Run gate-adjacent steps as separate calls.
+- **Ack sigils bind per-guard, and mostly to the LAST pipeline segment.**
+  `git commit ... | tail  # audit-ack` puts the ack on `tail`. Run the commit
+  bare. Some guards accept a sigil on any segment, others only on the offending
+  one — do not generalise from one guard's behaviour.
+- **Sigils must lead the trailing comment.** The override is read from the
+  leading run of recognised tokens, so `# see audit-ack notes` overrides nothing.
+- **`--no-verify` is blocked before any override is even considered.** There is
+  no way to skip the native hooks; fix the cause.
+- **Chained commits are heavily restricted** — across worktrees, blocked
+  outright; within one, later commits must be pure `--amend` with no intervening
+  git command. `cd "$VAR" && git commit` fails closed with a *branch-verification*
+  message, which reads like a branch problem and is not: use a literal path.
+- **Worktree removal is not yours to do.** `git worktree remove` is blocked;
+  `scripts/worktree_lifecycle.py` owns it, with a 7-day trash bin, and reaps
+  unchanged worktrees on a daily timer. Leave a dead worktree alone.
+- **Editing a tracked git hook blocks the commit** until its hash is re-recorded
+  (`scripts/update_hook_versions.sh`), and editing `scripts/hooks/*` changes
+  nothing until `sync-hooks.sh` copies it into `.git/hooks/`.
+- **`.github/**` and prompt surfaces are never "docs"** for substantiality
+  purposes — they always reach the depth gate.
+
+**CI is not one check.** Ten of eleven jobs block; only `review-depth-check` is
+advisory. Several are reproducible locally BEFORE pushing, which is far cheaper
+than a red PR:
+
+```bash
+ruff check src/ tests/ scripts/
+python scripts/check_external_io.py
+python scripts/check_subsystem_map.py
+python scripts/check_shared_artifact_consumers.py
+```
+
+Do NOT run the full pytest suite locally (it is banned, and the concurrent-test
+guard blocks a second run anyway) — CI's `test` job is the blocking one.
+
+**Detecting a running pytest: match argv STRUCTURE, never a substring.** Any
+check that greps command lines for `pytest` matches ITS OWN command line —
+`pgrep -f "python -m pytest"`, `ps | grep`, and a bash `case *pytest*` all
+self-match, as does another session's wait-loop. Test `argv[0]`'s basename, or a
+python interpreter with an adjacent `-m pytest`.
 
 ## Pre-Commit Gate
 
@@ -980,11 +1147,29 @@ findings below, a gated `gh pr merge`:
   names the PR's current head — so if any required routine never ran, ran on a stale
   commit, or was rate-limited, the merge blocks (naming the missing kinds). An ADVISORY
   routine still posts its review on the PR to be read/addressed, but its absence does not
-  block. If a required routine is pending or rate-limited, wait for it, or
-  append `# scheduled-review-override` to merge anyway (the conscious "merge without the
-  scheduled reviews" case). The marker means "ran **clean**", not merely "ran": a
+  block. A missing marker has **three causes needing different actions**, and the block
+  message now names which one you are in — do not guess:
+  (1) *no marker at any head* — nothing has run; on a freshly-opened PR a routine may
+  still be in flight, so **waiting is correct**;
+  (2) *a marker at an EARLIER head* — a routine ran, then a push moved the head. Routines
+  are generally not re-run on a push, so waiting is unlikely to help: re-review the
+  current head and post the marker by hand;
+  (3) *a marker AT this head that was REFUSED* — see the clean-verdict rule below.
+  Or append `# scheduled-review-override` to merge anyway (the conscious "merge without
+  the scheduled reviews" case). Head match is EXACT — no ancestor walk, no delta
+  tolerance, unlike the Codex freshness gate, which grants relief on a provably trivial
+  delta. That asymmetry is deliberate: the Codex classifier judges code-review
+  substantiality by file type and size, and an inferential leak lands in exactly the small
+  doc edit it would wave through. The marker means "ran **clean**", not merely "ran": a
   review whose body carries a blocking finding (`[P1]`/`HARD BLOCK`/`### ERROR`, unless a
   clean verdict overrides) is rejected, and DISMISSED/PENDING(draft) reviews don't count.
+  **ALWAYS end a genuinely-clean scheduled review with an explicit verdict line**
+  (`VERDICT: PASS`, or `PII/Secrets/Wording: CLEAN`). The blocking patterns are plain
+  substrings with no negation awareness, so prose like "not a hard block" or "no hard
+  blocks found" TRIPS them — measured on two 2026-08-28 PRs whose markers both contained
+  that phrase in negated prose; the one that also carried a clean-verdict line was
+  accepted and the one without it was silently refused. Without the verdict line a clean
+  review can be rejected on wording alone;
   Fail-closed: an unreadable comments/reviews fetch BLOCKS (never a false all-clear);
 - requires the PR base to equal the repo's default branch (retarget guard);
 - blocks unless mergeability is a definite `MERGEABLE` (a failed/unknown read

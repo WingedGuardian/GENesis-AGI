@@ -121,16 +121,30 @@ install_pkg() {
         echo "  ERROR: No package manager found. Install $pkg_apt manually."
         return 1
     fi
+    # `|| rc=$?` on every capture, NOT a bare assignment followed by `rc=$?`.
+    # Under `set -e` (line 10) an assignment whose value is a command substitution
+    # INHERITS that substitution's exit status and fires errexit, so a bare
+    # `output=$(...)` never reaches a following `rc=$?` when the install fails —
+    # the diagnostic block below would be dead code on the exact path it exists
+    # for. MEASURED: a bare call to this function with a failing install printed
+    # NOTHING and died; with `|| rc=$?` it prints the failure line and still
+    # returns non-zero. (Every current call site happens to use `|| …`, which
+    # disables errexit inside the function and hid this — so it was latent, not
+    # live. The next bare call site would have lost the diagnostics silently.)
+    rc=0
     if [[ "$PKG_MGR" == "apt" ]]; then
-        output=$(sudo apt-get install -y -qq "$pkg_apt" 2>&1)
+        output=$(sudo apt-get install -y -qq "$pkg_apt" 2>&1) || rc=$?
     else
-        output=$(sudo "$PKG_MGR" install -y -q "$pkg_dnf" 2>&1)
+        output=$(sudo "$PKG_MGR" install -y -q "$pkg_dnf" 2>&1) || rc=$?
     fi
-    rc=$?
     if [[ $rc -ne 0 ]]; then
-        # Show the last meaningful line of output for diagnostics
+        # Show the last meaningful line of output for diagnostics.
+        # The `|| last_line=""` matters: `set -o pipefail` is also on, so when the
+        # install produced only blank lines `grep -v` exits 1, the pipeline exits
+        # 1, and this assignment would abort the function BEFORE the echo — losing
+        # the very "no output" fallback written for that case.
         local last_line
-        last_line=$(echo "$output" | grep -v '^\s*$' | tail -1)
+        last_line=$(echo "$output" | grep -v '^\s*$' | tail -1) || last_line=""
         echo "  install failed (exit $rc): ${last_line:-no output}"
     fi
     return $rc
@@ -261,7 +275,11 @@ fi
 _node_version_ok() {
     command -v node &>/dev/null || return 1
     local ver
-    ver=$(node --version 2>/dev/null | sed 's/^v//')
+    # Guarded for the same reason as install_pkg: a broken `node` makes this
+    # pipeline non-zero under pipefail, and a bare assignment would abort the
+    # caller instead of returning "not ok". Latent today (every call site is
+    # `if _node_version_ok`), which is exactly how this class hides.
+    ver=$(node --version 2>/dev/null | sed 's/^v//') || ver=""
     local major="${ver%%.*}"
     [[ "$major" -ge 20 ]] 2>/dev/null
 }
@@ -814,7 +832,15 @@ else
         sudo systemctl reload ssh 2>/dev/null || sudo systemctl reload sshd 2>/dev/null || true
         # Verify the EFFECTIVE value — another drop-in sorting earlier would
         # silently win (first-value-wins), leaving dead-client detection off.
-        SSHD_EFFECTIVE=$(sudo sshd -T 2>/dev/null | grep -i '^clientaliveinterval ' | awk '{print $2}')
+        # `|| SSHD_EFFECTIVE=""` is load-bearing, and this site is worse than most:
+        # it is TOP LEVEL, so unlike a function there is no `|| …` call site to
+        # disable errexit. Under `set -o pipefail` a failing `sshd -T` (or a grep
+        # that matches nothing) makes the assignment non-zero and aborts bootstrap
+        # HERE — immediately after the sshd drop-in was written and sshd reloaded,
+        # skipping git hooks, unit rendering, timer enablement and the
+        # setup-complete marker, with no message. The else-branch below is written
+        # for exactly the empty/odd value that the abort prevents it from ever seeing.
+        SSHD_EFFECTIVE=$(sudo sshd -T 2>/dev/null | grep -i '^clientaliveinterval ' | awk '{print $2}') || SSHD_EFFECTIVE=""
         if [[ "$SSHD_EFFECTIVE" == "15" ]]; then
             echo "  ClientAlive configured (15s x 4 -> dead client HUP'd in ~60s)"
         else
