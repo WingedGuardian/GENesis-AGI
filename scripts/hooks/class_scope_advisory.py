@@ -37,7 +37,7 @@ def _repo_root(path: Path) -> Path | None:
             ["git", "rev-parse", "--show-toplevel"],
             cwd=path.parent, capture_output=True, text=True, timeout=5,
         )
-    except (subprocess.SubprocessError, OSError):
+    except (subprocess.SubprocessError, OSError, ValueError):
         return None
     return Path(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip() else None
 
@@ -48,7 +48,7 @@ def _committed_source(repo: Path, rel: str) -> str:
             ["git", "show", f"HEAD:{rel}"],
             cwd=repo, capture_output=True, text=True, timeout=5,
         )
-    except (subprocess.SubprocessError, OSError):
+    except (subprocess.SubprocessError, OSError, ValueError):
         return ""
     return out.stdout if out.returncode == 0 else ""
 
@@ -58,6 +58,8 @@ def _committed_source(repo: Path, rel: str) -> str:
 # Project convention puts hook scratch under ~/tmp, which disk-hygiene prunes.
 _SENTINEL_DIR = Path.home() / "tmp" / "genesis-class-scope"
 _SENTINEL_TTL_SECONDS = 24 * 60 * 60
+# Fallback dedup when the sentinel directory is unusable.
+_IN_PROCESS_REPORTED: set[str] = set()
 
 
 def _already_reported(key: str) -> bool:
@@ -68,17 +70,28 @@ def _already_reported(key: str) -> bool:
     """
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
     sentinel = _SENTINEL_DIR / digest
-    if sentinel.exists():
-        return True
-    with contextlib.suppress(OSError):
+    try:
         _SENTINEL_DIR.mkdir(parents=True, exist_ok=True)
         cutoff = time.time() - _SENTINEL_TTL_SECONDS
         for stale in _SENTINEL_DIR.iterdir():
             with contextlib.suppress(OSError):
                 if stale.stat().st_mtime < cutoff:
                     stale.unlink()
-        sentinel.touch()
-    return False
+        # O_CREAT|O_EXCL claims the sentinel atomically. A separate
+        # exists()-then-touch has a window in which two concurrent hooks both
+        # see it missing and both report the same finding.
+        os.close(os.open(sentinel, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        return False
+    except FileExistsError:
+        return True
+    except OSError:
+        # Cannot write the sentinel at all (read-only or full disk). Report
+        # ONCE-per-process rather than on every edit: an advisory that cannot
+        # remember what it said must not become a nag.
+        if key in _IN_PROCESS_REPORTED:
+            return True
+        _IN_PROCESS_REPORTED.add(key)
+        return False
 
 
 def main() -> int:

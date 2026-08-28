@@ -246,3 +246,274 @@ class TestCommitAdvisoryTargeting:
         import class_scope_commit_advisory as cca
 
         assert cca._targets_a_commit(command) is expected
+
+
+class TestEscapeHandlingIsAnAllowlist:
+    """A blocklist of escaped characters is wrong by construction.
+
+    Every escape it forgets (\\xNN, \\uXXXX, octal, \\a\\b\\f\\v) puts a character
+    into the grep core that never appears in raw source, so the prefilter misses
+    and the scan returns a confident empty result — the same silent-skip shape
+    as the regex prototype this scanner replaced.
+    """
+
+    @pytest.mark.parametrize(
+        "literal",
+        [
+            "\u2014 no qualifying rows yet today\n",   # \u escape
+            "\xe9 accented prose sentence here\n",     # \x escape
+            "bell \a and prose that follows it\n",     # \a
+            "vertical \v tab inside prose text\n",     # \v
+        ],
+    )
+    def test_core_contains_only_verbatim_characters(self, literal):
+        core = searchable_core(literal)
+        assert core, "no searchable core extracted"
+        # Whatever survives must appear literally in a source rendering.
+        assert core in repr(literal), (
+            f"core {core!r} is not present verbatim in the source form"
+        )
+
+    def test_exotic_escape_orphan_is_still_found(self, repo):
+        import subprocess
+
+        lit = "\u2014 no qualifying rows yet today\n"
+        old = f"def a():\n    return {lit!r}\n"
+        edited = _write(repo, "a.py", old)
+        _write(repo, "b.py", f"X = {lit!r}\n")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        new = 'def a():\n    return "*a completely different sentence*\\n"\n'
+
+        findings = find_orphaned_literals(edited, old, new, repo)
+        assert findings, "a literal with a unicode escape was silently skipped"
+        assert [p.name for p in findings[0]["survivors"]] == ["b.py"]
+
+    def test_embedded_nul_does_not_raise(self, repo):
+        """ValueError from subprocess is neither SubprocessError nor OSError."""
+        import subprocess
+
+        old = 'X = "alpha beta gamma \x00 delta epsilon zeta"\n'
+        edited = _write(repo, "a.py", old)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        new = 'X = "something else entirely for this one"\n'
+        assert find_orphaned_literals(edited, old, new, repo) == []
+
+
+class TestProvenanceScopeAndReassignment:
+    def test_same_method_name_in_two_classes_does_not_collide(self):
+        """Keying by bare name compares one class's method to the other's.
+
+        The file that motivated this scanner has the same method name in two
+        builder classes, so a last-one-wins map would have missed its defect.
+        """
+        old = (
+            "class A:\n"
+            "    def h(self, db):\n"
+            "        rows = get_all(db)\n"
+            "        return len(rows)\n"
+            "class B:\n"
+            "    def h(self, db):\n"
+            "        rows = get_all(db)\n"
+            "        return len(rows)\n"
+        )
+        new = old.replace(
+            "        rows = get_all(db)\n        return len(rows)\n"
+            "class B:", "        rows = get_prompt_rows(db)\n"
+            "        return len(rows)\nclass B:", 1
+        )
+        findings = find_unrevisited_uses(old, new)
+        assert findings, "the change in A.h was masked by B.h"
+        assert findings[0]["function"] == "A.h"
+
+    def test_later_reassignment_does_not_mask_the_change(self):
+        """Last-assignment-wins silences the exact motivating case."""
+        old = (
+            "def s(db):\n"
+            "    entries = get_all(db)\n"
+            "    entries = normalize(entries)\n"
+            "    return len(entries) / total(entries)\n"
+        )
+        new = old.replace("get_all(db)", "get_prompt_rows(db)")
+        findings = find_unrevisited_uses(old, new)
+        assert findings, "a reassignment after the read hid the provenance change"
+        assert "get_all" in findings[0]["was"]
+        assert "get_prompt_rows" in findings[0]["now"]
+
+    def test_walrus_provenance_is_visible(self):
+        old = "def s(db):\n    if (entries := get_all(db)):\n        return len(entries)\n"
+        new = old.replace("get_all(db)", "get_prompt_rows(db)")
+        assert find_unrevisited_uses(old, new)
+
+    def test_annotated_assignment_provenance_is_visible(self):
+        old = "def s(db):\n    rows: list = get_all(db)\n    return len(rows)\n"
+        new = old.replace("get_all(db)", "get_prompt_rows(db)")
+        assert find_unrevisited_uses(old, new)
+
+    def test_dotted_callee_change_is_detected(self):
+        """Pins Attribute handling in _callee_identity, which was unconstrained."""
+        old = "def s(db):\n    rows = crud.get_all(db)\n    return len(rows)\n"
+        new = old.replace("crud.get_all(db)", "crud.get_prompt_rows(db)")
+        findings = find_unrevisited_uses(old, new)
+        assert findings and findings[0]["was"] == "get_all"
+
+
+class TestBudgetIsEnforcedInsideTheSurvivorLoop:
+    def test_many_matching_files_still_respect_the_budget(self, repo):
+        """A single common core can match hundreds of files.
+
+        Checking the deadline only between literals lets one literal's survivor
+        loop run unbounded, which is where the real overrun lives.
+        """
+        import subprocess
+        import time
+
+        core = "the quick brown fox jumps over lazy dogs"
+        old = f'def a():\n    return "{core}"\n'
+        edited = _write(repo, "a.py", old)
+        # Survivors must be EXPENSIVE TO PARSE, not merely numerous: the inner
+        # deadline guards the ast.parse loop, and over tiny files that loop is
+        # free, so a weaker fixture cannot tell the check from its absence.
+        bulk = "".join(
+            f"def f{n}(a, b):\n    return (a + b) * {n} if a else b\n"
+            for n in range(1200)
+        )
+        for i in range(60):
+            _write(repo, f"pkg/mod{i}.py", f'X = "{core}"\n{bulk}')
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        new = 'def a():\n    return "an entirely different sentence here"\n'
+
+        t = time.perf_counter()
+        find_orphaned_literals(edited, old, new, repo, budget_seconds=0.05)
+        elapsed = time.perf_counter() - t
+        assert elapsed < 1.5, f"budget overrun: {elapsed:.2f}s for a 0.05s budget"
+
+
+class TestHooksEndToEnd:
+    """Run both hooks as real subprocesses with real payloads.
+
+    Nothing previously executed either ``main()``, so deleting the dedup, or the
+    provenance call, or the whole advisory body, left the suite green. These run
+    the actual entry points the way Claude Code runs them.
+    """
+
+    _HOOKS = Path(__file__).resolve().parents[2] / "scripts" / "hooks"
+
+    @pytest.fixture
+    def diverged(self, tmp_path):
+        """A repo where one file's message changed and its sibling's did not."""
+        import subprocess
+
+        for cmd in (["git", "init", "-q"],
+                    ["git", "config", "user.email", "t@t"],
+                    ["git", "config", "user.name", "t"]):
+            subprocess.run(cmd, cwd=tmp_path, check=True, capture_output=True)
+        msg = '"*No performance data yet for this domain.*\\n"'
+        (tmp_path / "a.py").write_text(f"def a():\n    return {msg}\n")
+        (tmp_path / "b.py").write_text(f"def b():\n    return {msg}\n")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True,
+                       capture_output=True)
+        (tmp_path / "a.py").write_text(
+            'def a():\n    return "*No qualifying rows are shown here.*\\n"\n'
+        )
+        return tmp_path
+
+    def _run(self, script, payload, cwd):
+        import json
+        import subprocess
+        import sys
+
+        return subprocess.run(
+            [sys.executable, str(self._HOOKS / script)],
+            input=json.dumps(payload), capture_output=True, text=True,
+            timeout=60, cwd=str(cwd),
+        )
+
+    def test_edit_advisory_reports_and_never_blocks(self, diverged, monkeypatch):
+        monkeypatch.setenv("HOME", str(diverged))  # isolate the sentinel dir
+        r = self._run(
+            "class_scope_advisory.py",
+            {"tool_name": "Edit", "session_id": "t1",
+             "tool_input": {"file_path": str(diverged / "a.py")}},
+            diverged,
+        )
+        assert r.returncode == 0, "an advisory must never block an edit"
+        assert "b.py" in r.stderr
+
+    def test_edit_advisory_dedups_within_a_session(self, diverged, monkeypatch):
+        monkeypatch.setenv("HOME", str(diverged))
+        payload = {"tool_name": "Edit", "session_id": "t2",
+                   "tool_input": {"file_path": str(diverged / "a.py")}}
+        first = self._run("class_scope_advisory.py", payload, diverged)
+        second = self._run("class_scope_advisory.py", payload, diverged)
+        assert "b.py" in first.stderr
+        assert not second.stderr.strip(), "repeated edits must not nag"
+
+    def test_commit_advisory_reads_the_staged_blob(self, diverged):
+        """Staged content, not the worktree: they differ after `git add`."""
+        import subprocess
+
+        subprocess.run(["git", "add", "-A"], cwd=diverged, check=True,
+                       capture_output=True)
+        # Now diverge the WORKTREE from the index; the advisory must ignore this.
+        (diverged / "a.py").write_text('def a():\n    return "unstaged text"\n')
+
+        r = self._run(
+            "class_scope_commit_advisory.py",
+            {"tool_name": "Bash", "session_id": "t3",
+             "tool_input": {"command": f"git -C {diverged} commit -m x"}},
+            diverged,
+        )
+        assert r.returncode == 0
+        assert "b.py" in r.stderr, "the staged divergence was not reported"
+
+    @pytest.mark.parametrize("command", ["ls -la", "git status", "git tag commit"])
+    def test_commit_advisory_silent_on_non_commits(self, diverged, command):
+        r = self._run(
+            "class_scope_commit_advisory.py",
+            {"tool_name": "Bash", "session_id": "t4",
+             "tool_input": {"command": command}},
+            diverged,
+        )
+        assert r.returncode == 0
+        assert not r.stderr.strip(), f"{command!r} should not trigger the scan"
+
+    def test_edit_advisory_reports_provenance_too(self, tmp_path, monkeypatch):
+        """The advisory must surface BOTH scans, not just orphaned literals.
+
+        Deleting the provenance call from the hook's main() previously left the
+        whole suite green, because every end-to-end case exercised only the
+        literal path.
+        """
+        import subprocess
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        for cmd in (["git", "init", "-q"],
+                    ["git", "config", "user.email", "t@t"],
+                    ["git", "config", "user.name", "t"]):
+            subprocess.run(cmd, cwd=tmp_path, check=True, capture_output=True)
+        src = (
+            "def section(db):\n"
+            "    entries = get_all(db)\n"
+            "    if not entries:\n"
+            "        return 'none'\n"
+            "    return sum(entries) / len(entries)\n"
+        )
+        (tmp_path / "m.py").write_text(src)
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True,
+                       capture_output=True)
+        (tmp_path / "m.py").write_text(src.replace("get_all(db)", "get_prompt_rows(db)"))
+
+        r = self._run(
+            "class_scope_advisory.py",
+            {"tool_name": "Edit", "session_id": "prov",
+             "tool_input": {"file_path": str(tmp_path / "m.py")}},
+            tmp_path,
+        )
+        assert r.returncode == 0
+        assert "entries" in r.stderr and "get_prompt_rows" in r.stderr, (
+            "the provenance scan was not reported by the hook"
+        )

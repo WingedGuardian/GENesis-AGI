@@ -43,7 +43,14 @@ def _targets_a_commit(command: str) -> bool:
         return False
     for seg in segments:
         argv = getattr(seg, "argv", None) or []
-        if len(argv) >= 2 and argv[0] == "git" and "commit" in argv[1:]:
+        if not argv or argv[0] != "git":
+            continue
+        # The SUBCOMMAND, skipping git's own leading options and their values,
+        # so `git tag commit` (a ref merely NAMED commit) does not fire.
+        i = 1
+        while i < len(argv) and argv[i].startswith("-"):
+            i += 2 if argv[i] in {"-C", "-c", "--git-dir", "--work-tree"} else 1
+        if i < len(argv) and argv[i] == "commit":
             return True
     return False
 
@@ -53,7 +60,7 @@ def _git(args: list[str], cwd: str) -> str:
         out = subprocess.run(
             ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=5
         )
-    except (subprocess.SubprocessError, OSError):
+    except (subprocess.SubprocessError, OSError, ValueError):
         return ""
     return out.stdout if out.returncode == 0 else ""
 
@@ -70,8 +77,12 @@ def main() -> int:
 
     staged = [
         r for r in _git(
-            ["diff", "--cached", "--name-only", "--diff-filter=M"], repo_root
-        ).split()
+            ["diff", "--cached", "--name-only", "--diff-filter=M", "-z"],
+            repo_root,
+        ).split("\0")
+        # -z, split on NUL: whitespace-splitting turns "my file.py" into two
+        # bogus paths and the real file is silently skipped, and without -z a
+        # non-ASCII path comes back quoted and fails the same way.
         if r.endswith(".py")
     ][:_MAX_FILES]
 
@@ -83,11 +94,12 @@ def main() -> int:
         old_src = _git(["show", f"HEAD:{rel}"], repo_root)
         if not old_src:
             continue
-        try:
-            new_src = (repo / rel).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            # A non-UTF-8 .py file must skip only ITSELF. Letting this raise
-            # would abandon every remaining staged file too.
+        # The INDEX blob, not the worktree. `git add -p` or an edit made after
+        # staging means the two differ, and reviewing the worktree would report
+        # on text that is not being committed (and miss divergence that exists
+        # only in what is).
+        new_src = _git(["show", f":{rel}"], repo_root)
+        if not new_src:
             continue
         for f in find_orphaned_literals(
             repo / rel, old_src, new_src, repo, budget_seconds=per_file
