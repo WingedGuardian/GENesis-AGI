@@ -2696,10 +2696,16 @@ def _scheduled_review_rows(pr_num: str, repo: str | None = None) -> list[dict] |
     return rows
 
 
-def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str, set[str]] | None:
-    """Map of ``head-sha -> {kinds}`` from valid owner-authored scheduled-review markers
-    on the PR, or ``None`` on an UNREADABLE fetch (the caller fail-closes on both None
-    and an empty map — None only distinguishes "could not read" from "read, no marker").
+def _scheduled_review_marker_scan(
+    pr_num: str, repo: str | None = None
+) -> tuple[dict[str, set[str]], dict[str, set[str]]] | None:
+    """``(accepted, rejected_not_clean)`` maps of ``head-sha -> {kinds}`` for the PR's
+    owner-authored scheduled-review markers, or ``None`` on an UNREADABLE fetch.
+
+    Both maps come from ONE pass so they cannot drift apart. ``accepted`` is what the
+    gate honours; ``rejected_not_clean`` is markers that parsed fine and named a head,
+    but whose body read as carrying a blocking finding. Only the DIAGNOSTIC message
+    consumes the second map — it never widens what satisfies the gate.
 
     A marker is trusted only when its author is the repo OWNER: ``login == owner`` OR
     ``author_association == "OWNER"`` (belt-and-suspenders — the marker itself is the
@@ -2716,7 +2722,8 @@ def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str,
     except Exception:
         owner_repo = repo
     owner = (owner_repo.split("/")[0] if owner_repo else "").lower() or None
-    by_head: dict[str, set[str]] = {}
+    accepted: dict[str, set[str]] = {}
+    rejected: dict[str, set[str]] = {}
     for row in rows:
         login = (row.get("login") or "").lower()
         assoc = (row.get("author_association") or "").upper()
@@ -2735,10 +2742,16 @@ def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str,
         # gate. Owner-authored review bodies are never seen by _check_pr_review_findings
         # (bots only), so without this a scheduled reviewer that explicitly BLOCKED would
         # still stamp its marker and slip the merge through.
-        if any(p.search(body) for p in _BLOCKING_PATTERNS) and not any(
+        #
+        # Such a marker is RECORDED (not dropped on the floor) so the block message can
+        # tell "you posted one and it was rejected" apart from "nobody posted anything" —
+        # measured 2026-08-28: those two produced the identical `present: none` line, and
+        # the only signal distinguishing an accepted marker from a rejected one was
+        # whether its prose happened to contain a _CLEAN_PATTERNS phrase.
+        not_clean = any(p.search(body) for p in _BLOCKING_PATTERNS) and not any(
             c.search(body) for c in _CLEAN_PATTERNS
-        ):
-            continue
+        )
+        target = rejected if not_clean else accepted
         # Defense-in-depth follow-up: for rows from /pulls/N/reviews we could ALSO
         # cross-check GitHub's authoritative `commit_id` vs the marker sha (issue comments
         # carry none). Deferred (LOW): the marker sha is matched EXACTLY vs the authoritative
@@ -2748,8 +2761,8 @@ def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str,
             kind_m = _SCHEDULED_REVIEW_KIND_RE.search(block)
             if not head_m or not kind_m:
                 continue  # a marker must name both a head AND a kind to count
-            by_head.setdefault(head_m.group(1).lower(), set()).add(kind_m.group(1).lower())
-    return by_head
+            target.setdefault(head_m.group(1).lower(), set()).add(kind_m.group(1).lower())
+    return accepted, rejected
 
 
 def _check_scheduled_claude_reviewed_head(
@@ -2765,11 +2778,45 @@ def _check_scheduled_claude_reviewed_head(
     40-char), else a BLOCK MESSAGE naming the MISSING kinds.
 
     Fail-CLOSED — this gate never passes on absence of positive evidence: if the head
-    cannot be read, or the comment/review fetch errors (``_scheduled_review_markers`` →
+    cannot be read, or the comment/review fetch errors (``_scheduled_review_marker_scan`` →
     None), the merge is BLOCKED. A read that simply does not carry every required kind
     at this head (a routine didn't run, ran on a stale commit, or was rate-limited) also
     blocks. The merge path and the report path share this single fail-closed decision,
     so the report can never issue a false all-clear here.
+
+    WHY THE BLOCK MESSAGE BRANCHES. A missing marker has THREE causes calling for
+    DIFFERENT operator actions, all distinguishable from what was already read. Every
+    branch is scoped to the MISSING kinds — a marker for an already-satisfied kind
+    explains nothing about this block, and prescribing a remedy for it sends the operator
+    to fix something that is not broken:
+      * a marker for a missing kind AT THIS head that was REFUSED as not-clean → neither
+        waiting nor re-reviewing helps; the body's wording (or a real finding) is the
+        cause. Reported FIRST: its remedy is unique, and it is the cause most easily
+        mistaken for "nobody posted anything".
+      * a marker for a missing kind at some OTHER head, ACCEPTED OR REFUSED → a routine
+        ran, then a push moved the head. Routines are not generally re-run on a push, so
+        waiting is unlikely to help; re-review the current head and post the marker.
+      * no marker for the missing kind(s) at any head → nothing has run for them. On a
+        freshly-opened PR a routine may still be in flight, and waiting IS the right move.
+    An earlier draft collapsed everything into an unconditional "waiting will not clear
+    this", which was wrong for the third case and pushed the operator toward
+    ``# scheduled-review-override`` — i.e. toward waiving the IRREDUCIBLE leak gate — in
+    the one situation where patience was the correct answer. Keep the branches, and keep
+    them scoped to ``missing``.
+
+    The message deliberately reports only what it OBSERVED (which heads carry markers)
+    and hedges the schedule ("generally not re-run"). The routines live OUTSIDE this repo
+    and this gate cannot see their triggers, so an unconditional claim about when they
+    fire would be asserting a guarantee the code cannot back — and would become actively
+    misleading on an install that also runs them on ``synchronize``.
+
+    Head match is EXACT — there is no ancestor walk and no delta tolerance here, unlike
+    the Codex freshness gate, which grants relief on a provably trivial delta via
+    ``_classify_post_review_delta``. That asymmetry is deliberate for now: that
+    classifier judges CODE-REVIEW substantiality by file type and size, and an
+    inferential leak (household/schedule/habit detail, not a token a regex can catch)
+    arrives in exactly the small doc edit it would wave through. A leak-specific
+    tolerance is tracked separately; do not reuse the code-review classifier for it.
 
     SCOPE: this gate enforces ONLY for a merge targeting the configured PUBLIC repo
     (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any other
@@ -2796,7 +2843,8 @@ def _check_scheduled_claude_reviewed_head(
             f"reviews (GitHub query failed).\n"
             f"Retry, or append '# scheduled-review-override' to merge anyway."
         )
-    markers = _scheduled_review_markers(pr_num, repo=repo)
+    scan = _scheduled_review_marker_scan(pr_num, repo=repo)
+    markers, rejected = (None, {}) if scan is None else scan
     if markers is None:
         return (
             f"could not read PR #{pr_num}'s comments/reviews to verify the scheduled Claude "
@@ -2808,14 +2856,70 @@ def _check_scheduled_claude_reviewed_head(
     missing = [k for k in required if k not in kinds_here]
     if not missing:
         return None
+    # WHY the marker is missing decides whether waiting is useful, and the two causes are
+    # DISTINGUISHABLE from what was actually read — so report the observed state instead
+    # of asserting a routine schedule this repo cannot see (the routines live outside it).
+    # Every branch below is scoped to the MISSING kinds. A marker for a kind that is
+    # already satisfied says nothing about why this merge is blocked, and prescribing a
+    # remedy for it sends the operator to fix something that is not broken.
+    missing_set = set(missing)
+    refused_here = sorted(rejected.get(head, set()) & missing_set)
+    # Any marker for a missing kind on some OTHER head — ACCEPTED OR REFUSED. Both prove a
+    # routine ran on a different commit, which is the whole content of this branch; only
+    # counting accepted ones sent a refused-at-a-stale-head PR down the "nothing has run,
+    # wait for it" path, i.e. straight back into the wrong-advice bug.
+    other_heads = sorted(
+        {
+            h[:12]
+            for by_head in (markers, rejected)
+            for h, kinds in by_head.items()
+            if h != head and (kinds & missing_set)
+        }
+    )
+    shown = ", ".join(other_heads[:3]) + (
+        f" (+{len(other_heads) - 3} more)" if len(other_heads) > 3 else ""
+    )
+    if refused_here:
+        # A marker IS present on this exact head — it was refused for reading as not-clean.
+        # Reported first: it is the only cause whose remedy is neither waiting nor
+        # re-reviewing, and the one most easily mistaken for "nobody posted anything".
+        cause = (
+            f"A marker for {', '.join(refused_here)} IS present at THIS head, but it was "
+            f"REFUSED because its body reads as carrying a blocking finding "
+            f"(matches one of [P1] / HARD BLOCK / an '### ERROR' heading) without an "
+            f"explicit clean verdict to override it. A marker must mean it ran clean, not "
+            f"merely that it ran. If the review really was clean, the prose tripped the "
+            f"check — re-post it ending with an explicit verdict line, exactly "
+            f"'VERDICT: PASS' or 'PII/Secrets/Wording: CLEAN'. If the finding is real, fix "
+            f"it first."
+        )
+    elif other_heads:
+        cause = (
+            f"A marker for the missing kind(s) is present for a DIFFERENT head ({shown}), "
+            f"so a routine HAS run on this PR — just not on the current commit. Routines "
+            f"are generally not re-run when a later push moves the head, so waiting is "
+            f"unlikely to clear this on its own: re-run the missing review(s) against the "
+            f"current head and post the marker yourself."
+        )
+    else:
+        # Scoped to the missing kinds on purpose: with more than one required kind, a
+        # blanket "no marker at ANY head" contradicts the `present:` list on the line above
+        # whenever another kind is already satisfied.
+        cause = (
+            f"No marker for {', '.join(missing)} is present at ANY head on this PR yet. If "
+            f"it was just opened, a routine may still be in flight — wait for it. If it "
+            f"has been open a while, re-run the missing review(s) against the current head "
+            f"and post the marker yourself."
+        )
     return (
         f"scheduled Claude review(s) missing at head {head[:12]}: {', '.join(missing)} "
         f"(required: {', '.join(required)}; present: "
         f"{', '.join(sorted(kinds_here)) or 'none'}).\n"
-        f"Each routine posts a comment/review carrying "
-        f"'<!-- genesis-scheduled-review: head=<sha> kind=<name> -->' once it runs on THIS "
-        f"exact commit — wait for the missing routine(s) to run on the current head, or "
-        f"append '# scheduled-review-override' to merge without them."
+        f"{cause}\n"
+        f"A marker is a comment/review by the repo OWNER carrying "
+        f"'<!-- genesis-scheduled-review: head={head} kind=<name> -->' — the FULL 40-hex "
+        f"head, exactly as written here.\n"
+        f"Or append '# scheduled-review-override' to merge without the missing review(s)."
     )
 
 
