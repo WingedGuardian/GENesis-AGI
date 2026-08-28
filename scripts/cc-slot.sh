@@ -292,7 +292,9 @@ else
     esac
 fi
 
-echo "→ Slot ${SLOT} (session: ${SESSION_NAME})" >&2
+# `live: N` = current numeric cc-N count (excludes retired cc-manual-* strays);
+# the gate/fallback message above carries the cap itself.
+echo "→ Slot ${SLOT} (session: ${SESSION_NAME}, live: ${existing})" >&2
 
 # Redirect CC temp to dedicated directory (keeps /tmp clean)
 export TMPDIR="$HOME/.genesis/cc-tmp"
