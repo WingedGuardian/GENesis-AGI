@@ -1,0 +1,122 @@
+name: Contributor review trigger
+
+# Ask the automated reviewer to look at an OUTSIDE contributor's PR — but only
+# when that PR is answering an issue we actually put on the board.
+#
+# WHY THIS EXISTS. The reviewer runs automatically for the maintainer's own PRs
+# and does not for forks, which is the right default: an outside PR should not be
+# able to spend the reviewer's quota by existing. But a contributor who picked up
+# a labelled issue is not a drive-by, and making them wait for a human to type
+# "@codex review" is friction we chose, not friction we want.
+#
+# ── SECURITY: why this is `pull_request_target`, and what that obliges ───────
+# A `pull_request` run for a fork gets a READ-ONLY token, so it cannot comment.
+# `pull_request_target` gets a writable token — but it runs in the BASE repo's
+# context with that token available, so if it ever executed head-ref code, an
+# outside contributor would be running arbitrary code with repository write
+# access. That is the single well-known footgun of this trigger.
+#
+# The mitigation here is structural rather than careful: this workflow NEVER
+# obtains the head code. There is no `actions/checkout`, no build, no install, no
+# test, and no `run:` step that consumes PR-authored content. It reads metadata
+# through the API and posts one comment. Nothing an author writes is executed,
+# and the only PR-authored value it reads (labels on a LINKED ISSUE) is compared
+# against a fixed allow-list rather than interpolated anywhere.
+#
+# Keep it that way. If this workflow ever needs to inspect the diff, that work
+# belongs in a separate `pull_request` job with the default read-only token.
+
+on:
+  pull_request_target:
+    # `opened` covers the normal case; `ready_for_review` covers a PR that was
+    # opened as a draft, since the reviewer treats leaving draft as the start.
+    types: [opened, ready_for_review]
+
+# Least privilege. `pull-requests: write` is the ONLY elevated scope, and it
+# exists solely to post the trigger comment.
+permissions:
+  contents: read
+  issues: read
+  pull-requests: write
+
+concurrency:
+  # One trigger per PR. A draft opened and then marked ready fires twice.
+  group: contributor-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  request-review:
+    runs-on: ubuntu-latest
+    # Only outside contributions. The maintainer's own PRs already get an
+    # automatic review, so triggering here would spend a second one for nothing.
+    if: >-
+      github.event.pull_request.head.repo.full_name != github.repository &&
+      github.event.pull_request.draft == false
+    steps:
+      - name: Trigger a review when the PR answers a labelled issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Labels that mark an issue as one we invited work on. An issue
+            // carrying none of these is not part of the contributor pipeline,
+            // and its PR waits for a human like any other outside change.
+            const INVITED = ['good first issue', 'first-timers-only', 'help wanted'];
+
+            const pr = context.payload.pull_request;
+
+            // A FORMAL closing link, not a mention. `closingIssuesReferences` is
+            // populated only by "Closes #N"-style keywords, so this cannot be
+            // satisfied by a PR body that merely names an issue number — which
+            // matters, because the PR body is attacker-controlled text and the
+            // whole point is that the ISSUE (ours) decides, not the PR (theirs).
+            const q = `
+              query($owner:String!, $repo:String!, $number:Int!) {
+                repository(owner:$owner, name:$repo) {
+                  pullRequest(number:$number) {
+                    closingIssuesReferences(first: 10) {
+                      nodes { number labels(first: 20) { nodes { name } } }
+                    }
+                  }
+                }
+              }`;
+            const data = await github.graphql(q, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              number: pr.number,
+            });
+
+            const issues = data.repository.pullRequest.closingIssuesReferences.nodes || [];
+            const matched = issues.find(i =>
+              (i.labels.nodes || []).some(l => INVITED.includes(l.name.toLowerCase()))
+            );
+
+            if (!matched) {
+              core.info(
+                `PR #${pr.number} closes no issue carrying ${JSON.stringify(INVITED)} — ` +
+                `no review requested. Linked issues: ` +
+                (issues.map(i => `#${i.number}`).join(', ') || 'none')
+              );
+              return;
+            }
+
+            // Do not stack requests. The concurrency group serialises runs but
+            // does not dedupe across event types, and a human may have already
+            // asked — in which case a second request only burns quota.
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              per_page: 100,
+            });
+            if (comments.some(c => c.body && c.body.includes('@codex review'))) {
+              core.info(`PR #${pr.number} already has a review request — not repeating it.`);
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body: '@codex review',
+            });
+            core.info(`Requested a review on PR #${pr.number} (closes #${matched.number}).`);
