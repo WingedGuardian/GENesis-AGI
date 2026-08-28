@@ -2327,7 +2327,15 @@ def _check_codex_reviewed_head(
                 f"Codex reviews on PR-open — it does NOT auto-review a later fix-commit; "
                 f"comment '@codex review' on the PR to review the current head (then wait), "
                 f"or append '# stale-review-override' to merge without a current Codex "
-                f"review (e.g. Codex is down)."
+                f"review (e.g. Codex is genuinely down).\n"
+                f"NOTE: the GitHub reviewer and the `codex exec` CLI are separate SURFACES; do "
+                f"not infer one from the other. OBSERVED once (2026-08-27): the CLI reported "
+                f"a two-week usage lockout while the GitHub reviewer, asked minutes later, "
+                f"returned a full review on the same commit. Whether that is separate "
+                f"metering, a plan-tier difference or a CLI-side fault was NOT established "
+                f"— so treat each surface as independently available until proven otherwise: "
+                f"post '@codex review' and check for a review at head BEFORE concluding "
+                f"Codex is unavailable."
             ),
             None,
         )
@@ -2358,6 +2366,15 @@ def _check_codex_reviewed_head(
                 f"Comment '@codex review' on the PR to re-review the current head (Codex "
                 f"does NOT auto-review fix-commits), then wait; or append "
                 f"'# stale-review-override' to merge anyway.\n"
+                f"NOTE: the GitHub reviewer and the `codex exec` CLI are separate SURFACES; do "
+                f"not infer one from the other. OBSERVED once (2026-08-27): the CLI reported "
+                f"a two-week usage lockout while the GitHub reviewer, asked minutes later, "
+                f"returned a full review on the same commit. Whether that is separate "
+                f"metering, a plan-tier difference or a CLI-side fault was NOT established "
+                f"— so treat each surface as independently available until proven otherwise: "
+                f"post '@codex review' and check for a review at head BEFORE concluding "
+                f"Codex is unavailable."
+                f"\n"
                 f"  (inspect the unreviewed commits: git log {reviewed[:12]}..{head[:12]} "
                 f"--oneline)"
             ),
