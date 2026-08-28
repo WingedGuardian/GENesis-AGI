@@ -137,7 +137,17 @@ from shell_parse import (  # noqa: E402
     git_subcommand,
     has_trailing_override,
     split_segments,
+    strip_heredoc_bodies,
+    untokenizable,
 )
+
+# Literal danger-flags that mark a HARD-blocked op (force push, hook bypass,
+# admin-merge to public main). Consulted ONLY on the un-tokenizable path, where
+# analyze() has gone blind — a closed-set literal claim, so a flag this list does
+# not name simply degrades to the status-quo (the net only ADDS a block, never
+# flips one to allow). Long forms only: `-f`/`-n` short forms are too noisy to
+# match on a raw string and are left to the (tracked) hardening follow-up.
+_FORCE_NV_ADMIN = re.compile(r"(?:^|\s)(?:--force(?:-with-lease)?|--no-verify|--admin)(?:\s|=|$)")
 
 # Local push allowlist (offline re-push cache). SOFT dependency, guarded exactly
 # like the review_state import above: a module-LOAD exception must degrade to
@@ -3759,10 +3769,46 @@ def main() -> int:
         # quoted mentions excluded). Each guarded subcommand is matched on real
         # argv, and the `# review-override` approval binds to its OWN segment.
         segs = analyze(cmd)
+
         push_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "push"]
         merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
+
+        # ── Fail-closed blind-spot net ─────────────────────────────
+        # analyze()/_argv degrade to a naive split SILENTLY on a command shlex
+        # can't tokenize (e.g. an ANSI-C `$'…\'…'` whose escaped quote mis-closes
+        # a `$()` and swallows a trailing `&& git push --force` into a redirect
+        # target — a live bypass). Fire on the DISCREPANCY: the raw text names a
+        # hard-blocked flag, the command is un-tokenizable (so the parse cannot be
+        # trusted), and yet analyze() surfaced NO gated segment to gate. That
+        # three-way conjunction is what makes this precise — requiring the missing
+        # segment lets every command analyze() DID parse (a legit `--force` push, a
+        # `$'…'` message, an apostrophe in a trailing `#` comment) flow to the real
+        # gates below instead of being refused here. Mirrors protected_paths_guard's
+        # tokenizability probe; here-doc bodies are stripped first (data, not argv).
+        if not (push_segs or merge_pr_segs or merge_git_segs):
+            _stripped = strip_heredoc_bodies(cmd)
+            # The flag search runs on the ORIGINAL text (OR the stripped one), never
+            # on the stripped text ALONE: an ANSI-C desync can land a `<<WORD` inside
+            # the falsely-unquoted window, and the stripper then deletes the very
+            # lines carrying `--force` — starving the match and silently standing the
+            # net down (a reproduced fail-OPEN). Stripping may only ever REMOVE the
+            # evidence this net keys on, so it must not be the sole source of it;
+            # here-doc bodies remain stripped for the TOKENIZABILITY probe, which is
+            # where they earn their keep (a legit heredoc must not read as a blind spot).
+            if untokenizable(_stripped) and (
+                _FORCE_NV_ADMIN.search(cmd) or _FORCE_NV_ADMIN.search(_stripped)
+            ):
+                print(
+                    "BLOCKED: this command is not safely tokenizable (e.g. ANSI-C "
+                    "$'...' quoting) yet names a hard-blocked flag "
+                    "(--force/--no-verify/--admin) the guard cannot verify. Rewrite "
+                    "it in a simple, directly-parseable form (plain single/double "
+                    "quotes, or a -F <file>) and re-run.",
+                    file=sys.stderr,
+                )
+                return 2
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
         # command carrying more than one would collapse into ONE ask/gate

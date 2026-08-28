@@ -22,13 +22,14 @@ import sys
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks"))
-from hook_input import field, read_payload  # noqa: E402
+from hook_input import field, read_payload, run_guard  # noqa: E402
 from shell_parse import (  # noqa: E402
     analyze,
     commit_skips_hooks,
     git_subcommand,
     has_trailing_override,
     split_segments,
+    untokenizable,
 )
 
 # Sentinel: the commit's effective cwd cannot be confidently resolved (a cd into
@@ -609,6 +610,29 @@ def main() -> None:
     # string (a reply body, an echo). Confirm a REAL executed commit segment
     # before applying the branch/review rules, else allow.
     if not any(git_subcommand(s.argv) == "commit" for s in segs):
+        # ── Fail-closed blind-spot net ──────────────────────────────────────
+        # "No commit segment" is a trustworthy verdict only when the command was
+        # PARSEABLE. analyze() mis-parses an ANSI-C `$'…\'…'` command and DROPS
+        # the real commit segment, so this very early-out is what lets a
+        # commit-to-main / --no-verify / unreviewed commit sail through (a live,
+        # reproduced bypass). When the word "commit" appears (guaranteed past the
+        # _COMMIT_PATTERN early-out above) but the command is un-tokenizable, the
+        # empty parse is not evidence of absence → refuse instead of allowing.
+        # Here-doc bodies are stripped first (stdin data, never executed argv), so
+        # a legit `git commit -F - <<'EOF'` heredoc does not trip this.
+        # Wrapped LOCALLY: this module's __main__ calls main() with NO run_guard,
+        # so an uncaught helper error would exit 1 — which CC treats as
+        # NON-blocking (fail OPEN). Any probe exception therefore fails CLOSED.
+        try:
+            if untokenizable(command, strip_heredocs=True):
+                _deny(
+                    "BLOCKED: this command is not safely tokenizable (e.g. ANSI-C "
+                    "$'...' quoting) and mentions a commit the guard cannot verify. "
+                    "Rewrite with plain single/double quotes or `git commit -F "
+                    "<file>` and re-run."
+                )
+        except Exception:  # noqa: BLE001 — fail CLOSED; a guard must never crash open
+            _deny("BLOCKED: the commit-guard tokenizability probe failed — refusing (fail closed).")
         sys.exit(0)
 
     # Rule 0: Block --no-verify / -n on ANY executed commit segment — it
@@ -1017,4 +1041,11 @@ def _deny(message: str) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Fail CLOSED on an unexpected crash. CC's PreToolUse contract is "exit 2 =
+    # block; ANY other code = non-blocking error → the tool RUNS", so a bare
+    # main() let every uncaught exception in this gate (Rule 0, the branch/review
+    # rules, git_root_for, …) exit 1 = silent FAIL-OPEN on a commit. run_guard
+    # converts that to exit 2 and logs loudly; SystemExit (every deliberate
+    # _deny/allow path here) propagates untouched, so allow/block decisions are
+    # unchanged. Mirrors git_push_guard.py's wiring.
+    run_guard(main, "review_enforcement_commit")
