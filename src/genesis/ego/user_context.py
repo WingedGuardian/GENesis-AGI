@@ -1487,11 +1487,20 @@ class UserEgoContextBuilder:
             # tracked (avg 94%)" over a 627-domain map averaging 6%.
             avg_conf = sum(e.get("confidence", 0) for e in entries) / len(entries)
             _plural = "domain" if len(entries) == 1 else "domains"
+            # "Current" is only true relative to the freshest row, and the
+            # window is anchored on that row precisely so a dead refresh job
+            # keeps everything rather than blanking the map. During such an
+            # outage every row here is months old, so an unqualified "current"
+            # is false exactly when it matters. Date it instead of asserting it.
+            _newest = max(
+                (e.get("updated_at") or "" for e in entries), default=""
+            )[:10]
+            _asof = f", newest evidence {_newest}" if _newest else ""
             return (
                 f"## Your Track Record\n"
-                f"{len(entries)} {_plural} with current, qualifying evidence "
-                f"(avg confidence: {avg_conf:.0%}); stale and thin rows are not "
-                f"counted.\n"
+                f"{len(entries)} {_plural} with qualifying evidence "
+                f"(avg confidence: {avg_conf:.0%}{_asof}); stale and thin rows "
+                f"are not counted.\n"
             )
 
         _TREND_ICONS = {"improving": "+", "declining": "-", "stable": "="}

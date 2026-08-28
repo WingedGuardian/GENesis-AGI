@@ -127,6 +127,14 @@ async def upsert(
 # is precisely the failure the clamp exists to prevent. Degrade to wall-clock
 # instead.
 #
+# Note the order: ``MAX(julianday(...))``, NOT ``julianday(MAX(...))``. ``MAX``
+# over the raw column is a LEXICAL max over text, so a malformed value
+# ('zzzz-...') outranks every ISO timestamp, parses to NULL, and COALESCE then
+# substitutes wall-clock — hiding every uniformly-old row and collapsing the
+# dead-refresh guarantee in exactly the corruption case COALESCE was added to
+# tolerate. Aggregating over PARSED values skips unparseable rows instead of
+# letting one of them decide the window.
+#
 # (A PARTIAL refresh outage is still not covered: one source failing while the
 # others keep writing holds the anchor at now, and that source's domains do age
 # out. Tracked separately.)
@@ -186,7 +194,7 @@ def _recency_clause(stale_after_days: int | None) -> tuple[str, list]:
     return (
         " AND julianday(updated_at) >= "
         "MIN(COALESCE("
-        "julianday((SELECT MAX(updated_at) FROM capability_map)), "
+        "(SELECT MAX(julianday(updated_at)) FROM capability_map), "
         "julianday('now')), julianday('now')) - ?",
         [int(stale_after_days)],
     )

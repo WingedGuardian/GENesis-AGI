@@ -1166,3 +1166,48 @@ class TestCountFailureDoesNotAbortTheCycle:
         wrapped = self._FailSecondRead(thin_db)
         out = await EgoContextBuilder(db=wrapped)._self_model_section()
         assert "count unavailable" in out
+
+
+class TestLightDepthDatesItsEvidence:
+    """The light branch renders no table, so its sentence is the whole claim.
+
+    The window is anchored on the freshest row precisely so a dead refresh job
+    keeps every row rather than blanking the map — which means during such an
+    outage every row is months old. An unqualified "current" is therefore false
+    exactly when the guarantee is doing its job.
+    """
+
+    @pytest.fixture
+    async def aged_db(self):
+        from datetime import UTC, datetime, timedelta
+
+        from genesis.db.schema import TABLES
+
+        async with aiosqlite.connect(":memory:") as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute(TABLES["capability_map"])
+            stamp = (datetime.now(UTC) - timedelta(days=200)).isoformat()
+            for i in range(3):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.9, 40, 'stable', 'e', ?)",
+                    (f"d{i}", f"dom{i}", stamp),
+                )
+            await conn.commit()
+            yield conn, stamp[:10]
+
+    async def test_does_not_call_a_months_old_map_current(self, aged_db):
+        from genesis.ego.user_context import UserEgoContextBuilder
+
+        db, stamp = aged_db
+        out = await UserEgoContextBuilder(db=db)._capability_performance_section(
+            depth="light"
+        )
+        # The rows ARE kept — that is the dead-refresh guarantee working.
+        assert "3 domains" in out
+        # ...but they must not be described as current.
+        assert "current, qualifying evidence" not in out
+        assert f"newest evidence {stamp}" in out, (
+            "the light line asserts freshness it cannot support"
+        )

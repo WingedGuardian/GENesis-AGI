@@ -586,3 +586,57 @@ class TestWindowExcludesInBothDirections:
         assert await cap_crud.get_weakest(db, max_confidence=1.0), (
             "get_weakest blanked by the same NULL anchor"
         )
+
+
+class TestMalformedAnchorDuringOutage:
+    """The corruption case the COALESCE fallback was added to tolerate.
+
+    ``MAX(updated_at)`` is a LEXICAL max over text, so a malformed value like
+    ``zzzz-not-a-time`` outranks every ISO timestamp. ``julianday()`` then
+    returns NULL for it, COALESCE substitutes wall-clock now, and every
+    uniformly-old row falls outside the window — defeating the dead-refresh-job
+    guarantee in exactly the corruption case the fallback exists to tolerate.
+
+    The earlier fixture paired a malformed row only with FRESH rows, where
+    substituting now happens to give the right answer, so it could not see this.
+    """
+
+    @staticmethod
+    async def _insert(db, domain, updated_at, *, confidence=0.7, sample_size=9):
+        await db.execute(
+            "INSERT INTO capability_map (id, domain, confidence, sample_size, "
+            "trend, evidence_summary, updated_at) "
+            "VALUES (?, ?, ?, ?, 'stable', '', ?)",
+            (f"id-{domain}", domain, confidence, sample_size, updated_at),
+        )
+        await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_dead_job_plus_malformed_row_still_hides_nothing(self, db):
+        from datetime import UTC, datetime, timedelta
+
+        old_stamp = (datetime.now(UTC) - timedelta(days=120)).isoformat()
+        for i in range(3):
+            await self._insert(db, f"aged{i}", old_stamp)
+        # Lexically greater than any ISO timestamp, and unparseable.
+        await self._insert(db, "corrupt", "zzzz-not-a-time")
+
+        domains = {e["domain"] for e in await cap_crud.get_prompt_rows(db)}
+        assert {"aged0", "aged1", "aged2"} <= domains, (
+            "a malformed anchor collapsed the dead-refresh guarantee — every "
+            "uniformly-old row was hidden"
+        )
+
+    @pytest.mark.asyncio
+    async def test_malformed_row_does_not_shift_a_healthy_window(self, db):
+        """The anchor must come from the newest PARSEABLE row, not the garbage."""
+        from datetime import UTC, datetime, timedelta
+
+        now = datetime.now(UTC)
+        await self._insert(db, "fresh", now.isoformat())
+        await self._insert(db, "stale", (now - timedelta(days=90)).isoformat())
+        await self._insert(db, "corrupt", "zzzz-not-a-time")
+
+        domains = {e["domain"] for e in await cap_crud.get_prompt_rows(db)}
+        assert "fresh" in domains
+        assert "stale" not in domains, "the window stopped excluding stale rows"
