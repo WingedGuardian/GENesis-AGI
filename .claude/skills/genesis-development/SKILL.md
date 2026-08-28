@@ -205,6 +205,22 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   passed may be testing nothing; a whole suite passing every review round
   while a reviewer keeps finding real spec bugs is the tell that the tests
   encode the same wrong spec as the code.
+- **A RED that comes back GREEN is TWO hypotheses, not one.** Either the test is
+  vacuous, or the MUTATION silently failed to apply — and the second is common,
+  because the auto-formatter reflows lines and a `str.replace()` anchor written
+  from memory then matches nothing. So: `assert mutated != original` after every
+  injection, and `ast.parse()` it before writing (an invalid mutation breaks
+  collection, and that failure reads as a successful RED). Restore from a file
+  copy taken beforehand, never `git checkout` — the work is uncommitted.
+- **Vacuous-test shapes to check for by name.** A test is vacuous when: its
+  assertion is ALSO true on the success path (`assert x.blocked is False` where
+  a successful call also returns False — assert the fact that DISTINGUISHES
+  them); its setup short-circuits the path it names (passing an explicit
+  argument the code prefers over the env var under test); or its fixture never
+  creates the shape it claims (a `bash -c 'sleep 30 # marker'` decoy
+  exec-replaces itself and loses the marker from its argv — add a
+  guard-the-guard assert that the fixture really has the property). Ask of every
+  new test: *would this still pass if the mechanism it names were deleted?*
 - **Contested/subtle specs: write the expectations first.** When what-should-
   happen is itself under discussion (which keys count, which states clear an
   alarm), enumerate the expectation table as failing tests BEFORE implementing
@@ -649,6 +665,24 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      cost), name the cap explicitly ("we've hit the 3-round escalation cap"),
      and get a FRESH decision: keep hardening, switch to a robust-by-
      construction redesign, narrow scope, or shelve.
+  **Count CLASSES, not findings, when judging whether the cap has fired.**
+  Before fixing anything in a second round, tabulate the findings with a CLASS
+  column. Findings that look unrelated one at a time routinely share one
+  generator — five across three rounds once reduced to a single defect (two
+  layers that had to agree about every lever and could not), and patching
+  instances twice changed nothing while deleting the second layer removed all
+  five at once. If one class has ≥2 entries, the fix is architectural. The count
+  that matters is "consecutive rounds surfacing a NEW class", not the finding
+  total.
+
+  A corollary that costs a round if missed: when you delete a duplicated layer,
+  verify the class is closed by enumerating the registry for the BEHAVIOUR, not
+  for the deleted file's NAME. A name-scoped guard beneath a class-scoped claim
+  passes happily while a sibling oracle sits on the same event and matcher.
+  (And if the invariant turns out not to be statically checkable, say so and
+  narrow the test to what it can prove — a guard that cries wolf gets deleted by
+  whoever hits it next.)
+
   These three are backstopped by a **machine layer** with **two tiers, not one**.
   The tier you hit FIRST is the one most sessions do not know exists:
 
