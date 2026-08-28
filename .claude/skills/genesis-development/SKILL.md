@@ -163,6 +163,30 @@ string ends in `\n`). The acceptance replay is what exposed it. A matcher that
 finds nothing is indistinguishable from a matcher that looks at nothing —
 only replaying a known-positive tells them apart.
 
+### A blocked compound command loses EVERYTHING in it
+
+A PreToolUse block kills the **whole** Bash call, not the offending part — so a
+guard firing on step 3 also silently discards steps 1 and 2, while the error
+text talks only about step 3. This repo has many blocking guards
+(`review_enforcement_commit`, `full_suite_guard`, `concurrent_test_guard`,
+`git_push_guard`, the destructive/protected-path guards), so it is not rare.
+
+**Never chain a state-changing step with a step that can be blocked.** Keep
+`cd`, heredocs, file writes and restore-from-backup in their own invocation,
+separate from test runs, commits, pushes, or anything a guard inspects.
+
+**After any block, verify state before continuing.** Run `pwd`, and re-check the
+file you believed you wrote. Do not assume the earlier half of the command ran.
+Prefer `git -C <literal path>` and absolute script paths over a persistent `cd`,
+so a lost `cd` cannot silently redirect later commands.
+
+Measured cost in one session: four heredocs that never wrote, a
+restore-from-backup that never ran (leaving a file deliberately regressed), and
+a `cd` that never happened — so edits landed in the **wrong worktree** and had
+to be reverted as cross-branch contamination. Guard false-positives make this
+worse: `shell_parse` mis-parses backslash line-continuations and quoted heredoc
+bodies, so legitimate commands get blocked too.
+
 ### Instance-Fix vs Class-Fix Gate
 
 When a mechanism failed to write or propagate something (a memory, a

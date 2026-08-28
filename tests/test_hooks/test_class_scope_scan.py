@@ -24,6 +24,27 @@ from class_scope_scan import (  # noqa: E402
 )
 
 
+def _advisory_context(result) -> str:
+    """The text a hook actually DELIVERS to the model, or "" if none.
+
+    Asserting on stderr proved only that the hook wrote something. Claude Code
+    discards stderr from a hook that exits 0, so a stderr-only advisory is
+    written, logged, testable — and never seen. The model reads
+    ``hookSpecificOutput.additionalContext`` on stdout and nothing else, so
+    that is what these tests read too.
+    """
+    import json as _json
+
+    out = (result.stdout or "").strip()
+    if not out:
+        return ""
+    try:
+        payload = _json.loads(out)
+    except ValueError:
+        return ""
+    return payload.get("hookSpecificOutput", {}).get("additionalContext", "")
+
+
 def _write(tmp_path: Path, rel: str, body: str) -> Path:
     p = tmp_path / rel
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -234,7 +255,9 @@ class TestCommitAdvisoryTargeting:
         "command,expected",
         [
             ("git commit -m x", True),
-            ("git -C /some/path commit -m x", True),
+            # A real directory: the resolver refuses a -C path that does not
+            # exist, since such a commit cannot run anyway.
+            ("git -C /tmp commit -m x", True),
             ("git add -A && git commit -m x", True),
             ("ls -la", False),
             ("git status", False),
@@ -245,7 +268,7 @@ class TestCommitAdvisoryTargeting:
     def test_only_real_commits_are_targeted(self, command, expected):
         import class_scope_commit_advisory as cca
 
-        assert cca._targets_a_commit(command) is expected
+        assert (cca._commit_target_cwd(command) is not None) is expected
 
 
 class TestEscapeHandlingIsAnAllowlist:
@@ -439,7 +462,8 @@ class TestHooksEndToEnd:
             diverged,
         )
         assert r.returncode == 0, "an advisory must never block an edit"
-        assert "b.py" in r.stderr
+        ctx = _advisory_context(r)
+        assert "b.py" in ctx
 
     def test_edit_advisory_dedups_within_a_session(self, diverged, monkeypatch):
         monkeypatch.setenv("HOME", str(diverged))
@@ -447,8 +471,8 @@ class TestHooksEndToEnd:
                    "tool_input": {"file_path": str(diverged / "a.py")}}
         first = self._run("class_scope_advisory.py", payload, diverged)
         second = self._run("class_scope_advisory.py", payload, diverged)
-        assert "b.py" in first.stderr
-        assert not second.stderr.strip(), "repeated edits must not nag"
+        assert "b.py" in _advisory_context(first)
+        assert not _advisory_context(second), "repeated edits must not nag"
 
     def test_commit_advisory_reads_the_staged_blob(self, diverged):
         """Staged content, not the worktree: they differ after `git add`."""
@@ -466,7 +490,9 @@ class TestHooksEndToEnd:
             diverged,
         )
         assert r.returncode == 0
-        assert "b.py" in r.stderr, "the staged divergence was not reported"
+        assert "b.py" in _advisory_context(r), (
+            "the staged divergence was not reported"
+        )
 
     @pytest.mark.parametrize("command", ["ls -la", "git status", "git tag commit"])
     def test_commit_advisory_silent_on_non_commits(self, diverged, command):
@@ -477,7 +503,7 @@ class TestHooksEndToEnd:
             diverged,
         )
         assert r.returncode == 0
-        assert not r.stderr.strip(), f"{command!r} should not trigger the scan"
+        assert not _advisory_context(r), f"{command!r} should not trigger the scan"
 
     def test_edit_advisory_reports_provenance_too(self, tmp_path, monkeypatch):
         """The advisory must surface BOTH scans, not just orphaned literals.
@@ -513,7 +539,84 @@ class TestHooksEndToEnd:
              "tool_input": {"file_path": str(tmp_path / "m.py")}},
             tmp_path,
         )
+        ctx = _advisory_context(r)
         assert r.returncode == 0
-        assert "entries" in r.stderr and "get_prompt_rows" in r.stderr, (
+        assert "entries" in ctx and "get_prompt_rows" in ctx, (
             "the provenance scan was not reported by the hook"
         )
+
+
+class TestLiteralMultiplicityAndConcatenation:
+    """Two ways a real change becomes invisible while looking like a clean run."""
+
+    def test_changing_one_of_two_copies_in_a_file_is_visible(self, repo):
+        """Set difference sees nothing when the file keeps another copy."""
+        import subprocess
+
+        lit = "*No performance data yet for this domain.*"
+        old = f'def a():\n    return "{lit}"\n\n\ndef a2():\n    return "{lit}"\n'
+        edited = _write(repo, "a.py", old)
+        _write(repo, "b.py", f'X = "{lit}"\n')
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        # Change only the FIRST occurrence; the second keeps the old text alive.
+        new = old.replace(f'"{lit}"', '"*No qualifying rows are shown.*"', 1)
+
+        findings = find_orphaned_literals(edited, old, new, repo)
+        assert findings, "a change was masked by a second copy in the same file"
+        assert [p.name for p in findings[0]["survivors"]] == ["b.py"]
+
+    def test_implicitly_concatenated_literal_is_greppable(self, repo):
+        """The joined VALUE never appears contiguously in source.
+
+        A core taken from the value is a pattern git grep can never match, so
+        the sibling is skipped in silence.
+        """
+        import subprocess
+
+        old = (
+            "def a():\n"
+            '    return ("a distinctive opening fragment "\n'
+            '            "and its continuation here")\n'
+        )
+        edited = _write(repo, "a.py", old)
+        _write(repo, "b.py",
+               'X = ("a distinctive opening fragment "\n'
+               '     "and its continuation here")\n')
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        new = 'def a():\n    return "something entirely different now"\n'
+
+        findings = find_orphaned_literals(edited, old, new, repo)
+        assert findings, "an implicitly concatenated literal was silently skipped"
+        assert [p.name for p in findings[0]["survivors"]] == ["b.py"]
+
+
+class TestCommitTargetResolution:
+    @pytest.mark.parametrize(
+        "command,expected_suffix",
+        [
+            ("git commit -m x", ""),
+            ("git -C /tmp/other commit -m x", "/tmp/other"),
+            ("git -c user.name=z commit -m x", ""),
+            ("git tag commit", None),
+            ("git status", None),
+            ("ls -la", None),
+        ],
+    )
+    def test_target_follows_the_command_not_the_hook_cwd(
+        self, command, expected_suffix, tmp_path, monkeypatch
+    ):
+        import os
+
+        import class_scope_commit_advisory as cca
+
+        monkeypatch.chdir(tmp_path)
+        os.makedirs("/tmp/other", exist_ok=True)
+        got = cca._commit_target_cwd(command)
+        if expected_suffix is None:
+            assert got is None, f"{command!r} should not be treated as a commit"
+        elif expected_suffix:
+            assert got == expected_suffix, (
+                f"{command!r} must target its -C path, not the hook's cwd"
+            )
+        else:
+            assert got == str(tmp_path)

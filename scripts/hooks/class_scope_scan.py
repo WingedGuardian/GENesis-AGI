@@ -16,6 +16,7 @@ timeouts. Neither entry point raises; both are budget-bounded.
 from __future__ import annotations
 
 import ast
+import collections
 import difflib
 import subprocess
 import time
@@ -56,15 +57,52 @@ def _remaining(deadline: float) -> float:
 
 def string_literals(source: str) -> set[str]:
     """Every string constant in *source*, by VALUE (escapes already resolved)."""
+    return set(literal_counts(source))
+
+
+def literal_counts(source: str) -> collections.Counter[str]:
+    """Every string constant with its OCCURRENCE COUNT.
+
+    Counts, not a set: comparing sets makes a change invisible whenever the
+    edited file still holds another copy of the old text. The value stays in
+    both sets, the difference is empty, and the scanner never looks at the
+    siblings — silently, on the exact shape it exists to catch.
+    """
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return set()
-    return {
+        return collections.Counter()
+    return collections.Counter(
         node.value
         for node in ast.walk(tree)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
-    }
+    )
+
+
+def source_cores(source: str) -> dict[str, str]:
+    """``{literal value: greppable core taken from its SOURCE TEXT}``.
+
+    The core must come from the source, not the value. For an implicitly
+    concatenated literal — ``("old prose " "continued here")`` — the AST hands
+    back the joined value, which never appears contiguously in the file, so a
+    core derived from it is a pattern `git grep` can never match and the sibling
+    is skipped in silence.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    cores: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        segment = ast.get_source_segment(source, node) or ""
+        core = searchable_core(segment) if segment else ""
+        # Keep the longest core seen for a given value — a value written
+        # several ways should be searched by its most distinctive rendering.
+        if len(core) > len(cores.get(node.value, "")):
+            cores[node.value] = core
+    return cores
 
 
 def searchable_core(literal: str) -> str:
@@ -138,7 +176,14 @@ def find_orphaned_literals(
     Returns ``[{literal, survivors: [path, ...]}]``, empty when the edit left no
     orphans. Never raises, and never runs past *budget_seconds*.
     """
-    removed = string_literals(old_source) - string_literals(new_source)
+    old_counts = literal_counts(old_source)
+    new_counts = literal_counts(new_source)
+    # A DECREASE in occurrences, not mere absence: changing one of two copies in
+    # the same file leaves the value present, and set difference sees nothing.
+    removed = {
+        lit for lit, n in old_counts.items() if new_counts[lit] < n
+    }
+    cores = source_cores(old_source)
     candidates = sorted(
         (lit for lit in removed if _is_prose(lit)), key=len, reverse=True
     )[:MAX_LITERALS_CHECKED]
@@ -149,7 +194,8 @@ def find_orphaned_literals(
         if _remaining(deadline) <= 0:
             break
         survivors = []
-        for path in _grep_candidates(searchable_core(lit), repo_root, deadline):
+        # The core comes from the literal's SOURCE rendering, not its value.
+        for path in _grep_candidates(cores.get(lit, ""), repo_root, deadline):
             # Checked per candidate, not just per literal: one common core can
             # match hundreds of files, and parsing them is what actually
             # overruns.

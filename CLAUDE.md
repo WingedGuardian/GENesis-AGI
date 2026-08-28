@@ -389,6 +389,23 @@ When a user shares a file path or URL in conversation:
   after `/task` intake.
 - **Never pipe background Bash commands.** `run_in_background` with pipes
   produces empty output. Run without pipes or in foreground.
+- **A blocked compound command loses EVERYTHING in it.** A PreToolUse block
+  kills the WHOLE Bash call, not the offending part — so a guard firing on step
+  3 silently discards steps 1 and 2 while the error text mentions only step 3.
+  Never chain a state-changing step (`cd`, heredoc, file write,
+  restore-from-backup) with one a guard can block (test run, commit, push).
+  After any block, run `pwd` and re-check the file you believed you wrote —
+  never assume the earlier half ran. Prefer `git -C <literal path>` and absolute
+  script paths over a persistent `cd`, so a lost `cd` cannot silently redirect
+  later commands into the wrong worktree. Detail in the genesis-development skill.
+- **Check closing tags on long tool-call parameters.** A closing tag that does
+  not match its opening tag silently swallows every following parameter into the
+  preceding string; the tool then reports those parameters as *missing*, which
+  reads like a tool bug and is not one. It recurs on long, multi-sentence values.
+  Repeated IDENTICAL validation errors mean the CALL is malformed — the error
+  echoes `input_value`, which holds the proof; read it, and check whether the
+  same tool succeeded earlier in the session, before concluding anything about
+  the tool.
 - **Plan mode by default** for any task with 3+ steps or architectural
   decisions. If something goes sideways — STOP and re-plan.
 - **Use subagents** to keep main context clean. One concern per subagent.

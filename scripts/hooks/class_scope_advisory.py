@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -142,13 +143,24 @@ def main() -> int:
         )
 
     if lines:
-        print(
-            "[class-scope] This edit may have changed one member of a set:\n"
-            + "\n".join(lines)
-            + "\n  Enumerate the rest before moving on — fixing the named instance "
-            "and leaving siblings is what turns one review finding into three "
-            "rounds.",
-            file=sys.stderr,
+        # The documented PostToolUse channel, NOT stderr. Claude Code discards
+        # stderr from a hook that exits 0, so an advisory printed there is
+        # written, logged, testable — and never seen. The whole feature is
+        # inert without this. Precedent: scripts/hooks/edit_verify_advisory.py.
+        json.dump(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": (
+                        "[class-scope] This edit may have changed one member of "
+                        "a set:\n" + "\n".join(lines)
+                        + "\n  Enumerate the rest before moving on — fixing the "
+                        "named instance and leaving siblings is what turns one "
+                        "review finding into three rounds."
+                    ),
+                }
+            },
+            sys.stdout,
         )
     return 0
 

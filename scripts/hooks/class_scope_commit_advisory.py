@@ -15,6 +15,7 @@ Never blocks: always exits 0.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -36,23 +37,41 @@ _MAX_FILES = 12
 _MAX_NOTES = 8
 
 
-def _targets_a_commit(command: str) -> bool:
+def _commit_target_cwd(command: str) -> str | None:
+    """The directory the commit will actually run in, or None if not a commit.
+
+    Repository discovery must follow the COMMAND, not the hook's own cwd: a
+    session committing another worktree with `git -C <path> commit` would
+    otherwise have its staged changes read from the wrong checkout, and the
+    advisory would say nothing about the commit that is about to happen.
+    """
     try:
         segments = analyze(command)
     except Exception:  # noqa: BLE001 — advisory, never fail loudly
-        return False
+        return None
     for seg in segments:
         argv = getattr(seg, "argv", None) or []
         if not argv or argv[0] != "git":
             continue
-        # The SUBCOMMAND, skipping git's own leading options and their values,
-        # so `git tag commit` (a ref merely NAMED commit) does not fire.
+        # Walk git's own options, capturing -C, to find the SUBCOMMAND — so
+        # `git tag commit` (a ref merely NAMED commit) does not fire.
+        target = getattr(seg, "cwd", None) or os.getcwd()
         i = 1
         while i < len(argv) and argv[i].startswith("-"):
-            i += 2 if argv[i] in {"-C", "-c", "--git-dir", "--work-tree"} else 1
+            if argv[i] == "-C" and i + 1 < len(argv):
+                candidate = argv[i + 1]
+                target = (
+                    candidate if os.path.isabs(candidate)
+                    else os.path.join(target, candidate)
+                )
+                i += 2
+            elif argv[i] in {"-c", "--git-dir", "--work-tree"}:
+                i += 2
+            else:
+                i += 1
         if i < len(argv) and argv[i] == "commit":
-            return True
-    return False
+            return target if os.path.isdir(target) else None
+    return None
 
 
 def _git(args: list[str], cwd: str) -> str:
@@ -67,17 +86,22 @@ def _git(args: list[str], cwd: str) -> str:
 
 def main() -> int:
     command = field(read_payload(), "command")
-    if not command or not _targets_a_commit(command):
+    if not command:
+        return 0
+    target_cwd = _commit_target_cwd(command)
+    if target_cwd is None:
         return 0
 
-    repo_root = _git(["rev-parse", "--show-toplevel"], os.getcwd()).strip()
+    repo_root = _git(["rev-parse", "--show-toplevel"], target_cwd).strip()
     if not repo_root:
         return 0
     repo = Path(repo_root)
 
     staged = [
         r for r in _git(
-            ["diff", "--cached", "--name-only", "--diff-filter=M", "-z"],
+            # M and R: a renamed-AND-edited file has status R, and excluding it
+            # drops exactly the kind of change most likely to leave siblings.
+            ["diff", "--cached", "--name-only", "--diff-filter=MR", "-z"],
             repo_root,
         ).split("\0")
         # -z, split on NUL: whitespace-splitting turns "my file.py" into two
@@ -117,12 +141,24 @@ def main() -> int:
             )
 
     if notes:
-        print(
-            "[class-scope] This change may fix instances while leaving siblings:\n"
-            + "\n".join(notes[:_MAX_NOTES])
-            + "\n  Not blocking. But enumerate the class first — this is the "
-            "pattern the mode-switch gate exists to stop, seen earlier.",
-            file=sys.stderr,
+        # The documented PreToolUse channel, NOT stderr: stderr from a hook that
+        # exits 0 is discarded, so the advisory would be inert. permissionDecision
+        # stays "allow" — this never blocks.
+        json.dump(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "additionalContext": (
+                        "[class-scope] This change may fix instances while "
+                        "leaving siblings:\n" + "\n".join(notes[:_MAX_NOTES])
+                        + "\n  Not blocking. But enumerate the class first — "
+                        "this is the pattern the mode-switch gate exists to "
+                        "stop, seen earlier."
+                    ),
+                }
+            },
+            sys.stdout,
         )
     return 0
 
