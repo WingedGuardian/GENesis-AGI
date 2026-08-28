@@ -143,7 +143,15 @@ def missing_receipts(body: str) -> list[str]:
     missing = []
     for marker in _RECEIPTS:
         # Marker at line start, a colon, then something that isn't whitespace.
-        pattern = re.compile(rf"^\s*{re.escape(marker)}\s*:\s*(\S.*)$", re.MULTILINE)
+        # `[^\S\n]` is horizontal whitespace ONLY. Plain `\s*` matches newlines,
+        # so a body like "CC-Gate-Changelog:\nCC-Gate-Soak: 2.1.246 ..." let the
+        # EMPTY changelog trailer borrow the soak line as its value and both
+        # markers came back satisfied by one real receipt. Two bare trailers
+        # followed by any prose did the same.
+        pattern = re.compile(
+            rf"^[^\S\n]*{re.escape(marker)}[^\S\n]*:[^\S\n]*(\S[^\n]*)$",
+            re.MULTILINE,
+        )
         m = pattern.search(body)
         if not m or _PLACEHOLDER_RE.search(m.group(1)):
             missing.append(marker)
@@ -177,9 +185,11 @@ def check(*, base_sha: str, body: str, repo_root: Path) -> str:
             "downgrade path is the project's incident-recovery route."
         )
 
-    if not body.strip():
-        raise Skip("no PR body available in the environment")
-
+    # NOTE: an empty body is NOT a Skip. A bodyless PR is a routine input, and
+    # the absence of both receipts is fully determined by it — there is nothing
+    # indeterminate to be graceful about. Skipping here fail-opened the gate on
+    # the easiest case to hit. (`Skip` stays reserved for a genuinely unavailable
+    # event value: no base SHA, an unfetched base ref, an unparseable pin.)
     absent = missing_receipts(body)
     if absent:
         lines = [

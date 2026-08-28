@@ -5,9 +5,9 @@
 # executing the binary currently on disk, and which are still running a copy
 # that has since been replaced.
 #
-# Why this exists (a real incident, 2026-08-27): the container was aligned to a
-# candidate CC version and a 2-3 day local-first soak was declared started.
-# Measured at the end of it, THREE of four interactive sessions were still
+# Why this exists (a real incident on a live install): a container was aligned to
+# a candidate CC version and a 2-3 day local-first soak was declared started.
+# Measured at the end of it, MOST interactive sessions were still
 # executing the pre-align binary — npm had replaced the package underneath
 # them, and a long-lived process keeps its original mapping until it restarts.
 # `claude --version` did not reveal this: it spawns a FRESH child, which reads
@@ -94,18 +94,50 @@ canonical_real=""
 canonical_real="$(readlink -f "$canonical_path" 2>/dev/null)" || canonical_real=""
 [ -n "$canonical_real" ] || canonical_real="$canonical_path"
 
-canonical_inode=""
-canonical_inode="$(stat -c %i "$canonical_real" 2>/dev/null)" || canonical_inode=""
-if [ -z "$canonical_inode" ]; then
+canonical_version=""
+canonical_version="$("$canonical_path" --version 2>/dev/null | awk '{print $1}')" || canonical_version=""
+
+# PATH precedence is NOT identity. `cc_shadow_scan` deliberately never trusts a
+# bare `command -v claude` because a stale extra copy on a different interactive
+# PATH has repeatedly won here — and if that copy wins, this sweep inverts its
+# own verdict: sessions on the stale binary get reported "current" and the ones
+# on the real install get reported "stale", corrupting exactly the soak evidence
+# it exists to produce. So cross-check the known prefixes: if another copy exists
+# at a DIFFERENT version, canonical identity is ambiguous and this refuses to
+# answer rather than crowning whichever one PATH happened to surface.
+CC_PROBE_DIRS="${CC_PROBE_DIRS:-/usr/local/bin:/usr/bin:$HOME/.npm-global/bin}"
+_oldIFS="$IFS"
+IFS=':'
+for _d in $CC_PROBE_DIRS; do
+    _cand="$_d/claude"
+    [ -x "$_cand" ] || continue
+    _cand_real="$(readlink -f "$_cand" 2>/dev/null)" || _cand_real="$_cand"
+    [ "$_cand_real" = "$canonical_real" ] && continue
+    _cand_ver="$("$_cand" --version 2>/dev/null | awk '{print $1}')" || _cand_ver=""
+    if [ -n "$_cand_ver" ] && [ -n "$canonical_version" ] && [ "$_cand_ver" != "$canonical_version" ]; then
+        IFS="$_oldIFS"
+        echo "cc-running-versions: UNDETERMINED — more than one Claude Code is installed at" >&2
+        echo "  DIFFERENT versions: $canonical_real ($canonical_version) and $_cand_real ($_cand_ver)." >&2
+        echo "  Which one is canonical is then a PATH accident, and this sweep would report" >&2
+        echo "  the wrong half of your sessions as stale. Run cc_shadow_scan first." >&2
+        exit 2
+    fi
+done
+IFS="$_oldIFS"
+
+# Identity is DEVICE + inode. An inode number is unique only within a
+# filesystem, so a binary on another mount can collide numerically and be
+# reported "current" while it is an entirely different file — realistic when a
+# user-prefix install and a system npm install live on separate mounts.
+canonical_id=""
+canonical_id="$(stat -c '%d:%i' "$canonical_real" 2>/dev/null)" || canonical_id=""
+if [ -z "$canonical_id" ]; then
     echo "cc-running-versions: UNDETERMINED — cannot stat $canonical_real" >&2
     exit 2
 fi
 
-canonical_version=""
-canonical_version="$("$canonical_path" --version 2>/dev/null | awk '{print $1}')" || canonical_version=""
-
 say "on-disk canonical: $canonical_real"
-say "                  inode=$canonical_inode version=${canonical_version:-unknown}"
+say "                  dev:inode=$canonical_id version=${canonical_version:-unknown}"
 say ""
 
 # --- sweep live processes ---------------------------------------------------
@@ -139,11 +171,20 @@ for procdir in "$PROC_ROOT"/[0-9]*; do
     exe_clean="${exe_target% (deleted)}"
     exe_base="${exe_clean##*/}"
 
+    # Identify by EXECUTABLE SHAPE, not by "claude appears somewhere in the
+    # path". `*claude*` classified any unrelated binary living under a directory
+    # whose name happens to contain it — /opt/claude-tools/vim would be counted
+    # stale and could fail an otherwise clean sweep, invalidating a good soak.
     is_cc=0
     node_wrapped=0
-    case "$exe_clean" in
-        *claude*) is_cc=1 ;;
+    case "$exe_base" in
+        claude|claude.exe) is_cc=1 ;;
     esac
+    if [ "$is_cc" = "0" ]; then
+        case "$exe_clean" in
+            */@anthropic-ai/claude-code/*|*/.claude-code-*/*) is_cc=1 ;;
+        esac
+    fi
     if [ "$is_cc" = "0" ]; then
         case "$exe_base" in
             node|nodejs)
@@ -167,19 +208,19 @@ for procdir in "$PROC_ROOT"/[0-9]*; do
     fi
 
     run_inode=""
-    run_inode="$(stat -L -c %i "$procdir/exe" 2>/dev/null)" || run_inode=""
+    run_inode="$(stat -L -c '%d:%i' "$procdir/exe" 2>/dev/null)" || run_inode=""
     if [ -z "$run_inode" ]; then
         undetermined=$((undetermined + 1))
         say "  UNDETERMINED pid=$pid  cannot resolve running inode; started=$started"
         continue
     fi
 
-    if [ "$run_inode" = "$canonical_inode" ]; then
+    if [ "$run_inode" = "$canonical_id" ]; then
         current=$((current + 1))
-        say "  current      pid=$pid  inode=$run_inode  started=$started"
+        say "  current      pid=$pid  id=$run_inode  started=$started"
     else
         stale=$((stale + 1))
-        say "  STALE        pid=$pid  inode=$run_inode (on-disk is $canonical_inode)  started=$started"
+        say "  STALE        pid=$pid  id=$run_inode (on-disk is $canonical_id)  started=$started"
         say "               running: $exe_target"
     fi
 done
@@ -200,7 +241,14 @@ if [ "$undetermined" -gt 0 ]; then
 fi
 
 if [ "$unreadable" -gt 0 ]; then
-    say "note: $unreadable CC-looking process(es) belong to another user and were not inspected."
+    # Identified as CC by its command line, but /proc/<pid>/exe was not readable
+    # (another user, or a procfs/ptrace restriction). That session was NEVER
+    # checked, so "all clear" would be a claim about processes this run could not
+    # see — and the soak receipt that quotes it would be false. Refuse.
+    echo "cc-running-versions: UNDETERMINED — $unreadable Claude Code process(es) could not be" >&2
+    echo "  inspected (another user, or procfs/ptrace restrictions), so this run cannot say" >&2
+    echo "  whether they are on the current binary. Re-run with access to those processes." >&2
+    exit 2
 fi
 
 say "cc-running-versions: OK — all $current live Claude Code process(es) run the on-disk binary."

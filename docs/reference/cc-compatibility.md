@@ -98,13 +98,23 @@ These are different questions and need different checks.
 `CC_PROBE_DIRS` for extra on-disk copies and removes the stale ones.
 
 `scripts/check_cc_running_versions.sh` answers **running**: for every live CC
-process it resolves `stat -L /proc/<pid>/exe` — procfs keeps that inode
-reference alive even after npm unlinks the file — and compares it against the
-inode of the binary on disk today.
+process it resolves `stat -L /proc/<pid>/exe` — procfs keeps that reference
+alive even after npm unlinks the file — and compares its **device + inode**
+against the binary on disk today. (Device matters: an inode number is unique
+only within a filesystem, so a user-prefix install and a system npm install on
+separate mounts can collide numerically.)
 
-A box can pass the first and fail the second. Measured here on 2026-08-27:
-exactly one canonical binary installed, at the intended version, while **four of
-ten live CC processes were still executing the replaced predecessor**. A
+It refuses to answer when canonical identity is ambiguous. `command -v claude`
+is PATH precedence, not identity — the reason `cc_shadow_scan` never trusts it
+either — so the sweep cross-checks `CC_PROBE_DIRS` and exits *undetermined* if a
+second copy sits there at a different version. With a stale shadow winning PATH
+the sweep would otherwise report the wrong half of the sessions as stale, which
+is worse than no answer. A CC process whose `/proc/<pid>/exe` cannot be read is
+likewise undetermined, never counted as clean.
+
+A box can pass the first and fail the second. Measured on a live install:
+exactly one canonical binary installed, at the intended version, while **a
+majority of live CC processes were still executing the replaced predecessor**. A
 long-running process keeps its original mapping until it restarts, and
 `claude --version` cannot reveal this — it spawns a *fresh child*, which reads
 the new on-disk binary and truthfully reports the new version while the session
@@ -136,6 +146,16 @@ same kind of check, and the same strength, as
 `scripts/check_hook_versions_complete.sh`.
 
 It compares the **parsed pin value**, not whether the file changed, so the many
+It is a **separate workflow from `ci.yml` on purpose.** The check reads the PR
+BODY, which stays mutable after a run finishes, and GitHub's default
+`pull_request` activity types (`opened`, `synchronize`, `reopened`) do not
+observe an edit. Without `edited`, receipts could be added after a red run with
+no re-check — or removed after a green one, leaving a passing status that
+describes a body which no longer exists. Activity types are per-workflow, so
+putting `edited` on `ci.yml` would re-run the whole suite on every description
+tweak. It anchors on the merge ref's first parent (`HEAD^1`) rather than
+`base.sha`, which lags `main`, for the same reason the leak scan does.
+
 PRs that edit `cc_version.sh` for other reasons are unaffected. **Downgrades are
 auto-exempt** — a rollback returns to a version that already ran here, and the
 downgrade path is this project's incident-recovery route (the reason a managed

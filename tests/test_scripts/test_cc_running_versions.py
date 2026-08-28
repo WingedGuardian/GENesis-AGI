@@ -1,11 +1,11 @@
 """Running-binary sweep (scripts/check_cc_running_versions.sh).
 
 Reports which LIVE Claude Code processes execute the binary currently on disk
-and which still run a copy that has since been replaced. Origin: on 2026-08-27
-four of ten live CC processes on this host were still executing the pre-align
-binary while ``claude --version`` — which spawns a fresh child — truthfully
-reported the new one, so a local-first soak had accumulated days of "real use"
-on the old release.
+and which still run a copy that has since been replaced. Origin: on a live
+install, most CC processes were still executing the pre-align binary while
+``claude --version`` — which spawns a fresh child — truthfully reported the new
+one, so a local-first soak had accumulated days of "real use" on the old
+release.
 
 Every test drives a FIXTURE proc root via ``--proc-root`` and a fixture
 ``claude`` on PATH, so all three verdict branches (OK / STALE / UNDETERMINED)
@@ -173,6 +173,65 @@ def test_empty_proc_root_does_not_glob_literally(world):
 
     assert res.returncode == EXIT_OK
     assert "current=0" in res.stdout
+
+
+def test_two_installs_at_different_versions_refuse_to_answer(world, tmp_path: Path):
+    """PATH precedence is not identity — and getting it wrong INVERTS the verdict.
+
+    `cc_shadow_scan` deliberately never trusts a bare `command -v claude`,
+    because a stale extra copy has repeatedly won interactive PATH here. If that
+    copy is crowned canonical, this sweep reports every session on the stale
+    binary as "current" and every session on the real install as "stale" —
+    corrupting exactly the soak evidence it exists to produce. Refuse instead.
+    """
+    other_dir = tmp_path / "probe_prefix"
+    _make_binary(other_dir / "claude", "1.0.0")  # a DIFFERENT version
+    _make_proc_entry(world["proc"], 701, world["canonical"])
+
+    env = dict(os.environ)
+    env["PATH"] = f"{world['bindir']}:{env['PATH']}"
+    env["CC_PROBE_DIRS"] = str(other_dir)
+    res = subprocess.run(
+        ["bash", str(_SCRIPT), "--proc-root", str(world["proc"])],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert res.returncode == EXIT_UNDETERMINED, res.stdout
+    assert "more than one Claude Code" in res.stderr
+    assert "cc_shadow_scan" in res.stderr, "point the operator at the fix"
+
+
+def test_matching_second_copy_does_not_block(world, tmp_path: Path):
+    """Over-rejection guard: a second copy at the SAME version is not ambiguous."""
+    other_dir = tmp_path / "probe_prefix_same"
+    _make_binary(other_dir / "claude", "2.1.246")  # same version as canonical
+    _make_proc_entry(world["proc"], 801, world["canonical"])
+
+    env = dict(os.environ)
+    env["PATH"] = f"{world['bindir']}:{env['PATH']}"
+    env["CC_PROBE_DIRS"] = str(other_dir)
+    res = subprocess.run(
+        ["bash", str(_SCRIPT), "--proc-root", str(world["proc"])],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert res.returncode == EXIT_OK, res.stderr
+
+
+def test_an_unreadable_cc_process_is_not_all_clear(world, tmp_path: Path):
+    """Identified as CC by cmdline but /proc/<pid>/exe unreadable → exit 2.
+
+    Reporting OK would be a claim about a session this run could not see, and a
+    soak receipt quoting that sweep would be false.
+    """
+    d = world["proc"] / "901"
+    d.mkdir(parents=True)
+    (d / "cmdline").write_bytes(b"claude\x00")   # looks like CC, no exe link
+
+    res = _run(world["proc"], world["bindir"])
+
+    assert res.returncode == EXIT_UNDETERMINED, res.stdout
+    assert "could not be" in res.stderr
 
 
 def test_no_claude_on_path_is_undetermined(tmp_path: Path):

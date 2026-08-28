@@ -1,0 +1,59 @@
+name: CC pin receipts
+
+# A PR that moves the Claude Code pin FORWARD must carry both gate receipts in
+# its body. Merging the pin publishes it — `origin` is the public repo — so the
+# pin PR is the wrong place to discover a skipped gate.
+#
+# WHY A SEPARATE WORKFLOW RATHER THAN A JOB IN ci.yml: this check consumes the
+# PR BODY, which is mutable state that the default `pull_request` activity types
+# do not observe. Those defaults are `opened`, `synchronize` and `reopened`
+# only — so an author could add the receipts after a red run and never get a
+# re-check, or (worse) DELETE them after a green one and merge a status that
+# describes a body which no longer exists. `edited` closes that.
+#
+# It cannot simply be added to ci.yml's trigger: activity types are declared per
+# WORKFLOW, so `edited` there would re-run the entire suite — the full test job
+# included — on every description tweak, for a check that takes seconds. Hence a
+# dedicated, cheap workflow with its own trigger.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+# Body edits arrive in bursts while someone is composing. Keep only the newest.
+concurrency:
+  group: cc-pin-receipts-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cc-pin-receipts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history: the guard reads the pin as of the base commit. A
+          # shallow clone makes that unreadable and the guard SKIPS loudly
+          # rather than blocking every PR — correct, but not the intended path.
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: CC pin-receipt guard
+        env:
+          # Attacker-controlled text: passed via env, NEVER interpolated into
+          # `run`. Same handling ci.yml uses for PR_BASE_SHA.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          # HEAD^1 of the pull_request MERGE ref is the base branch tip as of
+          # this run — NOT github.event.pull_request.base.sha, which lags main.
+          # With the stale value, a long-lived unrelated PR re-running after a
+          # pin bump landed on main would compare the merge result's NEW pin
+          # against the old one and demand receipts from a PR that never touched
+          # the pin. ci.yml's leak-scan anchors on HEAD^1 for the same reason.
+          base="$(git rev-parse HEAD^1)"
+          echo "comparing against base $base (merge ref first parent)"
+          python scripts/check_cc_pin_receipts.py --base-sha "$base"

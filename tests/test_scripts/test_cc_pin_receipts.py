@@ -235,14 +235,55 @@ def test_unreachable_base_ref_skips(repo):
     assert "cannot read" in str(exc.value)
 
 
-def test_forward_with_no_body_skips_rather_than_blocks(repo):
-    """No PR body in the environment is an unknown, not a violation."""
+def test_forward_with_an_empty_body_BLOCKS(repo):
+    """An empty PR body on a forward bump is a violation, not an unknown.
+
+    This test previously asserted the OPPOSITE and thereby encoded a fail-open
+    AS THE SPEC: a bodyless PR is one of the most common inputs there is, and the
+    absence of both receipts is fully determined by it. Nothing is indeterminate,
+    so there is nothing to be graceful about. `Skip` stays reserved for values
+    that are genuinely unavailable (no base SHA, unfetched base ref).
+    """
     repo["set_head_pin"]("2.1.246")
 
-    with pytest.raises(mod.Skip) as exc:
+    with pytest.raises(mod.MissingReceipts) as exc:
         mod.check(base_sha=repo["base"], body="   ", repo_root=repo["path"])
 
-    assert "no PR body" in str(exc.value)
+    text = str(exc.value)
+    assert "CC-Gate-Changelog" in text
+    assert "CC-Gate-Soak" in text
+
+
+def test_a_bare_trailer_cannot_borrow_the_next_lines_value(repo):
+    """`\\s*` matches NEWLINES — so an empty trailer swallowed the line below it.
+
+    With plain `\\s*`, "CC-Gate-Changelog:\nCC-Gate-Soak: 2.1.246 ..." satisfied
+    BOTH markers from one real receipt: the empty changelog trailer matched
+    across the newline and took the soak line as its value.
+    """
+    repo["set_head_pin"]("2.1.246")
+    body = (
+        "CC-Gate-Changelog:\n"
+        "CC-Gate-Soak: 2.1.246 on container 08-25..08-27, sweep clean, sign-off recorded\n"
+    )
+
+    with pytest.raises(mod.MissingReceipts) as exc:
+        mod.check(base_sha=repo["base"], body=body, repo_root=repo["path"])
+
+    assert "CC-Gate-Changelog" in str(exc.value)
+
+
+def test_two_bare_trailers_followed_by_prose_satisfy_nothing(repo):
+    """The same newline bug, in the shape that needs no real receipt at all."""
+    repo["set_head_pin"]("2.1.246")
+    body = "CC-Gate-Changelog:\nCC-Gate-Soak:\nsome ordinary prose about the change\n"
+
+    with pytest.raises(mod.MissingReceipts) as exc:
+        mod.check(base_sha=repo["base"], body=body, repo_root=repo["path"])
+
+    text = str(exc.value)
+    assert "CC-Gate-Changelog" in text
+    assert "CC-Gate-Soak" in text
 
 
 def test_unparseable_head_pin_skips(repo):
@@ -333,3 +374,79 @@ def test_exit_code_downgrade_is_zero(repo, tmp_path):
     )
 
     assert rc == 0
+
+
+# ── the workflow trigger is part of the gate ──────────────────────────────
+
+
+def test_workflow_reruns_when_the_pr_body_is_edited():
+    """The gate reads the PR BODY, which is mutable after a run completes.
+
+    GitHub's default `pull_request` activity types are opened / synchronize /
+    reopened. With only those, an author could add the receipts after a red run
+    and never get re-checked — or DELETE them after a green one and merge a
+    status describing a body that no longer exists. `edited` is what makes the
+    reported status describe the body that actually merges.
+
+    It also must NOT live in ci.yml: activity types are per-WORKFLOW, so `edited`
+    there would re-run the whole suite (the ~23-minute test job included) on
+    every description tweak.
+    """
+    import yaml
+
+    wf_dir = _REPO_ROOT / ".github" / "workflows"
+    wf = yaml.safe_load((wf_dir / "cc-pin-receipts.yml").read_text())
+    # PyYAML parses a bare `on:` key as the boolean True.
+    trigger = wf.get("on", wf.get(True))
+    types = trigger["pull_request"]["types"]
+
+    assert "edited" in types, (
+        "without `edited` the receipts can be removed after a green run"
+    )
+    for required in ("opened", "synchronize", "reopened"):
+        assert required in types, (
+            f"naming `types` REPLACES the defaults, so {required} must be listed"
+        )
+
+    ci = yaml.safe_load((wf_dir / "ci.yml").read_text())
+    assert "cc-pin-receipts" not in ci["jobs"], (
+        "the receipt job must stay OUT of ci.yml — sharing that workflow's "
+        "trigger would either lose `edited` or re-run the full suite on every "
+        "body edit"
+    )
+
+
+def test_workflow_compares_against_the_merge_refs_first_parent():
+    """base.sha lags main; HEAD^1 of the merge ref does not.
+
+    With the stale value, an unrelated long-lived PR re-running after a pin bump
+    landed on main compares the merge result's NEW pin against the OLD one and
+    demands receipts from a PR that never touched the pin. ci.yml's leak-scan
+    anchors on HEAD^1 for exactly this reason.
+    """
+    import yaml
+
+    wf = yaml.safe_load(
+        (_REPO_ROOT / ".github" / "workflows" / "cc-pin-receipts.yml").read_text()
+    )
+    steps = wf["jobs"]["cc-pin-receipts"]["steps"]
+    # Strip shell comments: the run block explains WHY base.sha is wrong, and
+    # a naive substring check would read that explanation as the defect itself.
+    run_blocks = "\n".join(
+        line
+        for s in steps
+        if "run" in s
+        for line in s["run"].splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    env_blocks = "\n".join(
+        f"{k}={v}" for s in steps for k, v in (s.get("env") or {}).items()
+    )
+
+    assert "HEAD^1" in run_blocks
+    # Assert on the EXECUTED step, not the file text — the surrounding comment
+    # names base.sha to explain why it is wrong, and a whole-file substring
+    # check would flag that explanation as the defect it warns about.
+    assert "pull_request.base.sha" not in run_blocks + env_blocks, (
+        "base.sha lags main — use the merge ref's first parent"
+    )
