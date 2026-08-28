@@ -274,7 +274,7 @@ Brief it with THIS (adapt the range/source):
 >   plugin loading (2.1.215 removed CC's proactive `/code-review` + `/verify`, making Genesis's own
 >   review-enforcement hooks the primary trigger rather than a backstop).
 > - **Permissions / auto mode / Monitor** — anything changing what is auto-approved.
-> - **Worktrees** — this install runs ~45; isolation, retention sweeps, `--worktree`.
+> - **Worktrees** — an active install can carry dozens; isolation, retention sweeps, `--worktree`.
 > - **Cross-session** — `SendMessage`/`ListAgents`, sockets in rootless containers.
 > - **Security** — credential handling, permission-bypass fixes, sandbox/redaction.
 > - **Model / routing** — alias→model drift, family step-down, pricing/limits.
