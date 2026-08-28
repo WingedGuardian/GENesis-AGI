@@ -563,6 +563,15 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   The second reviewer should see the improved code, not the same unfixed diff
   both would otherwise review; parallel also doubles review spend per baseline.
   (Standing user directive.)
+- **A different model is the real correctness gate; Codex is the default.** A Claude
+  reviewer shares this model's blind spots, so it clears the LOCAL depth gate but is not
+  the cross-model gate. When Codex is down/quota-limited AND an approved alternative
+  reviewer is available (e.g. a Kimi Code CLI on the box — only with explicit per-use user
+  approval), run it non-interactively and feed it only the diff + an adversarial mandate:
+  `kimi -p "<review prompt>" -m <namespaced-alias, e.g. kimi-code/k3> --output-format text`
+  from the target worktree, in the background (it reads the diff/files with its own tools).
+  Use the namespaced model alias, not a bare one; `-p` does not combine with `--auto`/`-y`.
+  Never merge on a same-model-only review.
 - **Escalation cap — a HARD BLOCK at 3 rounds that each find NEW defects.**
   A *round* = one review→fix→re-review iteration (local reviewer rounds and
   cloud-bot re-review rounds count together, per change). The cap is enforced
