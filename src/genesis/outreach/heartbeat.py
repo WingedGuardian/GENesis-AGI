@@ -92,6 +92,51 @@ class OutreachHeartbeat:
         )
 
 
+
+    def _submit(self, coro_factory) -> bool:
+        """Run a coroutine on the captured main loop. False if none is live.
+
+        Cancels the submission whenever the wait does not complete normally. A
+        timed-out ``Future.result()`` does NOT cancel the underlying task, so
+        without this a stalled loop would leave each tick pending while the next
+        one is submitted -- accumulating tasks that all fire at once on recovery,
+        emitting stale pulses and a burst of successes.
+        """
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return False
+        future = asyncio.run_coroutine_threadsafe(coro_factory(), loop)
+        try:
+            future.result(timeout=self._TICK_TIMEOUT_S)
+        except BaseException:
+            future.cancel()
+            raise
+        return True
+
+    def _record_failure(self, rt: object, exc: BaseException) -> None:
+        """Persist a failed tick, from the live loop when there is one.
+
+        ``record_job_failure`` persists through the SAME loop-dependent path as
+        ``record_job_success``: called from this worker thread it updates memory
+        and never the table. Recording success on the loop but failure off it
+        would leave exactly half the defect in place -- the failure direction,
+        which is the half an operator most needs to see.
+        """
+
+        async def _record() -> None:
+            rt.record_job_failure(
+                "outreach_heartbeat", "heartbeat emission failed", exc=exc
+            )
+
+        try:
+            if self._submit(_record):
+                return
+        except BaseException:
+            # Already handling a failure; fall through to the degraded path
+            # rather than masking the original exception with this one.
+            pass
+        rt.record_job_failure("outreach_heartbeat", "heartbeat emission failed", exc=exc)
+
     def _tick(self, rt: object, Subsystem: object, Severity: object) -> None:
         """Emit one pulse and record job health, on the runtime's main loop.
 
@@ -112,11 +157,7 @@ class OutreachHeartbeat:
             # its DB write onto a loop that keeps running afterwards.
             rt.record_job_success("outreach_heartbeat")
 
-        loop = self._loop
-        if loop is not None and loop.is_running():
-            asyncio.run_coroutine_threadsafe(_emit_and_record(), loop).result(
-                timeout=self._TICK_TIMEOUT_S
-            )
+        if self._submit(_emit_and_record):
             return
 
         # No live main loop (start() ran outside one). Emit on a throwaway loop;
@@ -151,9 +192,7 @@ class OutreachHeartbeat:
                     from genesis.runtime import GenesisRuntime
 
                     rt = GenesisRuntime.instance()
-                    rt.record_job_failure(
-                        "outreach_heartbeat", "heartbeat emission failed", exc=exc
-                    )
+                    self._record_failure(rt, exc)
                 except Exception:
                     pass
             self._stop_event.wait(self._interval)
