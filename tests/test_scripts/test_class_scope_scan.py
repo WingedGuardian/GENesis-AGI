@@ -1180,11 +1180,61 @@ class TestOutputIsASCIIOnly:
     the real trigger needs a subprocess with a doctored environment.
     """
 
+    def test_output_survives_an_ascii_stdout_with_non_ascii_data(self, repo):
+        """The DATA half of the class, which the static check cannot see.
+
+        The check below keeps non-ASCII out of this file's own print calls. It
+        is only half the class: the output also INTERPOLATES scanned data --
+        paths, git error text, and literal values through `!r`, which in Python
+        3 does not escape printable non-ASCII. So ordinary accented prose in a
+        SCANNED file puts non-ASCII on stdout no matter what this source says.
+
+        Run as a real subprocess because the encoding is a property of the
+        process's streams; pytest's capture replaces them, so an in-process
+        test cannot reach this at all.
+        """
+        import os
+        import subprocess
+        import sys
+
+        shared = 'a shared sentence of prose caf\u00e9 here'
+        (repo / "m.py").write_text(f'A = "{shared}"\n', encoding="utf-8")
+        (repo / "b.py").write_text(f'B = "{shared}"\n', encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+             "commit", "-qm", "seed"], cwd=repo, check=True,
+        )
+        (repo / "m.py").write_text("A = 1\n", encoding="utf-8")
+
+        scanner = Path(__file__).resolve()
+        for parent in scanner.parents:
+            cand = parent / "scripts" / "class_scope_scan.py"
+            if cand.exists():
+                scanner = cand
+                break
+
+        env = {**os.environ, "PYTHONIOENCODING": "ascii"}
+        r = subprocess.run(
+            [sys.executable, str(scanner), "--base", "HEAD"],
+            cwd=repo, env=env, capture_output=True, text=True, timeout=120,
+        )
+        assert "UnicodeEncodeError" not in r.stderr, (
+            "a scanned non-ASCII literal aborted the run mid-output: "
+            f"{r.stderr[-400:]}"
+        )
+        # And the run must COMPLETE -- the abort's real damage was the summary
+        # line never printing, so a partial run read as a whole one.
+        assert "changed file(s) scanned" in r.stdout, (
+            f"the summary line never printed; rc={r.returncode} "
+            f"stdout={r.stdout[-300:]!r}"
+        )
+        assert "b.py" in r.stdout, "the sibling finding itself was lost"
+
     def test_no_print_statement_contains_non_ascii(self):
         import ast
-        import pathlib
 
-        src = pathlib.Path(__file__).resolve()
+        src = Path(__file__).resolve()
         scan = None
         for parent in src.parents:
             cand = parent / "scripts" / "class_scope_scan.py"

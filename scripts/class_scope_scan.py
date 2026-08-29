@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import ast
 import collections
+import contextlib
 import difflib
 import subprocess
 import sys
@@ -282,7 +283,9 @@ def find_orphaned_literals(
     ``search_incomplete`` key on any finding whose search could not be
     completed, so a partial answer is never read as a whole one. Empty when the
     edit left no
-    orphans. Never raises, and never runs past *budget_seconds*.
+    orphans. Never runs past *budget_seconds*. Raises ``ValueError`` for a
+    *max_literals* below 1 -- a caller bug, not an input the scan can report
+    on; every other failure is REPORTED (as a finding or a skip), not raised.
 
     Two optional out-params make the result INTERPRETABLE, which is the whole
     point of this tool: an empty finding list means "clean" only if you also
@@ -832,6 +835,26 @@ def _changed_python_files(base: str, cwd: str, staged: bool) -> list[tuple[str, 
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Make stdout survivable BEFORE anything is printed.
+    #
+    # A static check keeps non-ASCII out of this file's own `print` calls, but
+    # that is only half the class: the output also INTERPOLATES scanned data --
+    # file paths, git error text, and literal values via `!r`, which in Python 3
+    # does not escape printable non-ASCII. So a scanned file containing ordinary
+    # accented prose emits non-ASCII regardless of what this source contains.
+    # Under a non-UTF-8 stdout encoding that raises BETWEEN a finding and the
+    # summary line, and a partial run prints as a complete one -- the single
+    # failure this whole tool exists to prevent.
+    #
+    # `backslashreplace` rather than `replace`: an escaped literal is still
+    # greppable and still identifies the sibling, where U+FFFD would not.
+    for _stream in (sys.stdout, sys.stderr):
+        # Suppressed, not handled: a stream that is not a reconfigurable
+        # TextIOWrapper (a pytest capture object, a pipe wrapper) has nothing
+        # to harden, and the scan must never fail over its own output setup.
+        with contextlib.suppress(AttributeError, ValueError):
+            _stream.reconfigure(errors="backslashreplace")
+
     parser = argparse.ArgumentParser(
         prog="class_scope_scan",
         description="Find changes that fixed one instance and left siblings behind.",
