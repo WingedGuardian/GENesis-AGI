@@ -79,6 +79,15 @@ COMPOUND_FROZEN = [
     ("walrus", "if (n := datetime.now(UTC)):\n    NOW = n\n"),
     ("nested-class", "class A:\n    class B:\n        NOW = datetime.now(UTC)\n"),
     ("kwonly-default", "def f(*, t=datetime.now(UTC)):\n    return t\n"),
+    # A genexp is lazy EXCEPT its leftmost iterable, which runs at creation.
+    (
+        "genexp leftmost iterable",
+        "S = list(str(t) for t in [datetime.now(UTC)])\n",
+    ),
+    (
+        "class-scoped fixture",
+        '@pytest.fixture(scope="class")\ndef s():\n    return datetime.now(UTC)\n',
+    ),
     (
         "metaclass-keyword",
         "def mk(x):\n    return type\n\n\nclass C(metaclass=mk(datetime.now(UTC))):\n    pass\n",
@@ -107,6 +116,28 @@ DEFERRED_SAFE = [
         "skipif is import-time by contract",
         '@pytest.mark.skipif(datetime.now(UTC).year > 3000, reason="never")\n'
         "def test_x():\n    pass\n",
+    ),
+    (
+        "xfail is import-time by contract",
+        '@pytest.mark.xfail(datetime.now(UTC).year < 2027, reason="never")\n'
+        "def test_x():\n    pass\n",
+    ),
+    (
+        "module-level pytestmark skipif",
+        'pytestmark = pytest.mark.skipif(datetime.now(UTC).year > 3000, reason="x")\n',
+    ),
+    (
+        "genexp inner-clause iterable is lazy",
+        "G = (x for y in [1] for x in [datetime.now(UTC)])\n",
+    ),
+    (
+        "default of a def nested in a test",
+        "def test_x():\n    def helper(t=datetime.now(UTC)):\n"
+        "        return t\n    return helper\n",
+    ),
+    (
+        "dunder-main block never runs in a suite",
+        'if __name__ == "__main__":\n    NOW = datetime.now(UTC)\n',
     ),
 ]
 
@@ -237,7 +268,11 @@ def test_recognises_dotted_clock_variants(tmp_path, expr):
 )
 def test_unprovable_fixture_scope_fails_closed(tmp_path, decorator):
     """The guard cannot prove the scope is narrow, so it must not assume it is."""
-    _write(tmp_path, f'_S = "session"\n_KW = {{}}\n{decorator}\ndef f():\n    return datetime.now(UTC)\n')
+    body = (
+        f'_S = "session"\n_KW = {{}}\n{decorator}\n'
+        f'def f():\n    return datetime.now(UTC)\n'
+    )
+    _write(tmp_path, body)
     assert len(check.scan(tmp_path)) == 1
 
 
@@ -249,6 +284,7 @@ def test_unparseable_file_is_reported_not_silently_skipped(tmp_path):
     assert violations[0][2] == "unparseable"
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores these permission bits")
 @pytest.mark.parametrize("mode", ["non-utf8", "unreadable"])
 def test_file_that_cannot_be_read_is_reported_not_silently_skipped(tmp_path, mode):
     """The same fail-closed rule for READ errors — this branch printed CLEAN over a bomb."""
@@ -264,6 +300,35 @@ def test_file_that_cannot_be_read_is_reported_not_silently_skipped(tmp_path, mod
         assert violations[0][2] == "unreadable"
     finally:
         os.chmod(f, 0o644)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores these permission bits")
+def test_unlistable_directory_is_reported_not_silently_skipped(tmp_path):
+    """rglob swallows an unlistable dir, hiding every file beneath it."""
+    sub = tmp_path / "locked"
+    sub.mkdir()
+    (sub / "test_bomb.py").write_text("NOW = datetime.now(UTC)\n")
+    os.chmod(sub, 0o000)
+    try:
+        violations = check.scan(tmp_path)
+        assert len(violations) == 1
+        assert violations[0][2] == "unreadable-dir"
+    finally:
+        os.chmod(sub, 0o755)
+
+
+def test_one_waiver_never_covers_a_nested_span(tmp_path):
+    """A marker inside a class body must not also waive the class's OWN base clock."""
+    base = "class TestT(type(datetime.now())):\n"
+    inner = "    SEED = time.time()\n"
+    waiver = "    # frozen-clock-ok: 5d vs a 35d window\n"
+    _write(tmp_path, base + inner)
+    assert len(check.scan(tmp_path)) == 2
+    _write(tmp_path, base + waiver + inner)
+    assert len(check.scan(tmp_path)) == 1  # the base clock is still its own site
+    top = "# frozen-clock-ok: unbounded, base class only\n"
+    _write(tmp_path, top + base + waiver + inner)
+    assert check.scan(tmp_path) == []
 
 
 def test_repo_tests_tree_is_clean():
