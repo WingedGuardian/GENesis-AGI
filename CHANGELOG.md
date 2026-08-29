@@ -118,6 +118,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   alone would let one transient network blip demand release receipts from every open
   PR.
 
+  A pin file that is not valid UTF-8 now lands on the CONTENT side of that axis
+  rather than crashing the check. The CI adapter reads the base with `git show`,
+  which decodes as it reads, and the decode error is not one of the error types that
+  read was catching — so a single stray byte in `cc_version.sh` ended the run with a
+  traceback instead of a verdict, and took the `--advisory` mode's "never exits
+  non-zero" guarantee with it. Reading it as CONTENT is what keeps that byte from
+  buying a free pass: the *plumbing* classification would have waved the pin through
+  unreceipted. The equivalent head-side read already did this; only the base-side one
+  was missed.
+
   A base pin that is not **installable** yields no reference value either. `npm
   install @anthropic-ai/claude-code@2.1.0250` does not resolve, so that version never
   ran anywhere — and both the unchanged and the *backward* exemptions rest on the

@@ -77,6 +77,15 @@ ERROR POLICY — WHAT BLOCKS AND WHAT DOES NOT
     ``direction_verified=False`` so a caller cannot mistake it for a real PASS.
     Receipts are a line in the PR body, so this refuses a merge, never the
     repository's ability to repair itself.
+  * **That base-side rule splits in two, and the split decides the verdict.**
+    CONTENT — git ran and what came back is not a readable pin (absent, empty,
+    assigned twice, not valid UTF-8) — is a fact about the TREE, and takes the
+    require-receipts path above. PLUMBING — the read ITSELF failed, git would not
+    run, the contents API timed out — is this gate failing, not either branch, and
+    passes NON-BLOCKING (``base_unreadable``); blocking there would wall off every
+    merge in the repository on one transient hiccup, through a gate with no
+    override sigil. Collapsing the two is a live fail-open: a non-UTF-8 base read
+    as plumbing would hand a free pass to a pin nobody can decode.
   * PASS when the pin is unchanged, respelled to the same version, or moves
     backward.
 
@@ -685,6 +694,18 @@ def read_pin_at(ref: str, *, repo_root: Path) -> str:
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise PinTransportError(f"cannot run git: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        # `text=True` decodes INSIDE subprocess.run, and UnicodeDecodeError is a
+        # ValueError — neither of the types above. Left uncaught it escaped the
+        # base-read handler in main() and crashed --advisory with a traceback.
+        #
+        # CONTENT, not transport: git ran and handed back bytes, and those bytes
+        # are not a readable pin — a fact about the TREE. PinTransportError would
+        # set base_unreadable=True, which evaluate() reads as this gate's own
+        # plumbing failing and passes NON-BLOCKING; a pin nobody can decode would
+        # then merge with no receipts. Same call read_pin_head already makes for
+        # the identical condition on the head side.
+        raise PinUnreadable(f"{_PIN_PATH} at {ref} is not valid UTF-8: {exc}") from exc
     if out.returncode != 0:
         raise PinUnreadable(f"cannot read {_PIN_PATH} at {ref}: {out.stderr.strip()[:200]}")
     return out.stdout

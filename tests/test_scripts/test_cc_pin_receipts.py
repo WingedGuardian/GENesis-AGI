@@ -335,6 +335,71 @@ def test_invalid_utf8_pin_file_raises_from_the_adapter(tmp_path: Path) -> None:
     assert "UTF-8" in str(exc.value)
 
 
+def _repo_with_pin_bytes(root: Path, raw: bytes) -> None:
+    """A throwaway git repo whose HEAD commit holds ``raw`` as the pin file.
+
+    Bytes, not text, because the case under test is a pin file that is not valid
+    UTF-8 at all — writing it through ``write_text`` could not express it.
+    """
+    pin = root / "scripts" / "lib"
+    pin.mkdir(parents=True)
+    (pin / "cc_version.sh").write_bytes(raw)
+    run = lambda *a: subprocess.run(a, cwd=root, check=True, capture_output=True)  # noqa: E731
+    run("git", "init", "-q")
+    run("git", "config", "user.email", "t@example.invalid")
+    run("git", "config", "user.name", "t")
+    run("git", "add", "-A")
+    run("git", "commit", "-qm", "pin")
+
+
+def test_invalid_utf8_pin_at_a_REF_is_a_content_fault(tmp_path: Path) -> None:
+    """The BASE-side twin of the head-side test above, which was missed.
+
+    `read_pin_at` shells out to `git show <ref>:<path>` with `text=True`, so the
+    decode happens INSIDE `subprocess.run`. It caught only
+    `(OSError, subprocess.SubprocessError)`, and `UnicodeDecodeError` is a
+    `ValueError` — neither. It escaped the base-read handler in `main()` and
+    crashed `--advisory` with a traceback.
+    """
+    _repo_with_pin_bytes(tmp_path, b'CC_VERSION="${CC_VERSION:-2.1.246}"\n# \xff\xfe\n')
+
+    with pytest.raises(receipts.PinUnreadable) as exc:
+        receipts.read_pin_at("HEAD", repo_root=tmp_path)
+
+    assert "UTF-8" in str(exc.value)
+
+
+def test_invalid_utf8_at_a_ref_is_NOT_classified_as_a_transport_failure(
+    tmp_path: Path,
+) -> None:
+    """The assertion with teeth, and the reason the test above is not enough.
+
+    `PinTransportError` SUBCLASSES `PinUnreadable`, so a test that only asserts
+    `PinUnreadable` passes for the WRONG fix too. The distinction decides the
+    verdict: a transport error sets `base_unreadable=True`, which `evaluate()`
+    treats as this gate's own plumbing failing and lets through NON-BLOCKING —
+    a free pass. Here git RAN and returned bytes; the bytes are not a readable
+    pin, which is a fact about the TREE. Content, so receipts are required.
+    """
+    _repo_with_pin_bytes(tmp_path, b"\xff\xfe not a pin at all\n")
+
+    with pytest.raises(receipts.PinUnreadable) as exc:
+        receipts.read_pin_at("HEAD", repo_root=tmp_path)
+
+    assert not isinstance(exc.value, receipts.PinTransportError), (
+        "a non-UTF-8 pin file is a CONTENT fault, not a transport failure — "
+        "classifying it as transport hands out a free pass on a pin nobody can read"
+    )
+
+
+def test_a_valid_pin_at_a_ref_still_reads_back(tmp_path: Path) -> None:
+    """Control. Without it, a `read_pin_at` that raised on EVERYTHING would
+    satisfy both tests above."""
+    _repo_with_pin_bytes(tmp_path, b'CC_VERSION="${CC_VERSION:-2.1.246}"\n')
+
+    assert "2.1.246" in receipts.read_pin_at("HEAD", repo_root=tmp_path)
+
+
 # ── what counts as a receipt ──────────────────────────────────────────────
 
 
