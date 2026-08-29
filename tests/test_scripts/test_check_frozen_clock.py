@@ -84,6 +84,18 @@ COMPOUND_FROZEN = [
         "genexp leftmost iterable",
         "S = list(str(t) for t in [datetime.now(UTC)])\n",
     ),
+    # A lambda BODY is deferred, but its DEFAULTS bind where the lambda appears.
+    ("lambda default", "F = lambda seed=datetime.now(UTC): seed\n"),
+    (
+        "broad-fixture setup before yield",
+        '@pytest.fixture(scope="session")\ndef r():\n'
+        "    t = datetime.now(UTC)\n    yield t\n",
+    ),
+    (
+        "decorator merely ENDING in skipif is not the pytest mark",
+        "def custom_skipif(*a, **k):\n    return lambda f: f\n\n\n"
+        "@custom_skipif(time.time())\ndef test_a():\n    pass\n",
+    ),
     (
         "class-scoped fixture",
         '@pytest.fixture(scope="class")\ndef s():\n    return datetime.now(UTC)\n',
@@ -134,6 +146,19 @@ DEFERRED_SAFE = [
         "default of a def nested in a test",
         "def test_x():\n    def helper(t=datetime.now(UTC)):\n"
         "        return t\n    return helper\n",
+    ),
+    (
+        "broad-fixture teardown after yield",
+        '@pytest.fixture(scope="session")\ndef r():\n'
+        "    yield 1\n    done = datetime.now(UTC)\n    return done\n",
+    ),
+    ("gmtime with an epoch argument converts", "EPOCH = time.gmtime(0)\n"),
+    ("localtime with an argument converts", "T = time.localtime(0)\n"),
+    (
+        "decorator merely ENDING in fixture is not a fixture",
+        "def not_a_fixture(**k):\n    return lambda f: f\n\n\n"
+        '@not_a_fixture(scope="session")\ndef g():\n'
+        "    return datetime.now(UTC)\n",
     ),
     (
         "dunder-main block never runs in a suite",
@@ -328,6 +353,31 @@ def test_one_waiver_never_covers_a_nested_span(tmp_path):
     assert len(check.scan(tmp_path)) == 1  # the base clock is still its own site
     top = "# frozen-clock-ok: unbounded, base class only\n"
     _write(tmp_path, top + base + waiver + inner)
+    assert check.scan(tmp_path) == []
+
+
+def test_waiver_binds_to_its_own_statement_not_the_enclosing_block(tmp_path):
+    """A stale marker in an `if`/`try` must not exempt a clock added elsewhere in it.
+
+    Pooling every clock in a compound statement into one span and counting waivers
+    across it lets a marker left beside a deleted clock silently cover a new one.
+    """
+    _write(
+        tmp_path,
+        "if True:\n"
+        "    # frozen-clock-ok: 5d, belongs to a line that no longer exists\n"
+        "    A = 1\n"
+        "    B = datetime.now(UTC)\n",
+    )
+    assert len(check.scan(tmp_path)) == 1
+    # ...and a marker on the clock's OWN statement still works.
+    _write(
+        tmp_path,
+        "if True:\n"
+        "    A = 1\n"
+        "    # frozen-clock-ok: 5d vs a 35d window\n"
+        "    B = datetime.now(UTC)\n",
+    )
     assert check.scan(tmp_path) == []
 
 

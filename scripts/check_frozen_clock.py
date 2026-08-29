@@ -111,11 +111,15 @@ CLOCK_SUFFIXES: tuple[str, ...] = (
     "time.clock_gettime_ns",
 )
 
+# ``localtime(secs)``/``gmtime(secs)`` CONVERT a supplied epoch value; only their
+# zero-argument forms read the current clock.
+ARG_SENSITIVE: frozenset[str] = frozenset({"time.localtime", "time.gmtime"})
+
 # Fixture scopes whose body is evaluated once, well before the tests that use it.
 BROAD_SCOPES = frozenset({"session", "module", "package", "class"})
 
 # Decorators whose arguments are import-time BY CONTRACT — flagging them is noise.
-IMPORT_TIME_BY_DESIGN = ("skipif", "xfail")
+IMPORT_TIME_BY_DESIGN = frozenset({"skipif", "xfail"})
 
 OPT_OUT = re.compile(r"#\s*frozen-clock-ok:\s*(?P<reason>\S.*)")
 # A margin is a magnitude. "unbounded" is the honest form for a site nothing ages.
@@ -142,36 +146,68 @@ def _is_clock(dotted: str) -> bool:
     return any(dotted == s or dotted.endswith("." + s) for s in CLOCK_SUFFIXES)
 
 
-def _clock_calls(node: ast.AST) -> list[tuple[int, int, str, int]]:
-    """Clock calls in ``node``, NOT descending into anything evaluated later.
+def _terminal(dotted: str) -> str:
+    """Last dotted component — ``pytest.mark.skipif`` -> ``skipif``.
+
+    Matched exactly rather than by suffix: ``endswith("skipif")`` also accepts
+    ``custom_skipif``, which would let an arbitrary decorator disarm the guard, and
+    ``endswith("fixture")`` accepts ``not_a_fixture``, which would flag its body.
+    """
+    return dotted.rsplit(".", 1)[-1]
+
+
+def _reads_the_clock(call: ast.Call) -> bool:
+    """True if this call actually reads the current time."""
+    dotted = _dotted(call.func)
+    if not _is_clock(dotted):
+        return False
+    if any(dotted == s or dotted.endswith("." + s) for s in ARG_SENSITIVE):
+        # gmtime(0) converts a supplied epoch; gmtime() reads the clock.
+        return not (call.args or call.keywords)
+    return True
+
+
+def _eager_children(node: ast.AST) -> list[ast.AST]:
+    """Children of ``node`` evaluated NOW, with the deferred parts pruned.
+
+    Three constructs are part-eager and part-deferred, and treating any of them as
+    wholly deferred loses a real import-time read:
+      * a ``def``/``lambda`` BODY runs when called, but its DEFAULTS are evaluated
+        where the definition appears;
+      * a generator expression's element and inner ``for`` clauses are lazy, but its
+        LEFTMOST iterable is consumed when the generator is created.
+    """
+    out: list[ast.AST] = []
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.Lambda):
+            out.extend(child.args.defaults)
+            out.extend(d for d in child.args.kw_defaults if d)
+            continue
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue  # its defaults/decorators are visited with the function itself
+        if isinstance(child, ast.GeneratorExp):
+            if child.generators:
+                out.append(child.generators[0].iter)
+            continue
+        out.append(child)
+    return out
+
+
+def _clock_calls(node: ast.AST) -> list[ast.Call]:
+    """Clock-reading calls in ``node`` that are evaluated when ``node`` is.
 
     The ROOT is checked as well as the children: a scoped fixture may hold a nested
-    ``def`` whose body only runs when the returned callable is invoked. Such a node's
-    own defaults and decorators are not lost — every function in the tree is visited
-    separately for those.
+    ``def`` whose body only runs when the returned callable is invoked.
     """
     if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
         return []
-    found: list[tuple[int, int, str, int]] = []
+    found: list[ast.Call] = []
     stack: list[ast.AST] = [node]
     while stack:
         cur = stack.pop()
-        if isinstance(cur, ast.Call):
-            dotted = _dotted(cur.func)
-            if _is_clock(dotted):
-                found.append((cur.lineno, cur.col_offset, dotted, id(cur)))
-        for child in ast.iter_child_nodes(cur):
-            # Deferred: a function/lambda body runs when called.
-            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
-                continue
-            # A generator expression is lazy EXCEPT its leftmost iterable, which is
-            # evaluated the moment the genexp is created. Comprehensions are eager
-            # throughout and stay in scope.
-            if isinstance(child, ast.GeneratorExp):
-                if child.generators:
-                    stack.append(child.generators[0].iter)
-                continue
-            stack.append(child)
+        if isinstance(cur, ast.Call) and _reads_the_clock(cur):
+            found.append(cur)
+        stack.extend(_eager_children(cur))
     return found
 
 
@@ -184,7 +220,7 @@ def _fixture_scope(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
     """
     for dec in fn.decorator_list:
         target = dec.func if isinstance(dec, ast.Call) else dec
-        if not _dotted(target).endswith("fixture"):
+        if _terminal(_dotted(target)) != "fixture":
             continue
         if not isinstance(dec, ast.Call):
             return "function"
@@ -249,6 +285,20 @@ def _top_level_functions(tree: ast.AST):
     return out
 
 
+def _fixture_setup(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.stmt]:
+    """The statements of a fixture that run during SETUP.
+
+    A generator fixture's statements after ``yield`` run at TEARDOWN — after every
+    consumer has finished — so a clock read there cannot age before it is used.
+    """
+    setup: list[ast.stmt] = []
+    for stmt in fn.body:
+        setup.append(stmt)
+        if any(isinstance(n, ast.Yield | ast.YieldFrom) for n in ast.walk(stmt)):
+            break
+    return setup
+
+
 def _is_dunder_main(node: ast.stmt) -> bool:
     """``if __name__ == "__main__":`` — never executed under pytest."""
     if not isinstance(node, ast.If):
@@ -272,11 +322,32 @@ def _under_import_time_contract(node: ast.AST) -> set[int]:
         if not isinstance(sub_node, ast.Call):
             continue
         target = sub_node.func
-        if _dotted(target).endswith(IMPORT_TIME_BY_DESIGN):
+        if _terminal(_dotted(target)) in IMPORT_TIME_BY_DESIGN:
             for inner in ast.walk(sub_node):
-                if isinstance(inner, ast.Call) and _is_clock(_dotted(inner.func)):
+                if isinstance(inner, ast.Call) and _reads_the_clock(inner):
                     exempt.add(id(inner))
     return exempt
+
+
+def _enclosing_statements(tree: ast.AST) -> dict[int, ast.stmt]:
+    """id(node) -> the INNERMOST statement containing it.
+
+    A waiver binds to the statement its clock actually sits in. Keying to an outer
+    compound statement instead would pool every clock in an ``if``/``try`` block into
+    one span, where a stale marker left beside a deleted clock would silently exempt a
+    different clock added elsewhere in the same block.
+    """
+    owner: dict[int, ast.stmt] = {}
+
+    def walk(node: ast.AST, current: ast.stmt | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            inner = child if isinstance(child, ast.stmt) else current
+            if inner is not None:
+                owner[id(child)] = inner
+            walk(child, inner)
+
+    walk(tree, None)
+    return owner
 
 
 def scan_source(source: str, rel: str) -> list[Violation]:
@@ -284,18 +355,22 @@ def scan_source(source: str, rel: str) -> list[Violation]:
     tree = ast.parse(source)
     lines = source.splitlines()
     comments = _comment_lines(source)
-    hits: dict[tuple[int, int, str], Hit] = {}
-
+    owner = _enclosing_statements(tree)
     exempt_calls = _under_import_time_contract(tree)
-
-    def record(node: ast.AST, shape: str, span: tuple[int, int]) -> None:
-        for lineno, col, dotted, node_id in _clock_calls(node):
-            if node_id in exempt_calls:
-                continue
-            hits.setdefault((lineno, col, dotted), (lineno, col, dotted, shape, *span))
+    hits: dict[tuple[int, int, str], Hit] = {}
 
     def span_of(node: ast.AST) -> tuple[int, int]:
         return (node.lineno, getattr(node, "end_lineno", None) or node.lineno)
+
+    def record(node: ast.AST, shape: str, span: tuple[int, int] | None = None) -> None:
+        for call in _clock_calls(node):
+            if id(call) in exempt_calls:
+                continue
+            # Bind to the innermost statement holding THIS call, not to the outer
+            # construct we happened to start the walk from.
+            here = span if span is not None else span_of(owner.get(id(call), call))
+            key = (call.lineno, call.col_offset, _dotted(call.func))
+            hits.setdefault(key, (*key, shape, *here))
 
     def walk_import_time(body: list[ast.stmt], shape: str) -> None:
         """Statements evaluated when the module is imported."""
@@ -306,13 +381,10 @@ def scan_source(source: str, rel: str) -> list[Violation]:
                 continue  # only runs when the file is executed directly, never in a suite
             if isinstance(st, ast.ClassDef):
                 for extra in [*st.decorator_list, *st.bases, *st.keywords]:
-                    # span_of(extra), NOT span_of(st): keying these to the whole class
-                    # body would let one waiver inside the class silence a base-class
-                    # clock, and let that same waiver be counted twice.
                     record(extra, shape, span_of(extra))
                 walk_import_time(st.body, "class-body")
                 continue
-            record(st, shape, span_of(st))
+            record(st, shape)
 
     walk_import_time(tree.body, "module-body")
 
@@ -325,17 +397,17 @@ def scan_source(source: str, rel: str) -> list[Violation]:
         for dec in node.decorator_list:
             record(dec, "decorator-arg", span_of(dec))
         if (_fixture_scope(node) or "function") in BROAD_SCOPES:
-            for st in node.body:
-                record(st, "scoped-fixture", span_of(st))
+            for st in _fixture_setup(node):
+                record(st, "scoped-fixture")
 
     by_span: dict[tuple[int, int], list[Hit]] = {}
     for hit in hits.values():
         by_span.setdefault((hit[4], hit[5]), []).append(hit)
 
     out: list[Violation] = []
-    for (start, end), group in by_span.items():
+    for (start_line, end_line), group in by_span.items():
         # One recorded measurement per site: N calls in a span need N waivers.
-        waived = _markers_for_span(comments, lines, start, end)
+        waived = _markers_for_span(comments, lines, start_line, end_line)
         for hit in sorted(group)[waived:]:
             out.append((rel, hit[0], hit[3], hit[2]))
     return sorted(out, key=lambda v: (v[0], v[1]))
