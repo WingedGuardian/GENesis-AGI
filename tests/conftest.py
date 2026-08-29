@@ -109,22 +109,29 @@ def _is_introspection_only(config) -> bool:
     Kept as a predicate rather than inlined so the exemption set is one
     reviewable list; see the caller for why these must not be blocked.
 
-    ``version`` is deliberately NOT in that list, which is not obvious — MEASURED
-    against the installed pytest, no spelling of it both reaches this hook AND
-    prints-and-exits:
+    ``version`` is deliberately NOT in that list, which is not obvious. MEASURED
+    across two pytest versions, because the project pins only ``pytest>=8.0`` and
+    the behaviour differs between them:
 
     * ``--version`` — ``Config.main()`` short-circuits it (it matches the literal
       token at count 1) before the infrastructure starts, so we never run.
+      Same on 9.0.3 and 9.1.1.
     * ``--version --version`` / ``-VV`` — ``helpconfig.pytest_cmdline_main``
       returns at ``version > 1``, before ``_do_configure()``. Again never run.
-    * ``-V`` — neither branch fires (``Config.main`` matches the *string*
-      ``--version``; ``version == 1`` is not ``> 1``), so it falls through to
-      ``wrap_session`` and runs the WHOLE SUITE.
+    * ``-V`` — VERSION-DEPENDENT, and that is the whole reason this note exists.
+      On 9.0.3 neither branch fires (``Config.main`` matches the *string*
+      ``--version``, and ``version == 1`` is not ``> 1``), so it falls through to
+      ``wrap_session`` and runs the WHOLE SUITE. On 9.1.1 pytest answers it early
+      and this hook never loads.
 
-    Exempting ``version`` therefore bought nothing for the first two and, for
-    ``-V``, would wave a full unserialized suite straight past the lock — the
+    Removing ``version`` is right under EITHER behaviour: where ``-V`` never
+    reaches us the entry is simply dead, and where it does reach us it is a full
+    unserialized suite that exempting would wave straight past the lock — the
     opposite of the point. It reads like a harmless entry, which is why the
-    measurement is written down rather than left to the next reader's intuition.
+    measurement is written down rather than left to the next reader's intuition,
+    and why the test guarding it asserts the safety PROPERTY (``-V`` never runs a
+    session past a held lock) rather than either version's mechanism. An earlier
+    version of that test encoded 9.0.3's behaviour and failed on CI's 9.1.1.
     """
     opt = config.option
     return any(

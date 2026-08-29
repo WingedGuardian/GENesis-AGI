@@ -736,14 +736,21 @@ class TestConftestWiring:
         assert result.returncode == 0, f"{mode} was refused: {out[:400]}"
         assert "Traceback (most recent call last)" not in out
 
-    def test_dash_V_is_not_treated_as_introspection(self, tmp_path, holder):
-        """``-V`` RUNS THE SUITE, so it must be governed like any other run.
+    def test_dash_V_never_runs_an_unserialized_suite(self, tmp_path, holder):
+        """``-V`` must never end up running the suite past a held lock.
 
-        pytest exempts a single ``--version`` itself, before this conftest is
-        reached; but ``-V`` reaches ``pytest_configure`` and then falls through
-        to a normal session. Treating it as "introspection" would hand a full,
-        unserialized suite a free pass past the lock. This is fast precisely
-        because the refusal lands at configure time, before collection.
+        Asserts the SAFETY PROPERTY, not one pytest's mechanism — because the
+        mechanism differs by version and the project pins only ``pytest>=8.0``.
+        MEASURED: on 9.0.3 ``-V`` reaches ``pytest_configure`` and falls through
+        to an ordinary session, so it must be refused; on 9.1.1 pytest answers
+        it and exits before this conftest ever loads. An earlier version of this
+        test asserted the 9.0.3 behaviour and duly failed on CI's 9.1.1 — an
+        install-specific assumption, which is exactly what a floating dependency
+        forbids.
+
+        Either outcome is acceptable and both are safe. What must never happen
+        is the third one: exit 0 having actually collected and run tests while
+        another run holds the lock.
         """
         path = tmp_path / "pytest.lock"
         holder(path)
@@ -751,10 +758,17 @@ class TestConftestWiring:
         result = self._run(["-V"], path)
         out = result.stdout + result.stderr
 
-        assert result.returncode == pytest_lock.EXIT_LOCK_HELD, (
-            f"-V was exempted from the lock, so it would have run the whole "
-            f"suite unserialized: rc={result.returncode} {out[:300]}"
+        if result.returncode == pytest_lock.EXIT_LOCK_HELD:
+            return  # governed by the lock — correct on any version
+        assert result.returncode == 0, (
+            f"-V failed for neither reason: rc={result.returncode} {out[:300]}"
         )
+        # Exit 0 is only acceptable if pytest short-circuited BEFORE us. If it
+        # actually ran a session, the exemption let an unserialized suite past.
+        for marker in ("test session starts", "collected", "passed", "failed"):
+            assert marker not in out, (
+                f"-V ran a session past a held lock (saw {marker!r}): {out[:300]}"
+            )
 
     def test_the_disable_lever_really_lets_a_contended_run_through(
         self, tmp_path, holder
