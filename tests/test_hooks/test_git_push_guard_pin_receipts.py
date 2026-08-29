@@ -407,22 +407,31 @@ _BASE_DEGRADATIONS = {
     "blob undecodable": "__undecodable__",
 }
 _HEAD_INTENTS = {
-    # (head pin, body) — the pin is untouched, or moved forward WITH both receipts.
-    "pin untouched": (PIN_BASE, ""),
-    "forward bump with receipts": (PIN_FORWARD, RECEIPTS),
+    # (head pin, body, must_block) — what the PR is DOING to the pin. Every intent
+    # here WRITES the pin; a PR that leaves it alone is the test below this one.
+    "forward bump with receipts": (PIN_FORWARD, RECEIPTS, False),
+    "forward bump WITHOUT receipts": (PIN_FORWARD, "", True),
 }
 
 
 @pytest.mark.parametrize("degradation", sorted(_BASE_DEGRADATIONS))
 @pytest.mark.parametrize("intent", sorted(_HEAD_INTENTS))
-def test_no_base_side_fault_may_block_a_merge(monkeypatch, degradation, intent):
-    """The full product of (base fault × what the PR is doing). Every cell passes.
+def test_a_base_side_fault_asks_for_receipts_it_never_decides_alone(
+    monkeypatch, degradation, intent
+):
+    """The full product of (base fault × what the PR is doing to the pin).
 
-    Parametrised over the PRODUCT deliberately: the original bug was found only
-    because the "pin untouched" column was checked, and a matrix with that axis
-    pinned would have shown four of the six as harmless.
+    Parametrised over the PRODUCT deliberately: pinning either axis hides cells.
+    That is not hypothetical here — an earlier revision of THIS test asserted every
+    cell passes, went green, and was wrong. A base-side fault does not block, but
+    "does not block" is not the same as "waves through": with the base unreadable
+    the direction cannot be computed, so the receipts are required IN ITS PLACE.
+
+    The `WITHOUT receipts` column is the one that was open. CI does not cover it —
+    a PR that repairs the base and bundles a forward bump resolves a merge tree
+    containing the REPAIRED file, so lockstep passes and the check is green.
     """
-    head_pin, body = _HEAD_INTENTS[intent]
+    head_pin, body, must_block = _HEAD_INTENTS[intent]
     monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
     monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
     monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", _BASE_DEGRADATIONS[degradation])
@@ -431,20 +440,18 @@ def test_no_base_side_fault_may_block_a_merge(monkeypatch, degradation, intent):
 
     blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
 
-    assert blocked is False, (
-        f"base fault {degradation!r} blocked a PR ({intent}). A base-side fault must "
-        f"never block: no PR can repair it here and CI already covers it. Message: {msg}"
+    assert blocked is must_block, (
+        f"base fault {degradation!r} + {intent}: expected blocked={must_block}, got "
+        f"{blocked}. Message: {msg}"
     )
-    # It must also be VISIBLE. The merge arm prints a message only when it is marked
-    # as a note, so an unmarked fail-open merges in silence — which is how "the
+    # A pass here must also be VISIBLE. The merge arm prints a message only when it is
+    # marked as a note, so an unmarked fail-open merges in silence — which is how "the
     # residue is narrow and named" became false at the only surface a human reads.
-    # A genuine pass ("pin unchanged") has nothing to warn about and is exempt.
-    if "unchanged" not in msg:
+    if not blocked:
         assert msg.startswith("NOTE:"), (
             f"base fault {degradation!r} did not block, but the message is not marked as "
             f"a note, so the merge arm will not print it: {msg}"
         )
-        assert "NOT verified" in msg, f"a fail-open must say it did not verify: {msg}"
 
 
 @pytest.mark.parametrize("degradation", sorted(_BASE_DEGRADATIONS))
@@ -453,15 +460,21 @@ def test_a_PR_that_leaves_the_pin_file_alone_is_never_blocked(monkeypatch, degra
 
     A PR that does not touch cc_version.sh inherits whatever is on the base AT ITS OWN
     HEAD. So a broken base makes the HEAD pin unreadable too, and the head-side rule
-    blocks the PR — the wedge simply moves from one side to the other. Identical bytes
-    at both refs cannot move the pin, so this must pass whatever state those bytes are
-    in. MEASURED before the fix: every one of these blocked.
+    blocks the PR — the wedge simply moves from one side to the other. The same blob at
+    both refs cannot move the pin, so this must pass whatever state that blob is in.
+    MEASURED before the fix: every one of these blocked.
     """
     same = _BASE_DEGRADATIONS[degradation]
     monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
     monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
     monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", same)
     monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", same)
+    # For the states with no readable content, IDENTITY is the blob SHA and nothing
+    # else — the seam has to say which blob, because that is exactly the information
+    # the gate now requires and the old content comparison could not supply.
+    if same == _mod._PIN_SEAM_UNDECODABLE:
+        monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE_SHA", "0" * 40)
+        monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE_SHA", "0" * 40)
     monkeypatch.setenv("_TEST_GH_PR_BODY", "an unrelated PR that never touches the pin")
 
     blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
@@ -470,6 +483,32 @@ def test_a_PR_that_leaves_the_pin_file_alone_is_never_blocked(monkeypatch, degra
         f"a PR that leaves the pin file untouched was blocked because the base is "
         f"{degradation!r}. Message: {msg}"
     )
+
+
+def test_two_DIFFERENT_unreadable_blobs_are_not_mistaken_for_an_untouched_pin(monkeypatch):
+    """The control for the test above, and a fixed fail-open.
+
+    "Untouched" used to be concluded from the two CONTENT values being equal. For every
+    state where content is unavailable both are `None`, so the predicate compared two
+    absences and reported them identical: a PR replacing one over-1MB pin blob with a
+    DIFFERENT over-1MB blob was declared not to have touched the pin, and skipped the
+    head-side undecodable block entirely.
+
+    Without this control the test above is satisfied by a gate that calls everything
+    unchanged — which is precisely the gate that shipped.
+    """
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+    monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", _mod._PIN_SEAM_UNDECODABLE)
+    monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", _mod._PIN_SEAM_UNDECODABLE)
+    monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE_SHA", "a" * 40)
+    monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE_SHA", "b" * 40)
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "")
+
+    blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
+
+    assert blocked is True, f"two different unreadable blobs are not an untouched pin: {msg}"
+    assert "could not be decoded" in msg, msg
 
 
 def test_a_forward_bump_still_blocks_when_the_base_is_FINE(monkeypatch):
@@ -486,14 +525,15 @@ def test_a_forward_bump_still_blocks_when_the_base_is_FINE(monkeypatch):
     assert blocked is True, f"a receipt-free forward bump must still block: {msg}"
 
 
-def test_a_non_canonical_version_is_INCOMPARABLE_and_still_blocks(monkeypatch):
-    """The one condition that blocks despite involving the base, and why it is not
-    a base-side rule.
+def test_the_canonical_repair_of_a_non_canonical_base_pin_is_ALLOWED(monkeypatch):
+    """Inverted 2026-08-29. It used to block, and blocking WAS the wedge.
 
-    `2.1.0246` and `2.1.246` compare EQUAL as integers, so the move cannot be judged.
-    It is reached only when the pin MOVES, and CI cannot see it on a PR — the merge
-    tree carries the good HEAD pin, so lockstep passes while main is red. Routing it
-    to the non-blocking base path would let a real forward bump merge unchecked.
+    `2.1.0246` on the base was treated as incomparable, so every PR touching the pin
+    was refused — described at the time as costing "pin-moving PRs alone", which
+    overlooked that the repair is itself a pin-moving PR. Through a gate with no
+    override sigil, the malformed pin was therefore unmergeable by anyone.
+
+    The versions are numerically EQUAL, so nothing is being released here.
     """
     monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
     monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
@@ -501,11 +541,34 @@ def test_a_non_canonical_version_is_INCOMPARABLE_and_still_blocks(monkeypatch):
         "_TEST_GH_BASE_PIN_FILE", 'CC_VERSION="${CC_VERSION:-2.1.0246}"\nNODE_MAJOR=22\n'
     )
     monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", PIN_FORWARD)
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "no receipts — nothing is being released")
+
+    blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
+
+    assert blocked is False, f"the only in-band repair of a malformed base must pass: {msg}"
+    assert "canonicalised" in msg, msg
+
+
+def test_a_pin_THIS_PR_wrote_in_non_canonical_form_still_blocks(monkeypatch):
+    """The control for the repair above — same rule, run the other way.
+
+    Without it, "allow the canonicalisation" is satisfied by a gate that also allows
+    `2.1.246` → `2.1.0246`, shipping to the public repo the exact spelling
+    `npm install` cannot resolve. Value decides DIRECTION; spelling decides
+    PUBLISHABILITY; only the second is this PR's responsibility, and only when this
+    PR wrote it.
+    """
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+    monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", PIN_FORWARD)
+    monkeypatch.setenv(
+        "_TEST_GH_HEAD_PIN_FILE", 'CC_VERSION="${CC_VERSION:-2.1.0246}"\nNODE_MAJOR=22\n'
+    )
     monkeypatch.setenv("_TEST_GH_PR_BODY", RECEIPTS)
 
     blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
 
-    assert blocked is True, f"an incomparable pin pair must block: {msg}"
+    assert blocked is True, f"a pin npm cannot install must not merge: {msg}"
     assert "canonical semver" in msg, msg
 
 
@@ -535,15 +598,19 @@ def test_the_live_404_path_classifies_a_deleted_pin_as_ABSENT(monkeypatch):
     assert "ABSENT at the PR head" in msg, msg
 
 
-def test_a_missing_pin_file_on_the_BASE_does_NOT_block(monkeypatch):
-    """Inverted 2026-08-28. It used to block, and that was the wedge.
+def test_a_missing_pin_file_on_the_BASE_asks_for_receipts_rather_than_wedging(monkeypatch):
+    """Revised twice, and the two revisions are the whole argument.
 
-    No base pin means no comparison — but the conclusion drawn from that was wrong.
-    A base with no pin is a fault in the base branch: every open PR inherits it, none
-    can repair it through this gate, and the gate has no override. It also already
-    reddens CI. So the old rule blocked every merge in the repository to prevent one
-    unverified bump, and the merge it blocked *hardest* was the one that would have
-    fixed the pin.
+    It BLOCKED originally: no base pin, no comparison, refuse. That wedged the repo —
+    a base with no pin is inherited by every open PR, repairable by none of them
+    through a gate with no override.
+
+    It PASSED next, on the reasoning that CI covers a malformed base. CI does not
+    cover THIS shape: the PR restores the pin file, so its merge tree is clean and
+    lockstep is green, and the restored value could be any version at all with no
+    receipts behind it.
+
+    So neither — the receipts are required in place of the comparison.
     """
     monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
     monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
@@ -553,9 +620,15 @@ def test_a_missing_pin_file_on_the_BASE_does_NOT_block(monkeypatch):
 
     blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
 
-    assert blocked is False
-    assert "ABSENT on the base branch" in msg
-    assert "NOT verified" in msg, "the fail-open must say it did not verify"
+    assert blocked is True, f"a restored pin with no receipts behind it must not merge: {msg}"
+    assert "could not be read" in msg, msg
+
+    # ...and the same PR WITH the receipts merges, marked as not having compared.
+    monkeypatch.setenv("_TEST_GH_PR_BODY", RECEIPTS)
+    blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
+
+    assert blocked is False, f"receipts present must clear it: {msg}"
+    assert msg.startswith("NOTE:"), f"a pass that compared nothing must be printed: {msg}"
 
 
 def test_an_unreadable_base_ref_is_plumbing_and_must_not_block(monkeypatch):

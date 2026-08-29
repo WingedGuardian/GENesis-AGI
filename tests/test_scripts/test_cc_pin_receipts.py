@@ -146,35 +146,66 @@ def test_reassignment_in_any_shape_blocks(second: str) -> None:
     _assert_blocked(_evaluate(head=HEAD + second + "\n"), "unreadable-head")
 
 
-def test_leading_zero_version_blocks_rather_than_comparing_equal() -> None:
-    """MEASURED fail-OPEN: int() collapses 2.1.0246 and 2.1.246 to one tuple.
+@pytest.mark.parametrize(
+    ("base_v", "head_v"),
+    [
+        ("2.1.246", "2.1.0246"),  # forward-ish: same number, respelled BADLY
+        ("2.1.246", "2.1.0250"),  # forward
+        ("2.1.246", "2.1.0100"),  # backward
+    ],
+    ids=["respelled", "forward", "backward"],
+)
+def test_a_non_canonical_pin_THIS_PR_WROTE_blocks_in_every_direction(
+    base_v: str, head_v: str
+) -> None:
+    """`npm install @anthropic-ai/claude-code@2.1.0246` does not resolve.
 
-    So a pin written with a leading zero read as "unchanged" against the plain
-    form and skipped the gate. npm cannot install it either.
+    So an authored leading-zero pin ships a version nothing can install, and the
+    direction it moved is beside the point. An earlier revision checked the spelling
+    only on the FORWARD path, which let `2.1.246` → `2.1.0246` through as "the same
+    version, respelled" — the canonicalisation exemption below, run backwards.
     """
     v = _evaluate(
-        head='CC_VERSION="${CC_VERSION:-2.1.0246}"\n',
-        base='CC_VERSION="${CC_VERSION:-2.1.246}"\n',
+        head=f'CC_VERSION="${{CC_VERSION:-{head_v}}}"\n',
+        base=f'CC_VERSION="${{CC_VERSION:-{base_v}}}"\n',
     )
 
-    _assert_blocked(v, "incomparable")
+    _assert_blocked(v, "unreadable-head")
 
 
-def test_a_leading_zero_on_the_BASE_still_blocks_and_is_not_treated_as_base_side() -> None:
-    """The guard against over-generalising the base-side rule.
+def test_a_non_canonical_pin_this_PR_INHERITED_does_not_block() -> None:
+    """The other half of the same rule, and the reason it is scoped to authorship.
 
-    Base-side faults do not block — but this one is not a base-side fault. It is
-    reached only when the pin MOVES (identical pins return early), and CI cannot see
-    it on a PR: the merge tree carries the good HEAD pin, so lockstep passes while
-    main is red. Routing it to `unreadable-base` would let a real forward bump merge
-    unchecked, which is the one hole the head/base split must not open.
+    A malformed pin already on the base branch is inherited by every open PR. If it
+    blocked, it would block all of them — including the one that repairs it, since
+    that PR necessarily carries the malformed pin at its base. That is the wedge this
+    module exists to avoid, so the spelling rule must not reintroduce it.
+    """
+    same = 'CC_VERSION="${CC_VERSION:-2.1.0246}"\n'
+
+    _assert_passes(_evaluate(head=same, base=same, body="no receipts anywhere"))
+
+
+def test_the_canonical_repair_of_a_non_canonical_base_is_ALLOWED() -> None:
+    """`2.1.0246` → `2.1.246` is the ONLY in-band repair for a malformed base pin.
+
+    It was BLOCKED until 2026-08-29, under a rule that refused to compare a
+    non-canonical pin on either side. That rule was described as costing only
+    "pin-moving PRs" — but the repair IS a pin-moving PR, so the malformed pin stayed
+    unmergeable-by-anyone through a gate with no override sigil.
+
+    The versions are numerically equal, so nothing is being released and no receipts
+    are required: `_numeric_value` compares VALUE, `_STRICT_SEMVER` polices SPELLING,
+    and separating those two is what makes the repair expressible.
     """
     v = _evaluate(
-        head='CC_VERSION="${CC_VERSION:-2.1.250}"\n',
+        head='CC_VERSION="${CC_VERSION:-2.1.246}"\n',
         base='CC_VERSION="${CC_VERSION:-2.1.0246}"\n',
+        body="no receipts anywhere",
     )
 
-    _assert_blocked(v, "incomparable")
+    _assert_passes(v)
+    assert "canonicalised" in v.message, v.message
 
 
 def test_unreadable_pin_blocks_it_does_not_skip() -> None:
@@ -188,25 +219,31 @@ def test_unreadable_pin_blocks_it_does_not_skip() -> None:
     ["", "   \n", "# no pin here at all\n", BASE + 'CC_VERSION="${CC_VERSION:-9.9.9}"\n'],
     ids=["empty", "whitespace", "no-assignment", "assigned-twice"],
 )
-def test_an_unreadable_BASE_pin_does_NOT_block(base: str) -> None:
-    """Inverted 2026-08-28, and the inversion is the whole point.
+def test_an_unreadable_BASE_pin_requires_RECEIPTS_rather_than_blocking(base: str) -> None:
+    """Both of the obvious answers here are wrong, which is why this is a third one.
 
-    A base-side fault belongs to the base branch: every open PR inherits it, none can
-    repair it through the merge gate, and that gate has no override sigil — so
-    blocking here wedged the entire repository, including the PR that would fix the
-    pin. It is also redundant. MEASURED: each of these makes
-    `check_cc_node_lockstep` exit 1, reddening the blocking CI workflow, which the
-    merge gate refuses independently and WITH a `# ci-override` escape.
+    BLOCKING wedges the repository: a base-side fault is inherited by every open PR,
+    repairable by none of them through a gate with no override sigil.
 
-    The verdict must still SAY it verified nothing — a silent pass here would be the
-    fail-open this change exists to make visible.
+    PASSING lets a release ship unreceipted. A PR that repairs the base and bundles a
+    forward bump in the same change is invisible to CI — its merge tree carries the
+    REPAIRED file, so `check_cc_node_lockstep` passes and the check is green. That
+    was a live fail-open between 2026-08-28 and 2026-08-29, and it was found by
+    review, not by this suite: the version of this test that asserted a plain pass
+    went green throughout.
+
+    So the gate asks for the ATTESTATION in place of the comparison it cannot run.
+    Receipts are a line in the PR body, so this refuses a merge, never the repo's
+    ability to repair itself.
     """
-    v = _evaluate(base=base)
+    _assert_blocked(_evaluate(base=base, body="prose, but no receipts"), "receipts")
 
-    assert not v.blocked, f"a base-side fault must not block: {v.message}"
-    assert v.reason == "unreadable-base", f"wrong reason: {v.reason!r}"
-    assert "BASE branch" in v.message, v.message
-    assert "could not run" in v.message, v.message
+    passing = _evaluate(base=base)
+    assert not passing.blocked, f"receipts present must pass: {passing.message}"
+    assert not passing.direction_verified, (
+        "a pass here verified the receipts and NOTHING about direction — saying "
+        "otherwise is the fail-open this whole path exists to make visible"
+    )
 
 
 def test_invalid_utf8_pin_file_raises_from_the_adapter(tmp_path: Path) -> None:

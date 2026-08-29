@@ -93,28 +93,37 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   non-blocking: refusing every merge whenever a read comes back unusable once walled
   off 50 merge-gate cases at a stroke.
 
-  The broad one: **no base-side condition blocks any more.** Previously an empty,
-  whitespace-only, unassigned, doubly-assigned or absent pin file on the base branch
-  blocked *every* pull request — including PRs that never touch `cc_version.sh`,
-  including a fully compliant pin bump carrying both receipts, and including the pull
-  request that would have repaired the pin. The gate has no override sigil by design,
-  so there was no in-band recovery: one bad commit to `main` stopped all merges.
+  The broad one: **the base branch no longer decides anything by itself.** Previously
+  an empty, whitespace-only, unassigned, doubly-assigned or absent pin file on the
+  base branch blocked *every* pull request — including PRs that never touch
+  `cc_version.sh`, including a fully compliant pin bump carrying both receipts, and
+  including the pull request that would have repaired the pin. The gate has no
+  override sigil by design, so there was no in-band recovery: one bad commit to `main`
+  stopped all merges.
 
-  That rule was also redundant. An unparseable pin on the base makes
-  `check_cc_node_lockstep` exit non-zero, which reddens the blocking `CI` workflow
-  (no `paths:` filter, so it runs on every PR), and the merge gate independently
-  refuses red CI — through a check that names the problem, fails on `main`'s own push
-  run, and *has* an escape hatch. The single merge the old rule blocked that CI does
-  not is the one that fixes the pin, whose merge tree carries the good file.
+  A base that cannot be read is now treated as a missing INPUT rather than as an
+  answer. Direction is then unknowable, and both of the obvious responses are wrong:
+  blocking wedges the repository, while passing lets a PR that repairs the base and
+  bundles a forward release in the same change ship with no receipts at all — a case
+  CI cannot see, because that PR's merge tree contains the *repaired* file, so
+  `cc-node-lockstep` passes and the check is green. So the gate asks for the receipts
+  in place of the comparison it could not run, and marks the verdict as having
+  verified nothing about direction. Receipts are a line in the PR body, so this
+  refuses a merge, never the repository's ability to repair itself.
 
-  A PR that leaves the pin file untouched is now recognised by comparing the two
-  sides as BYTES, before any parse: identical content cannot have moved the pin,
-  whatever state that content is in. Without this the wedge simply moved from the
-  base rule to the head rule, since such a PR inherits the broken file at its own
-  head. One condition still blocks despite involving the base — a non-canonical
-  version like `2.1.0246`, which compares equal to `2.1.246` as integers. It is
-  reached only when the pin actually moves, CI cannot see it on a PR, and its blast
-  radius is pin-moving PRs alone.
+  Whether a PR touched the pin at all is decided from the **blob SHA** at both refs,
+  before anything is parsed — the one question answerable when nothing parses, and the
+  reason an untouched PR is never asked for receipts. Comparing the file CONTENTS
+  instead does not work: they are both empty whenever a read fails, so two *different*
+  oversized blobs compared equal and reported an untouched pin.
+
+  Two rules now follow from the merge being the publication, since `origin` is the
+  public repo. A pin present but unreadable at the head blocks. And the head pin must
+  be canonical `X.Y.Z` **whenever the PR wrote it** — `npm install …@2.1.0218` does
+  not resolve — while a non-canonical pin *inherited* unchanged does not block, which
+  is what makes the canonical repair of a malformed pin (`2.1.0218` → `2.1.218`)
+  expressible at all. It was previously refused as "incomparable", leaving a malformed
+  pin unmergeable by anyone.
 
 - **SSH slot cap no longer collapses below the running session count.** The
   interactive-slot launcher (`scripts/cc-slot.sh`) sized its cap from
