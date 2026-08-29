@@ -2788,11 +2788,15 @@ def emit_scheduled_review_marker(pr_num: str, *, kind: str, repo: str | None = N
 
 def _scheduled_review_marker_scan(
     pr_num: str, repo: str | None = None
-) -> tuple[dict[str, set[str]], dict[str, set[str]], list[tuple[str | None, str]]] | None:
+) -> (
+    tuple[dict[str, set[str]], dict[str, set[str]], list[tuple[str | None, str, bool]]]
+    | None
+):
     """``(accepted, rejected_not_clean, unusable)`` for the PR's scheduled-review
     markers, or ``None`` on an UNREADABLE fetch.
 
-    ``unusable`` is a list of ``(kind_or_None, reason)`` for marker BLOCKS that were
+    ``unusable`` is a list of ``(kind_or_None, reason, grammar_only)`` for marker
+    BLOCKS that were
     seen and could not be counted — a head that is not a full 40-hex sha, a missing
     ``kind``, an author who is not the owner, a dismissed review. Every one of those
     was previously dropped in silence, which made 'you posted a marker that does not
@@ -2823,7 +2827,13 @@ def _scheduled_review_marker_scan(
     owner = (owner_repo.split("/")[0] if owner_repo else "").lower() or None
     accepted: dict[str, set[str]] = {}
     rejected: dict[str, set[str]] = {}
-    unusable: list[tuple[str | None, str]] = []
+    # (kind_or_None, reason, grammar_only). The third field is the whole point:
+    # True means a TRUSTED, CLEAN review really happened and only the marker text
+    # is malformed, so re-posting it is honest. False means no such review exists
+    # at this head -- another author's, a dismissed one, or one whose body carries
+    # a blocking finding -- and telling the owner to re-post there would be telling
+    # them to attest to something that did not happen.
+    unusable: list[tuple[str | None, str, bool]] = []
     for row in rows:
         body = row.get("body") or ""
         # Blocks are parsed BEFORE the trust checks, so a row about to be dropped can
@@ -2839,7 +2849,8 @@ def _scheduled_review_marker_scan(
                     (
                         _marker_kind_or_none(block),
                         f"it was posted by '{login or 'an unidentified account'}', who "
-                        f"is not the repo owner, so it is not trusted",
+                        f"is not the repo owner, so nothing here vouches for a review",
+                        False,
                     )
                 )
             continue
@@ -2849,14 +2860,22 @@ def _scheduled_review_marker_scan(
         # issue comments, so this only drops review rows; issue comments remain state-less.
         _state = (row.get("state") or "").upper()
         if _state in ("DISMISSED", "PENDING"):
-            for block in blocks:
-                unusable.append(
-                    (
-                        _marker_kind_or_none(block),
-                        f"it is carried by a {_state} review, which no longer vouches "
-                        f"for anything",
+            # Only DISMISSED is terminal. A PENDING review is an unpublished draft
+            # that can still be submitted, so it is precisely the IN-FLIGHT case
+            # where waiting can make this same review count -- recording it as
+            # unusable would attach "waiting cannot clear this" to the one state
+            # where waiting IS the answer. Dropped silently on purpose; it falls
+            # through to the absent/in-flight guidance.
+            if _state == "DISMISSED":
+                for block in blocks:
+                    unusable.append(
+                        (
+                            _marker_kind_or_none(block),
+                            "it is carried by a DISMISSED review, which no longer "
+                            "vouches for anything",
+                            False,
+                        )
                     )
-                )
             continue
         # The marker must mean "ran CLEAN", not merely "ran": a scheduled review whose body
         # CONTAINS a blocking finding ([P1]/HARD BLOCK/### ERROR, unless a clean marker
@@ -2894,7 +2913,16 @@ def _scheduled_review_marker_scan(
                     )
                 else:
                     why = "it carries no kind= field"
-                unusable.append((_marker_kind_or_none(block), why))
+                # A malformed marker on a body that reads as BLOCKING is not a typo
+                # to be re-posted. The verdict survives the malformed field, because
+                # pasting a clean marker over an unresolved finding would make the
+                # gate pass while the finding still stands.
+                if not_clean:
+                    why += (
+                        ", and its body reads as carrying a blocking finding, so a "
+                        "corrected marker would not make it count either"
+                    )
+                unusable.append((_marker_kind_or_none(block), why, not not_clean))
                 continue
             target.setdefault(head_m.group(1).lower(), set()).add(kind_m.group(1).lower())
     return accepted, rejected, unusable
@@ -3029,20 +3057,34 @@ def _check_scheduled_claude_reviewed_head(
                 heads_by_kind.setdefault(kind, set()).add(other_head[:12])
     # Within a KIND, refused-at-this-head wins: it is the most specific cause, and the only
     # one whose remedy is neither waiting nor re-reviewing.
-    elsewhere_kinds = {k for k in missing_set - refused_kinds if k in heads_by_kind}
     # A marker BLOCK that was seen but could not be counted. This group exists because
-    # the three above partition only the markers that PARSE — a block discarded during
+    # the ones above partition only the markers that PARSE — a block discarded during
     # the scan reached none of them and fell through to ABSENT, whose advice is to
     # wait. An unusable marker is the one cause where waiting is guaranteed useless.
-    # When a discarded block names no kind we cannot say WHICH kind it was for, so it
-    # claims all remaining ones: an operator re-posting a marker they did not need to
-    # is harmless, while being told to wait on a marker that will never count is the
-    # failure this group was added for.
-    _rest = missing_set - refused_kinds - elsewhere_kinds
-    _named = {k for k, _ in unusable if k is not None}
-    _unnamed = any(k is None for k, _ in unusable)
-    unusable_kinds = _rest if _unnamed and unusable else (_rest & _named)
-    absent_kinds = _rest - unusable_kinds
+    #
+    # It is scoped ONLY to kinds a block actually NAMED. An earlier version let a block
+    # with no kind= claim every remaining kind, reasoning that over-reporting is the
+    # safe direction. It is not, once the group carries a remedy: the guidance would
+    # tell the owner to post a `leaks` marker on the strength of a block that never
+    # mentioned leaks, and a hand-written marker satisfies the one gate this repository
+    # calls irreducible. An unscoped block is reported as unscoped, and every kind it
+    # cannot account for keeps its true state.
+    _named = {k for k, _, _ in unusable if k is not None}
+    # A CURRENT malformed marker outranks marker history for the same kind: "you posted
+    # one and it needs one character fixed" is more actionable than "a routine ran on an
+    # older commit", and the latter used to hide the former on any PR with history.
+    unusable_kinds = (missing_set - refused_kinds) & _named
+    elsewhere_kinds = {
+        k for k in missing_set - refused_kinds - unusable_kinds if k in heads_by_kind
+    }
+    absent_kinds = missing_set - refused_kinds - unusable_kinds - elsewhere_kinds
+    # Split by what the cause MEANS. Only a trusted, clean review with a malformed
+    # marker may be answered with "re-post it"; everything else has to be answered with
+    # "run the review", because minting the marker is exactly what must not happen.
+    _grammar = {k for k, _, ok in unusable if ok and k in unusable_kinds}
+    grammar_kinds = _grammar
+    untrusted_kinds = unusable_kinds - grammar_kinds
+    unscoped = [(r, ok) for k, r, ok in unusable if k is None]
 
     parts: list[str] = []
     if refused_kinds:
@@ -3065,17 +3107,44 @@ def _check_scheduled_claude_reviewed_head(
             f"so waiting is unlikely to clear this on its own: re-run against the current "
             f"head and post the marker yourself."
         )
-    if unusable_kinds:
-        detail = "; ".join(
-            f"[{k or 'no kind named'}] {r}" for k, r in unusable[:4]
-        ) + (f" (+{len(unusable) - 4} more)" if len(unusable) > 4 else "")
+    def _detail(kinds: set[str]) -> str:
+        # Filter to THIS group before truncating. Truncating the global list first
+        # showed four unrelated reasons and hid the one that caused this bullet.
+        rows = [f"[{k}] {r}" for k, r, _ in unusable if k in kinds]
+        return "; ".join(rows[:4]) + (f" (+{len(rows) - 4} more)" if len(rows) > 4 else "")
+
+    # The runnable form, and carrying --repo when one was given: run from another
+    # checkout, an emitter without it resolves this PR number in the wrong repository
+    # and prints a marker for the wrong head. The file is tracked non-executable and is
+    # not on PATH, so a bare invocation is command-not-found.
+    _repo_arg = f" --repo {repo}" if repo else ""
+    _emit = f"python3 scripts/hooks/git_push_guard.py --emit-marker {pr_num} --kind <name>{_repo_arg}"
+
+    if grammar_kinds:
         parts.append(
-            f"{', '.join(sorted(unusable_kinds))} — a marker block IS present on this "
-            f"PR but is UNUSABLE, so it counts for nothing: {detail}. This is NOT "
-            f"'nobody posted anything', and waiting cannot clear it — re-post the "
-            f"marker in the exact form below. "
-            f"`git_push_guard.py --emit-marker {pr_num} --kind <name>` prints one with "
-            f"the head read from GitHub, so the sha is never retyped."
+            f"{', '.join(sorted(grammar_kinds))} — a marker block IS present at this "
+            f"head from the owner and its body reads clean, but the block itself is "
+            f"UNUSABLE so it counts for nothing: {_detail(grammar_kinds)}. This is NOT "
+            f"'nobody posted anything', and waiting cannot clear it. The review really "
+            f"ran; only the marker text is wrong, so re-post it — `{_emit}` prints one "
+            f"with the head read from GitHub, so the sha is never retyped."
+        )
+    if untrusted_kinds:
+        parts.append(
+            f"{', '.join(sorted(untrusted_kinds))} — a marker block is present but "
+            f"nothing here vouches for a clean review at this head: "
+            f"{_detail(untrusted_kinds)}. Do NOT hand-write a marker to clear this. A "
+            f"marker is an attestation that the review RAN and came back clean, and on "
+            f"this path it did not — run the review against the current head (and "
+            f"resolve any finding it reports) before posting anything."
+        )
+    if unscoped:
+        _shown = "; ".join(r for r, _ in unscoped[:3])
+        parts.append(
+            f"unscoped — {len(unscoped)} marker block(s) on this PR name no kind, so "
+            f"they cannot be credited to any required review and are NOT counted "
+            f"against the kinds above: {_shown}. Re-post each naming its kind. Until "
+            f"then every required kind is reported by its own true state."
         )
     if absent_kinds:
         parts.append(

@@ -1457,11 +1457,30 @@ class TestAnUnusableMarkerIsNotReportedAsAbsent:
             f"full head this message also prints: {msg}"
         )
 
-    def test_a_marker_with_no_kind_is_reported_as_unusable(self, monkeypatch):
+    def test_a_marker_with_no_kind_is_reported_but_claims_no_kind(self, monkeypatch):
+        """Reported, yes. Attributed to a required review, no.
+
+        REWRITTEN, and worth saying why rather than quietly relaxing it. The first
+        version asserted this block produced an "unusable" bullet AND suppressed the
+        waiting guidance. Both were wrong, and review caught it: a block naming no
+        kind cannot be credited to any particular review, so attaching it to `leaks`
+        would have told the owner to post a leak marker on the strength of a block
+        that never mentioned leaks -- and a hand-written marker satisfies the one
+        gate this repository calls irreducible.
+
+        The corrected behaviour reports the block as UNSCOPED and leaves every
+        unidentified kind in its own true state. Here nothing else has been posted
+        for `leaks`, so its true state is absent, and absent legitimately carries the
+        in-flight guidance. The assertion that used to forbid that wording was
+        encoding the bug.
+        """
         body = f"scan done.\n<!-- genesis-scheduled-review: head={HEAD} -->"
         msg = self._block_msg(monkeypatch, self._row(body)).lower()
-        assert "unusable" in msg or "could not be parsed" in msg
-        assert "may still be in flight" not in msg
+        assert "unscoped" in msg, "a block that names no kind must still be reported"
+        assert "leaks — a marker block is present" not in msg, (
+            "the kindless block was credited to leaks; following that guidance would "
+            "satisfy the irreducible gate with no leak review behind it"
+        )
 
     def test_a_marker_from_a_non_owner_is_reported_not_silently_dropped(self, monkeypatch):
         """Untrusted is the CORRECT verdict; silent is not. Someone posted a marker.
@@ -1555,3 +1574,144 @@ class TestTheGateCanEmitAMarkerItWillItselfAccept:
         rc, cap = self._emit(monkeypatch, capsys, kind="Not A Kind")
         assert rc != 0
         assert "genesis-scheduled-review" not in cap.out
+
+
+class TestAnUnusableMarkerRemedyMatchesItsCause:
+    """Naming a marker unusable is only half the job; the REMEDY has to match WHY.
+
+    The first version of this feature had one remedy -- "re-post the marker" -- and
+    applied it to every cause. That is right for exactly one of them. For the rest it
+    tells the owner to hand-write an attestation for a review that never ran, never
+    finished, or ran and BLOCKED. Following it would satisfy the gate the repository
+    calls irreducible without the scan behind it ever happening. A diagnostic that
+    makes the message more informative and the outcome less safe is a bad trade, and
+    that is what review found here.
+
+    So the causes split in two:
+      GRAMMAR ONLY -- the owner posted it, the body is clean, only the marker text is
+        malformed. A trusted clean review really did happen. Re-post it.
+      NO TRUSTED CLEAN REVIEW -- posted by someone else, carried by a dismissed
+        review, or carrying a blocking finding. Minting a marker here would be a lie.
+        Run the review; resolve the finding.
+    """
+
+    BLOCKING = "[P1] a real finding that has not been resolved"
+
+    @staticmethod
+    def _row(body, *, login="owner", author_association="OWNER", state=None):
+        row = {"login": login, "author_association": author_association, "body": body}
+        if state is not None:
+            row["state"] = state
+        return json.dumps(row)
+
+    @staticmethod
+    def _marker(head=HEAD, kind="leaks"):
+        parts = [f"head={head}"] if head else []
+        if kind:
+            parts.append(f"kind={kind}")
+        return "<!-- genesis-scheduled-review: " + " ".join(parts) + " -->"
+
+    def _msg(self, monkeypatch, comments, required="leaks", repo="acme/pub"):
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", comments)
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", required)
+        msg = _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo=repo)
+        assert msg, "a head without an ACCEPTED marker must still block"
+        return msg
+
+    # ---- P1: a block naming no kind must not claim a required one ----------
+    def test_a_kindless_block_does_not_claim_the_irreducible_kind(self, monkeypatch):
+        """Otherwise the guidance invites minting a leak attestation that nothing ran."""
+        body = "scan done.\n" + self._marker(kind=None)
+        msg = self._msg(monkeypatch, self._row(body), required="code-review,leaks")
+        assert "unscoped" in msg.lower() or "does not say which" in msg.lower(), msg
+        assert "leaks — a marker block IS present" not in msg, (
+            "a block naming no kind was attributed to leaks; following that guidance "
+            "would satisfy the irreducible gate with no leak review"
+        )
+
+    # ---- P1: untrusted causes must not be answered with "re-post it" -------
+    def test_a_non_owner_marker_is_not_answered_by_minting_one(self, monkeypatch):
+        body = "scan done.\n" + self._marker()
+        msg = self._msg(
+            monkeypatch, self._row(body, login="drive-by", author_association="CONTRIBUTOR")
+        )
+        assert "drive-by" in msg
+        assert "run" in msg.lower() and "review" in msg.lower()
+        assert "--emit-marker" not in msg, (
+            "the emitter mints an attestation and performs no review; offering it here "
+            "turns an untrusted marker into a passing gate"
+        )
+
+    def test_a_dismissed_review_is_not_answered_by_minting_one(self, monkeypatch):
+        body = "scan done.\n" + self._marker()
+        msg = self._msg(monkeypatch, self._row(body, state="DISMISSED"))
+        assert "dismissed" in msg.lower()
+        assert "--emit-marker" not in msg
+
+    def test_a_blocking_body_with_a_malformed_marker_keeps_its_verdict(self, monkeypatch):
+        """The sharpest case: a real finding, plus a typo, must not become a typo."""
+        body = f"{self.BLOCKING}\n" + self._marker(head=HEAD[:8])
+        msg = self._msg(monkeypatch, self._row(body))
+        assert "blocking" in msg.lower(), msg
+        assert "--emit-marker" not in msg, (
+            "re-posting a clean marker over an unresolved blocking finding makes the "
+            "gate pass while the finding stands"
+        )
+
+    # ---- CONTROL: the one cause the original remedy WAS right for ---------
+    def test_a_grammar_only_marker_still_gets_the_re_post_remedy(self, monkeypatch):
+        """Without this, an implementation that refused to help anyone would pass
+        every assertion above while making the feature useless."""
+        body = "scan done, all clean.\n" + self._marker(head=HEAD[:8])
+        msg = self._msg(monkeypatch, self._row(body))
+        assert f"'{HEAD[:8]}'" in msg, "the malformed value must still be quoted"
+        assert "--emit-marker" in msg, "the grammar-only case is exactly what it is for"
+
+    # ---- P2: a pending review is in-flight, not unusable -------------------
+    def test_a_pending_review_keeps_the_waiting_guidance(self, monkeypatch):
+        """A pending review is an unpublished draft that can still be submitted, so
+        waiting CAN make it count -- the one thing the unusable wording denies."""
+        body = "scan done.\n" + self._marker()
+        msg = self._msg(monkeypatch, self._row(body, state="PENDING")).lower()
+        assert "may still be in flight" in msg
+
+    # ---- P2: a current malformed marker beats stale marker history --------
+    def test_a_current_unusable_marker_outranks_a_stale_valid_one(self, monkeypatch):
+        rows = "\n".join(
+            [
+                self._row("older run.\n" + self._marker(head=OTHER_HEAD)),
+                self._row("current run.\n" + self._marker(head=HEAD[:8])),
+            ]
+        )
+        msg = self._msg(monkeypatch, rows)
+        assert f"'{HEAD[:8]}'" in msg, (
+            "the malformed CURRENT marker is the actionable one and was hidden behind "
+            "the stale-head explanation"
+        )
+
+    # ---- P2: the suggested command must actually run -----------------------
+    def test_the_suggested_command_is_runnable_and_keeps_the_repo(self, monkeypatch):
+        body = "scan done, all clean.\n" + self._marker(head=HEAD[:8])
+        msg = self._msg(monkeypatch, self._row(body))
+        assert "python3 scripts/hooks/git_push_guard.py --emit-marker" in msg, (
+            "the file is tracked non-executable and is not on PATH, so a bare "
+            "invocation is command-not-found"
+        )
+        assert "--repo acme/pub" in msg, (
+            "run from another checkout, an emitter without --repo resolves the PR "
+            "number in the wrong repository"
+        )
+
+    # ---- P2: show the detail that belongs to THIS group -------------------
+    def test_the_detail_shown_belongs_to_the_kind_being_explained(self, monkeypatch):
+        """Truncating the global list first hid the one value that mattered."""
+        noise = [
+            self._row(f"run {i}.\n" + self._marker(head=HEAD[:8], kind="code-review"))
+            for i in range(4)
+        ]
+        rows = "\n".join([*noise, self._row("leaks run.\n" + self._marker(head=HEAD[:6]))])
+        msg = self._msg(monkeypatch, rows, required="leaks")
+        assert f"'{HEAD[:6]}'" in msg, (
+            "the leaks bullet showed four unrelated code-review reasons and hid its own"
+        )
