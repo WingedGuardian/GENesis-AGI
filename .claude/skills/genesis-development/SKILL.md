@@ -214,14 +214,21 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   Replaying real recorded inputs proves only that shapes you have ALREADY run
   still behave; it is structurally blind to a shape you have never typed. A
   guard change measured "0 false positives across 18k real commands" and still
-  hard-blocked `git status # don't commit yet`, because that corpus contained no
-  comment-apostrophe case that ALSO lacked a parsed segment. For any classifier
+  hard-blocked an ordinary command, because the corpus happened to contain no
+  instance of the one shape that mattered: a construct the parser mis-handles
+  that ALSO leaves the guard with no parsed segment. For any classifier
   or guard, enumerate the CROSS PRODUCT of the axes that actually drive the
-  decision — {operation} × {quoted, commented, here-doc, bare} × {evidence
-  present, absent} — and assert the invariant per cell, so an untested cell fails
+  decision — {operation} × {the constructs your parser can mis-segment} ×
+  {evidence present, absent} — and assert the invariant per cell, so an untested cell fails
   loudly instead of silently. Keep the corpus replay as the realism check; the
-  generated matrix is the coverage check. Skip a cell only with an explicit
-  reason recorded in the skip, since a silent skip and a hole look identical.
+  generated matrix is the coverage check FOR THE MODEL YOU DECLARED, which is
+  the most it can be — a construct you never thought of has no cell to skip and
+  so passes in silence, which is the same false confidence one level up. Naming
+  it "the coverage check" without that qualifier is the trap. Discovering new
+  axes is a different instrument: differential or property testing against a
+  canonical parser, which fails on shapes nobody enumerated. Skip a cell only
+  with an explicit reason recorded in the skip, since a silent skip and a hole
+  look identical.
 - **Anti-patterns (binding):** never assert on a mock's behavior when the real
   code path can run; never add test-only methods/branches to production
   classes; fakes implement the real contract (real method names, real return
@@ -376,13 +383,13 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   the open-set version and plan to harden it later; the review loop IS the
   hardening loop, one bug per round, and it does not converge.
 
-  **Two corollaries, each bought with a non-converging review loop.**
+  **Three corollaries, each bought with a non-converging review loop.**
 
   **(a) NEVER normalize the command text before a blind-spot probe.** A probe
   whose whole job is "notice that this text is unparseable" must read the RAW
   command. Preprocessing it can only ever DELETE the evidence the probe exists
   to find. MEASURED: a normalization step added in good faith — to stop a class
-  of multi-line command from prompting — turned an ORDINARY shape into a silent
+  of ordinary command from prompting — turned that shape into a silent
   ALLOW on two independent guards. Ordinary, not adversarial: the shape was one
   a developer writes without thinking, and the command really executed (verified
   against a shimmed binary, so the proof was execution rather than parse). The
@@ -393,6 +400,26 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   operation, so its branch never ran. The fix was a DELETION, and it closed both
   defects at once. When a guard loop will not converge, look for the component
   that MODELS shell semantics and remove it — refining it is the loop.
+
+  Scope this to a probe. Normalizing before a *tokenizer whose tokens you are
+  about to use* is a different act with a different fail direction, and a
+  sibling guard does exactly that, deliberately. Before calling any such site an
+  instance of this rule, the question to answer is whether the normalization
+  CAN change the tokenizability verdict or hide a target — and that is a
+  possibility question, so a count cannot answer it. Demand a STRUCTURAL
+  argument. The model is already in the repo, at
+  `scripts/hooks/destructive_command_guard.py:104-107`: its replacements only
+  ever insert spaces and separators, never quote or escape characters, so they
+  *cannot* corrupt the quote balance shlex decides on. That is a `cannot`; a
+  corpus run only ever yields `did not, here`, and by the rule above it is
+  structurally blind to the shape nobody typed. Run the corpus as
+  corroboration, never as the proof, and pair it with a control that DOES flip
+  — an unflipped corpus and an inert measurement look identical.
+
+  State the direction too, not just a total. The same sibling's fold splits a
+  word the shell would join, so a path can be judged shallower than the one
+  that would really be removed — the verdict moves, always toward refusing. "It
+  changes nothing" would have been the easier sentence and the false one.
 
   Deliberately stated without the triggering shapes. A guard's defeat
   conditions are not a teaching aid, and this file is public.
@@ -408,12 +435,28 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   is what lets the trigger stay broad instead of clever. Measured prompt rate
   after widening: 0.43% of ~19k real commands.
 
+  This does NOT loosen the fail-closed mandate above, and the two are easy to
+  read as contradicting each other. They are scoped by who is present: a
+  security-critical caller should treat an unparseable command as a BLOCK
+  wherever no one can answer a prompt, and the `ask` is the interactive form of
+  the same refusal — the operation does not proceed unverified either way. Where
+  a session is unattended, fail-closed governs and (c) applies.
+
+  Read that as the intended invariant, not as a description of the tree. On the
+  degraded path the shared parser still returns a naive split with no failure
+  signal, so a caller that sees no matching segment allows — the block above is
+  what the guard work is FOR, not what it already does. Anything written here
+  in the present tense about a net that has not merged is a status claim
+  without evidence, which this file forbids elsewhere and got wrong here.
+
   Corollaries of the corollaries, each measured: a net that returns inline
   PRE-EMPTS every gate below it (a hard block with no other backstop was
   observed downgrading to a prompt) — set a reason and DEFER it to the tail
-  where the other decisions are resolved. And the invariant pair "never silently
-  allowed" + "never hard blocked" is satisfied BY a block→ask downgrade, so pin
-  the verdict EXACTLY wherever a hard block is the contract.
+  where the other decisions are resolved. And an invariant pair of the form
+  "never silently allowed" + "never hard blocked" is satisfied BY a block→ask
+  downgrade, so pin the verdict EXACTLY wherever a hard block is the contract.
+  Read "never hard blocked" here only as the shape of the trap — as an actual
+  invariant it is false unscoped, and (c) below replaces it.
 
   **(c) The ask-cost argument does NOT survive the move to a refusal.** Rule (b)
   buys its broad trigger with "a false positive costs one confirmation" — and
@@ -426,18 +469,54 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   to avoid.
 
   Narrowing the refusal predicate is the obvious repair and it does not
-  converge, for a structural reason worth stating once: on the blind path the
-  parser cannot say whether an occurrence of a gated verb in the text is
-  executed or merely quoted, commented, or documented — that inability is the
-  premise of the net existing. So no rule written over the raw text can both
-  refuse the hidden real operation and permit the inert mention. Three narrowing
-  rounds on one predicate is the signature to STOP and make the policy decision
-  explicitly: either the unattended path does not refuse on this evidence (and
-  its residue is the pre-existing behaviour, which such designs usually already
-  name as their acceptable miss), or it does and the "never hard blocked"
-  invariant is false and must be deleted rather than left standing. Choosing by
-  measurement beats choosing by intuition: count how often the leg actually
-  fires on real unattended traffic before deciding what it is worth.
+  converge, for a reason worth stating precisely, because the imprecise version
+  of it is false. The claim is NOT that no raw-text rule could ever work — the
+  raw text does carry quote and comment syntax, and a complete canonical parser
+  could read it, which is what the canonical-parser rule above tells you to
+  reach for. The claim is bounded to a predicate built on the SAME degraded
+  parse that failed: at that point the guard cannot say whether an occurrence of
+  a gated verb is executed or merely quoted, commented, or documented, and that
+  inability is the premise of the net existing. A predicate with no more
+  information than the failure itself cannot both refuse the hidden operation
+  and permit the inert mention. Escaping that needs a different information
+  source — a fuller parser, or enforcement at the execution boundary, where
+  mentions are never classified at all — not a cleverer rule over the same text.
+
+  Three narrowing rounds on one predicate is the signature to STOP and make the
+  policy decision explicitly. The decision taken on the guard this was learned
+  from — recorded as a decision, not as a description of the shipped tree, which
+  at time of writing does not yet carry it: the unattended path KEEPS refusing,
+  and the invariant gets scoped rather than deleted. "A benign shape is never
+  hard blocked" was simply false as written; what is true and testable is that
+  it is never hard blocked where a human can approve, and where no one can, the
+  refusal carries an ACTIONABLE stderr — the cause and the rephrasing that
+  avoids it — so the session can proceed on its own. (That is a courtesy to the
+  operator, not the RECOVERABILITY of the Decision test above, which is about a
+  MISS degrading to the status quo. Same word, opposite failure direction; do
+  not satisfy the Decision test by printing a nicer error.) State the narrower
+  invariant; do not leave the false one standing, and do not delete the
+  guarantee that still holds.
+
+  Two things keep this from reading as licence. The open-set imprecision is
+  tolerable here ONLY because the verdict is `ask` or `deny` and never `allow` —
+  an imprecise predicate that cannot authorize anything does not violate the
+  Decision test, while the same predicate wired to an allow would. And a broad
+  regex over raw text is admissible ONLY as a mention scan that escalates to a
+  human; the moment it maps argv to an effect and authorizes on the result, it
+  is the hand-rolled-parser tar pit the mandate above forbids.
+
+  Measurement informed this rather than settling it: on 52 unattended
+  transcripts / 315 commands the leg had never fired in either direction, so
+  what was actually being chosen was which promise the suite should make, not
+  which incident to prevent.
+
+  A note on every number in these three rules, including the ones above. They
+  come from one operator's local session transcripts at one date, and no corpus
+  or harness is checked in, so a reader cannot reproduce or falsify them — the
+  differing denominators are different harvests, not one corpus quoted three
+  ways. Treat them as the scale at which something was observed, never as a
+  published result. A rule that only holds at someone else's numbers is not a
+  rule; each of these should stand on its stated mechanism alone.
 
 - **`out=$(cmd)` under `set -e` swallows the failure path — and NO linter catches
   it.** An assignment whose value is a command substitution INHERITS that
