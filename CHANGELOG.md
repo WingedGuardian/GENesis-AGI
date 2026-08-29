@@ -78,6 +78,28 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A refused Bash command now names the file writes it discarded.** A PreToolUse
+  block cancels the WHOLE Bash call, not the step the guard objected to — so a
+  command shaped `python3 - <<PY …writes a file… PY && git commit`, refused for the
+  commit, also lost the write, and the message named only the commit. It read as
+  "the commit didn't happen" rather than "and the edit you just made never
+  happened". Guards now emit a footnote naming what went with the refusal
+  (`scripts/hooks/discarded_write.py`), wired at each guard's own refusal point —
+  the guard about to refuse is the only thing that knows a block is happening, so
+  no separate predictor exists to drift out of sync with the guards it models.
+  Measured across every transcript on one box: of 790 real blocks, the note fires
+  on 204 and is silent on the rest. Supporting this, `shell_parse.Segment` gained
+  an additive `writes` field reporting OUTPUT-redirect targets (`> f`, `>> f`,
+  `&> f`), which the parser already parsed correctly but discarded — without it
+  `cat > file <<'EOF'`, the most common write idiom, was invisible because a bare
+  `cat` looks read-only. Input redirects, descriptor duplications (`2>&1`, `>&-`),
+  null sinks and process substitutions are excluded — but `>&word` for a
+  non-numeric word is a real write in bash and is counted as one, as is a digit
+  filename after a plain `>`. The note is strictly cosmetic and cannot
+  change a verdict: every import is guarded so a broken helper cannot fail-open a
+  security gate, and exit codes are asserted unchanged in both directions —
+  including with the helper made deliberately unreachable.
+
 - **SSH slot cap no longer collapses below the running session count.** The
   interactive-slot launcher (`scripts/cc-slot.sh`) sized its cap from
   *instantaneous free RAM* (`(MemAvailable − reserve) / per_session`), so each

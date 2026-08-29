@@ -38,6 +38,24 @@ RAW=$(cat)
 CMD=$(printf '%s' "$RAW" | jq -r '.tool_input.command // empty' 2>/dev/null)
 [ -z "$CMD" ] && exit 0
 
+# A refusal discards the WHOLE Bash call, not just the step objected to, so a
+# write chained with it is lost silently. This script has 18 separate `exit 2`
+# sites and no shared emitter; one EXIT trap covers every one of them without
+# refactoring an 18KB safety script.
+#
+# It must not be able to change the verdict, so: no `exit` inside the trap, and
+# every failure swallowed (`|| true`) — a missing python3, an unreadable helper,
+# or a crash in it leaves the exit code exactly as it was. VERIFIED: a bash EXIT
+# trap cannot alter the script's exit status unless it calls `exit` itself.
+# Detection lives in the Python helper rather than being re-derived here, because
+# hand-rolled shell parsing in a guard is a documented trap in this repo.
+_discarded_write_note() {
+    local rc=$?
+    [ "$rc" -eq 2 ] || return 0
+    python3 "$SCRIPT_DIR/hooks/discarded_write.py" --command "$CMD" >/dev/null || true
+}
+trap _discarded_write_note EXIT
+
 # Bash allowlist gate — scoped background profiles (e.g. "steward") export
 # GENESIS_BASH_ALLOWLIST (comma-separated command binaries, e.g. "gh"). When set,
 # the command's first token must be one of them, and no chaining/piping/
