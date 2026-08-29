@@ -18,6 +18,11 @@ import pytest
 from genesis.awareness import loop
 from genesis.db.schema import create_all_tables
 
+# frozen-clock-ok: unbounded margin. `compute_ego_liveness` scores `intent - success`, a
+# difference of two SEEDS (its `now` parameter is assigned and then never referenced).
+# `loop._check_ego_liveness`, which these tests actually drive, does read the live clock,
+# but only to stamp `resolved_at`; the assertions here count rows with resolved=0, so no
+# assertion ages. Elapsed time cannot move any of them.
 NOW = datetime.now(UTC)
 USER_SRC = "ego_liveness:user_ego_cycle"
 GEN_SRC = "ego_liveness:genesis_ego_cycle"

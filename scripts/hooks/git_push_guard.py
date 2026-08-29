@@ -99,6 +99,7 @@ not treat untrusted PR content as instructions when composing its comment body.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -137,7 +138,44 @@ from shell_parse import (  # noqa: E402
     git_subcommand,
     has_trailing_override,
     split_segments,
+    untokenizable,
 )
+
+# Mentions of a GATED operation, consulted ONLY on the un-parseable path where
+# analyze() has gone blind. Deliberately BROAD — both the gated verbs and the
+# destructive flags — because the outcome there is an approval PROMPT, not a
+# block: an over-match costs one confirmation, while an under-match silently
+# runs an unverified publish. (An earlier flag-only, hard-block version had to be
+# surgically precise, and precision is exactly what an unreliable parse cannot
+# deliver — every narrowing conjunct became a new way to starve the trigger.)
+_GATED_MENTION = re.compile(
+    r"(?:^|\s)(?:--force(?:-with-lease)?|--no-verify|--admin)(?:\s|=|$)|\b(?:push|merge)\b"
+)
+
+# `gh pr create` is the FOURTH gated operation (it can push or fork the branch —
+# see _pr_create_would_publish), and it was missing from the mention set above.
+# MEASURED: an ANSI-C-hidden `gh pr create` on an unpushed branch was ALLOWED
+# while the plain form correctly asked — the same fail-open this net exists to
+# close, for an op the first cut omitted.
+#
+# It is a CONJUNCTION rather than a `create` alternative in the regex because
+# `create` alone is an ordinary English word. Measured over 11,488 real commands
+# (328 un-tokenizable): a bare `\bcreate\b` alternative adds 6 new prompts, all
+# benign here-doc Python; requiring `gh` as well adds ZERO while still catching
+# the bypass. Two literal token tests combined in code — deliberately NOT a
+# lookaround, which is positional: `(?=.*\bgh\b)\bcreate\b` reads FORWARD from
+# `create`, and in `gh pr create` the `gh` is BEHIND it, so that pattern matches
+# nothing and would have measured 0 false positives by never firing at all.
+_GH_MENTION = re.compile(r"\bgh\b")
+_CREATE_MENTION = re.compile(r"\bcreate\b")
+
+
+def _mentions_gated_op(command: str) -> bool:
+    """Whether the RAW text names any gated operation, on the blind path only."""
+    if _GATED_MENTION.search(command):
+        return True
+    return bool(_GH_MENTION.search(command) and _CREATE_MENTION.search(command))
+
 
 # Local push allowlist (offline re-push cache). SOFT dependency, guarded exactly
 # like the review_state import above: a module-LOAD exception must degrade to
@@ -3024,6 +3062,250 @@ def _repo_default_branch(repo: str | None = None) -> str | None:
     return name or None
 
 
+#: The pin file the receipt gate compares. Kept here (not imported) so a missing
+#: checker module degrades to a NOTE rather than an import error at hook load.
+_PIN_FILE_PATH = "scripts/lib/cc_version.sh"
+
+
+def _load_pin_receipt_checker():
+    """Import scripts/check_cc_pin_receipts.py, or None if unavailable.
+
+    Lazy and failure-tolerant on purpose: the checker is a sibling script, not a
+    package, and a hook that cannot import it must not stop being a merge gate
+    for everything else.
+    """
+    import importlib.util
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    path = os.path.join(repo_root, "scripts", "check_cc_pin_receipts.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_cc_pin_receipts", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # Registered before exec: @dataclass resolves its module from sys.modules.
+        sys.modules["_cc_pin_receipts"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+#: `_pin_file_at_ref` outcomes. ABSENT is a fact about the PR's CONTENT (the API
+#: answered, and the file is not there at that ref); UNREADABLE is a fact about the
+#: PLUMBING (no slug, timeout, auth, transport). They take OPPOSITE fail directions,
+#: so collapsing them — as an earlier revision did by returning None for both — let a
+#: PR that DELETES the pin file take the plumbing path and merge unblocked, which
+#: contradicts the checker's own stated policy that an unreadable pin BLOCKS.
+_PIN_OK = "ok"
+_PIN_ABSENT = "absent"
+_PIN_UNREADABLE = "unreadable"
+#: Test-seam sentinels for the two NON-content outcomes (mirroring
+#: `_TEST_GH_PR_FILES`'s `__error__`). Any other seam value — including the EMPTY
+#: STRING — is content, because with the JSON contents form an empty file is a real,
+#: distinct state from both absence and an unreadable response.
+_PIN_SEAM_ABSENT = "__absent__"
+_PIN_SEAM_UNREADABLE = "__unreadable__"
+
+
+def _pin_file_at_ref(ref: str, repo: str | None, *, seam: str) -> tuple[str | None, str]:
+    """``(contents, outcome)`` for the pin file at ``ref``, read through the API.
+
+    Used for BOTH sides of the comparison — one code path, so the head and base
+    reads cannot drift apart in their fail direction (they did: the base side used
+    a hardcoded local ``git show origin/main``, which is neither bound to the repo
+    being merged into nor to the PR's actual base branch. On a checkout whose
+    ``origin`` is a fork, a genuine forward bump could read as a DOWNGRADE and be
+    exempted).
+
+    NOT from the local checkout: the gate runs from the main worktree, which is on
+    main, so the PR's version of the file is not on disk here. That is also the
+    property making this gate un-editable by the PR — only the DATA comes from the
+    PR, never the code reading it.
+    """
+    raw = os.environ.get(seam)
+    if raw is not None:
+        # The seam mirrors the live path's THREE outcomes, so a test cannot see
+        # behaviour production is incapable of producing. Both non-content outcomes
+        # need their own sentinel, because with the JSON form an EMPTY STRING is a
+        # legitimate third thing — a file that exists and is empty — and collapsing
+        # it into either sentinel would hide the very distinction this seam exists
+        # to exercise.
+        if raw == _PIN_SEAM_ABSENT:
+            return None, _PIN_ABSENT
+        if raw == _PIN_SEAM_UNREADABLE:
+            return None, _PIN_UNREADABLE
+        return raw, _PIN_OK
+    # Resolution order matters. `_canonical_public_repo()` reads install config and
+    # is legitimately absent on an install that never set `github.*` — the merge
+    # gate treats that as "uncertain, enforce", so falling back to the repo the
+    # process is actually in keeps the gate WORKING rather than silently
+    # unverifying on every such install (measured: it returned None here).
+    slug = (_normalize_repo(repo) if repo else None) or _canonical_public_repo()
+    if not slug:
+        slug = _derive_repo_from_cwd(os.getcwd())
+    if not slug:
+        return None, _PIN_UNREADABLE
+    try:
+        result = subprocess.run(
+            # The JSON representation, NOT `Accept: raw`. Raw returns bytes, and bytes
+            # cannot distinguish "the file is not there" from "the file is empty" from
+            # "the response was truncated" — all three arrive as an empty body, which
+            # forced the previous revision to GUESS from gh's stderr wording. The JSON
+            # form answers directly: `type` and `size` are facts about the tree, and a
+            # missing path is a 404. MEASURED: a present file returns
+            # {"name":…, "size":21747, "type":"file"}; an absent path returns 404.
+            ["gh", "api", f"repos/{slug}/contents/{_PIN_FILE_PATH}?ref={ref}"],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+    except Exception:
+        return None, _PIN_UNREADABLE
+    if result.returncode == 0:
+        try:
+            payload = json.loads(result.stdout or "")
+        except Exception:
+            # A zero exit whose body is not JSON is a stub or a truncated response —
+            # plumbing. This is the shape a test router's no-op reply takes, and it
+            # must not read as a fact about the tree.
+            return None, _PIN_UNREADABLE
+        if not isinstance(payload, dict):
+            # A directory lists as an ARRAY. Either way the pin file is not at this
+            # path, which is a fact about the PR's content.
+            return None, _PIN_ABSENT
+        if payload.get("type") != "file":
+            return None, _PIN_ABSENT  # a submodule or symlink-to-dir is not the pin
+        if payload.get("encoding") != "base64":
+            # >1MB blobs come back with encoding "none" and no content. Not absence —
+            # the file is there and we simply cannot read it this way.
+            return None, _PIN_UNREADABLE
+        try:
+            text = base64.b64decode(payload.get("content") or "").decode("utf-8", "replace")
+        except Exception:
+            return None, _PIN_UNREADABLE
+        # An EMPTY file is returned as content, deliberately, not as a state of its
+        # own. It exists, so it is not absent — and an empty pin is an UNPARSEABLE
+        # pin, which the checker's own policy already blocks. Classifying it here
+        # would duplicate that policy in the wiring, which is how the previous
+        # revision came to block a DELETED pin file while waving through one
+        # truncated to nothing: the same condition, enforced two different ways.
+        return text, _PIN_OK
+    # Non-zero. With the JSON form the only ambiguity left is which THING was not
+    # found, and gh names the ref case explicitly. MEASURED against the live API:
+    #   bad ref      -> gh: No commit found for the ref <sha> (HTTP 404)
+    #   missing file -> gh: Not Found (HTTP 404)
+    #   bad repo     -> gh: Not Found (HTTP 404)
+    # A bad ref is PLUMBING. Missing-file and missing-repo share one message — GitHub
+    # will not separate them, so as not to leak whether a private repo exists — but
+    # this gate is reached only after the head sha and base ref were read SUCCESSFULLY
+    # from that same repo, so the repo is known good by then and a bare Not Found is
+    # the path being absent.
+    stderr = (result.stderr or "").lower()
+    if "no commit found for the ref" in stderr:
+        return None, _PIN_UNREADABLE
+    if "not found" in stderr:
+        return None, _PIN_ABSENT
+    return None, _PIN_UNREADABLE
+
+
+def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
+    """The PR body. ``None`` means unreadable — distinct from an EMPTY body,
+    which is a real state that determines the answer by itself."""
+    raw = os.environ.get("_TEST_GH_PR_BODY")
+    if raw is not None:
+        return raw
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", pr_num, *_repo_args(repo), "--json", "body", "--jq", ".body"],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+    except Exception:
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
+    """Block a PR that moves the Claude Code pin FORWARD without its gate receipts.
+
+    THIS is the authority for the receipt gates, not a CI status. The body is
+    mutable after any CI run finishes, so a status describing it is a claim about
+    the past; read at merge time there is no window to edit it afterwards. The
+    CI job runs the same checker with ``--advisory`` purely for early feedback.
+
+    BOTH sides are read through the API, against the repo actually being merged
+    into and the PR's OWN base branch. An earlier revision read the base with a
+    local ``git show origin/main`` — not bound to the merge target and hardcoding
+    the branch name — so from a checkout whose ``origin`` is a fork (or whose
+    ``origin/main`` is simply unfetched) the comparison ran against the wrong base,
+    and a fork sitting on a HIGHER pin turned a genuine forward bump into a
+    "downgrade" that the gate exempts. Head still comes through the API, so the
+    code doing the reading is always main's copy.
+
+    FAIL DIRECTION, split deliberately — and the split is between CONTENT and
+    PLUMBING, not between "worked" and "didn't":
+      * The pin moved forward and a receipt is missing, or the pin cannot be READ
+        at either side, or the file is ABSENT at either side -> BLOCK. All are
+        facts about the PR's content, and publishing a release nobody can
+        characterise is the thing to prevent. Absence matters on its own: a PR that
+        DELETES the pin file has no readable pin, which the checker's policy says
+        must block — routing that through the plumbing path would let the deletion
+        merge unexamined.
+      * The gate's own PLUMBING failed (no checker module, unreadable head sha or
+        base ref, auth/transport error) -> NOTE, do not block. Walling off every
+        merge over a check that only ever guards a pin bump would be a worse
+        failure than the one it prevents.
+    """
+    checker = _load_pin_receipt_checker()
+    if checker is None:
+        return False, "NOTE: pin-receipt checker not importable — receipts NOT verified."
+
+    head_sha = _pr_head_sha(pr_num, repo=repo)
+    if not head_sha:
+        return False, "NOTE: PR head unreadable — pin receipts NOT verified."
+
+    base_ref = _pr_base_ref(pr_num, repo=repo)
+    if not base_ref:
+        return False, "NOTE: PR base ref unreadable — pin receipts NOT verified."
+
+    head_text, head_state = _pin_file_at_ref(head_sha, repo, seam="_TEST_GH_HEAD_PIN_FILE")
+    if head_state == _PIN_ABSENT:
+        return True, (
+            f"BLOCKED: {_PIN_FILE_PATH} is ABSENT at the PR head ({head_sha[:12]}). The pin "
+            f"cannot be read, so whether this PR moves it forward cannot be established — "
+            f"and a PR that removes the pin file is exactly the case this gate must not "
+            f"wave through. Restore it, or merge with the gate's own escape if the removal "
+            f"is intended."
+        )
+    if head_text is None:
+        return (
+            False,
+            f"NOTE: could not read {_PIN_FILE_PATH} at the PR head — receipts NOT verified.",
+        )
+
+    base_text, base_state = _pin_file_at_ref(base_ref, repo, seam="_TEST_GH_BASE_PIN_FILE")
+    if base_state == _PIN_ABSENT:
+        return True, (
+            f"BLOCKED: {_PIN_FILE_PATH} is ABSENT on the base branch ({base_ref}). There is "
+            f"no pin to compare against, so a forward move cannot be ruled out."
+        )
+    if base_text is None:
+        return False, (f"NOTE: {_PIN_FILE_PATH} unreadable on {base_ref} — receipts NOT verified.")
+
+    body = _pr_body_text(pr_num, repo)
+    if body is None:
+        return False, "NOTE: PR body unreadable — pin receipts NOT verified."
+
+    try:
+        verdict = checker.evaluate(base_pin_text=base_text, head_pin_text=head_text, body=body)
+    except Exception as exc:  # noqa: BLE001 — plumbing, not policy
+        return False, f"NOTE: pin-receipt check errored ({type(exc).__name__}) — NOT verified."
+
+    return verdict.blocked, verdict.message
+
+
 def _check_base_is_default(
     pr_num: str, *, force: bool = False, repo: str | None = None
 ) -> tuple[bool, str]:
@@ -3894,10 +4176,89 @@ def main() -> int:
         # quoted mentions excluded). Each guarded subcommand is matched on real
         # argv, and the `# review-override` approval binds to its OWN segment.
         segs = analyze(cmd)
+
         push_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "push"]
         merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
+
+        # ── Blind-spot net: unverifiable near a gated op → ask a human ──────
+        # analyze()/_argv degrade to a naive split SILENTLY, so an empty segment
+        # list is NOT evidence that no gated command is present: an ANSI-C
+        # `$'…\'…'` span, or an apostrophe in a here-doc body, is enough to drop
+        # a real, executing `git push --force` from the parse (reproduced on both
+        # guards). When the raw text names a gated op, the command will not
+        # tokenize, and the parse surfaced NO matching segment, the verdict is
+        # "unknown" — which earns a human decision, not a silent allow.
+        #
+        # ASK rather than BLOCK is load-bearing. A refusal has to be surgically
+        # precise about which unparseable commands are real, and precision is
+        # exactly what an unreliable parse cannot deliver — every narrowing
+        # conjunct became a new way to starve the trigger, while over-blocking
+        # broke benign shapes. Asking inverts the costs: a false positive is one
+        # confirmation, a miss is the pre-existing status quo. That is what lets
+        # the predicate stay broad.
+        #
+        # The reason is DEFERRED to the tail (like ask_reason / push_allow_reason
+        # above) so every hard block below — sqlite writes, --no-verify, the
+        # dispatched publish denies, the escalation cap — still takes precedence.
+        # Returning here would DOWNGRADE those to a prompt (measured).
+        # The segment check names ALL FOUR gated ops, not the three the first cut
+        # listed. `create_segs` is LOAD-BEARING — do not remove it.
+        #
+        # An earlier version of this comment claimed the opposite: that it was
+        # symmetry only, and mutation-tested to change no verdict. That claim was
+        # WRONG, and wrong in the direction that invites deleting the conjunct.
+        # Its four cells varied parse state (interactive/dispatched x
+        # parsed-create x untokenizable) and held the GATE OUTCOME fixed, so they
+        # all assumed a create that was already gated. The axis that matters is
+        # whether the create is gated at all: for one the real gate ALLOWS (a
+        # branch already on the remote, so no publish risk), dropping this
+        # conjunct lets the net fire on an untokenizable-but-benign create and
+        # turns an allow into a prompt, or into a refusal when unattended.
+        #
+        # A mutation test proves nothing about an axis its cells do not vary.
+        blind_spot_reason: str | None = None
+        if (
+            not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
+            and untokenizable(cmd)
+            and _mentions_gated_op(cmd)
+        ):
+            if _is_dispatched():
+                # No human is present to answer a prompt, and an unverifiable
+                # gated command must not proceed unattended. Mirrors the
+                # dispatched deny legs on the push / pr-create asks below.
+                print(
+                    "BLOCKED: this command cannot be parsed safely (e.g. "
+                    "ANSI-C $'...' quoting) and names a gated operation. "
+                    "Autonomous sessions cannot proceed on an unverifiable "
+                    "command.\n"
+                    "To proceed: if you are WRITING TEXT (a commit message, a "
+                    "plan, review notes) whose content merely mentions push or "
+                    "merge, use the Write tool instead of a here-doc — the "
+                    "apostrophe in ordinary prose is what makes this "
+                    "unparseable, and no amount of re-quoting a here-doc fixes "
+                    "it. If you are RUNNING a git command, rewrite it in a "
+                    "directly-parseable form (plain quotes, or -F <file>).",
+                    file=sys.stderr,
+                )
+                # The advice above is load-bearing, not decoration. An
+                # unattended session cannot ask what it did wrong, so a refusal
+                # it cannot act on is a wall rather than a cost — which is the
+                # whole basis for refusing here at all. MEASURED: the dominant
+                # real shape that reaches this leg is prose-to-a-file, and the
+                # previous message's only suggestion ("rewrite it in a
+                # directly-parseable form") does not apply to it.
+                return 2
+            blind_spot_reason = (
+                "This command could not be parsed safely (e.g. ANSI-C $'...' "
+                "quoting) and mentions a gated operation (push / merge / "
+                "gh pr create / --force / --no-verify / --admin), so the guard "
+                "cannot verify "
+                "what it would actually run. Approve only if you are sure. To "
+                "avoid the prompt, rewrite it in a directly-parseable form "
+                "(plain quotes, or -F <file>)."
+            )
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
         # command carrying more than one would collapse into ONE ask/gate
@@ -4376,6 +4737,30 @@ def main() -> int:
                     print(base_msg, file=sys.stderr)
                     return 2
 
+                # Pin receipts. This is the AUTHORITY for the two release gates
+                # (changelog read, local-first soak), deliberately not a CI
+                # status: the PR body stays mutable after a check run finishes,
+                # so only a merge-time read describes the body that merges. It
+                # also runs main's copy of the checker, so a PR cannot edit the
+                # code that gates it.
+                #
+                # NO override sigil, deliberately. Every sigil here waives exactly
+                # ONE gate so a waiver cannot silently disarm an unrelated one, so
+                # reusing # review-override (which waives the FINDING scans) would
+                # be exactly that. And a dedicated sigil would be an escape from a
+                # demand that takes seconds to satisfy honestly: if a gate really
+                # was not run, the action is to run it, not to wave it through.
+                # Incident recovery is already covered — a BACKWARD pin is exempt
+                # by construction, with no syntax to recall under pressure.
+                should_block, receipts_msg = _check_pin_receipts(pr_num, repo=merge_repo)
+                if should_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — CC pin moves forward without its gate receipts.",
+                        file=sys.stderr,
+                    )
+                    print(receipts_msg, file=sys.stderr)
+                    return 2
+
                 # Codex must have reviewed the CURRENT head (existence + freshness)
                 # — not merely have no open findings. This runs BEFORE the finding
                 # scans below: a review published between the scans and this check
@@ -4534,6 +4919,8 @@ def main() -> int:
         # Reached only if no hard-block above returned. Dispatched sessions
         # were already denied inline; here, an interactive human session gets a
         # native approve/deny dialog for its push / PR-create.
+        if ask_reason is None and blind_spot_reason is not None:
+            ask_reason = blind_spot_reason
         if ask_reason is not None:
             return _ask(ask_reason)
 
@@ -4645,6 +5032,17 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     # review published mid-run can't pass freshness with its P1s unscanned.
     blocked, msg = _check_base_is_default(pr_num, repo=repo)
     print(f"base-branch    : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (default)'}")
+    failures += 1 if blocked else 0
+    # Pin receipts: authoritative HERE, not in CI — the PR body is mutable after
+    # a check run completes, so only a merge-time read describes the body that
+    # actually merges.
+    blocked, msg = _check_pin_receipts(pr_num, repo=repo)
+    print(
+        f"pin-receipts   : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}"
+    )
+    if blocked:
+        for line in msg.splitlines()[1:]:
+            print(f"  {line}")
     failures += 1 if blocked else 0
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     if blocked:
