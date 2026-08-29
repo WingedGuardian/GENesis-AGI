@@ -650,6 +650,7 @@ def untokenizable(command: str) -> bool:
     except ValueError:
         return True
 
+
 def _basename(token: str) -> str:
     """Executable basename: /usr/bin/git → git, ./foo → foo."""
     return token.rsplit("/", 1)[-1]

@@ -129,6 +129,16 @@ _ALLOWED: dict[tuple[str, str, str], str] = {
         "them is what justifies the rejection. Re-examine if that detector is "
         "ever changed back."
     ),
+    ("scripts/hooks/git_push_guard.py", "here" + "-doc", "bypass"): (
+        "Two unrelated uses inside one window, not a claim about either. The "
+        "comment reports a false-positive measurement -- the new prompts it "
+        "counted were benign multi-line Python -- and separately notes that the "
+        "chosen predicate still catches the operation the net exists to catch. "
+        "Neither half says the construct defeated anything, which is the pairing "
+        "this file forbids. Kept as a waiver rather than reworded, because "
+        "editing correct prose to satisfy a detector teaches the wrong habit and "
+        "the next author will not know why the sentence reads oddly."
+    ),
 }
 
 

@@ -801,6 +801,7 @@ ruff check src/ tests/ scripts/
 python scripts/check_external_io.py
 python scripts/check_subsystem_map.py
 python scripts/check_shared_artifact_consumers.py
+python scripts/check_frozen_clock.py
 ```
 
 Do NOT run the full pytest suite locally (it is banned, and the concurrent-test
