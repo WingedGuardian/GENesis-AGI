@@ -17,7 +17,22 @@ shapes. With an ask, a false positive costs one confirmation and a miss is the
 pre-existing status quo, so the trigger can be broad.
 
 The invariants below are therefore: a bypass shape must NEVER be a silent allow,
-and a benign shape must NEVER be a hard block.
+and a benign shape must never be REFUSED WHERE SOMEONE CAN APPROVE IT.
+
+That second one used to read "a benign shape must NEVER be a hard block", full
+stop, and that is false — it was written from the interactive path and quietly
+assumed a human. An unattended session has nobody to answer an ask, so the only
+choices there are refuse or allow-unverified; a security gate does not pick the
+second, and the cost argument that buys a broad trigger ("a false positive costs
+one confirmation") does not survive the move. Narrowing the predicate until the
+old invariant held was attempted for three rounds and does not converge: on the
+blind path the parser cannot distinguish an executed gated verb from a quoted or
+commented one, and that inability IS the premise of the net.
+
+So unattended refusals of benign shapes are accepted, with a condition that is
+asserted rather than assumed — the refusal must be RECOVERABLE on its own,
+naming both the cause and the rewrite that avoids it, so a session with no human
+can act on it unaided.
 
 Trigger literals are assembled from fragments so this file's own text does not
 carry them (matches the convention in test_shell_parse.py).
@@ -65,6 +80,26 @@ def _decision(r: subprocess.CompletedProcess) -> str:
 
 _TEST_SLUG = "testowner/testrepo"
 
+# ALLOWLIST, not a subtract-list. Two ambient inputs reached the guards through
+# this helper and each made the suite report on something other than the code:
+# an inherited GENESIS_CC_SESSION made it test its CALLER's mode, and an
+# inherited GIT_DIR re-pointed repo-state gates at the developer's real
+# repository (both MEASURED verdict-changing). Both were fixed one key at a
+# time, a review round apart — which is the instance-not-class pattern this
+# allowlist exists to end. Anything not named here simply does not reach a
+# guard, so the next ambient input cannot leak in by default; adding one is a
+# deliberate, reviewable edit.
+#
+# Still inherited on purpose: PATH (git/gh must be findable — their ABSENCE
+# raises loudly in the fixture rather than silently changing a verdict), TMPDIR
+# and the locale vars (no verdict influence). HOME is deliberately NOT here: the
+# guards resolve ~/.genesis review state and config from it, and a guard that
+# writes (the push allowlist) would otherwise mutate the developer's real store
+# from a test run.
+_NEUTRAL_ENV = frozenset(
+    {"PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "PYTHONHASHSEED"}
+)
+
 
 def _unpushed_repo(tmp_path: Path, monkeypatch) -> str:
     """A repo whose branch is NOT on its remote, so `gh pr create` IS gated.
@@ -85,7 +120,24 @@ def _unpushed_repo(tmp_path: Path, monkeypatch) -> str:
     no real network dependency in the test.
     """
     monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", _TEST_SLUG)
-    run = lambda *a: subprocess.run(a, cwd=tmp_path, capture_output=True, text=True)  # noqa: E731
+
+    # Every step is CHECKED, and the end state is ASSERTED. Discarding these
+    # return codes made the fixture fail silently: with a developer global
+    # carrying `[commit] gpgsign = true`, `git commit` exits 128, the repo ends
+    # with no HEAD — and the tests built on it still passed, because the control
+    # they feed returns `ask` even for a bare directory that is not a repo at
+    # all. A fixture that cannot fail is the same defect as a test that cannot
+    # fail. (The gpgsign path is also neutralised at source by _run's
+    # GIT_CONFIG_GLOBAL pin, but the fixture asserts its own state regardless.)
+    env = {k: v for k, v in os.environ.items() if k in _NEUTRAL_ENV}
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_SYSTEM"] = os.devnull
+
+    def run(*a: str) -> subprocess.CompletedProcess:
+        r = subprocess.run(a, cwd=tmp_path, capture_output=True, text=True, env=env)
+        assert r.returncode == 0, f"fixture step {a!r} failed ({r.returncode}): {r.stderr}"
+        return r
+
     run("git", "init", "-q", "-b", "feature-x")
     run("git", "config", "user.email", "t@example.invalid")
     run("git", "config", "user.name", "t")
@@ -93,29 +145,62 @@ def _unpushed_repo(tmp_path: Path, monkeypatch) -> str:
     run("git", "add", "f.txt")
     run("git", "commit", "-qm", "init")
     run("git", "remote", "add", "origin", f"https://example.invalid/{_TEST_SLUG}.git")
+
+    assert run("git", "rev-parse", "HEAD").stdout.strip(), "fixture repo has no commit"
+    branch = run("git", "branch", "--show-current").stdout.strip()
+    assert branch == "feature-x", f"fixture branch is {branch!r}, not the unpushed one"
     return str(tmp_path)
 
 
-def _run(script: Path, cmd: str, cwd: str | None = None) -> subprocess.CompletedProcess:
-    """Run a guard against *cmd*.
+def _run(
+    script: Path,
+    cmd: str,
+    cwd: str | None = None,
+    *,
+    dispatched: str | None = None,
+) -> subprocess.CompletedProcess:
+    """Run a guard against *cmd* in a KNOWN environment, never the caller's.
+
+    Two properties of the child env are pinned deliberately, because both were
+    wrong once and each made the suite report on something other than the code:
 
     ``cwd`` is applied to BOTH the payload and the child's working directory.
-    They must agree: gates that read repo state (branch, remote, pushed-ness)
-    use the process cwd, so a payload-only cwd silently evaluated them against
-    whatever directory pytest happened to run from — this worktree, whose branch
-    IS pushed. That made a `gh pr create` control report "already on the remote"
-    and look un-gated, when the guard was correct and the harness was lying.
+    Gates that read repo state (branch, remote, pushed-ness) use the process
+    cwd, so a payload-only cwd silently evaluated them against whatever
+    directory pytest ran from — this worktree, whose branch IS pushed. That made
+    a `gh pr create` control report "already on the remote" and look un-gated,
+    when the guard was correct and the harness was lying.
+
+    ``GENESIS_CC_SESSION`` is STRIPPED unless a test opts in. Forwarding the
+    ambient marker meant the suite tested its CALLER's mode: launched from a
+    dispatched session it inherited ``=1``, and every case asserting the
+    interactive ask direction failed because production correctly hard-denies in
+    dispatched mode (measured: 21 failures). CI happens to run non-dispatched,
+    so this would never have surfaced there — the suite would just have been
+    quietly mode-dependent. Dispatch state is now an explicit argument, so each
+    test states the mode it means to exercise.
     """
     payload: dict = {"tool_name": "Bash", "tool_input": {"command": cmd}}
     if cwd is not None:
         payload["cwd"] = cwd
+    env = {k: v for k, v in os.environ.items() if k in _NEUTRAL_ENV}
+    # git prefers these over the cwd we just set, so an inherited GIT_DIR silently
+    # re-points the guard at the developer's real repo. MEASURED: the same
+    # `git commit -m 'plain message'` goes allow (empty tmp dir) -> block
+    # ("Direct commits to main are not allowed") purely from an inherited GIT_DIR.
+    # They are absent from the allowlist rather than unset here, so the allowlist
+    # stays the single place that decides what the child may see.
+    env["GIT_CONFIG_GLOBAL"] = os.devnull  # no developer gitconfig (gpgsign etc.)
+    env["GIT_CONFIG_SYSTEM"] = os.devnull
+    if dispatched is not None:
+        env["GENESIS_CC_SESSION"] = dispatched
     return subprocess.run(
         [_PY, str(script)],
         input=json.dumps(payload),
         capture_output=True,
         text=True,
         timeout=30,
-        env=dict(os.environ),
+        env=env,
         cwd=cwd,
     )
 
@@ -255,30 +340,94 @@ class TestDispatchMarkerIsExact:
     about. Over-blocking is the failure direction this design exists to avoid.
     """
 
+    # Un-tokenizable, and merely MENTIONS the word — no `git commit` adjacency.
+    # The interactive path asks about this; the dispatched path must NOT refuse
+    # it, because refusing is unappealable where nobody can confirm.
     _BENIGN = "echo $'don\\'t " + COMMIT + " this'"
+    # Un-tokenizable AND carries a real `git commit`. This is what the dispatched
+    # deny leg exists for, and what it must still catch after the narrowing.
+    _GATED = "echo $'a\\'b)c' && " + GIT + " " + COMMIT + " " + NV + " -m x"
 
     @pytest.mark.parametrize("value", ["0", "false", "no", "off", "2"])
-    def test_non_one_values_are_not_dispatched(self, tmp_path, monkeypatch, value):
+    def test_non_one_values_are_not_dispatched(self, tmp_path, value):
         """VERIFY-RED: every one of these hard-blocked before the exact compare."""
-        monkeypatch.setenv("GENESIS_CC_SESSION", value)
-        r = _run(_COMMIT_GUARD, self._BENIGN, cwd=str(tmp_path))
+        r = _run(_COMMIT_GUARD, self._BENIGN, cwd=str(tmp_path), dispatched=value)
         assert _decision(r) != "block", f"{value}: {r.stdout + r.stderr}"
 
-    def test_exact_one_is_dispatched(self, tmp_path, monkeypatch):
-        """CONTROL — the deny leg must still fire for the real marker.
+    def test_exact_one_is_dispatched(self, tmp_path):
+        """CONTROL — the deny leg must still fire for the real marker AND a real op.
 
-        Without this the test above is satisfied by a guard that never denies at
-        all, which is the same shape as a predicate that measures zero false
+        Without this the tests above are satisfied by a guard that never denies
+        at all, which is the same shape as a predicate that measures zero false
         positives by never firing.
+
+        Uses the GATED input deliberately. An earlier version of this control
+        used the benign one and passed only because the deny leg was
+        over-broad — so it would have gone green while the guard refused
+        `c.commit()` in a here-doc. A control has to demand the behaviour for a
+        case that genuinely warrants it, or it just re-measures the bug.
         """
-        monkeypatch.setenv("GENESIS_CC_SESSION", "1")
-        r = _run(_COMMIT_GUARD, self._BENIGN, cwd=str(tmp_path))
+        r = _run(_COMMIT_GUARD, self._GATED, cwd=str(tmp_path), dispatched="1")
         assert _decision(r) == "block", r.stdout + r.stderr
 
-    def test_unset_is_not_dispatched(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("GENESIS_CC_SESSION", raising=False)
+    def test_benign_mention_when_dispatched_is_refused_RECOVERABLY(self, tmp_path):
+        """The cost of the unattended deny leg, pinned rather than wished away.
+
+        This test used to assert `!= "block"` and was described as the lock that
+        justified narrowing the deny predicate. Narrowing was abandoned: it does
+        not converge, because on the blind path the parser cannot tell an
+        executed gated verb from one inside quoted data, which is the premise of
+        the net. So this shape IS refused when unattended, deliberately.
+
+        What is asserted instead is that the refusal can be acted on without a
+        human — cause and rewrite both named. That is the whole difference
+        between an accepted cost and a wedged session, and asserting it is what
+        caught the commit gate naming the rewrite only on its interactive `ask`,
+        i.e. giving the guidance exclusively to the session that could have
+        asked for it.
+        """
+        r = _run(_COMMIT_GUARD, self._BENIGN, cwd=str(tmp_path), dispatched="1")
+        if _decision(r) != "block":
+            return  # parseable after all — nothing to recover from
+        guidance = r.stderr.lower()
+        assert "parse" in guidance and ("rewrite" in guidance or "rephras" in guidance), (
+            "an unattended refusal must name both the cause and the way out — "
+            f"there is no one to ask.\n{r.stderr}"
+        )
+
+    def test_unset_is_not_dispatched(self, tmp_path):
+        """Absent marker — the helper strips it, so this is the real default."""
         r = _run(_COMMIT_GUARD, self._BENIGN, cwd=str(tmp_path))
         assert _decision(r) != "block", r.stdout + r.stderr
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            # Each entry is an ambient input MEASURED to change a guard verdict
+            # through this helper. One test per key, so the next leak fails with
+            # an obvious cause instead of as a scattered wave of failures in
+            # whichever mode or machine happens to be unlucky.
+            ("GENESIS_CC_SESSION", "1"),  # made the suite test its CALLER's mode
+            ("GIT_DIR", str(_WORKTREE / ".git")),  # re-points repo-state gates
+            ("GIT_WORK_TREE", str(_WORKTREE)),  # ditto, the other half of the pair
+            ("CDPATH", "/home"),  # review_enforcement_commit -> _CWD_UNKNOWN deny
+        ],
+    )
+    def test_helper_does_not_inherit_ambient_context(self, tmp_path, monkeypatch, key, value):
+        """LOCK: the suite tests its own context, never the caller's.
+
+        Two defects of this exact shape were found by external review rather
+        than by the suite — the helper forwarded the caller's environment, and
+        separately passed `cwd` only in the payload and never to the child. Both
+        made the harness describe a world that was not the one under test, and
+        both were fixed one key at a time. This locks the CLASS: the child sees
+        an allowlist, so an ambient value cannot reach a guard by default.
+        """
+        monkeypatch.setenv(key, value)
+        r = _run(_COMMIT_GUARD, self._BENIGN, cwd=str(tmp_path))
+        assert _decision(r) != "block", (
+            f"ambient {key} leaked into the guard subprocess: " + r.stdout + r.stderr
+        )
 
 
 class TestCommitGuardNet:
@@ -540,27 +689,91 @@ def _parser_sees_gated_op(cmd: str) -> bool:
 
 @pytest.mark.parametrize("op_name,op", _GATED_OPS, ids=[n for n, _ in _GATED_OPS])
 @pytest.mark.parametrize("ctx_name,wrap", _HIDING, ids=[n for n, _ in _HIDING])
+@pytest.mark.parametrize("dispatched", [None, "1"], ids=["interactive", "dispatched"])
 def test_matrix_hidden_gated_op_is_never_silently_allowed(
-    op_name, op, ctx_name, wrap, tmp_path
+    op_name, op, ctx_name, wrap, dispatched, tmp_path
 ):
-    """A gated op the PARSER CANNOT SEE must never be silently allowed."""
+    """A gated op the PARSER CANNOT SEE must never be silently allowed.
+
+    Run in BOTH modes. The two legs reach the same conclusion by different
+    predicates — interactive asks on a broad mention, dispatched refuses only on
+    a `git <verb>` adjacency — so a change to either can regress independently.
+    Before this axis existed, only the interactive leg was ever exercised.
+    """
     cmd = wrap(op)
     if _parser_sees_gated_op(cmd):
         pytest.skip("parser resolved the op — the ordinary gates own this verdict")
-    r = _run(_guard_for(op), cmd, cwd=str(tmp_path))
+    r = _run(_guard_for(op), cmd, cwd=str(tmp_path), dispatched=dispatched)
     assert _decision(r) in ("ask", "block"), (
-        f"{ctx_name}/{op_name} was silently ALLOWED\n{r.stdout}{r.stderr}"
+        f"{ctx_name}/{op_name} (dispatched={dispatched}) was silently ALLOWED\n"
+        f"{r.stdout}{r.stderr}"
     )
 
 
 @pytest.mark.parametrize("op_name,op", _GATED_OPS, ids=[n for n, _ in _GATED_OPS])
 @pytest.mark.parametrize("ctx_name,wrap", _INERT, ids=[n for n, _ in _INERT])
+@pytest.mark.parametrize("dispatched", [None, "1"], ids=["interactive", "dispatched"])
 def test_matrix_inert_mention_is_never_hard_blocked(
-    op_name, op, ctx_name, wrap, tmp_path
+    op_name, op, ctx_name, wrap, dispatched, tmp_path
 ):
-    r = _run(_guard_for(op), wrap(op), cwd=str(tmp_path))
-    assert _decision(r) != "block", (
-        f"{ctx_name}/{op_name} was HARD BLOCKED\n{r.stdout}{r.stderr}"
+    """Nothing gated EXECUTES in these cells. What that entitles them to differs
+    by mode, and an earlier version of this test got that wrong.
+
+    Two axes were missing and their absence hid a real regression. The verdict
+    was asserted as `!= "block"`, which `ask` satisfies — so when 18 of these 24
+    cells moved allow -> ask, the matrix stayed green while the false-positive
+    cost it exists to bound tripled unseen. And dispatch mode was not a
+    parameter at all, so the cell where those asks became REFUSALS did not exist
+    in the grid; it took an external audit to find it.
+
+    With both axes present the dispatched half went red, and the honest reading
+    is that the invariant was wrong, not the guard. "A benign shape is never
+    hard blocked" cannot hold unattended: there is no one to answer a prompt, so
+    the only two options there are refuse or allow-unverified, and a security
+    gate does not pick the second. Three rounds of narrowing the predicate were
+    spent trying to make the old invariant true before that was accepted — the
+    blind path cannot tell an executed verb from a quoted one, which is the
+    premise of the net existing, so no predicate over the same degraded parse
+    separates these cells from the real thing.
+
+    So the invariant is SCOPED rather than deleted. Interactively a benign shape
+    is never refused — an `ask` here is the accepted cost, one confirmation. In
+    an unattended session it may be refused, but the refusal must be RECOVERABLE
+    on its own: the message has to name the cause and the way out, so a session
+    with no human can rewrite the command and proceed. That is what makes this a
+    cost rather than a wall, and it is asserted, not assumed.
+
+    The verdict stays `!= "block"` on the interactive side rather than
+    `== "allow"` on purpose: the ask RATE is a separate measured quantity (see
+    the corpus figures in git_push_guard._GATED_MENTION) and pinning it per-cell
+    would freeze a cost decision inside a regression test.
+    """
+    r = _run(_guard_for(op), wrap(op), cwd=str(tmp_path), dispatched=dispatched)
+    decision = _decision(r)
+    if dispatched != "1":
+        assert decision != "block", (
+            f"{ctx_name}/{op_name} (interactive) was HARD BLOCKED — nothing "
+            f"gated executes in this cell, and a human is present to answer an "
+            f"ask.\n{r.stdout}{r.stderr}"
+        )
+        return
+    # Unattended. A refusal is PERMITTED here — not required. Many of these
+    # cells tokenize cleanly, so the net never fires and they are simply
+    # allowed, which is correct: nothing gated executes in them. What this half
+    # of the matrix pins is the shape of the refusal WHEN one happens. (The
+    # "never a silent allow" direction is the bypass matrix's job, not this
+    # one's — asserting it here too would duplicate that guarantee and make
+    # this test fail for the opposite reason.)
+    if decision != "block":
+        return
+    guidance = r.stderr.lower()
+    assert "cannot be parsed" in guidance or "parse" in guidance, (
+        f"{ctx_name}/{op_name} (dispatched) refused without naming the CAUSE. "
+        f"An unattended session cannot ask why.\n{r.stderr}"
+    )
+    assert "rewrite" in guidance or "rephras" in guidance, (
+        f"{ctx_name}/{op_name} (dispatched) refused without naming a way out. "
+        f"A refusal a session cannot act on is a wall, not a cost.\n{r.stderr}"
     )
 
 

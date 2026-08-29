@@ -684,7 +684,13 @@ def main() -> None:
                     _deny(
                         "BLOCKED: this command cannot be parsed safely (e.g. "
                         "ANSI-C $'...' quoting) and mentions a commit. Autonomous "
-                        "sessions cannot proceed on an unverifiable command."
+                        "sessions cannot proceed on an unverifiable command. "
+                        "Rewrite it in a directly-parseable form (plain quotes, "
+                        "or `git commit -F <file>`) and re-run."
+                        # The way OUT belongs here more than on the ask below:
+                        # an interactive session can ask a human what it did
+                        # wrong, an unattended one cannot. A refusal it cannot
+                        # act on is a wall; with the rewrite named it is a cost.
                     )
                 _ask(
                     "This command could not be parsed safely (e.g. ANSI-C $'...' "
