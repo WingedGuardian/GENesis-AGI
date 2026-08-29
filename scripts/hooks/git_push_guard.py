@@ -2453,6 +2453,29 @@ _DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
 # The leak/secret scanner is IRREDUCIBLE: always required, never removable by config. A
 # secret reaching a public repo is irreversible, so no local policy may waive it.
 _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
+
+# Scheduled-review kinds whose marker may be honoured from an EARLIER head of the
+# same PR, provided the named MECHANICAL scanner is green at the CURRENT head.
+#
+# WHY this exists, and why only for leaks. The routines are not re-run on a push,
+# so on any multi-push PR the marker sits at the first head and the gate blocks —
+# measured over ten recent PRs, every one with commits after its marker. The
+# operator's only escape was `# scheduled-review-override`, a sigil that checks
+# NOTHING, so routine use of it was eroding an override meant for exceptions.
+#
+# The relief is narrow BECAUSE the two layers cover different leak classes. The
+# mechanical scanner catches literal patterns (addresses, emails, configured
+# private patterns) and it runs per-head; the scheduled LLM review catches
+# INFERENTIAL leaks, which no pattern can. Honouring an earlier LLM review while
+# REQUIRING the mechanical one at this exact head therefore trades a re-read of
+# the inferential layer for a guarantee the literal layer covers the new commits
+# — strictly more checking than the bare override it replaces, never less.
+#
+# NOT a prose-delta tolerance. That was the first design and it was MEASURED
+# inert: 0 of 6 applicable PRs had a prose-free delta (22-692 added prose lines
+# each), because essentially every push adds a comment, docstring or string.
+# A relief valve that never opens leaves the override in daily use.
+_MECHANICAL_RESCAN_BY_KIND = {"leaks": "leak-detector"}
 # Every kind an install is ALLOWED to name in config. A configured kind outside this set
 # (a typo, a wrong type, a stale routine name) can never be satisfied by a real marker, so
 # the whole config is treated as invalid and we fail closed to the default rather than let
@@ -2820,6 +2843,94 @@ def _scheduled_review_marker_scan(
     return accepted, rejected
 
 
+def _mechanical_scan_conclusion(
+    head_sha: str, check_name: str, repo: str | None = None
+) -> str | None:
+    """The conclusion of check run *check_name* AT *head_sha*, or None if unreadable.
+
+    Binds the sha EXPLICITLY (``commits/{sha}/check-runs``) rather than reading the
+    PR's rollup, so the answer cannot silently describe a different commit than the
+    one the gate is deciding about.
+
+    Returns None on ANY doubt — a gh error, an unparseable payload, or the check
+    simply not present at this head. Callers treat None as "no relief": this feeds
+    a merge gate, so an unreadable mechanical scan must never read as a pass.
+
+    Tests inject via ``_TEST_GH_CHECK_RUNS`` (a JSON array of check-run objects).
+    """
+    raw = os.environ.get("_TEST_GH_CHECK_RUNS")
+    if raw is None:
+        try:
+            owner_repo = repo or _derive_repo_from_cwd(os.getcwd())
+        except Exception:
+            owner_repo = repo
+        if not owner_repo:
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{owner_repo}/commits/{head_sha}/check-runs",
+                    "--jq",
+                    ".check_runs",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),  # merge-path budget; fail-closed -> no relief
+            )
+            if result.returncode != 0:
+                return None
+            raw = result.stdout.strip()
+        except Exception:
+            return None
+    if not raw:
+        return None
+    try:
+        runs = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(runs, list):
+        return None
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        if (run.get("name") or "").strip() == check_name:
+            # A run still in flight has conclusion null -> not "success" -> no relief.
+            return (run.get("conclusion") or "").strip().lower() or None
+    return None  # the check never ran at this head
+
+
+def _relieve_kinds_by_mechanical_rescan(
+    missing: list[str],
+    accepted: dict[str, set[str]],
+    head: str,
+    repo: str | None = None,
+) -> tuple[list[str], list[tuple[str, str, str]]]:
+    """Drop kinds satisfiable by an earlier ACCEPTED marker + a green scanner at head.
+
+    Returns ``(still_missing, relieved)`` where each *relieved* entry is
+    ``(kind, earlier_head_12, check_name)`` for the message.
+
+    Only ``accepted`` markers count. A marker that was REFUSED at an earlier head
+    proves a routine ran and FOUND something — it must never grant relief, which is
+    why ``rejected`` is deliberately not a parameter here rather than merely unused.
+    """
+    relieved: list[tuple[str, str, str]] = []
+    for kind in missing:
+        check_name = _MECHANICAL_RESCAN_BY_KIND.get(kind)
+        if not check_name:
+            continue
+        earlier = sorted(h for h, kinds in accepted.items() if h != head and kind in kinds)
+        if not earlier:
+            continue  # never accepted anywhere in this PR -> nothing to carry forward
+        if _mechanical_scan_conclusion(head, check_name, repo=repo) != "success":
+            continue  # unreadable, absent, pending or failed -> fail CLOSED
+        relieved.append((kind, earlier[-1][:12], check_name))
+    relieved_kinds = {k for k, _, _ in relieved}
+    return [k for k in missing if k not in relieved_kinds], relieved
+
+
 def _check_scheduled_claude_reviewed_head(
     pr_num: str,
     head_sha: str | None = None,
@@ -2920,6 +3031,19 @@ def _check_scheduled_claude_reviewed_head(
     kinds_here = markers.get(head, set())
     required = _required_scheduled_review_kinds()
     missing = [k for k in required if k not in kinds_here]
+    if missing:
+        # A kind already ACCEPTED at an earlier head of this PR is satisfied when its
+        # mechanical scanner is green at THIS head (see _MECHANICAL_RESCAN_BY_KIND).
+        missing, relieved = _relieve_kinds_by_mechanical_rescan(
+            missing, markers, head, repo=repo
+        )
+        for kind, earlier_head, check_name in relieved:
+            print(
+                f"NOTE: scheduled '{kind}' review for PR #{pr_num} was accepted at "
+                f"{earlier_head} (not at head {head[:12]}), but '{check_name}' is green "
+                f"at this head — honouring the earlier review.",
+                file=sys.stderr,
+            )
     if not missing:
         return None
     # WHY the marker is missing decides whether waiting is useful, and the two causes are
