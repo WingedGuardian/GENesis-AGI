@@ -311,6 +311,19 @@ def _run(
     ):
         if value is not None:
             monkeypatch.setenv(seam, value)
+    # A case that injects a HEAD pin is describing a PR that EDITS the pin, so its
+    # changed-file list has to say so. The pin gate now asks that list first — a PR
+    # whose diff does not include the pin file cannot have moved it, which is what
+    # stops a stale PR being judged against a base tip that moved underneath it. The
+    # module-wide hermetic default (`src/benign.py` alone) is the opposite claim, and
+    # leaving it in place made these cases assert a pin bump while declaring the pin
+    # untouched — so the gate correctly skipped, and the cases silently stopped
+    # testing the thing they are named for.
+    if head_pin is not None:
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            json.dumps({"filename": _mod._PIN_FILE_PATH, "previous_filename": None}),
+        )
     monkeypatch.setattr(_mod.subprocess, "run", router or _router())
     payload = json.dumps(
         {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command}}

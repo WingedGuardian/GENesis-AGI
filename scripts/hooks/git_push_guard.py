@@ -3153,9 +3153,18 @@ def _pin_file_at_ref(
     # gate treats that as "uncertain, enforce", so falling back to the repo the
     # process is actually in keeps the gate WORKING rather than silently
     # unverifying on every such install (measured: it returned None here).
-    slug = (_normalize_repo(repo) if repo else None) or _canonical_public_repo()
-    if not slug:
-        slug = _derive_repo_from_cwd(os.getcwd())
+    # Inside the try, not above it. These three read install config, run git and touch
+    # the filesystem, so any of them CAN raise — a malformed genesis.yaml is enough.
+    # Uncaught, the exception left this function, left `_check_pin_receipts` (which
+    # wraps only the checker call, not the reads), and left the hook: a crashing merge
+    # gate, which is the wedge in its least recoverable form. MEASURED: a raising
+    # `_canonical_public_repo` propagated all the way out.
+    try:
+        slug = (_normalize_repo(repo) if repo else None) or _canonical_public_repo()
+        if not slug:
+            slug = _derive_repo_from_cwd(os.getcwd())
+    except Exception:  # noqa: BLE001 — resolving WHERE to read is plumbing
+        return None, _PIN_UNREADABLE, None
     if not slug:
         return None, _PIN_UNREADABLE, None
     try:
@@ -3252,6 +3261,34 @@ def _pin_blob_unchanged(
     return bool(head_blob) and head_blob == base_blob
 
 
+def _pr_edits_pin_file(pr_num: str, repo: str | None) -> bool | None:
+    """Does this PR's DIFF touch the pin file? ``None`` when that cannot be determined.
+
+    The authoritative form of "did this PR touch the pin", and it replaced comparing
+    the head tree against the base TIP. Those differ for any PR that simply branched
+    earlier than the base's latest pin change — the head still carries the older blob
+    — even though a three-way merge keeps the base's version and never touches the
+    file. Comparing tips therefore reported such a PR as having edited the pin, and if
+    the newer base pin was malformed it demanded release receipts from exactly the
+    stale, unrelated PRs the wedge fix exists to unblock.
+
+    GitHub computes the changed-file list against the MERGE BASE, which is what the
+    merge itself uses, so it answers the question directly rather than inferring it
+    from two moving trees.
+
+    Delegates to ``_pr_changed_files`` rather than reading the endpoint again. The
+    first version of this did re-read it, with its own parser and its own reading of
+    the ``_TEST_GH_PR_FILES`` seam — which that function already owns, in a different
+    format. The seam's real contents parsed to "no pin file here", so the gate
+    concluded the pin was untouched and skipped ITSELF. Two readers of one seam is
+    how a security gate silently turns off; there is one reader.
+    """
+    files = _pr_changed_files(pr_num, repo=repo)
+    if files is None:
+        return None  # API error, malformed page, or the 3000-row cap — cannot say
+    return _PIN_FILE_PATH in files
+
+
 def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
     """The PR body. ``None`` means unreadable — distinct from an EMPTY body,
     which is a real state that determines the answer by itself."""
@@ -3316,15 +3353,19 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
     generates bugs, not of four bugs. Each question below is answered from the
     strongest evidence available for it, and none may be answered out of order:
 
-      1. **Did this PR touch the pin file?** From the blob SHA, never from the
-         contents. The previous revision compared the two content values, which are
-         BOTH ``None`` whenever the read fails — so two different oversized blobs
-         compared equal and reported an untouched pin.
-      2. **Is the head pin usable?** Asked before any base-side branch runs. The
-         previous revision could return a base-side note first, so a PR introducing
+      1. **Did this PR touch the pin file?** From the PR's own changed-file list,
+         which GitHub computes against the MERGE BASE — the same thing the merge
+         uses. Falls back to the blob SHA when that list is unavailable or
+         truncated, and NEVER to the file contents: those are both ``None``
+         whenever a read fails, so two different oversized blobs compared equal and
+         reported an untouched pin.
+      2. **Is the head pin usable?** Asked before any base-side branch runs. An
+         earlier revision could return a base-side note first, so a PR introducing
          an empty pin file over an absent base merged with no usable pin at all.
       3. **Which direction, and are the receipts there?** Delegated whole to the
-         checker, with an unreadable base passed as ``None`` rather than returned on.
+         checker, with a base-side fault passed as an INPUT rather than returned on
+         — and with CONTENT (requires receipts) still distinguished from PLUMBING
+         (non-blocking note), which is the axis above applied to the base side.
     """
     checker = _load_pin_receipt_checker()
     if checker is None:
@@ -3353,9 +3394,17 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
     # broken file at its own head. MEASURED before this existed: with an emptied pin on
     # the base, every PR that left the file alone was blocked.
     #
-    # Answered from the blob SHA. The previous revision compared the two CONTENT values,
-    # which are both None for every unreadable state — so "unchanged" was concluded from
-    # two reads having failed, and two DIFFERENT >1MB blobs bypassed the head-side block.
+    # Answered FIRST from the PR's own changed-file list, which GitHub computes against
+    # the MERGE BASE. Comparing the head tree with the base TIP instead gets one class
+    # wrong: a PR that branched before the base's latest pin change still carries the
+    # older blob at its head, so the two tips differ even though the merge will keep
+    # the base's version and never touch the file. With a malformed new base pin, that
+    # demanded receipts from exactly the stale unrelated PRs this wedge fix unblocks.
+    #
+    # The blob SHA remains the FALLBACK for when that list is unavailable or truncated
+    # — never the file CONTENTS, which are both None for every unreadable state, so
+    # "unchanged" got concluded from two reads having failed and two DIFFERENT >1MB
+    # blobs bypassed the head-side block.
     #
     # Asked UNCONDITIONALLY, including when both sides read cleanly. Scoping it to the
     # unreadable states looks like an optimisation and is a bug: an EMPTY pin file is a
@@ -3364,7 +3413,10 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
     # the very wedge this exists to prevent, rebuilt out of the other three states.
     # MEASURED: both-empty and both-double-assigned each blocked until this became
     # unconditional.
-    if _pin_blob_unchanged(head_state, head_blob, base_state, base_blob):
+    edits_pin = _pr_edits_pin_file(pr_num, repo)
+    if edits_pin is False or (
+        edits_pin is None and _pin_blob_unchanged(head_state, head_blob, base_state, base_blob)
+    ):
         named = ""
         if head_text is not None:
             try:
@@ -3376,9 +3428,18 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
                 value = None
             if value:
                 named = f" ({value})"
+        # Name the EVIDENCE, not just the conclusion. The two paths are not equally
+        # strong — the PR's file list is authoritative, the blob comparison is an
+        # inference from two tips — and a reader deciding whether to trust a pass on a
+        # release gate needs to know which one answered.
+        why = (
+            "it is not among the files this PR changes"
+            if edits_pin is False
+            else "the same blob at the head and the base (changed-file list unavailable)"
+        )
         return False, (
-            f"CC pin{named}: {_PIN_FILE_PATH} is unchanged by this PR — the same blob at "
-            f"the head and the base, so it cannot have moved the pin. No receipts "
+            f"CC pin{named}: {_PIN_FILE_PATH} is unchanged by this PR — {why}, so it "
+            f"cannot have moved the pin. No receipts "
             f"required.{'' if head_state == _PIN_OK else f' (The file is in state {head_state!r}, which is a fault in {base_ref}, not in this PR.)'}"
         )
 
@@ -3421,7 +3482,16 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
         return False, "NOTE: PR body unreadable — pin receipts NOT verified."
 
     try:
-        verdict = checker.evaluate(base_pin_text=base_text, head_pin_text=head_text, body=body)
+        verdict = checker.evaluate(
+            base_pin_text=base_text,
+            head_pin_text=head_text,
+            body=body,
+            # CONTENT vs PLUMBING, preserved across the boundary. `base_text` is None
+            # for BOTH a base whose content is faulty and a base we simply could not
+            # read, and those take opposite fail directions — so the distinction has
+            # to travel with the value rather than be re-derived from it.
+            base_unreadable=(base_state == _PIN_UNREADABLE),
+        )
     except Exception as exc:  # noqa: BLE001 — plumbing, not policy
         return False, f"NOTE: pin-receipt check errored ({type(exc).__name__}) — NOT verified."
 
@@ -3434,7 +3504,12 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
     # runs main's copy, but a partial deploy is a real state) degrades to un-noted
     # rather than raising inside the gate.
     if not verdict.blocked and not getattr(verdict, "direction_verified", True):
-        return False, f"NOTE: {verdict.message} Receipts NOT verified."
+        # "Receipts NOT verified" is what every other fail-open on this path says, and
+        # it is WRONG here: this is the one pass where the receipts were checked and
+        # found present, and the DIRECTION is what went unverified. The message read
+        # "both gate receipts are present … Receipts NOT verified." — a contradiction
+        # at the only surface a human reads before merging.
+        return False, f"NOTE: {verdict.message} Pin DIRECTION not verified."
 
     return verdict.blocked, verdict.message
 

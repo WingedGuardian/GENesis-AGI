@@ -381,7 +381,13 @@ def _pin_of(text: str, *, where: str) -> str:
     return pin
 
 
-def evaluate(*, base_pin_text: str | None, head_pin_text: str, body: str) -> Verdict:
+def evaluate(
+    *,
+    base_pin_text: str | None,
+    head_pin_text: str,
+    body: str,
+    base_unreadable: bool = False,
+) -> Verdict:
     """The whole decision, as a pure function.
 
     Takes the two file CONTENTS rather than reading them, so the CI adapter can
@@ -434,6 +440,34 @@ def evaluate(*, base_pin_text: str | None, head_pin_text: str, body: str) -> Ver
             f"CC pin {head_pin!r} at the head is not a version (expected X.Y.Z), so "
             "whether this PR moves the pin forward cannot be established.",
             reason="unreadable-head",
+        )
+
+    # A base we could not READ AT ALL is this gate's own plumbing failing, not a fact
+    # about any branch — a contents-API timeout, a non-JSON body, an unresolvable ref.
+    # It must stay non-blocking, or one transient hiccup walls off every merge in the
+    # repository through a gate with no override sigil. Distinct from a base whose
+    # content is FAULTY (absent, empty, unassigned, doubly-assigned, undecodable),
+    # which is a real statement about the base branch and does require the receipts.
+    #
+    # Collapsing those two into "base_pin_text is None" is what this parameter exists
+    # to prevent: the CONTENT-vs-PLUMBING split is the gate's other axis, and the
+    # revision before this one flattened it on the base side while preserving it on
+    # the head side.
+    #
+    # Placed AFTER the head check, never before it. A base-side branch that returns
+    # ahead of head validation is the exact defect this module was restructured to
+    # remove, and re-adding one above would reintroduce it for this cell.
+    # `and base_pin_text is None` so the two parameters cannot contradict each other.
+    # If a caller ever supplies BOTH a flag saying "unreadable" and readable content,
+    # the CONTENT wins — it is the stronger evidence, and honouring the flag over it
+    # would discard a usable base and hand out a free pass on the say-so of a boolean.
+    if base_unreadable and base_pin_text is None:
+        return Verdict(
+            False,
+            f"The pin file could not be READ on the base branch — a transport failure "
+            f"in this check, not a fault in either branch. This PR pins {head_pin}, but "
+            f"the direction of the change could not be established.",
+            direction_verified=False,
         )
 
     # ── 2. WHICH DIRECTION? ──

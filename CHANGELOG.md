@@ -101,7 +101,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   override sigil by design, so there was no in-band recovery: one bad commit to `main`
   stopped all merges.
 
-  A base that cannot be read is now treated as a missing INPUT rather than as an
+  A base whose pin is *faulty* is now treated as a missing INPUT rather than as an
   answer. Direction is then unknowable, and both of the obvious responses are wrong:
   blocking wedges the repository, while passing lets a PR that repairs the base and
   bundles a forward release in the same change ship with no receipts at all — a case
@@ -111,11 +111,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   verified nothing about direction. Receipts are a line in the PR body, so this
   refuses a merge, never the repository's ability to repair itself.
 
-  Whether a PR touched the pin at all is decided from the **blob SHA** at both refs,
-  before anything is parsed — the one question answerable when nothing parses, and the
-  reason an untouched PR is never asked for receipts. Comparing the file CONTENTS
-  instead does not work: they are both empty whenever a read fails, so two *different*
-  oversized blobs compared equal and reported an untouched pin.
+  A base the gate simply could not *read* — an API timeout, a non-JSON body, an
+  unresolvable ref — stays non-blocking, as it always has. That distinction is the
+  gate's CONTENT-versus-PLUMBING axis applied to the base side, and it has to be
+  carried explicitly: both cases yield no base text, so deriving it from the text
+  alone would let one transient network blip demand release receipts from every open
+  PR.
+
+  Whether a PR touched the pin at all is decided from the PR's own **changed-file
+  list**, which GitHub computes against the merge base — the same thing the merge
+  uses. Comparing the head tree against the base *tip* gets one class wrong: a PR that
+  branched before the base's latest pin change still carries the older blob, so the
+  tips differ even though the merge keeps the base's version and never touches the
+  file. With a malformed new base pin that demanded receipts from exactly the stale,
+  unrelated PRs this fix exists to unblock. The **blob SHA** is the fallback when that
+  list is unavailable or truncated — never the file CONTENTS, which are both empty
+  whenever a read fails, so two *different* oversized blobs compared equal and
+  reported an untouched pin.
 
   Two rules now follow from the merge being the publication, since `origin` is the
   public repo. A pin present but unreadable at the head blocks. And the head pin must

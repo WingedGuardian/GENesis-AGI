@@ -308,17 +308,24 @@ boxes, blockquotes and bold all work.
 
 **Receipts are also required when the direction cannot be established.** The gate
 compares the pin at the PR head against the pin on the base branch. If the base
-branch's pin cannot be read at all — the file is missing, empty, carries no
-`CC_VERSION` assignment, or assigns it more than once — there is nothing to
-compare against, and the gate asks for the receipts *in place of* the comparison.
+branch's pin is unreadable — the file is missing, empty, carries no `CC_VERSION`
+assignment, or assigns it more than once — there is nothing to compare against,
+and the gate asks for the receipts *in place of* the comparison.
 
 This is the case a PR that **repairs** a broken pin file will hit, and the ask is
 deliberate: such a PR is establishing a pin rather than restoring a known one,
 and it is invisible to CI, because its merge tree contains the repaired file and
 `cc-node-lockstep` therefore passes. The receipts are a line in the PR body, so
-this refuses a merge, never the repository's ability to repair itself. A PR that
-leaves `scripts/lib/cc_version.sh` alone is unaffected — identity is decided by
-the blob SHA at both refs, before anything is parsed.
+this refuses a merge, never the repository's ability to repair itself.
+
+A *transport* failure reading the base — an API timeout, an unresolvable ref — is
+not the same thing and stays non-blocking, with a note printed at merge time.
+
+**A PR that does not edit `scripts/lib/cc_version.sh` is never asked for
+receipts**, whatever state the pin is in on either side. That is settled from the
+PR's own changed-file list, which GitHub computes against the merge base, so a PR
+that merely branched before the pin last changed is not mistaken for one that
+edits it.
 
 Two more rules follow from the pin being **published** by the merge, since
 `origin` is the public repo:

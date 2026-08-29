@@ -23,6 +23,7 @@ Network-free via the _TEST_GH_* env-injection seams.
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -37,10 +38,36 @@ _spec.loader.exec_module(_mod)
 HEAD = "a" * 40
 PIN_BASE = 'CC_VERSION="${CC_VERSION:-2.1.218}"\nNODE_MAJOR="${NODE_MAJOR:-22}"\n'
 PIN_FORWARD = 'CC_VERSION="${CC_VERSION:-2.1.246}"\nNODE_MAJOR="${NODE_MAJOR:-22}"\n'
+
+
+def _files(*paths: str) -> str:
+    """The `_TEST_GH_PR_FILES` seam's own wire format: one JSON object per line."""
+    return "\n".join(
+        json.dumps({"filename": p, "previous_filename": None}) for p in paths
+    )
+
+
 RECEIPTS = (
     "CC-Gate-Changelog: read (2.1.218, 2.1.246] in full from CHANGELOG.md, 2026-08-27\n"
     "CC-Gate-Soak: 2.1.246 soaked 2026-08-25..2026-08-27, sweep clean, signed off\n"
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_live_pr_file_list(monkeypatch):
+    """Default every test to "the changed-file list is unavailable".
+
+    `_pr_changed_files` shells out to `gh` when its seam is unset, so without this the
+    whole module would make a live API call per case. Defaulting to UNAVAILABLE rather
+    than to a file list is deliberate: it routes each test through the blob-SHA
+    FALLBACK, which is the weaker of the two paths and therefore the one needing the
+    coverage. Tests about the file list set the seam explicitly.
+
+    `__error__` and the one-JSON-object-per-line format are `_pr_changed_files`'s own
+    seam contract, not this module's — writing a second format for the same variable
+    is what let the pin gate read someone else's fixture and skip itself.
+    """
+    monkeypatch.setenv("_TEST_GH_PR_FILES", "__error__")
 
 
 @pytest.fixture
@@ -509,6 +536,129 @@ def test_two_DIFFERENT_unreadable_blobs_are_not_mistaken_for_an_untouched_pin(mo
 
     assert blocked is True, f"two different unreadable blobs are not an untouched pin: {msg}"
     assert "could not be decoded" in msg, msg
+
+
+@pytest.mark.parametrize(
+    ("base", "must_block"),
+    [
+        ("__unreadable__", False),  # PLUMBING — this check's own transport failed
+        ("__absent__", True),  # CONTENT — a real statement about the base
+        ("__undecodable__", True),  # CONTENT
+        ("", True),  # CONTENT
+    ],
+    ids=["transport failure", "absent", "undecodable", "empty"],
+)
+def test_a_base_TRANSPORT_failure_stays_non_blocking(monkeypatch, base, must_block):
+    """CONTENT vs PLUMBING, on the base side. Regression: it was flattened.
+
+    A contents-API timeout, a non-JSON body or an unresolvable ref yields no base text
+    — and so does a base whose pin is genuinely absent or unparseable. Routing both
+    through "no base text" made one transient hiccup demand release receipts from every
+    open PR, through a gate with no override sigil. That is the whole wedge, rebuilt out
+    of a network blip.
+
+    The split is the gate's other stated axis, and it was already preserved on the head
+    side; this asserts both halves so fixing one cannot silently drop the other.
+    """
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+    monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", base)
+    monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", PIN_FORWARD)
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "an ordinary PR with no receipts")
+
+    blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
+
+    assert blocked is must_block, f"base {base!r}: expected blocked={must_block}: {msg}"
+    if not blocked:
+        assert msg.startswith("NOTE:"), f"a plumbing pass must be printed at merge: {msg}"
+
+
+def test_a_transport_failure_does_not_excuse_an_unusable_HEAD(monkeypatch):
+    """Control for the test above — the ordering must survive the plumbing fix.
+
+    The non-blocking plumbing verdict sits AFTER head validation, not before it.
+    Putting it first would be the same defect that let a PR introduce an empty pin
+    file over a non-OK base and merge, which is what the three-question order exists
+    to prevent. Without this control, "make transport non-blocking" is satisfied by a
+    version that returns before ever looking at the head.
+    """
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+    monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", _mod._PIN_SEAM_UNREADABLE)
+    monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", "")  # present, empty, unparseable
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "")
+
+    blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
+
+    assert blocked is True, f"an unusable head must block regardless of the base: {msg}"
+
+
+def test_a_stale_PR_is_judged_on_its_DIFF_not_on_the_moving_base_tip(monkeypatch):
+    """A PR that branched before the base's pin changed still has the OLD blob.
+
+    Comparing the head tree against the base TIP therefore reports it as having edited
+    the pin, though a three-way merge keeps the base's version and never touches the
+    file. When the newer base pin is MALFORMED that demanded receipts from precisely
+    the stale, unrelated PRs the wedge fix exists to unblock — the wedge surviving in
+    the one population it was meant to free.
+
+    GitHub computes the changed-file list against the MERGE BASE, which is what the
+    merge itself uses, so it answers the question directly.
+    """
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+    # Base tip has moved to a doubly-assigned (malformed) pin; this PR's head still
+    # carries the older good one purely because it branched earlier.
+    monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", PIN_BASE + 'CC_VERSION="${CC_VERSION:-9.9.9}"\n')
+    monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", PIN_BASE)
+    monkeypatch.setenv("_TEST_GH_PR_FILES", _files("src/genesis/unrelated.py", "docs/notes.md"))
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "an unrelated PR that never touched the pin")
+
+    blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
+
+    assert blocked is False, f"a stale PR that does not edit the pin must merge: {msg}"
+    assert "not among the files this PR changes" in msg, msg
+
+
+def test_a_PR_that_DOES_edit_the_pin_is_still_judged(monkeypatch):
+    """Control for the test above.
+
+    Without it, "trust the changed-file list" is satisfied by a gate that treats every
+    PR as not touching the pin — which passes the wedge tests and disables the gate.
+    """
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+    monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", PIN_BASE)
+    monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", PIN_FORWARD)
+    monkeypatch.setenv("_TEST_GH_PR_FILES", _files(_mod._PIN_FILE_PATH, "src/genesis/other.py"))
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "a forward bump with no receipts at all")
+
+    blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
+
+    assert blocked is True, f"a real pin bump must still be judged: {msg}"
+    assert "moves FORWARD" in msg, msg
+
+
+def test_the_unverified_direction_note_does_not_contradict_itself(monkeypatch):
+    """The one pass where the receipts WERE checked and the direction was not.
+
+    The merge arm appended the generic "Receipts NOT verified." to every non-blocking
+    verdict, so this path rendered as "both gate receipts are present … Receipts NOT
+    verified." — self-contradictory, at the only surface a human reads before merging
+    a release.
+    """
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+    monkeypatch.setenv("_TEST_GH_BASE_PIN_FILE", _mod._PIN_SEAM_ABSENT)
+    monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", PIN_FORWARD)
+    monkeypatch.setenv("_TEST_GH_PR_BODY", RECEIPTS)
+
+    blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
+
+    assert blocked is False, msg
+    assert "receipts are present" in msg, msg
+    assert "Receipts NOT verified" not in msg, f"contradicts itself: {msg}"
+    assert "DIRECTION not verified" in msg, msg
 
 
 def test_a_forward_bump_still_blocks_when_the_base_is_FINE(monkeypatch):
