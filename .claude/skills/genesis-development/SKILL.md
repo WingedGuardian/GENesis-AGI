@@ -122,78 +122,6 @@ returned 0 in-server and **three** features shipped green but inert since
 July; the module's docstring claim "same-uid reads succeed" was a shell-tested
 falsehood. The fix routed around the ptrace-gated read entirely.)
 
-### Acceptance Bar + Measured Rate — the primary methodology
-
-**Use this as often as it applies. It is the default way to build anything here,
-not a special-occasion technique.** Unit tests prove the code does what you wrote.
-This proves the thing actually WORKS — with numbers and a denominator.
-
-Two artifacts, both produced BEFORE shipping:
-
-**1. The acceptance bar — replay the real defect.** Take the actual failure that
-motivated the work and run it through the new thing. If it does not catch/fix
-the case it exists for, it does not ship, however elegant it is and however
-green the suite is. Reconstruct the real case (from git history, from the
-transcript, from live data) rather than a stylised approximation — a synthetic
-case can pass while the real shape does not.
-
-**2. The measured rate — run it against real data and produce a number.**
-A claim like "low false-positive rate" or "it should be fine in practice" is not
-evidence. Run the thing over a real corpus — recent commits, live rows, real
-traffic, historical transcripts — and report `k/N (x.x%)`. **A number without a
-denominator is not a measurement.** Then look at the individual hits and say
-honestly which are real signal and which are noise; a "false-positive rate" that
-turns out to be mostly true positives is a fire rate, and saying so is part of
-the result.
-
-The measurement is a GATE, not a footnote. Decide the acceptable threshold
-BEFORE measuring, and if the number misses it, tighten and re-measure rather
-than shipping with a caveat. When you tighten, re-run the acceptance bar in the
-same breath — a filter that improves the rate by breaking the thing you built it
-for has made it worse, and only running both together catches that.
-
-Worked example (2026-08-27, the orphaned-literal detector):
-- Acceptance: replayed a real review defect; the detector named the exact
-  sibling file. PASS.
-- Measured: `1/151 real file-edits fired (0.7%)`. The single hit was an
-  identifier, not prose — so the filter was tightened to require interior
-  whitespace, re-measured at `0/151 (0.0%)`, **and the acceptance replay was
-  re-run to confirm the tightening had not blinded it.**
-- The companion provenance detector: acceptance PASS, `5/151 (3.3%)`, and on
-  inspection all five were genuine "this variable means something different
-  now" signals — reported as a fire rate, not an error rate.
-
-This also catches a specific self-deception. A first prototype of that same
-detector used a regex and reported "2 findings" while **silently skipping the
-entire class it was built for** (the pattern excluded backslashes; every prompt
-string ends in `\n`). The acceptance replay is what exposed it. A matcher that
-finds nothing is indistinguishable from a matcher that looks at nothing —
-only replaying a known-positive tells them apart.
-
-### A blocked compound command loses EVERYTHING in it
-
-A PreToolUse block kills the **whole** Bash call, not the offending part — so a
-guard firing on step 3 also silently discards steps 1 and 2, while the error
-text talks only about step 3. This repo has many blocking guards
-(`review_enforcement_commit`, `full_suite_guard`, `concurrent_test_guard`,
-`git_push_guard`, the destructive/protected-path guards), so it is not rare.
-
-**Never chain a state-changing step with a step that can be blocked.** Keep
-`cd`, heredocs, file writes and restore-from-backup in their own invocation,
-separate from test runs, commits, pushes, or anything a guard inspects.
-
-**After any block, verify state before continuing.** Run `pwd`, and re-check the
-file you believed you wrote. Do not assume the earlier half of the command ran.
-Prefer `git -C <literal path>` and absolute script paths over a persistent `cd`,
-so a lost `cd` cannot silently redirect later commands.
-
-Measured cost in one session: four heredocs that never wrote, a
-restore-from-backup that never ran (leaving a file deliberately regressed), and
-a `cd` that never happened — so edits landed in the **wrong worktree** and had
-to be reverted as cross-branch contamination. Guard false-positives make this
-worse: `shell_parse` mis-parses backslash line-continuations and quoted heredoc
-bodies, so legitimate commands get blocked too.
-
 ### Instance-Fix vs Class-Fix Gate
 
 When a mechanism failed to write or propagate something (a memory, a
@@ -655,31 +583,23 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
 
 ### Review-loop discipline
 
-- **A review's findings are a SAMPLE, not a to-do list.** This is the single
-  highest-value habit in this section, and the one most often skipped. CLAUDE.md
-  already says to treat the *user's* examples as a sample and enumerate the
-  broader class — the same rule applies to REVIEWER output and is easy to miss
-  there, because N findings look exactly like an N-item work queue. Before
-  fixing any finding: name the CLASS it belongs to, enumerate the full
-  population of that class (programmatically — an AST walk or a grep that lists
-  every member, not a mental scan), and fix the population. Then the next round
-  has nothing of that class left to find.
-  Origin: 2026-08-27, three defect-bearing rounds on one PR where each round's
-  fix introduced the next round's defect — one of three renderers, then one of
-  two branches in the same function, then one direction of a two-directional
-  boundary. Every round I fixed exactly what was named. The enumeration that
-  finally closed it took one AST script and would have worked in round one.
-- **Fixing the named instance is how a loop runs away.** If two consecutive
-  rounds each surface NEW defects, stop patching: that is the signature of
-  instance-fixing, and the commit gate will hard-block at the third round
-  (`review_enforcement_commit.py`, mode-switch then escalation cap). Switch to
-  enumeration BEFORE the gate has to say so.
 - **Run the pre-push adversarial pass with `/deep-review`** (`.claude/commands/deep-review.md`):
   one command that dispatches a fresh-context `genesis-architect` (+ `genesis-security-reviewer`
   on security surfaces) over the FULL branch diff with the right SHAPE — fail-open/state/TOCTOU/
   hand-rolled-parsing hunting, not a lint/secrets scan — and writes the evidence marker. This is
   the review that catches Round-1 bugs before Codex does; `/audit-changes` is only a light
   self-check.
+- **Enumerate a finding's siblings with `scripts/class_scope_scan.py` before calling
+  it fixed.** A reviewer names one site; the question is always how many there are.
+  The script diffs the literals and call-provenance of your change against the tree
+  and names what it thinks you left behind — run it from the worktree it is about.
+  MEASURED on 95 real class-divergences mined from this repo's history (a literal
+  removed from one file, then removed again from a second file in a later commit):
+  it catches 47 of the 47 that fall inside its stated scope, and fires on 7 of 100
+  ordinary commits. It is deliberately blind to identifier-shaped literals, which are
+  half of all real divergences — so a clean result narrows the question, it does not
+  close it. Its last line reports how much it did NOT check; read that before reading
+  the silence.
 - **PR review-findings status = `python3 scripts/hooks/git_push_guard.py --check-pr <N>`
   — ONLY.** This runs the SAME code path as the merge gate (strict fail-closed: a
   failed scan is never reported clean). NEVER hand-roll a `gh api pulls/N/comments`

@@ -59,6 +59,22 @@ When you fix, fix the mechanism/class — a per-instance patch is what spawns th
 round. `git add` the fix, but do NOT commit yet — the commit is the last step, after the marker.
 If you're on your 3rd defect-bearing round, STOP at the escalation cap (see SKILL.md).
 
+**Before you decide a finding is fixed, enumerate its siblings mechanically:**
+
+```bash
+python3 "$ROOT/scripts/class_scope_scan.py"                 # HEAD vs worktree
+python3 "$ROOT/scripts/class_scope_scan.py" --staged        # the index
+python3 "$ROOT/scripts/class_scope_scan.py" --max-literals 500   # exhaustive
+```
+
+It reports two things a diff does not show: a message you changed here that still
+exists verbatim somewhere else, and a variable whose source call you swapped while
+leaving some of its uses untouched. Read its last line — it states how many files it
+scanned and how many literals it did NOT check, so a quiet result and a clean one are
+distinguishable. If it says literals were skipped over the cap, re-run with
+`--max-literals 500` before believing the silence. It is a hint, not a gate: it does
+not know your intent, and a survivor it names may be correct.
+
 ## 4. Record evidence, mark, THEN commit (satisfies the commit review-depth gate)
 
 - The marker binds the **final staged content**, not the text the reviewer saw. So after
