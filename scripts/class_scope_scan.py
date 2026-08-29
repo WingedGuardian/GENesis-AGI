@@ -278,7 +278,10 @@ def find_orphaned_literals(
 ) -> list[dict]:
     """Literals this edit removed that still exist in other files.
 
-    Returns ``[{literal, survivors: [path, ...]}]``, empty when the edit left no
+    Returns ``[{literal, survivors: [path, ...]}]`` -- plus a
+    ``search_incomplete`` key on any finding whose search could not be
+    completed, so a partial answer is never read as a whole one. Empty when the
+    edit left no
     orphans. Never raises, and never runs past *budget_seconds*.
 
     Two optional out-params make the result INTERPRETABLE, which is the whole
@@ -301,6 +304,12 @@ def find_orphaned_literals(
     # the same file leaves the value present, and set difference sees nothing.
     removed = {lit for lit, n in old_counts.items() if new_counts[lit] < n}
     prose = sorted((lit for lit in removed if _is_prose(lit)), key=len, reverse=True)
+    if max_literals is not None and max_literals < 1:
+        # `main` validates at parse time, but this function is exported and
+        # directly tested, so the guarantee has to live where the slicing is:
+        # a negative limit makes `prose[:limit]` check everything but the last
+        # literal and then report that one as over the cap.
+        raise ValueError(f"max_literals must be >= 1 or None, got {max_literals}")
     limit = MAX_LITERALS_CHECKED if max_literals is None else max_literals
     candidates = prose[:limit]
 
@@ -341,6 +350,12 @@ def find_orphaned_literals(
             skipped.append({"literal": literal, "reason": reason})
 
     def _done(literal: str) -> None:
+        # Consults `_seen` like `_skip` does. The comment above describes this
+        # as a general defence against a literal recorded twice; without the
+        # early return it guarded only the skip side, and a mutation deleting
+        # the `_seen.add` here changed nothing.
+        if literal in _seen:
+            return
         _seen.add(literal)
         if examined is not None:
             examined.append(literal)
@@ -375,13 +390,28 @@ def find_orphaned_literals(
         if new_counts[lit] > 0:
             survivors.append(edited)
 
+        # Why an incomplete search is tracked as a STRING rather than a bool:
+        # the two causes below are the same shape -- part of the question went
+        # unanswered -- and they must be dispositioned identically, which a
+        # per-cause branch quietly failed to do. Whatever is PROVEN is still
+        # reported; only the unanswered part is disclosed.
+        search_incomplete = ""
+
         try:
             paths = _grep_candidates(core, repo_root, deadline)
         except GrepUnavailable as exc:
-            # The question was never answered. Reporting this literal as clean
-            # would be the exact failure the tool exists to name.
-            _skip(lit, f"could not search: {exc}")
-            continue
+            if not survivors:
+                # Nothing proven AND nothing searched. Reporting this literal
+                # as clean would be the exact failure the tool exists to name.
+                _skip(lit, f"could not search: {exc}")
+                continue
+            # A same-file survivor came from `new_counts`, not from the search,
+            # so it is a DEFINITE finding that the search failing cannot undo.
+            # Only the repository-wide half went unanswered. Discarding a proven
+            # finding because a later step failed is the mirror image of
+            # reporting an unproven clean.
+            paths = []
+            search_incomplete = f"repository search failed: {exc}"
 
         truncated = False
         for path in paths:
@@ -401,14 +431,37 @@ def find_orphaned_literals(
                 # the literal's value wherever an escape is involved.
                 if lit in string_literals(path.read_text(encoding="utf-8")):
                     survivors.append(path)
-            except (OSError, UnicodeDecodeError):
+            except (OSError, UnicodeDecodeError) as exc:
+                # THE THIRD WAY THE SEARCH COMES BACK PARTIAL, and the one an
+                # earlier pass missed while claiming the set was closed. `git
+                # grep` positively identified this file as containing the core;
+                # the read could not confirm whether the literal is really
+                # there. That question is unanswered in exactly the sense the
+                # two causes above are -- and falling through to `_done` here
+                # reported the literal as examined-CLEAN on evidence never
+                # gathered, which is the failure this tool exists to name in
+                # other people's code. Reachable without an exotic encoding:
+                # `--untracked` means git grep can list a path that a
+                # concurrent editor or build step removes before the read.
+                search_incomplete = search_incomplete or (
+                    f"could not read a candidate sibling: {exc}"
+                )
                 continue
 
+        if truncated:
+            # Same disposition as a failed grep: it is the other way the search
+            # can come back partial, and it used to report its survivors with
+            # no hint that more files went unexamined.
+            search_incomplete = search_incomplete or "survivor scan truncated by budget"
+
         if survivors:
-            findings.append({"literal": lit, "survivors": survivors})
+            finding = {"literal": lit, "survivors": survivors}
+            if search_incomplete:
+                finding["search_incomplete"] = search_incomplete
+            findings.append(finding)
             _done(lit)
-        elif truncated:
-            _skip(lit, "survivor scan truncated by budget")
+        elif search_incomplete:
+            _skip(lit, search_incomplete)
         else:
             _done(lit)
 
@@ -793,6 +846,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--budget", type=float, default=SCAN_BUDGET_SECONDS,
                         help=f"seconds per file (default {SCAN_BUDGET_SECONDS})")
     args = parser.parse_args(argv)
+    # Both bounds are validated HERE, at parse time, because both are used as
+    # slice indices or deadline arithmetic downstream where a negative value
+    # does not fail -- it quietly inverts the meaning. `--max-literals -1`
+    # checked EVERY literal except the last and then reported that last one as
+    # "over the -1-literal cap": the cap stopped bounding the work while the
+    # output still claimed a cap had been applied. A budget <= 0 makes the
+    # deadline already past, so every file reports as truncated.
+    if args.max_literals < 1:
+        parser.error("--max-literals must be at least 1")
+    if args.budget <= 0:
+        parser.error("--budget must be greater than 0")
 
     try:
         cwd = _git(["rev-parse", "--show-toplevel"], ".").strip()
@@ -852,6 +916,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n{new_path}")
             print(f"  changed {f['literal'].strip()[:70]!r}")
             print(f"  same text still in: {', '.join(survivors[:5])}")
+            if f.get("search_incomplete"):
+                # A finding from a partial search is still a finding, but the
+                # ABSENCE of further survivors was never established -- say so
+                # rather than let the reader infer a complete answer.
+                # ASCII only: this was the sole non-ASCII `print` in the
+                # file, and under a non-UTF-8 PYTHONIOENCODING it raised
+                # BETWEEN the finding and its caveat -- killing the remaining
+                # files and the summary line, so a partial run printed as a
+                # complete one. On the code path added to stop exactly that.
+                print(f"  (search incomplete: {f['search_incomplete']} -- "
+                      f"there may be more)")
         for f in find_unrevisited_uses(old_src, new_src):
             findings += 1
             print(f"\n{new_path}")

@@ -701,10 +701,18 @@ class TestGitFailureIsNotACleanResult:
 
         assert m._git_optional(["show", "HEAD:nope.py"], str(repo)) is None
 
-    def test_a_bad_base_ref_exits_non_zero(self, repo, capsys):
-        """It used to print "no modified Python files" and exit 0."""
+    def test_a_bad_base_ref_exits_non_zero(self, repo, capsys, monkeypatch):
+        """It used to print "no modified Python files" and exit 0.
+
+        The chdir is load-bearing, not tidiness: `main()` resolves the
+        repository with `rev-parse --show-toplevel` against the PROCESS cwd, so
+        without it this ran against the real repository under test. `rc != 0`
+        was then also satisfiable by `rev-parse` failing for an unrelated
+        reason, which is not the path this test is named for.
+        """
         import class_scope_scan as m
 
+        monkeypatch.chdir(repo)
         rc = m.main(["--base", "no-such-ref-at-all"])
         assert rc != 0, "an unreadable base ref reported success"
         assert "no modified Python files" not in capsys.readouterr().out
@@ -866,4 +874,344 @@ class TestEveryLiteralReachesExactlyOneVerdict:
         )
         assert any("truncated" in s["reason"] for s in skipped), (
             f"the per-file truncation was not recorded: {skipped}"
+        )
+
+
+class TestPartialSearchStillReportsWhatIsProven:
+    """An incomplete search must not discard evidence it already has.
+
+    Two exits can leave the question half-answered: `git grep` failing, and the
+    per-candidate deadline expiring. They are the SAME shape and must be
+    dispositioned the same way -- report every survivor already PROVEN, and
+    disclose that the rest of the search did not happen. Discarding a proven
+    finding because a later step failed is the mirror image of reporting an
+    unproven clean, which is the defect this whole scanner exists to name.
+    """
+
+    @staticmethod
+    def _two_copies(repo):
+        """One literal twice in one file; the edit updates only one copy.
+
+        The surviving copy is established from `new_counts` alone -- no search
+        is involved -- so it stays a definite finding however the search ends.
+        """
+        old = ('a = "the very same long message here"\n'
+               'b = "the very same long message here"\n')
+        new = ('a = "a totally different long message"\n'
+               'b = "the very same long message here"\n')
+        return old, new, _write(repo, "m.py", new)
+
+    def test_grep_failure_keeps_the_proven_same_file_survivor(self, repo, monkeypatch):
+        import class_scope_scan as m
+
+        old, new, edited = self._two_copies(repo)
+
+        def boom(*_a, **_k):
+            raise m.GrepUnavailable("git grep exited 128")
+
+        monkeypatch.setattr(m, "_grep_candidates", boom)
+        found = m.find_orphaned_literals(edited, old, new, repo)
+        assert found, "a proven same-file survivor was discarded by a failed search"
+        assert edited in found[0]["survivors"]
+        assert "search failed" in found[0]["search_incomplete"], (
+            "the finding must disclose that the repository-wide half never ran"
+        )
+
+    def test_grep_failure_with_nothing_proven_is_still_a_skip(self, repo, monkeypatch):
+        """The positive control: no survivor + no search really is unknown.
+
+        Without this, a fix that reported EVERYTHING on a failed grep would
+        pass the test above while destroying the guarantee it protects.
+        """
+        import class_scope_scan as m
+
+        old = 'a = "the very same long message here"\n'
+        new = 'a = "a totally different long message"\n'
+        edited = _write(repo, "m.py", new)
+
+        def boom(*_a, **_k):
+            raise m.GrepUnavailable("git grep exited 128")
+
+        monkeypatch.setattr(m, "_grep_candidates", boom)
+        skipped: list[dict] = []
+        found = m.find_orphaned_literals(edited, old, new, repo, skipped=skipped)
+        assert found == [], "reported a finding it had no evidence for"
+        assert skipped and "could not search" in skipped[0]["reason"]
+
+    def test_budget_truncation_also_discloses_the_partial_search(self, repo, monkeypatch):
+        """The sibling exit. It reported survivors with no hint of truncation."""
+        import class_scope_scan as m
+
+        old, new, edited = self._two_copies(repo)
+        monkeypatch.setattr(m, "_grep_candidates",
+                            lambda *a, **k: [repo / "other.py"])
+        _write(repo, "other.py", 'z = "the very same long message here"\n')
+        # Generous while the literal is selected, exhausted once the per-path
+        # loop starts consuming results. A blanket -1 starves the OUTER
+        # per-literal check instead and nothing reaches the survivor logic.
+        calls = {"n": 0}
+
+        def fake_remaining(_deadline):
+            calls["n"] += 1
+            # Call 1 is the OUTER per-literal budget check and must pass, or
+            # nothing reaches the survivor logic at all. Call 2 is the first
+            # per-path check, which is the one that must find the budget spent.
+            return 10.0 if calls["n"] <= 1 else 0.0
+
+        monkeypatch.setattr(m, "_remaining", fake_remaining)
+        found = m.find_orphaned_literals(edited, old, new, repo)
+        assert found, "the proven same-file survivor was dropped on truncation"
+        assert "truncated" in found[0]["search_incomplete"], (
+            "a truncated search reported its survivors as if the list were complete"
+        )
+
+
+class TestNumericBoundsAreValidated:
+    """Both operator-supplied numbers, not just the one a reviewer named.
+
+    `limit` is used as `prose[:limit]` / `prose[limit:]`. At -1 the scan checks
+    EVERY literal except the last and then reports that last one as "over the
+    -1-literal cap": the cap has stopped bounding anything while the output
+    still claims one was applied. `--budget <= 0` puts the deadline in the past.
+    """
+
+    @pytest.mark.parametrize(
+        "argv",
+        [["--max-literals", "0"], ["--max-literals", "-1"],
+         ["--budget", "0"], ["--budget", "-5"]],
+    )
+    def test_out_of_range_is_refused(self, argv, repo, monkeypatch):
+        import class_scope_scan as m
+
+        monkeypatch.chdir(repo)
+        with pytest.raises(SystemExit) as exc:
+            m.main(argv)
+        assert exc.value.code != 0
+
+    def test_valid_bounds_are_still_accepted(self, repo, monkeypatch, capsys):
+        """Positive control: the guard must not refuse legitimate values.
+
+        Needs a real commit -- the bare fixture has no HEAD, and `main` then
+        exits 2 for an entirely different reason, which would let a
+        refuse-everything guard pass this test.
+        """
+        import subprocess
+
+        import class_scope_scan as m
+
+        _write(repo, "seed.py", 'X = "a removed sentence with words here"\n')
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+             "commit", "-qm", "seed"], cwd=repo, check=True,
+        )
+        # DIRTY THE TREE. With the working tree equal to HEAD the changed-file
+        # set is empty and `main` returns 0 from an early exit without scanning
+        # anything -- so the bounds were parsed and never used, and a guard
+        # that refused everything AFTER the git calls would pass this too.
+        _write(repo, "seed.py", "X = 1\n")
+        monkeypatch.chdir(repo)
+        assert m.main(["--max-literals", "1", "--budget", "0.5"]) == 0
+        out = capsys.readouterr().out
+        assert "no modified Python files" not in out, (
+            "the scan body was never reached, so this proves nothing about the bounds"
+        )
+        assert "scanned" in out
+
+
+class TestAnUnreadableCandidateIsNeverClean:
+    """The THIRD way the search comes back partial.
+
+    `git grep` positively identifies a file as containing the core, and the
+    read then fails. The question about that candidate is unanswered in exactly
+    the sense a failed grep or an expired deadline leaves it unanswered — but
+    this arm used to `continue` and fall through to the examined-clean verdict,
+    so the tool reported a confident clean on evidence it never gathered. That
+    is the failure it exists to name in other people's code.
+
+    Reachable without an exotic encoding: `--untracked` is passed to git grep,
+    so a path it lists can be removed by a concurrent editor or build step
+    before the read, raising FileNotFoundError on the same line.
+    """
+
+    def test_an_undecodable_sibling_is_not_reported_clean(self, repo):
+        import class_scope_scan as m
+
+        shared = "a shared sentence of prose here"
+        old = f'A = "{shared}"\n'
+        new = "A = 1\n"
+        edited = _write(repo, "a.py", new)
+        # A real file git grep WILL match, that read() cannot decode as UTF-8.
+        (repo / "b.py").write_bytes(f'B = "{shared}"\n'.encode("latin-1")
+                                    + b'\n# caf\xe9\n')
+
+        skipped: list[dict] = []
+        examined: list[str] = []
+        findings = m.find_orphaned_literals(
+            edited, old, new, repo, skipped=skipped, examined=examined,
+        )
+        assert shared not in examined, (
+            "a literal whose only candidate could not be read was reported as "
+            "examined-clean — a confident answer to a question never asked"
+        )
+        assert findings or skipped, "the literal reached no verdict at all"
+        if skipped:
+            assert "could not read" in skipped[0]["reason"]
+
+    def test_a_readable_sibling_is_still_reported_normally(self, repo):
+        """Positive control: the new arm must not make every scan 'incomplete'."""
+        import class_scope_scan as m
+
+        shared = "a shared sentence of prose here"
+        old = f'A = "{shared}"\n'
+        new = "A = 1\n"
+        edited = _write(repo, "a.py", new)
+        _write(repo, "b.py", f'B = "{shared}"\n')
+
+        skipped: list[dict] = []
+        findings = m.find_orphaned_literals(edited, old, new, repo, skipped=skipped)
+        assert findings, "an ordinary survivor stopped being found"
+        assert "search_incomplete" not in findings[0], (
+            "a complete search was labelled incomplete"
+        )
+        assert skipped == []
+
+
+class TestTheOperatorSeesTheCaveat:
+    """`search_incomplete` is only worth adding if it reaches a human.
+
+    The library tests assert the dict key; deleting the entire block that
+    PRINTS it left the suite green, so the finding still rendered as
+    'same text still in: …' with no hint that the repository-wide half of the
+    search never ran — the exact reading error the key exists to prevent.
+    """
+
+    def test_the_incomplete_search_caveat_is_printed(self, repo, monkeypatch, capsys):
+        import subprocess
+
+        import class_scope_scan as m
+
+        two = ('a = "the very same long message here"\n'
+               'b = "the very same long message here"\n')
+        _write(repo, "m.py", two)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+             "commit", "-qm", "seed"], cwd=repo, check=True,
+        )
+        _write(repo, "m.py",
+               'a = "a totally different long message"\n'
+               'b = "the very same long message here"\n')
+
+        def boom(*_a, **_k):
+            raise m.GrepUnavailable("git grep exited 128")
+
+        monkeypatch.setattr(m, "_grep_candidates", boom)
+        monkeypatch.chdir(repo)
+        m.main([])
+        out = capsys.readouterr().out
+        assert "same text still in" in out, "the finding itself vanished"
+        assert "search incomplete" in out, (
+            "the finding printed as if the search had completed"
+        )
+
+    def test_a_complete_search_prints_no_caveat(self, repo, monkeypatch, capsys):
+        """Positive control: the caveat must not appear on every finding."""
+        import subprocess
+
+        import class_scope_scan as m
+
+        two = ('a = "the very same long message here"\n'
+               'b = "the very same long message here"\n')
+        _write(repo, "m.py", two)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+             "commit", "-qm", "seed"], cwd=repo, check=True,
+        )
+        _write(repo, "m.py",
+               'a = "a totally different long message"\n'
+               'b = "the very same long message here"\n')
+        monkeypatch.chdir(repo)
+        m.main([])
+        out = capsys.readouterr().out
+        assert "same text still in" in out
+        assert "search incomplete" not in out
+
+
+class TestLibraryEntryPointValidatesItsBounds:
+    """`main` validates at parse time; the exported function is called directly."""
+
+    def test_a_negative_cap_raises(self, repo):
+        import class_scope_scan as m
+
+        edited = _write(repo, "a.py", "A = 1\n")
+        with pytest.raises(ValueError, match="must be >= 1 or None"):
+            m.find_orphaned_literals(
+                edited, 'A = "some removed prose here"\n', "A = 1\n", repo,
+                max_literals=-1,
+            )
+
+    def test_none_and_positive_are_accepted(self, repo):
+        """Positive control against a guard that refuses everything."""
+        import class_scope_scan as m
+
+        edited = _write(repo, "a.py", "A = 1\n")
+        for cap in (None, 1, 50):
+            m.find_orphaned_literals(
+                edited, 'A = "some removed prose here"\n', "A = 1\n", repo,
+                max_literals=cap,
+            )
+
+
+class TestOutputIsASCIIOnly:
+    """No `print` in this tool may carry a non-ASCII character.
+
+    Not style. This is a CLI whose stdout encoding is the environment's: under
+    a non-UTF-8 `PYTHONIOENCODING` a non-ASCII `print` raises
+    UnicodeEncodeError mid-run. When that happened it landed BETWEEN a finding
+    and its caveat, killing every remaining file and the summary line — so a
+    partial run printed as a complete one, which is the single thing this tool
+    exists to prevent.
+
+    Asserted as a CLASS over the whole file rather than as a case for the one
+    character that did it, because the next one will be somewhere else and a
+    case test would not see it. Also cheap and deterministic, where reproducing
+    the real trigger needs a subprocess with a doctored environment.
+    """
+
+    def test_no_print_statement_contains_non_ascii(self):
+        import ast
+        import pathlib
+
+        src = pathlib.Path(__file__).resolve()
+        scan = None
+        for parent in src.parents:
+            cand = parent / "scripts" / "class_scope_scan.py"
+            if cand.exists():
+                scan = cand
+                break
+        assert scan is not None, "could not locate the scanner source"
+
+        text = scan.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        offenders = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "print"):
+                continue
+            segment = ast.get_source_segment(text, node) or ""
+            bad = {c for c in segment if ord(c) > 127}
+            # Also check what the string literals EVALUATE to: a `\u2014`
+            # escape is pure ASCII in the source and still emits a non-ASCII
+            # character at runtime, which is what actually raises.
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    bad |= {c for c in sub.value if ord(c) > 127}
+            if bad:
+                offenders.append((node.lineno, "".join(sorted(bad))))
+        assert not offenders, (
+            "non-ASCII in a print() — this raises under a non-UTF-8 "
+            f"PYTHONIOENCODING and aborts the run mid-output: {offenders}"
         )
