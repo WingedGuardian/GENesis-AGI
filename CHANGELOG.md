@@ -100,6 +100,37 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   security gate, and exit codes are asserted unchanged in both directions —
   including with the helper made deliberately unreachable.
 
+- **A test no longer reads the wall clock once at import and races the suite.**
+  `test_surplus_liveness.py` captured `datetime.now(UTC)` at module import and
+  seeded a heartbeat 30 minutes ahead of it; production ages that seed against
+  the *live* clock with a 5-minute future-skew tolerance, so the assertion only
+  held while under 25 minutes had elapsed since import — the whole suite's
+  runtime, not the test's. Past that edge it failed, and a re-run went green,
+  so it read as a flake; a 31-run survey put it at roughly 3% of runs. The seed
+  is now computed when the helper is called, shrinking the margin from the
+  suite's runtime to one test's. Measured on both sides of the boundary against
+  real production code: the case passes with 16 minutes of simulated elapsed
+  time and fails at 26.
+- **New `frozen-clock-check` CI guard for the whole class.** This was the third
+  recurrence; the two earlier sweeps each enumerated absolute date *literals* and
+  declared the class closed, so a clock frozen at import walked through both.
+  `scripts/check_frozen_clock.py` keys on *when the clock is read* rather than
+  how a date is spelled, and fails in seconds as its own job instead of surfacing
+  deep inside the suite. It flags wall-clock calls evaluated in a module body,
+  class body, default argument, decorator argument, or any fixture whose scope is
+  broader than `function` — including inside module-level `if`/`try`/`with`/`for`/
+  `while` bodies, comprehensions, and a generator expression's leftmost iterable,
+  which is evaluated at creation. It ignores the call-time forms that are the fix:
+  function and lambda bodies, the defaults and decorators of a `def` nested in one,
+  a generator expression's element, `skipif`/`xfail` conditions (import-time by
+  contract), and `if __name__ == "__main__":` blocks. Escape hatch
+  `# frozen-clock-ok: <why, with the measured margin>` on the flagged statement or
+  the comment block above it; the reason must state a magnitude, and a span needs
+  as many waivers as it has flagged calls, so one waiver cannot cover two sites. This closes the
+  mechanically-decidable sub-shape only — an absolute date literal is a bomb only
+  relative to a production threshold, which is not statically decidable, and no
+  claim is made that the literal population is clean.
+
 - **SSH slot cap no longer collapses below the running session count.** The
   interactive-slot launcher (`scripts/cc-slot.sh`) sized its cap from
   *instantaneous free RAM* (`(MemAvailable − reserve) / per_session`), so each
