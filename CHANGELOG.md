@@ -78,6 +78,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A test no longer reads the wall clock once at import and races the suite.**
+  `test_surplus_liveness.py` captured `datetime.now(UTC)` at module import and
+  seeded a heartbeat 30 minutes ahead of it; production ages that seed against
+  the *live* clock with a 5-minute future-skew tolerance, so the assertion only
+  held while under 25 minutes had elapsed since import — the whole suite's
+  runtime, not the test's. Past that edge it failed, and a re-run went green,
+  so it read as a flake; a 31-run survey put it at roughly 3% of runs. The seed
+  is now computed when the helper is called, shrinking the margin from the
+  suite's runtime to one test's. Measured on both sides of the boundary against
+  real production code: the case passes with 16 minutes of simulated elapsed
+  time and fails at 26.
 - **SSH slot cap no longer collapses below the running session count.** The
   interactive-slot launcher (`scripts/cc-slot.sh`) sized its cap from
   *instantaneous free RAM* (`(MemAvailable − reserve) / per_session`), so each
