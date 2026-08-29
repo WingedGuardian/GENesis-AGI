@@ -208,13 +208,18 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
 - **A RED that comes back GREEN is TWO hypotheses, not one.** Either the test is
   vacuous, or the MUTATION silently failed to apply — and the second is common,
   because the auto-formatter reflows lines and a `str.replace()` anchor written
-  from memory then matches nothing. So: `assert mutated != original` after every
-  injection, and syntax-check it with the MUTATED FILE'S OWN parser before
-  writing — `ast.parse()` for Python, `bash -n` for shell, the equivalent for
-  anything else (an invalid mutation breaks collection, and that failure reads
-  as a successful RED; conversely, running Python's parser over a shell hook
-  rejects a valid mutation and hides a real survivor). Restore from a file
-  copy taken beforehand, never `git checkout` — the work is uncommitted.
+  from memory then matches nothing. The PRINCIPLE, which is what to remember:
+  **every injection must prove it applied, by its own postcondition, before any
+  result is read as RED.** Two corollaries follow, and both have bitten:
+  prove it against the value THAT injection was handed, never against the
+  pristine original — with two or more edits, the first edit keeps a whole-file
+  `mutated != original` true while a later one silently misses its anchor, so
+  the partial mutation reads as complete (assert the anchor matched the expected
+  number of times); and prove it with the mutated file's OWN parser —
+  `ast.parse` for Python, `bash -n` for shell — since an invalid mutation breaks
+  collection and reads as a successful RED, while the wrong language's parser
+  rejects a valid mutation and hides a real survivor. Restore from a file copy
+  taken beforehand, never `git checkout` — the work is uncommitted.
 - **Vacuous-test shapes to check for by name.** A test is vacuous when: its
   assertion is ALSO true on the success path (`assert x.blocked is False` where
   a successful call also returns False — assert the fact that DISTINGUISHES
