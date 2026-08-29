@@ -429,7 +429,15 @@ When a user shares a file path or URL in conversation:
 - **Read before writing.** Never modify code you haven't fully read.
   Don't assume what a function does based on its name.
 - **Self-correction loop**: persist lessons as concrete rules that PREVENT
-  mistakes, not just document them.
+  mistakes, not just document them. A rule that only names the error is not
+  preventive — state the CORRECT action, or it will be re-read while the same
+  mistake repeats.
+- **Tool-call parameters** are `<parameter name="X">…</parameter>`, never a bare
+  `<X>…</X>` — a bare tag has no valid closing tag, so the value runs to the end
+  of the call and every later parameter is reported *missing*. Repeated IDENTICAL
+  validation errors mean the CALL is malformed, not the tool: change the
+  STRUCTURE, not the parameter text. Read the echoed `input_value` before
+  blaming any tool, and never file a bug report from a payload you have not read.
 - **NEVER hide broken things — FIX THEM.** Fix the root cause, not the
   symptom. This is a thinking rule, not just a code rule.
 - **Bugs you see get fixed or tracked — never ignored.** Fix now by default; a
