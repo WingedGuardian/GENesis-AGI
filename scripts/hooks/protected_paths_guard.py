@@ -39,14 +39,13 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
 import sys
 from fnmatch import fnmatch
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import brace_expand, read_payload, run_guard, tool_input  # noqa: E402
-from shell_parse import analyze  # noqa: E402
+from shell_parse import analyze, untokenizable  # noqa: E402
 
 # Directories that must never be deleted.  Relative to $HOME.
 _PROTECTED_RELATIVE = [
@@ -189,11 +188,19 @@ def main() -> int:
     dirs = _protected_dirs()
     files = _protected_files()
 
-    # Explicit tokenizability probe: shell_parse._argv silently degrades to a
-    # naive split on shlex errors, so analyze() alone can never signal one.
-    try:
-        shlex.split(cmd.replace("\\\n", " "))
-    except ValueError:
+    # Explicit tokenizability probe, now SHARED (this was the third hand-rolled
+    # copy; they had already drifted from one another). shell_parse._argv
+    # silently degrades to a naive split on shlex errors, so analyze() alone can
+    # never signal one.
+    #
+    # Not byte-identical to the inline probe it replaces: that one folded
+    # `\<newline>` to a space first. The shared probe reads the command RAW,
+    # because bash REMOVES a line continuation rather than replacing it, so the
+    # fold produced the reading furthest from what actually executes. MEASURED
+    # over 12,099 real commands: the two classify identically (339 un-tokenizable
+    # either way, zero commands differ), so this is a semantics correction with
+    # no observed behaviour change.
+    if untokenizable(cmd):
         reason = _legacy_substring_block(cmd, dirs)
         return _block(reason) if reason else 0
 

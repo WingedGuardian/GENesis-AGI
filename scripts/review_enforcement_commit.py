@@ -23,7 +23,7 @@ from pathlib import Path
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks"))
-from hook_input import field, read_payload  # noqa: E402
+from hook_input import field, read_payload, run_guard  # noqa: E402
 from shell_parse import (  # noqa: E402
     analyze,
     commit_skips_hooks,
@@ -1058,4 +1058,11 @@ def _deny(message: str) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Fail CLOSED on an unexpected crash. CC's PreToolUse contract is "exit 2 =
+    # block; ANY other code = non-blocking error -> the tool RUNS", so a bare
+    # main() let every uncaught exception in this gate (Rule 0, the branch/review
+    # rules, git_root_for, ...) exit 1 = a silent FAIL-OPEN on a commit.
+    # run_guard converts that to exit 2 and logs loudly; SystemExit (every
+    # deliberate _deny/allow path here) propagates untouched, so allow and block
+    # decisions are unchanged. Mirrors git_push_guard.py's wiring.
+    run_guard(main, "review_enforcement_commit")
