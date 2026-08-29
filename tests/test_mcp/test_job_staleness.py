@@ -25,6 +25,8 @@ _OK_RECENT = "2026-06-25T00:00:00+00:00"  # 3.0 days before _RUN   → below thr
 _OK_HEALTHY = _RUN                          # 0.0 days               → healthy
 # A recent last_run (well within the never-succeeded alarm's 35d recency window),
 # computed once at import — always inside the window, so no wall-clock flakiness.
+# frozen-clock-ok: ~35-day margin — seeded 1h back, must stay INSIDE the 35-day
+# never-succeeded recency window (`recent_since` in the health-alerts impl).
 _RECENT = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 

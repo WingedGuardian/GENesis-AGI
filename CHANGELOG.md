@@ -78,6 +78,31 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A test no longer reads the wall clock once at import and races the suite.**
+  `test_surplus_liveness.py` captured `datetime.now(UTC)` at module import and
+  seeded a heartbeat 30 minutes ahead of it; production ages that seed against
+  the *live* clock with a 5-minute future-skew tolerance, so the assertion only
+  held while under 25 minutes had elapsed since import — the whole suite's
+  runtime, not the test's. Measured on both sides of that boundary: the test
+  passed 16m02s into a run and failed at 27m12s, roughly 3% of runs. The seed is
+  now computed when the helper is called, shrinking the margin from the suite's
+  runtime to one test's. (An earlier draft of this entry claimed the old test
+  silently stopped exercising the branch it names; that is not what happens and
+  the claim is withdrawn — past the edge it fails loudly, because the
+  past-pulse path cannot satisfy the assertion either way.)
+- **New `frozen-clock-check` CI guard for the whole class.** This was the third
+  recurrence; the two earlier sweeps each enumerated absolute date *literals* and
+  declared the class closed, so a clock frozen at import walked through both.
+  `scripts/check_frozen_clock.py` keys on *when the clock is read* rather than
+  how a date is spelled, and fails in seconds as its own job instead of surfacing
+  deep inside the suite. It flags wall-clock calls evaluated in a module body,
+  class body, default argument, decorator argument, or a
+  session/module/package-scoped fixture, and ignores the call-time forms that are
+  the fix. Escape hatch `# frozen-clock-ok: <why, with the measured margin>` on
+  the line or the comment block above it; a reason is required. This closes the
+  mechanically-decidable sub-shape only — an absolute date literal is a bomb only
+  relative to a production threshold, which is not statically decidable, and no
+  claim is made that the literal population is clean.
 - **SSH slot cap no longer collapses below the running session count.** The
   interactive-slot launcher (`scripts/cc-slot.sh`) sized its cap from
   *instantaneous free RAM* (`(MemAvailable − reserve) / per_session`), so each
