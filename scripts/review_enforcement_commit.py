@@ -652,10 +652,11 @@ def main() -> None:
     if not any(git_subcommand(s.argv) == "commit" for s in segs):
         # ── Blind-spot net: unverifiable → ASK the human ────────────────────
         # "No commit segment" is a trustworthy verdict only when the command was
-        # PARSEABLE. analyze() mis-parses an ANSI-C `$'…\'…'` command and DROPS
-        # the real commit segment, so this very early-out is what lets a
-        # commit-to-main / --no-verify / unreviewed commit sail through (a live,
-        # reproduced bypass). When the word "commit" appears (guaranteed past the
+        # PARSEABLE. The parser can mis-segment a command and DROP the real
+        # commit segment, so this very early-out is what lets a commit-to-main
+        # / --no-verify / unreviewed commit through. Reproduced against a
+        # shimmed binary, so the proof was execution rather than a parse
+        # reading. When the word "commit" appears (guaranteed past the
         # _COMMIT_PATTERN early-out above) but the command is un-parseable, the
         # empty parse is not evidence of absence.
         #
@@ -754,8 +755,34 @@ def main() -> None:
             marker_content_current,
             reset_review_round,
         )
-    except ImportError:
-        # If review_state.py is missing, fail open — don't block
+    except Exception:  # noqa: BLE001 — ANY load failure, not just absence.
+        # If review_state cannot be loaded, fail open — don't block.
+        #
+        # WIDENED from `except ImportError` deliberately, and the wrapper below is
+        # exactly why. A SyntaxError (or any top-level runtime error) in
+        # review_state is NOT an ImportError, so it used to escape this handler
+        # and exit 1 — non-blocking, so the commit proceeded. Now that main() runs
+        # under run_guard, that same escape converts to a hard BLOCK instead, and
+        # MEASURED it blocks EVERY commit on the box: the trailing
+        # `# review-override` cannot rescue it either, because the override is
+        # parsed after this import. That includes the commit that would repair
+        # review_state, so the gate would wall off its own fix.
+        #
+        # The sibling (scripts/hooks/git_push_guard.py, the ESCALATION_ROUND_CAP
+        # import) widened the same handler for the same reason, but its degrade
+        # is NOT the same and the difference matters: it falls back to a default
+        # constant and keeps every gate armed, whereas this one abandons the
+        # whole gate — the direct-to-main rule, the review-marker requirement and
+        # the round rules all stop applying. That is a big loss, chosen over a
+        # bigger one, and it is the pre-existing behaviour for the absent case
+        # rather than something new. (The narrower handler was not "no guard": it
+        # caught absence and missed everything else.)
+        print(
+            "WARNING (review_enforcement_commit): review_state failed to load — "
+            "the review gate is DISABLED for this commit (fail-open). Fix "
+            "scripts/review_state.py; commits are unguarded until you do.",
+            file=sys.stderr,
+        )
         sys.exit(0)
 
     # Rule 1: Block commits on main. Fail closed when the cwd is ambiguous — we

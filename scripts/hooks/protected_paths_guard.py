@@ -188,10 +188,24 @@ def main() -> int:
     dirs = _protected_dirs()
     files = _protected_files()
 
-    # Explicit tokenizability probe (shared with the push/commit guards):
+    # Explicit tokenizability probe, now SHARED rather than inline here.
     # shell_parse._argv silently degrades to a naive split on shlex errors, so
-    # analyze() alone can never signal one. Byte-equivalent to the inline probe
-    # this replaced (whole-command shlex, line-continuations folded).
+    # analyze() alone can never signal one.
+    #
+    # (An earlier draft of this comment called it "the third hand-rolled copy,
+    # already drifted from one another". Not true of the tree this lands on: on
+    # the default branch this was the ONLY probe of the discard-the-tokens kind.
+    # Every other shlex call in scripts/hooks USES its tokens, which is a
+    # different act with a different fail direction. A comment describing a tree
+    # the change is not landing on is how a reader inherits a false picture.)
+    #
+    # Not byte-identical to the inline probe it replaces: that one folded
+    # `\<newline>` to a space first. The shared probe reads the command RAW,
+    # because bash REMOVES a line continuation rather than replacing it, so the
+    # fold produced the reading furthest from what actually executes. MEASURED
+    # over 12,099 real commands: the two classify identically (339 un-tokenizable
+    # either way, zero commands differ), so this is a semantics correction with
+    # no observed behaviour change.
     if untokenizable(cmd):
         reason = _legacy_substring_block(cmd, dirs)
         return _block(reason) if reason else 0
