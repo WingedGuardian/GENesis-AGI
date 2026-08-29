@@ -100,6 +100,126 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   security gate, and exit codes are asserted unchanged in both directions —
   including with the helper made deliberately unreachable.
 
+- **The ego's self-model stopped presenting stale, thin and arbitrarily-ranked
+  rows as present-tense capability.** `capability_map` feeds three ego-prompt
+  sections and the capability-improvement scanner. Measurements below come from
+  two live installs, distinguished as **A** (627 rows) and **B** (2102 rows) —
+  they differ because the flag-gated Outcome-Bus feed is on for A only.
+
+  *Thin rows.* Sources 5 and 6 already refused to emit a signal below 3 samples;
+  the journal / proposals / autonomy / procedural sources had no floor. Since
+  `procedural_memory.task_type` is a per-item slug rather than a category, that
+  left the large majority of the map as one-procedure "domains" — 596 of 597 on
+  A, 2066 of 2067 on B. On B they reached the ego: two single-procedure rows sat
+  in the rendered top-15, outranking a domain with n=70. The floor now applies
+  to the COMBINED sample size in `compute_capability_map`, and again on read, so
+  rows written before it existed are not still surfaced.
+
+  *Stale rows.* `updated_at` records when the AGGREGATOR last wrote a row, not
+  the age of its evidence. Only 3 of the 6 sources are time-windowed
+  (ego_proposals / cc_sessions / outcome_events, 30d); intervention_journal,
+  autonomy_state and procedural_memory are not, so domains fed only by those
+  never age — correct for present-tense state such as lifetime counters and
+  currently-stored procedures, and a documented wart for the journal's
+  historical events. The honest uniform reading is "the aggregator stopped
+  vouching for this row N days ago". For windowed-source domains the effect was
+  real and measured **on B**: a 43-day-old `1.0` at #2 in the rendered
+  self-model, and a **93-day-old** `0.0` row at the top of `get_weakest`,
+  steering the improvement scanner at a domain with no qualifying evidence since
+  May. Prompt-facing reads now exclude rows more than 14 days behind the
+  freshest. **On A the window excludes nothing** — maximum observed lag there is
+  6 days.
+
+  *Arbitrary ranking.* Confidence is a ratio, so well-exercised domains pile up
+  at exactly `1.0` — 19 such rows on A, more than filling a 15-row table. With
+  no secondary sort key SQLite returned an arbitrary 15, and an `n=3` row
+  displaced one with `n=3276`. Both bars are powerless here because every tied
+  row clears them; on A the top-15 was byte-identical before and after
+  filtering. The prompt read and `get_weakest` now break ties on
+  `sample_size DESC`, which is what actually changes A's rendered table
+  (`code_index` n=94 and `model_eval` n=44 replace four n=3 rows). Confidence
+  remains the primary key, so a very-high-n domain scoring slightly below `1.0`
+  can still fall outside the top-15; reworking the primary ranking is out of
+  scope here.
+
+  *Anchor safety.* The window anchors on the freshest USABLE row — date-shaped,
+  parseable, not in the future. Anchoring on the freshest row rather than
+  wall-clock means a totally dead refresh job ages the table uniformly and hides
+  **nothing**, instead of blanking the self-model the moment the scheduler
+  breaks. The other direction matters too: `MAX()` is unbounded above, so a
+  single row stamped ahead of real time would otherwise define the window for
+  every other row and hide all of them silently — and self-perpetuatingly, since
+  nothing rewrites a domain that has stopped being emitted. Future rows are
+  therefore EXCLUDED from the anchor rather than the anchor being clamped after
+  the fact: clamping leaves a uniformly-old table entirely outside the window. A
+  partial refresh outage remains uncovered and is tracked separately.
+
+  *Reads split by intent.* `get_all` and `get_by_domain` stay raw accessors;
+  `get_prompt_rows` and `get_weakest` carry the policy, so a future non-prompt
+  consumer cannot inherit ego-prompt filtering by accident. A new `count_all`
+  lets a renderer tell "the map is empty" apart from "every row was filtered" —
+  two states that must not produce the same sentence, since each is a false
+  claim in the other's situation. All three renderers now distinguish them and
+  name the real row count when rows were withheld.
+
+  *Anchor totality.* A `COALESCE` fallback to wall-clock is retained as
+  belt-and-braces. It is not an active guard: the anchor subquery filters on the
+  same predicate as the outer read, so it yields NULL only when no row passes
+  the outer predicate either and the result is empty regardless. It is kept so
+  the two cannot silently diverge later without a fallback already in place.
+
+  Three consequences are deliberate. **(1)** The light-depth "avg confidence"
+  figure moves sharply — `0.06 → 0.94` on A. The old number was not a capability
+  average at all: dominated by hundreds of zero-confidence one-sample rows, it
+  reported roughly "what share of stored procedure slugs carry confidence".
+  That branch renders no table, so it now states both figures as the qualifying
+  subset rather than as whole-map facts — left unqualified it read "31 domains
+  tracked (avg 94%)" over a 627-domain map averaging 6%.
+  **(2)** "N domains tracked" drops for the same reason (`627 → 31` on A,
+  `2102 → 19` on B); the renderers show a top-15/top-12, so those tables stay
+  full. **(3)** The focused-deficiency line reads `get_by_domain` — deliberately
+  unfiltered, since a capability-improvement cycle targets a domain *because* it
+  is weak — and is resolved BEFORE the empty-table check, so it survives even
+  when every row is filtered out. It now also stamps the row's last-vouched
+  date, because an unlabelled unfiltered row is exactly the present-tense claim
+  on old evidence this work removes elsewhere. All three renderers' empty states
+  now say rows were filtered rather than claiming no data exists; the base
+  builder additionally stopped rendering a query failure as an empty map.
+
+  *Withheld rows are named at every depth, and light means light.* The
+  dropped-row report reached the empty and deep exits but not the light one —
+  where it matters most, because that branch renders no table and so leaves the
+  reader nothing else to notice a loss by (the same call is what LOGS, so an
+  operator got no signal either). Separately, the Genesis renderer ACCEPTED a
+  `depth="light"` request and rendered the full fifteen-row table anyway: the
+  caller believed it had asked for the cheap form and was billed for the
+  expensive one. Both now honour it, sharing one sentence rather than two
+  copies — on a branch with no table the sentence is the entire claim, so a
+  figure qualified in one renderer and unqualified in the other is the same
+  "one field, two truth claims" defect from the other side. Neither was
+  reachable through today's focus profiles: of the seven,
+  `capability_performance` is `deep` in three and `skip` in four, and the
+  fallback used for an unknown focus type is `deep` — never `light` anywhere,
+  and the compaction layer only ever upgrades a section's depth. So this is a
+  latent fix, not a live one. What made both survive review is the more useful finding: the
+  render-state matrix built to catch exactly this class enumerated depth
+  *beside* its cross product instead of *inside* it, so all of its cells ran at
+  one depth. Depth is now an axis of the product.
+
+  *A negative window is refused instead of silently disabling de-duplication.*
+  `intervention_journal.aggregate_by_type` rendered a negative day count as the
+  SQLite modifier `'--N days'`, which SQLite rejects, yielding NULL; the
+  comparison against NULL is then NULL rather than false, so the exclusion held
+  for every row and every proposal was counted twice again — from a call that
+  returned a perfectly healthy-looking result. The sibling windowed API already
+  refused this loudly; the two no longer disagree. No shipped caller passes a
+  negative value, so this closes a trap rather than a live bug.
+
+  Nothing is deleted: rows below either bar stay in the table and stop being
+  RENDERED as present-tense capability. They are still read deliberately — by
+  `get_by_domain` for the focused-deficiency line, and by `count_all` to say how
+  many were withheld — and they simply stop being refreshed.
+
 - **A test no longer reads the wall clock once at import and races the suite.**
   `test_surplus_liveness.py` captured `datetime.now(UTC)` at module import and
   seeded a heartbeat 30 minutes ahead of it; production ages that seed against
