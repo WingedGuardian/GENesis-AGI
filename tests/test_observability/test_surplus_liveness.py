@@ -24,7 +24,6 @@ from genesis.db.schema import create_all_tables
 from genesis.observability.snapshots.surplus import surplus_status
 from genesis.runtime._core import GenesisRuntime
 
-NOW = datetime.now(UTC)
 _UNSET = object()
 
 
@@ -49,7 +48,10 @@ def _install_runtime(
 ):
     """Inject a stub runtime whose in-memory _job_health holds the surplus pulse.
 
-    pulse_min_ago: seed last_success that many minutes before NOW.
+    pulse_min_ago: seed last_success that many minutes before the CALL-TIME clock
+        (negative seeds the future). Read `now` HERE, never at import: production
+        ages this seed against the live clock, so a module-level capture makes the
+        margin the whole suite's runtime instead of this one test's.
     pulse_raw: seed a literal last_success value (e.g. a garbage string).
     neither set: no surplus_dispatch entry at all (never pulsed).
     """
@@ -60,7 +62,7 @@ def _install_runtime(
     if pulse_raw is not _UNSET:
         entry = {"surplus_dispatch": {"last_success": pulse_raw}}
     elif pulse_min_ago is not _UNSET:
-        ts = (NOW - timedelta(minutes=pulse_min_ago)).isoformat()
+        ts = (datetime.now(UTC) - timedelta(minutes=pulse_min_ago)).isoformat()
         entry = {"surplus_dispatch": {"last_success": ts}}
     GenesisRuntime._instance = SimpleNamespace(
         is_bootstrapped=bootstrapped,

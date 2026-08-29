@@ -340,6 +340,24 @@ jobs:
       - name: External-I/O egress guard
         run: python scripts/check_external_io.py
 
+  frozen-clock-check:
+    # A test that captures a wall clock at IMPORT time gives the whole suite's
+    # runtime to burn its safety margin, then fails on slow runners as an
+    # unreproducible "flake". Measured instance: a 25-minute margin that passed
+    # at 16m into a run and failed at 27m (~3% of runs). Runs as its own fast
+    # job so the finding reads as a lint error in seconds rather than surfacing
+    # 16 minutes into the suite. Escape hatch is
+    # '# frozen-clock-ok: <why, with the measured margin>'.
+    # See scripts/check_frozen_clock.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Frozen-clock guard
+        run: python scripts/check_frozen_clock.py
+
   subsystem-map-check:
     # Judgment-layer map guard: docs/architecture/CURRENT.md must claim every
     # top-level src/genesis module (an unmapped or vanished module = the map

@@ -103,8 +103,70 @@ def _reap_stale_pytest_basetemps(pytest_base: str) -> None:
             pass
 
 
+def _is_introspection_only(config) -> bool:
+    """Modes that print and exit without running tests (--help/--fixtures/--markers).
+
+    Kept as a predicate rather than inlined so the exemption set is one
+    reviewable list; see the caller for why these must not be blocked.
+
+    ``version`` is deliberately NOT in that list, which is not obvious. MEASURED
+    across two pytest versions, because the project pins only ``pytest>=8.0`` and
+    the behaviour differs between them:
+
+    * ``--version`` — ``Config.main()`` short-circuits it (it matches the literal
+      token at count 1) before the infrastructure starts, so we never run.
+      Same on 9.0.3 and 9.1.1.
+    * ``--version --version`` / ``-VV`` — ``helpconfig.pytest_cmdline_main``
+      returns at ``version > 1``, before ``_do_configure()``. Again never run.
+    * ``-V`` — VERSION-DEPENDENT, and that is the whole reason this note exists.
+      On 9.0.3 neither branch fires (``Config.main`` matches the *string*
+      ``--version``, and ``version == 1`` is not ``> 1``), so it falls through to
+      ``wrap_session`` and runs the WHOLE SUITE. On 9.1.1 pytest answers it early
+      and this hook never loads.
+
+    Removing ``version`` is right under EITHER behaviour: where ``-V`` never
+    reaches us the entry is simply dead, and where it does reach us it is a full
+    unserialized suite that exempting would wave straight past the lock — the
+    opposite of the point. It reads like a harmless entry, which is why the
+    measurement is written down rather than left to the next reader's intuition,
+    and why the test guarding it asserts the safety PROPERTY (``-V`` never runs a
+    session past a held lock) rather than either version's mechanism. An earlier
+    version of that test encoded 9.0.3's behaviour and failed on CI's 9.1.1.
+    """
+    opt = config.option
+    return any(
+        getattr(opt, name, False)
+        for name in ("help", "showfixtures", "show_fixtures_per_test", "markers")
+    )
+
+
 def pytest_configure(config):
+    # ── Box-wide serialization ─────────────────────────────────────────────
+    # Acquire BEFORE anything else, and before the basetemp early-return
+    # below, so every exit path from this function is already governed.
+    #
+    # This is the choke point every run of THIS repo's suite shares, whatever
+    # launched it and from whichever worktree — nothing else sits on the path of
+    # a cron job, a plain SSH shell or a background session. (The gauntlet
+    # scores FOREIGN fixture projects with their own rootdir, so this conftest
+    # never loads for it — it acquires the same lock itself.) Non-blocking and
+    # fail-open by contract, so a fault here can never stop the suite from
+    # running — see genesis.util.pytest_lock.
+    from genesis.util import pytest_lock
     from genesis.util.tmp import big_tmp_dir, should_redirect_pytest_basetemp
+
+    lock = pytest_lock.acquire()
+    config._genesis_pytest_lock = lock
+    if lock.blocked and not _is_introspection_only(config):
+        pytest.exit(lock.message, returncode=pytest_lock.EXIT_LOCK_HELD)
+    elif lock.blocked:
+        # Introspection modes run _do_configure() OUTSIDE wrap_session, so an
+        # Exit raised here escapes as a pluggy traceback (MEASURED: --help and
+        # --markers exit 1 with a traceback; --fixtures discards the status and
+        # exits 0, so a blocked call looks like it SUCCEEDED and listed
+        # nothing). They also collect nothing and run no tests, so there is no
+        # resource to govern — let them through.
+        lock.release()
 
     # Decide FIRST (pure, no I/O) — only touch the filesystem when we actually
     # redirect, so the no-op / CI / explicit-`--basetemp` path never creates
@@ -118,9 +180,9 @@ def pytest_configure(config):
     # Scope the leaf per-process. pytest CLEARS an explicit basetemp at session
     # start and roots tmp_path directly under it (no pytest-of-<user> numbered
     # rotation), so two concurrent runs sharing one path would rmtree each other's
-    # live temp. The CC concurrent-test guard only covers Bash-tool pytest —
-    # autonomy/gauntlet subprocesses bypass it — so the per-pid leaf is what keeps
-    # simultaneous runs isolated.
+    # live temp. The box lock now serializes runs that load this conftest, but a
+    # deliberate override (GENESIS_PYTEST_LOCK=0) or a foreign-rootdir run can
+    # still overlap, so the per-pid leaf remains what keeps their temp isolated.
     pytest_base = os.path.join(big_tmp_dir(), "pytest")
     # Reap dead-PID leaves from prior abnormal exits BEFORE creating ours, so the
     # ~/tmp/pytest dir can't accumulate (the daily hygiene job only prunes direct
@@ -143,6 +205,13 @@ def pytest_unconfigure(config):
     target = getattr(config, "_genesis_basetemp_cleanup", None)
     if target:
         shutil.rmtree(target, ignore_errors=True)
+
+    # Release the box-wide lock LAST, so it spans the whole session including
+    # this cleanup. (flock also drops on process death, so a crash cannot wedge
+    # the box — this is the orderly path, not the only one.)
+    lock = getattr(config, "_genesis_pytest_lock", None)
+    if lock is not None:
+        lock.release()
 
 
 # ── Safety: prevent tests from polluting production circuit breaker state ──
