@@ -822,6 +822,12 @@ class GenesisEgoContextBuilder:
                     f"| {domain} | {conf:.0%} | {icon} | {samples} | {evidence} |"
                 )
 
+            _clause = _cap_render.unusable_note(
+                await _cap_render.safe_count_unusable(self._db)
+            )
+            if _clause:
+                lines.append(f"*{_clause.strip()}*")
+
             lines.append(
                 "\nDeclining domains may need investigation. Improving domains "
                 "indicate effective maintenance patterns.\n"

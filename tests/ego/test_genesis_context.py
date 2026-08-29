@@ -993,6 +993,8 @@ class TestRenderStateMatrix:
       empty     - the map genuinely holds nothing
       filtered  - the map is FULL but every row failed a bar
       corrupt   - the map is full but the rows' timestamps are UNREADABLE
+      mixed     - healthy rows AND unreadable ones together
+      future    - healthy rows AND clock-skewed (future-dated) ones
       rows      - qualifying rows exist
 
     ``corrupt`` is enumerated separately from ``filtered`` because the two are
@@ -1002,7 +1004,7 @@ class TestRenderStateMatrix:
     actually broken.
     """
 
-    STATES = ("error", "empty", "filtered", "corrupt", "rows")
+    STATES = ("error", "empty", "filtered", "corrupt", "mixed", "future", "rows")
 
     @staticmethod
     async def _make_db(state):
@@ -1033,6 +1035,40 @@ class TestRenderStateMatrix:
                     "VALUES (?, ?, 0.9, 25, 'stable', 'e', '2026-13-45')",
                     (f"c{i}", f"corrupt{i}"),
                 )
+        elif state == "mixed":
+            # The COMMONER shape, and the one that stayed silent when the
+            # dropped-row report was wired into the empty branch alone: a
+            # corrupt row sitting next to healthy ones still renders a table,
+            # so nothing forces the reader to notice the row that vanished.
+            for i in range(3):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.8, 25, 'stable', 'e', ?)",
+                    (f"h{i}", f"healthy{i}", now),
+                )
+            await conn.execute(
+                "INSERT INTO capability_map (id, domain, confidence, "
+                "sample_size, trend, evidence_summary, updated_at) "
+                "VALUES ('cx', 'corrupt_one', 0.9, 25, 'stable', 'e', "
+                "'2026-13-45')"
+            )
+        elif state == "future":
+            from datetime import timedelta
+
+            for i in range(3):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.8, 25, 'stable', 'e', ?)",
+                    (f"h{i}", f"healthy{i}", now),
+                )
+            await conn.execute(
+                "INSERT INTO capability_map (id, domain, confidence, "
+                "sample_size, trend, evidence_summary, updated_at) "
+                "VALUES ('sk', 'skewed_one', 0.9, 25, 'stable', 'e', ?)",
+                ((datetime.now(UTC) + timedelta(days=30)).isoformat(),),
+            )
         elif state == "rows":
             for i in range(3):
                 await conn.execute(
@@ -1088,6 +1124,21 @@ class TestRenderStateMatrix:
             assert "unreadable timestamp" in out, (
                 f"{which}: corrupt rows were reported as merely stale or thin, "
                 "which is a false cause the ego cannot act on"
+            )
+        elif state == "mixed":
+            assert "healthy0" in out, f"{which}: qualifying rows must still render"
+            assert "unreadable timestamp" in out, (
+                f"{which}: a corrupt row alongside healthy ones was dropped "
+                "silently — the table renders, so nothing signals the loss"
+            )
+        elif state == "future":
+            assert "healthy0" in out, f"{which}: qualifying rows must still render"
+            assert "dated in the future" in out, (
+                f"{which}: a clock-skewed row was dropped without being named"
+            )
+            assert "unreadable timestamp" not in out, (
+                f"{which}: a future-dated row is READABLE — calling it "
+                "unreadable is a false cause the operator cannot act on"
             )
         elif state == "filtered":
             # Must NOT claim emptiness, and must say how many rows are really
@@ -1237,3 +1288,105 @@ class TestLightDepthDatesItsEvidence:
         assert f"last vouched {stamp}" in out, (
             "the light line asserts freshness it cannot support"
         )
+
+
+class TestNewestStampIsChronological:
+    """`last vouched` must name the latest INSTANT, not the largest STRING.
+
+    The recency SQL uses ``MAX(julianday(...))`` precisely because a text max
+    picks the wrong row across mixed formats. The renderer computed its own
+    "newest" with a raw ``max()`` over the same column, reproducing the bug the
+    SQL fix had just removed — fixing one member of a pair and leaving the
+    sibling is the class this whole area keeps hitting.
+    """
+
+    def test_t_separator_does_not_beat_a_later_space_separated_row(self):
+        from genesis.ego.user_context import _newest_stamp
+
+        # 'T' (0x54) sorts above ' ' (0x20), so a raw max() picks the 01:00 row.
+        entries = [
+            {"updated_at": "2026-08-20T01:00:00+00:00"},
+            {"updated_at": "2026-08-20 05:00:00+00:00"},
+        ]
+        assert _newest_stamp(entries).startswith("2026-08-20 05:00"), (
+            "the lexically-largest string won over the chronologically-latest "
+            "instant"
+        )
+
+    def test_offset_is_applied_before_comparing(self):
+        from genesis.ego.user_context import _newest_stamp
+
+        # 12:00+05:30 is 06:30Z; 08:00+00:00 is 08:00Z and therefore later,
+        # although it sorts LOWER as text.
+        entries = [
+            {"updated_at": "2026-08-20T12:00:00+05:30"},
+            {"updated_at": "2026-08-20T08:00:00+00:00"},
+        ]
+        assert _newest_stamp(entries) == "2026-08-20T08:00:00+00:00"
+
+    def test_unparseable_values_cannot_win(self):
+        from genesis.ego.user_context import _newest_stamp
+
+        entries = [
+            {"updated_at": "2026-08-20T08:00:00+00:00"},
+            {"updated_at": "9999-99-99"},
+            {"updated_at": ""},
+        ]
+        assert _newest_stamp(entries) == "2026-08-20T08:00:00+00:00"
+
+    def test_empty_input_is_empty_not_an_error(self):
+        from genesis.ego.user_context import _newest_stamp
+
+        assert _newest_stamp([]) == ""
+        assert _newest_stamp([{"updated_at": None}]) == ""
+
+
+class TestRendererUsesTheChronologicalHelper:
+    """The helper is correct; this pins that the RENDERER actually calls it.
+
+    Testing `_newest_stamp` directly proves the helper works and nothing more —
+    reverting the call site to a raw `max()` left those tests green, and a first
+    version of THIS test did too, because both fixtures shared a calendar date
+    and the rendered ``[:10]`` slice could not tell the two answers apart.
+
+    The stamps below are chosen so the lexical and chronological answers fall on
+    DIFFERENT UTC DATES, which is the only way the rendered string can
+    discriminate:
+
+        '2026-08-21T02:00:00+05:30'  ->  2026-08-20 20:30Z   (lexically LARGER)
+        '2026-08-20T23:00:00+00:00'  ->  2026-08-20 23:00Z   (chronologically LATER)
+
+    A raw max() renders "2026-08-21"; the correct answer renders "2026-08-20".
+    """
+
+    @pytest.mark.asyncio
+    async def test_light_depth_dates_the_map_chronologically(self):
+        from genesis.db.schema import TABLES
+        from genesis.ego.user_context import UserEgoContextBuilder
+
+        conn = await aiosqlite.connect(":memory:")
+        conn.row_factory = aiosqlite.Row
+        try:
+            await conn.execute(TABLES["capability_map"])
+            for i, stamp in enumerate(
+                ("2026-08-21T02:00:00+05:30", "2026-08-20T23:00:00+00:00")
+            ):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.8, 25, 'stable', 'e', ?)",
+                    (f"r{i}", f"dom{i}", stamp),
+                )
+            await conn.commit()
+
+            out = await UserEgoContextBuilder(db=conn)._capability_performance_section(
+                depth="light"
+            )
+        finally:
+            await conn.close()
+
+        assert "last vouched 2026-08-20" in out, (
+            f"the rendered date came from a lexical max(), not the latest "
+            f"instant: {out!r}"
+        )
+        assert "2026-08-21" not in out

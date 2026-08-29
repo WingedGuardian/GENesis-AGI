@@ -57,6 +57,36 @@ _USER_WORLD_CATEGORIES = frozenset(
 # _is_genesis_internal.
 
 
+def _newest_stamp(entries: list[dict]) -> str:
+    """The chronologically latest ``updated_at`` among *entries*, or "".
+
+    Parses before comparing. Values reaching here have already passed the
+    window's shape gate, so they are date-shaped — but they can still mix
+    separators and UTC offsets (a restore or a backfill produces exactly that),
+    and those are the inputs where a string compare and an instant compare
+    disagree. Unparseable values are skipped rather than allowed to win.
+    """
+    from datetime import datetime
+
+    best_key, best_raw = None, ""
+    for entry in entries:
+        raw = entry.get("updated_at") or ""
+        if not raw:
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw.replace(" ", "T"))
+        except ValueError:
+            continue
+        # Mixed aware/naive values cannot be compared directly; normalise to a
+        # common basis rather than raising on the first naive row.
+        key = parsed.timestamp() if parsed.tzinfo else parsed.replace(
+            tzinfo=UTC
+        ).timestamp()
+        if best_key is None or key > best_key:
+            best_key, best_raw = key, raw
+    return best_raw
+
+
 class UserEgoContextBuilder:
     """Builds the user-focused operational briefing for the user ego.
 
@@ -1494,9 +1524,14 @@ class UserEgoContextBuilder:
             # keeps everything rather than blanking the map. During such an
             # outage every row here is months old, so an unqualified "current"
             # is false exactly when it matters. Date it instead of asserting it.
-            _newest = max(
-                (e.get("updated_at") or "" for e in entries), default=""
-            )[:10]
+            # CHRONOLOGICALLY newest, not lexically largest. A raw max() over
+            # these strings is the exact bug the recency SQL uses
+            # MAX(julianday(...)) to avoid: across mixed formats or offsets,
+            # 'T' (0x54) sorts above ' ' (0x20) and '+05:30' above '+00:00', so
+            # the largest STRING can be an earlier INSTANT. Fixing that in the
+            # SQL and leaving this sibling doing the same wrong thing is how the
+            # class survives a fix.
+            _newest = _newest_stamp(entries)[:10]
             # "last vouched", not "newest evidence": updated_at records when the
             # aggregator last WROTE the row, not the age of the evidence behind
             # it. Three of the six sources are unwindowed (see capability_map),
@@ -1522,6 +1557,12 @@ class UserEgoContextBuilder:
             evidence = (e.get("evidence_summary") or "")[:80].replace("|", "/")
             icon = _TREND_ICONS.get(trend, "=")
             lines.append(f"| {domain} | {conf:.0%} | {icon} | {evidence} |")
+
+        _clause = _cap_render.unusable_note(
+            await _cap_render.safe_count_unusable(self._db)
+        )
+        if _clause:
+            lines.append(f"*{_clause.strip()}*")
 
         lines.append(
             "\nUse this to calibrate confidence on proposals. High-confidence "

@@ -956,3 +956,85 @@ class TestAnchorAcrossMixedTimestampFormats:
             "the anchor came from the lexically-largest offset rather than the "
             "chronologically-latest instant"
         )
+
+
+class TestSubMillisecondFutureStampsAreTolerated:
+    """The boundary the future-check has to get right, pinned deterministically.
+
+    ``julianday('now')`` resolves to MILLISECONDS while ``upsert`` writes
+    ``datetime.now(UTC).isoformat()``, which carries MICROSECONDS. A row is
+    therefore stamped up to ~1ms beyond what SQLite will call "now", and a
+    strict ``<=`` classifies the row the aggregator just wrote as future-dated
+    and drops it. MEASURED over 3000 write-then-read trials: 47.6% excluded
+    with a strict comparison, 0% with the grace.
+
+    Testing that through the real ``upsert`` does NOT work and the attempt is
+    recorded here so it is not repeated: the write, the commit and the read take
+    longer than a millisecond, so the row has aged out of the artefact by the
+    time it is read. That test passed 12 of 12 runs against the un-graced code —
+    vacuous. The property is therefore pinned at the boundary directly, with an
+    explicitly sub-millisecond stamp, which is deterministic.
+    """
+
+    @staticmethod
+    async def _insert(db, domain, updated_at):
+        await db.execute(
+            "INSERT INTO capability_map (id, domain, confidence, sample_size, "
+            "trend, evidence_summary, updated_at) "
+            "VALUES (?, ?, 0.8, 25, 'stable', '', ?)",
+            (f"id-{domain}", domain, updated_at),
+        )
+        await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_a_sub_second_future_stamp_is_kept(self, db):
+        """A stamp inside the grace window is a clock-resolution difference.
+
+        The offset is 500 MILLISECONDS, not the ~1ms of the real artefact, and
+        that is deliberate: the row has to still be in the future when the READ
+        happens, and the insert plus commit already consume more than a
+        millisecond. A microsecond-scale offset ages out before the query runs,
+        which makes the test pass against the un-graced code and prove nothing —
+        confirmed by mutation, twice, before this shape was arrived at.
+
+        500ms sits comfortably inside the 1s grace and comfortably outside query
+        latency, so the verdict is the same on a fast or a slow machine.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        now = datetime.now(UTC)
+        await self._insert(db, "anchor_row", now.isoformat())
+        await self._insert(
+            db, "just_ahead", (now + timedelta(milliseconds=500)).isoformat()
+        )
+
+        domains = {r["domain"] for r in await cap_crud.get_prompt_rows(db)}
+        assert "just_ahead" in domains, (
+            "a row stamped inside the grace window was treated as clock skew; "
+            "that band is the resolution gap between isoformat() and "
+            "julianday('now'), not a corrupt row"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_grace_does_not_admit_a_genuinely_skewed_row(self, db):
+        """The other half: the guard must still do what it exists for.
+
+        A grace wide enough to hide the artefact must stay far narrower than any
+        real clock skew, or it buys the fix by disabling the guard.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        now = datetime.now(UTC)
+        await self._insert(db, "healthy", now.isoformat())
+        for label, delta in (
+            ("skew_2s", timedelta(seconds=2)),
+            ("skew_1h", timedelta(hours=1)),
+            ("skew_30d", timedelta(days=30)),
+        ):
+            await self._insert(db, label, (now + delta).isoformat())
+
+        domains = {r["domain"] for r in await cap_crud.get_prompt_rows(db)}
+        assert "healthy" in domains
+        assert not domains & {"skew_2s", "skew_1h", "skew_30d"}, (
+            f"the grace admitted a clock-skewed row: {domains}"
+        )

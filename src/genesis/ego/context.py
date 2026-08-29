@@ -481,6 +481,17 @@ class EgoContextBuilder:
             evidence = (entry.get("evidence_summary") or "—")[:80].replace("|", "/")
             lines.append(f"| {domain} | {conf} | {trend} | {evidence} |")
 
+        # Rows that were dropped and cannot recover are reported HERE too, not
+        # only when the table comes back empty. A malformed row alongside
+        # healthy ones is exactly as invisible and exactly as permanent, and
+        # that is the commoner case — wiring this into the empty branch alone
+        # reported the rare state and stayed silent about the likely one.
+        _clause = _cap_render.unusable_note(
+            await _cap_render.safe_count_unusable(self._db)
+        )
+        if _clause:
+            lines.append(f"*{_clause.strip()}*")
+
         lines.append("")
         return "\n".join(lines)
 
