@@ -87,6 +87,31 @@ COMPOUND_FROZEN = [
     # A lambda BODY is deferred, but its DEFAULTS bind where the lambda appears.
     ("lambda default", "F = lambda seed=datetime.now(UTC): seed\n"),
     (
+        "lambda default used AS a def default",
+        "def f(cb=lambda seed=datetime.now(UTC): seed):\n    return cb\n",
+    ),
+    ("annotation without future import", "def f(t: datetime.now(UTC)):\n    return t\n"),
+    (
+        "dunder-main with a NON-eq comparison still runs",
+        'if __name__ != "__main__":\n    NOW = datetime.now(UTC)\n',
+    ),
+    (
+        "dunder-main compared to another module name still runs",
+        'if __name__ == "other":\n    NOW = datetime.now(UTC)\n',
+    ),
+    (
+        "fixture setup before a try/yield",
+        '@pytest.fixture(scope="session")\ndef r():\n'
+        "    t = datetime.now(UTC)\n    try:\n        yield t\n"
+        "    finally:\n        pass\n",
+    ),
+    (
+        "a yield in a NESTED helper must not cut setup short",
+        '@pytest.fixture(scope="session")\ndef r():\n'
+        "    def gen():\n        yield 1\n"
+        "    t = datetime.now(UTC)\n    return t\n",
+    ),
+    (
         "broad-fixture setup before yield",
         '@pytest.fixture(scope="session")\ndef r():\n'
         "    t = datetime.now(UTC)\n    yield t\n",
@@ -153,6 +178,16 @@ DEFERRED_SAFE = [
         "    yield 1\n    done = datetime.now(UTC)\n    return done\n",
     ),
     ("gmtime with an epoch argument converts", "EPOCH = time.gmtime(0)\n"),
+    (
+        "genexp used AS a def default is still lazy",
+        "def f(g=(datetime.now(UTC) for _ in range(3))):\n    return g\n",
+    ),
+    (
+        "a fixture's finally block runs at teardown",
+        '@pytest.fixture(scope="session")\ndef r():\n'
+        "    try:\n        yield 1\n    finally:\n"
+        "        done = datetime.now(UTC)\n",
+    ),
     ("localtime with an argument converts", "T = time.localtime(0)\n"),
     (
         "decorator merely ENDING in fixture is not a fixture",
@@ -279,6 +314,10 @@ def test_two_clocks_on_one_line_are_two_violations(tmp_path):
         "time.localtime()",
         "time.gmtime()",
         "time.clock_gettime(0)",
+        "time.process_time()",
+        "time.process_time_ns()",
+        "time.thread_time()",
+        "time.thread_time_ns()",
     ],
 )
 def test_recognises_dotted_clock_variants(tmp_path, expr):
@@ -377,6 +416,47 @@ def test_waiver_binds_to_its_own_statement_not_the_enclosing_block(tmp_path):
         "    A = 1\n"
         "    # frozen-clock-ok: 5d vs a 35d window\n"
         "    B = datetime.now(UTC)\n",
+    )
+    assert check.scan(tmp_path) == []
+
+
+def test_annotations_are_skipped_under_future_annotations(tmp_path):
+    """With `from __future__ import annotations` every annotation is a STRING.
+
+    Reporting a clock inside one would be a false positive on most files in this
+    repo, which use that import. Without it, an annotation IS evaluated at def
+    time and must still be caught — both directions are asserted here.
+    """
+    header = "from __future__ import annotations\n\n"
+    header += "import time\n\nimport pytest\n"
+    header += "from datetime import UTC, datetime\n\n"
+    f = tmp_path / "test_planted.py"
+    f.write_text(header + "def f(t: datetime.now(UTC)):\n    return t\n")
+    assert check.scan(tmp_path) == []
+    f.write_text(header + "X: datetime.now(UTC) = 1\n")
+    assert check.scan(tmp_path) == []
+    # ...and the same annotation without that import IS evaluated at def time.
+    _write(tmp_path, "def f(t: datetime.now(UTC)):\n    return t\n")
+    assert len(check.scan(tmp_path)) == 1
+
+
+@pytest.mark.parametrize(
+    "oddity",
+    ["\x0c", "\x85", "\x0b"],
+    ids=["form-feed", "next-line", "vertical-tab"],
+)
+def test_waiver_lookup_uses_pythons_own_line_model(tmp_path, oddity):
+    """`str.splitlines()` breaks on characters Python's tokenizer does not.
+
+    One of them inside an earlier string literal shifts every subsequent index, so
+    a valid waiver directly above a frozen clock is looked up on the wrong line and
+    missed — turning a documented site into a CI failure on an unrelated PR.
+    """
+    _write(
+        tmp_path,
+        f'MSG = "a{oddity}b"\n'
+        "# frozen-clock-ok: 5d vs a 35d window\n"
+        "NOW = datetime.now(UTC)\n",
     )
     assert check.scan(tmp_path) == []
 

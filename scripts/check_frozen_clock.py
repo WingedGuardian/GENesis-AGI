@@ -105,6 +105,10 @@ CLOCK_SUFFIXES: tuple[str, ...] = (
     "time.monotonic_ns",
     "time.perf_counter",
     "time.perf_counter_ns",
+    "time.process_time",
+    "time.process_time_ns",
+    "time.thread_time",
+    "time.thread_time_ns",
     "time.localtime",
     "time.gmtime",
     "time.clock_gettime",
@@ -167,6 +171,17 @@ def _reads_the_clock(call: ast.Call) -> bool:
     return True
 
 
+def _eager_parts(node: ast.AST) -> list[ast.AST]:
+    """The parts of a part-eager construct that are evaluated where it appears."""
+    if isinstance(node, ast.Lambda):
+        return [*node.args.defaults, *[d for d in node.args.kw_defaults if d]]
+    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+        return []  # its defaults/decorators are visited with the function itself
+    if isinstance(node, ast.GeneratorExp):
+        return [node.generators[0].iter] if node.generators else []
+    return [node]
+
+
 def _eager_children(node: ast.AST) -> list[ast.AST]:
     """Children of ``node`` evaluated NOW, with the deferred parts pruned.
 
@@ -179,17 +194,7 @@ def _eager_children(node: ast.AST) -> list[ast.AST]:
     """
     out: list[ast.AST] = []
     for child in ast.iter_child_nodes(node):
-        if isinstance(child, ast.Lambda):
-            out.extend(child.args.defaults)
-            out.extend(d for d in child.args.kw_defaults if d)
-            continue
-        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
-            continue  # its defaults/decorators are visited with the function itself
-        if isinstance(child, ast.GeneratorExp):
-            if child.generators:
-                out.append(child.generators[0].iter)
-            continue
-        out.append(child)
+        out.extend(_eager_parts(child))
     return out
 
 
@@ -199,10 +204,15 @@ def _clock_calls(node: ast.AST) -> list[ast.Call]:
     The ROOT is checked as well as the children: a scoped fixture may hold a nested
     ``def`` whose body only runs when the returned callable is invoked.
     """
-    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
-        return []
     found: list[ast.Call] = []
-    stack: list[ast.AST] = [node]
+    # The ROOT obeys the same rules as any child — it can itself be a part-eager
+    # construct (a lambda passed directly as a default, a bare generator
+    # expression), and treating it specially is what made those cases wrong in
+    # both directions.
+    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.GeneratorExp):
+        stack: list[ast.AST] = _eager_parts(node)
+    else:
+        stack = [node]
     while stack:
         cur = stack.pop()
         if isinstance(cur, ast.Call) and _reads_the_clock(cur):
@@ -285,22 +295,74 @@ def _top_level_functions(tree: ast.AST):
     return out
 
 
+def _own_yields(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.expr]:
+    """Yield expressions belonging to ``fn`` ITSELF, not to a nested function.
+
+    A ``yield`` inside a helper defined in the fixture says nothing about where the
+    fixture's own setup ends.
+    """
+    found: list[ast.expr] = []
+
+    def walk(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+                continue
+            if isinstance(child, ast.Yield | ast.YieldFrom):
+                found.append(child)
+            walk(child)
+
+    walk(fn)
+    return found
+
+
 def _fixture_setup(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.stmt]:
     """The statements of a fixture that run during SETUP.
 
-    A generator fixture's statements after ``yield`` run at TEARDOWN — after every
-    consumer has finished — so a clock read there cannot age before it is used.
+    A generator fixture's statements after its own ``yield`` run at TEARDOWN, once
+    every consumer has finished, so a clock read there cannot age before use. This
+    follows the fixture's execution FLOW rather than stopping at whichever statement
+    happens to contain a yield: a ``yield`` wrapped in ``try`` must not drag the
+    ``finally`` cleanup into setup, and a yield inside a nested helper must not cut
+    setup short and let a genuinely shared clock through.
     """
+    yields = _own_yields(fn)
+    if not yields:
+        return list(fn.body)  # a return-style fixture: the whole body is setup
+    first = min(y.lineno for y in yields)
     setup: list[ast.stmt] = []
-    for stmt in fn.body:
-        setup.append(stmt)
-        if any(isinstance(n, ast.Yield | ast.YieldFrom) for n in ast.walk(stmt)):
-            break
+
+    def collect(body: list[ast.stmt]) -> None:
+        for st in body:
+            if st.lineno > first:
+                return  # everything from here on runs after the yield
+            if (getattr(st, "end_lineno", None) or st.lineno) < first:
+                setup.append(st)
+                continue
+            # This statement SPANS the yield. Descend, so that a `finally` (which
+            # runs at teardown) is not swept in with the setup blocks.
+            blocks = [getattr(st, "body", None), getattr(st, "orelse", None)]
+            handlers = getattr(st, "handlers", None) or []
+            if not any(blocks) and not handlers:
+                setup.append(st)  # e.g. `yield expr` — the operand IS setup
+                continue
+            for block in blocks:
+                if block:
+                    collect(block)
+            for handler in handlers:
+                collect(handler.body)
+            # `finalbody` is deliberately NOT collected — it runs at teardown.
+
+    collect(fn.body)
     return setup
 
 
 def _is_dunder_main(node: ast.stmt) -> bool:
-    """``if __name__ == "__main__":`` — never executed under pytest."""
+    """Exactly ``if __name__ == "__main__":`` — never executed under pytest.
+
+    The comparison operator and the literal both matter: ``if __name__ !=
+    "__main__":`` and ``if __name__ == "some_module":`` DO run on import, so a
+    looser predicate would wave a real frozen clock straight through.
+    """
     if not isinstance(node, ast.If):
         return False
     test = node.test
@@ -308,6 +370,11 @@ def _is_dunder_main(node: ast.stmt) -> bool:
         isinstance(test, ast.Compare)
         and isinstance(test.left, ast.Name)
         and test.left.id == "__name__"
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.Eq)
+        and len(test.comparators) == 1
+        and isinstance(test.comparators[0], ast.Constant)
+        and test.comparators[0].value == "__main__"
     )
 
 
@@ -350,10 +417,43 @@ def _enclosing_statements(tree: ast.AST) -> dict[int, ast.stmt]:
     return owner
 
 
+def _annotations_are_deferred(tree: ast.Module) -> bool:
+    """True if ``from __future__ import annotations`` is active in this module.
+
+    With it, every annotation is stored as a STRING and never evaluated, so a clock
+    written in one cannot freeze anything. Without it (the language default on 3.12),
+    a ``def`` annotation is evaluated when the ``def`` executes.
+    """
+    for stmt in tree.body:
+        if isinstance(stmt, ast.ImportFrom) and stmt.module == "__future__" and any(
+            alias.name == "annotations" for alias in stmt.names
+        ):
+            return True
+    return False
+
+
+def _strip_annotations(node: ast.AST) -> None:
+    """Blank every annotation in ``node`` — they are strings, not evaluated code."""
+    for sub_node in ast.walk(node):
+        if isinstance(sub_node, ast.AnnAssign | ast.arg):
+            sub_node.annotation = None
+        elif isinstance(sub_node, ast.FunctionDef | ast.AsyncFunctionDef):
+            sub_node.returns = None
+
+
 def scan_source(source: str, rel: str) -> list[Violation]:
     """Return [(relpath, lineno, shape, dotted)] for un-waived frozen clocks."""
     tree = ast.parse(source)
-    lines = source.splitlines()
+    deferred_annotations = _annotations_are_deferred(tree)
+    if deferred_annotations:
+        # Under future-annotations they are never evaluated, so reporting a clock
+        # inside one would be a false positive on most of this repo's test files.
+        _strip_annotations(tree)
+    # split("\n"), NOT splitlines(): the latter also breaks on NEL, VT, FF and the
+    # Unicode line separators, which Python's tokenizer does not count as physical
+    # lines — one such character inside a string literal would shift every waiver
+    # lookup after it and drop a valid waiver.
+    lines = source.split("\n")
     comments = _comment_lines(source)
     owner = _enclosing_statements(tree)
     exempt_calls = _under_import_time_contract(tree)
@@ -396,6 +496,17 @@ def scan_source(source: str, rel: str) -> list[Violation]:
             record(default, "default-arg", sig_span)
         for dec in node.decorator_list:
             record(dec, "decorator-arg", span_of(dec))
+        if not deferred_annotations:
+            # Without future-annotations, a signature annotation is evaluated when the
+            # `def` executes — the same import-time moment as a default.
+            args = node.args
+            every = [*args.posonlyargs, *args.args, *args.kwonlyargs,
+                     args.vararg, args.kwarg]
+            for arg in every:
+                if arg is not None and arg.annotation is not None:
+                    record(arg.annotation, "annotation", sig_span)
+            if node.returns is not None:
+                record(node.returns, "annotation", sig_span)
         if (_fixture_scope(node) or "function") in BROAD_SCOPES:
             for st in _fixture_setup(node):
                 record(st, "scoped-fixture")
