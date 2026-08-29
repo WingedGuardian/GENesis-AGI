@@ -145,13 +145,66 @@ def test_backfill_excluded_by_default_included_on_flag():
     assert rep2["backfill_events"] == []
 
 
-def test_leak_invariant_detects_ambient_rows():
+def _extractor_row(rid, text, *, evidence=None):
+    """A ledger row shaped exactly as `_promote_live` writes one."""
+    return dict(
+        _fg_row(rid, text), added_by="ambient_ledger_extractor", evidence=evidence
+    )
+
+
+def test_leak_invariant_flags_an_extractor_row_in_shadow_mode():
+    """In shadow/off the extractor must write NOTHING live. Any row is a leak.
+
+    Keyed on the EXTRACTOR's own provenance value. It previously keyed on
+    "ambient", which is what a DISPATCHED CC session stamps — a different
+    writer entirely — so the first dispatched session to add a ledger row would
+    have been reported as an extractor leak.
+    """
     runs = [_run("r1", started=T1)]
-    ambient_row = dict(_fg_row("LX", "sneaky ambient write"), added_by="ambient")
-    rep = _rep.build_report(runs, [], [ambient_row])
+    rep = _rep.build_report(
+        runs, [], [_extractor_row("LX", "written in shadow")], mode="shadow"
+    )
     assert rep["leak_invariant_ok"] is False
-    md = _rep.render_md(rep, generated_at=T1)
-    assert "LEAK INVARIANT VIOLATION" in md
+    assert "LEAK INVARIANT VIOLATION" in _rep.render_md(rep, generated_at=T1)
+
+
+def test_a_dispatched_session_row_is_not_an_extractor_leak():
+    """The false-positive side, and the reason the values must stay distinct.
+
+    `_default_added_by()` stamps "ambient" on any dispatched CC session. That is
+    a human-directed write, not the extractor, and reporting it as a leak would
+    make the invariant cry wolf on the first one.
+    """
+    runs = [_run("r1", started=T1)]
+    dispatched = dict(_fg_row("LY", "dispatched session wrote this"),
+                      added_by="ambient")
+    rep = _rep.build_report(runs, [], [dispatched], mode="shadow")
+    assert rep["leak_invariant_ok"] is True
+
+
+def test_live_mode_holds_when_every_extractor_row_carries_its_quote():
+    """In live the rows are expected; the invariant becomes "show your source".
+
+    This is the case that was VIOLATED by construction: the promotion filter
+    demands a verified quote and `ledger_add` had no `evidence` column to put it
+    in, so every promoted row failed and the report screamed on every normal
+    run. An alarm that always fires is an alarm nobody reads.
+    """
+    runs = [_run("r1", started=T1)]
+    rep = _rep.build_report(
+        runs, [], [_extractor_row("LZ", "promoted", evidence="the source quote")],
+        mode="live",
+    )
+    assert rep["leak_invariant_ok"] is True
+
+
+def test_live_mode_flags_an_extractor_row_with_no_quote():
+    """The other direction — the invariant must still be able to fire."""
+    runs = [_run("r1", started=T1)]
+    rep = _rep.build_report(
+        runs, [], [_extractor_row("LW", "promoted, unsourced")], mode="live"
+    )
+    assert rep["leak_invariant_ok"] is False
 
 
 def test_health_metrics_and_render():

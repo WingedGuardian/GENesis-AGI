@@ -68,8 +68,15 @@ def build_report(
     ledger_rows: list[dict],
     *,
     include_backfill: bool = False,
+    mode: str | None = None,
 ) -> dict:
-    """Pure comparator — everything the markdown renders, as data."""
+    """Pure comparator — everything the markdown renders, as data.
+
+    *mode* selects how the leak invariant is judged; ``None`` reads the live
+    config. It is a parameter because a hardcoded read is unredirectable, which
+    makes the invariant's two branches untestable — and an invariant nobody can
+    test is the one that turns out to be VIOLATED by construction.
+    """
     from genesis.session_awareness.ledger_extractor import best_match
 
     live_runs = [r for r in runs if include_backfill or r["trigger"] != "backfill"]
@@ -139,7 +146,34 @@ def build_report(
         sum(1 for e in agreements if e.get("quote_verified")) / n_unique if n_unique else None
     )
     truncation_rate = sum(1 for r in live_runs if r.get("truncated")) / n_runs if n_runs else None
-    ambient_leaks = [r for r in ledger_rows if r.get("added_by") == "ambient"]
+    # The invariant is about the EXTRACTOR's own rows, and it has to key on the
+    # extractor's own provenance value. It previously keyed on "ambient", which
+    # is what `_default_added_by()` stamps on any DISPATCHED CC session — a
+    # different writer entirely. That read clean only because no dispatched
+    # session had yet added a ledger row; the first one would have been reported
+    # as an extractor leak.
+    #
+    # MODE-CONDITIONAL, because "wrote nothing live" stops being the invariant
+    # the moment live mode is the point:
+    #   off/shadow — ANY extractor row is a leak. The worker must not write.
+    #   live       — extractor rows are expected, but each must carry a VERIFIED
+    #                quote. An unquoted row means the promotion filter let
+    #                through something the extractor could not source in the
+    #                transcript, which is the failure worth catching once
+    #                writing is allowed.
+    extractor_rows = [
+        r for r in ledger_rows if r.get("added_by") == "ambient_ledger_extractor"
+    ]
+    if mode is None:
+        from genesis.session_awareness.ledger_shadow_config import effective_mode
+
+        mode = effective_mode()
+    if mode == "live":
+        leaks = [r for r in extractor_rows if not r.get("evidence")]
+        leak_label = "live: every extractor row carries its source quote"
+    else:
+        leaks = extractor_rows
+        leak_label = f"{mode}: zero extractor rows in the live ledger"
 
     return {
         "n_runs": n_runs,
@@ -159,8 +193,11 @@ def build_report(
         "truncation_rate": truncation_rate,
         "pivots": pivots,
         "backfill_events": backfill_events,
-        "leak_invariant_ok": len(ambient_leaks) == 0,
-        "ambient_leaks": ambient_leaks,
+        "leak_invariant_ok": len(leaks) == 0,
+        "leak_invariant_label": leak_label,
+        "leak_mode": mode,
+        "ambient_leaks": leaks,
+        "n_extractor_rows": len(extractor_rows),
         "include_backfill": include_backfill,
     }
 
@@ -188,8 +225,9 @@ def render_md(report: dict, *, generated_at: str) -> str:
         f" status {report['status_histogram']};"
         f" failure rate {_fmt_rate(report['failure_rate'])};"
         f" latency p50/p90 {report['latency_p50_ms']}/{report['latency_p90_ms']} ms",
-        f"- **Leak invariant** (zero ambient rows in live ledger):"
-        f" {'HELD' if report['leak_invariant_ok'] else 'VIOLATED — INVESTIGATE'}",
+        f"- **Leak invariant** ({report['leak_invariant_label']}):"
+        f" {'HELD' if report['leak_invariant_ok'] else 'VIOLATED — INVESTIGATE'}"
+        f"  ·  extractor rows: {report['n_extractor_rows']}",
         "",
         "## False positives — adjudicate each (would you have wanted this row?)",
         "",

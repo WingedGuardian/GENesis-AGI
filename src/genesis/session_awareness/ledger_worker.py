@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import tempfile
 import time
@@ -48,6 +49,10 @@ from genesis.session_awareness.ledger_extractor import (
 from genesis.session_awareness.ledger_shadow_config import effective_mode
 from genesis.session_awareness.transcript import parse_delta
 
+# The spawner captures this process's stderr to the worker error log, so a
+# warning here is durable rather than discarded.
+logger = logging.getLogger(__name__)
+
 CURSOR_FILENAME = "ledger_shadow_cursor.json"
 LOCK_FILENAME = "ledger_shadow.lock"
 
@@ -59,7 +64,16 @@ MAX_WINDOW_BYTES = 64 * 1024 * 1024
 
 
 def _sessions_root() -> Path:
-    return Path.home() / ".genesis" / "sessions"
+    """Where per-session state lives.
+
+    Defers to the canonical constant rather than recomputing the path. Three
+    spellings of this directory existed across the subsystem; two of them being
+    equal today is not a guarantee, and the mirror write below depends on the
+    two agreeing.
+    """
+    from genesis.session_charter import SESSIONS_DIR
+
+    return SESSIONS_DIR
 
 
 def _now() -> str:
@@ -120,6 +134,132 @@ async def _record_telemetry(db_path: Path | str, status: str, detail: str) -> bo
         return False
 
 
+# Provenance stamped on every row the extractor promotes. Distinct from
+# "ambient" ON PURPOSE: `_default_added_by()` already returns "ambient" for any
+# DISPATCHED CC session, and the shadow report's leak invariant keys on this
+# value to assert the extractor has written nothing live. One shared value would
+# make that check unable to tell the two apart on the day it starts mattering.
+# Mirrored by a schema CHECK (migration 0087).
+PROMOTION_ADDED_BY = "ambient_ledger_extractor"
+
+# INTERIM cap on rows promoted per run. Explicitly temporary: it is a guard held
+# until the overseer can prune the extractor's own tier, not a considered
+# number. A cap that guesses is worse than a validator that judges — but it
+# bounds the blast radius of a bad prompt-version in the meantime. Whatever it
+# drops is LOGGED, never silently truncated: a silent cap reads downstream as
+# "the extractor found nothing".
+PROMOTION_CAP = 5
+
+
+def _qualifies_for_promotion(ev: dict) -> bool:
+    """Conservative first cut: only unambiguous, quote-backed, novel agreements.
+
+    A false ledger row costs attention in EVERY later window, so this starts
+    tight and loosens on evidence rather than the reverse.
+
+    - ``kind == "agreement"`` — a pivot is a change of direction, not a
+      commitment, and reads badly as a checkbox.
+    - ``quote_verified`` — the extractor found the words in the transcript, so
+      the row is not a paraphrase of something never said.
+    - ``match_kind == "none"`` — it does not already correspond to a live
+      ledger row; promoting a match would duplicate what a human already wrote.
+    - ``duplicate_of is None`` — not a re-proposal of an earlier window's row.
+      This is also why promotion must run AFTER duplicate marking: the shadow
+      store's re-cover guarantee is a SHADOW guarantee, and without this gate a
+      run that failed mid-write would duplicate rows when the window is
+      re-covered.
+    """
+    return (
+        ev.get("kind") == "agreement"
+        and bool(ev.get("quote_verified"))
+        and ev.get("match_kind", "none") == "none"
+        and ev.get("duplicate_of") is None
+    )
+
+
+async def _promote_live(
+    db_path: Path | str, session_id: str, events: list[dict], *, trigger: str
+) -> dict:
+    """Write qualifying proposals into the REAL ledger. Live mode only.
+
+    Returns a summary for the run detail line. Best-effort per row: one bad row
+    must not cost the rest, and none of it may cost the shadow record that has
+    already been written.
+    """
+    if trigger == "backfill":
+        # --backfill replays historical windows and never advances the cursor.
+        # Promoting there would inject hundreds of months-old agreements into
+        # sessions that have long since ended.
+        return {"promoted": 0, "skipped_backfill": True}
+
+    qualifying = [ev for ev in events if _qualifies_for_promotion(ev)]
+    promoted_rows, dropped = qualifying[:PROMOTION_CAP], qualifying[PROMOTION_CAP:]
+    if dropped:
+        logger.warning(
+            "ledger promotion cap: promoted %d of %d qualifying proposals for %s, "
+            "dropped %d (cap=%d)",
+            len(promoted_rows), len(qualifying), session_id, len(dropped), PROMOTION_CAP,
+        )
+
+    if not promoted_rows:
+        return {"promoted": 0, "qualifying": len(qualifying), "dropped_by_cap": len(dropped)}
+
+    import aiosqlite
+
+    from genesis.db.crud import session_charters as crud
+    from genesis.session_charter import refresh_mirror
+
+    written = 0
+    try:
+        async with aiosqlite.connect(str(db_path), timeout=10) as db:
+            # Row factory is REQUIRED, not tidiness: `crud.get` builds
+            # `dict(row)`, which raises on a plain tuple. That exception was
+            # swallowed by refresh_mirror's best-effort `except`, so the mirror
+            # never refreshed and the run reported success anyway. Reproduced
+            # end-to-end before this line existed.
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA busy_timeout=5000")
+            await crud.upsert_stub(db, session_id)
+            for ev in promoted_rows:
+                try:
+                    await crud.ledger_add(
+                        db,
+                        session_id=session_id,
+                        text=ev.get("text") or "",
+                        source_ref=ev.get("turn_ref"),
+                        added_by=PROMOTION_ADDED_BY,
+                        # The filter REQUIRES a verified quote and then threw it
+                        # away: every promoted row had evidence NULL, which is
+                        # both unauditable for a human reading an autonomously
+                        # added row AND an automatic failure of the live-mode
+                        # leak invariant, which asks each extractor row for its
+                        # source text.
+                        evidence=ev.get("quote_preview"),
+                    )
+                    written += 1
+                except Exception:
+                    logger.warning(
+                        "ledger promotion failed for one proposal in %s",
+                        session_id, exc_info=True,
+                    )
+            # The mirror is what the NEXT window reads. A promoted row that
+            # never reaches charter.md is invisible where it was meant to help,
+            # so this is part of the write, not a nicety.
+            # Pass the worker's own root explicitly: reading the module
+            # constant inside refresh_mirror makes the destination
+            # unredirectable, and a test that cannot redirect it writes into
+            # the operator's real ~/.genesis/sessions.
+            await refresh_mirror(db, session_id, _sessions_root())
+    except Exception:
+        logger.warning("ledger promotion could not open the db", exc_info=True)
+
+    return {
+        "promoted": written,
+        "qualifying": len(qualifying),
+        "dropped_by_cap": len(dropped),
+    }
+
+
 async def _record_run(db_path: Path | str, **kwargs) -> bool:
     """One short-lived RW connection: run row + events, single commit.
 
@@ -136,12 +276,28 @@ async def _record_run(db_path: Path | str, **kwargs) -> bool:
         return False
 
 
-async def _load_match_context(db_path: Path | str, session_id: str) -> tuple[list, list]:
-    """(live ledger items, prior shadow events) for the match stage.
+async def _load_match_context(
+    db_path: Path | str, session_id: str
+) -> tuple[list, list, bool]:
+    """(live ledger items, prior shadow events, read_ok) for the match stage.
 
-    Best-effort reads: on any failure the extractor still runs — proposals
-    just carry match_kind='none' (the report recomputes matching offline
-    anyway; stored match_kind is the at-run-time signal only).
+    Best-effort for SHADOW purposes: on failure the extractor still runs and its
+    proposals simply carry match_kind='none' (the report recomputes matching
+    offline anyway).
+
+    The third value exists because that fail-open posture INVERTS once proposals
+    can be promoted. Both novelty signals derive from this read: an empty ledger
+    list makes every agreement look unmatched, and empty priors make every one
+    look non-duplicate. So a FAILED read does not merely lose information — it
+    makes everything look promotable, including exact duplicates of rows the
+    user already wrote. Failing open toward MORE write authority is the one
+    direction this must never take, and the caller cannot distinguish "read
+    fine, nothing matched" from "read failed" unless it is told.
+
+    Reachable: this read uses timeout=5 while the write path uses timeout=10
+    with busy_timeout=5000, so any 5-10s write lock (a migration's
+    BEGIN IMMEDIATE, a large consolidation write, a WAL checkpoint) fails the
+    gate and passes the write.
     """
     import aiosqlite
 
@@ -150,9 +306,13 @@ async def _load_match_context(db_path: Path | str, session_id: str) -> tuple[lis
             db.row_factory = aiosqlite.Row
             items = await ledger_list(db, session_id)
             priors = await shadow_crud.list_events(db, session_id)
-            return items, priors
+            return items, priors, True
     except Exception:
-        return [], []
+        logger.warning(
+            "ledger match context unreadable for %s — promotion will be skipped",
+            session_id, exc_info=True,
+        )
+        return [], [], False
 
 
 async def run_ledger_worker(
@@ -351,7 +511,9 @@ async def _run_locked(
         await _record_telemetry(db_path, "failed", "unparseable")
         return {"status": "failed", "detail": "unparseable"}
 
-    ledger_items, prior_events = await _load_match_context(db_path, session_id)
+    ledger_items, prior_events, match_read_ok = await _load_match_context(
+        db_path, session_id
+    )
     events = match_proposals(verdict, included, ledger_items, prior_events)
     observed_at = _now()
     for ev in events:
@@ -371,15 +533,36 @@ async def _run_locked(
         _advance_cursor(session_dir, end_byte, cursor)
     else:
         detail_notes.append("shadow_write_failed_cursor_preserved")
+
+    # Promotion runs only AFTER the shadow row is safely written: the shadow
+    # store is the audit trail for what the extractor proposed, and it must
+    # exist even if the live write then fails. It also has to run after the
+    # duplicate marking that match_proposals stamped onto these events, which
+    # is what makes a re-covered window idempotent.
+    promotion = {"promoted": 0}
+    if recorded and mode == "live":
+        if not match_read_ok:
+            # Both novelty signals came from a read that failed, so everything
+            # looks promotable. Skip rather than write on evidence that does not
+            # exist; the shadow row is recorded either way.
+            detail_notes.append("promotion_skipped_match_context_unreadable")
+            promotion = {"promoted": 0, "skipped_unreadable_context": True}
+        else:
+            promotion = await _promote_live(
+                db_path, session_id, events, trigger=trigger
+            )
+
     await _record_telemetry(
         db_path,
         "ok" if recorded else "failed",
-        f"turns={len(included)}|proposals={len(events)}|recorded={recorded}",
+        f"turns={len(included)}|proposals={len(events)}|recorded={recorded}"
+        f"|promoted={promotion.get('promoted', 0)}",
     )
     return {
         "status": "ok" if recorded else "failed",
         "n_proposals": len(events),
         "recorded": recorded,
+        "promoted": promotion.get("promoted", 0),
     }
 
 
@@ -460,7 +643,10 @@ async def _run_backfill(
         skipped = max(0, len(windows) - max_windows)
         windows = windows[-max_windows:]  # newest windows within the call cap
 
-        ledger_items, prior_events = await _load_match_context(db_path, session_id)
+        # Backfill never promotes, so the read-ok flag is irrelevant here.
+        ledger_items, prior_events, _ = await _load_match_context(
+            db_path, session_id
+        )
         priors = list(prior_events)
         outcomes: list[str] = []
         total_proposals = 0

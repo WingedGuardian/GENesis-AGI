@@ -95,8 +95,9 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         description=(
             "Ambient session-ledger extractor (session-manager PR-3) — "
             "master `enabled` + `mode` off/shadow/live. Shadow logs "
-            "proposals only (live session_ledger never written); `live` is "
-            "reserved and coerced to shadow until the data-gated flip PR. "
+            "proposals only; `live` also promotes the qualifying ones "
+            "into the real ledger as added_by='ambient_ledger_extractor'. "
+            "An invalid mode degrades to shadow, never to live. "
             "Read at worker startup — takes effect next compaction."
         ),
         config_filename="session_ledger_shadow.yaml",

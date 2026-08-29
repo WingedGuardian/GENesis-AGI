@@ -22,7 +22,15 @@ from datetime import UTC, datetime
 import aiosqlite
 
 VALID_LEDGER_STATUSES = frozenset({"open", "in_progress", "done", "absorbed", "dropped"})
-VALID_ADDED_BY = frozenset({"foreground", "ambient", "pulse"})
+# "ambient" means a DISPATCHED Claude Code session (see _default_added_by);
+# "ambient_ledger_extractor" is the detached Haiku extractor that watches a
+# session from the outside. They must stay distinct: the shadow report's leak
+# invariant keys on the extractor value to assert it has written nothing live,
+# and a shared value would make that check unable to tell them apart on the
+# very day it starts mattering. Mirrored by a schema CHECK (migration 0087).
+VALID_ADDED_BY = frozenset(
+    {"foreground", "ambient", "pulse", "ambient_ledger_extractor"}
+)
 
 # Living-field bounds (enforced here so every writer shares them)
 MAX_POINTERS = 12
@@ -187,8 +195,16 @@ async def ledger_add(
     text: str,
     source_ref: str | None = None,
     added_by: str = "foreground",
+    evidence: str | None = None,
 ) -> str:
-    """Add an open ledger item and return its id."""
+    """Add an open ledger item and return its id.
+
+    *evidence* is the source text a row is derived from. It matters most for
+    rows a human did not type: a machine-added row that cannot show where it
+    came from is unauditable, and the shadow report's live-mode leak invariant
+    asks exactly that question of every extractor row. The column existed and
+    the INSERT did not write it, so every such row would have answered "no".
+    """
     if added_by not in VALID_ADDED_BY:
         raise ValueError(f"invalid added_by: {added_by!r}")
     text = text.strip()[:MAX_LEDGER_TEXT_CHARS]
@@ -197,9 +213,10 @@ async def ledger_add(
     item_id = _new_id()
     await db.execute(
         """INSERT INTO session_ledger
-           (id, session_id, text, status, source_ref, added_by, created_at)
-           VALUES (?, ?, ?, 'open', ?, ?, ?)""",
-        (item_id, session_id, text, source_ref, added_by, _now_iso()),
+           (id, session_id, text, status, source_ref, added_by, evidence,
+            created_at)
+           VALUES (?, ?, ?, 'open', ?, ?, ?, ?)""",
+        (item_id, session_id, text, source_ref, added_by, evidence, _now_iso()),
     )
     await db.commit()
     return item_id
