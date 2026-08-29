@@ -753,13 +753,17 @@ class TestGauntletTakesTheBoxLock:
     async def test_cancellation_does_not_strand_the_box_lock(
         self, tmp_path, monkeypatch
     ):
-        """Cancelling the AWAIT does not stop the worker thread.
+        """The COMMON cancellation path: the worker observes the cancel.
 
-        It keeps waiting, eventually takes the flock, and returns a BoxLock
-        nobody holds a reference to. In a long-lived server process that fd and
-        GENESIS_PYTEST_LOCK_HELD would leak and the box lock would stay held
-        until restart, blocking every test run on the machine — the exact
-        outcome this whole change exists to prevent.
+        Scope, precisely — this test does NOT reach the late-release race, and
+        an earlier version of it claimed to. With the holder lingering far past
+        the cancel, the worker always sees the cancel event before it can win
+        the flock, so it returns an empty BoxLock and the late-release callback
+        never runs; ``add_done_callback(_release_late_lock)`` could be deleted
+        outright and this stayed green. What it genuinely proves is worth
+        keeping: cancelling the await neither strands the lock nor leaks the
+        held-flag into a long-lived process. The race itself is pinned by
+        test_a_lock_won_after_cancellation_is_released below.
         """
         import asyncio
 
@@ -820,6 +824,92 @@ class TestGauntletTakesTheBoxLock:
             if holder.poll() is None:
                 holder.kill()
             holder.wait(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_a_lock_won_after_cancellation_is_released(
+        self, tmp_path, monkeypatch
+    ):
+        """The late-release callback itself, driven directly.
+
+        The hazard: the worker thread cannot be interrupted, so a cancel that
+        arrives just after it wins the flock leaves a REAL held lock owned by a
+        future nobody awaits. Only ``_release_late_lock`` can free it, and in
+        the server that lock would otherwise be held until restart.
+
+        Driven rather than timed. That window is microseconds wide — the worker
+        bails the moment ``cancel.wait()`` returns True — so no arrangement of
+        sleeps schedules it reliably, and trying to is how the sibling test
+        above ended up proving nothing. Acquisition is stubbed to IGNORE the
+        cancel and hand back a genuinely held lock after the cancellation, which
+        is exactly the state the callback exists to clean up.
+        """
+        import asyncio
+
+        from genesis.eval import gauntlet
+        from genesis.util import pytest_lock
+
+        lock_path = tmp_path / "pytest.lock"
+        monkeypatch.setenv(pytest_lock.PATH_ENV, str(lock_path))
+        monkeypatch.delenv(pytest_lock.HELD_ENV, raising=False)
+        monkeypatch.setattr(gauntlet, "_LOCK_WAIT_S", 30.0)
+
+        won = {}
+        real_acquire = pytest_lock.acquire
+
+        def _wins_despite_the_cancel(**kwargs):
+            # Models the worker that had ALREADY won the flock when the cancel
+            # landed: it ignores `cancel` and returns a really-held lock.
+            time.sleep(0.3)
+            kwargs.pop("cancel", None)
+            kwargs.pop("wait", None)
+            kwargs.pop("timeout", None)
+            lock = real_acquire(lock_path=lock_path, **kwargs)
+            # Record the fact HERE. ``acquired`` is ``_fd is not None`` and
+            # ``release()`` nulls that fd, so reading it after the callback has
+            # run reports False — checking it later would invert this guard and
+            # fail the test precisely when the mechanism WORKED.
+            won["acquired"] = lock.acquired
+            won["lock"] = lock
+            return lock
+
+        monkeypatch.setattr(pytest_lock, "acquire", _wins_despite_the_cancel)
+
+        async def _never_reached(workdir, basetemp):
+            raise AssertionError("scoring must not run after cancellation")
+
+        monkeypatch.setattr(gauntlet, "_run_pytest_locked", _never_reached)
+
+        task = asyncio.create_task(
+            gauntlet._run_pytest(tmp_path / "wd", tmp_path / "bt")
+        )
+        await asyncio.sleep(0.05)  # cancel while acquisition is still in flight
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        for _ in range(200):
+            await asyncio.sleep(0.05)
+            if won.get("lock") is not None and _lock_is_free(lock_path):
+                break
+
+        # Guard the guard: if the stub never actually took the lock there is
+        # nothing for the callback to release and the assertions below are
+        # vacuous — the failure mode this whole test exists to correct.
+        assert won.get("lock") is not None, "the stub never completed"
+        assert won.get("acquired") is True, (
+            "the stub did not really hold the lock, so this proves nothing"
+        )
+        # Two independent signals, because either alone is weaker than it looks:
+        # the object having dropped its descriptor says the callback ran on THIS
+        # lock, and the file being free says the flock is genuinely gone.
+        assert won["lock"].acquired is False, (
+            "the lock object still holds its descriptor — _release_late_lock "
+            "did not release the lock it was given"
+        )
+        assert _lock_is_free(lock_path), (
+            "a lock won after cancellation was never released — "
+            "_release_late_lock did not run"
+        )
 
 
 def _lock_is_free(path) -> bool:

@@ -304,11 +304,15 @@ def _write_holder_record(fd: int) -> None:
     contender reads nothing. (A torn record is handled anyway — the decision
     never depends on the parse — but a needless window is still a window.)
     Best-effort: failing to describe ourselves must not cost us the lock we
-    already hold — so this suppresses Exception, not just OSError. ``argv`` is
-    attacker-agnostic but not encodable-agnostic: a non-UTF-8 byte in a filename
-    arrives via surrogateescape and makes ``.encode()`` raise UnicodeEncodeError,
-    which is a ValueError. The caller's fail-open then hid a stranded flock (see
-    the total region in ``_acquire_inner``).
+    already hold — so this suppresses Exception, not just OSError.
+
+    Both halves of that are deliberate. ``errors="replace"`` keeps the RECORD
+    from being the thing that fails: a non-UTF-8 byte in a filename arrives via
+    surrogateescape, and a strict encode raised UnicodeEncodeError — a
+    ValueError, which the old ``except OSError`` did not catch, so the caller's
+    fail-open hid a stranded flock. Replacing keeps a readable holder line
+    instead of losing it. The broad suppression stays anyway: it is belt to that
+    braces, and this function must never cost us the lock for any reason.
     """
     try:
         argv = " ".join(sys.argv)[:500]  # bounded — argv can be enormous
@@ -456,9 +460,12 @@ def _acquire_inner(
     # ProcessLock has no equivalent hazard only because its record is
     # ``str(os.getpid())`` — digits, which cannot fail to encode. This module
     # deliberately writes argv so contention can NAME the holder, and that
-    # choice is what makes the write fallible (a surrogateescape byte from a
-    # non-UTF-8 filename raises UnicodeEncodeError, which is not an OSError).
-    # So the guard belongs on the whole region, not on any one statement.
+    # richer record is what made the write fallible in the first place (a
+    # surrogateescape byte from a non-UTF-8 filename raised UnicodeEncodeError,
+    # which is not an OSError). The record write is itself hardened now, so this
+    # guard is no longer load-bearing for THAT path specifically — it is here
+    # because the region has two more statements, and the next one added would
+    # otherwise reopen the same hole silently.
     try:
         _write_holder_record(fd)
         if export_env:
