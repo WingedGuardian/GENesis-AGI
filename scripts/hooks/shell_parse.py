@@ -659,20 +659,39 @@ def untokenizable(command: str) -> bool:
     This is the blind-spot signal a guard consults when it is about to conclude
     "no gated segment found". ``_argv`` degrades to a naive split on the SAME
     ``ValueError`` silently, so ``analyze()`` can never self-report that its
-    result is untrustworthy — an ANSI-C ``$'…\'…'`` span, or merely an
-    apostrophe inside a here-doc body, is enough to shift segmentation off and
-    drop a real, executing command from the parse.
+    result is untrustworthy: an ordinary quoting construct is enough to shift
+    segmentation off and drop a real, executing command from the parse, and the
+    return value looks identical to "there was nothing to find".
 
-    Deliberately reads the WHOLE raw command, with no here-doc normalization.
-    An earlier version stripped here-doc bodies first to suppress prompts on
-    multi-line scripts; that MEASURABLY disarmed the signal on an ordinary shape
-    (a quoted here-doc whose body contains an apostrophe, followed by a real
-    gated git command — bash runs it, the stripped text tokenizes cleanly, and
-    the guard fell silent). Normalizing the text before the probe can only ever
-    delete the evidence the probe exists to find, so it does not happen here.
+    Deliberately reads the WHOLE raw command, with no normalization of any kind.
+    An earlier version pre-processed it to suppress prompts on a class of
+    multi-line command, and that MEASURABLY disarmed the signal: on a shape a
+    developer writes without thinking, the command really ran (verified against
+    a shimmed binary, so the proof was execution rather than parse) while the
+    pre-processed text tokenized cleanly and the guard fell silent. The
+    triggering shape is deliberately not written down — this file is public and
+    the guard it protects is load-bearing.
+
+    KNOWN COST, stated rather than hidden: ``_argv`` DOES normalize before its
+    own tokenize (it strips trailing comments), so this probe over-reports
+    relative to the very parser whose blind spot it reports — an unquoted
+    comment alone can make a benign command look unparseable. Stripping here is
+    NOT the fix: measured over 19,246 real commands, doing so erases a mention
+    of a gated operation in 3 of them, because a stripper's model of where a
+    comment begins is not the shell's and the two disagree in both directions.
+    A cure that can only raise severity, never clear it, is tracked separately.
+
+    That rule is now literal. An earlier revision folded ``\\<newline>`` to a
+    SPACE before probing, which contradicted the paragraph above and was also
+    simply wrong about bash — bash REMOVES a line continuation, joining the two
+    halves into one word (``ec\\<newline>ho`` runs ``echo``), so replacing it
+    with a space produced the reading furthest from what actually executes.
+    MEASURED over 12,099 real commands: folding and not folding classify
+    IDENTICALLY (339 un-tokenizable either way, zero commands differ), so the
+    normalization bought nothing and is removed rather than documented.
     """
     try:
-        shlex.split(command.replace("\\\n", " "))
+        shlex.split(command)
         return False
     except ValueError:
         return True

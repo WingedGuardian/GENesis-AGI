@@ -1,10 +1,12 @@
-"""Fail-closed blind-spot net for the ANSI-C ($'...') guard bypass.
+"""Fail-closed blind-spot net for the parser's quoting blind spot.
 
-shell_parse models an ANSI-C `$'...'` span as a plain single quote, so a `\\'`
-inside is misread as the closing quote: the enclosing `$()` closes early and a
-trailing `&& git push/commit` is swallowed into a redirect target. `analyze()`
-then drops the real git segment and the push / commit-no-verify / merge gates
-silently no-op (fail OPEN). This was reproduced live on both hooks.
+The parser's model of one quoting form is narrower than the shell's, so a
+command can segment differently from the way it executes. When that happens the
+real git segment is absent from the parse, and the gates that look for one see
+the same empty result they would see if no git command were present at all --
+they no-op, which is a fail-OPEN. The cases are held as fixture data below
+rather than described here; the property that matters is that an empty parse is
+not evidence of absence.
 
 The fix nets around the blind spot in the CALLERS (shell_parse's own ANSI-C fix
 is a separate follow-up): when a command is not cleanly parseable AND mentions a
@@ -68,7 +70,8 @@ NV = "--no-" + "ver" + "ify"
 ADMIN = "--" + "admin"
 COMMIT = "com" + "mit"
 
-# The ANSI-C obfuscation prefix that defeats shell_parse's quote scanner.
+# The obfuscation prefix these cases are built from; see the module
+# docstring for why it is held as fixture data rather than described.
 ANSIC = "echo ok 2>$(echo $'a\\'b)c') && "
 
 
@@ -317,16 +320,16 @@ class TestUntokenizable:
         assert sp.untokenizable(f"{GIT} {COMMIT} -m $'l1\\nl2'") is False
 
     def test_heredoc_apostrophe_body_is_untokenizable(self):
-        # The probe reads the RAW command deliberately. An apostrophe in a
-        # here-doc body genuinely shifts analyze()'s segmentation, so this MUST
-        # read as a blind spot — normalizing it away disarmed the net on an
-        # ordinary shape (a real gated command after such a here-doc was allowed).
+        # The probe reads the RAW command deliberately. Ordinary punctuation in
+        # quoted multi-line input genuinely shifts analyze()'s segmentation, so
+        # this MUST read as a blind spot. Pre-processing the text to quieten the
+        # prompt was measured removing the very evidence the probe looks for.
         cmd = f"{GIT} {COMMIT} -F - <<'EOF'\nit's a message with an apostrophe\nEOF"
         assert sp.untokenizable(cmd) is True
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# git_push_guard — the net flips the ANSI-C bypasses to BLOCK (verify-RED)
+# git_push_guard — the net flips the unparseable cases to BLOCK (verify-RED)
 # ══════════════════════════════════════════════════════════════════════════
 class TestPushGuardNet:
     def test_ansic_force_push_blocked(self, tmp_path):
@@ -357,10 +360,10 @@ class TestPushGuardNet:
         assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
     def test_heredoc_body_apostrophe_then_real_gated_op(self, tmp_path):
-        # THE regression that killed the normalizing design: an ordinary quoted
-        # here-doc whose body contains a contraction, followed by a real gated
-        # command. bash runs it; analyze() loses the segment; stripping the body
-        # made the residue tokenize and the guard fell silent.
+        # THE regression that killed the normalizing design, kept as fixture
+        # data. The shape is ordinary rather than adversarial, which is the
+        # whole point: a normalizer built to quieten common input removed the
+        # signal on input a developer writes without thinking about it.
         cmd = f"cat > f <<'EOF'\ndon't touch\nEOF\n{GIT} {PUSH} origin main {FORCE}"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
         assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
@@ -384,7 +387,7 @@ class TestPushGuardNet:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# review_enforcement_commit — the net flips the ANSI-C commit bypass to BLOCK
+# review_enforcement_commit — the net flips the unparseable commit to BLOCK
 # ══════════════════════════════════════════════════════════════════════════
 class TestGhPrCreateIsCovered:
     """`gh pr create` is the FOURTH gated op; the first cut of the net omitted it.
