@@ -22,6 +22,14 @@ WHAT IS FORBIDDEN — the pairing, not the shape
   scan string literals or test parameters. `cmd = "<the shape>"` is fine.
   `# <the shape> makes the guard fall silent` is not.
 
+  That distinction is drawn by `tokenize`, not by a regex over raw source. A
+  regex cannot tell a comment from a hash-prefixed line INSIDE a string
+  literal, so the first version of this file scanned exactly the fixture data
+  the paragraph above permits — the docstring claimed a property the code did
+  not have. The one place the coarse scan survives is a file that will not
+  tokenize at all, where over-reporting is the safe direction: a false positive
+  is a loud CI failure, a false negative is a published recipe.
+
 WHAT THIS IS NOT
   Not a classifier, and it cannot be. Prose is open-set: someone can describe
   the same thing in words this never sees, and no list of terms closes that.
@@ -34,8 +42,10 @@ WHAT THIS IS NOT
 from __future__ import annotations
 
 import ast
+import io
 import re
 import subprocess
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -84,6 +94,19 @@ _NEGATORS = (
 )
 _NEGATION_LOOKBACK = 40
 
+# Concessive phrases that CONTAIN a negator but assert rather than deny: "not
+# only X but Y" claims X. Left unhandled, the substring "not " inside them
+# suppressed a real recipe — the negation fix's own mirror-image defect, since
+# a negation list is itself a bag of substrings used as a claim detector. These
+# are stripped from the lookback window BEFORE the negator scan, so the
+# remaining text is judged on its own.
+_CONCESSIVE = (
+    "not only",
+    "not just",
+    "not merely",
+    "not simply",
+)
+
 # How close the two halves must be to read as one claim. A construct in one
 # paragraph and the word "bypass" three paragraphs later is not a recipe.
 _WINDOW = 240
@@ -124,13 +147,40 @@ def _tracked(suffixes: tuple[str, ...]) -> list[Path]:
     ]
 
 
+def _comment_runs(src: str) -> list[str]:
+    """Real COMMENT tokens, grouped into runs of consecutive lines.
+
+    Grouped because the window that binds the two halves of a recipe together
+    has to span a multi-line comment block; judged per line, a construct named
+    on one line and the defeat claimed on the next would read as unrelated.
+    """
+    runs: list[list[str]] = []
+    prev = None
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+            if tok.type != tokenize.COMMENT:
+                continue
+            line = tok.start[0]
+            if runs and prev is not None and line == prev + 1:
+                runs[-1].append(tok.string)
+            else:
+                runs.append([tok.string])
+            prev = line
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        # Will not tokenize — fall back to the coarse scan, which also reads
+        # string literals. Over-reporting is the correct direction here; see
+        # the module docstring.
+        return [m.group(0) for m in re.finditer(r"(?m)^[ \t]*#.*(?:\n[ \t]*#.*)*", src)]
+    return ["\n".join(r) for r in runs]
+
+
 def _prose_of_python(path: Path) -> list[str]:
     """Comments and docstrings only — never string literals or test data."""
     try:
         src = path.read_text(errors="replace")
     except OSError:
         return []
-    blocks = [m.group(0) for m in re.finditer(r"(?m)^[ \t]*#.*(?:\n[ \t]*#.*)*", src)]
+    blocks = _comment_runs(src)
     try:
         tree = ast.parse(src)
     except SyntaxError:
@@ -154,6 +204,8 @@ def _recipe_hits(text: str) -> list[tuple[str, str]]:
                 if at < 0:
                     continue
                 lead = window[max(0, at - _NEGATION_LOOKBACK) : at]
+                for phrase in _CONCESSIVE:
+                    lead = lead.replace(phrase, " ")
                 if any(neg in lead for neg in _NEGATORS):
                     continue  # denied, not asserted — see _NEGATORS
                 hits.append((construct, outcome))
@@ -209,6 +261,11 @@ def test_markdown_carries_no_bypass_recipe():
         ("a `|` inside a here" + "-doc body may over-block, never a bypass", False),
         ("a here" + "-doc cannot open a bypass here", False),
         ("an ANSI-C span does not bypass the gate", False),
+        # CONCESSIVE — carries a negator but ASSERTS. "not only X" claims X,
+        # and the negation list, being itself a bag of substrings, read it as a
+        # denial and swallowed a real recipe.
+        ("an ANSI-C span is not only able to bypass the gate", True),
+        ("a here" + "-doc does not just bypass it, it hides the command", True),
     ],
 )
 def test_the_detector_discriminates(prose, should_flag):
@@ -220,3 +277,49 @@ def test_the_detector_discriminates(prose, should_flag):
     a week, and a disabled gate is a doc line with extra steps.
     """
     assert bool(_recipe_hits(prose)) is should_flag
+
+
+def test_a_hash_line_inside_a_string_literal_is_not_read_as_a_comment(tmp_path):
+    """The permitted-fixture half of the rule, enforced rather than asserted.
+
+    The module docstring has always said string literals are not scanned. The
+    first implementation read raw source with a regex, which cannot tell a
+    comment from a hash-prefixed line inside a multiline string — so a shell
+    fixture, the one thing the rule explicitly allows, tripped the check. The
+    positive control below is what makes this test mean anything: without it,
+    a `_prose_of_python` that returned nothing at all would pass.
+    """
+    shape = "ANSI" + "-C"
+    recipe = f"# a {shape} span here makes the guard fall silent\n"
+
+    literal = tmp_path / "fixture_data.py"
+    literal.write_text(f"SCRIPT = '''\n{recipe}echo hi\n'''\n")
+    assert _prose_of_python(literal) == [], (
+        "a hash-prefixed line inside a string literal was read as prose; "
+        "fixture data is permitted and must not be scanned"
+    )
+
+    control = tmp_path / "real_comment.py"
+    control.write_text(recipe)
+    hits = [h for block in _prose_of_python(control) for h in _recipe_hits(block)]
+    assert hits, (
+        "POSITIVE CONTROL FAILED — the same text as a real comment was not "
+        "caught either, so the assertion above proves nothing"
+    )
+
+
+def test_an_untokenizable_file_falls_back_to_the_coarse_scan(tmp_path):
+    """The documented degradation, locked so it stays loud rather than silent.
+
+    A file that will not tokenize gets the regex, which over-reports. That is
+    the deliberate direction — a false positive is a CI failure someone reads,
+    a false negative is a recipe that ships. Pinned so the fallback cannot be
+    quietly changed to "return nothing", which would look identical on a clean
+    repository.
+    """
+    shape = "ANSI" + "-C"
+    broken = tmp_path / "unparseable.py"
+    broken.write_text(f"def f(:\n# a {shape} span here makes the guard fall silent\n")
+    blocks = _prose_of_python(broken)
+    assert blocks, "an untokenizable file yielded no prose — the fallback is gone"
+    assert [h for b in blocks for h in _recipe_hits(b)]
