@@ -412,14 +412,6 @@ When a user shares a file path or URL in conversation:
   anything that resolves its target from the directory it runs in (e.g.
   `review_state.py` `evidence-path`/`mark`). Run those from the worktree they
   are about. Detail in the genesis-development skill.
-- **Check closing tags on long tool-call parameters.** A closing tag that does
-  not match its opening tag silently swallows every following parameter into the
-  preceding string; the tool then reports those parameters as *missing*, which
-  reads like a tool bug and is not one. It recurs on long, multi-sentence values.
-  Repeated IDENTICAL validation errors mean the CALL is malformed — the error
-  echoes `input_value`, which holds the proof; read it, and check whether the
-  same tool succeeded earlier in the session, before concluding anything about
-  the tool.
 - **Plan mode by default** for any task with 3+ steps or architectural
   decisions. If something goes sideways — STOP and re-plan.
 - **Use subagents** to keep main context clean. One concern per subagent.
@@ -471,7 +463,10 @@ When a user shares a file path or URL in conversation:
   `input_value` first.** It shows how far the value actually ran, which is what
   distinguishes a malformed CALL from a wrong value or a genuine tool defect —
   repeated identical errors on their own do not establish which. If the echoed
-  value ran past its parameter, fix the STRUCTURE, not the text. Never file a
+  value ran past its parameter, fix the STRUCTURE, not the text; if it ended
+  where it should have, the structure is fine and the value or the tool is the
+  problem — and whether that same tool already succeeded earlier in the session
+  separates those two. Most likely on long, multi-sentence values. Never file a
   bug report from a payload you have not read.
 - **NEVER hide broken things — FIX THEM.** Fix the root cause, not the
   symptom. This is a thinking rule, not just a code rule.
