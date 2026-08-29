@@ -432,12 +432,16 @@ When a user shares a file path or URL in conversation:
   mistakes, not just document them. A rule that only names the error is not
   preventive — state the CORRECT action, or it will be re-read while the same
   mistake repeats.
-- **Tool-call parameters** are `<parameter name="X">…</parameter>`, never a bare
-  `<X>…</X>` — a bare tag has no valid closing tag, so the value runs to the end
-  of the call and every later parameter is reported *missing*. Repeated IDENTICAL
-  validation errors mean the CALL is malformed, not the tool: change the
-  STRUCTURE, not the parameter text. Read the echoed `input_value` before
-  blaming any tool, and never file a bug report from a payload you have not read.
+- **Tool-call parameters** are `<parameter name="X">…</parameter>`. A bare
+  `<X>…</X>` is not a shorthand for it: the wrapper is the only form recognised,
+  so the opening tag never starts a parameter and its `</X>` closes nothing —
+  the value runs on past where it should have ended, typically swallowing every
+  later parameter, which then reports as *missing*. **Read the echoed
+  `input_value` first.** It shows how far the value actually ran, which is what
+  distinguishes a malformed CALL from a wrong value or a genuine tool defect —
+  repeated identical errors on their own do not establish which. If the echoed
+  value ran past its parameter, fix the STRUCTURE, not the text. Never file a
+  bug report from a payload you have not read.
 - **NEVER hide broken things — FIX THEM.** Fix the root cause, not the
   symptom. This is a thinking rule, not just a code rule.
 - **Bugs you see get fixed or tracked — never ignored.** Fix now by default; a
