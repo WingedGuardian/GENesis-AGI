@@ -138,7 +138,44 @@ from shell_parse import (  # noqa: E402
     git_subcommand,
     has_trailing_override,
     split_segments,
+    untokenizable,
 )
+
+# Mentions of a GATED operation, consulted ONLY on the un-parseable path where
+# analyze() has gone blind. Deliberately BROAD — both the gated verbs and the
+# destructive flags — because the outcome there is an approval PROMPT, not a
+# block: an over-match costs one confirmation, while an under-match silently
+# runs an unverified publish. (An earlier flag-only, hard-block version had to be
+# surgically precise, and precision is exactly what an unreliable parse cannot
+# deliver — every narrowing conjunct became a new way to starve the trigger.)
+_GATED_MENTION = re.compile(
+    r"(?:^|\s)(?:--force(?:-with-lease)?|--no-verify|--admin)(?:\s|=|$)|\b(?:push|merge)\b"
+)
+
+# `gh pr create` is the FOURTH gated operation (it can push or fork the branch —
+# see _pr_create_would_publish), and it was missing from the mention set above.
+# MEASURED: an ANSI-C-hidden `gh pr create` on an unpushed branch was ALLOWED
+# while the plain form correctly asked — the same fail-open this net exists to
+# close, for an op the first cut omitted.
+#
+# It is a CONJUNCTION rather than a `create` alternative in the regex because
+# `create` alone is an ordinary English word. Measured over 11,488 real commands
+# (328 un-tokenizable): a bare `\bcreate\b` alternative adds 6 new prompts, all
+# benign here-doc Python; requiring `gh` as well adds ZERO while still catching
+# the bypass. Two literal token tests combined in code — deliberately NOT a
+# lookaround, which is positional: `(?=.*\bgh\b)\bcreate\b` reads FORWARD from
+# `create`, and in `gh pr create` the `gh` is BEHIND it, so that pattern matches
+# nothing and would have measured 0 false positives by never firing at all.
+_GH_MENTION = re.compile(r"\bgh\b")
+_CREATE_MENTION = re.compile(r"\bcreate\b")
+
+
+def _mentions_gated_op(command: str) -> bool:
+    """Whether the RAW text names any gated operation, on the blind path only."""
+    if _GATED_MENTION.search(command):
+        return True
+    return bool(_GH_MENTION.search(command) and _CREATE_MENTION.search(command))
+
 
 # Local push allowlist (offline re-push cache). SOFT dependency, guarded exactly
 # like the review_state import above: a module-LOAD exception must degrade to
@@ -4139,10 +4176,89 @@ def main() -> int:
         # quoted mentions excluded). Each guarded subcommand is matched on real
         # argv, and the `# review-override` approval binds to its OWN segment.
         segs = analyze(cmd)
+
         push_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "push"]
         merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
+
+        # ── Blind-spot net: unverifiable near a gated op → ask a human ──────
+        # analyze()/_argv degrade to a naive split SILENTLY, so an empty segment
+        # list is NOT evidence that no gated command is present: an ANSI-C
+        # `$'…\'…'` span, or an apostrophe in a here-doc body, is enough to drop
+        # a real, executing `git push --force` from the parse (reproduced on both
+        # guards). When the raw text names a gated op, the command will not
+        # tokenize, and the parse surfaced NO matching segment, the verdict is
+        # "unknown" — which earns a human decision, not a silent allow.
+        #
+        # ASK rather than BLOCK is load-bearing. A refusal has to be surgically
+        # precise about which unparseable commands are real, and precision is
+        # exactly what an unreliable parse cannot deliver — every narrowing
+        # conjunct became a new way to starve the trigger, while over-blocking
+        # broke benign shapes. Asking inverts the costs: a false positive is one
+        # confirmation, a miss is the pre-existing status quo. That is what lets
+        # the predicate stay broad.
+        #
+        # The reason is DEFERRED to the tail (like ask_reason / push_allow_reason
+        # above) so every hard block below — sqlite writes, --no-verify, the
+        # dispatched publish denies, the escalation cap — still takes precedence.
+        # Returning here would DOWNGRADE those to a prompt (measured).
+        # The segment check names ALL FOUR gated ops, not the three the first cut
+        # listed. `create_segs` is LOAD-BEARING — do not remove it.
+        #
+        # An earlier version of this comment claimed the opposite: that it was
+        # symmetry only, and mutation-tested to change no verdict. That claim was
+        # WRONG, and wrong in the direction that invites deleting the conjunct.
+        # Its four cells varied parse state (interactive/dispatched x
+        # parsed-create x untokenizable) and held the GATE OUTCOME fixed, so they
+        # all assumed a create that was already gated. The axis that matters is
+        # whether the create is gated at all: for one the real gate ALLOWS (a
+        # branch already on the remote, so no publish risk), dropping this
+        # conjunct lets the net fire on an untokenizable-but-benign create and
+        # turns an allow into a prompt, or into a refusal when unattended.
+        #
+        # A mutation test proves nothing about an axis its cells do not vary.
+        blind_spot_reason: str | None = None
+        if (
+            not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
+            and untokenizable(cmd)
+            and _mentions_gated_op(cmd)
+        ):
+            if _is_dispatched():
+                # No human is present to answer a prompt, and an unverifiable
+                # gated command must not proceed unattended. Mirrors the
+                # dispatched deny legs on the push / pr-create asks below.
+                print(
+                    "BLOCKED: this command cannot be parsed safely (e.g. "
+                    "ANSI-C $'...' quoting) and names a gated operation. "
+                    "Autonomous sessions cannot proceed on an unverifiable "
+                    "command.\n"
+                    "To proceed: if you are WRITING TEXT (a commit message, a "
+                    "plan, review notes) whose content merely mentions push or "
+                    "merge, use the Write tool instead of a here-doc — the "
+                    "apostrophe in ordinary prose is what makes this "
+                    "unparseable, and no amount of re-quoting a here-doc fixes "
+                    "it. If you are RUNNING a git command, rewrite it in a "
+                    "directly-parseable form (plain quotes, or -F <file>).",
+                    file=sys.stderr,
+                )
+                # The advice above is load-bearing, not decoration. An
+                # unattended session cannot ask what it did wrong, so a refusal
+                # it cannot act on is a wall rather than a cost — which is the
+                # whole basis for refusing here at all. MEASURED: the dominant
+                # real shape that reaches this leg is prose-to-a-file, and the
+                # previous message's only suggestion ("rewrite it in a
+                # directly-parseable form") does not apply to it.
+                return 2
+            blind_spot_reason = (
+                "This command could not be parsed safely (e.g. ANSI-C $'...' "
+                "quoting) and mentions a gated operation (push / merge / "
+                "gh pr create / --force / --no-verify / --admin), so the guard "
+                "cannot verify "
+                "what it would actually run. Approve only if you are sure. To "
+                "avoid the prompt, rewrite it in a directly-parseable form "
+                "(plain quotes, or -F <file>)."
+            )
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
         # command carrying more than one would collapse into ONE ask/gate
@@ -4803,6 +4919,8 @@ def main() -> int:
         # Reached only if no hard-block above returned. Dispatched sessions
         # were already denied inline; here, an interactive human session gets a
         # native approve/deny dialog for its push / PR-create.
+        if ask_reason is None and blind_spot_reason is not None:
+            ask_reason = blind_spot_reason
         if ask_reason is not None:
             return _ask(ask_reason)
 

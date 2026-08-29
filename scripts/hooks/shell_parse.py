@@ -22,6 +22,16 @@ This module centralizes that parsing so ``git_push_guard``,
 ``review_enforcement_commit``, and the destructive/path guards agree. Stdlib
 only; fail-open (a segment that won't tokenize degrades to a naive split rather
 than raising) — a guard must never crash the tool.
+
+That fail-open degradation is SILENT by design, which means ``analyze()`` can
+never report its own blind spot: "no gated segment found" and "no gated command
+present" are indistinguishable in its return value. A caller that treats the
+former as the latter fails OPEN. ``untokenizable()`` exists so a
+security-critical caller can tell them apart and choose its own fail direction
+at its own boundary — the parser degrades gracefully, each gate decides for
+itself what an unverifiable command means. Callers must probe the RAW command:
+normalizing text before a blind-spot probe can only ever delete the evidence
+the probe looks for.
 """
 
 from __future__ import annotations
@@ -595,6 +605,31 @@ def _argv(seg: str) -> list[str]:
         return shlex.split(core)
     except ValueError:
         return core.split()
+
+
+def untokenizable(command: str) -> bool:
+    """True when ``shlex`` cannot cleanly tokenize the command.
+
+    This is the blind-spot signal a guard consults when it is about to conclude
+    "no gated segment found". ``_argv`` degrades to a naive split on the SAME
+    ``ValueError`` silently, so ``analyze()`` can never self-report that its
+    result is untrustworthy — an ANSI-C ``$'…\'…'`` span, or merely an
+    apostrophe inside a here-doc body, is enough to shift segmentation off and
+    drop a real, executing command from the parse.
+
+    Deliberately reads the WHOLE raw command, with no here-doc normalization.
+    An earlier version stripped here-doc bodies first to suppress prompts on
+    multi-line scripts; that MEASURABLY disarmed the signal on an ordinary shape
+    (a quoted here-doc whose body contains an apostrophe, followed by a real
+    gated git command — bash runs it, the stripped text tokenizes cleanly, and
+    the guard fell silent). Normalizing the text before the probe can only ever
+    delete the evidence the probe exists to find, so it does not happen here.
+    """
+    try:
+        shlex.split(command.replace("\\\n", " "))
+        return False
+    except ValueError:
+        return True
 
 
 def _basename(token: str) -> str:
