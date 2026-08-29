@@ -44,6 +44,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -92,13 +93,115 @@ _TEST_SLUG = "testowner/testrepo"
 #
 # Still inherited on purpose: PATH (git/gh must be findable — their ABSENCE
 # raises loudly in the fixture rather than silently changing a verdict), TMPDIR
-# and the locale vars (no verdict influence). HOME is deliberately NOT here: the
-# guards resolve ~/.genesis review state and config from it, and a guard that
-# writes (the push allowlist) would otherwise mutate the developer's real store
-# from a test run.
+# and the locale vars (no verdict influence).
+#
+# HOME and GENESIS_HOME are not allow-listed either, but omitting them is NOT
+# enough and the previous version of this comment claimed otherwise. On POSIX
+# `os.path.expanduser("~")` falls back to the PASSWD-database home when HOME is
+# unset, so the guards went on resolving the developer's real ~/.genesis —
+# reading config through `_canonical_public_repo()` and, on an ls-remote hit,
+# WRITING the push allowlist there. A test run could mutate the real store, and
+# ambient config could change a verdict. Absence is not isolation; both are
+# PINNED to a sandbox below.
 _NEUTRAL_ENV = frozenset(
     {"PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "PYTHONHASHSEED"}
 )
+
+# One empty directory for the whole module. Nothing here is meant to persist;
+# the point is only that it is NOT the real home, so neither a read nor a write
+# can reach the developer's state.
+#
+# TemporaryDirectory rather than mkdtemp: a bare mkdtemp leaks a directory per
+# run, and TMPDIR here points at the Claude Code working temp, which a watchdog
+# kills sessions over when it fills. The finalizer cleans up at interpreter exit.
+_SANDBOX_HOME_TD = tempfile.TemporaryDirectory(prefix="guard-suite-home-")
+_SANDBOX_HOME = _SANDBOX_HOME_TD.name
+
+
+def _child_env(cwd: str | None = None, dispatched: str | None = None) -> dict[str, str]:
+    """The ONE place that decides what a guard child may see.
+
+    Built in two separate places before this, which is how the two ambient-input
+    bugs below each had to be fixed twice. One definition, two callers.
+    """
+    env = {k: v for k, v in os.environ.items() if k in _NEUTRAL_ENV}
+    # PINNED, not omitted. On POSIX `expanduser("~")` falls back to the passwd
+    # home when HOME is unset, so omitting it left the guards reading real config
+    # and writing the real push allowlist. GENESIS_HOME too: it overrides the
+    # ~/.genesis derivation outright, so leaving it ambient reopens the same hole
+    # from the other side.
+    env["HOME"] = _SANDBOX_HOME
+    env["GENESIS_HOME"] = str(Path(_SANDBOX_HOME) / ".genesis")
+    env["GIT_CONFIG_GLOBAL"] = os.devnull  # no developer gitconfig (gpgsign etc.)
+    env["GIT_CONFIG_SYSTEM"] = os.devnull
+    if cwd is not None:
+        # The SAME class as HOME, entering through the directory instead of a
+        # variable. TMPDIR is allow-listed as "no verdict influence", but it
+        # decides where tmp_path lives, and tmp_path is the guard's cwd — so if
+        # the temp root happens to sit inside a git repo on main, repo-state
+        # rules evaluate against THAT repo. MEASURED: moving --basetemp inside a
+        # main-branch repo turns three passing cases into
+        # "Direct commits to main are not allowed". A ceiling stops git walking
+        # up out of the scratch dir. It must be the PARENT: naming the directory
+        # itself does not stop the walk that starts there.
+        env["GIT_CEILING_DIRECTORIES"] = str(Path(cwd).parent)
+    if dispatched is not None:
+        env["GENESIS_CC_SESSION"] = dispatched
+    return env
+
+
+def _names_a_usable_escape(guidance: str) -> bool:
+    """Does the refusal name a route that WORKS, for both shapes that reach it?
+
+    Two distinct commands land on this leg and they need different advice:
+    a real git invocation that merely quotes badly (re-quote it, or -F <file>),
+    and — the dominant one in practice — prose being written to a file whose
+    text happens to contain a contraction and the word push or merge. No amount
+    of re-quoting a here-doc fixes the second; the route out is to write the
+    file with a tool instead. A message that only covers the first is a wall for
+    the more common case, so require both.
+    """
+    covers_command = "-f <file>" in guidance or "plain quotes" in guidance
+    covers_prose = "write tool" in guidance or "instead of a here-doc" in guidance
+    return covers_command and covers_prose
+
+
+def test_the_sandbox_home_is_what_the_guard_actually_RESOLVES(tmp_path):
+    """SHOULD-FIX 4 — the isolation fix had nothing pinning it.
+
+    MEASURED: reverting the HOME/GENESIS_HOME pin to the real home left this
+    suite fully green, so the guards would silently go back to reading the
+    developer's config and writing their real push allowlist. A fix no test can
+    fail on is a comment with extra steps.
+
+    Assert on the CHILD's resolution rather than on a verdict, because a verdict
+    is the same whether the pin works or not — and an empty sandbox directory is
+    likewise identical for a working pin and an inert one.
+    """
+    probe = (
+        "import os,sys;"
+        f"sys.path.insert(0,{str(_HOOKS_DIR)!r});"
+        "import push_allowlist as pa;"
+        "print(os.path.expanduser('~'))"
+    )
+    r = subprocess.run(
+        [_PY, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=_child_env(),
+        cwd=str(tmp_path),
+    )
+    resolved = r.stdout.strip()
+    assert resolved == _SANDBOX_HOME, (
+        "the guard child resolves a home that is NOT the sandbox, so ambient "
+        f"config can reach it and a write can escape into the real store.\n"
+        f"resolved={resolved!r} sandbox={_SANDBOX_HOME!r}\n{r.stderr}"
+    )
+    assert Path.home() != Path(_SANDBOX_HOME), (
+        "CONTROL: the sandbox IS the real home, so the assertion above is "
+        "trivially satisfied and proves nothing."
+    )
 
 
 def _unpushed_repo(tmp_path: Path, monkeypatch) -> str:
@@ -108,10 +211,16 @@ def _unpushed_repo(tmp_path: Path, monkeypatch) -> str:
     vacuous — control and variant both return `allow`, which is indistinguishable
     from "the op was never gated here":
 
-    1. The publish gates are scoped to the canonical public repo, so the remote
-       must resolve to it. Pinned via the `_TEST_CANONICAL_PUBLIC_REPO` seam and
-       a matching remote URL — never this install's real slug, which would be an
-       install-specific value in a tracked test and would not survive on a clone.
+    1. (RETRACTED — this fixture rests on condition 2 alone.) The docstring
+       used to claim the create gate is scoped to the canonical public repo, and
+       that the `_TEST_CANONICAL_PUBLIC_REPO` seam pins it. Neither half holds:
+       the seam is set with monkeypatch in the PARENT and the child environment
+       is allow-listed, so it never reaches the guard; and the create path
+       consults `_pr_create_would_publish`, not the canonical-repo check.
+       MEASURED: swapping the remote slug for an unrelated one changes no
+       verdict in any cell. The remote URL is still set, deliberately using a
+       placeholder slug rather than this install's real one, which would be an
+       install-specific value in a tracked test.
     2. `_pr_create_would_publish` only gates a create that might push or fork.
        An unpushed branch on an unreachable host makes the `ls-remote` check
        uncertain, which the guard treats as gated by contract.
@@ -129,9 +238,7 @@ def _unpushed_repo(tmp_path: Path, monkeypatch) -> str:
     # all. A fixture that cannot fail is the same defect as a test that cannot
     # fail. (The gpgsign path is also neutralised at source by _run's
     # GIT_CONFIG_GLOBAL pin, but the fixture asserts its own state regardless.)
-    env = {k: v for k, v in os.environ.items() if k in _NEUTRAL_ENV}
-    env["GIT_CONFIG_GLOBAL"] = os.devnull
-    env["GIT_CONFIG_SYSTEM"] = os.devnull
+    env = _child_env(str(tmp_path))
 
     def run(*a: str) -> subprocess.CompletedProcess:
         r = subprocess.run(a, cwd=tmp_path, capture_output=True, text=True, env=env)
@@ -183,17 +290,7 @@ def _run(
     payload: dict = {"tool_name": "Bash", "tool_input": {"command": cmd}}
     if cwd is not None:
         payload["cwd"] = cwd
-    env = {k: v for k, v in os.environ.items() if k in _NEUTRAL_ENV}
-    # git prefers these over the cwd we just set, so an inherited GIT_DIR silently
-    # re-points the guard at the developer's real repo. MEASURED: the same
-    # `git commit -m 'plain message'` goes allow (empty tmp dir) -> block
-    # ("Direct commits to main are not allowed") purely from an inherited GIT_DIR.
-    # They are absent from the allowlist rather than unset here, so the allowlist
-    # stays the single place that decides what the child may see.
-    env["GIT_CONFIG_GLOBAL"] = os.devnull  # no developer gitconfig (gpgsign etc.)
-    env["GIT_CONFIG_SYSTEM"] = os.devnull
-    if dispatched is not None:
-        env["GENESIS_CC_SESSION"] = dispatched
+    env = _child_env(cwd, dispatched)
     return subprocess.run(
         [_PY, str(script)],
         input=json.dumps(payload),
@@ -323,8 +420,14 @@ class TestGhPrCreateIsCovered:
         `\\bcreate\\b` alternative adds 6 new prompts, all benign here-doc
         Python; the conjunction adds zero. This pins the narrower predicate so a
         later 'simplification' to a single alternation has to fail here first.
+
+        The input has to be UNTOKENIZABLE or this pins nothing: the net fires
+        only on the blind path, so with a cleanly-parsing command a broadened
+        predicate would change no verdict and this test would pass either way.
+        An earlier version used exactly such an input and was therefore vacuous
+        with respect to the claim above.
         """
-        cmd = "python3 - <<'PY'\nx = \"it's\"  # create a thing\nprint(x)\nPY"
+        cmd = "cat > f <<'EOF'\ndon't create the file yet\nEOF"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
         assert _decision(r) == "allow", r.stdout + r.stderr
 
@@ -390,7 +493,7 @@ class TestDispatchMarkerIsExact:
         if _decision(r) != "block":
             return  # parseable after all — nothing to recover from
         guidance = r.stderr.lower()
-        assert "parse" in guidance and ("rewrite" in guidance or "rephras" in guidance), (
+        assert "parse" in guidance and _names_a_usable_escape(guidance), (
             "an unattended refusal must name both the cause and the way out — "
             f"there is no one to ask.\n{r.stderr}"
         )
@@ -452,9 +555,12 @@ class TestCommitGuardNet:
         assert _decision(r) != "block", r.stdout + r.stderr
 
     def test_benign_heredoc_commit_message_not_net_blocked(self, tmp_path):
-        # A legit heredoc commit message must not trip MY net (analyze sees the
-        # commit; the heredoc body is stripped) — it may be blocked for other
-        # reasons, but not with the tokenizability message.
+        # A legit multi-line message must not trip MY net. The reason is NOT
+        # that the body is stripped — nothing strips it any more, and the raw
+        # text here is genuinely untokenizable. The net stands down because
+        # analyze() still resolved the segment, and the net only fires where it
+        # found none. It may be blocked for other reasons, never with the
+        # tokenizability message.
         cmd = f"{GIT} {COMMIT} -F - <<'EOF'\nfix: it's a normal message\nEOF"
         r = _run(_COMMIT_GUARD, cmd, cwd=str(tmp_path))
         assert _decision(r) != "block", r.stdout + r.stderr
@@ -508,18 +614,19 @@ class TestAcceptanceCorpus:
         assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
     def test_decoy_segment_still_reaches_a_human(self, tmp_path):
-        """DOCUMENTED RESIDUE (deliberate evasion — NOT closed by this PR).
+        """DOCUMENTED RESIDUE — a shape this net does not close.
 
-        A decoy `git push origin main` before an ANSI-C desync makes analyze()
-        surface one gated segment, so the net (which fires only when NO gated
-        segment was parsed) stands down and the hidden force-push is neither
-        blocked nor mentioned in the approval prompt. Closing it needs
-        per-occurrence accounting of every gated flag against parsed segment spans
-        — more argv→effect modelling, which is the non-convergent tail this design
-        deliberately avoids. Sits in the same accepted-residue bucket as
-        eval / `python -c` / dynamic construction (2026-08-12 decision).
+        Closing this class needs per-occurrence accounting of every gated flag
+        against parsed segment spans: more argv-to-effect modelling, which is the
+        non-convergent tail this design deliberately avoids. Same accepted bucket
+        as eval / dynamic construction (2026-08-12 decision).
 
-        Locked so a future fix flips this deliberately rather than silently.
+        The mechanism is deliberately NOT written out here. This repository is
+        public and the shape is not closed, so an explanation of why the guard
+        misses it would narrow the search for anyone reading. The assertion stays
+        — it locks the residue so a future fix flips it deliberately rather than
+        silently — and whoever does that work can derive the reason from the
+        code in a minute. Private detail lives in the tracked follow-ups below.
         """
         cmd = f"{GIT} {PUSH} origin main && x=$'a\\'b<<PWN'\n{GIT} {PUSH} origin evil {FORCE}\nPWN"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
@@ -545,7 +652,7 @@ class TestAcceptanceCorpus:
 
         A `\\`-newline continuation tokenizes cleanly, so the tokenizability
         probe never fires — analyze() mis-attributing it is the SEPARATE
-        mis-segmentation class (follow-up `737cdea8`). Locked here so the
+        mis-segmentation class (follow-up `dc5ae7ff`). Locked here so the
         boundary is explicit and a future fix flips these deliberately rather
         than silently.
 
@@ -651,7 +758,10 @@ _GATED_OPS = [
     ("commit_plain", f"{GIT} {COMMIT} -m x"),
 ]
 
-# Contexts that HIDE a real, executed gated op from the parser.
+# Contexts that MAY hide a real, executed gated op from the parser. Two of
+# the four are resolved by analyze() for every op, so their cells skip —
+# they are kept as locks in case a parser change makes them live, but the
+# label would overstate coverage if it read as though all four hide..
 _HIDING = [
     ("ansic_prefix", lambda op: ANSIC + op),
     ("desync_line", lambda op: _DESYNC + op),
@@ -771,9 +881,17 @@ def test_matrix_inert_mention_is_never_hard_blocked(
         f"{ctx_name}/{op_name} (dispatched) refused without naming the CAUSE. "
         f"An unattended session cannot ask why.\n{r.stderr}"
     )
-    assert "rewrite" in guidance or "rephras" in guidance, (
-        f"{ctx_name}/{op_name} (dispatched) refused without naming a way out. "
-        f"A refusal a session cannot act on is a wall, not a cost.\n{r.stderr}"
+    # APPLICABILITY, not a keyword. `"rewrite" in guidance` passes on a message
+    # saying "do not rewrite", and — measured — it passed on a message whose only
+    # suggestion did not apply to the command at hand: the dominant real shape
+    # reaching this leg is prose being written to a FILE, where re-quoting a
+    # here-doc cannot help because the apostrophe is in the prose itself. The
+    # refusal has to cover BOTH cases, or an unattended session hits a wall on
+    # the common one.
+    assert _names_a_usable_escape(guidance), (
+        f"{ctx_name}/{op_name} (dispatched) refused without a way out that "
+        f"applies. A refusal a session cannot act on is a wall, not a cost.\n"
+        f"{r.stderr}"
     )
 
 

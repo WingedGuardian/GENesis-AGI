@@ -665,9 +665,13 @@ def main() -> None:
         # deliver: every narrowing conjunct became a new way to starve the trigger,
         # while over-blocking broke benign shapes (`git status # don't commit yet`).
         # Asking inverts those costs: a false positive is one confirmation, a miss
-        # is the pre-existing status quo. Bodies of QUOTED here-docs are dropped
-        # first (bash expands nothing in them), so a legit `git commit -F - <<'EOF'`
-        # does not prompt.
+        # is the pre-existing status quo.
+        #
+        # The probe reads the command RAW — the normalizer that used to
+        # pre-process it is deleted, so an ordinary contraction inside quoted
+        # multi-line input DOES reach this branch. It still does not prompt, but
+        # for a different reason than this comment used to give: analyze()
+        # resolves the segment, and the net only fires where it found none.
         try:
             if untokenizable(command):
                 # EXACT "1", never truthiness. `cc/invoker.py` stamps the marker as
@@ -684,9 +688,15 @@ def main() -> None:
                     _deny(
                         "BLOCKED: this command cannot be parsed safely (e.g. "
                         "ANSI-C $'...' quoting) and mentions a commit. Autonomous "
-                        "sessions cannot proceed on an unverifiable command. "
-                        "Rewrite it in a directly-parseable form (plain quotes, "
-                        "or `git commit -F <file>`) and re-run."
+                        "sessions cannot proceed on an unverifiable command.\n"
+                        "To proceed: if you are WRITING TEXT (a commit message, "
+                        "a plan, review notes) whose content merely mentions a "
+                        "commit, use the Write tool instead of a here-doc — an "
+                        "apostrophe in ordinary prose is what makes this "
+                        "unparseable, and re-quoting the here-doc cannot fix "
+                        "that. If you are RUNNING a git command, rewrite it in "
+                        "a directly-parseable form (plain quotes, or "
+                        "`git commit -F <file>`)."
                         # The way OUT belongs here more than on the ask below:
                         # an interactive session can ask a human what it did
                         # wrong, an unattended one cannot. A refusal it cannot

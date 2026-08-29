@@ -4204,15 +4204,20 @@ def main() -> int:
         # dispatched publish denies, the escalation cap — still takes precedence.
         # Returning here would DOWNGRADE those to a prompt (measured).
         # The segment check names ALL FOUR gated ops, not the three the first cut
-        # listed. HONEST SCOPE: `create_segs` here is symmetry, not a live guard.
-        # Mutation-tested — removing it changes no verdict in any of the four
-        # cells (interactive/dispatched x parsed-create/parsed-create-plus-
-        # untokenizable), because a create the parser DID resolve is answered by
-        # the real create gate first, and this net's verdict is deferred to the
-        # tail behind it. Kept so the condition states the whole set rather than
-        # an accidental subset, which is what let `create` fall out of the
-        # mention test in the first place. Do not cite it as the thing that
-        # prevents a double-prompt; that is the deferral's doing.
+        # listed. `create_segs` is LOAD-BEARING — do not remove it.
+        #
+        # An earlier version of this comment claimed the opposite: that it was
+        # symmetry only, and mutation-tested to change no verdict. That claim was
+        # WRONG, and wrong in the direction that invites deleting the conjunct.
+        # Its four cells varied parse state (interactive/dispatched x
+        # parsed-create x untokenizable) and held the GATE OUTCOME fixed, so they
+        # all assumed a create that was already gated. The axis that matters is
+        # whether the create is gated at all: for one the real gate ALLOWS (a
+        # branch already on the remote, so no publish risk), dropping this
+        # conjunct lets the net fire on an untokenizable-but-benign create and
+        # turns an allow into a prompt, or into a refusal when unattended.
+        #
+        # A mutation test proves nothing about an axis its cells do not vary.
         blind_spot_reason: str | None = None
         if (
             not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
@@ -4227,9 +4232,23 @@ def main() -> int:
                     "BLOCKED: this command cannot be parsed safely (e.g. "
                     "ANSI-C $'...' quoting) and names a gated operation. "
                     "Autonomous sessions cannot proceed on an unverifiable "
-                    "command — rewrite it in a directly-parseable form.",
+                    "command.\n"
+                    "To proceed: if you are WRITING TEXT (a commit message, a "
+                    "plan, review notes) whose content merely mentions push or "
+                    "merge, use the Write tool instead of a here-doc — the "
+                    "apostrophe in ordinary prose is what makes this "
+                    "unparseable, and no amount of re-quoting a here-doc fixes "
+                    "it. If you are RUNNING a git command, rewrite it in a "
+                    "directly-parseable form (plain quotes, or -F <file>).",
                     file=sys.stderr,
                 )
+                # The advice above is load-bearing, not decoration. An
+                # unattended session cannot ask what it did wrong, so a refusal
+                # it cannot act on is a wall rather than a cost — which is the
+                # whole basis for refusing here at all. MEASURED: the dominant
+                # real shape that reaches this leg is prose-to-a-file, and the
+                # previous message's only suggestion ("rewrite it in a
+                # directly-parseable form") does not apply to it.
                 return 2
             blind_spot_reason = (
                 "This command could not be parsed safely (e.g. ANSI-C $'...' "
