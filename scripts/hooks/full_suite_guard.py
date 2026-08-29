@@ -38,6 +38,19 @@ from shell_parse import (  # noqa: E402
     is_pytest_invocation,
 )
 
+try:  # A refusal discards the WHOLE Bash call, so name any write it took with it.
+    from discarded_write import warn as _warn_discarded  # noqa: E402
+except Exception:  # noqa: BLE001 — see below
+
+    def _warn_discarded(_command=None):
+        """No-op stand-in.
+
+        The note is cosmetic, but an UNGUARDED import that failed would abort this
+        module's load — and CC reads a non-2 exit as a NON-blocking error, so the
+        run this hook exists to refuse would proceed. A missing note must never
+        become a missing block.
+        """
+
 _OVERRIDE = "full-suite-ok"
 
 # pytest flags that consume the FOLLOWING token as their value, so that value is not
@@ -151,6 +164,7 @@ def main() -> None:
         f"local full run, append '# {_OVERRIDE}' to the command.",
         file=sys.stderr,
     )
+    _warn_discarded(cmd)
     sys.exit(2)
 
 

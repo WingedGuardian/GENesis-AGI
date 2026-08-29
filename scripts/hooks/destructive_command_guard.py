@@ -31,6 +31,20 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import brace_expand, field, read_payload, run_guard  # noqa: E402
 
+try:  # A refusal discards the WHOLE Bash call, so name any write it took with it.
+    from discarded_write import warn as _warn_discarded  # noqa: E402
+except Exception:  # noqa: BLE001
+
+    def _warn_discarded(_command=None):
+        """No-op stand-in.
+
+        The note is cosmetic, but an UNGUARDED import that failed would abort this
+        module's load — and CC reads a non-2 exit as a NON-blocking error, so the
+        recursive delete this hook exists to refuse would proceed. A missing note
+        must never become a missing block.
+        """
+
+
 # Legacy single-token pattern — kept as the fallback when shlex cannot
 # tokenize the command (unmatched quotes etc.).
 _RM_RF_PATTERN = re.compile(
@@ -205,6 +219,7 @@ def main() -> int:
                 "If intentional, ask the user to confirm.",
                 file=sys.stderr,
             )
+            _warn_discarded(cmd)
             return 2
 
     except (json.JSONDecodeError, KeyError):

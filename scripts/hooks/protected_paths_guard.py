@@ -47,6 +47,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import brace_expand, read_payload, run_guard, tool_input  # noqa: E402
 from shell_parse import analyze, untokenizable  # noqa: E402
 
+try:  # A refusal discards the WHOLE Bash call, so name any write it took with it.
+    from discarded_write import remember as _remember_command  # noqa: E402
+    from discarded_write import warn as _warn_discarded  # noqa: E402
+except Exception:  # noqa: BLE001 — see below
+
+    def _remember_command(_command=None):
+        """No-op stand-in.
+
+        The note is cosmetic, but an UNGUARDED import that failed would abort this
+        module's load — and CC reads a non-2 exit as a NON-blocking error, so the
+        protected-path deletion this hook exists to refuse would proceed. A missing
+        note must never become a missing block.
+        """
+
+    def _warn_discarded(_command=None):
+        """No-op stand-in. See ``_remember_command``."""
+
+
 # Directories that must never be deleted.  Relative to $HOME.
 _PROTECTED_RELATIVE = [
     ".claude/projects",  # CC session transcripts (JSONL)
@@ -172,6 +190,9 @@ def _block(reason: str) -> int:
         "them exactly (no globs).",
         file=sys.stderr,
     )
+    # Last, so it reads as a footnote to the refusal above. The command was handed
+    # over in main(); stdin was consumed by the payload read and cannot be re-read.
+    _warn_discarded()
     return 2
 
 
@@ -180,6 +201,7 @@ def main() -> int:
     cmd = tool_input(payload).get("command", "")
     if not cmd or not isinstance(cmd, str):
         return 0
+    _remember_command(cmd)
 
     # Fast path: no rm/rmdir word anywhere in the command.
     if not _RM_PATTERN.search(cmd):
