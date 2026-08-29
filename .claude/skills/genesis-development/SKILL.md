@@ -209,8 +209,11 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   vacuous, or the MUTATION silently failed to apply — and the second is common,
   because the auto-formatter reflows lines and a `str.replace()` anchor written
   from memory then matches nothing. So: `assert mutated != original` after every
-  injection, and `ast.parse()` it before writing (an invalid mutation breaks
-  collection, and that failure reads as a successful RED). Restore from a file
+  injection, and syntax-check it with the MUTATED FILE'S OWN parser before
+  writing — `ast.parse()` for Python, `bash -n` for shell, the equivalent for
+  anything else (an invalid mutation breaks collection, and that failure reads
+  as a successful RED; conversely, running Python's parser over a shell hook
+  rejects a valid mutation and hides a real survivor). Restore from a file
   copy taken beforehand, never `git checkout` — the work is uncommitted.
 - **Vacuous-test shapes to check for by name.** A test is vacuous when: its
   assertion is ALSO true on the success path (`assert x.blocked is False` where
@@ -665,15 +668,22 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      cost), name the cap explicitly ("we've hit the 3-round escalation cap"),
      and get a FRESH decision: keep hardening, switch to a robust-by-
      construction redesign, narrow scope, or shelve.
-  **Count CLASSES, not findings, when judging whether the cap has fired.**
+  **Tabulate findings by CLASS before fixing — but never let that change what
+  COUNTS.**
   Before fixing anything in a second round, tabulate the findings with a CLASS
   column. Findings that look unrelated one at a time routinely share one
   generator — five across three rounds once reduced to a single defect (two
   layers that had to agree about every lever and could not), and patching
   instances twice changed nothing while deleting the second layer removed all
-  five at once. If one class has ≥2 entries, the fix is architectural. The count
-  that matters is "consecutive rounds surfacing a NEW class", not the finding
-  total.
+  five at once. If one class has ≥2 entries, the fix is architectural.
+  **Class grouping decides HOW you fix — never whether the round counts.** The
+  counter is deliberately class-blind: `bump_review_round` increments on a
+  distinct staged diff and records no class (or reviewer) identity, and the
+  marking rule below is finding-based — ANY new BLOCKER/SHOULD-FIX/P1/P2 makes
+  the round defect-bearing, including the second instance of a class you have
+  already named. Passing `--clean` to keep a repeat-class round off the counter
+  is a falsification, and worse than miscounting: `--clean` RESETS the streak to
+  zero, so it disarms the cap outright rather than merely under-counting it.
 
   A corollary that costs a round if missed: when you delete a duplicated layer,
   verify the class is closed by enumerating the registry for the BEHAVIOUR, not
