@@ -59,12 +59,30 @@ def test_master_enabled_false_wins(config_dirs):
     assert lsc.effective_mode() == "off"
 
 
-def test_live_coerced_to_shadow_with_warning(config_dirs, caplog):
+def test_live_is_honoured(config_dirs):
+    """`live` was reserved until the write path existed. It exists now."""
     base, _ = config_dirs
     base.write_text("mode: live\n")
-    with caplog.at_level("WARNING"):
-        assert lsc.effective_mode() == "shadow"
-    assert any("reserved" in r.message for r in caplog.records)
+    assert lsc.effective_mode() == "live"
+
+
+def test_nothing_degrades_INTO_live(config_dirs, caplog):
+    """The failure direction must always be toward LESS write authority.
+
+    `live` promotes rows into the real ledger, so it must be reachable ONLY by
+    someone typing it. Every malformed, missing or unexpected value has to land
+    on shadow or off — a config typo must never be able to grant write
+    authority. Asserting the invalid case degrades to *shadow* is not enough on
+    its own: that assertion passes just as happily if the mode were ignored
+    entirely, so the live case above is its necessary partner.
+    """
+    base, _ = config_dirs
+    for bogus in ("LIVE", "Live", " live", "liveness", "true", "1", "", "yes"):
+        base.write_text(f"mode: {bogus!r}\n")
+        with caplog.at_level("WARNING"):
+            assert lsc.effective_mode() != "live", (
+                f"mode {bogus!r} reached live without being spelled exactly"
+            )
 
 
 def test_invalid_mode_degrades_to_shadow(config_dirs, caplog):
@@ -119,10 +137,17 @@ def test_validator_rejects_bad_values():
     assert _validate_session_ledger_shadow({"bogus": 1})
 
 
-def test_base_config_file_is_valid_shadow():
-    """The shipped config/session_ledger_shadow.yaml parses and yields shadow."""
+def test_base_config_file_ships_shadow_not_live():
+    """The shipped config must not promote until the evidence earns it.
+
+    Pinned deliberately: this one line decides whether a fresh install writes
+    autonomous rows into the user's ledger, and an accidental edit changes
+    behaviour on every install with no other signal. The write path is complete
+    and tested — that is precisely why the config value needs its own guard.
+    """
     import yaml
 
     base = Path(__file__).parents[2] / "config" / "session_ledger_shadow.yaml"
     cfg = yaml.safe_load(base.read_text())
     assert cfg == {"enabled": True, "mode": "shadow"}
+    assert cfg["mode"] in lsc.MODES

@@ -17,13 +17,12 @@ from __future__ import annotations
 
 import logging
 import os
-from pathlib import Path
 
 from genesis.mcp.health import mcp
+from genesis.session_charter import SESSIONS_DIR as _canonical_sessions_dir
 
 logger = logging.getLogger(__name__)
 
-_SESSIONS_DIR = Path.home() / ".genesis" / "sessions"
 
 
 def _get_db():
@@ -36,20 +35,23 @@ def _get_db():
     return getattr(svc, "_db", None)
 
 
-async def _refresh_mirror(db, session_id: str) -> None:
-    """Regenerate the charter.md human mirror after a mutation. Best-effort:
-    the DB is canonical, a failed mirror only goes stale until the next write."""
-    try:
-        from genesis.db.crud import session_charters as crud
-        from genesis.session_charter import write_charter_md
+# An ALIAS of the canonical constant, not a second definition — kept as a
+# module attribute because it is the seam this module's tests redirect, and a
+# suite that cannot redirect it writes charter.md into the real home tree.
+_SESSIONS_DIR = _canonical_sessions_dir
 
-        charter = await crud.get(db, session_id)
-        if charter is None:
-            return
-        ledger = await crud.ledger_list(db, session_id)
-        write_charter_md(_SESSIONS_DIR, session_id, charter, ledger)
-    except Exception:
-        logger.warning("charter.md refresh failed for %s", session_id, exc_info=True)
+
+async def _refresh_mirror(db, session_id: str) -> None:
+    """Regenerate the charter.md human mirror after a mutation.
+
+    Delegates to the canonical implementation in ``genesis.session_charter``,
+    which the ambient ledger extractor also calls. Two copies would be free to
+    drift, and both callers must agree on what a refresh does. The directory is
+    passed explicitly so this module's seam still governs where it lands.
+    """
+    from genesis.session_charter import refresh_mirror
+
+    await refresh_mirror(db, session_id, _SESSIONS_DIR)
 
 
 def _default_added_by() -> str:

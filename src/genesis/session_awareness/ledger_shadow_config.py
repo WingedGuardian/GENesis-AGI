@@ -3,14 +3,13 @@
 The ONE place the ledger shadow worker consults for policy (session-manager
 PR-3, ws3_immunity lineage):
 
-- :func:`effective_mode` — ``off | shadow``, re-read from the merged YAML
-  (``config/session_ledger_shadow.yaml`` + the user overlay
+- :func:`effective_mode` — ``off | shadow | live``, re-read from the merged
+  YAML (``config/session_ledger_shadow.yaml`` + the user overlay
   ``~/.genesis/config/session_ledger_shadow.local.yaml``) on EVERY call.
   No boot cache — a ``settings_update`` or hand edit takes effect on the
   next PreCompact-spawned worker instantly (each run is a fresh process
-  anyway). ``live`` is a RESERVED value: the write path lands with the
-  data-gated flip PR, so until then it is coerced to ``shadow`` with a
-  warning (sentinel dispatcher precedent) — never a silent live flip.
+  anyway). ``live`` promotes qualifying proposals into the real ledger;
+  it was reserved until the write path existed, and now it does.
 
 Failure posture: a missing/corrupt config degrades to DEFAULTS (enabled,
 shadow) — shadow writes nothing user-visible, so config damage costs at
@@ -77,13 +76,14 @@ def load_config() -> dict[str, Any]:
 
 
 def effective_mode() -> str:
-    """The mode the worker must run under: ``off`` or ``shadow`` — read live.
+    """The mode the worker must run under: ``off``, ``shadow`` or ``live``.
 
-    Master ``enabled: false`` → ``off``. ``live`` is reserved until the
-    data-gated flip PR implements the live write path — coerced to
-    ``shadow`` with a warning so a premature flip is loud and harmless.
-    An invalid value degrades to ``shadow`` (observable, never a silent
-    off, never live).
+    Read live, per call. Master ``enabled: false`` → ``off``.
+
+    An invalid value degrades to ``shadow``, never to ``live``: the failure
+    direction must be toward LESS write authority, so a typo or a corrupt
+    config can only ever cost one Haiku call per compaction, never a live
+    ledger write.
     """
     cfg = load_config()
     if not cfg.get("enabled", True):
@@ -93,11 +93,6 @@ def effective_mode() -> str:
         # A hand-edited unquoted `mode: off` parses as YAML-1.1 boolean
         # False. That intent is unambiguous — honor it.
         return "off"
-    if mode == "live":
-        logger.warning(
-            "session_ledger_shadow mode 'live' is reserved (flip PR pending) — coercing to shadow"
-        )
-        return "shadow"
     if mode not in MODES:
         logger.warning("session_ledger_shadow has invalid mode %r — degrading to shadow", mode)
         return "shadow"

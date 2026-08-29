@@ -1915,7 +1915,8 @@ TABLES = {
                         CHECK(status IN ('open','in_progress','done','absorbed','dropped')),
             source_ref  TEXT,
             added_by    TEXT NOT NULL DEFAULT 'foreground'
-                        CHECK(added_by IN ('foreground','ambient','pulse')),
+                        CHECK(added_by IN ('foreground','ambient','pulse',
+                                           'ambient_ledger_extractor')),
             evidence    TEXT,
             created_at  TEXT NOT NULL,
             updated_at  TEXT

@@ -13,10 +13,43 @@ enabled: true
 #   shadow — extract agreements/pivots from the transcript delta via headless
 #            Haiku and LOG proposals to session_ledger_shadow_* only; the
 #            live session_ledger is NEVER written
-#   live   — RESERVED: coerced to shadow (with a warning) until the
-#            data-gated flip PR lands the live write path. The flip is
-#            user-approved, driven by shadow precision reports.
+#   live   — everything shadow does, PLUS promoting the proposals that clear
+#            the qualifying bar into the real session_ledger, stamped
+#            added_by='ambient_ledger_extractor' so they stay distinguishable
+#            from rows a human or a dispatched session wrote.
 #
-# Hook-level kill switch (separate lever): GENESIS_LEDGER_SHADOW_DISABLED=1
-# stops the PreCompact hook from spawning the worker at all.
+# What `live` actually promotes (deliberately conservative — a false ledger row
+# costs attention in every later window, so this starts tight and loosens on
+# evidence): kind='agreement', a VERIFIED quote from the transcript, no match
+# against an existing ledger row, and not a duplicate of an earlier proposal.
+# A --backfill run NEVER promotes; it replays historical windows, and those
+# agreements belong to sessions that have already ended.
+#
+# INTERIM: at most 5 rows are promoted per run, and anything the cap drops is
+# logged rather than silently discarded. The cap is a stopgap until the
+# overseer can prune the extractor's own rows — a validator that judges beats a
+# number that guesses.
+#
+# Rollback, in order of bluntness: set `mode: shadow` here (takes effect at the
+# next compaction, no restart), or set GENESIS_LEDGER_SHADOW_DISABLED=1 to stop
+# the hook spawning the worker at all. An invalid mode degrades to shadow,
+# never to live — the failure direction is always toward less write authority.
+#
+# STILL SHADOW, DELIBERATELY. The write path above is complete and tested; the
+# EVIDENCE for turning it on is not there yet, and the reason is worth keeping:
+#
+#   · The precision report cannot gate this. Promotion requires
+#     match_kind='none', and the report classifies exactly that set as its
+#     false positives — so the metric measures the complement of what would
+#     ship and can never say anything about it, however long it soaks.
+#   · Hand adjudication of what WOULD have been written (n=40 of 307, one
+#     adjudicator, 2026-08-29): 17 wanted, 43%. Volume would have been ~307
+#     autonomous rows against 87 human ones over the same 45 days.
+#   · 23% of that set was one thing: the user's standing process directive,
+#     re-extracted as a fresh "agreement" whenever it was pasted.
+#
+# That last number is why the extractor prompt is now v2, aimed at the SUBJECT
+# of the work rather than the user's assent. The 43% describes v1 and does not
+# carry over. Flip when a fresh adjudication of v2 output earns it — this line
+# is the whole change.
 mode: shadow

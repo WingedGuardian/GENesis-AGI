@@ -474,3 +474,189 @@ async def test_telemetry_row_recorded(tmp_path, sessions_root, shadow_mode, db_p
         cur = await db.execute("SELECT call_site_id, model_id, success FROM call_site_last_run")
         rows = await cur.fetchall()
     assert rows and rows[0][0] == "ambient_ledger_extractor"
+
+
+# ── live promotion ───────────────────────────────────────────────────────
+#
+# Everything above runs under the `shadow_mode` fixture, so until this section
+# existed NOTHING exercised the live branch. Mutation-measured before it was
+# written: changing `if recorded and mode == "live":` to `if recorded:` — a
+# one-token edit that makes the shadow lane write to the live ledger — left the
+# suite fully green. A mode gate that nothing holds is not a gate.
+
+M87 = importlib.import_module(
+    "genesis.db.migrations.0087_session_ledger_ambient_extractor"
+)
+
+
+@pytest.fixture
+def live_mode(monkeypatch):
+    monkeypatch.setattr(lw, "effective_mode", lambda: "live")
+
+
+@pytest.fixture
+async def live_db_path(tmp_path) -> Path:
+    """Like `db_path`, plus the migration that admits the extractor's provenance."""
+    path = tmp_path / "genesis-live.db"
+    shadow_crud._tables_verified = False
+    async with aiosqlite.connect(str(path)) as db:
+        await M58.up(db)
+        await M59.up(db)
+        await M87.up(db)
+        await db.commit()
+    yield path
+    shadow_crud._tables_verified = False
+
+
+async def _ledger(db_path: Path) -> list[dict]:
+    async with aiosqlite.connect(str(db_path)) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM session_ledger ORDER BY created_at")
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def _run_once(tmp_path, transcript, db_path, agreements, *, trigger="manual",
+                    pivots=()):
+    fake = _verdict_claude(tmp_path, agreements, pivots)
+    end = transcript.stat().st_size
+    return await lw.run_ledger_worker(
+        SID, str(transcript), end, trigger=trigger, claude_path=fake,
+        db_path=db_path,
+    )
+
+
+async def test_shadow_mode_writes_nothing_to_the_live_ledger(
+    tmp_path, sessions_root, shadow_mode, live_db_path, transcript
+):
+    """The gate itself. This is the test whose absence let a one-token edit turn
+    the shadow lane into the live lane with CI green."""
+    out = await _run_once(tmp_path, transcript, live_db_path, [AGREEMENT])
+    assert out["status"] == "ok"
+    assert out.get("promoted", 0) == 0
+    assert await _ledger(live_db_path) == []
+
+
+async def test_live_mode_promotes_a_qualifying_agreement(
+    tmp_path, sessions_root, live_mode, live_db_path, transcript
+):
+    out = await _run_once(tmp_path, transcript, live_db_path, [AGREEMENT])
+    assert out["promoted"] == 1
+
+    (row,) = await _ledger(live_db_path)
+    assert row["text"] == AGREEMENT["text"]
+    assert row["added_by"] == "ambient_ledger_extractor"
+    assert row["status"] == "open"
+    # The filter DEMANDS a verified quote; the row must then be able to show it.
+    # Without this the live leak invariant fails on every promotion, and a human
+    # reading an autonomously-added row has no source for it.
+    assert row["evidence"], "promoted row carries no evidence"
+
+
+async def test_the_mirror_is_actually_refreshed(
+    tmp_path, sessions_root, live_mode, live_db_path, transcript
+):
+    """`charter.md` must exist after a promotion.
+
+    It did not. The connection carried no row factory, so `crud.get`'s
+    `dict(row)` raised, `refresh_mirror`'s best-effort `except` swallowed it,
+    and the run reported success while the mirror never updated — for every
+    promotion, always.
+    """
+    await _run_once(tmp_path, transcript, live_db_path, [AGREEMENT])
+    assert (sessions_root / SID / "charter.md").exists(), (
+        "charter.md was not written — the mirror refresh failed silently"
+    )
+
+
+async def test_backfill_never_promotes(
+    tmp_path, sessions_root, live_mode, live_db_path, transcript
+):
+    """Backfill replays historical windows; those agreements belong to sessions
+    that have already ended."""
+    out = await _run_once(
+        tmp_path, transcript, live_db_path, [AGREEMENT], trigger="backfill"
+    )
+    assert out["promoted"] == 0
+    assert await _ledger(live_db_path) == []
+
+
+async def test_an_unverified_quote_is_not_promoted(
+    tmp_path, sessions_root, live_mode, live_db_path, transcript
+):
+    """The quote must be findable in the transcript, or the row is a paraphrase
+    of something that may never have been said."""
+    bogus = dict(AGREEMENT, quote="a sentence that appears nowhere in the delta")
+    out = await _run_once(tmp_path, transcript, live_db_path, [bogus])
+    assert out["promoted"] == 0
+    assert await _ledger(live_db_path) == []
+
+
+async def test_a_pivot_is_not_promoted(
+    tmp_path, sessions_root, live_mode, live_db_path, transcript
+):
+    """A pivot is a change of direction, not a commitment — it reads badly as a
+    checkbox someone has to close."""
+    pivot = {"turn": 1, "text": "switch to the other approach", "quote": "yes, do that"}
+    out = await _run_once(tmp_path, transcript, live_db_path, [], pivots=[pivot])
+    assert out["promoted"] == 0
+    assert await _ledger(live_db_path) == []
+
+
+async def test_a_second_run_does_not_promote_the_same_agreement_twice(
+    tmp_path, sessions_root, live_mode, live_db_path, transcript
+):
+    """Idempotency across runs is NOT inherited from the shadow cursor.
+
+    The cursor's re-cover guarantee is a shadow guarantee; promotion needs its
+    own, which is why the filter gates on `duplicate_of` and on not matching an
+    existing ledger row.
+    """
+    first = await _run_once(tmp_path, transcript, live_db_path, [AGREEMENT])
+    assert first["promoted"] == 1
+
+    cursor_path = sessions_root / SID / lw.CURSOR_FILENAME
+    cursor_path.write_text(json.dumps({"last_byte": 0}))
+
+    await _run_once(tmp_path, transcript, live_db_path, [AGREEMENT])
+    assert len(await _ledger(live_db_path)) == 1, (
+        "the same agreement was promoted twice"
+    )
+
+
+async def test_promotion_is_skipped_when_the_match_context_is_unreadable(
+    tmp_path, sessions_root, live_mode, live_db_path, transcript, monkeypatch
+):
+    """Fail CLOSED. Both novelty signals come from that read, so a failure makes
+    everything look promotable — including duplicates of rows already written."""
+
+    async def _unreadable(_db_path, _sid):
+        return [], [], False
+
+    monkeypatch.setattr(lw, "_load_match_context", _unreadable)
+    out = await _run_once(tmp_path, transcript, live_db_path, [AGREEMENT])
+    assert out["promoted"] == 0
+    assert await _ledger(live_db_path) == []
+
+
+async def test_the_cap_bounds_a_single_run(
+    tmp_path, sessions_root, live_mode, live_db_path, transcript, monkeypatch
+):
+    """And what it drops is LOGGED, never silently truncated."""
+    monkeypatch.setattr(lw, "PROMOTION_CAP", 2)
+    # Texts must be genuinely DIFFERENT, not merely numbered. A first version
+    # used "distinct agreement number {i}", which the duplicate detector
+    # correctly collapsed to one — near-identical strings ARE duplicates, and
+    # the fixture was testing the deduper rather than the cap.
+    many = [
+        dict(AGREEMENT, text=t)
+        for t in (
+            "wire the rollback lever before the widget refactor ships",
+            "move the nightly export off the shared scheduler entirely",
+            "stop vendoring the parser and depend on it upstream instead",
+            "give the ingest queue its own retention policy",
+            "replace the polling loop with an event subscription",
+        )
+    ]
+    out = await _run_once(tmp_path, transcript, live_db_path, many)
+    assert out["promoted"] == 2
+    assert len(await _ledger(live_db_path)) == 2
