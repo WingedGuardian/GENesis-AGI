@@ -205,10 +205,16 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   passed may be testing nothing; a whole suite passing every review round
   while a reviewer keeps finding real spec bugs is the tell that the tests
   encode the same wrong spec as the code.
-- **A RED that comes back GREEN is TWO hypotheses, not one.** Either the test is
-  vacuous, or the MUTATION silently failed to apply — and the second is common,
-  because the auto-formatter reflows lines and a `str.replace()` anchor written
-  from memory then matches nothing. The PRINCIPLE, which is what to remember:
+- **A RED that comes back GREEN is THREE hypotheses, not one.** The test is
+  vacuous; or the MUTATION silently failed to apply — common, because the
+  auto-formatter reflows lines and a `str.replace()` anchor written from memory
+  then matches nothing; or the mutation applied to a mechanism that a SIBLING
+  LAYER still enforces, so the invariant holds and the green is correct. The
+  third is the one that gets a sound test rewritten: when two layers produce the
+  same behaviour (see the duplicated-layer entry below), mutate the WHOLE
+  mechanism, not one of its halves. Rule out the second before suspecting the
+  first, and the third before touching the test at all. The PRINCIPLE, which is
+  what to remember:
   **every injection must prove it applied, by its own postcondition, before any
   result is read as RED.** Two corollaries follow, and both have bitten:
   prove it against the value THAT injection was handed, never against the
@@ -219,7 +225,15 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   `ast.parse` for Python, `bash -n` for shell — since an invalid mutation breaks
   collection and reads as a successful RED, while the wrong language's parser
   rejects a valid mutation and hides a real survivor. Restore from a file copy
-  taken beforehand, never `git checkout` — the work is uncommitted.
+  taken beforehand, never `git checkout` — the work is uncommitted — and make
+  that restore UNCONDITIONAL (`trap restore EXIT`, a `finally:`), never the tail
+  of an `&&` chain. The expected outcome here is a NONZERO exit, and under
+  `set -e` a trailing restore is exactly the statement that never runs (the
+  `out=$(cmd)` entry in Common Traps is the same mechanism), so the shape that
+  reads as careful leaves a deliberately-broken file in an uncommitted worktree
+  on the ordinary path — as well as on interruption or a tool timeout. Refuse to
+  start if the file already differs from the snapshot, and verify the restore by
+  hash rather than assuming it.
 - **Vacuous-test shapes to check for by name.** A test is vacuous when: its
   assertion is ALSO true on the success path (`assert x.blocked is False` where
   a successful call also returns False — assert the fact that DISTINGUISHES
@@ -675,8 +689,12 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      construction redesign, narrow scope, or shelve.
   **Tabulate findings by CLASS before fixing — but never let that change what
   COUNTS.**
-  Before fixing anything in a second round, tabulate the findings with a CLASS
-  column. Findings that look unrelated one at a time routinely share one
+  Tabulate the findings with a CLASS column before fixing ANY round's findings,
+  including round ONE. Deferring the tabulation to the second round is what
+  spends a round discovering a shared cause that was visible in the first: if the
+  opening review returns several instances of one generator, an instance-level
+  first pass fixes the ones named and ships the rest as the next round's
+  findings. The tabulation is cheap and the round it saves is not. Findings that look unrelated one at a time routinely share one
   generator — five across three rounds once reduced to a single defect (two
   layers that had to agree about every lever and could not), and patching
   instances twice changed nothing while deleting the second layer removed all
