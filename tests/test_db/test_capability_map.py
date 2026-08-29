@@ -346,8 +346,39 @@ class TestAnchorIsClamped:
     """
 
     @staticmethod
+    async def _assert_seeded_in_future(db, domain):
+        """The skew fixture's PREMISE, asserted instead of assumed.
+
+        These tests mean nothing unless the seeded row is genuinely ahead of
+        the clock. With a literal anchor plus "+100 days" that stopped being
+        true on a fixed calendar date -- and the failure was not a quiet
+        no-op: the row became usable, won the ``MAX(updated_at)`` window
+        anchor, and evicted the healthy rows, so BOTH assertions below
+        inverted at once and the message read "a single clock-skewed row
+        blanked the healthy rows" -- i.e. exactly the production regression
+        the filter exists to prevent. Fail at the premise, loudly, instead.
+        """
+        cur = await db.execute(
+            "SELECT julianday(updated_at) > julianday('now') "
+            "FROM capability_map WHERE domain = ?",
+            (domain,),
+        )
+        row = await cur.fetchone()
+        assert row is not None and row[0] == 1, (
+            f"fixture precondition broken: {domain!r} is no longer in the "
+            "future, so this test no longer exercises clock skew"
+        )
+
+    @staticmethod
     async def _insert_at(db, domain, offset, *, confidence=0.5, sample_size=5,
-                         anchor="2026-08-27T13:00:00+00:00"):
+                         anchor=None):
+        # Read the clock HERE, in the body -- never as a default argument,
+        # which evaluates once at import (and is what
+        # scripts/check_frozen_clock.py flags). A literal anchor was the worse
+        # bug: see _assert_seeded_in_future.
+        from datetime import UTC, datetime
+
+        anchor = anchor or datetime.now(UTC).isoformat()
         await db.execute(
             "INSERT INTO capability_map (id, domain, confidence, sample_size, "
             "trend, evidence_summary, updated_at) "
@@ -361,6 +392,7 @@ class TestAnchorIsClamped:
         for i in range(4):
             await self._insert_at(db, f"healthy{i}", "-0 days")
         await self._insert_at(db, "skewed", "+100 days")
+        await self._assert_seeded_in_future(db, "skewed")
 
         domains = {e["domain"] for e in await cap_crud.get_prompt_rows(db)}
         assert {f"healthy{i}" for i in range(4)} <= domains, (
@@ -379,6 +411,7 @@ class TestAnchorIsClamped:
         """The scanner must not be handed only the poisoned domain."""
         await self._insert_at(db, "real_weak", "-0 days", confidence=0.2)
         await self._insert_at(db, "skewed", "+100 days", confidence=0.1)
+        await self._assert_seeded_in_future(db, "skewed")
 
         domains = [e["domain"] for e in await cap_crud.get_weakest(db)]
         assert "real_weak" in domains

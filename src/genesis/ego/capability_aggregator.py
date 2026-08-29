@@ -66,6 +66,16 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
             rate = success / total
             acc = domains.setdefault(domain, _DomainAccumulator(domain))
             acc.add_signal("journal", rate, total)
+    except ValueError:
+        # A rejected window is a CALLER bug, not an unavailable source. Folded
+        # into the generic handler below it was logged at DEBUG, with no
+        # exc_info, under a false cause -- so source 1 of 6 would drop out of
+        # the map and every domain's sample size would shrink with no signal
+        # anywhere. That is quieter than the double-count the guard replaced.
+        logger.error(
+            "Capability aggregation: intervention_journal window rejected",
+            exc_info=True,
+        )
     except Exception:
         logger.debug("Capability aggregation: intervention_journal unavailable")
 

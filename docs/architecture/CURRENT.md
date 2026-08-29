@@ -729,6 +729,16 @@ verified: 94be12b3 2026-08-06
   PARTIAL outage is not covered. Nothing is ever pruned; rows below a bar stop being refreshed and
   stop being RENDERED as present-tense capability — `get_by_domain` and
   `count_all` still read them deliberately.
+  Withheld rows are named on every exit of all three renderers THAT RENDERS
+  DATA, not only the empty and deep ones (the query-error exit does not
+  count them — that read already failed, so the count would too): a corrupt or future-dated row is just as excluded on the
+  light branch, which renders no table and so gives the reader nothing else to
+  notice the loss by (`unusable_note` is also what logs). Both depth-taking
+  renderers HONOUR `depth="light"` — accepting the keyword and emitting the full
+  table anyway silently bills the caller for fifteen rows it did not ask for —
+  and they share one sentence (`_capability_render.qualifying_subset_line`),
+  because on a branch that renders no table the sentence IS the whole claim and
+  two copies drift into one qualifying its figures and the other not.
   This is the naming-trap twin of this document — unrelated to the subsystem map.
 - Proposal pipeline (`proposals.py`): batch WHAT/WHY/HOW digests to Telegram,
   content firewall via `validate_batch()`, 6h digest rate-limit GROUNDWORK;

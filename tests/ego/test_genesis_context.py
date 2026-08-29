@@ -1082,18 +1082,43 @@ class TestRenderStateMatrix:
             await conn.close()  # every query on it now raises
         return conn
 
-    async def _render(self, which, state, focus=None):
+    @staticmethod
+    def _renderer_takes_depth(which):
+        """Does this renderer actually accept a ``depth`` keyword?
+
+        INSPECTED, never hardcoded. `context.py::_self_model_section` does not
+        take one, so its light cells legitimately render the deep output and
+        must not be held to the no-table rule. The day it grows a depth branch,
+        its cells start exercising it without anyone remembering a list here.
+        """
+        import inspect
+
+        from genesis.ego.context import EgoContextBuilder
+        from genesis.ego.user_context import UserEgoContextBuilder
+
+        method = {
+            "genesis": GenesisEgoContextBuilder._capability_performance_section,
+            "user": UserEgoContextBuilder._capability_performance_section,
+            "base": EgoContextBuilder._self_model_section,
+        }[which]
+        return "depth" in inspect.signature(method).parameters
+
+    async def _render(self, which, state, focus=None, depth="deep"):
         db = await self._make_db(state)
         try:
             if which == "genesis":
                 b = GenesisEgoContextBuilder(db=db)
                 b._focus_id = focus
-                return await b._capability_performance_section()
-            if which == "user":
+                method = b._capability_performance_section
+            elif which == "user":
                 from genesis.ego.user_context import UserEgoContextBuilder
-                return await UserEgoContextBuilder(db=db)._capability_performance_section()
-            from genesis.ego.context import EgoContextBuilder
-            return await EgoContextBuilder(db=db)._self_model_section()
+                method = UserEgoContextBuilder(db=db)._capability_performance_section
+            else:
+                from genesis.ego.context import EgoContextBuilder
+                method = EgoContextBuilder(db=db)._self_model_section
+            if self._renderer_takes_depth(which):
+                return await method(depth=depth)
+            return await method()
         finally:
             if state != "error":
                 await db.close()
@@ -1103,12 +1128,31 @@ class TestRenderStateMatrix:
     # and still missed the cell that exists only when `entries` is empty AND a
     # focus row is present — a cell reachable only where two conditions hold at
     # once. Separate enumerations do not reach the product.
+    # DEPTH IS AN AXIS OF THE PRODUCT, not a separate enumeration beside it.
+    # It used to be the latter, and that is exactly the mistake this class's
+    # docstring warns about: every cell here ran at the default "deep", while
+    # the light branch had one weaker test of its own that asserted only that
+    # no whole-map figure appeared. So a light render could drop a corrupt row
+    # silently -- the very claim the matrix exists to forbid -- and stay green.
+    # A renderer that does not take `depth` is not skipped: it renders its one
+    # form under both values, so adding a depth branch to it later cannot land
+    # unexercised.
     @pytest.mark.parametrize("which", ["genesis", "user", "base"])
     @pytest.mark.parametrize("state", STATES)
     @pytest.mark.parametrize("focus", [None, "t0"])
-    async def test_cell_renders_a_true_claim(self, which, state, focus):
-        out = await self._render(which, state, focus=focus)
-        assert out.strip(), f"{which}/{state} rendered nothing"
+    @pytest.mark.parametrize("depth", ["deep", "light"])
+    async def test_cell_renders_a_true_claim(self, which, state, focus, depth):
+        out = await self._render(which, state, focus=focus, depth=depth)
+        assert out.strip(), f"{which}/{state}/{depth} rendered nothing"
+
+        # A renderer that ACCEPTS depth must HONOUR it. Accepting the keyword
+        # and ignoring it is worse than not offering it: the caller believes it
+        # asked for the cheap form and is silently billed for the full table.
+        if depth == "light" and self._renderer_takes_depth(which):
+            assert "| Domain |" not in out, (
+                f"{which}: a light render still emitted the full table -- the "
+                "depth request was accepted and then ignored"
+            )
 
         if state == "error":
             assert "query error" in out, f"{which}: a failure must not read as data"
@@ -1126,13 +1170,15 @@ class TestRenderStateMatrix:
                 "which is a false cause the ego cannot act on"
             )
         elif state == "mixed":
-            assert "healthy0" in out, f"{which}: qualifying rows must still render"
+            if depth == "deep":
+                assert "healthy0" in out, f"{which}: qualifying rows must still render"
             assert "unreadable timestamp" in out, (
                 f"{which}: a corrupt row alongside healthy ones was dropped "
                 "silently — the table renders, so nothing signals the loss"
             )
         elif state == "future":
-            assert "healthy0" in out, f"{which}: qualifying rows must still render"
+            if depth == "deep":
+                assert "healthy0" in out, f"{which}: qualifying rows must still render"
             assert "dated in the future" in out, (
                 f"{which}: a clock-skewed row was dropped without being named"
             )
@@ -1150,27 +1196,33 @@ class TestRenderStateMatrix:
             assert "40 " in out, (
                 f"{which}/focus={focus}: should name the real row count"
             )
-        else:
+        elif depth == "deep":
             assert "real0" in out, f"{which}: qualifying rows must render"
 
+    # Parametrised over the RENDERER as well as the state. Pinning the shared
+    # sentence on one renderer only left the other free to stop calling the
+    # shared helper entirely: a mutant emitting a fabricated, unqualified
+    # "N domains, avg 99%." from the genesis light branch passed the whole
+    # suite. Extracting a shared helper prevents drift only while BOTH callers
+    # keep calling it, and nothing was testing that.
+    @pytest.mark.parametrize("which", ["genesis", "user", "base"])
     @pytest.mark.parametrize("state", STATES)
-    async def test_light_depth_never_states_a_whole_map_figure(self, state):
+    async def test_light_depth_never_states_a_whole_map_figure(self, which, state):
         """The light branch renders no table, so its numbers must be qualified."""
-        from genesis.ego.user_context import UserEgoContextBuilder
-
-        db = await self._make_db(state)
-        try:
-            out = await UserEgoContextBuilder(db=db)._capability_performance_section(
-                depth="light"
-            )
-        finally:
-            if state != "error":
-                await db.close()
+        out = await self._render(which, state, depth="light")
         assert "domains tracked" not in out, (
-            "unqualified whole-map phrasing reintroduced"
+            f"{which}: unqualified whole-map phrasing reintroduced"
         )
-        if state == "rows":
-            assert "qualifying evidence" in out
+        if state == "rows" and self._renderer_takes_depth(which):
+            # The sentence itself, not merely "some text appeared": a renderer
+            # that stopped calling the shared helper must fail here.
+            assert "3 domains with qualifying evidence" in out, (
+                f"{which}: the shared qualifying-subset sentence is not being used"
+            )
+            assert "avg confidence:" in out, f"{which}: no qualified average"
+            assert "stale and thin rows are not counted" in out, (
+                f"{which}: the subset qualification is missing"
+            )
 
 
 class TestCountFailureDoesNotAbortTheCycle:
@@ -1301,7 +1353,7 @@ class TestNewestStampIsChronological:
     """
 
     def test_t_separator_does_not_beat_a_later_space_separated_row(self):
-        from genesis.ego.user_context import _newest_stamp
+        from genesis.ego._capability_render import newest_stamp as _newest_stamp
 
         # 'T' (0x54) sorts above ' ' (0x20), so a raw max() picks the 01:00 row.
         entries = [
@@ -1314,7 +1366,7 @@ class TestNewestStampIsChronological:
         )
 
     def test_offset_is_applied_before_comparing(self):
-        from genesis.ego.user_context import _newest_stamp
+        from genesis.ego._capability_render import newest_stamp as _newest_stamp
 
         # 12:00+05:30 is 06:30Z; 08:00+00:00 is 08:00Z and therefore later,
         # although it sorts LOWER as text.
@@ -1325,7 +1377,7 @@ class TestNewestStampIsChronological:
         assert _newest_stamp(entries) == "2026-08-20T08:00:00+00:00"
 
     def test_unparseable_values_cannot_win(self):
-        from genesis.ego.user_context import _newest_stamp
+        from genesis.ego._capability_render import newest_stamp as _newest_stamp
 
         entries = [
             {"updated_at": "2026-08-20T08:00:00+00:00"},
@@ -1335,10 +1387,38 @@ class TestNewestStampIsChronological:
         assert _newest_stamp(entries) == "2026-08-20T08:00:00+00:00"
 
     def test_empty_input_is_empty_not_an_error(self):
-        from genesis.ego.user_context import _newest_stamp
+        from genesis.ego._capability_render import newest_stamp as _newest_stamp
 
         assert _newest_stamp([]) == ""
         assert _newest_stamp([{"updated_at": None}]) == ""
+
+    def test_a_naive_stamp_can_win_against_an_aware_one(self):
+        """The mixed aware/naive branch, which nothing exercised.
+
+        Every other fixture here carries an offset -- including the one whose
+        comment advertises the mixed case -- so replacing the naive-normalising
+        branch with `continue` left the whole suite green. The input is not
+        hypothetical: SQLite's own `datetime()` renders NAIVE, and this repo's
+        fixtures write exactly that, so a table restored or backfilled through
+        SQLite is entirely naive. Dropping those would render the sentence with
+        NO date on the one branch whose justification is that it must be dated.
+        """
+        from genesis.ego._capability_render import newest_stamp as _newest_stamp
+
+        entries = [
+            {"updated_at": "2026-08-20T08:00:00+00:00"},   # aware, earlier
+            {"updated_at": "2026-08-21 09:00:00"},          # naive, LATER
+        ]
+        assert _newest_stamp(entries) == "2026-08-21 09:00:00"
+
+    def test_an_all_naive_table_still_produces_a_date(self):
+        """What a SQLite-rendered table looks like end to end."""
+        from genesis.ego._capability_render import newest_stamp as _newest_stamp
+
+        assert _newest_stamp(
+            [{"updated_at": "2026-08-27 10:00:00"},
+             {"updated_at": "2026-08-28 09:00:00"}]
+        ) == "2026-08-28 09:00:00"
 
 
 class TestRendererUsesTheChronologicalHelper:
@@ -1360,8 +1440,16 @@ class TestRendererUsesTheChronologicalHelper:
     """
 
     @pytest.mark.asyncio
-    async def test_light_depth_dates_the_map_chronologically(self):
+    @pytest.mark.parametrize("which", ["user", "genesis"])
+    async def test_light_depth_dates_the_map_chronologically(self, which):
+        """Both depth-taking renderers, not just one.
+
+        Pinning the call site on one renderer leaves its sibling free to stop
+        calling the shared helper -- which is the drift the shared helper exists
+        to prevent, so it has to be asserted on every caller.
+        """
         from genesis.db.schema import TABLES
+        from genesis.ego.genesis_context import GenesisEgoContextBuilder
         from genesis.ego.user_context import UserEgoContextBuilder
 
         conn = await aiosqlite.connect(":memory:")
@@ -1379,9 +1467,11 @@ class TestRendererUsesTheChronologicalHelper:
                 )
             await conn.commit()
 
-            out = await UserEgoContextBuilder(db=conn)._capability_performance_section(
-                depth="light"
+            builder = (
+                UserEgoContextBuilder(db=conn) if which == "user"
+                else GenesisEgoContextBuilder(db=conn)
             )
+            out = await builder._capability_performance_section(depth="light")
         finally:
             await conn.close()
 
@@ -1390,3 +1480,111 @@ class TestRendererUsesTheChronologicalHelper:
             f"instant: {out!r}"
         )
         assert "2026-08-21" not in out
+
+
+class TestQualifyingSubsetLineContract:
+    """The shared light-render sentence, and the one input it must refuse.
+
+    It is shared precisely so the two light branches cannot drift into wording
+    where one qualifies its figures and the other does not -- so its contract
+    is worth pinning rather than left to whichever caller is read first.
+    """
+
+    def test_empty_entries_raise_a_named_error(self):
+        """A bare ZeroDivisionError here would abort the whole ego cycle.
+
+        Nothing between a context section and `assemble_context` catches a
+        per-section exception, so the failure has to name its own cause and
+        the right alternative rather than surfacing as arithmetic.
+        """
+        from genesis.ego._capability_render import qualifying_subset_line
+
+        with pytest.raises(ValueError, match="requires at least one entry"):
+            qualifying_subset_line([])
+
+    def test_figures_are_stated_as_the_qualifying_subset(self):
+        """Never as whole-map facts -- this branch renders no table."""
+        from genesis.ego._capability_render import qualifying_subset_line
+
+        line = qualifying_subset_line(
+            [{"confidence": 0.8, "updated_at": "2026-08-20T00:00:00+00:00"},
+             {"confidence": 0.6, "updated_at": "2026-08-21T00:00:00+00:00"}]
+        )
+        assert "2 domains with qualifying evidence" in line
+        assert "avg confidence: 70%" in line
+        assert "stale and thin rows are not counted" in line
+        assert "last vouched 2026-08-21" in line, "must date the claim"
+        assert "domains tracked" not in line, "unqualified whole-map phrasing"
+
+    @pytest.mark.asyncio
+    async def test_both_depths_of_a_renderer_use_the_same_header(self):
+        """The header now has ONE definition; this pins that it stays one.
+
+        It previously had two -- the light branch wrote its own copy -- so
+        renaming either left the two depths announcing different sections. A
+        divergence mutant cannot even be expressed against a single definition,
+        which is exactly why the property, not the mutant, is what to assert.
+        """
+        from genesis.ego.user_context import UserEgoContextBuilder
+
+        db = await TestRenderStateMatrix._make_db("rows")
+        try:
+            builder = UserEgoContextBuilder(db=db)
+            deep = await builder._capability_performance_section(depth="deep")
+            light = await builder._capability_performance_section(depth="light")
+        finally:
+            await db.close()
+        assert deep.splitlines()[0] == light.splitlines()[0], (
+            f"the two depths announce different sections: "
+            f"{deep.splitlines()[0]!r} vs {light.splitlines()[0]!r}"
+        )
+
+    def test_one_row_reads_singular(self):
+        """No matrix state seeds exactly one qualifying row, so nothing pinned
+        this: hardcoding "domains" passed the whole suite."""
+        from genesis.ego._capability_render import qualifying_subset_line
+
+        line = qualifying_subset_line(
+            [{"confidence": 0.5, "updated_at": "2026-08-20T00:00:00+00:00"}]
+        )
+        assert line.startswith("1 domain with"), line
+        assert "1 domains" not in line
+
+    def test_withheld_rows_reach_the_OPERATOR_not_only_the_prompt(self, caplog):
+        """The log is the stated justification, so it has to be asserted.
+
+        Both the CHANGELOG and CURRENT.md argue this change matters partly
+        because `unusable_note` is what LOGS -- an operator otherwise gets no
+        signal that rows vanished. Neutering that warning left the whole suite
+        green, which made the justification unfalsifiable.
+        """
+        import logging
+
+        from genesis.ego._capability_render import unusable_note
+
+        with caplog.at_level(logging.WARNING, logger="genesis.ego._capability_render"):
+            note = unusable_note({"unreadable": 2, "future": 1})
+        assert note, "the prompt clause is missing"
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            "rows were dropped and the operator was told nothing"
+        )
+
+    def test_no_withheld_rows_logs_nothing(self, caplog):
+        """Positive control: a clean map must not emit a spurious warning."""
+        import logging
+
+        from genesis.ego._capability_render import unusable_note
+
+        with caplog.at_level(logging.WARNING, logger="genesis.ego._capability_render"):
+            assert unusable_note({"unreadable": 0, "future": 0}) == ""
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_the_clause_is_appended_when_rows_were_withheld(self):
+        """The dropped-row report has to survive into the shared sentence."""
+        from genesis.ego._capability_render import qualifying_subset_line
+
+        line = qualifying_subset_line(
+            [{"confidence": 0.5, "updated_at": "2026-08-20T00:00:00+00:00"}],
+            " (2 rows withheld)",
+        )
+        assert line.endswith(" (2 rows withheld)")

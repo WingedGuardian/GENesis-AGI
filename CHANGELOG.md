@@ -164,6 +164,35 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   now say rows were filtered rather than claiming no data exists; the base
   builder additionally stopped rendering a query failure as an empty map.
 
+  *Withheld rows are named at every depth, and light means light.* The
+  dropped-row report reached the empty and deep exits but not the light one —
+  where it matters most, because that branch renders no table and so leaves the
+  reader nothing else to notice a loss by (the same call is what LOGS, so an
+  operator got no signal either). Separately, the Genesis renderer ACCEPTED a
+  `depth="light"` request and rendered the full fifteen-row table anyway: the
+  caller believed it had asked for the cheap form and was billed for the
+  expensive one. Both now honour it, sharing one sentence rather than two
+  copies — on a branch with no table the sentence is the entire claim, so a
+  figure qualified in one renderer and unqualified in the other is the same
+  "one field, two truth claims" defect from the other side. Neither was
+  reachable through today's focus profiles: of the seven,
+  `capability_performance` is `deep` in three and `skip` in four, and the
+  fallback used for an unknown focus type is `deep` — never `light` anywhere,
+  and the compaction layer only ever upgrades a section's depth. So this is a
+  latent fix, not a live one. What made both survive review is the more useful finding: the
+  render-state matrix built to catch exactly this class enumerated depth
+  *beside* its cross product instead of *inside* it, so all of its cells ran at
+  one depth. Depth is now an axis of the product.
+
+  *A negative window is refused instead of silently disabling de-duplication.*
+  `intervention_journal.aggregate_by_type` rendered a negative day count as the
+  SQLite modifier `'--N days'`, which SQLite rejects, yielding NULL; the
+  comparison against NULL is then NULL rather than false, so the exclusion held
+  for every row and every proposal was counted twice again — from a call that
+  returned a perfectly healthy-looking result. The sibling windowed API already
+  refused this loudly; the two no longer disagree. No shipped caller passes a
+  negative value, so this closes a trap rather than a live bug.
+
   Nothing is deleted: rows below either bar stay in the table and stop being
   RENDERED as present-tense capability. They are still read deliberately — by
   `get_by_domain` for the focused-deficiency line, and by `count_all` to say how

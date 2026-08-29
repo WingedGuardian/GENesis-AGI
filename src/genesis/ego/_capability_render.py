@@ -8,6 +8,7 @@ is one place to be right rather than three places to keep in step.
 from __future__ import annotations
 
 import logging
+from datetime import UTC
 
 import aiosqlite
 
@@ -45,6 +46,82 @@ async def safe_count_unusable(db: aiosqlite.Connection) -> dict[str, int]:
     except Exception:
         logger.warning("Failed to count unusable capability rows", exc_info=True)
         return {"unreadable": 0, "future": 0}
+
+
+def newest_stamp(entries: list[dict]) -> str:
+    """The chronologically latest ``updated_at`` among *entries*, or "".
+
+    Lives HERE, not in a renderer, because both the user and genesis light
+    branches stamp the same field. Two copies is how "one field, two truth
+    claims" gets reintroduced from the other side after being fixed on one.
+
+    Parses before comparing. Values reaching here have already passed the
+    window's shape gate, so they are date-shaped — but they can still mix
+    separators and UTC offsets (a restore or a backfill produces exactly that),
+    and those are the inputs where a string compare and an instant compare
+    disagree. Unparseable values are skipped rather than allowed to win.
+    """
+    from datetime import datetime
+
+    best_key, best_raw = None, ""
+    for entry in entries:
+        raw = entry.get("updated_at") or ""
+        if not raw:
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw.replace(" ", "T"))
+        except ValueError:
+            continue
+        # Mixed aware/naive values cannot be compared directly; normalise to a
+        # common basis rather than raising on the first naive row.
+        key = parsed.timestamp() if parsed.tzinfo else parsed.replace(
+            tzinfo=UTC
+        ).timestamp()
+        if best_key is None or key > best_key:
+            best_key, best_raw = key, raw
+    return best_raw
+
+
+def qualifying_subset_line(entries: list[dict], clause: str = "") -> str:
+    """The one-sentence stand-in a light render uses instead of a table.
+
+    Shared because BOTH light branches say it, and they must keep saying the
+    same thing: this sentence is the entire claim on a branch that renders no
+    table, so a figure left unqualified in one renderer and qualified in the
+    other is the "one field, two truth claims" defect wearing a different hat.
+
+    Every number is stated as the QUALIFYING SUBSET. An unqualified count here
+    reads as the whole map -- which is how "31 domains tracked (avg 94%)" came
+    to describe a 627-domain map averaging 6%.
+
+    The date is stamped rather than asserted as "current". The window anchors
+    on the freshest row precisely so a dead refresh job keeps everything rather
+    than blanking the map -- during such an outage every row here is months
+    old, so an unqualified "current" would be false exactly when it matters.
+    It reads "last vouched", never "newest evidence": ``updated_at`` records
+    when the AGGREGATOR last wrote the row, and three of the six sources are
+    unwindowed, so for those the two differ without limit.
+    """
+    if not entries:
+        # Nothing between a context section and `assemble_context` catches a
+        # per-section exception, so a bare ZeroDivisionError here would abort
+        # the whole ego cycle with an opaque message. Both current callers
+        # guard, but say the contract out loud and name the right alternative:
+        # the empty case is `empty_state_note`, which can tell "the map is
+        # empty" apart from "every row was filtered".
+        raise ValueError(
+            "qualifying_subset_line requires at least one entry; "
+            "use empty_state_note for the empty case"
+        )
+    avg = sum(e.get("confidence", 0.0) for e in entries) / len(entries)
+    plural = "domain" if len(entries) == 1 else "domains"
+    newest = newest_stamp(entries)[:10]
+    asof = f", last vouched {newest}" if newest else ""
+    return (
+        f"{len(entries)} {plural} with qualifying evidence "
+        f"(avg confidence: {avg:.0%}{asof}); stale and thin rows "
+        f"are not counted.{clause}"
+    )
 
 
 def unusable_note(unusable: dict[str, int] | None) -> str:

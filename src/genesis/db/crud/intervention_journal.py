@@ -134,6 +134,19 @@ async def aggregate_by_type(
     the other source cannot see. Defaults to None — no exclusion — so callers
     that read this table alone are unaffected.
     """
+    if exclude_proposals_within_days is not None and exclude_proposals_within_days < 0:
+        # A negative value renders the modifier '--N days', which SQLite
+        # REJECTS -> NULL. `p.created_at >= NULL` is then NULL rather than
+        # false, so NOT EXISTS holds for every row and the de-duplication
+        # silently becomes a no-op -- every proposal counted twice again,
+        # with a result that looks perfectly healthy. Measured, not assumed:
+        # datetime('now','--5 days') is NULL and '<any> >= NULL' is NULL.
+        # `capability_map._recency_clause` already refuses this loudly; the
+        # two windowed APIs must not disagree about it.
+        raise ValueError(
+            "exclude_proposals_within_days must be >= 0 or None, got "
+            f"{exclude_proposals_within_days}"
+        )
     cur = await db.execute(
         """SELECT
                action_type,

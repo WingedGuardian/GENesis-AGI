@@ -809,6 +809,25 @@ class GenesisEgoContextBuilder:
         if not entries and _empty_note is not None:
             lines.append(_empty_note)
         if entries:
+            # Honour the depth we ACCEPT. Taking the keyword and rendering the
+            # full table anyway is worse than not offering it: the dispatcher
+            # believes it asked for the cheap form and is silently billed for
+            # fifteen rows. The sibling `_own_goals_section` in this file has
+            # always branched here; this one only declared the parameter.
+            #
+            # Figures are stated as the QUALIFYING SUBSET, never as whole-map
+            # facts -- this branch renders no table, so the sentence is the
+            # entire claim and an unqualified count would be read as the map.
+            if depth == "light":
+                _light_clause = _cap_render.unusable_note(
+                    await _cap_render.safe_count_unusable(self._db)
+                )
+                lines.append(
+                    _cap_render.qualifying_subset_line(entries, _light_clause)
+                    + "\n"
+                )
+                return "\n".join(lines)
+
             lines.append("| Domain | Confidence | Trend | Samples | Evidence |")
             lines.append("|--------|-----------|-------|---------|----------|")
             for e in entries[:15]:
