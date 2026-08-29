@@ -78,6 +78,44 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A malformed Claude Code pin on `main` no longer wedges every merge in the
+  repository, and a pin blob that cannot be decoded at the head now blocks.** Two
+  fixes to the CC pin-receipt merge gate, one narrow and one broad.
+
+  The narrow one: the gate splits its fail direction between facts about a PR's
+  CONTENT (block) and failures of its own PLUMBING (note, do not block). A pin blob
+  over GitHub's 1MB inline limit (the contents API answers `"encoding": "none"` with
+  no content) and a blob whose base64 will not decode are both statements about what
+  the PR contains, yet both were classified as plumbing — so a PR moving the pin
+  forward while carrying either one skipped the receipt requirement entirely. They
+  now have their own `undecodable` outcome and block at the head. Genuine plumbing
+  failures (no repo slug, transport error, a non-JSON body, an unresolvable ref) stay
+  non-blocking: refusing every merge whenever a read comes back unusable once walled
+  off 50 merge-gate cases at a stroke.
+
+  The broad one: **no base-side condition blocks any more.** Previously an empty,
+  whitespace-only, unassigned, doubly-assigned or absent pin file on the base branch
+  blocked *every* pull request — including PRs that never touch `cc_version.sh`,
+  including a fully compliant pin bump carrying both receipts, and including the pull
+  request that would have repaired the pin. The gate has no override sigil by design,
+  so there was no in-band recovery: one bad commit to `main` stopped all merges.
+
+  That rule was also redundant. An unparseable pin on the base makes
+  `check_cc_node_lockstep` exit non-zero, which reddens the blocking `CI` workflow
+  (no `paths:` filter, so it runs on every PR), and the merge gate independently
+  refuses red CI — through a check that names the problem, fails on `main`'s own push
+  run, and *has* an escape hatch. The single merge the old rule blocked that CI does
+  not is the one that fixes the pin, whose merge tree carries the good file.
+
+  A PR that leaves the pin file untouched is now recognised by comparing the two
+  sides as BYTES, before any parse: identical content cannot have moved the pin,
+  whatever state that content is in. Without this the wedge simply moved from the
+  base rule to the head rule, since such a PR inherits the broken file at its own
+  head. One condition still blocks despite involving the base — a non-canonical
+  version like `2.1.0246`, which compares equal to `2.1.246` as integers. It is
+  reached only when the pin actually moves, CI cannot see it on a PR, and its blast
+  radius is pin-moving PRs alone.
+
 - **SSH slot cap no longer collapses below the running session count.** The
   interactive-slot launcher (`scripts/cc-slot.sh`) sized its cap from
   *instantaneous free RAM* (`(MemAvailable − reserve) / per_session`), so each

@@ -55,11 +55,32 @@ under incident pressure.
 ERROR POLICY — WHAT BLOCKS AND WHAT DOES NOT
 --------------------------------------------
   * BLOCK when the pin moved forward and a required receipt is absent.
-  * BLOCK when the pin cannot be READ at either side — unparseable, ambiguous,
-    or not valid UTF-8. "I cannot tell what this file pins" is not a reason to
-    wave a release through; it is the state a human must look at. (This is the
-    inverse of the old behaviour, where an unreadable pin skipped.)
+  * BLOCK when the HEAD pin cannot be READ — unparseable, ambiguous, or not valid
+    UTF-8. "I cannot tell what this PR pins" is not a reason to wave a release
+    through; it is the state a human must look at.
+  * BLOCK when either pin is not canonical semver (``reason="incomparable"``).
+    ``2.1.0246`` and ``2.1.246`` compare EQUAL as integers, so a pin written that
+    way would read as unchanged. This is reached only when the pin MOVES.
+  * **DO NOT BLOCK when the BASE pin cannot be read** (``reason="unreadable-base"``).
+    Changed 2026-08-28, and the reasoning is the important part: a base-side fault
+    belongs to the base branch, every open PR inherits it, and no PR can repair it
+    through the merge gate — which has no override sigil. Refusing there wedges the
+    repository rather than refusing one merge. It is also redundant. MEASURED: an
+    emptied file, a deleted assignment, a double assignment or a non-canonical
+    version each make ``check_cc_node_lockstep`` exit 1, reddening the blocking
+    ``CI`` workflow (which has no ``paths:`` filter, so it runs on every PR), and the
+    merge gate refuses red CI on its own — with a ``# ci-override`` escape this gate
+    lacks. The single PR the old rule blocked that CI does not is the PR that FIXES
+    the pin: its merge tree carries the good pin, so its CI is green.
   * PASS when the pin is unchanged or moves backward.
+
+SCOPE OF THAT POLICY — it governs TEXT THIS MODULE RECEIVES, not whether it
+receives any. ``evaluate()`` is handed two strings; everything above is about what
+those strings say. Whether a string can be produced at all is decided upstream by
+the merge gate's classifier (``git_push_guard._pin_file_at_ref``), which refuses a
+missing or undecodable pin AT THE HEAD before this module is called, and passes
+the same base-side conditions through as a non-blocking note — the same head/base
+split as above, applied one layer up.
 
 Note it compares the PARSED PIN VALUE, not whether the file changed:
 ``scripts/lib/cc_version.sh`` is edited for many reasons that leave the pin alone
@@ -171,9 +192,13 @@ class Verdict:
     message: str
     #: Which markers were absent — empty for every non-receipt outcome.
     missing: tuple[str, ...] = ()
-    #: "ok" | "receipts" | "unreadable". Lets a caller distinguish "the pin moved
-    #: without receipts" from "I could not read the pin", which are different
-    #: conversations with the operator even though both block.
+    #: "ok" | "receipts" | "unreadable-head" | "unreadable-base" | "incomparable".
+    #: Lets a caller distinguish "the pin moved without receipts" from "I could not
+    #: read the pin", which are different conversations with the operator — and, since
+    #: 2026-08-28, WHICH SIDE could not be read, because they take opposite fail
+    #: directions. ``unreadable-base`` is the only non-"ok" reason that does not block:
+    #: a base-side fault is inherited by every open PR, repairable by none of them
+    #: through this gate, and already caught by CI. See ``evaluate``.
     reason: str = "ok"
 
 
@@ -320,10 +345,53 @@ def evaluate(*, base_pin_text: str, head_pin_text: str, body: str) -> Verdict:
     """
     try:
         head_pin = _pin_of(head_pin_text, where="the proposed change")
+    except PinUnreadable as exc:
+        # The head pin does not parse — but if the file is byte-identical to the base,
+        # this PR did not touch it, and an unchanged file cannot have moved the pin
+        # forward. Blocking here is how fixing only the base side leaves the wedge in
+        # place: a PR that never touches cc_version.sh inherits the broken file at its
+        # own head, so the HEAD rule refuses it instead of the base rule. Compared as
+        # BYTES because that is the only comparison available when no parse is.
+        if head_pin_text == base_pin_text:
+            return Verdict(
+                False,
+                f"The pin file is unreadable, but it is byte-identical at the head and "
+                f"the base, so this PR does not touch it and cannot have moved the pin. "
+                f"No receipts required. The underlying fault is in the base branch: "
+                f"{exc}",
+                reason="unchanged-unreadable",
+            )
+        return Verdict(True, str(exc), reason="unreadable-head")
+
+    try:
         base_pin = _pin_of(base_pin_text, where="the base branch")
+    except PinUnreadable as exc:
+        # A base-side fault does NOT block. It belongs to the base branch, every open
+        # PR inherits it, none can repair it through this gate, and the merge gate that
+        # calls us has no override sigil — so refusing here wedges the repository
+        # instead of refusing one merge. It is also redundant: an unparseable pin on the
+        # base makes `check_cc_node_lockstep` exit non-zero, which reddens the blocking
+        # `CI` workflow, which the merge gate refuses independently and WITH an escape
+        # hatch. The one PR this used to block that CI does not is the PR that FIXES the
+        # pin — its merge tree carries the good pin, so its CI is green.
+        return Verdict(
+            False,
+            f"{exc} This is a fault in the BASE branch, not in this PR: no PR can repair "
+            f"it through this gate, and CI already fails on it. The receipt comparison "
+            f"could not run.",
+            reason="unreadable-base",
+        )
+
+    try:
         return _compare(base_pin, head_pin, body)
     except PinUnreadable as exc:
-        return Verdict(True, str(exc), reason="unreadable")
+        # `_version_tuple`'s non-canonical-semver refusal. Deliberately NOT folded into
+        # the base-side rule above, even when the base pin is the offender: it is reached
+        # only when the pin actually MOVES (identical pins return early), and CI cannot
+        # see it on a PR — the merge tree carries the good head pin, so lockstep passes
+        # while `main` is red. Routing it to the non-blocking path would let a genuine
+        # forward bump merge unchecked. Its blast radius is pin-moving PRs alone.
+        return Verdict(True, str(exc), reason="incomparable")
 
 
 def _compare(base_pin: str, head_pin: str, body: str) -> Verdict:

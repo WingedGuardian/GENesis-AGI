@@ -143,7 +143,7 @@ def test_reassignment_in_any_shape_blocks(second: str) -> None:
     shape here — the one it had a test for. Bash executes assignments after `;`,
     `||` and `&&` and inside one-line bodies, none of which start a line.
     """
-    _assert_blocked(_evaluate(head=HEAD + second + "\n"), "unreadable")
+    _assert_blocked(_evaluate(head=HEAD + second + "\n"), "unreadable-head")
 
 
 def test_leading_zero_version_blocks_rather_than_comparing_equal() -> None:
@@ -157,13 +157,56 @@ def test_leading_zero_version_blocks_rather_than_comparing_equal() -> None:
         base='CC_VERSION="${CC_VERSION:-2.1.246}"\n',
     )
 
-    _assert_blocked(v, "unreadable")
+    _assert_blocked(v, "incomparable")
+
+
+def test_a_leading_zero_on_the_BASE_still_blocks_and_is_not_treated_as_base_side() -> None:
+    """The guard against over-generalising the base-side rule.
+
+    Base-side faults do not block — but this one is not a base-side fault. It is
+    reached only when the pin MOVES (identical pins return early), and CI cannot see
+    it on a PR: the merge tree carries the good HEAD pin, so lockstep passes while
+    main is red. Routing it to `unreadable-base` would let a real forward bump merge
+    unchecked, which is the one hole the head/base split must not open.
+    """
+    v = _evaluate(
+        head='CC_VERSION="${CC_VERSION:-2.1.250}"\n',
+        base='CC_VERSION="${CC_VERSION:-2.1.0246}"\n',
+    )
+
+    _assert_blocked(v, "incomparable")
 
 
 def test_unreadable_pin_blocks_it_does_not_skip() -> None:
-    """"I cannot tell what this file pins" is not a reason to wave a release
+    """"I cannot tell what THIS PR pins" is not a reason to wave a release
     through — it is the state a human must look at. Inverse of the original."""
-    _assert_blocked(_evaluate(head="# no pin here at all\n"), "unreadable")
+    _assert_blocked(_evaluate(head="# no pin here at all\n"), "unreadable-head")
+
+
+@pytest.mark.parametrize(
+    "base",
+    ["", "   \n", "# no pin here at all\n", BASE + 'CC_VERSION="${CC_VERSION:-9.9.9}"\n'],
+    ids=["empty", "whitespace", "no-assignment", "assigned-twice"],
+)
+def test_an_unreadable_BASE_pin_does_NOT_block(base: str) -> None:
+    """Inverted 2026-08-28, and the inversion is the whole point.
+
+    A base-side fault belongs to the base branch: every open PR inherits it, none can
+    repair it through the merge gate, and that gate has no override sigil — so
+    blocking here wedged the entire repository, including the PR that would fix the
+    pin. It is also redundant. MEASURED: each of these makes
+    `check_cc_node_lockstep` exit 1, reddening the blocking CI workflow, which the
+    merge gate refuses independently and WITH a `# ci-override` escape.
+
+    The verdict must still SAY it verified nothing — a silent pass here would be the
+    fail-open this change exists to make visible.
+    """
+    v = _evaluate(base=base)
+
+    assert not v.blocked, f"a base-side fault must not block: {v.message}"
+    assert v.reason == "unreadable-base", f"wrong reason: {v.reason!r}"
+    assert "BASE branch" in v.message, v.message
+    assert "could not run" in v.message, v.message
 
 
 def test_invalid_utf8_pin_file_raises_from_the_adapter(tmp_path: Path) -> None:

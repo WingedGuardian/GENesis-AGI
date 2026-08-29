@@ -3054,20 +3054,38 @@ def _load_pin_receipt_checker():
         return None
 
 
-#: `_pin_file_at_ref` outcomes. ABSENT is a fact about the PR's CONTENT (the API
-#: answered, and the file is not there at that ref); UNREADABLE is a fact about the
-#: PLUMBING (no slug, timeout, auth, transport). They take OPPOSITE fail directions,
-#: so collapsing them — as an earlier revision did by returning None for both — let a
-#: PR that DELETES the pin file take the plumbing path and merge unblocked, which
-#: contradicts the checker's own stated policy that an unreadable pin BLOCKS.
+#: `_pin_file_at_ref` outcomes, split by FAIL DIRECTION rather than by how the read
+#: happened to fail. Three of the four are facts about the PR's CONTENT and BLOCK;
+#: exactly one is a failure of our own PLUMBING and does not.
+#:
+#:   OK           the bytes are in hand (an EMPTY file is OK — it exists, and an
+#:                empty pin is an unparseable pin, which the checker already blocks)
+#:   ABSENT       the API answered and the file is not at that ref            -> BLOCK
+#:   UNDECODABLE  the file IS at that ref and its bytes cannot be obtained    -> BLOCK
+#:   UNREADABLE   the read itself failed: no slug, timeout, auth, transport,
+#:                a non-JSON body, a ref that does not resolve                -> NOTE
+#:
+#: UNDECODABLE was folded into UNREADABLE until 2026-08-28, which put two CONTENT
+#: facts on the plumbing side: a blob over GitHub's 1MB inline limit (`"encoding":
+#: "none"`) and a blob whose base64 will not decode. Both say something about what
+#: the PR contains, so a forward pin move carrying either reported NOT-verified
+#: instead of blocking. That is the same shape as the deleted-vs-emptied pin bug this
+#: gate was built to close — one condition, two enforcements, one of them a fail-open
+#: — reintroduced one level down, in the classifier rather than the caller.
+#:
+#: The fix is NOT "make UNREADABLE block". Plumbing must stay non-blocking: a gate
+#: that refuses every merge whenever a read comes back unusable once walled off 50
+#: merge-gate cases at a stroke, and it guards a pin bump only.
 _PIN_OK = "ok"
 _PIN_ABSENT = "absent"
+_PIN_UNDECODABLE = "undecodable"
 _PIN_UNREADABLE = "unreadable"
-#: Test-seam sentinels for the two NON-content outcomes (mirroring
-#: `_TEST_GH_PR_FILES`'s `__error__`). Any other seam value — including the EMPTY
-#: STRING — is content, because with the JSON contents form an empty file is a real,
-#: distinct state from both absence and an unreadable response.
+#: Test-seam sentinels for every NON-content outcome (mirroring `_TEST_GH_PR_FILES`'s
+#: `__error__`). Each gets its own, because a seam that cannot express an outcome the
+#: live path produces hides exactly the distinction it exists to exercise. Any other
+#: seam value — including the EMPTY STRING — is content.
 _PIN_SEAM_ABSENT = "__absent__"
+_PIN_SEAM_UNDECODABLE = "__undecodable__"
 _PIN_SEAM_UNREADABLE = "__unreadable__"
 
 
@@ -3096,6 +3114,8 @@ def _pin_file_at_ref(ref: str, repo: str | None, *, seam: str) -> tuple[str | No
         # to exercise.
         if raw == _PIN_SEAM_ABSENT:
             return None, _PIN_ABSENT
+        if raw == _PIN_SEAM_UNDECODABLE:
+            return None, _PIN_UNDECODABLE
         if raw == _PIN_SEAM_UNREADABLE:
             return None, _PIN_UNREADABLE
         return raw, _PIN_OK
@@ -3141,12 +3161,21 @@ def _pin_file_at_ref(ref: str, repo: str | None, *, seam: str) -> tuple[str | No
             return None, _PIN_ABSENT  # a submodule or symlink-to-dir is not the pin
         if payload.get("encoding") != "base64":
             # >1MB blobs come back with encoding "none" and no content. Not absence —
-            # the file is there and we simply cannot read it this way.
-            return None, _PIN_UNREADABLE
+            # the file is there. But it is still a fact about what the PR CONTAINS,
+            # not about our plumbing: the API answered successfully and told us the
+            # pin is too large to read inline. A release whose pin nobody can
+            # characterise is the thing this gate exists to refuse.
+            return None, _PIN_UNDECODABLE
         try:
             text = base64.b64decode(payload.get("content") or "").decode("utf-8", "replace")
         except Exception:
-            return None, _PIN_UNREADABLE
+            # Only b64decode can reach this: `.decode(..., "replace")` substitutes
+            # U+FFFD for undecodable bytes and never raises, so non-UTF-8 content is
+            # NOT an error here — it arrives as text with replacement characters and
+            # the checker's own unparseable-pin rule judges it.
+            # Same side as ABSENT: the API said base64 and delivered something else,
+            # so the blob in the PR's tree is what is wrong, not the read.
+            return None, _PIN_UNDECODABLE
         # An EMPTY file is returned as content, deliberately, not as a state of its
         # own. It exists, so it is not absent — and an empty pin is an UNPARSEABLE
         # pin, which the checker's own policy already blocks. Classifying it here
@@ -3207,19 +3236,42 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
     "downgrade" that the gate exempts. Head still comes through the API, so the
     code doing the reading is always main's copy.
 
-    FAIL DIRECTION, split deliberately — and the split is between CONTENT and
-    PLUMBING, not between "worked" and "didn't":
-      * The pin moved forward and a receipt is missing, or the pin cannot be READ
-        at either side, or the file is ABSENT at either side -> BLOCK. All are
-        facts about the PR's content, and publishing a release nobody can
-        characterise is the thing to prevent. Absence matters on its own: a PR that
-        DELETES the pin file has no readable pin, which the checker's policy says
-        must block — routing that through the plumbing path would let the deletion
-        merge unexamined.
-      * The gate's own PLUMBING failed (no checker module, unreadable head sha or
-        base ref, auth/transport error) -> NOTE, do not block. Walling off every
-        merge over a check that only ever guards a pin bump would be a worse
-        failure than the one it prevents.
+    TWO AXES decide the fail direction, and they are independent.
+
+    CONTENT vs PLUMBING. A fact about the PR's content blocks; a failure of this
+    gate's own plumbing does not. An earlier revision phrased that first case as
+    "the pin cannot be READ", which OVERLAPS the plumbing case on the one state
+    that matters, and the code resolved the overlap fail-open — a >1MB pin blob
+    (the API answers ``"encoding": "none"``) took the plumbing path. Hence the
+    distinct UNDECODABLE outcome: present in the tree, bytes unobtainable, which is
+    a fact about the PR.
+
+    HEAD vs BASE. **No base-side condition blocks. Ever.** Base state belongs to
+    ``main``: every open PR inherits it, no PR can repair it through this gate, and
+    this gate has no override sigil — so a strict base rule wedges the repository
+    rather than refusing one merge.
+
+    That is not an accepted fail-open; it is the removal of a duplicate rule. A
+    malformed pin on ``main`` already turns CI RED — MEASURED, by running the real
+    ``check_cc_node_lockstep.check()``: an emptied file, a deleted assignment, a
+    double assignment and a non-canonical version all exit 1, and three live-pin
+    smoke tests in the ``test`` job fail alongside. Both jobs block, ``ci.yml`` has
+    no ``paths:`` filter so it runs on every PR, and this same gate independently
+    refuses red CI (see the ``ci_state in ("red", "pending")`` refusal on the merge
+    arm). CI is strictly the better instrument here: it fails on ``main``'s own push
+    run, it names the problem, and it HAS an escape (``# ci-override``).
+
+    The decisive case: a PR that does not touch the pin resolves a merge tree
+    carrying base's broken pin, so CI is red and the merge is already blocked. The
+    PR that REPAIRS the pin resolves a clean tree, so CI is green — and the old
+    base-side block refused precisely that one. It blocked the fix and nothing else
+    that CI was not already blocking.
+
+    The one condition that still blocks despite involving the base is
+    ``"incomparable"`` (a non-canonical version such as ``2.1.0246``), raised by the
+    checker. It is NOT a base-side rule: it fires only when the pin actually MOVES,
+    it is invisible to CI on the PR (the merge tree carries the good head pin), and
+    its blast radius is pin-moving PRs alone.
     """
     checker = _load_pin_receipt_checker()
     if checker is None:
@@ -3234,13 +3286,45 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
         return False, "NOTE: PR base ref unreadable — pin receipts NOT verified."
 
     head_text, head_state = _pin_file_at_ref(head_sha, repo, seam="_TEST_GH_HEAD_PIN_FILE")
+    base_text, base_state = _pin_file_at_ref(base_ref, repo, seam="_TEST_GH_BASE_PIN_FILE")
+
+    # DOES THIS PR TOUCH THE PIN AT ALL? Asked FIRST, and answered from the bytes rather
+    # than from a parse, because it is the only question that can be answered when the
+    # pin does not parse. Identical content at both refs cannot move the pin forward, so
+    # there is nothing for this gate to say — whatever state that content is in.
+    #
+    # Without this, a broken pin on the base wedges the repo through the HEAD rule
+    # instead of the base one: a PR that never touches cc_version.sh inherits the broken
+    # file at its own head, so "the head pin is unreadable" fires and blocks it. Fixing
+    # only the base side moved the wedge, it did not remove it. MEASURED before adding
+    # this: with an emptied pin on the base, every PR that left the file alone still
+    # blocked.
+    # Scoped to the case that NEEDS it: when both sides read cleanly the checker answers
+    # this itself and names the version ("CC pin unchanged (2.1.218)"), which is the more
+    # useful message. This shortcut exists for the states where no parse is possible.
+    if head_state == base_state != _PIN_OK and head_text == base_text:
+        return False, (
+            f"CC pin: {_PIN_FILE_PATH} is unchanged by this PR — byte-identical at the "
+            f"head and the base, so it cannot have moved the pin. No receipts required. "
+            f"(The file itself is in state {head_state!r}, which is a fault in "
+            f"{base_ref}, not in this PR.)"
+        )
+
     if head_state == _PIN_ABSENT:
         return True, (
             f"BLOCKED: {_PIN_FILE_PATH} is ABSENT at the PR head ({head_sha[:12]}). The pin "
             f"cannot be read, so whether this PR moves it forward cannot be established — "
             f"and a PR that removes the pin file is exactly the case this gate must not "
-            f"wave through. Restore it, or merge with the gate's own escape if the removal "
-            f"is intended."
+            f"wave through. Restore it: this gate has NO override sigil by design, so an "
+            f"intended removal needs the file restored in a separate change, not a waiver."
+        )
+    if head_state == _PIN_UNDECODABLE:
+        return True, (
+            f"BLOCKED: {_PIN_FILE_PATH} is present at the PR head ({head_sha[:12]}) but its "
+            f"contents could not be decoded — over GitHub's 1MB inline limit, or a blob that "
+            f"is not the base64 the API declared. The pin therefore cannot be read, so "
+            f"whether this PR moves it forward cannot be established. This is a fact about "
+            f"the PR's content, not a transport failure."
         )
     if head_text is None:
         return (
@@ -3248,14 +3332,25 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
             f"NOTE: could not read {_PIN_FILE_PATH} at the PR head — receipts NOT verified.",
         )
 
-    base_text, base_state = _pin_file_at_ref(base_ref, repo, seam="_TEST_GH_BASE_PIN_FILE")
+    # BASE never blocks — see the docstring. Every branch below is a NOTE, and they are
+    # kept separate only so the message names the actual condition: an operator reading
+    # "the base pin is unreadable" needs to go look at `main`, not at this PR.
     if base_state == _PIN_ABSENT:
-        return True, (
-            f"BLOCKED: {_PIN_FILE_PATH} is ABSENT on the base branch ({base_ref}). There is "
-            f"no pin to compare against, so a forward move cannot be ruled out."
+        return False, (
+            f"NOTE: {_PIN_FILE_PATH} is ABSENT on the base branch ({base_ref}) — receipts "
+            f"NOT verified. That is a fault in {base_ref}, not in this PR, and no PR can "
+            f"repair it through this gate. CI covers it: the pin file is required to parse."
+        )
+    if base_state == _PIN_UNDECODABLE:
+        return False, (
+            f"NOTE: {_PIN_FILE_PATH} on the base branch ({base_ref}) is present but its "
+            f"contents could not be decoded — receipts NOT verified. A fault in {base_ref}, "
+            f"not in this PR."
         )
     if base_text is None:
-        return False, (f"NOTE: {_PIN_FILE_PATH} unreadable on {base_ref} — receipts NOT verified.")
+        return False, (
+            f"NOTE: could not read {_PIN_FILE_PATH} on {base_ref} — receipts NOT verified."
+        )
 
     body = _pr_body_text(pr_num, repo)
     if body is None:
@@ -3265,6 +3360,15 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
         verdict = checker.evaluate(base_pin_text=base_text, head_pin_text=head_text, body=body)
     except Exception as exc:  # noqa: BLE001 — plumbing, not policy
         return False, f"NOTE: pin-receipt check errored ({type(exc).__name__}) — NOT verified."
+
+    # NORMALISE the one non-blocking verdict that did not actually verify anything, so
+    # it reads like every other fail-open on this path. The merge arm prints a message
+    # only when it is marked as a note, and a base-side fault that merged silently is
+    # precisely the outcome this whole change exists to make visible. A genuine PASS
+    # ("pin unchanged", "moves backward", "receipts present") is NOT marked — it has
+    # nothing to warn about.
+    if not verdict.blocked and verdict.reason == "unreadable-base":
+        return False, f"NOTE: {verdict.message} Receipts NOT verified."
 
     return verdict.blocked, verdict.message
 
@@ -4638,12 +4742,22 @@ def main() -> int:
                 # by construction, with no syntax to recall under pressure.
                 should_block, receipts_msg = _check_pin_receipts(pr_num, repo=merge_repo)
                 if should_block:
+                    # The headline names the COMMON case; receipts_msg names the actual
+                    # one, which may instead be an absent or undecodable pin at the head.
                     print(
-                        f"BLOCKED: PR #{pr_num} — CC pin moves forward without its gate receipts.",
+                        f"BLOCKED: PR #{pr_num} — CC pin gate refused this merge.",
                         file=sys.stderr,
                     )
                     print(receipts_msg, file=sys.stderr)
                     return 2
+                elif receipts_msg.startswith("NOTE:"):
+                    # A NOTE means the gate did NOT verify the receipts and is allowing the
+                    # merge anyway. That is the fail-open direction, so it has to be VISIBLE
+                    # at the moment of merging — every other fail-open gate on this path
+                    # prints its note, and this one silently discarded seven of them, which
+                    # made "the residue is narrow and named" false at the only surface a
+                    # human reads.
+                    print(receipts_msg, file=sys.stderr)
 
                 # Codex must have reviewed the CURRENT head (existence + freshness)
                 # — not merely have no open findings. This runs BEFORE the finding

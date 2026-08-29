@@ -1012,7 +1012,7 @@ _CASES: list[tuple[str, object, int, str]] = [
             mp, _merge_cmd(), head_pin=_PIN_FORWARD, base_pin=_PIN_BASE, pr_body="no receipts"
         ),
         2,
-        "pin moves forward",
+        "missing 2 required gate receipt(s)",
     ),
     (
         "pin_forward_with_both_receipts_allows_through_main",
@@ -1052,7 +1052,7 @@ _CASES: list[tuple[str, object, int, str]] = [
             pr_body="no receipts",
         ),
         2,
-        "pin moves forward",
+        "missing 2 required gate receipt(s)",
     ),
 ]
 
