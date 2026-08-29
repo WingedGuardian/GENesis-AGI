@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 
 import aiosqlite
 import pytest
@@ -198,13 +199,23 @@ async def test_failed_tick_persists_a_failure_row(factory, job_name):
 
         raised = await _drive(lambda: daemon._record_failure(rt, RuntimeError("emit exploded")))
         assert raised is None, f"recording the failure itself raised: {raised!r}"
-        await _drain_pending()
 
-        async with db.execute(
-            "SELECT last_failure, last_error FROM job_health WHERE job_name = ?",
-            (job_name,),
-        ) as cur:
-            row = await cur.fetchone()
+        # The record is submitted to the loop and NOT waited on (deliberately -- see
+        # test_failure_record_is_not_bounded_by_the_tick_timeout), so poll for the row
+        # rather than assuming it has landed. Bounded: if it never lands the assertion
+        # below still fires, so this cannot mask the defect it guards.
+        row = None
+        deadline = asyncio.get_running_loop().time() + 10
+        while asyncio.get_running_loop().time() < deadline:
+            await _drain_pending()
+            async with db.execute(
+                "SELECT last_failure, last_error FROM job_health WHERE job_name = ?",
+                (job_name,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is not None:
+                break
+            await asyncio.sleep(0.02)
 
         assert row is not None, (
             f"{job_name} left NO job_health row for a FAILED tick -- "
@@ -254,3 +265,53 @@ async def test_timed_out_tick_cancels_its_submission(factory):
         # The cancellation is delivered on this loop; give it a bounded chance.
         await asyncio.wait_for(cancelled.wait(), timeout=5)
         assert cancelled.is_set(), "the timed-out submission was never cancelled"
+
+
+@pytest.mark.parametrize(
+    ("factory",),
+    [(OutreachHeartbeat,), (DashboardHeartbeat,)],
+    ids=["outreach", "dashboard"],
+)
+async def test_failure_record_is_not_bounded_by_the_tick_timeout(factory):
+    """A slow failure record must NOT be abandoned and re-done off the loop.
+
+    A tick is cancelled when it outlives its timeout, because a stale pulse is
+    actively misleading. A failure record is the opposite: it stays true however
+    late it lands, and the situation it reports -- a wedged loop -- is exactly
+    when a bounded wait would expire. Bounding it would drop the record during
+    the whole stall, leaving the persisted row showing the previous SUCCESS.
+
+    Counting calls makes this timing-tolerant rather than racy: with a bounded
+    wait the on-loop attempt runs AND the degraded fallback runs too (two calls),
+    because the wait expires while the first is still in flight. Unbounded, the
+    record is made exactly once.
+    """
+    calls: list[str] = []
+
+    class _SlowRuntime:
+        """Records on the loop, slowly enough to outlive a tiny timeout."""
+
+        def record_job_failure(self, job_name, *args, **kwargs):
+            calls.append(job_name)
+            time.sleep(0.25)  # blocks the loop; a cancel cannot interrupt it
+
+    daemon = factory(interval_seconds=60)
+    daemon._loop = asyncio.get_running_loop()
+    daemon._TICK_TIMEOUT_S = 0.05  # far below the work, so a bounded wait WOULD expire
+
+    rt = _SlowRuntime()
+    raised = await _drive(lambda: daemon._record_failure(rt, RuntimeError("boom")))
+    assert raised is None, f"_record_failure raised: {raised!r}"
+
+    # Let the submitted coroutine finish on this loop.
+    for _ in range(200):
+        if calls:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.35)
+
+    assert len(calls) == 1, (
+        f"expected exactly ONE failure record, got {len(calls)} -- a second call "
+        "means the submission was abandoned on a timeout and re-done off the loop, "
+        "where it does not persist"
+    )

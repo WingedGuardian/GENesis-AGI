@@ -128,13 +128,22 @@ class OutreachHeartbeat:
                 "outreach_heartbeat", "heartbeat emission failed", exc=exc
             )
 
-        try:
-            if self._submit(_record):
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            try:
+                # Submitted WITHOUT _submit's bounded wait, deliberately. A tick is
+                # periodic and a stale one is actively misleading, so it is cancelled
+                # on timeout; a failure record is a one-off that stays true however
+                # late it lands. Bounding it would drop the record in precisely the
+                # scenario it describes — a loop wedged past the timeout is exactly
+                # when the wait would expire — leaving the persisted row showing the
+                # previous SUCCESS across the whole stall. Pending records are bounded
+                # by one per interval and settle when the loop recovers.
+                asyncio.run_coroutine_threadsafe(_record(), loop)
                 return
-        except BaseException:
-            # Already handling a failure; fall through to the degraded path
-            # rather than masking the original exception with this one.
-            pass
+            except RuntimeError:
+                # The loop stopped between the check and the submit; fall through.
+                pass
         rt.record_job_failure("outreach_heartbeat", "heartbeat emission failed", exc=exc)
 
     def _tick(self, rt: object, Subsystem: object, Severity: object) -> None:
