@@ -2407,6 +2407,10 @@ _SCHEDULED_REVIEW_BLOCK_RE = re.compile(
 # violating fail-closed (a failed/corrupt routine run must NOT satisfy the gate).
 _SCHEDULED_REVIEW_HEAD_RE = re.compile(r"\bhead=([0-9a-f]{40})(?=\s|\Z)")
 _SCHEDULED_REVIEW_KIND_RE = re.compile(r"\bkind=([a-z0-9][a-z0-9._-]*)(?=\s|\Z)")
+# Deliberately permissive, and used ONLY to quote back what a malformed marker
+# actually said. It must never feed the gate: matching loosely here is how the
+# operator learns their head= was abbreviated, not a second way to satisfy it.
+_SCHEDULED_REVIEW_LOOSE_HEAD_RE = re.compile(r"\bhead=(\S+)")
 
 # Default scheduled-review kinds the merge gate REQUIRES at head. A PR merges only when
 # a valid owner-authored marker for EACH effective required kind names the current head.
@@ -2714,11 +2718,88 @@ def _scheduled_review_rows(pr_num: str, repo: str | None = None) -> list[dict] |
     return rows
 
 
+def _marker_kind_or_none(block: str) -> str | None:
+    """The ``kind`` a marker block names, or None when it names none.
+
+    Lets a block that is being REJECTED still be attributed to the kind it was
+    meant to satisfy, so the block message can scope its guidance instead of
+    reporting an unattached complaint.
+    """
+    m = _SCHEDULED_REVIEW_KIND_RE.search(block)
+    return m.group(1) if m else None
+
+
+def emit_scheduled_review_marker(pr_num: str, *, kind: str, repo: str | None = None) -> int:
+    """Print the scheduled-review marker for ``pr_num``'s CURRENT head. 0 on success.
+
+    The PREVENT half of the marker contract. Nothing in this repository emitted a
+    marker: the 40-hex requirement lived in a regex on the CONSUMER side and in a
+    sentence asking a person to copy a commit sha by hand. A marker whose head was
+    abbreviated then matched no head at all, was discarded during the scan, and was
+    reported as "nobody posted anything" — advice to wait, for a review that had
+    already run.
+
+    Two properties make that unrepeatable here. The head is READ from GitHub rather
+    than typed. And the finished line is parsed back through the gate's OWN regexes,
+    with the captured values compared to what went in, before anything is printed —
+    so a marker this command emits is by construction a marker the gate counts, and a
+    change to either regex that breaks the pairing fails loudly rather than shipping a
+    producer that quietly disagrees with its consumer.
+
+    Refusals are silent on stdout: nothing that looks like a marker is ever printed on
+    a failure path, because a half-formed marker pasted into a PR is the defect.
+    """
+    if kind not in _KNOWN_SCHEDULED_REVIEW_KINDS:
+        print(
+            f"ERROR: kind={kind!r} is not a known scheduled-review kind, so a marker "
+            f"naming it could never satisfy the gate. Known kinds: "
+            f"{', '.join(_KNOWN_SCHEDULED_REVIEW_KINDS)}.",
+            file=sys.stderr,
+        )
+        return 2
+    head = (_pr_head_sha(pr_num, repo=repo) or "").strip().lower()
+    if not head:
+        print(
+            f"ERROR: could not read PR #{pr_num}'s head commit from GitHub. Refusing to "
+            f"emit a marker at all rather than emit one carrying a missing or partial "
+            f"head — that is the exact defect this command exists to prevent.",
+            file=sys.stderr,
+        )
+        return 1
+    marker = f"<!-- genesis-scheduled-review: head={head} kind={kind} -->"
+    # Round-trip through the CONSUMER's regexes. Not a formality: this is the only
+    # thing binding producer and consumer together, and it compares the CAPTURED
+    # values rather than merely checking that something matched.
+    blocks = _SCHEDULED_REVIEW_BLOCK_RE.findall(marker)
+    head_m = _SCHEDULED_REVIEW_HEAD_RE.search(blocks[0]) if len(blocks) == 1 else None
+    kind_m = _SCHEDULED_REVIEW_KIND_RE.search(blocks[0]) if len(blocks) == 1 else None
+    if not (head_m and kind_m and head_m.group(1) == head and kind_m.group(1) == kind):
+        print(
+            "ERROR: the marker just built does not parse back under this gate's own "
+            "marker grammar, so the producer and the consumer have drifted apart. "
+            "Nothing was emitted. Fix the grammar or this builder before posting "
+            "anything by hand.",
+            file=sys.stderr,
+        )
+        return 3
+    print(marker)
+    return 0
+
+
 def _scheduled_review_marker_scan(
     pr_num: str, repo: str | None = None
-) -> tuple[dict[str, set[str]], dict[str, set[str]]] | None:
-    """``(accepted, rejected_not_clean)`` maps of ``head-sha -> {kinds}`` for the PR's
-    owner-authored scheduled-review markers, or ``None`` on an UNREADABLE fetch.
+) -> tuple[dict[str, set[str]], dict[str, set[str]], list[tuple[str | None, str]]] | None:
+    """``(accepted, rejected_not_clean, unusable)`` for the PR's scheduled-review
+    markers, or ``None`` on an UNREADABLE fetch.
+
+    ``unusable`` is a list of ``(kind_or_None, reason)`` for marker BLOCKS that were
+    seen and could not be counted — a head that is not a full 40-hex sha, a missing
+    ``kind``, an author who is not the owner, a dismissed review. Every one of those
+    was previously dropped in silence, which made 'you posted a marker that does not
+    count' indistinguishable from 'nobody posted anything' — and the gate answers the
+    latter with 'a routine may still be in flight, waiting IS the right move'. MEASURED
+    on a live PR: an abbreviated head produced exactly that, and waiting could never
+    have cleared it.
 
     Both maps come from ONE pass so they cannot drift apart. ``accepted`` is what the
     gate honours; ``rejected_not_clean`` is markers that parsed fine and named a head,
@@ -2742,18 +2823,41 @@ def _scheduled_review_marker_scan(
     owner = (owner_repo.split("/")[0] if owner_repo else "").lower() or None
     accepted: dict[str, set[str]] = {}
     rejected: dict[str, set[str]] = {}
+    unusable: list[tuple[str | None, str]] = []
     for row in rows:
+        body = row.get("body") or ""
+        # Blocks are parsed BEFORE the trust checks, so a row about to be dropped can
+        # still report that it carried a marker. Refusing is right; refusing in
+        # silence is what sent an operator to wait for a routine that had already run.
+        blocks = _SCHEDULED_REVIEW_BLOCK_RE.findall(body)
         login = (row.get("login") or "").lower()
         assoc = (row.get("author_association") or "").upper()
         if login != owner and assoc != "OWNER":
-            continue  # not the repo owner — not a trusted scheduled review
+            # not the repo owner — not a trusted scheduled review
+            for block in blocks:
+                unusable.append(
+                    (
+                        _marker_kind_or_none(block),
+                        f"it was posted by '{login or 'an unidentified account'}', who "
+                        f"is not the repo owner, so it is not trusted",
+                    )
+                )
+            continue
         # A DISMISSED review no longer vouches, and a PENDING review is an UNPUBLISHED
         # draft that never ran publicly — neither should satisfy the gate (mirrors the
         # Codex-freshness path). `state` is present on /pulls/N/reviews rows and null on
         # issue comments, so this only drops review rows; issue comments remain state-less.
-        if (row.get("state") or "").upper() in ("DISMISSED", "PENDING"):
+        _state = (row.get("state") or "").upper()
+        if _state in ("DISMISSED", "PENDING"):
+            for block in blocks:
+                unusable.append(
+                    (
+                        _marker_kind_or_none(block),
+                        f"it is carried by a {_state} review, which no longer vouches "
+                        f"for anything",
+                    )
+                )
             continue
-        body = row.get("body") or ""
         # The marker must mean "ran CLEAN", not merely "ran": a scheduled review whose body
         # CONTAINS a blocking finding ([P1]/HARD BLOCK/### ERROR, unless a clean marker
         # overrides — same "clean wins" rule the finding scanners use) does NOT satisfy the
@@ -2774,13 +2878,26 @@ def _scheduled_review_marker_scan(
         # cross-check GitHub's authoritative `commit_id` vs the marker sha (issue comments
         # carry none). Deferred (LOW): the marker sha is matched EXACTLY vs the authoritative
         # HEAD by the caller, so a stale marker can't pass; this only catches a buggy reviewer.
-        for block in _SCHEDULED_REVIEW_BLOCK_RE.findall(body):
+        for block in blocks:
             head_m = _SCHEDULED_REVIEW_HEAD_RE.search(block)
             kind_m = _SCHEDULED_REVIEW_KIND_RE.search(block)
             if not head_m or not kind_m:
-                continue  # a marker must name both a head AND a kind to count
+                # A marker must name both a head AND a kind to count. Say WHICH is
+                # wrong and quote the offending value: on a long thread the operator
+                # otherwise cannot tell which of several markers is the broken one.
+                if not head_m:
+                    loose = _SCHEDULED_REVIEW_LOOSE_HEAD_RE.search(block)
+                    why = (
+                        f"its head={loose.group(1)!r} is not a full 40-hex commit sha"
+                        if loose
+                        else "it carries no head= field"
+                    )
+                else:
+                    why = "it carries no kind= field"
+                unusable.append((_marker_kind_or_none(block), why))
+                continue
             target.setdefault(head_m.group(1).lower(), set()).add(kind_m.group(1).lower())
-    return accepted, rejected
+    return accepted, rejected, unusable
 
 
 def _check_scheduled_claude_reviewed_head(
@@ -2873,7 +2990,7 @@ def _check_scheduled_claude_reviewed_head(
             f"Retry, or append '# scheduled-review-override' to merge anyway."
         )
     scan = _scheduled_review_marker_scan(pr_num, repo=repo)
-    markers, rejected = (None, {}) if scan is None else scan
+    markers, rejected, unusable = (None, {}, []) if scan is None else scan
     if markers is None:
         return (
             f"could not read PR #{pr_num}'s comments/reviews to verify the scheduled Claude "
@@ -2913,7 +3030,19 @@ def _check_scheduled_claude_reviewed_head(
     # Within a KIND, refused-at-this-head wins: it is the most specific cause, and the only
     # one whose remedy is neither waiting nor re-reviewing.
     elsewhere_kinds = {k for k in missing_set - refused_kinds if k in heads_by_kind}
-    absent_kinds = missing_set - refused_kinds - elsewhere_kinds
+    # A marker BLOCK that was seen but could not be counted. This group exists because
+    # the three above partition only the markers that PARSE — a block discarded during
+    # the scan reached none of them and fell through to ABSENT, whose advice is to
+    # wait. An unusable marker is the one cause where waiting is guaranteed useless.
+    # When a discarded block names no kind we cannot say WHICH kind it was for, so it
+    # claims all remaining ones: an operator re-posting a marker they did not need to
+    # is harmless, while being told to wait on a marker that will never count is the
+    # failure this group was added for.
+    _rest = missing_set - refused_kinds - elsewhere_kinds
+    _named = {k for k, _ in unusable if k is not None}
+    _unnamed = any(k is None for k, _ in unusable)
+    unusable_kinds = _rest if _unnamed and unusable else (_rest & _named)
+    absent_kinds = _rest - unusable_kinds
 
     parts: list[str] = []
     if refused_kinds:
@@ -2935,6 +3064,18 @@ def _check_scheduled_claude_reviewed_head(
             f"commit. Routines are generally not re-run when a later push moves the head, "
             f"so waiting is unlikely to clear this on its own: re-run against the current "
             f"head and post the marker yourself."
+        )
+    if unusable_kinds:
+        detail = "; ".join(
+            f"[{k or 'no kind named'}] {r}" for k, r in unusable[:4]
+        ) + (f" (+{len(unusable) - 4} more)" if len(unusable) > 4 else "")
+        parts.append(
+            f"{', '.join(sorted(unusable_kinds))} — a marker block IS present on this "
+            f"PR but is UNUSABLE, so it counts for nothing: {detail}. This is NOT "
+            f"'nobody posted anything', and waiting cannot clear it — re-post the "
+            f"marker in the exact form below. "
+            f"`git_push_guard.py --emit-marker {pr_num} --kind <name>` prints one with "
+            f"the head read from GitHub, so the sha is never retyped."
         )
     if absent_kinds:
         parts.append(
@@ -5011,4 +5152,31 @@ if __name__ == "__main__":
             )
             sys.exit(2)
         sys.exit(check_pr_report(sys.argv[2], repo=_repo))
+    # Producer mode: `git_push_guard.py --emit-marker <N> --kind <name> [--repo O/R]`
+    # prints the scheduled-review marker for that PR's CURRENT head, so the 40-hex
+    # sha is read rather than retyped. See emit_scheduled_review_marker.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--emit-marker":
+        _rest = sys.argv[3:]
+        _repo = _parse_check_pr_repo(_rest)
+        if _repo is _CHECK_PR_REPO_EMPTY:
+            print(
+                "ERROR: --repo/-R was given an empty value. Specify OWNER/REPO, or "
+                "omit the option to use the current repository.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        _kind = None
+        for _i, _a in enumerate(_rest):
+            if _a == "--kind" and _i + 1 < len(_rest):
+                _kind = _rest[_i + 1]
+            elif _a.startswith("--kind="):
+                _kind = _a.split("=", 1)[1]
+        if not _kind:
+            print(
+                "ERROR: --emit-marker needs --kind <name>. Known kinds: "
+                f"{', '.join(_KNOWN_SCHEDULED_REVIEW_KINDS)}.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        sys.exit(emit_scheduled_review_marker(sys.argv[2], kind=_kind, repo=_repo))
     run_guard(main, "git_push_guard")

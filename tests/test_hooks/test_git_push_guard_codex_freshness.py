@@ -1383,3 +1383,175 @@ class TestScheduledGateBlockMessageBranchesOnCause:
         assert "kind=" in msg
         assert "# scheduled-review-override" in msg
         assert "leaks" in msg
+
+
+SHORT_HEAD = HEAD[:8]
+
+
+class TestAnUnusableMarkerIsNotReportedAsAbsent:
+    """A marker BLOCK that is present but does not parse must not read as "nobody
+    posted anything".
+
+    MEASURED on a live PR, 2026-08-29. A leaks marker was posted whose machine
+    field carried an ABBREVIATED head (8 hex, not 40). ``_SCHEDULED_REVIEW_HEAD_RE``
+    requires the full 40, so the block matched, the head did not, and the marker was
+    dropped before it reached EITHER map. The gate then printed ``present: none`` and
+    routed the kind into ABSENT -- whose advice is that a routine "may still be in
+    flight, and waiting IS the right move". No amount of waiting could clear it; the
+    marker needed re-posting. The advice was not merely unhelpful, it was the exact
+    opposite of the remedy.
+
+    The partition this extends already documents THREE causes and calls itself total.
+    It is total over markers that PARSE. The parse discards a block before the
+    partition can see it, which is the same "decided from part of what had been read"
+    shape the function's own comment says three prior findings had -- one level up,
+    in the scan rather than in the branching.
+
+    Every test here asserts what its branch advises AND that it does not carry the
+    absent-branch advice, matching the convention above: a reworded regression that
+    flips the guidance fails instead of sliding through on surviving substrings.
+    """
+
+    @staticmethod
+    def _row(body, *, login="owner", author_association="OWNER", state=None):
+        row = {"login": login, "author_association": author_association, "body": body}
+        if state is not None:
+            row["state"] = state
+        return json.dumps(row)
+
+    def _block_msg(self, monkeypatch, comments):
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", comments)
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "leaks")
+        msg = _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
+        assert msg, "a head without an ACCEPTED marker must still block"
+        return msg
+
+    def test_an_abbreviated_head_is_reported_as_unusable(self, monkeypatch):
+        """The measured case: the operator did post one, and needs to know."""
+        body = f"scan done.\n<!-- genesis-scheduled-review: head={SHORT_HEAD} kind=leaks -->"
+        msg = self._block_msg(monkeypatch, self._row(body))
+        assert "unusable" in msg.lower() or "could not be parsed" in msg.lower(), msg
+
+    def test_an_abbreviated_head_does_not_advise_waiting(self, monkeypatch):
+        """The failure this exists to prevent -- and the one that actually happened."""
+        body = f"scan done.\n<!-- genesis-scheduled-review: head={SHORT_HEAD} kind=leaks -->"
+        msg = self._block_msg(monkeypatch, self._row(body)).lower()
+        assert "may still be in flight" not in msg
+        assert "waiting is the right move" not in msg
+
+    def test_the_offending_value_is_quoted_so_the_typo_is_visible(self, monkeypatch):
+        """Naming the cause without showing the value leaves the operator guessing
+        which of several markers on a long thread is the broken one.
+
+        Asserts the QUOTED form. A bare `SHORT_HEAD in msg` passes on the unfixed
+        code, because the abbreviated head is by construction a PREFIX of the full
+        head the closing grammar line already prints — so the substring is present
+        whether or not this branch exists. Verify-RED caught it: this test went green
+        before the fix was written.
+        """
+        body = f"scan done.\n<!-- genesis-scheduled-review: head={SHORT_HEAD} kind=leaks -->"
+        msg = self._block_msg(monkeypatch, self._row(body))
+        assert f"'{SHORT_HEAD}'" in msg, (
+            "the malformed head must be quoted, so it is distinguishable from the "
+            f"full head this message also prints: {msg}"
+        )
+
+    def test_a_marker_with_no_kind_is_reported_as_unusable(self, monkeypatch):
+        body = f"scan done.\n<!-- genesis-scheduled-review: head={HEAD} -->"
+        msg = self._block_msg(monkeypatch, self._row(body)).lower()
+        assert "unusable" in msg or "could not be parsed" in msg
+        assert "may still be in flight" not in msg
+
+    def test_a_marker_from_a_non_owner_is_reported_not_silently_dropped(self, monkeypatch):
+        """Untrusted is the CORRECT verdict; silent is not. Someone posted a marker.
+
+        Asserts the AUTHOR is named, not merely that the word "owner" appears: the
+        block message's closing grammar line already says "by the repo OWNER" on every
+        path, so `"owner" in msg` is true whether or not this branch exists. That is
+        the assertion-also-true-on-the-success-path shape, and it was the first draft
+        of this very test.
+        """
+        body = f"scan done.\n<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+        msg = self._block_msg(
+            monkeypatch, self._row(body, login="drive-by", author_association="CONTRIBUTOR")
+        )
+        assert "drive-by" in msg, "the untrusted author must be named"
+        assert "may still be in flight" not in msg.lower()
+
+    def test_a_marker_in_a_dismissed_review_is_reported(self, monkeypatch):
+        body = f"scan done.\n<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+        msg = self._block_msg(monkeypatch, self._row(body, state="DISMISSED")).lower()
+        assert "dismissed" in msg
+        assert "may still be in flight" not in msg
+
+    def test_a_GENUINELY_absent_marker_still_advises_waiting(self, monkeypatch):
+        """CONTROL. Without this, an implementation that called EVERYTHING unusable
+        would pass every assertion above while destroying the one case where patience
+        is the correct answer -- the exact regression the three-way partition was
+        built to prevent."""
+        msg = self._block_msg(monkeypatch, "").lower()
+        assert "may still be in flight" in msg
+        assert "waiting is the right move" in msg
+
+    def test_prose_mentioning_the_marker_without_one_is_still_absent(self, monkeypatch):
+        """CONTROL. A comment that TALKS about markers is not a marker; only a real
+        block counts, or every review conversation would read as an unusable marker."""
+        msg = self._block_msg(
+            monkeypatch, self._row("I will post the genesis-scheduled-review marker shortly.")
+        ).lower()
+        assert "may still be in flight" in msg
+
+
+class TestTheGateCanEmitAMarkerItWillItselfAccept:
+    """PREVENT, not just diagnose.
+
+    Every marker is hand-authored: nothing in this repository emitted one, so the
+    40-hex contract lived only in a regex on the consumer side and in prose asking a
+    human to copy a sha correctly. That is the shape that produced the abbreviated
+    head above.
+
+    These tests pin the ROUND TRIP -- what the emitter prints is fed back through the
+    real scan and must be ACCEPTED. Producer and consumer therefore cannot drift:
+    a change to either regex that the emitter does not satisfy fails here.
+    """
+
+    def _emit(self, monkeypatch, capsys, head=HEAD, kind="leaks"):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", head)
+        rc = _mod.emit_scheduled_review_marker("1", kind=kind, repo="acme/pub")
+        return rc, capsys.readouterr()
+
+    def test_the_emitted_marker_round_trips_through_the_real_scan(self, monkeypatch, capsys):
+        rc, cap = self._emit(monkeypatch, capsys)
+        assert rc == 0
+        marker = cap.out.strip()
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "leaks")
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            json.dumps({"login": "owner", "author_association": "OWNER", "body": marker}),
+        )
+        assert (
+            _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub") is None
+        ), f"the gate rejected its own emitter's output: {marker!r}"
+
+    def test_it_emits_the_full_forty_hex_head(self, monkeypatch, capsys):
+        _, cap = self._emit(monkeypatch, capsys)
+        assert f"head={HEAD}" in cap.out
+        assert f"head={HEAD[:8]} " not in cap.out
+
+    def test_it_refuses_rather_than_emitting_an_unusable_marker(self, monkeypatch, capsys):
+        """If the head cannot be read, printing a marker with a blank or partial head
+        would manufacture exactly the defect this change exists to remove."""
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", "")
+        rc = _mod.emit_scheduled_review_marker("1", kind="leaks", repo="acme/pub")
+        cap = capsys.readouterr()
+        assert rc != 0
+        assert "genesis-scheduled-review" not in cap.out
+
+    def test_it_refuses_a_kind_the_gate_could_never_accept(self, monkeypatch, capsys):
+        """A kind outside the marker grammar can never satisfy the gate, so emitting
+        it would hand the operator a marker that silently does nothing."""
+        rc, cap = self._emit(monkeypatch, capsys, kind="Not A Kind")
+        assert rc != 0
+        assert "genesis-scheduled-review" not in cap.out
