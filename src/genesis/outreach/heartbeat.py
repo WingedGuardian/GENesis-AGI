@@ -34,13 +34,31 @@ logger = logging.getLogger("genesis.outreach.heartbeat")
 class OutreachHeartbeat:
     """Background daemon thread that emits heartbeat events for outreach."""
 
+    # Bounded so a wedged main loop cannot pin the worker thread or let ticks
+    # overlap; must stay BELOW the pulse interval (60s) for that to hold.
+    _TICK_TIMEOUT_S = 30
+
     def __init__(self, interval_seconds: int = 60) -> None:
         self._interval = interval_seconds
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        # The runtime's main event loop, captured in start(). Each tick runs ON
+        # it rather than on a per-tick throwaway loop, because recording job
+        # health needs a RUNNING loop that OUTLIVES the call: persist_job_health
+        # schedules the DB write as a task and returns early when no loop is
+        # running, so a throwaway loop that is closed straight after the emit
+        # loses the write either way. None when start() is called outside a loop
+        # (tests, sync embedders) — the worker then falls back to the previous
+        # throwaway-loop behaviour.
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     def start(self) -> None:
         """Start the heartbeat background thread."""
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Started outside a running loop; _tick falls back (see _tick).
+            self._loop = None
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
@@ -73,6 +91,50 @@ class OutreachHeartbeat:
             and getattr(scheduler, "is_running", False)
         )
 
+
+    def _tick(self, rt: object, Subsystem: object, Severity: object) -> None:
+        """Emit one pulse and record job health, on the runtime's main loop.
+
+        Blocks on the scheduled coroutine so a failure still raises into _run's
+        handler (which records the job FAILURE) instead of being swallowed by a
+        discarded future. The wait is bounded below the pulse interval so a
+        wedged loop cannot stack overlapping ticks or pin this thread forever.
+        """
+
+        async def _emit_and_record() -> None:
+            await rt.event_bus.emit(
+                Subsystem.OUTREACH,
+                Severity.DEBUG,
+                "heartbeat",
+                "Outreach scheduler alive",
+            )
+            # Runs INSIDE the live main loop, so persist_job_health can schedule
+            # its DB write onto a loop that keeps running afterwards.
+            rt.record_job_success("outreach_heartbeat")
+
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(_emit_and_record(), loop).result(
+                timeout=self._TICK_TIMEOUT_S
+            )
+            return
+
+        # No live main loop (start() ran outside one). Emit on a throwaway loop;
+        # job health stays in-memory only, exactly as before this fix.
+        fallback = asyncio.new_event_loop()
+        try:
+            fallback.run_until_complete(
+                rt.event_bus.emit(
+                    Subsystem.OUTREACH,
+                    Severity.DEBUG,
+                    "heartbeat",
+                    "Outreach scheduler alive",
+                )
+            )
+        finally:
+            fallback.close()
+        rt.record_job_success("outreach_heartbeat")
+
     def _run(self) -> None:
         from genesis.observability.types import Severity, Subsystem
 
@@ -82,19 +144,7 @@ class OutreachHeartbeat:
 
                 rt = GenesisRuntime.instance()
                 if self._should_emit(rt):
-                    loop = asyncio.new_event_loop()
-                    try:
-                        loop.run_until_complete(
-                            rt.event_bus.emit(
-                                Subsystem.OUTREACH,
-                                Severity.DEBUG,
-                                "heartbeat",
-                                "Outreach scheduler alive",
-                            )
-                        )
-                    finally:
-                        loop.close()
-                    rt.record_job_success("outreach_heartbeat")
+                    self._tick(rt, Subsystem, Severity)
             except Exception as exc:
                 logger.error("Outreach heartbeat failed", exc_info=True)
                 try:
