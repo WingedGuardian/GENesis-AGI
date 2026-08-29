@@ -223,6 +223,42 @@ def test_the_canonical_repair_of_a_non_canonical_base_is_MERGEABLE_with_receipts
     )
 
 
+def test_an_UNINSTALLABLE_head_pin_blocks_even_when_the_base_read_failed() -> None:
+    """The one head-side content fact that survives having no base at all.
+
+    `npm install @anthropic-ai/claude-code@2.1.0218` does not resolve, so merging
+    that spelling publishes a version nothing can fetch. Everywhere else the
+    spelling rule is authorship-scoped — refusing an INHERITED malformed pin would
+    wedge every open PR — but authorship cannot be established without the base,
+    and that scoping does not rescue this path.
+
+    The trade decides it: a transport failure is transient, so refusing costs one
+    retry, while allowing costs a published pin nobody can install. An earlier
+    revision let it through and recorded that as an accepted consequence; the
+    trade was the wrong way round.
+    """
+    blocked = receipts.evaluate(
+        base_pin_text=None,
+        head_pin_text='CC_VERSION="${CC_VERSION:-2.1.0218}"\n',
+        body=BOTH,
+        base_unreadable=True,
+    )
+    assert blocked.blocked, f"an uninstallable pin must not merge: {blocked.message}"
+    assert "canonical semver" in blocked.message, blocked.message
+
+    # The control: the same transport failure with an INSTALLABLE head still takes
+    # the non-blocking plumbing path. Without this, "block on transport failure"
+    # would satisfy the assertion above while re-wedging the repo on a network blip.
+    fine = receipts.evaluate(
+        base_pin_text=None,
+        head_pin_text='CC_VERSION="${CC_VERSION:-2.1.218}"\n',
+        body=BOTH,
+        base_unreadable=True,
+    )
+    assert not fine.blocked, fine.message
+    assert not fine.direction_verified
+
+
 def test_a_rollback_to_an_UNINSTALLABLE_base_is_not_exempt() -> None:
     """The control for the test above, and the sharper half of the same defect.
 
@@ -300,6 +336,55 @@ def test_invalid_utf8_pin_file_raises_from_the_adapter(tmp_path: Path) -> None:
 
 
 # ── what counts as a receipt ──────────────────────────────────────────────
+
+
+def test_a_receipt_written_BESIDE_a_template_comment_counts() -> None:
+    """The shape this repo's own PR template produces, which the gate refused.
+
+    `PULL_REQUEST_TEMPLATE.md` is built entirely from `<!-- -->` blocks, so an
+    author filling it in naturally writes the answer on the same line as the
+    prompt. Both receipts below render perfectly on GitHub.
+
+    The scanner used to drop the whole remainder of a line once a comment appeared
+    on it — opening OR closing — so these were invisible, the gate refused, and the
+    message said the receipts were missing while they were plainly there. This gate
+    has no override sigil, so the author's only route was to guess why.
+    """
+    body = (
+        "## Testing\n"
+        "<!-- what did you run? --> CC-Gate-Changelog: read (2.1.218, 2.1.246] in "
+        "full from CHANGELOG.md, 2026-08-27\n"
+        "<!-- soak evidence --> CC-Gate-Soak: 2.1.246 soaked 2026-08-25..2026-08-27, "
+        "sweep clean, signed off\n"
+    )
+
+    assert receipts.missing_receipts(body) == []
+
+
+def test_several_comments_on_one_line_leave_the_text_between_them() -> None:
+    """One `partition` handles the first comment and loses everything after it."""
+    assert receipts.readable_body("a <!--x--> b <!--y--> c") == "a  b  c"
+
+
+@pytest.mark.parametrize(
+    ("body", "why"),
+    [
+        ("<!--\nCC-Gate-Changelog: x\nCC-Gate-Soak: y\n-->", "wholly inside a comment"),
+        ("<!-- oops\nCC-Gate-Changelog: x\nCC-Gate-Soak: y", "unterminated opener"),
+        ("```\nCC-Gate-Changelog: x\nCC-Gate-Soak: y\n```", "inside a fence"),
+        ("```\nCC-Gate-Changelog: x\n~~~\nCC-Gate-Soak: y", "fence closed by the wrong marker"),
+    ],
+    ids=["closed comment", "unterminated", "fenced", "mismatched fence"],
+)
+def test_genuinely_hidden_receipts_still_do_not_count(body: str, why: str) -> None:
+    """The control for the two tests above, and the reason they are safe.
+
+    Making text beside a comment visible must not make text INSIDE one visible.
+    Without these, "render more of the line" is satisfied by a scanner that strips
+    no comments at all — which would count a receipt nobody can see and defeat the
+    only enforcement this check has.
+    """
+    assert receipts.missing_receipts(body) == ["CC-Gate-Changelog", "CC-Gate-Soak"], why
 
 
 def test_receipts_hidden_in_an_html_comment_do_not_count() -> None:

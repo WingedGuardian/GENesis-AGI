@@ -317,12 +317,11 @@ leading-zero version like `2.1.0250`. `npm install` cannot resolve that spelling
 so it is not evidence that any version ever ran here — and the *unchanged* and
 *backward* exemptions both rest on exactly that claim.
 
-**The comparison reads the projected merge, not the PR head**, because the merge
-is what publishes. A PR head can be individually correct and still produce an
-unusable file once merged — for example, the base gains a second `CC_VERSION`
-assignment while the PR edits the original one, and git merges both lines
-cleanly. The gate falls back to the PR head when GitHub has not yet computed a
-merge commit, and its message says which ref it read.
+**Write the receipts where GitHub renders them.** They may sit on the same line
+as one of the template's `<!-- -->` prompts — the check reads what the rendered
+body shows. Receipts *inside* a comment or a code fence still do not count: the
+only enforcement here is a human reading a claim someone chose to make, and a
+receipt the reviewer cannot see defeats it.
 
 This is the case a PR that **repairs** a broken pin file will hit, and the ask is
 deliberate: such a PR is establishing a pin rather than restoring a known one,

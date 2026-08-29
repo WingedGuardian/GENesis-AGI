@@ -234,6 +234,39 @@ def _strip_formatting_chars(value: str) -> str:
     return "".join(ch for ch in value if unicodedata.category(ch) != "Cf")
 
 
+def _outside_comments(line: str, in_comment: bool) -> tuple[str, bool]:
+    """``(text outside HTML comments, still-open flag)`` for ONE line.
+
+    Scans the whole line rather than partitioning once, because a line may carry
+    several comments and may have real text after the last of them. Handling only
+    the first opener — or discarding a line the moment a closer appeared — is what
+    made a receipt written beside a template comment invisible.
+
+    An UNTERMINATED opener hides the rest of the line and stays open into the next,
+    which is what CommonMark does with an unclosed block and what the line scanner
+    was introduced for: a body ending ``<!-- template start`` must not have the
+    receipts below it counted.
+    """
+    out: list[str] = []
+    i, n = 0, len(line)
+    while i < n:
+        if in_comment:
+            close = line.find(_COMMENT_CLOSE, i)
+            if close == -1:
+                return "".join(out), True
+            i = close + len(_COMMENT_CLOSE)
+            in_comment = False
+            continue
+        opener = line.find(_COMMENT_OPEN, i)
+        if opener == -1:
+            out.append(line[i:])
+            return "".join(out), False
+        out.append(line[i:opener])
+        i = opener + len(_COMMENT_OPEN)
+        in_comment = True
+    return "".join(out), in_comment
+
+
 def readable_body(body: str) -> str:
     """The part of a PR body a human actually reads.
 
@@ -247,13 +280,18 @@ def readable_body(body: str) -> str:
     fence: str | None = None
 
     for line in body[:_MAX_BODY].splitlines():
-        stripped = line.strip()
-
-        if in_comment:
-            # Only the closer ends it; an opener inside a comment is inert.
-            if _COMMENT_CLOSE in line:
-                in_comment = False
-            continue
+        # Strip comments FIRST, and keep whatever the line has outside them. The
+        # previous version dropped the entire remainder of a line once it saw a
+        # comment — both when the comment opened on that line and when it closed
+        # there — so `<!-- what did you run? --> CC-Gate-Soak: …` was invisible to
+        # the check while rendering perfectly on GitHub. This repo's own
+        # PULL_REQUEST_TEMPLATE.md is built from `<!-- -->` blocks, so that is the
+        # shape an author naturally produces, and this gate has no override: it
+        # refused a compliant PR and told the author the receipts were missing
+        # while they were plainly there. MEASURED before the fix — both receipts
+        # reported absent, with the identical text on its own lines accepted.
+        rendered, in_comment = _outside_comments(line, in_comment)
+        stripped = rendered.strip()
 
         if fence is not None:
             # A fence is closed only by its OWN marker: ``~~~`` does not end a
@@ -267,16 +305,8 @@ def readable_body(body: str) -> str:
             fence = stripped[:3]
             continue
 
-        if _COMMENT_OPEN in line:
-            before, _, rest = line.partition(_COMMENT_OPEN)
-            if _COMMENT_CLOSE not in rest:
-                in_comment = True
-            # Text before the opener is still visible; the rest is not.
-            if before.strip():
-                visible.append(before)
-            continue
-
-        visible.append(line)
+        if stripped:
+            visible.append(rendered)
 
     return "\n".join(visible)
 
@@ -462,6 +492,21 @@ def evaluate(
     # the CONTENT wins — it is the stronger evidence, and honouring the flag over it
     # would discard a usable base and hand out a free pass on the say-so of a boolean.
     if base_unreadable and base_pin_text is None:
+        # One head-side CONTENT fact still applies with no base at all: a pin that
+        # cannot be INSTALLED. `npm install @…@2.1.0218` does not resolve, so
+        # merging that spelling publishes a version nothing can fetch — true
+        # whether this PR wrote it or inherited it, which is the one part of the
+        # spelling rule that does not need to know the author.
+        #
+        # Everywhere else the rule IS authorship-scoped, because refusing an
+        # inherited malformed pin would wedge every open PR. That scoping does not
+        # rescue this path: a transport failure is transient, so the cost of
+        # refusing here is one retry, while the cost of allowing is a published pin
+        # that cannot be installed. An earlier revision let it through and recorded
+        # that as an accepted consequence; on review the trade was the wrong way
+        # round.
+        if unpublishable := _refuse_unpublishable(head_pin):
+            return unpublishable
         return Verdict(
             False,
             f"The pin file could not be READ on the base branch — a transport failure "

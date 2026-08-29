@@ -126,13 +126,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   unknown-direction path, so the canonical repair stays mergeable but has to be
   attested like every other unverifiable direction.
 
-  The head-side read targets the **projected merge**, not the PR head, because the
-  merge is what publishes. A PR head can be individually spotless and still produce
-  an unpublishable file once merged: the base gains a second `CC_VERSION` assignment
-  after the PR branches, the PR edits the original assignment, git merges the two
-  different lines cleanly, and the released file has no statable pin. Neither side is
-  wrong alone; only the result is. It falls back to the PR head when GitHub has not
-  computed a merge commit yet, and says which ref answered.
+  A receipt written **beside** one of the PR template's `<!-- -->` prompts now
+  counts. The body scanner discarded the rest of any line a comment appeared on —
+  opening or closing — so an author filling in this repo's own template put both
+  receipts where GitHub renders them and the gate reported them missing, through a
+  check with no override sigil.
 
   Whether a PR touched the pin at all is decided from the PR's own **changed-file
   list**, which GitHub computes against the merge base — the same thing the merge
