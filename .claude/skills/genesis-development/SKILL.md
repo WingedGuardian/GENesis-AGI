@@ -381,19 +381,21 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   **(a) NEVER normalize the command text before a blind-spot probe.** A probe
   whose whole job is "notice that this text is unparseable" must read the RAW
   command. Preprocessing it can only ever DELETE the evidence the probe exists
-  to find. MEASURED: a here-doc-body stripper — added in good faith, to stop
-  multi-line scripts from prompting — turned an ORDINARY shape into a silent
-  ALLOW on two independent guards: a quoted here-doc whose body contained an
-  apostrophe, followed by a real gated git command. Bash ran the command
-  (verified with a shimmed `git`), the apostrophe shifted `analyze()`'s
-  segmentation so the real segment was lost, and the stripper deleted the very
-  line carrying the flag the guard keys on. The same stripper also modelled
-  bash comments as whitespace-preceded only, so a `;#` opener let it delete
-  executed code. It then turned out not to be load-bearing at all: every case
-  cited to justify it was one where the parser already resolved the operation,
-  so its branch never ran. The fix was a DELETION, and it closed both defects
-  at once. When a guard loop will not converge, look for the component that
-  MODELS shell semantics and remove it — refining it is the loop.
+  to find. MEASURED: a normalization step added in good faith — to stop a class
+  of multi-line command from prompting — turned an ORDINARY shape into a silent
+  ALLOW on two independent guards. Ordinary, not adversarial: the shape was one
+  a developer writes without thinking, and the command really executed (verified
+  against a shimmed binary, so the proof was execution rather than parse). The
+  normalizer removed the very evidence the guard keyed on, and its own model of
+  the shell's comment syntax was narrower than the shell's, so it could delete
+  executed code as well. It then turned out not to be load-bearing at all: every
+  case cited to justify it was one where the parser already resolved the
+  operation, so its branch never ran. The fix was a DELETION, and it closed both
+  defects at once. When a guard loop will not converge, look for the component
+  that MODELS shell semantics and remove it — refining it is the loop.
+
+  Deliberately stated without the triggering shapes. A guard's defeat
+  conditions are not a teaching aid, and this file is public.
 
   **(b) When the parse is unreliable, ASK — do not BLOCK.** A hard block forces
   a surgically precise trigger, and precision is exactly what an unreliable
@@ -409,10 +411,33 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   Corollaries of the corollaries, each measured: a net that returns inline
   PRE-EMPTS every gate below it (a hard block with no other backstop was
   observed downgrading to a prompt) — set a reason and DEFER it to the tail
-  where the other decisions are resolved. An `ask` needs a dispatched-session
-  deny leg, because no human is there to answer it. And the invariant pair
-  "never silently allowed" + "never hard blocked" is satisfied BY a block→ask
-  downgrade, so pin the verdict EXACTLY wherever a hard block is the contract.
+  where the other decisions are resolved. And the invariant pair "never silently
+  allowed" + "never hard blocked" is satisfied BY a block→ask downgrade, so pin
+  the verdict EXACTLY wherever a hard block is the contract.
+
+  **(c) The ask-cost argument does NOT survive the move to a refusal.** Rule (b)
+  buys its broad trigger with "a false positive costs one confirmation" — and
+  that is true only where someone can confirm. An unattended session has nobody
+  to answer, so the obvious completion of (b) is a deny leg for that path, and
+  that is where it goes wrong: the SAME broad predicate whose errors were cheap
+  now produces unappealable refusals of ordinary work. MEASURED: sharing one
+  predicate across both legs refused routine, entirely benign commands in
+  unattended sessions, in the one failure direction the design had been chosen
+  to avoid.
+
+  Narrowing the refusal predicate is the obvious repair and it does not
+  converge, for a structural reason worth stating once: on the blind path the
+  parser cannot say whether an occurrence of a gated verb in the text is
+  executed or merely quoted, commented, or documented — that inability is the
+  premise of the net existing. So no rule written over the raw text can both
+  refuse the hidden real operation and permit the inert mention. Three narrowing
+  rounds on one predicate is the signature to STOP and make the policy decision
+  explicitly: either the unattended path does not refuse on this evidence (and
+  its residue is the pre-existing behaviour, which such designs usually already
+  name as their acceptable miss), or it does and the "never hard blocked"
+  invariant is false and must be deleted rather than left standing. Choosing by
+  measurement beats choosing by intuition: count how often the leg actually
+  fires on real unattended traffic before deciding what it is worth.
 
 - **`out=$(cmd)` under `set -e` swallows the failure path — and NO linter catches
   it.** An assignment whose value is a command substitution INHERITS that
