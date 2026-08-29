@@ -186,26 +186,63 @@ def test_a_non_canonical_pin_this_PR_INHERITED_does_not_block() -> None:
     _assert_passes(_evaluate(head=same, base=same, body="no receipts anywhere"))
 
 
-def test_the_canonical_repair_of_a_non_canonical_base_is_ALLOWED() -> None:
-    """`2.1.0246` → `2.1.246` is the ONLY in-band repair for a malformed base pin.
+def test_the_canonical_repair_of_a_non_canonical_base_is_MERGEABLE_with_receipts() -> None:
+    """`2.1.0246` → `2.1.246` must be possible, and must be attested. Both halves.
 
-    It was BLOCKED until 2026-08-29, under a rule that refused to compare a
-    non-canonical pin on either side. That rule was described as costing only
-    "pin-moving PRs" — but the repair IS a pin-moving PR, so the malformed pin stayed
-    unmergeable-by-anyone through a gate with no override sigil.
+    Revised twice, and the pair of revisions is the argument.
 
-    The versions are numerically equal, so nothing is being released and no receipts
-    are required: `_numeric_value` compares VALUE, `_STRICT_SEMVER` polices SPELLING,
-    and separating those two is what makes the repair expressible.
+    It BLOCKED first, under a rule refusing to compare a non-canonical pin on either
+    side — described as costing only "pin-moving PRs", which overlooked that the
+    repair IS a pin-moving PR. The malformed pin was unmergeable by anyone through a
+    gate with no override sigil.
+
+    It then PASSED with no receipts, on the reasoning that the two spellings name one
+    version so nothing is being released. That reasoning treats the base as a
+    trustworthy statement of what is installed, and it is not: `npm install
+    @…@2.1.0246` does not resolve, so that version never ran anywhere. The same
+    leniency exempted `2.1.0250` → `2.1.246` as a "rollback" to a version that had
+    never existed.
+
+    So neither. A non-canonical base yields no reference value, the direction is
+    unknown, and the receipts are required in place of the comparison — the same bar
+    every other unverifiable direction meets. The repair stays in-band; it just has
+    to be attested.
     """
-    v = _evaluate(
-        head='CC_VERSION="${CC_VERSION:-2.1.246}"\n',
-        base='CC_VERSION="${CC_VERSION:-2.1.0246}"\n',
-        body="no receipts anywhere",
+    args = {
+        "head": 'CC_VERSION="${CC_VERSION:-2.1.246}"\n',
+        "base": 'CC_VERSION="${CC_VERSION:-2.1.0246}"\n',
+    }
+
+    _assert_blocked(_evaluate(body="no receipts anywhere", **args), "receipts")
+
+    passing = _evaluate(**args)
+    assert not passing.blocked, f"the repair must remain mergeable: {passing.message}"
+    assert not passing.direction_verified, (
+        "a non-canonical base cannot establish direction, and a pass that claims "
+        "otherwise is the exemption this test exists to prevent"
     )
 
-    _assert_passes(v)
-    assert "canonicalised" in v.message, v.message
+
+def test_a_rollback_to_an_UNINSTALLABLE_base_is_not_exempt() -> None:
+    """The control for the test above, and the sharper half of the same defect.
+
+    The backward exemption is justified by "a rollback returns to a version that
+    already ran here". When the base spelling cannot be installed, nothing ran, and
+    the justification is simply false — so `2.1.0250` → `2.1.246` passed with an
+    empty body while proving nothing at all about `2.1.246`.
+
+    Without this case, "require receipts for the canonical repair" is satisfied by a
+    fix that special-cases string equality and leaves every other non-canonical base
+    comparison exempt.
+    """
+    _assert_blocked(
+        _evaluate(
+            head='CC_VERSION="${CC_VERSION:-2.1.246}"\n',
+            base='CC_VERSION="${CC_VERSION:-2.1.0250}"\n',
+            body="no receipts anywhere",
+        ),
+        "receipts",
+    )
 
 
 def test_unreadable_pin_blocks_it_does_not_skip() -> None:

@@ -118,6 +118,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   alone would let one transient network blip demand release receipts from every open
   PR.
 
+  A base pin that is not **installable** yields no reference value either. `npm
+  install @anthropic-ai/claude-code@2.1.0250` does not resolve, so that version never
+  ran anywhere — and both the unchanged and the *backward* exemptions rest on the
+  claim that it did. Measured: `2.1.0250 → 2.1.246` passed with an empty body as a
+  "rollback" to a version that had never existed. A non-canonical base now takes the
+  unknown-direction path, so the canonical repair stays mergeable but has to be
+  attested like every other unverifiable direction.
+
+  The head-side read targets the **projected merge**, not the PR head, because the
+  merge is what publishes. A PR head can be individually spotless and still produce
+  an unpublishable file once merged: the base gains a second `CC_VERSION` assignment
+  after the PR branches, the PR edits the original assignment, git merges the two
+  different lines cleanly, and the released file has no statable pin. Neither side is
+  wrong alone; only the result is. It falls back to the PR head when GitHub has not
+  computed a merge commit yet, and says which ref answered.
+
   Whether a PR touched the pin at all is decided from the PR's own **changed-file
   list**, which GitHub computes against the merge base — the same thing the merge
   uses. Comparing the head tree against the base *tip* gets one class wrong: a PR that

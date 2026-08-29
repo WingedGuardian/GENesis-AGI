@@ -675,7 +675,7 @@ def test_a_forward_bump_still_blocks_when_the_base_is_FINE(monkeypatch):
     assert blocked is True, f"a receipt-free forward bump must still block: {msg}"
 
 
-def test_the_canonical_repair_of_a_non_canonical_base_pin_is_ALLOWED(monkeypatch):
+def test_the_canonical_repair_of_a_non_canonical_base_pin_is_MERGEABLE_with_receipts(monkeypatch):
     """Inverted 2026-08-29. It used to block, and blocking WAS the wedge.
 
     `2.1.0246` on the base was treated as incomparable, so every PR touching the pin
@@ -691,12 +691,20 @@ def test_the_canonical_repair_of_a_non_canonical_base_pin_is_ALLOWED(monkeypatch
         "_TEST_GH_BASE_PIN_FILE", 'CC_VERSION="${CC_VERSION:-2.1.0246}"\nNODE_MAJOR=22\n'
     )
     monkeypatch.setenv("_TEST_GH_HEAD_PIN_FILE", PIN_FORWARD)
-    monkeypatch.setenv("_TEST_GH_PR_BODY", "no receipts — nothing is being released")
+    monkeypatch.setenv("_TEST_GH_PR_BODY", "no receipts in this body")
 
     blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
 
-    assert blocked is False, f"the only in-band repair of a malformed base must pass: {msg}"
-    assert "canonicalised" in msg, msg
+    assert blocked is True, f"a non-canonical base cannot establish direction: {msg}"
+    assert "could not be read" in msg, msg
+
+    # ...and the SAME repair merges once attested. Blocking it outright is the wedge;
+    # exempting it silently treats an uninstallable spelling as proof of what ran.
+    monkeypatch.setenv("_TEST_GH_PR_BODY", RECEIPTS)
+    blocked, msg = _mod._check_pin_receipts("999", repo="owner/repo")
+
+    assert blocked is False, f"the repair must stay in-band: {msg}"
+    assert msg.startswith("NOTE:"), f"a pass that compared nothing must be printed: {msg}"
 
 
 def test_a_pin_THIS_PR_wrote_in_non_canonical_form_still_blocks(monkeypatch):

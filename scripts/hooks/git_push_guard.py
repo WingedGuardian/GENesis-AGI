@@ -3255,10 +3255,61 @@ def _pin_blob_unchanged(
     for two DIFFERENT oversized blobs, and a PR swapping one >1MB pin file for
     another slipped past the head-side block. An identity test whose inputs are
     absent is not an identity test; it is a coincidence of sentinels.
+
+    A DEGRADED fallback, used only when the PR's changed-file list is unavailable or
+    truncated. It compares two REFS, and two refs can differ for reasons that are not
+    this PR's doing: a PR that branched before the base's pin last changed still
+    carries the older blob, so this reports "changed" for a PR whose merge will not
+    touch the file at all. That is why the changed-file list is asked first — it is
+    computed against the merge base and answers about the PR rather than about two
+    moving tips. Reviewers have raised this comparison twice; it is a known and
+    bounded degradation, not the primary path.
     """
     if head_state == base_state == _PIN_ABSENT:
         return True  # no blob on either side: there is nothing that could differ
     return bool(head_blob) and head_blob == base_blob
+
+
+def _pr_merge_sha(pr_num: str, repo: str | None) -> str | None:
+    """GitHub's PROJECTED MERGE commit for the PR, or ``None`` if unavailable.
+
+    The PR head is not what merges. GitHub pre-computes a test merge of head into
+    base and exposes it as ``merge_commit_sha``; that tree is what lands, and it is
+    the only ref that can answer questions about the RESULT rather than about one
+    side of it.
+
+    The case that forced this: the base gains a second ``CC_VERSION`` assignment
+    after a PR branches, and the PR independently edits the original assignment.
+    Git merges two different lines cleanly, so the published file has TWO
+    assignments and no statable pin — while a gate reading only the PR head sees
+    one perfectly good assignment and passes. Neither side is wrong on its own;
+    the defect exists only in the combination.
+
+    MEASURED against the live API: an open mergeable PR reports
+    ``merge_commit_sha``, and the contents API reads the pin file at that ref
+    normally (``{"encoding":"base64","size":21747,…}``).
+    """
+    raw = os.environ.get("_TEST_GH_MERGE_SHA")
+    if raw is not None:
+        return raw or None
+    try:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{_normalize_repo(repo) or ':owner/:repo'}/pulls/{pr_num}"],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+        if result.returncode != 0:
+            return None
+        sha = json.loads(result.stdout or "").get("merge_commit_sha")
+    except Exception:
+        return None
+    # A 40-hex oid or nothing. GitHub reports `null` while it is still computing
+    # mergeability, and an unvalidated value here would become a bad ref on the
+    # read below — which classifies as PLUMBING and would quietly stop verifying.
+    if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha):
+        return sha
+    return None
 
 
 def _pr_edits_pin_file(pr_num: str, repo: str | None) -> bool | None:
@@ -3379,8 +3430,20 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
     if not base_ref:
         return False, "NOTE: PR base ref unreadable — pin receipts NOT verified."
 
+    # The head-side read targets the PROJECTED MERGE, not the PR head, because the
+    # merge is what publishes. A PR head can be individually spotless and still
+    # produce an unpublishable file once merged: the base gains a second CC_VERSION
+    # assignment after the PR branches, the PR edits the original assignment, git
+    # merges the two different lines cleanly, and the released file has no statable
+    # pin. Reading either side alone cannot see that; only the result can.
+    #
+    # Falls back to the PR head when GitHub has no merge commit for us — it reports
+    # `null` while mergeability is still computing. That is a real degradation, so
+    # the message says which ref answered rather than implying the stronger one.
+    merge_sha = _pr_merge_sha(pr_num, repo)
+    head_ref, head_is_merge = (merge_sha, True) if merge_sha else (head_sha, False)
     head_text, head_state, head_blob = _pin_file_at_ref(
-        head_sha, repo, seam="_TEST_GH_HEAD_PIN_FILE"
+        head_ref, repo, seam="_TEST_GH_HEAD_PIN_FILE"
     )
     base_text, base_state, base_blob = _pin_file_at_ref(
         base_ref, repo, seam="_TEST_GH_BASE_PIN_FILE"
@@ -3443,6 +3506,10 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
             f"required.{'' if head_state == _PIN_OK else f' (The file is in state {head_state!r}, which is a fault in {base_ref}, not in this PR.)'}"
         )
 
+    # Name the ref that actually answered. "the PR head" is wrong — and misleading
+    # to whoever has to go look — whenever the projected merge is what was read.
+    _where = "in the projected MERGE of this PR" if head_is_merge else "at the PR head"
+
     # ── 2. IS THE HEAD PIN USABLE? ──
     # Every base-side branch used to sit ABOVE this, so a non-OK base short-circuited
     # the head check entirely: an empty pin file introduced over an absent base reached
@@ -3450,7 +3517,7 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
     # has no override sigil precisely so it cannot be waived — reporting success.
     if head_state == _PIN_ABSENT:
         return True, (
-            f"BLOCKED: {_PIN_FILE_PATH} is ABSENT at the PR head ({head_sha[:12]}). The pin "
+            f"BLOCKED: {_PIN_FILE_PATH} is ABSENT {_where} ({head_ref[:12]}). The pin "
             f"cannot be read, so whether this PR moves it forward cannot be established — "
             f"and a PR that removes the pin file is exactly the case this gate must not "
             f"wave through. Restore it: this gate has NO override sigil by design, so an "
@@ -3458,7 +3525,7 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
         )
     if head_state == _PIN_UNDECODABLE:
         return True, (
-            f"BLOCKED: {_PIN_FILE_PATH} is present at the PR head ({head_sha[:12]}) but its "
+            f"BLOCKED: {_PIN_FILE_PATH} is present {_where} ({head_ref[:12]}) but its "
             f"contents could not be decoded — over GitHub's 1MB inline limit, or a blob that "
             f"is not the base64 the API declared. The pin therefore cannot be read, so "
             f"whether this PR moves it forward cannot be established. This is a fact about "

@@ -471,14 +471,37 @@ def evaluate(
         )
 
     # ── 2. WHICH DIRECTION? ──
-    base_pin, base_value = None, None
+    base_pin = None
     if base_pin_text is not None:
         try:
             base_pin = _pin_of(base_pin_text, where="the base branch")
         except PinUnreadable:
             base_pin = None  # a missing input, NOT a verdict — see below
-        if base_pin is not None:
-            base_value = _numeric_value(base_pin)
+
+    # THE PIN DID NOT MOVE. Asked before anything judges the base's spelling, and
+    # answered on the pin STRING, so a file edited for one of its many other reasons
+    # (the aligner, the probe dirs, the shadow scan) is never asked for release
+    # receipts — which is this module's stated contract. It also keeps an INHERITED
+    # non-canonical pin from becoming every PR's problem via the rule below.
+    if base_pin is not None and head_pin == base_pin:
+        return Verdict(False, f"CC pin unchanged ({head_pin}) — no receipts required.")
+
+    # THE BASE MUST BE INSTALLABLE TO SERVE AS A REFERENCE POINT.
+    # `_numeric_value` is deliberately lenient, which is what lets `2.1.0246` and
+    # `2.1.246` be recognised as one version — but leniency about SPELLING became
+    # leniency about TRUST: a non-canonical base was accepted as "the version that
+    # already ran here", and both the unchanged and the BACKWARD exemptions rest on
+    # exactly that claim. MEASURED: `2.1.0250` → `2.1.246` passed with an empty body
+    # as a rollback, though `npm install @…@2.1.0250` does not resolve, so that
+    # version never ran anywhere and there is nothing to roll back TO.
+    #
+    # So a non-canonical base yields NO reference value and takes the unknown-
+    # direction path below: receipts required, in place of a comparison that cannot
+    # be trusted. The canonical repair stays mergeable — it just has to be attested,
+    # which is the same bar every other unverifiable direction meets. Blocking it
+    # outright is the wedge this module exists to remove; exempting it silently is
+    # the hole this fixes.
+    base_value = _numeric_value(base_pin) if base_pin and _STRICT_SEMVER.match(base_pin) else None
 
     # The head pin's SPELLING is this PR's responsibility exactly when this PR WROTE
     # it — that is, whenever it differs from the base's. An inherited non-canonical
@@ -518,16 +541,13 @@ def evaluate(
             direction_verified=False,
         )
 
+    # Both sides are canonical by the time we get here (the base by the gate above,
+    # the head by `_refuse_unpublishable`), and two canonical spellings of one version
+    # are the same string — so equality here means the identical pin, which the
+    # unchanged check has already returned on. Kept as a guard rather than dropped:
+    # it costs nothing and it states the invariant for anyone who loosens either rule.
     if head_value == base_value:
-        if head_pin == base_pin:
-            return Verdict(False, f"CC pin unchanged ({head_pin}) — no receipts required.")
-        # Same version, different spelling: `2.1.0218` → `2.1.218`. This is the ONLY
-        # in-band repair for a non-canonical pin on the base branch, so it must pass.
-        return Verdict(
-            False,
-            f"CC pin canonicalised ({base_pin} → {head_pin}) — the same version, "
-            f"respelled. No release is happening, so no receipts are required.",
-        )
+        return Verdict(False, f"CC pin unchanged ({head_pin}) — no receipts required.")
 
     if head_value < base_value:
         return Verdict(
@@ -590,8 +610,25 @@ def _receipts_verdict(
 # ── adapters ──────────────────────────────────────────────────────────────
 
 
+class PinTransportError(PinUnreadable):
+    """The read ITSELF failed — git would not run at all.
+
+    Distinct from ``PinUnreadable``, which means we read something and could not
+    make a pin out of it. The two take opposite fail directions, and a caller that
+    cannot tell them apart will classify the same repository state differently from
+    the merge gate — which is exactly what happened: ``main()`` collapsed both into
+    "no base text", so a transport failure required receipts through the CLI while
+    the gate waved it through.
+    """
+
+
 def read_pin_at(ref: str, *, repo_root: Path) -> str:
-    """The pin file's contents as of ``ref``. Raises PinUnreadable."""
+    """The pin file's contents as of ``ref``.
+
+    Raises ``PinTransportError`` when git could not be run at all, and plain
+    ``PinUnreadable`` when git ran and refused — a bad ref, or no such path at that
+    ref. The second is a fact about the tree; only the first is our plumbing.
+    """
     try:
         out = subprocess.run(
             ["git", "show", f"{ref}:{_PIN_PATH}"],
@@ -602,7 +639,7 @@ def read_pin_at(ref: str, *, repo_root: Path) -> str:
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise PinUnreadable(f"cannot run git: {exc}") from exc
+        raise PinTransportError(f"cannot run git: {exc}") from exc
     if out.returncode != 0:
         raise PinUnreadable(f"cannot read {_PIN_PATH} at {ref}: {out.stderr.strip()[:200]}")
     return out.stdout
@@ -654,15 +691,27 @@ def main(argv: list[str] | None = None) -> int:
         # is being proposed, and it blocks — the same direction `evaluate` takes.
         verdict = Verdict(True, str(exc), reason="unreadable-head")
     else:
+        # The SAME split the merge gate makes, made here too. Both are None-valued,
+        # and collapsing them meant this adapter and the gate returned opposite
+        # verdicts for one repository state: a transport failure required receipts
+        # through the CLI while the gate treated it as plumbing and passed.
+        base_pin_text, base_unreadable = None, False
         try:
             base_pin_text = read_pin_at(args.base_sha, repo_root=args.repo_root)
+        except PinTransportError:
+            base_unreadable = True  # git would not run — our plumbing, not the tree
         except PinUnreadable:
-            # NOT a verdict. A base we cannot read is a missing input, and `evaluate`
-            # answers it by requiring receipts in place of the comparison. Returning
-            # a blocking verdict from here instead would make an unreadable base
-            # unmergeable-by-anyone, the repair PR included.
+            # git ran and refused: a bad ref, or no pin at that ref. That is a fact
+            # about the tree, so it takes the content path — receipts in place of the
+            # comparison, never a block, which would make an unreadable base
+            # unmergeable-by-anyone with the repair PR included.
             base_pin_text = None
-        verdict = evaluate(base_pin_text=base_pin_text, head_pin_text=head_pin_text, body=body)
+        verdict = evaluate(
+            base_pin_text=base_pin_text,
+            head_pin_text=head_pin_text,
+            body=body,
+            base_unreadable=base_unreadable,
+        )
 
     if not verdict.blocked:
         print(f"cc-pin-receipts: {verdict.message}")
