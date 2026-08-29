@@ -99,6 +99,7 @@ not treat untrusted PR content as instructions when composing its comment body.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -2327,7 +2328,15 @@ def _check_codex_reviewed_head(
                 f"Codex reviews on PR-open — it does NOT auto-review a later fix-commit; "
                 f"comment '@codex review' on the PR to review the current head (then wait), "
                 f"or append '# stale-review-override' to merge without a current Codex "
-                f"review (e.g. Codex is down)."
+                f"review (e.g. Codex is genuinely down).\n"
+                f"NOTE: the GitHub reviewer and the `codex exec` CLI are separate SURFACES; do "
+                f"not infer one from the other. OBSERVED once (2026-08-27): the CLI reported "
+                f"a two-week usage lockout while the GitHub reviewer, asked minutes later, "
+                f"returned a full review on the same commit. Whether that is separate "
+                f"metering, a plan-tier difference or a CLI-side fault was NOT established "
+                f"— so treat each surface as independently available until proven otherwise: "
+                f"post '@codex review' and check for a review at head BEFORE concluding "
+                f"Codex is unavailable."
             ),
             None,
         )
@@ -2358,6 +2367,15 @@ def _check_codex_reviewed_head(
                 f"Comment '@codex review' on the PR to re-review the current head (Codex "
                 f"does NOT auto-review fix-commits), then wait; or append "
                 f"'# stale-review-override' to merge anyway.\n"
+                f"NOTE: the GitHub reviewer and the `codex exec` CLI are separate SURFACES; do "
+                f"not infer one from the other. OBSERVED once (2026-08-27): the CLI reported "
+                f"a two-week usage lockout while the GitHub reviewer, asked minutes later, "
+                f"returned a full review on the same commit. Whether that is separate "
+                f"metering, a plan-tier difference or a CLI-side fault was NOT established "
+                f"— so treat each surface as independently available until proven otherwise: "
+                f"post '@codex review' and check for a review at head BEFORE concluding "
+                f"Codex is unavailable."
+                f"\n"
                 f"  (inspect the unreviewed commits: git log {reviewed[:12]}..{head[:12]} "
                 f"--oneline)"
             ),
@@ -2696,10 +2714,16 @@ def _scheduled_review_rows(pr_num: str, repo: str | None = None) -> list[dict] |
     return rows
 
 
-def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str, set[str]] | None:
-    """Map of ``head-sha -> {kinds}`` from valid owner-authored scheduled-review markers
-    on the PR, or ``None`` on an UNREADABLE fetch (the caller fail-closes on both None
-    and an empty map — None only distinguishes "could not read" from "read, no marker").
+def _scheduled_review_marker_scan(
+    pr_num: str, repo: str | None = None
+) -> tuple[dict[str, set[str]], dict[str, set[str]]] | None:
+    """``(accepted, rejected_not_clean)`` maps of ``head-sha -> {kinds}`` for the PR's
+    owner-authored scheduled-review markers, or ``None`` on an UNREADABLE fetch.
+
+    Both maps come from ONE pass so they cannot drift apart. ``accepted`` is what the
+    gate honours; ``rejected_not_clean`` is markers that parsed fine and named a head,
+    but whose body read as carrying a blocking finding. Only the DIAGNOSTIC message
+    consumes the second map — it never widens what satisfies the gate.
 
     A marker is trusted only when its author is the repo OWNER: ``login == owner`` OR
     ``author_association == "OWNER"`` (belt-and-suspenders — the marker itself is the
@@ -2716,7 +2740,8 @@ def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str,
     except Exception:
         owner_repo = repo
     owner = (owner_repo.split("/")[0] if owner_repo else "").lower() or None
-    by_head: dict[str, set[str]] = {}
+    accepted: dict[str, set[str]] = {}
+    rejected: dict[str, set[str]] = {}
     for row in rows:
         login = (row.get("login") or "").lower()
         assoc = (row.get("author_association") or "").upper()
@@ -2735,10 +2760,16 @@ def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str,
         # gate. Owner-authored review bodies are never seen by _check_pr_review_findings
         # (bots only), so without this a scheduled reviewer that explicitly BLOCKED would
         # still stamp its marker and slip the merge through.
-        if any(p.search(body) for p in _BLOCKING_PATTERNS) and not any(
+        #
+        # Such a marker is RECORDED (not dropped on the floor) so the block message can
+        # tell "you posted one and it was rejected" apart from "nobody posted anything" —
+        # measured 2026-08-28: those two produced the identical `present: none` line, and
+        # the only signal distinguishing an accepted marker from a rejected one was
+        # whether its prose happened to contain a _CLEAN_PATTERNS phrase.
+        not_clean = any(p.search(body) for p in _BLOCKING_PATTERNS) and not any(
             c.search(body) for c in _CLEAN_PATTERNS
-        ):
-            continue
+        )
+        target = rejected if not_clean else accepted
         # Defense-in-depth follow-up: for rows from /pulls/N/reviews we could ALSO
         # cross-check GitHub's authoritative `commit_id` vs the marker sha (issue comments
         # carry none). Deferred (LOW): the marker sha is matched EXACTLY vs the authoritative
@@ -2748,8 +2779,8 @@ def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str,
             kind_m = _SCHEDULED_REVIEW_KIND_RE.search(block)
             if not head_m or not kind_m:
                 continue  # a marker must name both a head AND a kind to count
-            by_head.setdefault(head_m.group(1).lower(), set()).add(kind_m.group(1).lower())
-    return by_head
+            target.setdefault(head_m.group(1).lower(), set()).add(kind_m.group(1).lower())
+    return accepted, rejected
 
 
 def _check_scheduled_claude_reviewed_head(
@@ -2765,11 +2796,56 @@ def _check_scheduled_claude_reviewed_head(
     40-char), else a BLOCK MESSAGE naming the MISSING kinds.
 
     Fail-CLOSED — this gate never passes on absence of positive evidence: if the head
-    cannot be read, or the comment/review fetch errors (``_scheduled_review_markers`` →
+    cannot be read, or the comment/review fetch errors (``_scheduled_review_marker_scan`` →
     None), the merge is BLOCKED. A read that simply does not carry every required kind
     at this head (a routine didn't run, ran on a stale commit, or was rate-limited) also
     blocks. The merge path and the report path share this single fail-closed decision,
     so the report can never issue a false all-clear here.
+
+    WHY THE BLOCK MESSAGE PARTITIONS. A missing marker has THREE causes calling for
+    DIFFERENT operator actions, all distinguishable from what was already read. The
+    missing kinds are PARTITIONED across those causes and EVERY non-empty group is
+    reported — this is not a precedence chain that picks one winner:
+      * REFUSED at this head — a marker is present on the current commit but read as
+        carrying a blocking finding. Neither waiting nor re-reviewing helps; the body's
+        wording (or a real finding) is the cause. It is also the cause most easily
+        mistaken for "nobody posted anything", since the gate's `present:` line shows
+        the same `none` either way.
+      * ELSEWHERE — a marker for that kind sits on some OTHER head, ACCEPTED OR REFUSED.
+        A routine ran, then a push moved the head. Routines are not generally re-run on a
+        push, so waiting is unlikely to help; re-review the current head and post it.
+      * ABSENT — no marker for that kind at any head. Nothing has run for it, so on a
+        freshly-opened PR a routine may still be in flight and waiting IS the right move.
+
+    Two design rules earned by successive review rounds, both of the SAME shape — a
+    decision made from only part of what had been read. Keep them:
+      1. Scope every group to ``missing``. A marker for an already-satisfied kind explains
+         nothing about this block, and prescribing a remedy for it sends the operator to
+         fix something that is not broken (it also let the message contradict its own
+         ``present:`` line one row above).
+      2. PARTITION rather than prioritise. Different kinds routinely fail for different
+         reasons — a refused ``code-review`` beside an absent ``leaks`` — and choosing a
+         single winning cause explained one kind while the other silently got no guidance
+         at all. Precedence exists only WITHIN a kind (refused-here beats elsewhere).
+
+    An earlier draft collapsed everything into an unconditional "waiting will not clear
+    this", which was wrong for the ABSENT case and pushed the operator toward
+    ``# scheduled-review-override`` — i.e. toward waiving the IRREDUCIBLE leak gate — in
+    the one situation where patience was the correct answer.
+
+    The message deliberately reports only what it OBSERVED (which heads carry markers)
+    and hedges the schedule ("generally not re-run"). The routines live OUTSIDE this repo
+    and this gate cannot see their triggers, so an unconditional claim about when they
+    fire would be asserting a guarantee the code cannot back — and would become actively
+    misleading on an install that also runs them on ``synchronize``.
+
+    Head match is EXACT — there is no ancestor walk and no delta tolerance here, unlike
+    the Codex freshness gate, which grants relief on a provably trivial delta via
+    ``_classify_post_review_delta``. That asymmetry is deliberate for now: that
+    classifier judges CODE-REVIEW substantiality by file type and size, and an
+    inferential leak (household/schedule/habit detail, not a token a regex can catch)
+    arrives in exactly the small doc edit it would wave through. A leak-specific
+    tolerance is tracked separately; do not reuse the code-review classifier for it.
 
     SCOPE: this gate enforces ONLY for a merge targeting the configured PUBLIC repo
     (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any other
@@ -2796,7 +2872,8 @@ def _check_scheduled_claude_reviewed_head(
             f"reviews (GitHub query failed).\n"
             f"Retry, or append '# scheduled-review-override' to merge anyway."
         )
-    markers = _scheduled_review_markers(pr_num, repo=repo)
+    scan = _scheduled_review_marker_scan(pr_num, repo=repo)
+    markers, rejected = (None, {}) if scan is None else scan
     if markers is None:
         return (
             f"could not read PR #{pr_num}'s comments/reviews to verify the scheduled Claude "
@@ -2808,14 +2885,73 @@ def _check_scheduled_claude_reviewed_head(
     missing = [k for k in required if k not in kinds_here]
     if not missing:
         return None
+    # WHY the marker is missing decides whether waiting is useful, and the two causes are
+    # DISTINGUISHABLE from what was actually read — so report the observed state instead
+    # of asserting a routine schedule this repo cannot see (the routines live outside it).
+    # Every branch below is scoped to the MISSING kinds. A marker for a kind that is
+    # already satisfied says nothing about why this merge is blocked, and prescribing a
+    # remedy for it sends the operator to fix something that is not broken.
+    # PARTITION the missing kinds by cause and report EVERY group — never pick one cause
+    # for the whole block. Different kinds routinely fail for different reasons (a refused
+    # code-review alongside an absent leaks), and collapsing to a single winner explains
+    # one kind while the other silently gets no guidance at all. THREE successive review
+    # findings on this function were that same shape — a branch deciding from part of what
+    # had been read — so this is the general form rather than a fourth point patch: a total
+    # partition needs no precedence BETWEEN groups, only within a single kind.
+    missing_set = set(missing)
+    refused_kinds = rejected.get(head, set()) & missing_set
+    # A marker for a missing kind on some OTHER head — ACCEPTED OR REFUSED. Both prove a
+    # routine ran on a different commit; counting only accepted ones sent a
+    # refused-at-a-stale-head PR down the "nothing has run, wait for it" path.
+    heads_by_kind: dict[str, set[str]] = {}
+    for by_head in (markers, rejected):
+        for other_head, kinds in by_head.items():
+            if other_head == head:
+                continue
+            for kind in kinds & missing_set:
+                heads_by_kind.setdefault(kind, set()).add(other_head[:12])
+    # Within a KIND, refused-at-this-head wins: it is the most specific cause, and the only
+    # one whose remedy is neither waiting nor re-reviewing.
+    elsewhere_kinds = {k for k in missing_set - refused_kinds if k in heads_by_kind}
+    absent_kinds = missing_set - refused_kinds - elsewhere_kinds
+
+    parts: list[str] = []
+    if refused_kinds:
+        parts.append(
+            f"{', '.join(sorted(refused_kinds))} — a marker IS present at THIS head, but it "
+            f"was REFUSED because its body reads as carrying a blocking finding (matching "
+            f"one of [P1] / HARD BLOCK / an '### ERROR' heading) with no explicit clean "
+            f"verdict to override it. A marker must mean it ran CLEAN, not merely that it "
+            f"ran. If the review really was clean, its prose tripped the check — re-post it "
+            f"ending with an explicit verdict line, exactly 'VERDICT: PASS' or "
+            f"'PII/Secrets/Wording: CLEAN'. If the finding is real, fix it first."
+        )
+    if elsewhere_kinds:
+        seen = sorted({h for k in elsewhere_kinds for h in heads_by_kind[k]})
+        shown = ", ".join(seen[:3]) + (f" (+{len(seen) - 3} more)" if len(seen) > 3 else "")
+        parts.append(
+            f"{', '.join(sorted(elsewhere_kinds))} — a marker is present for a DIFFERENT "
+            f"head ({shown}), so a routine HAS run on this PR, just not on the current "
+            f"commit. Routines are generally not re-run when a later push moves the head, "
+            f"so waiting is unlikely to clear this on its own: re-run against the current "
+            f"head and post the marker yourself."
+        )
+    if absent_kinds:
+        parts.append(
+            f"{', '.join(sorted(absent_kinds))} — no marker at ANY head on this PR yet. If "
+            f"it was just opened, a routine may still be in flight, and waiting IS the right "
+            f"move. If it has been open a while, re-run against the current head and post "
+            f"the marker yourself."
+        )
     return (
         f"scheduled Claude review(s) missing at head {head[:12]}: {', '.join(missing)} "
         f"(required: {', '.join(required)}; present: "
         f"{', '.join(sorted(kinds_here)) or 'none'}).\n"
-        f"Each routine posts a comment/review carrying "
-        f"'<!-- genesis-scheduled-review: head=<sha> kind=<name> -->' once it runs on THIS "
-        f"exact commit — wait for the missing routine(s) to run on the current head, or "
-        f"append '# scheduled-review-override' to merge without them."
+        + "".join(f"  * {p}\n" for p in parts)
+        + "A marker is a comment/review by the repo OWNER carrying "
+        f"'<!-- genesis-scheduled-review: head={head} kind=<name> -->' — the FULL 40-hex "
+        "head, exactly as written here.\n"
+        "Or append '# scheduled-review-override' to merge without the missing review(s)."
     )
 
 
@@ -2887,6 +3023,250 @@ def _repo_default_branch(repo: str | None = None) -> str | None:
             return None
     name = (raw or "").strip()
     return name or None
+
+
+#: The pin file the receipt gate compares. Kept here (not imported) so a missing
+#: checker module degrades to a NOTE rather than an import error at hook load.
+_PIN_FILE_PATH = "scripts/lib/cc_version.sh"
+
+
+def _load_pin_receipt_checker():
+    """Import scripts/check_cc_pin_receipts.py, or None if unavailable.
+
+    Lazy and failure-tolerant on purpose: the checker is a sibling script, not a
+    package, and a hook that cannot import it must not stop being a merge gate
+    for everything else.
+    """
+    import importlib.util
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    path = os.path.join(repo_root, "scripts", "check_cc_pin_receipts.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_cc_pin_receipts", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # Registered before exec: @dataclass resolves its module from sys.modules.
+        sys.modules["_cc_pin_receipts"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+#: `_pin_file_at_ref` outcomes. ABSENT is a fact about the PR's CONTENT (the API
+#: answered, and the file is not there at that ref); UNREADABLE is a fact about the
+#: PLUMBING (no slug, timeout, auth, transport). They take OPPOSITE fail directions,
+#: so collapsing them — as an earlier revision did by returning None for both — let a
+#: PR that DELETES the pin file take the plumbing path and merge unblocked, which
+#: contradicts the checker's own stated policy that an unreadable pin BLOCKS.
+_PIN_OK = "ok"
+_PIN_ABSENT = "absent"
+_PIN_UNREADABLE = "unreadable"
+#: Test-seam sentinels for the two NON-content outcomes (mirroring
+#: `_TEST_GH_PR_FILES`'s `__error__`). Any other seam value — including the EMPTY
+#: STRING — is content, because with the JSON contents form an empty file is a real,
+#: distinct state from both absence and an unreadable response.
+_PIN_SEAM_ABSENT = "__absent__"
+_PIN_SEAM_UNREADABLE = "__unreadable__"
+
+
+def _pin_file_at_ref(ref: str, repo: str | None, *, seam: str) -> tuple[str | None, str]:
+    """``(contents, outcome)`` for the pin file at ``ref``, read through the API.
+
+    Used for BOTH sides of the comparison — one code path, so the head and base
+    reads cannot drift apart in their fail direction (they did: the base side used
+    a hardcoded local ``git show origin/main``, which is neither bound to the repo
+    being merged into nor to the PR's actual base branch. On a checkout whose
+    ``origin`` is a fork, a genuine forward bump could read as a DOWNGRADE and be
+    exempted).
+
+    NOT from the local checkout: the gate runs from the main worktree, which is on
+    main, so the PR's version of the file is not on disk here. That is also the
+    property making this gate un-editable by the PR — only the DATA comes from the
+    PR, never the code reading it.
+    """
+    raw = os.environ.get(seam)
+    if raw is not None:
+        # The seam mirrors the live path's THREE outcomes, so a test cannot see
+        # behaviour production is incapable of producing. Both non-content outcomes
+        # need their own sentinel, because with the JSON form an EMPTY STRING is a
+        # legitimate third thing — a file that exists and is empty — and collapsing
+        # it into either sentinel would hide the very distinction this seam exists
+        # to exercise.
+        if raw == _PIN_SEAM_ABSENT:
+            return None, _PIN_ABSENT
+        if raw == _PIN_SEAM_UNREADABLE:
+            return None, _PIN_UNREADABLE
+        return raw, _PIN_OK
+    # Resolution order matters. `_canonical_public_repo()` reads install config and
+    # is legitimately absent on an install that never set `github.*` — the merge
+    # gate treats that as "uncertain, enforce", so falling back to the repo the
+    # process is actually in keeps the gate WORKING rather than silently
+    # unverifying on every such install (measured: it returned None here).
+    slug = (_normalize_repo(repo) if repo else None) or _canonical_public_repo()
+    if not slug:
+        slug = _derive_repo_from_cwd(os.getcwd())
+    if not slug:
+        return None, _PIN_UNREADABLE
+    try:
+        result = subprocess.run(
+            # The JSON representation, NOT `Accept: raw`. Raw returns bytes, and bytes
+            # cannot distinguish "the file is not there" from "the file is empty" from
+            # "the response was truncated" — all three arrive as an empty body, which
+            # forced the previous revision to GUESS from gh's stderr wording. The JSON
+            # form answers directly: `type` and `size` are facts about the tree, and a
+            # missing path is a 404. MEASURED: a present file returns
+            # {"name":…, "size":21747, "type":"file"}; an absent path returns 404.
+            ["gh", "api", f"repos/{slug}/contents/{_PIN_FILE_PATH}?ref={ref}"],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+    except Exception:
+        return None, _PIN_UNREADABLE
+    if result.returncode == 0:
+        try:
+            payload = json.loads(result.stdout or "")
+        except Exception:
+            # A zero exit whose body is not JSON is a stub or a truncated response —
+            # plumbing. This is the shape a test router's no-op reply takes, and it
+            # must not read as a fact about the tree.
+            return None, _PIN_UNREADABLE
+        if not isinstance(payload, dict):
+            # A directory lists as an ARRAY. Either way the pin file is not at this
+            # path, which is a fact about the PR's content.
+            return None, _PIN_ABSENT
+        if payload.get("type") != "file":
+            return None, _PIN_ABSENT  # a submodule or symlink-to-dir is not the pin
+        if payload.get("encoding") != "base64":
+            # >1MB blobs come back with encoding "none" and no content. Not absence —
+            # the file is there and we simply cannot read it this way.
+            return None, _PIN_UNREADABLE
+        try:
+            text = base64.b64decode(payload.get("content") or "").decode("utf-8", "replace")
+        except Exception:
+            return None, _PIN_UNREADABLE
+        # An EMPTY file is returned as content, deliberately, not as a state of its
+        # own. It exists, so it is not absent — and an empty pin is an UNPARSEABLE
+        # pin, which the checker's own policy already blocks. Classifying it here
+        # would duplicate that policy in the wiring, which is how the previous
+        # revision came to block a DELETED pin file while waving through one
+        # truncated to nothing: the same condition, enforced two different ways.
+        return text, _PIN_OK
+    # Non-zero. With the JSON form the only ambiguity left is which THING was not
+    # found, and gh names the ref case explicitly. MEASURED against the live API:
+    #   bad ref      -> gh: No commit found for the ref <sha> (HTTP 404)
+    #   missing file -> gh: Not Found (HTTP 404)
+    #   bad repo     -> gh: Not Found (HTTP 404)
+    # A bad ref is PLUMBING. Missing-file and missing-repo share one message — GitHub
+    # will not separate them, so as not to leak whether a private repo exists — but
+    # this gate is reached only after the head sha and base ref were read SUCCESSFULLY
+    # from that same repo, so the repo is known good by then and a bare Not Found is
+    # the path being absent.
+    stderr = (result.stderr or "").lower()
+    if "no commit found for the ref" in stderr:
+        return None, _PIN_UNREADABLE
+    if "not found" in stderr:
+        return None, _PIN_ABSENT
+    return None, _PIN_UNREADABLE
+
+
+def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
+    """The PR body. ``None`` means unreadable — distinct from an EMPTY body,
+    which is a real state that determines the answer by itself."""
+    raw = os.environ.get("_TEST_GH_PR_BODY")
+    if raw is not None:
+        return raw
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", pr_num, *_repo_args(repo), "--json", "body", "--jq", ".body"],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+    except Exception:
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
+    """Block a PR that moves the Claude Code pin FORWARD without its gate receipts.
+
+    THIS is the authority for the receipt gates, not a CI status. The body is
+    mutable after any CI run finishes, so a status describing it is a claim about
+    the past; read at merge time there is no window to edit it afterwards. The
+    CI job runs the same checker with ``--advisory`` purely for early feedback.
+
+    BOTH sides are read through the API, against the repo actually being merged
+    into and the PR's OWN base branch. An earlier revision read the base with a
+    local ``git show origin/main`` — not bound to the merge target and hardcoding
+    the branch name — so from a checkout whose ``origin`` is a fork (or whose
+    ``origin/main`` is simply unfetched) the comparison ran against the wrong base,
+    and a fork sitting on a HIGHER pin turned a genuine forward bump into a
+    "downgrade" that the gate exempts. Head still comes through the API, so the
+    code doing the reading is always main's copy.
+
+    FAIL DIRECTION, split deliberately — and the split is between CONTENT and
+    PLUMBING, not between "worked" and "didn't":
+      * The pin moved forward and a receipt is missing, or the pin cannot be READ
+        at either side, or the file is ABSENT at either side -> BLOCK. All are
+        facts about the PR's content, and publishing a release nobody can
+        characterise is the thing to prevent. Absence matters on its own: a PR that
+        DELETES the pin file has no readable pin, which the checker's policy says
+        must block — routing that through the plumbing path would let the deletion
+        merge unexamined.
+      * The gate's own PLUMBING failed (no checker module, unreadable head sha or
+        base ref, auth/transport error) -> NOTE, do not block. Walling off every
+        merge over a check that only ever guards a pin bump would be a worse
+        failure than the one it prevents.
+    """
+    checker = _load_pin_receipt_checker()
+    if checker is None:
+        return False, "NOTE: pin-receipt checker not importable — receipts NOT verified."
+
+    head_sha = _pr_head_sha(pr_num, repo=repo)
+    if not head_sha:
+        return False, "NOTE: PR head unreadable — pin receipts NOT verified."
+
+    base_ref = _pr_base_ref(pr_num, repo=repo)
+    if not base_ref:
+        return False, "NOTE: PR base ref unreadable — pin receipts NOT verified."
+
+    head_text, head_state = _pin_file_at_ref(head_sha, repo, seam="_TEST_GH_HEAD_PIN_FILE")
+    if head_state == _PIN_ABSENT:
+        return True, (
+            f"BLOCKED: {_PIN_FILE_PATH} is ABSENT at the PR head ({head_sha[:12]}). The pin "
+            f"cannot be read, so whether this PR moves it forward cannot be established — "
+            f"and a PR that removes the pin file is exactly the case this gate must not "
+            f"wave through. Restore it, or merge with the gate's own escape if the removal "
+            f"is intended."
+        )
+    if head_text is None:
+        return (
+            False,
+            f"NOTE: could not read {_PIN_FILE_PATH} at the PR head — receipts NOT verified.",
+        )
+
+    base_text, base_state = _pin_file_at_ref(base_ref, repo, seam="_TEST_GH_BASE_PIN_FILE")
+    if base_state == _PIN_ABSENT:
+        return True, (
+            f"BLOCKED: {_PIN_FILE_PATH} is ABSENT on the base branch ({base_ref}). There is "
+            f"no pin to compare against, so a forward move cannot be ruled out."
+        )
+    if base_text is None:
+        return False, (f"NOTE: {_PIN_FILE_PATH} unreadable on {base_ref} — receipts NOT verified.")
+
+    body = _pr_body_text(pr_num, repo)
+    if body is None:
+        return False, "NOTE: PR body unreadable — pin receipts NOT verified."
+
+    try:
+        verdict = checker.evaluate(base_pin_text=base_text, head_pin_text=head_text, body=body)
+    except Exception as exc:  # noqa: BLE001 — plumbing, not policy
+        return False, f"NOTE: pin-receipt check errored ({type(exc).__name__}) — NOT verified."
+
+    return verdict.blocked, verdict.message
 
 
 def _check_base_is_default(
@@ -4241,6 +4621,30 @@ def main() -> int:
                     print(base_msg, file=sys.stderr)
                     return 2
 
+                # Pin receipts. This is the AUTHORITY for the two release gates
+                # (changelog read, local-first soak), deliberately not a CI
+                # status: the PR body stays mutable after a check run finishes,
+                # so only a merge-time read describes the body that merges. It
+                # also runs main's copy of the checker, so a PR cannot edit the
+                # code that gates it.
+                #
+                # NO override sigil, deliberately. Every sigil here waives exactly
+                # ONE gate so a waiver cannot silently disarm an unrelated one, so
+                # reusing # review-override (which waives the FINDING scans) would
+                # be exactly that. And a dedicated sigil would be an escape from a
+                # demand that takes seconds to satisfy honestly: if a gate really
+                # was not run, the action is to run it, not to wave it through.
+                # Incident recovery is already covered — a BACKWARD pin is exempt
+                # by construction, with no syntax to recall under pressure.
+                should_block, receipts_msg = _check_pin_receipts(pr_num, repo=merge_repo)
+                if should_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — CC pin moves forward without its gate receipts.",
+                        file=sys.stderr,
+                    )
+                    print(receipts_msg, file=sys.stderr)
+                    return 2
+
                 # Codex must have reviewed the CURRENT head (existence + freshness)
                 # — not merely have no open findings. This runs BEFORE the finding
                 # scans below: a review published between the scans and this check
@@ -4510,6 +4914,17 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     # review published mid-run can't pass freshness with its P1s unscanned.
     blocked, msg = _check_base_is_default(pr_num, repo=repo)
     print(f"base-branch    : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (default)'}")
+    failures += 1 if blocked else 0
+    # Pin receipts: authoritative HERE, not in CI — the PR body is mutable after
+    # a check run completes, so only a merge-time read describes the body that
+    # actually merges.
+    blocked, msg = _check_pin_receipts(pr_num, repo=repo)
+    print(
+        f"pin-receipts   : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}"
+    )
+    if blocked:
+        for line in msg.splitlines()[1:]:
+            print(f"  {line}")
     failures += 1 if blocked else 0
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     if blocked:

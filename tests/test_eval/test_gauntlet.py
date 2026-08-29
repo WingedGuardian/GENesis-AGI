@@ -6,6 +6,10 @@ real on trivial in-test fixtures. Regression + file-lock logic is unit-tested.
 """
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -510,3 +514,476 @@ class TestRunPytestBounded:
         with pytest.raises(_asyncio.CancelledError):
             await task
         assert killpg_calls and killpg_calls[0][0] == 66667
+# ─────────────────────────────────────────────────────────────────────────────
+# Box test lock: the gauntlet is the one pytest launcher this repo's
+# tests/conftest.py cannot govern (it scores FOREIGN fixture projects, which
+# have their own rootdir), so it must acquire the lock itself or run
+# completely unserialized while occupying the box.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestGauntletTakesTheBoxLock:
+    @pytest.fixture(autouse=True)
+    def _no_ambient_lock_levers(self, monkeypatch):
+        """No ambient lock env may reach the code under test.
+
+        Every test here asserts on whether the box lock is HELD, so any lever
+        that disables or redirects acquisition makes the assertions meaningless.
+        The disable lever is the one that bites: running this file with
+        ``GENESIS_PYTEST_LOCK=0`` — the documented way to run tests while another
+        suite holds the box lock — turns every ``acquire`` into a permissive
+        no-op, and five tests then fail as though the gauntlet had stopped
+        locking. Same class as ``_clean_env`` in tests/test_util/test_pytest_lock.py.
+
+        PATH_ENV is deliberately NOT cleared here: each test sets it to its own
+        tmp lock, which is what keeps them off the real box lock.
+        """
+        from genesis.util import pytest_lock
+
+        for name in (
+            pytest_lock.DISABLE_ENV,
+            pytest_lock.WAIT_ENV,
+            pytest_lock.WAIT_TIMEOUT_ENV,
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+    @pytest.mark.asyncio
+    async def test_run_pytest_holds_the_lock_for_the_subprocess(self, tmp_path, monkeypatch):
+        """The lock must be HELD while the scoring subprocess runs — not merely
+        acquired and dropped before it."""
+        from genesis.eval import gauntlet
+        from genesis.util import pytest_lock
+
+        lock_path = tmp_path / "pytest.lock"
+        monkeypatch.setenv(pytest_lock.PATH_ENV, str(lock_path))
+        monkeypatch.delenv(pytest_lock.HELD_ENV, raising=False)
+
+        held_during_run: list[bool] = []
+
+        async def _fake_run(workdir, basetemp):
+            # Probe from a genuinely separate process: flock is per open-file
+            # description, so an in-process probe would be ambiguous.
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import fcntl,os,sys\n"
+                    "fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR)\n"
+                    "try:\n"
+                    "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                    "    print('free')\n"
+                    "except OSError:\n"
+                    "    print('held')\n",
+                    str(lock_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            held_during_run.append(probe.stdout.strip() == "held")
+            return 0, "1 passed"
+
+        monkeypatch.setattr(gauntlet, "_run_pytest_locked", _fake_run)
+
+        rc, out = await gauntlet._run_pytest(tmp_path / "wd", tmp_path / "bt")
+
+        assert rc == 0 and out == "1 passed"
+        assert held_during_run == [True], (
+            "the gauntlet ran its scoring pytest WITHOUT holding the box lock"
+        )
+
+    @pytest.mark.asyncio
+    async def test_lock_is_released_after_the_run(self, tmp_path, monkeypatch):
+        """Per-fixture acquire/release, so an interactive run only ever waits
+        out ONE fixture rather than the whole scoring pass."""
+        from genesis.eval import gauntlet
+        from genesis.util import pytest_lock
+
+        lock_path = tmp_path / "pytest.lock"
+        monkeypatch.setenv(pytest_lock.PATH_ENV, str(lock_path))
+        monkeypatch.delenv(pytest_lock.HELD_ENV, raising=False)
+
+        async def _fake_run(workdir, basetemp):
+            return 0, "ok"
+
+        monkeypatch.setattr(gauntlet, "_run_pytest_locked", _fake_run)
+        await gauntlet._run_pytest(tmp_path / "wd", tmp_path / "bt")
+
+        after = pytest_lock.acquire(lock_path=lock_path)
+        try:
+            assert after.acquired is True, "the gauntlet did not release the lock"
+        finally:
+            after.release()
+
+    @pytest.mark.asyncio
+    async def test_lock_is_released_when_the_run_raises(self, tmp_path, monkeypatch):
+        """A scoring crash must not strand the box lock for every other run."""
+        from genesis.eval import gauntlet
+        from genesis.util import pytest_lock
+
+        lock_path = tmp_path / "pytest.lock"
+        monkeypatch.setenv(pytest_lock.PATH_ENV, str(lock_path))
+        monkeypatch.delenv(pytest_lock.HELD_ENV, raising=False)
+
+        async def _boom(workdir, basetemp):
+            raise RuntimeError("scoring blew up")
+
+        monkeypatch.setattr(gauntlet, "_run_pytest_locked", _boom)
+
+        with pytest.raises(RuntimeError):
+            await gauntlet._run_pytest(tmp_path / "wd", tmp_path / "bt")
+
+        after = pytest_lock.acquire(lock_path=lock_path)
+        try:
+            assert after.acquired is True, "the lock leaked on the error path"
+        finally:
+            after.release()
+
+
+    @pytest.mark.asyncio
+    async def test_waiting_for_the_lock_does_not_block_the_event_loop(
+        self, tmp_path, monkeypatch
+    ):
+        """The lock wait is synchronous (time.sleep); this coroutine runs on
+        genesis-server's own event loop via the learning AsyncIOScheduler.
+        Calling acquire() inline would freeze Telegram, MCP and every other
+        scheduled job for as long as the lock stayed held.
+
+        Hold the lock from a real external process, then assert a concurrent
+        heartbeat task keeps ticking throughout the wait.
+        """
+        import asyncio
+
+        from genesis.eval import gauntlet
+        from genesis.util import pytest_lock
+
+        lock_path = tmp_path / "pytest.lock"
+        monkeypatch.setenv(pytest_lock.PATH_ENV, str(lock_path))
+        monkeypatch.delenv(pytest_lock.HELD_ENV, raising=False)
+        monkeypatch.setattr(gauntlet, "_LOCK_WAIT_S", 1.5)
+
+        holder_src = (
+            "import fcntl,os,sys,time\n"
+            "fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "open(sys.argv[2],'w').write('r')\n"
+            "time.sleep(30)\n"
+        )
+        ready = tmp_path / "ready"
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_src, str(lock_path), str(ready)]
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and not ready.exists():
+                await asyncio.sleep(0.02)
+            assert ready.exists(), "external lock holder never started"
+
+            ticks = 0
+
+            async def _heartbeat():
+                nonlocal ticks
+                while True:
+                    await asyncio.sleep(0.05)
+                    ticks += 1
+
+            async def _fake_run(workdir, basetemp):
+                return 0, "ok"
+
+            monkeypatch.setattr(gauntlet, "_run_pytest_locked", _fake_run)
+
+            beat = asyncio.create_task(_heartbeat())
+            try:
+                await gauntlet._run_pytest(tmp_path / "wd", tmp_path / "bt")
+            finally:
+                beat.cancel()
+
+            # ~1.5s of contended waiting at 50ms per tick. A blocked loop would
+            # produce roughly zero.
+            assert ticks >= 10, (
+                f"event loop advanced only {ticks} ticks while the gauntlet "
+                "waited for the box lock — the wait is blocking the loop"
+            )
+        finally:
+            holder.kill()
+            holder.wait(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_scores_anyway_when_the_lock_never_frees(self, tmp_path, monkeypatch):
+        """Fail OPEN: a scheduled eval silently skipped is worse than a brief
+        overlap, and unserialized is the pre-existing behaviour."""
+        import asyncio
+
+        from genesis.eval import gauntlet
+        from genesis.util import pytest_lock
+
+        lock_path = tmp_path / "pytest.lock"
+        monkeypatch.setenv(pytest_lock.PATH_ENV, str(lock_path))
+        monkeypatch.delenv(pytest_lock.HELD_ENV, raising=False)
+        monkeypatch.setattr(gauntlet, "_LOCK_WAIT_S", 0.5)
+
+        holder_src = (
+            "import fcntl,os,sys,time\n"
+            "fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "open(sys.argv[2],'w').write('r')\n"
+            "time.sleep(30)\n"
+        )
+        ready = tmp_path / "ready2"
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_src, str(lock_path), str(ready)]
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and not ready.exists():
+                await asyncio.sleep(0.02)
+
+            async def _fake_run(workdir, basetemp):
+                return 0, "scored"
+
+            monkeypatch.setattr(gauntlet, "_run_pytest_locked", _fake_run)
+            rc, out = await gauntlet._run_pytest(tmp_path / "wd", tmp_path / "bt")
+            assert (rc, out) == (0, "scored")
+        finally:
+            holder.kill()
+            holder.wait(timeout=5)
+
+
+    @pytest.mark.asyncio
+    async def test_cancellation_does_not_strand_the_box_lock(
+        self, tmp_path, monkeypatch
+    ):
+        """The COMMON cancellation path: the worker observes the cancel.
+
+        Scope, precisely — this test does NOT reach the late-release race, and
+        an earlier version of it claimed to. With the holder lingering far past
+        the cancel, the worker always sees the cancel event before it can win
+        the flock, so it returns an empty BoxLock and the late-release callback
+        never runs; ``add_done_callback(_release_late_lock)`` could be deleted
+        outright and this stayed green. What it genuinely proves is worth
+        keeping: cancelling the await neither strands the lock nor leaks the
+        held-flag into a long-lived process. The race itself is pinned by
+        test_a_lock_won_after_cancellation_is_released below.
+        """
+        import asyncio
+
+        from genesis.eval import gauntlet
+        from genesis.util import pytest_lock
+
+        lock_path = tmp_path / "pytest.lock"
+        monkeypatch.setenv(pytest_lock.PATH_ENV, str(lock_path))
+        monkeypatch.delenv(pytest_lock.HELD_ENV, raising=False)
+        monkeypatch.setattr(pytest_lock, "_POLL_SECONDS", 0.05)
+        monkeypatch.setattr(gauntlet, "_LOCK_WAIT_S", 30.0)
+
+        holder_src = (
+            "import fcntl,os,sys,time\n"
+            "fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "open(sys.argv[2],'w').write('r')\n"
+            "time.sleep(float(sys.argv[3]))\n"
+        )
+        ready = tmp_path / "cancel-ready"
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_src, str(lock_path), str(ready), "2.0"]
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and not ready.exists():
+                await asyncio.sleep(0.02)
+            assert ready.exists(), "external holder never started"
+
+            async def _never_reached(workdir, basetemp):
+                raise AssertionError("scoring must not run after cancellation")
+
+            monkeypatch.setattr(gauntlet, "_run_pytest_locked", _never_reached)
+
+            task = asyncio.create_task(
+                gauntlet._run_pytest(tmp_path / "wd", tmp_path / "bt")
+            )
+            await asyncio.sleep(0.2)  # let it reach the contended wait
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            # The external holder exits ~2s in; the orphaned worker then wins the
+            # lock. Keep the loop alive so the late-release callback can run.
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                if _lock_is_free(lock_path):
+                    break
+
+            assert _lock_is_free(lock_path), (
+                "the box lock is still held after cancellation — the worker "
+                "acquired it and nothing released it"
+            )
+            assert os.environ.get(pytest_lock.HELD_ENV) is None, (
+                "GENESIS_PYTEST_LOCK_HELD leaked into the server process"
+            )
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+            holder.wait(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_a_lock_won_after_cancellation_is_released(
+        self, tmp_path, monkeypatch
+    ):
+        """The late-release callback itself, driven directly.
+
+        The hazard: the worker thread cannot be interrupted, so a cancel that
+        arrives just after it wins the flock leaves a REAL held lock owned by a
+        future nobody awaits. Only ``_release_late_lock`` can free it, and in
+        the server that lock would otherwise be held until restart.
+
+        Driven rather than timed. That window is microseconds wide — the worker
+        bails the moment ``cancel.wait()`` returns True — so no arrangement of
+        sleeps schedules it reliably, and trying to is how the sibling test
+        above ended up proving nothing. Acquisition is stubbed to IGNORE the
+        cancel and hand back a genuinely held lock after the cancellation, which
+        is exactly the state the callback exists to clean up.
+        """
+        import asyncio
+
+        from genesis.eval import gauntlet
+        from genesis.util import pytest_lock
+
+        lock_path = tmp_path / "pytest.lock"
+        monkeypatch.setenv(pytest_lock.PATH_ENV, str(lock_path))
+        monkeypatch.delenv(pytest_lock.HELD_ENV, raising=False)
+        monkeypatch.setattr(gauntlet, "_LOCK_WAIT_S", 30.0)
+
+        won = {}
+        real_acquire = pytest_lock.acquire
+
+        def _wins_despite_the_cancel(**kwargs):
+            # Models the worker that had ALREADY won the flock when the cancel
+            # landed: it ignores `cancel` and returns a really-held lock.
+            time.sleep(0.3)
+            kwargs.pop("cancel", None)
+            kwargs.pop("wait", None)
+            kwargs.pop("timeout", None)
+            lock = real_acquire(lock_path=lock_path, **kwargs)
+            # Record the fact HERE. ``acquired`` is ``_fd is not None`` and
+            # ``release()`` nulls that fd, so reading it after the callback has
+            # run reports False — checking it later would invert this guard and
+            # fail the test precisely when the mechanism WORKED.
+            won["acquired"] = lock.acquired
+            won["lock"] = lock
+            return lock
+
+        monkeypatch.setattr(pytest_lock, "acquire", _wins_despite_the_cancel)
+
+        async def _never_reached(workdir, basetemp):
+            raise AssertionError("scoring must not run after cancellation")
+
+        monkeypatch.setattr(gauntlet, "_run_pytest_locked", _never_reached)
+
+        task = asyncio.create_task(
+            gauntlet._run_pytest(tmp_path / "wd", tmp_path / "bt")
+        )
+        await asyncio.sleep(0.05)  # cancel while acquisition is still in flight
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        for _ in range(200):
+            await asyncio.sleep(0.05)
+            if won.get("lock") is not None and _lock_is_free(lock_path):
+                break
+
+        # Guard the guard: if the stub never actually took the lock there is
+        # nothing for the callback to release and the assertions below are
+        # vacuous — the failure mode this whole test exists to correct.
+        assert won.get("lock") is not None, "the stub never completed"
+        assert won.get("acquired") is True, (
+            "the stub did not really hold the lock, so this proves nothing"
+        )
+        # Two independent signals, because either alone is weaker than it looks:
+        # the object having dropped its descriptor says the callback ran on THIS
+        # lock, and the file being free says the flock is genuinely gone.
+        assert won["lock"].acquired is False, (
+            "the lock object still holds its descriptor — _release_late_lock "
+            "did not release the lock it was given"
+        )
+        assert _lock_is_free(lock_path), (
+            "a lock won after cancellation was never released — "
+            "_release_late_lock did not run"
+        )
+
+
+def _lock_is_free(path) -> bool:
+    """Probe from a separate process: flock is per open-file-description, so an
+    in-process probe could not distinguish our own stray handle."""
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl,os,sys\n"
+            "fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR)\n"
+            "try:\n"
+            "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "    print('free')\n"
+            "except OSError:\n"
+            "    print('held')\n",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return probe.stdout.strip() == "free"
+
+
+def test_gauntlet_lock_wait_stays_under_asyncios_executor_join_timeout():
+    """A wait longer than asyncio's join timeout can orphan the box lock.
+
+    On interpreter shutdown asyncio waits THREAD_JOIN_TIMEOUT for executor
+    threads, then ABANDONS them and closes the loop — after which a future's
+    completion callback is silently dropped. A worker still waiting past that
+    point would go on to win the flock with nothing left to release it, and hold
+    the box lock while the process hangs at exit: a fail-CLOSED outcome from a
+    component whose first constraint is "fail OPEN, always".
+
+    Asserted against asyncio's own constant rather than a copied number, so a
+    CPython change moves the bound with it.
+    """
+    import asyncio.constants
+
+    from genesis.eval import gauntlet
+
+    assert gauntlet._LOCK_WAIT_S < asyncio.constants.THREAD_JOIN_TIMEOUT, (
+        f"_LOCK_WAIT_S={gauntlet._LOCK_WAIT_S} >= "
+        f"THREAD_JOIN_TIMEOUT={asyncio.constants.THREAD_JOIN_TIMEOUT}: a shutdown "
+        "mid-wait would orphan the worker and strand the box lock"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gauntlet_does_not_publish_held_env_to_the_server_process(
+    tmp_path, monkeypatch
+):
+    """The server spawns unrelated children with dict(os.environ); the held flag
+    must reach only the scoring subprocess, not everything the server starts."""
+
+    from genesis.eval import gauntlet
+    from genesis.util import pytest_lock
+
+    lock_path = tmp_path / "pytest.lock"
+    monkeypatch.setenv(pytest_lock.PATH_ENV, str(lock_path))
+    monkeypatch.delenv(pytest_lock.HELD_ENV, raising=False)
+
+    seen_in_process = []
+
+    async def _probe(workdir, basetemp):
+        seen_in_process.append(os.environ.get(pytest_lock.HELD_ENV))
+        return 0, "ok"
+
+    monkeypatch.setattr(gauntlet, "_run_pytest_locked", _probe)
+    await gauntlet._run_pytest(tmp_path / "wd", tmp_path / "bt")
+
+    assert seen_in_process == [None], (
+        "the gauntlet published GENESIS_PYTEST_LOCK_HELD into the server's own "
+        "environment — every CC session dispatched during the hold would "
+        "inherit it and skip the lock for its whole life"
+    )
