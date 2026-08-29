@@ -689,6 +689,16 @@ class TestErrorVisibilityMarkers:
             raise RuntimeError("db exploded")
 
         monkeypatch.setattr(ego_crud, "list_active_decisions", _boom)
+        # Give the fixture the table this read needs, so the ONLY route to the
+        # error branch is the patch above. Without it the real read raises on a
+        # missing table and the test passes with the monkeypatch DELETED --
+        # asserting the error branch without ever being the reason it ran.
+        # Same shape as the capability-performance case below; found by
+        # checking the sibling rather than only the one a reviewer named.
+        from genesis.db.schema import TABLES
+        await db.execute(TABLES["ego_directives"])
+        await db.commit()
+
         builder = GenesisEgoContextBuilder(
             db=db, health_data=mock_health_data, capabilities=capabilities,
         )
@@ -705,7 +715,21 @@ class TestErrorVisibilityMarkers:
         async def _boom(*a, **k):
             raise RuntimeError("db exploded")
 
-        monkeypatch.setattr(cap_crud, "get_all", _boom)
+        # Patch what the renderer ACTUALLY calls. This used to patch `get_all`,
+        # which the section stopped calling -- so the patch was inert and the
+        # assertion was satisfied by an unrelated failure (this fixture has no
+        # capability_map table, so the real read raises anyway). Deleting the
+        # monkeypatch entirely left the test GREEN, which is the definition of
+        # vacuous: it asserted the error branch without ever being the reason
+        # the error branch ran.
+        monkeypatch.setattr(cap_crud, "get_prompt_rows", _boom)
+        # Give the fixture the table, so the ONLY route to the error branch is
+        # the patch above. Without this the test still passes with the patch
+        # removed and proves nothing.
+        from genesis.db.schema import TABLES
+        await db.execute(TABLES["capability_map"])
+        await db.commit()
+
         builder = GenesisEgoContextBuilder(
             db=db, health_data=mock_health_data, capabilities=capabilities,
         )
