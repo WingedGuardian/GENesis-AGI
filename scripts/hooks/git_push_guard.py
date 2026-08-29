@@ -4203,10 +4203,16 @@ def main() -> int:
         # above) so every hard block below — sqlite writes, --no-verify, the
         # dispatched publish denies, the escalation cap — still takes precedence.
         # Returning here would DOWNGRADE those to a prompt (measured).
-        # The segment check covers ALL FOUR gated ops, not the three the first
-        # cut listed: create_segs belongs here for the same reason as the others
-        # — if the parser DID resolve a `gh pr create`, the real create gate below
-        # sees it and the net must stand down rather than double-prompt.
+        # The segment check names ALL FOUR gated ops, not the three the first cut
+        # listed. HONEST SCOPE: `create_segs` here is symmetry, not a live guard.
+        # Mutation-tested — removing it changes no verdict in any of the four
+        # cells (interactive/dispatched x parsed-create/parsed-create-plus-
+        # untokenizable), because a create the parser DID resolve is answered by
+        # the real create gate first, and this net's verdict is deferred to the
+        # tail behind it. Kept so the condition states the whole set rather than
+        # an accidental subset, which is what let `create` fall out of the
+        # mention test in the first place. Do not cite it as the thing that
+        # prevents a double-prompt; that is the deferral's doing.
         blind_spot_reason: str | None = None
         if (
             not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
