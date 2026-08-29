@@ -188,10 +188,16 @@ def main() -> int:
     dirs = _protected_dirs()
     files = _protected_files()
 
-    # Explicit tokenizability probe, now SHARED (this was the third hand-rolled
-    # copy; they had already drifted from one another). shell_parse._argv
-    # silently degrades to a naive split on shlex errors, so analyze() alone can
-    # never signal one.
+    # Explicit tokenizability probe, now SHARED rather than inline here.
+    # shell_parse._argv silently degrades to a naive split on shlex errors, so
+    # analyze() alone can never signal one.
+    #
+    # (An earlier draft of this comment called it "the third hand-rolled copy,
+    # already drifted from one another". Not true of the tree this lands on: on
+    # the default branch this was the ONLY probe of the discard-the-tokens kind.
+    # Every other shlex call in scripts/hooks USES its tokens, which is a
+    # different act with a different fail direction. A comment describing a tree
+    # the change is not landing on is how a reader inherits a false picture.)
     #
     # Not byte-identical to the inline probe it replaces: that one folded
     # `\<newline>` to a space first. The shared probe reads the command RAW,
