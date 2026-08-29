@@ -3069,7 +3069,10 @@ def _check_scheduled_claude_reviewed_head(
     # mentioned leaks, and a hand-written marker satisfies the one gate this repository
     # calls irreducible. An unscoped block is reported as unscoped, and every kind it
     # cannot account for keeps its true state.
-    _named = {k for k, _, _ in unusable if k is not None}
+    # Scoped to kinds a block actually NAMED, and named as a REQUIRED kind. A block
+    # naming no kind, or naming one nothing requires (a typo such as a singular form),
+    # cannot be credited to any review -- it is reported separately and claims nothing.
+    _named = {k for k, _, _ in unusable if k is not None} & missing_set
     # A CURRENT malformed marker outranks marker history for the same kind: "you posted
     # one and it needs one character fixed" is more actionable than "a routine ran on an
     # older commit", and the latter used to hide the former on any PR with history.
@@ -3078,13 +3081,11 @@ def _check_scheduled_claude_reviewed_head(
         k for k in missing_set - refused_kinds - unusable_kinds if k in heads_by_kind
     }
     absent_kinds = missing_set - refused_kinds - unusable_kinds - elsewhere_kinds
-    # Split by what the cause MEANS. Only a trusted, clean review with a malformed
-    # marker may be answered with "re-post it"; everything else has to be answered with
-    # "run the review", because minting the marker is exactly what must not happen.
-    _grammar = {k for k, _, ok in unusable if ok and k in unusable_kinds}
-    grammar_kinds = _grammar
-    untrusted_kinds = unusable_kinds - grammar_kinds
-    unscoped = [(r, ok) for k, r, ok in unusable if k is None]
+    # Everything this cannot attribute to a required kind. Including the wrong-kind
+    # case is the point: narrowing to named kinds without it made a block reading
+    # `kind=<near-miss>` vanish from every group, and the message went back to claiming
+    # nothing had been posted -- the exact misdiagnosis this whole change exists to end.
+    unscoped = [(k, r) for k, r, _ in unusable if k is None or k not in missing_set]
 
     parts: list[str] = []
     if refused_kinds:
@@ -3113,38 +3114,36 @@ def _check_scheduled_claude_reviewed_head(
         rows = [f"[{k}] {r}" for k, r, _ in unusable if k in kinds]
         return "; ".join(rows[:4]) + (f" (+{len(rows) - 4} more)" if len(rows) > 4 else "")
 
-    # The runnable form, and carrying --repo when one was given: run from another
-    # checkout, an emitter without it resolves this PR number in the wrong repository
-    # and prints a marker for the wrong head. The file is tracked non-executable and is
-    # not on PATH, so a bare invocation is command-not-found.
-    _repo_arg = f" --repo {repo}" if repo else ""
-    _emit = f"python3 scripts/hooks/git_push_guard.py --emit-marker {pr_num} --kind <name>{_repo_arg}"
-
-    if grammar_kinds:
+    # These bullets REPORT. They deliberately prescribe nothing.
+    #
+    # Six of six blocker-class review findings on the first version of this feature
+    # were in its advice, and none in its observations. The cause was structural: the
+    # advice had to know whether a trusted clean review existed, so each branch decided
+    # that for itself and each got it wrong differently -- offering to mint a marker for
+    # a review posted by someone else, for one that was dismissed, for one that came
+    # back BLOCKING. A marker is an attestation, and a gate that tells you how to write
+    # one is a gate explaining how to get past itself.
+    #
+    # What the reader needs from a GATE is what it found. What to do about it depends on
+    # facts this code cannot see -- whether the review actually ran, whether a finding
+    # was real -- and every attempt to guess ended up advising a way around the check.
+    # So: no remedy text, and no emitter suggestion, here. `--emit-marker` remains a
+    # command someone runs deliberately after a review, which is the only context in
+    # which it is honest.
+    if unusable_kinds:
         parts.append(
-            f"{', '.join(sorted(grammar_kinds))} — a marker block IS present at this "
-            f"head from the owner and its body reads clean, but the block itself is "
-            f"UNUSABLE so it counts for nothing: {_detail(grammar_kinds)}. This is NOT "
-            f"'nobody posted anything', and waiting cannot clear it. The review really "
-            f"ran; only the marker text is wrong, so re-post it — `{_emit}` prints one "
-            f"with the head read from GitHub, so the sha is never retyped."
-        )
-    if untrusted_kinds:
-        parts.append(
-            f"{', '.join(sorted(untrusted_kinds))} — a marker block is present but "
-            f"nothing here vouches for a clean review at this head: "
-            f"{_detail(untrusted_kinds)}. Do NOT hand-write a marker to clear this. A "
-            f"marker is an attestation that the review RAN and came back clean, and on "
-            f"this path it did not — run the review against the current head (and "
-            f"resolve any finding it reports) before posting anything."
+            f"{', '.join(sorted(unusable_kinds))} — a marker block IS present on this "
+            f"PR but could not be counted, so it stands for nothing: "
+            f"{_detail(unusable_kinds)}. This is NOT 'nobody posted anything'."
         )
     if unscoped:
-        _shown = "; ".join(r for r, _ in unscoped[:3])
+        shown = "; ".join(
+            f"[{k or 'no kind named'}] {r}" for k, r in unscoped[:3]
+        ) + (f" (+{len(unscoped) - 3} more)" if len(unscoped) > 3 else "")
         parts.append(
-            f"unscoped — {len(unscoped)} marker block(s) on this PR name no kind, so "
-            f"they cannot be credited to any required review and are NOT counted "
-            f"against the kinds above: {_shown}. Re-post each naming its kind. Until "
-            f"then every required kind is reported by its own true state."
+            f"unscoped — {len(unscoped)} marker block(s) on this PR name no required "
+            f"kind, so they are credited to nothing and counted against nothing: "
+            f"{shown}. Every required kind above is reported by its own state."
         )
     if absent_kinds:
         parts.append(

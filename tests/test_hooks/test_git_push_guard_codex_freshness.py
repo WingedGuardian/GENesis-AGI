@@ -1427,11 +1427,22 @@ class TestAnUnusableMarkerIsNotReportedAsAbsent:
         assert msg, "a head without an ACCEPTED marker must still block"
         return msg
 
-    def test_an_abbreviated_head_is_reported_as_unusable(self, monkeypatch):
-        """The measured case: the operator did post one, and needs to know."""
+    def test_an_abbreviated_head_is_reported_rather_than_treated_as_absent(self, monkeypatch):
+        """The measured case: the operator did post one, and needs to know.
+
+        Asserts the SUBSTANCE rather than a keyword. The first version matched on the
+        word "unusable" and broke when the wording changed, even though the behaviour
+        it cared about was intact -- a test that fails on a synonym is measuring the
+        sentence, not the property. What has to hold is that the malformed value is
+        shown and that the message actively denies the reading it used to give.
+        """
         body = f"scan done.\n<!-- genesis-scheduled-review: head={SHORT_HEAD} kind=leaks -->"
         msg = self._block_msg(monkeypatch, self._row(body))
-        assert "unusable" in msg.lower() or "could not be parsed" in msg.lower(), msg
+        assert f"'{SHORT_HEAD}'" in msg, "the offending value must be quoted back"
+        assert "not 'nobody posted anything'" in msg.lower(), (
+            "the report must contradict the absent reading, which is the one that "
+            "sent an operator away to wait"
+        )
 
     def test_an_abbreviated_head_does_not_advise_waiting(self, monkeypatch):
         """The failure this exists to prevent -- and the one that actually happened."""
@@ -1576,6 +1587,9 @@ class TestTheGateCanEmitAMarkerItWillItselfAccept:
         assert "genesis-scheduled-review" not in cap.out
 
 
+BLOCKING_PROSE = "[P1] a real finding that has not been resolved"
+
+
 class TestAnUnusableMarkerRemedyMatchesItsCause:
     """Naming a marker unusable is only half the job; the REMEDY has to match WHY.
 
@@ -1595,7 +1609,7 @@ class TestAnUnusableMarkerRemedyMatchesItsCause:
         Run the review; resolve the finding.
     """
 
-    BLOCKING = "[P1] a real finding that has not been resolved"
+    BLOCKING = BLOCKING_PROSE
 
     @staticmethod
     def _row(body, *, login="owner", author_association="OWNER", state=None):
@@ -1636,8 +1650,7 @@ class TestAnUnusableMarkerRemedyMatchesItsCause:
         msg = self._msg(
             monkeypatch, self._row(body, login="drive-by", author_association="CONTRIBUTOR")
         )
-        assert "drive-by" in msg
-        assert "run" in msg.lower() and "review" in msg.lower()
+        assert "drive-by" in msg, "the untrusted author must be named"
         assert "--emit-marker" not in msg, (
             "the emitter mints an attestation and performs no review; offering it here "
             "turns an untrusted marker into a passing gate"
@@ -1659,14 +1672,57 @@ class TestAnUnusableMarkerRemedyMatchesItsCause:
             "gate pass while the finding stands"
         )
 
-    # ---- CONTROL: the one cause the original remedy WAS right for ---------
-    def test_a_grammar_only_marker_still_gets_the_re_post_remedy(self, monkeypatch):
-        """Without this, an implementation that refused to help anyone would pass
-        every assertion above while making the feature useless."""
+    # ---- THE INVARIANT that makes this whole class impossible --------------
+    @pytest.mark.parametrize(
+        "label,row_kwargs,body_prefix,marker_kwargs",
+        [
+            ("grammar only", {}, "scan done, all clean.", {"head": HEAD[:8]}),
+            ("non-owner", {"login": "drive-by", "author_association": "CONTRIBUTOR"}, "x.", {}),
+            ("dismissed", {"state": "DISMISSED"}, "x.", {}),
+            ("blocking body", {}, BLOCKING_PROSE, {"head": HEAD[:8]}),
+            ("no kind", {}, "x.", {"kind": None}),
+            ("wrong kind", {}, "x.", {"head": HEAD[:8], "kind": "code-review"}),
+        ],
+    )
+    def test_no_cause_is_ever_answered_with_a_way_to_mint_a_marker(
+        self, monkeypatch, label, row_kwargs, body_prefix, marker_kwargs
+    ):
+        """The structural guarantee, replacing a remedy that kept being wrong.
+
+        Six of six blocker-class findings on the first version of this feature were
+        in its ADVICE and none in its observations, because the advice had to know
+        whether a trusted clean review existed and each branch decided that for
+        itself. A gate that explains how to write its own attestation is a gate
+        explaining how to get past itself.
+
+        So the message reports and prescribes nothing, and this asserts it for EVERY
+        cause rather than for the ones review happened to reach. A future branch that
+        reintroduces advice fails here instead of shipping and being found later.
+        """
+        body = body_prefix + "\n" + self._marker(**marker_kwargs)
+        msg = self._msg(monkeypatch, self._row(body, **row_kwargs))
+        assert "--emit-marker" not in msg, f"{label}: offered a way to mint a marker"
+        assert "re-post" not in msg.lower(), f"{label}: prescribed a remedy"
+
+    def test_the_report_still_names_the_cause(self, monkeypatch):
+        """CONTROL. Removing the advice must not remove the diagnosis -- an
+        implementation that said nothing at all would satisfy every assertion above
+        while restoring the exact silence this change was written to end."""
         body = "scan done, all clean.\n" + self._marker(head=HEAD[:8])
         msg = self._msg(monkeypatch, self._row(body))
         assert f"'{HEAD[:8]}'" in msg, "the malformed value must still be quoted"
-        assert "--emit-marker" in msg, "the grammar-only case is exactly what it is for"
+        assert "could not be counted" in msg
+        assert "not 'nobody posted anything'" in msg.lower()
+
+    def test_a_block_naming_an_unrequired_kind_is_still_reported(self, monkeypatch):
+        """A near-miss kind is the case that narrowing to named kinds broke: it
+        matched the grammar, so it was not malformed-by-field, but it belonged to no
+        required review, so it fell out of every group and the message went back to
+        claiming nothing had been posted."""
+        body = "scan done.\n" + self._marker(head=HEAD[:8], kind="code-review")
+        msg = self._msg(monkeypatch, self._row(body), required="leaks")
+        assert "unscoped" in msg.lower(), msg
+        assert f"'{HEAD[:8]}'" in msg
 
     # ---- P2: a pending review is in-flight, not unusable -------------------
     def test_a_pending_review_keeps_the_waiting_guidance(self, monkeypatch):
@@ -1688,19 +1744,6 @@ class TestAnUnusableMarkerRemedyMatchesItsCause:
         assert f"'{HEAD[:8]}'" in msg, (
             "the malformed CURRENT marker is the actionable one and was hidden behind "
             "the stale-head explanation"
-        )
-
-    # ---- P2: the suggested command must actually run -----------------------
-    def test_the_suggested_command_is_runnable_and_keeps_the_repo(self, monkeypatch):
-        body = "scan done, all clean.\n" + self._marker(head=HEAD[:8])
-        msg = self._msg(monkeypatch, self._row(body))
-        assert "python3 scripts/hooks/git_push_guard.py --emit-marker" in msg, (
-            "the file is tracked non-executable and is not on PATH, so a bare "
-            "invocation is command-not-found"
-        )
-        assert "--repo acme/pub" in msg, (
-            "run from another checkout, an emitter without --repo resolves the PR "
-            "number in the wrong repository"
         )
 
     # ---- P2: show the detail that belongs to THIS group -------------------
