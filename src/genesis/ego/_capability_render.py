@@ -32,17 +32,48 @@ async def safe_count(db: aiosqlite.Connection) -> int | None:
         return None
 
 
+async def safe_count_unusable(db: aiosqlite.Connection) -> int:
+    """Rows the window cannot classify, or 0 if the count itself failed.
+
+    Same fail-open contract as :func:`safe_count` and for the same reason: this
+    runs on the degraded branch, so it must never be the thing that raises.
+    """
+    try:
+        from genesis.db.crud import capability_map as cap_crud
+
+        return await cap_crud.count_unusable(db)
+    except Exception:
+        logger.warning("Failed to count unusable capability rows", exc_info=True)
+        return 0
+
+
 def empty_state_note(total: int | None, *, empty: str, filtered: str,
-                     unknown: str) -> str:
+                     unknown: str, unusable: int = 0) -> str:
     """Pick the sentence that is TRUE for this state.
 
-    Three distinct states, three sentences: the map is genuinely empty; the map
-    holds rows that were all filtered out; or the count could not be read. Each
-    message is a false claim in the other two situations, which is why the
-    choice is made once, here.
+    Four distinct states, four sentences: the map is genuinely empty; the map
+    holds rows that were all filtered out; some of those rows were filtered
+    because their timestamp is MALFORMED rather than merely old or thin; or the
+    count could not be read. Each message is a false claim in the others'
+    situations, which is why the choice is made once, here.
+
+    The malformed case is called out separately because it is the only one that
+    is a BUG rather than a normal state, and because it is otherwise permanent
+    and invisible — nothing rewrites such a row, so it never recovers on its
+    own. Telling the ego "stale or thin" when the truth is "corrupt" is the
+    same class of false statement this helper exists to prevent.
     """
     if total is None:
         return unknown
     if total == 0:
         return empty
-    return filtered.format(total=total)
+    note = filtered.format(total=total)
+    if unusable:
+        logger.warning(
+            "capability_map: %d row(s) have an unusable updated_at and are "
+            "permanently excluded from the self-model", unusable,
+        )
+        note = note.rstrip("\n").rstrip("*") + (
+            f" — {unusable} of them have an unreadable timestamp.*\n"
+        )
+    return note

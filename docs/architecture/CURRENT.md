@@ -721,11 +721,12 @@ verified: 94be12b3 2026-08-06
   autonomy_state and procedural_memory are not, so domains fed only by those
   never age out — correct for present-tense state, a known wart for the
   journal's historical events. The honest uniform reading is "the aggregator
-  stopped vouching for this row N days ago". Anchored on
-  `MIN(MAX(updated_at), now)`: freshest-row anchoring means a TOTAL refresh
-  outage hides nothing, and the clamp stops one future-dated row (clock skew)
-  from defining the window and blanking everything. A PARTIAL outage is not
-  covered. Nothing is ever pruned; rows below a bar stop being refreshed and
+  stopped vouching for this row N days ago". Anchored on the freshest row that
+  is USABLE — date-shaped, parseable, and not in the future. Freshest-row
+  anchoring means a TOTAL refresh outage hides nothing; excluding future-dated
+  rows from the anchor (inside the subquery, not by clamping afterwards) stops
+  one clock-skewed row from defining the window and blanking everything. A
+  PARTIAL outage is not covered. Nothing is ever pruned; rows below a bar stop being refreshed and
   stop being RENDERED as present-tense capability — `get_by_domain` and
   `count_all` still read them deliberately.
   This is the naming-trap twin of this document — unrelated to the subsystem map.

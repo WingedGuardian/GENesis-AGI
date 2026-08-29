@@ -146,11 +146,21 @@ async def aggregate_by_type(
            FROM intervention_journal
            WHERE outcome_status != 'pending'"""
         + (
+            # NOT EXISTS, not NOT IN. `x NOT IN (…)` evaluates to NULL --
+            # never true -- as soon as the subquery yields a single NULL, so one
+            # NULL id in ego_proposals would discard the ENTIRE resolved journal
+            # history rather than the duplicate rows, silently shrinking every
+            # domain's sample size. `id` is a TEXT PRIMARY KEY, which SQLite
+            # does not constrain to NOT NULL, so that is reachable in an
+            # imported or repaired database. The correlated form is NULL-safe by
+            # construction and also handles a NULL proposal_id without the extra
+            # OR: `p.id = NULL` is never true, so the row is kept.
             """
-             AND (proposal_id IS NULL OR proposal_id NOT IN (
-                   SELECT id FROM ego_proposals
-                   WHERE created_at >= datetime('now', ?)
-                     AND status IN ('approved','executed','rejected','failed')))"""
+             AND NOT EXISTS (
+                   SELECT 1 FROM ego_proposals p
+                   WHERE p.id = intervention_journal.proposal_id
+                     AND p.created_at >= datetime('now', ?)
+                     AND p.status IN ('approved','executed','rejected','failed'))"""
             if exclude_proposals_within_days is not None
             else ""
         )

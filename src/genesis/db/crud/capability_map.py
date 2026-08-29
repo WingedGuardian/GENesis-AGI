@@ -106,7 +106,11 @@ async def upsert(
 # days and then jumps to 23+ with nothing in between, so this sits in an empty
 # gap rather than on a knife-edge.
 #
-# Anchor. ``MIN(MAX(updated_at), now)`` — the freshest row, clamped to now.
+# Anchor. The freshest row that is USABLE — parseable, date-shaped, and not
+# in the future. There is no MIN()/clamp in the SQL: future rows are
+# EXCLUDED inside the subquery's WHERE rather than clamped after the fact.
+# (An earlier round did clamp; filtering first replaced it, for the reason
+# spelled out below. This comment described the old shape for two rounds.)
 #
 # Anchoring on the freshest row rather than wall-clock means that if the refresh
 # job stops entirely, the whole table ages together and NOTHING is hidden:
@@ -172,6 +176,70 @@ STALE_AFTER_DAYS = 14
 MIN_SAMPLE_SIZE = 3
 
 
+# A row's timestamp is USABLE only if it LOOKS LIKE A DATE, PARSES, and is NOT
+# IN THE FUTURE.
+#
+# TWO of those three are independently load-bearing. ``IS NOT NULL`` is NOT:
+# ``julianday(x) <= julianday('now')`` is itself NULL — and therefore never
+# true — whenever ``julianday(x)`` is NULL, so the comparison already excludes
+# every row the NULL check would have. MEASURED: dropping the conjunct changes
+# the verdict on 0 of 22 adversarial values, and the mutation survives the
+# suite. It is kept because it states the intent at the point of use and costs
+# nothing, not because removing it would change behaviour.
+#
+# (Recorded because the opposite was asserted here for a round, reasoning from
+# "julianday() can return NULL" — true — to "so this conjunct is needed" —
+# which does not follow, and was never measured.)
+#
+# Defined once and applied in BOTH places that need it -- choosing the anchor,
+# and choosing the rows returned. Applying it to only one of the two is not a
+# weaker version of the same protection, it is a distinct defect: with the
+# predicate on the anchor alone, a future-dated row is excluded from defining
+# the window but still satisfies `>= anchor - N`, so the corrupt row is the one
+# thing the read renders as current. It then feeds `get_weakest`, which drives
+# the capability-improvement scanner -- and because a row nothing rewrites can
+# never age, it would do so indefinitely.
+#
+# That is exactly what happened: an earlier round added the future-row guard to
+# the subquery and left the outer predicate alone. Hence a shared constant
+# rather than two hand-kept-in-sync copies.
+#
+# WHY THE SHAPE GATE. "It parses" is a far weaker claim than it reads as:
+# `julianday()` accepts SQLite's whole time-string grammar, not just ISO dates.
+# Measured, these all parse and are all <= now, so the other two halves admit
+# every one of them:
+#
+#   'now' / 'NOW'      -> resolved against the WALL CLOCK
+#   '12:00'            -> a bare time (2000-01-01)
+#   '2460000' / '0'    -> a raw Julian day NUMBER
+#
+# The first is the one that bites, and it defeats the central guarantee of this
+# whole design. The anchor is `MAX(updated_at)` rather than wall-clock so that a
+# dead refresh job ages the table UNIFORMLY and hides nothing. A row storing
+# 'now' re-dates itself on every read, so it is permanently the freshest: it
+# wins MAX() forever, pins the window to wall-clock, and every real row falls
+# outside it. Reproduced -- three 60-day-old rows plus one 'now' row returned
+# ONLY the corrupt row. Neither existing guard sees it: it is not in the future,
+# and it parses.
+#
+# The GLOB requires a leading YYYY-MM-DD, which no member of that grammar has.
+# It does NOT make the NULL check redundant -- '2026-13-45' is date-SHAPED and
+# still parses to NULL -- and it rejects no legitimate stored format (verified
+# against isoformat() with and without offset, SQLite's space-separated
+# rendering, and a bare date).
+#
+# Not reachable from application code today: `upsert` generates `updated_at`
+# itself and no caller supplies it. This predicate exists precisely to tolerate
+# values application code did not write -- a bad backfill, a hand-edit, a
+# restore -- so a gap in the direction it claims to cover is worth closing on
+# its own terms rather than on a reachability argument.
+_USABLE_TIMESTAMP = (
+    "updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' "
+    "AND julianday(updated_at) IS NOT NULL "
+    "AND julianday(updated_at) <= julianday('now')"
+)
+
+
 def _recency_clause(stale_after_days: int | None) -> tuple[str, list]:
     """SQL fragment + params restricting rows to the non-stale window.
 
@@ -194,15 +262,30 @@ def _recency_clause(stale_after_days: int | None) -> tuple[str, list]:
         raise ValueError(
             f"stale_after_days must be >= 0 or None, got {stale_after_days}"
         )
-    # Clamped to now: MAX() is unbounded ABOVE, so without MIN() a single row
-    # stamped in the future would define the window for every other row and hide
-    # all of them. julianday() (not a lexical MIN) because stored values are
-    # ``T``-separated with an offset while ``datetime('now')`` is space-
-    # separated — a lexical compare between those two shapes is meaningless.
+    # ``MAX(julianday(...))``, not ``julianday(MAX(...))``.
+    #
+    # The motivating input is NOT a malformed value — the GLOB in the same
+    # subquery's WHERE already excludes those. It is a table holding MIXED
+    # timestamp FORMATS, which is exactly what a backfill or a restore produces
+    # and what this predicate exists to tolerate. ``MAX`` over the raw column is
+    # a LEXICAL max over text, and across formats that picks the wrong row:
+    #
+    #   '2026-08-20T01:00:00+00:00' vs '2026-08-20 05:00:00'
+    #     MAX(julianday(...)) -> 2461272.708  (the 05:00 row, correct)
+    #     julianday(MAX(...)) -> 2461272.542  (the 01:00 row, because 'T' > ' ')
+    #
+    # Same failure across mixed UTC offsets. The window then shifts by hours.
+    #
+    # The COALESCE fallback is belt-and-braces, not an active guard: the
+    # subquery's WHERE is textually the same predicate as the outer one, so it
+    # yields NULL only when no row passes the outer predicate either, and the
+    # read is empty regardless. Kept so the two cannot diverge silently in
+    # future without the fallback already being there.
     return (
+        f" AND {_USABLE_TIMESTAMP}"
         " AND julianday(updated_at) >= "
         "COALESCE((SELECT MAX(julianday(updated_at)) FROM capability_map "
-        "          WHERE julianday(updated_at) <= julianday('now')), "
+        f"          WHERE {_USABLE_TIMESTAMP}), "
         "         julianday('now')) - ?",
         [int(stale_after_days)],
     )
@@ -226,6 +309,23 @@ async def get_all(db: aiosqlite.Connection) -> list[dict]:
     rows = await cur.fetchall()
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r, strict=False)) for r in rows]
+
+
+async def count_unusable(db: aiosqlite.Connection) -> int:
+    """Rows whose ``updated_at`` the window cannot classify.
+
+    Exists because the filter's failure mode is otherwise SILENT and
+    PERMANENT: a malformed row is excluded from both the anchor and the result
+    set, and nothing ever rewrites it (the aggregator only re-emits domains
+    that clear its gates), so it disappears from the self-model forever with no
+    signal anywhere. "Never hide broken things" applies to a filter as much as
+    to a crash.
+    """
+    cur = await db.execute(
+        f"SELECT COUNT(*) FROM capability_map WHERE NOT ({_USABLE_TIMESTAMP})"
+    )
+    row = await cur.fetchone()
+    return int(row[0]) if row else 0
 
 
 async def count_all(db: aiosqlite.Connection) -> int:

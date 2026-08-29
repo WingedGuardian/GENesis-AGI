@@ -992,10 +992,17 @@ class TestRenderStateMatrix:
       error     - the query raised
       empty     - the map genuinely holds nothing
       filtered  - the map is FULL but every row failed a bar
+      corrupt   - the map is full but the rows' timestamps are UNREADABLE
       rows      - qualifying rows exist
+
+    ``corrupt`` is enumerated separately from ``filtered`` because the two are
+    indistinguishable to the reader and only one of them is a bug. A malformed
+    row is excluded from the window and never rewritten afterwards, so without
+    naming it the ego is told "stale or thin" forever about data that is
+    actually broken.
     """
 
-    STATES = ("error", "empty", "filtered", "rows")
+    STATES = ("error", "empty", "filtered", "corrupt", "rows")
 
     @staticmethod
     async def _make_db(state):
@@ -1014,6 +1021,17 @@ class TestRenderStateMatrix:
                     "sample_size, trend, evidence_summary, updated_at) "
                     "VALUES (?, ?, 0.95, 1, 'stable', 'e', ?)",
                     (f"t{i}", f"t{i}", now),
+                )
+        elif state == "corrupt":
+            # Date-SHAPED but unparseable: passes the GLOB, julianday() -> NULL.
+            # Excluded from both the anchor and the result set, and nothing
+            # ever rewrites it.
+            for i in range(4):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.9, 25, 'stable', 'e', '2026-13-45')",
+                    (f"c{i}", f"corrupt{i}"),
                 )
         elif state == "rows":
             for i in range(3):
@@ -1062,6 +1080,14 @@ class TestRenderStateMatrix:
             assert "map is empty" in out, f"{which}: genuinely-empty must say so"
             assert "present;" not in out, (
                 f"{which}: must not imply rows were withheld when none exist"
+            )
+        elif state == "corrupt":
+            assert "map is empty" not in out, (
+                f"{which}: 4 rows present — claiming empty is false"
+            )
+            assert "unreadable timestamp" in out, (
+                f"{which}: corrupt rows were reported as merely stale or thin, "
+                "which is a false cause the ego cannot act on"
             )
         elif state == "filtered":
             # Must NOT claim emptiness, and must say how many rows are really
@@ -1208,6 +1234,6 @@ class TestLightDepthDatesItsEvidence:
         assert "3 domains" in out
         # ...but they must not be described as current.
         assert "current, qualifying evidence" not in out
-        assert f"newest evidence {stamp}" in out, (
+        assert f"last vouched {stamp}" in out, (
             "the light line asserts freshness it cannot support"
         )

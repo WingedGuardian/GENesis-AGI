@@ -460,6 +460,7 @@ class EgoContextBuilder:
             # failed a bar. Each message is a false claim in the other's
             # situation, so the count decides which is rendered.
             total = await _cap_render.safe_count(self._db)
+            _unusable = await _cap_render.safe_count_unusable(self._db)
             lines.append(_cap_render.empty_state_note(
                 total,
                 empty="*No capability data yet — the map is empty.*\n",
@@ -467,6 +468,7 @@ class EgoContextBuilder:
                          "stale or thin rows are not shown).*\n",
                 unknown="*No qualifying capability rows (count unavailable — "
                         "see logs).*\n",
+                unusable=_unusable,
             ))
             return "\n".join(lines)
 

@@ -1469,6 +1469,7 @@ class UserEgoContextBuilder:
             # failed a bar. Each message is a false claim in the other's
             # situation, so the count decides which is rendered.
             total = await _cap_render.safe_count(self._db)
+            _unusable = await _cap_render.safe_count_unusable(self._db)
             lines.append(_cap_render.empty_state_note(
                 total,
                 empty="*No track record yet — the map is empty.*\n",
@@ -1476,6 +1477,7 @@ class UserEgoContextBuilder:
                          "stale or thin rows are not shown).*\n",
                 unknown="*No qualifying track record (count unavailable — "
                         "see logs).*\n",
+                unusable=_unusable,
             ))
             return "\n".join(lines)
 
@@ -1495,7 +1497,13 @@ class UserEgoContextBuilder:
             _newest = max(
                 (e.get("updated_at") or "" for e in entries), default=""
             )[:10]
-            _asof = f", newest evidence {_newest}" if _newest else ""
+            # "last vouched", not "newest evidence": updated_at records when the
+            # aggregator last WROTE the row, not the age of the evidence behind
+            # it. Three of the six sources are unwindowed (see capability_map),
+            # so for those the two differ without limit. The sibling renderer in
+            # genesis_context.py words it the same way -- one field must not
+            # make two different claims depending on which prompt reads it.
+            _asof = f", last vouched {_newest}" if _newest else ""
             return (
                 f"## Your Track Record\n"
                 f"{len(entries)} {_plural} with qualifying evidence "

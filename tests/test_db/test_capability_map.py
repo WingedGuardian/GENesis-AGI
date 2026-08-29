@@ -366,6 +366,13 @@ class TestAnchorIsClamped:
         assert {f"healthy{i}" for i in range(4)} <= domains, (
             "a single clock-skewed row blanked the healthy rows"
         )
+        # The other direction, and the one that was actually broken: the future
+        # row must not be RETURNED either. Excluding it from the anchor while
+        # still returning it leaves the corrupt row as the one thing the ego
+        # renders as current -- and nothing rewrites it, so it never ages out.
+        assert "skewed" not in domains, (
+            "a future-dated row was rendered in the self-model as current"
+        )
 
     @pytest.mark.asyncio
     async def test_future_row_does_not_monopolise_get_weakest(self, db):
@@ -375,6 +382,13 @@ class TestAnchorIsClamped:
 
         domains = [e["domain"] for e in await cap_crud.get_weakest(db)]
         assert "real_weak" in domains
+        # Not merely "not alone": a corrupt row must not reach the scanner at
+        # all. It has the lowest confidence, so it would otherwise LEAD the
+        # weakness list and drive improvement cycles for a domain whose only
+        # distinguishing feature is a broken clock.
+        assert "skewed" not in domains, (
+            "the clock-skewed row was handed to the improvement scanner"
+        )
 
     @pytest.mark.asyncio
     async def test_clamp_does_not_break_the_dead_job_property(self, db):
@@ -497,11 +511,11 @@ class TestNegativeWindowRejected:
 class TestEmptyTableFailDirection:
     """An empty table must return empty, not raise.
 
-    The clamped anchor uses SQLite's scalar ``min()``, which returns NULL if any
-    argument is NULL — and ``MAX(updated_at)`` over an empty table IS NULL. That
-    makes the whole comparison NULL and filters everything, which is the right
-    answer here (there was nothing to show) but is worth pinning: it is the one
-    input where the clause evaluates to NULL rather than a boolean.
+    ``MAX(julianday(updated_at))`` over an empty table is NULL, so the anchor
+    subquery yields NULL and the comparison is NULL rather than a boolean —
+    filtering everything, which is the right answer when there was nothing to
+    show. Worth pinning because it is the one input where the clause is neither
+    true nor false.
     """
 
     @pytest.mark.asyncio
@@ -702,3 +716,243 @@ class TestFutureRowDuringDeadJob:
         domains = {e["domain"] for e in await cap_crud.get_prompt_rows(db)}
         assert "fresh" in domains
         assert "stale" not in domains, "the window stopped excluding stale rows"
+
+
+# Values SQLite's julianday() accepts that are NOT timestamps.
+#
+# Enumerated by probing julianday() rather than by picking examples: the
+# function accepts its full time-string grammar, not just ISO dates. Three
+# sub-classes, and they fail in different directions, so the population is
+# tested rather than the one member a review happened to name:
+#
+#   'now' / 'NOW'          -> resolves to WALL-CLOCK. Parses, is not in the
+#                             future, and therefore wins MAX() forever.
+#   '12:00' / '12:00:00'   -> a bare time, resolving to 2000-01-01.
+#   '2460000' / '0' / ...  -> a raw Julian day NUMBER.
+#
+# Only the first sub-class is actively harmful (it pins the anchor at
+# wall-clock, destroying the dead-refresh-job guarantee, and renders as
+# current forever). The rest resolve far outside the window and are inert
+# today -- they are included because the shape gate must exclude the CLASS,
+# not the one member that currently bites.
+_NON_TIMESTAMPS_JULIANDAY_ACCEPTS = [
+    "now",
+    "NOW",
+    "12:00",
+    "12:00:00",
+    "2460000",
+    "2460000.5",
+    "0",
+]
+
+
+class TestNonTimestampValuesAreNotUsable:
+    """``julianday()`` parses more than timestamps, and the predicate trusted it.
+
+    ``_USABLE_TIMESTAMP`` asks two questions -- does it parse, and is it in the
+    past -- and a stored ``'now'`` answers yes to both. It is not a timestamp at
+    all: SQLite resolves it against the wall clock, so it re-dates itself on
+    every read.
+
+    That defeats the one guarantee the anchor design exists to provide. The
+    anchor is ``MAX(updated_at)`` rather than wall-clock precisely so that a
+    dead refresh job ages the whole table together and hides NOTHING. A row
+    reading ``'now'`` is permanently the freshest, so the anchor is pinned to
+    wall-clock and every genuinely-old row falls outside the window -- the exact
+    failure the ``MIN``/``COALESCE`` guards were added to prevent, arriving
+    through a door neither of them watches (it is not in the future, and it
+    parses).
+
+    Not reachable from application code: ``upsert`` generates ``updated_at``
+    itself and no caller supplies it. This is a hole in a DEFENSIVE predicate
+    whose whole purpose is tolerating values application code did not write --
+    a bad backfill, a hand-edit, a restore. A defense with a gap in the
+    direction it claims to cover is worth closing on its own terms.
+    """
+
+    @staticmethod
+    async def _insert(db, domain, updated_at, *, confidence=0.7, sample_size=9):
+        await db.execute(
+            "INSERT INTO capability_map (id, domain, confidence, sample_size, "
+            "trend, evidence_summary, updated_at) "
+            "VALUES (?, ?, ?, ?, 'stable', '', ?)",
+            (f"id-{domain}", domain, confidence, sample_size, updated_at),
+        )
+        await db.commit()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bogus", _NON_TIMESTAMPS_JULIANDAY_ACCEPTS)
+    async def test_non_timestamp_row_is_never_returned(self, db, bogus):
+        """No member of the class may render as a capability."""
+        await cap_crud.upsert(db, domain="healthy", confidence=0.9, sample_size=50)
+        await self._insert(db, "bogus_domain", bogus)
+
+        domains = {e["domain"] for e in await cap_crud.get_prompt_rows(db)}
+        assert "healthy" in domains, "the healthy row disappeared"
+        assert "bogus_domain" not in domains, (
+            f"{bogus!r} is not a timestamp but was rendered as one; "
+            "julianday() accepts more than ISO dates"
+        )
+        # And it must not reach the weakness scanner either, which is the
+        # consumer that would act on it.
+        assert "bogus_domain" not in [
+            e["domain"] for e in await cap_crud.get_weakest(db, max_confidence=1.0)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_wall_clock_row_does_not_defeat_the_dead_job_property(self, db):
+        """The load-bearing one: a stored ``'now'`` must not pin the anchor.
+
+        Every real row is uniformly old, which is a dead refresh job -- the
+        case the anchor design promises to survive intact. One ``'now'`` row
+        re-dates itself to wall-clock on every read, so it wins MAX() forever
+        and drags the window with it, hiding every real row permanently.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        old = (datetime.now(UTC) - timedelta(days=60)).isoformat()
+        for i in range(3):
+            await self._insert(db, f"aged{i}", old)
+        await self._insert(db, "wall_clock", "now")
+
+        domains = {e["domain"] for e in await cap_crud.get_prompt_rows(db)}
+        assert {"aged0", "aged1", "aged2"} <= domains, (
+            "a stored 'now' pinned the anchor to wall-clock and hid every real "
+            "row -- the dead-refresh-job guarantee is defeated"
+        )
+        assert "wall_clock" not in domains
+
+    @pytest.mark.asyncio
+    async def test_shape_gate_keeps_every_legitimate_format(self, db):
+        """The gate must not buy correctness by rejecting real timestamps.
+
+        Both formats that actually occur: ``upsert`` writes
+        ``datetime.now(UTC).isoformat()`` (``T``-separated, ``+00:00`` offset)
+        while SQLite's own date functions render space-separated. A bare date
+        is included because it is a valid stored form the gate must not break.
+        """
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC)
+        legitimate = {
+            "iso_offset": now.isoformat(),
+            "iso_naive": now.replace(tzinfo=None).isoformat(),
+            "sqlite_space": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "bare_date": now.strftime("%Y-%m-%d"),
+        }
+        for domain, stamp in legitimate.items():
+            await self._insert(db, domain, stamp)
+
+        domains = {e["domain"] for e in await cap_crud.get_prompt_rows(db)}
+        assert set(legitimate) <= domains, (
+            f"the shape gate rejected a legitimate timestamp format: "
+            f"{set(legitimate) - domains}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_digit_shaped_but_unparseable_still_hides_nothing(self, db):
+        """A date-SHAPED but unparseable value must not blank the map.
+
+        ``'2026-13-45'`` clears the GLOB and still parses to NULL, so the shape
+        gate alone does not classify it — something downstream has to, and the
+        healthy rows must survive either way.
+
+        What this does NOT show, despite an earlier version of this docstring
+        saying so, is that ``IS NOT NULL`` is load-bearing. It is not:
+        ``julianday(x) <= julianday('now')`` is itself NULL whenever
+        ``julianday(x)`` is NULL, so the comparison already excludes this row.
+        Measured — dropping the conjunct changes 0 of 22 adversarial values, and
+        this test passes either way. Kept as documentation of intent, not as a
+        guard, and the docstring now says what the assertions actually prove.
+        """
+        for i in range(3):
+            await cap_crud.upsert(
+                db, domain=f"healthy{i}", confidence=0.9, sample_size=50
+            )
+        await self._insert(db, "impossible_date", "2026-13-45")
+
+        domains = {e["domain"] for e in await cap_crud.get_prompt_rows(db)}
+        assert {"healthy0", "healthy1", "healthy2"} <= domains, (
+            "a date-shaped but unparseable value blanked the map"
+        )
+        assert "impossible_date" not in domains
+
+
+class TestAnchorAcrossMixedTimestampFormats:
+    """``MAX(julianday(x))`` vs ``julianday(MAX(x))`` — the one predicate guard
+    that had no test at all.
+
+    The comment justifying it used to cite a malformed value like ``'zzzz-…'``,
+    but the GLOB in the same subquery excludes those before they reach the MAX,
+    so that input was unreachable and the guard looked decorative.
+
+    Its real motivating input is a table holding MIXED timestamp FORMATS —
+    exactly what a backfill or a restore produces, and precisely the situation
+    this predicate exists to tolerate. ``MAX`` over the raw TEXT is a LEXICAL
+    max, and ``'T'`` (0x54) sorts above ``' '`` (0x20), so the T-separated row
+    wins even when the space-separated one is genuinely later:
+
+        '2026-08-20T01:00:00+00:00'  vs  '2026-08-20 05:00:00'
+          MAX(julianday(...)) -> the 05:00 row   (correct)
+          julianday(MAX(...)) -> the 01:00 row   (four hours early)
+
+    Asserted by ABSENCE, deliberately: the wrong anchor is four hours EARLIER,
+    which makes the window start earlier and keep MORE. A test asserting a row
+    is present would pass under both. Only a row in the four-hour band — outside
+    the correct window, inside the wrong one — can tell them apart.
+    """
+
+    @staticmethod
+    async def _raw(db, domain, updated_at, *, confidence=0.7, sample_size=9):
+        await db.execute(
+            "INSERT INTO capability_map (id, domain, confidence, sample_size, "
+            "trend, evidence_summary, updated_at) "
+            "VALUES (?, ?, ?, ?, 'stable', '', ?)",
+            (f"id-{domain}", domain, confidence, sample_size, updated_at),
+        )
+        await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_lexical_max_would_pick_the_earlier_row(self, db):
+        # The freshest row is space-separated; a T-separated row four hours
+        # earlier outranks it lexically.
+        await self._raw(db, "t_separated", "2026-08-20T01:00:00+00:00")
+        await self._raw(db, "space_separated", "2026-08-20 05:00:00")
+        # In the band between the two candidate anchors' windows:
+        # 14d before 05:00 is Aug 6 05:00; 14d before 01:00 is Aug 6 01:00.
+        await self._raw(db, "in_the_band", "2026-08-06 03:00:00")
+
+        domains = {e["domain"] for e in await cap_crud.get_prompt_rows(db)}
+
+        assert "space_separated" in domains
+        assert "t_separated" in domains
+        assert "in_the_band" not in domains, (
+            "the anchor was taken from the lexically-largest row rather than "
+            "the chronologically-latest one — julianday(MAX(...)) instead of "
+            "MAX(julianday(...))"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mixed_utc_offsets_anchor_chronologically(self, db):
+        """The same failure across OFFSETS rather than separators.
+
+        ``'2026-08-20T12:00:00+05:30'`` is 06:30 UTC; ``'2026-08-20T08:00:00+00:00'``
+        is 08:00 UTC. The first is chronologically EARLIER but sorts HIGHER as
+        text ('1' > '0' at the hour), so a lexical MAX picks it and the anchor
+        lands 90 minutes early.
+
+        The discriminating row sits in that 90-minute band and is asserted
+        ABSENT — asserting the two anchor candidates are present would pass
+        under either implementation and prove nothing.
+        """
+        await self._raw(db, "east_offset", "2026-08-20T12:00:00+05:30")  # 06:30Z
+        await self._raw(db, "utc_later", "2026-08-20T08:00:00+00:00")  # 08:00Z
+        # 14d before 08:00Z is Aug 6 08:00Z; 14d before 06:30Z is Aug 6 06:30Z.
+        await self._raw(db, "band_row", "2026-08-06 07:00:00")
+
+        domains = {e["domain"] for e in await cap_crud.get_prompt_rows(db)}
+        assert {"east_offset", "utc_later"} <= domains
+        assert "band_row" not in domains, (
+            "the anchor came from the lexically-largest offset rather than the "
+            "chronologically-latest instant"
+        )

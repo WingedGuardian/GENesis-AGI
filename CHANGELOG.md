@@ -120,15 +120,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   can still fall outside the top-15; reworking the primary ranking is out of
   scope here.
 
-  *Anchor safety.* The window anchors on `MIN(MAX(updated_at), now)`. Anchoring
-  on the freshest row rather than wall-clock means a totally dead refresh job
-  ages the table uniformly and hides **nothing**, instead of blanking the
-  self-model the moment the scheduler breaks. The clamp covers the opposite
-  direction: `MAX()` is unbounded above, so without it a single row stamped
-  ahead of real time defined the window for every other row and hid all of them
-  silently — and self-perpetuatingly, since nothing rewrites a domain that has
-  stopped being emitted. A partial refresh outage remains uncovered and is
-  tracked separately.
+  *Anchor safety.* The window anchors on the freshest USABLE row — date-shaped,
+  parseable, not in the future. Anchoring on the freshest row rather than
+  wall-clock means a totally dead refresh job ages the table uniformly and hides
+  **nothing**, instead of blanking the self-model the moment the scheduler
+  breaks. The other direction matters too: `MAX()` is unbounded above, so a
+  single row stamped ahead of real time would otherwise define the window for
+  every other row and hide all of them silently — and self-perpetuatingly, since
+  nothing rewrites a domain that has stopped being emitted. Future rows are
+  therefore EXCLUDED from the anchor rather than the anchor being clamped after
+  the fact: clamping leaves a uniformly-old table entirely outside the window. A
+  partial refresh outage remains uncovered and is tracked separately.
 
   *Reads split by intent.* `get_all` and `get_by_domain` stay raw accessors;
   `get_prompt_rows` and `get_weakest` carry the policy, so a future non-prompt
@@ -138,11 +140,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   claim in the other's situation. All three renderers now distinguish them and
   name the real row count when rows were withheld.
 
-  *Anchor totality.* SQLite's scalar `min()` returns NULL if any argument is
-  NULL, and `julianday()` returns NULL for a value it cannot parse — so a single
-  unparseable `updated_at` would have made the whole predicate NULL and hidden
-  every row, silently. `COALESCE` degrades that to wall-clock instead: the same
-  failure the clamp exists to prevent, reached by a different input.
+  *Anchor totality.* A `COALESCE` fallback to wall-clock is retained as
+  belt-and-braces. It is not an active guard: the anchor subquery filters on the
+  same predicate as the outer read, so it yields NULL only when no row passes
+  the outer predicate either and the result is empty regardless. It is kept so
+  the two cannot silently diverge later without a fallback already in place.
 
   Three consequences are deliberate. **(1)** The light-depth "avg confidence"
   figure moves sharply — `0.06 → 0.94` on A. The old number was not a capability

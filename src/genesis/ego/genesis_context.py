@@ -775,6 +775,7 @@ class GenesisEgoContextBuilder:
         if not entries:
             _empty_note = _cap_render.empty_state_note(
                 await _cap_render.safe_count(self._db),
+                unusable=await _cap_render.safe_count_unusable(self._db),
                 empty="*No performance data yet — the map is empty.*\n",
                 filtered="*No qualifying capability rows ({total} present; "
                          "stale or thin rows are not shown).*\n",
