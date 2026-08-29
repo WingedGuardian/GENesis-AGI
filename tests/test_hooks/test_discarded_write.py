@@ -108,6 +108,27 @@ def test_dev_null_is_not_a_lost_write():
     assert _mod.discarded_writes("cat f 2>/dev/null && git push") == []
 
 
+@pytest.mark.parametrize("sink", ['"/dev/null"', "'/dev/null'", "/dev/null"])
+def test_a_QUOTED_null_sink_is_still_not_a_write(sink):
+    """bash accepts a quoted redirect target and resolves it to the same file, so
+    `> "/dev/null"` is the same sink as `> /dev/null`. Comparing the raw span
+    reported the quoted form as a discarded write."""
+    assert _mod.discarded_writes(f"printf x > {sink} && git push") == []
+
+
+def test_a_QUOTED_real_path_is_still_named():
+    """The unquoting must not swallow ordinary quoted paths, which is how a path
+    containing a space is written in the first place."""
+    assert _mod.discarded_writes('cp a b > "/tmp/out file.txt" && git push') == [
+        "/tmp/out file.txt"
+    ]
+
+
+def test_a_QUOTED_fd_digit_is_still_a_duplication():
+    """The same normalization is what lets `>&"1"` read as the dup it is."""
+    assert _mod.discarded_writes('make 2>&"1" && git push') == []
+
+
 def test_an_fd_duplication_is_not_a_write():
     """`2>&1` points a descriptor at another descriptor; it opens no file."""
     assert _mod.discarded_writes("make 2>&1 && git push") == []

@@ -410,10 +410,19 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
             # An OUTPUT redirect is the only evidence that this segment wrote a file:
             # the target is about to be dropped from both text views, so record it
             # first.
+            #
+            # Both decisions below read the target UNQUOTED, because bash accepts a
+            # quoted redirect target and resolves it to the same file: `> "/dev/null"`
+            # is the same sink as `> /dev/null`, and comparing the raw span would
+            # report the quoted form as a discarded write. The same normalization is
+            # what makes `>&"1"` read as the descriptor dup it is. The RAW span is
+            # what gets recorded — consistent with `redirects`, which also keeps raw
+            # text; consumers that display it strip quotes themselves.
+            unquoted = target.strip().strip("\"'")
             if (
                 target
-                and target not in _NULL_SINKS
-                and _is_write_redirect(command[i : i + op_len], target)
+                and unquoted not in _NULL_SINKS
+                and _is_write_redirect(command[i : i + op_len], unquoted)
             ):
                 wr.append(target)
             if "$" in target or "`" in target:
