@@ -244,6 +244,43 @@ class TestGhPrCreateIsCovered:
         assert _decision(r) == "allow", r.stdout + r.stderr
 
 
+class TestDispatchMarkerIsExact:
+    """The dispatch marker is the exact string "1" — never truthiness.
+
+    `cc/invoker.py` stamps "1"; every other consumer compares exactly
+    (git_push_guard._is_dispatched, pretool_check, genesis_stop_hook,
+    outcome_verification_hook). A truthiness test reads GENESIS_CC_SESSION=0 —
+    an operator explicitly turning it OFF — as dispatched, and hard-BLOCKS a
+    benign unparseable command that the interactive path should merely ask
+    about. Over-blocking is the failure direction this design exists to avoid.
+    """
+
+    _BENIGN = "echo $'don\\'t " + COMMIT + " this'"
+
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off", "2"])
+    def test_non_one_values_are_not_dispatched(self, tmp_path, monkeypatch, value):
+        """VERIFY-RED: every one of these hard-blocked before the exact compare."""
+        monkeypatch.setenv("GENESIS_CC_SESSION", value)
+        r = _run(_COMMIT_GUARD, self._BENIGN, cwd=str(tmp_path))
+        assert _decision(r) != "block", f"{value}: {r.stdout + r.stderr}"
+
+    def test_exact_one_is_dispatched(self, tmp_path, monkeypatch):
+        """CONTROL — the deny leg must still fire for the real marker.
+
+        Without this the test above is satisfied by a guard that never denies at
+        all, which is the same shape as a predicate that measures zero false
+        positives by never firing.
+        """
+        monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+        r = _run(_COMMIT_GUARD, self._BENIGN, cwd=str(tmp_path))
+        assert _decision(r) == "block", r.stdout + r.stderr
+
+    def test_unset_is_not_dispatched(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("GENESIS_CC_SESSION", raising=False)
+        r = _run(_COMMIT_GUARD, self._BENIGN, cwd=str(tmp_path))
+        assert _decision(r) != "block", r.stdout + r.stderr
+
+
 class TestCommitGuardNet:
     def test_ansic_commit_no_verify_blocked(self, tmp_path):
         r = _run(_COMMIT_GUARD, ANSIC + f"{GIT} {COMMIT} {NV}", cwd=str(tmp_path))

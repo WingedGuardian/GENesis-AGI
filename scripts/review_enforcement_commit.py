@@ -670,7 +670,16 @@ def main() -> None:
         # does not prompt.
         try:
             if untokenizable(command):
-                if os.environ.get("GENESIS_CC_SESSION"):
+                # EXACT "1", never truthiness. `cc/invoker.py` stamps the marker as
+                # "1" and every other consumer compares to it exactly
+                # (git_push_guard._is_dispatched, pretool_check, genesis_stop_hook,
+                # outcome_verification_hook). A truthiness test also treats
+                # GENESIS_CC_SESSION=0 — an operator explicitly turning it OFF — as
+                # dispatched, and would then HARD-BLOCK a benign unparseable
+                # mention such as `echo $'don\\'t commit this'` that the interactive
+                # path is meant to merely ask about. Over-blocking is the failure
+                # direction this whole design was chosen to avoid.
+                if os.environ.get("GENESIS_CC_SESSION") == "1":
                     # No human present to answer a prompt in a dispatched session.
                     _deny(
                         "BLOCKED: this command cannot be parsed safely (e.g. "
