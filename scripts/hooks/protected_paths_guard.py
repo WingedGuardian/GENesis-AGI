@@ -39,14 +39,13 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
 import sys
 from fnmatch import fnmatch
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import brace_expand, read_payload, run_guard, tool_input  # noqa: E402
-from shell_parse import analyze  # noqa: E402
+from shell_parse import analyze, untokenizable  # noqa: E402
 
 try:  # A refusal discards the WHOLE Bash call, so name any write it took with it.
     from discarded_write import remember as _remember_command  # noqa: E402
@@ -211,11 +210,11 @@ def main() -> int:
     dirs = _protected_dirs()
     files = _protected_files()
 
-    # Explicit tokenizability probe: shell_parse._argv silently degrades to a
-    # naive split on shlex errors, so analyze() alone can never signal one.
-    try:
-        shlex.split(cmd.replace("\\\n", " "))
-    except ValueError:
+    # Explicit tokenizability probe (shared with the push/commit guards):
+    # shell_parse._argv silently degrades to a naive split on shlex errors, so
+    # analyze() alone can never signal one. Byte-equivalent to the inline probe
+    # this replaced (whole-command shlex, line-continuations folded).
+    if untokenizable(cmd):
         reason = _legacy_substring_block(cmd, dirs)
         return _block(reason) if reason else 0
 
