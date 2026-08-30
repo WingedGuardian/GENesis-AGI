@@ -689,6 +689,16 @@ class TestErrorVisibilityMarkers:
             raise RuntimeError("db exploded")
 
         monkeypatch.setattr(ego_crud, "list_active_decisions", _boom)
+        # Give the fixture the table this read needs, so the ONLY route to the
+        # error branch is the patch above. Without it the real read raises on a
+        # missing table and the test passes with the monkeypatch DELETED --
+        # asserting the error branch without ever being the reason it ran.
+        # Same shape as the capability-performance case below; found by
+        # checking the sibling rather than only the one a reviewer named.
+        from genesis.db.schema import TABLES
+        await db.execute(TABLES["ego_directives"])
+        await db.commit()
+
         builder = GenesisEgoContextBuilder(
             db=db, health_data=mock_health_data, capabilities=capabilities,
         )
@@ -705,7 +715,21 @@ class TestErrorVisibilityMarkers:
         async def _boom(*a, **k):
             raise RuntimeError("db exploded")
 
-        monkeypatch.setattr(cap_crud, "get_all", _boom)
+        # Patch what the renderer ACTUALLY calls. This used to patch `get_all`,
+        # which the section stopped calling -- so the patch was inert and the
+        # assertion was satisfied by an unrelated failure (this fixture has no
+        # capability_map table, so the real read raises anyway). Deleting the
+        # monkeypatch entirely left the test GREEN, which is the definition of
+        # vacuous: it asserted the error branch without ever being the reason
+        # the error branch ran.
+        monkeypatch.setattr(cap_crud, "get_prompt_rows", _boom)
+        # Give the fixture the table, so the ONLY route to the error branch is
+        # the patch above. Without this the test still passes with the patch
+        # removed and proves nothing.
+        from genesis.db.schema import TABLES
+        await db.execute(TABLES["capability_map"])
+        await db.commit()
+
         builder = GenesisEgoContextBuilder(
             db=db, health_data=mock_health_data, capabilities=capabilities,
         )
@@ -834,3 +858,757 @@ class TestCapabilityPerformanceFocusedDeficiency:
         builder._focus_id = None
         section = await builder._capability_performance_section()
         assert "Focused deficiency" not in section
+
+    async def test_stale_focus_row_still_surfaced(self, cap_db):
+        """The deficiency line must survive the bars get_prompt_rows applies.
+
+        A capability_improvement cycle targets a domain BECAUSE it is weak, and
+        a weak domain is exactly the kind that stops being refreshed. If the
+        focus row is looked up by scanning get_all's output, the window hides it
+        and the advisory silently loses the deficiency it exists to name — so
+        the lookup goes through get_by_domain, which is never filtered.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        # A fresh row anchors the window; the focus row sits far behind it.
+        await self._insert(cap_db, "fresh_domain", 0.90)
+        await cap_db.execute(
+            "INSERT INTO capability_map "
+            "(id, domain, confidence, sample_size, trend, evidence_summary, "
+            " updated_at) VALUES (?, ?, ?, ?, ?, ?, datetime(?, '-93 days'))",
+            ("stale_weakling", "stale_weakling", 0.05, 6, "declining",
+             "stale-weakling-evidence", datetime.now(UTC).isoformat()),
+        )
+        await cap_db.commit()
+
+        builder = GenesisEgoContextBuilder(db=cap_db)
+        builder._focus_id = "stale_weakling"
+        section = await builder._capability_performance_section()
+
+        # Hidden from the table (it is stale)...
+        assert "| stale_weakling |" not in section
+        # ...but still named as the focused deficiency.
+        assert "Focused deficiency — stale_weakling" in section
+        assert "stale-weakling-evidence" in section
+        # ...and DATED. This is the one row shown unfiltered, so without a
+        # last-vouched stamp it is the row most likely to read as a
+        # present-tense claim on months-old evidence. A mutation blanking the
+        # stamp previously survived the whole suite.
+        _expected = (datetime.now(UTC) - timedelta(days=93)).strftime("%Y-%m-%d")
+        assert f"last vouched {_expected}" in section
+
+    async def test_focus_survives_an_entirely_filtered_table(self, cap_db):
+        """The S2 case: every row filtered out, focus line must still render.
+
+        This is the severe form of the bug the get_by_domain switch exists to
+        prevent. With the empty-check ahead of the focus lookup the section
+        returned "no data" and dropped the deficiency line — precisely when the
+        cycle was running to address that deficiency.
+        """
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).isoformat()
+        # Only thin rows (below the sample floor) — the prompt read returns [].
+        for i in range(3):
+            await cap_db.execute(
+                "INSERT INTO capability_map "
+                "(id, domain, confidence, sample_size, trend, evidence_summary, "
+                " updated_at) VALUES (?, ?, ?, 1, 'stable', ?, ?)",
+                (f"thin{i}", f"thin{i}", 0.95, f"thin{i}-evidence", now),
+            )
+        await cap_db.commit()
+
+        builder = GenesisEgoContextBuilder(db=cap_db)
+        builder._focus_id = "thin1"
+        section = await builder._capability_performance_section()
+
+        assert "Focused deficiency — thin1" in section
+        # And the empty state must not claim the table is empty when it is not.
+        assert "No performance data yet" not in section
+
+    async def test_filtered_empty_state_does_not_claim_no_data(self, cap_db):
+        """A fully-filtered table is not the same as an untracked one."""
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).isoformat()
+        await cap_db.execute(
+            "INSERT INTO capability_map "
+            "(id, domain, confidence, sample_size, trend, evidence_summary, "
+            " updated_at) VALUES ('t', 't', 0.9, 1, 'stable', 'e', ?)",
+            (now,),
+        )
+        await cap_db.commit()
+
+        builder = GenesisEgoContextBuilder(db=cap_db)
+        builder._focus_id = None
+        section = await builder._capability_performance_section()
+
+        assert "No qualifying capability rows" in section
+        assert "| t |" not in section
+
+
+class TestAllRenderersUseTheFilteredRead:
+    """All three prompt renderers must read get_prompt_rows, not get_all.
+
+    Pinned because a mutation reverting any single call site left the whole
+    suite green: the switch was unconstrained in two of three places. Each
+    renderer is also checked for an honest empty state — a table full of
+    filtered-out rows is not "no data", and telling the ego it has no track
+    record when the table holds thousands of rows is the exact class of false
+    self-claim this work exists to remove.
+    """
+
+    @pytest.fixture
+    async def thin_db(self):
+        """A table that is FULL but entirely below the sample floor."""
+        from datetime import UTC, datetime
+
+        from genesis.db.schema import TABLES
+
+        async with aiosqlite.connect(":memory:") as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute(TABLES["capability_map"])
+            now = datetime.now(UTC).isoformat()
+            for i in range(50):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.95, 1, 'stable', 'e', ?)",
+                    (f"thin{i}", f"thin{i}", now),
+                )
+            await conn.commit()
+            yield conn
+
+    async def test_genesis_context_does_not_claim_no_data(self, thin_db):
+        builder = GenesisEgoContextBuilder(db=thin_db)
+        builder._focus_id = None
+        out = await builder._capability_performance_section()
+        assert "No qualifying capability rows" in out
+        assert "| thin0 |" not in out
+
+    async def test_user_context_does_not_claim_no_track_record(self, thin_db):
+        from genesis.ego.user_context import UserEgoContextBuilder
+
+        out = await UserEgoContextBuilder(db=thin_db)._capability_performance_section()
+        assert "No performance data yet" not in out
+        assert "No qualifying track record" in out
+
+    async def test_base_context_does_not_tell_the_ego_to_run_aggregation(
+        self, thin_db
+    ):
+        """The old text advised an action that cannot help after the write floor."""
+        from genesis.ego.context import EgoContextBuilder
+
+        out = await EgoContextBuilder(db=thin_db)._self_model_section()
+        assert "run aggregation to populate" not in out
+        assert "No qualifying capability rows" in out
+
+
+class TestRenderStateMatrix:
+    """Every renderer x every result state must render something TRUE.
+
+    Written as a matrix rather than as cases, because the defects this replaces
+    were all the same shape: one cell of the surface was fixed and its siblings
+    were left asserting the old, now-false thing. Enumerating the cells makes an
+    unfixed sibling a test failure instead of a review finding.
+
+    States a prompt read can land in:
+      error     - the query raised
+      empty     - the map genuinely holds nothing
+      filtered  - the map is FULL but every row failed a bar
+      corrupt   - the map is full but the rows' timestamps are UNREADABLE
+      mixed     - healthy rows AND unreadable ones together
+      future    - healthy rows AND clock-skewed (future-dated) ones
+      rows      - qualifying rows exist
+
+    ``corrupt`` is enumerated separately from ``filtered`` because the two are
+    indistinguishable to the reader and only one of them is a bug. A malformed
+    row is excluded from the window and never rewritten afterwards, so without
+    naming it the ego is told "stale or thin" forever about data that is
+    actually broken.
+    """
+
+    STATES = ("error", "empty", "filtered", "corrupt", "mixed", "future", "rows")
+
+    @staticmethod
+    async def _make_db(state):
+        from datetime import UTC, datetime
+
+        from genesis.db.schema import TABLES
+
+        conn = await aiosqlite.connect(":memory:")
+        conn.row_factory = aiosqlite.Row
+        await conn.execute(TABLES["capability_map"])
+        now = datetime.now(UTC).isoformat()
+        if state == "filtered":
+            for i in range(40):  # present, but all below the sample floor
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.95, 1, 'stable', 'e', ?)",
+                    (f"t{i}", f"t{i}", now),
+                )
+        elif state == "corrupt":
+            # Date-SHAPED but unparseable: passes the GLOB, julianday() -> NULL.
+            # Excluded from both the anchor and the result set, and nothing
+            # ever rewrites it.
+            for i in range(4):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.9, 25, 'stable', 'e', '2026-13-45')",
+                    (f"c{i}", f"corrupt{i}"),
+                )
+        elif state == "mixed":
+            # The COMMONER shape, and the one that stayed silent when the
+            # dropped-row report was wired into the empty branch alone: a
+            # corrupt row sitting next to healthy ones still renders a table,
+            # so nothing forces the reader to notice the row that vanished.
+            for i in range(3):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.8, 25, 'stable', 'e', ?)",
+                    (f"h{i}", f"healthy{i}", now),
+                )
+            await conn.execute(
+                "INSERT INTO capability_map (id, domain, confidence, "
+                "sample_size, trend, evidence_summary, updated_at) "
+                "VALUES ('cx', 'corrupt_one', 0.9, 25, 'stable', 'e', "
+                "'2026-13-45')"
+            )
+        elif state == "future":
+            from datetime import timedelta
+
+            for i in range(3):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.8, 25, 'stable', 'e', ?)",
+                    (f"h{i}", f"healthy{i}", now),
+                )
+            await conn.execute(
+                "INSERT INTO capability_map (id, domain, confidence, "
+                "sample_size, trend, evidence_summary, updated_at) "
+                "VALUES ('sk', 'skewed_one', 0.9, 25, 'stable', 'e', ?)",
+                ((datetime.now(UTC) + timedelta(days=30)).isoformat(),),
+            )
+        elif state == "rows":
+            for i in range(3):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.8, 25, 'stable', 'e', ?)",
+                    (f"r{i}", f"real{i}", now),
+                )
+        await conn.commit()
+        if state == "error":
+            await conn.close()  # every query on it now raises
+        return conn
+
+    @staticmethod
+    def _renderer_takes_depth(which):
+        """Does this renderer actually accept a ``depth`` keyword?
+
+        INSPECTED, never hardcoded. `context.py::_self_model_section` does not
+        take one, so its light cells legitimately render the deep output and
+        must not be held to the no-table rule. The day it grows a depth branch,
+        its cells start exercising it without anyone remembering a list here.
+        """
+        import inspect
+
+        from genesis.ego.context import EgoContextBuilder
+        from genesis.ego.user_context import UserEgoContextBuilder
+
+        method = {
+            "genesis": GenesisEgoContextBuilder._capability_performance_section,
+            "user": UserEgoContextBuilder._capability_performance_section,
+            "base": EgoContextBuilder._self_model_section,
+        }[which]
+        return "depth" in inspect.signature(method).parameters
+
+    async def _render(self, which, state, focus=None, depth="deep"):
+        db = await self._make_db(state)
+        try:
+            if which == "genesis":
+                b = GenesisEgoContextBuilder(db=db)
+                b._focus_id = focus
+                method = b._capability_performance_section
+            elif which == "user":
+                from genesis.ego.user_context import UserEgoContextBuilder
+                method = UserEgoContextBuilder(db=db)._capability_performance_section
+            else:
+                from genesis.ego.context import EgoContextBuilder
+                method = EgoContextBuilder(db=db)._self_model_section
+            if self._renderer_takes_depth(which):
+                return await method(depth=depth)
+            return await method()
+        finally:
+            if state != "error":
+                await db.close()
+
+    # Parametrised over the CROSS PRODUCT of the axes, not each axis in turn.
+    # Enumerating the state axis with `focus` pinned to None covered every state
+    # and still missed the cell that exists only when `entries` is empty AND a
+    # focus row is present — a cell reachable only where two conditions hold at
+    # once. Separate enumerations do not reach the product.
+    # DEPTH IS AN AXIS OF THE PRODUCT, not a separate enumeration beside it.
+    # It used to be the latter, and that is exactly the mistake this class's
+    # docstring warns about: every cell here ran at the default "deep", while
+    # the light branch had one weaker test of its own that asserted only that
+    # no whole-map figure appeared. So a light render could drop a corrupt row
+    # silently -- the very claim the matrix exists to forbid -- and stay green.
+    # A renderer that does not take `depth` is not skipped: it renders its one
+    # form under both values, so adding a depth branch to it later cannot land
+    # unexercised.
+    @pytest.mark.parametrize("which", ["genesis", "user", "base"])
+    @pytest.mark.parametrize("state", STATES)
+    @pytest.mark.parametrize("focus", [None, "t0"])
+    @pytest.mark.parametrize("depth", ["deep", "light"])
+    async def test_cell_renders_a_true_claim(self, which, state, focus, depth):
+        out = await self._render(which, state, focus=focus, depth=depth)
+        assert out.strip(), f"{which}/{state}/{depth} rendered nothing"
+
+        # A renderer that ACCEPTS depth must HONOUR it. Accepting the keyword
+        # and ignoring it is worse than not offering it: the caller believes it
+        # asked for the cheap form and is silently billed for the full table.
+        if depth == "light" and self._renderer_takes_depth(which):
+            assert "| Domain |" not in out, (
+                f"{which}: a light render still emitted the full table -- the "
+                "depth request was accepted and then ignored"
+            )
+
+        if state == "error":
+            assert "query error" in out, f"{which}: a failure must not read as data"
+        elif state == "empty":
+            assert "map is empty" in out, f"{which}: genuinely-empty must say so"
+            assert "present;" not in out, (
+                f"{which}: must not imply rows were withheld when none exist"
+            )
+        elif state == "corrupt":
+            assert "map is empty" not in out, (
+                f"{which}: 4 rows present — claiming empty is false"
+            )
+            assert "unreadable timestamp" in out, (
+                f"{which}: corrupt rows were reported as merely stale or thin, "
+                "which is a false cause the ego cannot act on"
+            )
+        elif state == "mixed":
+            if depth == "deep":
+                assert "healthy0" in out, f"{which}: qualifying rows must still render"
+            assert "unreadable timestamp" in out, (
+                f"{which}: a corrupt row alongside healthy ones was dropped "
+                "silently — the table renders, so nothing signals the loss"
+            )
+        elif state == "future":
+            if depth == "deep":
+                assert "healthy0" in out, f"{which}: qualifying rows must still render"
+            assert "dated in the future" in out, (
+                f"{which}: a clock-skewed row was dropped without being named"
+            )
+            assert "unreadable timestamp" not in out, (
+                f"{which}: a future-dated row is READABLE — calling it "
+                "unreadable is a false cause the operator cannot act on"
+            )
+        elif state == "filtered":
+            # Must NOT claim emptiness, and must say how many rows are really
+            # there — including when a focus row is also being rendered, which
+            # is the cell that previously went silent.
+            assert "map is empty" not in out, (
+                f"{which}: 40 rows present — claiming empty is false"
+            )
+            assert "40 " in out, (
+                f"{which}/focus={focus}: should name the real row count"
+            )
+        elif depth == "deep":
+            assert "real0" in out, f"{which}: qualifying rows must render"
+
+    # Parametrised over the RENDERER as well as the state. Pinning the shared
+    # sentence on one renderer only left the other free to stop calling the
+    # shared helper entirely: a mutant emitting a fabricated, unqualified
+    # "N domains, avg 99%." from the genesis light branch passed the whole
+    # suite. Extracting a shared helper prevents drift only while BOTH callers
+    # keep calling it, and nothing was testing that.
+    @pytest.mark.parametrize("which", ["genesis", "user", "base"])
+    @pytest.mark.parametrize("state", STATES)
+    async def test_light_depth_never_states_a_whole_map_figure(self, which, state):
+        """The light branch renders no table, so its numbers must be qualified."""
+        out = await self._render(which, state, depth="light")
+        assert "domains tracked" not in out, (
+            f"{which}: unqualified whole-map phrasing reintroduced"
+        )
+        if state == "rows" and self._renderer_takes_depth(which):
+            # The sentence itself, not merely "some text appeared": a renderer
+            # that stopped calling the shared helper must fail here.
+            assert "3 domains with qualifying evidence" in out, (
+                f"{which}: the shared qualifying-subset sentence is not being used"
+            )
+            assert "avg confidence:" in out, f"{which}: no qualified average"
+            assert "stale and thin rows are not counted" in out, (
+                f"{which}: the subset qualification is missing"
+            )
+
+
+class TestCountFailureDoesNotAbortTheCycle:
+    """The count on the failure branch must not itself be able to fail loudly.
+
+    All three renderers wrap the main read in try/except and degrade to one
+    italic line. The row count added alongside it runs on that same degraded
+    branch — and nothing between a context section and `assemble_context`
+    catches per-section exceptions, so an unguarded second query turns a
+    graceful degradation into an aborted ego cycle.
+
+    A whole-DB failure fixture cannot reach this: it makes the FIRST read raise,
+    so the count is never called. The failure has to be per-call.
+    """
+
+    class _FailSecondRead:
+        """Wraps a connection; the Nth execute onward raises."""
+
+        def __init__(self, conn, fail_from=2):
+            self._conn = conn
+            self._calls = 0
+            self._fail_from = fail_from
+
+        async def execute(self, *a, **k):
+            self._calls += 1
+            if self._calls >= self._fail_from:
+                raise aiosqlite.OperationalError("database is locked")
+            return await self._conn.execute(*a, **k)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    @pytest.fixture
+    async def thin_db(self):
+        from datetime import UTC, datetime
+
+        from genesis.db.schema import TABLES
+
+        async with aiosqlite.connect(":memory:") as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute(TABLES["capability_map"])
+            now = datetime.now(UTC).isoformat()
+            for i in range(5):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.95, 1, 'stable', 'e', ?)",
+                    (f"thin{i}", f"thin{i}", now),
+                )
+            await conn.commit()
+            yield conn
+
+    async def test_genesis_section_survives_a_failing_count(self, thin_db):
+        wrapped = self._FailSecondRead(thin_db)
+        b = GenesisEgoContextBuilder(db=wrapped)
+        b._focus_id = None
+        out = await b._capability_performance_section()  # must not raise
+        assert "count unavailable" in out
+
+    async def test_user_section_survives_a_failing_count(self, thin_db):
+        from genesis.ego.user_context import UserEgoContextBuilder
+
+        wrapped = self._FailSecondRead(thin_db)
+        out = await UserEgoContextBuilder(db=wrapped)._capability_performance_section()
+        assert "count unavailable" in out
+
+    async def test_base_section_survives_a_failing_count(self, thin_db):
+        from genesis.ego.context import EgoContextBuilder
+
+        wrapped = self._FailSecondRead(thin_db)
+        out = await EgoContextBuilder(db=wrapped)._self_model_section()
+        assert "count unavailable" in out
+
+
+class TestLightDepthDatesItsEvidence:
+    """The light branch renders no table, so its sentence is the whole claim.
+
+    The window is anchored on the freshest row precisely so a dead refresh job
+    keeps every row rather than blanking the map — which means during such an
+    outage every row is months old. An unqualified "current" is therefore false
+    exactly when the guarantee is doing its job.
+    """
+
+    @pytest.fixture
+    async def aged_db(self):
+        from datetime import UTC, datetime, timedelta
+
+        from genesis.db.schema import TABLES
+
+        async with aiosqlite.connect(":memory:") as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute(TABLES["capability_map"])
+            stamp = (datetime.now(UTC) - timedelta(days=200)).isoformat()
+            for i in range(3):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.9, 40, 'stable', 'e', ?)",
+                    (f"d{i}", f"dom{i}", stamp),
+                )
+            await conn.commit()
+            yield conn, stamp[:10]
+
+    async def test_does_not_call_a_months_old_map_current(self, aged_db):
+        from genesis.ego.user_context import UserEgoContextBuilder
+
+        db, stamp = aged_db
+        out = await UserEgoContextBuilder(db=db)._capability_performance_section(
+            depth="light"
+        )
+        # The rows ARE kept — that is the dead-refresh guarantee working.
+        assert "3 domains" in out
+        # ...but they must not be described as current.
+        assert "current, qualifying evidence" not in out
+        assert f"last vouched {stamp}" in out, (
+            "the light line asserts freshness it cannot support"
+        )
+
+
+class TestNewestStampIsChronological:
+    """`last vouched` must name the latest INSTANT, not the largest STRING.
+
+    The recency SQL uses ``MAX(julianday(...))`` precisely because a text max
+    picks the wrong row across mixed formats. The renderer computed its own
+    "newest" with a raw ``max()`` over the same column, reproducing the bug the
+    SQL fix had just removed — fixing one member of a pair and leaving the
+    sibling is the class this whole area keeps hitting.
+    """
+
+    def test_t_separator_does_not_beat_a_later_space_separated_row(self):
+        from genesis.ego._capability_render import newest_stamp as _newest_stamp
+
+        # 'T' (0x54) sorts above ' ' (0x20), so a raw max() picks the 01:00 row.
+        entries = [
+            {"updated_at": "2026-08-20T01:00:00+00:00"},
+            {"updated_at": "2026-08-20 05:00:00+00:00"},
+        ]
+        assert _newest_stamp(entries).startswith("2026-08-20 05:00"), (
+            "the lexically-largest string won over the chronologically-latest "
+            "instant"
+        )
+
+    def test_offset_is_applied_before_comparing(self):
+        from genesis.ego._capability_render import newest_stamp as _newest_stamp
+
+        # 12:00+05:30 is 06:30Z; 08:00+00:00 is 08:00Z and therefore later,
+        # although it sorts LOWER as text.
+        entries = [
+            {"updated_at": "2026-08-20T12:00:00+05:30"},
+            {"updated_at": "2026-08-20T08:00:00+00:00"},
+        ]
+        assert _newest_stamp(entries) == "2026-08-20T08:00:00+00:00"
+
+    def test_unparseable_values_cannot_win(self):
+        from genesis.ego._capability_render import newest_stamp as _newest_stamp
+
+        entries = [
+            {"updated_at": "2026-08-20T08:00:00+00:00"},
+            {"updated_at": "9999-99-99"},
+            {"updated_at": ""},
+        ]
+        assert _newest_stamp(entries) == "2026-08-20T08:00:00+00:00"
+
+    def test_empty_input_is_empty_not_an_error(self):
+        from genesis.ego._capability_render import newest_stamp as _newest_stamp
+
+        assert _newest_stamp([]) == ""
+        assert _newest_stamp([{"updated_at": None}]) == ""
+
+    def test_a_naive_stamp_can_win_against_an_aware_one(self):
+        """The mixed aware/naive branch, which nothing exercised.
+
+        Every other fixture here carries an offset -- including the one whose
+        comment advertises the mixed case -- so replacing the naive-normalising
+        branch with `continue` left the whole suite green. The input is not
+        hypothetical: SQLite's own `datetime()` renders NAIVE, and this repo's
+        fixtures write exactly that, so a table restored or backfilled through
+        SQLite is entirely naive. Dropping those would render the sentence with
+        NO date on the one branch whose justification is that it must be dated.
+        """
+        from genesis.ego._capability_render import newest_stamp as _newest_stamp
+
+        entries = [
+            {"updated_at": "2026-08-20T08:00:00+00:00"},   # aware, earlier
+            {"updated_at": "2026-08-21 09:00:00"},          # naive, LATER
+        ]
+        assert _newest_stamp(entries) == "2026-08-21 09:00:00"
+
+    def test_an_all_naive_table_still_produces_a_date(self):
+        """What a SQLite-rendered table looks like end to end."""
+        from genesis.ego._capability_render import newest_stamp as _newest_stamp
+
+        assert _newest_stamp(
+            [{"updated_at": "2026-08-27 10:00:00"},
+             {"updated_at": "2026-08-28 09:00:00"}]
+        ) == "2026-08-28 09:00:00"
+
+
+class TestRendererUsesTheChronologicalHelper:
+    """The helper is correct; this pins that the RENDERER actually calls it.
+
+    Testing `_newest_stamp` directly proves the helper works and nothing more —
+    reverting the call site to a raw `max()` left those tests green, and a first
+    version of THIS test did too, because both fixtures shared a calendar date
+    and the rendered ``[:10]`` slice could not tell the two answers apart.
+
+    The stamps below are chosen so the lexical and chronological answers fall on
+    DIFFERENT UTC DATES, which is the only way the rendered string can
+    discriminate:
+
+        '2026-08-21T02:00:00+05:30'  ->  2026-08-20 20:30Z   (lexically LARGER)
+        '2026-08-20T23:00:00+00:00'  ->  2026-08-20 23:00Z   (chronologically LATER)
+
+    A raw max() renders "2026-08-21"; the correct answer renders "2026-08-20".
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("which", ["user", "genesis"])
+    async def test_light_depth_dates_the_map_chronologically(self, which):
+        """Both depth-taking renderers, not just one.
+
+        Pinning the call site on one renderer leaves its sibling free to stop
+        calling the shared helper -- which is the drift the shared helper exists
+        to prevent, so it has to be asserted on every caller.
+        """
+        from genesis.db.schema import TABLES
+        from genesis.ego.genesis_context import GenesisEgoContextBuilder
+        from genesis.ego.user_context import UserEgoContextBuilder
+
+        conn = await aiosqlite.connect(":memory:")
+        conn.row_factory = aiosqlite.Row
+        try:
+            await conn.execute(TABLES["capability_map"])
+            for i, stamp in enumerate(
+                ("2026-08-21T02:00:00+05:30", "2026-08-20T23:00:00+00:00")
+            ):
+                await conn.execute(
+                    "INSERT INTO capability_map (id, domain, confidence, "
+                    "sample_size, trend, evidence_summary, updated_at) "
+                    "VALUES (?, ?, 0.8, 25, 'stable', 'e', ?)",
+                    (f"r{i}", f"dom{i}", stamp),
+                )
+            await conn.commit()
+
+            builder = (
+                UserEgoContextBuilder(db=conn) if which == "user"
+                else GenesisEgoContextBuilder(db=conn)
+            )
+            out = await builder._capability_performance_section(depth="light")
+        finally:
+            await conn.close()
+
+        assert "last vouched 2026-08-20" in out, (
+            f"the rendered date came from a lexical max(), not the latest "
+            f"instant: {out!r}"
+        )
+        assert "2026-08-21" not in out
+
+
+class TestQualifyingSubsetLineContract:
+    """The shared light-render sentence, and the one input it must refuse.
+
+    It is shared precisely so the two light branches cannot drift into wording
+    where one qualifies its figures and the other does not -- so its contract
+    is worth pinning rather than left to whichever caller is read first.
+    """
+
+    def test_empty_entries_raise_a_named_error(self):
+        """A bare ZeroDivisionError here would abort the whole ego cycle.
+
+        Nothing between a context section and `assemble_context` catches a
+        per-section exception, so the failure has to name its own cause and
+        the right alternative rather than surfacing as arithmetic.
+        """
+        from genesis.ego._capability_render import qualifying_subset_line
+
+        with pytest.raises(ValueError, match="requires at least one entry"):
+            qualifying_subset_line([])
+
+    def test_figures_are_stated_as_the_qualifying_subset(self):
+        """Never as whole-map facts -- this branch renders no table."""
+        from genesis.ego._capability_render import qualifying_subset_line
+
+        line = qualifying_subset_line(
+            [{"confidence": 0.8, "updated_at": "2026-08-20T00:00:00+00:00"},
+             {"confidence": 0.6, "updated_at": "2026-08-21T00:00:00+00:00"}]
+        )
+        assert "2 domains with qualifying evidence" in line
+        assert "avg confidence: 70%" in line
+        assert "stale and thin rows are not counted" in line
+        assert "last vouched 2026-08-21" in line, "must date the claim"
+        assert "domains tracked" not in line, "unqualified whole-map phrasing"
+
+    @pytest.mark.asyncio
+    async def test_both_depths_of_a_renderer_use_the_same_header(self):
+        """The header now has ONE definition; this pins that it stays one.
+
+        It previously had two -- the light branch wrote its own copy -- so
+        renaming either left the two depths announcing different sections. A
+        divergence mutant cannot even be expressed against a single definition,
+        which is exactly why the property, not the mutant, is what to assert.
+        """
+        from genesis.ego.user_context import UserEgoContextBuilder
+
+        db = await TestRenderStateMatrix._make_db("rows")
+        try:
+            builder = UserEgoContextBuilder(db=db)
+            deep = await builder._capability_performance_section(depth="deep")
+            light = await builder._capability_performance_section(depth="light")
+        finally:
+            await db.close()
+        assert deep.splitlines()[0] == light.splitlines()[0], (
+            f"the two depths announce different sections: "
+            f"{deep.splitlines()[0]!r} vs {light.splitlines()[0]!r}"
+        )
+
+    def test_one_row_reads_singular(self):
+        """No matrix state seeds exactly one qualifying row, so nothing pinned
+        this: hardcoding "domains" passed the whole suite."""
+        from genesis.ego._capability_render import qualifying_subset_line
+
+        line = qualifying_subset_line(
+            [{"confidence": 0.5, "updated_at": "2026-08-20T00:00:00+00:00"}]
+        )
+        assert line.startswith("1 domain with"), line
+        assert "1 domains" not in line
+
+    def test_withheld_rows_reach_the_OPERATOR_not_only_the_prompt(self, caplog):
+        """The log is the stated justification, so it has to be asserted.
+
+        Both the CHANGELOG and CURRENT.md argue this change matters partly
+        because `unusable_note` is what LOGS -- an operator otherwise gets no
+        signal that rows vanished. Neutering that warning left the whole suite
+        green, which made the justification unfalsifiable.
+        """
+        import logging
+
+        from genesis.ego._capability_render import unusable_note
+
+        with caplog.at_level(logging.WARNING, logger="genesis.ego._capability_render"):
+            note = unusable_note({"unreadable": 2, "future": 1})
+        assert note, "the prompt clause is missing"
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            "rows were dropped and the operator was told nothing"
+        )
+
+    def test_no_withheld_rows_logs_nothing(self, caplog):
+        """Positive control: a clean map must not emit a spurious warning."""
+        import logging
+
+        from genesis.ego._capability_render import unusable_note
+
+        with caplog.at_level(logging.WARNING, logger="genesis.ego._capability_render"):
+            assert unusable_note({"unreadable": 0, "future": 0}) == ""
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_the_clause_is_appended_when_rows_were_withheld(self):
+        """The dropped-row report has to survive into the shared sentence."""
+        from genesis.ego._capability_render import qualifying_subset_line
+
+        line = qualifying_subset_line(
+            [{"confidence": 0.5, "updated_at": "2026-08-20T00:00:00+00:00"}],
+            " (2 rows withheld)",
+        )
+        assert line.endswith(" (2 rows withheld)")

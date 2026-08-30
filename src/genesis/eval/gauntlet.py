@@ -36,10 +36,12 @@ import fcntl
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -58,6 +60,7 @@ from genesis.eval.types import (
     ScorerType,
     TaskCategory,
 )
+from genesis.util import pytest_lock
 from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 if TYPE_CHECKING:
@@ -69,6 +72,16 @@ _FIXTURES_DIR = Path(__file__).resolve().parent / "gauntlet_fixtures"
 # Throwaway workdirs + the isolated CC Bash sandbox live under ~/tmp (NOT /tmp,
 # NOT ~/.genesis/cc-tmp — see CLAUDE.md temp rules).
 _GAUNTLET_ROOT = Path.home() / "tmp" / "gauntlet"
+
+# How long a scoring run waits for the box-wide test lock before giving up and
+# running anyway. MUST stay under asyncio's THREAD_JOIN_TIMEOUT (300s): on
+# interpreter shutdown asyncio waits that long for executor threads, then
+# ABANDONS them and closes the loop — after which a future's completion callback
+# is silently dropped (`_call_set_state` returns early on a closed loop). A
+# worker still waiting past that point would win the flock with nothing left to
+# release it, and hold the box lock while the process hangs at exit. 240s also
+# covers the realistic case: an interactive targeted suite is minutes.
+_LOCK_WAIT_S = 240.0
 
 # The PROTECTED surface: files the model must not touch. Editing tests or the
 # pytest config to fake a green run is a cheat → FAIL. Any add/modify/delete of
@@ -195,6 +208,20 @@ def _release_lock(fh) -> None:
         fh.close()
 
 
+def _release_late_lock(future: asyncio.Future) -> None:
+    """Release a box lock whose acquisition finished after we were cancelled."""
+    if future.cancelled():
+        return
+    if future.exception() is not None:
+        return
+    try:
+        future.result().release()
+    except Exception:
+        # This callback is the only thing between a cancellation and a box-wide
+        # lock leak; failing silently here is how that leak becomes invisible.
+        logger.warning("late box-lock release failed", exc_info=True)
+
+
 async def _run_pytest(workdir: Path, basetemp: Path) -> tuple[int, str]:
     """Run the fixture's pytest suite in ``workdir``. Returns (exit_code, output).
 
@@ -206,11 +233,90 @@ async def _run_pytest(workdir: Path, basetemp: Path) -> tuple[int, str]:
     ``tests/conftest.py`` redirect never loads for it (see
     ``genesis.util.tmp.should_redirect_pytest_basetemp``); without an explicit
     basetemp its tmp would default to ``$TMPDIR`` (watchgod-policed cc-tmp).
+
+    That same "own rootdir" fact is why the box-wide test lock is taken HERE
+    explicitly: the genesis ``tests/conftest.py`` that normally acquires it
+    never loads for a foreign fixture, so without this the SCORING run would be
+    entirely ungoverned while occupying the box for up to ``_PYTEST_TIMEOUT_S``.
+
+    SCOPE, precisely: this covers the scoring subprocess ONLY. The fixture
+    prompts instruct the agent to run ``python -m pytest`` itself while solving,
+    so a CC session iterating for 15-20 minutes issues its own, more frequent,
+    UNGOVERNED runs in that same foreign project. Holding the lock across a
+    whole agent session would starve every interactive run for the length of it
+    — worse than the overlap it prevents — so the boundary is deliberate rather
+    than overlooked. It QUEUES
+    (``wait=True``) rather than failing: a background eval should give way to
+    an interactive run and then proceed, not abort. The lock is taken per
+    fixture, not per gauntlet, so an interactive run only ever waits out one
+    fixture rather than the whole scoring pass. Fail-open by contract — if the
+    lock is unavailable for any reason, scoring still runs.
     """
+    # OFF-THREAD, always. ``pytest_lock.acquire(wait=True)`` is synchronous and
+    # sleeps in a loop; this coroutine is driven by the learning
+    # AsyncIOScheduler, which shares genesis-server's event loop. Calling it
+    # directly would freeze the whole server — Telegram, MCP, every other
+    # scheduled job — for as long as the lock stayed held.
+    # Cancelling the AWAIT does not stop the worker thread: it keeps waiting,
+    # eventually takes the flock, and returns a BoxLock nobody releases — the fd
+    # and GENESIS_PYTEST_LOCK_HELD would then leak in this long-lived server
+    # process and hold the box lock until restart, blocking every test run on
+    # the machine. So keep the future and release whatever it produces.
+    # export_env=False: this is the long-lived SERVER process, and it dispatches
+    # Claude-Code sessions with `env = dict(os.environ)`. Publishing the held
+    # flag here would leak it into any session started during the hold, silently
+    # disabling the lock for that session's entire multi-hour life. The one child
+    # that should see it gets it explicitly, below. Keeping it out of os.environ
+    # also removes an off-thread mutation of a mapping the main thread iterates
+    # while spawning subprocesses.
+    cancel = threading.Event()
+    future = asyncio.ensure_future(
+        asyncio.to_thread(
+            pytest_lock.acquire,
+            wait=True,
+            timeout=_LOCK_WAIT_S,
+            export_env=False,
+            cancel=cancel,
+        )
+    )
+    try:
+        # SHIELDED: cancelling a bare `await future` cancels the future itself,
+        # so its eventual result is discarded by asyncio and the callback below
+        # sees a cancelled future — the lock the worker went on to take would
+        # never be released. Shielding lets the outer await raise while the
+        # acquisition completes normally, so there is a real result to hand back.
+        lock = await asyncio.shield(future)
+    except asyncio.CancelledError:
+        # Stop the worker promptly, AND cover the race where it won the lock
+        # just before the event was set.
+        cancel.set()
+        future.add_done_callback(_release_late_lock)
+        raise
+    try:
+        if lock.blocked:
+            # Fail OPEN, deliberately: a scheduled eval silently skipped is
+            # worse than a brief overlap, and running unserialized is exactly
+            # the pre-existing behaviour. Say so rather than doing it quietly.
+            logger.warning(
+                "gauntlet: box test lock still held after %ss — scoring anyway "
+                "(unserialized)", _LOCK_WAIT_S,
+            )
+        return await _run_pytest_locked(workdir, basetemp)
+    finally:
+        lock.release()
+
+
+async def _run_pytest_locked(workdir: Path, basetemp: Path) -> tuple[int, str]:
+    """The scoring subprocess itself; the caller holds the box test lock."""
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
         "--basetemp", str(basetemp),
         cwd=str(workdir),
+        # The caller holds the box lock but deliberately kept the flag out of
+        # os.environ (see _run_pytest). Hand it to THIS child only: a fixture
+        # whose project did load a genesis-style conftest would otherwise
+        # contend with the lock its own parent is holding and fail spuriously.
+        env={**os.environ, pytest_lock.HELD_ENV: str(os.getpid())},
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         # Own group so the timeout kill reaps forked test children too.
