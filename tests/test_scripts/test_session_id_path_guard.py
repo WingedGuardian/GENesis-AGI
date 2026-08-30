@@ -414,3 +414,53 @@ class TestTheDocumentedContractMatchesTheCode:
             f"compiles {hook_input._SESSION_ID_RE.pattern!r} — a hook author "
             "following the doc would reject ids the runtime accepts"
         )
+
+
+class TestPayloadAuthorityIsDecidedByPresenceNotType:
+    """A present `session_id` must never be answered by the environment.
+
+    The hazard is not the value itself — it is that falling through to
+    `CLAUDE_SESSION_ID` answers with a DIFFERENT session's id, so callers read or
+    create that session's sentinels. An earlier revision gated the authoritative
+    branch on `isinstance(sid, str)`, which closed the present-unsafe-STRING case
+    and left `null`, numbers and lists falling through. Enumerated here as the
+    PRODUCT of payload shape and environment state, because pinning one axis is
+    how the sub-case survived the first fix.
+    """
+
+    # (label, payload, may the environment answer?)
+    SHAPES = [
+        ("key absent", {}, True),
+        ("empty string — documented as 'no id supplied'", {"session_id": ""}, True),
+        ("safe string", {"session_id": REAL_IDS[0]}, False),
+        ("unsafe string", {"session_id": "../../escaped"}, False),
+        ("json null", {"session_id": None}, False),
+        ("number", {"session_id": 12345}, False),
+        ("list", {"session_id": ["a"]}, False),
+        ("dict", {"session_id": {"a": 1}}, False),
+        ("bool", {"session_id": True}, False),
+    ]
+
+    @pytest.mark.parametrize("label,payload,env_may_answer", SHAPES)
+    def test_env_answers_only_when_no_id_was_supplied(
+        self, label, payload, env_may_answer, monkeypatch
+    ):
+        other = REAL_IDS[1]
+        monkeypatch.setenv("CLAUDE_SESSION_ID", other)
+        got = hook_input.session_id(payload)
+        if env_may_answer:
+            assert got == other, f"{label}: no id was supplied, so the env value is correct"
+        else:
+            assert got != other, (
+                f"{label}: a PRESENT session_id was answered with a different "
+                f"session's id from the environment"
+            )
+
+    @pytest.mark.parametrize("label,payload,_env", SHAPES)
+    def test_only_a_safe_id_is_ever_returned(self, label, payload, _env, monkeypatch):
+        """The complement: whatever comes back must itself be path-safe."""
+        monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+        got = hook_input.session_id(payload)
+        assert hook_input.is_safe_session_id(got), (
+            f"{label}: session_id() returned {got!r}, which fails the validator it enforces"
+        )

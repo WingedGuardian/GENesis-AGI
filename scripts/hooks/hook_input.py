@@ -165,15 +165,22 @@ def session_id(payload: dict, default: str = "unknown") -> str:
     invalid id is anomalous — the one case that warns — while an absent id (and
     an empty string, which is treated as absent) is normal and silent.
     """
-    if isinstance(payload, dict):
-        sid = payload.get("session_id")
-        if isinstance(sid, str) and sid:
-            # A PRESENT payload id is authoritative: return it if safe, else the
-            # default. Never fall through to the env var here — a stale/legacy
-            # CLAUDE_SESSION_ID would then answer for a DIFFERENT session, and
-            # callers would read or create that session's sentinels.
-            if is_safe_session_id(sid):
-                return sid
+    if isinstance(payload, dict) and "session_id" in payload:
+        sid = payload["session_id"]
+        # Authority is decided by PRESENCE of the key, not by the TYPE of its
+        # value. An earlier revision gated this branch on `isinstance(sid, str)`,
+        # which closed the case of a present unsafe STRING and left every other
+        # present-but-unusable value — JSON `null`, a number, a list — falling
+        # through to the env var below. That fallback then answers with a
+        # stale/legacy CLAUDE_SESSION_ID, i.e. a DIFFERENT session's id, and
+        # callers read or create that session's sentinels. Same defect, one
+        # sub-case wider.
+        #
+        # The empty string is the single documented exception: it means "no id
+        # supplied", so it is treated as absent and stays silent, as it always has.
+        if is_safe_session_id(sid):
+            return sid
+        if sid != "":
             print(
                 "WARNING: rejecting unsafe session_id (not a safe path component)",
                 file=sys.stderr,
