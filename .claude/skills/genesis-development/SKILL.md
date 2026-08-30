@@ -1188,7 +1188,8 @@ findings below, a gated `gh pr merge`:
   routine still posts its review on the PR to be read/addressed, but its absence does not
   block. The block message is an **inventory**, not a diagnosis: under each missing
   kind it lists EVERY marker block the scan found that names that kind, with its
-  status, and hides nothing. Run `git_push_guard.py --check-pr <N>` — it renders those
+  status, and hides nothing. Run `python3 scripts/hooks/git_push_guard.py --check-pr <N>`
+  — it renders those
   rows, not just the summary line (whose `present: none` clause reads like "nothing was
   posted" in every case below, and is the exact wording an operator was once measured
   acting wrongly on). Row statuses you will see:

@@ -1349,15 +1349,22 @@ class TestScheduledGateBlockMessageBranchesOnCause:
     def test_refused_marker_for_an_already_satisfied_kind_does_not_hijack_the_message(
         self, monkeypatch
     ):
-        """A refused marker whose kind is NOT missing must not drive the remedy.
+        """A refused marker whose kind is NOT missing must not drive the message.
 
-        leaks is satisfied by a clean marker at HEAD; a second, refused leaks marker also
-        sits at HEAD; code-review is what is actually missing. Prescribing "re-post the
-        leaks marker with a verdict line" fixes nothing and leaves the real gap unguided.
+        leaks is satisfied at HEAD; a second, refused leaks marker also sits at HEAD;
+        code-review is what is actually missing. The message must be about code-review.
+
+        REWRITTEN: the satisfying marker now carries an explicit verdict line. As first
+        written it was a PLAIN clean marker beside a refused one at the same head, and
+        the test asserted the plain one won -- which is the laundering defect
+        `TestARefusalAtHeadIsNotLaunderedByAPlainRepost` closes, in the other order. A
+        refusal at a head is cleared by a stated verdict, not by whichever row happens
+        to be clean; with the verdict present, leaks is genuinely satisfied and the
+        original intent of this test (no hijack by a satisfied kind) is preserved.
         """
         comments = "\n".join(
             [
-                self._marker_kind(HEAD, "leaks"),
+                self._marker_kind(HEAD, "leaks", "scheduled review done.\nVERDICT: PASS"),
                 self._marker_kind(HEAD, "leaks", self.REFUSED_PROSE),
             ]
         )
@@ -1752,15 +1759,20 @@ class TestAnUnusableMarkerRemedyMatchesItsCause:
         assert f"'{HEAD[:8]}'" in msg
 
     # ---- P2: a pending review is in-flight, not unusable -------------------
-    def test_a_pending_review_keeps_the_waiting_guidance(self, monkeypatch):
-        """A pending review is an unpublished draft that can still be submitted, so
-        waiting CAN make it count -- the one thing the unusable wording denies."""
+    def test_a_pending_review_at_head_is_listed_as_unpublished(self, monkeypatch):
+        """REWRITTEN from "keeps the waiting guidance". A draft naming the current
+        head used to be dropped so the generic in-flight note would stand in for it;
+        the inventory lists it as its own row, which says the same thing precisely:
+        unpublished, current head, counts once submitted."""
         body = "scan done.\n" + self._marker()
-        msg = self._msg(monkeypatch, self._row(body, state="PENDING")).lower()
-        assert "may still be in flight" in msg
+        msg = self._msg(monkeypatch, self._row(body, state="PENDING"))
+        assert "PENDING (unpublished) review naming the current head" in msg, msg
 
-    # ---- P2: a current malformed marker beats stale marker history --------
-    def test_a_current_unusable_marker_outranks_a_stale_valid_one(self, monkeypatch):
+    # ---- a current malformed marker is shown BESIDE stale history ----------
+    def test_a_current_unusable_marker_is_shown_beside_stale_history(self, monkeypatch):
+        """RENAMED from "...outranks a stale valid one". It never asserted the stale
+        row was hidden, only that the current typo was shown -- and under the inventory
+        both are shown. The name said precedence; the assertion never did."""
         rows = "\n".join(
             [
                 self._row("older run.\n" + self._marker(head=OTHER_HEAD)),
@@ -1768,10 +1780,8 @@ class TestAnUnusableMarkerRemedyMatchesItsCause:
             ]
         )
         msg = self._msg(monkeypatch, rows)
-        assert f"'{HEAD[:8]}'" in msg, (
-            "the malformed CURRENT marker is the actionable one and was hidden behind "
-            "the stale-head explanation"
-        )
+        assert f"'{HEAD[:8]}'" in msg, "the malformed CURRENT marker must be shown"
+        assert OTHER_HEAD[:12] in msg, "and so must the stale history -- nothing outranks"
 
     # ---- P2: show the detail that belongs to THIS group -------------------
     def test_the_detail_shown_belongs_to_the_kind_being_explained(self, monkeypatch):
@@ -1879,15 +1889,33 @@ class TestEveryMarkerFormIsAccountedFor:
             "waiting was advised for a draft that is stale whenever it is submitted"
         )
 
-    def test_a_pending_review_at_the_CURRENT_head_still_advises_waiting(self, monkeypatch):
-        """CONTROL. Without it, an implementation that reported every pending review
-        as unusable would pass the test above while destroying the one case where
-        submitting the draft genuinely does clear the gate."""
+    def test_a_pending_review_at_the_CURRENT_head_is_listed_as_unpublished(self, monkeypatch):
+        """Was the CONTROL asserting the generic in-flight note. REWRITTEN: this was
+        the last silent drop in the scan -- a current-head draft was `continue`d so the
+        generic note would cover it, which contradicts an inventory that promises to
+        list every block. The row is the precise form of "in flight": it names the
+        draft, the head, and that submission is what makes it count. The stale-draft
+        test above still discriminates: its row says submission would NOT help."""
         msg = self._msg(
             monkeypatch, self._row("draft.\n" + self._marker(head=HEAD), state="PENDING")
         )
         assert msg
-        assert "may still be in flight" in msg.lower()
+        assert "PENDING (unpublished) review naming the current head" in msg, msg
+        assert "counts only once that draft is submitted" in msg, msg
+        assert "may still be in flight" not in msg.lower(), (
+            "the generic note beside the specific row would say the same thing twice"
+        )
+
+    def test_a_block_with_BOTH_fields_malformed_reports_both(self, monkeypatch):
+        """`head=abc kind=leaks/failed`: the old if/else reported the short sha only and
+        hid the suffix saying the run FAILED -- one repair cycle per hidden field."""
+        msg = self._msg(
+            monkeypatch,
+            self._row("run failed.\n<!-- genesis-scheduled-review: head=abc kind=leaks/failed -->"),
+        )
+        assert msg
+        assert "'abc'" in msg and "'leaks/failed'" in msg, msg
+        assert "did NOT complete cleanly" in msg, msg
 
 
 class TestTheReportReadsEveryFieldPermissively:
@@ -2096,3 +2124,79 @@ class TestTheReportReadsEveryFieldPermissively:
             assert msg, block
             assert needle in msg, f"{block}\n{msg}"
             assert "carries no" not in msg, f"the field IS present:\n{msg}"
+class TestARefusalAtHeadIsNotLaunderedByAPlainRepost:
+    """PRE-EXISTING gate defect on the irreducible review, surfaced by adversarial review.
+
+    `not_clean` was computed PER ROW and each row chose its own map. So a second
+    owner comment at the same head — same marker, ordinary prose, no verdict line —
+    landed in `accepted` while the first row's [P1] sat in `rejected`, and the gate
+    PASSED. Nothing about the finding had changed; the head was identical.
+
+    The documented remedy for a refusal caused by prose is to re-post ending with an
+    EXPLICIT clean-verdict line, and that must keep working (control below). So the
+    rule is: at a head where this kind was refused, a later marker counts only if its
+    body carries an explicit clean verdict. A plain re-post is not an override; a
+    stated verdict is.
+    """
+
+    @staticmethod
+    def _row(body):
+        return json.dumps({"login": "owner", "author_association": "OWNER", "body": body})
+
+    @staticmethod
+    def _marker(head=HEAD):
+        return f"<!-- genesis-scheduled-review: head={head} kind=leaks -->"
+
+    def _gate(self, monkeypatch, rows):
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", "\n".join(rows))
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "leaks")
+        return _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
+
+    def test_a_plain_repost_does_not_override_a_refusal_at_the_same_head(self, monkeypatch):
+        msg = self._gate(
+            monkeypatch,
+            [
+                self._row("[P1] a real leak finding\n" + self._marker()),
+                self._row("scan done.\n" + self._marker()),
+            ],
+        )
+        assert msg, "a [P1] at this head was laundered by a plain re-post of the marker"
+        assert "IS present at THIS head but was REFUSED" in msg, msg
+
+    def test_order_does_not_matter(self, monkeypatch):
+        """The refusal may arrive AFTER the plain marker (a routine posting its finding
+        late); the outcome must be the same."""
+        msg = self._gate(
+            monkeypatch,
+            [
+                self._row("scan done.\n" + self._marker()),
+                self._row("[P1] a real leak finding\n" + self._marker()),
+            ],
+        )
+        assert msg, "a later [P1] at this head was ignored because a plain marker came first"
+
+    def test_an_explicit_clean_verdict_still_overrides(self, monkeypatch):
+        """CONTROL: the documented remedy. Without it, an implementation that made every
+        refusal permanent would pass the tests above while breaking the one documented
+        way to clear a prose-tripped refusal."""
+        msg = self._gate(
+            monkeypatch,
+            [
+                self._row("The config value is not a hard block.\n" + self._marker()),
+                self._row("Re-reviewed.\nVERDICT: PASS\n" + self._marker()),
+            ],
+        )
+        assert msg is None, f"an explicit verdict line must still clear a refusal:\n{msg}"
+
+    def test_a_refusal_at_another_head_does_not_taint_this_one(self, monkeypatch):
+        """CONTROL: scoping. A [P1] on an OLDER commit is exactly what a new commit
+        fixes; a plain clean marker at the NEW head must count."""
+        msg = self._gate(
+            monkeypatch,
+            [
+                self._row("[P1] finding on the old commit\n" + self._marker(head=OTHER_HEAD)),
+                self._row("scan done.\n" + self._marker()),
+            ],
+        )
+        assert msg is None, f"a refusal at a different head must not block this one:\n{msg}"

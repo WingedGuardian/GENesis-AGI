@@ -2865,6 +2865,9 @@ def _scheduled_review_marker_scan(
     # it only to count whether the OWNER has posted anything for a kind, because that is
     # the one thing that says whether the owner's routine has evidently already run.
     unusable: list[tuple[str | None, str, bool]] = []
+    # (head -> kinds) whose accepting row carried an EXPLICIT clean verdict. Consulted
+    # only where the same (head, kind) was also REFUSED by another row -- see below.
+    explicit_clean: dict[str, set[str]] = {}
     for row in rows:
         body = row.get("body") or ""
         # Blocks are parsed BEFORE the trust checks, so a row about to be dropped can
@@ -2892,25 +2895,27 @@ def _scheduled_review_marker_scan(
         _state = (row.get("state") or "").upper()
         if _state in ("DISMISSED", "PENDING"):
             # Only DISMISSED is terminal. A PENDING review is an unpublished draft
-            # that can still be submitted, so it is precisely the IN-FLIGHT case
-            # where waiting can make this same review count -- recording it as
-            # unusable would attach "waiting cannot clear this" to the one state
-            # where waiting IS the answer. Dropped silently on purpose; it falls
-            # through to the absent/in-flight guidance.
+            # that can still be submitted. Both are RECORDED: an earlier version dropped
+            # a current-head draft silently so the generic in-flight note would cover
+            # it, which was the one remaining silent drop in a message that promises to
+            # list every block it saw. The row is the precise form of that note.
             for block in blocks:
                 if _state == "PENDING":
-                    # Submitting the draft can only help if the marker already names
-                    # the CURRENT head. A pending review whose marker names an older
-                    # commit is stale no matter when it is submitted, and dropping it
-                    # silently sent the reader to wait for something that could never
-                    # count.
+                    # Whether submitting the draft can help depends on the head it
+                    # names: the current one counts once published; an older one is
+                    # stale no matter when it is submitted.
                     _hm = _SCHEDULED_REVIEW_HEAD_RE.search(block)
                     if head_sha and _hm and _hm.group(1).lower() == head_sha.lower():
-                        continue
-                    why = (
-                        "it is carried by a PENDING review and does not name the "
-                        "current head, so submitting that draft would not make it count"
-                    )
+                        why = (
+                            "it is carried by a PENDING (unpublished) review naming the "
+                            "current head, so it is not yet visible to the gate and "
+                            "counts only once that draft is submitted"
+                        )
+                    else:
+                        why = (
+                            "it is carried by a PENDING review and does not name the "
+                            "current head, so submitting that draft would not make it count"
+                        )
                 else:
                     why = (
                         "it is carried by a DISMISSED review, which no longer vouches "
@@ -2930,9 +2935,8 @@ def _scheduled_review_marker_scan(
         # measured 2026-08-28: those two produced the identical `present: none` line, and
         # the only signal distinguishing an accepted marker from a rejected one was
         # whether its prose happened to contain a _CLEAN_PATTERNS phrase.
-        not_clean = any(p.search(body) for p in _BLOCKING_PATTERNS) and not any(
-            c.search(body) for c in _CLEAN_PATTERNS
-        )
+        has_clean = any(c.search(body) for c in _CLEAN_PATTERNS)
+        not_clean = any(p.search(body) for p in _BLOCKING_PATTERNS) and not has_clean
         target = rejected if not_clean else accepted
         # Defense-in-depth follow-up: for rows from /pulls/N/reviews we could ALSO
         # cross-check GitHub's authoritative `commit_id` vs the marker sha (issue comments
@@ -2945,38 +2949,46 @@ def _scheduled_review_marker_scan(
                 # A marker must name both a head AND a kind to count. Say WHICH is
                 # wrong and quote the offending value: on a long thread the operator
                 # otherwise cannot tell which of several markers is the broken one.
+                # EVERY bad field is reported, not the first one found. An if/else here
+                # reported only the head, so `head=abc kind=leaks/failed` read as a short
+                # sha and the suffix saying the run FAILED was never shown -- one repair
+                # cycle per hidden field, on a message that promises to hide nothing.
+                reasons: list[str] = []
                 if not head_m:
                     loose = _SCHEDULED_REVIEW_LOOSE_HEAD_RE.search(block)
                     if not loose:
-                        why = "it carries no head= field"
+                        reasons.append("it carries no head= field")
                     elif not loose.group(1):
                         # `\S*` so an EMPTY value is seen. `\S+` reported it as no field
                         # at all -- the most likely producer fault (an uninterpolated
                         # variable) described as the operator having omitted the field.
-                        why = "its head= field is present but EMPTY"
+                        reasons.append("its head= field is present but EMPTY")
                     elif _SCHEDULED_REVIEW_ANYCASE_HEAD_RE.fullmatch(loose.group(1)):
-                        why = (
+                        reasons.append(
                             f"its head={loose.group(1)!r} is full length but not "
                             f"lowercase, and the grammar is lowercase hex"
                         )
                     else:
-                        why = (
+                        reasons.append(
                             f"its head={loose.group(1)!r} is not a full 40-hex commit sha"
+                            + _status_suffix_warning(loose.group(1))
                         )
-                        why += _status_suffix_warning(loose.group(1))
-                else:
+                if not kind_m:
                     # Read PERMISSIVELY to say what is actually there. The strict
                     # expression refuses a status-suffixed `kind=leaks/failed`, and
                     # reporting that refusal as an absent field told the operator a
                     # field they had written did not exist.
                     loose = _SCHEDULED_REVIEW_LOOSE_KIND_RE.search(block)
                     if not loose:
-                        why = "it carries no kind= field"
+                        reasons.append("it carries no kind= field")
                     elif not loose.group(1):
-                        why = "its kind= field is present but EMPTY"
+                        reasons.append("its kind= field is present but EMPTY")
                     else:
-                        why = f"its kind={loose.group(1)!r} is not a bare review name"
-                        why += _status_suffix_warning(loose.group(1))
+                        reasons.append(
+                            f"its kind={loose.group(1)!r} is not a bare review name"
+                            + _status_suffix_warning(loose.group(1))
+                        )
+                why = ", and ".join(reasons)
                 # A malformed marker on a body that reads as BLOCKING is not a typo
                 # to be re-posted. The verdict survives the malformed field, because
                 # pasting a clean marker over an unresolved finding would make the
@@ -3006,6 +3018,22 @@ def _scheduled_review_marker_scan(
                 )
                 continue
             target.setdefault(head_m.group(1).lower(), set()).add(_kind)
+            if target is accepted and has_clean:
+                explicit_clean.setdefault(head_m.group(1).lower(), set()).add(_kind)
+    # `not_clean` is decided PER ROW, and each row chose its own map. So a second owner
+    # comment at the SAME head -- same marker, ordinary prose, no verdict -- landed in
+    # `accepted` while the first row's [P1] sat in `rejected`, and the gate PASSED with
+    # nothing about the finding changed. A refusal and an acceptance for one (head, kind)
+    # are a contradiction the scan must resolve, and it resolves it the way the documented
+    # remedy already says: a prose-tripped refusal is cleared by re-posting WITH an explicit
+    # clean-verdict line. That stays. A plain re-post is not an override; a stated verdict
+    # is. Scoped to the same head -- a refusal on an OLDER commit is exactly what a new
+    # commit exists to fix, and must not taint a clean marker at the new head.
+    for h, refused in rejected.items():
+        if h in accepted:
+            accepted[h] -= refused - explicit_clean.get(h, set())
+            if not accepted[h]:
+                del accepted[h]
     return accepted, rejected, unusable
 
 
