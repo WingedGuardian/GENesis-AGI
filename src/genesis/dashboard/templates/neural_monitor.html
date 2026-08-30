@@ -1620,10 +1620,17 @@ function showDefaultPanel() {
 function renderDiscardedItems(container, queues) {
     const items = queues.discarded_items || [];
     // `discarded_items` is a LIMIT-20 review SAMPLE; `discarded_count` is the
-    // uncapped depth. PRINT `count`, GATE on `any` — the two can disagree in
-    // both directions, and gating on the sample alone once left rows with no
-    // clear-all button at all (2026-08-30).
-    const count = Math.max(queues.discarded_count ?? items.length, items.length);
+    // uncapped depth. ONE value drives the label AND every gate — the two can
+    // disagree in both directions, and gating on the sample alone once left
+    // rows with no clear-all button at all (2026-08-30).
+    //
+    // Number.isFinite BEFORE max(): Math.max coerces, so a non-numeric count
+    // ({} or "n/a") gives NaN — and NaN makes `=== 0`, `> items.length` and
+    // `> 1` all false at once, so the header would read "Discarded (NaN)" and
+    // the clear-all button would vanish. That is precisely the failure this
+    // block exists to prevent, reintroduced through the back door.
+    const reported = queues.discarded_count ?? items.length;
+    const count = Math.max(Number.isFinite(reported) ? reported : items.length, items.length);
     if (count === 0) return;
 
     // Toggle header

@@ -446,7 +446,9 @@ async def queues(
                     "discarded_at": row["completed_at"],
                 })
         except Exception:
-            # Record it like every sibling query does. Without this a failed
+            # Record it, as the deferred_work / dead_letters / pending_embeddings
+            # queries do (several other blocks here still swallow their failure
+            # -- a real gap, not a precedent to copy). Without this a failed
             # COUNT silently yields discarded_count=0, which the dashboard then
             # renders as a confident "nothing awaiting review" for a state we
             # do not actually know.

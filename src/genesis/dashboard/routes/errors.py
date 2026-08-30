@@ -12,6 +12,14 @@ from genesis.dashboard._blueprint import _async_route, blueprint
 logger = logging.getLogger(__name__)
 
 
+# How wide each source is read before grouping. Deliberately far above the
+# display limit (clamped to 200): source rows are GROUPED before display, so a
+# scan capped at the page size makes every derived total a truncated read that
+# looks like a real number. Filling this window is reported as
+# `groups_totals_truncated`, which renders the total as a lower bound.
+_SCAN_CAP = 1000
+
+
 @blueprint.route("/api/genesis/unified-errors")
 @_async_route
 async def unified_errors():
@@ -40,7 +48,9 @@ async def unified_errors():
     # attention strip rendered "6 active error groups" for any backlog >= 6,
     # because `limit=6` capped the three source reads the groups were built
     # from. Scan generously, group, publish true totals, then slice for display.
-    _SCAN_CAP = 1000
+    # `limit` is already clamped to <= 200 above, so this max() resolves to
+    # _SCAN_CAP today; it is written as a max so that raising the display clamp
+    # can never quietly leave the scan narrower than the page it must cover.
     scan_limit = max(limit, _SCAN_CAP)
     scan_truncated = False
 
@@ -82,6 +92,12 @@ async def unified_errors():
     try:
         dl_items = await dl_crud.query_recent(
             rt.db, since=since, limit=scan_limit,
+            # Only the grouping keys — this runs on the dashboard's
+            # unconditional 15s poll over the shared connection, and the scan is
+            # ~166x wider than the page it feeds. `payload` is ~4.5 KB/row and
+            # is never read here, so selecting it would move megabytes per poll
+            # to build a handful of group headers.
+            columns=("target_provider", "operation_type", "failure_reason", "created_at"),
         )
         scan_truncated = scan_truncated or len(dl_items) >= scan_limit
         dl_count = len(dl_items)

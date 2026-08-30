@@ -34,7 +34,10 @@ OVERVIEW_HTML = (
 
 STORE_OPEN = 'Alpine.store("genesisDashboard", {'
 STORE_CLOSE = re.compile(r"^      \}\);")
-MEMBER = re.compile(r"^        (?:async )?([A-Za-z_$][\w$]*)\s*[:(]")
+# Getters are captured WITH their `get `/`set ` prefix, so a duplicated getter
+# is caught (the accessor this file guards is one) while a legitimate
+# get/set pair for the same name is not flagged as a collision.
+MEMBER = re.compile(r"^        (?:async )?((?:get |set )?[A-Za-z_$][\w$]*)\s*[:(]")
 
 # If the file shrinks below this, the indentation convention the parser
 # relies on has probably changed and the scan has gone blind — fail loudly
@@ -148,6 +151,28 @@ def _accessor_body(name: str) -> str:
     return js[i : js.index("},", i)]
 
 
+def _member_line_span(name: str) -> set[int]:
+    """1-based line numbers occupied by a store member's body.
+
+    Exemptions must be scoped by POSITION, not by text. Comparing a line to the
+    concatenated body of the sanctioned accessors (`ln not in sanctioned_js`)
+    exempts any line ANYWHERE in the file that happens to be textually identical
+    to one inside an accessor -- so the guard could be walked past by copying a
+    sanctioned line verbatim, which is exactly the evasion it exists to stop.
+    """
+    lines = DASHBOARD_JS.read_text().splitlines()
+    start = None
+    for i, ln in enumerate(lines, 1):
+        if f"get {name}()" in ln or ln.startswith(f"        {name}("):
+            start = i
+            break
+    assert start is not None, f"member `{name}` not found in dashboard.js"
+    for j in range(start, len(lines) + 1):
+        if lines[j - 1] == "        },":
+            return set(range(start, j + 1))
+    raise AssertionError(f"`{name}` body never closed at member indentation")
+
+
 def test_alpine_store_exposes_exactly_one_accessor():
     """One number, used for every count and every gate."""
     js = DASHBOARD_JS.read_text()
@@ -239,11 +264,9 @@ def test_no_sample_derived_gate_escapes_the_accessor():
     """
     offenders: list[str] = []
     js = DASHBOARD_JS.read_text()
-    sanctioned_js = _accessor_body(_ACCESSOR)
-    i = js.index("get discardedQueueGroups()")
-    sanctioned_js += js[i : js.index("},", i)]
+    sanctioned = _member_line_span(_ACCESSOR) | _member_line_span("discardedQueueGroups")
     for lineno, ln in enumerate(js.splitlines(), 1):
-        if any(t in ln for t in _SAMPLE_DERIVED) and ".length" in ln and ln not in sanctioned_js:
+        if any(t in ln for t in _SAMPLE_DERIVED) and ".length" in ln and lineno not in sanctioned:
             offenders.append(f"dashboard.js:{lineno}: {ln.strip()[:110]}")
     for lineno, ln in enumerate(OVERVIEW_HTML.read_text().splitlines(), 1):
         if not (any(t in ln for t in _SAMPLE_DERIVED) and ".length" in ln):
@@ -265,16 +288,19 @@ def test_no_raw_sample_length_read_outside_the_accessors():
     bug class returning.
     """
     js = DASHBOARD_JS.read_text()
-    sanctioned = _accessor_body(_ACCESSOR)
+    sanctioned = _member_line_span(_ACCESSOR) | _member_line_span("discardedQueueGroups")
     offenders = [
         f"dashboard.js:{i}: {ln.strip()[:110]}"
         for i, ln in enumerate(js.splitlines(), 1)
-        if "discarded_items" in ln and ".length" in ln and ln not in sanctioned
+        if "discarded_items" in ln and ".length" in ln and i not in sanctioned
     ]
+    # In the template the sanctioned reader is the truncation label, and it is
+    # sanctioned because it ALSO reads the accessor -- not because it contains
+    # the word "showing", which any new line could adopt for free.
     offenders += [
         f"overview.html:{i}: {ln.strip()[:110]}"
         for i, ln in enumerate(OVERVIEW_HTML.read_text().splitlines(), 1)
-        if "discarded_items" in ln and ".length" in ln and "showing" not in ln
+        if "discarded_items" in ln and ".length" in ln and _ACCESSOR not in ln
     ]
     assert not offenders, (
         "Raw LIMIT-20 sample-length reads outside the accessors:\n  "
@@ -292,3 +318,100 @@ def test_guard_is_not_blind():
     assert js.count(_ACCESSOR) >= 4, "dashboard.js should define and use the accessor"
     for path in (NEURAL_MONITOR_HTML, AZ_NEURAL_MONITOR_HTML):
         assert path.exists(), f"{path} missing — the scan would silently cover nothing"
+
+
+def _member_body(name: str) -> str:
+    """The body of a store member declared as ``name() {`` or ``get name() {``.
+
+    Scoped by the store's 8-space indentation convention, same as the member
+    parser above: read to the first line that closes a member (``        },``).
+    """
+    js = DASHBOARD_JS.read_text()
+    for opener in (f"get {name}()", f"{name}()"):
+        i = js.find(opener)
+        if i != -1:
+            break
+    assert i != -1, f"dashboard.js does not define `{name}`"
+    lines = js[i:].splitlines()
+    out = []
+    for ln in lines:
+        out.append(ln)
+        if ln == "        },":
+            break
+    else:
+        raise AssertionError(f"`{name}` body never closed at member indentation")
+    return "\n".join(out)
+
+
+def _code_only(body: str) -> str:
+    """`body` with whole-line `//` comments removed.
+
+    Ordering assertions must read the CODE. The first version of the guard
+    below compared positions of a phrase that also appeared in the explanatory
+    comment it sat next to, so it reported the check as mis-ordered purely
+    because prose mentioned the branch it was guarding. A guard satisfiable --
+    or breakable -- by a comment is not a guard.
+    """
+    return "\n".join(
+        ln for ln in body.splitlines() if not ln.strip().startswith("//")
+    )
+
+
+def test_queue_verdict_is_unknown_when_the_section_failed():
+    """A failed queues section must not be reported as healthy.
+
+    `_or_error` replaces a failed gather section with `{"status": "error"}` --
+    truthy, and carrying NO `errors` key. So a verdict that only inspects
+    `errors` reads every depth field as a missing-zero and falls through to
+    "healthy - queues are clear", rendered in the same card as the panel's own
+    "Queue data unavailable" banner and folded into the top-level status.
+
+    Zeros that were never measured are not a clean bill of health.
+    """
+    body = _code_only(_member_body("queuesSemantic"))
+    assert 'queues.status === "error"' in body, (
+        "queuesSemantic() must treat a failed section as unknown; keying only "
+        "on `errors` misses _or_error's shape, which has no `errors` key"
+    )
+    # Ordering is the whole point: the check is worthless after the depth
+    # comparisons, because those already returned a verdict built from zeros.
+    assert body.index('queues.status === "error"') < body.index('state: "healthy"'), (
+        "the failed-section check must precede the depth checks, or the "
+        "verdict is already decided from counters that were never collected"
+    )
+
+
+def test_unknown_banner_is_scoped_to_its_own_source():
+    """The banner must not deny numbers the same panel is displaying.
+
+    `queues.errors` is ONE list shared by all four queue sources, each entry
+    source-prefixed. Keyed on the whole list, a `deferred_work` failure printed
+    "Queue data unavailable - this is not a confirmed zero" directly above a
+    correctly-counted discarded list with an enabled "Clear all 148".
+    """
+    body = _code_only(_member_body("queuesDataUnknown"))
+    assert '(q.errors || []).length > 0' not in body, (
+        "queuesDataUnknown must not fire on an unrelated source's failure"
+    )
+    assert 'startsWith("discarded")' in body, (
+        "scope the banner to discarded-side failures (entries are prefixed)"
+    )
+    assert 'q.status === "error"' in body, (
+        "a whole-section failure must still mark the count unknown"
+    )
+
+
+def test_neural_monitor_count_survives_a_non_numeric_payload():
+    """`Math.max` coerces, so an unguarded non-numeric count yields NaN.
+
+    NaN makes `=== 0`, `> items.length` and `> 1` ALL false at once, so the
+    header would read "Discarded (NaN)" and the clear-all button would vanish
+    -- the exact defect this block was written to fix, re-entering through
+    coercion. dashboard.js guards it; both plain-JS copies must too.
+    """
+    for path in (NEURAL_MONITOR_HTML, AZ_NEURAL_MONITOR_HTML):
+        src = path.read_text()
+        assert "Number.isFinite" in src, (
+            f"{path.name}: guard the reported count with Number.isFinite before "
+            "Math.max, or a non-numeric count silently removes the clear control"
+        )

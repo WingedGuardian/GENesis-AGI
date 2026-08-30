@@ -136,28 +136,47 @@ class HealthDataService:
         is released by the task's own done-callback, not a caller's ``finally``,
         so it survives the cancelling caller unwinding first; the ``.done()`` guard
         makes correctness independent of when that callback runs.
+
+        The retry loop exists for the post-mutation case (see
+        ``mark_inflight_stale``) and re-checks state after draining a stale
+        compute rather than assuming its own arrival won the race. Each extra
+        iteration costs one more mutation landing during the preceding compute,
+        so it is driven by write rate, not by spinning — every iteration awaits a
+        real pending task. Callers remain bounded by their own timeouts (the
+        dashboard route's ``_async_route`` deadline), so a sustained write storm
+        surfaces as that caller's timeout rather than an unbounded wait here.
         """
-        inflight = self._inflight
-        if inflight is not None and not inflight.done():
-            if not self._inflight_stale:
-                return await asyncio.shield(inflight)
-            # Predates a mutation: wait it out (preserving single-flight, so the
-            # probe-transition tracker never sees two concurrent computes), drop
-            # its result, then fall through and compute once against current
-            # state. Only the first caller to arrive clears the flag; any others
-            # coalesce onto the fresh compute below.
+        while True:
+            inflight = self._inflight
+            if inflight is not None and not inflight.done():
+                if not self._inflight_stale:
+                    return await asyncio.shield(inflight)
+                # Predates a mutation: wait it out (preserving single-flight, so
+                # the probe-transition tracker never sees two concurrent
+                # computes) and drop its result.
+                #
+                # The marker STAYS SET across this await. Clearing it here would
+                # publish "not stale" while `_inflight` still points at the very
+                # pre-mutation task being drained, so the next caller would take
+                # the coalescing branch above and be handed exactly the result
+                # the marker exists to withhold. It is cleared only where the
+                # replacement is installed, which is what puts every
+                # post-mutation caller behind that one replacement.
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(inflight)
+                continue
+            # No await between the done() check and the assignments below →
+            # race-free on the single-threaded loop, so exactly one caller
+            # installs the replacement and later arrivals coalesce onto it.
+            # Bare create_task BY DESIGN (reflex A4 sweep, 2026-07-21): every
+            # caller awaits via asyncio.shield and the orphan case retrieves the
+            # exception in _release_inflight — tracked_task would double-report
+            # handled snapshot failures.
             self._inflight_stale = False
-            with contextlib.suppress(Exception):
-                await asyncio.shield(inflight)
-        # No await between the done() check and the assignment below → race-free
-        # on the single-threaded loop. Bare create_task BY DESIGN (reflex A4
-        # sweep, 2026-07-21): every caller awaits via asyncio.shield and the
-        # orphan case retrieves the exception in _release_inflight —
-        # tracked_task would double-report handled snapshot failures.
-        task = asyncio.create_task(self._compute_snapshot())
-        self._inflight = task
-        task.add_done_callback(self._release_inflight)
-        return await asyncio.shield(task)
+            task = asyncio.create_task(self._compute_snapshot())
+            self._inflight = task
+            task.add_done_callback(self._release_inflight)
+            return await asyncio.shield(task)
 
     def mark_inflight_stale(self) -> None:
         """Mark the in-flight compute as predating a mutation.
@@ -176,12 +195,45 @@ class HealthDataService:
         the tracker backwards, emitting a false reverse transition.
 
         So the stale compute is not abandoned and not cancelled (cancelling
-        would break the callers already shielded on it). It is FLAGGED: the next
-        caller awaits it, discards the result, and only then starts one fresh
-        compute. At most one computation runs at any time, and no caller after
-        the mutation sees pre-mutation data.
+        would break the callers already shielded on it). It is FLAGGED: callers
+        arriving after the mutation await it, discard its result, and one of
+        them then starts a single fresh compute that the rest coalesce onto. At
+        most one computation runs at any time, and no caller after the mutation
+        sees pre-mutation data.
+
+        The marker is cleared by ``snapshot()`` when it installs that
+        replacement — NOT by the first caller to observe it. Clearing on
+        observation left ``_inflight`` pointing at the still-running
+        pre-mutation task with the marker already down, so the next caller
+        coalesced straight back onto it and was served the stale snapshot.
+
+        Deliberately loop-free, and deliberately not a compound update: the
+        dashboard is threaded WSGI Flask, so ``invalidate_snapshot_cache()``
+        reaches this from a request thread — for a sync route
+        (``routes/providers.py`` toggles breakers in a sync handler) there is no
+        running loop to schedule work on at all, and even an async route reaches
+        it from the worker thread that bridges via ``run_coroutine_threadsafe``.
+        So this method only ever sets a flag, and all coordination lives in
+        ``snapshot()``, which always runs on the loop thread.
+
+        The check-then-set below is therefore not atomic with respect to
+        ``snapshot()``. That is safe because every interleaving errs toward
+        recomputation, never toward serving stale data: the caller commits its
+        mutation BEFORE calling this, so any compute that starts afterwards
+        already reads post-mutation state. Losing the race means either
+        flagging a compute that was already fresh (costing one redundant
+        recompute) or skipping a flag when nothing is in flight (correct — the
+        next caller starts a compute that reads post-mutation state anyway).
         """
-        if self._inflight is not None and not self._inflight.done():
+        # ONE read of the shared handle, then operate on the local — the same
+        # discipline snapshot() follows. Re-reading `self._inflight` for the
+        # `.done()` call would be a cross-thread double-read: `_release_inflight`
+        # nulls the handle from the loop thread, so a switch between the two
+        # reads raises AttributeError on None out of invalidate_snapshot_cache()
+        # — into a route that has ALREADY committed its mutation, turning a
+        # successful clear/toggle into a 500.
+        inflight = self._inflight
+        if inflight is not None and not inflight.done():
             self._inflight_stale = True
 
     def _release_inflight(self, task: asyncio.Task) -> None:

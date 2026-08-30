@@ -188,3 +188,113 @@ class TestPartialDegradation:
             data = resp.get_json()
             assert data["partial"] is False
             assert data["sources_failed"] == []
+def _dl_row(i: int) -> dict:
+    """One dead_letter row, distinct enough to form its own group."""
+    return {
+        "id": f"dl{i}",
+        "operation_type": f"op{i}",
+        "target_provider": "qdrant",
+        "failure_reason": f"failure {i}",
+        "created_at": "2026-03-14T10:00:00",
+        "retry_count": 0,
+        "last_retry_at": None,
+        "status": "pending",
+    }
+
+
+class TestGroupTotalsAreNotAPage:
+    """The totals must describe the population, not the slice being displayed.
+
+    This is the defect the endpoint shipped: the strip asked for `limit=6`, the
+    three source reads were each capped at 6, and `len(groups)` was published as
+    a count -- so any backlog of six or more rendered as exactly "6". A number
+    that equals the cap looks like a real total, which is what made it survive.
+    """
+
+    def test_totals_count_the_population_while_groups_stay_a_page(self, client):
+        rows = [_dl_row(i) for i in range(25)]      # 25 distinct groups
+        rt = _mock_rt()
+        with (
+            patch("genesis.runtime.GenesisRuntime") as MockRT,
+            patch("genesis.db.crud.events.query_grouped_errors", new_callable=AsyncMock, return_value=[]),
+            patch("genesis.db.crud.dead_letter.query_recent", new_callable=AsyncMock, return_value=rows),
+            patch("genesis.db.crud.deferred_work.query_failed", new_callable=AsyncMock, return_value=[]),
+            patch("genesis.mcp.health_mcp._impl_health_alerts", new_callable=AsyncMock, return_value=[]),
+        ):
+            MockRT.instance.return_value = rt
+            data = client.get("/api/genesis/unified-errors?limit=6").get_json()
+
+        assert len(data["groups"]) == 6, "the display page must still honour limit"
+        assert data["groups_total"] == 25, (
+            f"groups_total published {data['groups_total']} — the length of the "
+            "page, not the population it was sliced from"
+        )
+        assert data["groups_totals_truncated"] is False, (
+            "25 rows is far short of the scan ceiling; nothing was truncated"
+        )
+
+    def test_source_reads_are_not_capped_by_the_display_limit(self, client):
+        """The scan width must not be the display width, or every total is a page."""
+        dl = AsyncMock(return_value=[])
+        rt = _mock_rt()
+        with (
+            patch("genesis.runtime.GenesisRuntime") as MockRT,
+            patch("genesis.db.crud.events.query_grouped_errors", new_callable=AsyncMock, return_value=[]),
+            patch("genesis.db.crud.dead_letter.query_recent", dl),
+            patch("genesis.db.crud.deferred_work.query_failed", new_callable=AsyncMock, return_value=[]),
+            patch("genesis.mcp.health_mcp._impl_health_alerts", new_callable=AsyncMock, return_value=[]),
+        ):
+            MockRT.instance.return_value = rt
+            client.get("/api/genesis/unified-errors?limit=6")
+
+        assert dl.await_args.kwargs["limit"] > 6, (
+            "the dead-letter scan inherited the display limit, so its total can "
+            "only ever report the page"
+        )
+
+    def test_the_scan_reads_only_the_columns_it_groups_by(self, client):
+        """A wide scan on a 15s poll must not drag row payloads with it.
+
+        `payload` holds the serialized operation and dominates row size
+        (measured ~4.5 KB average against a live store) and is never read by the
+        grouping. Selecting it moved megabytes per poll over the shared
+        connection to build a handful of group headers.
+        """
+        dl = AsyncMock(return_value=[])
+        rt = _mock_rt()
+        with (
+            patch("genesis.runtime.GenesisRuntime") as MockRT,
+            patch("genesis.db.crud.events.query_grouped_errors", new_callable=AsyncMock, return_value=[]),
+            patch("genesis.db.crud.dead_letter.query_recent", dl),
+            patch("genesis.db.crud.deferred_work.query_failed", new_callable=AsyncMock, return_value=[]),
+            patch("genesis.mcp.health_mcp._impl_health_alerts", new_callable=AsyncMock, return_value=[]),
+        ):
+            MockRT.instance.return_value = rt
+            client.get("/api/genesis/unified-errors")
+
+        columns = dl.await_args.kwargs.get("columns")
+        assert columns is not None, (
+            "the widened scan selects every column, including the payload it "
+            "never groups by"
+        )
+        assert "payload" not in columns, f"the scan still pulls `payload`: {columns}"
+
+    def test_a_full_scan_window_is_published_as_a_lower_bound(self, client):
+        """Filling the ceiling means the total is a floor — say so, don't imply a count."""
+        rt = _mock_rt()
+        with (
+            patch("genesis.runtime.GenesisRuntime") as MockRT,
+            patch("genesis.dashboard.routes.errors._SCAN_CAP", 3, create=True),
+            patch("genesis.db.crud.events.query_grouped_errors", new_callable=AsyncMock, return_value=[]),
+            patch("genesis.db.crud.dead_letter.query_recent", new_callable=AsyncMock,
+                  return_value=[_dl_row(i) for i in range(3)]),
+            patch("genesis.db.crud.deferred_work.query_failed", new_callable=AsyncMock, return_value=[]),
+            patch("genesis.mcp.health_mcp._impl_health_alerts", new_callable=AsyncMock, return_value=[]),
+        ):
+            MockRT.instance.return_value = rt
+            data = client.get("/api/genesis/unified-errors?limit=2").get_json()
+
+        assert data["groups_totals_truncated"] is True, (
+            "a source returned exactly the scan ceiling, so the total is a lower "
+            "bound and must be marked as one rather than shown as a count"
+        )

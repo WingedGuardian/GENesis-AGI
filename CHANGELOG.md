@@ -78,14 +78,28 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The Queues card could report "healthy — queues are clear" for counters it
+  never collected.** When the queues section of the health snapshot fails, it is
+  replaced wholesale by an error marker carrying no per-counter detail. The
+  card's verdict only inspected the per-counter error list, so it read every
+  depth as a missing zero and returned a confident green — displayed beside the
+  panel's own "Queue data unavailable" notice, and folded into the overall
+  dashboard status. Unmeasured zeros are now reported as unknown rather than
+  healthy. Relatedly, the "not a confirmed zero" notice was keyed on a list
+  shared by all four queue sources, so an unrelated counter failing printed it
+  above a correctly-counted list of discarded rows; it is now scoped to
+  failures of the count it actually describes.
+
 - **The attention strip reported "N active error groups" from a page, not a
   count.** `/api/genesis/unified-errors` was queried with `limit=6` and the strip
   counted the returned list, so any backlog of six or more displayed as exactly
   "6" — and the three source reads the groups are built from were each capped by
   that same limit, so the underlying totals were truncated too. The endpoint now
-  scans wide enough to group the real population, publishes true totals
-  alongside the display page, and marks the total as a lower bound (`6+`) in the
-  one case a source fills the entire scan window.
+  scans to a fixed ceiling far above the display page rather than to the page
+  itself, publishes the resulting totals alongside it, and marks a total as a
+  lower bound (`6+`) whenever a source fills that ceiling — so a number is
+  either the real depth or is visibly flagged as not being one. The scan reads
+  only the columns it groups by, so widening it does not pull row payloads.
 
 - **The `/genesis/monitor` page had the same discarded-count bug, plus a worse
   variant: rows you could not clear.** Its "Clear All Discarded" button was shown
@@ -104,7 +118,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   number equalled the cap it looked like a plausible total rather than a
   truncation. Every count AND every predicate now reads one derived
   accessor used for every displayed number and every gate, so no part of the
-  panel can disagree with another: it can no longer claim a backlog while
+  panel can disagree with another about the DEPTH: it can no longer claim a backlog while
   showing "no items awaiting review" or disabling the button that clears it,
   nor report 0 while listing rows. Where the count is non-zero but the review
   sample could not be loaded, the panel now says exactly that. The review list is labelled "showing 20 of N" whenever it is

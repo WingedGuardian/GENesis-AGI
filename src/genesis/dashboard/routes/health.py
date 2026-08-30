@@ -44,11 +44,20 @@ def invalidate_snapshot_cache() -> None:
 
     Three things are required, because there are two distinct staleness paths:
     clear the cached value; bump a generation counter so a compute that began
-    BEFORE this call declines to publish when it lands after it; and abandon the
-    flag the producer's in-flight computation so a caller arriving AFTER this
-    call waits it out and recomputes rather than being handed that same
-    pre-mutation result. The flag (rather than dropping the handle) keeps the
-    producer single-flight, which its probe-transition side effect requires.
+    BEFORE this call declines to publish when it lands after it; and FLAG the
+    producer's in-flight computation so a caller arriving AFTER this call waits
+    it out and recomputes rather than being handed that same pre-mutation
+    result. Flagging (rather than dropping the handle) keeps the producer
+    single-flight, which its probe-transition side effect requires.
+
+    Called from a Flask request thread, so the generation counter is bumped
+    concurrently with the loop thread reading it. The read-modify-write is not
+    atomic and two simultaneous invalidations can collapse into one increment —
+    which is harmless HERE, and deliberately left unlocked: the publish guard
+    asks only whether the counter still equals the value sampled before the
+    compute, and every racing writer stores ``load + 1``, so the counter always
+    advances and can never return to a previously sampled value. It is a change
+    detector, not a tally; nothing reads it as a count.
     """
     global _snapshot_cache, _snapshot_cache_ts, _snapshot_cache_gen
     _snapshot_cache = None

@@ -3723,6 +3723,16 @@
         queuesSemantic() {
           const queues = this.health.queues;
           if (!queues) return { state: "unknown", reason: "queue data unavailable" };
+          // A failed section is replaced by `_or_error` with {status:"error"},
+          // which is TRUTHY and carries NO `errors` key — so without this check
+          // every depth field below reads 0 and the card falls through to
+          // "healthy - queues are clear", directly beside the panel's own
+          // "Queue data unavailable" banner, and feeds that false healthy into
+          // overallHealthSemantic(). Zeros we never measured are not a clean
+          // bill of health.
+          if (queues.status === "error") {
+            return { state: "unknown", reason: "queue data could not be collected" };
+          }
           if ((queues.dead_letters || 0) > 0 || this.discardedTotal > 0
               || (queues.deferred_stuck || 0) > 0 || (queues.failed_embeddings || 0) > 0) {
             return { state: "error", reason: "stuck/failed items or dead letters require attention" };
@@ -4393,7 +4403,15 @@
         get queuesDataUnknown() {
           const q = this.health?.queues;
           if (!q) return false;            // card is hidden entirely
-          return q.status === "error" || (q.errors || []).length > 0;
+          if (q.status === "error") return true;   // whole section failed
+          // `errors` is ONE list shared by all four queue sources, and every
+          // entry is source-prefixed (see queues.py). Only a discarded-side
+          // failure makes THIS card's zero unknown: keying on the whole list
+          // printed "Queue data unavailable - this is not a confirmed zero"
+          // directly above a correctly-counted list of discarded rows whenever
+          // an unrelated counter failed, denying numbers the same panel was
+          // simultaneously showing.
+          return (q.errors || []).some((e) => String(e).startsWith("discarded"));
         },
 
         get discardedQueueGroups() {
