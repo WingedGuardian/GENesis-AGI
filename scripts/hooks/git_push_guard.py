@@ -2732,6 +2732,29 @@ def _scheduled_review_rows(pr_num: str, repo: str | None = None) -> list[dict] |
     return rows
 
 
+def _status_suffix_warning(raw: str) -> str:
+    """Extra clause for a refused field value carrying a ``/status`` suffix, else "".
+
+    Naming ONLY the grammar problem is an instruction to strip the suffix, and a reader
+    who follows it produces a well-formed marker attesting to a run that reported its own
+    failure -- on the gate this repository calls irreducible. The strict expressions above
+    exist to refuse exactly that shape, so a message that coaches the reader past them
+    undoes the guard in prose. Saying what the suffix MEANS costs one clause and removes
+    the invitation, without the message having to guess which review was intended.
+
+    Applies to both fields: `head=<sha>/failed` and `kind=<name>/failed` reach the same
+    branch by different routes, and fixing only the one a review happened to name is how
+    this class keeps coming back.
+    """
+    return (
+        ", and the status suffix reports that the run did NOT complete cleanly -- "
+        "re-posting it without the suffix would attest to a review that declared its "
+        "own failure, so the run itself needs repeating"
+        if "/" in raw
+        else ""
+    )
+
+
 def _marker_kind_or_none(block: str) -> str | None:
     """The ``kind`` a marker block names, or None when it names none.
 
@@ -2739,82 +2762,22 @@ def _marker_kind_or_none(block: str) -> str | None:
     meant to satisfy, so the block message can scope its guidance instead of
     reporting an unattached complaint.
 
-    A STATUS-SUFFIXED value (``kind=leaks/failed``) is refused by the gate grammar
-    -- correctly, since a failed run must never satisfy anything -- but it NAMES
-    its review unambiguously, and reading it here is not the attribution guess this
-    module deliberately refuses to make. The line is exact-match, not resemblance:
-    the segment before the suffix must BE a known kind. A near-miss like
-    ``kind=leak`` still returns None, because deciding it meant ``leaks`` would be
-    guessing at intent, and a guessed kind steers the reader toward vouching for a
-    review that never ran. Attribution is reporting-only either way -- the caller
-    records this on the UNUSABLE path, which never reaches ``accepted``.
+    Reads the STRICT grammar only, and deliberately so. An earlier revision also read a
+    status-suffixed value (``kind=leaks/failed``) by taking the segment before the suffix,
+    on the reasoning that it names its review unambiguously. That was wrong in a way worth
+    recording, because the argument for it sounded sober. A suffixed value denotes a run
+    that reported itself FAILED; crediting it to ``leaks`` made a failed run occupy the
+    kind, and — through the state rule below — SUPPRESS the bullet saying a real review had
+    run on an earlier commit. A failed run thereby outranked trusted history that an
+    untrusted stranger's marker was not permitted to outrank. The trust ordering came out
+    backwards, on the gate this repository calls irreducible.
+
+    A value the strict grammar refuses therefore names nothing here. It is still REPORTED,
+    with its raw text quoted, by the caller's unusable path — the operator sees it; it just
+    does not get to speak for a review.
     """
     m = _SCHEDULED_REVIEW_KIND_RE.search(block)
-    if m:
-        return m.group(1)
-    loose = _SCHEDULED_REVIEW_LOOSE_KIND_RE.search(block)
-    if loose:
-        stem = loose.group(1).split("/", 1)[0].lower()
-        if stem in _KNOWN_SCHEDULED_REVIEW_KINDS:
-            return stem
-    return None
-
-
-def emit_scheduled_review_marker(pr_num: str, *, kind: str, repo: str | None = None) -> int:
-    """Print the scheduled-review marker for ``pr_num``'s CURRENT head. 0 on success.
-
-    The PREVENT half of the marker contract. Nothing in this repository emitted a
-    marker: the 40-hex requirement lived in a regex on the CONSUMER side and in a
-    sentence asking a person to copy a commit sha by hand. A marker whose head was
-    abbreviated then matched no head at all, was discarded during the scan, and was
-    reported as "nobody posted anything" — advice to wait, for a review that had
-    already run.
-
-    Two properties make that unrepeatable here. The head is READ from GitHub rather
-    than typed. And the finished line is parsed back through the gate's OWN regexes,
-    with the captured values compared to what went in, before anything is printed —
-    so a marker this command emits is by construction a marker the gate counts, and a
-    change to either regex that breaks the pairing fails loudly rather than shipping a
-    producer that quietly disagrees with its consumer.
-
-    Refusals are silent on stdout: nothing that looks like a marker is ever printed on
-    a failure path, because a half-formed marker pasted into a PR is the defect.
-    """
-    if kind not in _KNOWN_SCHEDULED_REVIEW_KINDS:
-        print(
-            f"ERROR: kind={kind!r} is not a known scheduled-review kind, so a marker "
-            f"naming it could never satisfy the gate. Known kinds: "
-            f"{', '.join(_KNOWN_SCHEDULED_REVIEW_KINDS)}.",
-            file=sys.stderr,
-        )
-        return 2
-    head = (_pr_head_sha(pr_num, repo=repo) or "").strip().lower()
-    if not head:
-        print(
-            f"ERROR: could not read PR #{pr_num}'s head commit from GitHub. Refusing to "
-            f"emit a marker at all rather than emit one carrying a missing or partial "
-            f"head — that is the exact defect this command exists to prevent.",
-            file=sys.stderr,
-        )
-        return 1
-    marker = f"<!-- genesis-scheduled-review: head={head} kind={kind} -->"
-    # Round-trip through the CONSUMER's regexes. Not a formality: this is the only
-    # thing binding producer and consumer together, and it compares the CAPTURED
-    # values rather than merely checking that something matched.
-    blocks = _SCHEDULED_REVIEW_BLOCK_RE.findall(marker)
-    head_m = _SCHEDULED_REVIEW_HEAD_RE.search(blocks[0]) if len(blocks) == 1 else None
-    kind_m = _SCHEDULED_REVIEW_KIND_RE.search(blocks[0]) if len(blocks) == 1 else None
-    if not (head_m and kind_m and head_m.group(1) == head and kind_m.group(1) == kind):
-        print(
-            "ERROR: the marker just built does not parse back under this gate's own "
-            "marker grammar, so the producer and the consumer have drifted apart. "
-            "Nothing was emitted. Fix the grammar or this builder before posting "
-            "anything by hand.",
-            file=sys.stderr,
-        )
-        return 3
-    print(marker)
-    return 0
+    return m.group(1) if m else None
 
 
 def _scheduled_review_marker_scan(
@@ -2826,7 +2789,7 @@ def _scheduled_review_marker_scan(
     """``(accepted, rejected_not_clean, unusable)`` for the PR's scheduled-review
     markers, or ``None`` on an UNREADABLE fetch.
 
-    ``unusable`` is a list of ``(kind_or_None, reason, grammar_only)`` for marker
+    ``unusable`` is a list of ``(kind_or_None, reason, supersedes_state)`` for marker
     BLOCKS that were
     seen and could not be counted — a head that is not a full 40-hex sha, a missing
     ``kind``, an author who is not the owner, a dismissed review. Every one of those
@@ -2858,12 +2821,19 @@ def _scheduled_review_marker_scan(
     owner = (owner_repo.split("/")[0] if owner_repo else "").lower() or None
     accepted: dict[str, set[str]] = {}
     rejected: dict[str, set[str]] = {}
-    # (kind_or_None, reason, grammar_only). The third field is the whole point:
-    # True means a TRUSTED, CLEAN review really happened and only the marker text
-    # is malformed, so re-posting it is honest. False means no such review exists
-    # at this head -- another author's, a dismissed one, or one whose body carries
-    # a blocking finding -- and telling the owner to re-post there would be telling
-    # them to attest to something that did not happen.
+    # (kind_or_None, reason, supersedes_state). The third field decides ONE thing, and
+    # naming it for anything else is how it drifted: whether this block SUPERSEDES the
+    # kind's generic state in the message, or is reported alongside it.
+    #
+    # True where the block says something specific about THAT kind's status — a marker
+    # only the owner needs to correct, a kind nothing knows, a stale draft that cannot
+    # help. False where it says nothing about status: another author's block, or a
+    # dismissed review, both of which leave "has anything actually run?" untouched.
+    #
+    # It was once documented as "a TRUSTED, CLEAN review really happened", which it never
+    # computed and could not: the value is derived from whether the BODY tripped the
+    # blocking patterns, and a run that reports its own failure trips none of them. Under
+    # that reading a failed run counted as a clean one and outranked genuine history.
     unusable: list[tuple[str | None, str, bool]] = []
     for row in rows:
         body = row.get("body") or ""
@@ -2916,7 +2886,15 @@ def _scheduled_review_marker_scan(
                         "it is carried by a DISMISSED review, which no longer vouches "
                         "for anything"
                     )
-                unusable.append((_marker_kind_or_none(block), why, False))
+                # A stale PENDING draft SUPERSEDES the kind's generic state; a DISMISSED
+                # review does not. The difference is whether the block says anything about
+                # THIS kind's status. "A draft exists and naming an older commit means it
+                # cannot help you" is a specific, visible fact that the generic "something
+                # may still be in flight, waiting is right" would actively contradict. A
+                # dismissed review says only that IT no longer vouches — it leaves the
+                # question of whether anything has run untouched, so the kind keeps its own
+                # true state and its own advice.
+                unusable.append((_marker_kind_or_none(block), why, _state == "PENDING"))
             continue
         # The marker must mean "ran CLEAN", not merely "ran": a scheduled review whose body
         # CONTAINS a blocking finding ([P1]/HARD BLOCK/### ERROR, unless a clean marker
@@ -2958,17 +2936,18 @@ def _scheduled_review_marker_scan(
                         why = (
                             f"its head={loose.group(1)!r} is not a full 40-hex commit sha"
                         )
+                        why += _status_suffix_warning(loose.group(1))
                 else:
                     # Read PERMISSIVELY to say what is actually there. The strict
                     # expression refuses a status-suffixed `kind=leaks/failed`, and
                     # reporting that refusal as an absent field told the operator a
                     # field they had written did not exist.
                     loose = _SCHEDULED_REVIEW_LOOSE_KIND_RE.search(block)
-                    why = (
-                        f"its kind={loose.group(1)!r} is not a bare review name"
-                        if loose
-                        else "it carries no kind= field"
-                    )
+                    if not loose:
+                        why = "it carries no kind= field"
+                    else:
+                        why = f"its kind={loose.group(1)!r} is not a bare review name"
+                        why += _status_suffix_warning(loose.group(1))
                 # A malformed marker on a body that reads as BLOCKING is not a typo
                 # to be re-posted. The verdict survives the malformed field, because
                 # pasting a clean marker over an unresolved finding would make the
@@ -3146,33 +3125,42 @@ def _check_scheduled_claude_reviewed_head(
     # naming no kind, or naming one nothing requires (a typo such as a singular form),
     # cannot be credited to any review -- it is reported separately and claims nothing.
     _named = {k for k, _, _ in unusable if k is not None} & missing_set
-    # Being REPORTED and OUTRANKING history are two different jobs, and only the second
-    # may be gated on trust. Gating the first as well makes the block vanish from the
-    # message altogether -- silently dropping an untrusted marker is the very defect
-    # this change exists to end, and a test here catches it.
+    # ONE rule governs what follows, stated once because splitting it is what went wrong
+    # twice: A BLOCK SUPERSEDES A KIND'S GENERIC STATE ONLY IF IT SAYS SOMETHING SPECIFIC
+    # ABOUT THAT KIND'S STATUS. Anything else is reported ALONGSIDE the kind's true state,
+    # never instead of it.
     #
-    # So: every named kind is still reported (``_named``), while only a cause the OWNER
-    # can repair by fixing the marker (the third field) suppresses the history bullet.
-    # Letting EVERY unusable cause suppress it meant an untrusted block hid trusted
-    # evidence: on a public repository any account can post a marker naming the current
-    # head, and that erased "a routine ran on an older commit" -- the one fact telling
-    # the operator a review had ever happened. A dismissed review did the same. The
-    # verdict never moved (neither block satisfies anything); the report did.
-    _fixable_named = {
-        k for k, _, fixable in unusable if k is not None and fixable
+    # Reporting and superseding are separate jobs. ``_named`` is deliberately UNgated, so
+    # every named block is still reported; gating that too made blocks vanish from the
+    # message altogether -- silently dropping a marker is the defect this change exists to
+    # end, and six existing tests caught it immediately.
+    #
+    # The third field decides superseding, and it is NOT "can the owner repair this". That
+    # reading is close enough to survive casual inspection and wrong at one cell: a stale
+    # PENDING draft cannot be repaired by editing text, yet it must supersede, because
+    # "a draft exists and cannot help you" is precisely what the generic "something may
+    # still be in flight, waiting is right" would contradict. Superseding is true for a
+    # repairable marker, an unknown kind, and a stale draft; false for another author's
+    # block and a dismissed review, which say nothing about whether anything has run.
+    #
+    # Applying it to only ONE of the two consuming branches was the defect underneath all
+    # of this: an untrusted block stopped hiding "a routine ran on an older commit" but
+    # went on hiding "nothing has run yet, waiting is right" -- so on a public repository
+    # one comment from any account still deleted the guidance a fresh PR needs. The verdict
+    # never moved (no such block satisfies anything); the report an operator acts on did.
+    _superseding_named = {
+        k for k, _, supersedes in unusable if k is not None and supersedes
     } & missing_set
-    # A CURRENT malformed marker outranks marker history for the same kind: "you posted
-    # one and it needs one character fixed" is more actionable than "a routine ran on an
-    # older commit", and the latter used to hide the former on any PR with history.
     unusable_kinds = (missing_set - refused_kinds) & _named
-    # Subtracts the FIXABLE set, not every unusable kind, so a kind can now appear in
-    # BOTH bullets: "an untrusted block sits at head" AND "your own review ran on an
-    # older commit". That overlap is the point -- those are two independent facts and
-    # the operator needs both. Only a repairable typo earns the right to stand alone.
+    # Both consuming branches subtract the SAME set, so a kind can appear in two bullets:
+    # "an uncreditable block sits at head" AND its own true state. That overlap is the
+    # point -- they are independent facts and the operator needs both. Only a repairable
+    # marker earns the right to stand alone, because only then is "fix this one" the whole
+    # of the advice.
     elsewhere_kinds = {
-        k for k in missing_set - refused_kinds - _fixable_named if k in heads_by_kind
+        k for k in missing_set - refused_kinds - _superseding_named if k in heads_by_kind
     }
-    absent_kinds = missing_set - refused_kinds - unusable_kinds - elsewhere_kinds
+    absent_kinds = missing_set - refused_kinds - _superseding_named - elsewhere_kinds
     # Everything this cannot attribute to a required kind. Including the wrong-kind
     # case is the point: narrowing to named kinds without it made a block reading
     # `kind=<near-miss>` vanish from every group, and the message went back to claiming
@@ -3223,9 +3211,12 @@ def _check_scheduled_claude_reviewed_head(
     # What the reader needs from a GATE is what it found. What to do about it depends on
     # facts this code cannot see -- whether the review actually ran, whether a finding
     # was real -- and every attempt to guess ended up advising a way around the check.
-    # So: no remedy text, and no emitter suggestion, here. `--emit-marker` remains a
-    # command someone runs deliberately after a review, which is the only context in
-    # which it is honest.
+    # So: no remedy text here, and nothing offering to produce a marker. A command that
+    # emitted one was written and then removed: it was wired to nothing (the routines that
+    # actually post markers live outside this repository and were untouched), and the
+    # closing line of this very message already prints the complete marker with the full
+    # head filled in, so it duplicated output that already existed while adding a second
+    # place to reason about attestation.
     if unusable_kinds:
         parts.append(
             f"{', '.join(sorted(unusable_kinds))} — a marker block IS present on this "
@@ -5279,6 +5270,16 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         print(
             f"scheduled-claude: {'BLOCK — ' + sched_msg.splitlines()[0] if sched_msg else 'ok (at head)'}"
         )
+        # Render the TAIL, following the pin-receipts idiom above. Without this the whole
+        # per-cause diagnosis is discarded on the canonical pre-merge surface: line 0 is
+        # the summary, and its `present: none` clause is the exact string an operator was
+        # measured acting wrongly on -- they read "nothing was posted", waited, and the
+        # marker was sitting in the thread the whole time. The bullets that say WHICH
+        # cause it was live on lines 1+. Printing only line 0 means every improvement to
+        # them is invisible here, which is where the mistake was actually made.
+        if sched_msg:
+            for line in sched_msg.splitlines()[1:]:
+                print(f"  {line}")
         failures += 1 if sched_msg else 0
     # Fail-closed (the only mode now): a scan that could not be READ (gh error/malformed)
     # shows as a failure here, never as "ok" — the report must not issue a false all-clear.
@@ -5316,31 +5317,4 @@ if __name__ == "__main__":
             )
             sys.exit(2)
         sys.exit(check_pr_report(sys.argv[2], repo=_repo))
-    # Producer mode: `git_push_guard.py --emit-marker <N> --kind <name> [--repo O/R]`
-    # prints the scheduled-review marker for that PR's CURRENT head, so the 40-hex
-    # sha is read rather than retyped. See emit_scheduled_review_marker.
-    if len(sys.argv) >= 3 and sys.argv[1] == "--emit-marker":
-        _rest = sys.argv[3:]
-        _repo = _parse_check_pr_repo(_rest)
-        if _repo is _CHECK_PR_REPO_EMPTY:
-            print(
-                "ERROR: --repo/-R was given an empty value. Specify OWNER/REPO, or "
-                "omit the option to use the current repository.",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-        _kind = None
-        for _i, _a in enumerate(_rest):
-            if _a == "--kind" and _i + 1 < len(_rest):
-                _kind = _rest[_i + 1]
-            elif _a.startswith("--kind="):
-                _kind = _a.split("=", 1)[1]
-        if not _kind:
-            print(
-                "ERROR: --emit-marker needs --kind <name>. Known kinds: "
-                f"{', '.join(_KNOWN_SCHEDULED_REVIEW_KINDS)}.",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-        sys.exit(emit_scheduled_review_marker(sys.argv[2], kind=_kind, repo=_repo))
     run_guard(main, "git_push_guard")

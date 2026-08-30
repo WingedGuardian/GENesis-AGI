@@ -1057,14 +1057,33 @@ findings below, a gated `gh pr merge`:
   names the PR's current head — so if any required routine never ran, ran on a stale
   commit, or was rate-limited, the merge blocks (naming the missing kinds). An ADVISORY
   routine still posts its review on the PR to be read/addressed, but its absence does not
-  block. A missing marker has **three causes needing different actions**, and the block
-  message now names which one you are in — do not guess:
+  block. A missing marker has **five causes needing different actions**, and the block
+  message names which one you are in — do not guess. Run
+  `git_push_guard.py --check-pr <N>`, which renders the per-cause bullets, not just its
+  summary line (that line's `present: none` clause is a SUMMARY and reads like "nothing
+  was posted" in every one of these cases):
   (1) *no marker at any head* — nothing has run; on a freshly-opened PR a routine may
   still be in flight, so **waiting is correct**;
   (2) *a marker at an EARLIER head* — a routine ran, then a push moved the head. Routines
   are generally not re-run on a push, so waiting is unlikely to help: re-review the
   current head and post the marker by hand;
-  (3) *a marker AT this head that was REFUSED* — see the clean-verdict rule below.
+  (3) *a marker AT this head that was REFUSED* — see the clean-verdict rule below;
+  (4) *a marker block that is PRESENT but cannot be credited* — a head that is not full
+  40-lowercase-hex, a `kind` the grammar refuses, an author who is not the repo owner, a
+  dismissed review, a stale unpublished draft. It is reported with its raw text quoted, so
+  "you posted one that does not count" is distinguishable from "nobody posted anything";
+  (5) *a block naming no REQUIRED kind* — reported as unscoped, and deliberately credited
+  to no review: guessing which kind a block meant would steer the reader into attesting
+  for a review that never ran.
+  A block in (4) or (5) SUPERSEDES a kind's own state — replacing (1)'s or (2)'s advice —
+  only when it says something specific about that kind's status (a marker only the owner
+  need correct, an unknown kind, a stale draft that cannot help). Another author's block
+  and a dismissed review say nothing about whether anything ran, so they are reported
+  ALONGSIDE the kind's true state, never instead of it. On a public repository the
+  alternative lets one comment from any account delete the guidance a fresh PR needs.
+  A value carrying a `/status` suffix (`kind=leaks/failed`) is refused AND flagged as a
+  run that reported its own failure — naming only the grammar problem would read as an
+  instruction to strip the suffix and produce a marker vouching for a failed run.
   Or append `# scheduled-review-override` to merge anyway (the conscious "merge without
   the scheduled reviews" case). Head match is EXACT — no ancestor walk, no delta
   tolerance, unlike the Codex freshness gate, which grants relief on a provably trivial

@@ -815,6 +815,40 @@ class TestCheckPrReportFreshnessLabel:
         )
         assert "ok (current)" in out
 
+    def test_the_scheduled_row_renders_its_per_cause_tail(self, monkeypatch, capsys):
+        """The canonical report printed only line 0 of the scheduled-review message.
+
+        Line 0 is the summary, and its `present: none` clause is the exact string an
+        operator was measured acting wrongly on — read as "nothing was posted", waited,
+        while the marker sat in the thread. Every per-cause bullet lives on lines 1+, so
+        printing line 0 alone made the entire diagnosis invisible on the one surface
+        where the mistake is actually made. The sibling `pin-receipts` row already
+        rendered its tail; this asserts the scheduled row does too.
+        """
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "leaks")
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            json.dumps(
+                {
+                    "login": "drive-by",
+                    "author_association": "CONTRIBUTOR",
+                    "body": f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->",
+                }
+            ),
+        )
+        out = self._run_report(
+            monkeypatch,
+            capsys,
+            reviews=_reviews_jsonl(HEAD),
+            compare=_compare_json("identical"),
+        )
+        assert "scheduled-claude: BLOCK" in out
+        assert "drive-by" in out, (
+            "the per-cause bullet never reached the canonical report, so the whole "
+            f"diagnosis is invisible where the operator reads it:\n{out}"
+        )
+
 
 class TestMergeDeadline:
     """Codex P1 #1373: _gh_timeout bounds the AGGREGATE merge-path gh time under the
@@ -1501,19 +1535,45 @@ class TestAnUnusableMarkerIsNotReportedAsAbsent:
         path, so `"owner" in msg` is true whether or not this branch exists. That is
         the assertion-also-true-on-the-success-path shape, and it was the first draft
         of this very test.
+
+        REWRITTEN, and the reason is recorded rather than the line quietly relaxed.
+        This test used to ALSO assert the waiting guidance was suppressed. That is the
+        same defect a sibling test on this class had already been rewritten to remove:
+        `test_a_marker_with_no_kind_is_reported_but_claims_no_kind` records that a block
+        which cannot be credited "leaves every unidentified kind in its own true state",
+        and that "absent legitimately carries the in-flight guidance. The assertion that
+        used to forbid that wording was encoding the bug." An untrusted block is that
+        same shape reached by a different route — it says who posted it, and nothing
+        whatever about whether a review has run. On a PUBLIC repository the old
+        behaviour meant one comment from any account deleted the guidance a freshly
+        opened PR needs, which is the branch that exists to stop an operator reaching
+        for an override on the irreducible gate.
         """
         body = f"scan done.\n<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
         msg = self._block_msg(
             monkeypatch, self._row(body, login="drive-by", author_association="CONTRIBUTOR")
         )
         assert "drive-by" in msg, "the untrusted author must be named"
-        assert "may still be in flight" not in msg.lower()
+        assert "may still be in flight" in msg.lower(), (
+            "an untrusted block consumed the kind's true state; nothing trustworthy has "
+            f"run for leaks, so the waiting guidance must survive:\n{msg}"
+        )
 
     def test_a_marker_in_a_dismissed_review_is_reported(self, monkeypatch):
+        """Same rewrite, same precedent, reached by review STATE rather than authorship.
+
+        A dismissed review says only that IT no longer vouches. Whether anything has run
+        for this kind is a separate question it does not answer, so the kind keeps its
+        own state and its own advice. Contrast the stale-PENDING case below, which DOES
+        supersede: there the block genuinely reports on this kind's status.
+        """
         body = f"scan done.\n<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
         msg = self._block_msg(monkeypatch, self._row(body, state="DISMISSED")).lower()
         assert "dismissed" in msg
-        assert "may still be in flight" not in msg
+        assert "may still be in flight" in msg, (
+            "a dismissed review consumed the kind's true state, deleting the guidance "
+            f"for a review that has not run:\n{msg}"
+        )
 
     def test_a_GENUINELY_absent_marker_still_advises_waiting(self, monkeypatch):
         """CONTROL. Without this, an implementation that called EVERYTHING unusable
@@ -1531,60 +1591,6 @@ class TestAnUnusableMarkerIsNotReportedAsAbsent:
             monkeypatch, self._row("I will post the genesis-scheduled-review marker shortly.")
         ).lower()
         assert "may still be in flight" in msg
-
-
-class TestTheGateCanEmitAMarkerItWillItselfAccept:
-    """PREVENT, not just diagnose.
-
-    Every marker is hand-authored: nothing in this repository emitted one, so the
-    40-hex contract lived only in a regex on the consumer side and in prose asking a
-    human to copy a sha correctly. That is the shape that produced the abbreviated
-    head above.
-
-    These tests pin the ROUND TRIP -- what the emitter prints is fed back through the
-    real scan and must be ACCEPTED. Producer and consumer therefore cannot drift:
-    a change to either regex that the emitter does not satisfy fails here.
-    """
-
-    def _emit(self, monkeypatch, capsys, head=HEAD, kind="leaks"):
-        monkeypatch.setenv("_TEST_GH_HEAD_SHA", head)
-        rc = _mod.emit_scheduled_review_marker("1", kind=kind, repo="acme/pub")
-        return rc, capsys.readouterr()
-
-    def test_the_emitted_marker_round_trips_through_the_real_scan(self, monkeypatch, capsys):
-        rc, cap = self._emit(monkeypatch, capsys)
-        assert rc == 0
-        marker = cap.out.strip()
-        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
-        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "leaks")
-        monkeypatch.setenv(
-            "_TEST_GH_SCHEDULED_COMMENTS",
-            json.dumps({"login": "owner", "author_association": "OWNER", "body": marker}),
-        )
-        assert (
-            _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub") is None
-        ), f"the gate rejected its own emitter's output: {marker!r}"
-
-    def test_it_emits_the_full_forty_hex_head(self, monkeypatch, capsys):
-        _, cap = self._emit(monkeypatch, capsys)
-        assert f"head={HEAD}" in cap.out
-        assert f"head={HEAD[:8]} " not in cap.out
-
-    def test_it_refuses_rather_than_emitting_an_unusable_marker(self, monkeypatch, capsys):
-        """If the head cannot be read, printing a marker with a blank or partial head
-        would manufacture exactly the defect this change exists to remove."""
-        monkeypatch.setenv("_TEST_GH_HEAD_SHA", "")
-        rc = _mod.emit_scheduled_review_marker("1", kind="leaks", repo="acme/pub")
-        cap = capsys.readouterr()
-        assert rc != 0
-        assert "genesis-scheduled-review" not in cap.out
-
-    def test_it_refuses_a_kind_the_gate_could_never_accept(self, monkeypatch, capsys):
-        """A kind outside the marker grammar can never satisfy the gate, so emitting
-        it would hand the operator a marker that silently does nothing."""
-        rc, cap = self._emit(monkeypatch, capsys, kind="Not A Kind")
-        assert rc != 0
-        assert "genesis-scheduled-review" not in cap.out
 
 
 BLOCKING_PROSE = "[P1] a real finding that has not been resolved"
@@ -1917,39 +1923,49 @@ class TestTheReportReadsEveryFieldPermissively:
             f"the block DOES carry a kind= field; the gate merely refused it:\n{msg}"
         )
 
-    def test_a_status_suffixed_kind_does_not_advise_waiting(self, monkeypatch):
-        """The second false statement, and the more expensive one.
+    def test_a_status_suffixed_value_says_what_the_suffix_MEANS(self, monkeypatch):
+        """Naming only the grammar problem is an instruction to strip the suffix.
 
-        A failed run is the state where the operator most needs to hear "it ran and
-        failed" -- and instead heard "no marker at ANY head yet, waiting IS the right
-        move", which is the precise misdiagnosis this whole change exists to end.
+        A reader who follows "its kind is not a bare review name" produces a
+        well-formed marker attesting to a run that reported its own FAILURE, on the
+        gate this repository calls irreducible. The message must therefore say what
+        the suffix means, not merely that the grammar refused it.
+
+        Both fields reach this branch by different routes and both are asserted here:
+        fixing only the one a review happened to name is how this class recurs.
+        """
+        for value, mk in (
+            ("leaks/failed", lambda: self._marker(kind="leaks/failed")),
+            (f"{HEAD}/failed", lambda: self._marker(head=f"{HEAD}/failed")),
+        ):
+            msg = self._msg(monkeypatch, self._row("run failed.\n" + mk()))
+            assert msg, value
+            assert f"'{value}'" in msg, f"{value}: the operator's own text must be quoted:\n{msg}"
+            assert "did NOT complete cleanly" in msg, (
+                f"{value}: the message named the grammar problem only, which reads as "
+                f"'strip the suffix' and yields a marker vouching for a failed run:\n{msg}"
+            )
+
+    def test_a_refused_value_is_credited_to_no_review(self, monkeypatch):
+        """CONTROL for the reverted attribution, and it is the load-bearing one.
+
+        An earlier revision read `leaks/failed` as naming `leaks`, on the reasoning
+        that it says so unambiguously. That let a FAILED run occupy the kind and, via
+        the state rule, suppress the bullet reporting a real review on an earlier
+        commit — so a failed run outranked history that an untrusted stranger's marker
+        was not allowed to outrank. A value the strict grammar refuses now names
+        nothing, and `leaks` keeps its own true state.
+
+        Asserted for a value whose stem IS a real kind (`leaks/failed`), because that
+        is the one an attributing implementation would credit; a near-miss stem would
+        pass on both implementations and prove nothing.
         """
         msg = self._msg(monkeypatch, self._row("run failed.\n" + self._marker(kind="leaks/failed")))
         assert msg
-        assert "may still be in flight" not in msg.lower(), (
-            f"a routine that RAN was reported as never having been posted:\n{msg}"
-        )
-
-    def test_a_near_miss_kind_is_still_NOT_attributed(self, monkeypatch):
-        """CONTROL, and it guards a deliberate earlier refusal rather than a wording.
-
-        Reading `leaks/failed` as `leaks` is an exact match on the segment before the
-        suffix, not a resemblance judgement. `leak` is a resemblance judgement, and
-        attributing it was declined in review because a guessed kind steers the reader
-        toward vouching for a review that never ran. Without this control the permissive
-        read above could quietly widen into exactly that.
-
-        The value is `leak/failed`, NOT a bare `leak`, and the difference is the whole
-        point: a bare `leak` is matched by the STRICT expression and never reaches the
-        permissive branch at all, so a control written that way passes identically on
-        an implementation that guesses. This one drives the branch under test.
-        """
-        msg = self._msg(monkeypatch, self._row("bad run.\n" + self._marker(kind="leak/failed")))
-        assert msg
-        assert "'leak/failed'" in msg, f"the value the operator wrote must be quoted:\n{msg}"
+        assert "'leaks/failed'" in msg, f"the block must still be REPORTED:\n{msg}"
         assert "may still be in flight" in msg.lower(), (
-            "an unrecognisable kind was CREDITED to the required review it merely "
-            f"resembles; leaks has no marker and must still read as absent:\n{msg}"
+            "a refused value was credited to the review it names; leaks has no usable "
+            f"marker and must keep its own state:\n{msg}"
         )
 
     def test_an_uppercase_head_is_reported_as_case_not_as_length(self, monkeypatch):
@@ -2001,4 +2017,49 @@ class TestTheReportReadsEveryFieldPermissively:
         assert "dismissed" in msg.lower(), f"the dismissed block must be reported:\n{msg}"
         assert OTHER_HEAD[:12] in msg, (
             f"a dismissed review erased the trusted older-head evidence:\n{msg}"
+        )
+
+    def test_an_untrusted_block_does_not_erase_the_ABSENT_guidance(self, monkeypatch):
+        """The same rule on its OTHER consuming branch, and the reason it is one rule.
+
+        Gating only the history branch left this one open: on a freshly-opened PR where
+        the routine genuinely has not run, a single comment from any account deleted
+        "nothing has run yet, waiting is right" — the branch whose whole purpose is to
+        stop an operator reaching for an override on the irreducible gate. On a public
+        repository the trigger is one comment from anybody.
+        """
+        msg = self._msg(
+            monkeypatch,
+            self._row(
+                self._marker(head=HEAD), login="drive-by", author_association="CONTRIBUTOR"
+            ),
+        )
+        assert msg
+        assert "drive-by" in msg, f"the untrusted block must still be reported:\n{msg}"
+        assert "may still be in flight" in msg.lower(), (
+            "an untrusted comment consumed the kind's true state and deleted the "
+            f"waiting guidance a fresh PR needs:\n{msg}"
+        )
+
+    def test_an_owner_repairable_marker_DOES_still_outrank_history(self, monkeypatch):
+        """POSITIVE CONTROL for the rule above, without which it could be inert.
+
+        "Only a repairable block consumes a kind's state" is satisfied just as well by
+        an implementation where NOTHING consumes it — every test above would still pass
+        while the outranking this rule exists to preserve was silently gone. Here the
+        owner's own one-character typo sits at head, and the history bullet must yield
+        to it, because "fix this one" is then the whole of the advice.
+        """
+        rows = "\n".join(
+            [
+                self._row("older run.\n" + self._marker(head=OTHER_HEAD)),
+                self._row("scan done.\n" + self._marker(head=HEAD[:8])),
+            ]
+        )
+        msg = self._msg(monkeypatch, rows)
+        assert msg
+        assert f"'{HEAD[:8]}'" in msg, f"the repairable typo must be reported:\n{msg}"
+        assert OTHER_HEAD[:12] not in msg, (
+            "an owner-repairable marker at head no longer outranks stale history, so "
+            f"the trust rule has become inert rather than selective:\n{msg}"
         )
