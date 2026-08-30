@@ -2875,7 +2875,7 @@ def _scheduled_review_marker_scan(
     # "clean" (explicit verdict line), "refused" (blocking finding, no verdict) or "plain"
     # (neither). The verdict for the pair is resolved AFTER the loop from this list -- see
     # there for the rule and why the order matters.
-    stmts: dict[tuple[str, str], list[str]] = {}
+    stmts: dict[tuple[str, str], list[tuple[str, str]]] = {}
     # Chronology: rows carry `stamp` = last modification (updated_at for issue comments,
     # which are editable; submitted_at for reviews). The two endpoints are fetched
     # separately, so without sorting a review could sort before a comment posted after
@@ -3041,7 +3041,9 @@ def _scheduled_review_marker_scan(
                     _why += ", and its body reads as carrying a blocking finding"
                 unusable.append((_kind, _why, True))
                 continue
-            stmts.setdefault((head_m.group(1).lower(), _kind), []).append(verdict)
+            stmts.setdefault((head_m.group(1).lower(), _kind), []).append(
+                (row.get("stamp") or row.get("created_at") or "", verdict)
+            )
     # RESOLUTION. Each row used to choose its own map, so a second owner comment at the
     # same head -- same marker, ordinary prose -- was accepted while the first row's [P1]
     # sat refused, and the gate passed with the finding unchanged. The first fix let any
@@ -3058,45 +3060,39 @@ def _scheduled_review_marker_scan(
     # commit is what a new commit fixes. Every superseded row is still LISTED, so the
     # report never says one block where two exist.
     for (h, k), seq in stmts.items():
-        decisive = [v for v in seq if v != "plain"]
-        final = decisive[-1] if decisive else "plain"
+        decisive = [(st, v) for st, v in seq if v != "plain"]
+        if decisive:
+            # A TIE on real timestamps between contradictory decisive statements is
+            # refused. Sorting is stable, so tied rows keep fetch order -- issue
+            # comments before reviews -- which is not event order; a clean review and a
+            # blocking comment in the same second would otherwise resolve backwards.
+            # Rows with no stamp (the test seam) cannot tie: list order is their order.
+            top = max(st for st, _ in decisive)
+            tied = {v for st, v in decisive if st and st == top}
+            final = "refused" if len(tied) > 1 else decisive[-1][1]
+        else:
+            final = "plain"
         (rejected if final == "refused" else accepted).setdefault(h, set()).add(k)
-        # The verdict maps are SETS, so repeated statements collapsed to one rendered row
-        # and the report said one block where several were observed. Every repeat is a row.
-        same = seq.count(final) - 1 if final != "plain" else seq.count("plain") - 1
-        if same > 0:
-            unusable.append(
-                (k, f"{same} further block(s) at this head repeating the same statement", True)
+        # Every statement that did not become the verdict is still a row -- by STATUS
+        # and by COUNT, so the report never says one block where several were observed.
+        # ONE ROW PER BLOCK -- never a count folded into a row -- so the header's block
+        # count is the number of blocks the operator can see in the thread.
+        superseded = {
+            "plain": "a plain re-post at this head with no verdict line, not decisive",
+            "clean": "an explicit clean verdict at this head, superseded by a LATER blocking finding",
+            "refused": "a refusal at this head, superseded by a LATER explicit clean verdict",
+        }
+        seen_final = False
+        for _, v in seq:
+            if v == final and not seen_final:
+                seen_final = True  # the statement that became the verdict is rendered by its map
+                continue
+            text = (
+                "a further block at this head repeating the same statement"
+                if v == final
+                else superseded[v]
             )
-        if final == "refused":
-            n_plain = seq.count("plain")
-            if n_plain:
-                unusable.append(
-                    (
-                        k,
-                        f"a plain re-post at this head ({n_plain} block(s), no verdict "
-                        f"line) does not override the refusal for this kind",
-                        True,
-                    )
-                )
-            if "clean" in seq:
-                unusable.append(
-                    (
-                        k,
-                        "an explicit clean verdict at this head, superseded by a LATER "
-                        "blocking finding for this kind",
-                        True,
-                    )
-                )
-        elif "refused" in seq:
-            unusable.append(
-                (
-                    k,
-                    "a refusal at this head, superseded by a LATER explicit clean "
-                    "verdict for this kind",
-                    True,
-                )
-            )
+            unusable.append((k, text, True))
     return accepted, rejected, unusable
 
 
@@ -3263,9 +3259,9 @@ def _check_scheduled_claude_reviewed_head(
     # steers the reader toward attesting for a review that never ran.
     unscoped = [(k, r) for k, r, _ in unusable if k is None or k not in required_set]
     if unscoped:
-        listing = "".join(
-            f"\n      - [{k or 'no kind named'}] {r}" for k, r in unscoped[:6]
-        ) + (f"\n      - (+{len(unscoped) - 6} more)" if len(unscoped) > 6 else "")
+        # Every row, never a "+N more": a truncated inventory is a partial one, and the
+        # seventh block is as likely as the first to carry the failed-run suffix.
+        listing = "".join(f"\n      - [{k or 'no kind named'}] {r}" for k, r in unscoped)
         parts.append(
             f"unscoped — {len(unscoped)} marker block(s) name no required kind and count "
             f"toward nothing:{listing}"

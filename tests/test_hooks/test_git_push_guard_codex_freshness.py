@@ -2242,7 +2242,7 @@ class TestARefusalAtHeadIsNotLaunderedByAPlainRepost:
         )
         assert msg
         assert "leaks — 2 marker block(s) found" in msg, msg
-        assert "plain re-post" in msg, msg
+        assert "a plain re-post at this head" in msg, msg
 
 
 class TestNamingProblemsKeepTheBodyVerdict:
@@ -2325,3 +2325,68 @@ class TestChronologyComesFromTimestampsNotFetchOrder:
         msg = self._gate(monkeypatch, rows)
         assert msg
         assert "leaks — 2 marker block(s) found" in msg, msg
+
+
+class TestTiedTimestampsFailClosed:
+    """Sorting is stable, so tied stamps keep fetch order (issue comments before
+    reviews), which is not event order. Contradictory decisive statements that tie on
+    a REAL timestamp are refused; rows without a stamp keep list order and cannot tie."""
+
+    @staticmethod
+    def _rows(p1_stamp, pass_stamp):
+        m = f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+        return "\n".join([
+            json.dumps({"login": "owner", "author_association": "OWNER", "body": "[P1] found\n" + m, "stamp": p1_stamp}),
+            json.dumps({"login": "owner", "author_association": "OWNER", "body": "VERDICT: PASS\n" + m, "stamp": pass_stamp, "state": "APPROVED"}),
+        ])
+
+    def _gate(self, monkeypatch, rows):
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", rows)
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "leaks")
+        return _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
+
+    def test_a_tie_between_a_finding_and_a_verdict_is_refused(self, monkeypatch):
+        T = "2026-01-01T00:00:00Z"
+        assert self._gate(monkeypatch, self._rows(T, T)), "tied stamps resolved by fetch order and passed"
+
+    def test_a_later_verdict_by_one_second_still_clears(self, monkeypatch):
+        """CONTROL: the tie rule must not swallow a genuinely later verdict."""
+        assert self._gate(monkeypatch, self._rows("2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z")) is None
+
+    def test_unstamped_rows_keep_list_order_and_do_not_tie(self, monkeypatch):
+        """CONTROL for the seam: no stamps, [P1] then PASS in list order -> clears."""
+        m = f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+        rows = "\n".join([
+            json.dumps({"login": "owner", "author_association": "OWNER", "body": "[P1] found\n" + m}),
+            json.dumps({"login": "owner", "author_association": "OWNER", "body": "VERDICT: PASS\n" + m}),
+        ])
+        assert self._gate(monkeypatch, rows) is None
+
+
+class TestEveryStatementIsCountedAndEveryUnscopedRowShown:
+    @staticmethod
+    def _row(body, **kw):
+        d = {"login": "owner", "author_association": "OWNER", "body": body}
+        d.update(kw)
+        return json.dumps(d)
+
+    def _msg(self, monkeypatch, rows):
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", rows)
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "leaks")
+        return _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub") or ""
+
+    def test_two_refusals_a_verdict_and_a_plain_repost_at_a_stale_head_are_four_blocks(self, monkeypatch):
+        m = f"<!-- genesis-scheduled-review: head={OTHER_HEAD} kind=leaks -->"
+        rows = "\n".join([self._row("[P1] a\n" + m), self._row("[P1] b\n" + m), self._row("VERDICT: PASS\n" + m), self._row("scan.\n" + m)])
+        msg = self._msg(monkeypatch, rows)
+        assert "leaks — 4 marker block(s) found" in msg, msg
+        assert msg.count("a refusal at this head, superseded") == 2, msg
+        assert msg.count("a plain re-post at this head") == 1, msg
+
+    def test_more_than_six_unscoped_blocks_are_all_listed(self, monkeypatch):
+        rows = "\n".join(self._row(f"x{i}.\n<!-- genesis-scheduled-review: head={HEAD} kind=bogus{i} -->") for i in range(8))
+        msg = self._msg(monkeypatch, rows)
+        assert "more)" not in msg, msg
+        assert all(f"kind='bogus{i}'" in msg for i in range(8)), msg
