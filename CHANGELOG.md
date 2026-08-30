@@ -372,6 +372,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Security
 
+- **A malformed Claude Code session id can no longer create directories outside
+  the session tree.** Hooks store per-session state under
+  `~/.genesis/sessions/<session-id>/`, interpolating the id straight into the
+  path — and two sites create the directory. An id containing `/` or `..` therefore
+  escaped that tree, and the guard against it had been hand-copied into some hooks
+  in three different shapes while being omitted from eight call sites across four
+  files. The path-building sites now go through one shared helper
+  (`hook_input.session_path`), which returns nothing for an unsafe id so the caller
+  skips exactly the filesystem operation and nothing else; a site that needs only
+  the yes/no answer calls the shared validator directly. Normal sessions are
+  unaffected. This is the hook contract, not a repo-wide one: several other hooks
+  and a number of paths under `src/` still carry their own hand-written check —
+  including one file this change otherwise touches — and consolidating those is
+  separate work. An id that fails the check falls back to
+  the shared `unknown` key — itself a directory, so such sessions share one bucket
+  rather than escaping the tree.
+
 - **Hook-surface PRs can no longer merge without a current GitHub Codex review.**
   The merge gate's review-freshness check now treats any unreviewed delta touching
   the enforcement-hook surface (`scripts/hooks/**`, the global bash safety hook,
