@@ -1861,3 +1861,144 @@ class TestEveryMarkerFormIsAccountedFor:
         )
         assert msg
         assert "may still be in flight" in msg.lower()
+
+
+class TestTheReportReadsEveryFieldPermissively:
+    """One class behind several defects: the GATE's strict grammar was reused to answer
+    a REPORTING question, so a REFUSED value became indistinguishable from an ABSENT
+    one and the message asserted things that were false.
+
+    This change had already solved that once -- on the head axis, with a permissive
+    second read used only for the message. It did not generalise, and every remaining
+    field reproduced the defect on its own axis:
+
+      * head  -- had the permissive read, but still called a wrong-CASE 40-hex head
+                 "not a full 40-hex commit sha", sending the operator to recount 40
+                 characters and find nothing wrong
+      * kind  -- had no permissive read, so `kind=leaks/failed` (a form the strict
+                 grammar's own comment anticipates) was reported as carrying no kind
+                 field at all, and the kind then fell to "waiting IS the right move"
+                 for a routine that had run AND FAILED
+      * trust -- the fixable/not-fixable flag was computed at every call site and then
+                 discarded, so an UNTRUSTED block could suppress trusted evidence
+
+    Each test asserts the honest statement AND denies the false one, so a regression
+    that drops the permissive read fails instead of sliding through on a substring.
+    """
+
+    @staticmethod
+    def _row(body, *, login="owner", author_association="OWNER", **kw):
+        row = {"login": login, "author_association": author_association, "body": body}
+        row.update(kw)
+        return json.dumps(row)
+
+    @staticmethod
+    def _marker(head=HEAD, kind="leaks"):
+        parts = ([f"head={head}"] if head else []) + ([f"kind={kind}"] if kind else [])
+        return "<!-- genesis-scheduled-review: " + " ".join(parts) + " -->"
+
+    def _msg(self, monkeypatch, comments, required="leaks"):
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", comments)
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", required)
+        return _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
+
+    def test_a_status_suffixed_kind_is_not_reported_as_a_missing_field(self, monkeypatch):
+        """`kind=leaks/failed` is refused by the gate -- correctly -- but it IS there.
+
+        The strict expression's own comment names this exact form as the thing the
+        whitespace terminator exists to reject, so it is an anticipated shape rather
+        than a hypothetical. Reporting it as "carries no kind= field" is simply false.
+        """
+        msg = self._msg(monkeypatch, self._row("run failed.\n" + self._marker(kind="leaks/failed")))
+        assert msg, "a failed run satisfies nothing, so this must still block"
+        assert "'leaks/failed'" in msg, f"the value the operator wrote must be quoted:\n{msg}"
+        assert "carries no kind= field" not in msg, (
+            f"the block DOES carry a kind= field; the gate merely refused it:\n{msg}"
+        )
+
+    def test_a_status_suffixed_kind_does_not_advise_waiting(self, monkeypatch):
+        """The second false statement, and the more expensive one.
+
+        A failed run is the state where the operator most needs to hear "it ran and
+        failed" -- and instead heard "no marker at ANY head yet, waiting IS the right
+        move", which is the precise misdiagnosis this whole change exists to end.
+        """
+        msg = self._msg(monkeypatch, self._row("run failed.\n" + self._marker(kind="leaks/failed")))
+        assert msg
+        assert "may still be in flight" not in msg.lower(), (
+            f"a routine that RAN was reported as never having been posted:\n{msg}"
+        )
+
+    def test_a_near_miss_kind_is_still_NOT_attributed(self, monkeypatch):
+        """CONTROL, and it guards a deliberate earlier refusal rather than a wording.
+
+        Reading `leaks/failed` as `leaks` is an exact match on the segment before the
+        suffix, not a resemblance judgement. `leak` is a resemblance judgement, and
+        attributing it was declined in review because a guessed kind steers the reader
+        toward vouching for a review that never ran. Without this control the permissive
+        read above could quietly widen into exactly that.
+
+        The value is `leak/failed`, NOT a bare `leak`, and the difference is the whole
+        point: a bare `leak` is matched by the STRICT expression and never reaches the
+        permissive branch at all, so a control written that way passes identically on
+        an implementation that guesses. This one drives the branch under test.
+        """
+        msg = self._msg(monkeypatch, self._row("bad run.\n" + self._marker(kind="leak/failed")))
+        assert msg
+        assert "'leak/failed'" in msg, f"the value the operator wrote must be quoted:\n{msg}"
+        assert "may still be in flight" in msg.lower(), (
+            "an unrecognisable kind was CREDITED to the required review it merely "
+            f"resembles; leaks has no marker and must still read as absent:\n{msg}"
+        )
+
+    def test_an_uppercase_head_is_reported_as_case_not_as_length(self, monkeypatch):
+        """40 uppercase hex IS full length. Telling that operator it is not sends them
+        to count characters, find 40, and learn nothing about the real cause."""
+        msg = self._msg(monkeypatch, self._row("scan done.\n" + self._marker(head=HEAD.upper())))
+        assert msg
+        assert "lowercase" in msg, f"the real cause is case, and must be named:\n{msg}"
+        assert "is not a full 40-hex commit sha" not in msg, (
+            f"the head IS full length; only its case is wrong:\n{msg}"
+        )
+
+    def test_an_untrusted_block_does_not_erase_the_older_head_evidence(self, monkeypatch):
+        """On a PUBLIC repo any account can post a marker naming the current head.
+
+        Doing so used to delete the "a routine ran on an older commit" bullet -- the
+        one fact telling the operator a review had ever happened. The verdict never
+        moved (an untrusted marker satisfies nothing); the report an operator acts on
+        did, and it lost the actionable half.
+        """
+        rows = "\n".join(
+            [
+                self._row("older run.\n" + self._marker(head=OTHER_HEAD)),
+                self._row(
+                    "scan done.\n" + self._marker(head=HEAD),
+                    login="drive-by",
+                    author_association="CONTRIBUTOR",
+                ),
+            ]
+        )
+        msg = self._msg(monkeypatch, rows)
+        assert msg
+        assert "drive-by" in msg, f"the untrusted block must still be reported:\n{msg}"
+        assert OTHER_HEAD[:12] in msg, (
+            f"an untrusted commenter erased the trusted older-head evidence:\n{msg}"
+        )
+
+    def test_a_dismissed_review_does_not_erase_the_older_head_evidence(self, monkeypatch):
+        """Same mechanism, reached by review STATE rather than by authorship -- which
+        is why it is fixed on the flag both share rather than at either site."""
+        rows = "\n".join(
+            [
+                self._row("older run.\n" + self._marker(head=OTHER_HEAD)),
+                self._row("scan done.\n" + self._marker(head=HEAD), state="DISMISSED"),
+            ]
+        )
+        msg = self._msg(monkeypatch, rows)
+        assert msg
+        assert "dismissed" in msg.lower(), f"the dismissed block must be reported:\n{msg}"
+        assert OTHER_HEAD[:12] in msg, (
+            f"a dismissed review erased the trusted older-head evidence:\n{msg}"
+        )

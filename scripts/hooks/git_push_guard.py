@@ -2407,10 +2407,24 @@ _SCHEDULED_REVIEW_BLOCK_RE = re.compile(
 # violating fail-closed (a failed/corrupt routine run must NOT satisfy the gate).
 _SCHEDULED_REVIEW_HEAD_RE = re.compile(r"\bhead=([0-9a-f]{40})(?=\s|\Z)")
 _SCHEDULED_REVIEW_KIND_RE = re.compile(r"\bkind=([a-z0-9][a-z0-9._-]*)(?=\s|\Z)")
-# Deliberately permissive, and used ONLY to quote back what a malformed marker
-# actually said. It must never feed the gate: matching loosely here is how the
-# operator learns their head= was abbreviated, not a second way to satisfy it.
+# THE REPORTING GRAMMAR -- deliberately a SECOND, permissive read of the same text.
+#
+# The strict expressions above answer "does this count?" and must stay narrow. A
+# MESSAGE answers a different question -- "what did the operator actually write?"
+# -- and answering it with the strict expression produces confident falsehoods,
+# because a REFUSED value and an ABSENT one become indistinguishable. That is the
+# exact defect this whole change exists to end, so it must not be reintroduced one
+# field at a time: EVERY field the block message describes needs a permissive
+# counterpart here, and a new strict field is not finished until it has one.
+#
+# These must never feed the gate. Matching loosely here is how the operator learns
+# their head= was abbreviated -- never a second way to satisfy anything.
 _SCHEDULED_REVIEW_LOOSE_HEAD_RE = re.compile(r"\bhead=(\S+)")
+_SCHEDULED_REVIEW_LOOSE_KIND_RE = re.compile(r"\bkind=(\S+)")
+# A 40-hex head in the WRONG CASE is full-length and well-formed apart from case.
+# Telling that operator their head "is not a full 40-hex commit sha" sends them to
+# recount 40 characters and find nothing wrong, so the two causes are separated.
+_SCHEDULED_REVIEW_ANYCASE_HEAD_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
 
 # Default scheduled-review kinds the merge gate REQUIRES at head. A PR merges only when
 # a valid owner-authored marker for EACH effective required kind names the current head.
@@ -2724,9 +2738,26 @@ def _marker_kind_or_none(block: str) -> str | None:
     Lets a block that is being REJECTED still be attributed to the kind it was
     meant to satisfy, so the block message can scope its guidance instead of
     reporting an unattached complaint.
+
+    A STATUS-SUFFIXED value (``kind=leaks/failed``) is refused by the gate grammar
+    -- correctly, since a failed run must never satisfy anything -- but it NAMES
+    its review unambiguously, and reading it here is not the attribution guess this
+    module deliberately refuses to make. The line is exact-match, not resemblance:
+    the segment before the suffix must BE a known kind. A near-miss like
+    ``kind=leak`` still returns None, because deciding it meant ``leaks`` would be
+    guessing at intent, and a guessed kind steers the reader toward vouching for a
+    review that never ran. Attribution is reporting-only either way -- the caller
+    records this on the UNUSABLE path, which never reaches ``accepted``.
     """
     m = _SCHEDULED_REVIEW_KIND_RE.search(block)
-    return m.group(1) if m else None
+    if m:
+        return m.group(1)
+    loose = _SCHEDULED_REVIEW_LOOSE_KIND_RE.search(block)
+    if loose:
+        stem = loose.group(1).split("/", 1)[0].lower()
+        if stem in _KNOWN_SCHEDULED_REVIEW_KINDS:
+            return stem
+    return None
 
 
 def emit_scheduled_review_marker(pr_num: str, *, kind: str, repo: str | None = None) -> int:
@@ -2916,13 +2947,28 @@ def _scheduled_review_marker_scan(
                 # otherwise cannot tell which of several markers is the broken one.
                 if not head_m:
                     loose = _SCHEDULED_REVIEW_LOOSE_HEAD_RE.search(block)
-                    why = (
-                        f"its head={loose.group(1)!r} is not a full 40-hex commit sha"
-                        if loose
-                        else "it carries no head= field"
-                    )
+                    if not loose:
+                        why = "it carries no head= field"
+                    elif _SCHEDULED_REVIEW_ANYCASE_HEAD_RE.fullmatch(loose.group(1)):
+                        why = (
+                            f"its head={loose.group(1)!r} is full length but not "
+                            f"lowercase, and the grammar is lowercase hex"
+                        )
+                    else:
+                        why = (
+                            f"its head={loose.group(1)!r} is not a full 40-hex commit sha"
+                        )
                 else:
-                    why = "it carries no kind= field"
+                    # Read PERMISSIVELY to say what is actually there. The strict
+                    # expression refuses a status-suffixed `kind=leaks/failed`, and
+                    # reporting that refusal as an absent field told the operator a
+                    # field they had written did not exist.
+                    loose = _SCHEDULED_REVIEW_LOOSE_KIND_RE.search(block)
+                    why = (
+                        f"its kind={loose.group(1)!r} is not a bare review name"
+                        if loose
+                        else "it carries no kind= field"
+                    )
                 # A malformed marker on a body that reads as BLOCKING is not a typo
                 # to be re-posted. The verdict survives the malformed field, because
                 # pasting a clean marker over an unresolved finding would make the
@@ -3100,12 +3146,31 @@ def _check_scheduled_claude_reviewed_head(
     # naming no kind, or naming one nothing requires (a typo such as a singular form),
     # cannot be credited to any review -- it is reported separately and claims nothing.
     _named = {k for k, _, _ in unusable if k is not None} & missing_set
+    # Being REPORTED and OUTRANKING history are two different jobs, and only the second
+    # may be gated on trust. Gating the first as well makes the block vanish from the
+    # message altogether -- silently dropping an untrusted marker is the very defect
+    # this change exists to end, and a test here catches it.
+    #
+    # So: every named kind is still reported (``_named``), while only a cause the OWNER
+    # can repair by fixing the marker (the third field) suppresses the history bullet.
+    # Letting EVERY unusable cause suppress it meant an untrusted block hid trusted
+    # evidence: on a public repository any account can post a marker naming the current
+    # head, and that erased "a routine ran on an older commit" -- the one fact telling
+    # the operator a review had ever happened. A dismissed review did the same. The
+    # verdict never moved (neither block satisfies anything); the report did.
+    _fixable_named = {
+        k for k, _, fixable in unusable if k is not None and fixable
+    } & missing_set
     # A CURRENT malformed marker outranks marker history for the same kind: "you posted
     # one and it needs one character fixed" is more actionable than "a routine ran on an
     # older commit", and the latter used to hide the former on any PR with history.
     unusable_kinds = (missing_set - refused_kinds) & _named
+    # Subtracts the FIXABLE set, not every unusable kind, so a kind can now appear in
+    # BOTH bullets: "an untrusted block sits at head" AND "your own review ran on an
+    # older commit". That overlap is the point -- those are two independent facts and
+    # the operator needs both. Only a repairable typo earns the right to stand alone.
     elsewhere_kinds = {
-        k for k in missing_set - refused_kinds - unusable_kinds if k in heads_by_kind
+        k for k in missing_set - refused_kinds - _fixable_named if k in heads_by_kind
     }
     absent_kinds = missing_set - refused_kinds - unusable_kinds - elsewhere_kinds
     # Everything this cannot attribute to a required kind. Including the wrong-kind
