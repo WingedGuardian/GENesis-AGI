@@ -517,9 +517,13 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   CAN change the tokenizability verdict or hide a target — and that is a
   possibility question, so a count cannot answer it. Demand a STRUCTURAL
   argument. The model is already in the repo, at
-  `scripts/hooks/destructive_command_guard.py:104-107`: its replacements only
-  ever insert spaces and separators, never quote or escape characters, so they
-  *cannot* corrupt the quote balance shlex decides on. That is a `cannot`; a
+  `scripts/hooks/destructive_command_guard.py:101-120`: its replacements delete a
+  line continuation — which is what the shell does with it — or insert
+  whitespace and separators; none introduces a quote or an escape, so none can
+  corrupt the quote balance shlex decides on. (The deletion removes a backslash,
+  but a backslash-newline is a continuation, not an escape the shell keeps; the
+  one place the shell does keep it, inside single quotes, is an over-block the
+  guard states rather than hides.) That is a `cannot`; a
   corpus run only ever yields `did not, here`, and by the rule above it is
   structurally blind to the shape nobody typed. Run the corpus as
   corroboration, never as the proof, and pair it with a control that DOES flip
@@ -646,9 +650,10 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   tolerable here ONLY because the verdict is `ask` or `deny` and never `allow` —
   an imprecise predicate that cannot authorize anything does not violate the
   Decision test, while the same predicate wired to an allow would. And a broad
-  regex over raw text is admissible ONLY as a mention scan that escalates to a
-  human; the moment it maps argv to an effect and authorizes on the result, it
-  is the hand-rolled-parser tar pit the mandate above forbids.
+  regex over raw text is admissible ONLY as a mention scan whose outcome is an
+  `ask` where a person is present and a refusal where none is — never an allow;
+  the moment it maps argv to an effect and authorizes on the result, it is the
+  hand-rolled-parser tar pit the mandate above forbids.
 
   A measurement informed this rather than settling it, and it was afterwards
   WITHDRAWN — which is the more useful half of the story. The claim was that
