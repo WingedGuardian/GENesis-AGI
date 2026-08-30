@@ -2787,7 +2787,7 @@ def emit_scheduled_review_marker(pr_num: str, *, kind: str, repo: str | None = N
 
 
 def _scheduled_review_marker_scan(
-    pr_num: str, repo: str | None = None
+    pr_num: str, repo: str | None = None, head_sha: str | None = None
 ) -> (
     tuple[dict[str, set[str]], dict[str, set[str]], list[tuple[str | None, str, bool]]]
     | None
@@ -2866,16 +2866,26 @@ def _scheduled_review_marker_scan(
             # unusable would attach "waiting cannot clear this" to the one state
             # where waiting IS the answer. Dropped silently on purpose; it falls
             # through to the absent/in-flight guidance.
-            if _state == "DISMISSED":
-                for block in blocks:
-                    unusable.append(
-                        (
-                            _marker_kind_or_none(block),
-                            "it is carried by a DISMISSED review, which no longer "
-                            "vouches for anything",
-                            False,
-                        )
+            for block in blocks:
+                if _state == "PENDING":
+                    # Submitting the draft can only help if the marker already names
+                    # the CURRENT head. A pending review whose marker names an older
+                    # commit is stale no matter when it is submitted, and dropping it
+                    # silently sent the reader to wait for something that could never
+                    # count.
+                    _hm = _SCHEDULED_REVIEW_HEAD_RE.search(block)
+                    if head_sha and _hm and _hm.group(1).lower() == head_sha.lower():
+                        continue
+                    why = (
+                        "it is carried by a PENDING review and does not name the "
+                        "current head, so submitting that draft would not make it count"
                     )
+                else:
+                    why = (
+                        "it is carried by a DISMISSED review, which no longer vouches "
+                        "for anything"
+                    )
+                unusable.append((_marker_kind_or_none(block), why, False))
             continue
         # The marker must mean "ran CLEAN", not merely "ran": a scheduled review whose body
         # CONTAINS a blocking finding ([P1]/HARD BLOCK/### ERROR, unless a clean marker
@@ -2924,7 +2934,24 @@ def _scheduled_review_marker_scan(
                     )
                 unusable.append((_marker_kind_or_none(block), why, not not_clean))
                 continue
-            target.setdefault(head_m.group(1).lower(), set()).add(kind_m.group(1).lower())
+            _kind = kind_m.group(1).lower()
+            if _kind not in _KNOWN_SCHEDULED_REVIEW_KINDS:
+                # Parses cleanly and names a review nothing knows about -- a terminal
+                # typo such as a singular form. Recording it in `accepted` hid it
+                # completely: it can never match a required kind, so the message went
+                # back to "no marker at ANY head" and advised waiting, while the block
+                # sat visibly in the thread. Verdict-neutral either way (an unknown
+                # kind satisfies nothing), so this is purely so the reader can SEE it.
+                unusable.append(
+                    (
+                        _kind,
+                        f"it names kind={_kind!r}, which is not a known scheduled "
+                        f"review, so it can never satisfy one",
+                        True,
+                    )
+                )
+                continue
+            target.setdefault(head_m.group(1).lower(), set()).add(_kind)
     return accepted, rejected, unusable
 
 
@@ -3017,7 +3044,7 @@ def _check_scheduled_claude_reviewed_head(
             f"reviews (GitHub query failed).\n"
             f"Retry, or append '# scheduled-review-override' to merge anyway."
         )
-    scan = _scheduled_review_marker_scan(pr_num, repo=repo)
+    scan = _scheduled_review_marker_scan(pr_num, repo=repo, head_sha=head)
     markers, rejected, unusable = (None, {}, []) if scan is None else scan
     if markers is None:
         return (
@@ -3085,7 +3112,11 @@ def _check_scheduled_claude_reviewed_head(
     # case is the point: narrowing to named kinds without it made a block reading
     # `kind=<near-miss>` vanish from every group, and the message went back to claiming
     # nothing had been posted -- the exact misdiagnosis this whole change exists to end.
-    unscoped = [(k, r) for k, r, _ in unusable if k is None or k not in missing_set]
+    # REQUIRED, not MISSING. Keying on missing_set called a duplicate for an
+    # already-SATISFIED kind unscoped, so the bullet said it named no required kind
+    # directly beneath a summary line listing that kind as present.
+    _required_set = set(required)
+    unscoped = [(k, r) for k, r, _ in unusable if k is None or k not in _required_set]
 
     parts: list[str] = []
     if refused_kinds:

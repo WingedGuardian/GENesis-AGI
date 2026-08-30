@@ -1758,3 +1758,106 @@ class TestAnUnusableMarkerRemedyMatchesItsCause:
         assert f"'{HEAD[:6]}'" in msg, (
             "the leaks bullet showed four unrelated code-review reasons and hid its own"
         )
+
+
+class TestEveryMarkerFormIsAccountedFor:
+    """The remaining shape of this feature's defects: a marker form the
+    classification does not cover falls back to "nothing was posted".
+
+    That fallback is the original bug. Each case below is a form that reached it
+    by a different route -- one parsed too well to be called malformed, one was
+    dropped for its review state, one was filtered against the wrong set. They are
+    fixed together because they are one class; fixing the reported subset would
+    leave the unreported one for the next round.
+    """
+
+    @staticmethod
+    def _row(body, **kw):
+        row = {"login": "owner", "author_association": "OWNER", "body": body}
+        row.update(kw)
+        return json.dumps(row)
+
+    @staticmethod
+    def _marker(head=HEAD, kind="leaks"):
+        parts = ([f"head={head}"] if head else []) + ([f"kind={kind}"] if kind else [])
+        return "<!-- genesis-scheduled-review: " + " ".join(parts) + " -->"
+
+    def _msg(self, monkeypatch, comments, required="leaks"):
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", comments)
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", required)
+        return _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
+
+    def test_a_wellformed_marker_naming_an_unknown_kind_is_visible(self, monkeypatch):
+        """Parses perfectly, names a review nothing knows about (a singular typo).
+
+        It went into the accepted map under its own key, matched no required kind,
+        and so vanished -- the message said no marker existed at any head while the
+        block sat plainly in the thread. Being well-formed was exactly why it hid.
+        """
+        msg = self._msg(monkeypatch, self._row("scan done.\n" + self._marker(kind="leak")))
+        assert msg, "an unknown kind satisfies nothing, so this must still block"
+        assert "leak" in msg and "not a known scheduled" in msg, msg
+
+    def test_an_unknown_kind_is_NOT_attributed_to_the_kind_it_resembles(self, monkeypatch):
+        """DELIBERATELY not taken from review, and the reason is a prior finding.
+
+        Review asked that a near-miss kind also stop the required review from
+        advising that waiting may help. Doing that means deciding the block was
+        MEANT for that review -- and an earlier finding on this same PR was that an
+        unattributable block must never claim a required kind, precisely because a
+        claimed kind steers the reader toward posting a marker for a review nothing
+        vouches for. The two cannot both be satisfied without guessing intent.
+
+        Resolved toward the side with the security consequence: report both facts
+        and let the reader join them. The message says a block naming an unknown
+        review exists, and separately that the required review has no marker. Both
+        are true; neither asserts what the author meant.
+        """
+        msg = self._msg(monkeypatch, self._row("scan done.\n" + self._marker(kind="leak")))
+        assert "not a known scheduled" in msg, "the block must be visible"
+        assert "no marker at ANY head" in msg, (
+            "attributing the near-miss to the required kind is the guess a prior "
+            "finding forbade; the required kind's own state is that none was posted"
+        )
+
+    def test_a_duplicate_for_an_ALREADY_SATISFIED_kind_is_not_called_unscoped(
+        self, monkeypatch
+    ):
+        """The bullet contradicted the summary line two rows above it."""
+        rows = "\n".join(
+            [
+                self._row("clean run.\n" + self._marker(kind="leaks")),
+                self._row("dup.\n" + self._marker(head=HEAD[:8], kind="leaks")),
+            ]
+        )
+        msg = self._msg(monkeypatch, rows, required="code-review,leaks")
+        assert msg, "code-review is still missing, so this blocks"
+        assert "present: leaks" in msg, "leaks IS satisfied and the summary says so"
+        assert "unscoped" not in msg.lower(), (
+            "a duplicate for a SATISFIED required kind was reported as naming no "
+            f"required kind, contradicting the summary line above it:\n{msg}"
+        )
+
+    def test_a_pending_review_with_a_STALE_marker_does_not_advise_waiting(
+        self, monkeypatch
+    ):
+        """Submitting a draft cannot help when its marker names an older commit."""
+        msg = self._msg(
+            monkeypatch,
+            self._row("draft.\n" + self._marker(head=OTHER_HEAD), state="PENDING"),
+        )
+        assert msg
+        assert "may still be in flight" not in msg.lower(), (
+            "waiting was advised for a draft that is stale whenever it is submitted"
+        )
+
+    def test_a_pending_review_at_the_CURRENT_head_still_advises_waiting(self, monkeypatch):
+        """CONTROL. Without it, an implementation that reported every pending review
+        as unusable would pass the test above while destroying the one case where
+        submitting the draft genuinely does clear the gate."""
+        msg = self._msg(
+            monkeypatch, self._row("draft.\n" + self._marker(head=HEAD), state="PENDING")
+        )
+        assert msg
+        assert "may still be in flight" in msg.lower()
