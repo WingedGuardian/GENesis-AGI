@@ -1474,7 +1474,17 @@ The review-findings gate specifically:
    on CI alone. Note in PR that review was quota-limited.
 5. **Override**: Append `# review-override` to the merge command to
    bypass the gate (e.g., `gh pr merge 123 --squash --admin  # review-override`).
-   The override is logged. Use only when findings are intentionally accepted.
+   The override is logged — one metadata row per sigil in
+   `~/.genesis/merge_override_log.jsonl` (sigil, PR, bound head, which gate it
+   waived, and what the command actually got: `allowed` / `asked` / `blocked` /
+   `error`), so "was this escape reached for?" is a query rather than a survey.
+   `blocked` matters: a sigil can be appended to a command that some OTHER gate
+   then stops, which is a real signal but not an override that took effect, and
+   `asked` means the decision went to a human who may still have denied it.
+   Never any command text — the row is metadata only, because a trailing comment
+   rides a Bash command that can carry a credential. Every merge-path sigil is
+   covered, including `# escalation-ack`. Use only when findings are
+   intentionally accepted.
 6. **Read the PR's warning comments before merging — not just the hard gate.**
    Beyond Codex, a structural-review bot posts under the repo-owner account
    (`WingedGuardian`, review state COMMENTED) and emits **SOFT WARNINGs** (PII /

@@ -251,6 +251,34 @@ def _isolate_alert_queue(tmp_path):
     mp.undo()
 
 
+# ── Safety: prevent tests from writing REAL merge-override audit rows ───────
+@pytest.fixture(autouse=True)
+def _isolate_override_log(tmp_path):
+    """Redirect the merge gate's override log to tmp for ALL tests.
+
+    Any test that drives ``git_push_guard`` with an override sigil in the command
+    now produces a durable audit row, and the default path is the live log the
+    operator reads. MEASURED before this existed: four rows describing a PR that
+    does not exist — one blocked command retried during development — reached the
+    real file and had to be removed by hand. A store nobody isolated records
+    fiction before it records anything true.
+
+    Repo-wide rather than under ``tests/test_hooks/``: ``tests/test_scripts/``
+    also drives these hooks (some as subprocesses), and a bare local
+    ``git merge x  # merge-to-main-override`` is enough to write a row — no PR,
+    no network. Set on the environment so subprocess-launched hooks inherit it.
+
+    Uses a fixture-OWNED ``MonkeyPatch`` (not the shared ``monkeypatch``
+    fixture) so a test that calls ``monkeypatch.undo()`` mid-body cannot revert
+    this suite-isolation patch and re-expose the real log — mirrors
+    ``_isolate_alert_queue``.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setenv("GENESIS_MERGE_OVERRIDE_LOG", str(tmp_path / "merge_override_log.jsonl"))
+    yield
+    mp.undo()
+
+
 # ── Safety: prevent tests from writing to the REAL genesis.db ────────────────
 @pytest.fixture(autouse=True)
 def _isolate_genesis_db_path(tmp_path):

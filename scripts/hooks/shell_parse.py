@@ -535,6 +535,24 @@ _KNOWN_SIGILS = (
     "stale-review-override",
     "scheduled-review-override",
     "discard-override",
+    # Both of these were passed to has_trailing_override from the day they
+    # shipped but never listed here, which made the "kept in sync" claim above
+    # false and had a MEASURED effect: the leading-run scan treats an unlisted
+    # token as PROSE, so an unlisted sigil written FIRST silently disables every
+    # sigil after it (`# full-suite-ok audit-ack` → audit-ack undetected). The
+    # sigil queried first still matched, which is why it went unnoticed.
+    #
+    # NOTE this widens acceptance as well as detection, in the fail-OPEN
+    # direction: `# merge-to-main-override review-override` now waives the
+    # findings gate where the unlisted token previously ended the run and it did
+    # not. That is the intended contract — the operator typed both sigils
+    # literally — but it is a gate-loosening change and is named as one.
+    #
+    # A test derives this set from the guards themselves (an ast walk over
+    # scripts/hooks/), so the next divergence fails a test rather than waiting to
+    # be noticed.
+    "merge-to-main-override",  # git_push_guard: local `git merge` onto main/master
+    "full-suite-ok",  # full_suite_guard: run the whole pytest suite locally
 )
 
 
