@@ -49,10 +49,24 @@ CMD=$(printf '%s' "$RAW" | jq -r '.tool_input.command // empty' 2>/dev/null)
 # trap cannot alter the script's exit status unless it calls `exit` itself.
 # Detection lives in the Python helper rather than being re-derived here, because
 # hand-rolled shell parsing in a guard is a documented trap in this repo.
+_NOTE_ALREADY_EMITTED=0
 _discarded_write_note() {
     local rc=$?
     [ "$rc" -eq 2 ] || return 0
-    python3 "$SCRIPT_DIR/hooks/discarded_write.py" --command "$CMD" >/dev/null || true
+    # A delegated Python guard already emitted it — see the rm delegation below.
+    [ "${_NOTE_ALREADY_EMITTED:-0}" -eq 1 ] && return 0
+    # `timeout 1` is a BELT, not the fix. This hook is registered with a 5-SECOND
+    # budget (user-level settings), far tighter than the Python guards', and a hook
+    # killed before its `exit 2` is read by CC as a NON-blocking error — i.e. the
+    # refused command RUNS. A cosmetic note must not be able to buy that, so its
+    # cost is bounded here even if the helper regresses. MEASURED: without this and
+    # the accumulation cap, a 63KB in-bounds command took the hook to 5.005s and a
+    # SIGKILL, where origin/main refused it in 2.884s.
+    # stdout only to /dev/null — the note is written to STDERR, which is how it
+    # reaches the operator. Silencing stderr here would make the whole feature inert
+    # on this path while every test that checks exit codes still passed.
+    timeout 1 python3 "$SCRIPT_DIR/hooks/discarded_write.py" --command "$CMD" \
+        >/dev/null || true
 }
 trap _discarded_write_note EXIT
 
@@ -159,6 +173,12 @@ case "$CMD" in
                 _rc=0
                 printf '%s' "$RAW" | "$_py" "$SCRIPT_DIR/hooks/$_guard" >&2 || _rc=$?
                 if [ "$_rc" -eq 2 ]; then
+                    # The delegated guard already printed the discarded-write note
+                    # (its stderr is passed through above), so the EXIT trap must not
+                    # re-derive it. Paying for it twice inside one 5s budget is what
+                    # let a refused `rm -rf` run: the hook was SIGKILLed before
+                    # reaching this exit, and a non-2 exit is NON-blocking.
+                    _NOTE_ALREADY_EMITTED=1
                     exit 2
                 elif [ "$_rc" -ne 0 ]; then
                     # Guard crashed/unusable — fall back to the legacy globs

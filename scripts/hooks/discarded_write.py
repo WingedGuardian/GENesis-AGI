@@ -240,14 +240,34 @@ def discarded_writes(command: str) -> list[str]:
         if len(segs) + len(orphans) < 2:
             return []
 
+        # The cap is enforced INSIDE both loops, not only at the return. Capping the
+        # OUTPUT bounds what is printed; it does not bound the WORK, and the
+        # de-duplication below is O(len(found)) per candidate — quadratic in the
+        # number of segments.
+        #
+        # MEASURED, and this is a security property rather than a performance one:
+        # `rm -rf x && >q0000 >q0001 …` at 63,012 chars with ZERO substitutions sits
+        # INSIDE both bounds above, and cost 2.5s here. `bash_safety_hook.sh` pays
+        # that TWICE per block and is registered with a 5-SECOND timeout, so the hook
+        # was SIGKILLed before reaching its `exit 2` — and Claude Code reads any
+        # non-2 exit as non-blocking, so the refused `rm -rf` ran. Differential
+        # against origin/main: rc=2 in 2.884s there, rc=-9 at 5.005s here.
+        #
+        # The input bounds above do NOT cover this: they cap the PARSE, and the cost
+        # had moved to assembly. A shape that the bounds REJECT is not evidence about
+        # a shape they accept, which is the mistake that let this ship.
         found: list[str] = []
         for seg in segs:
+            if len(found) >= _MAX_NAMED:
+                break
             phrase = _describe(seg)
             if phrase and len(phrase) > _MAX_PHRASE:  # one long `cp` must not dominate
                 phrase = phrase[:_MAX_PHRASE] + "…"
             if phrase and phrase not in found:
                 found.append(phrase)
         for target in orphans:
+            if len(found) >= _MAX_NAMED:
+                break
             named = _plausible_target(target)
             if named and not any(named in phrase for phrase in found):
                 found.append(named)

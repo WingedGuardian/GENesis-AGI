@@ -314,6 +314,39 @@ def test_an_absurdly_long_command_is_bounded_not_parsed():
     assert __import__("time").monotonic() - start < 1.0
 
 
+def test_an_IN_BOUNDS_command_cannot_exhaust_the_hook_timeout():
+    """The bounds cap the PARSE; the note ASSEMBLY had to be bounded separately.
+
+    This is a security regression test, not a performance one. The shape below sits
+    INSIDE both input bounds (63,012 chars, zero substitutions) and cost 2.5s before
+    the accumulation cap, because de-duplication was O(len(found)) per candidate
+    while the cap applied only at the return. `bash_safety_hook.sh` paid that TWICE
+    per block and is registered with a 5-SECOND timeout, so the hook was SIGKILLed
+    before reaching `exit 2` — and Claude Code reads any non-2 exit as NON-blocking,
+    so the refused `rm -rf` ran. Differential at the time: origin/main refused it
+    rc=2 in 2.884s; this branch rc=-9 at 5.005s.
+
+    The two bound tests below do NOT cover this: their inputs are REJECTED by the
+    early returns, so they time a path that does no work and would pass against a
+    build with no downstream cost control at all — which was the build under review.
+    """
+    import time
+
+    cmd = ("rm -rf bt && " + " ".join(f">q{i:04d}" for i in range(9000)))[:65536]
+    assert len(cmd) < _mod._MAX_COMMAND_CHARS, "the shape must be INSIDE the bounds"
+    assert cmd.count("$(") + cmd.count("`") < _mod._MAX_SUBSTITUTIONS
+
+    start = time.monotonic()
+    result = _mod.discarded_writes(cmd)
+    elapsed = time.monotonic() - start
+
+    assert len(result) <= _mod._MAX_NAMED, "output must stay capped"
+    assert elapsed < 0.5, (
+        f"in-bounds command took {elapsed:.3f}s — this is paid twice inside a 5s "
+        "hook budget, and a hook killed before its exit 2 does not block"
+    )
+
+
 def test_the_bounds_sit_above_every_real_command_observed():
     """Sized from the corpus this was measured on: longest command 14,682 chars,
     most substitutions in one command 150. A bound that clipped ordinary work
