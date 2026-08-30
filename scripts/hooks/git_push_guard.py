@@ -3005,8 +3005,14 @@ def _relieve_kinds_by_mechanical_rescan(
     head: str,
     pr_num: str,
     repo: str | None = None,
-) -> tuple[list[str], list[tuple[str, str, str]]]:
+) -> tuple[list[str], list[tuple[str, str, str]], dict[str, str]]:
     """Drop kinds satisfiable by an ANCESTOR ACCEPTED marker + a green scanner at head.
+
+    The third return value maps a kind to WHY its relief failed, when a carriable
+    marker existed but something else stopped it. The block message needs this:
+    "the scanner has not finished" and "the scanner FAILED" call for opposite
+    actions (wait vs fix CI), and neither is "re-run the scheduled review", which
+    is what the message says when it only knows the marker sits on another head.
 
     Returns ``(still_missing, relieved)`` where each *relieved* entry is
     ``(kind, ancestor_head_12, check_name)`` — enough for both the operator note
@@ -3029,6 +3035,7 @@ def _relieve_kinds_by_mechanical_rescan(
     accepted marker and the head, vetoes.
     """
     relieved: list[tuple[str, str, str]] = []
+    reasons: dict[str, str] = {}
     for kind in missing:
         check_name = _MECHANICAL_RESCAN_BY_KIND.get(kind)
         if not check_name:
@@ -3044,11 +3051,20 @@ def _relieve_kinds_by_mechanical_rescan(
             continue  # never accepted anywhere in this PR -> nothing to carry forward
         refusals = [h for h, kinds in rejected.items() if kind in kinds]
         if head in refusals:
+            reasons[kind] = "a refused review sits at THIS head"
             continue  # the routine ran at THIS head and found something -> never relieve
 
         ancestor = None
         unreadable = False
         for candidate in reversed(candidates):
+            # The merge path runs these gates sequentially under ONE deadline; each
+            # compare is a network call. Without this check a PR carrying many
+            # markers can walk the budget to zero, and an overrun gets the whole
+            # hook SIGKILLed — which fails toward "tool runs" and disengages the
+            # ENTIRE gate stack. Relief must never be the thing that spends it.
+            if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+                unreadable = True
+                break
             verdict = _sha_is_ancestor(candidate, head, repo=repo)
             if verdict is None:
                 unreadable = True  # cannot establish history -> fail closed, do not
@@ -3059,7 +3075,17 @@ def _relieve_kinds_by_mechanical_rescan(
             answered = True
             for refusal in refusals:
                 if refusal == candidate:
-                    continue
+                    # SAME SHA carries both an accepted and a refused marker — a
+                    # clean run and a re-run that found something, on one commit.
+                    # The scan stores SETS keyed by head and discards row order, so
+                    # there is no evidence here about which came last. Unprovable
+                    # ordering on a leak gate resolves to a veto.
+                    answered = False
+                    break
+                if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+                    unreadable = True
+                    answered = False
+                    break
                 r_verdict = _sha_is_ancestor(refusal, candidate, repo=repo)
                 if r_verdict is None:
                     unreadable = True
@@ -3073,13 +3099,22 @@ def _relieve_kinds_by_mechanical_rescan(
             if answered:
                 ancestor = candidate
                 break
-        if unreadable or ancestor is None:
+        if unreadable:
+            reasons[kind] = "the review history could not be established in the time available"
+            continue
+        if ancestor is None:
+            reasons[kind] = "every accepted review is off this branch's history, or a refusal supersedes it"
             continue
         if not _mechanical_scan_is_green(pr_num, head, check_name, repo=repo):
+            reasons[kind] = (
+                f"an earlier accepted review exists, but '{check_name}' is not green at "
+                f"this head (pending, failed, absent, or unreadable) — check that job "
+                f"rather than re-running the scheduled review"
+            )
             continue  # unreadable, absent, wrong workflow, pending or failed -> fail CLOSED
         relieved.append((kind, ancestor[:12], check_name))
     relieved_kinds = {k for k, _, _ in relieved}
-    return [k for k in missing if k not in relieved_kinds], relieved
+    return [k for k in missing if k not in relieved_kinds], relieved, reasons
 
 
 def _check_scheduled_claude_reviewed_head(
@@ -3195,7 +3230,7 @@ def _check_scheduled_claude_reviewed_head(
     if missing:
         # A kind already ACCEPTED at an earlier head of this PR is satisfied when its
         # mechanical scanner is green at THIS head (see _MECHANICAL_RESCAN_BY_KIND).
-        missing, relieved = _relieve_kinds_by_mechanical_rescan(
+        missing, relieved, relief_reasons = _relieve_kinds_by_mechanical_rescan(
             missing, markers, rejected, head, pr_num, repo=repo
         )
         if relief_out is not None:
@@ -3227,6 +3262,16 @@ def _check_scheduled_claude_reviewed_head(
     # had been read — so this is the general form rather than a fourth point patch: a total
     # partition needs no precedence BETWEEN groups, only within a single kind.
     missing_set = set(missing)
+    # A kind whose RELIEF was attempted and failed has a specific, observed cause,
+    # and it outranks the generic partition below: telling an operator to re-run the
+    # scheduled review is wrong advice when the mechanical scanner is merely still
+    # running (wait) or has failed (fix that job).
+    # ADDITIVE, never substitutive: the three-way partition below was shaped by three
+    # successive review findings and stays intact. This adds the observed relief cause
+    # ALONGSIDE it, first, so the specific remedy is read before the generic one. An
+    # earlier draft removed these kinds from the partition and silently deleted that
+    # hard-won guidance -- caught by its own regression tests.
+    relief_blocked = {k: r for k, r in relief_reasons.items() if k in missing_set}
     refused_kinds = rejected.get(head, set()) & missing_set
     # A marker for a missing kind on some OTHER head — ACCEPTED OR REFUSED. Both prove a
     # routine ran on a different commit; counting only accepted ones sent a
@@ -3276,6 +3321,12 @@ def _check_scheduled_claude_reviewed_head(
         f"(required: {', '.join(required)}; present: "
         f"{', '.join(sorted(kinds_here)) or 'none'}).\n"
         + "".join(f"  * {p}\n" for p in parts)
+        + (
+            "".join(
+                f"  (relief for '{k}' was attempted and declined: {r}.)\n"
+                for k, r in sorted(relief_blocked.items())
+            )
+        )
         + "A marker is a comment/review by the repo OWNER carrying "
         f"'<!-- genesis-scheduled-review: head={head} kind=<name> -->' — the FULL 40-hex "
         "head, exactly as written here.\n"

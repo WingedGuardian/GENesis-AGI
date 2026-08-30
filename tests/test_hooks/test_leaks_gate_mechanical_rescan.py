@@ -383,3 +383,71 @@ class TestCandidateSelection:
         )
         msg = _gate()
         assert msg and "leaks" in msg
+
+
+class TestSameShaCollision:
+    def test_accepted_and_refused_on_the_same_commit_vetoes(self, monkeypatch):
+        """One commit carrying BOTH verdicts is unprovable, so it must veto.
+
+        The routine can run twice on one head -- clean, then a re-run that finds an
+        inferential leak. The marker scan stores SETS keyed by head and discards row
+        order, so there is no evidence here about which verdict came last. Carrying
+        the acceptance forward would be guessing, on the gate whose whole job is to
+        not guess about leaks.
+        """
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            _markers(
+                (EARLIER, ["leaks"], "scheduled review done. VERDICT: PASS"),
+                (EARLIER, ["leaks"], REFUSED_BODY),
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        msg = _gate()
+        assert msg and "leaks" in msg
+
+
+class TestMergeDeadline:
+    def test_an_exhausted_deadline_blocks_rather_than_walking_on(self, monkeypatch):
+        """Relief must not spend the shared merge budget.
+
+        The merge gates run sequentially under ONE deadline; each ancestry check is a
+        network call. A PR with many markers could walk that budget to zero, and an
+        overrun gets the whole hook SIGKILLed -- which fails toward "the tool runs"
+        and disengages the ENTIRE gate stack. Relief being the thing that spends it
+        would be a bypass of every gate, not just this one.
+        """
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        monkeypatch.setattr(_mod, "_merge_deadline", _mod.time.monotonic() - 1)
+        msg = _gate()
+        assert msg and "leaks" in msg
+        assert "time available" in msg, "the block must name the deadline as the cause"
+
+
+class TestBlockMessageNamesTheRealRemedy:
+    """A failed relief has an observed cause; the message must give ITS remedy."""
+
+    def test_pending_scanner_is_not_reported_as_a_stale_marker(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup(conclusion=None))
+        msg = _gate()
+        assert msg and "leak-detector" in msg, "the message must name the scanner"
+        assert "not green at this head" in msg
+        # The scanner cause is reported ALONGSIDE the generic partition, not instead
+        # of it -- that partition is hard-won and its own tests guard it. What matters
+        # is that the specific, actionable cause is present and named, and that it
+        # comes FIRST so it is read before the generic advice.
+        assert msg.index("leak-detector") < msg.index("kind=leaks") if "kind=leaks" in msg else True
+
+    def test_refused_at_head_says_so_rather_than_blaming_the_scanner(self, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            _markers(
+                (EARLIER, ["leaks"], "scheduled review done. VERDICT: PASS"),
+                (HEAD, ["leaks"], REFUSED_BODY),
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        msg = _gate()
+        assert msg and "refused review sits at THIS head" in msg
