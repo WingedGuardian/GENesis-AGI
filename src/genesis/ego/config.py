@@ -243,6 +243,12 @@ def validate_ego_config(changes: dict) -> list[str]:
         if not isinstance(v, (int, float)) or isinstance(v, bool) or not (0.0 <= v <= 1.0):
             errors.append("capability_weakness_threshold must be a number in [0.0, 1.0]")
     if "capability_improvement_min_sample_size" in changes:
+        # Scoped to the capability-improvement SCANNER (get_weakest). The
+        # rendered self-model uses the constant floor in db/crud/capability_map
+        # (MIN_SAMPLE_SIZE), so setting this below that value lets the scanner
+        # target a domain the rendered table omits. That domain still reaches
+        # the ego via the focused-deficiency line, which reads get_by_domain and
+        # is deliberately unfiltered.
         v = changes["capability_improvement_min_sample_size"]
         if not isinstance(v, int) or isinstance(v, bool) or v < 1:
             errors.append("capability_improvement_min_sample_size must be integer >= 1")

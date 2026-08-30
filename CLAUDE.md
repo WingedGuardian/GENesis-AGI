@@ -175,6 +175,15 @@ Applies to every assertion — in conversation, and doubly in anything written t
   One observation supports a question, not a conclusion. A derived list (digest, backlog,
   index, prior summary, plan doc) supports claims about the LIST — never about the corpus
   it was derived from. When the user names a corpus, read the corpus, not a proxy.
+- **A truncated listing is not absence.** A query whose result count EQUALS its limit is
+  a truncated read, not a complete one. Before any "X is not in Y" / "nothing matches" /
+  "there are N" claim drawn from a listing, reconcile the returned count against the
+  denominator the API reports (`total`, `totalCount`, `counts`), or paginate until a SHORT
+  read proves the end. **If a response states no denominator at all, that is not permission
+  to assume completeness — check it for truncation or an incompleteness marker before using
+  it.** When you have only the count, say "not found in K of N", never "absent". This
+  failure is silent and confident: an under-read is indistinguishable from a clean result,
+  so nothing prompts you to check.
 - **Evidence tiers.** Every stated fact is one of: **MEASURED** (number + denominator),
   **READ** (artifact + location, e.g. file:line / PR / live query), **INFERRED** (must be
   hedged out loud — "I think", "unverified, but"), or **ASSUMED** (say so). An unmarked
@@ -390,6 +399,27 @@ When a user shares a file path or URL in conversation:
   after `/task` intake.
 - **Never pipe background Bash commands.** `run_in_background` with pipes
   produces empty output. Run without pipes or in foreground.
+- **A blocked compound command loses EVERYTHING in it.** A PreToolUse block
+  kills the WHOLE Bash call, not the offending part — so a guard firing on step
+  3 silently discards steps 1 and 2 while the error text mentions only step 3.
+  Never chain a state-changing step (`cd`, heredoc, file write,
+  restore-from-backup) with one a guard can block (test run, commit, push).
+  After any block, run `pwd` and re-check the file you believed you wrote —
+  never assume the earlier half ran. Prefer `git -C <literal path>` and
+  `$ROOT/scripts/…` over a persistent `cd`, so a lost `cd` cannot silently
+  redirect later commands into the wrong worktree. Note the path spelling is
+  NOT what decides which worktree a script acts on — the PROCESS CWD is, for
+  anything that resolves its target from the directory it runs in (e.g.
+  `review_state.py` `evidence-path`/`mark`). Run those from the worktree they
+  are about. Detail in the genesis-development skill.
+- **Check closing tags on long tool-call parameters.** A closing tag that does
+  not match its opening tag silently swallows every following parameter into the
+  preceding string; the tool then reports those parameters as *missing*, which
+  reads like a tool bug and is not one. It recurs on long, multi-sentence values.
+  Repeated IDENTICAL validation errors mean the CALL is malformed — the error
+  echoes `input_value`, which holds the proof; read it, and check whether the
+  same tool succeeded earlier in the session, before concluding anything about
+  the tool.
 - **Plan mode by default** for any task with 3+ steps or architectural
   decisions. If something goes sideways — STOP and re-plan.
 - **Use subagents** to keep main context clean. One concern per subagent.
