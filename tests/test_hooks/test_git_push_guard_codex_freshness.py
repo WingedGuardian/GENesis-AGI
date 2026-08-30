@@ -2350,6 +2350,22 @@ class TestTiedTimestampsFailClosed:
         T = "2026-01-01T00:00:00Z"
         assert self._gate(monkeypatch, self._rows(T, T)), "tied stamps resolved by fetch order and passed"
 
+    def test_the_tie_is_reported_as_a_tie_not_as_supersession(self, monkeypatch):
+        """Failing closed is right; describing it wrongly is not. On a tie the verdict IS
+        present and NEITHER statement is later, so the ordinary refusal wording ("no
+        clean-verdict line overrides it", "superseded by a LATER blocking finding") states
+        two things that are false about this thread."""
+        T = "2026-01-01T00:00:00Z"
+        msg = self._gate(monkeypatch, self._rows(T, T))
+        assert msg
+        assert "SAME timestamp" in msg, msg
+        assert "which came last cannot be established" in msg, msg
+        assert "leaks — 2 marker block(s) found" in msg, "both blocks must still be rows"
+        assert "an explicit clean verdict at this head" in msg, msg
+        assert "a blocking finding at this head" in msg, msg
+        assert "superseded by a LATER" not in msg, msg
+        assert "no clean-verdict line overrides it" not in msg, msg
+
     def test_a_later_verdict_by_one_second_still_clears(self, monkeypatch):
         """CONTROL: the tie rule must not swallow a genuinely later verdict."""
         assert self._gate(monkeypatch, self._rows("2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z")) is None

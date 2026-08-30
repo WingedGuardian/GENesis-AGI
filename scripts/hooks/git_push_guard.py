@@ -3069,10 +3069,42 @@ def _scheduled_review_marker_scan(
             # Rows with no stamp (the test seam) cannot tie: list order is their order.
             top = max(st for st, _ in decisive)
             tied = {v for st, v in decisive if st and st == top}
-            final = "refused" if len(tied) > 1 else decisive[-1][1]
+            ambiguous = len(tied) > 1
+            final = "refused" if ambiguous else decisive[-1][1]
         else:
+            ambiguous = False
             final = "plain"
-        (rejected if final == "refused" else accepted).setdefault(h, set()).add(k)
+        if not ambiguous:
+            (rejected if final == "refused" else accepted).setdefault(h, set()).add(k)
+        if ambiguous:
+            # Failing closed is right; describing it as an ordinary refusal is not. On a
+            # tie the clean verdict IS present and NEITHER statement is later, so both
+            # halves of the usual wording -- "no clean-verdict line overrides it" and
+            # "superseded by a LATER finding" -- state something false about this thread.
+            # The pair is therefore recorded in NEITHER verdict map: staying out of
+            # `accepted` is what blocks (the missing set is computed from `accepted`
+            # alone), and staying out of `rejected` keeps the standard refusal row from
+            # making the false claim. This row is the whole explanation.
+            # One row per BLOCK here too, so the header's count still equals the number
+            # of blocks in the thread; each says what its own block was and why the pair
+            # cannot be ordered.
+            for _, v in seq:
+                what = {
+                    "clean": "an explicit clean verdict",
+                    "refused": "a blocking finding",
+                    "plain": "a plain re-post",
+                }[v]
+                unusable.append(
+                    (
+                        k,
+                        f"{what} at this head; a clean verdict and a blocking finding here "
+                        f"carry the SAME timestamp, so which came last cannot be "
+                        f"established and the finding stands; re-post the verdict so it is "
+                        f"unambiguously later",
+                        True,
+                    )
+                )
+            continue
         # Every statement that did not become the verdict is still a row -- by STATUS
         # and by COUNT, so the report never says one block where several were observed.
         # ONE ROW PER BLOCK -- never a count folded into a row -- so the header's block
