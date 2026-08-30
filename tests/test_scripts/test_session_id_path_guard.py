@@ -59,6 +59,46 @@ def _load(name: str, rel: str):
 
 hook_input = _load("hook_input", "hooks/hook_input.py")
 
+
+def _run_hook(script: str, payload: dict, home: Path, *, expect_ok: bool = True):
+    """Run a hook end to end against a sandboxed HOME, and PROVE it ran.
+
+    One module-level helper rather than one per test class: the two copies this
+    replaced were byte-identical, so a divergence between them would have been
+    invisible — the same replica shape this suite exists to catch.
+
+    The environment is SCRUBBED, not merely HOME-redirected. `GENESIS_REPO_ROOT`
+    points `genesis_urgent_alerts` at a real database and `GENESIS_DB_PATH`
+    overrides it outright, so an inherited environment makes the result depend on
+    the machine the suite runs on — which contradicts this file's install-agnostic
+    contract.
+
+    `expect_ok` asserts the hook exited 0. Without it, a hook that dies before
+    printing (a broken `sys.path` insert, an import error) yields EMPTY stdout in
+    both arms of a comparison, and an `unsafe.stdout == safe.stdout` assertion
+    passes while nothing under test ever executed.
+    """
+    (home / ".genesis").mkdir(parents=True, exist_ok=True)
+    (home / ".genesis" / "cc_context_enabled").touch()
+    env = {**os.environ, "HOME": str(home)}
+    for _var in ("GENESIS_CC_SESSION", "GENESIS_REPO_ROOT", "GENESIS_DB_PATH"):
+        env.pop(_var, None)
+    proc = subprocess.run(
+        [sys.executable, str(_SCRIPTS / script)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    if expect_ok:
+        assert proc.returncode == 0, (
+            f"{script} exited {proc.returncode} — a crashing hook produces empty "
+            f"stdout in every arm, so output comparisons pass while nothing ran."
+            f"\nstderr:\n{proc.stderr[:2000]}"
+        )
+    return proc
+
 # Traversal ids that must never reach a path join.
 TRAVERSALS = ["../../escaped", "a/b", "..", "../x", "a\\b", "with\x00nul", "abc\n"]
 # Ids in the real CC shape (measured: hex UUID v4) must keep working.
@@ -86,8 +126,18 @@ class TestIsSafeSessionId:
     def test_non_string_rejected(self):
         assert hook_input.is_safe_session_id(None) is False
 
-    def test_overlong_rejected(self):
-        assert hook_input.is_safe_session_id("a" * 129) is False
+    def test_length_bound_is_the_filesystem_limit_not_an_arbitrary_cap(self):
+        """Both directions, at the boundary.
+
+        Asserting only that something long is rejected lets the bound drift
+        downward silently, and a bound below the filesystem's own limit REGRESSES
+        ids that are valid path components and that the hand-rolled checks this
+        replaces accepted (they had no length limit at all).
+        """
+        assert hook_input.is_safe_session_id("a" * 255) is True, (
+            "255 bytes is a legal filename; rejecting it drops a usable session id"
+        )
+        assert hook_input.is_safe_session_id("a" * 256) is False
 
     def test_trailing_newline_rejected(self):
         """``^…$`` would ACCEPT this (``$`` matches before a final newline);
@@ -128,12 +178,25 @@ class TestHooksDoNotEscapeSessionDir:
         monkeypatch.setattr(mod, "_GENESIS_DIR", tmp_path / ".genesis")
         mod._buffer_message("../../escaped", "hi", datetime.now(UTC))
         assert not (tmp_path / "escaped").exists(), "traversal created a dir outside sessions/"
+        # Control: without this half the test also passes if _session_dir started
+        # returning None for EVERY id — an inert guard and a correct one score the
+        # same on the traversal case alone.
+        mod._buffer_message(REAL_IDS[0], "hi", datetime.now(UTC))
+        assert (tmp_path / ".genesis" / "sessions" / REAL_IDS[0] / "messages.jsonl").exists(), (
+            "a safe id must still be buffered — the guard is inert, not selective"
+        )
 
     def test_urgent_alerts_staleness_marker_does_not_escape(self, tmp_path, monkeypatch):
         mod = _load("genesis_urgent_alerts", "genesis_urgent_alerts.py")
         monkeypatch.setattr(mod, "_GENESIS_DIR", tmp_path / ".genesis")
         mod._record_staleness_nudge("../../escaped2", datetime.now(UTC))
         assert not (tmp_path / "escaped2").exists()
+        # Same control as above: prove the guard discriminates rather than refuses
+        # everything.
+        mod._record_staleness_nudge(REAL_IDS[0], datetime.now(UTC))
+        assert (tmp_path / ".genesis" / "sessions" / REAL_IDS[0]).exists(), (
+            "a safe id must still record its marker"
+        )
 
     def test_proactive_trail_path_does_not_escape(self, tmp_path, monkeypatch):
         mod = _load("proactive_memory_hook", "proactive_memory_hook.py")
@@ -159,22 +222,8 @@ class TestUnsafeIdSkipsOnlyThePathRead:
     returned early on an unsafe id and silently disabled that work.
     """
 
-    def _run(self, script: str, payload: dict, home: Path):
-        (home / ".genesis").mkdir(parents=True, exist_ok=True)
-        (home / ".genesis" / "cc_context_enabled").touch()
-        env = {**os.environ, "HOME": str(home)}
-        env.pop("GENESIS_CC_SESSION", None)
-        return subprocess.run(
-            [sys.executable, str(_SCRIPTS / script)],
-            input=json.dumps(payload),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=env,
-        )
-
     def test_session_end_still_writes_metadata_with_unsafe_id(self, tmp_path):
-        self._run(
+        _run_hook(
             "genesis_session_end.py",
             {"session_id": "../../escaped", "reason": "clear"},
             tmp_path,
@@ -185,7 +234,7 @@ class TestUnsafeIdSkipsOnlyThePathRead:
         assert not (tmp_path / "escaped").exists()
 
     def test_session_end_writes_metadata_with_safe_id(self, tmp_path):
-        self._run(
+        _run_hook(
             "genesis_session_end.py",
             {"session_id": REAL_IDS[0], "reason": "clear"},
             tmp_path,
@@ -199,8 +248,8 @@ class TestUnsafeIdSkipsOnlyThePathRead:
             "session_id": "../../escaped",
             "last_assistant_message": "You'll need to run the migration yourself.",
         }
-        unsafe = self._run("genesis_stop_hook.py", payload, tmp_path)
-        safe = self._run(
+        unsafe = _run_hook("genesis_stop_hook.py", payload, tmp_path)
+        safe = _run_hook(
             "genesis_stop_hook.py", {**payload, "session_id": REAL_IDS[0]}, tmp_path
         )
         # Whatever the payload-only checks emit, an unsafe id must not change it.
@@ -241,20 +290,6 @@ class TestRejectionDoesNotDisableNonPathWork:
     """Round-3 class: a path-safety rejection must not gate work that never
     touches the filesystem."""
 
-    def _run(self, script: str, payload: dict, home: Path):
-        (home / ".genesis").mkdir(parents=True, exist_ok=True)
-        (home / ".genesis" / "cc_context_enabled").touch()
-        env = {**os.environ, "HOME": str(home)}
-        env.pop("GENESIS_CC_SESSION", None)
-        return subprocess.run(
-            [sys.executable, str(_SCRIPTS / script)],
-            input=json.dumps(payload),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=env,
-        )
-
     def test_urgent_alerts_still_emits_context_for_a_rejected_id(self, tmp_path):
         """BEHAVIOURAL, not a source-text scan: an earlier revision asserted that
         a particular blanking statement was absent from main(), which would still
@@ -265,11 +300,11 @@ class TestRejectionDoesNotDisableNonPathWork:
         _emit_charter_tag uses the id only as a bound SQL parameter, so neither
         may be skipped for an id that merely fails the path rule."""
         payload = {"prompt": "hi", "hook_event_name": "UserPromptSubmit"}
-        safe = self._run(
+        safe = _run_hook(
             "genesis_urgent_alerts.py", {**payload, "session_id": REAL_IDS[0]}, tmp_path
         )
         unsafe_home = tmp_path / "u"
-        unsafe = self._run(
+        unsafe = _run_hook(
             "genesis_urgent_alerts.py",
             {**payload, "session_id": "../../escaped"},
             unsafe_home,

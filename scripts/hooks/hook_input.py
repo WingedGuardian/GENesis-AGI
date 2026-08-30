@@ -122,16 +122,22 @@ def tool_response(payload: dict) -> dict:
 # The allow-list is deliberately WIDER than the hex-UUID shape CC usually emits.
 # Measured 2026-08-27: 875 distinct ids across ~/.claude/projects/*/ and both
 # ``cc_sessions`` id columns — all 875 pass this pattern, and two are NOT hex
-# UUIDs (a ``wt-``-prefixed id, and a non-session directory entry). That is
-# precisely why this is not a UUID regex: the observed set already contains other
-# shapes, so
-# future CC id format does not break every hook at once — while still rejecting
-# ``/``, ``\\``, ``.``, NUL and control characters.
+# UUIDs (a ``wt-``-prefixed id, and a non-session directory entry). The observed
+# set already contains more than one shape, so a UUID regex would be a bet on a
+# format that has already varied; this pattern lets a future CC id format through
+# instead of breaking every hook at once, while still rejecting ``/``, ``\\``,
+# ``.``, NUL and control characters.
+#
+# The 255 bound is the FILESYSTEM's, not an arbitrary cap: ext4 and friends limit
+# a single name to 255 bytes, and every character this pattern admits is one byte
+# in UTF-8. A tighter bound would reject ids that are perfectly valid path
+# components — the previously-hand-rolled checks had no length limit at all, so
+# anything shorter silently regresses an id that used to work.
 #
 # ``\A…\Z`` rather than ``^…$``: ``$`` also matches BEFORE a trailing newline,
 # so ``^[A-Za-z0-9_-]+$`` accepts ``"abc\n"`` — itself a valid path component,
 # which would silently create a stray directory.
-_SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
+_SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,255}\Z")
 
 
 def is_safe_session_id(value: object) -> bool:
