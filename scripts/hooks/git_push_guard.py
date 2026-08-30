@@ -2754,9 +2754,13 @@ def _scheduled_review_rows(pr_num: str, repo: str | None = None) -> list[dict] |
                     "--paginate",
                     "--jq",
                     ".[] | {login: .user.login, author_association: .author_association, "
-                    "body: .body, state: .state, created_at: (.created_at // .submitted_at)}",
-                    # .state present on reviews, null on issue comments; the timestamp field
-                    # differs per endpoint and is what lets the scan order rows ACROSS them
+                    "body: .body, state: .state, "
+                    "stamp: (.updated_at // .submitted_at // .created_at)}",
+                    # .state present on reviews, null on issue comments. `stamp` is the LAST
+                    # MODIFICATION: issue comments are editable and an edit that adds a
+                    # finding must sort by when it was written, not when the comment was
+                    # created. Review bodies expose only submitted_at (an edited review body
+                    # keeps its original stamp -- documented residue in the scan).
                 ],
                 capture_output=True,
                 text=True,
@@ -2872,10 +2876,15 @@ def _scheduled_review_marker_scan(
     # (neither). The verdict for the pair is resolved AFTER the loop from this list -- see
     # there for the rule and why the order matters.
     stmts: dict[tuple[str, str], list[str]] = {}
-    # Chronology: the API rows carry created_at/submitted_at; the two endpoints are fetched
-    # separately, so without sorting a review could sort before a comment posted after it.
-    # Rows without a timestamp (the test seam) keep list order -- the sort is stable.
-    rows = sorted(rows, key=lambda r: (r.get("created_at") or ""))
+    # Chronology: rows carry `stamp` = last modification (updated_at for issue comments,
+    # which are editable; submitted_at for reviews). The two endpoints are fetched
+    # separately, so without sorting a review could sort before a comment posted after
+    # it; and sorting by CREATION would let a finding edited into an old comment lose
+    # to a verdict posted before the edit. Rows without a stamp (the test seam) keep list
+    # order -- the sort is stable. Residue, stated: an edited REVIEW body has no edit
+    # timestamp in the API, so a finding added by editing a review keeps the review's
+    # original position.
+    rows = sorted(rows, key=lambda r: (r.get("stamp") or r.get("created_at") or ""))
     for row in rows:
         body = row.get("body") or ""
         # Blocks are parsed BEFORE the trust checks, so a row about to be dropped can
@@ -3052,6 +3061,13 @@ def _scheduled_review_marker_scan(
         decisive = [v for v in seq if v != "plain"]
         final = decisive[-1] if decisive else "plain"
         (rejected if final == "refused" else accepted).setdefault(h, set()).add(k)
+        # The verdict maps are SETS, so repeated statements collapsed to one rendered row
+        # and the report said one block where several were observed. Every repeat is a row.
+        same = seq.count(final) - 1 if final != "plain" else seq.count("plain") - 1
+        if same > 0:
+            unusable.append(
+                (k, f"{same} further block(s) at this head repeating the same statement", True)
+            )
         if final == "refused":
             n_plain = seq.count("plain")
             if n_plain:

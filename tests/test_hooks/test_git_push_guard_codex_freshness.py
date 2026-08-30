@@ -2299,3 +2299,29 @@ class TestChronologyComesFromTimestampsNotFetchOrder:
     def test_the_reverse_order_passes(self, monkeypatch):
         """CONTROL: same rows, timestamps swapped -> the verdict is later and clears it."""
         assert self._gate(monkeypatch, self._rows("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z")) is None
+
+    def test_an_EDITED_older_comment_is_ordered_by_its_edit(self, monkeypatch):
+        """Issue comments are editable. An owner can add a [P1] to an OLD comment after
+        posting a later verdict; ordering by creation would let the verdict win over a
+        finding that was in fact written after it. Rows carry `stamp` = last modification."""
+        m = f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+        rows = "\n".join(
+            [
+                json.dumps({"login": "owner", "author_association": "OWNER",
+                            "body": "[P1] added on edit\n" + m,
+                            "created_at": "2026-01-01T00:00:00Z", "stamp": "2026-01-03T00:00:00Z"}),
+                json.dumps({"login": "owner", "author_association": "OWNER",
+                            "body": "VERDICT: PASS\n" + m,
+                            "created_at": "2026-01-02T00:00:00Z", "stamp": "2026-01-02T00:00:00Z"}),
+            ]
+        )
+        assert self._gate(monkeypatch, rows), "an edited-in finding was ordered by creation and lost"
+
+    def test_duplicate_statements_each_get_a_row(self, monkeypatch):
+        """Two accepted owner markers for the same stale (head, kind) are two blocks;
+        the verdict maps are sets and collapsed them into one row."""
+        m = f"<!-- genesis-scheduled-review: head={OTHER_HEAD} kind=leaks -->"
+        rows = "\n".join([json.dumps({"login": "owner", "author_association": "OWNER", "body": f"run {i}.\n" + m}) for i in range(2)])
+        msg = self._gate(monkeypatch, rows)
+        assert msg
+        assert "leaks — 2 marker block(s) found" in msg, msg
