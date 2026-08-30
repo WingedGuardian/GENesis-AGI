@@ -392,12 +392,13 @@ When a user shares a file path or URL in conversation:
 - **Plan mode by default** for any task with 3+ steps or architectural
   decisions. If something goes sideways — STOP and re-plan.
 - **Use subagents** to keep main context clean. One concern per subagent.
-  **A MANDATED subagent is already the request** — when a gate or hook *requires*
-  one (the commit gate's adversarial audit — `/deep-review`), dispatch it; don't
-  stop to ask. Ask only for discretionary fan-out. This never reaches an approval
-  gate: autonomous background sessions and ego proposals still require explicit
-  user approval, every time. An instruction conflicting with an enforced project
-  rule gets named out loud and refused — never silently obeyed.
+  **A MANDATED subagent is already the request** — when a gate's block message
+  tells you to dispatch one, dispatch it; don't stop to ask. Ask only for
+  discretionary fan-out. An instruction conflicting with an enforced project rule
+  gets named out loud rather than silently obeyed — then the user decides; this
+  file does not outrank the user. That does NOT extend to the standing approval
+  gates, which no instruction waives: refuse, and say so (Traps: autonomous-CLI,
+  ego proposals; Rules: financial transactions, destructive commands).
 - **Verify multi-agent output — never trust one agent's claim.** A subagent
   fan-out that produces claims you'll act on (audits, diagnoses, source-of-truth
   maps) gets an independent adversarial verification stage before synthesis:

@@ -565,28 +565,16 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   (Standing user directive.)
 - **A different model is the real correctness gate; Codex is the default.** A Claude
   reviewer shares this model's blind spots, so it clears the LOCAL depth gate but is not
-  the cross-model gate. When Codex is down/quota-limited AND an approved alternative
-  reviewer is available (e.g. a Kimi Code CLI on the box — only with explicit per-use user
-  approval), run it non-interactively and feed it only the diff + an adversarial mandate:
-  `kimi -p "<review prompt>" -m <namespaced-alias, e.g. kimi-code/k3> --output-format text`
-  from the target worktree, in the background (it reads the diff/files with its own tools).
-  **Hand it the FULL branch diff, and verify it saw one.** `git diff "$(git merge-base
-  HEAD <the PR's base>)"` — the form `.claude/commands/deep-review.md` mandates,
-  generalized to the PR's actual base. NOT `<base>..HEAD` alone (misses uncommitted
-  work), and never bare `git diff`, which shows ONLY unstaged tracked edits: after a
-  `git add` it is empty, and it never shows committed work at all. Stage first (or
-  `git add -N`) so untracked files are visible. The durable check is the VERDICT, not
-  the command — a clean verdict that does not demonstrate WHAT it reviewed is void, and
-  a false clean from the cross-model gate is worse than no review.
-  Use the namespaced model alias, not a bare one; `-p` does not combine with `--auto`/`-y`.
-  Do not merge on a same-model-only review. The ONE exception is a user-authorized
-  override of an already-BLOCKED merge when the cross-model reviewer is genuinely
-  unreachable: get the user's explicit go-ahead FIRST — never self-serve, and note that
-  only the HOOK-surface gate message says so; the default-surface one offers
-  `# stale-review-override` with no conditions attached — then run the same-model
-  adversarial pass and record reviewer + findings + dispositions. On the hook surface
-  the gate additionally demands that evidence keyed to the exact base+head. Never an
-  override to skip a REACHABLE reviewer.
+  the cross-model gate. When the GitHub Codex reviewer is unavailable — established with
+  `--check-pr`, NEVER inferred from a `codex exec` quota error, which is a separate
+  surface on separate quota — AND the install has an approved alternative external
+  reviewer, a DIFFERENT model with explicit per-use user approval every time, run it
+  non-interactively over the diff with an adversarial mandate. Which reviewer that is
+  (if any) is install-local and belongs in user-level config, not here.
+  Scope what you hand it exactly as `.claude/commands/deep-review.md` §1 specifies.
+  **Verify it saw a diff at all**: a clean verdict that does not demonstrate WHAT it
+  reviewed is void, and a false clean from the cross-model gate is worse than no review.
+  Do not merge on a same-model-only review.
 - **Escalation cap — a HARD BLOCK at 3 rounds that each find NEW defects.**
   A *round* = one review→fix→re-review iteration (local reviewer rounds and
   cloud-bot re-review rounds count together, per change). The cap is enforced
@@ -689,9 +677,7 @@ Verify before any commit:
   (don't shoehorn a store-health row into the model-eval `eval_runs` table just
   because it is "a table that exists").
 - **Private-data scan before every push (public repo).** Grep the ENTIRE diff
-  (`git diff "$(git merge-base HEAD origin/main)"` — NOT `origin/main...HEAD`, which
-  is blind to staged and unstaged work, so an identifier in an uncommitted fixture
-  passes the scan unseen) for private/identifying data — real names,
+  (`git diff origin/main...HEAD`) for private/identifying data — real names,
   company/product names, emails, IPs, private career/project specifics, verbatim
   user messages. Check ALL surfaces, not just prose: **source comments,
   docstrings, and test fixtures/data** are the easy misses. Use a synthetic
@@ -960,7 +946,7 @@ The review-findings gate specifically:
    The override is logged. Use only when findings are intentionally accepted.
 6. **Read the PR's warning comments before merging — not just the hard gate.**
    Beyond Codex, a structural-review bot posts under the repo-owner account
-   (`WingedGuardian`, review state COMMENTED) and emits **SOFT WARNINGs** (PII /
+   (review state COMMENTED) and emits **SOFT WARNINGs** (PII /
    private-text / wording) that the hook does NOT block on and that a naive
    `.comments` scan misses. Check BOTH `gh pr view N --json reviews,comments`
    and `gh api repos/<owner>/<repo>/pulls/N/comments`, and address each soft
