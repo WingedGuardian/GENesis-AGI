@@ -1186,33 +1186,35 @@ findings below, a gated `gh pr merge`:
   names the PR's current head — so if any required routine never ran, ran on a stale
   commit, or was rate-limited, the merge blocks (naming the missing kinds). An ADVISORY
   routine still posts its review on the PR to be read/addressed, but its absence does not
-  block. A missing marker has **five causes needing different actions**, and the block
-  message names which one you are in — do not guess. Run
-  `git_push_guard.py --check-pr <N>`, which renders the per-cause bullets, not just its
-  summary line (that line's `present: none` clause is a SUMMARY and reads like "nothing
-  was posted" in every one of these cases):
-  (1) *no marker at any head* — nothing has run; on a freshly-opened PR a routine may
-  still be in flight, so **waiting is correct**;
-  (2) *a marker at an EARLIER head* — a routine ran, then a push moved the head. Routines
-  are generally not re-run on a push, so waiting is unlikely to help: re-review the
-  current head and post the marker by hand;
-  (3) *a marker AT this head that was REFUSED* — see the clean-verdict rule below;
-  (4) *a marker block that is PRESENT but cannot be credited* — a head that is not full
-  40-lowercase-hex, a `kind` the grammar refuses, an author who is not the repo owner, a
-  dismissed review, a stale unpublished draft. It is reported with its raw text quoted, so
-  "you posted one that does not count" is distinguishable from "nobody posted anything";
-  (5) *a block naming no REQUIRED kind* — reported as unscoped, and deliberately credited
-  to no review: guessing which kind a block meant would steer the reader into attesting
-  for a review that never ran.
-  A block in (4) or (5) SUPERSEDES a kind's own state — replacing (1)'s or (2)'s advice —
-  only when it says something specific about that kind's status (a marker only the owner
-  need correct, an unknown kind, a stale draft that cannot help). Another author's block
-  and a dismissed review say nothing about whether anything ran, so they are reported
-  ALONGSIDE the kind's true state, never instead of it. On a public repository the
-  alternative lets one comment from any account delete the guidance a fresh PR needs.
-  A value carrying a `/status` suffix (`kind=leaks/failed`) is refused AND flagged as a
-  run that reported its own failure — naming only the grammar problem would read as an
-  instruction to strip the suffix and produce a marker vouching for a failed run.
+  block. The block message is an **inventory**, not a diagnosis: under each missing
+  kind it lists EVERY marker block the scan found that names that kind, with its
+  status, and hides nothing. Run `git_push_guard.py --check-pr <N>` — it renders those
+  rows, not just the summary line (whose `present: none` clause reads like "nothing was
+  posted" in every case below, and is the exact wording an operator was once measured
+  acting wrongly on). Row statuses you will see:
+  * *accepted at a DIFFERENT head* — a routine ran, then a push moved the head. Routines
+  are generally not re-run on a push; re-review the current head and post the marker;
+  * *REFUSED* (at this head or another) — the body reads as carrying a blocking finding
+  and no clean-verdict line overrides it; see the clean-verdict rule below. The message
+  deliberately does NOT print the verdict string, because a gate that prints the line
+  that makes it pass is explaining how to get past itself;
+  * *could not be counted: <reason>* — a head that is not full 40-lowercase-hex, an
+  empty or refused field value (quoted back verbatim), an author who is not the repo
+  owner, a dismissed review, a stale unpublished draft;
+  * *unscoped* — blocks naming no REQUIRED kind, listed and credited to nothing:
+  guessing which review a block "meant" would steer you into attesting for one that
+  never ran. A value carrying a `/status` suffix (`kind=leaks/failed`) lands here and
+  is flagged as a run that reported its own failure.
+  The one conditional is a COUNT, keyed on a fact: a kind with no OWNER-authored block at
+  any head gets "a routine may still be in flight — waiting is the right move", because
+  that is the only state where patience can help. A stranger's comment is not evidence
+  about the owner's routine and never silences that note; an owner's block in ANY state
+  (accepted elsewhere, refused, dismissed, stale draft, malformed) is, and does.
+  Why an inventory and not a diagnosis: the previous shape picked one cause per kind and
+  hid the rest, and every one of nine review findings across six rounds was a hidden fact
+  — a refused `[P1]` on an older commit hidden behind a typo at the current one, the only
+  evidence a review had ever run hidden by a drive-by comment. Precedence is the right
+  shape for a VERDICT; for a REPORT, hiding a true fact is never correct.
   Or append `# scheduled-review-override` to merge anyway (the conscious "merge without
   the scheduled reviews" case). Head match is EXACT — no ancestor walk, no delta
   tolerance, unlike the Codex freshness gate, which grants relief on a provably trivial

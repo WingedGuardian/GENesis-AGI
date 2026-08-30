@@ -1191,7 +1191,19 @@ OTHER_HEAD = "1111111111111111111111111111111111111111"
 
 
 class TestScheduledGateBlockMessageBranchesOnCause:
-    """A missing marker has two causes needing OPPOSITE actions; the message must branch.
+    """The block message is an INVENTORY: every marker block found is listed under the
+    kind it names, with its status, and nothing is subtracted from anything.
+
+    HISTORY. This class was written when the message PARTITIONED the missing kinds by
+    cause and let one cause per kind win. Across six review rounds every finding on
+    that shape was the same defect: the winning cause hid a fact the operator needed.
+    The tests below were rewritten from "the winning branch says X and not Y" to "the
+    row for X is present"; the reasoning is kept where a test's meaning changed. The
+    one conditional that survives is a count: a kind with no OWNER-authored block at
+    any head gets the in-flight note, because that is the only state in which waiting
+    can help.
+
+    Original framing, still true of the facts even though nothing "branches" now:
 
     * markers exist for OTHER heads -> a routine ran, then a push moved the head. Waiting
       is unlikely to help; re-review the current head and post the marker by hand.
@@ -1222,10 +1234,12 @@ class TestScheduledGateBlockMessageBranchesOnCause:
         return msg
 
     # -- branch 1: a marker exists, but for an earlier head ---------------------
-    def test_stale_marker_says_waiting_is_unlikely_to_help(self, monkeypatch):
-        msg = self._block_msg(monkeypatch, self._marker_at(OTHER_HEAD)).lower()
-        assert "unlikely to clear this" in msg
-        assert "re-run against the current head" in msg
+    def test_stale_marker_lists_the_older_head_as_a_row(self, monkeypatch):
+        """Was: asserts the advice "unlikely to clear this / re-run". The inventory
+        carries no advice; the fact it replaces it with is the accepted-elsewhere row."""
+        msg = self._block_msg(monkeypatch, self._marker_at(OTHER_HEAD))
+        assert f"accepted at a DIFFERENT head ({OTHER_HEAD[:12]})" in msg
+        assert "none of which counts at the current head" in msg
 
     def test_stale_marker_does_not_tell_the_operator_to_wait(self, monkeypatch):
         """The failure this branch exists to prevent: advice-to-wait on a pushed head."""
@@ -1262,17 +1276,18 @@ class TestScheduledGateBlockMessageBranchesOnCause:
         assert "IS present at THIS head" in msg
         assert "REFUSED" in msg
 
-    def test_refused_marker_gives_the_remedy_a_clean_verdict_line(self, monkeypatch):
-        """The remedy is neither waiting nor re-reviewing — it is the verdict line.
+    def test_refused_marker_states_the_cause_without_the_verdict_incantation(self, monkeypatch):
+        """INVERTED from its previous form, which asserted the two verdict strings VERBATIM.
 
-        Asserts the two remedy strings VERBATIM and conjunctively. An earlier version
-        used `"VERDICT: PASS" in msg or "CLEAN" in msg`, which could never fail inside
-        this branch: the branch's own fixed prose contains the word CLEAN, so the second
-        disjunct held even with the remedy sentence deleted entirely.
+        A gate that prints the exact line that makes it pass is explaining how to get
+        past itself: the refused body may carry a REAL finding, and "append this string"
+        launders it. The rule that decides "refused" is documented in the dev skill; the
+        message states the cause and stops.
         """
         msg = self._block_msg(monkeypatch, self._marker_at(HEAD, self.REFUSED_PROSE))
-        assert "VERDICT: PASS" in msg
-        assert "PII/Secrets/Wording: CLEAN" in msg
+        assert "no clean-verdict line overrides it" in msg
+        assert "VERDICT: PASS" not in msg
+        assert "PII/Secrets/Wording: CLEAN" not in msg
 
     def test_refused_marker_does_not_give_the_other_branches_advice(self, monkeypatch):
         """The failure this branch exists to prevent: being told to wait, or to re-post
@@ -1280,7 +1295,7 @@ class TestScheduledGateBlockMessageBranchesOnCause:
         msg = self._block_msg(monkeypatch, self._marker_at(HEAD, self.REFUSED_PROSE)).lower()
         assert "may still be in flight" not in msg
         assert "waiting is the right move" not in msg
-        assert "present for a different head" not in msg
+        assert "different head" not in msg
 
     def test_a_clean_verdict_line_makes_the_same_marker_pass(self, monkeypatch):
         """The remedy the message prescribes must actually work — end to end."""
@@ -1314,8 +1329,7 @@ class TestScheduledGateBlockMessageBranchesOnCause:
         the "nothing has run — wait for it" path: wrong claim AND wrong advice.
         """
         msg = self._block_msg(monkeypatch, self._marker_at(OTHER_HEAD, self.REFUSED_PROSE))
-        assert OTHER_HEAD[:12] in msg
-        assert "a marker is present for a DIFFERENT head" in msg
+        assert f"REFUSED at a DIFFERENT head ({OTHER_HEAD[:12]})" in msg
         assert "may still be in flight" not in msg.lower()
 
     def test_partial_acceptance_does_not_contradict_the_present_line(self, monkeypatch):
@@ -1329,8 +1343,8 @@ class TestScheduledGateBlockMessageBranchesOnCause:
         monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "code-review,leaks")
         msg = _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
         assert msg and "present: code-review" in msg
-        assert "at ANY head" in msg, "the no-marker branch is still the right one here"
-        assert "leaks — no marker at ANY head" in msg, "must be scoped to the MISSING kind"
+        assert "leaks — no marker block found" in msg, "must be scoped to the MISSING kind"
+        assert "code-review —" not in msg, "a satisfied kind gets no row at all"
 
     def test_refused_marker_for_an_already_satisfied_kind_does_not_hijack_the_message(
         self, monkeypatch
@@ -1353,7 +1367,7 @@ class TestScheduledGateBlockMessageBranchesOnCause:
         msg = _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
         assert msg and "code-review" in msg
         assert "REFUSED" not in msg, "the refused kind is already satisfied — not the cause"
-        assert "code-review — no marker at ANY head" in msg
+        assert "code-review — no marker block found" in msg
 
     def test_mixed_causes_report_every_missing_kind_not_just_one(self, monkeypatch):
         """Two missing kinds failing for DIFFERENT reasons must BOTH get guidance.
@@ -1375,14 +1389,14 @@ class TestScheduledGateBlockMessageBranchesOnCause:
         monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "code-review,leaks")
         msg = _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
         assert msg
-        # code-review: refused AT this head -> the verdict-line remedy.
-        assert "code-review — a marker IS present at THIS head" in msg
-        assert "VERDICT: PASS" in msg
-        # leaks: present at an EARLIER head -> the re-review remedy, naming that head.
-        assert "leaks — a marker is present for a DIFFERENT head" in msg
-        assert OTHER_HEAD[:12] in msg
-        # Neither kind may be silently dropped.
-        assert msg.count("  * ") == 2, "one bullet per cause group, both present"
+        # code-review: refused AT this head. The row states the cause; no incantation.
+        assert "code-review — 1 marker block(s) found" in msg
+        assert "IS present at THIS head but was REFUSED" in msg
+        # leaks: accepted at an EARLIER head, named.
+        assert "leaks — 1 marker block(s) found" in msg
+        assert f"accepted at a DIFFERENT head ({OTHER_HEAD[:12]})" in msg
+        # Neither kind may be silently dropped: one bullet per MISSING kind.
+        assert msg.count("  * ") == 2, "one bullet per missing kind, both present"
 
     def test_three_way_split_reports_all_three_causes(self, monkeypatch):
         """The full partition: refused here, present elsewhere, and absent — at once."""
@@ -1399,8 +1413,9 @@ class TestScheduledGateBlockMessageBranchesOnCause:
         monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "code-review,leaks")
         msg = _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
         assert msg and msg.count("  * ") == 2
-        assert "code-review — a marker IS present at THIS head" in msg
-        assert "leaks — a marker is present for a DIFFERENT head" in msg
+        assert "code-review — 1 marker block(s) found" in msg
+        assert "IS present at THIS head but was REFUSED" in msg
+        assert f"accepted at a DIFFERENT head ({third[:12]})" in msg
 
     # -- shared: what ALL branches must still carry -----------------------------
     @pytest.mark.parametrize("which", ["stale", "empty", "refused"])
@@ -1473,9 +1488,12 @@ class TestAnUnusableMarkerIsNotReportedAsAbsent:
         body = f"scan done.\n<!-- genesis-scheduled-review: head={SHORT_HEAD} kind=leaks -->"
         msg = self._block_msg(monkeypatch, self._row(body))
         assert f"'{SHORT_HEAD}'" in msg, "the offending value must be quoted back"
-        assert "not 'nobody posted anything'" in msg.lower(), (
-            "the report must contradict the absent reading, which is the one that "
-            "sent an operator away to wait"
+        assert "none of which counts at the current head" in msg, (
+            "the report must state that a block was FOUND, which is the reading that "
+            "used to be replaced by 'nothing was posted, wait'"
+        )
+        assert "may still be in flight" not in msg.lower(), (
+            "an owner block exists, so the routine has evidently run; waiting cannot help"
         )
 
     def test_an_abbreviated_head_does_not_advise_waiting(self, monkeypatch):
@@ -1560,19 +1578,22 @@ class TestAnUnusableMarkerIsNotReportedAsAbsent:
         )
 
     def test_a_marker_in_a_dismissed_review_is_reported(self, monkeypatch):
-        """Same rewrite, same precedent, reached by review STATE rather than authorship.
+        """Corrected twice, and the second correction is the honest one.
 
-        A dismissed review says only that IT no longer vouches. Whether anything has run
-        for this kind is a separate question it does not answer, so the kind keeps its
-        own state and its own advice. Contrast the stale-PENDING case below, which DOES
-        supersede: there the block genuinely reports on this kind's status.
+        First form: waiting guidance suppressed (the dismissed block "won"). Then
+        rewritten to keep the guidance, on the argument that a dismissed review says
+        nothing about whether anything ran. That argument was wrong: it is an OWNER-
+        authored review at this head, which is direct evidence the owner's routine ran.
+        The inventory lists the dismissed block; the in-flight note is keyed on owner
+        evidence, so it is correctly absent here and correctly present for a stranger's
+        block (test below).
         """
         body = f"scan done.\n<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
         msg = self._block_msg(monkeypatch, self._row(body, state="DISMISSED")).lower()
         assert "dismissed" in msg
-        assert "may still be in flight" in msg, (
-            "a dismissed review consumed the kind's true state, deleting the guidance "
-            f"for a review that has not run:\n{msg}"
+        assert "may still be in flight" not in msg, (
+            "an OWNER's dismissed review is evidence the owner's routine already ran at "
+            f"this head; waiting for it cannot help:\n{msg}"
         )
 
     def test_a_GENUINELY_absent_marker_still_advises_waiting(self, monkeypatch):
@@ -1718,7 +1739,7 @@ class TestAnUnusableMarkerRemedyMatchesItsCause:
         msg = self._msg(monkeypatch, self._row(body))
         assert f"'{HEAD[:8]}'" in msg, "the malformed value must still be quoted"
         assert "could not be counted" in msg
-        assert "not 'nobody posted anything'" in msg.lower()
+        assert "none of which counts at the current head" in msg
 
     def test_a_block_naming_an_unrequired_kind_is_still_reported(self, monkeypatch):
         """A near-miss kind is the case that narrowing to named kinds broke: it
@@ -1822,7 +1843,7 @@ class TestEveryMarkerFormIsAccountedFor:
         """
         msg = self._msg(monkeypatch, self._row("scan done.\n" + self._marker(kind="leak")))
         assert "not a known scheduled" in msg, "the block must be visible"
-        assert "no marker at ANY head" in msg, (
+        assert "leaks — no marker block found" in msg, (
             "attributing the near-miss to the required kind is the guess a prior "
             "finding forbade; the required kind's own state is that none was posted"
         )
@@ -2041,25 +2062,37 @@ class TestTheReportReadsEveryFieldPermissively:
             f"waiting guidance a fresh PR needs:\n{msg}"
         )
 
-    def test_an_owner_repairable_marker_DOES_still_outrank_history(self, monkeypatch):
-        """POSITIVE CONTROL for the rule above, without which it could be inert.
+    def test_every_block_for_a_kind_is_listed_and_nothing_outranks_anything(self, monkeypatch):
+        """The inventory invariant, on the scenario that ended the previous design.
 
-        "Only a repairable block consumes a kind's state" is satisfied just as well by
-        an implementation where NOTHING consumes it — every test above would still pass
-        while the outranking this rule exists to preserve was silently gone. Here the
-        owner's own one-character typo sits at head, and the history bullet must yield
-        to it, because "fix this one" is then the whole of the advice.
+        A REFUSED marker at an older head — its body carries a real [P1] — and the
+        owner's truncated marker at the current head. Under the partition, the typo
+        "won" and the [P1] vanished; the message then told the operator their sha was
+        short, and the layout handed them the full current head to fix it with. Doing
+        so mints a clean attestation at head while a leak finding stands unresolved on
+        the older commit. Both rows must be present; the count must say two.
         """
         rows = "\n".join(
             [
-                self._row("older run.\n" + self._marker(head=OTHER_HEAD)),
+                self._row("[P1] a real leak finding\n" + self._marker(head=OTHER_HEAD)),
                 self._row("scan done.\n" + self._marker(head=HEAD[:8])),
             ]
         )
         msg = self._msg(monkeypatch, rows)
         assert msg
-        assert f"'{HEAD[:8]}'" in msg, f"the repairable typo must be reported:\n{msg}"
-        assert OTHER_HEAD[:12] not in msg, (
-            "an owner-repairable marker at head no longer outranks stale history, so "
-            f"the trust rule has become inert rather than selective:\n{msg}"
-        )
+        assert "leaks — 2 marker block(s) found" in msg, msg
+        assert f"REFUSED at a DIFFERENT head ({OTHER_HEAD[:12]})" in msg, msg
+        assert f"'{HEAD[:8]}'" in msg, msg
+
+    def test_an_empty_field_value_is_not_reported_as_a_missing_field(self, monkeypatch):
+        """`head=` with no value is the single most likely producer fault (an
+        uninterpolated variable). It was reported as "carries no head= field", which
+        is the REFUSED-vs-ABSENT confusion this file forbids, at the empty-value cell."""
+        for block, needle in (
+            ("<!-- genesis-scheduled-review: head= kind=leaks -->", "head= field is present but EMPTY"),
+            (f"<!-- genesis-scheduled-review: head={HEAD} kind= -->", "kind= field is present but EMPTY"),
+        ):
+            msg = self._msg(monkeypatch, self._row("scan.\n" + block))
+            assert msg, block
+            assert needle in msg, f"{block}\n{msg}"
+            assert "carries no" not in msg, f"the field IS present:\n{msg}"
