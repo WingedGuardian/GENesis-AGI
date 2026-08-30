@@ -327,7 +327,8 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   that ALSO leaves the guard with no parsed segment. For any classifier
   or guard, enumerate the CROSS PRODUCT of the axes that actually drive the
   decision — {operation} × {the constructs your parser can mis-segment} ×
-  {evidence present, absent} — and assert the invariant per cell, so an untested cell fails
+  {evidence present, absent} × {interactive, unattended} — and assert the invariant per
+  cell, so an untested cell fails
   loudly instead of silently. Keep the corpus replay as the realism check; the
   generated matrix is the coverage check FOR THE MODEL YOU DECLARED, which is
   the most it can be — a construct you never thought of has no cell to skip and
@@ -524,10 +525,19 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   corroboration, never as the proof, and pair it with a control that DOES flip
   — an unflipped corpus and an inert measurement look identical.
 
-  State the direction too, not just a total. The same sibling's fold splits a
-  word the shell would join, so a path can be judged shallower than the one
-  that would really be removed — the verdict moves, always toward refusing. "It
-  changes nothing" would have been the easier sentence and the false one.
+  State the direction too, not just a total — and then check the direction on
+  the token you did not think of. The same sibling's fold used to split a word
+  the shell joins, and the paragraph that stood here said the verdict could
+  therefore only move toward refusing. That was measured on path operands and
+  was false on the option token: the split could hide the flags, and a spelling
+  the shell runs as a recursive-force removal of a protected path was allowed.
+  A reviewer found it from the diff; the earlier audit had split every position
+  of a path and never the option, and its zero came from benign traffic with no
+  true-positive control. The fold now deletes the sequence, which is what the
+  shell does, and the guard is asserted to give the same answer for the
+  continued and the joined spelling. The general lesson is the one above: the
+  examples you enumerate are a sample, and a direction claim needs the cell that
+  would falsify it.
 
   Deliberately stated without the triggering shapes. A guard's defeat
   conditions are not a teaching aid, and this file is public.
@@ -544,11 +554,16 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   after widening: 0.43% of ~19k real commands.
 
   This does NOT loosen the fail-closed mandate above, and the two are easy to
-  read as contradicting each other. They are scoped by who is present: a
-  security-critical caller should treat an unparseable command as a BLOCK
-  wherever no one can answer a prompt, and the `ask` is the interactive form of
-  the same refusal — the operation does not proceed unverified either way. Where
-  a session is unattended, fail-closed governs and (c) applies.
+  read as contradicting each other. Rule (b) is scoped to the git-operation
+  blind-spot net — a guard whose trigger is deliberately broad and whose false
+  positive is one confirmation. It is NOT a template for every guard: the
+  protected-paths and destructive-command guards hard-block an unreliable parse
+  even when a person is present, by design, because their false negative is an
+  irreplaceable path or a broad recursive removal and their false positive is a
+  rewrite. Within the net, the two rules are scoped by who is present: `ask` is
+  the interactive form of the refusal, and where a session is unattended
+  fail-closed governs and (c) applies. The operation proceeds unverified in
+  neither case.
 
   This is the shipped shape now, not an aspiration, and one distinction inside
   it must stay visible. The shared parser still degrades to a naive split with
