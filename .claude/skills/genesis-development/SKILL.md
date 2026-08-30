@@ -241,7 +241,11 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   `mutated != original` true while a later one silently misses its anchor, so
   the partial mutation reads as complete (assert the anchor matched the expected
   number of times); and prove it with the mutated file's OWN parser —
-  `ast.parse` for Python, `bash -n` for shell — since an invalid mutation breaks
+  `compile(src, path, "exec")` for Python (NOT `ast.parse`: that only builds a
+  tree, so it accepts context-invalid constructs like a `return` moved outside a
+  function or a `break` outside a loop, and the `SyntaxError` then surfaces at
+  COLLECTION, where a nonzero exit reads as a successful RED), `bash -n` for
+  shell — since an invalid mutation breaks
   collection and reads as a successful RED, while the wrong language's parser
   rejects a valid mutation and hides a real survivor. Restore from a file copy
   taken beforehand, never `git checkout` — the work is uncommitted — and make
