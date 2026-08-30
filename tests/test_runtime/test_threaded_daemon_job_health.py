@@ -315,3 +315,98 @@ async def test_failure_record_is_not_bounded_by_the_tick_timeout(factory):
         "means the submission was abandoned on a timeout and re-done off the loop, "
         "where it does not persist"
     )
+
+
+@pytest.mark.parametrize(
+    ("factory",),
+    [(OutreachHeartbeat,), (DashboardHeartbeat,)],
+    ids=["outreach", "dashboard"],
+)
+async def test_start_captures_the_running_loop(factory):
+    """start() must capture the loop, and every test until now assigned _loop by hand.
+
+    That left the fix's ENTIRE activation condition uncovered: deleting the
+    get_running_loop() capture would have left the whole suite green while
+    production silently lost every job-health row again.
+    """
+    daemon = factory(interval_seconds=3600)
+    daemon._stop_event.set()  # the worker exits immediately; we only inspect capture
+    daemon.start()
+    try:
+        assert daemon._loop is asyncio.get_running_loop()
+    finally:
+        daemon.stop()
+
+
+@pytest.mark.parametrize(
+    ("factory",),
+    [(OutreachHeartbeat,), (DashboardHeartbeat,)],
+    ids=["outreach", "dashboard"],
+)
+async def test_repeated_failures_coalesce_into_one_pending_record(factory):
+    """A stalled loop must not queue one failure record per tick.
+
+    Unbounded submission was the previous shape. During a wedge every tick times
+    out and queues another record, so a long stall lands them all at once on
+    recovery -- spiking consecutive_failures, permanently inflating total_failures,
+    and firing a retry per record where a retry registry is wired. "The daemon is
+    failing" is ONE fact however long the stall lasts.
+
+    The repeats are submitted from a single worker pass WITHOUT yielding to the
+    loop, which is what a wedge looks like from the daemon's side: the first record
+    is scheduled and cannot run, so the rest must be absorbed rather than queued.
+    Driving them through separate loop yields would let the first complete and prove
+    nothing.
+    """
+    calls: list[str] = []
+
+    class _CountingRuntime:
+        def record_job_failure(self, job_name, *args, **kwargs):
+            calls.append(job_name)
+
+    daemon = factory(interval_seconds=60)
+    daemon._loop = asyncio.get_running_loop()
+    rt = _CountingRuntime()
+
+    def _five_failures() -> None:
+        for n in range(5):
+            daemon._record_failure(rt, RuntimeError(str(n)))
+
+    assert await _drive(_five_failures) is None
+    for _ in range(200):
+        if calls:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.1)
+    await _drain_pending()
+
+    assert len(calls) == 1, (
+        f"expected the pending record to absorb the repeats, got {len(calls)} "
+        "-- a wedge would queue one per tick and burst on recovery"
+    )
+
+
+@pytest.mark.parametrize(
+    ("factory",),
+    [(OutreachHeartbeat,), (DashboardHeartbeat,)],
+    ids=["outreach", "dashboard"],
+)
+async def test_double_start_is_refused_while_running(factory):
+    """A second start() must not spawn a second pulsing thread.
+
+    The guard keys on the existing thread being ALIVE, so this stands in a live
+    one rather than starting a real worker: setting _stop_event first would let the
+    worker exit immediately, and restarting a DEAD daemon is correct behaviour, not
+    the case under test.
+    """
+    daemon = factory(interval_seconds=3600)
+    release = threading.Event()
+    sentinel = threading.Thread(target=lambda: release.wait(timeout=10), daemon=True)
+    sentinel.start()
+    daemon._thread = sentinel
+    try:
+        daemon.start()
+        assert daemon._thread is sentinel, "double start() replaced a live thread"
+    finally:
+        release.set()
+        sentinel.join(timeout=5)

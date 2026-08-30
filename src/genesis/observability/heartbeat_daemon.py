@@ -66,14 +66,35 @@ class HeartbeatDaemon:
         # a throwaway loop and pulses without recording health, which is the
         # pre-existing behaviour rather than a new failure.
         self._loop: asyncio.AbstractEventLoop | None = None
+        # The in-flight failure record, if any. See _record_failure: at most one.
+        self._pending_failure = None
 
     # --- lifecycle ---------------------------------------------------------
     def start(self) -> None:
-        """Start the heartbeat thread, capturing the loop it was started from."""
+        """Start the heartbeat thread, capturing the loop it was started from.
+
+        MUST be called from the runtime's loop thread. That is the fix's entire
+        activation condition, and it used to be silent: an embedder calling this
+        from a sync context gets ``_loop = None``, every tick takes the fallback,
+        and job health is never persisted — the exact defect this class exists to
+        remove. So the miss is now LOUD rather than inferred from missing rows.
+        """
+        if self._thread is not None and self._thread.is_alive():
+            logger.warning(
+                "%s heartbeat already running — ignoring duplicate start()",
+                self.job_name,
+            )
+            return
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
             self._loop = None
+            logger.warning(
+                "%s heartbeat started with NO running event loop: it will pulse, but "
+                "job health will not be persisted. Start it from the runtime's loop "
+                "thread to restore persistence.",
+                self.job_name,
+            )
         self._thread = threading.Thread(
             target=self._run, daemon=True, name=self.thread_name or "heartbeat",
         )
@@ -106,7 +127,12 @@ class HeartbeatDaemon:
         loop = self._loop
         if loop is None or not loop.is_running():
             return False
-        future = asyncio.run_coroutine_threadsafe(coro_factory(), loop)
+        coro = coro_factory()
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+        except RuntimeError:
+            coro.close()  # never scheduled -> close it rather than leak a warning
+            raise
         try:
             future.result(timeout=self._TICK_TIMEOUT_S)
         except BaseException:
@@ -155,13 +181,40 @@ class HeartbeatDaemon:
 
         loop = self._loop
         if loop is not None and loop.is_running():
-            try:
-                asyncio.run_coroutine_threadsafe(_record(), loop)
+            # COALESCE: at most ONE failure record may be in flight. Unbounded
+            # submission was the previous shape and it is wrong for the case it was
+            # written for — during a wedge every tick times out and queues another
+            # record, so a three-hour stall lands ~120 of them at once on recovery,
+            # driving consecutive_failures to ~120, permanently inflating
+            # total_failures, and firing a retry per record where a retry registry
+            # is wired. "The daemon is failing" is ONE fact however long the stall
+            # lasts; the pending record already carries it.
+            pending = self._pending_failure
+            if pending is not None and not pending.done():
                 return
+            coro = _record()
+            try:
+                self._pending_failure = asyncio.run_coroutine_threadsafe(coro, loop)
             except RuntimeError:
-                # The loop stopped between the check and the submit; fall through.
-                pass
+                # The loop stopped between the check and the submit. Close the
+                # coroutine explicitly: it was created as an argument and never
+                # scheduled, so without this it warns "never awaited" every tick
+                # through the shutdown window.
+                coro.close()
+            else:
+                # A concurrent.futures.Future does not warn on an unretrieved
+                # exception the way an asyncio task does, so an error inside the
+                # record would vanish silently.
+                self._pending_failure.add_done_callback(self._log_record_error)
+                return
         rt.record_job_failure(self.job_name, "heartbeat emission failed", exc=exc)
+
+    def _log_record_error(self, future) -> None:
+        """Surface an exception raised by a submitted failure record."""
+        try:
+            future.result()
+        except Exception:
+            logger.error("%s heartbeat failure-record failed", self.job_name, exc_info=True)
 
     def _run(self) -> None:
         from genesis.observability.types import Severity, Subsystem

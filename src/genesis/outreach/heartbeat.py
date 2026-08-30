@@ -18,9 +18,13 @@ that gives honest coverage:
     shared ``compute_heartbeat_staleness`` goes ``overdue`` →
     ``subsystem_stale:outreach``.
 
-Boundary (documented, out of scope): a WEDGED-but-alive event loop keeps
-``is_running`` True and this thread pulsing — detecting a wedged (vs stopped)
-scheduler is job_health's domain, the same bar the dashboard/ego heartbeats hold.
+Wedge behaviour (CHANGED, and this docstring used to say the opposite): the
+scheduler is an ``AsyncIOScheduler`` running on the runtime's main loop, and the
+pulse is now emitted ON that loop. So a WEDGED-but-alive loop no longer keeps this
+thread pulsing — the tick times out, the pulse ceases, and the stall surfaces as
+BOTH ``subsystem_stale:outreach`` and a job-health failure. Wedge detection is
+therefore no longer "job_health's domain, out of scope here"; it falls out of the
+mechanism. Recorded because the previous wording described the old contract.
 
 The threading, loop capture and health recording live in
 ``observability.heartbeat_daemon``; only the identity and the gate are here.
