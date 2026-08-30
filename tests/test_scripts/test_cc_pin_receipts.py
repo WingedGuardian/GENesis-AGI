@@ -483,6 +483,40 @@ def test_a_fence_is_closed_only_by_its_own_marker() -> None:
     _assert_blocked(_evaluate(body=f"~~~\n{BOTH}```\n"), "receipts")
 
 
+def test_an_unmatched_comment_INSIDE_a_fence_does_not_swallow_the_receipts() -> None:
+    """MEASURED over-rejection, on a gate with no override sigil.
+
+    Markdown treats `<!--` inside a fence as literal text. The scanner updated
+    comment state BEFORE checking the fence, so a fenced ```html example containing
+    an unmatched `<!--` turned comment-mode on, which hid the CLOSING fence, which
+    swallowed every receipt after it — both reported missing while both render
+    plainly on GitHub. Refusing a compliant PR with no recovery route is the same
+    wedge this module exists to remove, arriving through the body scanner.
+    """
+    body = f"```html\n<!-- example of a comment\n```\n{BOTH}"
+    passing = _evaluate(body=body)
+    assert not passing.blocked, f"receipts after a fenced comment must count: {passing.message}"
+
+
+def test_the_fence_and_comment_controls_survive_together() -> None:
+    """The properties the fix must not trade away, asserted in ONE place.
+
+    Reordering the fence and comment passes is what caused the bug above, and a
+    reordering can silently re-open any of these — each was itself a measured
+    defect once. Kept together so the whole set moves or none of it does.
+    """
+    cases = {
+        "inside a closed comment": f"<!-- {BOTH} -->",
+        "under an unterminated opener": f"<!-- template notes\n{BOTH}",
+        "inside a fence": f"```\n{BOTH}```\n",
+        "under a mismatched fence closer": f"~~~\n{BOTH}```\n",
+    }
+    still_visible = [label for label, body in cases.items() if not _evaluate(body=body).blocked]
+    assert not still_visible, (
+        f"receipts became visible where they must not be: {still_visible}"
+    )
+
+
 @pytest.mark.parametrize(
     "value",
     [

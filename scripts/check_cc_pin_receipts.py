@@ -309,6 +309,24 @@ def readable_body(body: str) -> str:
     fence: str | None = None
 
     for line in body[:_MAX_BODY].splitlines():
+        # A FENCED line is OPAQUE — checked before comment state is touched, and its
+        # own text is never interpreted. Markdown treats `<!--` inside a fence as
+        # literal characters, so letting it open a comment here made the scanner and
+        # the rendered view disagree: an unmatched `<!--` in a fenced example turned
+        # comment-mode on, which then hid the CLOSING fence, which swallowed every
+        # receipt after it. MEASURED — a body with a fenced ```html example followed
+        # by both receipts on their own lines reported both as missing, on a gate
+        # with no override sigil. That is the same wedge this module exists to
+        # remove, arriving through the body scanner instead of the pin parser.
+        #
+        # The closer is matched on the RAW line for the same reason: inside a fence
+        # there is no comment stripping to apply, and Markdown wants the marker at
+        # the start of the line regardless.
+        if fence is not None:
+            if line.strip().startswith(fence):
+                fence = None
+            continue
+
         # Strip comments FIRST, and keep whatever the line has outside them. The
         # previous version dropped the entire remainder of a line once it saw a
         # comment — both when the comment opened on that line and when it closed
@@ -322,14 +340,10 @@ def readable_body(body: str) -> str:
         rendered, in_comment = _outside_comments(line, in_comment)
         stripped = rendered.strip()
 
-        if fence is not None:
-            # A fence is closed only by its OWN marker: ``~~~`` does not end a
-            # ``` block, which is how a receipt below a mismatched closer stayed
-            # rendered-as-code while counting as visible.
-            if stripped.startswith(fence):
-                fence = None
-            continue
-
+        # A fence is closed only by its OWN marker: ``~~~`` does not end a ```
+        # block, which is how a receipt below a mismatched closer stayed
+        # rendered-as-code while counting as visible. (The close is handled at the
+        # top of the loop; this is the OPEN.)
         if stripped.startswith(_FENCE_MARKS):
             fence = stripped[:3]
             continue
