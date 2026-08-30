@@ -550,12 +550,22 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   the same refusal — the operation does not proceed unverified either way. Where
   a session is unattended, fail-closed governs and (c) applies.
 
-  Read that as the intended invariant, not as a description of the tree. On the
-  degraded path the shared parser still returns a naive split with no failure
-  signal, so a caller that sees no matching segment allows — the block above is
-  what the guard work is FOR, not what it already does. Anything written here
-  in the present tense about a net that has not merged is a status claim
-  without evidence, which this file forbids elsewhere and got wrong here.
+  This is the shipped shape now, not an aspiration, and one distinction inside
+  it must stay visible. The shared parser still degrades to a naive split with
+  NO failure signal, so a caller that only asks "did I get a matching segment?"
+  allows. What closes the hole is a separate conjunction AT THE CALLER — no
+  matching segment, AND the raw text is un-tokenizable, AND it names a gated
+  operation — which yields `ask` interactively and a refusal when unattended.
+  The parser's contract did not change and must not: it degrades, the caller
+  chooses the fail direction, exactly as the mandate above requires.
+
+  Earlier revisions of this passage described that net in the present tense
+  while it was still unmerged. Both directions of that error are worth naming,
+  because fixing one produces the other: an unbuilt mechanism written as
+  shipped, and then — once it does ship — a hedge left standing that now
+  understates the tree. A status sentence in a durable document is a claim with
+  a date on it. Re-check it against the code whenever the surrounding work
+  lands, not only when it is first written.
 
   Corollaries of the corollaries, each measured: a net that returns inline
   PRE-EMPTS every gate below it (a hard block with no other backstop was
@@ -592,18 +602,30 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
 
   Three narrowing rounds on one predicate is the signature to STOP and make the
   policy decision explicitly. The decision taken on the guard this was learned
-  from — recorded as a decision, not as a description of the shipped tree, which
-  at time of writing does not yet carry it: the unattended path KEEPS refusing,
+  from, and since shipped: the unattended path KEEPS refusing,
   and the invariant gets scoped rather than deleted. "A benign shape is never
   hard blocked" was simply false as written; what is true and testable is that
   it is never hard blocked where a human can approve, and where no one can, the
-  refusal carries an ACTIONABLE stderr — the cause and the rephrasing that
-  avoids it — so the session can proceed on its own. (That is a courtesy to the
-  operator, not the RECOVERABILITY of the Decision test above, which is about a
-  MISS degrading to the status quo. Same word, opposite failure direction; do
-  not satisfy the Decision test by printing a nicer error.) State the narrower
-  invariant; do not leave the false one standing, and do not delete the
-  guarantee that still holds.
+  refusal carries an ACTIONABLE stderr — the cause, plus a route that gives the
+  gate MORE information rather than less.
+
+  That last qualifier is load-bearing and the sloppy version of this sentence is
+  a bypass instruction. Telling an operator to find "a rephrasing that avoids
+  the predicate" invites mutating raw text until a degraded predicate stops
+  matching, while the same unverified operation still runs — the fail-closed
+  mandate defeated by its own error message. Only two routes are legitimate, and
+  neither is an evasion. If the text is PROSE that merely mentions a gated verb,
+  take it out of a shell command altogether — write the file with an editor tool
+  — because it was never an operation to gate and never should have been parsed
+  as one. If it IS the operation, express it so the parser can actually read it,
+  which does not dodge the gate but submits to it. A rewrite that suppresses the
+  trigger while still performing the operation is the one thing such a message
+  must never suggest, and a message is not "actionable" if that is what it
+  teaches. (Actionability here is a courtesy to the operator, NOT the
+  RECOVERABILITY of the Decision test above, which is about a MISS degrading to
+  the status quo. Same word, opposite failure direction; do not satisfy the
+  Decision test by printing a nicer error.) State the narrower invariant; do not
+  leave the false one standing, and do not delete the guarantee that still holds.
 
   Two things keep this from reading as licence. The open-set imprecision is
   tolerable here ONLY because the verdict is `ask` or `deny` and never `allow` —
@@ -613,18 +635,28 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   human; the moment it maps argv to an effect and authorizes on the result, it
   is the hand-rolled-parser tar pit the mandate above forbids.
 
-  Measurement informed this rather than settling it: on 52 unattended
-  transcripts / 315 commands the leg had never fired in either direction, so
-  what was actually being chosen was which promise the suite should make, not
-  which incident to prevent.
+  A measurement informed this rather than settling it, and it was afterwards
+  WITHDRAWN — which is the more useful half of the story. The claim was that
+  across a sample of unattended sessions the leg had never fired in either
+  direction. It does not survive: the transcripts it counted no longer existed
+  when someone went to re-derive it, and the sample was far too small to carry
+  a word as strong as "never" even while they did. Absence in a small sample is
+  the expected observation for a rare event, not evidence the event cannot
+  happen; the honest reading is that the leg's rate is LOW, which is a different
+  claim and a weaker one. What was actually being chosen was which promise the
+  suite should make, not which incident to prevent — and that conclusion never
+  rested on the number, which is why it outlived it.
 
   A note on every number in these three rules, including the ones above. They
   come from one operator's local session transcripts at one date, and no corpus
   or harness is checked in, so a reader cannot reproduce or falsify them — the
   differing denominators are different harvests, not one corpus quoted three
-  ways. Treat them as the scale at which something was observed, never as a
-  published result. A rule that only holds at someone else's numbers is not a
-  rule; each of these should stand on its stated mechanism alone.
+  ways. That is not a hypothetical weakness: one of them was withdrawn the
+  first time anyone tried, for exactly that reason. Treat them as the scale at
+  which something was observed, never as a published result. A rule that only
+  holds at someone else's numbers is not a rule; each of these should stand on
+  its stated mechanism alone — and if one ever seems to DEPEND on a figure,
+  that dependency is the defect to fix, not the figure to defend.
 
 - **`out=$(cmd)` under `set -e` swallows the failure path — and NO linter catches
   it.** An assignment whose value is a command substitution INHERITS that
