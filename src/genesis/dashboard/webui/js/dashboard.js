@@ -4522,12 +4522,15 @@
           const allAlerts = this.errorSummary.active_alerts || [];
           const criticalAlerts = allAlerts.filter(a => a.severity === "CRITICAL");
           const warningAlerts = allAlerts.filter(a => a.severity === "WARNING");
-          // Read the uncapped total, never the page length: `groups` is
-          // fetched with limit=6 and sliced server-side, so counting it renders
-          // "6 active error groups" for any number >= 6. Falls back to the page
-          // length only when the field is absent (older server).
+          // Read the uncapped total, never the page length: `groups` is the
+          // display page (limit=6), so counting it renders "6 active error
+          // groups" for any number >= 6. Falls back to the page length only
+          // when the field is absent (older server). `+` when even the server's
+          // scan window filled — the total is then a lower bound, and saying so
+          // is the whole point.
           const activeGroups = this.errorSummary.groups_active_total
             ?? (this.errorSummary.groups || []).filter(g => g.still_active).length;
+          const groupsSuffix = this.errorSummary.groups_totals_truncated ? "+" : "";
           if (criticalAlerts.length > 0) {
             items.push({ level: "critical", title: `${criticalAlerts.length} critical alert${criticalAlerts.length === 1 ? "" : "s"}`, detail: criticalAlerts.map(a => a.message).slice(0, 3).join("; "), href: "/genesis/errors" });
           }
@@ -4535,7 +4538,7 @@
             items.push({ level: "warning", title: `${warningAlerts.length} system warning${warningAlerts.length === 1 ? "" : "s"}`, detail: `${warningAlerts.length} call site${warningAlerts.length === 1 ? "" : "s"} on fallback or degraded`, href: "/genesis/errors" });
           }
           if (activeGroups > 0) {
-            items.push({ level: "warning", title: `${activeGroups} active error group${activeGroups === 1 ? "" : "s"}`, detail: "grouped warnings/errors across events, dead letters, or deferred work", href: "/genesis/errors" });
+            items.push({ level: "warning", title: `${activeGroups}${groupsSuffix} active error group${activeGroups === 1 && !groupsSuffix ? "" : "s"}`, detail: "grouped warnings/errors across events, dead letters, or deferred work", href: "/genesis/errors" });
           }
           if (this.errorSummary.partial) {
             const failed = (this.errorSummary.sources_failed || []).join(", ");

@@ -34,6 +34,15 @@ async def unified_errors():
     grouped = request.args.get("grouped", "true").lower() in ("true", "1", "yes")
     subsystem_filter = request.args.get("subsystem")
     limit = min(request.args.get("limit", 50, type=int), 200)
+    # Source rows are GROUPED before display, so the display limit must not cap
+    # the scan: capping it makes every derived total a truncated read that looks
+    # like a real number. That is the defect this endpoint shipped — the
+    # attention strip rendered "6 active error groups" for any backlog >= 6,
+    # because `limit=6` capped the three source reads the groups were built
+    # from. Scan generously, group, publish true totals, then slice for display.
+    _SCAN_CAP = 1000
+    scan_limit = max(limit, _SCAN_CAP)
+    scan_truncated = False
 
     now = datetime.now(UTC)
     thirty_min_ago = (now - timedelta(minutes=30)).isoformat()
@@ -49,8 +58,9 @@ async def unified_errors():
     try:
         if grouped:
             raw_groups = await events_crud.query_grouped_errors(
-                rt.db, since=since, subsystem=subsystem_filter, limit=limit,
+                rt.db, since=since, subsystem=subsystem_filter, limit=scan_limit,
             )
+            scan_truncated = scan_truncated or len(raw_groups) >= scan_limit
             event_count = sum(g["count"] for g in raw_groups)
             for g in raw_groups:
                 groups.append({
@@ -71,8 +81,9 @@ async def unified_errors():
 
     try:
         dl_items = await dl_crud.query_recent(
-            rt.db, since=since, limit=limit,
+            rt.db, since=since, limit=scan_limit,
         )
+        scan_truncated = scan_truncated or len(dl_items) >= scan_limit
         dl_count = len(dl_items)
         if grouped and dl_items:
             dl_groups: dict[str, dict] = {}
@@ -105,8 +116,9 @@ async def unified_errors():
 
     try:
         dw_items = await dw_crud.query_failed(
-            rt.db, since=since, limit=limit,
+            rt.db, since=since, limit=scan_limit,
         )
+        scan_truncated = scan_truncated or len(dw_items) >= scan_limit
         dw_count = len(dw_items)
         if grouped and dw_items:
             dw_groups: dict[str, dict] = {}
@@ -162,14 +174,17 @@ async def unified_errors():
         logger.warning("unified-errors: active_alerts source failed", exc_info=True)
         sources_failed.append("alerts")
 
-    # `groups` is a capped PAGE; these are the true depths. Rendering
-    # len(groups) as a total is the same defect as the discarded-queue count
-    # (2026-08-30): a limit displayed as a total, indistinguishable from a real
-    # value because it looks like one.
+    # `groups` is the FULL grouped set (built from a scan_limit-wide read);
+    # `groups[:limit]` is the display page. The totals below therefore describe
+    # the real population, not the page — rendering len(page) as a total is the
+    # defect this endpoint shipped. `groups_totals_truncated` is the loud
+    # marker for the one case the totals are still a lower bound: a source that
+    # filled the entire scan window.
     return jsonify({
         "groups": groups[:limit],
         "groups_total": len(groups),
         "groups_active_total": sum(1 for g in groups if g.get("still_active")),
+        "groups_totals_truncated": scan_truncated,
         "active_alerts": active_alerts,
         "totals": {
             "events": event_count,

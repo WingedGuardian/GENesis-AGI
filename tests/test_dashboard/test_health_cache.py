@@ -224,24 +224,15 @@ async def test_invalidation_abandons_the_producers_inflight_compute():
 
     svc = object.__new__(HealthDataService)
     svc._inflight = None
-    gate = asyncio.Event()
-    computes = {"n": 0}
-
-    async def _compute():
-        computes["n"] += 1
-        n = computes["n"]
-        await gate.wait()
-        # first compute reads pre-delete state, later ones read post-delete
-        return {"queues": {"discarded_count": 148 if n == 1 else 0}}
-
-    svc._compute_snapshot = _compute
-
+    svc._inflight_stale = False
     async def _until(cond, what):
         """Poll the CONDITION on a bounded deadline — never a fixed sleep.
 
         `snapshot()` is itself a coroutine that then creates the compute task,
         so the number of loop turns before `_compute` runs is an implementation
-        detail; asserting after a fixed number of yields is flaky by design.
+        detail; asserting after a fixed number of yields is flaky by design
+        (an earlier version of this test did exactly that and passed against
+        the broken implementation).
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 2.0
@@ -251,22 +242,82 @@ async def test_invalidation_abandons_the_producers_inflight_compute():
             await asyncio.sleep(0)
         raise AssertionError(f"timed out waiting for {what}")
 
+    async def _settles(cond, window):
+        """True if `cond` becomes true within `window` seconds.
+
+        The inverse of _until: used to assert something does NOT happen. A bare
+        `await asyncio.sleep(0)` is not enough — a freshly created task needs
+        several loop turns to reach its first await, so a single yield reports
+        "didn't happen" even when it was about to (an earlier version of this
+        test passed against the broken implementation for exactly that reason).
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + window
+        while loop.time() < deadline:
+            if cond():
+                return True
+            await asyncio.sleep(0.01)
+        return False
+
+    gate = asyncio.Event()
+    # Track CONCURRENCY semantically, not by counter-timing: `live` is the
+    # number of computes inside _compute_snapshot right now, `peak` the most
+    # ever simultaneous. Single-flight means peak == 1, and that holds no matter
+    # how the event loop interleaves — an assertion on a start-counter after a
+    # fixed number of yields does not (it passed against the broken design).
+    state = {"n": 0, "live": 0, "peak": 0}
+
+    async def _compute():
+        state["n"] += 1
+        state["live"] += 1
+        state["peak"] = max(state["peak"], state["live"])
+        n = state["n"]
+        try:
+            await gate.wait()
+            # first compute reads pre-delete state, later ones read post-delete
+            return {"queues": {"discarded_count": 148 if n == 1 else 0}}
+        finally:
+            state["live"] -= 1
+
+    svc._compute_snapshot = _compute
+
     first = asyncio.create_task(svc.snapshot())   # in flight, pre-delete
-    await _until(lambda: computes["n"] == 1, "the first compute to start")
+    await _until(lambda: state["n"] == 1, "the first compute to start")
 
     health_route.invalidate_snapshot_cache()      # the mutation lands
-    svc.abandon_inflight()                        # what invalidation must do
+    svc.mark_inflight_stale()                     # what invalidation must do
 
     second = asyncio.create_task(svc.snapshot())  # post-delete caller
-    await _until(lambda: computes["n"] == 2, "the post-mutation compute to start")
-    gate.set()
+
+    # THE DISCRIMINATOR. The first compute is still blocked on `gate`. If the
+    # implementation abandons the in-flight handle, this caller starts a SECOND
+    # compute immediately and n reaches 2 while the first is still inside
+    # _compute_snapshot — two concurrent computes. If it flags the compute
+    # stale instead, this caller awaits the first, so n cannot move until the
+    # gate opens. Bounded wait, then assert it did NOT happen.
+    started_concurrently = await _settles(lambda: state["n"] == 2, 0.4)
+    assert not started_concurrently, (
+        "a SECOND compute started while the first was still running — that "
+        "breaks the single-flight contract ProbeTransitionTracker relies on "
+        "(it takes no lock precisely because snapshot() promises single-flight), "
+        "so an older compute finishing last can emit a false reverse transition"
+    )
+
+    gate.set()                                    # release the stale compute
+    await _until(lambda: state["n"] == 2, "the fresh post-mutation compute")
     a, b = await first, await second
 
-    assert computes["n"] == 2, (
-        "the post-mutation caller was coalesced onto the pre-mutation compute — "
-        "it would publish deleted rows as current"
+    assert state["peak"] == 1, (
+        f"{state['peak']} computes ran CONCURRENTLY — that breaks the "
+        "single-flight contract ProbeTransitionTracker relies on (it takes no "
+        "lock precisely because snapshot() promises single-flight), so an older "
+        "compute finishing last can emit a false reverse probe transition"
     )
-    assert a["queues"]["discarded_count"] == 148   # pre-delete caller, correct for it
+    assert state["n"] == 2, "the post-mutation caller must get its own fresh compute"
+    assert a["queues"]["discarded_count"] == 148, (
+        "the pre-mutation caller keeps its own result — correct for its request"
+    )
     assert b["queues"]["discarded_count"] == 0, (
-        "the post-mutation caller must see post-mutation state"
+        "the post-mutation caller must see post-mutation state, not the stale "
+        "compute it waited on"
     )

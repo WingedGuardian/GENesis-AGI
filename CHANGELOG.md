@@ -78,6 +78,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The attention strip reported "N active error groups" from a page, not a
+  count.** `/api/genesis/unified-errors` was queried with `limit=6` and the strip
+  counted the returned list, so any backlog of six or more displayed as exactly
+  "6" — and the three source reads the groups are built from were each capped by
+  that same limit, so the underlying totals were truncated too. The endpoint now
+  scans wide enough to group the real population, publishes true totals
+  alongside the display page, and marks the total as a lower bound (`6+`) in the
+  one case a source fills the entire scan window.
+
 - **The `/genesis/monitor` page had the same discarded-count bug, plus a worse
   variant: rows you could not clear.** Its "Clear All Discarded" button was shown
   only when the 20-row sample held more than one entry, while its label printed

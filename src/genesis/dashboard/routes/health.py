@@ -45,8 +45,10 @@ def invalidate_snapshot_cache() -> None:
     Three things are required, because there are two distinct staleness paths:
     clear the cached value; bump a generation counter so a compute that began
     BEFORE this call declines to publish when it lands after it; and abandon the
-    producer's in-flight computation so a caller arriving AFTER this call is not
-    handed that same pre-mutation result.
+    flag the producer's in-flight computation so a caller arriving AFTER this
+    call waits it out and recomputes rather than being handed that same
+    pre-mutation result. The flag (rather than dropping the handle) keeps the
+    producer single-flight, which its probe-transition side effect requires.
     """
     global _snapshot_cache, _snapshot_cache_ts, _snapshot_cache_gen
     _snapshot_cache = None
@@ -64,8 +66,8 @@ def invalidate_snapshot_cache() -> None:
 
     rt = GenesisRuntime.instance()
     health_data = getattr(rt, "health_data", None)
-    if health_data is not None and hasattr(health_data, "abandon_inflight"):
-        health_data.abandon_inflight()
+    if health_data is not None and hasattr(health_data, "mark_inflight_stale"):
+        health_data.mark_inflight_stale()
 
 
 @blueprint.route("/api/genesis/health")

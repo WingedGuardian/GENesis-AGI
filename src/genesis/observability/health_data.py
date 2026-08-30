@@ -7,6 +7,7 @@ for cleaner organization. Each function takes explicit dependencies as parameter
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -114,6 +115,9 @@ class HealthDataService:
         self._probe_tracker = ProbeTransitionTracker()
         # Single-flight: concurrent snapshot() callers coalesce onto one compute.
         self._inflight: asyncio.Task | None = None
+        # True when the in-flight compute began before a mutation and must not
+        # be handed to callers arriving after it. See mark_inflight_stale().
+        self._inflight_stale: bool = False
 
     async def snapshot(self) -> dict:
         """Return full system health state, coalescing concurrent callers.
@@ -135,7 +139,16 @@ class HealthDataService:
         """
         inflight = self._inflight
         if inflight is not None and not inflight.done():
-            return await asyncio.shield(inflight)
+            if not self._inflight_stale:
+                return await asyncio.shield(inflight)
+            # Predates a mutation: wait it out (preserving single-flight, so the
+            # probe-transition tracker never sees two concurrent computes), drop
+            # its result, then fall through and compute once against current
+            # state. Only the first caller to arrive clears the flag; any others
+            # coalesce onto the fresh compute below.
+            self._inflight_stale = False
+            with contextlib.suppress(Exception):
+                await asyncio.shield(inflight)
         # No await between the done() check and the assignment below → race-free
         # on the single-threaded loop. Bare create_task BY DESIGN (reflex A4
         # sweep, 2026-07-21): every caller awaits via asyncio.shield and the
@@ -146,21 +159,30 @@ class HealthDataService:
         task.add_done_callback(self._release_inflight)
         return await asyncio.shield(task)
 
-    def abandon_inflight(self) -> None:
-        """Stop handing the in-flight compute to NEW callers after a mutation.
+    def mark_inflight_stale(self) -> None:
+        """Mark the in-flight compute as predating a mutation.
 
         ``snapshot()`` coalesces overlapping callers onto one computation. That
         is right for concurrent READS, but wrong immediately after a write: a
         caller arriving after the mutation would be handed a result computed
-        from pre-mutation state, and would then publish it as current.
+        from pre-mutation state and would publish it as current.
 
-        Existing awaiters keep the result they are already waiting on (their
-        request began before the write, so pre-write data is correct for them);
-        the next caller starts a compute that reads post-mutation state.
-        Dropping the handle is safe because ``_release_inflight`` clears only if
-        the handle is still the same task.
+        The obvious shortcut — dropping ``_inflight`` so the next caller starts
+        a fresh compute — BREAKS single-flight, and that is load-bearing here:
+        ``_compute_snapshot`` is not a pure read. It feeds ``_emit_probe_transitions``,
+        and ``ProbeTransitionTracker`` documents that it needs no lock precisely
+        because "its sole live caller runs it inside a single-flight snapshot()
+        build". Two concurrent computes let the older one finish last and move
+        the tracker backwards, emitting a false reverse transition.
+
+        So the stale compute is not abandoned and not cancelled (cancelling
+        would break the callers already shielded on it). It is FLAGGED: the next
+        caller awaits it, discards the result, and only then starts one fresh
+        compute. At most one computation runs at any time, and no caller after
+        the mutation sees pre-mutation data.
         """
-        self._inflight = None
+        if self._inflight is not None and not self._inflight.done():
+            self._inflight_stale = True
 
     def _release_inflight(self, task: asyncio.Task) -> None:
         """Done-callback: drop the in-flight handle when the compute finishes.
