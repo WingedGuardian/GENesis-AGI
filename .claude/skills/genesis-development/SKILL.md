@@ -205,20 +205,35 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   passed may be testing nothing; a whole suite passing every review round
   while a reviewer keeps finding real spec bugs is the tell that the tests
   encode the same wrong spec as the code.
-- **A RED that comes back GREEN is FOUR hypotheses, not one.** The run never
-  EXECUTED (a guard refused it, a lock held it, the tool timed out) and there is
-  no result at all; or the MUTATION silently failed to apply — common, because
-  the auto-formatter reflows lines and a `str.replace()` anchor written from
-  memory then matches nothing; or the mutation applied to a mechanism a SIBLING
-  LAYER still enforces, so the invariant holds and the green is correct; or the
-  test is vacuous. Check them in that order — cheapest and most common first —
-  and touch the test only when the other three are excluded. The first is the
-  one that produces a CONFIDENT FALSE NEGATIVE: a sweep reporting "all mutations
-  survived" is far more often a sweep that never ran, so make the runner ABORT
-  when the test command emits no result line rather than recording a survivor.
-  The third is the one that gets a SOUND test rewritten: when two layers produce
-  the same behaviour (see the duplicated-layer entry below), mutate the WHOLE
-  mechanism, not one of its halves. The PRINCIPLE, which is what to remember:
+- **A RED that comes back GREEN has AT LEAST five causes, and "the test is
+  vacuous" is the LAST one to reach for.** In rough order of how often they
+  actually occur:
+  1. **The run never EXECUTED** — a guard refused it, a lock held it, the tool
+     timed out — so there is no result at all. This is the CONFIDENT FALSE
+     NEGATIVE: a sweep reporting "all mutations survived" is far more often a
+     sweep that never ran. Make the runner ABORT when the test command emits no
+     result line, and treat a SKIPPED/deselected line the same way — it is a
+     result line, and it still means nothing ran.
+  2. **The MUTATION silently failed to apply** — the auto-formatter reflows
+     lines and a `str.replace()` anchor written from memory then matches nothing.
+  3. **The test ran against a DIFFERENT COPY of the code** — an installed
+     package shadowing the source tree, a stale `.pyc`, the wrong virtualenv, or
+     (measured, this session) a path relative to a process whose cwd had moved to
+     another worktree. The mutation applied, the run happened, the test is sound,
+     and none of the other causes fits.
+  4. **The mutation was BEHAVIOURALLY NULL** — it applied and parses, so every
+     postcondition below passes, but it changed no behaviour: swapped operands
+     that commute, an edit inside a dead branch, a type annotation Python does
+     not enforce (also measured this session). The remedy is a different
+     MUTATION, not a different test.
+  5. **A SIBLING LAYER still enforces the invariant**, so the green is correct.
+     When two layers produce the same behaviour, mutate the WHOLE mechanism, not
+     one of its halves. (The duplicated-layer anecdote in the review-loop section
+     is the worked example.)
+  Only after all five: the test is vacuous. The list is ordered, not closed —
+  if none of them fits, look for a sixth before rewriting a test that may be
+  sound, because rewriting a sound test is the expensive mistake here.
+  The PRINCIPLE, which is what to remember:
   **every injection must prove it applied, by its own postcondition, before any
   result is read as RED.** Two corollaries follow, and both have bitten:
   prove it against the value THAT injection was handed, never against the
@@ -230,8 +245,11 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   collection and reads as a successful RED, while the wrong language's parser
   rejects a valid mutation and hides a real survivor. Restore from a file copy
   taken beforehand, never `git checkout` — the work is uncommitted — and make
-  that restore UNCONDITIONAL (`trap restore EXIT`, a `finally:`), never the tail
-  of an `&&` chain. The expected outcome here is a NONZERO exit, and under
+  the restore ATTEMPT unconditional ON THE RUN'S OUTCOME (`trap restore EXIT`, a
+  `finally:`), never the tail of an `&&` chain. Unconditional means it always
+  RUNS, not that it always OVERWRITES: what it writes is still gated on the hash
+  check below. A `trap` that restores blindly is the very thing that destroys a
+  concurrent edit. The expected outcome here is a NONZERO exit, and under
   `set -e` a trailing restore is exactly the statement that never runs (the
   `out=$(cmd)` entry in Common Traps is the same mechanism), so the shape that
   reads as careful leaves a deliberately-broken file in an uncommitted worktree
@@ -245,7 +263,11 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   succeeded. If the file no longer matches what the mutation wrote, PRESERVE it
   and report the conflict instead. The cleanest way to avoid the window entirely
   is to mutate inside an isolated worktree nobody else is editing.
-- **Vacuous-test shapes to check for by name.** A test is vacuous when: its
+- **Vacuous-test shapes to check for by name** (a list of the common ones, not a
+  definition). The most frequent in practice is the one that never ran at all: a
+  test SKIPPED by a marker, or deselected by a `-k` filter or a wrong path, which
+  reports SKIPPED or "no tests ran" and never goes red — check the count, not just
+  the absence of failures. Beyond that, a test is vacuous when: its
   assertion is ALSO true on the success path (`assert x.blocked is False` where
   a successful call also returns False — assert the fact that DISTINGUISHES
   them); its setup short-circuits the path it names (passing an explicit
@@ -709,7 +731,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   generator — five across three rounds once reduced to a single defect (two
   layers that had to agree about every lever and could not), and patching
   instances twice changed nothing while deleting the second layer removed all
-  five at once. If one class has ≥2 entries, the fix is architectural.
+  five at once. If one class has ≥2 entries, look for the shared GENERATOR and fix
+  that; two findings can land in one superficial class without sharing a cause, so
+  the count is the prompt to look, not the verdict.
   **Class grouping decides HOW you fix — never whether the round counts.** The
   counter is deliberately class-blind: `bump_review_round` increments on a
   distinct staged diff and records no class (or reviewer) identity, and the
