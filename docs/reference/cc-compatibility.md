@@ -160,10 +160,13 @@ so a broken contract can't silently fail open again.
 path (`~/.genesis/sessions/<id>/`), and several `mkdir(parents=True)` — so an id
 carrying `/` or `..` would not merely read the wrong file, it would CREATE
 directories outside the session tree. `is_safe_session_id()` is the source of truth for
-hooks under `scripts/` (allow-list `\A[A-Za-z0-9_-]{1,128}\Z`, deliberately
+hooks under `scripts/` (allow-list `\A[A-Za-z0-9_-]{1,255}\Z`, deliberately
 wider than the hex-UUID shape CC usually emits — the observed id set already
 contains other shapes), and `session_id()` refuses to return a value that fails
-it.
+it. The 255 is the filesystem's own single-name limit, not a policy choice: every
+character the pattern admits is one byte in UTF-8, and a tighter bound would
+reject ids that are valid path components and that the hand-rolled checks this
+replaced accepted.
 
 It is NOT yet repo-wide: the helper lives in `scripts/hooks/`, which
 `src/genesis/**` can only reach through a `sys.path` insert, so several `src/`

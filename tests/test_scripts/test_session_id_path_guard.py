@@ -17,6 +17,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -385,3 +386,31 @@ class TestSuiteRunsInsideADispatchedSession:
         monkeypatch.delenv("GENESIS_CC_SESSION", raising=False)
         _load("proactive_memory_hook", "proactive_memory_hook.py")
         assert "GENESIS_CC_SESSION" not in os.environ
+
+
+class TestTheDocumentedContractMatchesTheCode:
+    """The compatibility doc STATES the allow-list; a reader treats it as the
+    contract and writes hooks against it.
+
+    This exists because the pattern and its documentation drifted the moment the
+    bound changed: the validator moved to 255 while
+    `docs/reference/cc-compatibility.md` still specified 128, so the canonical
+    doc told another hook author to reject ids the runtime deliberately accepts.
+    Comparing the two by eye is what failed; compare them mechanically.
+    """
+
+    _DOC = Path(__file__).resolve().parents[2] / "docs" / "reference" / "cc-compatibility.md"
+
+    def test_documented_allow_list_is_the_compiled_one(self):
+        text = self._DOC.read_text(encoding="utf-8")
+        quoted = re.search(r"allow-list `([^`]+)`", text)
+        assert quoted, (
+            f"{self._DOC.name} no longer states the allow-list in the expected "
+            "form — this guard cannot see drift it cannot find, so update the "
+            "pattern here rather than deleting the assertion"
+        )
+        assert quoted.group(1) == hook_input._SESSION_ID_RE.pattern, (
+            f"{self._DOC.name} documents {quoted.group(1)!r} but the validator "
+            f"compiles {hook_input._SESSION_ID_RE.pattern!r} — a hook author "
+            "following the doc would reject ids the runtime accepts"
+        )
