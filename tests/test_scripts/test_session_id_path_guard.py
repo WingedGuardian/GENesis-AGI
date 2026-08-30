@@ -13,6 +13,7 @@ nothing touches the real ``~/.genesis``.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -26,11 +27,34 @@ import pytest
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 
 
+@contextlib.contextmanager
+def _not_a_dispatched_session():
+    """Neutralise import-time dispatched-session exits for the duration of a load.
+
+    ``scripts/proactive_memory_hook.py`` calls ``sys.exit(0)`` at MODULE level
+    when ``GENESIS_CC_SESSION == "1"``, so an in-process load inside a dispatched
+    session raises ``SystemExit`` and every test touching that module ERRORS
+    instead of testing. That makes the suite green only because the variable
+    happens to be unset in the shell that runs it.
+
+    Applied in ``_load`` rather than at the two call sites that surfaced it: any
+    future module with an import-time environment guard gets the same protection.
+    The previous value is restored, so this never leaks into another test.
+    """
+    prev = os.environ.pop("GENESIS_CC_SESSION", None)
+    try:
+        yield
+    finally:
+        if prev is not None:
+            os.environ["GENESIS_CC_SESSION"] = prev
+
+
 def _load(name: str, rel: str):
-    spec = importlib.util.spec_from_file_location(name, _SCRIPTS / rel)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    with _not_a_dispatched_session():
+        spec = importlib.util.spec_from_file_location(name, _SCRIPTS / rel)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
 
 
 hook_input = _load("hook_input", "hooks/hook_input.py")
@@ -297,3 +321,32 @@ class TestCharterBlockKeepsDbLookupUnguarded:
         assert called.get("db") == "../../escaped", "DB lookup was skipped"
         assert "file" not in called, "path-based fallback must NOT run for an unsafe id"
         assert "Session Charter" in out, "canonical charter was suppressed"
+
+
+class TestSuiteRunsInsideADispatchedSession:
+    """These tests must EXERCISE the guard, not error before reaching it.
+
+    ``scripts/proactive_memory_hook.py`` exits at import when
+    ``GENESIS_CC_SESSION == "1"``. Before ``_load`` neutralised that, the two
+    tests below raised ``SystemExit: 0`` under a dispatched session and were
+    green everywhere else purely because the variable was unset — a suite that
+    reports success without running is worse than one that fails.
+    """
+
+    def test_module_loads_when_the_dispatched_session_flag_is_set(self, monkeypatch):
+        monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+        mod = _load("proactive_memory_hook", "proactive_memory_hook.py")
+        # The guard is reached and still correct, not merely importable.
+        assert mod._trail_path("../../escaped") is None
+
+    def test_the_flag_is_restored_after_a_load(self, monkeypatch):
+        """The neutralisation is scoped: it must not leak into later tests."""
+        monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+        _load("proactive_memory_hook", "proactive_memory_hook.py")
+        assert os.environ.get("GENESIS_CC_SESSION") == "1"
+
+    def test_an_unset_flag_stays_unset(self, monkeypatch):
+        """And it must not INVENT the variable where there was none."""
+        monkeypatch.delenv("GENESIS_CC_SESSION", raising=False)
+        _load("proactive_memory_hook", "proactive_memory_hook.py")
+        assert "GENESIS_CC_SESSION" not in os.environ

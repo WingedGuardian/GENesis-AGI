@@ -202,10 +202,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   path — and two sites create the directory. An id containing `/` or `..` therefore
   escaped that tree, and the guard against it had been hand-copied into some hooks
   in three different shapes while being omitted from eight call sites across four
-  files. There is now one shared validator (`hook_input.is_safe_session_id`) used
-  everywhere, and the shared `session_id()` accessor refuses to return a value that
-  fails it. Normal sessions are unaffected; an unrecognised id degrades to the
-  existing `unknown` fallback instead of touching the filesystem.
+  files. There is now one shared validator (`hook_input.is_safe_session_id`) behind
+  the session hooks, and the shared `session_id()` accessor refuses to return a value
+  that fails it. This covers the hook surface; a few paths under `src/` still carry
+  their own check and are being consolidated separately. Normal sessions are
+  unaffected; an unrecognised id degrades to the existing `unknown` fallback
+  instead of touching the filesystem.
 
 - **Hook-surface PRs can no longer merge without a current GitHub Codex review.**
   The merge gate's review-freshness check now treats any unreviewed delta touching
