@@ -450,15 +450,52 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
     return [
         _ParsedSegment(raw=r.strip(), argv_src=a.strip(), redirects=tuple(d), writes=tuple(w))
         for (r, a, d, w) in pairs
-        if r.strip()  # filter on RAW — keeps the exact set/alignment split_segments had
+        # Raw-empty segments are kept ONLY when they carry a write. Bash permits a
+        # redirection with no command and still creates or truncates the target —
+        # VERIFIED: `bash -c '> wo.txt'` creates wo.txt — so `> /tmp/result && git
+        # push` has a real write in a segment whose raw text is empty once the
+        # redirect is consumed. Filtering on raw alone discarded it silently.
+        #
+        # `split_segments` drops these again, so the stable list[str] API its four
+        # consumers iterate (the commit gate, the invalidator, two push-guard call
+        # sites) stays byte-identical, along with the golden corpus locking it. The
+        # segment is visible only to consumers that read `writes`.
+        if r.strip() or w
     ]
 
 
 def split_segments(command: str) -> list[str]:
     """Executed-segment raw strings — a thin, byte-identical view over
     ``parse_segments`` (all redirect/quote/comment semantics live there). Kept as the
-    stable ``list[str]`` API the cwd/occurrence consumers iterate."""
-    return [p.raw for p in parse_segments(command)]
+    stable ``list[str]`` API the cwd/occurrence consumers iterate.
+
+    Empty-raw entries are dropped here. ``parse_segments`` retains a segment that is
+    nothing but a redirection (``> f``) because it carries a real WRITE, but such a
+    segment has no command text — emitting ``""`` into this list would hand every
+    consumer a segment that executes nothing, and they match these strings against a
+    fresh re-split. The write is reachable through ``Segment.writes`` instead."""
+    return [p.raw for p in parse_segments(command) if p.raw]
+
+
+def write_targets(command: str) -> list[str]:
+    """Every OUTPUT-redirect target in *command*, in order, including orphans.
+
+    Additive, and deliberately its own entry point rather than a widening of
+    ``analyze``. A redirection with no command (``> f && …``) really does create or
+    truncate its target — VERIFIED: ``bash -c '> wo.txt'`` creates wo.txt — but it
+    executes nothing, so it is not a Segment any consumer should iterate: emitting
+    it from ``analyze`` broke the documented invariant that a depth-0 ``Segment.raw``
+    is exactly an element of a fresh ``split_segments`` (the corpus happened not to
+    cover the case, so the suite stayed green while the contract was violated).
+
+    Callers that want "what files does this command write" ask HERE; callers that
+    want "what does this command execute" keep asking ``analyze``. Never raises —
+    the module's fail-open contract.
+    """
+    try:
+        return [t for seg in parse_segments(command) for t in seg.writes]
+    except Exception:  # noqa: BLE001 — degrade, never crash a guard
+        return []
 
 
 def has_top_level_pipe(command: str, *, count_substitutions: bool = False) -> bool:
@@ -830,6 +867,12 @@ def analyze(command: str) -> list[Segment]:
     """
     out: list[Segment] = []
     for seg in parse_segments(command):
+        if not seg.raw:
+            # A redirection with no command carries a WRITE but executes nothing, and
+            # emitting it here would break the invariant the cwd/occurrence consumers
+            # rely on — that a depth-0 `Segment.raw` is exactly an element of a fresh
+            # `split_segments`. Its write reaches consumers through `write_targets`.
+            continue
         raw = seg.raw
         override = _has_trailing_override(raw)
         # argv is tokenized from the redirect-STRIPPED source, so a redirect target

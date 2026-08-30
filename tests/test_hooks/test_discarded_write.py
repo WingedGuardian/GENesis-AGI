@@ -68,10 +68,15 @@ def test_a_write_executable_is_named():
     assert _mod.discarded_writes("cp a b && git push") == ["cp a b"]
 
 
-def test_an_in_place_edit_names_the_FILES_not_the_script():
-    """`sed -i s/a/b/ f.py` edits f.py. Naming `s/a/b/` as a lost file would be
-    confidently wrong, which is worse than saying nothing."""
-    assert _mod.discarded_writes("sed -i s/a/b/ f.py && git commit -m x") == ["sed -i on f.py"]
+def test_an_in_place_edit_names_the_COMMAND_not_a_derived_file_list():
+    """The note shows the command, not which of its operands are files.
+
+    Deciding that means knowing which options consume a value — unbounded, and it
+    shipped two defects across two review rounds: first the in-place SPELLINGS were
+    missed, then the fix reported `-e`'s VALUE as an edited file. The raw text is
+    correct under any flag, including ones that do not exist yet.
+    """
+    assert _mod.discarded_writes("sed -i s/a/b/ f.py && git commit -m x") == ["sed -i s/a/b/ f.py"]
 
 
 @pytest.mark.parametrize(
@@ -94,16 +99,18 @@ def test_every_in_place_spelling_is_recognised(cmd):
     assert _mod.discarded_writes(f"{cmd} && git push"), f"missed an in-place form: {cmd}"
 
 
-def test_the_in_place_target_is_the_FILE_not_the_script():
-    assert _mod.discarded_writes("sed -i s/a/b/ f.py && git push") == ["sed -i on f.py"]
+def test_an_in_place_PROGRAM_is_never_reported_as_an_edited_file():
+    """The defect the redesign removes, in both spellings a program can arrive in.
 
-
-def test_an_in_place_program_from_a_FILE_does_not_lose_an_edited_file():
-    """`sed -i -f prog.sed f.py` has no script OPERAND — the program came from -f.
-    Dropping the first operand as if it were the script would drop a real file."""
-    assert _mod.discarded_writes("sed -i -f prog.sed f.py && git push") == [
-        "sed -i on prog.sed, f.py"
-    ]
+    An earlier revision listed `-e`'s expression and `-f`'s script FILE among the
+    edited files — and a test in this suite asserted that second one as correct,
+    which is how it survived a review round. Showing the command cannot get this
+    wrong, so the assertion is that no operand is singled out at all.
+    """
+    for cmd in ("sed -i -e s/a/b/ f.py", "sed -i -f prog.sed f.py"):
+        (phrase,) = _mod.discarded_writes(f"{cmd} && git push")
+        assert phrase == cmd, "the note must be the command, not a parsed file list"
+        assert " on " not in phrase, "no operand may be presented as the edited file"
 
 
 def test_a_quoted_in_place_LOOKALIKE_is_not_a_write():
@@ -156,9 +163,25 @@ def test_a_QUOTED_null_sink_is_still_not_a_write(sink):
 def test_a_QUOTED_real_path_is_still_named():
     """The unquoting must not swallow ordinary quoted paths, which is how a path
     containing a space is written in the first place."""
-    assert _mod.discarded_writes('cp a b > "/tmp/out file.txt" && git push') == [
-        "/tmp/out file.txt"
-    ]
+    (phrase,) = _mod.discarded_writes('cp a b > "/tmp/out file.txt" && git push')
+    assert "/tmp/out file.txt" in phrase
+
+
+def test_a_redirect_does_not_MASK_the_command_side_write():
+    """`cp a b 2>err.log` writes BOTH. An early return on the redirect target
+    reported only `err.log` and stayed silent about the copy — hiding the more
+    important write exactly when stderr was redirected, which is common."""
+    (phrase,) = _mod.discarded_writes("cp a b 2>err.log && git push")
+    assert "err.log" in phrase, "the redirect target must still be named"
+    assert "cp a b" in phrase, "the command-side write must not be masked by it"
+
+
+def test_a_write_ONLY_redirect_segment_is_not_dropped():
+    """`> /tmp/result` is a redirection with no command, and bash still creates the
+    file — VERIFIED with `bash -c '> wo.txt'`. The segment's raw text is empty once
+    the redirect is consumed, so filtering segments on raw alone discarded the write
+    silently."""
+    assert _mod.discarded_writes("> /tmp/result && git push") == ["/tmp/result"]
 
 
 def test_a_QUOTED_fd_digit_is_still_a_duplication():

@@ -41,7 +41,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from shell_parse import analyze  # noqa: E402
+from shell_parse import analyze, write_targets  # noqa: E402
 
 #: Executables whose whole purpose is to put bytes somewhere.
 _WRITE_EXES = frozenset(
@@ -134,24 +134,12 @@ def _in_place_edit(seg) -> bool:
     return False
 
 
-def _program_comes_from_a_flag(seg) -> bool:
-    """Whether the sed/perl PROGRAM was supplied by ``-e``/``-f`` rather than as an
-    operand.
-
-    It decides which operands are FILES. With ``sed -i 's/a/b/' f.py`` the first
-    operand is the script and the files follow it; with ``sed -i -f prog.sed f.py``
-    there is no script operand and treating the first file as one would drop a real
-    edited file from the note.
-    """
-    for arg in seg.argv[1:]:
-        if arg == "--":
-            return False
-        if arg in ("--expression", "--file") or arg.startswith(("--expression=", "--file=")):
-            return True
-        cluster = _short_cluster(arg)
-        if cluster and ("e" in cluster or "f" in cluster):
-            return True
-    return False
+# NOTE: an earlier revision had a `_program_comes_from_a_flag` helper here, to work
+# out which operands of a sed/perl command were FILES rather than the program. It is
+# deliberately gone. Deciding that requires knowing which options consume a value,
+# which is unbounded — the helper itself shipped a defect (it returned only a bool,
+# so `-e`'s value stayed in the operand list and was reported as an edited file).
+# `_command_text` shows the command instead, which needs no such knowledge.
 
 
 def _plausible_target(target: str) -> str | None:
@@ -172,27 +160,52 @@ def _plausible_target(target: str) -> str | None:
     return cleaned
 
 
+def _command_text(seg) -> str:
+    """The segment's own command text, bounded — NOT a derived list of its files.
+
+    Deriving which operands are FILES means modelling each tool's option grammar:
+    which flags cluster, which consume a value, which are program inputs. That is
+    argv-to-EFFECT mapping, and it has no closed boundary — two review rounds
+    demonstrated it here. Round 1 found the in-place SPELLINGS (`--in-place`,
+    `-ibak`, `-Ei`, `perl -pi`); the fix for it then reported `-e`'s VALUE as an
+    edited file, so `sed -i -e s/a/b/ f.py` named `s/a/b/` as a lost file, and six
+    `-e` expressions would push the real file past the display cap entirely.
+
+    The raw text is accurate under every flag, including ones invented tomorrow,
+    and it is what the reader has to re-run anyway. It costs some precision — the
+    note says which COMMAND was discarded rather than which file it touched — and
+    that is the right trade for a cosmetic note whose whole value is being
+    trustworthy.
+    """
+    text = " ".join(seg.raw.split())  # collapse newlines/runs; raw may span lines
+    return text[:_MAX_PHRASE] + "…" if len(text) > _MAX_PHRASE else text
+
+
 def _describe(seg) -> str | None:
-    """A short human phrase for what this segment writes, or None if it writes nothing."""
-    # An output redirect names its target exactly — the strongest signal available.
-    if seg.writes:
-        targets = [t for t in (_plausible_target(w) for w in seg.writes) if t]
-        if targets:
-            return ", ".join(targets[:_MAX_NAMED])
-    if _in_place_edit(seg):
-        operands = [a for a in seg.argv[1:] if not a.startswith("-")]
-        # Operand 0 is the SCRIPT (`s/a/b/`) only when no -e/-f supplied one —
-        # `sed -i -f prog.sed f.py` has no script operand, and dropping the first
-        # would drop a real edited file. Naming the script as a lost file would be
-        # confidently wrong in the other direction, so the flags decide.
-        files = operands if _program_comes_from_a_flag(seg) else operands[1:]
-        return f"{seg.exe} -i on {', '.join(files[:_MAX_NAMED])}" if files else f"{seg.exe} -i"
-    if seg.exe in _WRITE_EXES:
-        operands = [a for a in seg.argv[1:] if not a.startswith("-")]
-        return f"{seg.exe} {' '.join(operands[:_MAX_NAMED])}".strip()
-    if _inline_script(seg):
-        return f"an inline {seg.exe} script"
-    return None
+    """A short human phrase for what this segment writes, or None if it writes nothing.
+
+    Redirect targets and command-side writes are COMBINED, never alternatives. An
+    early return on `seg.writes` meant `cp a b 2>err.log` reported only `err.log`
+    and stayed silent about the copy — masking the more important write precisely
+    when stderr was redirected, which is common.
+    """
+    parts: list[str] = []
+    # Redirect targets come from the parser exactly, so these ARE named individually.
+    targets = [t for t in (_plausible_target(w) for w in seg.writes) if t]
+    parts.extend(targets[:_MAX_NAMED])
+
+    if _in_place_edit(seg) or seg.exe in _WRITE_EXES:
+        parts.append(_command_text(seg))
+    elif _inline_script(seg):
+        # A category, not an operand list — the script is inline, so there is no
+        # filename to name and no grammar to model.
+        parts.append(f"an inline {seg.exe} script")
+
+    if not parts:
+        return None
+    # dict.fromkeys de-duplicates while PRESERVING order — a redirect target and the
+    # command text can coincide.
+    return ", ".join(list(dict.fromkeys(parts))[:_MAX_NAMED])
 
 
 def discarded_writes(command: str) -> list[str]:
@@ -213,10 +226,20 @@ def discarded_writes(command: str) -> list[str]:
         if command.count("$(") + command.count("`") > _MAX_SUBSTITUTIONS:
             return []
         segs = analyze(command)
-        # One segment means the refused step is the ENTIRE call — there is no
-        # collateral to report, so stay quiet.
-        if len(segs) < 2:
+        # A redirection with NO command (`> f && git push`) writes but EXECUTES
+        # nothing, so `analyze` deliberately does not yield it — doing so broke the
+        # invariant its consumers rely on. Those orphan writes are still real, and
+        # are exactly the targets no executed segment claims.
+        claimed = {t for seg in segs for t in seg.writes}
+        orphans = [t for t in write_targets(command) if t not in claimed]
+
+        # ONE thing in the call means the refused step IS the whole call, so there is
+        # no collateral to report. Counted over segments AND orphan writes together:
+        # `> f && git push` is one segment plus one orphan, which is two things, while
+        # a lone `> f` is one thing and stays silent like any other single step.
+        if len(segs) + len(orphans) < 2:
             return []
+
         found: list[str] = []
         for seg in segs:
             phrase = _describe(seg)
@@ -224,6 +247,10 @@ def discarded_writes(command: str) -> list[str]:
                 phrase = phrase[:_MAX_PHRASE] + "…"
             if phrase and phrase not in found:
                 found.append(phrase)
+        for target in orphans:
+            named = _plausible_target(target)
+            if named and not any(named in phrase for phrase in found):
+                found.append(named)
         return found[:_MAX_NAMED]
     except Exception:  # noqa: BLE001 — cosmetic: never break the guard that called us
         return []
