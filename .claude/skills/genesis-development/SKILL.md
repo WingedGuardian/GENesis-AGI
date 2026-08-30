@@ -205,16 +205,20 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   passed may be testing nothing; a whole suite passing every review round
   while a reviewer keeps finding real spec bugs is the tell that the tests
   encode the same wrong spec as the code.
-- **A RED that comes back GREEN is THREE hypotheses, not one.** The test is
-  vacuous; or the MUTATION silently failed to apply — common, because the
-  auto-formatter reflows lines and a `str.replace()` anchor written from memory
-  then matches nothing; or the mutation applied to a mechanism that a SIBLING
-  LAYER still enforces, so the invariant holds and the green is correct. The
-  third is the one that gets a sound test rewritten: when two layers produce the
-  same behaviour (see the duplicated-layer entry below), mutate the WHOLE
-  mechanism, not one of its halves. Rule out the second before suspecting the
-  first, and the third before touching the test at all. The PRINCIPLE, which is
-  what to remember:
+- **A RED that comes back GREEN is FOUR hypotheses, not one.** The run never
+  EXECUTED (a guard refused it, a lock held it, the tool timed out) and there is
+  no result at all; or the MUTATION silently failed to apply — common, because
+  the auto-formatter reflows lines and a `str.replace()` anchor written from
+  memory then matches nothing; or the mutation applied to a mechanism a SIBLING
+  LAYER still enforces, so the invariant holds and the green is correct; or the
+  test is vacuous. Check them in that order — cheapest and most common first —
+  and touch the test only when the other three are excluded. The first is the
+  one that produces a CONFIDENT FALSE NEGATIVE: a sweep reporting "all mutations
+  survived" is far more often a sweep that never ran, so make the runner ABORT
+  when the test command emits no result line rather than recording a survivor.
+  The third is the one that gets a SOUND test rewritten: when two layers produce
+  the same behaviour (see the duplicated-layer entry below), mutate the WHOLE
+  mechanism, not one of its halves. The PRINCIPLE, which is what to remember:
   **every injection must prove it applied, by its own postcondition, before any
   result is read as RED.** Two corollaries follow, and both have bitten:
   prove it against the value THAT injection was handed, never against the
@@ -233,7 +237,14 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   reads as careful leaves a deliberately-broken file in an uncommitted worktree
   on the ordinary path — as well as on interruption or a tool timeout. Refuse to
   start if the file already differs from the snapshot, and verify the restore by
-  hash rather than assuming it.
+  hash rather than assuming it. And restore ONLY what you broke: compare against
+  the hash the MUTATION wrote before overwriting, because between the mutation
+  and the handler another session, agent or formatter may have edited that file,
+  and a blind snapshot restore silently destroys their uncommitted work — a
+  final hash check does not catch this, it only confirms the overwrite
+  succeeded. If the file no longer matches what the mutation wrote, PRESERVE it
+  and report the conflict instead. The cleanest way to avoid the window entirely
+  is to mutate inside an isolated worktree nobody else is editing.
 - **Vacuous-test shapes to check for by name.** A test is vacuous when: its
   assertion is ALSO true on the success path (`assert x.blocked is False` where
   a successful call also returns False — assert the fact that DISTINGUISHES
