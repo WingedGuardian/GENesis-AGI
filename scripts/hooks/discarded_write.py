@@ -96,18 +96,60 @@ def _inline_script(seg) -> bool:
     return any(a in _INLINE_FLAGS for a in seg.argv[1:])
 
 
-def _in_place_edit(seg) -> bool:
-    """``sed -i`` / ``perl -i`` — edits a file in place.
+def _short_cluster(arg: str) -> str | None:
+    """The clustered short-option letters of ``arg``, or None if it is not a cluster.
 
-    Only a leading ``-i`` (optionally with a backup suffix, ``-i.bak``) counts, and
-    only before a ``--`` end-of-options marker, so ``sed s/-i/x/ f`` is not a match.
+    ``-Ei`` is ``-E -i``; a guard that only recognises a STANDALONE ``-i`` misses it.
+    Modelling clustering is a documented requirement for argv guards in this repo,
+    and skipping it is how this predicate missed half its own subject.
+    """
+    if len(arg) < 2 or not arg.startswith("-") or arg.startswith("--"):
+        return None
+    return arg[1:]
+
+
+def _in_place_edit(seg) -> bool:
+    """``sed``/``perl`` editing files IN PLACE, in every spelling those tools accept.
+
+    GNU sed documents ``-i[SUFFIX], --in-place[=SUFFIX]``, and the suffix attaches
+    with no separator — so ``-i``, ``-i.bak``, ``-ibak``, the cluster ``-Ei``, the
+    long ``--in-place`` and ``--in-place=.bak`` are all in-place, as is perl's
+    clustered ``-pi``. An earlier version recognised only ``-i`` and ``-i.``, so an
+    ordinary ``sed --in-place … f.py`` before a refused push reported no lost write.
+
+    For sed and perl every short option spelled with an ``i`` IS the in-place one,
+    so membership in the cluster is the right test rather than a position. Scanning
+    stops at ``--`` so ``sed -- s/-i/x/ f`` is not a match.
     """
     if seg.exe not in ("sed", "perl"):
         return False
     for arg in seg.argv[1:]:
         if arg == "--":
             return False
-        if arg == "-i" or arg.startswith("-i."):
+        if arg == "--in-place" or arg.startswith("--in-place="):
+            return True
+        cluster = _short_cluster(arg)
+        if cluster and "i" in cluster:
+            return True
+    return False
+
+
+def _program_comes_from_a_flag(seg) -> bool:
+    """Whether the sed/perl PROGRAM was supplied by ``-e``/``-f`` rather than as an
+    operand.
+
+    It decides which operands are FILES. With ``sed -i 's/a/b/' f.py`` the first
+    operand is the script and the files follow it; with ``sed -i -f prog.sed f.py``
+    there is no script operand and treating the first file as one would drop a real
+    edited file from the note.
+    """
+    for arg in seg.argv[1:]:
+        if arg == "--":
+            return False
+        if arg in ("--expression", "--file") or arg.startswith(("--expression=", "--file=")):
+            return True
+        cluster = _short_cluster(arg)
+        if cluster and ("e" in cluster or "f" in cluster):
             return True
     return False
 
@@ -138,10 +180,12 @@ def _describe(seg) -> str | None:
         if targets:
             return ", ".join(targets[:_MAX_NAMED])
     if _in_place_edit(seg):
-        # operand 0 is the SCRIPT (`s/a/b/`), whether it is bare or the value of
-        # -e; the files it edits follow it. Naming the script as a lost file would
-        # be confidently wrong.
-        files = [a for a in seg.argv[1:] if not a.startswith("-")][1:]
+        operands = [a for a in seg.argv[1:] if not a.startswith("-")]
+        # Operand 0 is the SCRIPT (`s/a/b/`) only when no -e/-f supplied one —
+        # `sed -i -f prog.sed f.py` has no script operand, and dropping the first
+        # would drop a real edited file. Naming the script as a lost file would be
+        # confidently wrong in the other direction, so the flags decide.
+        files = operands if _program_comes_from_a_flag(seg) else operands[1:]
         return f"{seg.exe} -i on {', '.join(files[:_MAX_NAMED])}" if files else f"{seg.exe} -i"
     if seg.exe in _WRITE_EXES:
         operands = [a for a in seg.argv[1:] if not a.startswith("-")]
@@ -194,7 +238,10 @@ def note(command: str) -> str | None:
         "\nNOTE: the ENTIRE command was discarded, not just the step refused above.\n"
         "These writes did NOT happen:\n"
         + "".join(f"  - {w}\n" for w in writes)
-        + "Re-run them as their own command once the block above is resolved."
+        + "Re-run them once the block above is resolved, KEEPING whatever guarded\n"
+        "them in the original command — a write behind a `&&` test was conditional,\n"
+        "and re-running it alone can perform it in a state the original would have\n"
+        "skipped."
     )
 
 

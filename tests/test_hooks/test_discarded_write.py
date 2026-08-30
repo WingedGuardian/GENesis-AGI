@@ -74,6 +74,43 @@ def test_an_in_place_edit_names_the_FILES_not_the_script():
     assert _mod.discarded_writes("sed -i s/a/b/ f.py && git commit -m x") == ["sed -i on f.py"]
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "sed -i s/a/b/ f.py",
+        "sed -i.bak s/a/b/ f.py",
+        "sed -ibak s/a/b/ f.py",  # suffix attaches with NO separator
+        "sed -Ei s/a/b/ f.py",  # clustered short options
+        "sed --in-place s/a/b/ f.py",
+        "sed --in-place=.bak s/a/b/ f.py",
+        "perl -pi -e s/a/b/ f.py",  # perl's clustered form
+    ],
+)
+def test_every_in_place_spelling_is_recognised(cmd):
+    """GNU sed documents `-i[SUFFIX], --in-place[=SUFFIX]`, and the suffix attaches
+    with no separator. Recognising only `-i` and `-i.` missed the long forms, the
+    separator-less suffix, and every CLUSTER — so an ordinary `sed --in-place`
+    before a refused push reported that nothing was lost."""
+    assert _mod.discarded_writes(f"{cmd} && git push"), f"missed an in-place form: {cmd}"
+
+
+def test_the_in_place_target_is_the_FILE_not_the_script():
+    assert _mod.discarded_writes("sed -i s/a/b/ f.py && git push") == ["sed -i on f.py"]
+
+
+def test_an_in_place_program_from_a_FILE_does_not_lose_an_edited_file():
+    """`sed -i -f prog.sed f.py` has no script OPERAND — the program came from -f.
+    Dropping the first operand as if it were the script would drop a real file."""
+    assert _mod.discarded_writes("sed -i -f prog.sed f.py && git push") == [
+        "sed -i on prog.sed, f.py"
+    ]
+
+
+def test_a_quoted_in_place_LOOKALIKE_is_not_a_write():
+    """`--` ends option scanning, so an argument that merely contains `-i` is data."""
+    assert _mod.discarded_writes("sed -- s/-i/x/ f.py && git push") == []
+
+
 def test_a_write_AFTER_the_refused_step_is_still_named():
     """Ordering is irrelevant: the whole call is discarded, so a write behind the
     refused step is lost exactly as thoroughly as one in front of it."""
@@ -279,6 +316,24 @@ def test_the_note_says_the_WHOLE_command_was_discarded():
     assert "ENTIRE command was discarded" in text
     assert "did NOT happen" in text
     assert "an inline python3 script" in text
+
+
+def test_the_rerun_guidance_does_not_strip_a_write_of_its_CONDITION():
+    """A note that induces the WRONG action is worse than no note.
+
+    `test -f approved && cp draft final && git push` names `cp draft final`. Told
+    to "re-run them as their own command", a reader performs the copy even when
+    `approved` is absent — which the original shell would never have done. The
+    guidance must carry the prerequisite, not detach it."""
+    text = _mod.note("test -f approved && cp draft final && git push")
+    assert "cp draft final" in text
+    lowered = text.lower()
+    assert "keeping" in lowered and "guarded" in lowered, (
+        "the rerun guidance must tell the reader to preserve what guarded the write"
+    )
+    assert "as their own command" not in lowered, (
+        "the detached-rerun phrasing is what made this unsafe for a conditional write"
+    )
 
 
 def test_no_note_when_nothing_was_discarded():
