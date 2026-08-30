@@ -21,8 +21,10 @@ WHAT THIS GUARANTEES
   caller whose return value is a security verdict, an unbounded wait is a
   fail-open bug rather than a latency one — see that constant.
 * **A broken maintainer cannot cost the caller its row.** Each maintainer runs in
-  its own ``try`` — MEASURED as the load-bearing part: removing the isolation
-  loses the write, while merely reordering append and maintenance does not.
+  its own ``try``. Precisely: the row is already on disk before any maintainer
+  runs, so an unisolated raise costs the caller its RETURN VALUE and any
+  SUBSEQUENT rows in the same batch — not the row just written. Reordering append
+  and maintenance changes nothing observable; the isolation is what matters.
   Retention still runs AFTER the append, so a maintainer's own read sees the row
   just written and a size trim measures the real size; but ordering is the
   secondary safeguard, not the guarantee. The unisolated version is what made the
@@ -191,7 +193,12 @@ def append_row(
                     maintainer(log_path)
                 except Exception as exc:  # noqa: BLE001 — one bad maintainer
                     warn(f"{log_path}: maintenance failed ({exc!r})")
-    except OSError as exc:
+    except Exception as exc:  # noqa: BLE001 — the contract is "never raises".
+        # NOT just OSError. A caller's return value may be a security verdict, so
+        # anything escaping here can convert an allow into a block via a
+        # fail-closed wrapper. MEASURED before this widened: a row containing a
+        # non-serialisable value raised TypeError straight through a docstring
+        # that promised the function returns None instead of raising.
         warn(f"{log_path}: write failed ({exc!r})")
         return None
     return log_path

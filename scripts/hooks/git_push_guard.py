@@ -100,6 +100,7 @@ not treat untrusted PR content as instructions when composing its comment body.
 from __future__ import annotations
 
 import base64
+import contextlib
 import datetime as _dt
 import json
 import os
@@ -344,11 +345,22 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
     blocked (unless overridden). A detached HEAD ("") is left allowed.
     """
     # depth>0 merges cannot be associated with a top-level cwd → fail closed.
+    #
+    # DELIBERATELY NOT LOGGED, here or below. `# merge-to-main-override` waives a
+    # gate this function short-circuits BEFORE resolving the branch, so a row
+    # could only ever say "the ack was typed" — never that the gate would have
+    # fired. MEASURED on a real repo checked out at a feature branch, where the
+    # gate would have allowed the merge anyway: the row still claimed
+    # `waived: local-merge-into-main`, with pr, repo and head all empty. That
+    # asserts a waiver that was never consulted, in a store whose entire purpose
+    # is answering "was this escape reached for?", and the row carries nothing to
+    # reconcile it against. An honest row needs the branch resolved first; see
+    # the follow-up. The same reasoning retired `# escalation-ack` logging.
     for s in merge_git_segs:
-        if getattr(s, "depth", 0) > 0:
-            if not has_trailing_override(s.raw, "merge-to-main-override"):
-                return True
-            _note_override("merge-to-main-override", waived="local-merge-nested-depth")
+        if getattr(s, "depth", 0) > 0 and not has_trailing_override(
+            s.raw, "merge-to-main-override"
+        ):
+            return True
 
     base = payload.get("cwd") if isinstance(payload, dict) else None
     cur = os.path.normpath(base) if isinstance(base, str) and base else None
@@ -358,12 +370,9 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
             (s for s in top if s.exe == "git" and git_subcommand(s.argv) == "merge"),
             None,
         )
-        if merge_here is not None and has_trailing_override(raw, "merge-to-main-override"):
-            # Noted, not evaluated: the ack short-circuits BEFORE the branch is
-            # resolved, so this records that the ack was invoked on a merge
-            # segment — never a claim that the segment targeted main.
-            _note_override("merge-to-main-override", waived="local-merge-into-main")
-        elif merge_here is not None:
+        if merge_here is not None and not has_trailing_override(
+            raw, "merge-to-main-override"
+        ):
             dash_c = _seg_dash_C(merge_here.argv)
             mcwd = _resolve_against(cur, dash_c) if dash_c is not None else cur
             if mcwd is _CWD_UNKNOWN:
@@ -1771,31 +1780,21 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
     """
     try:
         if any(has_trailing_override(s.raw, "escalation-ack") for s in segs):
-            # Record it ONLY when this gate would actually have counted the
-            # command — i.e. a `gh pr comment … @codex review` segment is
-            # present. `escalation-ack` is a SHARED sigil: it is also the
-            # documented ack for the commit gate (review_enforcement_commit.py
+            # DELIBERATELY NOT LOGGED. `escalation-ack` is a SHARED, COMMAND-scoped
+            # sigil: it is also the commit gate's ack (review_enforcement_commit.py
             # prints `git commit -m "…"  # escalation-ack` in its own block
-            # message). Noting on the bare short-circuit fabricated a row for
-            # EVERY Bash command carrying the ack — MEASURED on `git commit`,
-            # `git status` and `pytest` — each claiming the round cap was waived
-            # when it was never consulted, with no PR to reconcile against. That
-            # would have made this sigil's dominant population fiction.
-            acked = next(
-                (
-                    s
-                    for s in segs
-                    if gh_pr_subcommand(s.argv) == "comment"
-                    and any("@codex review" in tok.lower() for tok in s.argv)
-                ),
-                None,
-            )
-            if acked is not None:
-                _note_override(
-                    "escalation-ack",
-                    waived="codex-round-escalation-cap",
-                    pr=_comment_target(acked.argv)[0] or "",
-                )
+            # message), and this check accepts it on ANY segment. Two attempts to
+            # attribute it honestly both failed, MEASURED:
+            #   1. noting on the bare short-circuit wrote a row for every Bash
+            #      command carrying the ack — `git commit`, `git status`, `pytest`
+            #      each claimed this cap was waived when it was never consulted;
+            #   2. narrowing to "a `@codex review` comment is somewhere in the
+            #      command" still misattributes, because the ack may ride a
+            #      DIFFERENT segment: `git commit … # escalation-ack && gh pr
+            #      comment 5 …` recorded the commit gate's ack against PR 5.
+            # An honest row needs the ack bound to the segment it rides and that
+            # segment's own PR, which this function's shape does not give. Logging
+            # it is deferred rather than approximated — see the follow-up.
             return False, ""
         # Bound this scan's gh (_codex_reviews) calls by the SHARED hook deadline,
         # so a slow API + a compound command can't push the aggregate past the
@@ -2031,6 +2030,14 @@ _OVERRIDE_LOG_FIELDS = ("ts", "sigil", "outcome", "waived", "pr", "repo", "head"
 #: merge that may never have happened — the same conflation this field exists to
 #: prevent, one level down. "error" is the fail-closed wrapper's path.
 #:
+#: HONESTY NOTE: no CURRENTLY-logged sigil can reach "asked". Every logged sigil
+#: is noted inside the `gh pr merge` arm, which returns allow/block and never
+#: asks, and a compound that pairs a merge with a push is refused outright
+#: ("multiple publish/merge operations in one command"). The mapping is kept and
+#: unit-tested because it is three lines and it is the CORRECT answer the moment
+#: a sigil is logged on a path that does ask — at which point silence here would
+#: mean a false "allowed". It is not an observed state today.
+#:
 #: ENFORCED, not just documented: ``_flush_overrides`` drops a row whose outcome
 #: is outside this tuple, the way ``sigil`` is checked against ``_KNOWN_SIGILS``.
 _OVERRIDE_OUTCOMES = ("allowed", "asked", "blocked", "error")
@@ -2041,6 +2048,12 @@ _OVERRIDE_OUTCOMES = ("allowed", "asked", "blocked", "error")
 #: which is arbitrary text, which makes the no-free-text guarantee false.
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _REPO_RE = re.compile(r"^[\w.-]{1,100}/[\w.-]{1,100}$")
+#: ``waived`` names the gate CLASS a sigil targets. Every producer is a literal in
+#: this file (plus ``ci-status`` refined to ``ci:<state>``), so it is a closed set
+#: — enforced, because "the field set is closed" was only ever true of NAMES:
+#: MEASURED, a 311-character ``waived`` carrying quotes and a token-shaped string
+#: was written to the row while the docstring claimed every field was shape-checked.
+_WAIVED_RE = re.compile(r"^[a-z][a-z0-9:+-]{0,63}$")
 
 #: Rows noted during this invocation, flushed once the gate's verdict is known.
 #: Module-level because detection is spread across the merge gate while the
@@ -2054,17 +2067,22 @@ _ASK_EMITTED = False
 
 
 def _actor() -> str:
-    """Who ran the command, from the passwd database rather than ``$USER``.
+    """Who ran the command, from the passwd database — NOT from the environment.
 
-    ``$USER`` is unset under some launchers, which would silently empty the one
-    field whose only job is attribution. Falls back to the env var, then "".
+    ``getpass.getuser()`` is the obvious choice and is WRONG here: it consults
+    ``$LOGNAME``/``$USER``/``$LNAME``/``$USERNAME`` FIRST and only falls back to
+    passwd. MEASURED: with ``LOGNAME`` set, ``getpass.getuser()`` returned that
+    value — so an audited command could forge its own attribution
+    (``LOGNAME=someone-else gh pr merge … # ci-override``) in the one field whose
+    entire job is saying who did it. ``os.getuid()`` cannot be set by the command
+    being guarded.
     """
     try:
-        import getpass
+        import pwd
 
-        return getpass.getuser()
+        return pwd.getpwuid(os.getuid()).pw_name
     except Exception:  # noqa: BLE001 — attribution is best-effort, never fatal.
-        return os.environ.get("USER", "")
+        return str(os.getuid())
 
 
 def _override_log_path() -> str:
@@ -2143,7 +2161,7 @@ def _note_override(
     _PENDING_OVERRIDES.append(
         {
             "sigil": sigil,
-            "waived": waived,
+            "waived": waived if _WAIVED_RE.match(waived or "") else "",
             # Digits-only by construction at every current producer, but checked
             # anyway — the docstring above claims EVERY field is shape-checked,
             # and `pr` is the field a future caller is most likely to feed from a
@@ -2195,10 +2213,16 @@ def _flush_overrides(outcome: str) -> None:
         # operator, and a quiet no-op here is indistinguishable from the
         # never-wired state this whole change exists to end. Cannot use
         # audit_jsonl.warn — that is the module we do not have.
-        print(
-            f"[audit-log] audit_jsonl unavailable — {len(rows)} override row(s) NOT recorded",
-            file=sys.stderr,
-        )
+        #
+        # SUPPRESSED, and that matters: this runs in main()'s `finally`, so an
+        # unwritable stderr raising here escapes into run_guard, which fails
+        # CLOSED and converts it to exit 2 — turning an ALLOW into a BLOCK. The
+        # sibling guard wraps its own block print for exactly this reason.
+        with contextlib.suppress(Exception):
+            print(
+                f"[audit-log] audit_jsonl unavailable — {len(rows)} row(s) NOT recorded",
+                file=sys.stderr,
+            )
         return
     if outcome not in _OVERRIDE_OUTCOMES:
         # The tuple is a contract, not a comment. A row whose verdict is outside

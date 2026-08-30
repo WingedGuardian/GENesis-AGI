@@ -543,10 +543,18 @@ _KNOWN_SIGILS = (
     # sigil queried first still matched, which is why it went unnoticed.
     #
     # NOTE this widens acceptance as well as detection, in the fail-OPEN
-    # direction: `# merge-to-main-override review-override` now waives the
-    # findings gate where the unlisted token previously ended the run and it did
-    # not. That is the intended contract — the operator typed both sigils
-    # literally — but it is a gate-loosening change and is named as one.
+    # direction, and the reach is wider than the merge gate. MEASURED against the
+    # previous parser, every one of these flipped False -> True:
+    #   `git clean -fdx  # full-suite-ok discard-override`         -> the
+    #   `git clean -fdx  # merge-to-main-override discard-override`   UNRECOVERABLE
+    #                                                                 clean block
+    #   `gh pr merge …   # full-suite-ok review-override`          -> findings gate
+    #   `gh pr merge …   # merge-to-main-override ci-override`     -> CI gate
+    #   `git commit      # full-suite-ok audit-ack | depth-ack`    -> commit gates
+    # That is the intended contract — the operator typed both sigils literally,
+    # and nothing in the repo auto-composes a multi-sigil comment — but it is a
+    # gate-loosening change, the sharpest case is the one that deletes untracked
+    # files, and both are named here rather than left to be discovered.
     #
     # A test derives this set from the guards themselves (an ast walk over
     # scripts/hooks/), so the next divergence fails a test rather than waiting to

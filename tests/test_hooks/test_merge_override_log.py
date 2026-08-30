@@ -19,6 +19,7 @@ Two constraints are inherited rather than invented, both from
 import ast
 import importlib.util
 import json
+import os
 import stat
 import subprocess
 import time
@@ -172,6 +173,36 @@ class TestNoCredentialLeak:
         assert secret not in text
         assert "Authorization" not in text
         assert "gh pr merge" not in text
+
+    def test_actor_cannot_be_forged_by_the_audited_command(self, log_path, monkeypatch):
+        """`actor` is the one field whose entire job is saying who did it.
+
+        `getpass.getuser()` looks right and is wrong: it reads $LOGNAME/$USER
+        FIRST and only then passwd. MEASURED with that version — `LOGNAME=...`
+        set by the very command being audited was written into the row, so a
+        merge could forge its own attribution.
+        """
+        monkeypatch.setenv("LOGNAME", "someone-else")
+        monkeypatch.setenv("USER", "someone-else")
+        _note_and_flush(waived="ci-status", pr="1", repo="o/r")
+        assert _rows(log_path)[0]["actor"] != "someone-else"
+
+    def test_waived_is_a_closed_shape(self, log_path):
+        """MEASURED before the check: a 311-char `waived` carrying quotes and a
+        token-shaped string was written to the row, while the docstring claimed
+        every field was shape-checked. It names a gate class, so it is closed."""
+        _note_and_flush(waived="X" * 300 + " ghp_secret", pr="1", repo="o/r")
+        assert _rows(log_path)[0]["waived"] == ""
+
+    def test_a_real_gate_class_survives(self, log_path):
+        """Positive control: the shape must not reject the values production sends."""
+        for w in ("ci-status", "ci:red", "codex-freshness+base-invariant"):
+            _note_and_flush(waived=w, pr="1", repo="o/r")
+        assert [r["waived"] for r in _rows(log_path)] == [
+            "ci-status",
+            "ci:red",
+            "codex-freshness+base-invariant",
+        ]
 
     def test_field_set_is_closed(self, log_path):
         """The expected names are LITERAL here, deliberately.
@@ -428,53 +459,28 @@ class TestWiredIntoTheMergePath:
         assert rc == 0, "the sigil should have let this through"
         assert [r["outcome"] for r in _rows(log_path)] == ["allowed"]
 
-    def test_escalation_ack_on_an_unrelated_command_records_nothing(self, monkeypatch, log_path):
-        """`escalation-ack` is a SHARED sigil — it is also the commit gate's ack,
-        printed by review_enforcement_commit.py as `git commit -m "…"  # escalation-ack`.
+    def test_command_scoped_acks_are_not_logged_at_all(self, monkeypatch, log_path):
+        """`escalation-ack` and `merge-to-main-override` are deliberately OUT of
+        scope — the pin for a decision, not an oversight.
 
-        MEASURED before this control existed: `git commit`, `git status` and even
-        `pytest` each wrote a row claiming the codex-round-escalation cap had been
-        waived, for a gate that was never consulted and with no PR to reconcile
-        against. That would have made this sigil's dominant population fiction.
+        Both are COMMAND-scoped acks whose gate is not evaluated where the sigil
+        is seen, so any row would assert a waiver that was never consulted, with
+        every identifying field empty. Two attempts to attribute them honestly
+        both produced fiction, MEASURED: `escalation-ack` on `git commit`,
+        `git status` and `pytest` each claimed the round cap was waived; after
+        narrowing, `git commit … # escalation-ack && gh pr comment 5 …` recorded
+        the COMMIT gate's ack against PR 5; and `merge-to-main-override` on a repo
+        checked out at a feature branch — where the gate would have allowed the
+        merge anyway — still claimed a local-merge-into-main waiver.
         """
         for cmd in (
             'git commit -m "wip"  # escalation-ack',
             "git status  # escalation-ack",
-            "pytest tests/test_x.py -q  # escalation-ack",
+            'gh pr comment 5 --body "@codex review"  # escalation-ack',
+            'git commit -m "x"  # escalation-ack && gh pr comment 5 --body "@codex review"',
         ):
             self._drive(monkeypatch, cmd)
-            assert _rows(log_path) == [], f"{cmd!r} fabricated a row"
-
-    def test_escalation_ack_is_recorded(self, monkeypatch, log_path):
-        """The cap-BYPASS sigil — the escape from the anti-whack-a-mole gate, and
-        the highest-signal one. It IS a has_trailing_override call site, and was
-        still missed by enumerating that helper's call sites."""
-        self._drive(monkeypatch, 'gh pr comment 5 --body "@codex review"  # escalation-ack')
-        (row,) = _rows(log_path)
-        assert row["sigil"] == "escalation-ack"
-        assert row["pr"] == "5"
-        assert row["waived"] == "codex-round-escalation-cap"
-
-    def test_an_ask_decision_is_not_recorded_as_allowed(self, monkeypatch, log_path, capsys):
-        """`_ask` returns 0 while emitting a prompt the human may still DENY, so
-        rc==0 is three states. Recording it as allowed would have the log assert a
-        merge that never happened."""
-        monkeypatch.setattr(
-            _mod,
-            "read_payload",
-            lambda: {
-                "hook_event_name": "PreToolUse",
-                "tool_name": "Bash",
-                "tool_input": {
-                    "command": "git merge feat  # merge-to-main-override && git push origin feat",
-                    "cwd": "/home/ubuntu/tmp",
-                },
-            },
-        )
-        rc = _mod.main()
-        assert rc == 0
-        assert '"ask"' in capsys.readouterr().out
-        assert [r["outcome"] for r in _rows(log_path)] == ["asked"]
+            assert _rows(log_path) == [], f"{cmd!r} produced a row"
 
     def test_no_sigil_writes_nothing(self, monkeypatch, log_path):
         """Positive control's twin: an ordinary merge must not log."""
@@ -494,8 +500,12 @@ class TestWiredIntoTheMergePath:
         assert secret not in text
         assert "GH_TOKEN" not in text
 
-    def test_merge_to_main_override_is_recorded(self, monkeypatch, tmp_path, log_path):
-        """The fifth merge-path sigil, and the second one the first cut missed."""
+    def test_a_local_merge_ack_writes_nothing(self, monkeypatch, tmp_path, log_path):
+        """`merge-to-main-override` is out of scope — see the class-scoped test
+        above. Pinned here too because this is the path that produced the fiction:
+        the ack short-circuits before the branch is resolved, so on a feature
+        branch (where the gate would have allowed the merge anyway) the row still
+        claimed a waiver, with pr, repo and head all empty."""
         monkeypatch.setattr(
             _mod,
             "read_payload",
@@ -509,7 +519,7 @@ class TestWiredIntoTheMergePath:
             },
         )
         _mod.main()
-        assert [r["sigil"] for r in _rows(log_path)] == ["merge-to-main-override"]
+        assert _rows(log_path) == []
 
 
 class TestLoggingCannotCostTheVerdict:
@@ -542,6 +552,35 @@ class TestLoggingCannotCostTheVerdict:
         )
         assert _mod.audit_jsonl.LOCK_TIMEOUT_S <= 1.0, "the bound itself has drifted"
         assert _rows(log_path) == [], "the row is what gets dropped, not the verdict"
+        assert "lock busy" in capsys.readouterr().err
+
+    def test_many_rows_share_ONE_deadline(self, log_path, capsys):
+        """The bound is on the CALLER's total delay, not on each row.
+
+        Per-row deadlines make the wait before the hook can return N x
+        LOCK_TIMEOUT_S, and N is not bounded — a compound command notes a row per
+        merge segment. Deleting the shared `deadline=` argument restores that and
+        was caught by NO test until this one: the only other timing test writes a
+        single row, where per-row and shared deadlines are indistinguishable.
+        """
+        log_path.parent.mkdir(parents=True)
+        lock = str(log_path) + ".lock"
+        holder = subprocess.Popen(["flock", lock, "-c", "sleep 10"])
+        try:
+            time.sleep(0.4)
+            _mod._PENDING_OVERRIDES.clear()
+            for n in range(6):
+                _mod._note_override("ci-override", waived="ci-status", pr=str(n), repo="o/r")
+            started = time.monotonic()
+            _mod._flush_overrides("allowed")
+            elapsed = time.monotonic() - started
+        finally:
+            holder.terminate()
+            holder.wait(timeout=5)
+        assert elapsed < 2.0, (
+            f"6 rows took {elapsed:.1f}s under contention — the deadline is being "
+            "applied per row, so the delay scales with the row count"
+        )
         assert "lock busy" in capsys.readouterr().err
 
     def test_the_row_lands_when_the_lock_is_free(self, log_path):
@@ -635,14 +674,21 @@ class TestSigilRunRegression:
         assert not undeclared, f"queried but not declared in _KNOWN_SIGILS: {undeclared}"
 
 
+#: The default, spelled out ONCE. Asserting only the SUFFIX was measured vacuous
+#: for the property these tests claim: a mutant returning
+#: `os.path.abspath(".genesis/merge_override_log.jsonl")` puts the log INSIDE the
+#: repo worktree — exactly "committed" — and still ends with that suffix.
+_EXPECTED_DEFAULT = os.path.expanduser("~/.genesis/merge_override_log.jsonl")
+
+
 def test_the_live_default_path_is_outside_any_repo(monkeypatch):
     """The log must survive worktree removal and never be committed."""
     monkeypatch.delenv("GENESIS_MERGE_OVERRIDE_LOG", raising=False)
-    assert _mod._override_log_path().endswith("/.genesis/merge_override_log.jsonl")
+    assert _mod._override_log_path() == _EXPECTED_DEFAULT
 
 
 def test_a_relative_env_override_is_refused(monkeypatch):
     """A relative path resolves against the hook's cwd — the repo — putting a
     durable audit file inside the working tree where it can be committed."""
     monkeypatch.setenv("GENESIS_MERGE_OVERRIDE_LOG", "merge_override_log.jsonl")
-    assert _mod._override_log_path().endswith("/.genesis/merge_override_log.jsonl")
+    assert _mod._override_log_path() == _EXPECTED_DEFAULT
