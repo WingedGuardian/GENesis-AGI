@@ -2843,90 +2843,169 @@ def _scheduled_review_marker_scan(
     return accepted, rejected
 
 
-def _mechanical_scan_conclusion(
-    head_sha: str, check_name: str, repo: str | None = None
-) -> str | None:
-    """The conclusion of check run *check_name* AT *head_sha*, or None if unreadable.
+def _mechanical_scan_is_green(
+    pr_num: str, head_sha: str, check_name: str, repo: str | None = None
+) -> bool:
+    """Whether *check_name* concluded SUCCESS for *head_sha*, identified by
+    ``(name, workflowName)`` rather than by display name alone.
 
-    Binds the sha EXPLICITLY (``commits/{sha}/check-runs``) rather than reading the
-    PR's rollup, so the answer cannot silently describe a different commit than the
-    one the gate is deciding about.
+    Reads ``headRefOid`` AND ``statusCheckRollup`` in ONE query so the rollup
+    provably describes the commit being decided: if the head returned alongside
+    it is not *head_sha*, the read is discarded. That preserves the sha binding a
+    ``commits/{sha}/check-runs`` read would give, while gaining ``workflowName``,
+    which that endpoint does not expose — and it is not paginated the way the
+    REST check-runs list is, so a scanner cannot fall off a later page and read
+    as absent (which would recreate the routine false block this relief exists to
+    retire).
 
-    Returns None on ANY doubt — a gh error, an unparseable payload, or the check
-    simply not present at this head. Callers treat None as "no relief": this feeds
-    a merge gate, so an unreadable mechanical scan must never read as a pass.
+    Identity is ``(name, workflowName)`` against ``_required_ci_workflows()``,
+    mirroring ``_ci_identity``. A bare display-name match would let a same-named
+    check from another app or workflow stand in for the real scanner — the decoy
+    class this file already documents at _ci_identity, and the whole point of
+    this relief is that the mechanical layer really ran.
 
-    Tests inject via ``_TEST_GH_CHECK_RUNS`` (a JSON array of check-run objects).
+    Returns False on ANY doubt: a gh error, an unparseable payload, a head that
+    does not match, no entry with that identity, or any conclusion other than
+    SUCCESS. This feeds a merge gate that forces --admin, so an unreadable or
+    ambiguous scan must never read as a pass.
+
+    Tests inject via ``_TEST_GH_ROLLUP_WITH_HEAD`` (a JSON object with
+    ``headRefOid`` and ``statusCheckRollup``).
     """
-    raw = os.environ.get("_TEST_GH_CHECK_RUNS")
+    raw = os.environ.get("_TEST_GH_ROLLUP_WITH_HEAD")
     if raw is None:
-        try:
-            owner_repo = repo or _derive_repo_from_cwd(os.getcwd())
-        except Exception:
-            owner_repo = repo
-        if not owner_repo:
-            return None
         try:
             result = subprocess.run(
                 [
                     "gh",
-                    "api",
-                    f"repos/{owner_repo}/commits/{head_sha}/check-runs",
-                    "--jq",
-                    ".check_runs",
+                    "pr",
+                    "view",
+                    pr_num,
+                    *_repo_args(repo),
+                    "--json",
+                    "headRefOid,statusCheckRollup",
                 ],
                 capture_output=True,
                 text=True,
                 timeout=_gh_timeout(8),  # merge-path budget; fail-closed -> no relief
             )
             if result.returncode != 0:
-                return None
+                return False
             raw = result.stdout.strip()
         except Exception:
-            return None
+            return False
     if not raw:
-        return None
+        return False
     try:
-        runs = json.loads(raw)
+        data = json.loads(raw)
     except Exception:
-        return None
-    if not isinstance(runs, list):
-        return None
-    for run in runs:
-        if not isinstance(run, dict):
+        return False
+    if not isinstance(data, dict):
+        return False
+    # The rollup and the head come from the SAME read; if that head is not the one
+    # being decided, the rollup describes a different commit and proves nothing.
+    if (data.get("headRefOid") or "").strip().lower() != (head_sha or "").strip().lower():
+        return False
+    rollup = data.get("statusCheckRollup")
+    if not isinstance(rollup, list):
+        return False
+    required_workflows = {w.strip().lower() for w in _required_ci_workflows()}
+    for entry in rollup:
+        if not isinstance(entry, dict):
             continue
-        if (run.get("name") or "").strip() == check_name:
-            # A run still in flight has conclusion null -> not "success" -> no relief.
-            return (run.get("conclusion") or "").strip().lower() or None
-    return None  # the check never ran at this head
+        if (entry.get("name") or "").strip() != check_name:
+            continue
+        workflow = (entry.get("workflowName") or "").strip().lower()
+        if not workflow or workflow not in required_workflows:
+            continue  # same display name, different (or unidentifiable) workflow
+        return (entry.get("conclusion") or "").strip().upper() == "SUCCESS"
+    return False
+
+
+def _sha_is_ancestor(ancestor: str, descendant: str, repo: str | None = None) -> bool:
+    """Whether *ancestor* is an ancestor of *descendant*, per GitHub's compare API.
+
+    Load-bearing for the relief below. "An earlier head of the same PR" is NOT
+    established by "a sha that differs from the current head": a force-push or a
+    history-rewriting rebase leaves the reviewed commit off the branch entirely,
+    so the PR can carry an entirely different tree while an old accepted marker
+    still names a real commit. Carrying that review forward would vouch for code
+    its reviewer never saw — precisely the inferential leak this irreducible gate
+    exists to catch.
+
+    Returns False on ANY doubt. Only compare ``status == "ahead"`` (the
+    descendant is ahead of the ancestor) counts; "diverged", "behind" and
+    "identical" do not, and neither does an unreadable read.
+
+    Tests inject via ``_TEST_GH_COMPARE_STATUS``.
+    """
+    raw = os.environ.get("_TEST_GH_COMPARE_STATUS")
+    if raw is None:
+        try:
+            owner_repo = repo or _derive_repo_from_cwd(os.getcwd())
+        except Exception:
+            owner_repo = repo
+        if not owner_repo:
+            return False
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{owner_repo}/compare/{ancestor}...{descendant}",
+                    "--jq",
+                    ".status",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),  # merge-path budget; fail-closed -> no relief
+            )
+            if result.returncode != 0:
+                return False
+            raw = result.stdout.strip()
+        except Exception:
+            return False
+    return (raw or "").strip().lower() == "ahead"
 
 
 def _relieve_kinds_by_mechanical_rescan(
     missing: list[str],
     accepted: dict[str, set[str]],
     head: str,
+    pr_num: str,
     repo: str | None = None,
 ) -> tuple[list[str], list[tuple[str, str, str]]]:
-    """Drop kinds satisfiable by an earlier ACCEPTED marker + a green scanner at head.
+    """Drop kinds satisfiable by an ANCESTOR ACCEPTED marker + a green scanner at head.
 
     Returns ``(still_missing, relieved)`` where each *relieved* entry is
-    ``(kind, earlier_head_12, check_name)`` for the message.
+    ``(kind, ancestor_head_12, check_name)`` — enough for both the operator note
+    and the report line, so a carried-forward review is never rendered as one
+    made at head.
 
-    Only ``accepted`` markers count. A marker that was REFUSED at an earlier head
-    proves a routine ran and FOUND something — it must never grant relief, which is
-    why ``rejected`` is deliberately not a parameter here rather than merely unused.
+    Only ``accepted`` markers count. A marker REFUSED at an earlier head proves a
+    routine ran and FOUND something; carrying it would convert a detected leak
+    into a merge. ``rejected`` is deliberately not a parameter rather than merely
+    unused.
     """
     relieved: list[tuple[str, str, str]] = []
     for kind in missing:
         check_name = _MECHANICAL_RESCAN_BY_KIND.get(kind)
         if not check_name:
             continue
-        earlier = sorted(h for h, kinds in accepted.items() if h != head and kind in kinds)
-        if not earlier:
+        candidates = sorted(h for h, kinds in accepted.items() if h != head and kind in kinds)
+        if not candidates:
             continue  # never accepted anywhere in this PR -> nothing to carry forward
-        if _mechanical_scan_conclusion(head, check_name, repo=repo) != "success":
-            continue  # unreadable, absent, pending or failed -> fail CLOSED
-        relieved.append((kind, earlier[-1][:12], check_name))
+        # Newest-first: prefer the most recent accepted review that is genuinely
+        # on this branch's history.
+        ancestor = next(
+            (h for h in reversed(candidates) if _sha_is_ancestor(h, head, repo=repo)),
+            None,
+        )
+        if ancestor is None:
+            continue  # rewritten history (or unreadable) -> the review is not OF this tree
+        if not _mechanical_scan_is_green(pr_num, head, check_name, repo=repo):
+            continue  # unreadable, absent, wrong workflow, pending or failed -> fail CLOSED
+        relieved.append((kind, ancestor[:12], check_name))
     relieved_kinds = {k for k, _, _ in relieved}
     return [k for k in missing if k not in relieved_kinds], relieved
 
@@ -2937,6 +3016,7 @@ def _check_scheduled_claude_reviewed_head(
     repo: str | None = None,
     *,
     force: bool = False,
+    relief_out: list[tuple[str, str, str]] | None = None,
 ) -> str | None:
     """Block a merge unless EVERY required scheduled Claude review (by the repo OWNER)
     has run on the PR's CURRENT head. Returns ``None`` when a valid owner marker for
@@ -3035,8 +3115,10 @@ def _check_scheduled_claude_reviewed_head(
         # A kind already ACCEPTED at an earlier head of this PR is satisfied when its
         # mechanical scanner is green at THIS head (see _MECHANICAL_RESCAN_BY_KIND).
         missing, relieved = _relieve_kinds_by_mechanical_rescan(
-            missing, markers, head, repo=repo
+            missing, markers, head, pr_num, repo=repo
         )
+        if relief_out is not None:
+            relief_out.extend(relieved)
         for kind, earlier_head, check_name in relieved:
             print(
                 f"NOTE: scheduled '{kind}' review for PR #{pr_num} was accepted at "
@@ -5212,10 +5294,23 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     if not _scheduled_gate_applies(repo):
         print("scheduled-claude: n/a (scoped to the public repo only)")
     else:
-        sched_msg = _check_scheduled_claude_reviewed_head(pr_num, verified_head, repo)
-        print(
-            f"scheduled-claude: {'BLOCK — ' + sched_msg.splitlines()[0] if sched_msg else 'ok (at head)'}"
+        sched_relief: list[tuple[str, str, str]] = []
+        sched_msg = _check_scheduled_claude_reviewed_head(
+            pr_num, verified_head, repo, relief_out=sched_relief
         )
+        if sched_msg:
+            sched_state = "BLOCK — " + sched_msg.splitlines()[0]
+        elif sched_relief:
+            # NEVER render a carried-forward review as one made at head: this line is
+            # what a human (and a structured consumer) reads to judge freshness, and
+            # "ok (at head)" here would be a false assertion about what was reviewed.
+            sched_state = "ok (" + "; ".join(
+                f"{kind} carried from {anc}, {check} green at head"
+                for kind, anc, check in sched_relief
+            ) + ")"
+        else:
+            sched_state = "ok (at head)"
+        print(f"scheduled-claude: {sched_state}")
         failures += 1 if sched_msg else 0
     # Fail-closed (the only mode now): a scan that could not be READ (gh error/malformed)
     # shows as a failure here, never as "ok" — the report must not issue a false all-clear.
