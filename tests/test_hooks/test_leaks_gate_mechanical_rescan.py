@@ -229,3 +229,157 @@ class TestScannerReader:
         monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", payload)
         got = _mod._mechanical_scan_is_green("1", HEAD, "leak-detector", repo="acme/pub")
         assert got is expected
+
+
+REFUSED_BODY = "[P1] inferential leak: a docstring naming a home town and employer"
+INTERMEDIATE = "2222222222222222222222222222222222222222"
+
+
+def _markers(*entries):
+    """Several owner-authored marker comments, oldest first (API order)."""
+    rows = []
+    for head, kinds, prefix in entries:
+        body = prefix + "\n" + "\n".join(
+            f"<!-- genesis-scheduled-review: head={head} kind={k} -->" for k in kinds
+        )
+        rows.append(json.dumps({"login": "owner", "author_association": "OWNER", "body": body}))
+    return "\n".join(rows)
+
+
+class TestRefusalVetoesRelief:
+    """The cell that matters most: a refusal AT or AFTER the carried review.
+
+    The mechanical scanner cannot see inferential leaks by construction, so if the
+    routine re-ran and refused, carrying an older clean review forward converts a
+    DETECTED leak into a merge — exactly what this gate exists to stop.
+    """
+
+    def test_refused_at_current_head_blocks(self, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            _markers(
+                (EARLIER, ["leaks"], "scheduled review done. VERDICT: PASS"),
+                (HEAD, ["leaks"], REFUSED_BODY),
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        msg = _gate()
+        assert msg and "leaks" in msg
+
+    def test_refused_between_the_carried_review_and_head_blocks(self, monkeypatch):
+        """A refusal on a commit still present at head is the same hole."""
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            _markers(
+                (EARLIER, ["leaks"], "scheduled review done. VERDICT: PASS"),
+                (INTERMEDIATE, ["leaks"], REFUSED_BODY),
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        # EARLIER is an ancestor of HEAD; the refusal at INTERMEDIATE is NOT an
+        # ancestor of EARLIER, so it lands after the carried review and must veto.
+        monkeypatch.setenv(
+            "_TEST_GH_COMPARE_STATUS",
+            json.dumps({
+                f"{EARLIER}...{HEAD}": "ahead",
+                f"{INTERMEDIATE}...{EARLIER}": "diverged",
+            }),
+        )
+        msg = _gate()
+        assert msg and "leaks" in msg
+
+    def test_refusal_already_answered_by_a_later_review_still_relieves(self, monkeypatch):
+        """A refusal that PREDATES the carried review was answered by it.
+
+        Without this the veto would be 'any refusal ever blocks forever', which is
+        too strict — a PR that had a leak, fixed it, and was re-reviewed clean
+        would never get relief again.
+        """
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            _markers(
+                (INTERMEDIATE, ["leaks"], REFUSED_BODY),
+                (EARLIER, ["leaks"], "re-reviewed after the fix. VERDICT: PASS"),
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        monkeypatch.setenv(
+            "_TEST_GH_COMPARE_STATUS",
+            json.dumps({
+                f"{EARLIER}...{HEAD}": "ahead",
+                f"{INTERMEDIATE}...{EARLIER}": "ahead",  # refusal predates the accept
+            }),
+        )
+        assert _gate() is None
+
+    def test_unreadable_refusal_ancestry_blocks(self, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            _markers(
+                (EARLIER, ["leaks"], "scheduled review done. VERDICT: PASS"),
+                (INTERMEDIATE, ["leaks"], REFUSED_BODY),
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        monkeypatch.setenv(
+            "_TEST_GH_COMPARE_STATUS",
+            json.dumps({f"{EARLIER}...{HEAD}": "ahead"}),  # refusal pair unspecified
+        )
+        msg = _gate()
+        assert msg and "leaks" in msg
+
+
+class TestDuplicateRollupEntries:
+    """One head can carry several runs of one job; order is not a guarantee."""
+
+    @pytest.mark.parametrize("order", ["success_first", "failure_first"])
+    def test_a_contradicting_rerun_blocks_in_either_order(self, monkeypatch, order):
+        entries = [
+            {"name": "leak-detector", "workflowName": "CI", "conclusion": "SUCCESS"},
+            {"name": "leak-detector", "workflowName": "CI", "conclusion": "FAILURE"},
+        ]
+        if order == "failure_first":
+            entries.reverse()
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
+        monkeypatch.setenv(
+            "_TEST_GH_ROLLUP_WITH_HEAD",
+            json.dumps({"headRefOid": HEAD, "statusCheckRollup": entries}),
+        )
+        msg = _gate()
+        assert msg and "leaks" in msg
+
+    def test_two_agreeing_successes_still_relieve(self, monkeypatch):
+        entries = [
+            {"name": "leak-detector", "workflowName": "CI", "conclusion": "SUCCESS"},
+            {"name": "leak-detector", "workflowName": "CI", "conclusion": "SUCCESS"},
+        ]
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
+        monkeypatch.setenv(
+            "_TEST_GH_ROLLUP_WITH_HEAD",
+            json.dumps({"headRefOid": HEAD, "statusCheckRollup": entries}),
+        )
+        assert _gate() is None
+
+
+class TestCandidateSelection:
+    def test_an_unreadable_compare_fails_closed_rather_than_trying_an_older_marker(
+        self, monkeypatch
+    ):
+        """A transient API error must not silently downgrade to an older review."""
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            _markers(
+                (INTERMEDIATE, ["leaks"], "older. VERDICT: PASS"),
+                (EARLIER, ["leaks"], "newer. VERDICT: PASS"),
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        # The NEWEST candidate's compare is unreadable; the older one would be
+        # 'ahead'. Falling back to it would carry a staler review than the gate
+        # was able to verify.
+        monkeypatch.setenv(
+            "_TEST_GH_COMPARE_STATUS",
+            json.dumps({f"{INTERMEDIATE}...{HEAD}": "ahead"}),
+        )
+        msg = _gate()
+        assert msg and "leaks" in msg

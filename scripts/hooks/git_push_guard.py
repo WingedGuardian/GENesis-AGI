@@ -2910,6 +2910,15 @@ def _mechanical_scan_is_green(
     if not isinstance(rollup, list):
         return False
     required_workflows = {w.strip().lower() for w in _required_ci_workflows()}
+    # Collect EVERY same-identity entry, never the first match. One head can carry
+    # several runs of one job (a re-run after a ruleset change, a superseded
+    # concurrency sibling), and rollup ORDER is not a guarantee -- _pr_ci_status
+    # refuses to trust it for exactly this reason. A first-match read of a
+    # SUCCESS-then-FAILURE pair reports green while the scanner is red, and under
+    # `# ci-override` this relief is the ONLY remaining check of the mechanical
+    # layer. So: at least one matching entry, and NO matching entry that
+    # contradicts SUCCESS.
+    conclusions: list[str] = []
     for entry in rollup:
         if not isinstance(entry, dict):
             continue
@@ -2918,11 +2927,13 @@ def _mechanical_scan_is_green(
         workflow = (entry.get("workflowName") or "").strip().lower()
         if not workflow or workflow not in required_workflows:
             continue  # same display name, different (or unidentifiable) workflow
-        return (entry.get("conclusion") or "").strip().upper() == "SUCCESS"
-    return False
+        conclusions.append((entry.get("conclusion") or "").strip().upper())
+    if not conclusions:
+        return False  # the scanner never ran at this head under that identity
+    return all(c == "SUCCESS" for c in conclusions)
 
 
-def _sha_is_ancestor(ancestor: str, descendant: str, repo: str | None = None) -> bool:
+def _sha_is_ancestor(ancestor: str, descendant: str, repo: str | None = None) -> bool | None:
     """Whether *ancestor* is an ancestor of *descendant*, per GitHub's compare API.
 
     Load-bearing for the relief below. "An earlier head of the same PR" is NOT
@@ -2937,16 +2948,32 @@ def _sha_is_ancestor(ancestor: str, descendant: str, repo: str | None = None) ->
     descendant is ahead of the ancestor) counts; "diverged", "behind" and
     "identical" do not, and neither does an unreadable read.
 
-    Tests inject via ``_TEST_GH_COMPARE_STATUS``.
+    Tests inject via ``_TEST_GH_COMPARE_STATUS``: either a bare status applying to
+    every pair, or a JSON object keyed ``"<ancestor>...<descendant>"`` so a test can
+    give different answers per pair. The map form exists because the relief walks
+    SEVERAL pairs (each candidate against the head, and each refusal against the
+    chosen candidate); with one global value those paths cannot be told apart, which
+    left the refusal-veto and multi-candidate cells untestable.
     """
     raw = os.environ.get("_TEST_GH_COMPARE_STATUS")
+    if raw is not None and raw.strip().startswith("{"):
+        try:
+            table = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(table, dict):
+            return None
+        found = table.get(f"{ancestor}...{descendant}")
+        if found is None:
+            return None  # unspecified pair -> unreadable, never a silent "ahead"
+        raw = str(found)
     if raw is None:
         try:
             owner_repo = repo or _derive_repo_from_cwd(os.getcwd())
         except Exception:
             owner_repo = repo
         if not owner_repo:
-            return False
+            return None
         try:
             result = subprocess.run(
                 [
@@ -2961,16 +2988,20 @@ def _sha_is_ancestor(ancestor: str, descendant: str, repo: str | None = None) ->
                 timeout=_gh_timeout(8),  # merge-path budget; fail-closed -> no relief
             )
             if result.returncode != 0:
-                return False
+                return None
             raw = result.stdout.strip()
         except Exception:
-            return False
-    return (raw or "").strip().lower() == "ahead"
+            return None
+    status = (raw or "").strip().lower()
+    if not status:
+        return None  # unreadable -> the CALLER must fail closed, not try another marker
+    return status == "ahead"
 
 
 def _relieve_kinds_by_mechanical_rescan(
     missing: list[str],
     accepted: dict[str, set[str]],
+    rejected: dict[str, set[str]],
     head: str,
     pr_num: str,
     repo: str | None = None,
@@ -2982,27 +3013,68 @@ def _relieve_kinds_by_mechanical_rescan(
     and the report line, so a carried-forward review is never rendered as one
     made at head.
 
-    Only ``accepted`` markers count. A marker REFUSED at an earlier head proves a
-    routine ran and FOUND something; carrying it would convert a detected leak
-    into a merge. ``rejected`` is deliberately not a parameter rather than merely
-    unused.
+    ``rejected`` IS a parameter, and load-bearing. An earlier draft omitted it on
+    the reasoning that a refusal at an EARLIER head cannot matter once a later
+    ACCEPTED review exists. That reasoning missed the cell that matters: a
+    refusal at the CURRENT head, or at any commit after the accepted one. The
+    routine re-runs, finds an INFERENTIAL leak (which the mechanical scanner
+    cannot see, by construction), posts a refused marker — and relief would
+    carry the older clean review forward and merge the leak. That is precisely
+    the class this gate exists to stop, so the veto below is the whole safety
+    argument, not a detail.
+
+    The rule: an accepted marker may be carried only when EVERY refusal for that
+    kind is an ANCESTOR of it — i.e. every refusal predates the accepted review
+    and was therefore answered by it. A refusal at the head, or between the
+    accepted marker and the head, vetoes.
     """
     relieved: list[tuple[str, str, str]] = []
     for kind in missing:
         check_name = _MECHANICAL_RESCAN_BY_KIND.get(kind)
         if not check_name:
             continue
-        candidates = sorted(h for h, kinds in accepted.items() if h != head and kind in kinds)
+        # Candidates in the scan's own order, which follows the API's chronological
+        # comment order, and take the LAST — the newest accepted review carries the
+        # smallest never-LLM-reviewed delta. Correctness does not depend on the
+        # ordering (any accepted ancestor that survives the refusal veto is sound);
+        # it minimises exposure. An earlier draft sorted the SHAs and called that
+        # "newest first", which is alphabetical hex order and means nothing.
+        candidates = [h for h, kinds in accepted.items() if h != head and kind in kinds]
         if not candidates:
             continue  # never accepted anywhere in this PR -> nothing to carry forward
-        # Newest-first: prefer the most recent accepted review that is genuinely
-        # on this branch's history.
-        ancestor = next(
-            (h for h in reversed(candidates) if _sha_is_ancestor(h, head, repo=repo)),
-            None,
-        )
-        if ancestor is None:
-            continue  # rewritten history (or unreadable) -> the review is not OF this tree
+        refusals = [h for h, kinds in rejected.items() if kind in kinds]
+        if head in refusals:
+            continue  # the routine ran at THIS head and found something -> never relieve
+
+        ancestor = None
+        unreadable = False
+        for candidate in reversed(candidates):
+            verdict = _sha_is_ancestor(candidate, head, repo=repo)
+            if verdict is None:
+                unreadable = True  # cannot establish history -> fail closed, do not
+                break              # silently fall back to an older marker
+            if not verdict:
+                continue  # rewritten history: this review is not OF this tree
+            # Every refusal must predate this accepted review.
+            answered = True
+            for refusal in refusals:
+                if refusal == candidate:
+                    continue
+                r_verdict = _sha_is_ancestor(refusal, candidate, repo=repo)
+                if r_verdict is None:
+                    unreadable = True
+                    answered = False
+                    break
+                if not r_verdict:
+                    answered = False  # a refusal at or after this review -> veto
+                    break
+            if unreadable:
+                break
+            if answered:
+                ancestor = candidate
+                break
+        if unreadable or ancestor is None:
+            continue
         if not _mechanical_scan_is_green(pr_num, head, check_name, repo=repo):
             continue  # unreadable, absent, wrong workflow, pending or failed -> fail CLOSED
         relieved.append((kind, ancestor[:12], check_name))
@@ -3067,13 +3139,22 @@ def _check_scheduled_claude_reviewed_head(
     fire would be asserting a guarantee the code cannot back — and would become actively
     misleading on an install that also runs them on ``synchronize``.
 
-    Head match is EXACT — there is no ancestor walk and no delta tolerance here, unlike
-    the Codex freshness gate, which grants relief on a provably trivial delta via
-    ``_classify_post_review_delta``. That asymmetry is deliberate for now: that
-    classifier judges CODE-REVIEW substantiality by file type and size, and an
-    inferential leak (household/schedule/habit detail, not a token a regex can catch)
-    arrives in exactly the small doc edit it would wave through. A leak-specific
-    tolerance is tracked separately; do not reuse the code-review classifier for it.
+    Head match is EXACT by default, and the code-review classifier must NEVER be
+    reused here: ``_classify_post_review_delta`` judges CODE-REVIEW substantiality by
+    file type and size, and an inferential leak (household/schedule/habit detail, not
+    a token a regex can catch) arrives in exactly the small doc edit it would wave
+    through. That prohibition is unchanged.
+
+    The ONE tolerance that exists is the leak-specific one this docstring used to
+    describe as "tracked separately": ``_relieve_kinds_by_mechanical_rescan`` may
+    carry an ACCEPTED marker forward from an ANCESTOR commit of this PR, but only
+    while the kind's MECHANICAL scanner is green at the exact current head, only
+    when no refusal for that kind sits at or after the carried review, and only for
+    kinds in ``_MECHANICAL_RESCAN_BY_KIND``. It is not a delta tolerance: nothing is
+    judged by how big or how doc-like the change is. It trades a re-read of the
+    inferential layer for a per-head guarantee about the literal layer — strictly
+    more checking than the ``# scheduled-review-override`` it exists to retire,
+    which verifies nothing at all.
 
     SCOPE: this gate enforces ONLY for a merge targeting the configured PUBLIC repo
     (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any other
@@ -3115,17 +3196,21 @@ def _check_scheduled_claude_reviewed_head(
         # A kind already ACCEPTED at an earlier head of this PR is satisfied when its
         # mechanical scanner is green at THIS head (see _MECHANICAL_RESCAN_BY_KIND).
         missing, relieved = _relieve_kinds_by_mechanical_rescan(
-            missing, markers, head, pr_num, repo=repo
+            missing, markers, rejected, head, pr_num, repo=repo
         )
         if relief_out is not None:
             relief_out.extend(relieved)
-        for kind, earlier_head, check_name in relieved:
-            print(
-                f"NOTE: scheduled '{kind}' review for PR #{pr_num} was accepted at "
-                f"{earlier_head} (not at head {head[:12]}), but '{check_name}' is green "
-                f"at this head — honouring the earlier review.",
-                file=sys.stderr,
-            )
+        # Announce ONLY when relief actually clears the gate. Printing "honouring
+        # the earlier review" while the merge is still denied on another kind
+        # describes a decision that was not made.
+        if not missing:
+            for kind, earlier_head, check_name in relieved:
+                print(
+                    f"NOTE: scheduled '{kind}' review for PR #{pr_num} was accepted at "
+                    f"{earlier_head} (not at head {head[:12]}), but '{check_name}' is green "
+                    f"at this head — honouring the earlier review.",
+                    file=sys.stderr,
+                )
     if not missing:
         return None
     # WHY the marker is missing decides whether waiting is useful, and the two causes are
