@@ -5,22 +5,26 @@ Scope note: this pins the producer only. The frontend regression — the actual
 because `queues.py` was already correct and these tests pass unchanged on the
 buggy revision.
 
-`queues()` returns TWO different things for discarded work: `discarded_count`
-(the true depth, an unbounded COUNT) and `discarded_items` (a LIMIT-20 review
-sample). Three dashboard sites render a count from this payload, and they must
-read `discarded_count`.
+`queues()` measures discarded work two ways that can disagree: an unbounded
+COUNT of the depth, and a LIMIT-20 review sample. It now reconciles them ONCE
+and publishes a single `discarded` object (`total`, `sample`, `sample_truncated`,
+`known`); the flat `discarded_count` / `discarded_items` keys remain for the
+depth alarm and pass-through consumers, derived from that object.
 
 Origin (2026-08-30): the overview panel and the attention strip both rendered
-`discarded_items.length`, so a queue holding 148 discarded rows reported
-"20 discarded items" — the truncation limit read as the total. Nothing caught
-it because nothing asserted the two fields diverge.
+the sample length, so a queue holding 148 discarded rows reported "20 discarded
+items" — a truncation limit read as a total. Publishing both numbers put that
+choice at every render site, and across three review rounds several chose wrong
+in different ways. Reconciling here is what makes those states unrepresentable
+rather than merely currently-correct.
 
-This pins the BACKEND half of that contract: the field must exist, must be the
-unbounded count, and must be independent of the sample cap. If `discarded_count`
-is ever dropped from the payload, the frontend's `discardedTotal` fallback
-silently reverts to the sample length. (`mcp/health/errors.py` also alerts on
-`discarded_count > 100`, so this is not the *only* consumer — but it is the one
-the dashboard renders.)
+These tests pin the producer's half: that the depth is independent of the sample
+cap, that each of the two queries can fail without corrupting the other's
+result, that `known` distinguishes a measured zero from an unmeasured one, and
+that the flat keys are derived rather than separately computed. The frontend
+half — that no surface reads the raw keys, and that all three normalisers agree
+with each other and with expected values — is in
+tests/test_dashboard/test_webui_js_integrity.py.
 """
 
 import importlib
@@ -110,3 +114,165 @@ async def test_discarded_count_is_zero_on_an_empty_queue(db):
 
     assert result["discarded_count"] == 0
     assert result["discarded_items"] == []
+
+
+class TestDiscardedIsReconciledOnce:
+    """The producer emits ONE reconciled object; nothing downstream re-derives it.
+
+    The panel used to receive an uncapped `discarded_count` beside a LIMIT-20
+    `discarded_items` sample, and four render surfaces each decided how to
+    reconcile two numbers that can disagree. Every one of those decisions was a
+    chance to pick wrong, and across three review rounds several did — printing
+    the sample size as the total, hiding a backlog behind an empty sample,
+    disabling the control that clears rows it was simultaneously listing.
+
+    Reconciling once, here, is what makes those states unrepresentable rather
+    than merely currently-correct: the frontends receive `total`, `sample`,
+    `sample_truncated` and `known`, and have nothing left to choose between.
+
+    These run against a real sqlite connection (the module fixture), so they
+    exercise the actual queries rather than a fake that could drift from them.
+    """
+
+    async def test_total_is_the_honest_value_when_count_exceeds_the_sample(self, db):
+        """`total` must never under-report — the original bug, on the new shape."""
+        await _seed(db, discarded=_DISCARDED)
+        d = (await q.queues(db, None, None, None))["discarded"]
+
+        assert d["known"] is True
+        assert d["total"] == _DISCARDED
+        assert len(d["sample"]) == 20, "the sample stays capped; only the total is uncapped"
+        assert d["sample_truncated"] is True
+
+    async def test_untruncated_when_everything_fits(self, db):
+        await _seed(db, discarded=3)
+        d = (await q.queues(db, None, None, None))["discarded"]
+
+        assert d["total"] == 3
+        assert d["sample_truncated"] is False, (
+            "claimed truncation with every row on screen — the panel would offer "
+            "a 'showing 3 of 3' label that reads as though rows were withheld"
+        )
+
+    async def test_empty_queue_is_known_and_zero(self, db):
+        d = (await q.queues(db, None, None, None))["discarded"]
+
+        assert d == {"total": 0, "sample": [], "sample_truncated": False, "known": True}, (
+            "an empty queue must be reported as a MEASURED zero — the panel "
+            "distinguishes it from an unknown one, and gets that from `known`"
+        )
+
+    async def test_a_failed_count_is_unknown_not_a_confident_zero(self, db, monkeypatch):
+        """A failed COUNT must never render as 'nothing awaiting review'."""
+        await _seed(db, discarded=_DISCARDED)
+        real = db.execute
+
+        async def _fail_the_count(sql, *a, **k):
+            if "COUNT(*)" in sql and "discarded" in sql:
+                raise RuntimeError("count query exploded")
+            return await real(sql, *a, **k)
+
+        monkeypatch.setattr(db, "execute", _fail_the_count)
+        d = (await q.queues(db, None, None, None))["discarded"]
+
+        assert d["known"] is False, (
+            "a failed count was published as a known depth, so the panel would "
+            "state a number it never measured"
+        )
+        assert d["total"] == len(d["sample"]), "rows already in hand should still be reported"
+
+    async def test_a_failed_sample_does_not_discard_a_good_count(self, db, monkeypatch):
+        """Two independent try blocks, not one.
+
+        The single-try version assigned the count and then ran the sample loop
+        inside the same block, so one unparseable row threw away a correct count
+        and the panel claimed the queue was empty.
+        """
+        await _seed(db, discarded=_DISCARDED)
+        real = db.execute
+
+        async def _fail_the_sample(sql, *a, **k):
+            if "SELECT id, work_type" in sql:
+                raise RuntimeError("sample query exploded")
+            return await real(sql, *a, **k)
+
+        monkeypatch.setattr(db, "execute", _fail_the_sample)
+        d = (await q.queues(db, None, None, None))["discarded"]
+
+        assert d["known"] is True, "the count succeeded and must stand on its own"
+        assert d["total"] == _DISCARDED
+        assert d["sample"] == []
+        assert d["sample_truncated"] is True, (
+            "rows exist and none are shown — the panel must say so rather than "
+            "imply it is displaying the whole queue"
+        )
+
+    async def test_the_flat_fields_are_derived_even_when_they_diverge(self, db, monkeypatch):
+        """The legacy keys stay, but as DERIVED values, not a second source.
+
+        Asserted under DIVERGENCE, deliberately: on the happy path the raw
+        counter and the reconciled total are equal, so computing the flat key
+        separately passes and the test proves nothing. The failed-count case
+        separates them — the raw counter is 0 while rows are in hand.
+
+        This is not cosmetic. `mcp/health/errors.py` raises its >100 depth alarm
+        from `discarded_count`, so a flat key wired to the raw counter would
+        silently under-report to the alarm in exactly the state where the
+        producer already knows better.
+        """
+        await _seed(db, discarded=3)
+        real = db.execute
+
+        async def _fail_the_count(sql, *a, **k):
+            if "COUNT(*)" in sql and "discarded" in sql:
+                raise RuntimeError("count query exploded")
+            return await real(sql, *a, **k)
+
+        monkeypatch.setattr(db, "execute", _fail_the_count)
+        stats = await q.queues(db, None, None, None)
+
+        assert stats["discarded"]["total"] == 3
+        assert stats["discarded_count"] == 3, (
+            "the flat key was computed separately from the object — it reports "
+            "the raw counter (0 here) while the object reports the 3 rows in "
+            "hand, so the depth alarm reads a number the producer knows is wrong"
+        )
+        assert stats["discarded_items"] == stats["discarded"]["sample"]
+
+    async def test_a_full_sample_is_truncated_even_when_the_count_is_unknown(self, db):
+        """A sample that FILLED its cap is a truncated read, never a complete one.
+
+        The subtle case, and the one a comparison alone cannot see. When the
+        COUNT fails, `total` falls back to the sample length — so
+        `total > len(sample)` is False at exactly the moment a full sample
+        proves more rows exist than were shipped. Reporting that as complete is
+        the original defect (a number equal to its own limit read as a real
+        total) reappearing one layer up.
+
+        The producer knows it hit the cap, so it says so; nothing downstream can
+        recover this by comparing the two numbers it was given.
+        """
+        await _seed(db, discarded=_DISCARDED)          # 25 > the 20-row cap
+        real = db.execute
+
+        async def _fail_the_count(sql, *a, **k):
+            if "COUNT(*)" in sql and "discarded" in sql:
+                raise RuntimeError("count query exploded")
+            return await real(sql, *a, **k)
+
+        monkeypatch_target = _fail_the_count
+        db.execute = monkeypatch_target
+        try:
+            d = (await q.queues(db, None, None, None))["discarded"]
+        finally:
+            db.execute = real
+
+        assert d["known"] is False
+        assert d["total"] == len(d["sample"]) == q._DISCARDED_SAMPLE_CAP, (
+            "precondition: this test is only meaningful when the sample fills "
+            "its cap and the total falls back to that same number"
+        )
+        assert d["sample_truncated"] is True, (
+            "a sample that filled its cap was reported as complete — the panel "
+            "would show 20 rows with no indication that more exist"
+        )

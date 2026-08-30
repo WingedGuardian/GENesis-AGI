@@ -3733,7 +3733,7 @@
           if (queues.status === "error") {
             return { state: "unknown", reason: "queue data could not be collected" };
           }
-          if ((queues.dead_letters || 0) > 0 || this.discardedTotal > 0
+          if ((queues.dead_letters || 0) > 0 || this.discarded.total > 0
               || (queues.deferred_stuck || 0) > 0 || (queues.failed_embeddings || 0) > 0) {
             return { state: "error", reason: "stuck/failed items or dead letters require attention" };
           }
@@ -4396,54 +4396,47 @@
           return this.groupQueueItems(this.health.queues?.deferred_items || []);
         },
 
-        // True when the queues section failed to compute, so a 0 means "we do
-        // not know", not "there is nothing". `_or_error` replaces the whole
-        // section with {"status": "error"} — which is TRUTHY, so the card still
-        // renders and would otherwise show a confident row of zeros.
-        get queuesDataUnknown() {
-          const q = this.health?.queues;
-          if (!q) return false;            // card is hidden entirely
-          if (q.status === "error") return true;   // whole section failed
-          // `errors` is ONE list shared by all four queue sources, and every
-          // entry is source-prefixed (see queues.py). Only a discarded-side
-          // failure makes THIS card's zero unknown: keying on the whole list
-          // printed "Queue data unavailable - this is not a confirmed zero"
-          // directly above a correctly-counted list of discarded rows whenever
-          // an unrelated counter failed, denying numbers the same panel was
-          // simultaneously showing.
-          return (q.errors || []).some((e) => String(e).startsWith("discarded"));
+        // The ONE reader of the discarded-queue payload in this file.
+        //
+        // The backend reconciles the uncapped depth and the LIMIT-20 review
+        // sample into a single object, so nothing here chooses between two
+        // numbers that can disagree — that fork, spread across four render
+        // surfaces, generated three rounds of bugs (2026-08-30): a 148-deep
+        // queue displayed as 20, a populated backlog with its clear-all button
+        // hidden, an empty-state message above rows it was listing.
+        //
+        // This normalises only for TRANSPORT damage — an old server with no
+        // `discarded` object, a section replaced wholesale by an error marker,
+        // a non-numeric total — never to re-derive a value the backend already
+        // decided. `known` distinguishes a measured zero from an unmeasured one,
+        // which is what lets the panel avoid claiming "nothing awaiting review"
+        // for a state it never observed.
+        get discarded() {
+          const d = this.health?.queues?.discarded;
+          if (!d || typeof d !== "object") {
+            // Absent: an older server, or `_or_error` replaced the whole queues
+            // section. Either way this is "we do not know", never a clean zero.
+            return { known: false, total: 0, sample: [], truncated: false };
+          }
+          const sample = Array.isArray(d.sample) ? d.sample : [];
+          const known = d.known === true && Number.isFinite(d.total);
+          // A non-finite total would make `> 0` and `=== 0` BOTH false, so the
+          // panel would render neither the list nor the empty state while the
+          // button read "Clear all NaN". The max() floor keeps the printed
+          // number from falling below the rows actually on screen, which would
+          // put "no items awaiting review" directly above a populated list.
+          const reported = Number.isFinite(d.total) ? d.total : sample.length;
+          const total = Math.max(reported, sample.length);
+          // Prefer the producer's own truncation verdict: it knows the sample
+          // hit its cap, which is invisible here when a failed count leaves
+          // total === sample.length. Fall back to comparing only if the field
+          // is missing (an older server).
+          const truncated = d.sample_truncated === true || total > sample.length;
+          return { known, total, sample, truncated };
         },
 
         get discardedQueueGroups() {
-          return this.groupQueueItems(this.health.queues?.discarded_items || []);
-        },
-
-        // Discarded work is reported by TWO values that can disagree:
-        // `discarded_count` (uncapped depth) and `discarded_items` (a LIMIT-20
-        // review sample). Reading the wrong one shipped three rounds of bugs
-        // (2026-08-30), so there is exactly ONE sanctioned accessor.
-        //
-        // ONE accessor, used for every count AND every gate. Deliberately not
-        // two: a "print this one, gate on that one" rule is a fork at every
-        // call site, and choosing wrong is what produced three rounds of bugs.
-        //
-        // max() because BOTH divergences are reachable and the larger value is
-        // the honest one in each:
-        //   count>0, sample empty  — queues.py assigns the count before the
-        //     sample loop inside one try, so a bad row empties only the sample.
-        //     Report 148, not 0, or the panel denies work it is about to clear.
-        //   count==0, sample full  — the count and the sample are two
-        //     un-transacted statements. Report the rows actually on screen, not
-        //     a stale 0 next to five visible entries.
-        // `??` not `||` so a legitimate 0 is not replaced by the sample length.
-        get discardedTotal() {
-          const q = this.health?.queues || {};
-          const sample = q.discarded_items?.length || 0;
-          const n = q.discarded_count ?? sample;
-          // A non-finite count would make BOTH `> 0` and `=== 0` false, so the
-          // panel would render neither the list nor the empty state while the
-          // button read "Clear all NaN".
-          return Math.max(Number.isFinite(n) ? n : sample, sample);
+          return this.groupQueueItems(this.discarded.sample);
         },
 
         get routingProviderList() {
@@ -4565,8 +4558,8 @@
           if ((this.health.queues?.dead_letters || 0) > 0) {
             items.push({ level: "critical", title: `${this.health.queues.dead_letters} dead letters`, detail: "requests exhausted all fallback providers; open the errors view to inspect", href: "/genesis/errors" });
           }
-          if (this.discardedTotal > 0) {
-            const n = this.discardedTotal;
+          if (this.discarded.total > 0) {
+            const n = this.discarded.total;
             items.push({ level: "warning", title: `${n} discarded item${n === 1 ? "" : "s"}`, detail: "work was dropped and can be reviewed or cleared below", href: "#queue-review", tab: "overview", anchor: "queue-review" });
           }
           // Fallback call sites are already captured in the warningAlerts

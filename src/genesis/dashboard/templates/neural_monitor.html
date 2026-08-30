@@ -1617,27 +1617,42 @@ function showDefaultPanel() {
 
 // ── Discarded items — iLO-style expand/clear ────────────────────────
 
+// The ONE reader of the discarded payload on this page. Mirrors the accessor in
+// dashboard.js, deliberately identically: the backend reconciles the uncapped
+// depth and the LIMIT-20 sample into a single object, so no render surface picks
+// between two numbers that can disagree. Normalises only for TRANSPORT damage —
+// an older server with no object, a queues section replaced by an error marker,
+// a non-numeric total — never to re-derive what the backend already decided.
+function normalizeDiscarded(queues) {
+    const d = queues && queues.discarded;
+    if (!d || typeof d !== 'object') {
+        return { known: false, total: 0, sample: [], truncated: false };
+    }
+    const sample = Array.isArray(d.sample) ? d.sample : [];
+    const known = d.known === true && Number.isFinite(d.total);
+    // max() floor: never print a number below the rows on screen. Prefer the
+    // producer's truncation verdict — it knows the sample hit its cap, which is
+    // invisible here when a failed count leaves total === sample.length.
+    const reported = Number.isFinite(d.total) ? d.total : sample.length;
+    const total = Math.max(reported, sample.length);
+    const truncated = d.sample_truncated === true || total > sample.length;
+    return { known: known, total: total, sample: sample, truncated: truncated };
+}
+
 function renderDiscardedItems(container, queues) {
-    const items = queues.discarded_items || [];
-    // `discarded_items` is a LIMIT-20 review SAMPLE; `discarded_count` is the
-    // uncapped depth. ONE value drives the label AND every gate — the two can
-    // disagree in both directions, and gating on the sample alone once left
-    // rows with no clear-all button at all (2026-08-30).
-    //
-    // Number.isFinite BEFORE max(): Math.max coerces, so a non-numeric count
-    // ({} or "n/a") gives NaN — and NaN makes `=== 0`, `> items.length` and
-    // `> 1` all false at once, so the header would read "Discarded (NaN)" and
-    // the clear-all button would vanish. That is precisely the failure this
-    // block exists to prevent, reintroduced through the back door.
-    const reported = queues.discarded_count ?? items.length;
-    const count = Math.max(Number.isFinite(reported) ? reported : items.length, items.length);
-    if (count === 0) return;
+    const d = normalizeDiscarded(queues);
+    const items = d.sample;
+    // Render whenever rows exist OR the depth is unknown. Returning early on a
+    // zero we never measured is how a backlog once rendered as nothing at all.
+    if (d.known && d.total === 0) return;
 
     // Toggle header
     const toggle = el('div', 'discarded-toggle');
-    const toggleText = el('span', null, count > items.length
-        ? 'Discarded (' + count + ', showing ' + items.length + ')'
-        : 'Discarded (' + count + ')');
+    const toggleText = el('span', null, !d.known
+        ? 'Discarded (depth unavailable' + (items.length ? ', showing ' + items.length : '') + ')'
+        : (d.truncated
+            ? 'Discarded (' + d.total + ', showing ' + items.length + ')'
+            : 'Discarded (' + d.total + ')'));
     const arrow = el('span', 'arrow', '\u25B6');
     toggle.appendChild(toggleText);
     toggle.appendChild(arrow);
@@ -1671,8 +1686,8 @@ function renderDiscardedItems(container, queues) {
         if (item.attempts > 0) meta.push(item.attempts + ' attempts');
         meta.push('age: ' + formatAge(item.age_s));
         if (item.discarded_at) {
-            const d = new Date(item.discarded_at);
-            meta.push('at ' + d.toLocaleTimeString());
+            const dt = new Date(item.discarded_at);
+            meta.push('at ' + dt.toLocaleTimeString());
         }
         card.appendChild(el('div', 'di-row', meta.join(' | ')));
 
@@ -1688,9 +1703,17 @@ function renderDiscardedItems(container, queues) {
         details.appendChild(card);
     }
 
-    // Clear All button
-    if (count > items.length || count > 1) {
-        const clearAllBtn = el('button', 'clear-btn clear-all-btn', 'Clear All Discarded (' + count + ')');
+    // Clear All button.
+    //
+    // Shown whenever the delete would do more than the per-row controls already
+    // offer — more rows exist than are listed, more than one row is listed, or
+    // the depth could not be read at all. That last case matters: the DELETE
+    // removes every discarded/expired row regardless, so withholding the control
+    // because the COUNT failed leaves a backlog with no way to clear it, which
+    // is the defect this page shipped.
+    if (!d.known || d.truncated || d.total > 1) {
+        const clearAllBtn = el('button', 'clear-btn clear-all-btn',
+            d.known ? 'Clear All Discarded (' + d.total + ')' : 'Clear All Discarded');
         clearAllBtn.addEventListener('click', function() {
             clearDiscardedItem('all').then(function() { fetchHealth(); });
         });

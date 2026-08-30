@@ -106,9 +106,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   only when the 20-row sample held more than one entry, while its label printed
   the true count — so a backlog whose sample failed to load displayed
   "Discarded (148)" with no clear control at all. The button now follows the real
-  depth, and the header labels the sample as truncated. (A queue holding exactly
-  one row still shows no clear-all button — that row is cleared by its own Clear
-  control, which is the intended behaviour.)
+  depth, and appears even when that depth could not be read — it deletes every
+  discarded row regardless, so withholding it was what stranded the backlog. The
+  header labels the sample as truncated. (A queue holding exactly one row still
+  shows no clear-all button — that row is cleared by its own Clear control,
+  which is the intended behaviour.)
 
 - **Dashboard reported the discarded-queue depth as 20 when it was 148.** The
   Queues panel and the attention strip both rendered `discarded_items.length` —
@@ -116,14 +118,26 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `discarded_count`, the true unbounded depth the backend already supplied. Any
   backlog above 20 therefore displayed as exactly 20, and because the displayed
   number equalled the cap it looked like a plausible total rather than a
-  truncation. Every count AND every predicate now reads one derived
-  accessor used for every displayed number and every gate, so no part of the
-  panel can disagree with another about the DEPTH: it can no longer claim a backlog while
-  showing "no items awaiting review" or disabling the button that clears it,
-  nor report 0 while listing rows. Where the count is non-zero but the review
-  sample could not be loaded, the panel now says exactly that. The review list is labelled "showing 20 of N" whenever it is
-  truncated, so the sample can no longer be mistaken for the whole queue.
-  Backend was already correct; no API change.
+  truncation. The depth and the review sample are now reconciled ONCE, by the
+  backend, and published as a single object; every surface renders what it is
+  given rather than deciding for itself which of two numbers to believe. So the
+  panel can no longer claim a backlog while showing "no items awaiting review",
+  disable the button that clears it, or report 0 while listing rows. The review
+  list is labelled "showing 20 of N" whenever it is truncated, so the sample
+  cannot be mistaken for the whole queue, and a depth that could not be read is
+  now reported as unknown instead of as an empty queue — with the clear-all
+  control still available, since it removes every row regardless of what was
+  counted.
+
+  **API change:** the health snapshot's `queues` section gains a `discarded`
+  object (`total`, `sample`, `sample_truncated`, `known`). The previous
+  `discarded_count` and `discarded_items` keys remain, and are now derived from
+  that object. `discarded_items` is unchanged. `discarded_count` changes in two
+  states, both toward honesty: when the depth query fails it reports the rows
+  actually in hand rather than 0, and when the depth and the sample disagree it
+  reports the larger rather than the depth alone. Anything reading it as "the
+  queue depth" — including the >100 queue-depth alert — keeps working and stops
+  under-reporting in those two states.
 
 - **"Clear all reviewed" now says how many rows it will actually delete.** It
   always deleted every discarded/expired row, not the 20 displayed — harmless
@@ -136,6 +150,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   it, so the client's immediate refetch re-rendered pre-delete counts: a
   "Cleared 148 discarded items" toast beside a panel still listing them, with
   per-row Clear buttons that silently did nothing. Mutations now bust the cache.
+
+  The cache moved into the health service, alongside the computation it caches,
+  and is reached only from the event loop — invalidation raised from a web
+  request is handed to the loop rather than touching shared state across
+  threads. A snapshot whose computation began before a mutation is never
+  published and never handed to a caller that arrived after it, so a cleared
+  queue cannot reappear for the rest of the cache window. Callers that need
+  current data are unaffected: only this endpoint accepts a cached result, and
+  it says so explicitly.
 
 - **The ego's self-model stopped presenting stale, thin and arbitrarily-ranked
   rows as present-tense capability.** `capability_map` feeds three ego-prompt

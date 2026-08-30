@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -115,11 +116,17 @@ class HealthDataService:
         self._probe_tracker = ProbeTransitionTracker()
         # Single-flight: concurrent snapshot() callers coalesce onto one compute.
         self._inflight: asyncio.Task | None = None
-        # True when the in-flight compute began before a mutation and must not
-        # be handed to callers arriving after it. See mark_inflight_stale().
-        self._inflight_stale: bool = False
+        # The compute that began BEFORE the most recent mutation, held by
+        # IDENTITY rather than as a flag. See invalidate().
+        self._stale_task: asyncio.Task | None = None
+        # Cached snapshot, served only to callers that opt into staleness via
+        # snapshot(max_age_s=...). Lives here rather than in the dashboard route
+        # module so that every piece of this mechanism is touched from the event
+        # loop alone — see invalidate().
+        self._cache: dict | None = None
+        self._cache_ts: float = 0.0
 
-    async def snapshot(self) -> dict:
+    async def snapshot(self, *, max_age_s: float = 0.0) -> dict:
         """Return full system health state, coalescing concurrent callers.
 
         The snapshot is expensive (systemd subprocesses + DB + network). Callers
@@ -129,112 +136,159 @@ class HealthDataService:
         READ-ONLY by contract (every caller reads via ``.get()``), so it is shared
         among coalesced callers without a defensive copy.
 
-        The shared task is awaited through ``asyncio.shield`` so one caller's
-        cancellation — e.g. the dashboard route's 15s ``_async_route`` timeout —
-        cannot cancel the in-flight snapshot out from under the other coalesced
-        callers (who catch ``Exception``, not ``CancelledError``). ``_inflight``
-        is released by the task's own done-callback, not a caller's ``finally``,
-        so it survives the cancelling caller unwinding first; the ``.done()`` guard
-        makes correctness independent of when that callback runs.
+        ``max_age_s`` opts into a cached result up to that many seconds old.
+        It defaults to 0, so every existing caller keeps computing fresh; only
+        the dashboard route, which is polled every 15s by every open tab, opts
+        in. A caller reading thresholds (the alert collector) must not silently
+        become one that fires and clears alerts on stale input.
 
-        The retry loop exists for the post-mutation case (see
-        ``mark_inflight_stale``) and re-checks state after draining a stale
-        compute rather than assuming its own arrival won the race. Each extra
-        iteration costs one more mutation landing during the preceding compute,
-        so it is driven by write rate, not by spinning — every iteration awaits a
-        real pending task. Callers remain bounded by their own timeouts (the
-        dashboard route's ``_async_route`` deadline), so a sustained write storm
-        surfaces as that caller's timeout rather than an unbounded wait here.
+        THREE invariants hold here, and each has cost a defect:
+
+        * **At most one compute runs at a time.** ``_compute_snapshot`` is not a
+          pure read — it feeds ``_emit_probe_transitions``, and
+          ``ProbeTransitionTracker`` documents that it needs no lock precisely
+          because its sole caller runs inside a single-flight ``snapshot()``
+          build. Two overlapping computes let the older finish last and move the
+          tracker backwards, emitting a false REVERSE transition.
+        * **No caller arriving after a mutation receives data computed before
+          it**, and no such data reaches the cache — where it would be served as
+          current for the rest of the window.
+        * **This state is touched from the event loop wherever one is
+          configured.** ``invalidate_snapshot_cache`` marshals the call onto it.
+          Two fallbacks do run on the calling thread: a host that never sets
+          ``GENESIS_EVENT_LOOP`` (the Agent Zero plugin registers its own
+          blueprint and does not), and a loop closed during shutdown. Both are
+          safe because ``invalidate`` performs three independent attribute
+          assignments and nothing reads a combination of them — a property of
+          the current body, not a guarantee of the design. A compound update
+          added there would need the marshalling this note says is not universal.
+
+        The shared task is awaited through ``asyncio.shield`` so one caller's
+        cancellation — e.g. the dashboard route's ``_async_route`` timeout —
+        cannot cancel the in-flight snapshot out from under the other coalesced
+        callers. ``_inflight`` is released by the task's own done-callback, not a
+        caller's ``finally``, so it survives the cancelling caller unwinding
+        first; the ``.done()`` guard makes correctness independent of when that
+        callback runs.
+
+        The retry loop handles the post-mutation case: rather than assuming its
+        own arrival won the race, a caller that finds a stale compute drains it
+        and re-checks. Every iteration awaits a real pending task, so it cannot
+        spin, and each extra iteration costs one more mutation landing during
+        the preceding compute — it is driven by write rate.
+
+        Only the dashboard route carries a deadline (``_async_route``'s 15s).
+        The seven bare callers — both ego context builders, the sentinel
+        dispatcher, the morning report, the alert collector, ``health_status``
+        and the Agent Zero health route — have none. Invalidations arrive only
+        from user-initiated dashboard mutations, so sustaining this loop beyond
+        one extra iteration needs a human clicking faster than a ~2s compute.
+        That bounds it in practice, which is a weaker claim than a timeout and
+        the accurate one.
         """
         while True:
+            if max_age_s > 0 and self._cache is not None \
+                    and (time.monotonic() - self._cache_ts) < max_age_s:
+                return self._cache
             inflight = self._inflight
             if inflight is not None and not inflight.done():
-                if not self._inflight_stale:
+                if inflight is not self._stale_task:
                     return await asyncio.shield(inflight)
-                # Predates a mutation: wait it out (preserving single-flight, so
-                # the probe-transition tracker never sees two concurrent
-                # computes) and drop its result.
-                #
-                # The marker STAYS SET across this await. Clearing it here would
-                # publish "not stale" while `_inflight` still points at the very
-                # pre-mutation task being drained, so the next caller would take
-                # the coalescing branch above and be handed exactly the result
-                # the marker exists to withhold. It is cleared only where the
-                # replacement is installed, which is what puts every
-                # post-mutation caller behind that one replacement.
+                # Predates a mutation: wait it out — which preserves
+                # single-flight — then discard its result and re-check. Nothing
+                # is cleared here; the identity stops mattering the moment a
+                # replacement is installed below. Clearing a marker at this
+                # point is what let the NEXT caller coalesce straight back onto
+                # the compute being drained.
                 with contextlib.suppress(Exception):
                     await asyncio.shield(inflight)
                 continue
-            # No await between the done() check and the assignments below →
-            # race-free on the single-threaded loop, so exactly one caller
-            # installs the replacement and later arrivals coalesce onto it.
-            # Bare create_task BY DESIGN (reflex A4 sweep, 2026-07-21): every
-            # caller awaits via asyncio.shield and the orphan case retrieves the
-            # exception in _release_inflight — tracked_task would double-report
-            # handled snapshot failures.
-            self._inflight_stale = False
-            task = asyncio.create_task(self._compute_snapshot())
+            # No await between the done() check and the assignments below, so on
+            # the single-threaded loop exactly one caller installs the
+            # replacement and later arrivals coalesce onto it. Bare create_task
+            # BY DESIGN (reflex A4 sweep, 2026-07-21): every caller awaits via
+            # asyncio.shield and the orphan case retrieves the exception in
+            # _release_inflight — tracked_task would double-report handled
+            # snapshot failures.
+            task = asyncio.create_task(self._compute_and_publish())
             self._inflight = task
             task.add_done_callback(self._release_inflight)
             return await asyncio.shield(task)
 
-    def mark_inflight_stale(self) -> None:
-        """Mark the in-flight compute as predating a mutation.
+    async def _compute_and_publish(self) -> dict:
+        """Run one compute and cache it unless a mutation overtook it.
 
-        ``snapshot()`` coalesces overlapping callers onto one computation. That
-        is right for concurrent READS, but wrong immediately after a write: a
-        caller arriving after the mutation would be handed a result computed
-        from pre-mutation state and would publish it as current.
+        The staleness check and the store sit here, immediately before the
+        return, so they run in the same event-loop callback that completes the
+        task: nothing can land between deciding to publish and publishing.
 
-        The obvious shortcut — dropping ``_inflight`` so the next caller starts
-        a fresh compute — BREAKS single-flight, and that is load-bearing here:
-        ``_compute_snapshot`` is not a pure read. It feeds ``_emit_probe_transitions``,
-        and ``ProbeTransitionTracker`` documents that it needs no lock precisely
-        because "its sole live caller runs it inside a single-flight snapshot()
-        build". Two concurrent computes let the older one finish last and move
-        the tracker backwards, emitting a false reverse transition.
+        This placement is one half of a REDUNDANT PAIR, not a lone load-bearing
+        invariant — a distinction worth stating precisely, because the obvious
+        stronger claim is false and was measured false. The other half is that
+        ``invalidate()`` marks the in-flight compute stale UNCONDITIONALLY,
+        including one that has already finished. Either alone is sufficient:
 
-        So the stale compute is not abandoned and not cancelled (cancelling
-        would break the callers already shielded on it). It is FLAGGED: callers
-        arriving after the mutation await it, discard its result, and one of
-        them then starts a single fresh compute that the rest coalesce onto. At
-        most one computation runs at any time, and no caller after the mutation
-        sees pre-mutation data.
+        * in-task publish + conditional marking — safe, because the check runs
+          before the task is ``done()``, so a finished task is never the case;
+        * done-callback publish + unconditional marking — safe, because
+          ``_release_inflight`` is registered first and therefore runs before any
+          invalidation queued after completion, while one queued earlier has
+          already marked the task.
 
-        The marker is cleared by ``snapshot()`` when it installs that
-        replacement — NOT by the first caller to observe it. Clearing on
-        observation left ``_inflight`` pointing at the still-running
-        pre-mutation task with the marker already down, so the next caller
-        coalesced straight back onto it and was served the stale snapshot.
-
-        Deliberately loop-free, and deliberately not a compound update: the
-        dashboard is threaded WSGI Flask, so ``invalidate_snapshot_cache()``
-        reaches this from a request thread — for a sync route
-        (``routes/providers.py`` toggles breakers in a sync handler) there is no
-        running loop to schedule work on at all, and even an async route reaches
-        it from the worker thread that bridges via ``run_coroutine_threadsafe``.
-        So this method only ever sets a flag, and all coordination lives in
-        ``snapshot()``, which always runs on the loop thread.
-
-        The check-then-set below is therefore not atomic with respect to
-        ``snapshot()``. That is safe because every interleaving errs toward
-        recomputation, never toward serving stale data: the caller commits its
-        mutation BEFORE calling this, so any compute that starts afterwards
-        already reads post-mutation state. Losing the race means either
-        flagging a compute that was already fresh (costing one redundant
-        recompute) or skipping a flag when nothing is in flight (correct — the
-        next caller starts a compute that reads post-mutation state anyway).
+        MEASURED by mutation: removing either one alone leaves the suite green;
+        removing BOTH is caught, by
+        ``test_publish_decision_is_atomic_with_the_compute_finishing``. Both are
+        kept deliberately so that a later edit to one cannot silently come to
+        depend on the other — an "optimisation" making ``invalidate()`` skip
+        finished tasks is safe today only because of this placement, and nothing
+        at that call site would say so.
         """
-        # ONE read of the shared handle, then operate on the local — the same
-        # discipline snapshot() follows. Re-reading `self._inflight` for the
-        # `.done()` call would be a cross-thread double-read: `_release_inflight`
-        # nulls the handle from the loop thread, so a switch between the two
-        # reads raises AttributeError on None out of invalidate_snapshot_cache()
-        # — into a route that has ALREADY committed its mutation, turning a
-        # successful clear/toggle into a 500.
-        inflight = self._inflight
-        if inflight is not None and not inflight.done():
-            self._inflight_stale = True
+        result = await self._compute_snapshot()
+        if asyncio.current_task() is not self._stale_task:
+            self._cache = result
+            self._cache_ts = time.monotonic()
+        return result
+
+    def invalidate(self) -> None:
+        """Drop the cached snapshot and disown any compute that predates this call.
+
+        Call after any mutation to the data the snapshot reads. Clearing the
+        cache alone is not enough: a computation already in flight began from
+        pre-mutation state, so it must neither be published nor handed to a
+        caller that arrives after this point.
+
+        The marking is deliberately imprecise in ONE direction: a compute
+        created after the mutation committed but before this callback ran is
+        already reading post-mutation state, and is discarded anyway. That costs
+        one redundant recompute (~2s, well inside the route's 15s deadline) and
+        never serves stale data, which is the direction to err in.
+
+        Staleness is the compute's IDENTITY, not a flag. It cannot be "cleared
+        too early", because a task stops being the stale one only when a
+        replacement takes its place — whereas the previous flag-based version
+        needed an explicit clear, and doing that one step early is what served a
+        pre-mutation snapshot to the caller after next.
+
+        The assignment is UNCONDITIONAL, and that is deliberate rather than
+        laziness about the ``None``/finished cases (both of which are harmless
+        here, since every stale-path read is behind a ``.done()`` check).
+        Marking a finished task is the second half of the redundant pair
+        described in ``_compute_and_publish``: it is what keeps a
+        done-callback publish safe. Narrowing this to
+        ``if t is not None and not t.done()`` is safe ONLY while that publish
+        stays inside the compute task.
+
+        LOOP THREAD ONLY. The dashboard is threaded WSGI Flask, so mutating
+        routes reach this from a request thread — a sync route
+        (``routes/providers.py`` toggles breakers in a plain ``def``) has no
+        running loop at all. ``invalidate_snapshot_cache()`` in
+        ``dashboard/routes/health.py`` marshals the call onto the runtime loop;
+        keeping that responsibility in ONE place is what removes cross-thread
+        access to every field this class owns.
+        """
+        self._cache = None
+        self._cache_ts = 0.0
+        self._stale_task = self._inflight
 
     def _release_inflight(self, task: asyncio.Task) -> None:
         """Done-callback: drop the in-flight handle when the compute finishes.
@@ -246,6 +300,11 @@ class HealthDataService:
         """
         if self._inflight is task:
             self._inflight = None
+        # Hygiene, not correctness: a finished task can never be mistaken for a
+        # live stale one (every read is behind a .done() check), but holding the
+        # reference would pin its result dict and muddy the state in a debugger.
+        if self._stale_task is task:
+            self._stale_task = None
         if not task.cancelled():
             exc = task.exception()
             if exc is not None:

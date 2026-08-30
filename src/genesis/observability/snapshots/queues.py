@@ -270,6 +270,11 @@ async def _resolve_dead_letter_storm(db: aiosqlite.Connection | None) -> None:
         )
 
 
+# How many discarded/expired rows the review sample carries. The panel shows a
+# sample, not the queue: the depth is counted separately and can be far larger.
+_DISCARDED_SAMPLE_CAP = 20
+
+
 async def queues(
     db: aiosqlite.Connection | None,
     deferred_queue: DeferredWorkQueue | None,
@@ -415,22 +420,46 @@ async def queues(
         except Exception:
             logger.warning("Failed to query deferred item details", exc_info=True)
 
+    # Discarded/expired review work is reported as ONE reconciled object.
+    #
+    # The depth is an uncapped COUNT and the review list is a LIMIT-20 SAMPLE,
+    # so the two can disagree in both directions. Publishing them as separate
+    # fields pushed that reconciliation onto every render surface, and each of
+    # the four decided independently — which is how a 148-deep queue displayed
+    # as 20, how a populated backlog lost its clear-all button, and how a panel
+    # came to claim "no items awaiting review" above rows it was listing.
+    # Deciding it once, here, leaves the frontends nothing to choose between.
     discarded_items: list[dict] = []
     discarded_count = 0
+    discarded_known = False
     if db:
+        # TWO independent try blocks, deliberately. Sharing one meant a single
+        # unparseable row in the sample loop discarded an already-correct count
+        # and the panel reported the queue as empty. They answer different
+        # questions and fail independently.
         try:
-            now_dt2 = datetime.now(UTC)
             cur = await db.execute(
                 "SELECT COUNT(*) FROM deferred_work_queue WHERE status IN ('discarded', 'expired')"
             )
             row = await cur.fetchone()
             discarded_count = row[0] if row else 0
+            discarded_known = True
+        except Exception:
+            # Recorded rather than swallowed: without this a failed COUNT yields
+            # 0, which the dashboard renders as a confident "nothing awaiting
+            # review" for a state nobody measured. `known` carries that
+            # distinction to the UI; the error string keeps it in the payload.
+            errors.append("discarded: count query failed")
+            logger.warning("Failed to count discarded deferred items", exc_info=True)
 
+        try:
+            now_dt2 = datetime.now(UTC)
             cur = await db.execute(
                 """SELECT id, work_type, call_site_id, deferred_reason, attempts,
                           error_message, status, created_at, completed_at
                    FROM deferred_work_queue WHERE status IN ('discarded', 'expired')
-                   ORDER BY completed_at DESC LIMIT 20"""
+                   ORDER BY completed_at DESC LIMIT ?""",
+                (_DISCARDED_SAMPLE_CAP,),
             )
             for row in await cur.fetchall():
                 age = (now_dt2 - datetime.fromisoformat(row["created_at"])).total_seconds()
@@ -446,14 +475,29 @@ async def queues(
                     "discarded_at": row["completed_at"],
                 })
         except Exception:
-            # Record it, as the deferred_work / dead_letters / pending_embeddings
-            # queries do (several other blocks here still swallow their failure
-            # -- a real gap, not a precedent to copy). Without this a failed
-            # COUNT silently yields discarded_count=0, which the dashboard then
-            # renders as a confident "nothing awaiting review" for a state we
-            # do not actually know.
-            errors.append("discarded: query failed")
+            errors.append("discarded: sample query failed")
             logger.warning("Failed to query discarded deferred items", exc_info=True)
+
+    # max(): the larger value is the honest one in BOTH directions of
+    # divergence — a count above the cap is the ordinary truncation case, and a
+    # count below the rows in hand (a write landing between the two statements)
+    # must not make the panel print a number smaller than the list beneath it.
+    # An unknown count contributes nothing rather than a spurious 0.
+    discarded = {
+        "total": max(discarded_count if discarded_known else 0, len(discarded_items)),
+        "sample": discarded_items,
+        "known": discarded_known,
+    }
+    # Truncated if the depth exceeds what was shipped OR the sample filled its
+    # cap. The second half is not redundant: when the COUNT fails, `total` falls
+    # back to the sample length, so `total > len(sample)` is False at exactly the
+    # moment a full sample proves there is more than we can see. A row count that
+    # EQUALS its limit is a truncated read, never a complete one — reporting it
+    # as complete is the original defect wearing the new shape.
+    discarded["sample_truncated"] = (
+        discarded["total"] > len(discarded["sample"])
+        or len(discarded["sample"]) >= _DISCARDED_SAMPLE_CAP
+    )
 
     deferred_processing = 0
     deferred_stuck = 0
@@ -523,8 +567,15 @@ async def queues(
         "embedded_total": embedded_total,
         "embedding_last_error": embedding_last_error,
         "deferred_items": deferred_items,
-        "discarded_count": discarded_count,
-        "discarded_items": discarded_items,
+        # ONE reconciled object; the flat keys below are DERIVED from it, never
+        # computed separately, so the backend cannot regrow the fork this change
+        # removed from the frontend.
+        "discarded": discarded,
+        # Retained for consumers that predate the object: the >100 depth alarm
+        # in mcp/health/errors.py (which requires a plain int) and pass-through
+        # readers such as health_status.
+        "discarded_count": discarded["total"],
+        "discarded_items": discarded["sample"],
         # WS-17: cumulative count of events dropped because the event-bus
         # persistence queue was full (0 when persistence/bus is unavailable).
         # NOTE: a cumulative counter, not an instantaneous depth — deliberately

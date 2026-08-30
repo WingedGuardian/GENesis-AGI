@@ -9,7 +9,11 @@ assert every member name is unique.
 """
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 DASHBOARD_JS = (
     Path(__file__).resolve().parents[2]
@@ -83,19 +87,27 @@ def test_store_member_names_are_unique():
 
 
 # ---------------------------------------------------------------------------
-# discarded-queue counts (2026-08-30) — POSITIVE assertions, by design.
+# History of this guard, kept because each version failed differently and the
+# next design was chosen to fix the previous failure.
 #
-# Discarded work is reported by two values that can disagree: `discarded_count`
-# (uncapped depth) and `discarded_items` (a LIMIT-20 review sample). The rule is
-# ONE accessor, `discardedTotal`, used for every count and every gate — so no
-# call site ever has to pick between the two raw values.
+# v1 scanned for the raw field name `discarded_items` plus `.length`. Wrong key:
+#    the surviving bug read `discardedQueueGroups.length`, a DERIVED symbol
+#    containing neither token, so the scan went green while the defect shipped.
+# v2 asserted POSITIVELY that each known gate named the `discardedTotal`
+#    accessor. Better, but it enumerated the gates — and a gate nobody thought to
+#    enumerate was not covered.
+# v3 (current) removes the thing being guarded instead of guarding it: the
+#    backend reconciles the depth and the sample into one object, so no frontend
+#    expression chooses between two numbers. What remains is a PROHIBITION —
+#    the raw keys may not appear in a frontend file at all — plus behavioural
+#    checks that execute the normalisers.
 #
-# The first version of this guard scanned for lines containing the raw field
-# name `discarded_items` plus `.length`. That is the wrong key: the surviving
-# instance read `discardedQueueGroups.length` — a DERIVED symbol containing
-# neither token — so the guard went green while the bug shipped. A negative scan
-# can always be routed around by another derived name; these tests therefore
-# assert POSITIVELY that each known gate names an accessor.
+# Two lessons from v1/v2 are load-bearing in what follows. Scope every assertion
+# by EXTRACTION (the enclosing attribute, the function body), never by substring
+# or proximity: an audit of v3 found three assertions that could not fail,
+# because their needles also occurred elsewhere in the same file. And an
+# agreement check needs an oracle: three implementations agreeing proves nothing
+# if all three are wrong, so the shape harness asserts expected values too.
 # ---------------------------------------------------------------------------
 
 NEURAL_MONITOR_HTML = (
@@ -107,311 +119,229 @@ AZ_NEURAL_MONITOR_HTML = (
     / "az_plugins" / "genesis" / "templates" / "neural_monitor.html"
 )
 
-# ONE accessor by design. A two-accessor scheme ("print this, gate on that")
-# reintroduces a fork at every call site — which is the generator this whole
-# guard exists to kill.
-_ACCESSOR = "discardedTotal"
+# --------------------------------------------------------------------------
+# Discarded-queue rendering
+# --------------------------------------------------------------------------
+# The backend reconciles the uncapped depth and the LIMIT-20 review sample into
+# ONE `queues.discarded` object, so no render surface chooses between two
+# numbers that can disagree. These guards are keyed as a PROHIBITION rather than
+# an allowlist: the previous shape sanctioned specific expressions, and each
+# review round found a new spelling that walked around it — a derived symbol, a
+# line copied verbatim from a sanctioned body, a file that was not in the list.
+#
+# Scanning DIRECTORIES rather than named files is deliberate: a new template
+# cannot escape the guard by not being enumerated.
 
-# Every spelling that resolves to the capped sample. A guard keyed on only the
-# raw field name is routed around by the first derived symbol someone adds.
-_SAMPLE_DERIVED = ("discarded_items", "discardedQueueGroups")
+_FRONTEND_DIRS = (
+    Path(__file__).resolve().parents[2] / "src" / "genesis" / "dashboard" / "webui" / "js",
+    Path(__file__).resolve().parents[2] / "src" / "genesis" / "dashboard" / "templates",
+    Path(__file__).resolve().parents[2] / "az_plugins" / "genesis" / "templates",
+)
 
-# The discarded panel is one card; scanning the whole 1000-line template makes
-# anchors like ":disabled=" match unrelated buttons. Extract the card first so
-# every assertion below is scoped to the code under guard.
-_PANEL_START = 'id="queue-review"'
-_PANEL_END = 'class="health-card"'
+# The raw producer keys. Reading either in a frontend file means that file is
+# reconciling the fork again instead of consuming the reconciled object.
+_RAW_KEYS = ("discarded_count", "discarded_items")
 
-
-def _discarded_panel() -> str:
-    """The queue-review CARD only.
-
-    Scoping matters: anchors like ``:disabled=`` match unrelated buttons
-    elsewhere in a 1200-line template, so an unscoped ``any(...)`` would pass on
-    a different button while the one under guard regressed. The first attempt at
-    this helper used an end anchor that occurs BEFORE the start anchor, so it
-    silently returned the rest of the file and scoped nothing — hence the
-    bounded assertion below.
-    """
-    src = OVERVIEW_HTML.read_text()
-    a = src.index(_PANEL_START)
-    nxt = src.find(_PANEL_END, a + len(_PANEL_START))
-    panel = src[a:nxt] if nxt != -1 else src[a:]
-    total = len(src.splitlines())
-    assert len(panel.splitlines()) < total * 0.5, (
-        "the panel extractor is not scoping — it returned "
-        f"{len(panel.splitlines())} of {total} lines. Re-check the anchors."
-    )
-    return panel
+_NORMALISER_MARKS = ("Array.isArray", "Number.isFinite")
 
 
-def _accessor_body(name: str) -> str:
-    js = DASHBOARD_JS.read_text()
-    i = js.index(f"get {name}()")
-    return js[i : js.index("},", i)]
+def _frontend_files() -> list[Path]:
+    out: list[Path] = []
+    for d in _FRONTEND_DIRS:
+        assert d.is_dir(), f"frontend directory missing, guard would scan nothing: {d}"
+        out.extend(p for p in d.rglob("*") if p.suffix in (".js", ".html") and p.is_file())
+    assert out, "no frontend files found — the scan has gone blind"
+    return out
 
 
-def _member_line_span(name: str) -> set[int]:
-    """1-based line numbers occupied by a store member's body.
-
-    Exemptions must be scoped by POSITION, not by text. Comparing a line to the
-    concatenated body of the sanctioned accessors (`ln not in sanctioned_js`)
-    exempts any line ANYWHERE in the file that happens to be textually identical
-    to one inside an accessor -- so the guard could be walked past by copying a
-    sanctioned line verbatim, which is exactly the evasion it exists to stop.
-    """
-    lines = DASHBOARD_JS.read_text().splitlines()
-    start = None
-    for i, ln in enumerate(lines, 1):
-        if f"get {name}()" in ln or ln.startswith(f"        {name}("):
-            start = i
-            break
-    assert start is not None, f"member `{name}` not found in dashboard.js"
-    for j in range(start, len(lines) + 1):
-        if lines[j - 1] == "        },":
-            return set(range(start, j + 1))
-    raise AssertionError(f"`{name}` body never closed at member indentation")
+# A RAW reader touches the payload straight off the health snapshot
+# (`queues.discarded` / `queues?.discarded`) and therefore owns the job of
+# surviving a malformed or absent one. A file consuming an already-normalised
+# accessor — `$store.genesisDashboard.discarded` in the Alpine template — is a
+# renderer, and requiring it to re-guard would push a second normalisation into
+# the exact layer this change removed one from.
+_RAW_READ = re.compile(r"queues\s*\??\.\s*discarded\b")
 
 
-def test_alpine_store_exposes_exactly_one_accessor():
-    """One number, used for every count and every gate."""
-    js = DASHBOARD_JS.read_text()
-    assert f"get {_ACCESSOR}()" in js, f"dashboard.js must expose `{_ACCESSOR}`"
-    assert "get discardedAny()" not in js, (
-        "a second accessor reintroduces the print-vs-gate fork that generated "
-        "this bug class — keep exactly one"
-    )
-    body = _accessor_body(_ACCESSOR)
-    assert "discarded_count ??" in body, (
-        "must use `??` — `||` replaces a legitimate 0 with the sample length"
-    )
-    assert "Math.max" in body, (
-        "must be max(count, sample) — both divergences are reachable and the "
-        "larger value is the honest one in each"
-    )
+def _raw_discarded_readers() -> list[Path]:
+    return [p for p in _frontend_files() if _RAW_READ.search(p.read_text())]
 
 
-def test_clear_all_control_is_gated_on_the_accessor():
-    """The button that clears every row must not be gated on the 20-row sample.
-
-    On /genesis/monitor that exact mistake left a 148-row backlog with no
-    clear-all control at all.
-    """
-    panel = _discarded_panel()
-    assert "clearAllDiscardedItems()" in panel, "clear-all button vanished from the panel"
-    disabled = [ln for ln in panel.splitlines() if ":disabled=" in ln]
-    assert disabled, "clear-all button lost its :disabled binding"
-    assert any(_ACCESSOR in ln for ln in disabled), (
-        "the clear-all :disabled must read the accessor:\n  "
-        + "\n  ".join(ln.strip()[:120] for ln in disabled)
-    )
+# Start/end markers for each raw reader's normaliser. Extraction beats a
+# whole-file scan: the marks these guards look for occur elsewhere in the same
+# files for unrelated reasons, so an unscoped assertion cannot fail.
+_NORMALISER_BOUNDS = (
+    ("function normalizeDiscarded(queues) {", "\nfunction renderDiscardedItems"),
+    ("get discarded() {", "get discardedQueueGroups()"),
+)
 
 
-def test_empty_state_is_gated_on_the_total_not_the_sample():
-    """The exact 2026-08-30 BLOCKER, pinned.
-
-    `discardedQueueGroups` derives from the LIMIT-20 sample. Gating the
-    "nothing to review" message on it rendered that message directly beneath
-    "showing 0 of 148" with an enabled "Clear all 148" button.
-    """
-    lines = _discarded_panel().splitlines()
-    idx = next(
-        (i for i, ln in enumerate(lines)
-         if "No discarded or expired items awaiting review" in ln),
-        None,
-    )
-    assert idx is not None, "empty-state message vanished"
-    gate = next((lines[j] for j in range(idx - 1, -1, -1) if "x-if=" in lines[j]), "")
-    assert f"{_ACCESSOR} === 0" in gate, (
-        "the empty-state message must be gated on the accessor === 0, not on "
-        f"the sample-derived group list. Its gate is:\n  {gate.strip()[:160]}"
-    )
-
-
-def test_panel_explains_a_populated_count_with_an_unloadable_sample():
-    """count>0 with an empty sample must say so, not claim there is nothing."""
-    panel = _discarded_panel()
-    assert "review sample could not be loaded" in panel, (
-        "the panel must explain the count>0 / empty-sample state explicitly"
-    )
-
-
-def test_neural_monitor_surfaces_do_not_gate_on_the_sample():
-    """Both copies of the /genesis/monitor page carry the same class."""
-    for path in (NEURAL_MONITOR_HTML, AZ_NEURAL_MONITOR_HTML):
-        src = path.read_text()
-        assert "queues.discarded_count ?? items.length" in src, (
-            f"{path.name}: count must use `??`, not `||`"
-        )
-        assert "if (items.length > 1) {" not in src, (
-            f"{path.name}: the clear-all button must not be gated on the sample "
-            "length — that left a populated backlog with no clear control."
-        )
-        assert "showing ' + items.length" in src, (
-            f"{path.name}: must label the sample as truncated when count > sample"
-        )
-
-
-def test_no_sample_derived_gate_escapes_the_accessor():
-    """A predicate on ANY sample-derived value must be paired with the accessor.
-
-    Keyed on the failure that survived a whole review round: the offending gate
-    read `discardedQueueGroups.length` — a DERIVED symbol containing neither
-    `discarded_count` nor `discarded_items`, so a scan for the raw field name
-    walked straight past it. Both spellings are covered here, and the one
-    legitimate sample predicate (the unloadable-sample branch) is legitimate
-    precisely because it ALSO reads the accessor.
-    """
-    offenders: list[str] = []
-    js = DASHBOARD_JS.read_text()
-    sanctioned = _member_line_span(_ACCESSOR) | _member_line_span("discardedQueueGroups")
-    for lineno, ln in enumerate(js.splitlines(), 1):
-        if any(t in ln for t in _SAMPLE_DERIVED) and ".length" in ln and lineno not in sanctioned:
-            offenders.append(f"dashboard.js:{lineno}: {ln.strip()[:110]}")
-    for lineno, ln in enumerate(OVERVIEW_HTML.read_text().splitlines(), 1):
-        if not (any(t in ln for t in _SAMPLE_DERIVED) and ".length" in ln):
+def _normaliser_body(path: Path) -> str:
+    src = path.read_text()
+    for start, end in _NORMALISER_BOUNDS:
+        i = src.find(start)
+        if i == -1:
             continue
-        if _ACCESSOR in ln:  # paired with the accessor -> legitimate
-            continue
-        offenders.append(f"overview.html:{lineno}: {ln.strip()[:110]}")
-    assert not offenders, (
-        "Sample-derived predicate not paired with the accessor — this is the "
-        "shape that survived a review round:\n  " + "\n  ".join(offenders)
+        j = src.find(end, i)
+        assert j != -1, f"{path.name}: normaliser opened but never closed"
+        return src[i:j]
+    raise AssertionError(
+        f"{path.name} reads `queues.discarded` but defines no recognised "
+        "normaliser — either it is reconciling inline, or these bounds are stale"
     )
 
 
-def test_no_raw_sample_length_read_outside_the_accessors():
-    """Backstop for NEW code.
+def test_no_frontend_file_reads_the_raw_producer_keys():
+    """The whole bug class, forbidden outright.
 
-    The two accessor bodies are the only sanctioned readers of the raw sample
-    length; the truncation label legitimately prints it. Anything else is the
-    bug class returning.
+    `discarded_count` and `discarded_items` are the two values whose
+    reconciliation produced three rounds of defects. The backend now publishes
+    one object; a frontend reading either raw key is re-opening the fork, and no
+    exemption is granted for any file, line or spelling.
     """
-    js = DASHBOARD_JS.read_text()
-    sanctioned = _member_line_span(_ACCESSOR) | _member_line_span("discardedQueueGroups")
     offenders = [
-        f"dashboard.js:{i}: {ln.strip()[:110]}"
-        for i, ln in enumerate(js.splitlines(), 1)
-        if "discarded_items" in ln and ".length" in ln and i not in sanctioned
-    ]
-    # In the template the sanctioned reader is the truncation label, and it is
-    # sanctioned because it ALSO reads the accessor -- not because it contains
-    # the word "showing", which any new line could adopt for free.
-    offenders += [
-        f"overview.html:{i}: {ln.strip()[:110]}"
-        for i, ln in enumerate(OVERVIEW_HTML.read_text().splitlines(), 1)
-        if "discarded_items" in ln and ".length" in ln and _ACCESSOR not in ln
+        f"{p.name}:{i}: {ln.strip()[:100]}"
+        for p in _frontend_files()
+        for i, ln in enumerate(p.read_text().splitlines(), 1)
+        if any(k in ln for k in _RAW_KEYS)
     ]
     assert not offenders, (
-        "Raw LIMIT-20 sample-length reads outside the accessors:\n  "
-        + "\n  ".join(offenders)
+        "frontend files reading the raw producer keys instead of the reconciled "
+        "`queues.discarded` object:\n  " + "\n  ".join(offenders)
     )
 
 
-def test_guard_is_not_blind():
-    """Blindness guard: the scans above pass trivially if nothing is there."""
-    html = OVERVIEW_HTML.read_text()
-    js = DASHBOARD_JS.read_text()
-    assert html.count(_ACCESSOR) >= 6, (
-        "overview.html should render/gate on the accessor in several places"
+def test_each_reader_normalises_defensively():
+    """Every file that reads the object guards the shapes transport can damage.
+
+    An older server sends no object at all, `_or_error` can replace the whole
+    queues section, and a non-numeric total would make `> 0` and `=== 0` BOTH
+    false — rendering neither the list nor the empty state while the button read
+    "Clear all NaN".
+    """
+    readers = _raw_discarded_readers()
+    assert len(readers) >= 3, (
+        f"expected the three raw readers (dashboard.js and both monitor pages), "
+        f"found {[p.name for p in readers]} — the scan has gone blind"
     )
-    assert js.count(_ACCESSOR) >= 4, "dashboard.js should define and use the accessor"
-    for path in (NEURAL_MONITOR_HTML, AZ_NEURAL_MONITOR_HTML):
-        assert path.exists(), f"{path} missing — the scan would silently cover nothing"
+    for path in readers:
+        # Scope to the normaliser BODY. A file-wide token scan passes on marks
+        # that appear anywhere: `Array.isArray` already occurs several times in
+        # both dashboard.js and neural_monitor.html for unrelated reasons, so
+        # deleting it from the normaliser left the whole-file assertion green.
+        body = _normaliser_body(path)
+        missing = [m for m in _NORMALISER_MARKS if m not in body]
+        assert not missing, (
+            f"{path.name}'s discarded normaliser omits {', '.join(missing)} — a "
+            "malformed or absent payload would render as a confident number"
+        )
 
 
-def _member_body(name: str) -> str:
-    """The body of a store member declared as ``name() {`` or ``get name() {``.
+def test_the_empty_state_distinguishes_measured_zero_from_unknown():
+    """"Nothing awaiting review" may only be claimed for a MEASURED zero.
 
-    Scoped by the store's 8-space indentation convention, same as the member
-    parser above: read to the first line that closes a member (``        },``).
+    `known` is the producer's own statement about whether it counted. Gating the
+    empty state on the total alone reports an unread depth as an empty queue —
+    the confident-zero defect, one layer up from where it was fixed.
     """
-    js = DASHBOARD_JS.read_text()
-    for opener in (f"get {name}()", f"{name}()"):
-        i = js.find(opener)
-        if i != -1:
-            break
-    assert i != -1, f"dashboard.js does not define `{name}`"
-    lines = js[i:].splitlines()
-    out = []
-    for ln in lines:
-        out.append(ln)
-        if ln == "        },":
-            break
-    else:
-        raise AssertionError(f"`{name}` body never closed at member indentation")
-    return "\n".join(out)
+    panel = (
+        Path(__file__).resolve().parents[2]
+        / "src" / "genesis" / "dashboard" / "templates" / "partials" / "tabs" / "overview.html"
+    ).read_text()
+    assert "discarded.known" in panel, (
+        "the panel never consults `known`, so it cannot tell a counted zero "
+        "from a count that failed"
+    )
+    assert "No discarded or expired items awaiting review" in panel
+    i = panel.index("No discarded or expired items awaiting review")
+    # Scope to the ENCLOSING template, not a character window. A window wide
+    # enough to contain the gate also contains the neighbouring unknown-depth
+    # banner, whose own `discarded.known` satisfied the assertion while the gate
+    # under test had lost it — the guard passed against the exact regression.
+    j = panel.rindex('<template x-if="', 0, i)
+    gate = panel[j:panel.index('">', j)]
+    assert "discarded.known" in gate, (
+        "the empty-state message is not gated on `known` — an unread depth "
+        f"would render as 'nothing awaiting review'. Gate reads: {gate[:160]}"
+    )
 
 
-def _code_only(body: str) -> str:
-    """`body` with whole-line `//` comments removed.
+def test_clear_all_survives_an_unknown_depth():
+    """The control that clears the backlog must not vanish when the count fails.
 
-    Ordering assertions must read the CODE. The first version of the guard
-    below compared positions of a phrase that also appeared in the explanatory
-    comment it sat next to, so it reported the check as mis-ordered purely
-    because prose mentioned the branch it was guarding. A guard satisfiable --
-    or breakable -- by a comment is not a guard.
+    The DELETE removes every discarded/expired row regardless of what was
+    counted, so withholding the button because the COUNT failed strands the
+    backlog — the worst variant found on the monitor page, where a populated
+    queue rendered with no clear control at all.
     """
-    return "\n".join(
-        ln for ln in body.splitlines() if not ln.strip().startswith("//")
+    for rel in ("src/genesis/dashboard/templates/neural_monitor.html",
+                "az_plugins/genesis/templates/neural_monitor.html"):
+        src = (Path(__file__).resolve().parents[2] / rel).read_text()
+        assert "if (!d.known || d.truncated || d.total > 1)" in src, (
+            f"{rel}: the clear-all gate does not include the unknown-depth case"
+        )
+
+    panel = (
+        Path(__file__).resolve().parents[2]
+        / "src" / "genesis" / "dashboard" / "templates" / "partials" / "tabs" / "overview.html"
+    ).read_text()
+    # Anchor on the CLICK HANDLER, which is unique to this button, then take
+    # the `:disabled` immediately before it. Two earlier attempts show why the
+    # anchor has to be unique rather than merely nearby: searching the panel for
+    # the gate expression matched a second, unrelated occurrence, and searching
+    # for the first `:disabled=` matched a setup button hundreds of lines above.
+    i = panel.index("clearAllDiscardedItems")
+    j = panel.rindex(":disabled=", 0, i)
+    binding = panel[j:panel.index('"', panel.index('"', j) + 1) + 1]
+    assert "discarded.known" in binding, (
+        "the clear-all button is disabled on the total alone, so a depth that "
+        f"could not be read disables the only control that clears it. "
+        f"Binding reads: {binding[:160]}"
+    )
+
+
+def test_the_three_normalisers_agree_on_every_payload_shape():
+    """Execute all three copies against the shape table and compare outputs.
+
+    Static assertions cannot tell whether three independently-edited copies
+    still BEHAVE the same, and "they look similar" is what allowed the monitor
+    pages to drift from dashboard.js in the first place. This runs them.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; the static guards above still apply")
+
+    harness = Path(__file__).resolve().parents[2] / "tests" / "assets" / "discarded_shape_check.js"
+    assert harness.is_file(), f"shape harness missing: {harness}"
+    r = subprocess.run([node, str(harness)], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, (
+        "the three discarded normalisers disagree on at least one payload "
+        f"shape:\n{r.stdout}\n{r.stderr}"
     )
 
 
 def test_queue_verdict_is_unknown_when_the_section_failed():
     """A failed queues section must not be reported as healthy.
 
-    `_or_error` replaces a failed gather section with `{"status": "error"}` --
-    truthy, and carrying NO `errors` key. So a verdict that only inspects
-    `errors` reads every depth field as a missing-zero and falls through to
-    "healthy - queues are clear", rendered in the same card as the panel's own
-    "Queue data unavailable" banner and folded into the top-level status.
+    `_or_error` replaces a failed section with `{"status": "error"}` — truthy,
+    and carrying NO `errors` key. So a verdict that only inspects `errors` reads
+    every depth field as a missing-zero and falls through to "healthy - queues
+    are clear", rendered in the same card as the panel's own "Queue data
+    unavailable" notice and folded into the top-level status.
 
-    Zeros that were never measured are not a clean bill of health.
+    Restored here after the guard rewrite dropped it with the helpers it used.
+    The production check was never removed; only its test was, which is the
+    quieter half of that mistake.
     """
-    body = _code_only(_member_body("queuesSemantic"))
-    assert 'queues.status === "error"' in body, (
+    js = DASHBOARD_JS.read_text()
+    i = js.index("queuesSemantic() {")
+    body = js[i:js.index("\n        },", i)]
+    code = "\n".join(ln for ln in body.splitlines() if not ln.strip().startswith("//"))
+    assert 'queues.status === "error"' in code, (
         "queuesSemantic() must treat a failed section as unknown; keying only "
-        "on `errors` misses _or_error's shape, which has no `errors` key"
+        "on `errors` misses _or_error's shape, which carries no `errors` key"
     )
-    # Ordering is the whole point: the check is worthless after the depth
-    # comparisons, because those already returned a verdict built from zeros.
-    assert body.index('queues.status === "error"') < body.index('state: "healthy"'), (
-        "the failed-section check must precede the depth checks, or the "
-        "verdict is already decided from counters that were never collected"
+    assert code.index('queues.status === "error"') < code.index('state: "healthy"'), (
+        "the failed-section check must precede the depth checks, or the verdict "
+        "is already decided from counters that were never collected"
     )
-
-
-def test_unknown_banner_is_scoped_to_its_own_source():
-    """The banner must not deny numbers the same panel is displaying.
-
-    `queues.errors` is ONE list shared by all four queue sources, each entry
-    source-prefixed. Keyed on the whole list, a `deferred_work` failure printed
-    "Queue data unavailable - this is not a confirmed zero" directly above a
-    correctly-counted discarded list with an enabled "Clear all 148".
-    """
-    body = _code_only(_member_body("queuesDataUnknown"))
-    assert '(q.errors || []).length > 0' not in body, (
-        "queuesDataUnknown must not fire on an unrelated source's failure"
-    )
-    assert 'startsWith("discarded")' in body, (
-        "scope the banner to discarded-side failures (entries are prefixed)"
-    )
-    assert 'q.status === "error"' in body, (
-        "a whole-section failure must still mark the count unknown"
-    )
-
-
-def test_neural_monitor_count_survives_a_non_numeric_payload():
-    """`Math.max` coerces, so an unguarded non-numeric count yields NaN.
-
-    NaN makes `=== 0`, `> items.length` and `> 1` ALL false at once, so the
-    header would read "Discarded (NaN)" and the clear-all button would vanish
-    -- the exact defect this block was written to fix, re-entering through
-    coercion. dashboard.js guards it; both plain-JS copies must too.
-    """
-    for path in (NEURAL_MONITOR_HTML, AZ_NEURAL_MONITOR_HTML):
-        src = path.read_text()
-        assert "Number.isFinite" in src, (
-            f"{path.name}: guard the reported count with Number.isFinite before "
-            "Math.max, or a non-numeric count silently removes the clear control"
-        )
