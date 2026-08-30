@@ -146,6 +146,22 @@ class HealthDataService:
         task.add_done_callback(self._release_inflight)
         return await asyncio.shield(task)
 
+    def abandon_inflight(self) -> None:
+        """Stop handing the in-flight compute to NEW callers after a mutation.
+
+        ``snapshot()`` coalesces overlapping callers onto one computation. That
+        is right for concurrent READS, but wrong immediately after a write: a
+        caller arriving after the mutation would be handed a result computed
+        from pre-mutation state, and would then publish it as current.
+
+        Existing awaiters keep the result they are already waiting on (their
+        request began before the write, so pre-write data is correct for them);
+        the next caller starts a compute that reads post-mutation state.
+        Dropping the handle is safe because ``_release_inflight`` clears only if
+        the handle is still the same task.
+        """
+        self._inflight = None
+
     def _release_inflight(self, task: asyncio.Task) -> None:
         """Done-callback: drop the in-flight handle when the compute finishes.
 

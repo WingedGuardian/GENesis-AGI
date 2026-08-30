@@ -78,6 +78,42 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The `/genesis/monitor` page had the same discarded-count bug, plus a worse
+  variant: rows you could not clear.** Its "Clear All Discarded" button was shown
+  only when the 20-row sample held more than one entry, while its label printed
+  the true count — so a backlog whose sample failed to load displayed
+  "Discarded (148)" with no clear control at all. The button now follows the real
+  depth, and the header labels the sample as truncated. (A queue holding exactly
+  one row still shows no clear-all button — that row is cleared by its own Clear
+  control, which is the intended behaviour.)
+
+- **Dashboard reported the discarded-queue depth as 20 when it was 148.** The
+  Queues panel and the attention strip both rendered `discarded_items.length` —
+  the length of a deliberately capped `LIMIT 20` review sample — instead of
+  `discarded_count`, the true unbounded depth the backend already supplied. Any
+  backlog above 20 therefore displayed as exactly 20, and because the displayed
+  number equalled the cap it looked like a plausible total rather than a
+  truncation. Every count AND every predicate now reads one derived
+  accessor used for every displayed number and every gate, so no part of the
+  panel can disagree with another: it can no longer claim a backlog while
+  showing "no items awaiting review" or disabling the button that clears it,
+  nor report 0 while listing rows. Where the count is non-zero but the review
+  sample could not be loaded, the panel now says exactly that. The review list is labelled "showing 20 of N" whenever it is
+  truncated, so the sample can no longer be mistaken for the whole queue.
+  Backend was already correct; no API change.
+
+- **"Clear all reviewed" now says how many rows it will actually delete.** It
+  always deleted every discarded/expired row, not the 20 displayed — harmless
+  while the panel hid the difference, misleading once it reports the true
+  depth. The button reads "Clear all N" with a tooltip stating it is permanent
+  and covers rows not shown.
+
+- **Clearing the queue no longer leaves the dashboard showing the rows it just
+  deleted.** The health snapshot is cached for up to 30s and nothing invalidated
+  it, so the client's immediate refetch re-rendered pre-delete counts: a
+  "Cleared 148 discarded items" toast beside a panel still listing them, with
+  per-row Clear buttons that silently did nothing. Mutations now bust the cache.
+
 - **The ego's self-model stopped presenting stale, thin and arbitrarily-ranked
   rows as present-tense capability.** `capability_map` feeds three ego-prompt
   sections and the capability-improvement scanner. Measurements below come from

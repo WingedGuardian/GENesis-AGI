@@ -162,8 +162,14 @@ async def unified_errors():
         logger.warning("unified-errors: active_alerts source failed", exc_info=True)
         sources_failed.append("alerts")
 
+    # `groups` is a capped PAGE; these are the true depths. Rendering
+    # len(groups) as a total is the same defect as the discarded-queue count
+    # (2026-08-30): a limit displayed as a total, indistinguishable from a real
+    # value because it looks like one.
     return jsonify({
         "groups": groups[:limit],
+        "groups_total": len(groups),
+        "groups_active_total": sum(1 for g in groups if g.get("still_active")),
         "active_alerts": active_alerts,
         "totals": {
             "events": event_count,
@@ -196,4 +202,13 @@ async def clear_deferred_item(item_id):
         )
     await rt.db.commit()
     cleared = cur.rowcount
+    # Unconditional by design. The queues snapshot is cached up to 30s, and a
+    # `cleared == 0` result is the STRONGEST signal the caller's view is stale
+    # (it clicked Clear on a row the cache still shows but the DB no longer
+    # has) — precisely when the cache most needs busting. Guarding on `cleared`
+    # would skip the phantom-row case this exists to fix, and `rowcount` is -1
+    # (truthy) on some drivers anyway.
+    from genesis.dashboard.routes.health import invalidate_snapshot_cache
+
+    invalidate_snapshot_cache()
     return jsonify({"cleared": cleared})

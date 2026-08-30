@@ -446,6 +446,11 @@ async def queues(
                     "discarded_at": row["completed_at"],
                 })
         except Exception:
+            # Record it like every sibling query does. Without this a failed
+            # COUNT silently yields discarded_count=0, which the dashboard then
+            # renders as a confident "nothing awaiting review" for a state we
+            # do not actually know.
+            errors.append("discarded: query failed")
             logger.warning("Failed to query discarded deferred items", exc_info=True)
 
     deferred_processing = 0

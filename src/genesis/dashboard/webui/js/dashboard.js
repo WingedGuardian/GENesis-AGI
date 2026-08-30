@@ -3723,7 +3723,7 @@
         queuesSemantic() {
           const queues = this.health.queues;
           if (!queues) return { state: "unknown", reason: "queue data unavailable" };
-          if ((queues.dead_letters || 0) > 0 || (queues.discarded_items?.length || 0) > 0
+          if ((queues.dead_letters || 0) > 0 || this.discardedTotal > 0
               || (queues.deferred_stuck || 0) > 0 || (queues.failed_embeddings || 0) > 0) {
             return { state: "error", reason: "stuck/failed items or dead letters require attention" };
           }
@@ -4386,8 +4386,46 @@
           return this.groupQueueItems(this.health.queues?.deferred_items || []);
         },
 
+        // True when the queues section failed to compute, so a 0 means "we do
+        // not know", not "there is nothing". `_or_error` replaces the whole
+        // section with {"status": "error"} — which is TRUTHY, so the card still
+        // renders and would otherwise show a confident row of zeros.
+        get queuesDataUnknown() {
+          const q = this.health?.queues;
+          if (!q) return false;            // card is hidden entirely
+          return q.status === "error" || (q.errors || []).length > 0;
+        },
+
         get discardedQueueGroups() {
           return this.groupQueueItems(this.health.queues?.discarded_items || []);
+        },
+
+        // Discarded work is reported by TWO values that can disagree:
+        // `discarded_count` (uncapped depth) and `discarded_items` (a LIMIT-20
+        // review sample). Reading the wrong one shipped three rounds of bugs
+        // (2026-08-30), so there is exactly ONE sanctioned accessor.
+        //
+        // ONE accessor, used for every count AND every gate. Deliberately not
+        // two: a "print this one, gate on that one" rule is a fork at every
+        // call site, and choosing wrong is what produced three rounds of bugs.
+        //
+        // max() because BOTH divergences are reachable and the larger value is
+        // the honest one in each:
+        //   count>0, sample empty  — queues.py assigns the count before the
+        //     sample loop inside one try, so a bad row empties only the sample.
+        //     Report 148, not 0, or the panel denies work it is about to clear.
+        //   count==0, sample full  — the count and the sample are two
+        //     un-transacted statements. Report the rows actually on screen, not
+        //     a stale 0 next to five visible entries.
+        // `??` not `||` so a legitimate 0 is not replaced by the sample length.
+        get discardedTotal() {
+          const q = this.health?.queues || {};
+          const sample = q.discarded_items?.length || 0;
+          const n = q.discarded_count ?? sample;
+          // A non-finite count would make BOTH `> 0` and `=== 0` false, so the
+          // panel would render neither the list nor the empty state while the
+          // button read "Clear all NaN".
+          return Math.max(Number.isFinite(n) ? n : sample, sample);
         },
 
         get routingProviderList() {
@@ -4484,7 +4522,12 @@
           const allAlerts = this.errorSummary.active_alerts || [];
           const criticalAlerts = allAlerts.filter(a => a.severity === "CRITICAL");
           const warningAlerts = allAlerts.filter(a => a.severity === "WARNING");
-          const activeGroups = (this.errorSummary.groups || []).filter(g => g.still_active).length;
+          // Read the uncapped total, never the page length: `groups` is
+          // fetched with limit=6 and sliced server-side, so counting it renders
+          // "6 active error groups" for any number >= 6. Falls back to the page
+          // length only when the field is absent (older server).
+          const activeGroups = this.errorSummary.groups_active_total
+            ?? (this.errorSummary.groups || []).filter(g => g.still_active).length;
           if (criticalAlerts.length > 0) {
             items.push({ level: "critical", title: `${criticalAlerts.length} critical alert${criticalAlerts.length === 1 ? "" : "s"}`, detail: criticalAlerts.map(a => a.message).slice(0, 3).join("; "), href: "/genesis/errors" });
           }
@@ -4501,8 +4544,9 @@
           if ((this.health.queues?.dead_letters || 0) > 0) {
             items.push({ level: "critical", title: `${this.health.queues.dead_letters} dead letters`, detail: "requests exhausted all fallback providers; open the errors view to inspect", href: "/genesis/errors" });
           }
-          if ((this.health.queues?.discarded_items?.length || 0) > 0) {
-            items.push({ level: "warning", title: `${this.health.queues.discarded_items.length} discarded item${this.health.queues.discarded_items.length === 1 ? "" : "s"}`, detail: "work was dropped and can be reviewed or cleared below", href: "#queue-review", tab: "overview", anchor: "queue-review" });
+          if (this.discardedTotal > 0) {
+            const n = this.discardedTotal;
+            items.push({ level: "warning", title: `${n} discarded item${n === 1 ? "" : "s"}`, detail: "work was dropped and can be reviewed or cleared below", href: "#queue-review", tab: "overview", anchor: "queue-review" });
           }
           // Fallback call sites are already captured in the warningAlerts
           // bucket above (severity=WARNING from health_alerts). The dedicated

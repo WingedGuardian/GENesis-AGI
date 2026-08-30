@@ -31,6 +31,43 @@ _snapshot_cache_ts: float = 0.0
 _SNAPSHOT_CACHE_TTL_S = 30.0
 
 
+_snapshot_cache_gen: int = 0
+
+
+def invalidate_snapshot_cache() -> None:
+    """Force the next /api/genesis/health to recompute.
+
+    Call after any mutation to the queues/health data. Without this, a
+    ``DELETE`` + immediate refetch is served from the <=30s-old cache, so the
+    UI shows a success toast beside the pre-delete counts it just cleared
+    (observed 2026-08-30: "Cleared 148" next to "showing 20 of 148").
+
+    Three things are required, because there are two distinct staleness paths:
+    clear the cached value; bump a generation counter so a compute that began
+    BEFORE this call declines to publish when it lands after it; and abandon the
+    producer's in-flight computation so a caller arriving AFTER this call is not
+    handed that same pre-mutation result.
+    """
+    global _snapshot_cache, _snapshot_cache_ts, _snapshot_cache_gen
+    _snapshot_cache = None
+    _snapshot_cache_ts = 0.0
+    _snapshot_cache_gen += 1
+
+    # Clearing this module's cache is NOT enough: HealthDataService.snapshot()
+    # coalesces overlapping callers onto one in-flight computation, so the next
+    # request would be handed a result computed BEFORE the mutation — and,
+    # having sampled the generation after the bump, would republish it with a
+    # full fresh TTL. Because this function also nulls the cache, every request
+    # in that window misses and coalesces onto that same stale compute, so
+    # skipping this would widen the very window the call is meant to close.
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    health_data = getattr(rt, "health_data", None)
+    if health_data is not None and hasattr(health_data, "abandon_inflight"):
+        health_data.abandon_inflight()
+
+
 @blueprint.route("/api/genesis/health")
 @_async_route(timeout=_HEALTH_SNAPSHOT_TIMEOUT_S)
 async def health_snapshot():
@@ -46,9 +83,13 @@ async def health_snapshot():
     if _snapshot_cache is not None and (now_mono - _snapshot_cache_ts) < _SNAPSHOT_CACHE_TTL_S:
         snapshot = dict(_snapshot_cache)
     else:
+        gen = _snapshot_cache_gen
         fresh = await rt.health_data.snapshot()
-        _snapshot_cache = fresh
-        _snapshot_cache_ts = now_mono
+        # Publish only if nothing invalidated the cache while we were computing;
+        # otherwise this result predates a mutation and would resurrect it.
+        if gen == _snapshot_cache_gen:
+            _snapshot_cache = fresh
+            _snapshot_cache_ts = time.monotonic()
         snapshot = dict(fresh)
 
     status_path = Path.home() / ".genesis" / "status.json"
