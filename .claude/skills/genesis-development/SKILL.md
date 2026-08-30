@@ -570,8 +570,23 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   approval), run it non-interactively and feed it only the diff + an adversarial mandate:
   `kimi -p "<review prompt>" -m <namespaced-alias, e.g. kimi-code/k3> --output-format text`
   from the target worktree, in the background (it reads the diff/files with its own tools).
+  **Hand it the FULL branch diff, and verify it saw one.** `git diff "$(git merge-base
+  HEAD <the PR's base>)"` — the form `.claude/commands/deep-review.md` mandates,
+  generalized to the PR's actual base. NOT `<base>..HEAD` alone (misses uncommitted
+  work), and never bare `git diff`, which shows ONLY unstaged tracked edits: after a
+  `git add` it is empty, and it never shows committed work at all. Stage first (or
+  `git add -N`) so untracked files are visible. The durable check is the VERDICT, not
+  the command — a clean verdict that does not demonstrate WHAT it reviewed is void, and
+  a false clean from the cross-model gate is worse than no review.
   Use the namespaced model alias, not a bare one; `-p` does not combine with `--auto`/`-y`.
-  Never merge on a same-model-only review.
+  Do not merge on a same-model-only review. The ONE exception is a user-authorized
+  override of an already-BLOCKED merge when the cross-model reviewer is genuinely
+  unreachable: get the user's explicit go-ahead FIRST — never self-serve, and note that
+  only the HOOK-surface gate message says so; the default-surface one offers
+  `# stale-review-override` with no conditions attached — then run the same-model
+  adversarial pass and record reviewer + findings + dispositions. On the hook surface
+  the gate additionally demands that evidence keyed to the exact base+head. Never an
+  override to skip a REACHABLE reviewer.
 - **Escalation cap — a HARD BLOCK at 3 rounds that each find NEW defects.**
   A *round* = one review→fix→re-review iteration (local reviewer rounds and
   cloud-bot re-review rounds count together, per change). The cap is enforced
@@ -674,7 +689,9 @@ Verify before any commit:
   (don't shoehorn a store-health row into the model-eval `eval_runs` table just
   because it is "a table that exists").
 - **Private-data scan before every push (public repo).** Grep the ENTIRE diff
-  (`git diff origin/main...HEAD`) for private/identifying data — real names,
+  (`git diff "$(git merge-base HEAD origin/main)"` — NOT `origin/main...HEAD`, which
+  is blind to staged and unstaged work, so an identifier in an uncommitted fixture
+  passes the scan unseen) for private/identifying data — real names,
   company/product names, emails, IPs, private career/project specifics, verbatim
   user messages. Check ALL surfaces, not just prose: **source comments,
   docstrings, and test fixtures/data** are the easy misses. Use a synthetic
