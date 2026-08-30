@@ -2754,13 +2754,7 @@ def _scheduled_review_rows(pr_num: str, repo: str | None = None) -> list[dict] |
                     "--paginate",
                     "--jq",
                     ".[] | {login: .user.login, author_association: .author_association, "
-                    "body: .body, state: .state, "
-                    "stamp: (.updated_at // .submitted_at // .created_at)}",
-                    # .state present on reviews, null on issue comments. `stamp` is the LAST
-                    # MODIFICATION: issue comments are editable and an edit that adds a
-                    # finding must sort by when it was written, not when the comment was
-                    # created. Review bodies expose only submitted_at (an edited review body
-                    # keeps its original stamp -- documented residue in the scan).
+                    "body: .body, state: .state}",  # .state present on reviews, null on issue comments
                 ],
                 capture_output=True,
                 text=True,
@@ -2871,20 +2865,6 @@ def _scheduled_review_marker_scan(
     # it only to count whether the OWNER has posted anything for a kind, because that is
     # the one thing that says whether the owner's routine has evidently already run.
     unusable: list[tuple[str | None, str, bool]] = []
-    # Every owner statement about a (head, kind), in CHRONOLOGICAL order, classified as
-    # "clean" (explicit verdict line), "refused" (blocking finding, no verdict) or "plain"
-    # (neither). The verdict for the pair is resolved AFTER the loop from this list -- see
-    # there for the rule and why the order matters.
-    stmts: dict[tuple[str, str], list[str]] = {}
-    # Chronology: rows carry `stamp` = last modification (updated_at for issue comments,
-    # which are editable; submitted_at for reviews). The two endpoints are fetched
-    # separately, so without sorting a review could sort before a comment posted after
-    # it; and sorting by CREATION would let a finding edited into an old comment lose
-    # to a verdict posted before the edit. Rows without a stamp (the test seam) keep list
-    # order -- the sort is stable. Residue, stated: an edited REVIEW body has no edit
-    # timestamp in the API, so a finding added by editing a review keeps the review's
-    # original position.
-    rows = sorted(rows, key=lambda r: (r.get("stamp") or r.get("created_at") or ""))
     for row in rows:
         body = row.get("body") or ""
         # Blocks are parsed BEFORE the trust checks, so a row about to be dropped can
@@ -2952,9 +2932,10 @@ def _scheduled_review_marker_scan(
         # measured 2026-08-28: those two produced the identical `present: none` line, and
         # the only signal distinguishing an accepted marker from a rejected one was
         # whether its prose happened to contain a _CLEAN_PATTERNS phrase.
-        has_clean = any(c.search(body) for c in _CLEAN_PATTERNS)
-        not_clean = any(p.search(body) for p in _BLOCKING_PATTERNS) and not has_clean
-        verdict = "refused" if not_clean else ("clean" if has_clean else "plain")
+        not_clean = any(p.search(body) for p in _BLOCKING_PATTERNS) and not any(
+            c.search(body) for c in _CLEAN_PATTERNS
+        )
+        target = rejected if not_clean else accepted
         # Defense-in-depth follow-up: for rows from /pulls/N/reviews we could ALSO
         # cross-check GitHub's authoritative `commit_id` vs the marker sha (issue comments
         # carry none). Deferred (LOW): the marker sha is matched EXACTLY vs the authoritative
@@ -3041,62 +3022,7 @@ def _scheduled_review_marker_scan(
                     _why += ", and its body reads as carrying a blocking finding"
                 unusable.append((_kind, _why, True))
                 continue
-            stmts.setdefault((head_m.group(1).lower(), _kind), []).append(verdict)
-    # RESOLUTION. Each row used to choose its own map, so a second owner comment at the
-    # same head -- same marker, ordinary prose -- was accepted while the first row's [P1]
-    # sat refused, and the gate passed with the finding unchanged. The first fix let any
-    # explicit clean verdict win regardless of order, which passed a LATER [P1] posted
-    # after an earlier verdict. Order is the whole question, so the rule is stated in it:
-    #
-    #   THE OWNER'S LATEST DECISIVE STATEMENT ABOUT (head, kind) GOVERNS.
-    #
-    # Decisive = an explicit clean-verdict line, or a blocking finding. Plain rows (neither)
-    # are not decisive in either direction: they count only when nothing decisive was ever
-    # said. So a plain re-post never overrides a refusal, the documented remedy (re-post
-    # WITH a verdict) still clears a prose-tripped refusal, and a re-run that finds
-    # something after a verdict is heard. Scoped to the head -- a finding on an older
-    # commit is what a new commit fixes. Every superseded row is still LISTED, so the
-    # report never says one block where two exist.
-    for (h, k), seq in stmts.items():
-        decisive = [v for v in seq if v != "plain"]
-        final = decisive[-1] if decisive else "plain"
-        (rejected if final == "refused" else accepted).setdefault(h, set()).add(k)
-        # The verdict maps are SETS, so repeated statements collapsed to one rendered row
-        # and the report said one block where several were observed. Every repeat is a row.
-        same = seq.count(final) - 1 if final != "plain" else seq.count("plain") - 1
-        if same > 0:
-            unusable.append(
-                (k, f"{same} further block(s) at this head repeating the same statement", True)
-            )
-        if final == "refused":
-            n_plain = seq.count("plain")
-            if n_plain:
-                unusable.append(
-                    (
-                        k,
-                        f"a plain re-post at this head ({n_plain} block(s), no verdict "
-                        f"line) does not override the refusal for this kind",
-                        True,
-                    )
-                )
-            if "clean" in seq:
-                unusable.append(
-                    (
-                        k,
-                        "an explicit clean verdict at this head, superseded by a LATER "
-                        "blocking finding for this kind",
-                        True,
-                    )
-                )
-        elif "refused" in seq:
-            unusable.append(
-                (
-                    k,
-                    "a refusal at this head, superseded by a LATER explicit clean "
-                    "verdict for this kind",
-                    True,
-                )
-            )
+            target.setdefault(head_m.group(1).lower(), set()).add(_kind)
     return accepted, rejected, unusable
 
 
