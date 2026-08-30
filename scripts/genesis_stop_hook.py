@@ -33,6 +33,11 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+# The shared hook-input helper lives in scripts/hooks/; this script runs from
+# scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_input import session_path  # noqa: E402
+
 _FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _GENESIS_DIR = Path.home() / ".genesis"
 _RESUME_SIGNAL_FILE = _GENESIS_DIR / "last_resume_signal.json"
@@ -75,12 +80,15 @@ def main() -> None:
     if not session_id:
         return
 
-    # Read last user message from session-scoped buffer
-    session_dir = _GENESIS_DIR / "sessions" / session_id
-    messages_file = session_dir / "messages.jsonl"
-
+    # Read last user message from session-scoped buffer. The id is a PATH
+    # COMPONENT only here, so an unsafe id skips this read — it must NOT skip
+    # the giving-up-pattern check below, which is session-independent (it needs
+    # only the assistant message from the hook payload).
     last_user_msg = ""
-    if messages_file.exists():
+    messages_file = session_path(
+        _GENESIS_DIR / "sessions", session_id, "messages.jsonl"
+    )
+    if messages_file is not None and messages_file.exists():
         try:
             lines = messages_file.read_text().strip().splitlines()
             if lines:
