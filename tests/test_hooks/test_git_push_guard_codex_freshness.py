@@ -1362,10 +1362,12 @@ class TestScheduledGateBlockMessageBranchesOnCause:
         to be clean; with the verdict present, leaks is genuinely satisfied and the
         original intent of this test (no hijack by a satisfied kind) is preserved.
         """
+        # Order matters now: the owner's LATEST decisive statement governs, so the
+        # refused prose comes first and the explicit verdict clears it.
         comments = "\n".join(
             [
-                self._marker_kind(HEAD, "leaks", "scheduled review done.\nVERDICT: PASS"),
                 self._marker_kind(HEAD, "leaks", self.REFUSED_PROSE),
+                self._marker_kind(HEAD, "leaks", "scheduled review done.\nVERDICT: PASS"),
             ]
         )
         monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
@@ -2124,6 +2126,125 @@ class TestTheReportReadsEveryFieldPermissively:
             assert msg, block
             assert needle in msg, f"{block}\n{msg}"
             assert "carries no" not in msg, f"the field IS present:\n{msg}"
+class TestARefusalAtHeadIsNotLaunderedByAPlainRepost:
+    """PRE-EXISTING gate defect on the irreducible review, surfaced by adversarial review.
+
+    `not_clean` was computed PER ROW and each row chose its own map. So a second
+    owner comment at the same head — same marker, ordinary prose, no verdict line —
+    landed in `accepted` while the first row's [P1] sat in `rejected`, and the gate
+    PASSED. Nothing about the finding had changed; the head was identical.
+
+    The documented remedy for a refusal caused by prose is to re-post ending with an
+    EXPLICIT clean-verdict line, and that must keep working (control below). So the
+    rule is: at a head where this kind was refused, a later marker counts only if its
+    body carries an explicit clean verdict. A plain re-post is not an override; a
+    stated verdict is.
+    """
+
+    @staticmethod
+    def _row(body):
+        return json.dumps({"login": "owner", "author_association": "OWNER", "body": body})
+
+    @staticmethod
+    def _marker(head=HEAD):
+        return f"<!-- genesis-scheduled-review: head={head} kind=leaks -->"
+
+    def _gate(self, monkeypatch, rows):
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", "\n".join(rows))
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "leaks")
+        return _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
+
+    def test_a_plain_repost_does_not_override_a_refusal_at_the_same_head(self, monkeypatch):
+        msg = self._gate(
+            monkeypatch,
+            [
+                self._row("[P1] a real leak finding\n" + self._marker()),
+                self._row("scan done.\n" + self._marker()),
+            ],
+        )
+        assert msg, "a [P1] at this head was laundered by a plain re-post of the marker"
+        assert "IS present at THIS head but was REFUSED" in msg, msg
+
+    def test_order_does_not_matter(self, monkeypatch):
+        """The refusal may arrive AFTER the plain marker (a routine posting its finding
+        late); the outcome must be the same."""
+        msg = self._gate(
+            monkeypatch,
+            [
+                self._row("scan done.\n" + self._marker()),
+                self._row("[P1] a real leak finding\n" + self._marker()),
+            ],
+        )
+        assert msg, "a later [P1] at this head was ignored because a plain marker came first"
+
+    def test_an_explicit_clean_verdict_still_overrides(self, monkeypatch):
+        """CONTROL: the documented remedy. Without it, an implementation that made every
+        refusal permanent would pass the tests above while breaking the one documented
+        way to clear a prose-tripped refusal."""
+        msg = self._gate(
+            monkeypatch,
+            [
+                self._row("The config value is not a hard block.\n" + self._marker()),
+                self._row("Re-reviewed.\nVERDICT: PASS\n" + self._marker()),
+            ],
+        )
+        assert msg is None, f"an explicit verdict line must still clear a refusal:\n{msg}"
+
+    def test_a_refusal_at_another_head_does_not_taint_this_one(self, monkeypatch):
+        """CONTROL: scoping. A [P1] on an OLDER commit is exactly what a new commit
+        fixes; a plain clean marker at the NEW head must count."""
+        msg = self._gate(
+            monkeypatch,
+            [
+                self._row("[P1] finding on the old commit\n" + self._marker(head=OTHER_HEAD)),
+                self._row("scan done.\n" + self._marker()),
+            ],
+        )
+        assert msg is None, f"a refusal at a different head must not block this one:\n{msg}"
+
+    # ---- the rule is CHRONOLOGICAL: the owner's latest decisive statement governs ----
+    def test_a_LATER_refusal_overrides_an_earlier_clean_verdict(self, monkeypatch):
+        """A clean verdict, then a re-run that posts a [P1] at the same head. The
+        newer finding is unresolved; a set-based reconcile that let any explicit
+        clean verdict win regardless of order passed the gate here."""
+        msg = self._gate(
+            monkeypatch,
+            [
+                self._row("Re-reviewed.\nVERDICT: PASS\n" + self._marker()),
+                self._row("[P1] a finding the re-run found\n" + self._marker()),
+            ],
+        )
+        assert msg, "a later [P1] at this head was overridden by an EARLIER clean verdict"
+        assert "IS present at THIS head but was REFUSED" in msg, msg
+
+    def test_a_plain_repost_after_a_clean_verdict_is_still_accepted(self, monkeypatch):
+        """CONTROL for chronology: plain rows are not decisive in either direction."""
+        msg = self._gate(
+            monkeypatch,
+            [
+                self._row("VERDICT: PASS\n" + self._marker()),
+                self._row("scan done.\n" + self._marker()),
+            ],
+        )
+        assert msg is None, msg
+
+    def test_every_row_for_the_pair_stays_in_the_inventory(self, monkeypatch):
+        """The verdict picks one statement; the report still lists all of them. A
+        plain re-post that lost to a refusal, and a refusal that lost to a later
+        verdict, must both be visible -- or the operator thinks a post never arrived."""
+        msg = self._gate(
+            monkeypatch,
+            [
+                self._row("[P1] a real leak finding\n" + self._marker()),
+                self._row("scan done.\n" + self._marker()),
+            ],
+        )
+        assert msg
+        assert "leaks — 2 marker block(s) found" in msg, msg
+        assert "a plain re-post at this head" in msg, msg
+
+
 class TestNamingProblemsKeepTheBodyVerdict:
     @staticmethod
     def _row(body):
@@ -2146,3 +2267,142 @@ class TestNamingProblemsKeepTheBodyVerdict:
         msg = self._msg(monkeypatch, f"scan.\n<!-- genesis-scheduled-review: head={HEAD} kind=LEAKS -->")
         assert "'LEAKS'" in msg and "not lowercase" in msg, msg
         assert "not a bare review name" not in msg, msg
+
+
+class TestChronologyComesFromTimestampsNotFetchOrder:
+    """Issue comments and review bodies are fetched from two endpoints and concatenated,
+    so fetch order is not time order. With timestamps present, a review posted AFTER a
+    comment must be read after it even though it arrives first in the list."""
+
+    @staticmethod
+    def _rows(p1_at, pass_at):
+        m = f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+        return "\n".join(
+            [
+                json.dumps({"login": "owner", "author_association": "OWNER",
+                            "body": "[P1] found on re-run\n" + m, "created_at": p1_at}),
+                json.dumps({"login": "owner", "author_association": "OWNER",
+                            "body": "VERDICT: PASS\n" + m, "created_at": pass_at}),
+            ]
+        )
+
+    def _gate(self, monkeypatch, rows):
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", rows)
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "leaks")
+        return _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
+
+    def test_a_later_refusal_wins_even_when_it_is_listed_first(self, monkeypatch):
+        msg = self._gate(monkeypatch, self._rows("2026-01-02T00:00:00Z", "2026-01-01T00:00:00Z"))
+        assert msg, "the refusal is the later statement by timestamp and must govern"
+
+    def test_the_reverse_order_passes(self, monkeypatch):
+        """CONTROL: same rows, timestamps swapped -> the verdict is later and clears it."""
+        assert self._gate(monkeypatch, self._rows("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z")) is None
+
+    def test_an_EDITED_older_comment_is_ordered_by_its_edit(self, monkeypatch):
+        """Issue comments are editable. An owner can add a [P1] to an OLD comment after
+        posting a later verdict; ordering by creation would let the verdict win over a
+        finding that was in fact written after it. Rows carry `stamp` = last modification."""
+        m = f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+        rows = "\n".join(
+            [
+                json.dumps({"login": "owner", "author_association": "OWNER",
+                            "body": "[P1] added on edit\n" + m,
+                            "created_at": "2026-01-01T00:00:00Z", "stamp": "2026-01-03T00:00:00Z"}),
+                json.dumps({"login": "owner", "author_association": "OWNER",
+                            "body": "VERDICT: PASS\n" + m,
+                            "created_at": "2026-01-02T00:00:00Z", "stamp": "2026-01-02T00:00:00Z"}),
+            ]
+        )
+        assert self._gate(monkeypatch, rows), "an edited-in finding was ordered by creation and lost"
+
+    def test_duplicate_statements_each_get_a_row(self, monkeypatch):
+        """Two accepted owner markers for the same stale (head, kind) are two blocks;
+        the verdict maps are sets and collapsed them into one row."""
+        m = f"<!-- genesis-scheduled-review: head={OTHER_HEAD} kind=leaks -->"
+        rows = "\n".join([json.dumps({"login": "owner", "author_association": "OWNER", "body": f"run {i}.\n" + m}) for i in range(2)])
+        msg = self._gate(monkeypatch, rows)
+        assert msg
+        assert "leaks — 2 marker block(s) found" in msg, msg
+
+
+class TestTiedTimestampsFailClosed:
+    """Sorting is stable, so tied stamps keep fetch order (issue comments before
+    reviews), which is not event order. Contradictory decisive statements that tie on
+    a REAL timestamp are refused; rows without a stamp keep list order and cannot tie."""
+
+    @staticmethod
+    def _rows(p1_stamp, pass_stamp):
+        m = f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+        return "\n".join([
+            json.dumps({"login": "owner", "author_association": "OWNER", "body": "[P1] found\n" + m, "stamp": p1_stamp}),
+            json.dumps({"login": "owner", "author_association": "OWNER", "body": "VERDICT: PASS\n" + m, "stamp": pass_stamp, "state": "APPROVED"}),
+        ])
+
+    def _gate(self, monkeypatch, rows):
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", rows)
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "leaks")
+        return _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub")
+
+    def test_a_tie_between_a_finding_and_a_verdict_is_refused(self, monkeypatch):
+        T = "2026-01-01T00:00:00Z"
+        assert self._gate(monkeypatch, self._rows(T, T)), "tied stamps resolved by fetch order and passed"
+
+    def test_the_tie_is_reported_as_a_tie_not_as_supersession(self, monkeypatch):
+        """Failing closed is right; describing it wrongly is not. On a tie the verdict IS
+        present and NEITHER statement is later, so the ordinary refusal wording ("no
+        clean-verdict line overrides it", "superseded by a LATER blocking finding") states
+        two things that are false about this thread."""
+        T = "2026-01-01T00:00:00Z"
+        msg = self._gate(monkeypatch, self._rows(T, T))
+        assert msg
+        assert "SAME timestamp" in msg, msg
+        assert "which came last cannot be established" in msg, msg
+        assert "leaks — 2 marker block(s) found" in msg, "both blocks must still be rows"
+        assert "an explicit clean verdict at this head" in msg, msg
+        assert "a blocking finding at this head" in msg, msg
+        assert "superseded by a LATER" not in msg, msg
+        assert "no clean-verdict line overrides it" not in msg, msg
+
+    def test_a_later_verdict_by_one_second_still_clears(self, monkeypatch):
+        """CONTROL: the tie rule must not swallow a genuinely later verdict."""
+        assert self._gate(monkeypatch, self._rows("2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z")) is None
+
+    def test_unstamped_rows_keep_list_order_and_do_not_tie(self, monkeypatch):
+        """CONTROL for the seam: no stamps, [P1] then PASS in list order -> clears."""
+        m = f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+        rows = "\n".join([
+            json.dumps({"login": "owner", "author_association": "OWNER", "body": "[P1] found\n" + m}),
+            json.dumps({"login": "owner", "author_association": "OWNER", "body": "VERDICT: PASS\n" + m}),
+        ])
+        assert self._gate(monkeypatch, rows) is None
+
+
+class TestEveryStatementIsCountedAndEveryUnscopedRowShown:
+    @staticmethod
+    def _row(body, **kw):
+        d = {"login": "owner", "author_association": "OWNER", "body": body}
+        d.update(kw)
+        return json.dumps(d)
+
+    def _msg(self, monkeypatch, rows):
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", rows)
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "leaks")
+        return _mod._check_scheduled_claude_reviewed_head("1", head_sha=HEAD, repo="acme/pub") or ""
+
+    def test_two_refusals_a_verdict_and_a_plain_repost_at_a_stale_head_are_four_blocks(self, monkeypatch):
+        m = f"<!-- genesis-scheduled-review: head={OTHER_HEAD} kind=leaks -->"
+        rows = "\n".join([self._row("[P1] a\n" + m), self._row("[P1] b\n" + m), self._row("VERDICT: PASS\n" + m), self._row("scan.\n" + m)])
+        msg = self._msg(monkeypatch, rows)
+        assert "leaks — 4 marker block(s) found" in msg, msg
+        assert msg.count("a refusal at this head, superseded") == 2, msg
+        assert msg.count("a plain re-post at this head") == 1, msg
+
+    def test_more_than_six_unscoped_blocks_are_all_listed(self, monkeypatch):
+        rows = "\n".join(self._row(f"x{i}.\n<!-- genesis-scheduled-review: head={HEAD} kind=bogus{i} -->") for i in range(8))
+        msg = self._msg(monkeypatch, rows)
+        assert "more)" not in msg, msg
+        assert all(f"kind='bogus{i}'" in msg for i in range(8)), msg

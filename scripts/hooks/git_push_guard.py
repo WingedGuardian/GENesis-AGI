@@ -2754,7 +2754,13 @@ def _scheduled_review_rows(pr_num: str, repo: str | None = None) -> list[dict] |
                     "--paginate",
                     "--jq",
                     ".[] | {login: .user.login, author_association: .author_association, "
-                    "body: .body, state: .state}",  # .state present on reviews, null on issue comments
+                    "body: .body, state: .state, "
+                    "stamp: (.updated_at // .submitted_at // .created_at)}",
+                    # .state present on reviews, null on issue comments. `stamp` is the LAST
+                    # MODIFICATION: issue comments are editable and an edit that adds a
+                    # finding must sort by when it was written, not when the comment was
+                    # created. Review bodies expose only submitted_at (an edited review body
+                    # keeps its original stamp -- documented residue in the scan).
                 ],
                 capture_output=True,
                 text=True,
@@ -2865,6 +2871,20 @@ def _scheduled_review_marker_scan(
     # it only to count whether the OWNER has posted anything for a kind, because that is
     # the one thing that says whether the owner's routine has evidently already run.
     unusable: list[tuple[str | None, str, bool]] = []
+    # Every owner statement about a (head, kind), in CHRONOLOGICAL order, classified as
+    # "clean" (explicit verdict line), "refused" (blocking finding, no verdict) or "plain"
+    # (neither). The verdict for the pair is resolved AFTER the loop from this list -- see
+    # there for the rule and why the order matters.
+    stmts: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    # Chronology: rows carry `stamp` = last modification (updated_at for issue comments,
+    # which are editable; submitted_at for reviews). The two endpoints are fetched
+    # separately, so without sorting a review could sort before a comment posted after
+    # it; and sorting by CREATION would let a finding edited into an old comment lose
+    # to a verdict posted before the edit. Rows without a stamp (the test seam) keep list
+    # order -- the sort is stable. Residue, stated: an edited REVIEW body has no edit
+    # timestamp in the API, so a finding added by editing a review keeps the review's
+    # original position.
+    rows = sorted(rows, key=lambda r: (r.get("stamp") or r.get("created_at") or ""))
     for row in rows:
         body = row.get("body") or ""
         # Blocks are parsed BEFORE the trust checks, so a row about to be dropped can
@@ -2932,10 +2952,9 @@ def _scheduled_review_marker_scan(
         # measured 2026-08-28: those two produced the identical `present: none` line, and
         # the only signal distinguishing an accepted marker from a rejected one was
         # whether its prose happened to contain a _CLEAN_PATTERNS phrase.
-        not_clean = any(p.search(body) for p in _BLOCKING_PATTERNS) and not any(
-            c.search(body) for c in _CLEAN_PATTERNS
-        )
-        target = rejected if not_clean else accepted
+        has_clean = any(c.search(body) for c in _CLEAN_PATTERNS)
+        not_clean = any(p.search(body) for p in _BLOCKING_PATTERNS) and not has_clean
+        verdict = "refused" if not_clean else ("clean" if has_clean else "plain")
         # Defense-in-depth follow-up: for rows from /pulls/N/reviews we could ALSO
         # cross-check GitHub's authoritative `commit_id` vs the marker sha (issue comments
         # carry none). Deferred (LOW): the marker sha is matched EXACTLY vs the authoritative
@@ -3022,7 +3041,90 @@ def _scheduled_review_marker_scan(
                     _why += ", and its body reads as carrying a blocking finding"
                 unusable.append((_kind, _why, True))
                 continue
-            target.setdefault(head_m.group(1).lower(), set()).add(_kind)
+            stmts.setdefault((head_m.group(1).lower(), _kind), []).append(
+                (row.get("stamp") or row.get("created_at") or "", verdict)
+            )
+    # RESOLUTION. Each row used to choose its own map, so a second owner comment at the
+    # same head -- same marker, ordinary prose -- was accepted while the first row's [P1]
+    # sat refused, and the gate passed with the finding unchanged. The first fix let any
+    # explicit clean verdict win regardless of order, which passed a LATER [P1] posted
+    # after an earlier verdict. Order is the whole question, so the rule is stated in it:
+    #
+    #   THE OWNER'S LATEST DECISIVE STATEMENT ABOUT (head, kind) GOVERNS.
+    #
+    # Decisive = an explicit clean-verdict line, or a blocking finding. Plain rows (neither)
+    # are not decisive in either direction: they count only when nothing decisive was ever
+    # said. So a plain re-post never overrides a refusal, the documented remedy (re-post
+    # WITH a verdict) still clears a prose-tripped refusal, and a re-run that finds
+    # something after a verdict is heard. Scoped to the head -- a finding on an older
+    # commit is what a new commit fixes. Every superseded row is still LISTED, so the
+    # report never says one block where two exist.
+    for (h, k), seq in stmts.items():
+        decisive = [(st, v) for st, v in seq if v != "plain"]
+        if decisive:
+            # A TIE on real timestamps between contradictory decisive statements is
+            # refused. Sorting is stable, so tied rows keep fetch order -- issue
+            # comments before reviews -- which is not event order; a clean review and a
+            # blocking comment in the same second would otherwise resolve backwards.
+            # Rows with no stamp (the test seam) cannot tie: list order is their order.
+            top = max(st for st, _ in decisive)
+            tied = {v for st, v in decisive if st and st == top}
+            ambiguous = len(tied) > 1
+            final = "refused" if ambiguous else decisive[-1][1]
+        else:
+            ambiguous = False
+            final = "plain"
+        if not ambiguous:
+            (rejected if final == "refused" else accepted).setdefault(h, set()).add(k)
+        if ambiguous:
+            # Failing closed is right; describing it as an ordinary refusal is not. On a
+            # tie the clean verdict IS present and NEITHER statement is later, so both
+            # halves of the usual wording -- "no clean-verdict line overrides it" and
+            # "superseded by a LATER finding" -- state something false about this thread.
+            # The pair is therefore recorded in NEITHER verdict map: staying out of
+            # `accepted` is what blocks (the missing set is computed from `accepted`
+            # alone), and staying out of `rejected` keeps the standard refusal row from
+            # making the false claim. This row is the whole explanation.
+            # One row per BLOCK here too, so the header's count still equals the number
+            # of blocks in the thread; each says what its own block was and why the pair
+            # cannot be ordered.
+            for _, v in seq:
+                what = {
+                    "clean": "an explicit clean verdict",
+                    "refused": "a blocking finding",
+                    "plain": "a plain re-post",
+                }[v]
+                unusable.append(
+                    (
+                        k,
+                        f"{what} at this head; a clean verdict and a blocking finding here "
+                        f"carry the SAME timestamp, so which came last cannot be "
+                        f"established and the finding stands; re-post the verdict so it is "
+                        f"unambiguously later",
+                        True,
+                    )
+                )
+            continue
+        # Every statement that did not become the verdict is still a row -- by STATUS
+        # and by COUNT, so the report never says one block where several were observed.
+        # ONE ROW PER BLOCK -- never a count folded into a row -- so the header's block
+        # count is the number of blocks the operator can see in the thread.
+        superseded = {
+            "plain": "a plain re-post at this head with no verdict line, not decisive",
+            "clean": "an explicit clean verdict at this head, superseded by a LATER blocking finding",
+            "refused": "a refusal at this head, superseded by a LATER explicit clean verdict",
+        }
+        seen_final = False
+        for _, v in seq:
+            if v == final and not seen_final:
+                seen_final = True  # the statement that became the verdict is rendered by its map
+                continue
+            text = (
+                "a further block at this head repeating the same statement"
+                if v == final
+                else superseded[v]
+            )
+            unusable.append((k, text, True))
     return accepted, rejected, unusable
 
 
@@ -3189,9 +3291,9 @@ def _check_scheduled_claude_reviewed_head(
     # steers the reader toward attesting for a review that never ran.
     unscoped = [(k, r) for k, r, _ in unusable if k is None or k not in required_set]
     if unscoped:
-        listing = "".join(
-            f"\n      - [{k or 'no kind named'}] {r}" for k, r in unscoped[:6]
-        ) + (f"\n      - (+{len(unscoped) - 6} more)" if len(unscoped) > 6 else "")
+        # Every row, never a "+N more": a truncated inventory is a partial one, and the
+        # seventh block is as likely as the first to carry the failed-run suffix.
+        listing = "".join(f"\n      - [{k or 'no kind named'}] {r}" for k, r in unscoped)
         parts.append(
             f"unscoped — {len(unscoped)} marker block(s) name no required kind and count "
             f"toward nothing:{listing}"
