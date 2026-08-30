@@ -3243,14 +3243,23 @@ def _pin_file_at_ref(
             # characterise is the thing this gate exists to refuse.
             return None, _PIN_UNDECODABLE, blob
         try:
-            text = base64.b64decode(payload.get("content") or "").decode("utf-8", "replace")
+            text = base64.b64decode(payload.get("content") or "").decode("utf-8")
         except Exception:
-            # Only b64decode can reach this: `.decode(..., "replace")` substitutes
-            # U+FFFD for undecodable bytes and never raises, so non-UTF-8 content is
-            # NOT an error here — it arrives as text with replacement characters and
-            # the checker's own unparseable-pin rule judges it.
-            # Same side as ABSENT: the API said base64 and delivered something else,
-            # so the blob in the PR's tree is what is wrong, not the read.
+            # STRICT decode, deliberately. The previous revision decoded with
+            # "replace" and argued that non-UTF-8 was therefore not an error because
+            # "the checker's own unparseable-pin rule judges it". It does not: the
+            # replacement makes the file PARSEABLE, so that rule never fires.
+            # MEASURED — a head holding a valid ASCII `CC_VERSION` assignment plus a
+            # single 0xff byte in a comment decoded to a clean pin and took the
+            # BACKWARD-rollback exemption, while the local adapter classified the very
+            # same bytes as a blocking content fault. One repository state, two
+            # opposite verdicts, with the AUTHORITATIVE path taking the permissive one.
+            #
+            # Both failure modes land here now — b64decode failing, and bytes that are
+            # not UTF-8 — and both are facts about the blob in the PR's tree rather
+            # than about this read, which is what `_PIN_UNDECODABLE` already means for
+            # an over-1MB blob. Blocking at the head is the same answer
+            # `read_pin_at`/`read_pin_head` give for the identical condition.
             return None, _PIN_UNDECODABLE, blob
         # An EMPTY file is returned as content, deliberately, not as a state of its
         # own. It exists, so it is not absent — and an empty pin is an UNPARSEABLE

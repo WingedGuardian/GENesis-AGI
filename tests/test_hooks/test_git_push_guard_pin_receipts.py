@@ -22,9 +22,11 @@ Network-free via the _TEST_GH_* env-injection seams.
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -829,3 +831,61 @@ def test_the_base_is_read_at_the_PRs_own_ref_not_a_hardcoded_branch(monkeypatch)
 
     assert seen["_TEST_GH_BASE_PIN_FILE"] == "release-2.x", "base not read at the PR's base ref"
     assert seen["_TEST_GH_HEAD_PIN_FILE"] == HEAD, "head not read at the PR head sha"
+
+
+# ── the API decode itself: the seam takes TEXT, so it cannot reach this ──────
+
+
+def _api_response(monkeypatch, raw: bytes):
+    """Fake the contents-API call so the real base64+decode path runs.
+
+    The `_TEST_GH_*_PIN_FILE` seams hand `_pin_file_at_ref` a `str`, which
+    short-circuits exactly the decode under test here — so a seam-based test cannot
+    cover it, and did not.
+    """
+    payload = json.dumps(
+        {
+            "type": "file",
+            "encoding": "base64",
+            "content": base64.b64encode(raw).decode("ascii"),
+            "sha": "d" * 40,
+        }
+    )
+    monkeypatch.setattr(
+        _mod.subprocess,
+        "run",
+        lambda cmd, *a, **kw: SimpleNamespace(returncode=0, stdout=payload, stderr=""),
+    )
+
+
+def test_a_non_utf8_pin_blob_is_UNDECODABLE_not_silently_repaired(monkeypatch):
+    """MEASURED bypass: the gate decoded API content with `errors="replace"`, so a
+    head holding a VALID ascii `CC_VERSION` assignment plus one stray 0xff byte
+    decoded to a perfectly parseable pin and took the backward-rollback exemption —
+    while the local adapter classified the same bytes as a blocking content fault.
+    One repository state, two opposite verdicts, and the AUTHORITATIVE path was the
+    permissive one.
+
+    The replacement is why the checker's unparseable-pin rule never fired: it made
+    the file parseable. Strict decode routes it to `_PIN_UNDECODABLE` instead.
+    """
+    monkeypatch.delenv("_TEST_GH_HEAD_PIN_FILE", raising=False)
+    _api_response(monkeypatch, b'CC_VERSION="${CC_VERSION:-2.1.245}"\n# note \xff\xfe\n')
+
+    text, state, blob = _mod._pin_file_at_ref("headsha", "owner/repo", seam="_UNSET_SEAM_")
+
+    assert state == _mod._PIN_UNDECODABLE, "a non-UTF-8 pin blob must be a content fault"
+    assert text is None
+    assert blob, "the blob sha must survive — two undecodable blobs still differ"
+
+
+def test_a_valid_utf8_pin_blob_still_reads_back(monkeypatch):
+    """Control. Without it, a decode that raised on everything would satisfy the
+    test above while breaking every ordinary read."""
+    monkeypatch.delenv("_TEST_GH_HEAD_PIN_FILE", raising=False)
+    _api_response(monkeypatch, PIN_BASE.encode("utf-8"))
+
+    text, state, _ = _mod._pin_file_at_ref("headsha", "owner/repo", seam="_UNSET_SEAM_")
+
+    assert state == _mod._PIN_OK
+    assert text == PIN_BASE

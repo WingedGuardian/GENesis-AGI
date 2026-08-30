@@ -183,13 +183,33 @@ _MAX_BODY = 65_536
 #: would repair it — which is the wedge this module exists to avoid, arriving by a
 #: different door. Whether the pin is well-formed is only this PR's business when
 #: this PR is the one shipping it.
-_STRICT_SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+#: Components are BOUNDED, and the bound is load-bearing rather than tidiness.
+#: `_numeric_value` calls `int()` on each component, and CPython raises ValueError
+#: above 4300 digits (the integer-string conversion limit). The merge gate catches
+#: that as PLUMBING and returns non-blocking, so `2.1.` followed by 5,000 zeroes and
+#: a 1 walked straight through a gate with no override sigil — an uninstallable pin
+#: merged with no receipts. Nine digits is already ~4 orders of magnitude past any
+#: real Claude Code component, and a version that does not match is simply "not
+#: X.Y.Z", which BLOCKS. Bounding the pattern is what keeps the huge value from
+#: reaching `int()` at all, rather than catching an exception after the fact.
+_MAX_VERSION_DIGITS = 9
+_STRICT_SEMVER = re.compile(
+    rf"^(0|[1-9][0-9]{{0,{_MAX_VERSION_DIGITS - 1}}})"
+    rf"\.(0|[1-9][0-9]{{0,{_MAX_VERSION_DIGITS - 1}}})"
+    rf"\.(0|[1-9][0-9]{{0,{_MAX_VERSION_DIGITS - 1}}})$"
+)
 
 #: Any ``X.Y.Z`` of digits, leading zeros included — the pin's numeric VALUE rather
 #: than its spelling. This is what DIRECTION is computed from, so that a base pin
 #: nobody can respell (``2.1.0218``) still yields the comparison "2.1.218 is the
 #: same version", instead of an unanswerable question that blocks the repair.
-_NUMERIC_SEMVER = re.compile(r"^([0-9]+)\.([0-9]+)\.([0-9]+)$")
+#: Bounded for the same reason as `_STRICT_SEMVER` above — this is the pattern whose
+#: groups are handed to `int()`, so the bound belongs here most of all.
+_NUMERIC_SEMVER = re.compile(
+    rf"^([0-9]{{1,{_MAX_VERSION_DIGITS}}})"
+    rf"\.([0-9]{{1,{_MAX_VERSION_DIGITS}}})"
+    rf"\.([0-9]{{1,{_MAX_VERSION_DIGITS}}})$"
+)
 
 #: Below this many alphanumerics a value is not a receipt, it is a keystroke.
 #: Kills ".", "-", "n/a" and a lone zero-width space. NOT a truthfulness check —
