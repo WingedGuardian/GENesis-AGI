@@ -1193,6 +1193,17 @@ Verify before any commit:
   mention WITHOUT the `Ledger:` marker is context, not completion (the pulse
   only proposes it). Find ids via `session_charter` or the charter injection
   block.
+- **Anything a hook prints to CC's context has a hard, measured ceiling.**
+  The harness FILES a hook's stdout above **10,000 characters per hook entry**
+  (CC 2.1.246; undocumented, version-volatile — see
+  `docs/reference/cc-compatibility.md`) and shows the model a 2 KB preview;
+  the rest silently never arrives. The SessionStart injection is therefore
+  four `--part` entries with per-part budgets, CI ceilings on every tracked
+  identity file (`tests/test_scripts/test_context_injection_budget.py`), and a
+  watcher over the harness's own filings. Adding protocol text to an identity
+  file is a budget decision: put DETAIL in a reference doc and a pointer in the
+  injected file. If you add or grow a hook's stdout, measure it against the
+  cap; after a CC bump, re-run the probe (`GENESIS_CTX_PROBE_BYTES`).
 
 ## Generalizability Gate — build for ANY install, not this one
 

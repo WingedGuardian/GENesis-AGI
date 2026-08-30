@@ -1,0 +1,24 @@
+# Context-injection watcher (awareness hourly band).
+#
+# The Claude Code harness silently persists a SessionStart hook's stdout above
+# an undocumented, version-volatile size threshold — the model then receives a
+# ~2 KB preview and the session runs WITHOUT its identity, charter, and
+# essential knowledge, with nothing anywhere saying so. This watcher reads the
+# GROUND TRUTH (the harness's own persisted files plus the emitter's
+# over-budget self-report) and raises an infrastructure_alert when a fresh
+# filing exists.
+#
+# Values here merge over built-in defaults; a .local.yaml overlay merges over
+# this file. Env kill switch: GENESIS_CONTEXT_INJECTION_WATCH_DISABLED=1.
+
+enabled: true
+
+# How far back a persisted filing counts as a live incident (hours).
+lookback_hours: 24
+
+# Max filings listed inside a single alert.
+max_listed: 5
+
+# critical = the ~5-minute Telegram path. This class ran unnoticed for a month
+# because every layer failed quietly; do not demote without a reason.
+alert_priority: critical

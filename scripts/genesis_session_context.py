@@ -43,16 +43,75 @@ if _SECRETS_PATH.is_file():
 _FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _SETUP_COMPLETE = Path.home() / ".genesis" / "setup-complete"
 _IDENTITY_DIR = Path(__file__).resolve().parent.parent / "src" / "genesis" / "identity"
-_IDENTITY_FILES = ["SOUL.md", "USER.md", "CONVERSATION.md", "STEERING.md"]
+# Which identity files ride which part. Split across two hook entries because
+# each entry gets its own harness budget (see the cap block below).
+_IDENTITY_PARTS = {
+    "identity-core": ["SOUL.md", "STEERING.md"],
+    "identity-user": ["USER.md", "CONVERSATION.md"],
+}
 _SESSION_START_FILE = Path.home() / ".genesis" / "session_start"
 _SESSION_CONFIG = Path.home() / ".genesis" / "session_config.json"
 _SKILLS_DIR = Path(__file__).resolve().parent.parent / "src" / "genesis" / "skills"
 
+# ── The harness output cap, and the part budget ─────────────────────────
+# Claude Code persists a hook's stdout above a size threshold: the WHOLE output
+# goes to a file and the model receives a ~2 KB preview. Everything below the
+# preview is then invisible — not truncated visibly, GONE, with no marker in
+# context saying so.
+#
+# MEASURED 2026-08-30 on this install (CC 2.1.246; ~25 probe sessions via the
+# env-gated seam in main(), method in docs/reference/cc-compatibility.md):
+#   * threshold = EXACTLY 10,000 CHARACTERS of hook stdout (10,000 inline,
+#     10,001 filed; 6,000 two-byte chars = 12,044 BYTES arrived inline, so the
+#     unit is characters, not bytes);
+#   * the budget is PER HOOK ENTRY — two SessionStart hooks emitting 9,000
+#     chars each both arrived inline, in print AND interactive mode. That
+#     per-entry budget is why this script runs as FOUR settings.json entries
+#     (--part charter | identity-core | identity-user | knowledge);
+#   * the threshold MOVES ACROSS VERSIONS: on CC 2.1.218 it sat near the high
+#     20 Ks (filings were rare, 28-32 KB); the 2.1.246 update dropped it to
+#     10 K and the filing rate tripled the SAME DAY. Whether it can also change
+#     WITHOUT a version bump (a remote flag) is UNVERIFIED — the product does
+#     use remote gates, but no evidence ties one to this threshold. Either way
+#     the constant below is a measured value for one pinned version, and the
+#     ALARMS — the per-prompt scream, the awareness watcher over the harness's
+#     own filings — carry the guarantee, never this number. The watcher never
+#     reads this constant, which is what makes it right even when this is wrong.
+_HOOK_STDOUT_CAP = 10_000
+_PART_BUDGET = 9_800
+
+_PARTS = ("charter", "identity-core", "identity-user", "knowledge")
+
+# Room reserved for the trailing `_[ctx <part>: N/M chars]_` self-audit line.
+_AUDIT_LINE_RESERVE = 60
+
+_CONVERSATION_POINTER = (
+    "## Conversation protocol — omitted for size\n\n"
+    "USER.md left this hook's output no room for "
+    "`src/genesis/identity/CONVERSATION.md` under the harness's per-hook stdout "
+    "cap (over it, the WHOLE output is filed away behind a 2 KB preview). Read "
+    "that file directly when conversation protocol matters."
+)
+
+_emitted_chars = 0
+
 
 def _emit(text: str) -> None:
-    """Print a section and flush immediately so it survives a timeout kill."""
+    """Print a section and flush immediately so it survives a timeout kill.
+
+    Streams rather than buffering — the flush-per-section contract is what makes
+    a timeout kill lose only the tail. The counter counts CHARACTERS (the
+    harness's measured unit); `print` adds the newline, so count it.
+    """
+    global _emitted_chars
+    _emitted_chars += len(text) + 1
     print(text)
     sys.stdout.flush()
+
+
+def _fits(block: str, *, reserve: int = 0) -> bool:
+    """Would emitting ``block`` (plus a divider, plus ``reserve``) stay in budget?"""
+    return _emitted_chars + len(block) + 6 + reserve <= _PART_BUDGET
 
 
 def _routed_session_notice(model: str | None) -> str | None:
@@ -257,6 +316,24 @@ def _sync_genesis_hooks() -> None:
 
 
 def main() -> None:
+    # Harness-cap probe (PR-A0 measurement seam — inert unless the env var is
+    # set, which only the probe driver does). The Claude Code harness persists
+    # hook stdout above an UNDOCUMENTED size threshold, replacing it with a
+    # ~2 KB preview; the threshold is not a published constant and is remotely
+    # tunable, so it must be MEASURED on the installed version, not assumed.
+    # Emits exactly N filler characters and nothing else, so the observed
+    # inline-vs-filed outcome is attributable to N alone.
+    _probe = os.environ.get("GENESIS_CTX_PROBE_BYTES")
+    if _probe:
+        try:
+            _n = int(_probe)
+        except ValueError:
+            return
+        _ch = "é" if os.environ.get("GENESIS_CTX_PROBE_MODE") == "multibyte" else "A"
+        sys.stdout.write("PROBE-START " + _ch * _n + " PROBE-END")
+        sys.stdout.flush()
+        return
+
     # Eject lever: flag file absent → no Genesis context
     if not _FLAG.exists():
         return
@@ -289,10 +366,48 @@ def main() -> None:
     elif _hook_session_id:
         _hook_model = _cached_session_model(_hook_session_id)
 
+    # ── Which PART of the injection this invocation emits ──────────────
+    # The harness budget is PER HOOK ENTRY (measured — see the cap comment at
+    # the top), so settings.json wires this script FOUR times with --part
+    # charter | identity-core | identity-user | knowledge, in that order, each
+    # under its own 10,000-char budget. No argument = ALL parts in sequence —
+    # the test/manual path ONLY: wired as a single hook it would exceed the
+    # per-entry cap, which is precisely the bug this split fixes (a wiring
+    # test pins the four-entry form in settings.json).
+    # FAIL CLOSED on a mis-wire. `all` emits every part under ONE hook entry,
+    # which is guaranteed to exceed the cap — the exact bug this split fixes —
+    # so it is reachable ONLY by an explicit `--part all` (tests, manual runs),
+    # never as a fallback. A missing or unrecognised --part means the wiring
+    # and this script disagree, which happens in production through version
+    # skew: `.claude/hooks/genesis-hook` runs the MAIN-tree script, so a
+    # worktree still carrying single-entry settings.json invokes the new script
+    # with no --part. MEASURED on this branch (the inverse skew): four-entry
+    # settings.json against the old main-tree script produced clustered ~31 KB
+    # filings. A mis-wire therefore degrades to the charter part ALONE — small,
+    # in-budget, and loud — instead of one guaranteed silent filing.
+    part = "charter"
+    miswired = ""
+    if "--part" in sys.argv:
+        try:
+            requested = sys.argv[sys.argv.index("--part") + 1]
+        except IndexError:
+            requested = ""
+        if requested in (*_PARTS, "all"):
+            part = requested
+        else:
+            miswired = f"--part {requested!r} is not one of {(*_PARTS, 'all')}"
+    else:
+        miswired = "no --part argument (settings.json wiring is out of date)"
+
+    def _in(*parts: str) -> bool:
+        return part == "all" or part in parts
+
     # Phase 6: self-heal Genesis git hooks before doing anything else.
     # Runs on every session start so community installs auto-pick up hook
-    # updates without requiring a bootstrap.sh re-run.
-    _sync_genesis_hooks()
+    # updates without requiring a bootstrap.sh re-run. Charter part only —
+    # four concurrent invocations must not race four sync subprocesses.
+    if _in("charter"):
+        _sync_genesis_hooks()
 
     # Bridge-dispatched sessions get identity via --system-prompt; skip those
     # sections but still inject procedures, temporal context, and capabilities.
@@ -300,19 +415,19 @@ def main() -> None:
 
     first = True
 
-    if not is_genesis_session:
+    if not is_genesis_session and _in("charter"):
         # Record session start time for the urgent-alert UserPromptSubmit hook
         # (bridge manages its own session tracking)
         _SESSION_START_FILE.parent.mkdir(parents=True, exist_ok=True)
         _SESSION_START_FILE.write_text(datetime.now(UTC).isoformat())
 
-        # 0.5. Session Configuration — inject the effort level AND the
-        # first-reply status-header directive into the highest-salience slot
-        # (the very top of the injection). The header (`[<model> / <effort>]`)
-        # is fully specified in CONVERSATION.md → "Session Start", but that spec
-        # sits hundreds of lines deep and gets buried under the user's first
-        # task, so it fired unreliably. Echoing the directive here — where the
-        # LLM reads it first — is what makes it emit. The MODEL is now injected
+        # 0.5. Session Configuration — the effort level AND the first-reply
+        # status-header directive. The header (`[<model> / <effort>]`) is fully
+        # specified in CONVERSATION.md → "Session Start", but that spec sits
+        # hundreds of lines deep and gets buried under the user's first task, so
+        # it fired unreliably; echoing the directive in its own short block is
+        # what makes it emit. (It no longer arrives "at the top" — see the
+        # ordering note on the charter block below.) The MODEL is now injected
         # authoritatively from CC's SessionStart `model` field (re-sent on every
         # compact, unlike the "You are powered by …" env line, which freezes at
         # original session start and goes stale after a /model switch or a
@@ -334,23 +449,81 @@ def main() -> None:
         )
         first = False
 
-        # 1. Identity files (disk, always available, no external deps)
-        for name in _IDENTITY_FILES:
-            path = _IDENTITY_DIR / name
-            if path.exists():
+        # 0.6. Session charter (advisory): the immutable origin + living mission
+        # + the OPEN ledger — persisted by the PreCompact hook
+        # (scripts/genesis_precompact.py) and re-asserted into every window so
+        # recency-biased compaction can never erase what this session is FOR.
+        # Foreground-only.
+        #
+        # ORDERING, MEASURED (2026-08-30, 4 real sessions): CC concatenates
+        # parallel SessionStart hook output in COMPLETION order, not
+        # settings-declaration order. This part does a subprocess + a DB read +
+        # a worker spawn, so it reliably lands LAST (4/4), and the two disk-only
+        # identity parts swap between runs. Do NOT reason about where a block
+        # appears relative to another part. That costs nothing now: every part
+        # is under the per-hook cap, so everything ARRIVES — landing near the
+        # user's first message is if anything better for attention. It mattered
+        # only in the pre-split world, where being late meant being filed away.
+        try:
+            _charter_block = _charter_emission_block(_hook_session_id, _hook_source)
+            if _charter_block:
+                _emit("\n\n---\n\n")
+                _emit(_charter_block)
+        except Exception:
+            pass  # Charter is advisory — never block session start
+
+    # 1. Identity files (disk, always available, no external deps), split
+    # across two PARTS so each rides its own 10 K hook budget:
+    #   identity-core: SOUL + STEERING (tracked; CI ceilings pin their sizes)
+    #   identity-user: USER + CONVERSATION (USER is install-local — CI cannot
+    #     see it, so the guard is runtime: CONVERSATION degrades to a pointer
+    #     when USER leaves it no room, and an oversized USER itself truncates
+    #     LOUDLY rather than silently taking the part over the cliff).
+    if not is_genesis_session:
+        for _pname, _files in _IDENTITY_PARTS.items():
+            if not _in(_pname):
+                continue
+            for _idx, name in enumerate(_files):
+                path = _IDENTITY_DIR / name
+                if not path.exists():
+                    continue
                 content = path.read_text(encoding="utf-8").strip()
-                if content:
-                    if not first:
-                        _emit("\n\n---\n\n")
-                    _emit(content)
-                    first = False
+                if not content:
+                    continue
+                # Room this part still owes AFTER this file: the audit line, and
+                # the elision pointer for any file still to come in this part.
+                # Without the second term an oversized USER.md truncates to
+                # exactly the budget and the CONVERSATION pointer that follows
+                # pushes the part over — a marker + scream for a window that
+                # actually lost nothing. Loud-but-wrong is still wrong.
+                _tail = _AUDIT_LINE_RESERVE + (
+                    len(_CONVERSATION_POINTER) + 6 if _idx + 1 < len(_files) else 0
+                )
+                if name == "CONVERSATION.md" and not _fits(content, reserve=_AUDIT_LINE_RESERVE):
+                    content = _CONVERSATION_POINTER
+                elif not _fits(content, reserve=_tail):
+                    # A never-elided file that alone busts the part budget:
+                    # truncate visibly. Losing the tail of one file beats the
+                    # harness silently filing the ENTIRE part.
+                    keep = max(0, _PART_BUDGET - _emitted_chars - _tail - 200)
+                    content = (
+                        content[:keep] + f"\n\n_[{name} truncated at {keep} chars — the full file "
+                        "exceeds this hook's stdout budget; read "
+                        f"src/genesis/identity/{name} directly.]_"
+                    )
+                if not first:
+                    _emit("\n\n---\n\n")
+                _emit(content)
+                first = False
 
     # 1.5. First-run onboarding detection
     # Inject the onboarding prompt while the install is not yet FUNCTIONAL — the
     # live floor (CC login + an LLM key + an embedding key), not merely while the
     # bootstrap marker is absent. So a bootstrapped-but-keyless box is still guided.
     # If the floor helper can't be imported for any reason, fall back to the marker.
-    if not is_genesis_session:
+    # Charter part: highest-salience slot, and on the fresh installs where this
+    # fires the charter itself is tiny, so the part budget has ample room.
+    if not is_genesis_session and _in("charter"):
         try:
             from genesis.onboarding.floor import compute_floor
 
@@ -384,31 +557,33 @@ def main() -> None:
     if is_genesis_session:
         # 2. Cognitive state from DB — for ego/background sessions only.
         # Foreground sessions get essential knowledge instead (see below).
-        try:
-            cog = asyncio.run(_load_cognitive_state(last_session_data))
-            if cog:
+        # Charter part (the dispatched session's highest-salience block).
+        if _in("charter"):
+            try:
+                cog = asyncio.run(_load_cognitive_state(last_session_data))
+                if cog:
+                    if not first:
+                        _emit("\n\n---\n\n")
+                    _emit("## Current Cognitive State\n\n" + cog)
+                    first = False
+            except Exception:
                 if not first:
                     _emit("\n\n---\n\n")
-                _emit("## Current Cognitive State\n\n" + cog)
+                _emit(
+                    "## GENESIS ALERT: Cognitive State Unavailable\n\n"
+                    "The database query for cognitive state failed. This may indicate "
+                    "a DB or system health issue.\n\n"
+                    "**Action:** Use the health_status MCP tool to investigate, or check "
+                    "`~/.genesis/status.json` for current resilience state."
+                )
                 first = False
-        except Exception:
-            if not first:
-                _emit("\n\n---\n\n")
-            _emit(
-                "## GENESIS ALERT: Cognitive State Unavailable\n\n"
-                "The database query for cognitive state failed. This may indicate "
-                "a DB or system health issue.\n\n"
-                "**Action:** Use the health_status MCP tool to investigate, or check "
-                "`~/.genesis/status.json` for current resilience state."
-            )
-            first = False
     else:
-        # 2. Essential knowledge for foreground sessions.
+        # 2. Essential knowledge for foreground sessions (knowledge part).
         # Replaces cognitive state — shows what Genesis knows, not system health.
         # Critical alerts only surface if genuinely user-blocking.
         _ek_file = Path.home() / ".genesis" / "essential_knowledge.md"
         _ek_emitted = False
-        if _ek_file.exists():
+        if _in("knowledge") and _ek_file.exists():
             try:
                 ek_content = _ek_file.read_text(encoding="utf-8").strip()
                 if ek_content:
@@ -427,40 +602,33 @@ def main() -> None:
         # NO "---" divider so it reads as session context for recollection, not
         # a standalone report to recite at the user. Foreground-only (this is
         # the non-genesis-session branch). Writer: genesis.memory.open_loops.
-        try:
-            _inflight = _load_inflight_block()
-            for _chunk in _inflight_emission_chunks(_inflight, ek_emitted=_ek_emitted, first=first):
-                _emit(_chunk)
-            if _inflight:
-                first = False
-        except Exception:
-            pass  # In-flight state is advisory — never block session start
+        if _in("knowledge"):
+            try:
+                _inflight = _load_inflight_block()
+                for _chunk in _inflight_emission_chunks(
+                    _inflight, ek_emitted=_ek_emitted, first=first
+                ):
+                    _emit(_chunk)
+                if _inflight:
+                    first = False
+            except Exception:
+                pass  # In-flight state is advisory — never block session start
 
-        # Session charter (advisory): the immutable origin + living mission
-        # persisted by the PreCompact hook (scripts/genesis_precompact.py) —
-        # re-asserted into every window so recency-biased compaction can
-        # never erase what this session is FOR. Foreground-only.
-        try:
-            _charter_block = _charter_emission_block(_hook_session_id, _hook_source)
-            if _charter_block:
-                if not first:
-                    _emit("\n\n---\n\n")
-                _emit(_charter_block)
-                first = False
-        except Exception:
-            pass  # Charter is advisory — never block session start
+        # (The charter block is emitted in the charter part, directly under
+        # Session Configuration — see there for why it is not here.)
 
         # Repo-pulse worker (advisory): fire-and-forget the global merged-PR
-        # ↔ open-ledger matcher (PR-4a). The charter block above surfaces the
+        # ↔ open-ledger matcher (PR-4a). The charter block surfaces the
         # PREVIOUS completed pulse's proposals — one boundary behind at
         # worst, by design (a pulse takes ~1 gh round-trip + 1 Haiku call).
         # The helper is fail-open end-to-end; pulse must never block session
-        # start.
-        _spawn_repo_pulse_worker(_hook_source)
+        # start. Charter part (it feeds the charter's proposal sub-block).
+        if _in("charter"):
+            _spawn_repo_pulse_worker(_hook_source)
 
         # Critical-only alert: surface genuinely user-blocking issues (DB down, etc.)
         _status_file = Path.home() / ".genesis" / "status.json"
-        if _status_file.exists():
+        if _in("knowledge") and _status_file.exists():
             try:
                 import json as _json_status
 
@@ -488,7 +656,7 @@ def main() -> None:
         # fail-open), mirroring the status.json read above.
         # Writer: src/genesis/cc/fallback_state.py.
         _fallback_file = Path.home() / ".genesis" / "cc_fallback_state.json"
-        if _fallback_file.exists():
+        if _in("knowledge") and _fallback_file.exists():
             try:
                 import json as _json_fb
 
@@ -515,7 +683,12 @@ def main() -> None:
 
         # Routed-session NOTICE (advisory): surfaces when `gmodel <peer>` launched
         # this window on a non-Anthropic roster model (see _routed_session_notice).
-        _routed_notice = _routed_session_notice(os.environ.get("GENESIS_ROSTER_MODEL"))
+        # Never elided (correctness: it tells the model what it is running on).
+        _routed_notice = (
+            _routed_session_notice(os.environ.get("GENESIS_ROSTER_MODEL"))
+            if _in("knowledge")
+            else None
+        )
         if _routed_notice:
             if not first:
                 _emit("\n\n---\n\n")
@@ -527,7 +700,7 @@ def main() -> None:
         from genesis.learning.procedural.session_inject import load_active_procedures
 
         _db_path = Path.home() / "genesis" / "data" / "genesis.db"
-        procedures = asyncio.run(load_active_procedures(_db_path))
+        procedures = asyncio.run(load_active_procedures(_db_path)) if _in("knowledge") else ""
         if procedures:
             if not first:
                 _emit("\n\n---\n\n")
@@ -541,7 +714,7 @@ def main() -> None:
         pass  # Procedures are advisory; silent failure is correct
 
     # 2.6. Codebase L0 — package index from AST code index (advisory)
-    if not is_genesis_session:
+    if not is_genesis_session and _in("knowledge"):
         try:
             import aiosqlite
 
@@ -577,16 +750,25 @@ def main() -> None:
                         "\nUse `codebase_navigate` MCP tool for drill-down "
                         "(L1: modules in a package, L2: symbols in a module)."
                     )
+                    _l0_block = "\n".join(lines)
+                    if not _fits(_l0_block):
+                        # Elidable: the package index is a convenience view of
+                        # data `codebase_navigate` serves on demand.
+                        _l0_block = (
+                            "## Codebase\n\nPackage index omitted for byte budget — "
+                            "use the `codebase_navigate` MCP tool (L0: packages, "
+                            "L1: modules, L2: symbols)."
+                        )
                     if not first:
                         _emit("\n\n---\n\n")
-                    _emit("\n".join(lines))
+                    _emit(_l0_block)
                     first = False
         except Exception:
             pass  # Codebase index is advisory — silent failure is correct
 
     # 3. Previous session context (temporal awareness — uses pre-loaded data)
     try:
-        prev_session = _format_previous_session(last_session_data)
+        prev_session = _format_previous_session(last_session_data) if _in("knowledge") else None
         if prev_session:
             if not first:
                 _emit("\n\n---\n\n")
@@ -597,7 +779,7 @@ def main() -> None:
 
     # 4. Resume signal (user signaled they want to return)
     try:
-        resume_signal = _load_resume_signal()
+        resume_signal = _load_resume_signal() if _in("knowledge") else None
         if resume_signal:
             if not first:
                 _emit("\n\n---\n\n")
@@ -607,6 +789,11 @@ def main() -> None:
         pass  # Resume signal is advisory
 
     # 5. Capabilities + MCP tools (dynamic from registry, fallback to static)
+    # Knowledge part only — the remaining blocks all belong to it, so parts
+    # that are not "knowledge" finish here with their audit + marker.
+    if not _in("knowledge"):
+        _finish_part(part, _hook_session_id, miswired)
+        return
     if not first:
         _emit("\n\n---\n\n")
 
@@ -651,7 +838,13 @@ def main() -> None:
                 "(research, outreach, browser automation, etc.). "
                 "The skill injection hook nudges you when one matches."
             )
-            _emit("\n".join(lines))
+            _caps_block = "\n".join(lines)
+            # First tier of the elision ladder: the capability roster is the
+            # largest block whose content is recoverable on demand, and CC
+            # injects the real MCP tool list separately anyway (see the comment
+            # above). Degrade to the fallback pointer before touching anything
+            # per-session.
+            _emit(_caps_block if _fits(_caps_block) else _mcp_fallback)
         except Exception:
             _emit(_mcp_fallback)
     else:
@@ -691,6 +884,127 @@ def main() -> None:
                 )
         except Exception:
             pass  # Crash reporting itself must not crash the hook
+
+    _finish_part(part, _hook_session_id, miswired)
+
+
+# Per-(session, part) over-budget markers. NOT one shared file: the four parts
+# run as four CONCURRENT hook invocations, so a shared dict would be a
+# read-modify-write race in which an under-budget sibling's clear erases an
+# over-budget part's entry — an alarm that races is not an alarm. It was also
+# global, so one session's clean start silenced another session's live loss.
+# One file per writer removes both by construction.
+_MARKER_STEM = "injection_over_budget"
+_MARKER_LEGACY = Path.home() / ".genesis" / "session_awareness" / f"{_MARKER_STEM}.json"
+
+
+def _marker_dir(session_id: str) -> Path | None:
+    """The per-session marker directory, or None when the id is unsafe as a path.
+
+    Uses the shared ``hook_input.session_path`` chokepoint (the sibling
+    UserPromptSubmit hook imports it the same way) rather than re-deriving the
+    id guard here — hooks previously hand-copied that check in three shapes and
+    omitted it in four files.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+        from hook_input import session_path
+    except Exception:
+        return None
+    return session_path(Path.home() / ".genesis" / "sessions", session_id)
+
+
+def _marker_path(session_id: str, part: str) -> Path:
+    """Where THIS invocation records its own over-budget state.
+
+    Falls back to a session-less global path when the id is unusable, so a
+    weird session id degrades to a noisier alarm, never to a silent one.
+    """
+    d = _marker_dir(session_id)
+    if d is None:
+        return _MARKER_LEGACY.with_name(f"{_MARKER_STEM}_{part}.json")
+    return d / f"{_MARKER_STEM}_{part}.json"
+
+
+def _finish_part(part: str, session_id: str, miswired: str = "") -> None:
+    """Per-part self-audit + over-budget/mis-wire marker. Once per invocation.
+
+    The audit line makes the state legible IN-BAND every window instead of
+    discoverable months later from filed artifacts; the marker is what the
+    per-prompt tag screams about until a later healthy run of the same part
+    clears it. The manual/test ``all`` mode skips the marker (a manual full run
+    legitimately exceeds one hook's budget and must not raise a false alarm)
+    but keeps the audit line.
+    """
+    over = _emitted_chars > _PART_BUDGET
+    _emit(f"\n_[ctx {part}: {_emitted_chars}/{_PART_BUDGET} chars]_")
+    if miswired:
+        _write_marker(
+            "wiring",
+            session_id,
+            reason=f"session-context hook invoked with {miswired}",
+            over=True,
+        )
+        print(
+            f"[session_context] MIS-WIRED: {miswired}. Emitted the charter part only "
+            "so this invocation stays under the harness cap; the rest of the context "
+            "is MISSING from this session. Fix the SessionStart wiring in "
+            ".claude/settings.json (four --part entries).",
+            file=sys.stderr,
+        )
+        return
+    if part != "all":
+        _write_marker(part, session_id, reason="", over=over)
+    if over:
+        print(
+            f"[session_context] part '{part}' emitted {_emitted_chars} chars against a "
+            f"{_PART_BUDGET}-char budget (the harness FILES hook stdout above "
+            f"{_HOOK_STDOUT_CAP} chars and previews ~2 KB) — this part may not have "
+            "reached the model.",
+            file=sys.stderr,
+        )
+
+
+def _write_marker(part: str, session_id: str, *, reason: str, over: bool) -> None:
+    """Create or remove THIS part's marker file. No shared state, no RMW.
+
+    Fail-open both ways: an unwritable marker must never break session start,
+    and a failed CLEAR leaves a stale alarm (annoying, loud, safe) rather than a
+    silent one.
+    """
+    import json
+
+    path = _marker_path(session_id, part)
+    try:
+        if over:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "part": part,
+                        "session_id": session_id,
+                        "chars": _emitted_chars,
+                        "budget": _PART_BUDGET,
+                        "reason": reason,
+                        "ts": datetime.now(UTC).isoformat(),
+                    }
+                )
+            )
+        elif path.exists():
+            path.unlink()
+    except OSError as exc:
+        # Fail-open on the WRITE (a marker must never break session start) but
+        # never fail QUIET: an unwritable sessions dir would otherwise take the
+        # per-prompt scream with it, which is the silent-failure class this
+        # whole change exists to remove. The hourly ground-truth watcher still
+        # covers it — this line is what makes the degrade visible NOW rather
+        # than at the next tick.
+        print(
+            f"[session_context] could not record the '{part}' budget marker at {path}: "
+            f"{exc}. The per-prompt alarm for this session is DEGRADED; the hourly "
+            "context-injection watcher is the remaining cover.",
+            file=sys.stderr,
+        )
 
 
 def _load_last_session_data() -> dict | None:
@@ -956,6 +1270,112 @@ def _pulse_floor() -> float:
     return floor
 
 
+# Mirrors MAX_MISSION_CHARS / the origin cap in db/crud/session_charters.py.
+# The store bounds these on write; re-cutting them here only hid text.
+_MISSION_CAP = 1_000
+_ORIGIN_CAP = 1_200
+# Whole-block ceiling. Generous by design: the charter is the one per-session,
+# actionable block in the injection, and a real one (origin + mission + a few
+# open rows) is a fraction of this. When it IS hit the degrade is structured —
+# see _shrink_charter_block — never a mid-row slice.
+_CHARTER_BLOCK_MAX = 8_000
+
+
+def _ledger_lines(
+    ledger: list[dict], escalations: dict, *, text_cap: int | None = None
+) -> list[str]:
+    """One line per OPEN ledger row: full text, full id, escalation link if any.
+
+    Rows render UNCUT by default. The 120-char cut this replaces turned a
+    founding agreement into a fragment that stopped mid-clause, which reads as a
+    stray note rather than a commitment — the id is what `session_ledger_update`
+    needs, and the text is what makes the row mean anything.
+
+    ``text_cap`` is for the degrade tier only, and note WHERE it cuts: the id
+    leads the line so shortening the text can never cost the handle. Capping a
+    trailing-id format is how a first version of this dropped every id in the
+    degrade — caught by its own test.
+    """
+    out = []
+    for item in ledger:
+        mark = "~" if item.get("status") == "in_progress" else " "
+        row_id = str(item.get("id", ""))
+        text = str(item.get("text", ""))
+        link = ""
+        esc = escalations.get(row_id)
+        if esc:
+            # A revived session must be able to close BOTH records; without the
+            # id it would have to go looking for a follow-up it does not know
+            # exists.
+            link = f" → escalated: follow_up {str(esc[0])[:8]} ({esc[1]})"
+        if text_cap is not None:
+            if len(text) > text_cap:
+                text = text[:text_cap] + "…"
+            out.append(f"- [{mark}] (id: {row_id}) {text}{link}")
+        else:
+            out.append(f"- [{mark}] {text} (id: {row_id}){link}")
+    return out
+
+
+def _shrink_charter_block(
+    header: str,
+    ledger_header: str,
+    ledger: list[dict],
+    escalations: dict,
+    footer: str,
+    session_id: str,
+) -> str:
+    """Fit an oversized charter block WITHOUT losing an open row id.
+
+    A flat slice at N characters cuts mid-row and takes every id after it, so
+    the block silently stops naming the agreements it exists to name while still
+    LOOKING complete. This degrades by TIER instead — prose, then row text, then
+    rows to bare ids — rebuilding from the row DATA rather than re-cutting
+    rendered strings. Re-cutting was the first version and it dropped every id,
+    because the id trailed the text it was shortening; its own test caught it.
+    The footer (carrying the charter.md path) survives every tier, so the full
+    text is always one Read away.
+    """
+    note = (
+        "_Origin and mission omitted for length \u2014 full charter at"
+        f" ~/.genesis/sessions/{session_id}/charter.md_"
+    )
+
+    def _assemble(rows: list[str], ledger_line: str) -> str:
+        return "\n".join([header, "", note, "", ledger_line, *rows, "", footer])
+
+    # Tier 2: drop origin/mission/pointers/pulse; rows stay whole.
+    tier2 = _assemble(_ledger_lines(ledger, escalations), ledger_header)
+    if len(tier2) <= _CHARTER_BLOCK_MAX:
+        return tier2
+
+    # Tier 3: id FIRST, text trimmed to a lead fragment.
+    tier3 = _assemble(_ledger_lines(ledger, escalations, text_cap=140), ledger_header)
+    if len(tier3) <= _CHARTER_BLOCK_MAX:
+        return tier3
+
+    # Tier 4: ids only. Nothing else survives, but nothing is INVISIBLE — every
+    # open row is still named and addressable by session_ledger_update.
+    ids = [str(item.get("id", "")) for item in ledger]
+    return _assemble(
+        [f"- {i}" for i in ids],
+        f"**Ledger (open) \u2014 {len(ids)} rows, ids only for length:**",
+    )
+
+
+def _escalation_dedup_key(ledger_id: str) -> str:
+    """`follow_ups.dedup_key` linking a ledger row to its escalation follow-up.
+
+    Inlined rather than imported: this hook is stdlib-only by design, so a broken
+    venv can never wedge a session. `genesis.session_awareness.ledger_escalation_link`
+    owns the formula and a parity test asserts these two agree — a change there
+    that this does not follow fails loudly instead of silently unlinking rows.
+    """
+    import hashlib
+
+    return hashlib.sha256(f"ledger_escalation|{ledger_id}".encode()).hexdigest()
+
+
 def _load_charter_db(session_id: str, db_path: Path | None) -> tuple[dict | None, list[dict]]:
     """Charter row + open/in_progress ledger items from the canonical DB.
 
@@ -989,12 +1409,40 @@ def _load_charter_db(session_id: str, db_path: Path | None) -> tuple[dict | None
                 except (ValueError, TypeError):
                     charter["pointers"] = []
                 cur = await db.execute(
+                    # LIMIT is a sanity bound, not a display cap: every open row
+                    # renders. The old LIMIT 6 silently dropped the 7th
+                    # agreement, and a dropped row is indistinguishable from a
+                    # session that never made one.
                     "SELECT id, text, status FROM session_ledger"
                     " WHERE session_id = ? AND status IN ('open','in_progress')"
-                    " ORDER BY created_at LIMIT 6",
+                    " ORDER BY created_at LIMIT 200",
                     (session_id,),
                 )
                 items = [dict(r) for r in await cur.fetchall()]
+                try:
+                    # Escalation links (own guard, like the pulse read below):
+                    # a row left undisposed long enough becomes a follow-up, and
+                    # a session that comes back alive has to SEE that so it can
+                    # close both. Keyed on the follow-up's dedup_key, which is
+                    # uniquely indexed. An install without the follow_ups table
+                    # renders exactly as before.
+                    _keys = {_escalation_dedup_key(str(i["id"])): str(i["id"]) for i in items}
+                    if _keys:
+                        cur = await db.execute(
+                            "SELECT id, status, dedup_key FROM follow_ups"  # noqa: S608
+                            # Interpolates only a run of '?' placeholders whose
+                            # COUNT comes from len(_keys); every value is bound.
+                            f" WHERE dedup_key IN ({','.join('?' * len(_keys))})",
+                            tuple(_keys),
+                        )
+                        _esc = {}
+                        for r in await cur.fetchall():
+                            _lid = _keys.get(r["dedup_key"])
+                            if _lid:
+                                _esc[_lid] = (r["id"], r["status"])
+                        charter["_escalations"] = _esc
+                except Exception:
+                    charter["_escalations"] = {}
                 cur = await db.execute(
                     "SELECT status, COUNT(*) FROM session_ledger"
                     " WHERE session_id = ? GROUP BY status",
@@ -1079,8 +1527,8 @@ def _charter_emission_block(
     origin = str(charter.get("origin_prompt") or "").strip()
     if not origin:
         return ""
-    if len(origin) > 1200:
-        origin = origin[:1200] + " …[truncated — full text in charter.md]"
+    if len(origin) > _ORIGIN_CAP:
+        origin = origin[:_ORIGIN_CAP] + " …[truncated — full text in charter.md]"
     origin_quoted = "\n".join(f"> {line}" for line in origin.splitlines())
 
     lines = [
@@ -1091,17 +1539,32 @@ def _charter_emission_block(
         origin_quoted,
     ]
     mission = str(charter.get("mission") or "").strip()
+    compactions = charter.get("compaction_count", 0) or 0
     if mission:
-        lines += ["", f"**Mission:** {mission[:200]}"]
+        # Cap mirrors MAX_MISSION_CHARS in db/crud/session_charters.py — the
+        # store already bounds this, so re-cutting it at 200 only ever hid text
+        # the writer deliberately kept. (Not imported: this hook is stdlib-only.)
+        lines += ["", f"**Mission:** {mission[:_MISSION_CAP]}"]
+    elif compactions >= 1:
+        # A charter whose mission was never set falls back to the raw origin
+        # everywhere it is displayed, and a raw origin is often a half-formed
+        # first sentence that reads as noise — so the session tunes it out and
+        # the ledger goes with it. After a compaction the purpose IS knowable,
+        # so say the field is empty rather than showing something that isn't.
+        lines += [
+            "",
+            f"**Mission:** _not set after {compactions} compactions — set it via"
+            " session_charter_update when the purpose is clear._",
+        ]
     pointers = charter.get("pointers") or []
     if pointers:
         lines += ["", "**Pointers:**"]
         lines += [f"- {str(p)[:100]}" for p in pointers[:6]]
+    escalations = charter.get("_escalations") or {}
+    ledger_header = "**Ledger (open) — close via session_ledger_update:**"
     if ledger:
-        lines += ["", "**Ledger (open) — close via session_ledger_update:**"]
-        for item in ledger:
-            mark = "~" if item.get("status") == "in_progress" else " "
-            lines.append(f"- [{mark}] {str(item.get('text', ''))[:120]} (id: {item.get('id', '')})")
+        lines += ["", ledger_header]
+        lines += _ledger_lines(ledger, escalations)
     proposals = charter.get("_pulse_proposals") or []
     if proposals:
         # Repo-pulse fuzzy/bare-hex proposals (PR-4a): the exact marker tier
@@ -1126,12 +1589,14 @@ def _charter_emission_block(
         closed_n = sum(counts.values()) - open_n
         footer += f" · ledger: {open_n} open / {closed_n} closed"
     footer += f" · full charter: ~/.genesis/sessions/{session_id}/charter.md_"
-    lines += ["", footer]
-    block = "\n".join(lines)
-    # ~600-token ceiling (char proxy): bounded by construction in the typical
-    # case; the guard only bites on pathological field contents.
-    if len(block) > 2800:
-        block = block[:2800] + "\n_…[truncated — full charter in charter.md]_"
+    block = "\n".join([*lines, "", footer])
+    if len(block) > _CHARTER_BLOCK_MAX:
+        # Structured degrade, not a slice: a flat cut lands mid-row and takes
+        # every id after it with no marker, so the block stops naming the
+        # agreements it exists to name while still LOOKING complete.
+        block = _shrink_charter_block(
+            lines[0], ledger_header, ledger, escalations, footer, session_id
+        )
     return block
 
 

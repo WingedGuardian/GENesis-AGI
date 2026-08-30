@@ -190,17 +190,52 @@ def _ro_uri(db_path: Path) -> str:
     return f"file:{pathname2url(str(db_path))}?mode=ro"
 
 
-def _emit_charter_tag(session_id: str) -> None:
-    """One-line drift tag: [Charter: <mission|origin snippet> | open: N].
+# The tag runs on EVERY prompt, so it is bounded on three axes: rows shown,
+# characters per row, and total bytes. Generous enough that an ordinary ledger
+# renders whole; the caps exist so a pathological one cannot flood every turn.
+_TAG_MAX_ROWS = 8
+_TAG_ROW_CHARS = 140
+_TAG_MISSION_CHARS = 80
+_TAG_MAX_BYTES = 1_500
 
-    Read-only stdlib sqlite3, mode=ro URI (WAL-aware — never immutable=1,
-    which misses un-checkpointed writes), 500ms connect / 300ms busy budget:
-    this runs on EVERY prompt and must never cost the user anything.
-    Omitted entirely when the session has no charter row yet (pre-first-
-    compaction — the origin is still in context), the DB/table is missing
-    (un-migrated install), or the DB is locked. open counts open+in_progress
-    ledger rows; "open: 0" IS shown for a chartered session — a clear ledger
-    is signal.
+
+def _escalation_dedup_key(ledger_id: str) -> str:
+    """`follow_ups.dedup_key` linking a ledger row to its escalation follow-up.
+
+    Inlined rather than imported: this hook is stdlib-only by design (a broken
+    venv must never wedge a prompt). `genesis.session_awareness.ledger_escalation_link`
+    owns the formula; `tests/test_scripts/test_urgent_alerts_charter_tag.py`
+    asserts THIS function equals the package one, so a change there that this
+    does not follow fails loudly instead of silently unlinking every row.
+    """
+    import hashlib
+
+    return hashlib.sha256(f"ledger_escalation|{ledger_id}".encode()).hexdigest()
+
+
+def _emit_charter_tag(session_id: str) -> None:
+    """Per-prompt ledger INVENTORY: the head line plus one line per open row.
+
+    This used to print a COUNT — `[Charter: <label> | open: N]`. A count is
+    indistinguishable from N items already handled, and that is not theoretical:
+    a session ran seven days with three founding agreements open behind exactly
+    that number while the model read past it every turn. The same
+    count-instead-of-inventory defect had just been fixed in the merge gate.
+    So every open row is NAMED here, with the id `session_ledger_update` needs.
+
+    The label degrades honestly too. With no mission set the old tag fell back to
+    the origin prompt's first 60 characters, which for a spoken prompt is a
+    half-formed clause that reads as noise — so after a compaction (when the
+    purpose IS knowable) it says the field is UNSET instead, and names the tool
+    that fills it.
+
+    Read-only stdlib sqlite3, mode=ro URI (WAL-aware — never immutable=1, which
+    misses un-checkpointed writes), 500ms connect / 300ms busy budget: this runs
+    on EVERY prompt and must never cost the user anything. Omitted entirely when
+    the session has no charter row yet (pre-first-compaction — the origin is
+    still in context), the DB/table is missing (un-migrated install), or the DB
+    is locked. "open: 0" IS shown for a chartered session — a clear ledger is
+    signal.
     """
     try:
         root = os.environ.get("GENESIS_REPO_ROOT", "")
@@ -211,32 +246,101 @@ def _emit_charter_tag(session_id: str) -> None:
         try:
             conn.execute("PRAGMA busy_timeout=300")
             row = conn.execute(
-                "SELECT mission, origin_prompt FROM session_charters"
+                "SELECT mission, origin_prompt, compaction_count FROM session_charters"
                 " WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
             if row is None:
                 return
+            rows = conn.execute(
+                "SELECT id, text, status FROM session_ledger WHERE session_id = ?"
+                " AND status IN ('open','in_progress') ORDER BY created_at LIMIT ?",
+                (session_id, _TAG_MAX_ROWS),
+            ).fetchall()
             (open_n,) = conn.execute(
                 "SELECT COUNT(*) FROM session_ledger WHERE session_id = ?"
                 " AND status IN ('open','in_progress')",
                 (session_id,),
             ).fetchone()
+            escalations = {}
+            try:
+                # Own guard: an install without the follow_ups table (or without
+                # the dedup index) renders exactly as it did before.
+                keys = {_escalation_dedup_key(str(r[0])): str(r[0]) for r in rows}
+                if keys:
+                    placeholders = ",".join("?" * len(keys))
+                    for fid, dk in conn.execute(
+                        "SELECT id, dedup_key FROM follow_ups"  # noqa: S608
+                        # Interpolates only '?' placeholders; values are bound.
+                        f" WHERE dedup_key IN ({placeholders})",
+                        tuple(keys),
+                    ).fetchall():
+                        if keys.get(dk):
+                            escalations[keys[dk]] = str(fid)
+            except Exception:
+                escalations = {}
         finally:
             conn.close()
-        mission, origin = row
+        mission, origin, compactions = row[0], row[1], row[2] or 0
         label = (mission or "").strip()
+        first_line = next((ln for ln in (origin or "").strip().splitlines() if ln.strip()), "")
+        if not label and not first_line:
+            # A STUB row: the PreCompact hook creates the row and fills the
+            # origin later, so "no mission" here does not mean drift \u2014 it means
+            # there is no charter yet. Checked BEFORE the drift branch, which
+            # would otherwise nag about an unset mission on a charter that does
+            # not exist (caught by the omission-matrix test).
+            return
         if label:
-            label = label[:80] + ("…" if len(label) > 80 else "")
-        else:
-            first_line = next(
-                (ln for ln in (origin or "").strip().splitlines() if ln.strip()), ""
+            label = "mission: " + label[:_TAG_MISSION_CHARS] + (
+                "\u2026" if len(label) > _TAG_MISSION_CHARS else ""
             )
-            if not first_line:
-                return
-            snippet = first_line[:60] + ("…" if len(first_line) > 60 else "")
+        elif compactions >= 1:
+            label = (
+                f"mission: UNSET after {compactions} compactions"
+                " \u2014 session_charter_update"
+            )
+        else:
+            snippet = first_line[:60] + ("\u2026" if len(first_line) > 60 else "")
             label = f'origin: "{snippet}"'
-        print(f"[Charter: {label} | open: {open_n}]")
+
+        head = f"[Ledger open: {open_n} | {label}]"
+        body_lines = []
+        for rid, text, status in rows:
+            mark = " [~]" if status == "in_progress" else ""
+            body = str(text or "")
+            if len(body) > _TAG_ROW_CHARS:
+                body = body[:_TAG_ROW_CHARS] + "\u2026"
+            link = ""
+            fid = escalations.get(str(rid))
+            if fid:
+                link = f" \u2192 escalated: follow_up {fid[:8]}"
+            body_lines.append(f"- {str(rid)[:8]}{mark} {body}{link}")
+
+        # Trim rows to fit the byte cap, then RECOMPUTE the overflow pointer for
+        # what actually rendered. A first version popped lines off the end, which
+        # ate the pointer FIRST and left a truncated list looking complete \u2014
+        # count-instead-of-inventory reintroduced by the very cap meant to keep
+        # the inventory affordable (MEASURED: 12 open rows rendered as 7, no
+        # pointer). The pointer is the one line that must survive: it is what
+        # says "this list is not all of it".
+        def _assemble(lines: list[str]) -> str:
+            shown = len(lines)
+            tail = (
+                [
+                    f"\u2026and {open_n - shown} more \u2014 see"
+                    f" ~/.genesis/sessions/{session_id}/charter.md"
+                ]
+                if open_n > shown
+                else []
+            )
+            return "\n".join([head, *lines, *tail])
+
+        tag = _assemble(body_lines)
+        while len(tag.encode("utf-8")) > _TAG_MAX_BYTES and body_lines:
+            body_lines.pop()
+            tag = _assemble(body_lines)
+        print(tag)
         sys.stdout.flush()
     except Exception:
         return  # fail-open: a tag miss must never surface as an error
@@ -425,6 +529,78 @@ def _emit_staleness_nudge(session_id: str, now: datetime) -> None:
         return  # fail-open: a nudge miss must never surface as an error
 
 
+_MARKER_STEM = "injection_over_budget"
+_LEGACY_MARKER_DIR = _GENESIS_DIR / "session_awareness"
+
+
+def _budget_marker_files(session_id: str) -> list[Path]:
+    """This session's over-budget markers (one file per part; see the emitter).
+
+    Per-(session, part) files rather than one shared JSON: the four parts run
+    concurrently, so a shared dict raced — an under-budget sibling's clear could
+    erase an over-budget part's entry, and a global file let one session silence
+    another. Also sweeps the legacy session-less path so a marker written by an
+    older emitter still screams.
+    """
+    found: list[Path] = []
+    d = _session_dir(session_id)
+    if d is not None:
+        found.extend(sorted(d.glob(f"{_MARKER_STEM}*.json")))
+    found.extend(sorted(_LEGACY_MARKER_DIR.glob(f"{_MARKER_STEM}*.json")))
+    return found
+
+
+def _emit_injection_over_budget_alert(session_id: str) -> None:
+    """SCREAM, every prompt, while the SessionStart injection is over budget.
+
+    The failure this guards is silent by construction: the harness files an
+    over-cap injection and hands the model a 2 KB preview, so identity, the
+    charter, and essential knowledge simply never arrive — and nothing looks
+    wrong. That ran for a MONTH on this install (143 filings, 58 sessions)
+    before anyone noticed. This line is deliberately loud and repeats until the
+    SessionStart hook clears the marker with an under-budget run.
+    """
+    try:
+        wiring: list[str] = []
+        over: list[str] = []
+        for path in _budget_marker_files(session_id):
+            try:
+                info = json.loads(path.read_text())
+            except (OSError, ValueError):
+                # An unreadable marker is still evidence something wrote one.
+                over.append(f"{path.stem} (unreadable)")
+                continue
+            if not isinstance(info, dict):
+                continue
+            part = str(info.get("part") or path.stem)
+            if part == "wiring":
+                wiring.append(str(info.get("reason") or "unknown reason"))
+            else:
+                over.append(
+                    f"{part} ({info.get('chars', '?')}/{info.get('budget', '?')} chars at "
+                    f"{str(info.get('ts', '?'))[:16]})"
+                )
+        if wiring:
+            print(
+                f"[ALERT: session-context hook MIS-WIRED — {'; '.join(wiring)}. Only the "
+                "charter part was emitted, so identity and essential knowledge are MISSING "
+                "from this session. Fix the four --part SessionStart entries in "
+                ".claude/settings.json, then restart the session.]"
+            )
+        if over:
+            print(
+                f"[ALERT: session-context injection OVER BUDGET — part(s) {', '.join(over)}. "
+                "The harness FILES a hook's stdout above its cap and previews ~2 KB, so those "
+                "parts (identity/charter/EK) may be MISSING from this window. Trim "
+                "scripts/genesis_session_context.py's payload; each part's alarm clears on "
+                "its next under-budget session start.]"
+            )
+        if wiring or over:
+            sys.stdout.flush()
+    except Exception:
+        return  # fail-open: the alert must never break the prompt
+
+
 def main() -> None:
     # Skip if Genesis context is disabled
     if not _FLAG.exists():
@@ -448,6 +624,8 @@ def main() -> None:
     # 1. Temporal context (always, even if no session_id)
     if session_id:
         _emit_temporal_context(session_id, now)
+        # 1a. Injection-over-budget / mis-wire SCREAM (every prompt until cleared)
+        _emit_injection_over_budget_alert(session_id)
         # 1b. Charter drift tag (chartered sessions only; fail-open)
         _emit_charter_tag(session_id)
         # 1c. MCP stale-code nudge (only when this session's MCP is behind the

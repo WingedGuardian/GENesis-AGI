@@ -868,6 +868,57 @@ Mitigated, not eliminated.
 
 ---
 
+### Hook stdout is silently FILED above 10,000 characters (measured 2.1.246, 2026-08-30)
+
+**Undocumented in the hooks reference, settings reference, troubleshooting and
+error docs, and not configurable** (no settings key, env var or flag — the
+`MAX_MCP_OUTPUT_TOKENS` lever is for MCP tools only). Above the threshold the
+harness writes the hook's whole stdout to
+`~/.claude/projects/<slug>/<session>/tool-results/hook-<uuid>-stdout.txt` and
+hands the model a `<persisted-output>` wrapper with a **2,000-character
+preview**. Nothing errors. The session simply runs without whatever sat below
+the preview.
+
+**Measured on this install's pinned binary, via ~25 real probe sessions**
+(`GENESIS_CTX_PROBE_BYTES=<n>` makes `scripts/genesis_session_context.py` emit
+exactly n filler characters; classify from the new session's transcript —
+inline vs `Output too large`):
+
+| Fact | Value | Evidence |
+|---|---|---|
+| Threshold | **exactly 10,000 chars** | 10,000 inline / 10,001 filed |
+| Unit | **characters**, not bytes | 6,000 two-byte chars (12,044 B) inline |
+| Scope | **per hook entry** | two SessionStart hooks × 9,000 chars → both inline |
+| Mode | same in `-p` and interactive | both file at 10,001 |
+| Version volatility | **yes** | on 2.1.218 the threshold sat near the high 20 Ks (filings were rare, 28–32 KB); the 2.1.246 update dropped it to 10 K and the filing rate on this box tripled the same day (2–6/day → 16–21/day) |
+| Remote tunability | **UNVERIFIED — do not assume either way** | CC does use remote feature gates generally (the `we("tengu_<name>", <default>)` idiom appears throughout the bundle), and the TOOL-result threshold resolver consults a per-name override map. But the hook path does not visibly go through that resolver, and the minified symbol is reused across bundles, so nothing ties a remote gate to THIS threshold. Treat a cap change as possible without a version bump, and rely on the filings watcher rather than on the pin, but do not state remote tunability as fact |
+
+**Ordering between hook entries is COMPLETION order, not declaration order**
+(MEASURED 2026-08-30, 6 real sessions). The part doing a subprocess + a DB read
+lands last in 6/6 runs even though it is declared first, and the two disk-only
+parts swap between runs. So do not reason about where one hook's block sits
+relative to another's — and note this cannot be measured by "read the newest
+transcript": with concurrent sessions on the box that picks someone else's, which
+briefly produced a phantom "the charter part vanished" result here. Attribute a
+probe to its own transcript by before/after set difference.
+
+Consequence: the SessionStart injection ships as **four hook entries**
+(`--part charter | identity-core | identity-user | knowledge`), each held
+under `_PART_BUDGET = 9_800` with a per-part self-audit line, an over-budget
+marker the per-prompt tag screams about, and an awareness watcher over the
+harness's own filings (`context_injection_monitor`, critical → Telegram).
+**After any CC bump, re-run the probe** at 9,978 / 9,979 (the exact edge
+including the 22-char probe wrapper) and at two-hook 9 K + 9 K; if either
+moves, `_HOOK_STDOUT_CAP` and the part budgets are the constants to revisit.
+
+Measurement traps met while establishing this, so the next person does not
+repeat them: (1) the `Output too large (NNkB)` parenthetical is the OUTPUT's
+size, not the cap; (2) a Bash TOOL result probe does not transfer to hooks
+(tools carry per-tool `maxResultSizeChars`); (3) an interactive probe with no
+typed turn writes no transcript, and "newest transcript" mis-attributes a
+concurrent session's — identify your own transcript by before/after set
+difference and send a real turn.
+
 ## Known Risks
 
 ### Rebase-Like Risk for CC
