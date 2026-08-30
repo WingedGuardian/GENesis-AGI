@@ -1474,7 +1474,24 @@ The review-findings gate specifically:
    on CI alone. Note in PR that review was quota-limited.
 5. **Override**: Append `# review-override` to the merge command to
    bypass the gate (e.g., `gh pr merge 123 --squash --admin  # review-override`).
-   The override is logged. Use only when findings are intentionally accepted.
+   The override is logged — one metadata row per sigil in
+   `~/.genesis/merge_override_log.jsonl` (sigil, PR, bound head, which gate it
+   waived, and what the command actually got: `allowed` / `asked` / `blocked` /
+   `error`), so "was this escape reached for?" is a query rather than a survey.
+   `blocked` matters: a sigil can be appended to a command that some OTHER gate
+   then stops, which is a real signal but not an override that took effect, and
+   `asked` means the decision went to a human who may still have denied it.
+   Never any command text — the row is metadata only, because a trailing comment
+   rides a Bash command that can carry a credential.
+   **Scope, stated so the log is not read as more complete than it is:** the four
+   PR-merge sigils are covered (`# review-override`, `# ci-override`,
+   `# stale-review-override`, `# scheduled-review-override`), from the point the
+   PR is resolved onward. A merge rejected before that — no `--admin`, or an
+   unresolvable repo/PR — writes nothing. The command-scoped acks
+   (`# escalation-ack`, `# merge-to-main-override`) are deliberately NOT logged:
+   their gate is not evaluated where the sigil is seen, so a row could only say
+   the ack was typed, never that it waived anything. Use only when findings are
+   intentionally accepted.
 6. **Read the PR's warning comments before merging — not just the hard gate.**
    Beyond Codex, a structural-review bot posts under the repo-owner account
    (`WingedGuardian`, review state COMMENTED) and emits **SOFT WARNINGs** (PII /

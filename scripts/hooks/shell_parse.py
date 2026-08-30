@@ -535,6 +535,32 @@ _KNOWN_SIGILS = (
     "stale-review-override",
     "scheduled-review-override",
     "discard-override",
+    # Both of these were passed to has_trailing_override from the day they
+    # shipped but never listed here, which made the "kept in sync" claim above
+    # false and had a MEASURED effect: the leading-run scan treats an unlisted
+    # token as PROSE, so an unlisted sigil written FIRST silently disables every
+    # sigil after it (`# full-suite-ok audit-ack` → audit-ack undetected). The
+    # sigil queried first still matched, which is why it went unnoticed.
+    #
+    # NOTE this widens acceptance as well as detection, in the fail-OPEN
+    # direction, and the reach is wider than the merge gate. MEASURED against the
+    # previous parser, every one of these flipped False -> True:
+    #   `git clean -fdx  # full-suite-ok discard-override`         -> the
+    #   `git clean -fdx  # merge-to-main-override discard-override`   UNRECOVERABLE
+    #                                                                 clean block
+    #   `gh pr merge …   # full-suite-ok review-override`          -> findings gate
+    #   `gh pr merge …   # merge-to-main-override ci-override`     -> CI gate
+    #   `git commit      # full-suite-ok audit-ack | depth-ack`    -> commit gates
+    # That is the intended contract — the operator typed both sigils literally,
+    # and nothing in the repo auto-composes a multi-sigil comment — but it is a
+    # gate-loosening change, the sharpest case is the one that deletes untracked
+    # files, and both are named here rather than left to be discovered.
+    #
+    # A test derives this set from the guards themselves (an ast walk over
+    # scripts/hooks/), so the next divergence fails a test rather than waiting to
+    # be noticed.
+    "merge-to-main-override",  # git_push_guard: local `git merge` onto main/master
+    "full-suite-ok",  # full_suite_guard: run the whole pytest suite locally
 )
 
 

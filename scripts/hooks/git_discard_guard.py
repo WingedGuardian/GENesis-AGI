@@ -103,7 +103,6 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-import fcntl
 import json
 import os
 import subprocess
@@ -112,6 +111,16 @@ import time
 
 # Self-locate so sibling hook modules resolve whether run as a script or imported.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# SOFT dependency: this guard BLOCKS `git clean` (exit 2), and a module-load
+# exception exits 1, which the harness treats as non-blocking — so an unimportable
+# brand-new logging module would let an unrecoverable `git clean -fdx` through.
+# Snapshot logging degrades to a no-op instead. Mirrors git_push_guard's guard on
+# the same import, for the same reason.
+try:
+    import audit_jsonl  # noqa: E402
+except Exception:  # noqa: BLE001 — logging must never disarm the clean block.
+    audit_jsonl = None
+
 from hook_input import field, read_payload  # noqa: E402
 from shell_parse import analyze, has_trailing_override  # noqa: E402
 
@@ -189,9 +198,9 @@ _TOTAL_SNAPSHOT_BUDGET_S = 8.0
 # Self-trim the snapshot JSONL when it grows past this (no external consumer /
 # rotation exists); keep the most recent half.
 _SNAPSHOT_LOG_MAX_BYTES = 1_000_000
-# Recovery logs may sit in ~/.genesis alongside secrets — own-user only.
-_LOG_DIR_MODE = 0o700
-_LOG_FILE_MODE = 0o600
+# Own-user-only modes for logs that sit in ~/.genesis beside secrets now live in
+# audit_jsonl (LOG_DIR_MODE / LOG_FILE_MODE), shared with the merge-gate override
+# log so the two cannot diverge.
 
 
 def _snapshot_log_path() -> str:
@@ -238,48 +247,24 @@ def _snapshot_worktree(cwd: str, timeout: float = _GIT_TIMEOUT_S) -> str | None:
     return sha or None
 
 
-def _open_own(path: str, *, append: bool):
-    """Open ``path`` for writing, creating it own-user-only (0600) with NO
-    umask window — ``os.open`` applies the mode AT create time, unlike
-    ``open()`` then ``chmod`` (which is briefly world/group-readable per the
-    process umask). A pre-existing looser file is separately tightened by
-    ``_restrict``; the 0700 log dir already gates access regardless."""
-    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
-    fd = os.open(path, flags, _LOG_FILE_MODE)
-    return os.fdopen(fd, "a" if append else "w", encoding="utf-8")
-
-
 def _write_log_row(row: dict) -> str | None:
-    """Append ``row`` to the recovery JSONL under an exclusive flock on a SIDECAR
-    lock file (locking the log fh itself is defeated by the trim's os.replace —
-    the lock rides the OLD inode and a waiter appends to the orphan). The
-    sidecar is never replaced, so every writer serializes on one inode. Returns
-    the log path on success, None on any OS error. Files are created own-user
-    only (the log can carry local repo paths and sits beside secrets)."""
+    """Append ``row`` to the recovery JSONL, then self-trim past the size cap.
+
+    The locking, own-user create modes and atomic rewrite live in
+    ``audit_jsonl`` — extracted from HERE when the merge gate's override log
+    needed the same properties, so the two cannot drift apart. Returns the log
+    path, or None if the write failed (reported on stderr, never raised: a
+    logging failure must not break the user's command).
+
+    ``_SNAPSHOT_LOG_MAX_BYTES`` is read at CALL time so a test can lower it.
+    Returns None when the writer is unavailable (see the guarded import).
+    """
+    if audit_jsonl is None:
+        return None
     log_path = _snapshot_log_path()
-    # A relative override has an empty dirname — makedirs("") raises.
-    os.makedirs(os.path.dirname(log_path) or ".", mode=_LOG_DIR_MODE, exist_ok=True)
-    lock_path = log_path + ".lock"
-    with _open_own(lock_path, append=True) as lk:
-        _restrict(lock_path)  # tighten a pre-existing loose sidecar
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        with _open_own(log_path, append=True) as fh:
-            _restrict(log_path)
-            fh.write(json.dumps(row) + "\n")
-        if os.path.getsize(log_path) > _SNAPSHOT_LOG_MAX_BYTES:
-            with open(log_path, encoding="utf-8") as rd:
-                lines = rd.readlines()
-            tmp = log_path + ".tmp"
-            with _open_own(tmp, append=False) as wr:
-                wr.writelines(lines[len(lines) // 2 :])
-            os.replace(tmp, log_path)
-    return log_path
-
-
-def _restrict(path: str) -> None:
-    """Best-effort chmod to own-user-only; a chmod failure never aborts logging."""
-    with contextlib.suppress(OSError):
-        os.chmod(path, _LOG_FILE_MODE)
+    return audit_jsonl.append_row(
+        log_path, row, maintain=[audit_jsonl.trim_by_size(_SNAPSHOT_LOG_MAX_BYTES)]
+    )
 
 
 def _tokens_after_subcommand(argv: list[str], sub: str) -> list[str]:
@@ -457,9 +442,12 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
             "cwd": cwd,
             "sha": sha,
         }
+        # _write_log_row no longer raises — audit_jsonl converts an OS error to
+        # None and reports it — so the old `contextlib.suppress(OSError)` here is
+        # gone rather than left reading as live protection. `or log_path` keeps
+        # the note pointing at the intended path when the write failed.
         log_path = _snapshot_log_path()
-        with contextlib.suppress(OSError):
-            log_path = _write_log_row(row) or log_path
+        log_path = _write_log_row(row) or log_path
         notes.append(
             f"[git-discard-guard] snapshotted the worktree at {cwd} as "
             f"{sha[:12]} (tracked changes only — `git stash create` does NOT "
