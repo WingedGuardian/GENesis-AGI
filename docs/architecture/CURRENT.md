@@ -425,7 +425,7 @@ gated — that contract is one-directional.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 2f0239cb 2026-08-07
+verified: d8204a0c 2026-08-25
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -447,14 +447,22 @@ verified: 2f0239cb 2026-08-07
   curator-drafted issue via the fail-closed `contribution/sanitize.py scan_prose`
   (title+body+labels — every string that egresses), then HOLDS it: the
   `approval_requests` row FIRST, then `pending_issue_posts` (mirroring the email
-  gate). Each hold is per-item owner-approved on the dashboard (excluded from
-  `approve_all_pending`, like email). The `contributor_issue_watcher` drain
+  gate). By default each hold is per-item owner-approved on the dashboard (excluded
+  from `approve_all_pending`, like email). **Autonomous posture (opt-in,
+  `require_approval: false`):** the propose tool resolves its OWN approval
+  server-side (`resolved_by="genesis:contributor-worklog"`, fail-CLOSED — only an
+  explicit boolean false disables the human gate; default true so a fresh clone
+  never auto-posts), so the curator posts without a human — Genesis is the vetting
+  authority (scan_prose + the rate cap). The `contributor_issue_watcher` drain
   (every 5 min, learning scheduler) resolves approved holds under the
   `contributor_worklog` mode lever (`autonomy/contributor_worklog_config.py`,
   default `propose_only`): `live` → `gh issue create` (shadow-gated door
   `observe_github_issue_create`, `mark_posted` BEFORE `mark_consumed` +
-  pre-post `gh issue list` dedup for idempotency); `propose_only` → dry-run
-  terminal (never posts). Terminal rows pruned >30d via
+  pre-post `gh issue list` dedup for idempotency), rate-limited by
+  `max_posts_per_day` (rolling-24h `count_posted_since`, per-row before the create
+  so N approved rows in one tick are bounded; cautious-rollout brake); `propose_only`
+  → dry-run terminal (never posts). The STOP is `mode: off` / the env kill (freezes
+  the drain, incl. approved held rows). Terminal rows pruned >30d via
   `scripts/prune_contributor_issue_posts.py`; held rows never pruned. The
   curator campaigns are LOCAL user data (uncommitted).
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
@@ -701,8 +709,37 @@ verified: 94be12b3 2026-08-06
   controls before adding call sites.
 - **`capability_aggregator.py` → `capability_map` table** = per-domain
   self-confidence from up to 6 sources (inverse-confidence weighted; the
-  Outcome-Bus feed is flag-gated OFF). This is the naming-trap twin of this
-  document — unrelated to the subsystem map.
+  Outcome-Bus feed is flag-gated, default OFF). Reads split by intent: `get_all` and
+  `get_by_domain` are raw accessors; `get_prompt_rows` and `get_weakest` are
+  prompt-facing and apply two bars — `MIN_SAMPLE_SIZE` combined samples (also
+  enforced on write, one shared constant) and `STALE_AFTER_DAYS` behind the
+  freshest row, and they break confidence ties on `sample_size DESC` (ties at
+  exactly 1.0 are common enough to fill a top-15 on their own, so without it the
+  rendered set is arbitrary). Note what `updated_at` means: when the AGGREGATOR
+  last wrote the row, not evidence age. Only 3 of the 6 sources are windowed
+  (ego_proposals / cc_sessions / outcome_events, 30d); intervention_journal,
+  autonomy_state and procedural_memory are not, so domains fed only by those
+  never age out — correct for present-tense state, a known wart for the
+  journal's historical events. The honest uniform reading is "the aggregator
+  stopped vouching for this row N days ago". Anchored on the freshest row that
+  is USABLE — date-shaped, parseable, and not in the future. Freshest-row
+  anchoring means a TOTAL refresh outage hides nothing; excluding future-dated
+  rows from the anchor (inside the subquery, not by clamping afterwards) stops
+  one clock-skewed row from defining the window and blanking everything. A
+  PARTIAL outage is not covered. Nothing is ever pruned; rows below a bar stop being refreshed and
+  stop being RENDERED as present-tense capability — `get_by_domain` and
+  `count_all` still read them deliberately.
+  Withheld rows are named on every exit of all three renderers THAT RENDERS
+  DATA, not only the empty and deep ones (the query-error exit does not
+  count them — that read already failed, so the count would too): a corrupt or future-dated row is just as excluded on the
+  light branch, which renders no table and so gives the reader nothing else to
+  notice the loss by (`unusable_note` is also what logs). Both depth-taking
+  renderers HONOUR `depth="light"` — accepting the keyword and emitting the full
+  table anyway silently bills the caller for fifteen rows it did not ask for —
+  and they share one sentence (`_capability_render.qualifying_subset_line`),
+  because on a branch that renders no table the sentence IS the whole claim and
+  two copies drift into one qualifying its figures and the other not.
+  This is the naming-trap twin of this document — unrelated to the subsystem map.
 - Proposal pipeline (`proposals.py`): batch WHAT/WHY/HOW digests to Telegram,
   content firewall via `validate_batch()`, 6h digest rate-limit GROUNDWORK;
   `_NEVER_DISPATCH_ACTION_TYPES` blocklist lives in `session.py`. Dispatches

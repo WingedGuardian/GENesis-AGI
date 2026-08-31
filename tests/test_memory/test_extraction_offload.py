@@ -411,3 +411,43 @@ async def test_partial_read_failure_does_not_advance_or_extract(db, tmp_path, mo
     assert row["last_extracted_line"] == 2  # unchanged
     assert row["last_extracted_byte"] == 100  # NOT advanced to 150
     assert extract_calls == []  # partial set discarded, never extracted
+
+
+def test_build_spine_and_haystack_is_never_called_on_the_loop():
+    """`build_spine_and_haystack` reads+parses a whole JSONL transcript (a
+    synchronous `for line in f`) that wedged the event loop ~1s at a time from
+    this background job. Every call site in extraction_job.py must offload it to
+    a thread — i.e. it appears ONLY as an argument to `asyncio.to_thread`, never
+    as a direct call. Guards against a regression re-introducing the blocking
+    call."""
+    import ast
+    from pathlib import Path
+
+    from genesis.memory import extraction_job
+
+    src = Path(extraction_job.__file__).read_text()
+    tree = ast.parse(src)
+
+    direct_calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "build_spine_and_haystack"
+    ]
+    assert direct_calls == [], (
+        f"{len(direct_calls)} direct (on-loop) call(s) to build_spine_and_haystack "
+        "in extraction_job.py — wrap each in `await asyncio.to_thread(...)`."
+    )
+
+    # ...and it IS still used (passed to to_thread), so the guard isn't vacuous.
+    to_thread_args = [
+        arg.id
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "to_thread"
+        for arg in n.args
+        if isinstance(arg, ast.Name)
+    ]
+    assert "build_spine_and_haystack" in to_thread_args

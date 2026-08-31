@@ -1,6 +1,9 @@
 # Concurrent Sessions & Worktrees
 
 > Expanded reference with examples and edge cases: `.claude/docs/concurrent-sessions.md`
+> — including **Coordinating With a Peer Session**: when to message another
+> session, why a reply needs a higher bar than a send, and why a peer's claim
+> is a lead rather than a fact.
 
 Multiple Claude Code sessions may work on this repo simultaneously. Rules:
 

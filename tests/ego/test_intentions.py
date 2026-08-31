@@ -11,27 +11,12 @@ import pytest
 
 @pytest.fixture()
 async def db(tmp_path):
-    """In-memory DB with ego_intentions table."""
+    """In-memory DB with the PRODUCTION ego_intentions schema (no drift)."""
+    from genesis.db.schema import TABLES
+
     async with aiosqlite.connect(":memory:") as conn:
         conn.row_factory = aiosqlite.Row
-        await conn.execute("""
-            CREATE TABLE ego_intentions (
-                id                TEXT PRIMARY KEY,
-                content           TEXT NOT NULL,
-                trigger_condition TEXT NOT NULL,
-                ego_source        TEXT NOT NULL,
-                status            TEXT NOT NULL DEFAULT 'active'
-                    CHECK (status IN ('active', 'fired', 'expired', 'withdrawn')),
-                created_at        TEXT NOT NULL,
-                fired_at          TEXT,
-                proposal_id       TEXT,
-                cycle_count       INTEGER NOT NULL DEFAULT 0,
-                max_cycles        INTEGER NOT NULL DEFAULT 20,
-                reasoning         TEXT,
-                priority          TEXT NOT NULL DEFAULT 'normal'
-                    CHECK (priority IN ('low', 'normal', 'high'))
-            )
-        """)
+        await conn.execute(TABLES["ego_intentions"])
         await conn.commit()
         yield conn
 
@@ -346,6 +331,292 @@ class TestContextInjection:
         )
         text = await build_intentions_section(db, "genesis_ego_cycle")
         assert "No active intentions" in text
+
+    @pytest.mark.asyncio
+    async def test_system_rows_do_not_consume_llm_slots(self, db):
+        """System follow-through rows render but don't eat the LLM's 5 slots."""
+        from genesis.db.crud import ego_intentions
+        from genesis.ego.intentions_context import build_intentions_section
+
+        await ego_intentions.create(
+            db,
+            content="Review dispatch outcome for proposal abc12345",
+            trigger_condition="Next ego cycle",
+            ego_source="user_ego_cycle",
+            origin="system",
+            proposal_id="abc12345deadbeef",
+        )
+        await ego_intentions.create(
+            db,
+            content="LLM-created intention",
+            trigger_condition="Some trigger",
+            ego_source="user_ego_cycle",
+        )
+        text = await build_intentions_section(db, "user_ego_cycle")
+        # Both rows are mandatory-review...
+        assert "2 active intention" in text
+        assert "Review dispatch outcome" in text
+        # ...the system row is labelled as follow-through...
+        assert "follow-through" in text
+        # ...but only the LLM row counts against the cap (5 - 1 = 4).
+        assert "4 slot(s) available" in text
+
+
+# ---------------------------------------------------------------------------
+# System-origin (dispatch follow-through) CRUD tests
+# ---------------------------------------------------------------------------
+
+
+class TestSystemOrigin:
+    @staticmethod
+    async def _fill_llm_cap(db, source="user_ego_cycle"):
+        from genesis.db.crud import ego_intentions
+
+        for i in range(ego_intentions.MAX_ACTIVE_PER_SOURCE):
+            iid = await ego_intentions.create(
+                db,
+                content=f"Intention {i}",
+                trigger_condition=f"Trigger {i}",
+                ego_source=source,
+            )
+            assert iid is not None
+
+    @pytest.mark.asyncio
+    async def test_system_origin_bypasses_cap(self, db):
+        """A system follow-through row is created even when the LLM cap is full."""
+        from genesis.db.crud import ego_intentions
+
+        await self._fill_llm_cap(db)
+        iid = await ego_intentions.create(
+            db,
+            content="Review dispatch outcome for proposal abc12345",
+            trigger_condition="Next ego cycle",
+            ego_source="user_ego_cycle",
+            origin="system",
+            proposal_id="abc12345deadbeef",
+        )
+        assert iid is not None
+        items = await ego_intentions.list_active(db, "user_ego_cycle")
+        assert len(items) == 6
+
+    @pytest.mark.asyncio
+    async def test_system_rows_do_not_count_toward_llm_cap(self, db):
+        """LLM creations still succeed when system rows are present."""
+        from genesis.db.crud import ego_intentions
+
+        for i in range(3):
+            await ego_intentions.create(
+                db,
+                content=f"Follow-through {i}",
+                trigger_condition="Next ego cycle",
+                ego_source="user_ego_cycle",
+                origin="system",
+                proposal_id=f"prop{i:012d}",
+            )
+        # All 5 LLM slots must still be open.
+        await self._fill_llm_cap(db)
+
+    @pytest.mark.asyncio
+    async def test_llm_cap_still_enforced(self, db):
+        """Default-origin creation is still capped at MAX_ACTIVE_PER_SOURCE."""
+        from genesis.db.crud import ego_intentions
+
+        await self._fill_llm_cap(db)
+        iid = await ego_intentions.create(
+            db,
+            content="One too many",
+            trigger_condition="Trigger",
+            ego_source="user_ego_cycle",
+        )
+        assert iid is None
+
+    @pytest.mark.asyncio
+    async def test_origin_and_proposal_id_persisted(self, db):
+        from genesis.db.crud import ego_intentions
+
+        await ego_intentions.create(
+            db,
+            content="Review dispatch outcome",
+            trigger_condition="Next ego cycle",
+            ego_source="genesis_ego_cycle",
+            origin="system",
+            proposal_id="feedfacecafebeef",
+        )
+        items = await ego_intentions.list_active(db, "genesis_ego_cycle")
+        assert items[0]["origin"] == "system"
+        assert items[0]["proposal_id"] == "feedfacecafebeef"
+
+    @pytest.mark.asyncio
+    async def test_default_origin_is_ego(self, db):
+        from genesis.db.crud import ego_intentions
+
+        await ego_intentions.create(
+            db,
+            content="Plain intention",
+            trigger_condition="Trigger",
+            ego_source="genesis_ego_cycle",
+        )
+        items = await ego_intentions.list_active(db, "genesis_ego_cycle")
+        assert items[0]["origin"] == "ego"
+
+    @pytest.mark.asyncio
+    async def test_has_active_for_proposal(self, db):
+        from genesis.db.crud import ego_intentions
+
+        assert not await ego_intentions.has_active_for_proposal(
+            db, "user_ego_cycle", "abc12345deadbeef"
+        )
+        await ego_intentions.create(
+            db,
+            content="Review dispatch outcome",
+            trigger_condition="Next ego cycle",
+            ego_source="user_ego_cycle",
+            origin="system",
+            proposal_id="abc12345deadbeef",
+        )
+        assert await ego_intentions.has_active_for_proposal(
+            db, "user_ego_cycle", "abc12345deadbeef"
+        )
+        # Different source is isolated; different proposal is distinct.
+        assert not await ego_intentions.has_active_for_proposal(
+            db, "genesis_ego_cycle", "abc12345deadbeef"
+        )
+        assert not await ego_intentions.has_active_for_proposal(
+            db, "user_ego_cycle", "0000000000000000"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fire_without_proposal_id_preserves_creation_ref(self, db):
+        """Firing with no proposal_id must not erase the system row's provenance."""
+        from genesis.db.crud import ego_intentions
+
+        iid = await ego_intentions.create(
+            db,
+            content="Review dispatch outcome",
+            trigger_condition="Next ego cycle",
+            ego_source="user_ego_cycle",
+            origin="system",
+            proposal_id="abc12345deadbeef",
+        )
+        ok = await ego_intentions.fire(db, iid, ego_source="user_ego_cycle")
+        assert ok is True
+        cursor = await db.execute(
+            "SELECT proposal_id FROM ego_intentions WHERE id = ?", (iid,)
+        )
+        row = await cursor.fetchone()
+        assert row["proposal_id"] == "abc12345deadbeef"
+
+    @pytest.mark.asyncio
+    async def test_increment_unreviewed_ages_unmentioned_rows(self, db):
+        """Implicit-keep: rows omitted from the review output still age."""
+        from genesis.db.crud import ego_intentions
+
+        reviewed = await ego_intentions.create(
+            db,
+            content="Reviewed row",
+            trigger_condition="T",
+            ego_source="user_ego_cycle",
+        )
+        unmentioned = await ego_intentions.create(
+            db,
+            content="Unmentioned row",
+            trigger_condition="T",
+            ego_source="user_ego_cycle",
+        )
+        other_source = await ego_intentions.create(
+            db,
+            content="Other ego's row",
+            trigger_condition="T",
+            ego_source="genesis_ego_cycle",
+        )
+        bumped = await ego_intentions.increment_unreviewed(
+            db, "user_ego_cycle", [reviewed]
+        )
+        assert bumped == 1
+        rows = {
+            r["id"]: r["cycle_count"]
+            for r in await db.execute_fetchall(
+                "SELECT id, cycle_count FROM ego_intentions"
+            )
+        }
+        assert rows[unmentioned] == 1
+        assert rows[reviewed] == 0  # excluded (explicit keep bumps separately)
+        assert rows[other_source] == 0  # cross-ego isolation
+
+    @pytest.mark.asyncio
+    async def test_increment_unreviewed_empty_reviewed_ages_all(self, db):
+        """LLM omitted the whole review block — every active row still ages."""
+        from genesis.db.crud import ego_intentions
+
+        a = await ego_intentions.create(
+            db, content="A", trigger_condition="T", ego_source="user_ego_cycle"
+        )
+        b = await ego_intentions.create(
+            db,
+            content="B",
+            trigger_condition="T",
+            ego_source="user_ego_cycle",
+            origin="system",
+            proposal_id="abc12345deadbeef",
+        )
+        bumped = await ego_intentions.increment_unreviewed(db, "user_ego_cycle", [])
+        assert bumped == 2
+        rows = {
+            r["id"]: r["cycle_count"]
+            for r in await db.execute_fetchall(
+                "SELECT id, cycle_count FROM ego_intentions"
+            )
+        }
+        assert rows[a] == 1 and rows[b] == 1
+
+    @pytest.mark.asyncio
+    async def test_increment_unreviewed_skips_inactive(self, db):
+        from genesis.db.crud import ego_intentions
+
+        iid = await ego_intentions.create(
+            db, content="A", trigger_condition="T", ego_source="user_ego_cycle"
+        )
+        await ego_intentions.withdraw(db, iid, ego_source="user_ego_cycle")
+        bumped = await ego_intentions.increment_unreviewed(db, "user_ego_cycle", [])
+        assert bumped == 0
+
+    @pytest.mark.asyncio
+    async def test_mechanical_ttl_system_row_expires_without_compliance(self, db):
+        """A follow-through row the ego NEVER reviews is reaped at max_cycles=3."""
+        from genesis.db.crud import ego_intentions
+
+        await ego_intentions.create(
+            db,
+            content="Review dispatch outcome",
+            trigger_condition="Next ego cycle",
+            ego_source="user_ego_cycle",
+            origin="system",
+            proposal_id="abc12345deadbeef",
+            max_cycles=3,
+        )
+        for _ in range(4):  # strict >: survives cycles 1-3, reaped at 4
+            await ego_intentions.increment_unreviewed(db, "user_ego_cycle", [])
+        expired = await ego_intentions.expire_overdue(db, "user_ego_cycle")
+        assert expired == 1
+        assert await ego_intentions.list_active(db, "user_ego_cycle") == []
+
+    @pytest.mark.asyncio
+    async def test_withdrawn_row_does_not_block_new_followthrough(self, db):
+        """Dedup only considers ACTIVE rows — a reviewed/closed one clears the way."""
+        from genesis.db.crud import ego_intentions
+
+        iid = await ego_intentions.create(
+            db,
+            content="Review dispatch outcome",
+            trigger_condition="Next ego cycle",
+            ego_source="user_ego_cycle",
+            origin="system",
+            proposal_id="abc12345deadbeef",
+        )
+        await ego_intentions.withdraw(db, iid, ego_source="user_ego_cycle")
+        assert not await ego_intentions.has_active_for_proposal(
+            db, "user_ego_cycle", "abc12345deadbeef"
+        )
 
 
 # ---------------------------------------------------------------------------

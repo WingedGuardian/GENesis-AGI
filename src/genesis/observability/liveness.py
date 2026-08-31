@@ -53,7 +53,13 @@ STALL_FLOOR_MINUTES = 3 * 60
 FUTURE_SKEW_TOLERANCE_MINUTES = 5
 
 
-def _parse(iso: str | None) -> datetime | None:
+def parse_iso_utc(iso: str | None) -> datetime | None:
+    """Parse an ISO timestamp to an aware UTC datetime, or None if unusable.
+
+    The shared timestamp parser for the liveness/heartbeat layer: a naive value is
+    normalized to UTC (so a later ``dt > aware`` comparison never raises TypeError),
+    and an empty/unparseable value returns None. Reused by the heartbeat-staleness
+    helper so both read timestamps identically (see mcp/health/manifest.py)."""
     if not iso:
         return None
     try:
@@ -61,6 +67,10 @@ def _parse(iso: str | None) -> datetime | None:
     except (ValueError, TypeError):
         return None
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
+
+
+# Back-compat internal alias (this module's own call sites).
+_parse = parse_iso_utc
 
 
 def stall_threshold_minutes(current_interval_minutes: float) -> float:

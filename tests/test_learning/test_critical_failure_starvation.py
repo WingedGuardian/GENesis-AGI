@@ -237,3 +237,85 @@ async def test_healthy_loop_no_recent_lag_still_fires(monkeypatch):
     c = CriticalFailureCollector([_probe("qdrant", ProbeStatus.DOWN, timed_out=True)])
     r = await c.collect()
     assert r.value == 1.0
+
+
+# --- MECHANISM LOCK: the note names EVERY failing probe across the whole state space ---
+# The critical_failure note is a state machine over {confirmed-DOWN, timed-out-DOWN,
+# DEGRADED} x {genuine, starvation-suppressed}. Codex found a dropped-identity bug in a
+# different corner three rounds running (genuine-DOWN drops DEGRADED; genuine lumps a
+# timeout as confirmed DOWN; suppressed drops the residual DEGRADED name). Instead of
+# patching a fourth instance, this locks the INVARIANT: whatever the combination and
+# whichever path builds the note, every probe that is DOWN or DEGRADED is NAMED in the
+# baseline_note. A future path that drops an identity fails HERE.
+# DISTINCTIVE names, deliberately NOT substrings of _DEFAULT_NOTE (which literally
+# contains "db/qdrant (+ollama...)") — so a `fragment in note` assertion can ONLY be
+# satisfied by the failing-probe naming logic, never vacuously by the static explainer.
+_DB = "db_primary"
+_QD = "qdrant_vectors"
+_OL = "ollama_local"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "loop_mode,probes,must_contain",
+    [
+        # genuine path (healthy loop -> a timed-out DOWN is a real failure, not
+        # suppressed). Assert the GROUP LABEL too, not just presence, so a mislabel
+        # (Codex round 2: a timeout rendered under DOWN:) also fails here.
+        ("healthy", [(_DB, ProbeStatus.DOWN, False)], [f"down: {_DB}"]),
+        (
+            "healthy",
+            [(_DB, ProbeStatus.DOWN, False), (_OL, ProbeStatus.DEGRADED, False)],
+            [f"down: {_DB}", f"degraded: {_OL}"],
+        ),
+        (
+            "healthy",
+            [(_DB, ProbeStatus.DOWN, False), (_QD, ProbeStatus.DOWN, True)],
+            [f"down: {_DB}", f"timed out: {_QD}"],
+        ),
+        (
+            "healthy",
+            [
+                (_DB, ProbeStatus.DOWN, False),
+                (_QD, ProbeStatus.DOWN, True),
+                (_OL, ProbeStatus.DEGRADED, False),
+            ],
+            [f"down: {_DB}", f"timed out: {_QD}", f"degraded: {_OL}"],
+        ),
+        ("healthy", [(_OL, ProbeStatus.DEGRADED, False)], [f"degraded: {_OL}"]),
+        ("healthy", [(_QD, ProbeStatus.DOWN, True)], [f"timed out: {_QD}"]),
+        (
+            "healthy",
+            [(_QD, ProbeStatus.DOWN, True), (_OL, ProbeStatus.DEGRADED, False)],
+            [f"timed out: {_QD}", f"degraded: {_OL}"],
+        ),
+        # starvation-suppressed path (starved loop + ALL DOWN probes timed out). The
+        # suppression note has a different shape (no _DEFAULT_NOTE), so assert the
+        # distinctive name presence — non-vacuous because the explainer is absent here.
+        ("starved", [(_QD, ProbeStatus.DOWN, True)], [_QD]),
+        (
+            "starved",
+            [(_QD, ProbeStatus.DOWN, True), (_OL, ProbeStatus.DEGRADED, False)],
+            [_QD, _OL],
+        ),
+        (
+            "starved",
+            [
+                (_QD, ProbeStatus.DOWN, True),
+                (_DB, ProbeStatus.DOWN, True),
+                (_OL, ProbeStatus.DEGRADED, False),
+            ],
+            [_QD, _DB, _OL],
+        ),
+    ],
+)
+async def test_note_names_every_down_or_degraded_probe(
+    monkeypatch, loop_mode, probes, must_contain
+):
+    lagging = loop_mode == "starved"
+    monkeypatch.setattr(loop_health, "read", lambda: _sample(age_s=0.1, lagging=lagging))
+    collector = CriticalFailureCollector([_probe(n, s, timed_out=t) for n, s, t in probes])
+    reading = await collector.collect()
+    note = (reading.baseline_note or "").lower()
+    for frag in must_contain:
+        assert frag in note, f"{frag!r} missing from {loop_mode} note: {note!r}"

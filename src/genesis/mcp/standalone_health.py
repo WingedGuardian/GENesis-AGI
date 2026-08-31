@@ -36,11 +36,21 @@ class StandaloneHealthDataService:
         self._routing_config = None
         self._dead_letter = None
 
-    async def snapshot(self) -> dict:
+    async def snapshot(self, *, max_age_s: float = 0.0) -> dict:
         """Read status.json and return health snapshot.
 
         Returns a dict compatible with HealthDataService.snapshot() output,
         adapted from the status file's simpler format.
+
+        `max_age_s` is accepted for signature parity with HealthDataService and
+        ignored: this reads a small file on every call, so there is nothing to
+        cache and no in-flight compute to coalesce.
+
+        Parity here is hygiene, not a fix for an observed break — this class has
+        no production instantiation today, so nothing currently passes the
+        argument to it. It is declared so the two implementations of this
+        informal interface cannot drift into a TypeError if one is ever
+        substituted for the other.
         """
         if not self._status_path.exists():
             return {

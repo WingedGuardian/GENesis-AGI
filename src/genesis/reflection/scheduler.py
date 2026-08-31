@@ -30,8 +30,8 @@ class ReflectionScheduler:
     - Learning regression check runs after a SUCCESSFUL quality calibration
 
     ``assessment_day`` is retained for back-compat but no longer pins the fire
-    day. Timezone is resolved via ``genesis.env.user_timezone()`` (USER_TIMEZONE
-    env → genesis.yaml timezone → UTC fallback).
+    day. Timezone is resolved via ``genesis.env.user_timezone()`` (genesis.yaml
+    timezone → USER_TIMEZONE env fallback → UTC).
     """
 
     def __init__(

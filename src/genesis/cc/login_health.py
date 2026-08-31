@@ -7,14 +7,18 @@ Background sessions ride the same credentials, so a lapsed login silently
 kills autonomy. (Discovered 2026-08-18: nothing anywhere read
 ``refreshTokenExpiresAt``.)
 
-Two consumers:
+Three consumers:
 
 - the awareness check ``_check_cc_login_expiry`` (warns days ahead via the
   standard critical-observation → Telegram path);
 - the invoker's fallback injection: when the login is HARD-expired and a live
   ``claude auth status`` probe CONFIRMS logged-out, CC invocations (foreground turns and
 background dispatches alike) get ``CLAUDE_CODE_OAUTH_TOKEN`` from the operator's stored 1-year setup-token
-  (``~/.genesis/cc_oauth_token.env``, written by ``scripts/store_cc_token.sh``).
+  (``~/.genesis/cc_oauth_token.env``, written by ``scripts/store_cc_token.sh``);
+- the interactive-slot gate ``cc/login_gate.py`` (a faithful mirror of the
+  invoker's fallback contract) — reuses ``fallback_env_if_login_dead`` /
+  ``read_fallback_token`` / ``fallback_token_is_stale`` to decide whether a
+  ``scripts/cc-slot.sh`` pane should inject the setup-token.
 
 The injection mirrors the host guardian's honest boundary
 (``guardian/diagnosis.py``): the env token OVERRIDES a stored login, so it is
@@ -39,6 +43,11 @@ from genesis.util.proc_kill import kill_process_group, reap_bounded
 logger = logging.getLogger(__name__)
 
 _TOKEN_FILE = Path("~/.genesis/cc_oauth_token.env").expanduser()
+
+# `claude setup-token` mints a ~1-year OAuth token. Injecting one past that life
+# exports a known-dead credential (CC then errors instead of falling back to the
+# normal /login prompt), so the fallback treats a provably-old token as absent.
+_SETUP_TOKEN_LIFETIME_S = 365 * 24 * 3600
 
 # Confirmed-logged-out probe results are cached briefly so a burst of
 # background dispatches during an outage doesn't spawn a probe subprocess
@@ -111,6 +120,48 @@ def read_fallback_token() -> str | None:
     return None
 
 
+def fallback_token_created_at() -> datetime | None:
+    """The setup-token's stored INTAKE time (UTC), or None when unknown.
+
+    Reads ``GENESIS_CC_TOKEN_CREATED_AT`` (unix seconds) — the moment
+    ``store_cc_token.sh`` STORED the token (``date +%s`` at intake), NOT the
+    token's issuance time. The token is an opaque ``sk-ant-oat`` bearer string
+    with no client-readable ``iat``/``exp``, so intake is the only timestamp we
+    have; it equals issuance for the documented ``claude setup-token | store``
+    pipe, but the ``--file`` deferred path can make it LATER than issuance. A
+    missing/unparseable value is "unknown", never an error.
+    """
+    try:
+        for line in _TOKEN_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("GENESIS_CC_TOKEN_CREATED_AT="):
+                raw = line.split("=", 1)[1].strip().strip('"').strip("'")
+                return datetime.fromtimestamp(int(raw), tz=UTC)
+    except (OSError, ValueError, OverflowError):
+        return None
+    return None
+
+
+def fallback_token_is_stale(*, now: datetime | None = None) -> bool:
+    """True when the setup-token is past a COARSE ~1-year age keyed on INTAKE time.
+
+    This is a safety net, not an exact-expiry check: the token is opaque
+    (``sk-ant-oat``, no readable ``exp``), so age is measured from the stored
+    INTAKE timestamp (see ``fallback_token_created_at``), which approximates —
+    but for the ``--file`` deferred path may UNDER-state — the real token age.
+    Fail-safe direction: an unknown/unparseable intake time returns False (don't
+    block a possibly-valid token) — only an intake time we can read AND that is
+    older than the lifetime blocks injection. This mirrors the probe's
+    "ambiguity never acts" stance; the primary gate remains the live login-dead
+    detection in ``fallback_env_if_login_dead``, not this coarse age bound.
+    """
+    created = fallback_token_created_at()
+    if created is None:
+        return False
+    now = now or datetime.now(UTC)
+    return (now - created).total_seconds() >= _SETUP_TOKEN_LIFETIME_S
+
+
 async def probe_logged_out(cc_path: str = "claude", timeout_s: float = 15.0) -> bool:
     """Return True ONLY when ``claude auth status --json`` CONFIRMS
     ``loggedIn: false``. Timeouts, unparseable output, and any other state
@@ -154,6 +205,7 @@ async def fallback_env_if_login_dead(
     *,
     probe=None,
     token_reader=read_fallback_token,
+    token_is_stale=fallback_token_is_stale,
     cc_path: str = "claude",
 ) -> dict[str, str] | None:
     """Env additions for a background CC invocation, or None (the common case).
@@ -162,7 +214,8 @@ async def fallback_env_if_login_dead(
     1. refresh token HARD-expired per credentials.json (cheap file read; a
        working or merely-near-expiry login never proceeds);
     2. live probe CONFIRMS logged-out (cached _PROBE_CACHE_TTL_S seconds);
-    3. a stored setup-token exists.
+    3. a stored setup-token exists AND is not provably past its ~1-year life
+       (injecting a known-dead token is worse than leaving the /login prompt).
     """
     if probe is None:
         # Bind the probe to the CALLER'S configured executable — probing a
@@ -193,6 +246,14 @@ async def fallback_env_if_login_dead(
             "setup-token is stored (~/.genesis/cc_oauth_token.env) — background "
             "sessions will fail until /login or `claude setup-token` + "
             "scripts/store_cc_token.sh",
+        )
+        return None
+
+    if token_is_stale():
+        logger.warning(
+            "CC login expired + confirmed logged-out, but the stored setup-token "
+            "is itself past its ~1-year lifetime — NOT injecting a known-dead "
+            "credential. Refresh it: `claude setup-token` + scripts/store_cc_token.sh",
         )
         return None
 
