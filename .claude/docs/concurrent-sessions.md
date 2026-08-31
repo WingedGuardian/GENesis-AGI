@@ -37,11 +37,18 @@ about the other half of the problem: two sessions editing the same region, or
 each acting on a claim the other got wrong. That is what this section is for.
 
 > **Scope: sessions that HAVE `SendMessage`.** Reflection, inbox, mail-judge and
-> sentinel-degraded sessions deny it by design (`cc/session_config.py`,
-> `sentinel/dispatcher.py`, `mail/monitor.py`, pinned by
-> `tests/test_cc/test_spawn_lockdown.py`) and have no interactive user to escalate
-> to. Their routes are `observation_write`, `follow_up_create`, `outreach_send`,
-> or an ego proposal — never a peer.
+> sentinel-degraded sessions deny it by design — read the denylists themselves
+> (`cc/session_config.py`, `sentinel/dispatcher.py`, `mail/monitor.py`) rather than a
+> test, since `tests/test_cc/test_spawn_lockdown.py` scopes its shared assertions to the
+> subagent-SPAWN class and pins `SendMessage` only for the mail judge.
+>
+> Their escalation route is **whatever their own config still permits, which is less than
+> you would guess** — a reflection session's denylist is DERIVED as
+> `(live registry − read-allowlist − observation_write)`, so `follow_up_create` and
+> `outreach_send` are denied to it along with every other MCP write; `observation_write`
+> and the parsed `observations` output field are all it has. Check the profile before
+> telling such a session to "file a follow-up": naming a route it cannot take is worse
+> than naming none.
 
 ### The rule: the constraint is on the REPLY, not the send
 
@@ -74,10 +81,10 @@ window and gives it nothing.
 
 ### A peer's claim is a LEAD, not a fact
 
-Peer sessions are as capable as you are, and they are wrong about as often as you
-are. One observed exchange between two competent sessions carried four wrong
-claims, in both directions — an unimplementable stopgap, a mis-attributed
-authorship, an under-counted census, an incomplete region table. Every one was
+Peer sessions are as capable as you are, and they get things wrong. One observed
+exchange between two competent sessions carried four wrong claims, in both
+directions — an unimplementable stopgap, a mis-attributed authorship, an
+under-counted census, an incomplete region table. Every one was
 caught by the recipient re-deriving it rather than accepting it. Treat that as an
 anecdote, not a rate: it is one exchange.
 
@@ -108,27 +115,34 @@ Attribution is possible but uneven. In rough order of strength:
   copied exactly as the row prints it; when two rows share a name, append that
   row's `[ref]` — that is what it is for. `ListAgents` also reports your OWN name,
   so sign with it rather than an invented handle.
-- **This repo's own session→work index is the strongest link**: a PR body citing
-  `Ledger: <32-hex>` resolves to a `session_ledger` row, which carries
-  `session_id`; `cc_sessions` then carries that session's transcript UUID, pid and
-  topic. Coverage is PARTIAL — only work that used the ledger convention is
-  indexed — so a miss here is "not recorded", never "did not happen".
-- **Commit authorship separates session CLASSES, not sessions.** Autonomous
-  commits and the owner's own commits carry different author identities, but two
-  sessions of the same class are indistinguishable this way.
+- **Commits already carry the session that made them.** `prepare-commit-msg` appends
+  a `Genesis-Session: <8hex>` trailer (and an `Install: <8hex>`), so a commit names its
+  own session without any forensics. Check the trailer first; it is the purpose-built
+  link and it costs one `git log` read. Author identity is a much weaker signal —
+  it separates session CLASSES at best, never two sessions of the same class.
+- **The ledger indexes work to sessions.** A PR body citing `Ledger: <32-hex>` resolves
+  to a `session_ledger` row whose `session_id` is **the CC transcript session id, which
+  matches `cc_sessions.cc_session_id` — NOT `cc_sessions.id`** (the two differ; joining
+  on the wrong one silently returns nothing). Coverage is PARTIAL: only work that used
+  the ledger convention is indexed, so a miss is "not recorded", never "did not happen".
 
 When those come up short, **ONE targeted question to the likely owner is the
 mechanism, not a workaround** — cheaper and more reliable than forensics. Ask
-something specific and answerable ("did you ship X?"), make the no-op case
-explicit ("if it wasn't you, say so and ignore the rest"), and accept the answer.
+something specific and answerable ("did you ship X?") and make the no-op case
+explicit ("if it wasn't you, say so and ignore the rest"). The answer is subject to the
+same rule as any other peer claim: a plain "not me" can be taken at face value, but an
+EXECUTION or ATTRIBUTION claim — "yes, I shipped X", "that's already fixed" — is a lead
+to verify against the commit trailer, the ledger or the diff before you build on it.
 Do not open a correspondence: a coordination exchange should terminate, and every
 message in it should be one the recipient would have wanted.
 
-Grepping transcripts — the CC project transcript directory, and
-`~/.genesis/background-sessions/` for reflection/inbox/surplus sessions — remains
-the LAST RESORT it is called elsewhere in these docs, not a first move: it is slow,
-often inconclusive, and there are two stores, so searching one proves nothing about
-the other.
+Grepping transcripts remains the LAST RESORT it is called elsewhere in these docs, not
+a first move: it is slow and often inconclusive. If you do reach for it, note that a
+session's transcript store is not its working directory — a dispatched session RUNS in
+`~/.genesis/background-sessions/` but its transcript is written under the encoded
+Claude project directory for the path it was launched against. Resolve the store before
+searching it, and remember there is more than one, so a miss in the store you searched
+proves nothing about the other.
 
 ### Claiming a region
 
@@ -136,6 +150,11 @@ When you are about to work in a file other sessions touch, say which FUNCTIONS y
 will change, not which line numbers. Line numbers go stale the moment anyone
 merges; function names survive a merge and a rebase. State the deletions too — a
 change that only adds is a different collision risk from one that rewrites.
+
+For a file with no functions — Markdown, YAML, systemd units, SQL — name the region the
+way that file is actually structured: the heading or section for prose, the top-level key
+for config, the object for SQL. The point is an identifier that survives a merge, not the
+word "function": line numbers are what must not be used.
 
 A claim only exists where another session will read it: the PR body (or the PR
 itself, once open) is the durable place, and a direct message is the way to reach
