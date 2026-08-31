@@ -6,6 +6,7 @@ Follows the aiohttp pattern from surplus/compute_availability.py.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -83,14 +84,25 @@ def _load_guardian_remote_from_config() -> object | None:
 async def probe_db(
     db: aiosqlite.Connection,
     *,
+    timeout_s: float = 3,
     clock=None,
 ) -> ProbeResult:
-    """Probe the SQLite database with a simple query."""
+    """Probe the SQLite database with a simple query.
+
+    Bounded by ``timeout_s`` (parity with probe_qdrant/probe_ollama) so a
+    slow-but-not-down DB cannot hang unbounded inside the critical_failure
+    ``asyncio.gather``; a timeout is reported DOWN with ``timed_out=True`` so the
+    starvation-suppression logic can evaluate it the same way as the other probes.
+    """
     _clock = clock or (lambda: datetime.now(UTC))
     start = time.monotonic()
-    try:
+
+    async def _run_query() -> None:
         async with db.execute("SELECT 1") as cursor:
             await cursor.fetchone()
+
+    try:
+        await asyncio.wait_for(_run_query(), timeout=timeout_s)
         latency = (time.monotonic() - start) * 1000
         return ProbeResult(
             name="db",
@@ -106,6 +118,7 @@ async def probe_db(
             latency_ms=round(latency, 2),
             message=str(exc),
             checked_at=_clock().isoformat(),
+            timed_out=isinstance(exc, TimeoutError),
         )
 
 
@@ -585,7 +598,6 @@ async def probe_browser_processes() -> ProbeResult:
     Returns HEALTHY (0 processes), DEGRADED (1-3, likely active session),
     or DOWN (4+, likely orphaned accumulation).
     """
-    import asyncio
 
     from genesis.browser.types import BROWSER_PGREP_PATTERNS
 
@@ -629,7 +641,6 @@ async def collect_probe_results(
     Used by the remediation registry to check which probes are failing.
     Each probe runs independently — a failure in one does not block others.
     """
-    import asyncio
 
     results: dict[str, ProbeResult] = {}
 

@@ -115,8 +115,8 @@ class TestProbeTimeoutFlag:
 
     @pytest.mark.asyncio
     async def test_probe_result_defaults_not_timed_out(self):
-        # Default is False so probe_db (no timeout) and healthy probes never
-        # accidentally read as timeout-caused.
+        # Default is False so a healthy probe never accidentally reads as
+        # timeout-caused (only an actual TimeoutError sets it).
         r = ProbeResult(name="x", status=ProbeStatus.HEALTHY, latency_ms=0.0)
         assert r.timed_out is False
 
