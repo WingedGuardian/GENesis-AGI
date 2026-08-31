@@ -102,6 +102,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The morning report no longer cries "surplus heartbeat overdue" during a long
+  healthy dispatch.** Surplus emits its subsystem heartbeat only at the end of a
+  dispatch cycle, and a single healthy dispatch can run 15-30 minutes — longer than
+  the old 10-minute overdue threshold — so a busy-but-healthy surplus was flagged
+  "heartbeat overdue" in the morning report and the subsystem-heartbeats view. The
+  threshold is loosened to 3 hours, matching the surplus dashboard tile's own
+  liveness bound; a genuinely dead surplus is still caught within ~15 minutes by the
+  scheduler watchdog, which reads a separate, per-dispatch signal.
+
 - **A partial write to the concurrent-session record no longer erases fields it
   was not told about.** The row has several writers that each know a different
   part of it, and all but one of its columns were overwritten unconditionally —

@@ -424,6 +424,77 @@ async def test_repeated_failures_coalesce_into_one_pending_record(factory):
     [(OutreachHeartbeat,), (DashboardHeartbeat,)],
     ids=["outreach", "dashboard"],
 )
+async def test_a_completed_record_re_arms_for_the_next_failure(factory):
+    """Coalescing is a CONCURRENCY bound, NOT a one-record-per-process latch.
+
+    The test above pins ``pending.done()`` to False for its whole burst -- that is
+    what makes its count assertion meaningful, and it is also what makes it
+    structurally blind to the OTHER half of the same predicate. MEASURED against
+    that test alone: weakening the guard to ``if pending is not None: return``
+    leaves the entire file green, while production stops recording after its FIRST
+    failure for the lifetime of the process -- consecutive_failures frozen at 1,
+    last_failure frozen at the first stall, and a wired retry registry never firing
+    again.
+
+    That is also the ORDINARY case rather than the exotic one: ``_run`` calls
+    ``_record_failure`` once per interval (60s default), so a healthy loop with a
+    throwing emit completes each record long before the next tick and depends on
+    the re-arm entirely. The wedged case is the rare one.
+
+    No threads here either, for the same reason the test above dropped them: the
+    only thing this needs is for the first record to COMPLETE before the second is
+    submitted, which is an await, not a race.
+    """
+    calls: list[str] = []
+
+    class _CountingRuntime:
+        def record_job_failure(self, job_name, *args, **kwargs):
+            calls.append(job_name)
+
+    daemon = factory(interval_seconds=60)
+    daemon._loop = asyncio.get_running_loop()
+    rt = _CountingRuntime()
+
+    daemon._record_failure(rt, RuntimeError("a"))
+    deadline = asyncio.get_running_loop().time() + 10
+    while not calls and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    await _drain_pending()
+
+    # Guard the guard: if the first record never landed, the assertion below would
+    # pass for the wrong reason.
+    assert len(calls) == 1, "the first record never landed -- this test proves nothing"
+    # The first record must not still be IN FLIGHT, or the second submission would
+    # be absorbed and this would re-test coalescing. Deliberately permissive about
+    # HOW: retaining the completed future and clearing it in a done-callback are
+    # both valid re-arms, and the callback form is arguably better since it stops
+    # holding the exception. Asserting `is not None and .done()` would fail a
+    # correct implementation -- constraining the mechanism instead of pinning the
+    # behaviour, which is the very defect this file keeps being about.
+    pending = daemon._pending_failure
+    assert pending is None or pending.done(), (
+        "the first failure record is still in flight, so the submission below "
+        "would exercise coalescing rather than the re-arm branch"
+    )
+
+    daemon._record_failure(rt, RuntimeError("b"))
+    deadline = asyncio.get_running_loop().time() + 10
+    while len(calls) < 2 and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    await _drain_pending()
+
+    assert len(calls) == 2, (
+        f"the COMPLETED pending record was never re-armed, got {len(calls)} -- a "
+        "daemon that keeps failing would record only its first failure, freezing "
+        "consecutive_failures and never re-firing the retry registry"
+    )
+
+
+@pytest.mark.parametrize(
+    ("factory",),
+    [(OutreachHeartbeat,), (DashboardHeartbeat,)],
+    ids=["outreach", "dashboard"],
+)
 async def test_double_start_is_refused_while_running(factory):
     """A second start() must not spawn a second pulsing thread.
 
