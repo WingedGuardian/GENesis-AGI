@@ -565,12 +565,16 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   (Standing user directive.)
 - **A different model is the real correctness gate; Codex is the default.** A Claude
   reviewer shares this model's blind spots, so it clears the LOCAL depth gate but is not
-  the cross-model gate. When the GitHub Codex reviewer is unavailable — established with
-  `--check-pr`, NEVER inferred from a `codex exec` quota error, which is a separate
-  surface on separate quota — AND the install has an approved alternative external
-  reviewer, a DIFFERENT model with explicit per-use user approval every time, run it
-  non-interactively over the diff with an adversarial mandate. Which reviewer that is
-  (if any) is install-local and belongs in user-level config, not here.
+  the cross-model gate. When the GitHub Codex reviewer is unavailable AND the install
+  has an approved alternative external reviewer — a DIFFERENT model, with explicit
+  per-use user approval every time — run it non-interactively over the diff with an
+  adversarial mandate. Which reviewer that is (if any) is install-local and belongs in
+  user-level config, not here.
+  **Unavailable is established by ASKING**: comment `@codex review`, wait, and read the
+  reply. An explicit usage-limits comment is unavailability. Nothing else is — silence
+  is not, and neither is `--check-pr` reporting no review, which says the same thing
+  whether the reviewer is down or was simply never triggered at this head. Nor is a
+  `codex exec` quota error: that is a separate surface on separate quota.
   Scope what you hand it exactly as `.claude/commands/deep-review.md` §1 specifies.
   **Verify it saw a diff at all**: a clean verdict that does not demonstrate WHAT it
   reviewed is void, and a false clean from the cross-model gate is worse than no review.
