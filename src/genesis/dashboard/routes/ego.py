@@ -124,11 +124,16 @@ async def ego_status():
                 rt._db,
                 f"last_proactive_fire:{mgr.source_tag}",
             )
+            last_gated = await ego_crud.get_state(
+                rt._db,
+                f"last_gated:{mgr.source_tag}",
+            )
             live = compute_ego_liveness(
                 last_success_at=last_success,
                 last_intent_at=last_intent,
                 current_interval_minutes=mgr.current_interval_minutes,
                 gated=bool(snap.get("gated")),
+                last_gated_at=last_gated,
             )
             snap["last_success_at"] = live.last_success_at
             snap["stalled"] = live.stalled
@@ -146,6 +151,58 @@ async def ego_status():
 
     user_cadence = await _cadence_snapshot(rt._ego_cadence_manager)
     genesis_cadence = await _cadence_snapshot(rt._genesis_ego_cadence_manager)
+
+    # Total-cessation (scheduler-death) tile signal. The per-ego intent-lag
+    # liveness (``stalled`` above) is BLIND to it: when a cadence scheduler dies,
+    # last_proactive_fire and last_success freeze together, the lag never opens,
+    # and the verdict stays healthy (see ego.liveness coverage boundary). The
+    # dedicated 5-min ego_heartbeat pulse keeps beating through a consumer/gate
+    # deadlock and stops ONLY on scheduler death, so its staleness is the honest
+    # total-cessation signal — reading the SAME signal + 4h threshold as the
+    # subsystem_stale:ego alert, so tile and alert can never disagree.
+    # SCHEDULER-LEVEL: the Subsystem.EGO heartbeat is shared across both ego
+    # managers, so it goes stale only when BOTH stop (or the process dies);
+    # single-ego cessation needs per-ego heartbeat tagging (follow-up).
+    # raise_on_error=True → a broken read fails LOUD (unknown), never a spurious
+    # healthy tile.
+    ego_heartbeat_stale = False
+    ego_heartbeat_age_s = None
+    ego_heartbeat_error = False
+    try:
+        from datetime import UTC, datetime
+
+        from genesis.mcp.health.manifest import (
+            HEARTBEAT_EXPECTED,
+            compute_heartbeat_staleness,
+        )
+
+        hb = await compute_heartbeat_staleness("ego", db=rt._db, raise_on_error=True)
+        status = hb.get("status")
+        ego_heartbeat_stale = status == "overdue"
+        ego_heartbeat_age_s = hb.get("age_seconds")
+        # unknown (unparseable/future ts) can't confirm liveness → error, not healthy.
+        # never_started (#10): compute_heartbeat_staleness now resolves the manifest-
+        # informed "failed to start / never pulsed" verdict itself → error, not healthy
+        # (this is the case the no_heartbeat boot-grace block below used to catch before
+        # compute owned it; keep flagging it so a dead-at-boot ego tile is never green).
+        ego_heartbeat_error = status in ("unknown", "never_started")
+        # no_heartbeat = NO pulse on record. ego emits a "start" pulse at bootstrap
+        # (cadence.py:302), so past a short boot-grace window this is a real absence
+        # (never-started / lost), NOT a healthy tile. Within the grace window (just
+        # after boot, ego's first pulse pending) it is benign. A None boot stamp
+        # (degraded boot) → no grace → treat as error (fail-loud, the safe way). (P2-5)
+        if status == "no_heartbeat":
+            _booted_at = getattr(rt, "_bootstrap_completed_at", None)
+            _grace_s = HEARTBEAT_EXPECTED["ego"][0] + 60  # one pulse interval + margin
+            within_grace = False
+            if _booted_at is not None:
+                within_grace = (datetime.now(UTC) - _booted_at).total_seconds() < _grace_s
+            ego_heartbeat_error = not within_grace
+    except Exception:
+        import logging as _logging
+
+        _logging.getLogger(__name__).debug("ego heartbeat-staleness read failed", exc_info=True)
+        ego_heartbeat_error = True
 
     # Genesis ego config — uses dedicated config fields
     genesis_ego_config = {
@@ -200,6 +257,11 @@ async def ego_status():
             "uncompacted_cycles": uncompacted,
             "shadow_morning_report": config.shadow_morning_report,
             "board_size": config.board_size,
+            # Scheduler-level total-cessation signal (egoSemantic flips the tile
+            # + rollup red on stale; unknown/error → unknown, never a green lie).
+            "ego_heartbeat_stale": ego_heartbeat_stale,
+            "ego_heartbeat_age_s": ego_heartbeat_age_s,
+            "ego_heartbeat_error": ego_heartbeat_error,
             "egos": egos,
         }
     )

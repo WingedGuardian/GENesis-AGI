@@ -10,6 +10,21 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _pin_required_ci_workflows(monkeypatch):
+    """Pin the merge gate's required-CI-workflow identity policy to the shipped
+    default ("CI") for EVERY hook test. The required set is config-driven from the
+    host's ``~/.genesis/config/genesis.yaml`` (see git_push_guard.
+    _required_ci_workflows), so without this pin any test that seeds a green CI
+    rollup would have its green-vs-incomplete verdict depend on the dev box's local
+    config and go non-deterministic — a flaky-by-environment security-gate test is
+    how a real regression gets waved through as "known flake". Config-path behavior
+    has its own tests (TestRequiredCiWorkflowsConfig), which delete this seam;
+    per-test overrides (e.g. "CodeQL") simply setenv later and win."""
+    monkeypatch.setenv("_TEST_REQUIRED_CI_WORKFLOWS", "CI")
+    yield
+
+
 def _load_settings() -> dict:
     """Load .claude/settings.json from the repo root."""
     here = Path(__file__).resolve()

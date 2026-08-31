@@ -7,6 +7,10 @@ Configuration precedence (highest to lowest):
   1. Environment variable (e.g. OLLAMA_URL)
   2. ~/.genesis/config/genesis.yaml  (local install config)
   3. Hardcoded default (safe for a fresh clone)
+
+Exception: ``user_timezone()`` deliberately inverts this to FILE-first
+(genesis.yaml -> USER_TIMEZONE env fallback -> UTC) because timezone is the one
+setting with a live, dashboard-owned mutation surface; see its docstring.
 """
 
 from __future__ import annotations
@@ -543,18 +547,55 @@ def models_md_synthesis_enabled() -> bool:
     return True
 
 
+def _valid_zone(name: str) -> bool:
+    """True iff ``name`` resolves as an IANA zone (guards against typos)."""
+    try:
+        from zoneinfo import (  # noqa: PLC0415 — lazy; zoneinfo is stdlib
+            ZoneInfo,
+            ZoneInfoNotFoundError,
+        )
+
+        ZoneInfo(name)
+        return True
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        return False
+
+
 def user_timezone() -> str:
     """User's local timezone (IANA format).
 
-    Precedence: USER_TIMEZONE env var → local config timezone → UTC.
+    Precedence: genesis.yaml ``timezone`` → USER_TIMEZONE env var → UTC.
     Used by tz.py and any subsystem that formats timestamps for display.
+
+    genesis.yaml is authoritative because timezone is the one setting with a
+    live, dashboard-owned mutation surface: the Configuration-tab dropdown
+    writes the file and ``tz.reload()`` picks it up without a restart. The
+    ``USER_TIMEZONE`` env var is a DEPRECATED fallback, consulted only when the
+    file has no ``timezone`` key (e.g. a standard install that never ran
+    setup-local-config). This deliberately diverges from the env-first house
+    convention (``github_user`` etc.) for that reason; a one-time seed migration
+    (``db/migrations/0086``) copies a real env value into the file before this
+    precedence took effect, so the flip preserves behavior on existing installs.
     """
-    env_val = os.environ.get("USER_TIMEZONE")
-    if env_val:
-        return env_val.strip()
+    # A valid IANA zone is always a non-empty string that ``ZoneInfo`` accepts.
+    # Accept ONLY that at each layer — a blank string, a non-string YAML scalar
+    # (``timezone: no`` → False, ``0`` → int), or a TYPO (e.g. ``Amrica/Chicago``
+    # written by a setup-local-config free-form prompt) is treated as unset and
+    # falls through, rather than being returned and crashing the CronTrigger /
+    # ZoneInfo consumers that trust this function's output.
     local_val = _local_config().get("timezone")
-    if local_val:
-        return str(local_val).strip()
+    if isinstance(local_val, str) and local_val.strip():
+        candidate = local_val.strip()
+        if _valid_zone(candidate):
+            return candidate
+        logger.warning(
+            "genesis.yaml timezone %r is not a valid IANA zone — falling back; "
+            "set a valid zone via the dashboard Timezone control.",
+            candidate,
+        )
+    env_val = (os.environ.get("USER_TIMEZONE") or "").strip()
+    if env_val and _valid_zone(env_val):
+        return env_val
     return "UTC"
 
 

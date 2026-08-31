@@ -24,6 +24,11 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+# The shared hook-input helper lives in scripts/hooks/; this script runs from
+# scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_input import session_path  # noqa: E402
+
 _FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _GENESIS_DIR = Path.home() / ".genesis"
 _LAST_SESSION_FILE = _GENESIS_DIR / "last_foreground_session.json"
@@ -116,13 +121,17 @@ def main() -> None:
 
     now = datetime.now(UTC).isoformat()
 
-    # Read message buffer from session-scoped state (written by UserPromptSubmit)
-    session_dir = _GENESIS_DIR / "sessions" / session_id
-    messages_file = session_dir / "messages.jsonl"
+    # Read message buffer from session-scoped state (written by UserPromptSubmit).
+    # The id is a PATH COMPONENT only here, so an unsafe id skips this read — it
+    # must NOT skip the path-independent writes below (last-session metadata uses
+    # the id as JSON data, not as a path).
     messages: list[dict] = []
     topic_hint = ""
 
-    if messages_file.exists():
+    messages_file = session_path(
+        _GENESIS_DIR / "sessions", session_id, "messages.jsonl"
+    )
+    if messages_file is not None and messages_file.exists():
         try:
             lines = messages_file.read_text().strip().splitlines()
             import contextlib

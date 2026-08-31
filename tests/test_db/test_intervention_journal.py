@@ -34,6 +34,77 @@ async def db(tmp_path):
         yield conn
 
 
+class TestProposalDeduplication:
+    """`exclude_proposals_within_days` shipped untested; these cover it.
+
+    A proposal batch writes BOTH an ego_proposals row and a matching
+    intervention_journal row, and the capability aggregator reads both sources
+    under the same action type -- so two observations counted as four and
+    cleared a three-sample floor built to suppress exactly that.
+    """
+
+    @staticmethod
+    async def _with_proposals(db):
+        await db.execute("""
+            CREATE TABLE ego_proposals (
+                id          TEXT PRIMARY KEY,
+                created_at  TEXT NOT NULL,
+                status      TEXT NOT NULL
+            )
+        """)
+        await db.commit()
+
+    @staticmethod
+    async def _journal_row(db, jid, proposal_id):
+        await db.execute(
+            "INSERT INTO intervention_journal (id, ego_source, proposal_id, "
+            "action_type, action_summary, outcome_status, confidence, created_at) "
+            "VALUES (?, 'genesis', ?, 'dispatch', 's', 'approved', 0.5, "
+            "datetime('now'))",
+            (jid, proposal_id),
+        )
+        await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_a_duplicated_proposal_is_counted_once(self, db):
+        await self._with_proposals(db)
+        await self._journal_row(db, "j1", "p1")
+        await db.execute(
+            "INSERT INTO ego_proposals (id, created_at, status) "
+            "VALUES ('p1', datetime('now'), 'approved')"
+        )
+        await db.commit()
+        rows = await journal_crud.aggregate_by_type(
+            db, exclude_proposals_within_days=30
+        )
+        assert not rows, f"the journal copy of a recent proposal was counted: {rows}"
+
+    @pytest.mark.asyncio
+    async def test_a_null_proposal_id_does_not_discard_the_history(self, db):
+        """One NULL id must not wipe every unrelated row.
+
+        `x NOT IN (…)` is NULL -- never true -- the moment the subquery yields a
+        single NULL, so the whole resolved history would be discarded rather
+        than the duplicates. `id` is a TEXT PRIMARY KEY, which SQLite does not
+        constrain to NOT NULL, so this is reachable in an imported or repaired
+        database. Silent, and it would shrink every domain's sample size.
+        """
+        await self._with_proposals(db)
+        await self._journal_row(db, "j1", "unrelated-proposal")
+        await db.execute(
+            "INSERT INTO ego_proposals (id, created_at, status) "
+            "VALUES (NULL, datetime('now'), 'approved')"
+        )
+        await db.commit()
+        rows = await journal_crud.aggregate_by_type(
+            db, exclude_proposals_within_days=30
+        )
+        assert rows, (
+            "a single NULL proposal id discarded the entire resolved history"
+        )
+        assert rows[0]["total"] == 1
+
+
 class TestCreate:
     @pytest.mark.asyncio
     async def test_create_returns_id(self, db):
@@ -205,3 +276,67 @@ class TestQueries:
         outreach = next(a for a in aggs if a["action_type"] == "outreach")
         assert outreach["total"] == 2
         assert outreach["approved"] == 2
+
+
+class TestNegativeWindowIsRefused:
+    """A negative window must RAISE, not silently disable the de-duplication.
+
+    Measured, not reasoned: SQLite renders a negative value as the modifier
+    ``'--N days'``, which it rejects, yielding NULL. ``p.created_at >= NULL``
+    is then NULL rather than false, so ``NOT EXISTS`` holds for every row and
+    the exclusion becomes a no-op -- every proposal counted twice again, from a
+    call that returns a perfectly healthy-looking result set. That is the worst
+    shape a validation gap can take: a wrong answer wearing a right answer's
+    grammar.
+
+    ``capability_map._recency_clause`` already refuses this loudly. The two
+    windowed APIs disagreeing about the same input is how one of them gets
+    "fixed" later by copying the wrong one.
+    """
+
+    @staticmethod
+    async def _with_proposals(db):
+        """The exclusion SQL joins ego_proposals; the base fixture omits it.
+
+        Created here so the accepted-values case exercises the REAL query
+        instead of dying on a missing table -- a test that fails for a setup
+        reason proves nothing about the guard it is named for.
+        """
+        await db.execute(
+            "CREATE TABLE ego_proposals (id TEXT PRIMARY KEY, "
+            "created_at TEXT NOT NULL, status TEXT NOT NULL)"
+        )
+        await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_negative_window_raises(self, db):
+        await self._with_proposals(db)
+        with pytest.raises(ValueError, match="must be >= 0 or None"):
+            await journal_crud.aggregate_by_type(
+                db, exclude_proposals_within_days=-5,
+            )
+
+    @pytest.mark.asyncio
+    async def test_zero_and_none_are_still_accepted(self, db):
+        """0 is a legitimate empty window; None disables the exclusion.
+
+        Asserted against a table with a ROW in it. `== []` on an empty table is
+        equally true for a correct window, a broken one, and a function that
+        returns [] unconditionally -- the assertion would hold on the success
+        path either way, which makes it decoration rather than a test.
+        """
+        await self._with_proposals(db)
+        await journal_crud.create(
+            db, ego_source="genesis", proposal_id="p-z", cycle_id="c-z",
+            action_type="dispatch", action_summary="s", confidence=0.5,
+        )
+        await journal_crud.resolve(db, "p-z", outcome_status="approved")
+
+        for window in (0, None):
+            aggs = await journal_crud.aggregate_by_type(
+                db, exclude_proposals_within_days=window,
+            )
+            assert [a["action_type"] for a in aggs] == ["dispatch"], (
+                f"window={window!r} dropped a row it should have counted"
+            )
+            assert aggs[0]["total"] == 1

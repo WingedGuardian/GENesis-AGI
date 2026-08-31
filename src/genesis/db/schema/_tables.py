@@ -1158,12 +1158,15 @@ TABLES = {
                 CHECK (status IN ('active', 'fired', 'expired', 'withdrawn')),
             created_at        TEXT NOT NULL,
             fired_at          TEXT,
-            proposal_id       TEXT,                   -- FK to ego_proposals.id (set on fire)
+            proposal_id       TEXT,                   -- FK to ego_proposals.id (set on fire;
+                                                      -- system rows: source dispatch proposal, set at creation)
             cycle_count       INTEGER NOT NULL DEFAULT 0,
             max_cycles        INTEGER NOT NULL DEFAULT 20,
             reasoning         TEXT,
             priority          TEXT NOT NULL DEFAULT 'normal'
-                CHECK (priority IN ('low', 'normal', 'high'))
+                CHECK (priority IN ('low', 'normal', 'high')),
+            origin            TEXT NOT NULL DEFAULT 'ego'  -- 'ego' (LLM-created, capped) |
+                                                          -- 'system' (dispatch follow-through, uncapped)
         )
     """,
     # ── Intervention Journal ────────────────────────────────────────────────

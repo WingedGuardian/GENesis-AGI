@@ -17,7 +17,11 @@ from genesis.dashboard.api import blueprint
 
 # Dates relative to now so the resolved-history recency window (14 days) is
 # pinned on BOTH sides without a fixed calendar date that rots after 14 days.
+# frozen-clock-ok: 11-day margin — seeded 3d back, must stay INSIDE the 14-day
+# resolved-history window (the `_cutoff` in the ego-directives route).
 _RECENT_RESOLVED = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+# frozen-clock-ok: unbounded margin — seeded 30d back and must stay OUTSIDE that same
+# 14-day window; elapsed time only deepens the staleness it asserts.
 _STALE_RESOLVED = (datetime.now(UTC) - timedelta(days=30)).isoformat()
 
 
