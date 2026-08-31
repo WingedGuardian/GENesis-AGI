@@ -2768,6 +2768,29 @@ class EgoSession:
         ``push_reactive_event``)."""
         self._reply_signal_sink = sink
 
+    def _emit_question_signal(self, *, kind: str, summary: str, urgency: str) -> None:
+        """Wake THIS ego with the OUTCOME of a question it asked — answer,
+        no-reply, or not-delivered. The durable ego_question observation is the
+        record; this reactive signal ensures a cycle actually RUNS to see it,
+        because the 4h context section is opportunistic (a cycle may not fire
+        inside the window) and the failure outcomes have no other wake path
+        (Codex #1499 P1-c-3)."""
+        sink = self._reply_signal_sink
+        if sink is None:
+            return
+        priority = {"low": "low", "normal": "medium", "high": "high"}.get(urgency, "low")
+        try:
+            sink({
+                "type": kind,
+                "summary": summary,
+                "priority": priority,
+                "source": "ego_question",
+            })
+        except Exception:
+            logger.warning(
+                "Reply signal sink failed for ego question (%s)", kind, exc_info=True,
+            )
+
     async def _process_questions(self, questions: list[dict]) -> None:
         """Deliver ego questions to the user with reply capture.
 
@@ -2797,6 +2820,17 @@ class EgoSession:
         if not hasattr(self._outreach_pipeline, "submit_and_wait"):
             logger.warning(
                 "Outreach pipeline lacks submit_and_wait — skipping questions"
+            )
+            return
+        # submit_and_wait silently degrades to fire-and-forget when no reply
+        # waiter is wired (returns immediately, reply always None) — a question
+        # would be "sent" yet unanswerable. Skip rather than mislead the ego with
+        # an instant no_reply (Codex #1499 P2#10).
+        _supports = getattr(self._outreach_pipeline, "supports_reply_wait", None)
+        if callable(_supports) and _supports() is False:
+            logger.warning(
+                "Outreach pipeline has no reply-wait infra — skipping %d question(s)",
+                len(questions),
             )
             return
 
@@ -2874,10 +2908,26 @@ class EgoSession:
 
         try:
             salience = {"low": 0.3, "normal": 0.6, "high": 0.9}.get(urgency, 0.6)
+            # Per-question correlation id → a UNIQUE outreach topic, so the
+            # pipeline in-flight de-dup guard (_awaited_dup_key keys on
+            # signal_type+topic) never collapses two DISTINCT questions that share
+            # a 100-char lead-in. Questions are never de-duped by design
+            # (governance _DEDUP_WINDOWS["ego_question"]=0); this closes the
+            # in-flight path too (Codex #1499 P2#7).
+            q_id = uuid.uuid4().hex[:8]
+            # The waiter is quote-reply-only (standalone_resolvable=False below),
+            # so the DELIVERED text must tell the user to reply-to-this-message —
+            # a plain next-DM answer would hit no waiter. `content` stays clean
+            # (it is what the outcome observations record); the instruction lives
+            # only in the outreach context (Codex #1499 P2#8).
+            delivered_text = f"{content}\n\n(Reply to this message to answer.)"
             request = OutreachRequest(
                 category=OutreachCategory.NOTIFICATION,
-                topic=content[:100],
-                context=content,
+                # `topic` is an internal correlation/de-dup key, NOT display text
+                # (the user sees `context`); it only surfaces as a subject line on
+                # email-ish channels, and questions are telegram-only.
+                topic=f"{content[:80]} · {q_id}",
+                context=delivered_text,
                 salience_score=salience,
                 signal_type="ego_question",
                 channel="telegram",
@@ -2921,6 +2971,14 @@ class EgoSession:
                     category="ego_question",
                     created_at=datetime.now(UTC).isoformat(),
                 )
+                self._emit_question_signal(
+                    kind="question_not_delivered",
+                    summary=(
+                        f"Your question was NOT delivered "
+                        f"(status={result.status.value}) — reconsider/retry: {content[:70]}"
+                    ),
+                    urgency=urgency,
+                )
                 return
 
             if reply:
@@ -2960,31 +3018,14 @@ class EgoSession:
                         reply[:500],
                         exc_info=True,
                     )
-                sink = self._reply_signal_sink
-                if sink is not None:
-                    try:
-                        sink(
-                            {
-                                "type": "user_reply",
-                                "summary": (
-                                    f"User answered your question "
-                                    f"({content[:60]}): {reply[:120]}"
-                                ),
-                                # Cadence _map_priority knows low/medium/high
-                                # ("normal" would fall through to low).
-                                "priority": {
-                                    "low": "low",
-                                    "normal": "medium",
-                                    "high": "high",
-                                }[urgency],
-                                "source": "ego_question",
-                            }
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Reply signal sink failed for ego question",
-                            exc_info=True,
-                        )
+                self._emit_question_signal(
+                    kind="user_reply",
+                    summary=(
+                        f"User answered your question "
+                        f"({content[:60]}): {reply[:120]}"
+                    ),
+                    urgency=urgency,
+                )
             else:
                 await obs_crud.create(
                     self._db,
@@ -2999,6 +3040,14 @@ class EgoSession:
                     priority="low",
                     category="ego_question",
                     created_at=datetime.now(UTC).isoformat(),
+                )
+                self._emit_question_signal(
+                    kind="question_no_reply",
+                    summary=(
+                        f"Your question went unanswered after "
+                        f"{int(DEFAULT_REPLY_TIMEOUT_S / 3600)}h: {content[:70]}"
+                    ),
+                    urgency=urgency,
                 )
         except Exception:
             logger.warning(

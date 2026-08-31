@@ -1209,7 +1209,7 @@ class UserEgoContextBuilder:
 
     async def _ego_question_section(self, *, depth: str = "deep") -> str:
         """Answers to questions THIS ego asked the user via the B3 questions
-        channel (last 24h).
+        channel (last 4h).
 
         Without this, the asking user ego never SEES the answer: the reply comes
         back as a reactive signal that only WAKES the cycle (its summary is not
@@ -1233,7 +1233,11 @@ class UserEgoContextBuilder:
             cursor = await self._db.execute(
                 "SELECT content, created_at FROM observations "
                 "WHERE source = 'ego_question' AND resolved = 0 "
-                "AND created_at >= datetime('now', '-4 hours') "
+                # datetime() normalizes the stored ISO-8601 'T' separator to
+                # SQLite's space form; a raw text compare treats every same-day
+                # 'T' row as newer than the space-formatted cutoff ('T' > ' '),
+                # so the 4h window would never actually bound (Codex #1499 P2#6).
+                "AND datetime(created_at) >= datetime('now', '-4 hours') "
                 "ORDER BY created_at DESC LIMIT 8"
             )
             rows = await cursor.fetchall()
@@ -1245,7 +1249,7 @@ class UserEgoContextBuilder:
         if not rows:
             return ""  # rare — omit the section entirely rather than add noise
 
-        header = "## Answers To Your Questions (24h)\n"
+        header = "## Answers To Your Questions (4h)\n"
         if depth == "light":
             return f"{header}{len(rows)} update(s).\n"
 

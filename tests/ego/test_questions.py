@@ -10,7 +10,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -51,6 +51,8 @@ def session():
     s = object.__new__(EgoSession)
     s._outreach_pipeline = AsyncMock()
     s._outreach_pipeline.submit_and_wait = AsyncMock(return_value=(_delivered(), None))
+    # Reply-wait infra present by default (P2#10 guard); sync so it isn't a coroutine.
+    s._outreach_pipeline.supports_reply_wait = Mock(return_value=True)
     s._db = AsyncMock()
     s._source_tag = "user_ego_cycle"
     # object.__new__ skips __init__ — mirror its questions-channel attrs.
@@ -109,7 +111,7 @@ class TestProcessQuestions:
         assert signals[0]["source"] == "ego_question"
 
     @pytest.mark.asyncio
-    async def test_timeout_writes_unanswered_observation_no_signal(self, session):
+    async def test_timeout_writes_unanswered_observation_and_wakes_ego(self, session):
         session._outreach_pipeline.submit_and_wait = AsyncMock(return_value=(_delivered(), None))
         signals: list[dict] = []
         session.set_reply_signal_sink(signals.append)
@@ -121,7 +123,13 @@ class TestProcessQuestions:
 
         obs_create.assert_called_once()
         assert "unanswered" in obs_create.call_args.kwargs["content"]
-        assert signals == []
+        # P1-c-3: the asking ego must LEARN the no-reply outcome. The 4h context
+        # section is opportunistic (a cycle may not run inside the window before
+        # the ~2h timeout row ages out), so a reactive signal wakes the ego.
+        # Previously this asserted signals == [] — that WAS the bug.
+        assert len(signals) == 1
+        assert signals[0]["type"] == "question_no_reply"
+        assert signals[0]["source"] == "ego_question"
 
     @pytest.mark.asyncio
     async def test_cap_two_questions_per_cycle(self, session):
@@ -158,7 +166,11 @@ class TestProcessQuestions:
         assert obs_create.call_args.kwargs["type"] == "not_delivered"
         assert "NOT delivered" in obs_create.call_args.kwargs["content"]
         assert obs_create.call_args.kwargs["origin_class"] == "first_party"
-        assert signals == []
+        # P1-c-3: a delivery failure must also wake the asking ego so it can
+        # reason about a retry (previously asserted signals == [] — the bug).
+        assert len(signals) == 1
+        assert signals[0]["type"] == "question_not_delivered"
+        assert signals[0]["source"] == "ego_question"
 
     @pytest.mark.asyncio
     async def test_questions_deliver_sequentially_in_one_task(self, session):
@@ -353,3 +365,96 @@ def test_ego_qa_is_an_always_section():
     assert "ego_qa" in focus._ALWAYS_SECTIONS
     # And it resolves to "always" (never trimmed) in the reactive profile.
     assert focus.FOCUS_CONTEXT_WEIGHTS["reactive"]["ego_qa"] == "always"
+
+
+class TestQuestionRemediation2:
+    """Codex #1499 round-2 remediation — P2#7/#8/#10 (P1-b deferred: f/u 8cc2c200)."""
+
+    @pytest.mark.asyncio
+    async def test_delivered_text_carries_quote_reply_instruction(self, session):
+        """P2#8: the waiter is quote-reply-only, so the DELIVERED text must tell
+        the user to reply-to-the-message; a plain next-DM answer hits no waiter.
+        `content` (what the observations record) stays clean — the instruction
+        lives only in the outreach `context`."""
+        with patch("genesis.db.crud.observations.create", new=AsyncMock()):
+            await session._process_questions([{"content": "Ship it?", "urgency": "normal"}])
+            await _drain_question_tasks(session)
+        request = session._outreach_pipeline.submit_and_wait.call_args[0][0]
+        assert "Ship it?" in request.context
+        assert "reply to this message" in request.context.lower()
+
+    @pytest.mark.asyncio
+    async def test_distinct_questions_get_unique_topic(self, session):
+        """P2#7: two DISTINCT questions sharing a 100-char lead-in must not
+        collapse via the pipeline in-flight guard (_awaited_dup_key keys on
+        signal_type+topic) — each question gets a unique topic identity."""
+        prefix = "X" * 100
+        with patch("genesis.db.crud.observations.create", new=AsyncMock()):
+            await session._process_questions(
+                [
+                    {"content": prefix + " ALPHA", "urgency": "normal"},
+                    {"content": prefix + " BETA", "urgency": "normal"},
+                ]
+            )
+            await _drain_question_tasks(session)
+        calls = session._outreach_pipeline.submit_and_wait.call_args_list
+        assert len(calls) == 2
+        topics = {c[0][0].topic for c in calls}
+        assert len(topics) == 2, f"topics collided: {topics}"
+
+    @pytest.mark.asyncio
+    async def test_questions_skipped_without_reply_wait_infra(self, session):
+        """P2#10: submit_and_wait silently falls back to fire-and-forget when the
+        pipeline has no reply-waiter — so a question could be 'sent' but never
+        answerable. Skip (with a log) rather than deliver an un-answerable prompt."""
+        session._outreach_pipeline.supports_reply_wait = Mock(return_value=False)
+        with patch("genesis.db.crud.observations.create", new=AsyncMock()):
+            await session._process_questions([{"content": "Q?", "urgency": "normal"}])
+            await _drain_question_tasks(session)
+        session._outreach_pipeline.submit_and_wait.assert_not_called()
+
+
+def test_static_identity_schemas_advertise_questions():
+    """P2#5: the STATIC identity schemas the model sees every cycle must include
+    `questions` — not only the dynamic context contract — or the two disagree."""
+    from pathlib import Path
+
+    import genesis
+
+    identity = Path(genesis.__file__).parent / "identity"
+    for name in ("USER_EGO_SESSION.md", "GENESIS_EGO_SESSION.md"):
+        text = (identity / name).read_text()
+        assert '"questions"' in text, f"{name} static schema omits questions[]"
+
+
+@pytest.mark.asyncio
+async def test_ego_question_section_excludes_stale_rows():
+    """P2#6: the 4h window must actually bound. Stored created_at is ISO-8601
+    ('T' separator); a raw text compare against datetime('now',...) (space
+    separator) wrongly includes same-day old rows ('T' > ' '). A 5h-old reply
+    must be EXCLUDED."""
+    from datetime import UTC, datetime, timedelta
+
+    import aiosqlite
+
+    from genesis.db.schema import TABLES
+    from genesis.ego.user_context import UserEgoContextBuilder
+
+    async with aiosqlite.connect(":memory:") as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute(TABLES["observations"])
+        await db.commit()
+        stale_ts = (datetime.now(UTC) - timedelta(hours=5)).isoformat()
+        await db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, content, priority, category, created_at, resolved) "
+            "VALUES ('o_old','ego_question','user_reply',?,?,'ego_question',?,0)",
+            ("Ego asked: stale?\nUser replied: old answer.", "medium", stale_ts),
+        )
+        await db.commit()
+
+        builder = object.__new__(UserEgoContextBuilder)
+        builder._db = db
+        section = await builder._ego_question_section()
+
+    assert section == "", f"5h-old row leaked past the 4h window: {section!r}"

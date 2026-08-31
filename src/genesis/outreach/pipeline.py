@@ -115,6 +115,13 @@ class OutreachPipeline:
         """Attach a ReplyWaiter for bidirectional outreach."""
         self._reply_waiter = waiter
 
+    def supports_reply_wait(self) -> bool:
+        """True when reply-wait infra is wired. Without it, submit_and_wait
+        degrades to fire-and-forget (returns immediately, reply always None),
+        so an awaited prompt can never be answered — callers that REQUIRE a
+        reply (e.g. the ego questions channel) should check this first."""
+        return self._reply_waiter is not None
+
     def set_thread_tracker(self, tracker: object) -> None:
         """Attach a ThreadTracker for email thread auto-registration."""
         self._thread_tracker = tracker
