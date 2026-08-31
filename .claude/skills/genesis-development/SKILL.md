@@ -313,6 +313,101 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   passed may be testing nothing; a whole suite passing every review round
   while a reviewer keeps finding real spec bugs is the tell that the tests
   encode the same wrong spec as the code.
+- **A RED that comes back GREEN has AT LEAST six causes, and "the test is
+  vacuous" is the LAST one to reach for.** In rough order of how often they
+  actually occur:
+  1. **The run never EXECUTED** — a guard refused it, a lock held it, the tool
+     timed out — so there is no result at all. This is the CONFIDENT FALSE
+     NEGATIVE: a sweep reporting "all mutations survived" is far more often a
+     sweep that never ran. Make the runner ABORT when the test command emits no
+     result line, and treat a SKIPPED/deselected line FOR THE TEST UNDER
+     VERIFICATION the same way — it is a result line, and it still means
+     nothing ran. Scope that check to the target: a suite carrying legitimate
+     `skipif` tests emits SKIPPED lines on every healthy run, so a runner that
+     aborts on ANY of them refuses every run — and the agent then either sits
+     blocked or starts stripping skip markers to unblock itself.
+  2. **The MUTATION silently failed to apply** — the auto-formatter reflows
+     lines and a `str.replace()` anchor written from memory then matches nothing.
+  3. **The test ran against a DIFFERENT COPY of the code** — an installed
+     package shadowing the source tree, a stale `.pyc`, the wrong virtualenv, or
+     (measured, this session) a path relative to a process whose cwd had moved to
+     another worktree. The mutation applied, the run happened, the test is sound,
+     and none of the other causes fits.
+  4. **The mutation was BEHAVIOURALLY NULL** — it applied and parses, so every
+     postcondition below passes, but it changed no behaviour: swapped operands
+     that commute, an edit inside a dead branch, a type annotation Python does
+     not enforce (also measured this session). The remedy is a different
+     MUTATION, not a different test.
+  5. **A SIBLING LAYER still enforces the invariant**, so the green is correct.
+     When two layers produce the same behaviour, mutate the WHOLE mechanism, not
+     one of its halves. (The duplicated-layer anecdote in the review-loop section
+     is the worked example.)
+  6. **A SIBLING TEST LEAKED STATE that masks the mutation** — an undone
+     `monkeypatch`, a stray `os.environ` entry, a mutated singleton or a
+     module-level cache — so the mutated path is never reached in THIS run.
+     It matches none of the five above: the run executed, the mutation applied
+     and is not behaviourally null, the code is the right copy, and no
+     production layer is enforcing anything. MEASURED in this repo: a leaked
+     disable lever made the very lock under test a no-op, and five real
+     failures read as a story about the mechanism instead. The remedy is test
+     ISOLATION (an autouse fixture that clears the lever) — NOT a different
+     mutation, and NOT a different test.
+  Only after all six: the test is vacuous. The list is ordered and still not
+  closed — if none of them fits, the vacuous conclusion is UNPROVEN rather than
+  established: look for the cause you have not modelled before rewriting a test
+  that may be sound, because rewriting a sound test is the expensive mistake
+  here.
+  The PRINCIPLE, which is what to remember:
+  **every injection must prove it applied, by its own postcondition, before any
+  result is read as RED.** Two corollaries follow, and both have bitten:
+  prove it against the value THAT injection was handed, never against the
+  pristine original — with two or more edits, the first edit keeps a whole-file
+  `mutated != original` true while a later one silently misses its anchor, so
+  the partial mutation reads as complete (assert the anchor matched the expected
+  number of times); and prove it with the mutated file's OWN parser —
+  `compile(src, path, "exec")` for Python (NOT `ast.parse`: that only builds a
+  tree, so it accepts context-invalid constructs like a `return` moved outside a
+  function or a `break` outside a loop, and the `SyntaxError` then surfaces at
+  COLLECTION, where a nonzero exit reads as a successful RED), `bash -n` for
+  shell — since an invalid mutation breaks collection and reads as a successful
+  RED, while the wrong language's parser
+  rejects a valid mutation and hides a real survivor. Restore from a file copy
+  taken beforehand, never `git checkout` — the work is uncommitted — and make
+  the restore ATTEMPT unconditional ON THE RUN'S OUTCOME (`trap restore EXIT`, a
+  `finally:`), never the tail of an `&&` chain. Unconditional means it always
+  RUNS, not that it always OVERWRITES: what it writes is still gated on the hash
+  check below. A `trap` that restores blindly is the very thing that destroys a
+  concurrent edit. The expected outcome here is a NONZERO exit, and under
+  `set -e` a trailing restore is exactly the statement that never runs (the
+  `out=$(cmd)` entry in Common Traps is the same mechanism), so the shape that
+  reads as careful leaves a deliberately-broken file in an uncommitted worktree
+  on the ordinary path — as well as on interruption or a tool timeout. Take
+  that copy ONCE for the whole sweep and refuse to start EACH cycle if the file
+  already differs from it — a copy re-taken immediately before each mutation
+  makes the check vacuous, since the file trivially matches a copy a moment
+  old; the baseline exists to catch a PREVIOUS cycle that failed to restore, or
+  a concurrent edit. Verify the restore by hash rather than assuming it. And
+  restore ONLY what you broke: compare against
+  the hash the MUTATION wrote before overwriting, because between the mutation
+  and the handler another session, agent or formatter may have edited that file,
+  and a blind snapshot restore silently destroys their uncommitted work — a
+  final hash check does not catch this, it only confirms the overwrite
+  succeeded. If the file no longer matches what the mutation wrote, PRESERVE it
+  and report the conflict instead. The cleanest way to avoid the window entirely
+  is to mutate inside an isolated worktree nobody else is editing.
+- **Vacuous-test shapes to check for by name** (a list of the common ones, not a
+  definition). The most frequent in practice is the one that never ran at all: a
+  test SKIPPED by a marker, or deselected by a `-k` filter or a wrong path, which
+  reports SKIPPED or "no tests ran" and never goes red — check the count, not just
+  the absence of failures. Beyond that, a test is vacuous when: its
+  assertion is ALSO true on the success path (`assert x.blocked is False` where
+  a successful call also returns False — assert the fact that DISTINGUISHES
+  them); its setup short-circuits the path it names (passing an explicit
+  argument the code prefers over the env var under test); or its fixture never
+  creates the shape it claims (a `bash -c 'sleep 30 # marker'` decoy
+  exec-replaces itself and loses the marker from its argv — add a
+  guard-the-guard assert that the fixture really has the property). Ask of every
+  new test: *would this still pass if the mechanism it names were deleted?*
 - **Contested/subtle specs: write the expectations first.** When what-should-
   happen is itself under discussion (which keys count, which states clear an
   alarm), enumerate the expectation table as failing tests BEFORE implementing
@@ -799,12 +894,18 @@ path not covered by its own unit test, it needs `/deep-review`. If it only
 touches things with clear, isolated test coverage, code-reviewer inline
 is sufficient."
 
-**There is no `/review` command.** Older text here (and the commit gate's own
-deny message) says "Run /review" — measured, `.claude/commands/` ships
-`deep-review.md` and `audit-changes.md`, and there is no user-level commands
-directory. The real options are **`/deep-review`** (dispatches the adversarial
-pass AND writes the evidence marker) and the built-in `/code-review`.
-`/audit-changes` is a light self-check, not a substitute for either.
+**`/review` is not in this repo — it comes from the optional `superpowers`
+plugin.** Where that plugin is installed, `/review` and
+`superpowers:code-reviewer` are the preferred path. Where it is not, those names
+do not resolve, and older text saying "Run /review" sends you after nothing —
+which is why the enforcement hooks now name the plugin as optional rather than
+assuming it. **Check, don't assume, in either direction**: the plugin is offered
+by the official marketplace, so its presence is per-install, not per-repo.
+
+Always available, plugin or no: **`/deep-review`** (dispatches the adversarial
+pass AND writes the evidence marker), the built-in `/code-review`, and the
+by-hand `scripts/review_state.py evidence-path` → `mark` flow.
+`/audit-changes` is a light self-check, not a substitute for any of them.
 
 The enforcement hooks (`review_enforcement_prompt.py`,
 `review_enforcement_commit.py`) still fire on every change — they are
@@ -965,6 +1066,22 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   The second reviewer should see the improved code, not the same unfixed diff
   both would otherwise review; parallel also doubles review spend per baseline.
   (Standing user directive.)
+- **A different model is the real correctness gate; Codex is the default.** A Claude
+  reviewer shares this model's blind spots, so it clears the LOCAL depth gate but is not
+  the cross-model gate. When the GitHub Codex reviewer is unavailable AND the install
+  has an approved alternative external reviewer — a DIFFERENT model, with explicit
+  per-use user approval every time — run it non-interactively over the diff with an
+  adversarial mandate. Which reviewer that is (if any) is install-local and belongs in
+  user-level config, not here.
+  **Unavailable is established by ASKING**: comment `@codex review`, wait, and read the
+  reply. An explicit usage-limits comment is unavailability. Nothing else is — silence
+  is not, and neither is `--check-pr` reporting no review, which says the same thing
+  whether the reviewer is down or was simply never triggered at this head. Nor is a
+  `codex exec` quota error: that is a separate surface on separate quota.
+  Scope what you hand it exactly as `.claude/commands/deep-review.md` §1 specifies.
+  **Verify it saw a diff at all**: a clean verdict that does not demonstrate WHAT it
+  reviewed is void, and a false clean from the cross-model gate is worse than no review.
+  Do not merge on a same-model-only review.
 - **Escalation cap — a HARD BLOCK at 3 rounds that each find NEW defects.**
   A *round* = one review→fix→re-review iteration (local reviewer rounds and
   cloud-bot re-review rounds count together, per change). The cap is enforced
@@ -984,6 +1101,37 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      cost), name the cap explicitly ("we've hit the 3-round escalation cap"),
      and get a FRESH decision: keep hardening, switch to a robust-by-
      construction redesign, narrow scope, or shelve.
+  **Tabulate findings by CLASS before fixing — but never let that change what
+  COUNTS.**
+  Tabulate the findings with a CLASS column before fixing ANY round's findings,
+  including round ONE. Deferring the tabulation to the second round is what
+  spends a round discovering a shared cause that was visible in the first: if the
+  opening review returns several instances of one generator, an instance-level
+  first pass fixes the ones named and ships the rest as the next round's
+  findings. The tabulation is cheap and the round it saves is not. Findings that look unrelated one at a time routinely share one
+  generator — five across three rounds once reduced to a single defect (two
+  layers that had to agree about every lever and could not), and patching
+  instances twice changed nothing while deleting the second layer removed all
+  five at once. If one class has ≥2 entries, look for the shared GENERATOR and fix
+  that; two findings can land in one superficial class without sharing a cause, so
+  the count is the prompt to look, not the verdict.
+  **Class grouping decides HOW you fix — never whether the round counts.** The
+  counter is deliberately class-blind: `bump_review_round` increments on a
+  distinct staged diff and records no class (or reviewer) identity, and the
+  marking rule below is finding-based — ANY new BLOCKER/SHOULD-FIX/P1/P2 makes
+  the round defect-bearing, including the second instance of a class you have
+  already named. Passing `--clean` to keep a repeat-class round off the counter
+  is a falsification, and worse than miscounting: `--clean` RESETS the streak to
+  zero, so it disarms the cap outright rather than merely under-counting it.
+
+  A corollary that costs a round if missed: when you delete a duplicated layer,
+  verify the class is closed by enumerating the registry for the BEHAVIOUR, not
+  for the deleted file's NAME. A name-scoped guard beneath a class-scoped claim
+  passes happily while a sibling oracle sits on the same event and matcher.
+  (And if the invariant turns out not to be statically checkable, say so and
+  narrow the test to what it can prove — a guard that cries wolf gets deleted by
+  whoever hits it next.)
+
   These three are backstopped by a **machine layer** with **two tiers, not one**.
   The tier you hit FIRST is the one most sessions do not know exists:
 
@@ -1423,11 +1571,21 @@ findings below, a gated `gh pr merge`:
   evidence a review had ever run hidden by a drive-by comment. Precedence is the right
   shape for a VERDICT; for a REPORT, hiding a true fact is never correct.
   Or append `# scheduled-review-override` to merge anyway (the conscious "merge without
-  the scheduled reviews" case). Head match is EXACT — no ancestor walk, no delta
+  the scheduled reviews" case). Head match is EXACT for the LLM marker — no delta
   tolerance, unlike the Codex freshness gate, which grants relief on a provably trivial
   delta. That asymmetry is deliberate: the Codex classifier judges code-review
   substantiality by file type and size, and an inferential leak lands in exactly the small
-  doc edit it would wave through. The marker means "ran **clean**", not merely "ran": a
+  doc edit it would wave through. The ONE relief the leaks kind gets is MECHANICAL, not a
+  delta tolerance: an ACCEPTED `leaks` marker on an ANCESTOR commit of head satisfies the
+  gate when the `leak-detector` job of the `CI` workflow is green at head (identity pinned
+  to that (name, workflow) pair; `_MECHANICAL_RESCAN_BY_KIND`), and NEVER when any
+  refused `leaks` marker — or any blocking finding the scan could not credit to a head
+  or kind (a tie, a malformed marker) — exists anywhere in the PR (the head axis is not
+  a time axis — a later acceptance at an older head must not outrank a refusal). `--check-pr` renders a
+  carried marker as `ok (leaks carried from <sha>, leak-detector green at head)`, never
+  as `ok (at head)`. Measured motive: 6 of 10 sampled multi-push PRs were blocked purely
+  because the routine does not re-stamp after a push, and the override had become
+  routine. The marker means "ran **clean**", not merely "ran": a
   review whose body carries a blocking finding (`[P1]`/`HARD BLOCK`/`### ERROR`, unless a
   clean verdict overrides) is rejected, and DISMISSED/PENDING(draft) reviews don't count.
   **ALWAYS end a genuinely-clean scheduled review with an explicit verdict line**
@@ -1497,7 +1655,7 @@ The review-findings gate specifically:
    intentionally accepted.
 6. **Read the PR's warning comments before merging — not just the hard gate.**
    Beyond Codex, a structural-review bot posts under the repo-owner account
-   (`WingedGuardian`, review state COMMENTED) and emits **SOFT WARNINGs** (PII /
+   (review state COMMENTED) and emits **SOFT WARNINGs** (PII /
    private-text / wording) that the hook does NOT block on and that a naive
    `.comments` scan misses. Check BOTH `gh pr view N --json reviews,comments`
    and `gh api repos/<owner>/<repo>/pulls/N/comments`, and address each soft

@@ -55,11 +55,46 @@ under incident pressure.
 ERROR POLICY — WHAT BLOCKS AND WHAT DOES NOT
 --------------------------------------------
   * BLOCK when the pin moved forward and a required receipt is absent.
-  * BLOCK when the pin cannot be READ at either side — unparseable, ambiguous,
-    or not valid UTF-8. "I cannot tell what this file pins" is not a reason to
-    wave a release through; it is the state a human must look at. (This is the
-    inverse of the old behaviour, where an unreadable pin skipped.)
-  * PASS when the pin is unchanged or moves backward.
+  * BLOCK when the HEAD pin cannot be READ — unparseable, ambiguous, not valid
+    UTF-8, or not ``X.Y.Z``. "I cannot tell what this PR pins" is not a reason to
+    wave a release through; it is the state a human must look at.
+  * BLOCK when the head pin is not CANONICAL semver (leading zeros) **and this PR
+    wrote it** — i.e. it differs from the base's. ``npm install
+    @anthropic-ai/claude-code@2.1.0218`` does not resolve, so an authored pin in
+    that form ships a version nothing can install, in any direction: forward,
+    backward, unknown, or a respelling of the same number. NOT applied when the
+    head pin is identical to the base's. An INHERITED malformed pin is not this
+    PR's to fix, and refusing it would make that pin block every open PR including
+    its own repair — the wedge above, arriving by a different door.
+  * **REQUIRE RECEIPTS — do not block outright — when the BASE pin cannot be read.**
+    Direction is then unknowable, and the two available answers are both wrong:
+    blocking wedges the repository (a base-side fault is inherited by every open PR
+    and repairable by none of them through a gate with no override sigil), while
+    passing lets a PR that repairs the base and bundles a forward release ship
+    unreceipted. CI does not cover that second case — the merge tree carries the
+    REPAIRED file, so lockstep passes and the check is green. So the gate asks for
+    the attestation in place of the comparison, and marks the verdict
+    ``direction_verified=False`` so a caller cannot mistake it for a real PASS.
+    Receipts are a line in the PR body, so this refuses a merge, never the
+    repository's ability to repair itself.
+  * **That base-side rule splits in two, and the split decides the verdict.**
+    CONTENT — git ran and what came back is not a readable pin (absent, empty,
+    assigned twice, not valid UTF-8) — is a fact about the TREE, and takes the
+    require-receipts path above. PLUMBING — the read ITSELF failed, git would not
+    run, the contents API timed out — is this gate failing, not either branch, and
+    passes NON-BLOCKING (``base_unreadable``); blocking there would wall off every
+    merge in the repository on one transient hiccup, through a gate with no
+    override sigil. Collapsing the two is a live fail-open: a non-UTF-8 base read
+    as plumbing would hand a free pass to a pin nobody can decode.
+  * PASS when the pin is unchanged, respelled to the same version, or moves
+    backward.
+
+SCOPE OF THAT POLICY — it governs TEXT THIS MODULE RECEIVES, not whether it
+receives any. ``evaluate()`` is handed the head's content and either the base's
+content or ``None``; everything above is about what those say. Whether the file
+changed AT ALL is decided upstream by the merge gate, from the blob SHA — content
+cannot distinguish "identical" from "both unavailable", and asking it to do so is
+what let two different oversized blobs read as an untouched pin.
 
 Note it compares the PARSED PIN VALUE, not whether the file changed:
 ``scripts/lib/cc_version.sh`` is edited for many reasons that leave the pin alone
@@ -139,11 +174,42 @@ _FENCE_MARKS = ("```", "~~~")
 #: GitHub's PR-body limit. Bound the work regardless of the scanner's O(n).
 _MAX_BODY = 65_536
 
-#: Canonical semver only — no leading zeros. `int()` collapses "2.1.0246" and
-#: "2.1.246" to the same tuple, so a pin written the first way reads as UNCHANGED
-#: against the second and skips the gate entirely. npm cannot install a
-#: leading-zero version either, so refusing to compare it is right twice.
-_STRICT_SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+#: Canonical semver only — no leading zeros. Applied to the HEAD pin, and ONLY on
+#: the paths where this PR is publishing it: npm cannot install a leading-zero
+#: version, so a forward move to one ships a pin that does not resolve.
+#:
+#: NOT applied when the pin is unchanged or moves backward. Refusing there makes a
+#: malformed pin already on the base branch block every PR — including the one that
+#: would repair it — which is the wedge this module exists to avoid, arriving by a
+#: different door. Whether the pin is well-formed is only this PR's business when
+#: this PR is the one shipping it.
+#: Components are BOUNDED, and the bound is load-bearing rather than tidiness.
+#: `_numeric_value` calls `int()` on each component, and CPython raises ValueError
+#: above 4300 digits (the integer-string conversion limit). The merge gate catches
+#: that as PLUMBING and returns non-blocking, so `2.1.` followed by 5,000 zeroes and
+#: a 1 walked straight through a gate with no override sigil — an uninstallable pin
+#: merged with no receipts. Nine digits is already ~4 orders of magnitude past any
+#: real Claude Code component, and a version that does not match is simply "not
+#: X.Y.Z", which BLOCKS. Bounding the pattern is what keeps the huge value from
+#: reaching `int()` at all, rather than catching an exception after the fact.
+_MAX_VERSION_DIGITS = 9
+_STRICT_SEMVER = re.compile(
+    rf"^(0|[1-9][0-9]{{0,{_MAX_VERSION_DIGITS - 1}}})"
+    rf"\.(0|[1-9][0-9]{{0,{_MAX_VERSION_DIGITS - 1}}})"
+    rf"\.(0|[1-9][0-9]{{0,{_MAX_VERSION_DIGITS - 1}}})$"
+)
+
+#: Any ``X.Y.Z`` of digits, leading zeros included — the pin's numeric VALUE rather
+#: than its spelling. This is what DIRECTION is computed from, so that a base pin
+#: nobody can respell (``2.1.0218``) still yields the comparison "2.1.218 is the
+#: same version", instead of an unanswerable question that blocks the repair.
+#: Bounded for the same reason as `_STRICT_SEMVER` above — this is the pattern whose
+#: groups are handed to `int()`, so the bound belongs here most of all.
+_NUMERIC_SEMVER = re.compile(
+    rf"^([0-9]{{1,{_MAX_VERSION_DIGITS}}})"
+    rf"\.([0-9]{{1,{_MAX_VERSION_DIGITS}}})"
+    rf"\.([0-9]{{1,{_MAX_VERSION_DIGITS}}})$"
+)
 
 #: Below this many alphanumerics a value is not a receipt, it is a keystroke.
 #: Kills ".", "-", "n/a" and a lone zero-width space. NOT a truthfulness check —
@@ -171,10 +237,22 @@ class Verdict:
     message: str
     #: Which markers were absent — empty for every non-receipt outcome.
     missing: tuple[str, ...] = ()
-    #: "ok" | "receipts" | "unreadable". Lets a caller distinguish "the pin moved
-    #: without receipts" from "I could not read the pin", which are different
-    #: conversations with the operator even though both block.
+    #: "ok" | "receipts" | "unreadable-head". Lets a caller distinguish "the pin
+    #: moved without receipts" from "I could not read the pin at all", which are
+    #: different conversations with the operator.
+    #:
+    #: The base branch has no reason of its own. It is not a party to the decision
+    #: — it supplies a reference point, and when it cannot, that shows up as
+    #: ``direction_verified=False`` rather than as an outcome. Reasons naming the
+    #: base (``unreadable-base``, ``incomparable``, ``unchanged-unreadable``) existed
+    #: until 2026-08-29 and were removed with the branching that produced them.
     reason: str = "ok"
+    #: Whether the base branch actually yielded a version to compare against. False
+    #: means the direction of this change is UNKNOWN — receipts were required in
+    #: place of a comparison, so a non-blocking verdict here has verified the
+    #: attestation and nothing else. Callers surface it; they must not treat a pass
+    #: on this path as "the pin did not move forward".
+    direction_verified: bool = True
 
 
 def _strip_formatting_chars(value: str) -> str:
@@ -183,6 +261,39 @@ def _strip_formatting_chars(value: str) -> str:
     a body of ``CC-Gate-Soak: \\u200b`` satisfied a "has a non-space value" test
     while rendering as an empty line."""
     return "".join(ch for ch in value if unicodedata.category(ch) != "Cf")
+
+
+def _outside_comments(line: str, in_comment: bool) -> tuple[str, bool]:
+    """``(text outside HTML comments, still-open flag)`` for ONE line.
+
+    Scans the whole line rather than partitioning once, because a line may carry
+    several comments and may have real text after the last of them. Handling only
+    the first opener — or discarding a line the moment a closer appeared — is what
+    made a receipt written beside a template comment invisible.
+
+    An UNTERMINATED opener hides the rest of the line and stays open into the next,
+    which is what CommonMark does with an unclosed block and what the line scanner
+    was introduced for: a body ending ``<!-- template start`` must not have the
+    receipts below it counted.
+    """
+    out: list[str] = []
+    i, n = 0, len(line)
+    while i < n:
+        if in_comment:
+            close = line.find(_COMMENT_CLOSE, i)
+            if close == -1:
+                return "".join(out), True
+            i = close + len(_COMMENT_CLOSE)
+            in_comment = False
+            continue
+        opener = line.find(_COMMENT_OPEN, i)
+        if opener == -1:
+            out.append(line[i:])
+            return "".join(out), False
+        out.append(line[i:opener])
+        i = opener + len(_COMMENT_OPEN)
+        in_comment = True
+    return "".join(out), in_comment
 
 
 def readable_body(body: str) -> str:
@@ -198,36 +309,47 @@ def readable_body(body: str) -> str:
     fence: str | None = None
 
     for line in body[:_MAX_BODY].splitlines():
-        stripped = line.strip()
-
-        if in_comment:
-            # Only the closer ends it; an opener inside a comment is inert.
-            if _COMMENT_CLOSE in line:
-                in_comment = False
-            continue
-
+        # A FENCED line is OPAQUE — checked before comment state is touched, and its
+        # own text is never interpreted. Markdown treats `<!--` inside a fence as
+        # literal characters, so letting it open a comment here made the scanner and
+        # the rendered view disagree: an unmatched `<!--` in a fenced example turned
+        # comment-mode on, which then hid the CLOSING fence, which swallowed every
+        # receipt after it. MEASURED — a body with a fenced ```html example followed
+        # by both receipts on their own lines reported both as missing, on a gate
+        # with no override sigil. That is the same wedge this module exists to
+        # remove, arriving through the body scanner instead of the pin parser.
+        #
+        # The closer is matched on the RAW line for the same reason: inside a fence
+        # there is no comment stripping to apply, and Markdown wants the marker at
+        # the start of the line regardless.
         if fence is not None:
-            # A fence is closed only by its OWN marker: ``~~~`` does not end a
-            # ``` block, which is how a receipt below a mismatched closer stayed
-            # rendered-as-code while counting as visible.
-            if stripped.startswith(fence):
+            if line.strip().startswith(fence):
                 fence = None
             continue
 
+        # Strip comments FIRST, and keep whatever the line has outside them. The
+        # previous version dropped the entire remainder of a line once it saw a
+        # comment — both when the comment opened on that line and when it closed
+        # there — so `<!-- what did you run? --> CC-Gate-Soak: …` was invisible to
+        # the check while rendering perfectly on GitHub. This repo's own
+        # PULL_REQUEST_TEMPLATE.md is built from `<!-- -->` blocks, so that is the
+        # shape an author naturally produces, and this gate has no override: it
+        # refused a compliant PR and told the author the receipts were missing
+        # while they were plainly there. MEASURED before the fix — both receipts
+        # reported absent, with the identical text on its own lines accepted.
+        rendered, in_comment = _outside_comments(line, in_comment)
+        stripped = rendered.strip()
+
+        # A fence is closed only by its OWN marker: ``~~~`` does not end a ```
+        # block, which is how a receipt below a mismatched closer stayed
+        # rendered-as-code while counting as visible. (The close is handled at the
+        # top of the loop; this is the OPEN.)
         if stripped.startswith(_FENCE_MARKS):
             fence = stripped[:3]
             continue
 
-        if _COMMENT_OPEN in line:
-            before, _, rest = line.partition(_COMMENT_OPEN)
-            if _COMMENT_CLOSE not in rest:
-                in_comment = True
-            # Text before the opener is still visible; the rest is not.
-            if before.strip():
-                visible.append(before)
-            continue
-
-        visible.append(line)
+        if stripped:
+            visible.append(rendered)
 
     return "\n".join(visible)
 
@@ -286,14 +408,39 @@ def missing_receipts(body: str) -> list[str]:
     return missing
 
 
-def _version_tuple(version: str) -> tuple[int, ...]:
-    if not _STRICT_SEMVER.match(version):
-        raise PinUnreadable(
-            f"{version!r} is not canonical semver (leading zeros, or not X.Y.Z). "
-            "Refusing to compare: 2.1.0246 and 2.1.246 compare EQUAL as integers, "
-            "so a pin written that way would read as unchanged."
-        )
-    return tuple(int(p) for p in version.split("."))
+def _numeric_value(version: str) -> tuple[int, ...] | None:
+    """The pin's numeric value, or ``None`` if it is not ``X.Y.Z`` at all.
+
+    Deliberately tolerant of leading zeros. DIRECTION is a question about versions,
+    not about spelling, and ``2.1.0218`` names the same release as ``2.1.218``. An
+    earlier revision refused to compare either side unless both were canonical,
+    which made a single malformed pin on the base branch unmergeable-by-anyone —
+    the canonical repair included, since it is itself a pin-moving change. The
+    spelling is still enforced, by ``_refuse_unpublishable`` below, at the one
+    point where it can do harm: a pin this PR moves FORWARD.
+    """
+    match = _NUMERIC_SEMVER.match(version)
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def _refuse_unpublishable(head_pin: str) -> Verdict | None:
+    """A Verdict when the head pin must not be PUBLISHED, else ``None``.
+
+    Called only from the paths that ship the head pin — a forward move, and a move
+    whose direction could not be established. ``npm install @2.1.0218`` does not
+    resolve, so merging that pin breaks every install path that reads it, and this
+    gate is the last thing standing between such a pin and the public repo.
+    """
+    if _STRICT_SEMVER.match(head_pin):
+        return None
+    return Verdict(
+        True,
+        f"CC pin {head_pin!r} is not canonical semver (leading zeros, or not X.Y.Z). "
+        "This PR publishes that pin, and npm cannot install it — `npm install "
+        "@anthropic-ai/claude-code@2.1.0218` does not resolve. Write it as X.Y.Z "
+        "with no leading zeros.",
+        reason="unreadable-head",
+    )
 
 
 def _pin_of(text: str, *, where: str) -> str:
@@ -307,31 +454,190 @@ def _pin_of(text: str, *, where: str) -> str:
     return pin
 
 
-def evaluate(*, base_pin_text: str, head_pin_text: str, body: str) -> Verdict:
+def evaluate(
+    *,
+    base_pin_text: str | None,
+    head_pin_text: str,
+    body: str,
+    base_unreadable: bool = False,
+) -> Verdict:
     """The whole decision, as a pure function.
 
     Takes the two file CONTENTS rather than reading them, so the CI adapter can
     supply them from git and the merge gate from the GitHub API, and so the
-    behaviour is testable without a repository at all.
+    behaviour is testable without a repository at all. ``base_pin_text=None`` means
+    the base pin could not be read AT ALL — see the third question below.
 
     NEVER raises for a policy outcome — every decision, pass or block, comes back
     as a Verdict. A caller that reads ``.blocked`` gets the whole truth, and one
     that forgets a ``try`` does not get a silent pass.
+
+    TWO ORDERED QUESTIONS, and the order is the design
+    --------------------------------------------------
+    This replaced (2026-08-29) a cascade of early returns over the product of
+    (head state × base state × parse outcome). Four separate cells of that product
+    were found to return the wrong answer, in four review rounds, by four different
+    arguments — which is the signature of a shape that generates bugs rather than
+    of four bugs. Two of them let an unreceipted forward bump merge; one blocked
+    every possible repair of a malformed base. The cure is that the base branch no
+    longer has any early return of its own:
+
+      1. **Is the head pin readable?** Answered with no reference to the base
+         whatsoever. Unreadable ⇒ BLOCK. Previously a base-side branch could return
+         BEFORE this question was asked, so a PR that introduced an empty pin file
+         over an absent base merged with no usable pin at the head.
+
+      2. **Which direction does it move?** The base supplies a reference point, and
+         when it cannot supply one, that is not an answer — it is a missing input.
+         Receipts are then required IN PLACE of the comparison, and the verdict is
+         marked ``direction_verified=False``. Previously an unreadable base returned
+         a non-blocking verdict directly, so a PR that repaired the base and bundled
+         a forward release in the same change skipped the receipts entirely. CI does
+         not cover that case: the merge tree carries the REPAIRED file, so lockstep
+         passes and the check is green.
+
+    WHAT IS NOT ASKED HERE. "Did this PR touch the pin file?" — the caller answers
+    it, from the blob SHA, before calling. This module sees CONTENT, and content
+    cannot distinguish "identical" from "both unavailable".
     """
+    # ── 1. IS THE HEAD PIN READABLE? ──
     try:
         head_pin = _pin_of(head_pin_text, where="the proposed change")
-        base_pin = _pin_of(base_pin_text, where="the base branch")
-        return _compare(base_pin, head_pin, body)
     except PinUnreadable as exc:
-        return Verdict(True, str(exc), reason="unreadable")
+        return Verdict(True, str(exc), reason="unreadable-head")
 
+    head_value = _numeric_value(head_pin)
+    if head_value is None:
+        return Verdict(
+            True,
+            f"CC pin {head_pin!r} at the head is not a version (expected X.Y.Z), so "
+            "whether this PR moves the pin forward cannot be established.",
+            reason="unreadable-head",
+        )
 
-def _compare(base_pin: str, head_pin: str, body: str) -> Verdict:
+    # A base we could not READ AT ALL is this gate's own plumbing failing, not a fact
+    # about any branch — a contents-API timeout, a non-JSON body, an unresolvable ref.
+    # It must stay non-blocking, or one transient hiccup walls off every merge in the
+    # repository through a gate with no override sigil. Distinct from a base whose
+    # content is FAULTY (absent, empty, unassigned, doubly-assigned, undecodable),
+    # which is a real statement about the base branch and does require the receipts.
+    #
+    # Collapsing those two into "base_pin_text is None" is what this parameter exists
+    # to prevent: the CONTENT-vs-PLUMBING split is the gate's other axis, and the
+    # revision before this one flattened it on the base side while preserving it on
+    # the head side.
+    #
+    # Placed AFTER the head check, never before it. A base-side branch that returns
+    # ahead of head validation is the exact defect this module was restructured to
+    # remove, and re-adding one above would reintroduce it for this cell.
+    # `and base_pin_text is None` so the two parameters cannot contradict each other.
+    # If a caller ever supplies BOTH a flag saying "unreadable" and readable content,
+    # the CONTENT wins — it is the stronger evidence, and honouring the flag over it
+    # would discard a usable base and hand out a free pass on the say-so of a boolean.
+    if base_unreadable and base_pin_text is None:
+        # One head-side CONTENT fact still applies with no base at all: a pin that
+        # cannot be INSTALLED. `npm install @…@2.1.0218` does not resolve, so
+        # merging that spelling publishes a version nothing can fetch — true
+        # whether this PR wrote it or inherited it, which is the one part of the
+        # spelling rule that does not need to know the author.
+        #
+        # Everywhere else the rule IS authorship-scoped, because refusing an
+        # inherited malformed pin would wedge every open PR. That scoping does not
+        # rescue this path: a transport failure is transient, so the cost of
+        # refusing here is one retry, while the cost of allowing is a published pin
+        # that cannot be installed. An earlier revision let it through and recorded
+        # that as an accepted consequence; on review the trade was the wrong way
+        # round.
+        if unpublishable := _refuse_unpublishable(head_pin):
+            return unpublishable
+        return Verdict(
+            False,
+            f"The pin file could not be READ on the base branch — a transport failure "
+            f"in this check, not a fault in either branch. This PR pins {head_pin}, but "
+            f"the direction of the change could not be established.",
+            direction_verified=False,
+        )
 
-    if head_pin == base_pin:
+    # ── 2. WHICH DIRECTION? ──
+    base_pin = None
+    if base_pin_text is not None:
+        try:
+            base_pin = _pin_of(base_pin_text, where="the base branch")
+        except PinUnreadable:
+            base_pin = None  # a missing input, NOT a verdict — see below
+
+    # THE PIN DID NOT MOVE. Asked before anything judges the base's spelling, and
+    # answered on the pin STRING, so a file edited for one of its many other reasons
+    # (the aligner, the probe dirs, the shadow scan) is never asked for release
+    # receipts — which is this module's stated contract. It also keeps an INHERITED
+    # non-canonical pin from becoming every PR's problem via the rule below.
+    if base_pin is not None and head_pin == base_pin:
         return Verdict(False, f"CC pin unchanged ({head_pin}) — no receipts required.")
 
-    if _version_tuple(head_pin) < _version_tuple(base_pin):
+    # THE BASE MUST BE INSTALLABLE TO SERVE AS A REFERENCE POINT.
+    # `_numeric_value` is deliberately lenient, which is what lets `2.1.0246` and
+    # `2.1.246` be recognised as one version — but leniency about SPELLING became
+    # leniency about TRUST: a non-canonical base was accepted as "the version that
+    # already ran here", and both the unchanged and the BACKWARD exemptions rest on
+    # exactly that claim. MEASURED: `2.1.0250` → `2.1.246` passed with an empty body
+    # as a rollback, though `npm install @…@2.1.0250` does not resolve, so that
+    # version never ran anywhere and there is nothing to roll back TO.
+    #
+    # So a non-canonical base yields NO reference value and takes the unknown-
+    # direction path below: receipts required, in place of a comparison that cannot
+    # be trusted. The canonical repair stays mergeable — it just has to be attested,
+    # which is the same bar every other unverifiable direction meets. Blocking it
+    # outright is the wedge this module exists to remove; exempting it silently is
+    # the hole this fixes.
+    base_value = _numeric_value(base_pin) if base_pin and _STRICT_SEMVER.match(base_pin) else None
+
+    # The head pin's SPELLING is this PR's responsibility exactly when this PR WROTE
+    # it — that is, whenever it differs from the base's. An inherited non-canonical
+    # pin is not this PR's to fix, and refusing it would wedge every open PR; an
+    # authored one is, and `npm install @…@2.1.0218` does not resolve.
+    #
+    # Placed here, ahead of the direction branches, because it applies to ALL of them.
+    # Checking it only on the forward path let a PR REPLACE a good `2.1.246` with
+    # `2.1.0246` and pass as "the same version, respelled" — the F4 repair rule run
+    # backwards, shipping the exact pin npm cannot install.
+    if base_pin != head_pin and (unpublishable := _refuse_unpublishable(head_pin)):
+        return unpublishable
+
+    if base_value is None:
+        # Direction is unknowable, so the gate falls back to the attestation. It does
+        # NOT fall back to permission: an unreadable base is exactly the state a PR
+        # that rewrites the pin file produces, and waving those through is how a
+        # release ships unreceipted. Receipts are in-band — a line in the PR body —
+        # so this refuses a merge, never the repository's ability to repair itself.
+        absent = missing_receipts(body)
+        if absent:
+            return _receipts_verdict(
+                absent,
+                f"The base branch's pin could not be read, so whether this PR moves the "
+                f"CC pin forward cannot be established. Receipts are required in place "
+                f"of that comparison. This PR pins {head_pin}, and the body is missing "
+                f"{len(absent)} required gate receipt(s):",
+                direction_verified=False,
+            )
+        return Verdict(
+            False,
+            f"The base branch's pin could not be read, so the direction of this change "
+            f"was NOT established — but both gate receipts are present for {head_pin}, "
+            f"which is what the comparison would have required. The base-side fault is "
+            f"inherited by every open PR and repairable by none of them through this "
+            f"gate; CI covers it (the pin file is required to parse).",
+            direction_verified=False,
+        )
+
+    # Both sides are canonical by the time we get here (the base by the gate above,
+    # the head by `_refuse_unpublishable`), and two canonical spellings of one version
+    # are the same string — so equality here means the identical pin, which the
+    # unchanged check has already returned on. Kept as a guard rather than dropped:
+    # it costs nothing and it states the invariant for anyone who loosens either rule.
+    if head_value == base_value:
+        return Verdict(False, f"CC pin unchanged ({head_pin}) — no receipts required.")
+
+    if head_value < base_value:
         return Verdict(
             False,
             f"CC pin moves BACKWARD ({base_pin} → {head_pin}) — exempt. A rollback "
@@ -347,12 +653,23 @@ def _compare(base_pin: str, head_pin: str, body: str) -> Verdict:
             False,
             f"CC pin moves forward ({base_pin} → {head_pin}) and both gate receipts are present.",
         )
-
-    lines = [
+    return _receipts_verdict(
+        absent,
         f"CC pin moves FORWARD ({base_pin} → {head_pin}) but the PR body is missing "
         f"{len(absent)} required gate receipt(s):",
-        "",
-    ]
+    )
+
+
+def _receipts_verdict(
+    absent: list[str], headline: str, *, direction_verified: bool = True
+) -> Verdict:
+    """The blocking receipts message, rendered once for both paths that require them.
+
+    Shared so the forward-move case and the unknown-direction case cannot drift in
+    what they ask the author to DO — the remediation is identical, and only the
+    reason for asking differs.
+    """
+    lines = [headline, ""]
     for marker in absent:
         why, example = _RECEIPTS[marker]
         lines.append(f"  {marker}: — {why}")
@@ -369,14 +686,37 @@ def _compare(base_pin: str, head_pin: str, body: str) -> Verdict:
         "This checks the receipts are PRESENT; it cannot check they are true. If a",
         "gate genuinely was not run, run it — do not write the line.",
     ]
-    return Verdict(True, "\n".join(lines), tuple(absent), reason="receipts")
+    return Verdict(
+        True,
+        "\n".join(lines),
+        tuple(absent),
+        reason="receipts",
+        direction_verified=direction_verified,
+    )
 
 
 # ── adapters ──────────────────────────────────────────────────────────────
 
 
+class PinTransportError(PinUnreadable):
+    """The read ITSELF failed — git would not run at all.
+
+    Distinct from ``PinUnreadable``, which means we read something and could not
+    make a pin out of it. The two take opposite fail directions, and a caller that
+    cannot tell them apart will classify the same repository state differently from
+    the merge gate — which is exactly what happened: ``main()`` collapsed both into
+    "no base text", so a transport failure required receipts through the CLI while
+    the gate waved it through.
+    """
+
+
 def read_pin_at(ref: str, *, repo_root: Path) -> str:
-    """The pin file's contents as of ``ref``. Raises PinUnreadable."""
+    """The pin file's contents as of ``ref``.
+
+    Raises ``PinTransportError`` when git could not be run at all, and plain
+    ``PinUnreadable`` when git ran and refused — a bad ref, or no such path at that
+    ref. The second is a fact about the tree; only the first is our plumbing.
+    """
     try:
         out = subprocess.run(
             ["git", "show", f"{ref}:{_PIN_PATH}"],
@@ -387,7 +727,19 @@ def read_pin_at(ref: str, *, repo_root: Path) -> str:
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise PinUnreadable(f"cannot run git: {exc}") from exc
+        raise PinTransportError(f"cannot run git: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        # `text=True` decodes INSIDE subprocess.run, and UnicodeDecodeError is a
+        # ValueError — neither of the types above. Left uncaught it escaped the
+        # base-read handler in main() and crashed --advisory with a traceback.
+        #
+        # CONTENT, not transport: git ran and handed back bytes, and those bytes
+        # are not a readable pin — a fact about the TREE. PinTransportError would
+        # set base_unreadable=True, which evaluate() reads as this gate's own
+        # plumbing failing and passes NON-BLOCKING; a pin nobody can decode would
+        # then merge with no receipts. Same call read_pin_head already makes for
+        # the identical condition on the head side.
+        raise PinUnreadable(f"{_PIN_PATH} at {ref} is not valid UTF-8: {exc}") from exc
     if out.returncode != 0:
         raise PinUnreadable(f"cannot read {_PIN_PATH} at {ref}: {out.stderr.strip()[:200]}")
     return out.stdout
@@ -433,13 +785,33 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if args.advisory else 1
 
     try:
+        head_pin_text = read_pin_head(args.repo_root)
+    except PinUnreadable as exc:
+        # The head is this change's own file. Unreadable here is a fact about what
+        # is being proposed, and it blocks — the same direction `evaluate` takes.
+        verdict = Verdict(True, str(exc), reason="unreadable-head")
+    else:
+        # The SAME split the merge gate makes, made here too. Both are None-valued,
+        # and collapsing them meant this adapter and the gate returned opposite
+        # verdicts for one repository state: a transport failure required receipts
+        # through the CLI while the gate treated it as plumbing and passed.
+        base_pin_text, base_unreadable = None, False
+        try:
+            base_pin_text = read_pin_at(args.base_sha, repo_root=args.repo_root)
+        except PinTransportError:
+            base_unreadable = True  # git would not run — our plumbing, not the tree
+        except PinUnreadable:
+            # git ran and refused: a bad ref, or no pin at that ref. That is a fact
+            # about the tree, so it takes the content path — receipts in place of the
+            # comparison, never a block, which would make an unreadable base
+            # unmergeable-by-anyone with the repair PR included.
+            base_pin_text = None
         verdict = evaluate(
-            base_pin_text=read_pin_at(args.base_sha, repo_root=args.repo_root),
-            head_pin_text=read_pin_head(args.repo_root),
+            base_pin_text=base_pin_text,
+            head_pin_text=head_pin_text,
             body=body,
+            base_unreadable=base_unreadable,
         )
-    except PinUnreadable as exc:  # I/O from the adapters, not a policy outcome
-        verdict = Verdict(True, str(exc), reason="unreadable")
 
     if not verdict.blocked:
         print(f"cc-pin-receipts: {verdict.message}")
