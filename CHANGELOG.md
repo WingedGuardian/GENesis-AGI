@@ -78,6 +78,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A multi-push PR no longer needs `# scheduled-review-override` just because the
+  leak-scan routine stamped an earlier commit.** The merge gate now accepts an
+  ACCEPTED `leaks` marker on an ancestor of the current head when the `leak-detector`
+  job of the `CI` workflow is green at head — the mechanical scanner re-ran on the
+  exact commit being merged, which is the literal-leak guarantee the exact-head rule
+  existed to keep. Measured motive: 6 of 10 sampled multi-push PRs were blocked purely
+  because the routine does not re-stamp after a push, so the override had become the
+  routine path. The relief is deliberately blunt where it matters: ANY refused `leaks`
+  marker anywhere in the PR denies it (a later acceptance at an older head must never
+  outrank a refusal — the head axis is not a time axis), the carried marker must be a
+  verified ancestor (an unreadable compare is "unknown", never "yes"), the scanner is
+  pinned to its named workflow rather than to membership in the required-CI set, and
+  every compare respects the shared merge deadline. `--check-pr` renders a carried
+  marker as `ok (leaks carried from <sha>, leak-detector green at head)`, never as
+  `ok (at head)`. Only the `leaks` kind is mapped; `code-review` gets no mechanical
+  relief. A blocking finding the marker scan cannot credit to a head or a kind (a
+  same-timestamp tie, or a malformed marker with a blocking body) is now returned by
+  the scan as structured residue and denies relief the same way a refusal does — an
+  adversarial audit reproduced that path before the field existed. Measured on the 40
+  most recent marker-carrying PRs: 14 were relief-eligible and the rule denies none of
+  them; 7 carry benign uncountable rows that a blanket rule would have denied.
 - **A refused Bash command now names the file writes it discarded.** A PreToolUse
   block cancels the WHOLE Bash call, not the step the guard objected to — so a
   command shaped `python3 - <<PY …writes a file… PY && git commit`, refused for the
@@ -394,6 +415,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   gate; the other repointed sites stay on free flash.
 
 ### Security
+
+- **A malformed Claude Code session id can no longer create directories outside
+  the session tree.** Hooks store per-session state under
+  `~/.genesis/sessions/<session-id>/`, interpolating the id straight into the
+  path — and two sites create the directory. An id containing `/` or `..` therefore
+  escaped that tree, and the guard against it had been hand-copied into some hooks
+  in three different shapes while being omitted from eight call sites across four
+  files. The path-building sites now go through one shared helper
+  (`hook_input.session_path`), which returns nothing for an unsafe id so the caller
+  skips exactly the filesystem operation and nothing else; a site that needs only
+  the yes/no answer calls the shared validator directly. Normal sessions are
+  unaffected. This is the hook contract, not a repo-wide one: several other hooks
+  and a number of paths under `src/` still carry their own hand-written check —
+  including one file this change otherwise touches — and consolidating those is
+  separate work. An id that fails the check falls back to
+  the shared `unknown` key — itself a directory, so such sessions share one bucket
+  rather than escaping the tree.
 
 - **Hook-surface PRs can no longer merge without a current GitHub Codex review.**
   The merge gate's review-freshness check now treats any unreviewed delta touching

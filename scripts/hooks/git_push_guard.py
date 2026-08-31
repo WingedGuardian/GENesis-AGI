@@ -2462,6 +2462,24 @@ _SCHEDULED_REVIEW_BLOCK_RE = re.compile(
 # violating fail-closed (a failed/corrupt routine run must NOT satisfy the gate).
 _SCHEDULED_REVIEW_HEAD_RE = re.compile(r"\bhead=([0-9a-f]{40})(?=\s|\Z)")
 _SCHEDULED_REVIEW_KIND_RE = re.compile(r"\bkind=([a-z0-9][a-z0-9._-]*)(?=\s|\Z)")
+# THE REPORTING GRAMMAR -- deliberately a SECOND, permissive read of the same text.
+#
+# The strict expressions above answer "does this count?" and must stay narrow. A
+# MESSAGE answers a different question -- "what did the operator actually write?"
+# -- and answering it with the strict expression produces confident falsehoods,
+# because a REFUSED value and an ABSENT one become indistinguishable. That is the
+# exact defect this whole change exists to end, so it must not be reintroduced one
+# field at a time: EVERY field the block message describes needs a permissive
+# counterpart here, and a new strict field is not finished until it has one.
+#
+# These must never feed the gate. Matching loosely here is how the operator learns
+# their head= was abbreviated -- never a second way to satisfy anything.
+_SCHEDULED_REVIEW_LOOSE_HEAD_RE = re.compile(r"\bhead=(\S*)")
+_SCHEDULED_REVIEW_LOOSE_KIND_RE = re.compile(r"\bkind=(\S*)")
+# A 40-hex head in the WRONG CASE is full-length and well-formed apart from case.
+# Telling that operator their head "is not a full 40-hex commit sha" sends them to
+# recount 40 characters and find nothing wrong, so the two causes are separated.
+_SCHEDULED_REVIEW_ANYCASE_HEAD_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
 
 # Default scheduled-review kinds the merge gate REQUIRES at head. A PR merges only when
 # a valid owner-authored marker for EACH effective required kind names the current head.
@@ -2471,6 +2489,37 @@ _DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
 # The leak/secret scanner is IRREDUCIBLE: always required, never removable by config. A
 # secret reaching a public repo is irreversible, so no local policy may waive it.
 _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
+
+# Scheduled-review kinds whose marker may be honoured from an EARLIER head of the
+# same PR, provided the named MECHANICAL scanner is green at the CURRENT head.
+#
+# WHY this exists, and why only for leaks. The routines are not re-run on a push,
+# so on any multi-push PR the marker sits at the first head and the gate blocks —
+# measured over ten recent PRs, every one with commits after its marker. The
+# operator's only escape was `# scheduled-review-override`, a sigil that checks
+# NOTHING, so routine use of it was eroding an override meant for exceptions.
+#
+# The relief is narrow BECAUSE the two layers cover different leak classes. The
+# mechanical scanner catches literal patterns (addresses, emails, configured
+# private patterns) and it runs per-head; the scheduled LLM review catches
+# INFERENTIAL leaks, which no pattern can. Honouring an earlier LLM review while
+# REQUIRING the mechanical one at this exact head therefore trades a re-read of
+# the inferential layer for a guarantee the literal layer covers the new commits
+# — strictly more checking than the bare override it replaces, never less.
+#
+# NOT a prose-delta tolerance. That was the first design and it was MEASURED
+# inert: 0 of 6 applicable PRs had a prose-free delta (22-692 added prose lines
+# each), because essentially every push adds a comment, docstring or string.
+# A relief valve that never opens leaves the override in daily use.
+# kind -> (check name, WORKFLOW name) for the mechanical scanner that may carry an
+# earlier accepted review forward. The workflow half is the round-4 finding: matching
+# the display name against the whole required-CI set lets a same-named check from
+# ANOTHER workflow stand in for the real scanner. Both halves are read from this
+# repo's own .github/workflows/ci.yml (`name: CI`; the `leak-detector` job), so they
+# travel with a clone rather than describing one install. A suite named differently
+# simply finds no match, and no match means NO RELIEF -- the pre-relief behaviour, so
+# the failure direction of a wrong pin is a missing convenience, never a weaker gate.
+_MECHANICAL_RESCAN_BY_KIND = {"leaks": ("leak-detector", "CI")}
 # Every kind an install is ALLOWED to name in config. A configured kind outside this set
 # (a typo, a wrong type, a stale routine name) can never be satisfied by a real marker, so
 # the whole config is treated as invalid and we fail closed to the default rather than let
@@ -2754,7 +2803,13 @@ def _scheduled_review_rows(pr_num: str, repo: str | None = None) -> list[dict] |
                     "--paginate",
                     "--jq",
                     ".[] | {login: .user.login, author_association: .author_association, "
-                    "body: .body, state: .state}",  # .state present on reviews, null on issue comments
+                    "body: .body, state: .state, "
+                    "stamp: (.updated_at // .submitted_at // .created_at)}",
+                    # .state present on reviews, null on issue comments. `stamp` is the LAST
+                    # MODIFICATION: issue comments are editable and an edit that adds a
+                    # finding must sort by when it was written, not when the comment was
+                    # created. Review bodies expose only submitted_at (an edited review body
+                    # keeps its original stamp -- documented residue in the scan).
                 ],
                 capture_output=True,
                 text=True,
@@ -2769,11 +2824,72 @@ def _scheduled_review_rows(pr_num: str, repo: str | None = None) -> list[dict] |
     return rows
 
 
+def _status_suffix_warning(raw: str) -> str:
+    """Extra clause for a refused field value carrying a ``/status`` suffix, else "".
+
+    Naming ONLY the grammar problem is an instruction to strip the suffix, and a reader
+    who follows it produces a well-formed marker attesting to a run that reported its own
+    failure -- on the gate this repository calls irreducible. The strict expressions above
+    exist to refuse exactly that shape, so a message that coaches the reader past them
+    undoes the guard in prose. Saying what the suffix MEANS costs one clause and removes
+    the invitation, without the message having to guess which review was intended.
+
+    Applies to both fields: `head=<sha>/failed` and `kind=<name>/failed` reach the same
+    branch by different routes, and fixing only the one a review happened to name is how
+    this class keeps coming back.
+    """
+    return (
+        ", and the status suffix reports that the run did NOT complete cleanly -- "
+        "re-posting it without the suffix would attest to a review that declared its "
+        "own failure, so the run itself needs repeating"
+        if "/" in raw
+        else ""
+    )
+
+
+def _marker_kind_or_none(block: str) -> str | None:
+    """The ``kind`` a marker block names, or None when it names none.
+
+    Lets a block that is being REJECTED still be attributed to the kind it was
+    meant to satisfy, so the block message can scope its guidance instead of
+    reporting an unattached complaint.
+
+    Reads the STRICT grammar only, and deliberately so. An earlier revision also read a
+    status-suffixed value (``kind=leaks/failed``) by taking the segment before the suffix,
+    on the reasoning that it names its review unambiguously. That was wrong in a way worth
+    recording, because the argument for it sounded sober. A suffixed value denotes a run
+    that reported itself FAILED; crediting it to ``leaks`` made a failed run occupy the
+    kind, and — through the state rule below — SUPPRESS the bullet saying a real review had
+    run on an earlier commit. A failed run thereby outranked trusted history that an
+    untrusted stranger's marker was not permitted to outrank. The trust ordering came out
+    backwards, on the gate this repository calls irreducible.
+
+    A value the strict grammar refuses therefore names nothing here. It is still REPORTED,
+    with its raw text quoted, by the caller's unusable path — the operator sees it; it just
+    does not get to speak for a review.
+    """
+    m = _SCHEDULED_REVIEW_KIND_RE.search(block)
+    return m.group(1) if m else None
+
+
 def _scheduled_review_marker_scan(
-    pr_num: str, repo: str | None = None
-) -> tuple[dict[str, set[str]], dict[str, set[str]]] | None:
-    """``(accepted, rejected_not_clean)`` maps of ``head-sha -> {kinds}`` for the PR's
-    owner-authored scheduled-review markers, or ``None`` on an UNREADABLE fetch.
+    pr_num: str, repo: str | None = None, head_sha: str | None = None
+) -> (
+    tuple[dict[str, set[str]], dict[str, set[str]], list[tuple[str | None, str, bool]]]
+    | None
+):
+    """``(accepted, rejected_not_clean, unusable, blocking_residue)`` for the PR's scheduled-review
+    markers, or ``None`` on an UNREADABLE fetch.
+
+    ``unusable`` is a list of ``(kind_or_None, reason, owner_authored)`` for marker
+    BLOCKS that were
+    seen and could not be counted — a head that is not a full 40-hex sha, a missing
+    ``kind``, an author who is not the owner, a dismissed review. Every one of those
+    was previously dropped in silence, which made 'you posted a marker that does not
+    count' indistinguishable from 'nobody posted anything' — and the gate answers the
+    latter with 'a routine may still be in flight, waiting IS the right move'. MEASURED
+    on a live PR: an abbreviated head produced exactly that, and waiting could never
+    have cleared it.
 
     Both maps come from ONE pass so they cannot drift apart. ``accepted`` is what the
     gate honours; ``rejected_not_clean`` is markers that parsed fine and named a head,
@@ -2797,18 +2913,89 @@ def _scheduled_review_marker_scan(
     owner = (owner_repo.split("/")[0] if owner_repo else "").lower() or None
     accepted: dict[str, set[str]] = {}
     rejected: dict[str, set[str]] = {}
+    # (kind_or_None, reason, owner_authored). The third field is a FACT, not a
+    # judgement. It once carried one -- "trusted and clean", later "supersedes the
+    # kind's state" -- and every consumer of that judgement was a place the message
+    # could hide something true. Authorship is observed, not decided: the message uses
+    # it only to count whether the OWNER has posted anything for a kind, because that is
+    # the one thing that says whether the owner's routine has evidently already run.
+    unusable: list[tuple[str | None, str, bool]] = []
+    # BLOCKING RESIDUE: head -> kinds for which the owner's body READ AS BLOCKING but
+    # the finding could not be credited to `rejected` -- a same-timestamp tie (recorded
+    # in neither verdict map), or a malformed / unknown-kind marker whose body carries
+    # the finding. Structured, so a consumer never has to match the prose in
+    # `unusable`. Keyed "" when no head can be attributed; kind "*" when no kind can.
+    # Additive: the three return shapes above are unchanged.
+    blocking_residue: dict[str, set[str]] = {}
+    # Every owner statement about a (head, kind), in CHRONOLOGICAL order, classified as
+    # "clean" (explicit verdict line), "refused" (blocking finding, no verdict) or "plain"
+    # (neither). The verdict for the pair is resolved AFTER the loop from this list -- see
+    # there for the rule and why the order matters.
+    stmts: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    # Chronology: rows carry `stamp` = last modification (updated_at for issue comments,
+    # which are editable; submitted_at for reviews). The two endpoints are fetched
+    # separately, so without sorting a review could sort before a comment posted after
+    # it; and sorting by CREATION would let a finding edited into an old comment lose
+    # to a verdict posted before the edit. Rows without a stamp (the test seam) keep list
+    # order -- the sort is stable. Residue, stated: an edited REVIEW body has no edit
+    # timestamp in the API, so a finding added by editing a review keeps the review's
+    # original position.
+    rows = sorted(rows, key=lambda r: (r.get("stamp") or r.get("created_at") or ""))
     for row in rows:
+        body = row.get("body") or ""
+        # Blocks are parsed BEFORE the trust checks, so a row about to be dropped can
+        # still report that it carried a marker. Refusing is right; refusing in
+        # silence is what sent an operator to wait for a routine that had already run.
+        blocks = _SCHEDULED_REVIEW_BLOCK_RE.findall(body)
         login = (row.get("login") or "").lower()
         assoc = (row.get("author_association") or "").upper()
         if login != owner and assoc != "OWNER":
-            continue  # not the repo owner — not a trusted scheduled review
+            # not the repo owner — not a trusted scheduled review
+            for block in blocks:
+                unusable.append(
+                    (
+                        _marker_kind_or_none(block),
+                        f"it was posted by '{login or 'an unidentified account'}', who "
+                        f"is not the repo owner, so nothing here vouches for a review",
+                        False,
+                    )
+                )
+            continue
         # A DISMISSED review no longer vouches, and a PENDING review is an UNPUBLISHED
         # draft that never ran publicly — neither should satisfy the gate (mirrors the
         # Codex-freshness path). `state` is present on /pulls/N/reviews rows and null on
         # issue comments, so this only drops review rows; issue comments remain state-less.
-        if (row.get("state") or "").upper() in ("DISMISSED", "PENDING"):
+        _state = (row.get("state") or "").upper()
+        if _state in ("DISMISSED", "PENDING"):
+            # Only DISMISSED is terminal. A PENDING review is an unpublished draft
+            # that can still be submitted. Both are RECORDED: an earlier version dropped
+            # a current-head draft silently so the generic in-flight note would cover
+            # it, which was the one remaining silent drop in a message that promises to
+            # list every block it saw. The row is the precise form of that note.
+            for block in blocks:
+                if _state == "PENDING":
+                    # Whether submitting the draft can help depends on the head it
+                    # names: the current one counts once published; an older one is
+                    # stale no matter when it is submitted.
+                    _hm = _SCHEDULED_REVIEW_HEAD_RE.search(block)
+                    if head_sha and _hm and _hm.group(1).lower() == head_sha.lower():
+                        why = (
+                            "it is carried by a PENDING (unpublished) review naming the "
+                            "current head, so it is not yet visible to the gate; once "
+                            "submitted it is read like any other block"
+                        )
+                    else:
+                        why = (
+                            "it is carried by a PENDING review and does not name the "
+                            "current head, so submitting that draft would not make it count"
+                        )
+                else:
+                    why = (
+                        "it is carried by a DISMISSED review, which no longer vouches "
+                        "for anything"
+                    )
+                unusable.append((_marker_kind_or_none(block), why, True))
             continue
-        body = row.get("body") or ""
         # The marker must mean "ran CLEAN", not merely "ran": a scheduled review whose body
         # CONTAINS a blocking finding ([P1]/HARD BLOCK/### ERROR, unless a clean marker
         # overrides — same "clean wins" rule the finding scanners use) does NOT satisfy the
@@ -2821,21 +3008,511 @@ def _scheduled_review_marker_scan(
         # measured 2026-08-28: those two produced the identical `present: none` line, and
         # the only signal distinguishing an accepted marker from a rejected one was
         # whether its prose happened to contain a _CLEAN_PATTERNS phrase.
-        not_clean = any(p.search(body) for p in _BLOCKING_PATTERNS) and not any(
-            c.search(body) for c in _CLEAN_PATTERNS
-        )
-        target = rejected if not_clean else accepted
+        has_clean = any(c.search(body) for c in _CLEAN_PATTERNS)
+        not_clean = any(p.search(body) for p in _BLOCKING_PATTERNS) and not has_clean
+        verdict = "refused" if not_clean else ("clean" if has_clean else "plain")
         # Defense-in-depth follow-up: for rows from /pulls/N/reviews we could ALSO
         # cross-check GitHub's authoritative `commit_id` vs the marker sha (issue comments
         # carry none). Deferred (LOW): the marker sha is matched EXACTLY vs the authoritative
         # HEAD by the caller, so a stale marker can't pass; this only catches a buggy reviewer.
-        for block in _SCHEDULED_REVIEW_BLOCK_RE.findall(body):
+        for block in blocks:
             head_m = _SCHEDULED_REVIEW_HEAD_RE.search(block)
             kind_m = _SCHEDULED_REVIEW_KIND_RE.search(block)
             if not head_m or not kind_m:
-                continue  # a marker must name both a head AND a kind to count
-            target.setdefault(head_m.group(1).lower(), set()).add(kind_m.group(1).lower())
-    return accepted, rejected
+                # A marker must name both a head AND a kind to count. Say WHICH is
+                # wrong and quote the offending value: on a long thread the operator
+                # otherwise cannot tell which of several markers is the broken one.
+                # EVERY bad field is reported, not the first one found. An if/else here
+                # reported only the head, so `head=abc kind=leaks/failed` read as a short
+                # sha and the suffix saying the run FAILED was never shown -- one repair
+                # cycle per hidden field, on a message that promises to hide nothing.
+                reasons: list[str] = []
+                if not head_m:
+                    loose = _SCHEDULED_REVIEW_LOOSE_HEAD_RE.search(block)
+                    if not loose:
+                        reasons.append("it carries no head= field")
+                    elif not loose.group(1):
+                        # `\S*` so an EMPTY value is seen. `\S+` reported it as no field
+                        # at all -- the most likely producer fault (an uninterpolated
+                        # variable) described as the operator having omitted the field.
+                        reasons.append("its head= field is present but EMPTY")
+                    elif _SCHEDULED_REVIEW_ANYCASE_HEAD_RE.fullmatch(loose.group(1)):
+                        reasons.append(
+                            f"its head={loose.group(1)!r} is full length but not "
+                            f"lowercase, and the grammar is lowercase hex"
+                        )
+                    else:
+                        reasons.append(
+                            f"its head={loose.group(1)!r} is not a full 40-hex commit sha"
+                            + _status_suffix_warning(loose.group(1))
+                        )
+                if not kind_m:
+                    # Read PERMISSIVELY to say what is actually there. The strict
+                    # expression refuses a status-suffixed `kind=leaks/failed`, and
+                    # reporting that refusal as an absent field told the operator a
+                    # field they had written did not exist.
+                    loose = _SCHEDULED_REVIEW_LOOSE_KIND_RE.search(block)
+                    if not loose:
+                        reasons.append("it carries no kind= field")
+                    elif not loose.group(1):
+                        reasons.append("its kind= field is present but EMPTY")
+                    elif loose.group(1).lower() in _KNOWN_SCHEDULED_REVIEW_KINDS:
+                        reasons.append(
+                            f"its kind={loose.group(1)!r} is a known review but not "
+                            f"lowercase, and the grammar is lowercase"
+                        )
+                    else:
+                        reasons.append(
+                            f"its kind={loose.group(1)!r} is not a bare review name"
+                            + _status_suffix_warning(loose.group(1))
+                        )
+                why = ", and ".join(reasons)
+                # A malformed marker on a body that reads as BLOCKING is not a typo
+                # to be re-posted. The verdict survives the malformed field, because
+                # pasting a clean marker over an unresolved finding would make the
+                # gate pass while the finding still stands.
+                if not_clean:
+                    why += (
+                        ", and its body reads as carrying a blocking finding, so a "
+                        "corrected marker would not make it count either"
+                    )
+                    # No parseable head -> unattributable residue, keyed "". The KIND is
+                    # retained only when it names a review that actually exists: a
+                    # syntactically valid but UNKNOWN kind (`kind=leak`, the singular
+                    # typo) would otherwise file the residue under a name no required
+                    # kind ever matches, and the blocking finding would be filed into
+                    # nothing -- relief carries past it. Codex reproduced exactly that
+                    # through the gate entry point. Unknown or unparseable -> "*", which
+                    # denies every kind, because a blocking finding nobody can attribute
+                    # is not evidence about one review, it is evidence about all of them.
+                    _residue_kind = _marker_kind_or_none(block)
+                    blocking_residue.setdefault("", set()).add(
+                        _residue_kind
+                        if _residue_kind in _KNOWN_SCHEDULED_REVIEW_KINDS
+                        else "*"
+                    )
+                unusable.append((_marker_kind_or_none(block), why, True))
+                continue
+            _kind = kind_m.group(1).lower()
+            if _kind not in _KNOWN_SCHEDULED_REVIEW_KINDS:
+                # Parses cleanly and names a review nothing knows about -- a terminal
+                # typo such as a singular form. Recording it in `accepted` hid it
+                # completely: it can never match a required kind, so the message went
+                # back to "no marker at ANY head" and advised waiting, while the block
+                # sat visibly in the thread. Verdict-neutral either way (an unknown
+                # kind satisfies nothing), so this is purely so the reader can SEE it.
+                _why = (
+                    f"it names kind={_kind!r}, which is not a known scheduled "
+                    f"review, so it can never satisfy one"
+                )
+                if not_clean:
+                    # The body's verdict survives the naming problem, exactly as it
+                    # does for a malformed field: reporting only the typo invites a
+                    # corrected marker over an unresolved finding.
+                    _why += ", and its body reads as carrying a blocking finding"
+                    # A blocking body under a kind nothing knows about cannot be
+                    # credited to any kind -- so it is residue against ALL of them.
+                    blocking_residue.setdefault("", set()).add("*")
+                unusable.append((_kind, _why, True))
+                continue
+            stmts.setdefault((head_m.group(1).lower(), _kind), []).append(
+                (row.get("stamp") or row.get("created_at") or "", verdict)
+            )
+    # RESOLUTION. Each row used to choose its own map, so a second owner comment at the
+    # same head -- same marker, ordinary prose -- was accepted while the first row's [P1]
+    # sat refused, and the gate passed with the finding unchanged. The first fix let any
+    # explicit clean verdict win regardless of order, which passed a LATER [P1] posted
+    # after an earlier verdict. Order is the whole question, so the rule is stated in it:
+    #
+    #   THE OWNER'S LATEST DECISIVE STATEMENT ABOUT (head, kind) GOVERNS.
+    #
+    # Decisive = an explicit clean-verdict line, or a blocking finding. Plain rows (neither)
+    # are not decisive in either direction: they count only when nothing decisive was ever
+    # said. So a plain re-post never overrides a refusal, the documented remedy (re-post
+    # WITH a verdict) still clears a prose-tripped refusal, and a re-run that finds
+    # something after a verdict is heard. Scoped to the head -- a finding on an older
+    # commit is what a new commit fixes. Every superseded row is still LISTED, so the
+    # report never says one block where two exist.
+    for (h, k), seq in stmts.items():
+        decisive = [(st, v) for st, v in seq if v != "plain"]
+        if decisive:
+            # A TIE on real timestamps between contradictory decisive statements is
+            # refused. Sorting is stable, so tied rows keep fetch order -- issue
+            # comments before reviews -- which is not event order; a clean review and a
+            # blocking comment in the same second would otherwise resolve backwards.
+            # Rows with no stamp (the test seam) cannot tie: list order is their order.
+            top = max(st for st, _ in decisive)
+            tied = {v for st, v in decisive if st and st == top}
+            ambiguous = len(tied) > 1
+            final = "refused" if ambiguous else decisive[-1][1]
+        else:
+            ambiguous = False
+            final = "plain"
+        if not ambiguous:
+            (rejected if final == "refused" else accepted).setdefault(h, set()).add(k)
+        if ambiguous:
+            # Failing closed is right; describing it as an ordinary refusal is not. On a
+            # tie the clean verdict IS present and NEITHER statement is later, so both
+            # halves of the usual wording -- "no clean-verdict line overrides it" and
+            # "superseded by a LATER finding" -- state something false about this thread.
+            # The pair is therefore recorded in NEITHER verdict map: staying out of
+            # `accepted` is what blocks (the missing set is computed from `accepted`
+            # alone), and staying out of `rejected` keeps the standard refusal row from
+            # making the false claim. This row is the whole explanation.
+            # One row per BLOCK here too, so the header's count still equals the number
+            # of blocks in the thread; each says what its own block was and why the pair
+            # cannot be ordered.
+            # The tie IS blocking evidence at this head that neither map can carry.
+            blocking_residue.setdefault(h, set()).add(k)
+            for _, v in seq:
+                what = {
+                    "clean": "an explicit clean verdict",
+                    "refused": "a blocking finding",
+                    "plain": "a plain re-post",
+                }[v]
+                unusable.append(
+                    (
+                        k,
+                        f"{what} at this head; a clean verdict and a blocking finding here "
+                        f"carry the SAME timestamp, so which came last cannot be "
+                        f"established and the finding stands; re-post the verdict so it is "
+                        f"unambiguously later",
+                        True,
+                    )
+                )
+            continue
+        # Every statement that did not become the verdict is still a row -- by STATUS
+        # and by COUNT, so the report never says one block where several were observed.
+        # ONE ROW PER BLOCK -- never a count folded into a row -- so the header's block
+        # count is the number of blocks the operator can see in the thread.
+        superseded = {
+            "plain": "a plain re-post at this head with no verdict line, not decisive",
+            "clean": "an explicit clean verdict at this head, superseded by a LATER blocking finding",
+            "refused": "a refusal at this head, superseded by a LATER explicit clean verdict",
+        }
+        seen_final = False
+        for _, v in seq:
+            if v == final and not seen_final:
+                seen_final = True  # the statement that became the verdict is rendered by its map
+                continue
+            text = (
+                "a further block at this head repeating the same statement"
+                if v == final
+                else superseded[v]
+            )
+            unusable.append((k, text, True))
+    return accepted, rejected, unusable, blocking_residue
+
+
+def _mechanical_scan_is_green(
+    pr_num: str, head_sha: str, check_name: str, workflow: str, repo: str | None = None
+) -> bool:
+    """Whether *check_name* concluded SUCCESS for *head_sha*, identified by
+    ``(name, workflowName)`` rather than by display name alone.
+
+    Reads ``headRefOid`` AND ``statusCheckRollup`` in ONE query so the rollup
+    provably describes the commit being decided: if the head returned alongside
+    it is not *head_sha*, the read is discarded. That preserves the sha binding a
+    ``commits/{sha}/check-runs`` read would give, while gaining ``workflowName``,
+    which that endpoint does not expose — and it is not paginated the way the
+    REST check-runs list is, so a scanner cannot fall off a later page and read
+    as absent (which would recreate the routine false block this relief exists to
+    retire).
+
+    Identity is ``(name, workflowName)`` against the kind's PINNED workflow,
+    mirroring ``_ci_identity``. A bare display-name match would let a same-named
+    check from another app or workflow stand in for the real scanner — the decoy
+    class this file already documents at _ci_identity, and the whole point of
+    this relief is that the mechanical layer really ran.
+
+    Returns False on ANY doubt: a gh error, an unparseable payload, a head that
+    does not match, no entry with that identity, or any conclusion other than
+    SUCCESS. This feeds a merge gate that forces --admin, so an unreadable or
+    ambiguous scan must never read as a pass.
+
+    Tests inject via ``_TEST_GH_ROLLUP_WITH_HEAD`` (a JSON object with
+    ``headRefOid`` and ``statusCheckRollup``).
+    """
+    raw = os.environ.get("_TEST_GH_ROLLUP_WITH_HEAD")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    pr_num,
+                    *_repo_args(repo),
+                    "--json",
+                    "headRefOid,statusCheckRollup",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),  # merge-path budget; fail-closed -> no relief
+            )
+            if result.returncode != 0:
+                return False
+            raw = result.stdout.strip()
+        except Exception:
+            return False
+    if not raw:
+        return False
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    # The rollup and the head come from the SAME read; if that head is not the one
+    # being decided, the rollup describes a different commit and proves nothing.
+    if (data.get("headRefOid") or "").strip().lower() != (head_sha or "").strip().lower():
+        return False
+    rollup = data.get("statusCheckRollup")
+    if not isinstance(rollup, list):
+        return False
+    # Pinned to the ONE workflow the scanner belongs to, not to membership in the
+    # required-CI SET. The set has no meaningful order and several members, so
+    # "some required workflow published a check with this name" is satisfied by a
+    # decoy from an unrelated workflow -- the same identity confusion _ci_identity
+    # documents, one level down.
+    wanted_workflow = (workflow or "").strip().lower()
+    if not wanted_workflow:
+        return False  # an unpinned kind can never be established -> fail closed
+    # Collect EVERY same-identity entry, never the first match. One head can carry
+    # several runs of one job (a re-run after a ruleset change, a superseded
+    # concurrency sibling), and rollup ORDER is not a guarantee -- _pr_ci_status
+    # refuses to trust it for exactly this reason. A first-match read of a
+    # SUCCESS-then-FAILURE pair reports green while the scanner is red, and under
+    # `# ci-override` this relief is the ONLY remaining check of the mechanical
+    # layer. So: at least one matching entry, and NO matching entry that
+    # contradicts SUCCESS.
+    conclusions: list[str] = []
+    for entry in rollup:
+        if not isinstance(entry, dict):
+            continue
+        if (entry.get("name") or "").strip() != check_name:
+            continue
+        entry_workflow = (entry.get("workflowName") or "").strip().lower()
+        if not entry_workflow or entry_workflow != wanted_workflow:
+            continue  # same display name, different (or unidentifiable) workflow
+        conclusions.append((entry.get("conclusion") or "").strip().upper())
+    if not conclusions:
+        return False  # the scanner never ran at this head under that identity
+    return all(c == "SUCCESS" for c in conclusions)
+
+
+def _sha_is_ancestor(ancestor: str, descendant: str, repo: str | None = None) -> bool | None:
+    """Whether *ancestor* is an ancestor of *descendant*, per GitHub's compare API.
+
+    Load-bearing for the relief below. "An earlier head of the same PR" is NOT
+    established by "a sha that differs from the current head": a force-push or a
+    history-rewriting rebase leaves the reviewed commit off the branch entirely,
+    so the PR can carry an entirely different tree while an old accepted marker
+    still names a real commit. Carrying that review forward would vouch for code
+    its reviewer never saw — precisely the inferential leak this irreducible gate
+    exists to catch.
+
+    Returns False on ANY doubt. Only compare ``status == "ahead"`` (the
+    descendant is ahead of the ancestor) counts; "diverged", "behind" and
+    "identical" do not, and neither does an unreadable read.
+
+    Tests inject via ``_TEST_GH_COMPARE_STATUS``: either a bare status applying to
+    every pair, or a JSON object keyed ``"<ancestor>...<descendant>"`` so a test can
+    give different answers per pair. The map form exists because the relief may try
+    SEVERAL candidates against the head (an unreadable one is skipped for the next);
+    with one global value those cells cannot be told apart.
+    """
+    raw = os.environ.get("_TEST_GH_COMPARE_STATUS")
+    if raw is not None and raw.strip().startswith("{"):
+        try:
+            table = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(table, dict):
+            return None
+        found = table.get(f"{ancestor}...{descendant}")
+        if found is None:
+            return None  # unspecified pair -> unreadable, never a silent "ahead"
+        raw = str(found)
+    if raw is None:
+        try:
+            owner_repo = repo or _derive_repo_from_cwd(os.getcwd())
+        except Exception:
+            owner_repo = repo
+        if not owner_repo:
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{owner_repo}/compare/{ancestor}...{descendant}",
+                    "--jq",
+                    ".status",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),  # merge-path budget; fail-closed -> no relief
+            )
+            if result.returncode != 0:
+                return None
+            raw = result.stdout.strip()
+        except Exception:
+            return None
+    status = (raw or "").strip().lower()
+    if not status:
+        return None  # unreadable -> "unknown": the caller may try another candidate,
+        #              and fails closed only if NO candidate verifies
+    return status == "ahead"
+
+
+def _relieve_kinds_by_mechanical_rescan(
+    missing: list[str],
+    accepted: dict[str, set[str]],
+    rejected: dict[str, set[str]],
+    residue: dict[str, set[str]],
+    head: str,
+    pr_num: str,
+    repo: str | None = None,
+) -> tuple[list[str], list[tuple[str, str, str]], dict[str, str]]:
+    """Drop kinds satisfiable by an ANCESTOR ACCEPTED marker + a green scanner at head.
+
+    Returns ``(still_missing, relieved, reasons)``. Each *relieved* entry is
+    ``(kind, ancestor_head_12, check_name)`` -- enough for both the operator note and
+    the report line, so a carried-forward review is never rendered as one made at
+    head. *reasons* maps a kind to WHY relief failed when a carriable marker existed:
+    "the scanner has not finished" and "the scanner FAILED" call for opposite actions
+    (wait vs fix that job), and neither is "re-run the scheduled review", which is
+    what the message says when it only knows the marker sits on another head.
+
+    THE RULE: **any refusal for the kind, anywhere in this PR, denies relief.**
+
+    That is deliberately blunter than the predicate it replaces, which tried to
+    establish that every refusal PREDATED the accepted review it was carrying, via a
+    refusal-vs-candidate ancestry walk. Four review rounds found four different ways
+    that reconstruction was wrong -- too permissive at one round (a refusal at the
+    head overridden by an older acceptance), too strict at the next (an off-branch
+    refusal false-blocking) -- which is the signature of a predicate the available
+    data cannot support. The blunt membership test deletes the whole class: the
+    nested loop, its per-refusal network compares, the merge-budget pressure they
+    created, and the same-SHA collision case.
+
+    Two things make the bluntness affordable rather than merely simpler.
+
+    First, the OWNER'S CHRONOLOGY ALREADY RAN. ``_scheduled_review_marker_scan``
+    resolves the owner's latest decisive statement per (head, kind) before this is
+    reached, so a refusal later answered by a clean verdict AT THAT HEAD never
+    reaches ``rejected`` at all. What lands here is a refusal the owner never
+    retracted at the commit it was made about.
+
+    Second, the head axis is NOT a time axis. A clean review of yesterday's code says
+    nothing about today's, so a later acceptance at an older head must never outrank a
+    refusal -- cross-head resolution may only ever ADD acceptance, never remove a
+    refusal. A predicate that let one refusal be "answered" is exactly a predicate that
+    can remove one.
+
+    MEASURED cost, main's own scan over the 40 most recent PRs (all 40 carry a leaks
+    marker): 14 are relief-eligible -- no accepted marker at head, one elsewhere --
+    and this rule denies none of them; two PRs carry a refused row, both already
+    satisfied at their final head. So the observed price of denying on any refusal
+    is ZERO relief lost, and the fallback for the case that does occur is the
+    override plus a human reading a leak finding -- the right outcome when a leaks
+    review has refused.
+
+    BLOCKING RESIDUE closes the one path that reads `rejected` alone would leave: a
+    blocking finding the scan cannot credit to `rejected` -- a same-timestamp tie
+    (neither map, by design) or a malformed / unknown-kind marker whose body reads as
+    blocking. The scan now returns it STRUCTURALLY (``blocking_residue``, head -> kinds,
+    "" for unattributable, "*" for kind-less), so this predicate denies on it without
+    ever matching prose. An adversarial audit reproduced the hole before this existed:
+    a [P1] body under a 12-char ``head=`` at HEAD -- a producer fault the scan records
+    as observed live -- was carried over by the older clean review. On the 40-PR
+    corpus, 7 PRs carry BENIGN unusable rows (re-posts, a short sha, a superseded
+    refusal) and none carry residue: denying on residue costs nothing measured, where
+    denying on any unusable row would have cost 7/40 on their next push.
+    """
+    relieved: list[tuple[str, str, str]] = []
+    reasons: dict[str, str] = {}
+    for kind in missing:
+        pin = _MECHANICAL_RESCAN_BY_KIND.get(kind)
+        if not pin:
+            continue
+        check_name, workflow = pin
+        # ANY refusal for this kind, at ANY head -> no relief. See THE RULE above.
+        if any(kind in kinds for kinds in rejected.values()):
+            reasons[kind] = (
+                "a scheduled review for this kind was REFUSED in this PR and never "
+                "retracted at the commit it was made about, so no earlier review is "
+                "carried forward -- read that finding rather than re-running the review"
+            )
+            continue
+        # Blocking evidence the scan could not credit to `rejected` -- a same-timestamp
+        # tie at some head, or a malformed / unknown-kind marker whose body reads as
+        # blocking -- is RESIDUE, and it denies exactly as a refusal does, at ANY head:
+        # the finding was never provably retracted, and the head axis is not a time
+        # axis. A "*" entry is a blocking body under no creditable kind: it denies
+        # every kind. This closes the path an adversarial audit REPRODUCED (2026-08-30):
+        # a [P1] body under a 12-char `head=` at HEAD landed in `unusable`, and relief
+        # carried the older clean review straight over it.
+        residue_kinds: set[str] = set()
+        for kinds in residue.values():
+            residue_kinds |= kinds
+        if kind in residue_kinds or "*" in residue_kinds:
+            reasons[kind] = (
+                "a marker in this PR carries a blocking finding that could not be "
+                "credited to a head or a kind (a malformed field, or a verdict tied "
+                "with a clean one), so no earlier review is carried forward -- "
+                "resolve that finding first"
+            )
+            continue
+        candidates = [h for h, kinds in accepted.items() if h != head and kind in kinds]
+        if not candidates:
+            continue  # never accepted anywhere in this PR -> nothing to carry forward
+        # ANY accepted ancestor will do; stop at the first. The previous code took the
+        # LAST candidate to minimise the un-LLM-reviewed delta, and called that
+        # "newest" -- but `accepted` is keyed by SHA and carries no order, so that was
+        # a claim the data does not support (round-4 finding). The safety argument is
+        # the per-head mechanical scan below, never the size of the delta, so nothing
+        # rests on which ancestor is chosen.
+        ancestor = None
+        unreadable = False
+        for candidate in candidates:
+            # The merge path runs these gates sequentially under ONE deadline, and each
+            # compare is a network call. An overrun gets the whole hook SIGKILLed, which
+            # fails toward "the tool runs" and disengages the ENTIRE gate stack. Relief
+            # must never be the thing that spends that budget.
+            if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+                unreadable = True
+                break
+            verdict = _sha_is_ancestor(candidate, head, repo=repo)
+            if verdict is None:
+                # An unreadable compare is "I do not know", not "no". It is recorded,
+                # and the loop moves on: since nothing rests on WHICH accepted ancestor
+                # is carried, a candidate that verifies is not a downgrade from one that
+                # could not be read. Only when no candidate verifies does the unknown
+                # decide the outcome -- closed.
+                unreadable = True
+                continue
+            if verdict:
+                ancestor = candidate
+                break
+        if ancestor is None:
+            reasons[kind] = (
+                "the review history could not be established in the time available"
+                if unreadable
+                else "every accepted review for this kind is off this branch's history"
+            )
+            continue
+        if not _mechanical_scan_is_green(pr_num, head, check_name, workflow, repo=repo):
+            reasons[kind] = (
+                f"an earlier accepted review exists, but '{check_name}' is not green at "
+                f"this head (pending, failed, absent, or unreadable) -- check that job "
+                f"rather than re-running the scheduled review"
+            )
+            continue  # unreadable, absent, wrong workflow, pending or failed -> fail CLOSED
+        relieved.append((kind, ancestor[:12], check_name))
+    relieved_kinds = {k for k, _, _ in relieved}
+    return [k for k in missing if k not in relieved_kinds], relieved, reasons
 
 
 def _check_scheduled_claude_reviewed_head(
@@ -2844,6 +3521,7 @@ def _check_scheduled_claude_reviewed_head(
     repo: str | None = None,
     *,
     force: bool = False,
+    relief_out: list[tuple[str, str, str]] | None = None,
 ) -> str | None:
     """Block a merge unless EVERY required scheduled Claude review (by the repo OWNER)
     has run on the PR's CURRENT head. Returns ``None`` when a valid owner marker for
@@ -2857,36 +3535,17 @@ def _check_scheduled_claude_reviewed_head(
     blocks. The merge path and the report path share this single fail-closed decision,
     so the report can never issue a false all-clear here.
 
-    WHY THE BLOCK MESSAGE PARTITIONS. A missing marker has THREE causes calling for
-    DIFFERENT operator actions, all distinguishable from what was already read. The
-    missing kinds are PARTITIONED across those causes and EVERY non-empty group is
-    reported — this is not a precedence chain that picks one winner:
-      * REFUSED at this head — a marker is present on the current commit but read as
-        carrying a blocking finding. Neither waiting nor re-reviewing helps; the body's
-        wording (or a real finding) is the cause. It is also the cause most easily
-        mistaken for "nobody posted anything", since the gate's `present:` line shows
-        the same `none` either way.
-      * ELSEWHERE — a marker for that kind sits on some OTHER head, ACCEPTED OR REFUSED.
-        A routine ran, then a push moved the head. Routines are not generally re-run on a
-        push, so waiting is unlikely to help; re-review the current head and post it.
-      * ABSENT — no marker for that kind at any head. Nothing has run for it, so on a
-        freshly-opened PR a routine may still be in flight and waiting IS the right move.
-
-    Two design rules earned by successive review rounds, both of the SAME shape — a
-    decision made from only part of what had been read. Keep them:
-      1. Scope every group to ``missing``. A marker for an already-satisfied kind explains
-         nothing about this block, and prescribing a remedy for it sends the operator to
-         fix something that is not broken (it also let the message contradict its own
-         ``present:`` line one row above).
-      2. PARTITION rather than prioritise. Different kinds routinely fail for different
-         reasons — a refused ``code-review`` beside an absent ``leaks`` — and choosing a
-         single winning cause explained one kind while the other silently got no guidance
-         at all. Precedence exists only WITHIN a kind (refused-here beats elsewhere).
-
-    An earlier draft collapsed everything into an unconditional "waiting will not clear
-    this", which was wrong for the ABSENT case and pushed the operator toward
-    ``# scheduled-review-override`` — i.e. toward waiving the IRREDUCIBLE leak gate — in
-    the one situation where patience was the correct answer.
+    WHY THE BLOCK MESSAGE IS AN INVENTORY. Every marker block the scan found is listed
+    under the kind it names with its status — accepted at another head, refused (here or
+    elsewhere), or uncreditable with the reason — and nothing is subtracted from anything.
+    The previous shape partitioned the missing kinds by cause and let one cause per kind
+    win. Across six review rounds every finding on it was the same defect: the winning
+    cause hid a fact the operator needed (a refused [P1] on an older commit, the only
+    evidence a review had ever run, a field that was present but refused). Precedence is
+    the right shape for the VERDICT, which needs one answer; it is the wrong shape for a
+    REPORT, where hiding a true fact is never correct. The one conditional left is a
+    count: a kind with zero rows gets the in-flight note, since "nothing found at all" is
+    the only state where waiting can help.
 
     The message deliberately reports only what it OBSERVED (which heads carry markers)
     and hedges the schedule ("generally not re-run"). The routines live OUTSIDE this repo
@@ -2894,13 +3553,22 @@ def _check_scheduled_claude_reviewed_head(
     fire would be asserting a guarantee the code cannot back — and would become actively
     misleading on an install that also runs them on ``synchronize``.
 
-    Head match is EXACT — there is no ancestor walk and no delta tolerance here, unlike
-    the Codex freshness gate, which grants relief on a provably trivial delta via
-    ``_classify_post_review_delta``. That asymmetry is deliberate for now: that
-    classifier judges CODE-REVIEW substantiality by file type and size, and an
-    inferential leak (household/schedule/habit detail, not a token a regex can catch)
-    arrives in exactly the small doc edit it would wave through. A leak-specific
-    tolerance is tracked separately; do not reuse the code-review classifier for it.
+    Head match is EXACT by default, and the code-review classifier must NEVER be
+    reused here: ``_classify_post_review_delta`` judges CODE-REVIEW substantiality by
+    file type and size, and an inferential leak (household/schedule/habit detail, not
+    a token a regex can catch) arrives in exactly the small doc edit it would wave
+    through. That prohibition is unchanged.
+
+    The ONE tolerance that exists is the leak-specific one this docstring used to
+    describe as "tracked separately": ``_relieve_kinds_by_mechanical_rescan`` may
+    carry an ACCEPTED marker forward from an ANCESTOR commit of this PR, but only
+    while the kind's MECHANICAL scanner is green at the exact current head, only
+    never when any refusal or uncreditable blocking finding for that kind exists in the PR, and only for
+    kinds in ``_MECHANICAL_RESCAN_BY_KIND``. It is not a delta tolerance: nothing is
+    judged by how big or how doc-like the change is. It trades a re-read of the
+    inferential layer for a per-head guarantee about the literal layer — strictly
+    more checking than the ``# scheduled-review-override`` it exists to retire,
+    which verifies nothing at all.
 
     SCOPE: this gate enforces ONLY for a merge targeting the configured PUBLIC repo
     (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any other
@@ -2927,8 +3595,8 @@ def _check_scheduled_claude_reviewed_head(
             f"reviews (GitHub query failed).\n"
             f"Retry, or append '# scheduled-review-override' to merge anyway."
         )
-    scan = _scheduled_review_marker_scan(pr_num, repo=repo)
-    markers, rejected = (None, {}) if scan is None else scan
+    scan = _scheduled_review_marker_scan(pr_num, repo=repo, head_sha=head)
+    markers, rejected, unusable, residue = (None, {}, [], {}) if scan is None else scan
     if markers is None:
         return (
             f"could not read PR #{pr_num}'s comments/reviews to verify the scheduled Claude "
@@ -2938,71 +3606,132 @@ def _check_scheduled_claude_reviewed_head(
     kinds_here = markers.get(head, set())
     required = _required_scheduled_review_kinds()
     missing = [k for k in required if k not in kinds_here]
+    if missing:
+        # A kind already ACCEPTED at an earlier head of this PR is satisfied when its
+        # mechanical scanner is green at THIS head (see _MECHANICAL_RESCAN_BY_KIND).
+        missing, relieved, relief_reasons = _relieve_kinds_by_mechanical_rescan(
+            missing, markers, rejected, residue, head, pr_num, repo=repo
+        )
+        if relief_out is not None:
+            relief_out.extend(relieved)
+        # Announce ONLY when relief actually clears the gate. Printing "honouring
+        # the earlier review" while the merge is still denied on another kind
+        # describes a decision that was not made.
+        if not missing:
+            for kind, earlier_head, check_name in relieved:
+                print(
+                    f"NOTE: scheduled '{kind}' review for PR #{pr_num} was accepted at "
+                    f"{earlier_head} (not at head {head[:12]}), but '{check_name}' is green "
+                    f"at this head — honouring the earlier review.",
+                    file=sys.stderr,
+                )
     if not missing:
         return None
-    # WHY the marker is missing decides whether waiting is useful, and the two causes are
-    # DISTINGUISHABLE from what was actually read — so report the observed state instead
-    # of asserting a routine schedule this repo cannot see (the routines live outside it).
-    # Every branch below is scoped to the MISSING kinds. A marker for a kind that is
-    # already satisfied says nothing about why this merge is blocked, and prescribing a
-    # remedy for it sends the operator to fix something that is not broken.
-    # PARTITION the missing kinds by cause and report EVERY group — never pick one cause
-    # for the whole block. Different kinds routinely fail for different reasons (a refused
-    # code-review alongside an absent leaks), and collapsing to a single winner explains
-    # one kind while the other silently gets no guidance at all. THREE successive review
-    # findings on this function were that same shape — a branch deciding from part of what
-    # had been read — so this is the general form rather than a fourth point patch: a total
-    # partition needs no precedence BETWEEN groups, only within a single kind.
-    missing_set = set(missing)
-    refused_kinds = rejected.get(head, set()) & missing_set
-    # A marker for a missing kind on some OTHER head — ACCEPTED OR REFUSED. Both prove a
-    # routine ran on a different commit; counting only accepted ones sent a
-    # refused-at-a-stale-head PR down the "nothing has run, wait for it" path.
-    heads_by_kind: dict[str, set[str]] = {}
-    for by_head in (markers, rejected):
-        for other_head, kinds in by_head.items():
-            if other_head == head:
-                continue
-            for kind in kinds & missing_set:
-                heads_by_kind.setdefault(kind, set()).add(other_head[:12])
-    # Within a KIND, refused-at-this-head wins: it is the most specific cause, and the only
-    # one whose remedy is neither waiting nor re-reviewing.
-    elsewhere_kinds = {k for k in missing_set - refused_kinds if k in heads_by_kind}
-    absent_kinds = missing_set - refused_kinds - elsewhere_kinds
-
+    # The message is an INVENTORY, not a verdict. Every marker block the scan found is
+    # listed under the kind it names, with its status, and NOTHING is subtracted from
+    # anything. The verdict above (block) is the only decision this function makes.
+    #
+    # Six review rounds and nine findings on the previous shape of this message shared
+    # one anatomy: a rule decided which true fact "won" for a kind and the losing fact was
+    # hidden -- a refused [P1] at an older commit hidden by a typo at the current one; the
+    # only evidence that a review had ever run hidden by a stranger's comment; a present
+    # field reported as absent. Each fix moved the rule and the next reviewer found the
+    # next hidden fact. A report has no winners. An operator can read three lines; they
+    # cannot read a line that was deleted for them.
+    #
+    # What follows therefore contains no precedence, no superseding, no attribution
+    # beyond the strict grammar, and no remedy text. The one conditional is a COUNT: a
+    # kind with zero rows gets the in-flight note, because "nothing at all was found" is
+    # the single state where waiting can help; a kind with rows gets a line saying none
+    # of them counts at the current head. Both are facts about the list above them.
+    required_set = set(required)
+    refused_here = rejected.get(head, set())
+    # ADDITIVE to the inventory above, never substitutive. A kind whose RELIEF was
+    # attempted and DECLINED has a specific observed cause -- the mechanical scanner is
+    # still running, or failed, or the carried marker is not an ancestor -- and telling
+    # the operator to re-run the scheduled review is wrong advice in every one of those
+    # states. Rendered as its own line after the per-kind rows (see the return below),
+    # so it adds a fact and hides none: the inventory's own rule.
+    relief_blocked = {k: r for k, r in relief_reasons.items() if k in set(missing)}
     parts: list[str] = []
-    if refused_kinds:
+    for kind in missing:
+        # (row text, owner-authored). Accepted/refused rows are owner-authored by
+        # construction -- the scan admits nothing else to those maps.
+        rows: list[tuple[str, bool]] = []
+        # Accepted markers at OTHER heads -- a routine ran, then the head moved.
+        for other_head, kinds in sorted(markers.items()):
+            if other_head != head and kind in kinds:
+                rows.append((f"accepted at a DIFFERENT head ({other_head[:12]})", True))
+        # Refused markers, here and elsewhere. Stated as the fact the scan observed;
+        # the clean-verdict rule that decides "refused" lives in the dev skill, and the
+        # exact verdict string is deliberately NOT quoted here -- a gate that prints the
+        # incantation that makes it pass is explaining how to get past itself.
+        if kind in refused_here:
+            rows.append(
+                (
+                    "a marker IS present at THIS head but was REFUSED: its body reads as "
+                    "carrying a blocking finding ([P1] / HARD BLOCK / an '### ERROR' "
+                    "heading) and no clean-verdict line overrides it",
+                    True,
+                )
+            )
+        for other_head, kinds in sorted(rejected.items()):
+            if other_head != head and kind in kinds:
+                rows.append((f"REFUSED at a DIFFERENT head ({other_head[:12]}), same reason", True))
+        # Blocks that named this kind but could not be counted, each with its reason.
+        for named, reason, owner_authored in unusable:
+            if named == kind:
+                rows.append((f"could not be counted: {reason}", owner_authored))
+        listing = "".join(f"\n      - {r}" for r, _ in rows)
+        # The in-flight note is the ONE conditional, and it is a count over a fact: has
+        # the OWNER posted anything for this kind, at any head, in any state? If so, the
+        # owner's routine has evidently already run and waiting for it cannot help. If
+        # not, nothing the gate can see rules it out -- and a stranger's comment is not
+        # evidence about the owner's routine, so it must not silence the note. On a
+        # public repository that would let any account delete the one line telling a
+        # fresh PR's operator that patience, not an override, is the answer.
+        owner_evidence = any(owner for _, owner in rows)
+        if rows and owner_evidence:
+            parts.append(
+                f"{kind} — {len(rows)} marker block(s) found for this kind, none of which "
+                f"counts at the current head:{listing}"
+            )
+        elif rows:
+            parts.append(
+                f"{kind} — {len(rows)} marker block(s) found for this kind, none of which "
+                f"counts at the current head, and none posted by the repo owner:{listing}"
+                f"\n      No owner marker for this kind at any head. If the PR was just "
+                f"opened, a routine may still be in flight, and waiting is the right move."
+            )
+        else:
+            parts.append(
+                f"{kind} — no marker block found for this kind at any head. If the PR was "
+                f"just opened, a routine may still be in flight, and waiting is the right "
+                f"move."
+            )
+    # Blocks that named no REQUIRED kind. Listed so they are visible, credited to
+    # nothing: deciding which review a block "meant" is a guess, and a guessed kind
+    # steers the reader toward attesting for a review that never ran.
+    unscoped = [(k, r) for k, r, _ in unusable if k is None or k not in required_set]
+    if unscoped:
+        # Every row, never a "+N more": a truncated inventory is a partial one, and the
+        # seventh block is as likely as the first to carry the failed-run suffix.
+        listing = "".join(f"\n      - [{k or 'no kind named'}] {r}" for k, r in unscoped)
         parts.append(
-            f"{', '.join(sorted(refused_kinds))} — a marker IS present at THIS head, but it "
-            f"was REFUSED because its body reads as carrying a blocking finding (matching "
-            f"one of [P1] / HARD BLOCK / an '### ERROR' heading) with no explicit clean "
-            f"verdict to override it. A marker must mean it ran CLEAN, not merely that it "
-            f"ran. If the review really was clean, its prose tripped the check — re-post it "
-            f"ending with an explicit verdict line, exactly 'VERDICT: PASS' or "
-            f"'PII/Secrets/Wording: CLEAN'. If the finding is real, fix it first."
-        )
-    if elsewhere_kinds:
-        seen = sorted({h for k in elsewhere_kinds for h in heads_by_kind[k]})
-        shown = ", ".join(seen[:3]) + (f" (+{len(seen) - 3} more)" if len(seen) > 3 else "")
-        parts.append(
-            f"{', '.join(sorted(elsewhere_kinds))} — a marker is present for a DIFFERENT "
-            f"head ({shown}), so a routine HAS run on this PR, just not on the current "
-            f"commit. Routines are generally not re-run when a later push moves the head, "
-            f"so waiting is unlikely to clear this on its own: re-run against the current "
-            f"head and post the marker yourself."
-        )
-    if absent_kinds:
-        parts.append(
-            f"{', '.join(sorted(absent_kinds))} — no marker at ANY head on this PR yet. If "
-            f"it was just opened, a routine may still be in flight, and waiting IS the right "
-            f"move. If it has been open a while, re-run against the current head and post "
-            f"the marker yourself."
+            f"unscoped — {len(unscoped)} marker block(s) name no required kind and count "
+            f"toward nothing:{listing}"
         )
     return (
         f"scheduled Claude review(s) missing at head {head[:12]}: {', '.join(missing)} "
         f"(required: {', '.join(required)}; present: "
         f"{', '.join(sorted(kinds_here)) or 'none'}).\n"
         + "".join(f"  * {p}\n" for p in parts)
+        + (
+            "".join(
+                f"  (relief for '{k}' was attempted and declined: {r}.)\n"
+                for k, r in sorted(relief_blocked.items())
+            )
+        )
         + "A marker is a comment/review by the repo OWNER carrying "
         f"'<!-- genesis-scheduled-review: head={head} kind=<name> -->' — the FULL 40-hex "
         "head, exactly as written here.\n"
@@ -5107,10 +5836,33 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     if not _scheduled_gate_applies(repo):
         print("scheduled-claude: n/a (scoped to the public repo only)")
     else:
-        sched_msg = _check_scheduled_claude_reviewed_head(pr_num, verified_head, repo)
-        print(
-            f"scheduled-claude: {'BLOCK — ' + sched_msg.splitlines()[0] if sched_msg else 'ok (at head)'}"
+        sched_relief: list[tuple[str, str, str]] = []
+        sched_msg = _check_scheduled_claude_reviewed_head(
+            pr_num, verified_head, repo, relief_out=sched_relief
         )
+        if sched_msg:
+            sched_state = "BLOCK — " + sched_msg.splitlines()[0]
+        elif sched_relief:
+            # NEVER render a carried-forward review as one made at head: this line is
+            # what a human (and a structured consumer) reads to judge freshness, and
+            # "ok (at head)" here would be a false assertion about what was reviewed.
+            sched_state = "ok (" + "; ".join(
+                f"{kind} carried from {anc}, {check} green at head"
+                for kind, anc, check in sched_relief
+            ) + ")"
+        else:
+            sched_state = "ok (at head)"
+        print(f"scheduled-claude: {sched_state}")
+        # Render the TAIL, following the pin-receipts idiom above. Without this the whole
+        # per-cause diagnosis is discarded on the canonical pre-merge surface: line 0 is
+        # the summary, and its `present: none` clause is the exact string an operator was
+        # measured acting wrongly on -- they read "nothing was posted", waited, and the
+        # marker was sitting in the thread the whole time. The bullets that say WHICH
+        # cause it was live on lines 1+. Printing only line 0 means every improvement to
+        # them is invisible here, which is where the mistake was actually made.
+        if sched_msg:
+            for line in sched_msg.splitlines()[1:]:
+                print(f"  {line}")
         failures += 1 if sched_msg else 0
     # Fail-closed (the only mode now): a scan that could not be READ (gh error/malformed)
     # shows as a failure here, never as "ok" — the report must not issue a false all-clear.

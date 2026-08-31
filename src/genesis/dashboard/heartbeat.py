@@ -1,72 +1,24 @@
 """Dashboard heartbeat — emits periodic heartbeats to the event bus.
 
-The web UI runs in the same process as all Genesis subsystems. If the Flask
-app degrades (routes broken, event loop stalled) this heartbeat will stop,
-allowing subsystem_heartbeats() to detect the issue.  If the entire process
-dies, external monitoring (status.json file age, systemd watchdog) covers
-the gap — this heartbeat handles the *degraded-but-alive* case.
+The web UI runs in the same process as all Genesis subsystems. If the Flask app
+degrades (routes broken, event loop stalled) this heartbeat stops, allowing
+``subsystem_heartbeats()`` to detect the issue. If the entire process dies,
+external monitoring (status.json file age, systemd watchdog) covers the gap —
+this heartbeat handles the *degraded-but-alive* case.
+
+The threading, loop capture and health recording live in
+``observability.heartbeat_daemon``; only the identity is here.
 """
 
 from __future__ import annotations
 
-import asyncio
-import logging
-import threading
-
-logger = logging.getLogger("genesis.dashboard.heartbeat")
+from genesis.observability.heartbeat_daemon import HeartbeatDaemon
 
 
-class DashboardHeartbeat:
-    """Background daemon thread that emits heartbeat events for the web UI."""
+class DashboardHeartbeat(HeartbeatDaemon):
+    """Emits the dashboard liveness pulse while the runtime is bootstrapped."""
 
-    def __init__(self, interval_seconds: int = 60) -> None:
-        self._interval = interval_seconds
-        self._thread: threading.Thread | None = None
-        self._stop_event = threading.Event()
-
-    def start(self) -> None:
-        """Start the heartbeat background thread."""
-        self._thread = threading.Thread(
-            target=self._run, daemon=True, name="dashboard-heartbeat",
-        )
-        self._thread.start()
-        logger.info("Dashboard heartbeat started (interval=%ds)", self._interval)
-
-    def stop(self) -> None:
-        """Signal the thread to stop and wait for it."""
-        self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=5)
-
-    def _run(self) -> None:
-        from genesis.observability.types import Severity, Subsystem
-
-        while not self._stop_event.is_set():
-            try:
-                from genesis.runtime import GenesisRuntime
-
-                rt = GenesisRuntime.instance()
-                if rt.is_bootstrapped and rt.event_bus:
-                    loop = asyncio.new_event_loop()
-                    try:
-                        loop.run_until_complete(
-                            rt.event_bus.emit(
-                                Subsystem.DASHBOARD,
-                                Severity.DEBUG,
-                                "heartbeat",
-                                "Dashboard web UI alive",
-                            )
-                        )
-                    finally:
-                        loop.close()
-                    rt.record_job_success("dashboard_heartbeat")
-            except Exception as exc:
-                logger.error("Dashboard heartbeat failed", exc_info=True)
-                try:
-                    from genesis.runtime import GenesisRuntime
-
-                    rt = GenesisRuntime.instance()
-                    rt.record_job_failure("dashboard_heartbeat", "heartbeat emission failed", exc=exc)
-                except Exception:
-                    pass
-            self._stop_event.wait(self._interval)
+    subsystem_name = "DASHBOARD"
+    job_name = "dashboard_heartbeat"
+    message = "Dashboard web UI alive"
+    thread_name = "dashboard-heartbeat"
