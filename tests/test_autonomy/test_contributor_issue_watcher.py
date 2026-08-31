@@ -232,19 +232,24 @@ async def test_live_adopts_existing_open_issue_no_repost(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_adopt_genesis_authored_issue_is_authoritative(db, monkeypatch):
-    """Crash-recovery: adopting an open issue GENESIS itself authored (our own gh
-    account, case-insensitive) stays authoritative (adopted=0) so its later closure
-    can still resolve the follow_up."""
+async def test_adopt_owner_authored_issue_is_not_authoritative(db, monkeypatch):
+    """Provenance simplification (Codex round-4 finding 1): author identity is NOT a
+    sound creation signal in a single-owner install, so EVERY adopt is non-authoritative
+    (adopted=1) — only an in-band Genesis CREATE is authoritative. Here an open issue
+    authored by OUR OWN gh account is adopted → adopted=1, so its later closure never
+    auto-resolves the follow_up. Trade (fail-safe): a crash-recovered Genesis issue no
+    longer auto-resolves — it stays pending, manually resolvable, never a false
+    completion."""
     _mode(monkeypatch, "live")
-    monkeypatch.setattr(ciw, "github_user", lambda: "WingedGuardian")
     existing = json.dumps(
         [
             {
                 "number": 7,
                 "title": "add a NEWCOMER task",
                 "url": f"https://github.com/{_REPO}/issues/7",
-                "author": {"login": "wingedguardian"},  # our account (case-insensitive)
+                "author": {
+                    "login": "wingedguardian"
+                },  # our own account — no longer trusted as provenance
             }
         ]
     )
@@ -258,16 +263,17 @@ async def test_adopt_genesis_authored_issue_is_authoritative(db, monkeypatch):
     assert not gh.created()
     row = await pip.get_by_id(db, pid)
     assert row["status"] == "posted"
-    assert row["adopted"] == 0  # authoritative — Genesis authored it
+    assert row["adopted"] == 1  # FIX finding-1: ALL adopts non-authoritative (author not trusted)
 
 
 @pytest.mark.asyncio
 async def test_adopt_external_authored_issue_is_not_authoritative(db, monkeypatch):
     """Adopting a coincidental-title issue authored by SOMEONE ELSE marks it
-    adopted=1 so its closure never auto-resolves Genesis's follow_up. Fail-safe:
-    a missing author (see the base adopt test) is also treated as adopted=1."""
+    adopted=1 so its closure never auto-resolves Genesis's follow_up. Post-finding-1
+    the author is irrelevant (every adopt is adopted=1); paired with
+    test_adopt_owner_authored_issue_is_not_authoritative this proves author identity no
+    longer changes the verdict."""
     _mode(monkeypatch, "live")
-    monkeypatch.setattr(ciw, "github_user", lambda: "WingedGuardian")
     existing = json.dumps(
         [
             {

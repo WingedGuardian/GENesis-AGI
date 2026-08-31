@@ -3,9 +3,12 @@
 The poster drain adopts a pre-existing OPEN issue whose title matches a proposal
 (this covers BOTH crash-idempotency — Genesis created it then crashed before
 ``mark_posted`` — AND a coincidental external/human issue with the same title).
-Only a Genesis-CREATED issue (or a crash-recovery adopt of an issue Genesis itself
-authored) is an authoritative close-link; an adopted EXTERNAL issue must not
-auto-resolve the originating follow_up. This column records that provenance so
+Only a Genesis-CREATED issue (the drain's create branch, ``adopted = 0``) is an
+authoritative close-link; EVERY adopt — an external/human coincidental-title issue
+OR a crash-recovery adopt of one Genesis itself created — is recorded ``adopted = 1``
+and must not auto-resolve the originating follow_up (author identity cannot soundly
+confirm provenance on adopt in a single-owner install, so adopts are
+non-authoritative — fail-safe). This column records that provenance so
 ``posted_index_for_repo`` (the close-loop join) can exclude adopted rows
 (``adopted = 1``).
 

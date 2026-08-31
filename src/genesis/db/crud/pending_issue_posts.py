@@ -95,13 +95,16 @@ async def mark_posted(
     given hold).
 
     ``adopted`` records provenance for the WS-A close-loop. ``False`` (default) =
-    Genesis CREATED this issue — an authoritative close-link, so a PR closing it may
-    auto-resolve the originating follow_up. ``True`` = Genesis merely ADOPTED a
-    pre-existing open issue it did NOT author (an external coincidental-title issue),
-    so its later closure must NOT auto-resolve the follow_up. Only created
-    (``adopted=0``) rows feed ``posted_index_for_repo`` (a Genesis crash-recovery
-    adopt of an issue Genesis itself authored is classified ``adopted=0`` by the
-    drain — it is still authoritative)."""
+    Genesis CREATED this issue in-band (the drain's create branch) — an authoritative
+    close-link, so a PR closing it may auto-resolve the originating follow_up.
+    ``True`` = Genesis ADOPTED a pre-existing open issue; the drain sets this for EVERY
+    adopt, regardless of author, so its later closure must NOT auto-resolve the
+    follow_up. Only created (``adopted=0``) rows feed ``posted_index_for_repo``. NOTE:
+    a crash-recovery adopt of an issue Genesis itself created (crashed before this
+    mark_posted) is ALSO ``adopted=1`` — author identity cannot soundly distinguish it
+    from a human coincidental-title issue in a single-owner install, so it is treated
+    non-authoritatively (fail-safe: its follow_up stays pending rather than risk a
+    false auto-resolve)."""
     cursor = await db.execute(
         "UPDATE pending_issue_posts "
         "SET status = 'posted', issue_number = ?, issue_url = ?, posted_at = ?, adopted = ? "
@@ -164,12 +167,14 @@ async def posted_index_for_repo(db: aiosqlite.Connection, repo: str) -> dict[int
     issue_number would be a data anomaly, so the FIRST row (by rowid) wins rather
     than corrupting the map.
 
-    ``adopted = 0`` excludes issues Genesis ADOPTED but did not author (external
-    coincidental-title issues): a PR closing such an issue must not auto-resolve the
-    follow_up. Genesis-CREATED issues (including a crash-recovery adopt of an issue
-    Genesis authored, classified adopted=0 by the drain) remain authoritative. Legacy
-    rows posted before this column existed default to 0 (treated as created) — an
-    accepted, bounded residue since adoption is rare and the column is net-new.
+    ``adopted = 0`` excludes EVERY issue Genesis ADOPTED (a pre-existing open issue,
+    including a crash-recovery adopt of one Genesis itself created): a PR closing an
+    adopted issue must not auto-resolve the follow_up. Only issues Genesis CREATES
+    in-band (``adopted=0``) remain authoritative — author identity cannot soundly
+    confirm provenance on adopt in a single-owner install, so adopts are
+    non-authoritative (fail-safe). Legacy rows posted before this column existed
+    default to 0 (treated as created) — an accepted, bounded residue since adoption is
+    rare and the column is net-new.
 
     The ``repo`` comparison is ``COLLATE NOCASE``: the stored repo is
     config-derived while the caller's repo is gh-canonical (``gh repo view``), and

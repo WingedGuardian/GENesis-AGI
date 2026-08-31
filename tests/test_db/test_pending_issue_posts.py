@@ -467,8 +467,8 @@ class TestPostedIndexForRepo:
 
     @pytest.mark.asyncio
     async def test_adopted_rows_excluded_from_close_loop(self, db):
-        # An issue Genesis ADOPTED but did not author (an external coincidental-title
-        # issue) must NOT feed the close-loop join: a PR closing it should never
+        # An issue Genesis ADOPTED (author-independent — every adopt is marked
+        # adopted=True) must NOT feed the close-loop join: a PR closing it should never
         # auto-resolve the follow_up. A Genesis-CREATED issue (adopted default False)
         # still indexes normally.
         adopted_row = {

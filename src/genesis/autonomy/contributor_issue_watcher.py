@@ -50,7 +50,6 @@ from genesis.autonomy.contributor_worklog_config import (
 )
 from genesis.db.crud import approval_requests as approval_crud
 from genesis.db.crud import pending_issue_posts as pip
-from genesis.env import github_user
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +118,7 @@ def _find_open_issue_by_title(repo: str, title_norm: str) -> tuple[bool, dict | 
             "--state",
             "open",
             "--json",
-            "number,title,url,createdAt,author",
+            "number,title,url,createdAt",
             "--limit",
             "200",
         ]
@@ -236,25 +235,24 @@ async def _resolve_approved(
         # string `posted_at >= since` comparison in count_posted_since is format-uniform
         # (no Z-vs-+00:00 footgun); a malformed value falls back to ``now`` (fail-safe).
         adopt_ts = _normalize_ts(existing.get("createdAt")) or now
-        # Create-vs-adopt provenance for the close-loop. An adopted issue is an
-        # authoritative close-link ONLY when Genesis itself authored it (a
-        # crash-recovery adopt of an issue we created seconds ago). An issue authored
-        # by anyone else — an external coincidental-title issue — must NOT let its
-        # later closure auto-resolve the follow_up. Fail-safe: treat as adopted (not
-        # authoritative) UNLESS we can positively confirm our own account authored it,
-        # so an unknown author or unset owner never yields a false auto-resolve.
-        issue_author = (existing.get("author") or {}).get("login") or ""
-        gh_owner = github_user() or ""
-        adopted = not (
-            issue_author and gh_owner and issue_author.strip().lower() == gh_owner.strip().lower()
-        )
+        # Create-vs-adopt provenance for the close-loop. EVERY adopt is
+        # non-authoritative (adopted=True); ONLY an issue Genesis CREATES in-band (the
+        # create branch below, adopted=0 by default) is an authoritative close-link.
+        # Author identity CANNOT distinguish a Genesis crash-recovery creation from a
+        # human coincidental-title issue in this single-owner install — both carry the
+        # owner's gh account — and a genuine crash-recovery adopt leaves no DB record to
+        # check (the crash happened before mark_posted), so there is no sound signal to
+        # infer authorship. Trade (fail-safe): a crash-recovered Genesis issue no longer
+        # auto-resolves its follow_up (it stays pending, manually resolvable) — never a
+        # false completion. Retires the round-3 author-identity proxy (Codex round-4
+        # finding 1: author ≠ creation provenance).
         if await pip.mark_posted(
             rt_db,
             row["id"],
             issue_number=num,
             issue_url=existing.get("url"),
             posted_at=adopt_ts,
-            adopted=adopted,
+            adopted=True,
         ):
             await approval_crud.mark_consumed(rt_db, row["request_id"], consumed_at=now)
             logger.info(
