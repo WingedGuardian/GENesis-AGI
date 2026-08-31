@@ -418,3 +418,69 @@ async def test_a_post_mutation_caller_recovers_from_a_failing_stale_compute():
         "the post-mutation caller inherited the failure of the compute it was "
         "only draining, instead of running its own"
     )
+
+
+@pytest.mark.asyncio
+async def test_the_cache_predicate_never_returns_none_when_invalidated_mid_read():
+    """A concurrent `invalidate()` between the predicate's two cache reads.
+
+    `snapshot()` reads `self._cache` TWICE on the fast path — once to test it
+    for None, once to return it — with a `time.monotonic()` call in between.
+    Every field the service owns is normally written on the loop thread, which
+    makes that safe; but `invalidate_snapshot_cache()` documents a LOOP-LESS
+    fallback (no `GENESIS_EVENT_LOOP` configured — the Agent Zero plugin host,
+    and any embedded host) where it calls `invalidate()` directly from the
+    mutating Flask request thread while a health request runs on another. A
+    switch landing between those two reads then returns None, and the route's
+    `dict(await ...snapshot(...))` raises TypeError on a request that had
+    already committed its mutation.
+
+    The interleaving is made deterministic rather than raced: `time.monotonic`
+    is the one call the predicate makes BETWEEN the two reads, so a stub that
+    invalidates from inside it reproduces exactly the window, with no timing
+    dependence. This is the same double-read shape already fixed once on this
+    branch at `mark_inflight_stale()` — the class, not that instance.
+    """
+    import genesis.observability.health_data as hd
+
+    svc, gate, state = _gated_service()
+    gate.set()
+
+    warm = await svc.snapshot(max_age_s=30.0)
+    assert svc._cache is not None, "precondition: the cache must be warm"
+
+    real_monotonic = hd.time.monotonic
+    fired: list[int] = []
+
+    def _invalidating_monotonic():
+        # Fires once, on the predicate's read — modelling the other thread.
+        #
+        # It performs the FIRST assignment of `invalidate()` and not the second,
+        # which is the interleaving that actually bites: `invalidate()` writes
+        # `_cache = None` and then `_cache_ts = 0.0` as two separate stores, so
+        # a reader suspended between them sees a nulled cache alongside a still
+        # fresh timestamp — the predicate passes and the return re-reads None.
+        # Calling the whole of `invalidate()` here does NOT reproduce it: the
+        # zeroed timestamp makes the age check fail and the caller recomputes,
+        # which is why an earlier version of this test passed against the bug.
+        if not fired:
+            fired.append(1)
+            svc._cache = None
+        return real_monotonic()
+
+    hd.time.monotonic = _invalidating_monotonic
+    try:
+        result = await svc.snapshot(max_age_s=30.0)
+    finally:
+        hd.time.monotonic = real_monotonic
+
+    assert fired, "the stub never ran — the predicate no longer reads the clock here"
+    assert result is not None, (
+        "snapshot() returned None: the fast path re-read self._cache after a "
+        "concurrent invalidate() nulled it, which makes the route raise in dict(None)"
+    )
+    assert isinstance(result, dict), f"expected a snapshot dict, got {type(result)!r}"
+    assert result == warm or state["n"] == 2, (
+        "the result is neither the value captured before the invalidation nor a "
+        "freshly computed one — it came from somewhere it should not have"
+    )

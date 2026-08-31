@@ -433,6 +433,7 @@ async def queues(
     discarded_count = 0
     discarded_known = False
     sample_has_more = False
+    sample_ok = False
     if db:
         # TWO independent try blocks, deliberately. Sharing one meant a single
         # unparseable row in the sample loop discarded an already-correct count
@@ -485,36 +486,65 @@ async def queues(
                     "age_s": round(age),
                     "discarded_at": row["completed_at"],
                 })
+            # Set only after the loop COMPLETES. A row that fails to parse part
+            # way through leaves items in hand at a length under the cap, which
+            # is indistinguishable from a complete short read by length alone.
+            sample_ok = True
         except Exception:
             errors.append("discarded: sample query failed")
             logger.warning("Failed to query discarded deferred items", exc_info=True)
 
-    # max(): the larger value is the honest one in BOTH directions of
-    # divergence — a count above the cap is the ordinary truncation case, and a
-    # count below the rows in hand (a write landing between the two statements)
-    # must not make the panel print a number smaller than the list beneath it.
-    # An unknown count contributes nothing rather than a spurious 0.
-    # Depth comes from TWO reads that are not transactional with each other: an
-    # exact COUNT at t1, and the sample at t2 proving "at least this many" — one
-    # more than it ships when the probe row comes back. `known` therefore means
-    # "total is an EXACT depth", NOT "the count query succeeded": a count the
-    # sample contradicts is stale, and a total resting on it is a floor.
+    # `known` means "total is an EXACT depth", NOT "the count query succeeded",
+    # and WHICH READ WAS COMPLETE is what decides it — never arithmetic between
+    # two reads that never shared an instant.
     #
-    # Four defects in this class came from conflating those. Each fix corrected
-    # the cell in front of it and left an adjacent one wrong, because `known`
-    # described one read while `total` composed two. The full cross-product is
-    # enumerated in tests/test_observability/test_queues_discarded_count.py
+    # The two statements are not transactional with each other, so reconciling
+    # them can only ever catch divergence in one direction: a count taken before
+    # rows arrived reads LOW and the sample contradicts it, but a count taken
+    # before a prune reads HIGH and nothing in the sample can contradict that at
+    # all. Five defects in this class came from trying anyway — each fix
+    # corrected the cell in front of it and left an adjacent one wrong, because
+    # `known` described one read while `total` composed two.
+    #
+    # The rule below replaces that reconciliation with a property of a single
+    # statement: a sample read at LIMIT cap+1 that comes back SHORT has
+    # exhausted the matching rows at its own snapshot, so it IS the depth. The
+    # COUNT is consulted only when the probe row proves the sample was
+    # truncated — the one case where the rows in hand are merely a floor.
+    #
+    # KNOWN RESIDUE, stated rather than hidden: in exactly that truncated case
+    # the total still rests on a non-transactional COUNT, so a prune landing
+    # between the two statements can publish an inflated depth as exact for one
+    # cache window. Closing it needs both values read under one snapshot; that
+    # is measured and decided separately, not patched here.
+    #
+    # The full cross-product is enumerated in
+    # tests/test_observability/test_queues_discarded_count.py
     # (test_every_evidence_cell) — a cell nobody considered has to show up as a
     # missing ROW there rather than as silence.
     _sample_floor = len(discarded_items) + (1 if sample_has_more else 0)
-    _contradicted = discarded_known and discarded_count < _sample_floor
-    _known = discarded_known and not _contradicted
-    discarded = {
-        "total": (
+    if sample_ok and not sample_has_more:
+        # A sample read at LIMIT cap+1 that came back SHORT exhausted the
+        # matching rows at its own statement's snapshot. That is an exact depth
+        # from a single read, so no COUNT can improve on it — not one that
+        # failed, not one lagging low, and not one lagging HIGH (a prune landing
+        # between the two statements lowers the truth while leaving the count
+        # untouched, which comparing the two reads cannot detect at all).
+        _known = True
+        _total = len(discarded_items)
+    else:
+        # The probe fired, or the sample did not finish: the rows in hand are a
+        # floor, and the COUNT is the only depth evidence there is. A count the
+        # floor contradicts is stale, so the total rests on it as a floor too.
+        _contradicted = discarded_known and discarded_count < _sample_floor
+        _known = discarded_known and not _contradicted
+        _total = (
             discarded_count
             if _known
             else max(discarded_count if discarded_known else 0, _sample_floor)
-        ),
+        )
+    discarded = {
+        "total": _total,
         "sample": discarded_items,
         "known": _known,
     }

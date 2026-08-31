@@ -187,9 +187,20 @@ class HealthDataService:
         the accurate one.
         """
         while True:
-            if max_age_s > 0 and self._cache is not None \
+            # ONE read of the field, reused — never test one load and return a
+            # second. Every field here is normally written on the loop thread,
+            # but `invalidate_snapshot_cache()` documents a loop-less fallback
+            # that calls `invalidate()` straight from a request thread, and
+            # `invalidate()` nulls the cache and zeroes the timestamp as two
+            # separate stores. A reader suspended between them re-read None and
+            # handed it to a route that does `dict(...)` on the result. Binding
+            # the value once makes the hazard unrepresentable rather than
+            # defended against, which is the same correction already applied to
+            # the double-read in `mark_inflight_stale()`.
+            cached = self._cache
+            if max_age_s > 0 and cached is not None \
                     and (time.monotonic() - self._cache_ts) < max_age_s:
-                return self._cache
+                return cached
             inflight = self._inflight
             if inflight is not None and not inflight.done():
                 if inflight is not self._stale_task:

@@ -127,9 +127,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   reports the larger rather than the depth alone. Anything reading it as "the
   queue depth" — including the >100 queue-depth alert — keeps working and
   under-reports far less in those states: where a failed count previously
-  yielded zero, it now yields the rows actually in hand. That is a floor, not
-  the depth, so an alert threshold above the sample cap can still be missed
-  while the count query is failing.
+  yielded zero, it now yields the rows actually in hand.
+
+  A depth is reported as EXACT whenever the read that produced it was complete,
+  not merely whenever the count query happened to succeed. A review sample read
+  under a `LIMIT` of one past the cap that comes back short has exhausted the
+  matching rows at its own snapshot, so it is the depth — which means a small
+  queue is now reported exactly even while the count query is failing, instead
+  of as "5+" beside a "queue data unavailable" notice for a number that had in
+  fact just been measured. It also means a count that disagrees with a complete
+  sample no longer influences the total in either direction: a count taken
+  before rows arrived reads low, and one taken before a prune removed them reads
+  high, and neither can be detected by comparing two reads that never shared an
+  instant. Only a TRUNCATED sample still depends on the count, and there the
+  total is published as a floor unless the count is consistent with it. The
+  remaining exposure is stated rather than hidden: with a truncated sample, a
+  prune landing between the two reads can still publish an inflated depth as
+  exact for one cache window; closing that needs both values read under one
+  snapshot and is tracked separately.
 
 - **"Clear all reviewed" now says how many rows it will actually delete.** It
   always deleted every discarded/expired row, not the 20 displayed — harmless
@@ -148,7 +163,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   request is handed to the loop rather than touching shared state across
   threads. A snapshot whose computation began before a mutation is never
   published and never handed to a caller that arrived after it, so a cleared
-  queue cannot reappear for the rest of the cache window. Callers that need
+  queue cannot reappear for the rest of the cache window. On a host that
+  configures no event loop for that hand-off (an embedded plugin host, where
+  invalidation runs on the request thread instead), the cached value is read
+  once and reused rather than tested and then re-read, so an invalidation
+  arriving mid-read can no longer make the endpoint fail outright. Callers that need
   current data are unaffected: only this endpoint accepts a cached result, and
   it says so explicitly.
 

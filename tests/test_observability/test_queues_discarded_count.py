@@ -340,43 +340,77 @@ class TestDiscardedIsReconciledOnce:
 # ---------------------------------------------------------------------------
 _CAP = q._DISCARDED_SAMPLE_CAP
 
-# (label, rows_in_db, count_query_ok, expected_total, expected_known)
+# (label, rows_in_db, count_mode, sample_mode, expected_total, expected_known)
+#
+# THE RULE the table encodes, stated once so a new cell can be derived rather
+# than guessed: a sample read under `LIMIT cap+1` that comes back SHORT has
+# exhausted the matching rows at that statement's own snapshot, so it IS the
+# depth, exactly — and no COUNT can improve on it, whether that COUNT failed,
+# lagged low, or lagged high. The COUNT is consulted only when the probe row
+# proves the sample was truncated. That is one rule replacing the reconciliation
+# that produced five consecutive defects: `known` follows from which read was
+# complete, not from arithmetic between two reads that never shared an instant.
 _EVIDENCE_CELLS = [
-    ("empty queue, count ok",           0,        True,  0,        True),
-    ("below cap, count agrees",         5,        True,  5,        True),
-    ("exactly cap, count agrees",       _CAP,     True,  _CAP,     True),
-    ("above cap, count agrees",         _CAP + 1, True,  _CAP + 1, True),
-    ("far above cap, count agrees",     148,      True,  148,      True),
-    # The count is real but was taken before rows arrived; the sample proves
-    # more exist than it reported. The total is then a floor, not a measurement.
-    ("count stale-low vs sample",       _CAP,     "stale_low", _CAP,     False),
-    ("count stale-low vs probe",        _CAP + 1, "stale_low", _CAP + 1, False),
+    # ---- the sample is complete and the count agrees: nothing to reconcile
+    ("empty queue, count ok",           0,        True,  True, 0,        True),
+    ("below cap, count agrees",         5,        True,  True, 5,        True),
+    ("exactly cap, count agrees",       _CAP,     True,  True, _CAP,     True),
+    ("above cap, count agrees",         _CAP + 1, True,  True, _CAP + 1, True),
+    ("far above cap, count agrees",     148,      True,  True, 148,      True),
+    # ---- the count is WRONG in either direction, and a complete sample
+    # overrules it. Stale-low was the fourth defect in this class; stale-high
+    # is undetectable by comparing the two reads (a prune between them lowers
+    # the truth, never the count), which is exactly why completeness — not
+    # arithmetic — has to be what decides.
+    ("count stale-low, sample complete",  _CAP, "stale_low",  True, _CAP, True),
+    ("count stale-high, sample complete", 5,    "stale_high", True, 5,    True),
+    # ---- the probe fired: the sample is a floor, so the count is the only
+    # depth evidence there is, and a count the floor contradicts is not exact.
+    ("count stale-low vs probe",        _CAP + 1, "stale_low", True, _CAP + 1, False),
     # The count lands EXACTLY on the shipped sample size while the probe proves
     # another row exists. Comparing the count against the rows shipped says
     # "no contradiction" here and publishes an exact 20 for a deeper queue; only
     # comparing against the FLOOR (shipped + probe) catches it. This row was
     # added because a mutation that made that comparison survived the table —
     # the hole was in the enumeration, not the code.
-    ("count equals sample, probe proves more", _CAP + 1, "stale_at_cap", _CAP + 1, False),
-    # No count at all: everything rests on the sample.
-    ("count failed, empty",             0,        False, 0,        False),
-    ("count failed, below cap",         5,        False, 5,        False),
-    ("count failed, exactly cap",       _CAP,     False, _CAP,     False),
-    ("count failed, above cap",         _CAP + 1, False, _CAP + 1, False),
+    ("count equals sample, probe proves more", _CAP + 1, "stale_at_cap", True, _CAP + 1, False),
+    # ---- no count at all. A complete sample still yields an EXACT depth; only
+    # a truncated one degrades to a floor.
+    ("count failed, empty",             0,        False, True, 0,        True),
+    ("count failed, below cap",         5,        False, True, 5,        True),
+    ("count failed, exactly cap",       _CAP,     False, True, _CAP,     True),
+    ("count failed, above cap",         _CAP + 1, False, True, _CAP + 1, False),
+    # ---- the sample is the read that failed. It proves nothing about depth,
+    # so completeness cannot be inferred from its length; the count carries it.
+    ("sample failed, count ok",         5,        True,  False, 5,   True),
+    ("sample failed, count ok, deep",   148,      True,  False, 148, True),
+    ("sample failed, count failed too", 5,        False, False, 0,   False),
+    # ---- the sample raised PART WAY THROUGH parsing. Rows already appended are
+    # in hand, but the read did not finish, so its length is not a depth. This
+    # is the cell a bare `len(rows) <= cap` completeness test gets wrong.
+    ("sample parse error, count ok",     5, True,  "partial", 5, True),
+    ("sample parse error, count failed", 5, False, "partial", 2, False),
 ]
 
 
 @pytest.mark.parametrize(
-    "label,rows,count_mode,want_total,want_known",
+    "label,rows,count_mode,sample_mode,want_total,want_known",
     _EVIDENCE_CELLS,
     ids=[c[0] for c in _EVIDENCE_CELLS],
 )
-async def test_every_evidence_cell(db, label, rows, count_mode, want_total, want_known):
+async def test_every_evidence_cell(
+    db, label, rows, count_mode, sample_mode, want_total, want_known
+):
     """`known` is true iff `total` is an exact depth, across every cell.
 
-    `count_mode` is True (the COUNT runs normally), False (it raises), or
-    "stale_low" (it returns a value from before rows arrived — the interleaving
-    that produced the fourth defect in this class).
+    `count_mode` is True (the COUNT runs normally), False (it raises),
+    "stale_low"/"stale_high" (it returns a value from before rows arrived, or
+    from before a prune removed them — the two interleavings the two reads
+    cannot detect between themselves).
+
+    `sample_mode` is True (normal), False (the query raises), or "partial" (the
+    query returns rows but one of them fails to parse mid-loop, so the read is
+    incomplete at a length that looks complete).
     """
     await _seed(db, discarded=rows)
     real = db.execute
@@ -387,12 +421,32 @@ async def test_every_evidence_cell(db, label, rows, count_mode, want_total, want
                 raise RuntimeError("count query exploded")
             # stale_low: the depth before the most recent arrivals.
             # stale_at_cap: the depth happens to equal what the sample ships.
-            stale_value = _CAP if count_mode == "stale_at_cap" else max(0, rows - 6)
+            # stale_high: the depth before a prune deleted rows.
+            if count_mode == "stale_at_cap":
+                stale_value = _CAP
+            elif count_mode == "stale_high":
+                stale_value = rows + 100
+            else:
+                stale_value = max(0, rows - 6)
 
             class _Stale:
                 async def fetchone(self_inner):
                     return (stale_value,)
             return _Stale()
+        if sample_mode is not True and "ORDER BY completed_at" in sql:
+            if sample_mode is False:
+                raise RuntimeError("sample query exploded")
+            # "partial": hand back real rows with one unparseable timestamp, so
+            # the append loop raises AFTER two rows are already in hand.
+            cur = await real(sql, *a, **k)
+            fetched = [dict(r) for r in await cur.fetchall()]
+            assert len(fetched) > 2, f"{label}: partial mode needs >2 rows to be meaningful"
+            fetched[2] = {**fetched[2], "created_at": "not-a-timestamp"}
+
+            class _Partial:
+                async def fetchall(self_inner):
+                    return fetched
+            return _Partial()
         return await real(sql, *a, **k)
 
     db.execute = _patched
