@@ -177,6 +177,73 @@ async def _drive(fn) -> BaseException | None:
     return captured[0] if captured else None
 
 
+async def _drive_wedged(fn) -> BaseException | None:
+    """Run fn() on a worker thread while the event loop is genuinely BLOCKED.
+
+    This is the difference between modelling a stall and merely running beside
+    one. ``_drive`` keeps the loop turning (it polls with a 10 ms sleep), so a
+    record submitted by the worker CAN complete mid-burst -- and coalescing is
+    still satisfied there, because it is a CONCURRENCY bound; what does not hold
+    in that case is a cumulative count of one. A test that asserts the count must
+    create the "submitted and unable to run" state, not hope for it.
+
+    Sequencing, and every step of it is load-bearing:
+      * the worker waits on ``entered`` so it cannot submit before the wedge;
+      * ``call_soon`` enqueues ``_blocker`` BEFORE this task's own resume handle
+        and the ready queue is FIFO (it appends to the TAIL, so this is an
+        ordering guarantee relative to the resume, never "runs first overall"),
+        so the single ``sleep(0)`` below is enough for the loop to enter it;
+      * while ``_blocker`` sits in ``released.wait()`` the loop runs NOTHING --
+        ``run_coroutine_threadsafe`` still enqueues, but nothing drains it;
+      * the worker sets ``released`` when it is done, and only then does the
+        loop resume and run whatever was queued.
+    Both waits are deadline-bounded so a regression fails the test instead of
+    hanging the suite.
+    """
+    entered = threading.Event()
+    released = threading.Event()
+    captured: list[BaseException] = []
+    # Guard the guard: records whether the wedge was still held when the worker
+    # released it. Without this, an ordering regression (a sleep(0) that becomes
+    # sleep(0.01), a call_soon moved after the await, a different loop policy)
+    # degrades this test silently back into the ~50% flake it was written to
+    # remove -- and the failures would read as a coalescing regression, sending
+    # the next session to debug production code that is fine.
+    wedge_held: list[bool] = []
+
+    def _blocker() -> None:
+        entered.set()
+        wedge_held.append(released.wait(timeout=15))
+
+    def _worker() -> None:
+        try:
+            # STRICTLY smaller than the join bound below, or this message can
+            # never print: the loop only reaches the join before _blocker runs
+            # or after it returns, so a 15s wait here would always lose the race
+            # to a 5s join and report the wrong cause.
+            if not entered.wait(timeout=2):
+                raise AssertionError("event loop never entered the wedge")
+            fn()
+        except BaseException as exc:  # noqa: BLE001 - returned to the caller
+            captured.append(exc)
+        finally:
+            released.set()
+
+    thread = threading.Thread(target=_worker, name="wedge-worker", daemon=True)
+    thread.start()
+    asyncio.get_running_loop().call_soon(_blocker)
+    await asyncio.sleep(0)  # yield: the loop enters _blocker and stays there
+    thread.join(timeout=5)
+    if thread.is_alive():
+        raise AssertionError("worker thread did not finish within 5s")
+    if not wedge_held or not wedge_held[0]:
+        raise AssertionError(
+            "the wedge broke before the worker finished -- this test's "
+            "precondition did not hold, so its result proves nothing"
+        )
+    return captured[0] if captured else None
+
+
 @pytest.mark.parametrize(
     ("factory", "job_name"),
     [(OutreachHeartbeat, "outreach_heartbeat"), (DashboardHeartbeat, "dashboard_heartbeat")],
@@ -352,11 +419,19 @@ async def test_repeated_failures_coalesce_into_one_pending_record(factory):
     and firing a retry per record where a retry registry is wired. "The daemon is
     failing" is ONE fact however long the stall lasts.
 
-    The repeats are submitted from a single worker pass WITHOUT yielding to the
-    loop, which is what a wedge looks like from the daemon's side: the first record
-    is scheduled and cannot run, so the rest must be absorbed rather than queued.
-    Driving them through separate loop yields would let the first complete and prove
-    nothing.
+    The repeats are submitted while the event loop is genuinely WEDGED, which is
+    what a stall looks like from the daemon's side: the first record is scheduled
+    and CANNOT run, so the rest must be absorbed rather than queued.
+
+    That wedge is the whole point, and an earlier version of this test only
+    described it. It used ``_drive``, which keeps the loop turning, so the first
+    record could complete mid-burst -- at which point ``_record_failure`` is
+    SUPPOSED to submit another, and the assertion below failed. MEASURED at the
+    time: ~50% locally (6 of 12 runs), on either parametrization, and twice on
+    main's own CI. The mechanism guarantees a CONCURRENCY bound -- at most one
+    record IN FLIGHT -- and the cumulative count asserted here is only equivalent
+    to it while nothing can drain. ``_drive_wedged`` establishes that precondition
+    instead of hoping for it.
     """
     calls: list[str] = []
 
@@ -372,7 +447,11 @@ async def test_repeated_failures_coalesce_into_one_pending_record(factory):
         for n in range(5):
             daemon._record_failure(rt, RuntimeError(str(n)))
 
-    assert await _drive(_five_failures) is None
+    assert await _drive_wedged(_five_failures) is None
+    assert not calls, (
+        f"the loop drained {len(calls)} record(s) DURING the supposed wedge -- "
+        "the precondition broke, so the count below measures nothing"
+    )
     for _ in range(200):
         if calls:
             break
@@ -383,6 +462,67 @@ async def test_repeated_failures_coalesce_into_one_pending_record(factory):
     assert len(calls) == 1, (
         f"expected the pending record to absorb the repeats, got {len(calls)} "
         "-- a wedge would queue one per tick and burst on recovery"
+    )
+
+
+@pytest.mark.parametrize(
+    ("factory",),
+    [(OutreachHeartbeat,), (DashboardHeartbeat,)],
+    ids=["outreach", "dashboard"],
+)
+async def test_a_completed_record_re_arms_for_the_next_failure(factory):
+    """Coalescing is a CONCURRENCY bound, NOT a one-record-per-process latch.
+
+    The wedged test above pins ``pending.done()`` to False for its whole burst,
+    which is what makes its count assertion meaningful -- and which also makes it
+    structurally blind to the other half of the same predicate. MEASURED: with
+    only that test, weakening the guard to ``if pending is not None: return``
+    leaves the entire file green, while production stops recording after its
+    FIRST failure for the lifetime of the process -- consecutive_failures frozen
+    at 1, last_failure frozen at the first stall, and a wired retry registry
+    never firing again.
+
+    That is also the ORDINARY case, not the exotic one: ``_run`` calls
+    ``_record_failure`` once per interval (60s default), so a healthy loop with a
+    throwing emit completes each record long before the next tick and depends on
+    the re-arm entirely.
+
+    This test is deliberately NOT racy -- it drives the first record to
+    COMPLETION before submitting the second, so it asserts a state rather than a
+    timing window.
+    """
+    calls: list[str] = []
+
+    class _CountingRuntime:
+        def record_job_failure(self, job_name, *args, **kwargs):
+            calls.append(job_name)
+
+    daemon = factory(interval_seconds=60)
+    daemon._loop = asyncio.get_running_loop()
+    rt = _CountingRuntime()
+
+    assert await _drive(lambda: daemon._record_failure(rt, RuntimeError("a"))) is None
+    for _ in range(200):
+        if calls:
+            break
+        await asyncio.sleep(0.01)
+    await _drain_pending()
+    # Guard the guard: if the first record never landed, the re-arm assertion
+    # below would pass for the wrong reason.
+    assert len(calls) == 1, "the first record never landed -- this test proves nothing"
+    assert daemon._pending_failure is not None and daemon._pending_failure.done()
+
+    assert await _drive(lambda: daemon._record_failure(rt, RuntimeError("b"))) is None
+    for _ in range(200):
+        if len(calls) == 2:
+            break
+        await asyncio.sleep(0.01)
+    await _drain_pending()
+
+    assert len(calls) == 2, (
+        f"the COMPLETED pending record was never re-armed, got {len(calls)} -- a "
+        "daemon that keeps failing would record only its first failure, freezing "
+        "consecutive_failures and never re-firing the retry registry"
     )
 
 
