@@ -1504,8 +1504,9 @@ class UserEgoContextBuilder:
 
         try:
             from genesis.db.crud import capability_map as cap_crud
+            from genesis.ego import _capability_render as _cap_render
 
-            entries = await cap_crud.get_all(self._db)
+            entries = await cap_crud.get_prompt_rows(self._db)
         except Exception:
             logger.warning("Failed to query capability performance", exc_info=True)
             lines.append(
@@ -1514,14 +1515,44 @@ class UserEgoContextBuilder:
             return "\n".join(lines)
 
         if not entries:
-            lines.append("*No performance data yet.*\n")
+            # Two DIFFERENT states reach here and must not produce the same
+            # sentence: a genuinely empty map, and a full map whose every row
+            # failed a bar. Each message is a false claim in the other's
+            # situation, so the count decides which is rendered.
+            total = await _cap_render.safe_count(self._db)
+            _unusable = await _cap_render.safe_count_unusable(self._db)
+            lines.append(_cap_render.empty_state_note(
+                total,
+                empty="*No track record yet — the map is empty.*\n",
+                filtered="*No qualifying track record ({total} domains present; "
+                         "stale or thin rows are not shown).*\n",
+                unknown="*No qualifying track record (count unavailable — "
+                        "see logs).*\n",
+                unusable=_unusable,
+            ))
             return "\n".join(lines)
 
         if depth == "light":
-            avg_conf = sum(e.get("confidence", 0) for e in entries) / len(entries)
-            return (
-                f"## Your Track Record\n"
-                f"{len(entries)} domains tracked (avg confidence: {avg_conf:.0%}).\n"
+            # The dropped-row report belongs on THIS branch too, not only on
+            # the empty and deep ones. A corrupt or future-dated row is just as
+            # excluded here, and this branch renders no table -- so nothing else
+            # on the page hints that anything went missing. `unusable_note` is
+            # also what LOGS, so omitting it left the operator with no signal on
+            # this path at all.
+            #
+            # The sentence itself is SHARED with genesis_context's light branch:
+            # it is the entire claim on a branch that renders no table, so the
+            # two must not drift into wording one qualifies and the other does
+            # not.
+            _light_clause = _cap_render.unusable_note(
+                await _cap_render.safe_count_unusable(self._db)
+            )
+            # Built from `lines`, which already holds the header. Writing the
+            # header a second time here is the same duplication this change
+            # removed one level down for the sentence -- rename one copy and
+            # the two depths emit different headers for the same section.
+            return "\n".join(
+                [*lines, _cap_render.qualifying_subset_line(entries, _light_clause) + "\n"]
             )
 
         _TREND_ICONS = {"improving": "+", "declining": "-", "stable": "="}
@@ -1535,6 +1566,12 @@ class UserEgoContextBuilder:
             evidence = (e.get("evidence_summary") or "")[:80].replace("|", "/")
             icon = _TREND_ICONS.get(trend, "=")
             lines.append(f"| {domain} | {conf:.0%} | {icon} | {evidence} |")
+
+        _clause = _cap_render.unusable_note(
+            await _cap_render.safe_count_unusable(self._db)
+        )
+        if _clause:
+            lines.append(f"*{_clause.strip()}*")
 
         lines.append(
             "\nUse this to calibrate confidence on proposals. High-confidence "

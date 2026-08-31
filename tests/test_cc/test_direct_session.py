@@ -542,3 +542,172 @@ async def test_record_outcome_missing_file_marks_failed(db, tmp_path):
     prop = await get_proposal(db, "prop-miss")
     assert prop["status"] == "failed"
     assert "verification_failed" in (prop["user_response"] or "")
+
+
+# --- dispatch-outcome recall visibility (B2a) ---
+#
+# Dispatch outcomes must be RETRIEVABLE by default recall / the proactive hook so
+# the ego (and CC sessions) can recall what happened to a dispatch. Two gaps this
+# locks: (1) a SUCCESSFUL dispatch wrote no memory at all; (2) the failure memory
+# was tagged source_subsystem="ego", which EXCLUDES it from default recall. The
+# fix stores both polarities WITHOUT source_subsystem (operational history, not
+# internal decisional output — classified in test_store_subsystem_coverage's
+# USER_CONTEXT_ALLOWLIST).
+
+
+class _RecordingStore:
+    """Fake MemoryStore implementing the real .store(**kwargs) contract."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def store(self, **kwargs):
+        self.calls.append(kwargs)
+        return "mem-id"
+
+
+def _recording_runner(db, store):
+    from types import SimpleNamespace
+
+    return DirectSessionRunner(
+        invoker=AsyncMock(),
+        session_manager=AsyncMock(),
+        config_builder=AsyncMock(),
+        runtime=SimpleNamespace(_db=db, _memory_store=store),
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_success_writes_recallable_memory(db):
+    """A successful dispatch must write a memory tagged dispatch_success, and it
+    must be recallable (NO source_subsystem, else default recall excludes it)."""
+    from genesis.db.crud.ego import create_proposal
+
+    store = _RecordingStore()
+    await create_proposal(db, id="prop-ok", action_type="dispatch", content="x", status="executed")
+    req = DirectSessionRequest(prompt="t", caller_context="ego_proposal:prop-ok")
+    res = DirectSessionResult(session_id="s-ok", success=True, output_text="all done")
+    await _recording_runner(db, store)._record_proposal_outcome(req, res)
+
+    succ = [c for c in store.calls if "dispatch_success" in (c.get("tags") or [])]
+    assert len(succ) == 1, "a successful dispatch must write exactly one outcome memory"
+    assert "prop-ok" in succ[0].get("content", "")
+    assert succ[0].get("source_subsystem") is None, (
+        "dispatch outcome memories must be recallable — no source_subsystem tag"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_failure_memory_is_recallable(db):
+    """A failed dispatch's memory must also be recallable (untagged), symmetric
+    with success — today it is tagged source_subsystem='ego' and hidden."""
+    from genesis.db.crud.ego import create_proposal
+
+    store = _RecordingStore()
+    await create_proposal(db, id="prop-bad", action_type="dispatch", content="x", status="executed")
+    req = DirectSessionRequest(prompt="t", caller_context="ego_proposal:prop-bad")
+    res = DirectSessionResult(session_id="s-bad", success=False, output_text="it broke")
+    await _recording_runner(db, store)._record_proposal_outcome(req, res)
+
+    fail = [c for c in store.calls if "dispatch_failure" in (c.get("tags") or [])]
+    assert len(fail) == 1, "a failed dispatch must write exactly one outcome memory"
+    assert fail[0].get("source_subsystem") is None, (
+        "dispatch outcome memories must be recallable — no source_subsystem tag"
+    )
+
+
+# --- WS-3 provenance: dispatch outcomes inherit the SESSION's origin (Codex #1487) ---
+#
+# A research/interact/etc. dispatch is external_untrusted — its output can echo
+# web/browser content. These outcome memories are now default-recallable (the
+# source_subsystem drop above), so an UNSTAMPED one defaults to first_party and
+# bypasses recall-time external-content handling: a laundered indirect prompt
+# injection into later proactive sessions. The outcome store must carry the SAME
+# origin the session's own memories carry, and pin memory_class="fact" so a
+# summary echoing MUST/NEVER isn't heuristically misfiled as a rule.
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_stamps_external_untrusted_origin(db):
+    """A research-profile dispatch outcome is stored external_untrusted, not the
+    first_party default — else it launders external content into default recall."""
+    from genesis.db.crud.ego import create_proposal
+
+    store = _RecordingStore()
+    await create_proposal(db, id="prop-ext", action_type="dispatch", content="x", status="executed")
+    req = DirectSessionRequest(
+        prompt="t", profile="research", caller_context="ego_proposal:prop-ext"
+    )
+    res = DirectSessionResult(
+        session_id="s-ext", success=True, output_text="web-sourced findings summary"
+    )
+    await _recording_runner(db, store)._record_proposal_outcome(req, res)
+
+    out = [c for c in store.calls if c.get("source") == "ego_dispatch_outcome"]
+    assert len(out) == 1
+    assert out[0].get("origin_class") == "external_untrusted", (
+        "a research (external_untrusted) dispatch outcome must NOT be stored first_party"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_first_party_profile_leaves_origin_none(db):
+    """An observe-profile (first-party) dispatch passes origin_class=None so the
+    store's own derive_origin_class resolves first_party — no over-stamping."""
+    from genesis.db.crud.ego import create_proposal
+
+    store = _RecordingStore()
+    await create_proposal(db, id="prop-fp", action_type="dispatch", content="x", status="executed")
+    req = DirectSessionRequest(prompt="t", profile="observe", caller_context="ego_proposal:prop-fp")
+    res = DirectSessionResult(session_id="s-fp", success=True, output_text="ok")
+    await _recording_runner(db, store)._record_proposal_outcome(req, res)
+
+    out = [c for c in store.calls if c.get("source") == "ego_dispatch_outcome"]
+    assert len(out) == 1
+    assert out[0].get("origin_class") is None
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_pins_fact_memory_class(db):
+    """Dispatch outcomes pin memory_class='fact' — an outcome whose summary echoes
+    a rule-like phrase (MUST/NEVER) must not be heuristically misfiled as a rule."""
+    from genesis.db.crud.ego import create_proposal
+
+    store = _RecordingStore()
+    await create_proposal(db, id="prop-mc", action_type="dispatch", content="x", status="executed")
+    req = DirectSessionRequest(prompt="t", caller_context="ego_proposal:prop-mc")
+    res = DirectSessionResult(
+        session_id="s-mc", success=True, output_text="You MUST NEVER skip the gate"
+    )
+    await _recording_runner(db, store)._record_proposal_outcome(req, res)
+
+    out = [c for c in store.calls if c.get("source") == "ego_dispatch_outcome"]
+    assert len(out) == 1
+    assert out[0].get("memory_class") == "fact"
+
+
+@pytest.mark.asyncio
+async def test_verification_failure_memory_stamps_origin_and_class(db, tmp_path):
+    """The verification-failure outcome store (the OTHER recallable outcome write)
+    is stamped the same way — external_untrusted origin + fact class."""
+    from genesis.db.crud.ego import create_proposal
+
+    store = _RecordingStore()
+    await create_proposal(
+        db,
+        id="prop-vf",
+        action_type="dispatch",
+        content="x",
+        status="executed",
+        expected_outputs=json.dumps({"files": [str(tmp_path / "never-written.md")]}),
+    )
+    req = DirectSessionRequest(
+        prompt="t", profile="research", caller_context="ego_proposal:prop-vf"
+    )
+    res = DirectSessionResult(session_id="s-vf", success=True, output_text="claims done")
+    await _recording_runner(db, store)._record_proposal_outcome(req, res)
+
+    vf = [c for c in store.calls if c.get("source") == "ego_dispatch_verification"]
+    assert len(vf) == 1
+    assert vf[0].get("origin_class") == "external_untrusted"
+    assert vf[0].get("memory_class") == "fact"

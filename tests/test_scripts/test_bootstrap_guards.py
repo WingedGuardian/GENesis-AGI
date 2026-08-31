@@ -233,3 +233,98 @@ def test_officecli_arch_and_checksum_logic_functional(tmp_path):
     assert "riscv64=" in out  # unsupported → empty
     assert "good=accept" in out
     assert "bad=reject" in out  # checksum mismatch refused
+
+
+# ── install_pkg: errexit must not swallow the failure diagnostics ────
+
+
+def _install_pkg_source() -> str:
+    """The real install_pkg body, extracted from the shipped script."""
+    lines = BOOTSTRAP.read_text().splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("install_pkg() {"))
+    end = next(i for i, ln in enumerate(lines[start:], start) if ln == "}")
+    return "\n".join(lines[start : end + 1])
+
+
+def _run_install_pkg(tmp_path, sudo_body: str, pkg_mgr: str = "apt"):
+    """Call install_pkg as a BARE statement under `set -euo pipefail`.
+
+    Bare is the whole point: every current call site uses `|| …`, which disables
+    errexit inside the function and hides the bug. It must also run in its OWN
+    process — wrapping the call in `|| echo` to capture output would itself
+    suppress errexit and silently invalidate the test.
+    """
+    script = tmp_path / "harness.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"PKG_MGR={pkg_mgr}\n"
+        f"sudo() {{ {sudo_body} }}\n"
+        f"{_install_pkg_source()}\n"
+        "install_pkg somepkg\n"
+        'echo "NEXT_LINE_REACHED"\n'
+    )
+    return subprocess.run(["bash", str(script)], capture_output=True, text=True)
+
+
+def test_install_pkg_reports_the_real_error_on_failure(tmp_path):
+    """The diagnostic block exists FOR the failure path and must run on it."""
+    r = _run_install_pkg(tmp_path, 'printf "E: Unable to locate package\\n"; return 100;')
+    assert "install failed (exit 100)" in r.stdout, f"diagnostic lost: {r.stdout!r}"
+    assert "E: Unable to locate package" in r.stdout
+    assert r.returncode == 100, "a failed install must still propagate non-zero"
+
+
+def test_install_pkg_reports_when_the_installer_printed_nothing(tmp_path):
+    r = _run_install_pkg(tmp_path, "return 7;")
+    assert "install failed (exit 7): no output" in r.stdout, r.stdout
+    assert r.returncode == 7
+
+
+def test_install_pkg_survives_blank_only_installer_output(tmp_path):
+    """`set -o pipefail` is on, so `grep -v '^\\s*$'` finding nothing exits 1 and
+    would abort the diagnostic assignment itself — losing the `no output`
+    fallback written for exactly this case."""
+    r = _run_install_pkg(tmp_path, 'printf "\\n   \\n"; return 100;')
+    assert "install failed (exit 100): no output" in r.stdout, r.stdout
+    assert r.returncode == 100
+
+
+def test_install_pkg_success_path_is_unchanged(tmp_path):
+    r = _run_install_pkg(tmp_path, 'printf "done\\n"; return 0;')
+    assert "NEXT_LINE_REACHED" in r.stdout
+    assert "install failed" not in r.stdout
+    assert r.returncode == 0
+
+
+def test_install_pkg_captures_status_without_a_bare_assignment():
+    """Structural guard on the shape itself. Under `set -e`, `out=$(cmd)` inherits
+    the substitution's exit status and fires errexit, so a following `rc=$?` is
+    unreachable on failure. shellcheck has no check for this at any severity
+    (verified against -o all), which is why it is pinned here."""
+    body = _install_pkg_source()
+    # Every capture in the function guards its status. Matched on the guard, not
+    # on exact flags, so an unrelated apt-flag change does not break this test
+    # under a misleading name.
+    # Comment lines excluded: the explanatory comment above the fix quotes the
+    # very shape being asserted on, and would otherwise be counted as a capture.
+    captures = [
+        ln for ln in body.splitlines()
+        if "output=$(" in ln and not ln.lstrip().startswith("#")
+    ]
+    assert len(captures) == 2, f"expected both package-manager branches, got {captures}"
+    for ln in captures:
+        assert ln.rstrip().endswith("|| rc=$?"), f"unguarded capture: {ln.strip()}"
+    # A bare `rc=$?` on its own line is the unreachable form — matched at ANY
+    # indentation, so re-indenting the function cannot silently disarm this.
+    bare = [ln for ln in body.splitlines() if ln.strip() == "rc=$?"]
+    assert not bare, "bare `rc=$?` after the capture is unreachable on failure"
+
+
+def test_install_pkg_dnf_branch_reports_failures_too(tmp_path):
+    """The non-apt branch is a separate capture and needs its own guard —
+    a string assertion alone would not catch the two branches diverging."""
+    r = _run_install_pkg(tmp_path, 'printf "Error: No match for argument\\n"; return 1;', pkg_mgr="dnf")
+    assert "install failed (exit 1)" in r.stdout, r.stdout
+    assert "No match for argument" in r.stdout
+    assert r.returncode == 1

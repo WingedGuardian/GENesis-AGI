@@ -390,9 +390,9 @@
                       </template>
                     </div>
                   </template>
-                  <template x-if="($store.genesisDashboard.health.queues.discarded_items?.length || 0) > 0">
+                  <template x-if="$store.genesisDashboard.discarded.total > 0">
                     <div style="margin-top: 0.3rem; font-size: 0.72rem; color: #d9534f; font-weight: 600;">
-                      <span x-text="$store.genesisDashboard.health.queues.discarded_items.length"></span> discarded — needs review
+                      <span x-text="$store.genesisDashboard.discarded.totalLabel"></span> discarded — needs review
                     </div>
                   </template>
                   <div style="font-size: 0.82rem; cursor: default;"
@@ -452,15 +452,23 @@
                   </template>
                   <div style="margin-top:0.55rem; border-top:1px solid rgba(255,255,255,0.06); padding-top:0.55rem;">
                     <div style="display:flex; justify-content:space-between; gap:0.5rem; align-items:center; margin-bottom:0.35rem;">
-                      <div style="font-size:0.7rem; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; color:var(--color-text-secondary);">Discarded review</div>
+                      <div style="font-size:0.7rem; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; color:var(--color-text-secondary);">Discarded review<template x-if="$store.genesisDashboard.discarded.truncated"><span style="font-weight:400; text-transform:none; letter-spacing:0;" x-text="' — showing ' + $store.genesisDashboard.discarded.sample.length + ' of ' + $store.genesisDashboard.discarded.totalLabel"></span></template></div>
                       <button type="button"
                               style="font-size:0.68rem; padding:0.22rem 0.45rem; border-radius:4px; border:1px solid rgba(217,83,79,0.3); color:#d9534f; background:transparent; cursor:pointer;"
-                              :disabled="$store.genesisDashboard.queueReview.clearingAll || ($store.genesisDashboard.health.queues.discarded_items?.length || 0) === 0"
+                              :disabled="!!$store.genesisDashboard.queueReview.clearingAll || ($store.genesisDashboard.discarded.known && $store.genesisDashboard.discarded.total === 0)"
                               @click="$store.genesisDashboard.clearAllDiscardedItems()"
-                              x-text="$store.genesisDashboard.queueReview.clearingAll ? 'Clearing...' : 'Clear all reviewed'"></button>
+                              x-text="$store.genesisDashboard.queueReview.clearingAll ? 'Clearing...' : ('Clear all ' + $store.genesisDashboard.discarded.totalLabel)"
+                              :title="'Permanently deletes all ' + $store.genesisDashboard.discarded.totalLabel + ' discarded/expired rows, not just the ones shown' + ($store.genesisDashboard.discarded.known ? '' : '. The depth could not be read, so there may be more.')"></button>
                     </div>
-                    <template x-if="$store.genesisDashboard.discardedQueueGroups.length === 0">
+                    <template x-if="!$store.genesisDashboard.discarded.known">
+                      <div class="health-card-detail" style="margin-top:0; color:#f0ad4e;">Queue data unavailable — this is not a confirmed zero.</div>
+                    </template>
+                    <template x-if="$store.genesisDashboard.discarded.known && $store.genesisDashboard.discarded.total === 0">
                       <div class="health-card-detail" style="margin-top:0;">No discarded or expired items awaiting review.</div>
+                    </template>
+                    <template x-if="$store.genesisDashboard.discarded.known && $store.genesisDashboard.discarded.total > 0 && $store.genesisDashboard.discarded.sample.length === 0">
+                      <div class="health-card-detail" style="margin-top:0; color:#f0ad4e;"
+                           x-text="$store.genesisDashboard.discarded.totalLabel + ' discarded/expired rows exist, but the review sample could not be loaded. Clear all still applies to every one of them.'"></div>
                     </template>
                     <template x-for="group in $store.genesisDashboard.discardedQueueGroups" :key="group.key">
                       <div style="margin-bottom:0.5rem; padding:0.45rem 0.55rem; border-radius:6px; background:rgba(217,83,79,0.08); border:1px solid rgba(217,83,79,0.18);">

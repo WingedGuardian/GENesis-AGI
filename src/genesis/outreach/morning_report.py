@@ -920,10 +920,11 @@ class MorningReportGenerator:
         section entirely. This is not a standing checklist.
         """
         lines: list[str] = []
-        # Subsystems already surfaced via a ``subsystem_stale:<name>`` alert in the
-        # health-alerts block below — the heartbeat-staleness block must not list
-        # them a SECOND time (P2-6 dedup). Populated from the alerts actually
-        # emitted, so it stays correct if the alert set changes.
+        # Subsystems already surfaced via a ``subsystem_stale:<name>`` or
+        # ``subsystem_never_started:<name>`` alert in the health-alerts block below —
+        # the heartbeat-staleness block must not list them a SECOND time (P2-6 dedup).
+        # Populated from the alerts actually emitted, so it stays correct if the alert
+        # set changes.
         stale_alert_names: set[str] = set()
 
         # Health alerts (call sites down, queue depth, resilience warnings)
@@ -946,7 +947,13 @@ class MorningReportGenerator:
                         f"- **{severity}**: {a.get('message', 'Unknown')} "
                         f"(id: {alert_id})"
                     )
-                    if alert_id.startswith("subsystem_stale:"):
+                    if alert_id.startswith(
+                        ("subsystem_stale:", "subsystem_never_started:")
+                    ):
+                        # never_started is rendered HERE (via the alert), and its
+                        # heartbeat status ("never_started") is not "overdue" so the
+                        # block below skips it anyway — capture the name regardless so
+                        # the dedup set stays complete if that block ever widens.
                         stale_alert_names.add(alert_id.split(":", 1)[1])
         except Exception:
             logger.warning("Failed to query health alerts for morning report", exc_info=True)

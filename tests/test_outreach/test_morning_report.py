@@ -109,6 +109,50 @@ async def test_critical_issues_dedupes_subsystem_stale(db, mock_health, mock_dra
 
 
 @pytest.mark.asyncio
+async def test_critical_issues_surfaces_and_dedupes_subsystem_never_started(
+    db, mock_health, mock_drafter
+):
+    """A subsystem_never_started:<name> alert (the new never-started liveness id) is
+    surfaced by the morning report (it passes the WARNING+ filter, it is not a
+    call_site: alert) and its name is captured into the dedup set so the
+    heartbeat-staleness block never lists it a SECOND time. A subsystem with a plain
+    overdue heartbeat but no alert is still surfaced once by the hb block."""
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    alerts = [
+        {
+            "id": "subsystem_never_started:inbox",
+            "severity": "WARNING",
+            "message": "Subsystem 'inbox' never started — enabled but no heartbeat since boot",
+        },
+    ]
+    # inbox's heartbeat verdict is "never_started" (mutually exclusive with overdue —
+    # never_started requires zero pulses). The hb block only renders "overdue", so the
+    # dedup capture is defensive here; assert inbox is NOT double-listed regardless.
+    heartbeats = {
+        "inbox": {"status": "never_started", "last_seen": None, "reason": "init-failed"},
+        "surplus": {"status": "overdue", "age_seconds": 5000, "last_seen": "y"},
+    }
+    with (
+        patch(
+            "genesis.mcp.health_mcp._impl_health_alerts",
+            new=AsyncMock(return_value=alerts),
+        ),
+        patch(
+            "genesis.mcp.health.manifest._impl_subsystem_heartbeats",
+            new=AsyncMock(return_value=heartbeats),
+        ),
+    ):
+        text = await gen._get_critical_issues()
+
+    assert text is not None
+    # inbox is surfaced exactly once — via its never_started alert line.
+    assert text.count("'inbox'") == 1
+    assert "subsystem_never_started:inbox" in text
+    # surplus has a heartbeat but no alert → still surfaced once by the hb block.
+    assert "'surplus'" in text
+
+
+@pytest.mark.asyncio
 async def test_generate_calls_health_snapshot(db, mock_health, mock_drafter):
     gen = MorningReportGenerator(mock_health, db, mock_drafter)
     await gen.generate()

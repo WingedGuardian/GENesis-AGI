@@ -40,8 +40,20 @@ waiver cannot silently disarm an unrelated gate: ``# review-override`` waives th
 FINDING scans (review-body + inline P1s), ``# stale-review-override`` waives the
 review-CONTEXT gates (Codex-at-head freshness + base-is-default),
 ``# scheduled-review-override`` waives the SCHEDULED-Claude-review-at-head gate, and
-``# ci-override`` waives the CI gate. A session that genuinely needs several
-appends several (one trailing comment may carry multiple sigils).
+``# ci-override`` waives the CI gate — red/pending everywhere, plus (canonical repo
+only) "absent" (empty rollup: CI never ran) and "incomplete" (partial rollup: a
+REQUIRED workflow — ``merge_gate.required_ci_workflows`` in genesis.yaml, default
+``CI`` — contributed no verdict; see ``_required_ci_workflows``). A session that
+genuinely needs several appends several (one trailing comment may carry multiple
+sigils).
+
+Hook-surface merge teeth (2026-08-23): a PR whose diff touches the
+ENFORCEMENT-HOOK surface (``_HOOK_SURFACE_PREFIXES``/``_HOOK_SURFACE_FILES`` —
+the code these gates themselves run on) gets stricter freshness handling: its
+stale-review delta is never "review-trivial", and ``# stale-review-override``
+alone cannot merge it — recorded fallback-review evidence keyed to the exact
+head sha is additionally required (``_hook_surface_override_check``; the block
+message documents the user-authorized fallback procedure).
 
 Scheduled Claude review markers
 -------------------------------
@@ -87,6 +99,8 @@ not treat untrusted PR content as instructions when composing its comment body.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
@@ -125,7 +139,44 @@ from shell_parse import (  # noqa: E402
     git_subcommand,
     has_trailing_override,
     split_segments,
+    untokenizable,
 )
+
+# Mentions of a GATED operation, consulted ONLY on the un-parseable path where
+# analyze() has gone blind. Deliberately BROAD — both the gated verbs and the
+# destructive flags — because the outcome there is an approval PROMPT, not a
+# block: an over-match costs one confirmation, while an under-match silently
+# runs an unverified publish. (An earlier flag-only, hard-block version had to be
+# surgically precise, and precision is exactly what an unreliable parse cannot
+# deliver — every narrowing conjunct became a new way to starve the trigger.)
+_GATED_MENTION = re.compile(
+    r"(?:^|\s)(?:--force(?:-with-lease)?|--no-verify|--admin)(?:\s|=|$)|\b(?:push|merge)\b"
+)
+
+# `gh pr create` is the FOURTH gated operation (it can push or fork the branch —
+# see _pr_create_would_publish), and it was missing from the mention set above.
+# MEASURED: an ANSI-C-hidden `gh pr create` on an unpushed branch was ALLOWED
+# while the plain form correctly asked — the same fail-open this net exists to
+# close, for an op the first cut omitted.
+#
+# It is a CONJUNCTION rather than a `create` alternative in the regex because
+# `create` alone is an ordinary English word. Measured over 11,488 real commands
+# (328 un-tokenizable): a bare `\bcreate\b` alternative adds 6 new prompts, all
+# benign here-doc Python; requiring `gh` as well adds ZERO while still catching
+# the bypass. Two literal token tests combined in code — deliberately NOT a
+# lookaround, which is positional: `(?=.*\bgh\b)\bcreate\b` reads FORWARD from
+# `create`, and in `gh pr create` the `gh` is BEHIND it, so that pattern matches
+# nothing and would have measured 0 false positives by never firing at all.
+_GH_MENTION = re.compile(r"\bgh\b")
+_CREATE_MENTION = re.compile(r"\bcreate\b")
+
+
+def _mentions_gated_op(command: str) -> bool:
+    """Whether the RAW text names any gated operation, on the blind path only."""
+    if _GATED_MENTION.search(command):
+        return True
+    return bool(_GH_MENTION.search(command) and _CREATE_MENTION.search(command))
+
 
 # Local push allowlist (offline re-push cache). SOFT dependency, guarded exactly
 # like the review_state import above: a module-LOAD exception must degrade to
@@ -704,6 +755,15 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
                         caller lets it pass. This is the state that catches a
                         conflicting branch / dropped ``pull_request`` trigger, which
                         would otherwise merge un-CI'd.
+      * ``"incomplete"`` — the rollup is NON-empty and nothing is red/pending, but a
+                        REQUIRED workflow (rollup ``workflowName``; config-driven via
+                        ``merge_gate.required_ci_workflows``, default ``CI`` — see
+                        _required_ci_workflows) never contributed a verdict. Closes the
+                        #1484-P2 partial-rollup residual: e.g. a lone green CodeQL with
+                        the CI suite absent (a workflow-specific trigger drop) must not
+                        read green. ``problem_checks`` carries the MISSING workflow
+                        names. Enforced like ``"absent"``: canonical repo only,
+                        waivable by ``# ci-override``.
       * ``"unknown"`` — could NOT determine: an API error, empty/no output, an
                         unparseable payload, or a non-empty payload with no CI-shaped
                         entries. Callers FAIL OPEN, because blocking a merge on our own
@@ -779,6 +839,12 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
     red: list[str] = []
     pending: list[str] = []
     saw_recognized = False
+    # Workflows that contributed a VERDICT on this head (casefolded ``workflowName``),
+    # for the required-identity check below. SKIPPED/NEUTRAL entries deliberately do
+    # NOT contribute — a fully-skipped required suite tested nothing. Legacy
+    # StatusContexts (no workflowName) contribute "" and can never satisfy a named
+    # required workflow (fail-closed on the Actions-only canonical repo).
+    workflows_ran: set[str] = set()
     for c in checks:
         if not isinstance(c, dict):
             continue
@@ -786,6 +852,7 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         conclusion = c.get("conclusion")  # CheckRun
         status = c.get("status")  # CheckRun: QUEUED/IN_PROGRESS/COMPLETED/PENDING/…
         state = c.get("state")  # StatusContext: SUCCESS/FAILURE/PENDING/ERROR
+        wf_key = (c.get("workflowName") or "").strip().casefold()
         if conclusion in _CI_SKIP_CONCLUSIONS:
             saw_recognized = True
             continue
@@ -803,12 +870,28 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
                 # NO same-identity success at-or-after it (e.g. SUCCESS-then-cancel
                 # on an unchanged head) falls through and stays red.
                 saw_recognized = True
+                # A superseded duplicate implies a same-identity SUCCESS exists on
+                # this head, so the workflow demonstrably ran.
+                workflows_ran.add(wf_key)
                 continue
         if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
             saw_recognized = True
             red.append(name)
         elif conclusion in _CI_GREEN or state in _CI_GREEN:
+            # The ONLY branch (besides the superseded-cancel drop above, which implies
+            # a green sibling) that feeds workflows_ran: the required-identity check
+            # runs only when nothing is red/pending (those return first, and already
+            # block), so only PASSING verdicts can vouch that a required workflow ran.
+            # A COMPLETED run with a null conclusion (the benign ignore below) carries
+            # no verdict and deliberately does NOT vouch — fail-closed. Vouching is
+            # additionally gated on a CheckRun-shaped pass (``conclusion``): a
+            # StatusContext-shaped green (``state``) can't carry a real Actions
+            # workflowName, so an entry gluing state=SUCCESS to a workflowName key
+            # must not satisfy the required identity by construction (not merely by
+            # gh's current output shape).
             saw_recognized = True
+            if conclusion in _CI_GREEN:
+                workflows_ran.add(wf_key)
         elif status in _CI_TERMINAL_STATUSES:
             saw_recognized = True
             if conclusion is not None:
@@ -835,15 +918,19 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         return "pending", sorted(set(pending))
     if not saw_recognized:
         return "unknown", []  # payload had no CI-shaped entries
-    # KNOWN RESIDUAL (deferred, Codex #1484 P2): "green" here means every check that
-    # IS present concluded success — it does NOT assert the REQUIRED CI workflow ran.
-    # A partial rollup (e.g. only a green CodeQL, the CI suite absent) reads green.
-    # The "absent" branch above only catches a FULLY-empty rollup (the conflicting-
-    # branch symptom, where CI+CodeQL are both pull_request-gated and neither builds).
-    # Closing the partial case robustly needs a config-driven "required CI check
-    # identity" (a required-CI analogue of _required_scheduled_review_kinds) so it
-    # does NOT false-block an install whose CI is legitimately path-filtered/skipped
-    # for a docs-only PR. Tracked as a follow-up; not bundled here.
+    # Required-workflow identity (closes the #1484-P2 partial-rollup residual): every
+    # present check passed, but "green" must ALSO assert that each REQUIRED workflow
+    # (default "CI"; config lever merge_gate.required_ci_workflows for an install whose
+    # suite is named differently) actually contributed a passing verdict. Otherwise a
+    # workflow-specific trigger drop — e.g. a lone green CodeQL, the CI suite absent —
+    # reads green and merges an untested PR. (The "absent" branch above only catches a
+    # FULLY-empty rollup.) Canonical-scoping and the # ci-override valve are applied by
+    # the CALLERS, exactly as for "absent", so a non-canonical repo is never blocked
+    # by this identity policy.
+    required = _required_ci_workflows()
+    missing = sorted(w for w in required if w.strip().casefold() not in workflows_ran)
+    if missing:
+        return "incomplete", missing
     return "green", []
 
 
@@ -1370,6 +1457,96 @@ def _pr_head_sha(pr_num: str, repo: str | None = None) -> str | None:
     return sha or None
 
 
+def _pr_base_sha(pr_num: str, repo: str | None = None) -> str | None:
+    """The LIVE tip oid of the PR's base branch, or None on any error.
+
+    Deliberately NOT ``pulls/N → .base.sha``: that field is a SNAPSHOT taken at
+    PR creation/retarget and does not advance with the base branch (measured
+    2026-08-23 against live PRs — three pre-merge PRs still reported the old
+    tip while a post-merge control reported the new one). The evidence binding
+    exists precisely for the base-advanced case, so it must read the branch
+    ref's current tip.
+
+    Resolution is via GraphQL ``repository.ref(qualifiedName:"refs/heads/<branch>")``
+    with the branch passed as a raw-string VARIABLE — NOT the REST ``commits/{ref}``
+    endpoint (Codex #10). Interpolating a branch name into a URL path is ambiguous
+    and fragile in two ways the REST path could not fully close: (1) an UNqualified
+    ``commits/<name>`` resolves a same-named TAG or a branch literally named
+    ``heads/x`` to the WRONG ref (a wrong-tip evidence binding that stays valid
+    after the real base moves); (2) a name that is structural in a URL (``#``
+    fragment, ``?`` query, ``%`` escape) truncates the request. A fully-qualified
+    ``refs/heads/<branch>`` passed as a GraphQL variable is unambiguous (heads vs
+    tags) AND carries no URL-path interpolation at all, closing both classes at once.
+    A branch ref's ``target`` is always a Commit, so ``.target.oid`` is its live tip.
+
+    Consumed by the hook-surface override evidence identity (see
+    _hook_surface_override_check). Tests inject via ``_TEST_GH_BASE_OID``.
+    """
+    raw = os.environ.get("_TEST_GH_BASE_OID")
+    if raw is None:
+        ref = _pr_base_ref(pr_num, repo=repo)
+        # Reject only an ASCII control char or a plain ASCII space — Git's own ref
+        # rules (git check-ref-format) forbid exactly those, and they'd be garbage in
+        # a base branch name. Do NOT reject every Python str.isspace() code point
+        # (Codex P2, round 5): non-ASCII whitespace (e.g. U+00A0) is a LEGAL Git branch
+        # character, and rejecting it would falsely block the authorized
+        # fallback-evidence path for a legitimately-named branch.
+        if not ref or any(ord(c) < 0x20 or ord(c) == 0x7F or c == " " for c in ref):
+            return None
+        # GraphQL needs an explicit owner/name (no REST ``:owner/:repo`` placeholder).
+        # Resolve the slug from the passed repo, else the cwd's base repo; fail-closed
+        # if it can't be resolved or split. A non-str ``repo`` (an unresolved-repo
+        # sentinel) fails CLOSED here — never fall through to a cwd guess, and never
+        # reach _normalize_repo's ``str``-typed body with a non-str (would TypeError
+        # OUTSIDE the subprocess try). Belt-and-suspenders: callers already fail-closed
+        # on the sentinel before this runs.
+        if repo is not None and not isinstance(repo, str):
+            return None
+        slug = _normalize_repo(repo) if repo else _derive_repo_from_cwd(os.getcwd())
+        if not slug or "/" not in slug:
+            return None
+        owner, name = slug.split("/", 1)
+        query = (
+            "query($owner:String!,$name:String!,$ref:String!){"
+            "repository(owner:$owner,name:$name){ref(qualifiedName:$ref){target{oid}}}}"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    "graphql",
+                    # -f (raw string), NOT -F: -F type-coerces and reads @file, which
+                    # would mangle a numeric-looking or @-leading branch name. -f keeps
+                    # every value a literal GraphQL String.
+                    "-f",
+                    f"query={query}",
+                    "-f",
+                    f"owner={owner}",
+                    "-f",
+                    f"name={name}",
+                    "-f",
+                    f"ref=refs/heads/{ref}",
+                    "--jq",
+                    ".data.repository.ref.target.oid",
+                ],
+                capture_output=True,
+                text=True,
+                # Merge-path budget (see main()): runs ONLY on the rare
+                # stale-review-override path; fail direction is closed there.
+                timeout=_gh_timeout(6),
+            )
+            # A missing branch → ``ref: null`` → jq emits the literal "null"; a GraphQL
+            # error → data null → same. Both, and any non-zero exit, fail closed below.
+            raw = result.stdout if result.returncode == 0 else ""
+        except Exception:
+            return None
+    sha = (raw or "").strip()
+    if not sha or sha == "null":
+        return None
+    return sha
+
+
 def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
     """EVERY Codex review record ``{commit_id, state}`` on the PR, oldest-first,
     or None on any API/parse error (distinct from ``[]`` = query succeeded, no
@@ -1699,6 +1876,303 @@ def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str
     return latest
 
 
+# ── Hook-surface merge teeth (2026-08-23, user decision) ─────────────────────
+# The ENFORCEMENT-HOOK surface is the code the merge/push/commit gates themselves
+# run on: an unreviewed change here disarms every other gate, so it gets stricter
+# review teeth than ordinary code. Two rules, both scoped to these paths:
+#   1. A stale-review delta touching this surface is NEVER "review-trivial"
+#      (_classify_post_review_delta): a "small single-file touch-up" to a guard
+#      is exactly the change that must not skip re-review.
+#   2. `# stale-review-override` alone cannot merge a hook-surface PR without a
+#      current GitHub Codex review — it additionally requires recorded
+#      fallback-review evidence keyed to the EXACT head sha
+#      (_hook_surface_override_check). The GitHub Codex review is the required
+#      evidence class (user decision, 2026-08-23); the fallback procedure
+#      (user-authorized local codex / Claude Code adversarial review) is the
+#      documented exception path, not a self-serve bypass.
+# WHY this exists (the origin story — keep it, it is the anti-rationalization):
+# on PR #1432 a hand-rolled findings query returned empty and was reported as
+# "review-clean" while 13 real Codex findings (10 P1) sat on the PR; only this
+# file's merge gate caught it. The lesson: the human-facing claim and the gate
+# MUST run the same code path, and the gate's own code must never merge
+# unreviewed. Tests: tests/test_hooks/test_git_push_guard_hook_surface.py.
+# config/behavioral_rules/ rides as a prefix: behavioral_linter.py loads every
+# YAML under it (decision config = enforcement surface, see the note in
+# _HOOK_SURFACE_FILES).
+_HOOK_SURFACE_PREFIXES = ("scripts/hooks/", ".claude/hooks/", "config/behavioral_rules/")
+# EVERY hook wired in .claude/settings.json is fence surface — not only the
+# blocking gates: any script auto-executing inside sessions is enforcement-
+# adjacent (architect SHOULD-FIX 2026-08-23: the named-list-as-sample trap this
+# PR itself documents — review_enforcement_commit.py et al. lived outside the
+# original 4-file fence). Over-fencing costs only stricter review; a guardrail
+# test (test_git_push_guard_hook_surface.py) parses settings.json and FAILS CI
+# if a wired hook ever falls outside this fence, so the set is self-maintaining.
+_HOOK_SURFACE_FILES = frozenset(
+    {
+        "scripts/bash_safety_hook.sh",  # the global Bash chokepoint
+        "scripts/review_scope.py",  # substantiality classifier (feeds THIS gate)
+        "scripts/review_state.py",  # escalation counter + review markers
+        ".claude/settings.json",  # hook wiring (inline blob + matchers)
+        # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
+        # resolves bare names as scripts/<name>); scripts/hooks/* wirings are
+        # covered by the prefix above.
+        "scripts/behavioral_linter.py",
+        "scripts/check_stale_pending.py",
+        "scripts/content_safety_hook.py",
+        "scripts/contribution_offer_hook.py",
+        "scripts/edit_failure_sensor.py",
+        "scripts/file_context_hook.py",
+        "scripts/file_modification_audit_hook.py",
+        "scripts/genesis_precompact.py",
+        "scripts/genesis_session_context.py",
+        "scripts/genesis_session_end.py",
+        "scripts/genesis_stop_hook.py",
+        "scripts/genesis_urgent_alerts.py",
+        "scripts/plan_bookmark_hook.py",
+        "scripts/pretool_check.py",
+        "scripts/proactive_memory_hook.py",
+        "scripts/procedure_advisor.py",
+        "scripts/review_enforcement_commit.py",
+        "scripts/review_enforcement_prompt.py",
+        "scripts/review_invalidate_on_commit.py",
+        "scripts/surface_open_prs.py",
+        "scripts/surface_pr_updates.py",
+        # Hook-owned DECISION CONFIGURATION (Codex P2, round 1): these files
+        # determine what the wired hooks enforce, and the ordinary
+        # substantiality classifier treats YAML as docs/config (review-trivial)
+        # — so a rewrite that removes blocking patterns could merge on a stale
+        # review. Config that drives enforcement is enforcement surface.
+        "config/protected_paths.yaml",  # pretool_check.py
+        "config/repo_topology.yaml",  # repo_routing_guard.py
+    }
+)
+
+
+def _is_hook_surface_path(path: str) -> bool:
+    """True iff ``path`` (repo-relative, as GitHub reports it) is enforcement-hook
+    surface. Prefix matches are real path segments (``scripts/hooks/x``), never
+    substrings (``scripts/hooks_readme.md`` does not match)."""
+    return path in _HOOK_SURFACE_FILES or any(path.startswith(p) for p in _HOOK_SURFACE_PREFIXES)
+
+
+# A real fallback review (reviewer + findings + dispositions) is substantive; this
+# floor rejects a rubber-stamp / stray/boilerplate file at the evidence path (Codex
+# P2 round 2). Note the filename already binds repo+PR+base+head, so the content
+# check's marginal value is specifically catching a stale body copied to a correctly
+# named file. Anti-autopilot floor, NOT tamper-proof — the teeth are the human merge
+# + cloud reviewer (same threat model as review_state's evidence check).
+_MIN_OVERRIDE_EVIDENCE_CHARS = 200
+# Bound the read on the merge-gate hot path (the floor is 200 chars; any real review
+# fits easily) so an oversized file in the evidence dir can't be slurped into memory.
+_MAX_OVERRIDE_EVIDENCE_READ = 65536
+
+
+def _override_evidence_dir() -> str:
+    """Directory holding fallback-review evidence files
+    (``<repo>__<pr>__<base-tip-12>__<head-sha>.txt``).
+
+    ``GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR`` overrides (config knob + test seam);
+    default lives outside the repo so evidence survives worktree removal and is
+    never committed."""
+    return os.environ.get("GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR") or os.path.expanduser(
+        "~/.genesis/override_review_evidence"
+    )
+
+
+def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
+    """Every filename the PR touches (including rename SOURCES via
+    ``previous_filename`` — a guard renamed OUT of scripts/hooks/ is a hook
+    change), or None on any API/parse error. GitHub caps ``pulls/N/files`` at
+    3000 entries; at the cap a hook file may sit beyond it → None (the caller
+    fails closed). Tests inject via ``_TEST_GH_PR_FILES`` (one JSON object per
+    line: ``{filename, previous_filename}``; the literal ``__error__`` simulates
+    an API error)."""
+    raw = os.environ.get("_TEST_GH_PR_FILES")
+    if raw == "__error__":
+        return None
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/files",
+                    "--paginate",
+                    "--jq",
+                    ".[] | {filename: .filename, previous_filename: .previous_filename}",
+                ],
+                capture_output=True,
+                text=True,
+                # Merge-path timeout budget (see main()): this runs ONLY on the
+                # rare `# stale-review-override` path, so one paginated read
+                # stays inside the hook's wall-clock.
+                timeout=_gh_timeout(8),
+            )
+            if result.returncode != 0:
+                return None
+            raw = result.stdout
+        except Exception:
+            return None
+    files: list[str] = []
+    rows = 0
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            return None  # malformed page → cannot vouch for the full file set
+        if not isinstance(obj, dict):
+            return None
+        rows += 1
+        # Strict record shape (Codex P2, round 1): a null/empty/non-string
+        # filename means the record did NOT parse into a usable path — treating
+        # it as parsed could hide a hook file behind a degenerate row. Require
+        # a nonempty string filename; previous_filename may be None (no rename)
+        # or a nonempty string. Anything else → None → caller fails closed.
+        fname = obj.get("filename")
+        if not isinstance(fname, str) or not fname:
+            return None
+        files.append(fname)
+        prev = obj.get("previous_filename")
+        if prev is not None:
+            if not isinstance(prev, str) or not prev:
+                return None
+            files.append(prev)
+    if rows >= 3000:
+        # The cap applies to API ROWS, not the expanded path list (renames
+        # contribute two paths per row — Codex P2, round 1): at the documented
+        # 3000-entry endpoint cap a hook file may be hidden beyond it.
+        return None
+    return files
+
+
+def _hook_surface_override_check(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
+    """Gate the ``# stale-review-override`` escape on hook-surface PRs.
+
+    Returns ``(should_block, message)``. Fail direction is CLOSED throughout:
+    an unreadable diff or head sha blocks — this path exists precisely because
+    the normal review evidence is absent, so uncertainty must not widen the
+    escape. Non-hook-surface PRs pass untouched (the sigil keeps its normal
+    meaning there)."""
+    files = _pr_changed_files(pr_num, repo=repo)
+    if files is None:
+        return (
+            True,
+            (
+                f"could not read PR #{pr_num}'s changed files to scope the "
+                f"stale-review-override (hook-surface PRs need fallback-review "
+                f"evidence). Retry when GitHub answers — this read failing "
+                f"closed is deliberate."
+            ),
+        )
+    touched = sorted({f for f in files if _is_hook_surface_path(f)})
+    if not touched:
+        return False, ""
+    head = _pr_head_sha(pr_num, repo=repo)
+    if not head:
+        return (
+            True,
+            (
+                f"PR #{pr_num} touches the enforcement-hook surface "
+                f"({', '.join(touched[:4])}) but its head sha could not be read, "
+                f"so fallback-review evidence cannot be verified. Retry."
+            ),
+        )
+    head = head.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        # A network-sourced string becomes a path component below — validate the
+        # exact oid shape (mirrors _SCHEDULED_REVIEW_HEAD_RE) so garbage blocks
+        # EXPLICITLY instead of via an accidental unmatchable filename.
+        return (
+            True,
+            (
+                f"PR #{pr_num}'s head sha read back malformed ({head[:24]!r}) — "
+                f"cannot key fallback-review evidence. Retry."
+            ),
+        )
+    # Evidence identity = repo + PR + BASE + head (Codex P2s, rounds 1+2): a
+    # commit sha alone does not identify the PR/base whose FULL diff the
+    # fallback review covered — the same head can appear on another PR or in a
+    # fork, and (round 2) a retarget or advancing default branch changes the
+    # effective diff while head stays put; the sigil this path serves also
+    # waives _check_base_is_default, so base must be bound HERE. The bound value
+    # is the base branch's LIVE tip (never pulls/N.base.sha — a creation-time
+    # snapshot; see _pr_base_sha): binding to the live tip over-expires (any
+    # base move → re-record) — the safe direction on this rare, user-authorized
+    # path. Fail-closed on an unreadable base.
+    base = _pr_base_sha(pr_num, repo=repo)
+    if not base or not re.fullmatch(r"[0-9a-f]{40}", base.strip().lower()):
+        return (
+            True,
+            (
+                f"PR #{pr_num}'s BASE sha could not be read (or was malformed) — "
+                f"fallback-review evidence is base-bound and cannot be verified. "
+                f"Retry."
+            ),
+        )
+    base = base.strip().lower()
+    repo_slug = (_normalize_repo(repo) or "local").replace("/", "_")
+    evidence_path = os.path.join(
+        _override_evidence_dir(), f"{repo_slug}__{pr_num}__{base[:12]}__{head}.txt"
+    )
+    try:
+        with open(evidence_path, encoding="utf-8", errors="replace") as _ef:
+            evidence_text = _ef.read(_MAX_OVERRIDE_EVIDENCE_READ)
+    except OSError:
+        evidence_text = ""
+    # Validate the CONTENT, not just presence (Codex P2, round 2): a stray or
+    # rubber-stamp file at the right path must not waive the gate. Require a
+    # substantive review that NAMES the exact head it vouches for — the 12-hex
+    # head prefix must appear in the body (the procedure below instructs this),
+    # and the body must clear a minimum length. Fail-closed on a short/unbound file.
+    has_evidence = (
+        len(evidence_text.strip()) >= _MIN_OVERRIDE_EVIDENCE_CHARS
+        and head[:12] in evidence_text.lower()
+    )
+    if has_evidence:
+        # Residual TOCTOU, accepted as part of the force path's documented
+        # "conscious unbound merge" contract: a push landing between this head
+        # read and the merge would merge a head the evidence does not name. The
+        # window is seconds, re-running re-reads the head, and binding here
+        # would force --match-head-commit onto override merges — declined.
+        print(
+            f"NOTE: hook-surface override on PR #{pr_num} backed by fallback-review "
+            f"evidence at {evidence_path} (head {head[:12]}).",
+            file=sys.stderr,
+        )
+        return False, ""
+    return (
+        True,
+        (
+            f"'# stale-review-override' is NOT sufficient by itself here: PR "
+            f"#{pr_num}'s diff touches the ENFORCEMENT-HOOK surface "
+            f"({', '.join(touched[:4])}{', …' if len(touched) > 4 else ''}) — the "
+            f"code the merge/push gates themselves run on. Merging it without a "
+            f"current GitHub Codex review additionally requires recorded "
+            f"fallback-review evidence for the EXACT head {head[:12]}.\n"
+            f"Procedure (requires the user's explicit authorization — never "
+            f"self-serve):\n"
+            f"  1. Get the user's go-ahead for the override.\n"
+            f"  2. Run a fallback adversarial review of the full PR diff: local "
+            f"`codex exec` when quota allows, else a Claude Code adversarial "
+            f"review (genesis-architect).\n"
+            f"  3. Record reviewer + findings + dispositions — and reference the "
+            f"head sha {head[:12]} in the body — in:\n"
+            f"       {evidence_path}\n"
+            f"  4. Re-run this merge (same sigil). A new push changes the head "
+            f"sha, and a base-branch change (retarget OR base advancing) "
+            f"re-keys too — re-review and re-record.\n"
+            f"WHY: 2026-08-23 — an unreviewed merge on this surface disarms every "
+            f"other gate; the GitHub Codex review is the required evidence class "
+            f"(user decision), and this file's own history (#1432: 13 findings "
+            f"invisible to a hand-rolled query) is the proof the gate must not "
+            f"trust the author's claim of cleanliness."
+        ),
+    )
+
+
 def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | None) -> str | None:
     """Substantiality of what HEAD adds OVER the Codex-reviewed SHA, via the compare API.
 
@@ -1769,6 +2243,29 @@ def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | No
         return None
     if len(files) >= 300:
         return "substantial"  # compare file cap hit → can't rule out substantial code
+    # Hook-surface teeth rule 1: a delta touching the enforcement-hook surface is
+    # NEVER review-trivial, no matter how small — see the block above
+    # _is_hook_surface_path for the why. Rename sources count (previous_filename):
+    # a guard renamed/moved out of scripts/hooks/ IS a hook change.
+    for f in files:
+        if not isinstance(f, dict):
+            return None
+        # A record MUST carry a readable string ``filename`` — a missing/null/empty
+        # one means we cannot confirm this path is NOT a hook-surface file, so fail
+        # CLOSED (unclassifiable → the caller blocks a stale review) rather than skip
+        # it (Codex P2, round 5: a malformed compare record must not let a hook-surface
+        # delta read as review-trivial; ``gh --jq`` still builds an object when the
+        # upstream field is absent, so this shape is reachable). ``previous_filename``
+        # is optional, but when present must likewise be a non-empty string.
+        fn = f.get("filename")
+        if not isinstance(fn, str) or not fn:
+            return None
+        prev = f.get("previous_filename")
+        if prev is not None and (not isinstance(prev, str) or not prev):
+            return None
+        for val in (fn, prev):
+            if val and _is_hook_surface_path(val):
+                return "substantial"
     try:
         # review_scope lives in scripts/ (parent of scripts/hooks/). Lazy import ON
         # PURPOSE: an import failure must degrade THIS classification to None (the
@@ -1803,7 +2300,10 @@ def _check_codex_reviewed_head(
     only on positive evidence. ``force`` (a ``# stale-review-override`` on the
     merge segment — deliberately NOT ``# review-override``, which waives the P1
     finding scans; the two boundaries are independent) is the conscious escape
-    (e.g. a genuine Codex outage).
+    (e.g. a genuine Codex outage). On the HOOK SURFACE ``force`` additionally
+    requires recorded fallback-review evidence regardless of head-freshness — the
+    same sigil waives ``_check_base_is_default`` and the evidence identity binds the
+    BASE, which a head-only review cannot vouch for (see Codex #9 disposition below).
 
     Returns ``(should_block, message, verified_head)`` — ``verified_head`` is the
     full head oid this check verified/classified against (when not blocked and
@@ -1813,6 +2313,25 @@ def _check_codex_reviewed_head(
     cannot smuggle an unreviewed head through (TOCTOU — Codex P1, PR #1366).
     """
     if force:
+        # Hook-surface teeth rule 2: the sigil alone is not enough when the PR
+        # touches the enforcement-hook surface — recorded fallback-review
+        # evidence for the exact head is additionally required (fail-closed).
+        # verified_head stays None on the pass path: the force path keeps its
+        # documented "conscious unbound merge" contract (no --match-head bind).
+        #
+        # NOTE (Codex #9, dispositioned FALSE-POSITIVE 2026-08-26): #9 proposed
+        # skipping this evidence demand when a current at-head Codex review already
+        # exists. That is UNSAFE and was reverted: this force path is reached via
+        # # stale-review-override, which ALSO waives _check_base_is_default, and
+        # _hook_surface_override_check's evidence identity binds the BASE tip — which
+        # a head-only Codex review provably cannot vouch for (see _check_base_is_default's
+        # docstring: "GitHub's review object records no base, so freshness alone cannot
+        # see it"). Skipping evidence on a fresh review would let a hook-surface PR
+        # RETARGETED to a non-default base merge with no base-bound review. A fresh
+        # head-review is NOT a substitute for base-bound evidence here.
+        blocked, msg = _hook_surface_override_check(pr_num, repo=repo)
+        if blocked:
+            return True, msg, None
         return False, "", None
     head = _pr_head_sha(pr_num, repo=repo)
     if not head:
@@ -1847,7 +2366,15 @@ def _check_codex_reviewed_head(
                 f"Codex reviews on PR-open — it does NOT auto-review a later fix-commit; "
                 f"comment '@codex review' on the PR to review the current head (then wait), "
                 f"or append '# stale-review-override' to merge without a current Codex "
-                f"review (e.g. Codex is down)."
+                f"review (e.g. Codex is genuinely down).\n"
+                f"NOTE: the GitHub reviewer and the `codex exec` CLI are separate SURFACES; do "
+                f"not infer one from the other. OBSERVED once (2026-08-27): the CLI reported "
+                f"a two-week usage lockout while the GitHub reviewer, asked minutes later, "
+                f"returned a full review on the same commit. Whether that is separate "
+                f"metering, a plan-tier difference or a CLI-side fault was NOT established "
+                f"— so treat each surface as independently available until proven otherwise: "
+                f"post '@codex review' and check for a review at head BEFORE concluding "
+                f"Codex is unavailable."
             ),
             None,
         )
@@ -1878,6 +2405,15 @@ def _check_codex_reviewed_head(
                 f"Comment '@codex review' on the PR to re-review the current head (Codex "
                 f"does NOT auto-review fix-commits), then wait; or append "
                 f"'# stale-review-override' to merge anyway.\n"
+                f"NOTE: the GitHub reviewer and the `codex exec` CLI are separate SURFACES; do "
+                f"not infer one from the other. OBSERVED once (2026-08-27): the CLI reported "
+                f"a two-week usage lockout while the GitHub reviewer, asked minutes later, "
+                f"returned a full review on the same commit. Whether that is separate "
+                f"metering, a plan-tier difference or a CLI-side fault was NOT established "
+                f"— so treat each surface as independently available until proven otherwise: "
+                f"post '@codex review' and check for a review at head BEFORE concluding "
+                f"Codex is unavailable."
+                f"\n"
                 f"  (inspect the unreviewed commits: git log {reviewed[:12]}..{head[:12]} "
                 f"--oneline)"
             ),
@@ -1909,6 +2445,24 @@ _SCHEDULED_REVIEW_BLOCK_RE = re.compile(
 # violating fail-closed (a failed/corrupt routine run must NOT satisfy the gate).
 _SCHEDULED_REVIEW_HEAD_RE = re.compile(r"\bhead=([0-9a-f]{40})(?=\s|\Z)")
 _SCHEDULED_REVIEW_KIND_RE = re.compile(r"\bkind=([a-z0-9][a-z0-9._-]*)(?=\s|\Z)")
+# THE REPORTING GRAMMAR -- deliberately a SECOND, permissive read of the same text.
+#
+# The strict expressions above answer "does this count?" and must stay narrow. A
+# MESSAGE answers a different question -- "what did the operator actually write?"
+# -- and answering it with the strict expression produces confident falsehoods,
+# because a REFUSED value and an ABSENT one become indistinguishable. That is the
+# exact defect this whole change exists to end, so it must not be reintroduced one
+# field at a time: EVERY field the block message describes needs a permissive
+# counterpart here, and a new strict field is not finished until it has one.
+#
+# These must never feed the gate. Matching loosely here is how the operator learns
+# their head= was abbreviated -- never a second way to satisfy anything.
+_SCHEDULED_REVIEW_LOOSE_HEAD_RE = re.compile(r"\bhead=(\S*)")
+_SCHEDULED_REVIEW_LOOSE_KIND_RE = re.compile(r"\bkind=(\S*)")
+# A 40-hex head in the WRONG CASE is full-length and well-formed apart from case.
+# Telling that operator their head "is not a full 40-hex commit sha" sends them to
+# recount 40 characters and find nothing wrong, so the two causes are separated.
+_SCHEDULED_REVIEW_ANYCASE_HEAD_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
 
 # Default scheduled-review kinds the merge gate REQUIRES at head. A PR merges only when
 # a valid owner-authored marker for EACH effective required kind names the current head.
@@ -1918,6 +2472,37 @@ _DEFAULT_REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
 # The leak/secret scanner is IRREDUCIBLE: always required, never removable by config. A
 # secret reaching a public repo is irreversible, so no local policy may waive it.
 _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
+
+# Scheduled-review kinds whose marker may be honoured from an EARLIER head of the
+# same PR, provided the named MECHANICAL scanner is green at the CURRENT head.
+#
+# WHY this exists, and why only for leaks. The routines are not re-run on a push,
+# so on any multi-push PR the marker sits at the first head and the gate blocks —
+# measured over ten recent PRs, every one with commits after its marker. The
+# operator's only escape was `# scheduled-review-override`, a sigil that checks
+# NOTHING, so routine use of it was eroding an override meant for exceptions.
+#
+# The relief is narrow BECAUSE the two layers cover different leak classes. The
+# mechanical scanner catches literal patterns (addresses, emails, configured
+# private patterns) and it runs per-head; the scheduled LLM review catches
+# INFERENTIAL leaks, which no pattern can. Honouring an earlier LLM review while
+# REQUIRING the mechanical one at this exact head therefore trades a re-read of
+# the inferential layer for a guarantee the literal layer covers the new commits
+# — strictly more checking than the bare override it replaces, never less.
+#
+# NOT a prose-delta tolerance. That was the first design and it was MEASURED
+# inert: 0 of 6 applicable PRs had a prose-free delta (22-692 added prose lines
+# each), because essentially every push adds a comment, docstring or string.
+# A relief valve that never opens leaves the override in daily use.
+# kind -> (check name, WORKFLOW name) for the mechanical scanner that may carry an
+# earlier accepted review forward. The workflow half is the round-4 finding: matching
+# the display name against the whole required-CI set lets a same-named check from
+# ANOTHER workflow stand in for the real scanner. Both halves are read from this
+# repo's own .github/workflows/ci.yml (`name: CI`; the `leak-detector` job), so they
+# travel with a clone rather than describing one install. A suite named differently
+# simply finds no match, and no match means NO RELIEF -- the pre-relief behaviour, so
+# the failure direction of a wrong pin is a missing convenience, never a weaker gate.
+_MECHANICAL_RESCAN_BY_KIND = {"leaks": ("leak-detector", "CI")}
 # Every kind an install is ALLOWED to name in config. A configured kind outside this set
 # (a typo, a wrong type, a stale routine name) can never be satisfied by a real marker, so
 # the whole config is treated as invalid and we fail closed to the default rather than let
@@ -1994,6 +2579,106 @@ def _required_scheduled_review_kinds() -> tuple[str, ...]:
     # leaks (and any irreducible kind) is always required, even if config omits it.
     merged = list(dict.fromkeys([*kinds, *_IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS]))
     return tuple(merged)
+
+
+# The GitHub Actions workflow name(s) whose PRESENCE in a PR's check rollup the CI
+# gate requires before trusting "green" (the required-CI analogue of the scheduled-
+# review kinds above). Default = the canonical repo's ci.yml `name: CI`. Unlike the
+# scheduled kinds there is NO irreducible floor and NO known-set whitelist: the
+# identity is install-specific free text (a fork's suite may be named anything), so
+# config must be able to REPLACE the set — but never to EMPTY it (see the validator).
+_DEFAULT_REQUIRED_CI_WORKFLOWS = ("CI",)
+
+
+def _validate_configured_workflows(items: object) -> list[str] | None:
+    """Validate a configured required-CI-workflow list. Returns the cleaned list
+    (stripped, deduped, case PRESERVED for display; matching is case-insensitive), or
+    None if ANYTHING is off — not a list, an EMPTY list, a non-string element, or a
+    blank element. None makes the caller fail CLOSED to the default. An empty list is
+    deliberately invalid: it would DISABLE the identity check entirely, and the
+    per-merge escape for a consciously CI-less merge is ``# ci-override``, not config
+    (non-canonical repos are already exempt via _scheduled_gate_applies)."""
+    if not isinstance(items, list) or not items:
+        return None
+    out: list[str] = []
+    for w in items:
+        if not isinstance(w, str):
+            return None  # wrong type (e.g. [123]) -> invalid -> default
+        ww = w.strip()
+        if not ww:
+            return None  # blank ([" "]) -> invalid -> default
+        out.append(ww)
+    return list(dict.fromkeys(out))
+
+
+def _required_ci_workflows() -> tuple[str, ...]:
+    """The GitHub Actions workflow names (rollup ``workflowName``) the CI gate REQUIRES
+    to have contributed a passing verdict before ``_pr_ci_status`` returns "green".
+
+    Default: ``("CI",)`` — the canonical repo's ci.yml workflow, which has NO paths
+    filters and therefore always runs on a PR to main. An install whose required suite
+    is named differently configures it locally (keeping install policy out of the
+    public default):
+
+        # ~/.genesis/config/genesis.yaml
+        merge_gate:
+          required_ci_workflows: [My Suite]
+
+    Fail-CLOSED toward the default: a missing key / unreadable file / parse error /
+    duplicate key / wrong type / EMPTY list / blank element ALL fall back to the full
+    default — there is no config value that disables the check. Because free-text
+    config can also EXPAND the required set (unlike the whitelist-relaxed scheduled
+    kinds, whose default is maximal), a fallback here can silently NARROW a stricter
+    declared policy — so when the key is visibly present but its value was discarded,
+    a NOTE is printed naming the substitution (the fallback itself is unchanged).
+    Test seam: ``_TEST_REQUIRED_CI_WORKFLOWS`` (comma-separated) overrides the config
+    file; a blank seam parses to an empty (=invalid) list and also yields the
+    default."""
+    raw = os.environ.get("_TEST_REQUIRED_CI_WORKFLOWS")
+    configured: list[str] | None = None
+    key_seen_in_file = False
+    if raw is not None:
+        configured = _validate_configured_workflows(
+            [w.strip() for w in raw.split(",") if w.strip()]
+        )
+    else:
+        try:
+            import yaml  # lazy: keep the hook import-light; the genesis venv has pyyaml
+
+            path = os.path.expanduser("~/.genesis/config/genesis.yaml")
+            with open(path) as fh:
+                text = fh.read()
+            # A textual sighting of the KEY LINE (not a comment/prose mention): if the
+            # value is then discarded (dup key, parse error, invalid shape), the
+            # operator DECLARED a policy we are about to substitute — that must not be
+            # silent. A key-absent file (the normal install) stays silent. Checked
+            # BEFORE the parse so a yaml error can't skip it.
+            key_seen_in_file = bool(re.search(r"(?m)^\s*required_ci_workflows\s*:", text))
+            # Same duplicate-key hazard as the scheduled kinds: yaml.safe_load keeps
+            # the LAST value silently, so a badly-merged file could swap the required
+            # identity. Line-scan the realistic cases and fail closed.
+            if (
+                len(re.findall(r"(?m)^merge_gate\s*:", text)) > 1
+                or len(re.findall(r"(?m)^\s*required_ci_workflows\s*:", text)) > 1
+            ):
+                raise ValueError("duplicate merge_gate/required_ci_workflows key")
+            cfg = yaml.safe_load(text) or {}
+            value = (cfg.get("merge_gate") or {}).get("required_ci_workflows")
+            configured = _validate_configured_workflows(value)
+        except Exception:
+            configured = None  # fail-closed: fall back to the default set below
+    if configured is None:
+        if key_seen_in_file:
+            print(
+                "NOTE: merge_gate.required_ci_workflows in ~/.genesis/config/"
+                "genesis.yaml is present but unreadable/invalid (duplicate key, "
+                "wrong type, empty list, or blank element) — enforcing the DEFAULT "
+                f"required set {_DEFAULT_REQUIRED_CI_WORKFLOWS} instead of your "
+                "configured value. Fix the config to restore your declared policy.",
+                file=sys.stderr,
+            )
+        return _DEFAULT_REQUIRED_CI_WORKFLOWS
+    return tuple(configured)
 
 
 def _canonical_public_repo() -> str | None:
@@ -2101,7 +2786,13 @@ def _scheduled_review_rows(pr_num: str, repo: str | None = None) -> list[dict] |
                     "--paginate",
                     "--jq",
                     ".[] | {login: .user.login, author_association: .author_association, "
-                    "body: .body, state: .state}",  # .state present on reviews, null on issue comments
+                    "body: .body, state: .state, "
+                    "stamp: (.updated_at // .submitted_at // .created_at)}",
+                    # .state present on reviews, null on issue comments. `stamp` is the LAST
+                    # MODIFICATION: issue comments are editable and an edit that adds a
+                    # finding must sort by when it was written, not when the comment was
+                    # created. Review bodies expose only submitted_at (an edited review body
+                    # keeps its original stamp -- documented residue in the scan).
                 ],
                 capture_output=True,
                 text=True,
@@ -2116,10 +2807,77 @@ def _scheduled_review_rows(pr_num: str, repo: str | None = None) -> list[dict] |
     return rows
 
 
-def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str, set[str]] | None:
-    """Map of ``head-sha -> {kinds}`` from valid owner-authored scheduled-review markers
-    on the PR, or ``None`` on an UNREADABLE fetch (the caller fail-closes on both None
-    and an empty map — None only distinguishes "could not read" from "read, no marker").
+def _status_suffix_warning(raw: str) -> str:
+    """Extra clause for a refused field value carrying a ``/status`` suffix, else "".
+
+    Naming ONLY the grammar problem is an instruction to strip the suffix, and a reader
+    who follows it produces a well-formed marker attesting to a run that reported its own
+    failure -- on the gate this repository calls irreducible. The strict expressions above
+    exist to refuse exactly that shape, so a message that coaches the reader past them
+    undoes the guard in prose. Saying what the suffix MEANS costs one clause and removes
+    the invitation, without the message having to guess which review was intended.
+
+    Applies to both fields: `head=<sha>/failed` and `kind=<name>/failed` reach the same
+    branch by different routes, and fixing only the one a review happened to name is how
+    this class keeps coming back.
+    """
+    return (
+        ", and the status suffix reports that the run did NOT complete cleanly -- "
+        "re-posting it without the suffix would attest to a review that declared its "
+        "own failure, so the run itself needs repeating"
+        if "/" in raw
+        else ""
+    )
+
+
+def _marker_kind_or_none(block: str) -> str | None:
+    """The ``kind`` a marker block names, or None when it names none.
+
+    Lets a block that is being REJECTED still be attributed to the kind it was
+    meant to satisfy, so the block message can scope its guidance instead of
+    reporting an unattached complaint.
+
+    Reads the STRICT grammar only, and deliberately so. An earlier revision also read a
+    status-suffixed value (``kind=leaks/failed``) by taking the segment before the suffix,
+    on the reasoning that it names its review unambiguously. That was wrong in a way worth
+    recording, because the argument for it sounded sober. A suffixed value denotes a run
+    that reported itself FAILED; crediting it to ``leaks`` made a failed run occupy the
+    kind, and — through the state rule below — SUPPRESS the bullet saying a real review had
+    run on an earlier commit. A failed run thereby outranked trusted history that an
+    untrusted stranger's marker was not permitted to outrank. The trust ordering came out
+    backwards, on the gate this repository calls irreducible.
+
+    A value the strict grammar refuses therefore names nothing here. It is still REPORTED,
+    with its raw text quoted, by the caller's unusable path — the operator sees it; it just
+    does not get to speak for a review.
+    """
+    m = _SCHEDULED_REVIEW_KIND_RE.search(block)
+    return m.group(1) if m else None
+
+
+def _scheduled_review_marker_scan(
+    pr_num: str, repo: str | None = None, head_sha: str | None = None
+) -> (
+    tuple[dict[str, set[str]], dict[str, set[str]], list[tuple[str | None, str, bool]]]
+    | None
+):
+    """``(accepted, rejected_not_clean, unusable, blocking_residue)`` for the PR's scheduled-review
+    markers, or ``None`` on an UNREADABLE fetch.
+
+    ``unusable`` is a list of ``(kind_or_None, reason, owner_authored)`` for marker
+    BLOCKS that were
+    seen and could not be counted — a head that is not a full 40-hex sha, a missing
+    ``kind``, an author who is not the owner, a dismissed review. Every one of those
+    was previously dropped in silence, which made 'you posted a marker that does not
+    count' indistinguishable from 'nobody posted anything' — and the gate answers the
+    latter with 'a routine may still be in flight, waiting IS the right move'. MEASURED
+    on a live PR: an abbreviated head produced exactly that, and waiting could never
+    have cleared it.
+
+    Both maps come from ONE pass so they cannot drift apart. ``accepted`` is what the
+    gate honours; ``rejected_not_clean`` is markers that parsed fine and named a head,
+    but whose body read as carrying a blocking finding. Only the DIAGNOSTIC message
+    consumes the second map — it never widens what satisfies the gate.
 
     A marker is trusted only when its author is the repo OWNER: ``login == owner`` OR
     ``author_association == "OWNER"`` (belt-and-suspenders — the marker itself is the
@@ -2136,40 +2894,608 @@ def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str,
     except Exception:
         owner_repo = repo
     owner = (owner_repo.split("/")[0] if owner_repo else "").lower() or None
-    by_head: dict[str, set[str]] = {}
+    accepted: dict[str, set[str]] = {}
+    rejected: dict[str, set[str]] = {}
+    # (kind_or_None, reason, owner_authored). The third field is a FACT, not a
+    # judgement. It once carried one -- "trusted and clean", later "supersedes the
+    # kind's state" -- and every consumer of that judgement was a place the message
+    # could hide something true. Authorship is observed, not decided: the message uses
+    # it only to count whether the OWNER has posted anything for a kind, because that is
+    # the one thing that says whether the owner's routine has evidently already run.
+    unusable: list[tuple[str | None, str, bool]] = []
+    # BLOCKING RESIDUE: head -> kinds for which the owner's body READ AS BLOCKING but
+    # the finding could not be credited to `rejected` -- a same-timestamp tie (recorded
+    # in neither verdict map), or a malformed / unknown-kind marker whose body carries
+    # the finding. Structured, so a consumer never has to match the prose in
+    # `unusable`. Keyed "" when no head can be attributed; kind "*" when no kind can.
+    # Additive: the three return shapes above are unchanged.
+    blocking_residue: dict[str, set[str]] = {}
+    # Every owner statement about a (head, kind), in CHRONOLOGICAL order, classified as
+    # "clean" (explicit verdict line), "refused" (blocking finding, no verdict) or "plain"
+    # (neither). The verdict for the pair is resolved AFTER the loop from this list -- see
+    # there for the rule and why the order matters.
+    stmts: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    # Chronology: rows carry `stamp` = last modification (updated_at for issue comments,
+    # which are editable; submitted_at for reviews). The two endpoints are fetched
+    # separately, so without sorting a review could sort before a comment posted after
+    # it; and sorting by CREATION would let a finding edited into an old comment lose
+    # to a verdict posted before the edit. Rows without a stamp (the test seam) keep list
+    # order -- the sort is stable. Residue, stated: an edited REVIEW body has no edit
+    # timestamp in the API, so a finding added by editing a review keeps the review's
+    # original position.
+    rows = sorted(rows, key=lambda r: (r.get("stamp") or r.get("created_at") or ""))
     for row in rows:
+        body = row.get("body") or ""
+        # Blocks are parsed BEFORE the trust checks, so a row about to be dropped can
+        # still report that it carried a marker. Refusing is right; refusing in
+        # silence is what sent an operator to wait for a routine that had already run.
+        blocks = _SCHEDULED_REVIEW_BLOCK_RE.findall(body)
         login = (row.get("login") or "").lower()
         assoc = (row.get("author_association") or "").upper()
         if login != owner and assoc != "OWNER":
-            continue  # not the repo owner — not a trusted scheduled review
+            # not the repo owner — not a trusted scheduled review
+            for block in blocks:
+                unusable.append(
+                    (
+                        _marker_kind_or_none(block),
+                        f"it was posted by '{login or 'an unidentified account'}', who "
+                        f"is not the repo owner, so nothing here vouches for a review",
+                        False,
+                    )
+                )
+            continue
         # A DISMISSED review no longer vouches, and a PENDING review is an UNPUBLISHED
         # draft that never ran publicly — neither should satisfy the gate (mirrors the
         # Codex-freshness path). `state` is present on /pulls/N/reviews rows and null on
         # issue comments, so this only drops review rows; issue comments remain state-less.
-        if (row.get("state") or "").upper() in ("DISMISSED", "PENDING"):
+        _state = (row.get("state") or "").upper()
+        if _state in ("DISMISSED", "PENDING"):
+            # Only DISMISSED is terminal. A PENDING review is an unpublished draft
+            # that can still be submitted. Both are RECORDED: an earlier version dropped
+            # a current-head draft silently so the generic in-flight note would cover
+            # it, which was the one remaining silent drop in a message that promises to
+            # list every block it saw. The row is the precise form of that note.
+            for block in blocks:
+                if _state == "PENDING":
+                    # Whether submitting the draft can help depends on the head it
+                    # names: the current one counts once published; an older one is
+                    # stale no matter when it is submitted.
+                    _hm = _SCHEDULED_REVIEW_HEAD_RE.search(block)
+                    if head_sha and _hm and _hm.group(1).lower() == head_sha.lower():
+                        why = (
+                            "it is carried by a PENDING (unpublished) review naming the "
+                            "current head, so it is not yet visible to the gate; once "
+                            "submitted it is read like any other block"
+                        )
+                    else:
+                        why = (
+                            "it is carried by a PENDING review and does not name the "
+                            "current head, so submitting that draft would not make it count"
+                        )
+                else:
+                    why = (
+                        "it is carried by a DISMISSED review, which no longer vouches "
+                        "for anything"
+                    )
+                unusable.append((_marker_kind_or_none(block), why, True))
             continue
-        body = row.get("body") or ""
         # The marker must mean "ran CLEAN", not merely "ran": a scheduled review whose body
         # CONTAINS a blocking finding ([P1]/HARD BLOCK/### ERROR, unless a clean marker
         # overrides — same "clean wins" rule the finding scanners use) does NOT satisfy the
         # gate. Owner-authored review bodies are never seen by _check_pr_review_findings
         # (bots only), so without this a scheduled reviewer that explicitly BLOCKED would
         # still stamp its marker and slip the merge through.
-        if any(p.search(body) for p in _BLOCKING_PATTERNS) and not any(
-            c.search(body) for c in _CLEAN_PATTERNS
-        ):
-            continue
+        #
+        # Such a marker is RECORDED (not dropped on the floor) so the block message can
+        # tell "you posted one and it was rejected" apart from "nobody posted anything" —
+        # measured 2026-08-28: those two produced the identical `present: none` line, and
+        # the only signal distinguishing an accepted marker from a rejected one was
+        # whether its prose happened to contain a _CLEAN_PATTERNS phrase.
+        has_clean = any(c.search(body) for c in _CLEAN_PATTERNS)
+        not_clean = any(p.search(body) for p in _BLOCKING_PATTERNS) and not has_clean
+        verdict = "refused" if not_clean else ("clean" if has_clean else "plain")
         # Defense-in-depth follow-up: for rows from /pulls/N/reviews we could ALSO
         # cross-check GitHub's authoritative `commit_id` vs the marker sha (issue comments
         # carry none). Deferred (LOW): the marker sha is matched EXACTLY vs the authoritative
         # HEAD by the caller, so a stale marker can't pass; this only catches a buggy reviewer.
-        for block in _SCHEDULED_REVIEW_BLOCK_RE.findall(body):
+        for block in blocks:
             head_m = _SCHEDULED_REVIEW_HEAD_RE.search(block)
             kind_m = _SCHEDULED_REVIEW_KIND_RE.search(block)
             if not head_m or not kind_m:
-                continue  # a marker must name both a head AND a kind to count
-            by_head.setdefault(head_m.group(1).lower(), set()).add(kind_m.group(1).lower())
-    return by_head
+                # A marker must name both a head AND a kind to count. Say WHICH is
+                # wrong and quote the offending value: on a long thread the operator
+                # otherwise cannot tell which of several markers is the broken one.
+                # EVERY bad field is reported, not the first one found. An if/else here
+                # reported only the head, so `head=abc kind=leaks/failed` read as a short
+                # sha and the suffix saying the run FAILED was never shown -- one repair
+                # cycle per hidden field, on a message that promises to hide nothing.
+                reasons: list[str] = []
+                if not head_m:
+                    loose = _SCHEDULED_REVIEW_LOOSE_HEAD_RE.search(block)
+                    if not loose:
+                        reasons.append("it carries no head= field")
+                    elif not loose.group(1):
+                        # `\S*` so an EMPTY value is seen. `\S+` reported it as no field
+                        # at all -- the most likely producer fault (an uninterpolated
+                        # variable) described as the operator having omitted the field.
+                        reasons.append("its head= field is present but EMPTY")
+                    elif _SCHEDULED_REVIEW_ANYCASE_HEAD_RE.fullmatch(loose.group(1)):
+                        reasons.append(
+                            f"its head={loose.group(1)!r} is full length but not "
+                            f"lowercase, and the grammar is lowercase hex"
+                        )
+                    else:
+                        reasons.append(
+                            f"its head={loose.group(1)!r} is not a full 40-hex commit sha"
+                            + _status_suffix_warning(loose.group(1))
+                        )
+                if not kind_m:
+                    # Read PERMISSIVELY to say what is actually there. The strict
+                    # expression refuses a status-suffixed `kind=leaks/failed`, and
+                    # reporting that refusal as an absent field told the operator a
+                    # field they had written did not exist.
+                    loose = _SCHEDULED_REVIEW_LOOSE_KIND_RE.search(block)
+                    if not loose:
+                        reasons.append("it carries no kind= field")
+                    elif not loose.group(1):
+                        reasons.append("its kind= field is present but EMPTY")
+                    elif loose.group(1).lower() in _KNOWN_SCHEDULED_REVIEW_KINDS:
+                        reasons.append(
+                            f"its kind={loose.group(1)!r} is a known review but not "
+                            f"lowercase, and the grammar is lowercase"
+                        )
+                    else:
+                        reasons.append(
+                            f"its kind={loose.group(1)!r} is not a bare review name"
+                            + _status_suffix_warning(loose.group(1))
+                        )
+                why = ", and ".join(reasons)
+                # A malformed marker on a body that reads as BLOCKING is not a typo
+                # to be re-posted. The verdict survives the malformed field, because
+                # pasting a clean marker over an unresolved finding would make the
+                # gate pass while the finding still stands.
+                if not_clean:
+                    why += (
+                        ", and its body reads as carrying a blocking finding, so a "
+                        "corrected marker would not make it count either"
+                    )
+                    # No parseable head -> unattributable residue, keyed "". The KIND is
+                    # retained only when it names a review that actually exists: a
+                    # syntactically valid but UNKNOWN kind (`kind=leak`, the singular
+                    # typo) would otherwise file the residue under a name no required
+                    # kind ever matches, and the blocking finding would be filed into
+                    # nothing -- relief carries past it. Codex reproduced exactly that
+                    # through the gate entry point. Unknown or unparseable -> "*", which
+                    # denies every kind, because a blocking finding nobody can attribute
+                    # is not evidence about one review, it is evidence about all of them.
+                    _residue_kind = _marker_kind_or_none(block)
+                    blocking_residue.setdefault("", set()).add(
+                        _residue_kind
+                        if _residue_kind in _KNOWN_SCHEDULED_REVIEW_KINDS
+                        else "*"
+                    )
+                unusable.append((_marker_kind_or_none(block), why, True))
+                continue
+            _kind = kind_m.group(1).lower()
+            if _kind not in _KNOWN_SCHEDULED_REVIEW_KINDS:
+                # Parses cleanly and names a review nothing knows about -- a terminal
+                # typo such as a singular form. Recording it in `accepted` hid it
+                # completely: it can never match a required kind, so the message went
+                # back to "no marker at ANY head" and advised waiting, while the block
+                # sat visibly in the thread. Verdict-neutral either way (an unknown
+                # kind satisfies nothing), so this is purely so the reader can SEE it.
+                _why = (
+                    f"it names kind={_kind!r}, which is not a known scheduled "
+                    f"review, so it can never satisfy one"
+                )
+                if not_clean:
+                    # The body's verdict survives the naming problem, exactly as it
+                    # does for a malformed field: reporting only the typo invites a
+                    # corrected marker over an unresolved finding.
+                    _why += ", and its body reads as carrying a blocking finding"
+                    # A blocking body under a kind nothing knows about cannot be
+                    # credited to any kind -- so it is residue against ALL of them.
+                    blocking_residue.setdefault("", set()).add("*")
+                unusable.append((_kind, _why, True))
+                continue
+            stmts.setdefault((head_m.group(1).lower(), _kind), []).append(
+                (row.get("stamp") or row.get("created_at") or "", verdict)
+            )
+    # RESOLUTION. Each row used to choose its own map, so a second owner comment at the
+    # same head -- same marker, ordinary prose -- was accepted while the first row's [P1]
+    # sat refused, and the gate passed with the finding unchanged. The first fix let any
+    # explicit clean verdict win regardless of order, which passed a LATER [P1] posted
+    # after an earlier verdict. Order is the whole question, so the rule is stated in it:
+    #
+    #   THE OWNER'S LATEST DECISIVE STATEMENT ABOUT (head, kind) GOVERNS.
+    #
+    # Decisive = an explicit clean-verdict line, or a blocking finding. Plain rows (neither)
+    # are not decisive in either direction: they count only when nothing decisive was ever
+    # said. So a plain re-post never overrides a refusal, the documented remedy (re-post
+    # WITH a verdict) still clears a prose-tripped refusal, and a re-run that finds
+    # something after a verdict is heard. Scoped to the head -- a finding on an older
+    # commit is what a new commit fixes. Every superseded row is still LISTED, so the
+    # report never says one block where two exist.
+    for (h, k), seq in stmts.items():
+        decisive = [(st, v) for st, v in seq if v != "plain"]
+        if decisive:
+            # A TIE on real timestamps between contradictory decisive statements is
+            # refused. Sorting is stable, so tied rows keep fetch order -- issue
+            # comments before reviews -- which is not event order; a clean review and a
+            # blocking comment in the same second would otherwise resolve backwards.
+            # Rows with no stamp (the test seam) cannot tie: list order is their order.
+            top = max(st for st, _ in decisive)
+            tied = {v for st, v in decisive if st and st == top}
+            ambiguous = len(tied) > 1
+            final = "refused" if ambiguous else decisive[-1][1]
+        else:
+            ambiguous = False
+            final = "plain"
+        if not ambiguous:
+            (rejected if final == "refused" else accepted).setdefault(h, set()).add(k)
+        if ambiguous:
+            # Failing closed is right; describing it as an ordinary refusal is not. On a
+            # tie the clean verdict IS present and NEITHER statement is later, so both
+            # halves of the usual wording -- "no clean-verdict line overrides it" and
+            # "superseded by a LATER finding" -- state something false about this thread.
+            # The pair is therefore recorded in NEITHER verdict map: staying out of
+            # `accepted` is what blocks (the missing set is computed from `accepted`
+            # alone), and staying out of `rejected` keeps the standard refusal row from
+            # making the false claim. This row is the whole explanation.
+            # One row per BLOCK here too, so the header's count still equals the number
+            # of blocks in the thread; each says what its own block was and why the pair
+            # cannot be ordered.
+            # The tie IS blocking evidence at this head that neither map can carry.
+            blocking_residue.setdefault(h, set()).add(k)
+            for _, v in seq:
+                what = {
+                    "clean": "an explicit clean verdict",
+                    "refused": "a blocking finding",
+                    "plain": "a plain re-post",
+                }[v]
+                unusable.append(
+                    (
+                        k,
+                        f"{what} at this head; a clean verdict and a blocking finding here "
+                        f"carry the SAME timestamp, so which came last cannot be "
+                        f"established and the finding stands; re-post the verdict so it is "
+                        f"unambiguously later",
+                        True,
+                    )
+                )
+            continue
+        # Every statement that did not become the verdict is still a row -- by STATUS
+        # and by COUNT, so the report never says one block where several were observed.
+        # ONE ROW PER BLOCK -- never a count folded into a row -- so the header's block
+        # count is the number of blocks the operator can see in the thread.
+        superseded = {
+            "plain": "a plain re-post at this head with no verdict line, not decisive",
+            "clean": "an explicit clean verdict at this head, superseded by a LATER blocking finding",
+            "refused": "a refusal at this head, superseded by a LATER explicit clean verdict",
+        }
+        seen_final = False
+        for _, v in seq:
+            if v == final and not seen_final:
+                seen_final = True  # the statement that became the verdict is rendered by its map
+                continue
+            text = (
+                "a further block at this head repeating the same statement"
+                if v == final
+                else superseded[v]
+            )
+            unusable.append((k, text, True))
+    return accepted, rejected, unusable, blocking_residue
+
+
+def _mechanical_scan_is_green(
+    pr_num: str, head_sha: str, check_name: str, workflow: str, repo: str | None = None
+) -> bool:
+    """Whether *check_name* concluded SUCCESS for *head_sha*, identified by
+    ``(name, workflowName)`` rather than by display name alone.
+
+    Reads ``headRefOid`` AND ``statusCheckRollup`` in ONE query so the rollup
+    provably describes the commit being decided: if the head returned alongside
+    it is not *head_sha*, the read is discarded. That preserves the sha binding a
+    ``commits/{sha}/check-runs`` read would give, while gaining ``workflowName``,
+    which that endpoint does not expose — and it is not paginated the way the
+    REST check-runs list is, so a scanner cannot fall off a later page and read
+    as absent (which would recreate the routine false block this relief exists to
+    retire).
+
+    Identity is ``(name, workflowName)`` against the kind's PINNED workflow,
+    mirroring ``_ci_identity``. A bare display-name match would let a same-named
+    check from another app or workflow stand in for the real scanner — the decoy
+    class this file already documents at _ci_identity, and the whole point of
+    this relief is that the mechanical layer really ran.
+
+    Returns False on ANY doubt: a gh error, an unparseable payload, a head that
+    does not match, no entry with that identity, or any conclusion other than
+    SUCCESS. This feeds a merge gate that forces --admin, so an unreadable or
+    ambiguous scan must never read as a pass.
+
+    Tests inject via ``_TEST_GH_ROLLUP_WITH_HEAD`` (a JSON object with
+    ``headRefOid`` and ``statusCheckRollup``).
+    """
+    raw = os.environ.get("_TEST_GH_ROLLUP_WITH_HEAD")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    pr_num,
+                    *_repo_args(repo),
+                    "--json",
+                    "headRefOid,statusCheckRollup",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),  # merge-path budget; fail-closed -> no relief
+            )
+            if result.returncode != 0:
+                return False
+            raw = result.stdout.strip()
+        except Exception:
+            return False
+    if not raw:
+        return False
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    # The rollup and the head come from the SAME read; if that head is not the one
+    # being decided, the rollup describes a different commit and proves nothing.
+    if (data.get("headRefOid") or "").strip().lower() != (head_sha or "").strip().lower():
+        return False
+    rollup = data.get("statusCheckRollup")
+    if not isinstance(rollup, list):
+        return False
+    # Pinned to the ONE workflow the scanner belongs to, not to membership in the
+    # required-CI SET. The set has no meaningful order and several members, so
+    # "some required workflow published a check with this name" is satisfied by a
+    # decoy from an unrelated workflow -- the same identity confusion _ci_identity
+    # documents, one level down.
+    wanted_workflow = (workflow or "").strip().lower()
+    if not wanted_workflow:
+        return False  # an unpinned kind can never be established -> fail closed
+    # Collect EVERY same-identity entry, never the first match. One head can carry
+    # several runs of one job (a re-run after a ruleset change, a superseded
+    # concurrency sibling), and rollup ORDER is not a guarantee -- _pr_ci_status
+    # refuses to trust it for exactly this reason. A first-match read of a
+    # SUCCESS-then-FAILURE pair reports green while the scanner is red, and under
+    # `# ci-override` this relief is the ONLY remaining check of the mechanical
+    # layer. So: at least one matching entry, and NO matching entry that
+    # contradicts SUCCESS.
+    conclusions: list[str] = []
+    for entry in rollup:
+        if not isinstance(entry, dict):
+            continue
+        if (entry.get("name") or "").strip() != check_name:
+            continue
+        entry_workflow = (entry.get("workflowName") or "").strip().lower()
+        if not entry_workflow or entry_workflow != wanted_workflow:
+            continue  # same display name, different (or unidentifiable) workflow
+        conclusions.append((entry.get("conclusion") or "").strip().upper())
+    if not conclusions:
+        return False  # the scanner never ran at this head under that identity
+    return all(c == "SUCCESS" for c in conclusions)
+
+
+def _sha_is_ancestor(ancestor: str, descendant: str, repo: str | None = None) -> bool | None:
+    """Whether *ancestor* is an ancestor of *descendant*, per GitHub's compare API.
+
+    Load-bearing for the relief below. "An earlier head of the same PR" is NOT
+    established by "a sha that differs from the current head": a force-push or a
+    history-rewriting rebase leaves the reviewed commit off the branch entirely,
+    so the PR can carry an entirely different tree while an old accepted marker
+    still names a real commit. Carrying that review forward would vouch for code
+    its reviewer never saw — precisely the inferential leak this irreducible gate
+    exists to catch.
+
+    Returns False on ANY doubt. Only compare ``status == "ahead"`` (the
+    descendant is ahead of the ancestor) counts; "diverged", "behind" and
+    "identical" do not, and neither does an unreadable read.
+
+    Tests inject via ``_TEST_GH_COMPARE_STATUS``: either a bare status applying to
+    every pair, or a JSON object keyed ``"<ancestor>...<descendant>"`` so a test can
+    give different answers per pair. The map form exists because the relief may try
+    SEVERAL candidates against the head (an unreadable one is skipped for the next);
+    with one global value those cells cannot be told apart.
+    """
+    raw = os.environ.get("_TEST_GH_COMPARE_STATUS")
+    if raw is not None and raw.strip().startswith("{"):
+        try:
+            table = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(table, dict):
+            return None
+        found = table.get(f"{ancestor}...{descendant}")
+        if found is None:
+            return None  # unspecified pair -> unreadable, never a silent "ahead"
+        raw = str(found)
+    if raw is None:
+        try:
+            owner_repo = repo or _derive_repo_from_cwd(os.getcwd())
+        except Exception:
+            owner_repo = repo
+        if not owner_repo:
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{owner_repo}/compare/{ancestor}...{descendant}",
+                    "--jq",
+                    ".status",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),  # merge-path budget; fail-closed -> no relief
+            )
+            if result.returncode != 0:
+                return None
+            raw = result.stdout.strip()
+        except Exception:
+            return None
+    status = (raw or "").strip().lower()
+    if not status:
+        return None  # unreadable -> "unknown": the caller may try another candidate,
+        #              and fails closed only if NO candidate verifies
+    return status == "ahead"
+
+
+def _relieve_kinds_by_mechanical_rescan(
+    missing: list[str],
+    accepted: dict[str, set[str]],
+    rejected: dict[str, set[str]],
+    residue: dict[str, set[str]],
+    head: str,
+    pr_num: str,
+    repo: str | None = None,
+) -> tuple[list[str], list[tuple[str, str, str]], dict[str, str]]:
+    """Drop kinds satisfiable by an ANCESTOR ACCEPTED marker + a green scanner at head.
+
+    Returns ``(still_missing, relieved, reasons)``. Each *relieved* entry is
+    ``(kind, ancestor_head_12, check_name)`` -- enough for both the operator note and
+    the report line, so a carried-forward review is never rendered as one made at
+    head. *reasons* maps a kind to WHY relief failed when a carriable marker existed:
+    "the scanner has not finished" and "the scanner FAILED" call for opposite actions
+    (wait vs fix that job), and neither is "re-run the scheduled review", which is
+    what the message says when it only knows the marker sits on another head.
+
+    THE RULE: **any refusal for the kind, anywhere in this PR, denies relief.**
+
+    That is deliberately blunter than the predicate it replaces, which tried to
+    establish that every refusal PREDATED the accepted review it was carrying, via a
+    refusal-vs-candidate ancestry walk. Four review rounds found four different ways
+    that reconstruction was wrong -- too permissive at one round (a refusal at the
+    head overridden by an older acceptance), too strict at the next (an off-branch
+    refusal false-blocking) -- which is the signature of a predicate the available
+    data cannot support. The blunt membership test deletes the whole class: the
+    nested loop, its per-refusal network compares, the merge-budget pressure they
+    created, and the same-SHA collision case.
+
+    Two things make the bluntness affordable rather than merely simpler.
+
+    First, the OWNER'S CHRONOLOGY ALREADY RAN. ``_scheduled_review_marker_scan``
+    resolves the owner's latest decisive statement per (head, kind) before this is
+    reached, so a refusal later answered by a clean verdict AT THAT HEAD never
+    reaches ``rejected`` at all. What lands here is a refusal the owner never
+    retracted at the commit it was made about.
+
+    Second, the head axis is NOT a time axis. A clean review of yesterday's code says
+    nothing about today's, so a later acceptance at an older head must never outrank a
+    refusal -- cross-head resolution may only ever ADD acceptance, never remove a
+    refusal. A predicate that let one refusal be "answered" is exactly a predicate that
+    can remove one.
+
+    MEASURED cost, main's own scan over the 40 most recent PRs (all 40 carry a leaks
+    marker): 14 are relief-eligible -- no accepted marker at head, one elsewhere --
+    and this rule denies none of them; two PRs carry a refused row, both already
+    satisfied at their final head. So the observed price of denying on any refusal
+    is ZERO relief lost, and the fallback for the case that does occur is the
+    override plus a human reading a leak finding -- the right outcome when a leaks
+    review has refused.
+
+    BLOCKING RESIDUE closes the one path that reads `rejected` alone would leave: a
+    blocking finding the scan cannot credit to `rejected` -- a same-timestamp tie
+    (neither map, by design) or a malformed / unknown-kind marker whose body reads as
+    blocking. The scan now returns it STRUCTURALLY (``blocking_residue``, head -> kinds,
+    "" for unattributable, "*" for kind-less), so this predicate denies on it without
+    ever matching prose. An adversarial audit reproduced the hole before this existed:
+    a [P1] body under a 12-char ``head=`` at HEAD -- a producer fault the scan records
+    as observed live -- was carried over by the older clean review. On the 40-PR
+    corpus, 7 PRs carry BENIGN unusable rows (re-posts, a short sha, a superseded
+    refusal) and none carry residue: denying on residue costs nothing measured, where
+    denying on any unusable row would have cost 7/40 on their next push.
+    """
+    relieved: list[tuple[str, str, str]] = []
+    reasons: dict[str, str] = {}
+    for kind in missing:
+        pin = _MECHANICAL_RESCAN_BY_KIND.get(kind)
+        if not pin:
+            continue
+        check_name, workflow = pin
+        # ANY refusal for this kind, at ANY head -> no relief. See THE RULE above.
+        if any(kind in kinds for kinds in rejected.values()):
+            reasons[kind] = (
+                "a scheduled review for this kind was REFUSED in this PR and never "
+                "retracted at the commit it was made about, so no earlier review is "
+                "carried forward -- read that finding rather than re-running the review"
+            )
+            continue
+        # Blocking evidence the scan could not credit to `rejected` -- a same-timestamp
+        # tie at some head, or a malformed / unknown-kind marker whose body reads as
+        # blocking -- is RESIDUE, and it denies exactly as a refusal does, at ANY head:
+        # the finding was never provably retracted, and the head axis is not a time
+        # axis. A "*" entry is a blocking body under no creditable kind: it denies
+        # every kind. This closes the path an adversarial audit REPRODUCED (2026-08-30):
+        # a [P1] body under a 12-char `head=` at HEAD landed in `unusable`, and relief
+        # carried the older clean review straight over it.
+        residue_kinds: set[str] = set()
+        for kinds in residue.values():
+            residue_kinds |= kinds
+        if kind in residue_kinds or "*" in residue_kinds:
+            reasons[kind] = (
+                "a marker in this PR carries a blocking finding that could not be "
+                "credited to a head or a kind (a malformed field, or a verdict tied "
+                "with a clean one), so no earlier review is carried forward -- "
+                "resolve that finding first"
+            )
+            continue
+        candidates = [h for h, kinds in accepted.items() if h != head and kind in kinds]
+        if not candidates:
+            continue  # never accepted anywhere in this PR -> nothing to carry forward
+        # ANY accepted ancestor will do; stop at the first. The previous code took the
+        # LAST candidate to minimise the un-LLM-reviewed delta, and called that
+        # "newest" -- but `accepted` is keyed by SHA and carries no order, so that was
+        # a claim the data does not support (round-4 finding). The safety argument is
+        # the per-head mechanical scan below, never the size of the delta, so nothing
+        # rests on which ancestor is chosen.
+        ancestor = None
+        unreadable = False
+        for candidate in candidates:
+            # The merge path runs these gates sequentially under ONE deadline, and each
+            # compare is a network call. An overrun gets the whole hook SIGKILLed, which
+            # fails toward "the tool runs" and disengages the ENTIRE gate stack. Relief
+            # must never be the thing that spends that budget.
+            if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+                unreadable = True
+                break
+            verdict = _sha_is_ancestor(candidate, head, repo=repo)
+            if verdict is None:
+                # An unreadable compare is "I do not know", not "no". It is recorded,
+                # and the loop moves on: since nothing rests on WHICH accepted ancestor
+                # is carried, a candidate that verifies is not a downgrade from one that
+                # could not be read. Only when no candidate verifies does the unknown
+                # decide the outcome -- closed.
+                unreadable = True
+                continue
+            if verdict:
+                ancestor = candidate
+                break
+        if ancestor is None:
+            reasons[kind] = (
+                "the review history could not be established in the time available"
+                if unreadable
+                else "every accepted review for this kind is off this branch's history"
+            )
+            continue
+        if not _mechanical_scan_is_green(pr_num, head, check_name, workflow, repo=repo):
+            reasons[kind] = (
+                f"an earlier accepted review exists, but '{check_name}' is not green at "
+                f"this head (pending, failed, absent, or unreadable) -- check that job "
+                f"rather than re-running the scheduled review"
+            )
+            continue  # unreadable, absent, wrong workflow, pending or failed -> fail CLOSED
+        relieved.append((kind, ancestor[:12], check_name))
+    relieved_kinds = {k for k, _, _ in relieved}
+    return [k for k in missing if k not in relieved_kinds], relieved, reasons
 
 
 def _check_scheduled_claude_reviewed_head(
@@ -2178,6 +3504,7 @@ def _check_scheduled_claude_reviewed_head(
     repo: str | None = None,
     *,
     force: bool = False,
+    relief_out: list[tuple[str, str, str]] | None = None,
 ) -> str | None:
     """Block a merge unless EVERY required scheduled Claude review (by the repo OWNER)
     has run on the PR's CURRENT head. Returns ``None`` when a valid owner marker for
@@ -2185,11 +3512,46 @@ def _check_scheduled_claude_reviewed_head(
     40-char), else a BLOCK MESSAGE naming the MISSING kinds.
 
     Fail-CLOSED — this gate never passes on absence of positive evidence: if the head
-    cannot be read, or the comment/review fetch errors (``_scheduled_review_markers`` →
+    cannot be read, or the comment/review fetch errors (``_scheduled_review_marker_scan`` →
     None), the merge is BLOCKED. A read that simply does not carry every required kind
     at this head (a routine didn't run, ran on a stale commit, or was rate-limited) also
     blocks. The merge path and the report path share this single fail-closed decision,
     so the report can never issue a false all-clear here.
+
+    WHY THE BLOCK MESSAGE IS AN INVENTORY. Every marker block the scan found is listed
+    under the kind it names with its status — accepted at another head, refused (here or
+    elsewhere), or uncreditable with the reason — and nothing is subtracted from anything.
+    The previous shape partitioned the missing kinds by cause and let one cause per kind
+    win. Across six review rounds every finding on it was the same defect: the winning
+    cause hid a fact the operator needed (a refused [P1] on an older commit, the only
+    evidence a review had ever run, a field that was present but refused). Precedence is
+    the right shape for the VERDICT, which needs one answer; it is the wrong shape for a
+    REPORT, where hiding a true fact is never correct. The one conditional left is a
+    count: a kind with zero rows gets the in-flight note, since "nothing found at all" is
+    the only state where waiting can help.
+
+    The message deliberately reports only what it OBSERVED (which heads carry markers)
+    and hedges the schedule ("generally not re-run"). The routines live OUTSIDE this repo
+    and this gate cannot see their triggers, so an unconditional claim about when they
+    fire would be asserting a guarantee the code cannot back — and would become actively
+    misleading on an install that also runs them on ``synchronize``.
+
+    Head match is EXACT by default, and the code-review classifier must NEVER be
+    reused here: ``_classify_post_review_delta`` judges CODE-REVIEW substantiality by
+    file type and size, and an inferential leak (household/schedule/habit detail, not
+    a token a regex can catch) arrives in exactly the small doc edit it would wave
+    through. That prohibition is unchanged.
+
+    The ONE tolerance that exists is the leak-specific one this docstring used to
+    describe as "tracked separately": ``_relieve_kinds_by_mechanical_rescan`` may
+    carry an ACCEPTED marker forward from an ANCESTOR commit of this PR, but only
+    while the kind's MECHANICAL scanner is green at the exact current head, only
+    never when any refusal or uncreditable blocking finding for that kind exists in the PR, and only for
+    kinds in ``_MECHANICAL_RESCAN_BY_KIND``. It is not a delta tolerance: nothing is
+    judged by how big or how doc-like the change is. It trades a re-read of the
+    inferential layer for a per-head guarantee about the literal layer — strictly
+    more checking than the ``# scheduled-review-override`` it exists to retire,
+    which verifies nothing at all.
 
     SCOPE: this gate enforces ONLY for a merge targeting the configured PUBLIC repo
     (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any other
@@ -2216,7 +3578,8 @@ def _check_scheduled_claude_reviewed_head(
             f"reviews (GitHub query failed).\n"
             f"Retry, or append '# scheduled-review-override' to merge anyway."
         )
-    markers = _scheduled_review_markers(pr_num, repo=repo)
+    scan = _scheduled_review_marker_scan(pr_num, repo=repo, head_sha=head)
+    markers, rejected, unusable, residue = (None, {}, [], {}) if scan is None else scan
     if markers is None:
         return (
             f"could not read PR #{pr_num}'s comments/reviews to verify the scheduled Claude "
@@ -2226,16 +3589,136 @@ def _check_scheduled_claude_reviewed_head(
     kinds_here = markers.get(head, set())
     required = _required_scheduled_review_kinds()
     missing = [k for k in required if k not in kinds_here]
+    if missing:
+        # A kind already ACCEPTED at an earlier head of this PR is satisfied when its
+        # mechanical scanner is green at THIS head (see _MECHANICAL_RESCAN_BY_KIND).
+        missing, relieved, relief_reasons = _relieve_kinds_by_mechanical_rescan(
+            missing, markers, rejected, residue, head, pr_num, repo=repo
+        )
+        if relief_out is not None:
+            relief_out.extend(relieved)
+        # Announce ONLY when relief actually clears the gate. Printing "honouring
+        # the earlier review" while the merge is still denied on another kind
+        # describes a decision that was not made.
+        if not missing:
+            for kind, earlier_head, check_name in relieved:
+                print(
+                    f"NOTE: scheduled '{kind}' review for PR #{pr_num} was accepted at "
+                    f"{earlier_head} (not at head {head[:12]}), but '{check_name}' is green "
+                    f"at this head — honouring the earlier review.",
+                    file=sys.stderr,
+                )
     if not missing:
         return None
+    # The message is an INVENTORY, not a verdict. Every marker block the scan found is
+    # listed under the kind it names, with its status, and NOTHING is subtracted from
+    # anything. The verdict above (block) is the only decision this function makes.
+    #
+    # Six review rounds and nine findings on the previous shape of this message shared
+    # one anatomy: a rule decided which true fact "won" for a kind and the losing fact was
+    # hidden -- a refused [P1] at an older commit hidden by a typo at the current one; the
+    # only evidence that a review had ever run hidden by a stranger's comment; a present
+    # field reported as absent. Each fix moved the rule and the next reviewer found the
+    # next hidden fact. A report has no winners. An operator can read three lines; they
+    # cannot read a line that was deleted for them.
+    #
+    # What follows therefore contains no precedence, no superseding, no attribution
+    # beyond the strict grammar, and no remedy text. The one conditional is a COUNT: a
+    # kind with zero rows gets the in-flight note, because "nothing at all was found" is
+    # the single state where waiting can help; a kind with rows gets a line saying none
+    # of them counts at the current head. Both are facts about the list above them.
+    required_set = set(required)
+    refused_here = rejected.get(head, set())
+    # ADDITIVE to the inventory above, never substitutive. A kind whose RELIEF was
+    # attempted and DECLINED has a specific observed cause -- the mechanical scanner is
+    # still running, or failed, or the carried marker is not an ancestor -- and telling
+    # the operator to re-run the scheduled review is wrong advice in every one of those
+    # states. Rendered as its own line after the per-kind rows (see the return below),
+    # so it adds a fact and hides none: the inventory's own rule.
+    relief_blocked = {k: r for k, r in relief_reasons.items() if k in set(missing)}
+    parts: list[str] = []
+    for kind in missing:
+        # (row text, owner-authored). Accepted/refused rows are owner-authored by
+        # construction -- the scan admits nothing else to those maps.
+        rows: list[tuple[str, bool]] = []
+        # Accepted markers at OTHER heads -- a routine ran, then the head moved.
+        for other_head, kinds in sorted(markers.items()):
+            if other_head != head and kind in kinds:
+                rows.append((f"accepted at a DIFFERENT head ({other_head[:12]})", True))
+        # Refused markers, here and elsewhere. Stated as the fact the scan observed;
+        # the clean-verdict rule that decides "refused" lives in the dev skill, and the
+        # exact verdict string is deliberately NOT quoted here -- a gate that prints the
+        # incantation that makes it pass is explaining how to get past itself.
+        if kind in refused_here:
+            rows.append(
+                (
+                    "a marker IS present at THIS head but was REFUSED: its body reads as "
+                    "carrying a blocking finding ([P1] / HARD BLOCK / an '### ERROR' "
+                    "heading) and no clean-verdict line overrides it",
+                    True,
+                )
+            )
+        for other_head, kinds in sorted(rejected.items()):
+            if other_head != head and kind in kinds:
+                rows.append((f"REFUSED at a DIFFERENT head ({other_head[:12]}), same reason", True))
+        # Blocks that named this kind but could not be counted, each with its reason.
+        for named, reason, owner_authored in unusable:
+            if named == kind:
+                rows.append((f"could not be counted: {reason}", owner_authored))
+        listing = "".join(f"\n      - {r}" for r, _ in rows)
+        # The in-flight note is the ONE conditional, and it is a count over a fact: has
+        # the OWNER posted anything for this kind, at any head, in any state? If so, the
+        # owner's routine has evidently already run and waiting for it cannot help. If
+        # not, nothing the gate can see rules it out -- and a stranger's comment is not
+        # evidence about the owner's routine, so it must not silence the note. On a
+        # public repository that would let any account delete the one line telling a
+        # fresh PR's operator that patience, not an override, is the answer.
+        owner_evidence = any(owner for _, owner in rows)
+        if rows and owner_evidence:
+            parts.append(
+                f"{kind} — {len(rows)} marker block(s) found for this kind, none of which "
+                f"counts at the current head:{listing}"
+            )
+        elif rows:
+            parts.append(
+                f"{kind} — {len(rows)} marker block(s) found for this kind, none of which "
+                f"counts at the current head, and none posted by the repo owner:{listing}"
+                f"\n      No owner marker for this kind at any head. If the PR was just "
+                f"opened, a routine may still be in flight, and waiting is the right move."
+            )
+        else:
+            parts.append(
+                f"{kind} — no marker block found for this kind at any head. If the PR was "
+                f"just opened, a routine may still be in flight, and waiting is the right "
+                f"move."
+            )
+    # Blocks that named no REQUIRED kind. Listed so they are visible, credited to
+    # nothing: deciding which review a block "meant" is a guess, and a guessed kind
+    # steers the reader toward attesting for a review that never ran.
+    unscoped = [(k, r) for k, r, _ in unusable if k is None or k not in required_set]
+    if unscoped:
+        # Every row, never a "+N more": a truncated inventory is a partial one, and the
+        # seventh block is as likely as the first to carry the failed-run suffix.
+        listing = "".join(f"\n      - [{k or 'no kind named'}] {r}" for k, r in unscoped)
+        parts.append(
+            f"unscoped — {len(unscoped)} marker block(s) name no required kind and count "
+            f"toward nothing:{listing}"
+        )
     return (
         f"scheduled Claude review(s) missing at head {head[:12]}: {', '.join(missing)} "
         f"(required: {', '.join(required)}; present: "
         f"{', '.join(sorted(kinds_here)) or 'none'}).\n"
-        f"Each routine posts a comment/review carrying "
-        f"'<!-- genesis-scheduled-review: head=<sha> kind=<name> -->' once it runs on THIS "
-        f"exact commit — wait for the missing routine(s) to run on the current head, or "
-        f"append '# scheduled-review-override' to merge without them."
+        + "".join(f"  * {p}\n" for p in parts)
+        + (
+            "".join(
+                f"  (relief for '{k}' was attempted and declined: {r}.)\n"
+                for k, r in sorted(relief_blocked.items())
+            )
+        )
+        + "A marker is a comment/review by the repo OWNER carrying "
+        f"'<!-- genesis-scheduled-review: head={head} kind=<name> -->' — the FULL 40-hex "
+        "head, exactly as written here.\n"
+        "Or append '# scheduled-review-override' to merge without the missing review(s)."
     )
 
 
@@ -2307,6 +3790,529 @@ def _repo_default_branch(repo: str | None = None) -> str | None:
             return None
     name = (raw or "").strip()
     return name or None
+
+
+#: The pin file the receipt gate compares. Kept here (not imported) so a missing
+#: checker module degrades to a NOTE rather than an import error at hook load.
+_PIN_FILE_PATH = "scripts/lib/cc_version.sh"
+
+
+def _load_pin_receipt_checker():
+    """Import scripts/check_cc_pin_receipts.py, or None if unavailable.
+
+    Lazy and failure-tolerant on purpose: the checker is a sibling script, not a
+    package, and a hook that cannot import it must not stop being a merge gate
+    for everything else.
+    """
+    import importlib.util
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    path = os.path.join(repo_root, "scripts", "check_cc_pin_receipts.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_cc_pin_receipts", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # Registered before exec: @dataclass resolves its module from sys.modules.
+        sys.modules["_cc_pin_receipts"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+#: `_pin_file_at_ref` outcomes, split by FAIL DIRECTION rather than by how the read
+#: happened to fail. Three of the four are facts about the PR's CONTENT and BLOCK;
+#: exactly one is a failure of our own PLUMBING and does not.
+#:
+#:   OK           the bytes are in hand (an EMPTY file is OK — it exists, and an
+#:                empty pin is an unparseable pin, which the checker already blocks)
+#:   ABSENT       the API answered and the file is not at that ref            -> BLOCK
+#:   UNDECODABLE  the file IS at that ref and its bytes cannot be obtained    -> BLOCK
+#:   UNREADABLE   the read itself failed: no slug, timeout, auth, transport,
+#:                a non-JSON body, a ref that does not resolve                -> NOTE
+#:
+#: UNDECODABLE was folded into UNREADABLE until 2026-08-28, which put two CONTENT
+#: facts on the plumbing side: a blob over GitHub's 1MB inline limit (`"encoding":
+#: "none"`) and a blob whose base64 will not decode. Both say something about what
+#: the PR contains, so a forward pin move carrying either reported NOT-verified
+#: instead of blocking. That is the same shape as the deleted-vs-emptied pin bug this
+#: gate was built to close — one condition, two enforcements, one of them a fail-open
+#: — reintroduced one level down, in the classifier rather than the caller.
+#:
+#: The fix is NOT "make UNREADABLE block". Plumbing must stay non-blocking: a gate
+#: that refuses every merge whenever a read comes back unusable once walled off 50
+#: merge-gate cases at a stroke, and it guards a pin bump only.
+_PIN_OK = "ok"
+_PIN_ABSENT = "absent"
+_PIN_UNDECODABLE = "undecodable"
+_PIN_UNREADABLE = "unreadable"
+#: Test-seam sentinels for every NON-content outcome (mirroring `_TEST_GH_PR_FILES`'s
+#: `__error__`). Each gets its own, because a seam that cannot express an outcome the
+#: live path produces hides exactly the distinction it exists to exercise. Any other
+#: seam value — including the EMPTY STRING — is content.
+_PIN_SEAM_ABSENT = "__absent__"
+_PIN_SEAM_UNDECODABLE = "__undecodable__"
+_PIN_SEAM_UNREADABLE = "__unreadable__"
+
+
+def _git_blob_sha(text: str) -> str:
+    """The git blob SHA of ``text`` — what the contents API reports as ``sha``.
+
+    Used only by the test seam, and computed the REAL way rather than hashed some
+    convenient other way, so a seam-driven test exercises the same identity relation
+    production does: same content ⇒ same SHA, different content ⇒ different SHA.
+    """
+    data = text.encode("utf-8")
+    return hashlib.sha1(b"blob %d\x00%s" % (len(data), data)).hexdigest()  # noqa: S324
+
+
+def _pin_file_at_ref(
+    ref: str, repo: str | None, *, seam: str
+) -> tuple[str | None, str, str | None]:
+    """``(contents, outcome, blob_sha)`` for the pin file at ``ref``, via the API.
+
+    ``blob_sha`` is the identity of the file as a whole, and it is the ONLY sound
+    answer to "did this PR touch the pin?" when the contents cannot be read. The
+    contents API returns it even when it withholds the content — MEASURED against
+    a 1.62MB blob in this repo: ``{"encoding":"none","content":"","sha":"1419cf30…"}``.
+    ``None`` means no blob was identified (absent, or the read failed), and two
+    ``None`` SHAs are NEVER equal for this purpose.
+
+    Used for BOTH sides of the comparison — one code path, so the head and base
+    reads cannot drift apart in their fail direction (they did: the base side used
+    a hardcoded local ``git show origin/main``, which is neither bound to the repo
+    being merged into nor to the PR's actual base branch. On a checkout whose
+    ``origin`` is a fork, a genuine forward bump could read as a DOWNGRADE and be
+    exempted).
+
+    NOT from the local checkout: the gate runs from the main worktree, which is on
+    main, so the PR's version of the file is not on disk here. That is also the
+    property making this gate un-editable by the PR — only the DATA comes from the
+    PR, never the code reading it.
+    """
+    raw = os.environ.get(seam)
+    if raw is not None:
+        # The seam mirrors the live path's THREE outcomes, so a test cannot see
+        # behaviour production is incapable of producing. Both non-content outcomes
+        # need their own sentinel, because with the JSON form an EMPTY STRING is a
+        # legitimate third thing — a file that exists and is empty — and collapsing
+        # it into either sentinel would hide the very distinction this seam exists
+        # to exercise.
+        #
+        # The blob SHA is a SECOND seam (``<seam>_SHA``) rather than something derived
+        # from the sentinel, because the whole point of carrying a SHA is that two
+        # unreadable blobs can still be different. A test that cannot set them apart
+        # cannot exercise the case that made this necessary.
+        blob = os.environ.get(f"{seam}_SHA") or None
+        if raw == _PIN_SEAM_ABSENT:
+            return None, _PIN_ABSENT, None  # nothing at the path: there is no blob
+        if raw == _PIN_SEAM_UNDECODABLE:
+            return None, _PIN_UNDECODABLE, blob
+        if raw == _PIN_SEAM_UNREADABLE:
+            return None, _PIN_UNREADABLE, blob
+        # Content present: derive the SHA the real way unless the test pins one, so
+        # identical seam text is identical to the gate exactly as it would be live.
+        return raw, _PIN_OK, blob or _git_blob_sha(raw)
+    # Resolution order matters. `_canonical_public_repo()` reads install config and
+    # is legitimately absent on an install that never set `github.*` — the merge
+    # gate treats that as "uncertain, enforce", so falling back to the repo the
+    # process is actually in keeps the gate WORKING rather than silently
+    # unverifying on every such install (measured: it returned None here).
+    # Inside the try, not above it. These three read install config, run git and touch
+    # the filesystem, so any of them CAN raise — a malformed genesis.yaml is enough.
+    # Uncaught, the exception left this function, left `_check_pin_receipts` (which
+    # wraps only the checker call, not the reads), and left the hook: a crashing merge
+    # gate, which is the wedge in its least recoverable form. MEASURED: a raising
+    # `_canonical_public_repo` propagated all the way out.
+    try:
+        slug = (_normalize_repo(repo) if repo else None) or _canonical_public_repo()
+        if not slug:
+            slug = _derive_repo_from_cwd(os.getcwd())
+    except Exception:  # noqa: BLE001 — resolving WHERE to read is plumbing
+        return None, _PIN_UNREADABLE, None
+    if not slug:
+        return None, _PIN_UNREADABLE, None
+    try:
+        result = subprocess.run(
+            # The JSON representation, NOT `Accept: raw`. Raw returns bytes, and bytes
+            # cannot distinguish "the file is not there" from "the file is empty" from
+            # "the response was truncated" — all three arrive as an empty body, which
+            # forced the previous revision to GUESS from gh's stderr wording. The JSON
+            # form answers directly: `type` and `size` are facts about the tree, and a
+            # missing path is a 404. MEASURED: a present file returns
+            # {"name":…, "size":21747, "type":"file"}; an absent path returns 404.
+            ["gh", "api", f"repos/{slug}/contents/{_PIN_FILE_PATH}?ref={ref}"],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+    except Exception:
+        return None, _PIN_UNREADABLE, None
+    if result.returncode == 0:
+        try:
+            payload = json.loads(result.stdout or "")
+        except Exception:
+            # A zero exit whose body is not JSON is a stub or a truncated response —
+            # plumbing. This is the shape a test router's no-op reply takes, and it
+            # must not read as a fact about the tree.
+            return None, _PIN_UNREADABLE, None
+        if not isinstance(payload, dict):
+            # A directory lists as an ARRAY. Either way the pin file is not at this
+            # path, which is a fact about the PR's content.
+            return None, _PIN_ABSENT, None
+        blob = payload.get("sha") or None
+        if payload.get("type") != "file":
+            return None, _PIN_ABSENT, None  # a submodule/symlink-to-dir is not the pin
+        if payload.get("encoding") != "base64":
+            # >1MB blobs come back with encoding "none" and no content. Not absence —
+            # the file is there. But it is still a fact about what the PR CONTAINS,
+            # not about our plumbing: the API answered successfully and told us the
+            # pin is too large to read inline. A release whose pin nobody can
+            # characterise is the thing this gate exists to refuse.
+            return None, _PIN_UNDECODABLE, blob
+        try:
+            text = base64.b64decode(payload.get("content") or "").decode("utf-8")
+        except Exception:
+            # STRICT decode, deliberately. The previous revision decoded with
+            # "replace" and argued that non-UTF-8 was therefore not an error because
+            # "the checker's own unparseable-pin rule judges it". It does not: the
+            # replacement makes the file PARSEABLE, so that rule never fires.
+            # MEASURED — a head holding a valid ASCII `CC_VERSION` assignment plus a
+            # single 0xff byte in a comment decoded to a clean pin and took the
+            # BACKWARD-rollback exemption, while the local adapter classified the very
+            # same bytes as a blocking content fault. One repository state, two
+            # opposite verdicts, with the AUTHORITATIVE path taking the permissive one.
+            #
+            # Both failure modes land here now — b64decode failing, and bytes that are
+            # not UTF-8 — and both are facts about the blob in the PR's tree rather
+            # than about this read, which is what `_PIN_UNDECODABLE` already means for
+            # an over-1MB blob. Blocking at the head is the same answer
+            # `read_pin_at`/`read_pin_head` give for the identical condition.
+            return None, _PIN_UNDECODABLE, blob
+        # An EMPTY file is returned as content, deliberately, not as a state of its
+        # own. It exists, so it is not absent — and an empty pin is an UNPARSEABLE
+        # pin, which the checker's own policy already blocks. Classifying it here
+        # would duplicate that policy in the wiring, which is how the previous
+        # revision came to block a DELETED pin file while waving through one
+        # truncated to nothing: the same condition, enforced two different ways.
+        return text, _PIN_OK, blob
+    # Non-zero. With the JSON form the only ambiguity left is which THING was not
+    # found, and gh names the ref case explicitly. MEASURED against the live API:
+    #   bad ref      -> gh: No commit found for the ref <sha> (HTTP 404)
+    #   missing file -> gh: Not Found (HTTP 404)
+    #   bad repo     -> gh: Not Found (HTTP 404)
+    # A bad ref is PLUMBING. Missing-file and missing-repo share one message — GitHub
+    # will not separate them, so as not to leak whether a private repo exists — but
+    # this gate is reached only after the head sha and base ref were read SUCCESSFULLY
+    # from that same repo, so the repo is known good by then and a bare Not Found is
+    # the path being absent.
+    stderr = (result.stderr or "").lower()
+    if "no commit found for the ref" in stderr:
+        return None, _PIN_UNREADABLE, None
+    if "not found" in stderr:
+        return None, _PIN_ABSENT, None
+    return None, _PIN_UNREADABLE, None
+
+
+def _pin_blob_unchanged(
+    head_state: str, head_blob: str | None, base_state: str, base_blob: str | None
+) -> bool:
+    """True only when the pin file is PROVABLY the same at both refs.
+
+    Two ways to prove it, and no third: the same blob SHA, or nothing at the path on
+    either side. Anything else — including two reads that both failed — is NOT proof
+    and must return False, because the caller treats True as "this PR cannot have
+    moved the pin" and skips every remaining check on that basis.
+
+    The predicate this replaced compared the two CONTENT values. Those are both
+    ``None`` for every state in which content is unavailable, so it answered True
+    for two DIFFERENT oversized blobs, and a PR swapping one >1MB pin file for
+    another slipped past the head-side block. An identity test whose inputs are
+    absent is not an identity test; it is a coincidence of sentinels.
+
+    A DEGRADED fallback, used only when the PR's changed-file list is unavailable or
+    truncated. It compares two REFS, and two refs can differ for reasons that are not
+    this PR's doing: a PR that branched before the base's pin last changed still
+    carries the older blob, so this reports "changed" for a PR whose merge will not
+    touch the file at all. That is why the changed-file list is asked first — it is
+    computed against the merge base and answers about the PR rather than about two
+    moving tips. Reviewers have raised this comparison twice; it is a known and
+    bounded degradation, not the primary path.
+    """
+    if head_state == base_state == _PIN_ABSENT:
+        return True  # no blob on either side: there is nothing that could differ
+    return bool(head_blob) and head_blob == base_blob
+
+
+def _pr_edits_pin_file(pr_num: str, repo: str | None) -> bool | None:
+    """Does this PR's DIFF touch the pin file? ``None`` when that cannot be determined.
+
+    The authoritative form of "did this PR touch the pin", and it replaced comparing
+    the head tree against the base TIP. Those differ for any PR that simply branched
+    earlier than the base's latest pin change — the head still carries the older blob
+    — even though a three-way merge keeps the base's version and never touches the
+    file. Comparing tips therefore reported such a PR as having edited the pin, and if
+    the newer base pin was malformed it demanded release receipts from exactly the
+    stale, unrelated PRs the wedge fix exists to unblock.
+
+    GitHub computes the changed-file list against the MERGE BASE, which is what the
+    merge itself uses, so it answers the question directly rather than inferring it
+    from two moving trees.
+
+    Delegates to ``_pr_changed_files`` rather than reading the endpoint again. The
+    first version of this did re-read it, with its own parser and its own reading of
+    the ``_TEST_GH_PR_FILES`` seam — which that function already owns, in a different
+    format. The seam's real contents parsed to "no pin file here", so the gate
+    concluded the pin was untouched and skipped ITSELF. Two readers of one seam is
+    how a security gate silently turns off; there is one reader.
+    """
+    files = _pr_changed_files(pr_num, repo=repo)
+    if files is None:
+        return None  # API error, malformed page, or the 3000-row cap — cannot say
+    return _PIN_FILE_PATH in files
+
+
+def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
+    """The PR body. ``None`` means unreadable — distinct from an EMPTY body,
+    which is a real state that determines the answer by itself."""
+    raw = os.environ.get("_TEST_GH_PR_BODY")
+    if raw is not None:
+        return raw
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", pr_num, *_repo_args(repo), "--json", "body", "--jq", ".body"],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(6),
+        )
+    except Exception:
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
+    """Block a PR that moves the Claude Code pin FORWARD without its gate receipts.
+
+    THIS is the authority for the receipt gates, not a CI status. The body is
+    mutable after any CI run finishes, so a status describing it is a claim about
+    the past; read at merge time there is no window to edit it afterwards. The
+    CI job runs the same checker with ``--advisory`` purely for early feedback.
+
+    BOTH sides are read through the API, against the repo actually being merged
+    into and the PR's OWN base branch. An earlier revision read the base with a
+    local ``git show origin/main`` — not bound to the merge target and hardcoding
+    the branch name — so from a checkout whose ``origin`` is a fork (or whose
+    ``origin/main`` is simply unfetched) the comparison ran against the wrong base,
+    and a fork sitting on a HIGHER pin turned a genuine forward bump into a
+    "downgrade" that the gate exempts. Head still comes through the API, so the
+    code doing the reading is always main's copy.
+
+    TWO AXES decide the fail direction, and they are independent.
+
+    CONTENT vs PLUMBING. A fact about the PR's content blocks; a failure of this
+    gate's own plumbing does not. An earlier revision phrased that first case as
+    "the pin cannot be READ", which OVERLAPS the plumbing case on the one state
+    that matters, and the code resolved the overlap fail-open — a >1MB pin blob
+    (the API answers ``"encoding": "none"``) took the plumbing path. Hence the
+    distinct UNDECODABLE outcome: present in the tree, bytes unobtainable, which is
+    a fact about the PR.
+
+    HEAD vs BASE. **No base-side condition returns a verdict of its own.** Base
+    state belongs to ``main``: every open PR inherits it, no PR can repair it
+    through this gate, and this gate has no override sigil — so a strict base rule
+    wedges the repository rather than refusing one merge. But the base is not
+    therefore harmless to ignore. It is an INPUT to the direction comparison, and
+    when it cannot supply one, the checker requires the receipts in place of that
+    comparison (``direction_verified=False``) instead of passing. A PR that repairs
+    a malformed base and bundles a forward release in the same change is otherwise
+    invisible to everything: its merge tree carries the REPAIRED pin, so lockstep
+    passes and CI is green.
+
+    THREE QUESTIONS, IN ORDER, and the order is the design
+    ------------------------------------------------------
+    Replaced (2026-08-29) a cascade of early returns over the product of
+    (head state × base state × parse outcome). Four cells of that product were found
+    to answer wrongly, across four review rounds — the signature of a shape that
+    generates bugs, not of four bugs. Each question below is answered from the
+    strongest evidence available for it, and none may be answered out of order:
+
+      1. **Did this PR touch the pin file?** From the PR's own changed-file list,
+         which GitHub computes against the MERGE BASE — the same thing the merge
+         uses. Falls back to the blob SHA when that list is unavailable or
+         truncated, and NEVER to the file contents: those are both ``None``
+         whenever a read fails, so two different oversized blobs compared equal and
+         reported an untouched pin.
+      2. **Is the head pin usable?** Asked before any base-side branch runs. An
+         earlier revision could return a base-side note first, so a PR introducing
+         an empty pin file over an absent base merged with no usable pin at all.
+      3. **Which direction, and are the receipts there?** Delegated whole to the
+         checker, with a base-side fault passed as an INPUT rather than returned on
+         — and with CONTENT (requires receipts) still distinguished from PLUMBING
+         (non-blocking note), which is the axis above applied to the base side.
+    """
+    checker = _load_pin_receipt_checker()
+    if checker is None:
+        return False, "NOTE: pin-receipt checker not importable — receipts NOT verified."
+
+    head_sha = _pr_head_sha(pr_num, repo=repo)
+    if not head_sha:
+        return False, "NOTE: PR head unreadable — pin receipts NOT verified."
+
+    base_ref = _pr_base_ref(pr_num, repo=repo)
+    if not base_ref:
+        return False, "NOTE: PR base ref unreadable — pin receipts NOT verified."
+
+    # The head-side read targets the PR HEAD. A revision of this gate read GitHub's
+    # projected merge commit instead, to catch a file that only becomes unpublishable
+    # once merged — the base gains a second CC_VERSION assignment after the PR
+    # branches, the PR edits the original, git merges both lines cleanly, and the
+    # result has no statable pin. That case is real, and the mechanism was reverted
+    # anyway, for two reasons worth keeping written down:
+    #
+    #   * Its fallback fired only when GitHub reported NO merge commit, never when
+    #     reading AT one failed. A failed read fell through to the plumbing NOTE, so
+    #     a slow contents API turned an unreceipted forward bump into a merge. This
+    #     gate runs late in a shared wall-clock budget and `_gh_timeout` floors at
+    #     1s, which makes "slow" the ordinary case rather than the exotic one.
+    #   * It was the gate's SEVENTH network read, and every failure mode on this
+    #     path is fail-open. Each read added is another independent chance to allow,
+    #     so gathering more evidence was making the gate less reliable, not more.
+    #
+    # The merge-tree case is tracked separately, to be built with its tests first.
+    head_text, head_state, head_blob = _pin_file_at_ref(
+        head_sha, repo, seam="_TEST_GH_HEAD_PIN_FILE"
+    )
+    base_text, base_state, base_blob = _pin_file_at_ref(
+        base_ref, repo, seam="_TEST_GH_BASE_PIN_FILE"
+    )
+
+    # ── 1. DID THIS PR TOUCH THE PIN FILE AT ALL? ──
+    # An untouched file cannot have moved the pin, whatever state it is in, so this is
+    # the one question worth asking before anything is parsed — and the only one that
+    # CAN be asked when nothing parses. Without it, a broken pin on the base wedges the
+    # repo through the HEAD rule: a PR that never touches cc_version.sh inherits the
+    # broken file at its own head. MEASURED before this existed: with an emptied pin on
+    # the base, every PR that left the file alone was blocked.
+    #
+    # Answered FIRST from the PR's own changed-file list, which GitHub computes against
+    # the MERGE BASE. Comparing the head tree with the base TIP instead gets one class
+    # wrong: a PR that branched before the base's latest pin change still carries the
+    # older blob at its head, so the two tips differ even though the merge will keep
+    # the base's version and never touch the file. With a malformed new base pin, that
+    # demanded receipts from exactly the stale unrelated PRs this wedge fix unblocks.
+    #
+    # The blob SHA remains the FALLBACK for when that list is unavailable or truncated
+    # — never the file CONTENTS, which are both None for every unreadable state, so
+    # "unchanged" got concluded from two reads having failed and two DIFFERENT >1MB
+    # blobs bypassed the head-side block.
+    #
+    # Asked UNCONDITIONALLY, including when both sides read cleanly. Scoping it to the
+    # unreadable states looks like an optimisation and is a bug: an EMPTY pin file is a
+    # successful read (state OK, content ""), so an empty pin on `main` left both sides
+    # OK, skipped this question, and blocked every PR on "the head pin is unparseable" —
+    # the very wedge this exists to prevent, rebuilt out of the other three states.
+    # MEASURED: both-empty and both-double-assigned each blocked until this became
+    # unconditional.
+    edits_pin = _pr_edits_pin_file(pr_num, repo)
+    if edits_pin is False or (
+        edits_pin is None and _pin_blob_unchanged(head_state, head_blob, base_state, base_blob)
+    ):
+        named = ""
+        if head_text is not None:
+            try:
+                # Public on the checker module (re-exported from scripts/ci). Best-effort
+                # cosmetics only: an unparseable pin is exactly the case that reaches
+                # here, so a failure to name it must not change the outcome.
+                value = checker.parse_cc_version(head_text)
+            except Exception:  # noqa: BLE001 — message text, not policy
+                value = None
+            if value:
+                named = f" ({value})"
+        # Name the EVIDENCE, not just the conclusion. The two paths are not equally
+        # strong — the PR's file list is authoritative, the blob comparison is an
+        # inference from two tips — and a reader deciding whether to trust a pass on a
+        # release gate needs to know which one answered.
+        why = (
+            "it is not among the files this PR changes"
+            if edits_pin is False
+            else "the same blob at the head and the base (changed-file list unavailable)"
+        )
+        return False, (
+            f"CC pin{named}: {_PIN_FILE_PATH} is unchanged by this PR — {why}, so it "
+            f"cannot have moved the pin. No receipts "
+            f"required.{'' if head_state == _PIN_OK else f' (The file is in state {head_state!r}, which is a fault in {base_ref}, not in this PR.)'}"
+        )
+
+    # ── 2. IS THE HEAD PIN USABLE? ──
+    # Every base-side branch used to sit ABOVE this, so a non-OK base short-circuited
+    # the head check entirely: an empty pin file introduced over an absent base reached
+    # the base's NOTE and merged, with no usable pin at the head and this gate — which
+    # has no override sigil precisely so it cannot be waived — reporting success.
+    if head_state == _PIN_ABSENT:
+        return True, (
+            f"BLOCKED: {_PIN_FILE_PATH} is ABSENT at the PR head ({head_sha[:12]}). The pin "
+            f"cannot be read, so whether this PR moves it forward cannot be established — "
+            f"and a PR that removes the pin file is exactly the case this gate must not "
+            f"wave through. Restore it: this gate has NO override sigil by design, so an "
+            f"intended removal needs the file restored in a separate change, not a waiver."
+        )
+    if head_state == _PIN_UNDECODABLE:
+        return True, (
+            f"BLOCKED: {_PIN_FILE_PATH} is present at the PR head ({head_sha[:12]}) but its "
+            f"contents could not be decoded — over GitHub's 1MB inline limit, or a blob that "
+            f"is not the base64 the API declared. The pin therefore cannot be read, so "
+            f"whether this PR moves it forward cannot be established. This is a fact about "
+            f"the PR's content, not a transport failure."
+        )
+    if head_text is None:
+        return (
+            False,
+            f"NOTE: could not read {_PIN_FILE_PATH} at the PR head — receipts NOT verified.",
+        )
+
+    # ── 3. WHICH DIRECTION, AND ARE THE RECEIPTS THERE? ──
+    # The base gets NO branch of its own. Whatever went wrong with it arrives at the
+    # checker as `base_pin_text=None`, which is a missing INPUT, not a verdict: the
+    # checker then requires the receipts in place of the comparison it could not run.
+    # Returning here instead — which is what the three deleted branches above did —
+    # let a PR that repairs the base and bundles a forward release merge unreceipted,
+    # a case CI cannot see because the merge tree carries the repaired file.
+    body = _pr_body_text(pr_num, repo)
+    if body is None:
+        return False, "NOTE: PR body unreadable — pin receipts NOT verified."
+
+    try:
+        verdict = checker.evaluate(
+            base_pin_text=base_text,
+            head_pin_text=head_text,
+            body=body,
+            # CONTENT vs PLUMBING, preserved across the boundary. `base_text` is None
+            # for BOTH a base whose content is faulty and a base we simply could not
+            # read, and those take opposite fail directions — so the distinction has
+            # to travel with the value rather than be re-derived from it.
+            base_unreadable=(base_state == _PIN_UNREADABLE),
+        )
+    except Exception as exc:  # noqa: BLE001 — plumbing, not policy
+        return False, f"NOTE: pin-receipt check errored ({type(exc).__name__}) — NOT verified."
+
+    # NORMALISE the non-blocking verdict that did not actually compare anything, so it
+    # reads like every other fail-open on this path. The merge arm prints a message only
+    # when it is marked as a note, and a base-side fault that merged silently is
+    # precisely the outcome this whole change exists to make visible. A genuine PASS
+    # ("pin unchanged", "moves backward", "receipts present") is NOT marked — it has
+    # nothing to warn about. `getattr` so an older checker on disk (this gate always
+    # runs main's copy, but a partial deploy is a real state) degrades to un-noted
+    # rather than raising inside the gate.
+    if not verdict.blocked and not getattr(verdict, "direction_verified", True):
+        # "Receipts NOT verified" is what every other fail-open on this path says, and
+        # it is WRONG here: this is the one pass where the receipts were checked and
+        # found present, and the DIRECTION is what went unverified. The message read
+        # "both gate receipts are present … Receipts NOT verified." — a contradiction
+        # at the only surface a human reads before merging.
+        return False, f"NOTE: {verdict.message} Pin DIRECTION not verified."
+
+    return verdict.blocked, verdict.message
 
 
 def _check_base_is_default(
@@ -3179,10 +5185,89 @@ def main() -> int:
         # quoted mentions excluded). Each guarded subcommand is matched on real
         # argv, and the `# review-override` approval binds to its OWN segment.
         segs = analyze(cmd)
+
         push_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "push"]
         merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
+
+        # ── Blind-spot net: unverifiable near a gated op → ask a human ──────
+        # analyze()/_argv degrade to a naive split SILENTLY, so an empty segment
+        # list is NOT evidence that no gated command is present: an ANSI-C
+        # `$'…\'…'` span, or an apostrophe in a here-doc body, is enough to drop
+        # a real, executing `git push --force` from the parse (reproduced on both
+        # guards). When the raw text names a gated op, the command will not
+        # tokenize, and the parse surfaced NO matching segment, the verdict is
+        # "unknown" — which earns a human decision, not a silent allow.
+        #
+        # ASK rather than BLOCK is load-bearing. A refusal has to be surgically
+        # precise about which unparseable commands are real, and precision is
+        # exactly what an unreliable parse cannot deliver — every narrowing
+        # conjunct became a new way to starve the trigger, while over-blocking
+        # broke benign shapes. Asking inverts the costs: a false positive is one
+        # confirmation, a miss is the pre-existing status quo. That is what lets
+        # the predicate stay broad.
+        #
+        # The reason is DEFERRED to the tail (like ask_reason / push_allow_reason
+        # above) so every hard block below — sqlite writes, --no-verify, the
+        # dispatched publish denies, the escalation cap — still takes precedence.
+        # Returning here would DOWNGRADE those to a prompt (measured).
+        # The segment check names ALL FOUR gated ops, not the three the first cut
+        # listed. `create_segs` is LOAD-BEARING — do not remove it.
+        #
+        # An earlier version of this comment claimed the opposite: that it was
+        # symmetry only, and mutation-tested to change no verdict. That claim was
+        # WRONG, and wrong in the direction that invites deleting the conjunct.
+        # Its four cells varied parse state (interactive/dispatched x
+        # parsed-create x untokenizable) and held the GATE OUTCOME fixed, so they
+        # all assumed a create that was already gated. The axis that matters is
+        # whether the create is gated at all: for one the real gate ALLOWS (a
+        # branch already on the remote, so no publish risk), dropping this
+        # conjunct lets the net fire on an untokenizable-but-benign create and
+        # turns an allow into a prompt, or into a refusal when unattended.
+        #
+        # A mutation test proves nothing about an axis its cells do not vary.
+        blind_spot_reason: str | None = None
+        if (
+            not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
+            and untokenizable(cmd)
+            and _mentions_gated_op(cmd)
+        ):
+            if _is_dispatched():
+                # No human is present to answer a prompt, and an unverifiable
+                # gated command must not proceed unattended. Mirrors the
+                # dispatched deny legs on the push / pr-create asks below.
+                print(
+                    "BLOCKED: this command cannot be parsed safely (e.g. "
+                    "ANSI-C $'...' quoting) and names a gated operation. "
+                    "Autonomous sessions cannot proceed on an unverifiable "
+                    "command.\n"
+                    "To proceed: if you are WRITING TEXT (a commit message, a "
+                    "plan, review notes) whose content merely mentions push or "
+                    "merge, use the Write tool instead of a here-doc — the "
+                    "apostrophe in ordinary prose is what makes this "
+                    "unparseable, and no amount of re-quoting a here-doc fixes "
+                    "it. If you are RUNNING a git command, rewrite it in a "
+                    "directly-parseable form (plain quotes, or -F <file>).",
+                    file=sys.stderr,
+                )
+                # The advice above is load-bearing, not decoration. An
+                # unattended session cannot ask what it did wrong, so a refusal
+                # it cannot act on is a wall rather than a cost — which is the
+                # whole basis for refusing here at all. MEASURED: the dominant
+                # real shape that reaches this leg is prose-to-a-file, and the
+                # previous message's only suggestion ("rewrite it in a
+                # directly-parseable form") does not apply to it.
+                return 2
+            blind_spot_reason = (
+                "This command could not be parsed safely (e.g. ANSI-C $'...' "
+                "quoting) and mentions a gated operation (push / merge / "
+                "gh pr create / --force / --no-verify / --admin), so the guard "
+                "cannot verify "
+                "what it would actually run. Approve only if you are sure. To "
+                "avoid the prompt, rewrite it in a directly-parseable form "
+                "(plain quotes, or -F <file>)."
+            )
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
         # command carrying more than one would collapse into ONE ask/gate
@@ -3498,7 +5583,9 @@ def main() -> int:
                 # pre-gate repo/PR resolution above (6s each) — carries a tight
                 # per-call timeout (6-8s): pre-gates + fail-closed gates
                 # (derive 6 + resolve 6 + mergeable 8 + ci 8 + base 6+6 +
-                # freshness 6+8 + delta 8 = 62s absolute worst) each reach
+                # freshness 6+8 + delta 8 = 62s absolute worst; the FORCE
+                # branch swaps freshness+delta for its hook-surface evidence
+                # reads, files 8 + head 6 = strictly less) each reach
                 # their own block/allow decision at or inside the budget, and
                 # any ONE of them timing out fail-closes IMMEDIATELY (the
                 # additive worst case needs every call slow-but-successful);
@@ -3604,6 +5691,32 @@ def main() -> int:
                         "(consciously accepted).",
                         file=sys.stderr,
                     )
+                # "incomplete" = a NON-empty rollup whose present checks are green, but
+                # a REQUIRED workflow (default "CI") contributed no verdict — e.g. a
+                # lone green CodeQL after a workflow-specific trigger drop (#1484-P2).
+                # Same scoping + valve as "absent": canonical repo only, # ci-override.
+                elif ci_state == "incomplete" and _scheduled_gate_applies(merge_repo):
+                    if not ci_override:
+                        print(
+                            f"BLOCKED: required CI workflow(s) missing from PR "
+                            f"#{pr_num}'s check rollup: {', '.join(ci_bad[:6])}. The "
+                            "checks that ARE present are green, but the required "
+                            "workflow never ran — most often a workflow-specific "
+                            "trigger drop (push a commit or re-run the workflow to "
+                            "re-fire) or a fully-skipped suite. The required set comes "
+                            "from merge_gate.required_ci_workflows in "
+                            "~/.genesis/config/genesis.yaml (default: CI). If you are "
+                            "intentionally merging without it, append a trailing "
+                            "'# ci-override' (logged).",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    print(
+                        f"NOTE: required CI workflow(s) missing on #{pr_num} "
+                        f"({', '.join(ci_bad[:6])}) — merging via # ci-override "
+                        "(consciously accepted).",
+                        file=sys.stderr,
+                    )
 
                 force_override = merge_seg.override
                 # The review-CONTEXT waiver (freshness + base gates) is a SEPARATE
@@ -3632,6 +5745,40 @@ def main() -> int:
                     )
                     print(base_msg, file=sys.stderr)
                     return 2
+
+                # Pin receipts. This is the AUTHORITY for the two release gates
+                # (changelog read, local-first soak), deliberately not a CI
+                # status: the PR body stays mutable after a check run finishes,
+                # so only a merge-time read describes the body that merges. It
+                # also runs main's copy of the checker, so a PR cannot edit the
+                # code that gates it.
+                #
+                # NO override sigil, deliberately. Every sigil here waives exactly
+                # ONE gate so a waiver cannot silently disarm an unrelated one, so
+                # reusing # review-override (which waives the FINDING scans) would
+                # be exactly that. And a dedicated sigil would be an escape from a
+                # demand that takes seconds to satisfy honestly: if a gate really
+                # was not run, the action is to run it, not to wave it through.
+                # Incident recovery is already covered — a BACKWARD pin is exempt
+                # by construction, with no syntax to recall under pressure.
+                should_block, receipts_msg = _check_pin_receipts(pr_num, repo=merge_repo)
+                if should_block:
+                    # The headline names the COMMON case; receipts_msg names the actual
+                    # one, which may instead be an absent or undecodable pin at the head.
+                    print(
+                        f"BLOCKED: PR #{pr_num} — CC pin gate refused this merge.",
+                        file=sys.stderr,
+                    )
+                    print(receipts_msg, file=sys.stderr)
+                    return 2
+                elif receipts_msg.startswith("NOTE:"):
+                    # A NOTE means the gate did NOT verify the receipts and is allowing the
+                    # merge anyway. That is the fail-open direction, so it has to be VISIBLE
+                    # at the moment of merging — every other fail-open gate on this path
+                    # prints its note, and this one silently discarded seven of them, which
+                    # made "the residue is narrow and named" false at the only surface a
+                    # human reads.
+                    print(receipts_msg, file=sys.stderr)
 
                 # Codex must have reviewed the CURRENT head (existence + freshness)
                 # — not merely have no open findings. This runs BEFORE the finding
@@ -3791,6 +5938,8 @@ def main() -> int:
         # Reached only if no hard-block above returned. Dispatched sessions
         # were already denied inline; here, an interactive human session gets a
         # native approve/deny dialog for its push / PR-create.
+        if ask_reason is None and blind_spot_reason is not None:
+            ask_reason = blind_spot_reason
         if ask_reason is not None:
             return _ask(ask_reason)
 
@@ -3890,10 +6039,29 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         # conflicting branch or a dropped pull_request trigger).
         print("  ↳ BLOCK — no CI checks have run (empty check set); pull_request CI never fired.")
         failures += 1
+    elif ci_state == "incomplete" and _scheduled_gate_applies(repo):
+        # Mirror the enforcement arm: a partial rollup missing a required workflow
+        # (merge_gate.required_ci_workflows, default CI) blocks on the canonical repo.
+        print(
+            "  ↳ BLOCK — required CI workflow(s) missing from the check rollup "
+            f"({', '.join(ci_bad[:6])}); the required suite never ran."
+        )
+        failures += 1
     # Order mirrors the gate: base-invariant → freshness → finding scans, so a
     # review published mid-run can't pass freshness with its P1s unscanned.
     blocked, msg = _check_base_is_default(pr_num, repo=repo)
     print(f"base-branch    : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (default)'}")
+    failures += 1 if blocked else 0
+    # Pin receipts: authoritative HERE, not in CI — the PR body is mutable after
+    # a check run completes, so only a merge-time read describes the body that
+    # actually merges.
+    blocked, msg = _check_pin_receipts(pr_num, repo=repo)
+    print(
+        f"pin-receipts   : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}"
+    )
+    if blocked:
+        for line in msg.splitlines()[1:]:
+            print(f"  {line}")
     failures += 1 if blocked else 0
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     if blocked:
@@ -3939,10 +6107,33 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     if not _scheduled_gate_applies(repo):
         print("scheduled-claude: n/a (scoped to the public repo only)")
     else:
-        sched_msg = _check_scheduled_claude_reviewed_head(pr_num, verified_head, repo)
-        print(
-            f"scheduled-claude: {'BLOCK — ' + sched_msg.splitlines()[0] if sched_msg else 'ok (at head)'}"
+        sched_relief: list[tuple[str, str, str]] = []
+        sched_msg = _check_scheduled_claude_reviewed_head(
+            pr_num, verified_head, repo, relief_out=sched_relief
         )
+        if sched_msg:
+            sched_state = "BLOCK — " + sched_msg.splitlines()[0]
+        elif sched_relief:
+            # NEVER render a carried-forward review as one made at head: this line is
+            # what a human (and a structured consumer) reads to judge freshness, and
+            # "ok (at head)" here would be a false assertion about what was reviewed.
+            sched_state = "ok (" + "; ".join(
+                f"{kind} carried from {anc}, {check} green at head"
+                for kind, anc, check in sched_relief
+            ) + ")"
+        else:
+            sched_state = "ok (at head)"
+        print(f"scheduled-claude: {sched_state}")
+        # Render the TAIL, following the pin-receipts idiom above. Without this the whole
+        # per-cause diagnosis is discarded on the canonical pre-merge surface: line 0 is
+        # the summary, and its `present: none` clause is the exact string an operator was
+        # measured acting wrongly on -- they read "nothing was posted", waited, and the
+        # marker was sitting in the thread the whole time. The bullets that say WHICH
+        # cause it was live on lines 1+. Printing only line 0 means every improvement to
+        # them is invisible here, which is where the mistake was actually made.
+        if sched_msg:
+            for line in sched_msg.splitlines()[1:]:
+                print(f"  {line}")
         failures += 1 if sched_msg else 0
     # Fail-closed (the only mode now): a scan that could not be READ (gh error/malformed)
     # shows as a failure here, never as "ok" — the report must not issue a false all-clear.

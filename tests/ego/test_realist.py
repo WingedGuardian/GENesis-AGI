@@ -285,11 +285,15 @@ class TestCapabilityMapFix:
             lambda *a, **k: EgoConfig(outcome_bus_capability_feed=False),
         )
 
-        # Create proposals: 1 approved, 1 rejected, 3 withdrawn
-        await ego_crud.create_proposal(
-            db, id="cap1", action_type="maintenance", content="Approved"
-        )
-        await ego_crud.resolve_proposal(db, "cap1", status="approved")
+        # Create proposals: 2 approved, 1 rejected, 3 withdrawn.
+        # Three TERMINAL proposals, not two, so the domain clears the
+        # aggregator's minimum-sample floor — at n=2 it would not be emitted at
+        # all and this test would pass vacuously while checking nothing.
+        for _pid in ("cap1", "cap1b"):
+            await ego_crud.create_proposal(
+                db, id=_pid, action_type="maintenance", content="Approved"
+            )
+            await ego_crud.resolve_proposal(db, _pid, status="approved")
 
         await ego_crud.create_proposal(
             db, id="cap2", action_type="maintenance", content="Rejected"
@@ -305,11 +309,13 @@ class TestCapabilityMapFix:
         results = await compute_capability_map(db)
         maint = [r for r in results if r["domain"] == "maintenance"]
 
-        # Without fix: 1/5 = 20%. With fix: 1/2 = 50%.
-        if maint:
-            assert maint[0]["confidence"] >= 0.4, (
-                f"Expected >= 0.4 (withdrawn excluded), got {maint[0]['confidence']}"
-            )
+        # Without fix: 2/6 = 33%. With fix: 2/3 = 67%.
+        # Asserted unconditionally — a `if maint:` guard would let the whole
+        # check evaporate the moment the domain stopped being emitted.
+        assert maint, "maintenance domain must be emitted for this test to mean anything"
+        assert maint[0]["confidence"] >= 0.4, (
+            f"Expected >= 0.4 (withdrawn excluded), got {maint[0]['confidence']}"
+        )
 
 
 # -- Realist filter integration tests --

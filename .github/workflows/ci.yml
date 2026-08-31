@@ -340,6 +340,24 @@ jobs:
       - name: External-I/O egress guard
         run: python scripts/check_external_io.py
 
+  frozen-clock-check:
+    # A test that captures a wall clock at IMPORT time gives the whole suite's
+    # runtime to burn its safety margin, then fails on slow runners as an
+    # unreproducible "flake". Measured instance: a 25-minute margin that passed
+    # at 16m into a run and failed at 27m (~3% of runs). Runs as its own fast
+    # job so the finding reads as a lint error in seconds rather than surfacing
+    # 16 minutes into the suite. Escape hatch is
+    # '# frozen-clock-ok: <why, with the measured margin>'.
+    # See scripts/check_frozen_clock.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Frozen-clock guard
+        run: python scripts/check_frozen_clock.py
+
   subsystem-map-check:
     # Judgment-layer map guard: docs/architecture/CURRENT.md must claim every
     # top-level src/genesis module (an unmapped or vanished module = the map
@@ -431,6 +449,48 @@ jobs:
           # matching the leak-detector job. Passed via env (not interpolated into run).
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python scripts/check_review_depth.py
+
+  cc-pin-receipts:
+    # Advisory early warning that a pin bump is missing its gate receipts (the
+    # full changelog read, and the local-first soak — docs/reference/
+    # cc-compatibility.md §Updating). Advisory BY DESIGN (exit 0 always), for a
+    # reason specific to this check rather than inherited from the job above: it
+    # reads the PR BODY, which stays mutable after a run completes. A completed
+    # check run is immutable and the merge gate treats a stale FAILURE as red on
+    # purpose (PR #1424 — the gate forces `--admin`, so letting a later SUCCESS
+    # clear an earlier FAILURE would make re-running a job until green enough to
+    # merge). A BLOCKING status over a mutable input therefore could not be
+    # cleared by fixing the input; the author would have to push a commit to get
+    # a fresh head. The enforcing teeth are the merge gate, which re-reads the
+    # body at merge time from main's copy of the checker.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # merge-base needs history on both sides.
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: CC pin-receipt advisory
+        env:
+          # Attacker-controlled text: passed via env, NEVER interpolated into
+          # `run`. Same handling the leak-detector job uses for PR_BASE_SHA.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          # merge-base, NOT HEAD^1: parent count is not a reliable "this is the
+          # merge ref" signal, and scripts/ci/leak_scan_added_lines.py rejects
+          # that inference for the same reason.
+          #
+          # BOTH commands are guarded. Under `set -e` an unresolvable origin/main
+          # (or no common ancestor) would kill the step and turn this job RED —
+          # in a job whose entire justification is that it cannot fail. An empty
+          # base is handled by the checker itself: advisory mode reports "no base
+          # SHA to compare against" and exits 0.
+          git fetch --no-tags --quiet origin main || true
+          base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
+          python scripts/check_cc_pin_receipts.py --advisory --base-sha "$base"
 
   test:
     runs-on: ubuntu-latest

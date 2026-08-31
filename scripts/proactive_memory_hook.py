@@ -36,6 +36,11 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+# The shared hook-input helper lives in scripts/hooks/; this script runs from
+# scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_input import session_path  # noqa: E402
+
 REPO_DIR = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_DIR / "src"
 if str(SRC_DIR) not in sys.path:
@@ -281,14 +286,20 @@ _MAX_TRAIL_DISPLAY = 50  # Show up to this many pivots — the full session arc 
 _GENESIS_PREFIX = str(Path.home() / "genesis") + "/"
 
 
-def _trail_path(session_id: str) -> Path:
-    """Path to the intent trail file for a session."""
-    return _TRAIL_DIR / session_id / "intent_trail.json"
+def _trail_path(session_id: str) -> Path | None:
+    """Path to the intent trail file for a session, or None if the id is unsafe.
+
+    ``session_id`` is a path component here, so an id carrying ``/`` or ``..``
+    would escape the sessions dir (mirrors ``_ws_path``/``_load_recent_files``).
+    """
+    return session_path(_TRAIL_DIR, session_id, "intent_trail.json")
 
 
 def _load_trail(session_id: str) -> dict:
     """Load intent trail from disk. Returns empty structure if missing."""
     path = _trail_path(session_id)
+    if path is None:
+        return {"session_id": session_id, "pivots": [], "last_keywords": [], "msg_count": 0}
     try:
         if path.exists():
             return json.loads(path.read_text())
@@ -300,6 +311,8 @@ def _load_trail(session_id: str) -> dict:
 def _save_trail(session_id: str, trail: dict) -> None:
     """Atomic write of intent trail to disk."""
     path = _trail_path(session_id)
+    if path is None:
+        return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
@@ -429,6 +442,13 @@ def _update_and_format_trail(
     Returns None if trail has fewer than 2 pivots (not useful yet).
     """
     if not session_id:
+        return None
+
+    # The trail workflow is persistence-backed end to end: without a safe trail
+    # path _save_trail discards every update, so EVERY turn would look like the
+    # first pivot and record a false conversation_pivot observation. Abort the
+    # workflow rather than run it against a trail that can never be saved.
+    if _trail_path(session_id) is None:
         return None
 
     # Skip harness-injected turns (task notifications, system reminders,
@@ -1297,11 +1317,10 @@ def _extract_genesis_summary(session_id: str) -> str | None:
 
     Returns None if file doesn't exist or is empty.
     """
-    if not session_id:
-        return None
-
-    obs_path = Path.home() / ".genesis" / "sessions" / session_id / "tool_observations.jsonl"
-    if not obs_path.exists():
+    obs_path = session_path(
+        Path.home() / ".genesis" / "sessions", session_id, "tool_observations.jsonl"
+    )
+    if obs_path is None or not obs_path.exists():
         return None
 
     try:
