@@ -510,7 +510,18 @@ async def test_a_completed_record_re_arms_for_the_next_failure(factory):
     # Guard the guard: if the first record never landed, the re-arm assertion
     # below would pass for the wrong reason.
     assert len(calls) == 1, "the first record never landed -- this test proves nothing"
-    assert daemon._pending_failure is not None and daemon._pending_failure.done()
+    # The first record must not still be IN FLIGHT, or the second submission
+    # would be absorbed and this would test coalescing again rather than re-arm.
+    # Deliberately permissive about HOW: retaining the completed future and
+    # clearing it in a done-callback are both valid re-arms, and the callback
+    # form is arguably better since it stops holding the exception. Asserting
+    # `is not None and .done()` would have failed a correct implementation --
+    # over-constraining the mechanism instead of pinning the behaviour.
+    pending = daemon._pending_failure
+    assert pending is None or pending.done(), (
+        "the first failure record is still in flight, so the second submission "
+        "below would exercise coalescing rather than the re-arm branch"
+    )
 
     assert await _drive(lambda: daemon._record_failure(rt, RuntimeError("b"))) is None
     for _ in range(200):
