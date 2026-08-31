@@ -2493,7 +2493,15 @@ _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
 # inert: 0 of 6 applicable PRs had a prose-free delta (22-692 added prose lines
 # each), because essentially every push adds a comment, docstring or string.
 # A relief valve that never opens leaves the override in daily use.
-_MECHANICAL_RESCAN_BY_KIND = {"leaks": "leak-detector"}
+# kind -> (check name, WORKFLOW name) for the mechanical scanner that may carry an
+# earlier accepted review forward. The workflow half is the round-4 finding: matching
+# the display name against the whole required-CI set lets a same-named check from
+# ANOTHER workflow stand in for the real scanner. Both halves are read from this
+# repo's own .github/workflows/ci.yml (`name: CI`; the `leak-detector` job), so they
+# travel with a clone rather than describing one install. A suite named differently
+# simply finds no match, and no match means NO RELIEF -- the pre-relief behaviour, so
+# the failure direction of a wrong pin is a missing convenience, never a weaker gate.
+_MECHANICAL_RESCAN_BY_KIND = {"leaks": ("leak-detector", "CI")}
 # Every kind an install is ALLOWED to name in config. A configured kind outside this set
 # (a typo, a wrong type, a stale routine name) can never be satisfied by a real marker, so
 # the whole config is treated as invalid and we fail closed to the default rather than let
@@ -2852,7 +2860,7 @@ def _scheduled_review_marker_scan(
     tuple[dict[str, set[str]], dict[str, set[str]], list[tuple[str | None, str, bool]]]
     | None
 ):
-    """``(accepted, rejected_not_clean, unusable)`` for the PR's scheduled-review
+    """``(accepted, rejected_not_clean, unusable, blocking_residue)`` for the PR's scheduled-review
     markers, or ``None`` on an UNREADABLE fetch.
 
     ``unusable`` is a list of ``(kind_or_None, reason, owner_authored)`` for marker
@@ -2894,6 +2902,13 @@ def _scheduled_review_marker_scan(
     # it only to count whether the OWNER has posted anything for a kind, because that is
     # the one thing that says whether the owner's routine has evidently already run.
     unusable: list[tuple[str | None, str, bool]] = []
+    # BLOCKING RESIDUE: head -> kinds for which the owner's body READ AS BLOCKING but
+    # the finding could not be credited to `rejected` -- a same-timestamp tie (recorded
+    # in neither verdict map), or a malformed / unknown-kind marker whose body carries
+    # the finding. Structured, so a consumer never has to match the prose in
+    # `unusable`. Keyed "" when no head can be attributed; kind "*" when no kind can.
+    # Additive: the three return shapes above are unchanged.
+    blocking_residue: dict[str, set[str]] = {}
     # Every owner statement about a (head, kind), in CHRONOLOGICAL order, classified as
     # "clean" (explicit verdict line), "refused" (blocking finding, no verdict) or "plain"
     # (neither). The verdict for the pair is resolved AFTER the loop from this list -- see
@@ -3043,6 +3058,11 @@ def _scheduled_review_marker_scan(
                         ", and its body reads as carrying a blocking finding, so a "
                         "corrected marker would not make it count either"
                     )
+                    # No parseable head -> unattributable residue. A malformed kind
+                    # field attributes to no kind, which on a leak gate means EVERY kind.
+                    blocking_residue.setdefault("", set()).add(
+                        _marker_kind_or_none(block) or "*"
+                    )
                 unusable.append((_marker_kind_or_none(block), why, True))
                 continue
             _kind = kind_m.group(1).lower()
@@ -3062,6 +3082,9 @@ def _scheduled_review_marker_scan(
                     # does for a malformed field: reporting only the typo invites a
                     # corrected marker over an unresolved finding.
                     _why += ", and its body reads as carrying a blocking finding"
+                    # A blocking body under a kind nothing knows about cannot be
+                    # credited to any kind -- so it is residue against ALL of them.
+                    blocking_residue.setdefault("", set()).add("*")
                 unusable.append((_kind, _why, True))
                 continue
             stmts.setdefault((head_m.group(1).lower(), _kind), []).append(
@@ -3111,6 +3134,8 @@ def _scheduled_review_marker_scan(
             # One row per BLOCK here too, so the header's count still equals the number
             # of blocks in the thread; each says what its own block was and why the pair
             # cannot be ordered.
+            # The tie IS blocking evidence at this head that neither map can carry.
+            blocking_residue.setdefault(h, set()).add(k)
             for _, v in seq:
                 what = {
                     "clean": "an explicit clean verdict",
@@ -3148,11 +3173,11 @@ def _scheduled_review_marker_scan(
                 else superseded[v]
             )
             unusable.append((k, text, True))
-    return accepted, rejected, unusable
+    return accepted, rejected, unusable, blocking_residue
 
 
 def _mechanical_scan_is_green(
-    pr_num: str, head_sha: str, check_name: str, repo: str | None = None
+    pr_num: str, head_sha: str, check_name: str, workflow: str, repo: str | None = None
 ) -> bool:
     """Whether *check_name* concluded SUCCESS for *head_sha*, identified by
     ``(name, workflowName)`` rather than by display name alone.
@@ -3166,7 +3191,7 @@ def _mechanical_scan_is_green(
     as absent (which would recreate the routine false block this relief exists to
     retire).
 
-    Identity is ``(name, workflowName)`` against ``_required_ci_workflows()``,
+    Identity is ``(name, workflowName)`` against the kind's PINNED workflow,
     mirroring ``_ci_identity``. A bare display-name match would let a same-named
     check from another app or workflow stand in for the real scanner — the decoy
     class this file already documents at _ci_identity, and the whole point of
@@ -3217,7 +3242,14 @@ def _mechanical_scan_is_green(
     rollup = data.get("statusCheckRollup")
     if not isinstance(rollup, list):
         return False
-    required_workflows = {w.strip().lower() for w in _required_ci_workflows()}
+    # Pinned to the ONE workflow the scanner belongs to, not to membership in the
+    # required-CI SET. The set has no meaningful order and several members, so
+    # "some required workflow published a check with this name" is satisfied by a
+    # decoy from an unrelated workflow -- the same identity confusion _ci_identity
+    # documents, one level down.
+    wanted_workflow = (workflow or "").strip().lower()
+    if not wanted_workflow:
+        return False  # an unpinned kind can never be established -> fail closed
     # Collect EVERY same-identity entry, never the first match. One head can carry
     # several runs of one job (a re-run after a ruleset change, a superseded
     # concurrency sibling), and rollup ORDER is not a guarantee -- _pr_ci_status
@@ -3232,8 +3264,8 @@ def _mechanical_scan_is_green(
             continue
         if (entry.get("name") or "").strip() != check_name:
             continue
-        workflow = (entry.get("workflowName") or "").strip().lower()
-        if not workflow or workflow not in required_workflows:
+        entry_workflow = (entry.get("workflowName") or "").strip().lower()
+        if not entry_workflow or entry_workflow != wanted_workflow:
             continue  # same display name, different (or unidentifiable) workflow
         conclusions.append((entry.get("conclusion") or "").strip().upper())
     if not conclusions:
@@ -3258,10 +3290,9 @@ def _sha_is_ancestor(ancestor: str, descendant: str, repo: str | None = None) ->
 
     Tests inject via ``_TEST_GH_COMPARE_STATUS``: either a bare status applying to
     every pair, or a JSON object keyed ``"<ancestor>...<descendant>"`` so a test can
-    give different answers per pair. The map form exists because the relief walks
-    SEVERAL pairs (each candidate against the head, and each refusal against the
-    chosen candidate); with one global value those paths cannot be told apart, which
-    left the refusal-veto and multi-candidate cells untestable.
+    give different answers per pair. The map form exists because the relief may try
+    SEVERAL candidates against the head (an unreadable one is skipped for the next);
+    with one global value those cells cannot be told apart.
     """
     raw = os.environ.get("_TEST_GH_COMPARE_STATUS")
     if raw is not None and raw.strip().startswith("{"):
@@ -3302,7 +3333,8 @@ def _sha_is_ancestor(ancestor: str, descendant: str, repo: str | None = None) ->
             return None
     status = (raw or "").strip().lower()
     if not status:
-        return None  # unreadable -> the CALLER must fail closed, not try another marker
+        return None  # unreadable -> "unknown": the caller may try another candidate,
+        #              and fails closed only if NO candidate verifies
     return status == "ahead"
 
 
@@ -3310,113 +3342,143 @@ def _relieve_kinds_by_mechanical_rescan(
     missing: list[str],
     accepted: dict[str, set[str]],
     rejected: dict[str, set[str]],
+    residue: dict[str, set[str]],
     head: str,
     pr_num: str,
     repo: str | None = None,
 ) -> tuple[list[str], list[tuple[str, str, str]], dict[str, str]]:
     """Drop kinds satisfiable by an ANCESTOR ACCEPTED marker + a green scanner at head.
 
-    The third return value maps a kind to WHY its relief failed, when a carriable
-    marker existed but something else stopped it. The block message needs this:
-    "the scanner has not finished" and "the scanner FAILED" call for opposite
-    actions (wait vs fix CI), and neither is "re-run the scheduled review", which
-    is what the message says when it only knows the marker sits on another head.
+    Returns ``(still_missing, relieved, reasons)``. Each *relieved* entry is
+    ``(kind, ancestor_head_12, check_name)`` -- enough for both the operator note and
+    the report line, so a carried-forward review is never rendered as one made at
+    head. *reasons* maps a kind to WHY relief failed when a carriable marker existed:
+    "the scanner has not finished" and "the scanner FAILED" call for opposite actions
+    (wait vs fix that job), and neither is "re-run the scheduled review", which is
+    what the message says when it only knows the marker sits on another head.
 
-    Returns ``(still_missing, relieved)`` where each *relieved* entry is
-    ``(kind, ancestor_head_12, check_name)`` — enough for both the operator note
-    and the report line, so a carried-forward review is never rendered as one
-    made at head.
+    THE RULE: **any refusal for the kind, anywhere in this PR, denies relief.**
 
-    ``rejected`` IS a parameter, and load-bearing. An earlier draft omitted it on
-    the reasoning that a refusal at an EARLIER head cannot matter once a later
-    ACCEPTED review exists. That reasoning missed the cell that matters: a
-    refusal at the CURRENT head, or at any commit after the accepted one. The
-    routine re-runs, finds an INFERENTIAL leak (which the mechanical scanner
-    cannot see, by construction), posts a refused marker — and relief would
-    carry the older clean review forward and merge the leak. That is precisely
-    the class this gate exists to stop, so the veto below is the whole safety
-    argument, not a detail.
+    That is deliberately blunter than the predicate it replaces, which tried to
+    establish that every refusal PREDATED the accepted review it was carrying, via a
+    refusal-vs-candidate ancestry walk. Four review rounds found four different ways
+    that reconstruction was wrong -- too permissive at one round (a refusal at the
+    head overridden by an older acceptance), too strict at the next (an off-branch
+    refusal false-blocking) -- which is the signature of a predicate the available
+    data cannot support. The blunt membership test deletes the whole class: the
+    nested loop, its per-refusal network compares, the merge-budget pressure they
+    created, and the same-SHA collision case.
 
-    The rule: an accepted marker may be carried only when EVERY refusal for that
-    kind is an ANCESTOR of it — i.e. every refusal predates the accepted review
-    and was therefore answered by it. A refusal at the head, or between the
-    accepted marker and the head, vetoes.
+    Two things make the bluntness affordable rather than merely simpler.
+
+    First, the OWNER'S CHRONOLOGY ALREADY RAN. ``_scheduled_review_marker_scan``
+    resolves the owner's latest decisive statement per (head, kind) before this is
+    reached, so a refusal later answered by a clean verdict AT THAT HEAD never
+    reaches ``rejected`` at all. What lands here is a refusal the owner never
+    retracted at the commit it was made about.
+
+    Second, the head axis is NOT a time axis. A clean review of yesterday's code says
+    nothing about today's, so a later acceptance at an older head must never outrank a
+    refusal -- cross-head resolution may only ever ADD acceptance, never remove a
+    refusal. A predicate that let one refusal be "answered" is exactly a predicate that
+    can remove one.
+
+    MEASURED cost, main's own scan over the 40 most recent PRs (all 40 carry a leaks
+    marker): 14 are relief-eligible -- no accepted marker at head, one elsewhere --
+    and this rule denies none of them; two PRs carry a refused row, both already
+    satisfied at their final head. So the observed price of denying on any refusal
+    is ZERO relief lost, and the fallback for the case that does occur is the
+    override plus a human reading a leak finding -- the right outcome when a leaks
+    review has refused.
+
+    BLOCKING RESIDUE closes the one path that reads `rejected` alone would leave: a
+    blocking finding the scan cannot credit to `rejected` -- a same-timestamp tie
+    (neither map, by design) or a malformed / unknown-kind marker whose body reads as
+    blocking. The scan now returns it STRUCTURALLY (``blocking_residue``, head -> kinds,
+    "" for unattributable, "*" for kind-less), so this predicate denies on it without
+    ever matching prose. An adversarial audit reproduced the hole before this existed:
+    a [P1] body under a 12-char ``head=`` at HEAD -- a producer fault the scan records
+    as observed live -- was carried over by the older clean review. On the 40-PR
+    corpus, 7 PRs carry BENIGN unusable rows (re-posts, a short sha, a superseded
+    refusal) and none carry residue: denying on residue costs nothing measured, where
+    denying on any unusable row would have cost 7/40 on their next push.
     """
     relieved: list[tuple[str, str, str]] = []
     reasons: dict[str, str] = {}
     for kind in missing:
-        check_name = _MECHANICAL_RESCAN_BY_KIND.get(kind)
-        if not check_name:
+        pin = _MECHANICAL_RESCAN_BY_KIND.get(kind)
+        if not pin:
             continue
-        # Candidates in the scan's own order, which follows the API's chronological
-        # comment order, and take the LAST — the newest accepted review carries the
-        # smallest never-LLM-reviewed delta. Correctness does not depend on the
-        # ordering (any accepted ancestor that survives the refusal veto is sound);
-        # it minimises exposure. An earlier draft sorted the SHAs and called that
-        # "newest first", which is alphabetical hex order and means nothing.
+        check_name, workflow = pin
+        # ANY refusal for this kind, at ANY head -> no relief. See THE RULE above.
+        if any(kind in kinds for kinds in rejected.values()):
+            reasons[kind] = (
+                "a scheduled review for this kind was REFUSED in this PR and never "
+                "retracted at the commit it was made about, so no earlier review is "
+                "carried forward -- read that finding rather than re-running the review"
+            )
+            continue
+        # Blocking evidence the scan could not credit to `rejected` -- a same-timestamp
+        # tie at some head, or a malformed / unknown-kind marker whose body reads as
+        # blocking -- is RESIDUE, and it denies exactly as a refusal does, at ANY head:
+        # the finding was never provably retracted, and the head axis is not a time
+        # axis. A "*" entry is a blocking body under no creditable kind: it denies
+        # every kind. This closes the path an adversarial audit REPRODUCED (2026-08-30):
+        # a [P1] body under a 12-char `head=` at HEAD landed in `unusable`, and relief
+        # carried the older clean review straight over it.
+        residue_kinds: set[str] = set()
+        for kinds in residue.values():
+            residue_kinds |= kinds
+        if kind in residue_kinds or "*" in residue_kinds:
+            reasons[kind] = (
+                "a marker in this PR carries a blocking finding that could not be "
+                "credited to a head or a kind (a malformed field, or a verdict tied "
+                "with a clean one), so no earlier review is carried forward -- "
+                "resolve that finding first"
+            )
+            continue
         candidates = [h for h, kinds in accepted.items() if h != head and kind in kinds]
         if not candidates:
             continue  # never accepted anywhere in this PR -> nothing to carry forward
-        refusals = [h for h, kinds in rejected.items() if kind in kinds]
-        if head in refusals:
-            reasons[kind] = "a refused review sits at THIS head"
-            continue  # the routine ran at THIS head and found something -> never relieve
-
+        # ANY accepted ancestor will do; stop at the first. The previous code took the
+        # LAST candidate to minimise the un-LLM-reviewed delta, and called that
+        # "newest" -- but `accepted` is keyed by SHA and carries no order, so that was
+        # a claim the data does not support (round-4 finding). The safety argument is
+        # the per-head mechanical scan below, never the size of the delta, so nothing
+        # rests on which ancestor is chosen.
         ancestor = None
         unreadable = False
-        for candidate in reversed(candidates):
-            # The merge path runs these gates sequentially under ONE deadline; each
-            # compare is a network call. Without this check a PR carrying many
-            # markers can walk the budget to zero, and an overrun gets the whole
-            # hook SIGKILLed — which fails toward "tool runs" and disengages the
-            # ENTIRE gate stack. Relief must never be the thing that spends it.
+        for candidate in candidates:
+            # The merge path runs these gates sequentially under ONE deadline, and each
+            # compare is a network call. An overrun gets the whole hook SIGKILLed, which
+            # fails toward "the tool runs" and disengages the ENTIRE gate stack. Relief
+            # must never be the thing that spends that budget.
             if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
                 unreadable = True
                 break
             verdict = _sha_is_ancestor(candidate, head, repo=repo)
             if verdict is None:
-                unreadable = True  # cannot establish history -> fail closed, do not
-                break              # silently fall back to an older marker
-            if not verdict:
-                continue  # rewritten history: this review is not OF this tree
-            # Every refusal must predate this accepted review.
-            answered = True
-            for refusal in refusals:
-                if refusal == candidate:
-                    # SAME SHA carries both an accepted and a refused marker — a
-                    # clean run and a re-run that found something, on one commit.
-                    # The scan stores SETS keyed by head and discards row order, so
-                    # there is no evidence here about which came last. Unprovable
-                    # ordering on a leak gate resolves to a veto.
-                    answered = False
-                    break
-                if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
-                    unreadable = True
-                    answered = False
-                    break
-                r_verdict = _sha_is_ancestor(refusal, candidate, repo=repo)
-                if r_verdict is None:
-                    unreadable = True
-                    answered = False
-                    break
-                if not r_verdict:
-                    answered = False  # a refusal at or after this review -> veto
-                    break
-            if unreadable:
-                break
-            if answered:
+                # An unreadable compare is "I do not know", not "no". It is recorded,
+                # and the loop moves on: since nothing rests on WHICH accepted ancestor
+                # is carried, a candidate that verifies is not a downgrade from one that
+                # could not be read. Only when no candidate verifies does the unknown
+                # decide the outcome -- closed.
+                unreadable = True
+                continue
+            if verdict:
                 ancestor = candidate
                 break
-        if unreadable:
-            reasons[kind] = "the review history could not be established in the time available"
-            continue
         if ancestor is None:
-            reasons[kind] = "every accepted review is off this branch's history, or a refusal supersedes it"
+            reasons[kind] = (
+                "the review history could not be established in the time available"
+                if unreadable
+                else "every accepted review for this kind is off this branch's history"
+            )
             continue
-        if not _mechanical_scan_is_green(pr_num, head, check_name, repo=repo):
+        if not _mechanical_scan_is_green(pr_num, head, check_name, workflow, repo=repo):
             reasons[kind] = (
                 f"an earlier accepted review exists, but '{check_name}' is not green at "
-                f"this head (pending, failed, absent, or unreadable) — check that job "
+                f"this head (pending, failed, absent, or unreadable) -- check that job "
                 f"rather than re-running the scheduled review"
             )
             continue  # unreadable, absent, wrong workflow, pending or failed -> fail CLOSED
@@ -3473,7 +3535,7 @@ def _check_scheduled_claude_reviewed_head(
     describe as "tracked separately": ``_relieve_kinds_by_mechanical_rescan`` may
     carry an ACCEPTED marker forward from an ANCESTOR commit of this PR, but only
     while the kind's MECHANICAL scanner is green at the exact current head, only
-    when no refusal for that kind sits at or after the carried review, and only for
+    never when any refusal or uncreditable blocking finding for that kind exists in the PR, and only for
     kinds in ``_MECHANICAL_RESCAN_BY_KIND``. It is not a delta tolerance: nothing is
     judged by how big or how doc-like the change is. It trades a re-read of the
     inferential layer for a per-head guarantee about the literal layer — strictly
@@ -3506,7 +3568,7 @@ def _check_scheduled_claude_reviewed_head(
             f"Retry, or append '# scheduled-review-override' to merge anyway."
         )
     scan = _scheduled_review_marker_scan(pr_num, repo=repo, head_sha=head)
-    markers, rejected, unusable = (None, {}, []) if scan is None else scan
+    markers, rejected, unusable, residue = (None, {}, [], {}) if scan is None else scan
     if markers is None:
         return (
             f"could not read PR #{pr_num}'s comments/reviews to verify the scheduled Claude "
@@ -3520,7 +3582,7 @@ def _check_scheduled_claude_reviewed_head(
         # A kind already ACCEPTED at an earlier head of this PR is satisfied when its
         # mechanical scanner is green at THIS head (see _MECHANICAL_RESCAN_BY_KIND).
         missing, relieved, relief_reasons = _relieve_kinds_by_mechanical_rescan(
-            missing, markers, rejected, head, pr_num, repo=repo
+            missing, markers, rejected, residue, head, pr_num, repo=repo
         )
         if relief_out is not None:
             relief_out.extend(relieved)

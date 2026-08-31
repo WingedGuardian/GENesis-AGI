@@ -138,6 +138,19 @@ class TestScannerIdentity:
         msg = _gate()
         assert msg and "leaks" in msg
 
+    def test_same_name_from_another_REQUIRED_workflow_blocks(self, monkeypatch):
+        """Round-4 finding, now pinned: membership in the required-CI SET is not
+        identity. The pre-pin code PASSED this shape (measured by the audit)."""
+        monkeypatch.setenv("_TEST_REQUIRED_CI_WORKFLOWS", "CI,Nightly")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup(workflow="Nightly"))
+        msg = _gate()
+        assert msg and "not green at this head" in msg
+
+    def test_empty_workflow_pin_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        assert _mod._mechanical_scan_is_green("1", HEAD, "leak-detector", "", repo="acme/pub") is False
+
     def test_missing_workflow_name_blocks(self, monkeypatch):
         """A legacy status context / non-Actions app has no workflowName: unidentifiable."""
         monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
@@ -227,7 +240,7 @@ class TestScannerReader:
     )
     def test_reader(self, monkeypatch, payload, expected):
         monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", payload)
-        got = _mod._mechanical_scan_is_green("1", HEAD, "leak-detector", repo="acme/pub")
+        got = _mod._mechanical_scan_is_green("1", HEAD, "leak-detector", "CI", repo="acme/pub")
         assert got is expected
 
 
@@ -246,12 +259,17 @@ def _markers(*entries):
     return "\n".join(rows)
 
 
-class TestRefusalVetoesRelief:
-    """The cell that matters most: a refusal AT or AFTER the carried review.
+class TestAnyRefusalDenies:
+    """THE RULE: a refusal for the kind, anywhere in the PR, denies relief.
 
-    The mechanical scanner cannot see inferential leaks by construction, so if the
-    routine re-ran and refused, carrying an older clean review forward converts a
-    DETECTED leak into a merge — exactly what this gate exists to stop.
+    The mechanical scanner cannot see inferential leaks by construction, so carrying
+    an older clean review past a refusal would convert a DETECTED leak into a merge.
+    The previous predicate tried to establish that every refusal PREDATED the carried
+    review via ancestry compares; four review rounds found four ways that
+    reconstruction was wrong. The membership test replaces all of it. The owner's
+    chronology already ran inside the scan: a refusal answered by a clean verdict AT
+    ITS OWN HEAD never reaches `rejected`, so what lands here is a refusal the owner
+    never retracted at the commit it was made about.
     """
 
     def test_refused_at_current_head_blocks(self, monkeypatch):
@@ -267,7 +285,6 @@ class TestRefusalVetoesRelief:
         assert msg and "leaks" in msg
 
     def test_refused_between_the_carried_review_and_head_blocks(self, monkeypatch):
-        """A refusal on a commit still present at head is the same hole."""
         monkeypatch.setenv(
             "_TEST_GH_SCHEDULED_COMMENTS",
             _markers(
@@ -276,24 +293,21 @@ class TestRefusalVetoesRelief:
             ),
         )
         monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
-        # EARLIER is an ancestor of HEAD; the refusal at INTERMEDIATE is NOT an
-        # ancestor of EARLIER, so it lands after the carried review and must veto.
-        monkeypatch.setenv(
-            "_TEST_GH_COMPARE_STATUS",
-            json.dumps({
-                f"{EARLIER}...{HEAD}": "ahead",
-                f"{INTERMEDIATE}...{EARLIER}": "diverged",
-            }),
-        )
         msg = _gate()
         assert msg and "leaks" in msg
 
-    def test_refusal_already_answered_by_a_later_review_still_relieves(self, monkeypatch):
-        """A refusal that PREDATES the carried review was answered by it.
+    def test_a_refusal_that_predates_the_accepted_review_still_denies(self, monkeypatch):
+        """DELIBERATE, decided 2026-08-30: the head axis is not a time axis.
 
-        Without this the veto would be 'any refusal ever blocks forever', which is
-        too strict — a PR that had a leak, fixed it, and was re-reviewed clean
-        would never get relief again.
+        A clean review of yesterday's code says nothing about today's, so a LATER
+        acceptance at an OLDER head must never outrank a refusal. Cross-head resolution
+        may only ever ADD acceptance, never remove a refusal. The previous version of
+        this test asserted the opposite ("answered by a later review still relieves");
+        that was the predicate the redesign deleted. Measured cost on the 30 most
+        recent marker-carrying PRs: zero relief lost -- every observed refusal was
+        superseded at its own head, false, or followed by a clean marker at the final
+        head. The fallback for the case that does occur is the override plus a human
+        reading a leak finding, which is the right outcome.
         """
         monkeypatch.setenv(
             "_TEST_GH_SCHEDULED_COMMENTS",
@@ -303,16 +317,15 @@ class TestRefusalVetoesRelief:
             ),
         )
         monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
-        monkeypatch.setenv(
-            "_TEST_GH_COMPARE_STATUS",
-            json.dumps({
-                f"{EARLIER}...{HEAD}": "ahead",
-                f"{INTERMEDIATE}...{EARLIER}": "ahead",  # refusal predates the accept
-            }),
-        )
-        assert _gate() is None
+        msg = _gate()
+        assert msg and "leaks" in msg
+        assert "REFUSED in this PR" in msg, "the reason must name the refusal, not the scanner"
 
-    def test_unreadable_refusal_ancestry_blocks(self, monkeypatch):
+    def test_no_ancestry_compare_is_spent_on_a_refusal(self, monkeypatch):
+        """The membership test costs no network: with a refusal present, relief is
+        denied before any compare runs -- even when every compare would be
+        UNREADABLE. (The old predicate walked the refusals with per-refusal compares
+        and could exhaust the shared merge deadline doing it.)"""
         monkeypatch.setenv(
             "_TEST_GH_SCHEDULED_COMMENTS",
             _markers(
@@ -321,12 +334,86 @@ class TestRefusalVetoesRelief:
             ),
         )
         monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
-        monkeypatch.setenv(
-            "_TEST_GH_COMPARE_STATUS",
-            json.dumps({f"{EARLIER}...{HEAD}": "ahead"}),  # refusal pair unspecified
+        monkeypatch.setenv("_TEST_GH_COMPARE_STATUS", "")  # every compare unreadable
+        msg = _gate()
+        assert msg and "REFUSED in this PR" in msg
+        assert "time available" not in msg, "a refusal must be the stated cause, not the deadline"
+
+
+def _stamped(*entries):
+    """Owner marker rows WITH timestamps, so the scan's tie rule can engage (rows without
+    a stamp keep list order and cannot tie)."""
+    rows = []
+    for head, kinds, prefix, stamp in entries:
+        body = prefix + "\n" + "\n".join(
+            f"<!-- genesis-scheduled-review: head={head} kind={k} -->" for k in kinds
         )
+        rows.append(json.dumps({
+            "login": "owner", "author_association": "OWNER", "body": body, "stamp": stamp,
+        }))
+    return "\n".join(rows)
+
+
+class TestBlockingResidueDenies:
+    """The path an adversarial audit REPRODUCED on the entry point (2026-08-30): a
+    blocking finding the scan files under `unusable` rather than `rejected` must deny
+    relief exactly as a refusal does. Both shapes below granted relief before the scan
+    exposed `blocking_residue`."""
+
+    def test_blocking_body_under_a_short_sha_at_head_denies(self, monkeypatch):
+        """A [P1] under a 12-char head= is a producer fault the scan records as seen
+        live. It is unattributable to a head, so it is residue under "" and denies."""
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            _markers(
+                (EARLIER, ["leaks"], "scheduled review done. VERDICT: PASS"),
+                (HEAD[:12], ["leaks"], REFUSED_BODY),
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
         msg = _gate()
         assert msg and "leaks" in msg
+        assert "could not be credited" in msg, "the reason must name the residue, not the scanner"
+
+    def test_blocking_body_under_an_unknown_kind_denies_every_kind(self, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            _markers(
+                (EARLIER, ["leaks"], "scheduled review done. VERDICT: PASS"),
+                (HEAD, ["leak"], REFUSED_BODY),  # singular typo: no known kind
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        msg = _gate()
+        assert msg and "could not be credited" in msg
+
+    def test_same_timestamp_tie_at_head_denies(self, monkeypatch):
+        """A clean verdict and a blocking finding at HEAD with the SAME stamp land in
+        neither verdict map by design; the tie is residue at HEAD and denies."""
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            _stamped(
+                (EARLIER, ["leaks"], "scheduled review done. VERDICT: PASS", "2026-08-30T10:00:00Z"),
+                (HEAD, ["leaks"], "re-run. VERDICT: PASS", "2026-08-30T12:00:00Z"),
+                (HEAD, ["leaks"], REFUSED_BODY, "2026-08-30T12:00:00Z"),
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        msg = _gate()
+        assert msg and "could not be credited" in msg
+
+    def test_benign_unusable_rows_do_not_deny(self, monkeypatch):
+        """CONTROL: a short-sha marker with a CLEAN body is plain `unusable`, never
+        residue -- 7 of 40 recent PRs carry rows like it, and they must still relieve."""
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            _markers(
+                (EARLIER, ["leaks"], "scheduled review done. VERDICT: PASS"),
+                (HEAD[:12], ["leaks"], "re-run. PII scan: CLEAN"),
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        assert _gate() is None
 
 
 class TestDuplicateRollupEntries:
@@ -362,10 +449,16 @@ class TestDuplicateRollupEntries:
 
 
 class TestCandidateSelection:
-    def test_an_unreadable_compare_fails_closed_rather_than_trying_an_older_marker(
-        self, monkeypatch
-    ):
-        """A transient API error must not silently downgrade to an older review."""
+    """Any accepted ancestor will do. Nothing rests on WHICH one is carried: the safety
+    argument is the per-head mechanical scan, never the age of the carried review (the
+    previous code took the last candidate and called that "newest", a claim the SHA-keyed
+    map cannot support). So an unreadable compare is "I do not know", not "no": it is
+    recorded and the next candidate is tried; only when no candidate verifies does the
+    unknown decide -- closed."""
+
+    def test_multiple_accepted_markers_relieve(self, monkeypatch):
+        """The load-bearing case: about a third of recent PRs carry MORE than one accepted
+        leaks marker. Both are ancestors; relief must not depend on picking one."""
         monkeypatch.setenv(
             "_TEST_GH_SCHEDULED_COMMENTS",
             _markers(
@@ -374,26 +467,71 @@ class TestCandidateSelection:
             ),
         )
         monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
-        # The NEWEST candidate's compare is unreadable; the older one would be
-        # 'ahead'. Falling back to it would carry a staler review than the gate
-        # was able to verify.
+        relief: list = []
+        assert _gate(relief_out=relief) is None
+        assert relief and relief[0][0] == "leaks"
+
+    def test_one_unreadable_candidate_does_not_block_when_another_verifies(self, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            _markers(
+                (INTERMEDIATE, ["leaks"], "first in scan order. VERDICT: PASS"),
+                (EARLIER, ["leaks"], "second. VERDICT: PASS"),
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        # INTERMEDIATE's compare is unreadable (unspecified); EARLIER's is 'ahead'.
         monkeypatch.setenv(
             "_TEST_GH_COMPARE_STATUS",
-            json.dumps({f"{INTERMEDIATE}...{HEAD}": "ahead"}),
+            json.dumps({f"{EARLIER}...{HEAD}": "ahead"}),
         )
+        assert _gate() is None
+
+    def test_all_unreadable_fails_closed(self, monkeypatch):
+        """When NOTHING can be proven the unknown decides, and it decides closed --
+        never a silent fall-through to relief."""
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            _markers(
+                (INTERMEDIATE, ["leaks"], "older. VERDICT: PASS"),
+                (EARLIER, ["leaks"], "newer. VERDICT: PASS"),
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        monkeypatch.setenv("_TEST_GH_COMPARE_STATUS", json.dumps({}))
         msg = _gate()
         assert msg and "leaks" in msg
+        assert "time available" in msg
+
+    def test_off_branch_plus_unreadable_still_fails_closed(self, monkeypatch):
+        """A candidate that is provably NOT an ancestor is skipped (that is a real
+        'no'); if the only other candidate is unreadable, the unknown still wins."""
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            _markers(
+                (INTERMEDIATE, ["leaks"], "rewritten away. VERDICT: PASS"),
+                (EARLIER, ["leaks"], "unreadable. VERDICT: PASS"),
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        monkeypatch.setenv(
+            "_TEST_GH_COMPARE_STATUS",
+            json.dumps({f"{INTERMEDIATE}...{HEAD}": "diverged"}),
+        )
+        msg = _gate()
+        assert msg and "time available" in msg
 
 
 class TestSameShaCollision:
     def test_accepted_and_refused_on_the_same_commit_vetoes(self, monkeypatch):
-        """One commit carrying BOTH verdicts is unprovable, so it must veto.
+        """One commit carrying both verdicts is resolved by the SCAN, not by us.
 
         The routine can run twice on one head -- clean, then a re-run that finds an
-        inferential leak. The marker scan stores SETS keyed by head and discards row
-        order, so there is no evidence here about which verdict came last. Carrying
-        the acceptance forward would be guessing, on the gate whose whole job is to
-        not guess about leaks.
+        inferential leak. The scan resolves that by the owner's latest DECISIVE
+        statement (rows carry timestamps; the test seam keeps list order), so the later
+        refusal governs and lands in `rejected`; the membership test then denies. The
+        relief code carries NO same-commit veto of its own any more -- two answers to
+        one question was exactly the class the redesign deleted.
         """
         monkeypatch.setenv(
             "_TEST_GH_SCHEDULED_COMMENTS",
@@ -450,4 +588,4 @@ class TestBlockMessageNamesTheRealRemedy:
         )
         monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
         msg = _gate()
-        assert msg and "refused review sits at THIS head" in msg
+        assert msg and "REFUSED in this PR" in msg

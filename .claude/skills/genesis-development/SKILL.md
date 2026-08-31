@@ -1423,11 +1423,21 @@ findings below, a gated `gh pr merge`:
   evidence a review had ever run hidden by a drive-by comment. Precedence is the right
   shape for a VERDICT; for a REPORT, hiding a true fact is never correct.
   Or append `# scheduled-review-override` to merge anyway (the conscious "merge without
-  the scheduled reviews" case). Head match is EXACT — no ancestor walk, no delta
+  the scheduled reviews" case). Head match is EXACT for the LLM marker — no delta
   tolerance, unlike the Codex freshness gate, which grants relief on a provably trivial
   delta. That asymmetry is deliberate: the Codex classifier judges code-review
   substantiality by file type and size, and an inferential leak lands in exactly the small
-  doc edit it would wave through. The marker means "ran **clean**", not merely "ran": a
+  doc edit it would wave through. The ONE relief the leaks kind gets is MECHANICAL, not a
+  delta tolerance: an ACCEPTED `leaks` marker on an ANCESTOR commit of head satisfies the
+  gate when the `leak-detector` job of the `CI` workflow is green at head (identity pinned
+  to that (name, workflow) pair; `_MECHANICAL_RESCAN_BY_KIND`), and NEVER when any
+  refused `leaks` marker — or any blocking finding the scan could not credit to a head
+  or kind (a tie, a malformed marker) — exists anywhere in the PR (the head axis is not
+  a time axis — a later acceptance at an older head must not outrank a refusal). `--check-pr` renders a
+  carried marker as `ok (leaks carried from <sha>, leak-detector green at head)`, never
+  as `ok (at head)`. Measured motive: 6 of 10 sampled multi-push PRs were blocked purely
+  because the routine does not re-stamp after a push, and the override had become
+  routine. The marker means "ran **clean**", not merely "ran": a
   review whose body carries a blocking finding (`[P1]`/`HARD BLOCK`/`### ERROR`, unless a
   clean verdict overrides) is rejected, and DISMISSED/PENDING(draft) reviews don't count.
   **ALWAYS end a genuinely-clean scheduled review with an explicit verdict line**
