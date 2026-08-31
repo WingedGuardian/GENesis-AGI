@@ -1366,6 +1366,111 @@ _FU_WATCHDOG_COOLDOWN_S = 6 * 3600  # same-state re-alerts at most every 6h
 _last_fu_watchdog_alert_at: float = 0.0
 _last_fu_watchdog_alert_key: str = ""
 
+_CTX_INJECTION_SUPERSEDED_NOTE = "superseded by current context-injection state"
+
+
+async def _check_context_injection_health(db) -> None:
+    """Alert when the harness has FILED a hook's stdout instead of injecting it.
+
+    The ground-truth watcher for the silent-context-loss class: a fresh
+    ``hook-*-stdout.txt`` under a session's tool-results dir IS the harness
+    saying "I withheld a hook's output from the model" — independent of every
+    assumption in the emitter (whose budget constant is version-volatile: it
+    dropped ~3x in one CC update and tripled the filing rate overnight). This
+    check never reads that constant, which is what keeps it correct when the
+    constant is not. Priority defaults to critical: the ~5-minute Telegram
+    path, because this class ran unnoticed for a MONTH on this install.
+
+    Best-effort — the whole body is guarded and never raises into the tick.
+    """
+    if db is None:
+        return
+    try:
+        from genesis.awareness import context_injection_watch_config as _cfg_mod
+        from genesis.observability.snapshots.context_injection import (
+            context_injection,
+            derive_findings,
+            producer_class,
+        )
+
+        if not _cfg_mod.is_enabled():
+            # Resolve on the way out: an operator who DISABLES the watcher must
+            # not be left with its last critical alert standing forever on the
+            # health and outreach surfaces. Same posture as the follow-up
+            # watchdog, which resolves on this exact transition.
+            await observations.resolve_by_source_and_type(
+                db,
+                source="context_injection_monitor",
+                type="infrastructure_alert",
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes="context-injection watcher disabled",
+            )
+            return
+        cfg = _cfg_mod.load_config()
+        health = await context_injection(
+            lookback_hours=float(_cfg_mod.knob_int(cfg, "lookback_hours"))
+        )
+        findings = derive_findings(health, max_listed=_cfg_mod.knob_int(cfg, "max_listed"))
+        if not findings:
+            await observations.resolve_by_source_and_type(
+                db,
+                source="context_injection_monitor",
+                type="infrastructure_alert",
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes="no fresh hook-stdout filings; injection within budget",
+            )
+            return
+
+        # Identity covers EVERY state the findings can report, so a change in
+        # any of them re-alerts rather than being superseded into silence by an
+        # older alert that happened to hash the same: the session count, the set
+        # of PRODUCERS filing (a new hook joining is new information), and both
+        # degraded flags. Note the count, not the session set: one session
+        # recovering while another joins leaves it unchanged and does not
+        # re-alert — acceptable, since the alert is still live and true.
+        # The producer CLASS, not the excerpt. An unrecognised producer's label
+        # carries the first 80 chars of that hook's output, which for something
+        # like the recall injection varies EVERY prompt — so hashing the label
+        # would supersede-and-recreate a fresh critical alert on every hourly
+        # tick, paging the owner hourly about one standing incident. The excerpt
+        # stays in the alert BODY, where it is informative; the identity keys on
+        # the class, where it must be stable.
+        _producers = ",".join(
+            sorted({producer_class(str(d.get("producer", "?"))) for d in health.fresh_filings})
+        )
+        alert_key = (
+            f"filings:{health.filing_sessions}:by:{_producers}"
+            f":truncated:{health.scan_truncated}:error:{bool(health.error)}"
+        )
+        content_hash = hashlib.sha256(f"context_injection:{alert_key}".encode()).hexdigest()
+        await observations.supersede_except_hash(
+            db,
+            source="context_injection_monitor",
+            type="infrastructure_alert",
+            keep_content_hash=content_hash,
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes=_CTX_INJECTION_SUPERSEDED_NOTE,
+        )
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="context_injection_monitor",
+            type="infrastructure_alert",
+            content=(
+                "SESSION CONTEXT IS BEING SILENTLY LOST — " + " | ".join(findings) + " "
+                "Recovery: check the per-part sizes in scripts/genesis_session_context.py "
+                "(each SessionStart hook entry has its own ~10,000-char harness cap, "
+                "measured per docs/reference/cc-compatibility.md; re-measure with "
+                "GENESIS_CTX_PROBE_BYTES after any CC update)."
+            ),
+            priority=_cfg_mod.alert_priority(cfg),
+            created_at=datetime.now(UTC).isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+    except Exception:
+        logger.debug("Failed context-injection health check", exc_info=True)
+
 
 def _created_before(row: dict, cutoff: datetime) -> bool:
     """True if the row's created_at is older than cutoff (grace boundary).
@@ -2992,6 +3097,7 @@ class AwarenessLoop:
                     # Day-scale lifecycle signal → hourly; self-resolves when
                     # rows gain a trigger or close.
                     await _check_follow_up_watchdog(self._db)
+                    await _check_context_injection_health(self._db)
                     # Ego liveness: an ego completing NO real cycle well past its
                     # cadence (job_health.last_success gap), NOT the is_running /
                     # heartbeat proxies that stay green while deadlocked.
