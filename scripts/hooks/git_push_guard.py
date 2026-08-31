@@ -100,6 +100,7 @@ not treat untrusted PR content as instructions when composing its comment body.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -3820,25 +3821,63 @@ def _load_pin_receipt_checker():
         return None
 
 
-#: `_pin_file_at_ref` outcomes. ABSENT is a fact about the PR's CONTENT (the API
-#: answered, and the file is not there at that ref); UNREADABLE is a fact about the
-#: PLUMBING (no slug, timeout, auth, transport). They take OPPOSITE fail directions,
-#: so collapsing them — as an earlier revision did by returning None for both — let a
-#: PR that DELETES the pin file take the plumbing path and merge unblocked, which
-#: contradicts the checker's own stated policy that an unreadable pin BLOCKS.
+#: `_pin_file_at_ref` outcomes, split by FAIL DIRECTION rather than by how the read
+#: happened to fail. Three of the four are facts about the PR's CONTENT and BLOCK;
+#: exactly one is a failure of our own PLUMBING and does not.
+#:
+#:   OK           the bytes are in hand (an EMPTY file is OK — it exists, and an
+#:                empty pin is an unparseable pin, which the checker already blocks)
+#:   ABSENT       the API answered and the file is not at that ref            -> BLOCK
+#:   UNDECODABLE  the file IS at that ref and its bytes cannot be obtained    -> BLOCK
+#:   UNREADABLE   the read itself failed: no slug, timeout, auth, transport,
+#:                a non-JSON body, a ref that does not resolve                -> NOTE
+#:
+#: UNDECODABLE was folded into UNREADABLE until 2026-08-28, which put two CONTENT
+#: facts on the plumbing side: a blob over GitHub's 1MB inline limit (`"encoding":
+#: "none"`) and a blob whose base64 will not decode. Both say something about what
+#: the PR contains, so a forward pin move carrying either reported NOT-verified
+#: instead of blocking. That is the same shape as the deleted-vs-emptied pin bug this
+#: gate was built to close — one condition, two enforcements, one of them a fail-open
+#: — reintroduced one level down, in the classifier rather than the caller.
+#:
+#: The fix is NOT "make UNREADABLE block". Plumbing must stay non-blocking: a gate
+#: that refuses every merge whenever a read comes back unusable once walled off 50
+#: merge-gate cases at a stroke, and it guards a pin bump only.
 _PIN_OK = "ok"
 _PIN_ABSENT = "absent"
+_PIN_UNDECODABLE = "undecodable"
 _PIN_UNREADABLE = "unreadable"
-#: Test-seam sentinels for the two NON-content outcomes (mirroring
-#: `_TEST_GH_PR_FILES`'s `__error__`). Any other seam value — including the EMPTY
-#: STRING — is content, because with the JSON contents form an empty file is a real,
-#: distinct state from both absence and an unreadable response.
+#: Test-seam sentinels for every NON-content outcome (mirroring `_TEST_GH_PR_FILES`'s
+#: `__error__`). Each gets its own, because a seam that cannot express an outcome the
+#: live path produces hides exactly the distinction it exists to exercise. Any other
+#: seam value — including the EMPTY STRING — is content.
 _PIN_SEAM_ABSENT = "__absent__"
+_PIN_SEAM_UNDECODABLE = "__undecodable__"
 _PIN_SEAM_UNREADABLE = "__unreadable__"
 
 
-def _pin_file_at_ref(ref: str, repo: str | None, *, seam: str) -> tuple[str | None, str]:
-    """``(contents, outcome)`` for the pin file at ``ref``, read through the API.
+def _git_blob_sha(text: str) -> str:
+    """The git blob SHA of ``text`` — what the contents API reports as ``sha``.
+
+    Used only by the test seam, and computed the REAL way rather than hashed some
+    convenient other way, so a seam-driven test exercises the same identity relation
+    production does: same content ⇒ same SHA, different content ⇒ different SHA.
+    """
+    data = text.encode("utf-8")
+    return hashlib.sha1(b"blob %d\x00%s" % (len(data), data)).hexdigest()  # noqa: S324
+
+
+def _pin_file_at_ref(
+    ref: str, repo: str | None, *, seam: str
+) -> tuple[str | None, str, str | None]:
+    """``(contents, outcome, blob_sha)`` for the pin file at ``ref``, via the API.
+
+    ``blob_sha`` is the identity of the file as a whole, and it is the ONLY sound
+    answer to "did this PR touch the pin?" when the contents cannot be read. The
+    contents API returns it even when it withholds the content — MEASURED against
+    a 1.62MB blob in this repo: ``{"encoding":"none","content":"","sha":"1419cf30…"}``.
+    ``None`` means no blob was identified (absent, or the read failed), and two
+    ``None`` SHAs are NEVER equal for this purpose.
 
     Used for BOTH sides of the comparison — one code path, so the head and base
     reads cannot drift apart in their fail direction (they did: the base side used
@@ -3860,21 +3899,40 @@ def _pin_file_at_ref(ref: str, repo: str | None, *, seam: str) -> tuple[str | No
         # legitimate third thing — a file that exists and is empty — and collapsing
         # it into either sentinel would hide the very distinction this seam exists
         # to exercise.
+        #
+        # The blob SHA is a SECOND seam (``<seam>_SHA``) rather than something derived
+        # from the sentinel, because the whole point of carrying a SHA is that two
+        # unreadable blobs can still be different. A test that cannot set them apart
+        # cannot exercise the case that made this necessary.
+        blob = os.environ.get(f"{seam}_SHA") or None
         if raw == _PIN_SEAM_ABSENT:
-            return None, _PIN_ABSENT
+            return None, _PIN_ABSENT, None  # nothing at the path: there is no blob
+        if raw == _PIN_SEAM_UNDECODABLE:
+            return None, _PIN_UNDECODABLE, blob
         if raw == _PIN_SEAM_UNREADABLE:
-            return None, _PIN_UNREADABLE
-        return raw, _PIN_OK
+            return None, _PIN_UNREADABLE, blob
+        # Content present: derive the SHA the real way unless the test pins one, so
+        # identical seam text is identical to the gate exactly as it would be live.
+        return raw, _PIN_OK, blob or _git_blob_sha(raw)
     # Resolution order matters. `_canonical_public_repo()` reads install config and
     # is legitimately absent on an install that never set `github.*` — the merge
     # gate treats that as "uncertain, enforce", so falling back to the repo the
     # process is actually in keeps the gate WORKING rather than silently
     # unverifying on every such install (measured: it returned None here).
-    slug = (_normalize_repo(repo) if repo else None) or _canonical_public_repo()
+    # Inside the try, not above it. These three read install config, run git and touch
+    # the filesystem, so any of them CAN raise — a malformed genesis.yaml is enough.
+    # Uncaught, the exception left this function, left `_check_pin_receipts` (which
+    # wraps only the checker call, not the reads), and left the hook: a crashing merge
+    # gate, which is the wedge in its least recoverable form. MEASURED: a raising
+    # `_canonical_public_repo` propagated all the way out.
+    try:
+        slug = (_normalize_repo(repo) if repo else None) or _canonical_public_repo()
+        if not slug:
+            slug = _derive_repo_from_cwd(os.getcwd())
+    except Exception:  # noqa: BLE001 — resolving WHERE to read is plumbing
+        return None, _PIN_UNREADABLE, None
     if not slug:
-        slug = _derive_repo_from_cwd(os.getcwd())
-    if not slug:
-        return None, _PIN_UNREADABLE
+        return None, _PIN_UNREADABLE, None
     try:
         result = subprocess.run(
             # The JSON representation, NOT `Accept: raw`. Raw returns bytes, and bytes
@@ -3890,7 +3948,7 @@ def _pin_file_at_ref(ref: str, repo: str | None, *, seam: str) -> tuple[str | No
             timeout=_gh_timeout(6),
         )
     except Exception:
-        return None, _PIN_UNREADABLE
+        return None, _PIN_UNREADABLE, None
     if result.returncode == 0:
         try:
             payload = json.loads(result.stdout or "")
@@ -3898,28 +3956,47 @@ def _pin_file_at_ref(ref: str, repo: str | None, *, seam: str) -> tuple[str | No
             # A zero exit whose body is not JSON is a stub or a truncated response —
             # plumbing. This is the shape a test router's no-op reply takes, and it
             # must not read as a fact about the tree.
-            return None, _PIN_UNREADABLE
+            return None, _PIN_UNREADABLE, None
         if not isinstance(payload, dict):
             # A directory lists as an ARRAY. Either way the pin file is not at this
             # path, which is a fact about the PR's content.
-            return None, _PIN_ABSENT
+            return None, _PIN_ABSENT, None
+        blob = payload.get("sha") or None
         if payload.get("type") != "file":
-            return None, _PIN_ABSENT  # a submodule or symlink-to-dir is not the pin
+            return None, _PIN_ABSENT, None  # a submodule/symlink-to-dir is not the pin
         if payload.get("encoding") != "base64":
             # >1MB blobs come back with encoding "none" and no content. Not absence —
-            # the file is there and we simply cannot read it this way.
-            return None, _PIN_UNREADABLE
+            # the file is there. But it is still a fact about what the PR CONTAINS,
+            # not about our plumbing: the API answered successfully and told us the
+            # pin is too large to read inline. A release whose pin nobody can
+            # characterise is the thing this gate exists to refuse.
+            return None, _PIN_UNDECODABLE, blob
         try:
-            text = base64.b64decode(payload.get("content") or "").decode("utf-8", "replace")
+            text = base64.b64decode(payload.get("content") or "").decode("utf-8")
         except Exception:
-            return None, _PIN_UNREADABLE
+            # STRICT decode, deliberately. The previous revision decoded with
+            # "replace" and argued that non-UTF-8 was therefore not an error because
+            # "the checker's own unparseable-pin rule judges it". It does not: the
+            # replacement makes the file PARSEABLE, so that rule never fires.
+            # MEASURED — a head holding a valid ASCII `CC_VERSION` assignment plus a
+            # single 0xff byte in a comment decoded to a clean pin and took the
+            # BACKWARD-rollback exemption, while the local adapter classified the very
+            # same bytes as a blocking content fault. One repository state, two
+            # opposite verdicts, with the AUTHORITATIVE path taking the permissive one.
+            #
+            # Both failure modes land here now — b64decode failing, and bytes that are
+            # not UTF-8 — and both are facts about the blob in the PR's tree rather
+            # than about this read, which is what `_PIN_UNDECODABLE` already means for
+            # an over-1MB blob. Blocking at the head is the same answer
+            # `read_pin_at`/`read_pin_head` give for the identical condition.
+            return None, _PIN_UNDECODABLE, blob
         # An EMPTY file is returned as content, deliberately, not as a state of its
         # own. It exists, so it is not absent — and an empty pin is an UNPARSEABLE
         # pin, which the checker's own policy already blocks. Classifying it here
         # would duplicate that policy in the wiring, which is how the previous
         # revision came to block a DELETED pin file while waving through one
         # truncated to nothing: the same condition, enforced two different ways.
-        return text, _PIN_OK
+        return text, _PIN_OK, blob
     # Non-zero. With the JSON form the only ambiguity left is which THING was not
     # found, and gh names the ref case explicitly. MEASURED against the live API:
     #   bad ref      -> gh: No commit found for the ref <sha> (HTTP 404)
@@ -3932,10 +4009,68 @@ def _pin_file_at_ref(ref: str, repo: str | None, *, seam: str) -> tuple[str | No
     # the path being absent.
     stderr = (result.stderr or "").lower()
     if "no commit found for the ref" in stderr:
-        return None, _PIN_UNREADABLE
+        return None, _PIN_UNREADABLE, None
     if "not found" in stderr:
-        return None, _PIN_ABSENT
-    return None, _PIN_UNREADABLE
+        return None, _PIN_ABSENT, None
+    return None, _PIN_UNREADABLE, None
+
+
+def _pin_blob_unchanged(
+    head_state: str, head_blob: str | None, base_state: str, base_blob: str | None
+) -> bool:
+    """True only when the pin file is PROVABLY the same at both refs.
+
+    Two ways to prove it, and no third: the same blob SHA, or nothing at the path on
+    either side. Anything else — including two reads that both failed — is NOT proof
+    and must return False, because the caller treats True as "this PR cannot have
+    moved the pin" and skips every remaining check on that basis.
+
+    The predicate this replaced compared the two CONTENT values. Those are both
+    ``None`` for every state in which content is unavailable, so it answered True
+    for two DIFFERENT oversized blobs, and a PR swapping one >1MB pin file for
+    another slipped past the head-side block. An identity test whose inputs are
+    absent is not an identity test; it is a coincidence of sentinels.
+
+    A DEGRADED fallback, used only when the PR's changed-file list is unavailable or
+    truncated. It compares two REFS, and two refs can differ for reasons that are not
+    this PR's doing: a PR that branched before the base's pin last changed still
+    carries the older blob, so this reports "changed" for a PR whose merge will not
+    touch the file at all. That is why the changed-file list is asked first — it is
+    computed against the merge base and answers about the PR rather than about two
+    moving tips. Reviewers have raised this comparison twice; it is a known and
+    bounded degradation, not the primary path.
+    """
+    if head_state == base_state == _PIN_ABSENT:
+        return True  # no blob on either side: there is nothing that could differ
+    return bool(head_blob) and head_blob == base_blob
+
+
+def _pr_edits_pin_file(pr_num: str, repo: str | None) -> bool | None:
+    """Does this PR's DIFF touch the pin file? ``None`` when that cannot be determined.
+
+    The authoritative form of "did this PR touch the pin", and it replaced comparing
+    the head tree against the base TIP. Those differ for any PR that simply branched
+    earlier than the base's latest pin change — the head still carries the older blob
+    — even though a three-way merge keeps the base's version and never touches the
+    file. Comparing tips therefore reported such a PR as having edited the pin, and if
+    the newer base pin was malformed it demanded release receipts from exactly the
+    stale, unrelated PRs the wedge fix exists to unblock.
+
+    GitHub computes the changed-file list against the MERGE BASE, which is what the
+    merge itself uses, so it answers the question directly rather than inferring it
+    from two moving trees.
+
+    Delegates to ``_pr_changed_files`` rather than reading the endpoint again. The
+    first version of this did re-read it, with its own parser and its own reading of
+    the ``_TEST_GH_PR_FILES`` seam — which that function already owns, in a different
+    format. The seam's real contents parsed to "no pin file here", so the gate
+    concluded the pin was untouched and skipped ITSELF. Two readers of one seam is
+    how a security gate silently turns off; there is one reader.
+    """
+    files = _pr_changed_files(pr_num, repo=repo)
+    if files is None:
+        return None  # API error, malformed page, or the 3000-row cap — cannot say
+    return _PIN_FILE_PATH in files
 
 
 def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
@@ -3973,19 +4108,48 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
     "downgrade" that the gate exempts. Head still comes through the API, so the
     code doing the reading is always main's copy.
 
-    FAIL DIRECTION, split deliberately — and the split is between CONTENT and
-    PLUMBING, not between "worked" and "didn't":
-      * The pin moved forward and a receipt is missing, or the pin cannot be READ
-        at either side, or the file is ABSENT at either side -> BLOCK. All are
-        facts about the PR's content, and publishing a release nobody can
-        characterise is the thing to prevent. Absence matters on its own: a PR that
-        DELETES the pin file has no readable pin, which the checker's policy says
-        must block — routing that through the plumbing path would let the deletion
-        merge unexamined.
-      * The gate's own PLUMBING failed (no checker module, unreadable head sha or
-        base ref, auth/transport error) -> NOTE, do not block. Walling off every
-        merge over a check that only ever guards a pin bump would be a worse
-        failure than the one it prevents.
+    TWO AXES decide the fail direction, and they are independent.
+
+    CONTENT vs PLUMBING. A fact about the PR's content blocks; a failure of this
+    gate's own plumbing does not. An earlier revision phrased that first case as
+    "the pin cannot be READ", which OVERLAPS the plumbing case on the one state
+    that matters, and the code resolved the overlap fail-open — a >1MB pin blob
+    (the API answers ``"encoding": "none"``) took the plumbing path. Hence the
+    distinct UNDECODABLE outcome: present in the tree, bytes unobtainable, which is
+    a fact about the PR.
+
+    HEAD vs BASE. **No base-side condition returns a verdict of its own.** Base
+    state belongs to ``main``: every open PR inherits it, no PR can repair it
+    through this gate, and this gate has no override sigil — so a strict base rule
+    wedges the repository rather than refusing one merge. But the base is not
+    therefore harmless to ignore. It is an INPUT to the direction comparison, and
+    when it cannot supply one, the checker requires the receipts in place of that
+    comparison (``direction_verified=False``) instead of passing. A PR that repairs
+    a malformed base and bundles a forward release in the same change is otherwise
+    invisible to everything: its merge tree carries the REPAIRED pin, so lockstep
+    passes and CI is green.
+
+    THREE QUESTIONS, IN ORDER, and the order is the design
+    ------------------------------------------------------
+    Replaced (2026-08-29) a cascade of early returns over the product of
+    (head state × base state × parse outcome). Four cells of that product were found
+    to answer wrongly, across four review rounds — the signature of a shape that
+    generates bugs, not of four bugs. Each question below is answered from the
+    strongest evidence available for it, and none may be answered out of order:
+
+      1. **Did this PR touch the pin file?** From the PR's own changed-file list,
+         which GitHub computes against the MERGE BASE — the same thing the merge
+         uses. Falls back to the blob SHA when that list is unavailable or
+         truncated, and NEVER to the file contents: those are both ``None``
+         whenever a read fails, so two different oversized blobs compared equal and
+         reported an untouched pin.
+      2. **Is the head pin usable?** Asked before any base-side branch runs. An
+         earlier revision could return a base-side note first, so a PR introducing
+         an empty pin file over an absent base merged with no usable pin at all.
+      3. **Which direction, and are the receipts there?** Delegated whole to the
+         checker, with a base-side fault passed as an INPUT rather than returned on
+         — and with CONTENT (requires receipts) still distinguished from PLUMBING
+         (non-blocking note), which is the axis above applied to the base side.
     """
     checker = _load_pin_receipt_checker()
     if checker is None:
@@ -3999,14 +4163,107 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
     if not base_ref:
         return False, "NOTE: PR base ref unreadable — pin receipts NOT verified."
 
-    head_text, head_state = _pin_file_at_ref(head_sha, repo, seam="_TEST_GH_HEAD_PIN_FILE")
+    # The head-side read targets the PR HEAD. A revision of this gate read GitHub's
+    # projected merge commit instead, to catch a file that only becomes unpublishable
+    # once merged — the base gains a second CC_VERSION assignment after the PR
+    # branches, the PR edits the original, git merges both lines cleanly, and the
+    # result has no statable pin. That case is real, and the mechanism was reverted
+    # anyway, for two reasons worth keeping written down:
+    #
+    #   * Its fallback fired only when GitHub reported NO merge commit, never when
+    #     reading AT one failed. A failed read fell through to the plumbing NOTE, so
+    #     a slow contents API turned an unreceipted forward bump into a merge. This
+    #     gate runs late in a shared wall-clock budget and `_gh_timeout` floors at
+    #     1s, which makes "slow" the ordinary case rather than the exotic one.
+    #   * It was the gate's SEVENTH network read, and every failure mode on this
+    #     path is fail-open. Each read added is another independent chance to allow,
+    #     so gathering more evidence was making the gate less reliable, not more.
+    #
+    # The merge-tree case is tracked separately, to be built with its tests first.
+    head_text, head_state, head_blob = _pin_file_at_ref(
+        head_sha, repo, seam="_TEST_GH_HEAD_PIN_FILE"
+    )
+    base_text, base_state, base_blob = _pin_file_at_ref(
+        base_ref, repo, seam="_TEST_GH_BASE_PIN_FILE"
+    )
+
+    # ── 1. DID THIS PR TOUCH THE PIN FILE AT ALL? ──
+    # An untouched file cannot have moved the pin, whatever state it is in, so this is
+    # the one question worth asking before anything is parsed — and the only one that
+    # CAN be asked when nothing parses. Without it, a broken pin on the base wedges the
+    # repo through the HEAD rule: a PR that never touches cc_version.sh inherits the
+    # broken file at its own head. MEASURED before this existed: with an emptied pin on
+    # the base, every PR that left the file alone was blocked.
+    #
+    # Answered FIRST from the PR's own changed-file list, which GitHub computes against
+    # the MERGE BASE. Comparing the head tree with the base TIP instead gets one class
+    # wrong: a PR that branched before the base's latest pin change still carries the
+    # older blob at its head, so the two tips differ even though the merge will keep
+    # the base's version and never touch the file. With a malformed new base pin, that
+    # demanded receipts from exactly the stale unrelated PRs this wedge fix unblocks.
+    #
+    # The blob SHA remains the FALLBACK for when that list is unavailable or truncated
+    # — never the file CONTENTS, which are both None for every unreadable state, so
+    # "unchanged" got concluded from two reads having failed and two DIFFERENT >1MB
+    # blobs bypassed the head-side block.
+    #
+    # Asked UNCONDITIONALLY, including when both sides read cleanly. Scoping it to the
+    # unreadable states looks like an optimisation and is a bug: an EMPTY pin file is a
+    # successful read (state OK, content ""), so an empty pin on `main` left both sides
+    # OK, skipped this question, and blocked every PR on "the head pin is unparseable" —
+    # the very wedge this exists to prevent, rebuilt out of the other three states.
+    # MEASURED: both-empty and both-double-assigned each blocked until this became
+    # unconditional.
+    edits_pin = _pr_edits_pin_file(pr_num, repo)
+    if edits_pin is False or (
+        edits_pin is None and _pin_blob_unchanged(head_state, head_blob, base_state, base_blob)
+    ):
+        named = ""
+        if head_text is not None:
+            try:
+                # Public on the checker module (re-exported from scripts/ci). Best-effort
+                # cosmetics only: an unparseable pin is exactly the case that reaches
+                # here, so a failure to name it must not change the outcome.
+                value = checker.parse_cc_version(head_text)
+            except Exception:  # noqa: BLE001 — message text, not policy
+                value = None
+            if value:
+                named = f" ({value})"
+        # Name the EVIDENCE, not just the conclusion. The two paths are not equally
+        # strong — the PR's file list is authoritative, the blob comparison is an
+        # inference from two tips — and a reader deciding whether to trust a pass on a
+        # release gate needs to know which one answered.
+        why = (
+            "it is not among the files this PR changes"
+            if edits_pin is False
+            else "the same blob at the head and the base (changed-file list unavailable)"
+        )
+        return False, (
+            f"CC pin{named}: {_PIN_FILE_PATH} is unchanged by this PR — {why}, so it "
+            f"cannot have moved the pin. No receipts "
+            f"required.{'' if head_state == _PIN_OK else f' (The file is in state {head_state!r}, which is a fault in {base_ref}, not in this PR.)'}"
+        )
+
+    # ── 2. IS THE HEAD PIN USABLE? ──
+    # Every base-side branch used to sit ABOVE this, so a non-OK base short-circuited
+    # the head check entirely: an empty pin file introduced over an absent base reached
+    # the base's NOTE and merged, with no usable pin at the head and this gate — which
+    # has no override sigil precisely so it cannot be waived — reporting success.
     if head_state == _PIN_ABSENT:
         return True, (
             f"BLOCKED: {_PIN_FILE_PATH} is ABSENT at the PR head ({head_sha[:12]}). The pin "
             f"cannot be read, so whether this PR moves it forward cannot be established — "
             f"and a PR that removes the pin file is exactly the case this gate must not "
-            f"wave through. Restore it, or merge with the gate's own escape if the removal "
-            f"is intended."
+            f"wave through. Restore it: this gate has NO override sigil by design, so an "
+            f"intended removal needs the file restored in a separate change, not a waiver."
+        )
+    if head_state == _PIN_UNDECODABLE:
+        return True, (
+            f"BLOCKED: {_PIN_FILE_PATH} is present at the PR head ({head_sha[:12]}) but its "
+            f"contents could not be decoded — over GitHub's 1MB inline limit, or a blob that "
+            f"is not the base64 the API declared. The pin therefore cannot be read, so "
+            f"whether this PR moves it forward cannot be established. This is a fact about "
+            f"the PR's content, not a transport failure."
         )
     if head_text is None:
         return (
@@ -4014,23 +4271,46 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
             f"NOTE: could not read {_PIN_FILE_PATH} at the PR head — receipts NOT verified.",
         )
 
-    base_text, base_state = _pin_file_at_ref(base_ref, repo, seam="_TEST_GH_BASE_PIN_FILE")
-    if base_state == _PIN_ABSENT:
-        return True, (
-            f"BLOCKED: {_PIN_FILE_PATH} is ABSENT on the base branch ({base_ref}). There is "
-            f"no pin to compare against, so a forward move cannot be ruled out."
-        )
-    if base_text is None:
-        return False, (f"NOTE: {_PIN_FILE_PATH} unreadable on {base_ref} — receipts NOT verified.")
-
+    # ── 3. WHICH DIRECTION, AND ARE THE RECEIPTS THERE? ──
+    # The base gets NO branch of its own. Whatever went wrong with it arrives at the
+    # checker as `base_pin_text=None`, which is a missing INPUT, not a verdict: the
+    # checker then requires the receipts in place of the comparison it could not run.
+    # Returning here instead — which is what the three deleted branches above did —
+    # let a PR that repairs the base and bundles a forward release merge unreceipted,
+    # a case CI cannot see because the merge tree carries the repaired file.
     body = _pr_body_text(pr_num, repo)
     if body is None:
         return False, "NOTE: PR body unreadable — pin receipts NOT verified."
 
     try:
-        verdict = checker.evaluate(base_pin_text=base_text, head_pin_text=head_text, body=body)
+        verdict = checker.evaluate(
+            base_pin_text=base_text,
+            head_pin_text=head_text,
+            body=body,
+            # CONTENT vs PLUMBING, preserved across the boundary. `base_text` is None
+            # for BOTH a base whose content is faulty and a base we simply could not
+            # read, and those take opposite fail directions — so the distinction has
+            # to travel with the value rather than be re-derived from it.
+            base_unreadable=(base_state == _PIN_UNREADABLE),
+        )
     except Exception as exc:  # noqa: BLE001 — plumbing, not policy
         return False, f"NOTE: pin-receipt check errored ({type(exc).__name__}) — NOT verified."
+
+    # NORMALISE the non-blocking verdict that did not actually compare anything, so it
+    # reads like every other fail-open on this path. The merge arm prints a message only
+    # when it is marked as a note, and a base-side fault that merged silently is
+    # precisely the outcome this whole change exists to make visible. A genuine PASS
+    # ("pin unchanged", "moves backward", "receipts present") is NOT marked — it has
+    # nothing to warn about. `getattr` so an older checker on disk (this gate always
+    # runs main's copy, but a partial deploy is a real state) degrades to un-noted
+    # rather than raising inside the gate.
+    if not verdict.blocked and not getattr(verdict, "direction_verified", True):
+        # "Receipts NOT verified" is what every other fail-open on this path says, and
+        # it is WRONG here: this is the one pass where the receipts were checked and
+        # found present, and the DIRECTION is what went unverified. The message read
+        # "both gate receipts are present … Receipts NOT verified." — a contradiction
+        # at the only surface a human reads before merging.
+        return False, f"NOTE: {verdict.message} Pin DIRECTION not verified."
 
     return verdict.blocked, verdict.message
 
@@ -5483,12 +5763,22 @@ def main() -> int:
                 # by construction, with no syntax to recall under pressure.
                 should_block, receipts_msg = _check_pin_receipts(pr_num, repo=merge_repo)
                 if should_block:
+                    # The headline names the COMMON case; receipts_msg names the actual
+                    # one, which may instead be an absent or undecodable pin at the head.
                     print(
-                        f"BLOCKED: PR #{pr_num} — CC pin moves forward without its gate receipts.",
+                        f"BLOCKED: PR #{pr_num} — CC pin gate refused this merge.",
                         file=sys.stderr,
                     )
                     print(receipts_msg, file=sys.stderr)
                     return 2
+                elif receipts_msg.startswith("NOTE:"):
+                    # A NOTE means the gate did NOT verify the receipts and is allowing the
+                    # merge anyway. That is the fail-open direction, so it has to be VISIBLE
+                    # at the moment of merging — every other fail-open gate on this path
+                    # prints its note, and this one silently discarded seven of them, which
+                    # made "the residue is narrow and named" false at the only surface a
+                    # human reads.
+                    print(receipts_msg, file=sys.stderr)
 
                 # Codex must have reviewed the CURRENT head (existence + freshness)
                 # — not merely have no open findings. This runs BEFORE the finding
