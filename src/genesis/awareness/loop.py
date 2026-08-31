@@ -895,6 +895,10 @@ async def _check_ego_liveness(db) -> None:
                     db,
                     f"last_proactive_fire:{source_tag}",
                 )
+                last_gated = await ego_crud.get_state(
+                    db,
+                    f"last_gated:{source_tag}",
+                )
                 gated = (
                     await ego_crud.has_pending_cli_approval(db, source_tag) if gate_on else False
                 )
@@ -903,6 +907,7 @@ async def _check_ego_liveness(db) -> None:
                     last_intent_at=last_intent,
                     current_interval_minutes=mgr.current_interval_minutes,
                     gated=gated,
+                    last_gated_at=last_gated,
                 )
             except Exception:
                 logger.debug(

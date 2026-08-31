@@ -159,6 +159,44 @@ async def test_gated_ego_not_alerted(db, monkeypatch):
     assert await _open_count(db, USER_SRC) == 0
 
 
+async def _seed_last_gated(db, source, *, minutes_ago):
+    t = (NOW - timedelta(minutes=minutes_ago)).isoformat()
+    await db.execute(
+        "INSERT INTO ego_state (key, value, updated_at) VALUES (?, ?, ?)",
+        (f"last_gated:{source}", t, t),
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_recent_gate_release_no_alert(db, monkeypatch):
+    """The gate-RELEASE race: a pending CLI approval was just granted, so the
+    ego is no longer `gated`, but `last_success` still trails until the
+    unblocked cycle completes. Recently gate-held (last_gated 1m ago) → within
+    the grace → no alert. WITHOUT the grace this stalled-shaped ego would
+    falsely alert."""
+    _wire(monkeypatch, user_mgr=_mgr(), genesis_mgr=None, gate_on=True)
+    await _seed(db, "user_ego_cycle", success_min_ago=6 * 60 + 30, intent_min_ago=5)
+    await _seed_last_gated(db, "user_ego_cycle", minutes_ago=1)
+
+    await loop._check_ego_liveness(db)
+
+    assert await _open_count(db, USER_SRC) == 0
+
+
+@pytest.mark.asyncio
+async def test_gate_release_grace_expired_still_alerts(db, monkeypatch):
+    """Grace does not mask indefinitely: long after the gate released (well past
+    one interval) a still-stale completion alerts as a genuine stall."""
+    _wire(monkeypatch, user_mgr=_mgr(interval=90), genesis_mgr=None, gate_on=False)
+    await _seed(db, "user_ego_cycle", success_min_ago=6 * 60 + 30, intent_min_ago=5)
+    await _seed_last_gated(db, "user_ego_cycle", minutes_ago=300)  # 5h > 90m grace
+
+    await loop._check_ego_liveness(db)
+
+    assert await _open_count(db, USER_SRC) == 1
+
+
 @pytest.mark.asyncio
 async def test_idempotent_then_resolves_on_recovery(db, monkeypatch):
     """Repeated ticks while stalled keep exactly one open alert; once a cycle
