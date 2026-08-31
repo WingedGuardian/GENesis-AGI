@@ -65,6 +65,7 @@ USER_CONTEXT_ALLOWLIST: dict[str, str] = {
     # now land as extractable transcripts (W0.5), so there is no .store() call
     # here to classify.
     "channels/voice/genesis_bridge.py::_remember": "user-spoken fact via the voice remember tool (first-party user content; must stay in recall)",
+    "cc/direct_session.py::_record_proposal_outcome": "ego dispatch outcomes (success/failure/verification) are operational history, not internal decisional output — must stay in default recall + the proactive hook so the ego and CC sessions can recall what happened to a dispatch (B2a)",
     "eval/longmemeval/ingest.py::ingest_haystack": "LongMemEval benchmark haystack ingest into an EPHEMERAL throwaway store "
     "(first_party user-history content; never touches prod; not a subsystem)",
     "knowledge/ingest_upload.py::_store_as_is": "user-uploaded knowledge_base content (external-world, recallable)",

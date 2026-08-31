@@ -333,25 +333,17 @@ async def init(rt: GenesisRuntime) -> None:
                             _gid = _prop.get("goal_id") if _prop else None
                             if _gid:
                                 _content = (_prop.get("content") or "")[:60]
-                                # Extract outcome summary from session
-                                # metadata (stored by DirectSessionRunner
-                                # at direct_session.py:479,483).
-                                # Prefer error when present — DirectSession
-                                # calls complete() even on is_error=True;
-                                # only Python exceptions trigger fail().
-                                _error = (_meta.get("error") or "").strip()
-                                if _error:
-                                    _outcome = _error[:120]
-                                else:
-                                    _outcome = (_meta.get("output_text") or "")[:120]
-                                _outcome = _outcome.replace("\n", " ").strip()
-                                if _outcome:
-                                    _note = (
-                                        f"[{status}] {_content}: "
-                                        f"{_outcome} (session:{session_id[:8]})"
-                                    )
-                                else:
-                                    _note = f"[{status}] {_content} (session:{session_id[:8]})"
+                                # The raw session outcome is intentionally NOT
+                                # embedded in the goal-progress note. Progress
+                                # notes render into ego-surfaced goal context
+                                # (world_snapshot / user_context) — a privileged
+                                # surface — and a research/interact dispatch's
+                                # output is external_untrusted (indirect prompt-
+                                # injection risk). status + the (first-party)
+                                # proposal title + session id anchor the note;
+                                # the full outcome is on the execution_outcome
+                                # observation + the recallable dispatch memory.
+                                _note = f"[{status}] {_content} (session:{session_id[:8]})"
                                 await user_goals.add_progress_note(
                                     rt._db,
                                     _gid,
@@ -365,6 +357,49 @@ async def init(rt: GenesisRuntime) -> None:
                         except Exception:
                             logger.debug(
                                 "Failed to record goal progress",
+                                exc_info=True,
+                            )
+
+                        # B2b follow-through: force the OWNING ego to review
+                        # this dispatch outcome on its next cycle (step-2,
+                        # retry, or close). Every terminal dispatch gets one;
+                        # dedup + cap bypass live in the helper/CRUD.
+                        try:
+                            from genesis.ego.dispatch_followthrough import (
+                                record_dispatch_followthrough,
+                            )
+
+                            _err = (_meta.get("error") or "").strip()
+                            _out = _err or (_meta.get("output_text") or "")
+                            # A rate/quota-parked dispatch stamps park_id into
+                            # metadata (direct_session.py) and is NOT terminal.
+                            # Recording a follow-through now would misreport it
+                            # as failed, so the parked case is passed to the
+                            # helper to withhold. KNOWN GAP, tracked in follow-up
+                            # 837f8b63: the resume does NOT re-fire this, because
+                            # rate_limit_resume rewrites caller_context to
+                            # `rate_limit_resume:<park_id>`, severing the
+                            # `ego_proposal:` linkage this block gates on — so the
+                            # parked class stays uncovered until that reconnection
+                            # lands. Removing B2b's premature "failed" review is
+                            # still strictly better than shipping a false one.
+                            # behavioral-lint: ignore no-hide-problems
+                            _parked = bool(_meta.get("park_id"))
+                            _iid = await record_dispatch_followthrough(
+                                rt._db,
+                                proposal_id=caller_ctx.split("ego_proposal:")[-1],
+                                session_id=session_id,
+                                status=status,
+                                outcome=_out,
+                                failed=bool(_err) or status != "completed",
+                                parked=_parked,
+                            )
+                            if _iid:
+                                # create() defers the commit to the caller.
+                                await rt._db.commit()
+                        except Exception:
+                            logger.warning(
+                                "Failed to create dispatch follow-through",
                                 exc_info=True,
                             )
                 except Exception:

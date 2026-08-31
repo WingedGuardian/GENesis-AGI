@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import pytest
@@ -39,12 +38,6 @@ async def db(tmp_path):
 @pytest.fixture()
 def collector(db):
     return CCVersionCollector(db)
-
-
-@pytest.fixture()
-def collector_with_pipeline(db):
-    mock_pipeline = MagicMock()
-    return CCVersionCollector(db, pipeline_getter=lambda: mock_pipeline), mock_pipeline
 
 
 def _mock_version(version: str):
@@ -143,109 +136,74 @@ class TestVersionDetection:
         assert reading.failed is False
 
 
-class TestAnalyzerIntegration:
-    """Verify CCUpdateAnalyzer is called on version change."""
+class TestNoImpactAnalysis:
+    """The collector is DETECT-AND-RECORD ONLY — it must never run analysis.
+
+    Impact analysis was deliberately removed from this collector: driving a
+    variable-cost multi-LLM operation from a signal tick was a reliability bug in
+    every form (awaited inline, a fixed caller deadline cancelled it and stored NO
+    finding on exactly the big multi-release jump it existed for; dispatched as a
+    background task, it was lost on shutdown after the baseline had already
+    advanced, so it never retried). Analysis now lives on the on-demand
+    ``recon_cc_update_check`` MCP path and the idempotent daily pre-eval job.
+    """
 
     @pytest.mark.asyncio
-    async def test_analyzer_called_on_version_change(self, db) -> None:
-        """When router is provided and version changes, analyzer runs."""
-        router = MagicMock()
-        collector = CCVersionCollector(db, router=router)
-
-        mock_analyze = AsyncMock(return_value={"impact": "informational", "finding_id": "f-1"})
-
+    async def test_version_change_records_without_invoking_analyzer(self, collector, db) -> None:
+        """A version change records + signals 1.0 and NEVER touches the analyzer."""
         with _mock_version("1.0.0"):
-            await collector.collect()  # Store initial
+            await collector.collect()  # establish baseline
 
         with (
             _mock_version("1.1.0"),
             patch("genesis.recon.cc_update_analyzer.CCUpdateAnalyzer") as MockAnalyzer,
         ):
-            MockAnalyzer.return_value.analyze = mock_analyze
             reading = await collector.collect()
 
         assert reading.value == 1.0
-        MockAnalyzer.assert_called_once_with(db=db, router=router, pipeline=None, memory_store=None)
-        mock_analyze.assert_awaited_once_with("1.0.0", "1.1.0")
-
-    @pytest.mark.asyncio
-    async def test_analyzer_not_called_without_version_change(self, db) -> None:
-        """No version change means no analyzer call."""
-        router = MagicMock()
-        collector = CCVersionCollector(db, router=router)
-
-        with (
-            _mock_version("1.0.0"),
-            patch("genesis.recon.cc_update_analyzer.CCUpdateAnalyzer") as MockAnalyzer,
-        ):
-            await collector.collect()  # First run
-            await collector.collect()  # Same version
-
+        assert reading.failed is False
+        # The durable record is written...
+        cursor = await db.execute(
+            "SELECT content FROM observations WHERE type = 'version_change'"
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        data = json.loads(row["content"])
+        assert data["old_version"] == "1.0.0"
+        assert data["new_version"] == "1.1.0"
+        # ...and the analyzer is never constructed or called.
         MockAnalyzer.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_analyzer_timeout_still_signals(self, db) -> None:
-        """When analyzer times out, signal still fires with value=1.0."""
-        router = MagicMock()
-        collector = CCVersionCollector(db, router=router)
+    def test_collector_exposes_no_analysis_surface(self) -> None:
+        """The analysis method and the params that fed it are gone for good.
 
-        with _mock_version("1.0.0"):
-            await collector.collect()
+        Guards the REMOVAL itself: a refactor that reintroduces _analyze_update —
+        or the router/pipeline/memory_store wiring that existed only to feed it —
+        would resurrect the lifecycle-bug class this removal eliminated.
+        """
+        import inspect
 
-        async def slow_analyze(*args, **kwargs):
-            await asyncio.sleep(999)
-
-        with (
-            _mock_version("1.1.0"),
-            patch("genesis.recon.cc_update_analyzer.CCUpdateAnalyzer") as MockAnalyzer,
-            patch("genesis.learning.signals.cc_version.asyncio.wait_for", side_effect=TimeoutError),
-        ):
-            MockAnalyzer.return_value.analyze = AsyncMock(side_effect=slow_analyze)
-            reading = await collector.collect()
-
-        assert reading.value == 1.0
-        assert reading.failed is False
+        assert not hasattr(CCVersionCollector, "_analyze_update")
+        params = set(inspect.signature(CCVersionCollector.__init__).parameters)
+        assert params == {"self", "db"}
 
     @pytest.mark.asyncio
-    async def test_analyzer_exception_still_signals(self, db) -> None:
-        """When analyzer raises, signal still fires with value=1.0."""
-        router = MagicMock()
-        collector = CCVersionCollector(db, router=router)
-
+    async def test_change_signals_once_then_resets(self, collector) -> None:
+        """The baseline advances, so the change is a one-shot event signal."""
         with _mock_version("1.0.0"):
             await collector.collect()
-
+        with _mock_version("1.1.0"):
+            first = await collector.collect()
         with (
             _mock_version("1.1.0"),
-            patch("genesis.recon.cc_update_analyzer.CCUpdateAnalyzer") as MockAnalyzer,
+            patch.object(
+                CCVersionCollector, "_check_registry_version", new_callable=AsyncMock,
+            ),
         ):
-            MockAnalyzer.return_value.analyze = AsyncMock(side_effect=RuntimeError("boom"))
-            reading = await collector.collect()
+            second = await collector.collect()
 
-        assert reading.value == 1.0
-        assert reading.failed is False
-
-    @pytest.mark.asyncio
-    async def test_no_router_analyzer_runs_without_llm(self, db) -> None:
-        """Without router, analyzer runs but falls back to non-LLM path."""
-        collector = CCVersionCollector(db)  # No router
-
-        mock_analyze = AsyncMock(return_value={"impact": "informational", "finding_id": "f-2"})
-
-        with _mock_version("1.0.0"):
-            await collector.collect()
-
-        with (
-            _mock_version("1.1.0"),
-            patch("genesis.recon.cc_update_analyzer.CCUpdateAnalyzer") as MockAnalyzer,
-        ):
-            MockAnalyzer.return_value.analyze = mock_analyze
-            reading = await collector.collect()
-
-        assert reading.value == 1.0
-        # Analyzer is called with router=None — it works without LLM, just stores basic finding
-        MockAnalyzer.assert_called_once_with(db=db, router=None, pipeline=None, memory_store=None)
-        mock_analyze.assert_awaited_once_with("1.0.0", "1.1.0")
+        assert first.value == 1.0
+        assert second.value == 0.0
 
     @pytest.mark.asyncio
     async def test_registry_check_runs_on_no_change(self, db) -> None:
@@ -286,26 +244,6 @@ class TestAnalyzerIntegration:
         assert reading.value == 0.0
         assert reading.failed is False
 
-    @pytest.mark.asyncio
-    async def test_pipeline_threaded_to_analyzer(self, db) -> None:
-        """Pipeline getter is resolved and passed through to CCUpdateAnalyzer."""
-        router = MagicMock()
-        mock_pipeline = MagicMock()
-        collector = CCVersionCollector(db, router=router, pipeline_getter=lambda: mock_pipeline)
-
-        mock_analyze = AsyncMock(return_value={"impact": "informational", "finding_id": "f-3"})
-
-        with _mock_version("1.0.0"):
-            await collector.collect()
-
-        with (
-            _mock_version("1.1.0"),
-            patch("genesis.recon.cc_update_analyzer.CCUpdateAnalyzer") as MockAnalyzer,
-        ):
-            MockAnalyzer.return_value.analyze = mock_analyze
-            await collector.collect()
-
-        MockAnalyzer.assert_called_once_with(db=db, router=router, pipeline=mock_pipeline, memory_store=None)
 
 
 class TestRegistryCheck:
