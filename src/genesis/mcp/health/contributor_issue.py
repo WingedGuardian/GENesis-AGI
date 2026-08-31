@@ -79,13 +79,16 @@ _AREA_LABELS = frozenset(
         "area:other",
     }
 )
-# A real difficulty/environment signal — NOT ``help wanted`` (a "community welcome"
-# marker that says nothing about difficulty or whether a running instance is needed).
+# A contributor-lane label. ``help wanted`` is kept as the lane for experienced /
+# community clone-only work — beyond a newcomer ice-breaker but not needing a
+# running instance. Without it such a task has no truthful label and would be
+# forced to mislabel as beginner or be excluded (per Codex review, 2026-08-31).
 _ENV_DIFFICULTY_LABELS = frozenset(
     {
         "good first issue",
         "first-timers-only",
         "needs-genesis-instance",
+        "help wanted",
     }
 )
 
@@ -161,26 +164,32 @@ async def _impl_contributor_issue_propose(
         return {"status": "blocked", "reasons": reasons, "scanners_run": scan.scanners_run}
 
     # 1b) Label policy (fail-closed) — require a domain (area:*) AND a
-    #     difficulty/environment label. AFTER the privacy scan so a private-data
-    #     proposal reports `blocked` (security), not `rejected` (policy). No row is
-    #     written on rejection; the curator gets a clear reason and self-corrects.
-    label_set = set(label_list)
-    if not (label_set & _AREA_LABELS):
-        return {
-            "status": "rejected",
-            "reason": (
-                "missing an area:* label — every issue needs one domain label "
-                f"({', '.join(sorted(_AREA_LABELS))})"
-            ),
-        }
-    if not (label_set & _ENV_DIFFICULTY_LABELS):
-        return {
-            "status": "rejected",
-            "reason": (
-                "missing a difficulty/environment label — every issue needs one "
-                f"({', '.join(sorted(_ENV_DIFFICULTY_LABELS))})"
-            ),
-        }
+    #     difficulty/environment label. SCOPED to the configured public tracker
+    #     (`_default_repo()`), where the area:*/difficulty taxonomy is defined: a
+    #     human-approved cross-repo post to a repo without these labels is left to
+    #     the human, since mandating labels that don't exist there would fail at
+    #     `gh issue create` and strand the hold (retry-forever, consuming max_held).
+    #     AFTER the privacy scan so a private-data proposal reports `blocked`
+    #     (security), not `rejected` (policy). No row on rejection; the curator gets
+    #     a clear reason and self-corrects.
+    if repo == _default_repo():
+        label_set = set(label_list)
+        if not (label_set & _AREA_LABELS):
+            return {
+                "status": "rejected",
+                "reason": (
+                    "missing an area:* label — every issue needs one domain label "
+                    f"({', '.join(sorted(_AREA_LABELS))})"
+                ),
+            }
+        if not (label_set & _ENV_DIFFICULTY_LABELS):
+            return {
+                "status": "rejected",
+                "reason": (
+                    "missing a difficulty/environment label — every issue needs one "
+                    f"({', '.join(sorted(_ENV_DIFFICULTY_LABELS))})"
+                ),
+            }
 
     # 2) Backpressure + DB-side dedup (GitHub open-issue dedup is done at post
     #    time in the drain — the curator profile has no gh).

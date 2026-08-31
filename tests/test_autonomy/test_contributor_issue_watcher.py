@@ -543,7 +543,11 @@ async def test_e2e_autoapprove_then_drain_posts(db, tmp_path, monkeypatch):
     # the test exercises the post path, not the empty-config edge (covered elsewhere).
     monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)
     res = await ci._impl_contributor_issue_propose(
-        db, title="Autonomous newcomer task", body="A clean, public-safe task.", repo=_REPO
+        db,
+        title="Autonomous newcomer task",
+        body="A clean, public-safe task.",
+        labels=["good first issue", "area:runtime"],
+        repo=_REPO,
     )
     assert res["status"] == "held"
     assert res["auto_approved"] is True

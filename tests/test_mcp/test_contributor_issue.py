@@ -333,9 +333,10 @@ async def test_malformed_repo_components_rejected(db, live):
 
 
 @pytest.mark.asyncio
-async def test_rejected_missing_area_label(db, live):
+async def test_rejected_missing_area_label(db, live, monkeypatch):
     """A proposal with a difficulty label but NO area:* domain label is rejected
     with no row — the public tracker must stay navigable by domain."""
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)  # teeth scoped to the tracker
     res = await ci._impl_contributor_issue_propose(
         db, title="A clean title", body="A clean body.", labels=["good first issue"], repo=_REPO
     )
@@ -347,9 +348,10 @@ async def test_rejected_missing_area_label(db, live):
 
 
 @pytest.mark.asyncio
-async def test_rejected_missing_env_label(db, live):
+async def test_rejected_missing_env_label(db, live, monkeypatch):
     """An area:* label but NO difficulty/environment label is rejected — every
     issue must declare a lane (good first issue / needs-genesis-instance / …)."""
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)  # teeth scoped to the tracker
     res = await ci._impl_contributor_issue_propose(
         db, title="A clean title", body="A clean body.", labels=["area:runtime"], repo=_REPO
     )
@@ -361,8 +363,9 @@ async def test_rejected_missing_env_label(db, live):
 
 
 @pytest.mark.asyncio
-async def test_rejected_no_labels(db, live):
+async def test_rejected_no_labels(db, live, monkeypatch):
     """No labels at all → rejected (missing area is reported first)."""
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)  # teeth scoped to the tracker
     res = await ci._impl_contributor_issue_propose(
         db, title="A clean title", body="A clean body.", labels=[], repo=_REPO
     )
@@ -371,15 +374,33 @@ async def test_rejected_no_labels(db, live):
 
 
 @pytest.mark.asyncio
-async def test_area_other_is_a_valid_domain(db, live):
+async def test_area_other_is_a_valid_domain(db, live, monkeypatch):
     """area:other is the escape hatch for a genuinely cross-cutting issue, so a
     well-formed proposal is never wrongly rejected."""
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)  # teeth scoped to the tracker
     res = await ci._impl_contributor_issue_propose(
         db,
         title="A cross-cutting clean title",
         body="A clean body.",
         labels=["good first issue", "area:other"],
         repo=_REPO,
+    )
+    assert res["status"] == "held"
+
+
+@pytest.mark.asyncio
+async def test_label_policy_scoped_to_tracker_repo(db, live, monkeypatch):
+    """The label teeth is scoped to the configured tracker (`_default_repo()`),
+    where the area:* taxonomy exists. A human-approved post to a DIFFERENT repo is
+    NOT subjected to the policy (those labels may not exist there) — so an unlabeled
+    cross-repo proposal is held, not rejected."""
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)
+    res = await ci._impl_contributor_issue_propose(
+        db,
+        title="A clean cross-repo task",
+        body="A clean body.",
+        labels=[],  # no area/difficulty labels ...
+        repo="WingedGuardian/GENesis-Voice",  # ... but a NON-tracker repo → teeth skipped
     )
     assert res["status"] == "held"
 
