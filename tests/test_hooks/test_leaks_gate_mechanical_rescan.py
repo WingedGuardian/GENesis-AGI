@@ -387,6 +387,35 @@ class TestBlockingResidueDenies:
         msg = _gate()
         assert msg and "could not be credited" in msg
 
+    def test_short_sha_with_a_valid_but_UNKNOWN_kind_denies(self, monkeypatch):
+        """Codex round 6, reproduced through the gate: `head=<short> kind=leak` parses a
+        syntactically valid kind that names no real review. Filing residue under "leak"
+        put the blocking finding somewhere no required kind ever looks, and relief
+        carried past it. An unknown kind is unattributable -> "*" -> denies every kind."""
+        monkeypatch.setenv(
+            "_TEST_GH_SCHEDULED_COMMENTS",
+            _markers(
+                (EARLIER, ["leaks"], "scheduled review done. VERDICT: PASS"),
+                (HEAD[:12], ["leak"], REFUSED_BODY),
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        msg = _gate()
+        assert msg and "could not be credited" in msg
+
+    def test_short_sha_with_a_KNOWN_other_kind_denies_only_that_kind(self, monkeypatch):
+        """CONTROL for the fix above: a KNOWN kind is still retained, so residue for
+        `code-review` does not deny `leaks`. Without this the fix could be "always *",
+        which would make every malformed blocking marker deny every kind forever."""
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS",
+            _markers(
+                (EARLIER, ["leaks"], "scheduled review done. VERDICT: PASS"),
+                (HEAD[:12], ["code-review"], REFUSED_BODY),
+            ),
+        )
+        monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+        assert _gate() is None
+
     def test_same_timestamp_tie_at_head_denies(self, monkeypatch):
         """A clean verdict and a blocking finding at HEAD with the SAME stamp land in
         neither verdict map by design; the tie is residue at HEAD and denies."""
@@ -589,3 +618,76 @@ class TestBlockMessageNamesTheRealRemedy:
         monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
         msg = _gate()
         assert msg and "REFUSED in this PR" in msg
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The CLASS, enumerated: blocking evidence must never be filed where the
+# relief decision does not read it
+# ══════════════════════════════════════════════════════════════════════════
+_HEADS = {"valid": HEAD, "short": HEAD[:12], "empty": "", "absent": None}
+_KINDS = {"required": "leaks", "known-other": "code-review", "unknown": "leak", "absent": None}
+_BODIES = {"blocking": REFUSED_BODY, "clean": "scheduled review done. VERDICT: PASS"}
+_STATES = {"live": None, "dismissed": "DISMISSED", "pending": "PENDING"}
+_AUTHORS = {"owner": ("owner", "OWNER"), "stranger": ("someone", "NONE")}
+
+
+def _cell_marker(head, kind):
+    parts = []
+    if head is not None:
+        parts.append(f"head={head}")
+    if kind is not None:
+        parts.append(f"kind={kind}")
+    return "<!-- genesis-scheduled-review: " + " ".join(parts) + " -->"
+
+
+@pytest.mark.parametrize("author", sorted(_AUTHORS))
+@pytest.mark.parametrize("state", sorted(_STATES))
+@pytest.mark.parametrize("body", sorted(_BODIES))
+@pytest.mark.parametrize("kind", sorted(_KINDS))
+@pytest.mark.parametrize("head", sorted(_HEADS))
+def test_matrix_blocking_evidence_is_never_filed_out_of_reach(
+    head, kind, body, state, author, monkeypatch
+):
+    """Two review rounds found the SAME class one branch apart: a blocking finding
+    recorded somewhere the relief decision does not read (round 5: the `unusable`
+    bucket; round 6: residue filed under an unknown kind). Two instances is the
+    signal to enumerate rather than patch a third time.
+
+    The axes below are the ones that decide WHERE the scan files a marker. The
+    invariant: a LIVE, OWNER-authored, BLOCKING marker denies relief for the kind it
+    names, and for EVERY kind when it names none that exists — an unattributable
+    finding is evidence about all reviews, not one.
+
+    Deliberately NOT asserted, each with the scan's own reason (an unasserted cell
+    and a hole look identical, so they are named here):
+      * author=stranger — a non-owner comment is not the owner's routine speaking;
+        the scan drops it before any verdict (`login != owner`).
+      * state=dismissed — a dismissed review no longer vouches for anything, and
+        dismissal is an authoritative act by someone with permission.
+      * state=pending — an unpublished draft never ran publicly; the scan states it
+        is read like any other block once submitted.
+    """
+    login, assoc = _AUTHORS[author]
+    row = {"login": login, "author_association": assoc,
+           "body": _BODIES[body] + "\n" + _cell_marker(_HEADS[head], _KINDS[kind])}
+    if _STATES[state]:
+        row["state"] = _STATES[state]
+    monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", "\n".join([
+        json.dumps({"login": "owner", "author_association": "OWNER",
+                    "body": "scheduled review done. VERDICT: PASS\n"
+                            + _cell_marker(EARLIER, "leaks")}),
+        json.dumps(row),
+    ]))
+    monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup())
+
+    denied = _gate() is not None
+    live_owner_blocking = body == "blocking" and state == "live" and author == "owner"
+    if live_owner_blocking and _KINDS[kind] != "code-review":
+        assert denied, (
+            f"blocking finding filed out of reach: head={head} kind={kind} — relief was "
+            f"granted over a live owner finding"
+        )
+    elif live_owner_blocking:
+        assert not denied, (
+            "over-correction: a code-review finding must not deny the leaks gate"
+        )

@@ -3058,10 +3058,20 @@ def _scheduled_review_marker_scan(
                         ", and its body reads as carrying a blocking finding, so a "
                         "corrected marker would not make it count either"
                     )
-                    # No parseable head -> unattributable residue. A malformed kind
-                    # field attributes to no kind, which on a leak gate means EVERY kind.
+                    # No parseable head -> unattributable residue, keyed "". The KIND is
+                    # retained only when it names a review that actually exists: a
+                    # syntactically valid but UNKNOWN kind (`kind=leak`, the singular
+                    # typo) would otherwise file the residue under a name no required
+                    # kind ever matches, and the blocking finding would be filed into
+                    # nothing -- relief carries past it. Codex reproduced exactly that
+                    # through the gate entry point. Unknown or unparseable -> "*", which
+                    # denies every kind, because a blocking finding nobody can attribute
+                    # is not evidence about one review, it is evidence about all of them.
+                    _residue_kind = _marker_kind_or_none(block)
                     blocking_residue.setdefault("", set()).add(
-                        _marker_kind_or_none(block) or "*"
+                        _residue_kind
+                        if _residue_kind in _KNOWN_SCHEDULED_REVIEW_KINDS
+                        else "*"
                     )
                 unusable.append((_marker_kind_or_none(block), why, True))
                 continue
