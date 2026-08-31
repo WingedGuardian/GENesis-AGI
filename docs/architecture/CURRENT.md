@@ -445,7 +445,10 @@ verified: d8204a0c 2026-08-25
 - **The Contributor Work-Log posts public GitHub issues, gated like email.** A
   server-side MCP tool (`contributor_issue_propose`, genesis-health) sanitizes a
   curator-drafted issue via the fail-closed `contribution/sanitize.py scan_prose`
-  (title+body+labels — every string that egresses), then HOLDS it: the
+  (title+body+labels — every string that egresses) and enforces the label policy
+  (fail-closed, AFTER the scan: a proposal missing an `area:*` domain label or a
+  difficulty/environment label — `_AREA_LABELS`/`_ENV_DIFFICULTY_LABELS` — is
+  `rejected` with no row), then HOLDS it: the
   `approval_requests` row FIRST, then `pending_issue_posts` (mirroring the email
   gate). By default each hold is per-item owner-approved on the dashboard (excluded
   from `approve_all_pending`, like email). **Autonomous posture (opt-in,

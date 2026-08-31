@@ -52,6 +52,43 @@ from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
 
+# Label policy (fail-closed). Every proposed contributor issue must carry a
+# domain label (``area:*``) AND a difficulty/environment label, so the public
+# tracker stays navigable by domain and newcomers can find right-sized work.
+# Enforced in ``_impl`` below, AFTER the privacy scan (so a private-data proposal
+# reports ``blocked`` — the security verdict — rather than ``rejected``).
+#
+# PRODUCER: the labels are emitted by the curator's PROMPT — the install-local
+# contributor-worklog strategy doc, not any in-repo default (campaigns are user
+# data; see the module docstring). This validator is the machine BACKSTOP so a
+# drifting prompt can't silently ship unlabeled issues; a rejected proposal's
+# ``reason`` enumerates the valid labels, so an LLM curator that loops on error
+# self-corrects. ``area:other`` is the escape hatch for a genuinely cross-cutting
+# issue, so a valid proposal is never wrongly rejected. Keep in sync with the
+# GitHub label set (created via ``gh label create``).
+_AREA_LABELS = frozenset(
+    {
+        "area:memory",
+        "area:dashboard",
+        "area:runtime",
+        "area:guardian",
+        "area:autonomy",
+        "area:channels",
+        "area:knowledge",
+        "area:eval",
+        "area:other",
+    }
+)
+# A real difficulty/environment signal — NOT ``help wanted`` (a "community welcome"
+# marker that says nothing about difficulty or whether a running instance is needed).
+_ENV_DIFFICULTY_LABELS = frozenset(
+    {
+        "good first issue",
+        "first-timers-only",
+        "needs-genesis-instance",
+    }
+)
+
 
 def _default_repo() -> str:
     owner = github_user()
@@ -122,6 +159,28 @@ async def _impl_contributor_issue_propose(
         ]
         logger.warning("contributor_issue_propose BLOCKED %d finding(s): %s", len(reasons), reasons)
         return {"status": "blocked", "reasons": reasons, "scanners_run": scan.scanners_run}
+
+    # 1b) Label policy (fail-closed) — require a domain (area:*) AND a
+    #     difficulty/environment label. AFTER the privacy scan so a private-data
+    #     proposal reports `blocked` (security), not `rejected` (policy). No row is
+    #     written on rejection; the curator gets a clear reason and self-corrects.
+    label_set = set(label_list)
+    if not (label_set & _AREA_LABELS):
+        return {
+            "status": "rejected",
+            "reason": (
+                "missing an area:* label — every issue needs one domain label "
+                f"({', '.join(sorted(_AREA_LABELS))})"
+            ),
+        }
+    if not (label_set & _ENV_DIFFICULTY_LABELS):
+        return {
+            "status": "rejected",
+            "reason": (
+                "missing a difficulty/environment label — every issue needs one "
+                f"({', '.join(sorted(_ENV_DIFFICULTY_LABELS))})"
+            ),
+        }
 
     # 2) Backpressure + DB-side dedup (GitHub open-issue dedup is done at post
     #    time in the drain — the curator profile has no gh).
