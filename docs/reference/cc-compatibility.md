@@ -306,6 +306,49 @@ person merging, and the only enforcement this has is a human reading a claim
 someone chose to make. Ordinary markdown is fine: list bullets, `- [x]` task
 boxes, blockquotes and bold all work.
 
+**Receipts are also required when the direction cannot be established.** The gate
+compares the pin the PR will publish against the pin on the base branch. If the
+base branch's pin is unreadable — the file is missing, empty, carries no
+`CC_VERSION` assignment, or assigns it more than once — there is nothing to
+compare against, and the gate asks for the receipts *in place of* the comparison.
+
+The same applies when the base pin is present but **not installable**, such as a
+leading-zero version like `2.1.0250`. `npm install` cannot resolve that spelling,
+so it is not evidence that any version ever ran here — and the *unchanged* and
+*backward* exemptions both rest on exactly that claim.
+
+**Write the receipts where GitHub renders them.** They may sit on the same line
+as one of the template's `<!-- -->` prompts — the check reads what the rendered
+body shows. Receipts *inside* a comment or a code fence still do not count: the
+only enforcement here is a human reading a claim someone chose to make, and a
+receipt the reviewer cannot see defeats it.
+
+This is the case a PR that **repairs** a broken pin file will hit, and the ask is
+deliberate: such a PR is establishing a pin rather than restoring a known one,
+and it is invisible to CI, because its merge tree contains the repaired file and
+`cc-node-lockstep` therefore passes. The receipts are a line in the PR body, so
+this refuses a merge, never the repository's ability to repair itself.
+
+A *transport* failure reading the base — an API timeout, an unresolvable ref — is
+not the same thing and stays non-blocking, with a note printed at merge time.
+
+**A PR that does not edit `scripts/lib/cc_version.sh` is never asked for
+receipts**, whatever state the pin is in on either side. That is settled from the
+PR's own changed-file list, which GitHub computes against the merge base, so a PR
+that merely branched before the pin last changed is not mistaken for one that
+edits it.
+
+Two more rules follow from the pin being **published** by the merge, since
+`origin` is the public repo:
+
+* The head pin must be canonical `X.Y.Z` with no leading zeros **whenever this PR
+  wrote it** — `npm install @anthropic-ai/claude-code@2.1.0218` does not resolve.
+  A non-canonical pin *inherited* unchanged from the base is not blocked; that
+  would make one bad commit block every open PR, including its own repair.
+* A pin that is present but unreadable at the head — unparseable, ambiguous, over
+  GitHub's 1MB inline limit — blocks. "I cannot tell what this PR pins" is not a
+  reason to wave a release through.
+
 **The merge gate is the authority; CI is advisory.** The check reads the PR
 BODY, which stays mutable after any CI run finishes, so a CI status describing
 it is a claim about the past. It therefore runs at merge time

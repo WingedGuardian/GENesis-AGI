@@ -99,6 +99,89 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   adversarial audit reproduced that path before the field existed. Measured on the 40
   most recent marker-carrying PRs: 14 were relief-eligible and the rule denies none of
   them; 7 carry benign uncountable rows that a blanket rule would have denied.
+- **A malformed Claude Code pin on `main` no longer wedges every merge in the
+  repository, and a pin blob that cannot be decoded at the head now blocks.** Two
+  fixes to the CC pin-receipt merge gate, one narrow and one broad.
+
+  The narrow one: the gate splits its fail direction between facts about a PR's
+  CONTENT (block) and failures of its own PLUMBING (note, do not block). A pin blob
+  over GitHub's 1MB inline limit (the contents API answers `"encoding": "none"` with
+  no content) and a blob whose base64 will not decode are both statements about what
+  the PR contains, yet both were classified as plumbing — so a PR moving the pin
+  forward while carrying either one skipped the receipt requirement entirely. They
+  now have their own `undecodable` outcome and block at the head. Genuine plumbing
+  failures (no repo slug, transport error, a non-JSON body, an unresolvable ref) stay
+  non-blocking: refusing every merge whenever a read comes back unusable once walled
+  off 50 merge-gate cases at a stroke.
+
+  The broad one: **the base branch no longer decides anything by itself.** Previously
+  an empty, whitespace-only, unassigned, doubly-assigned or absent pin file on the
+  base branch blocked *every* pull request — including PRs that never touch
+  `cc_version.sh`, including a fully compliant pin bump carrying both receipts, and
+  including the pull request that would have repaired the pin. The gate has no
+  override sigil by design, so there was no in-band recovery: one bad commit to `main`
+  stopped all merges.
+
+  A base whose pin is *faulty* is now treated as a missing INPUT rather than as an
+  answer. Direction is then unknowable, and both of the obvious responses are wrong:
+  blocking wedges the repository, while passing lets a PR that repairs the base and
+  bundles a forward release in the same change ship with no receipts at all — a case
+  CI cannot see, because that PR's merge tree contains the *repaired* file, so
+  `cc-node-lockstep` passes and the check is green. So the gate asks for the receipts
+  in place of the comparison it could not run, and marks the verdict as having
+  verified nothing about direction. Receipts are a line in the PR body, so this
+  refuses a merge, never the repository's ability to repair itself.
+
+  A base the gate simply could not *read* — an API timeout, a non-JSON body, an
+  unresolvable ref — stays non-blocking, as it always has. That distinction is the
+  gate's CONTENT-versus-PLUMBING axis applied to the base side, and it has to be
+  carried explicitly: both cases yield no base text, so deriving it from the text
+  alone would let one transient network blip demand release receipts from every open
+  PR.
+
+  A pin file that is not valid UTF-8 now lands on the CONTENT side of that axis
+  rather than crashing the check. The CI adapter reads the base with `git show`,
+  which decodes as it reads, and the decode error is not one of the error types that
+  read was catching — so a single stray byte in `cc_version.sh` ended the run with a
+  traceback instead of a verdict, and took the `--advisory` mode's "never exits
+  non-zero" guarantee with it. Reading it as CONTENT is what keeps that byte from
+  buying a free pass: the *plumbing* classification would have waved the pin through
+  unreceipted. The equivalent head-side read already did this; only the base-side one
+  was missed.
+
+  A base pin that is not **installable** yields no reference value either. `npm
+  install @anthropic-ai/claude-code@2.1.0250` does not resolve, so that version never
+  ran anywhere — and both the unchanged and the *backward* exemptions rest on the
+  claim that it did. Measured: `2.1.0250 → 2.1.246` passed with an empty body as a
+  "rollback" to a version that had never existed. A non-canonical base now takes the
+  unknown-direction path, so the canonical repair stays mergeable but has to be
+  attested like every other unverifiable direction.
+
+  A receipt written **beside** one of the PR template's `<!-- -->` prompts now
+  counts. The body scanner discarded the rest of any line a comment appeared on —
+  opening or closing — so an author filling in this repo's own template put both
+  receipts where GitHub renders them and the gate reported them missing, through a
+  check with no override sigil.
+
+  Whether a PR touched the pin at all is decided from the PR's own **changed-file
+  list**, which GitHub computes against the merge base — the same thing the merge
+  uses. Comparing the head tree against the base *tip* gets one class wrong: a PR that
+  branched before the base's latest pin change still carries the older blob, so the
+  tips differ even though the merge keeps the base's version and never touches the
+  file. With a malformed new base pin that demanded receipts from exactly the stale,
+  unrelated PRs this fix exists to unblock. The **blob SHA** is the fallback when that
+  list is unavailable or truncated — never the file CONTENTS, which are both empty
+  whenever a read fails, so two *different* oversized blobs compared equal and
+  reported an untouched pin.
+
+  Two rules now follow from the merge being the publication, since `origin` is the
+  public repo. A pin present but unreadable at the head blocks. And the head pin must
+  be canonical `X.Y.Z` **whenever the PR wrote it** — `npm install …@2.1.0218` does
+  not resolve — while a non-canonical pin *inherited* unchanged does not block, which
+  is what makes the canonical repair of a malformed pin (`2.1.0218` → `2.1.218`)
+  expressible at all. It was previously refused as "incomparable", leaving a malformed
+  pin unmergeable by anyone.
+
 - **The ego's self-model stopped presenting stale, thin and arbitrarily-ranked
   rows as present-tense capability.** `capability_map` feeds three ego-prompt
   sections and the capability-improvement scanner. Measurements below come from
@@ -249,6 +332,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   mechanically-decidable sub-shape only — an absolute date literal is a bomb only
   relative to a production threshold, which is not statically decidable, and no
   claim is made that the literal population is clean.
+
 - **SSH slot cap no longer collapses below the running session count.** The
   interactive-slot launcher (`scripts/cc-slot.sh`) sized its cap from
   *instantaneous free RAM* (`(MemAvailable − reserve) / per_session`), so each

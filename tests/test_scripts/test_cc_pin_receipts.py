@@ -143,27 +143,180 @@ def test_reassignment_in_any_shape_blocks(second: str) -> None:
     shape here — the one it had a test for. Bash executes assignments after `;`,
     `||` and `&&` and inside one-line bodies, none of which start a line.
     """
-    _assert_blocked(_evaluate(head=HEAD + second + "\n"), "unreadable")
+    _assert_blocked(_evaluate(head=HEAD + second + "\n"), "unreadable-head")
 
 
-def test_leading_zero_version_blocks_rather_than_comparing_equal() -> None:
-    """MEASURED fail-OPEN: int() collapses 2.1.0246 and 2.1.246 to one tuple.
+@pytest.mark.parametrize(
+    ("base_v", "head_v"),
+    [
+        ("2.1.246", "2.1.0246"),  # forward-ish: same number, respelled BADLY
+        ("2.1.246", "2.1.0250"),  # forward
+        ("2.1.246", "2.1.0100"),  # backward
+    ],
+    ids=["respelled", "forward", "backward"],
+)
+def test_a_non_canonical_pin_THIS_PR_WROTE_blocks_in_every_direction(
+    base_v: str, head_v: str
+) -> None:
+    """`npm install @anthropic-ai/claude-code@2.1.0246` does not resolve.
 
-    So a pin written with a leading zero read as "unchanged" against the plain
-    form and skipped the gate. npm cannot install it either.
+    So an authored leading-zero pin ships a version nothing can install, and the
+    direction it moved is beside the point. An earlier revision checked the spelling
+    only on the FORWARD path, which let `2.1.246` → `2.1.0246` through as "the same
+    version, respelled" — the canonicalisation exemption below, run backwards.
     """
     v = _evaluate(
-        head='CC_VERSION="${CC_VERSION:-2.1.0246}"\n',
-        base='CC_VERSION="${CC_VERSION:-2.1.246}"\n',
+        head=f'CC_VERSION="${{CC_VERSION:-{head_v}}}"\n',
+        base=f'CC_VERSION="${{CC_VERSION:-{base_v}}}"\n',
     )
 
-    _assert_blocked(v, "unreadable")
+    _assert_blocked(v, "unreadable-head")
+
+
+def test_a_non_canonical_pin_this_PR_INHERITED_does_not_block() -> None:
+    """The other half of the same rule, and the reason it is scoped to authorship.
+
+    A malformed pin already on the base branch is inherited by every open PR. If it
+    blocked, it would block all of them — including the one that repairs it, since
+    that PR necessarily carries the malformed pin at its base. That is the wedge this
+    module exists to avoid, so the spelling rule must not reintroduce it.
+    """
+    same = 'CC_VERSION="${CC_VERSION:-2.1.0246}"\n'
+
+    _assert_passes(_evaluate(head=same, base=same, body="no receipts anywhere"))
+
+
+def test_the_canonical_repair_of_a_non_canonical_base_is_MERGEABLE_with_receipts() -> None:
+    """`2.1.0246` → `2.1.246` must be possible, and must be attested. Both halves.
+
+    Revised twice, and the pair of revisions is the argument.
+
+    It BLOCKED first, under a rule refusing to compare a non-canonical pin on either
+    side — described as costing only "pin-moving PRs", which overlooked that the
+    repair IS a pin-moving PR. The malformed pin was unmergeable by anyone through a
+    gate with no override sigil.
+
+    It then PASSED with no receipts, on the reasoning that the two spellings name one
+    version so nothing is being released. That reasoning treats the base as a
+    trustworthy statement of what is installed, and it is not: `npm install
+    @…@2.1.0246` does not resolve, so that version never ran anywhere. The same
+    leniency exempted `2.1.0250` → `2.1.246` as a "rollback" to a version that had
+    never existed.
+
+    So neither. A non-canonical base yields no reference value, the direction is
+    unknown, and the receipts are required in place of the comparison — the same bar
+    every other unverifiable direction meets. The repair stays in-band; it just has
+    to be attested.
+    """
+    args = {
+        "head": 'CC_VERSION="${CC_VERSION:-2.1.246}"\n',
+        "base": 'CC_VERSION="${CC_VERSION:-2.1.0246}"\n',
+    }
+
+    _assert_blocked(_evaluate(body="no receipts anywhere", **args), "receipts")
+
+    passing = _evaluate(**args)
+    assert not passing.blocked, f"the repair must remain mergeable: {passing.message}"
+    assert not passing.direction_verified, (
+        "a non-canonical base cannot establish direction, and a pass that claims "
+        "otherwise is the exemption this test exists to prevent"
+    )
+
+
+def test_an_UNINSTALLABLE_head_pin_blocks_even_when_the_base_read_failed() -> None:
+    """The one head-side content fact that survives having no base at all.
+
+    `npm install @anthropic-ai/claude-code@2.1.0218` does not resolve, so merging
+    that spelling publishes a version nothing can fetch. Everywhere else the
+    spelling rule is authorship-scoped — refusing an INHERITED malformed pin would
+    wedge every open PR — but authorship cannot be established without the base,
+    and that scoping does not rescue this path.
+
+    The trade decides it: a transport failure is transient, so refusing costs one
+    retry, while allowing costs a published pin nobody can install. An earlier
+    revision let it through and recorded that as an accepted consequence; the
+    trade was the wrong way round.
+    """
+    blocked = receipts.evaluate(
+        base_pin_text=None,
+        head_pin_text='CC_VERSION="${CC_VERSION:-2.1.0218}"\n',
+        body=BOTH,
+        base_unreadable=True,
+    )
+    assert blocked.blocked, f"an uninstallable pin must not merge: {blocked.message}"
+    assert "canonical semver" in blocked.message, blocked.message
+
+    # The control: the same transport failure with an INSTALLABLE head still takes
+    # the non-blocking plumbing path. Without this, "block on transport failure"
+    # would satisfy the assertion above while re-wedging the repo on a network blip.
+    fine = receipts.evaluate(
+        base_pin_text=None,
+        head_pin_text='CC_VERSION="${CC_VERSION:-2.1.218}"\n',
+        body=BOTH,
+        base_unreadable=True,
+    )
+    assert not fine.blocked, fine.message
+    assert not fine.direction_verified
+
+
+def test_a_rollback_to_an_UNINSTALLABLE_base_is_not_exempt() -> None:
+    """The control for the test above, and the sharper half of the same defect.
+
+    The backward exemption is justified by "a rollback returns to a version that
+    already ran here". When the base spelling cannot be installed, nothing ran, and
+    the justification is simply false — so `2.1.0250` → `2.1.246` passed with an
+    empty body while proving nothing at all about `2.1.246`.
+
+    Without this case, "require receipts for the canonical repair" is satisfied by a
+    fix that special-cases string equality and leaves every other non-canonical base
+    comparison exempt.
+    """
+    _assert_blocked(
+        _evaluate(
+            head='CC_VERSION="${CC_VERSION:-2.1.246}"\n',
+            base='CC_VERSION="${CC_VERSION:-2.1.0250}"\n',
+            body="no receipts anywhere",
+        ),
+        "receipts",
+    )
 
 
 def test_unreadable_pin_blocks_it_does_not_skip() -> None:
-    """"I cannot tell what this file pins" is not a reason to wave a release
+    """"I cannot tell what THIS PR pins" is not a reason to wave a release
     through — it is the state a human must look at. Inverse of the original."""
-    _assert_blocked(_evaluate(head="# no pin here at all\n"), "unreadable")
+    _assert_blocked(_evaluate(head="# no pin here at all\n"), "unreadable-head")
+
+
+@pytest.mark.parametrize(
+    "base",
+    ["", "   \n", "# no pin here at all\n", BASE + 'CC_VERSION="${CC_VERSION:-9.9.9}"\n'],
+    ids=["empty", "whitespace", "no-assignment", "assigned-twice"],
+)
+def test_an_unreadable_BASE_pin_requires_RECEIPTS_rather_than_blocking(base: str) -> None:
+    """Both of the obvious answers here are wrong, which is why this is a third one.
+
+    BLOCKING wedges the repository: a base-side fault is inherited by every open PR,
+    repairable by none of them through a gate with no override sigil.
+
+    PASSING lets a release ship unreceipted. A PR that repairs the base and bundles a
+    forward bump in the same change is invisible to CI — its merge tree carries the
+    REPAIRED file, so `check_cc_node_lockstep` passes and the check is green. That
+    was a live fail-open between 2026-08-28 and 2026-08-29, and it was found by
+    review, not by this suite: the version of this test that asserted a plain pass
+    went green throughout.
+
+    So the gate asks for the ATTESTATION in place of the comparison it cannot run.
+    Receipts are a line in the PR body, so this refuses a merge, never the repo's
+    ability to repair itself.
+    """
+    _assert_blocked(_evaluate(base=base, body="prose, but no receipts"), "receipts")
+
+    passing = _evaluate(base=base)
+    assert not passing.blocked, f"receipts present must pass: {passing.message}"
+    assert not passing.direction_verified, (
+        "a pass here verified the receipts and NOTHING about direction — saying "
+        "otherwise is the fail-open this whole path exists to make visible"
+    )
 
 
 def test_invalid_utf8_pin_file_raises_from_the_adapter(tmp_path: Path) -> None:
@@ -182,7 +335,121 @@ def test_invalid_utf8_pin_file_raises_from_the_adapter(tmp_path: Path) -> None:
     assert "UTF-8" in str(exc.value)
 
 
+def _repo_with_pin_bytes(root: Path, raw: bytes) -> None:
+    """A throwaway git repo whose HEAD commit holds ``raw`` as the pin file.
+
+    Bytes, not text, because the case under test is a pin file that is not valid
+    UTF-8 at all — writing it through ``write_text`` could not express it.
+    """
+    pin = root / "scripts" / "lib"
+    pin.mkdir(parents=True)
+    (pin / "cc_version.sh").write_bytes(raw)
+    run = lambda *a: subprocess.run(a, cwd=root, check=True, capture_output=True)  # noqa: E731
+    run("git", "init", "-q")
+    run("git", "config", "user.email", "t@example.invalid")
+    run("git", "config", "user.name", "t")
+    run("git", "add", "-A")
+    run("git", "commit", "-qm", "pin")
+
+
+def test_invalid_utf8_pin_at_a_REF_is_a_content_fault(tmp_path: Path) -> None:
+    """The BASE-side twin of the head-side test above, which was missed.
+
+    `read_pin_at` shells out to `git show <ref>:<path>` with `text=True`, so the
+    decode happens INSIDE `subprocess.run`. It caught only
+    `(OSError, subprocess.SubprocessError)`, and `UnicodeDecodeError` is a
+    `ValueError` — neither. It escaped the base-read handler in `main()` and
+    crashed `--advisory` with a traceback.
+    """
+    _repo_with_pin_bytes(tmp_path, b'CC_VERSION="${CC_VERSION:-2.1.246}"\n# \xff\xfe\n')
+
+    with pytest.raises(receipts.PinUnreadable) as exc:
+        receipts.read_pin_at("HEAD", repo_root=tmp_path)
+
+    assert "UTF-8" in str(exc.value)
+
+
+def test_invalid_utf8_at_a_ref_is_NOT_classified_as_a_transport_failure(
+    tmp_path: Path,
+) -> None:
+    """The assertion with teeth, and the reason the test above is not enough.
+
+    `PinTransportError` SUBCLASSES `PinUnreadable`, so a test that only asserts
+    `PinUnreadable` passes for the WRONG fix too. The distinction decides the
+    verdict: a transport error sets `base_unreadable=True`, which `evaluate()`
+    treats as this gate's own plumbing failing and lets through NON-BLOCKING —
+    a free pass. Here git RAN and returned bytes; the bytes are not a readable
+    pin, which is a fact about the TREE. Content, so receipts are required.
+    """
+    _repo_with_pin_bytes(tmp_path, b"\xff\xfe not a pin at all\n")
+
+    with pytest.raises(receipts.PinUnreadable) as exc:
+        receipts.read_pin_at("HEAD", repo_root=tmp_path)
+
+    assert not isinstance(exc.value, receipts.PinTransportError), (
+        "a non-UTF-8 pin file is a CONTENT fault, not a transport failure — "
+        "classifying it as transport hands out a free pass on a pin nobody can read"
+    )
+
+
+def test_a_valid_pin_at_a_ref_still_reads_back(tmp_path: Path) -> None:
+    """Control. Without it, a `read_pin_at` that raised on EVERYTHING would
+    satisfy both tests above."""
+    _repo_with_pin_bytes(tmp_path, b'CC_VERSION="${CC_VERSION:-2.1.246}"\n')
+
+    assert "2.1.246" in receipts.read_pin_at("HEAD", repo_root=tmp_path)
+
+
 # ── what counts as a receipt ──────────────────────────────────────────────
+
+
+def test_a_receipt_written_BESIDE_a_template_comment_counts() -> None:
+    """The shape this repo's own PR template produces, which the gate refused.
+
+    `PULL_REQUEST_TEMPLATE.md` is built entirely from `<!-- -->` blocks, so an
+    author filling it in naturally writes the answer on the same line as the
+    prompt. Both receipts below render perfectly on GitHub.
+
+    The scanner used to drop the whole remainder of a line once a comment appeared
+    on it — opening OR closing — so these were invisible, the gate refused, and the
+    message said the receipts were missing while they were plainly there. This gate
+    has no override sigil, so the author's only route was to guess why.
+    """
+    body = (
+        "## Testing\n"
+        "<!-- what did you run? --> CC-Gate-Changelog: read (2.1.218, 2.1.246] in "
+        "full from CHANGELOG.md, 2026-08-27\n"
+        "<!-- soak evidence --> CC-Gate-Soak: 2.1.246 soaked 2026-08-25..2026-08-27, "
+        "sweep clean, signed off\n"
+    )
+
+    assert receipts.missing_receipts(body) == []
+
+
+def test_several_comments_on_one_line_leave_the_text_between_them() -> None:
+    """One `partition` handles the first comment and loses everything after it."""
+    assert receipts.readable_body("a <!--x--> b <!--y--> c") == "a  b  c"
+
+
+@pytest.mark.parametrize(
+    ("body", "why"),
+    [
+        ("<!--\nCC-Gate-Changelog: x\nCC-Gate-Soak: y\n-->", "wholly inside a comment"),
+        ("<!-- oops\nCC-Gate-Changelog: x\nCC-Gate-Soak: y", "unterminated opener"),
+        ("```\nCC-Gate-Changelog: x\nCC-Gate-Soak: y\n```", "inside a fence"),
+        ("```\nCC-Gate-Changelog: x\n~~~\nCC-Gate-Soak: y", "fence closed by the wrong marker"),
+    ],
+    ids=["closed comment", "unterminated", "fenced", "mismatched fence"],
+)
+def test_genuinely_hidden_receipts_still_do_not_count(body: str, why: str) -> None:
+    """The control for the two tests above, and the reason they are safe.
+
+    Making text beside a comment visible must not make text INSIDE one visible.
+    Without these, "render more of the line" is satisfied by a scanner that strips
+    no comments at all — which would count a receipt nobody can see and defeat the
+    only enforcement this check has.
+    """
+    assert receipts.missing_receipts(body) == ["CC-Gate-Changelog", "CC-Gate-Soak"], why
 
 
 def test_receipts_hidden_in_an_html_comment_do_not_count() -> None:
@@ -214,6 +481,40 @@ def test_a_fence_is_closed_only_by_its_own_marker() -> None:
     """MEASURED: `~~~` does not close a ``` block, so receipts under a mismatched
     closer still render as code while the old stripper treated them as visible."""
     _assert_blocked(_evaluate(body=f"~~~\n{BOTH}```\n"), "receipts")
+
+
+def test_an_unmatched_comment_INSIDE_a_fence_does_not_swallow_the_receipts() -> None:
+    """MEASURED over-rejection, on a gate with no override sigil.
+
+    Markdown treats `<!--` inside a fence as literal text. The scanner updated
+    comment state BEFORE checking the fence, so a fenced ```html example containing
+    an unmatched `<!--` turned comment-mode on, which hid the CLOSING fence, which
+    swallowed every receipt after it — both reported missing while both render
+    plainly on GitHub. Refusing a compliant PR with no recovery route is the same
+    wedge this module exists to remove, arriving through the body scanner.
+    """
+    body = f"```html\n<!-- example of a comment\n```\n{BOTH}"
+    passing = _evaluate(body=body)
+    assert not passing.blocked, f"receipts after a fenced comment must count: {passing.message}"
+
+
+def test_the_fence_and_comment_controls_survive_together() -> None:
+    """The properties the fix must not trade away, asserted in ONE place.
+
+    Reordering the fence and comment passes is what caused the bug above, and a
+    reordering can silently re-open any of these — each was itself a measured
+    defect once. Kept together so the whole set moves or none of it does.
+    """
+    cases = {
+        "inside a closed comment": f"<!-- {BOTH} -->",
+        "under an unterminated opener": f"<!-- template notes\n{BOTH}",
+        "inside a fence": f"```\n{BOTH}```\n",
+        "under a mismatched fence closer": f"~~~\n{BOTH}```\n",
+    }
+    still_visible = [label for label, body in cases.items() if not _evaluate(body=body).blocked]
+    assert not still_visible, (
+        f"receipts became visible where they must not be: {still_visible}"
+    )
 
 
 @pytest.mark.parametrize(
