@@ -205,15 +205,19 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   passed may be testing nothing; a whole suite passing every review round
   while a reviewer keeps finding real spec bugs is the tell that the tests
   encode the same wrong spec as the code.
-- **A RED that comes back GREEN has AT LEAST five causes, and "the test is
+- **A RED that comes back GREEN has AT LEAST six causes, and "the test is
   vacuous" is the LAST one to reach for.** In rough order of how often they
   actually occur:
   1. **The run never EXECUTED** — a guard refused it, a lock held it, the tool
      timed out — so there is no result at all. This is the CONFIDENT FALSE
      NEGATIVE: a sweep reporting "all mutations survived" is far more often a
      sweep that never ran. Make the runner ABORT when the test command emits no
-     result line, and treat a SKIPPED/deselected line the same way — it is a
-     result line, and it still means nothing ran.
+     result line, and treat a SKIPPED/deselected line FOR THE TEST UNDER
+     VERIFICATION the same way — it is a result line, and it still means
+     nothing ran. Scope that check to the target: a suite carrying legitimate
+     `skipif` tests emits SKIPPED lines on every healthy run, so a runner that
+     aborts on ANY of them refuses every run — and the agent then either sits
+     blocked or starts stripping skip markers to unblock itself.
   2. **The MUTATION silently failed to apply** — the auto-formatter reflows
      lines and a `str.replace()` anchor written from memory then matches nothing.
   3. **The test ran against a DIFFERENT COPY of the code** — an installed
@@ -230,9 +234,21 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
      When two layers produce the same behaviour, mutate the WHOLE mechanism, not
      one of its halves. (The duplicated-layer anecdote in the review-loop section
      is the worked example.)
-  Only after all five: the test is vacuous. The list is ordered, not closed —
-  if none of them fits, look for a sixth before rewriting a test that may be
-  sound, because rewriting a sound test is the expensive mistake here.
+  6. **A SIBLING TEST LEAKED STATE that masks the mutation** — an undone
+     `monkeypatch`, a stray `os.environ` entry, a mutated singleton or a
+     module-level cache — so the mutated path is never reached in THIS run.
+     It matches none of the five above: the run executed, the mutation applied
+     and is not behaviourally null, the code is the right copy, and no
+     production layer is enforcing anything. MEASURED in this repo: a leaked
+     disable lever made the very lock under test a no-op, and five real
+     failures read as a story about the mechanism instead. The remedy is test
+     ISOLATION (an autouse fixture that clears the lever) — NOT a different
+     mutation, and NOT a different test.
+  Only after all six: the test is vacuous. The list is ordered and still not
+  closed — if none of them fits, the vacuous conclusion is UNPROVEN rather than
+  established: look for the cause you have not modelled before rewriting a test
+  that may be sound, because rewriting a sound test is the expensive mistake
+  here.
   The PRINCIPLE, which is what to remember:
   **every injection must prove it applied, by its own postcondition, before any
   result is read as RED.** Two corollaries follow, and both have bitten:
@@ -245,8 +261,8 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   tree, so it accepts context-invalid constructs like a `return` moved outside a
   function or a `break` outside a loop, and the `SyntaxError` then surfaces at
   COLLECTION, where a nonzero exit reads as a successful RED), `bash -n` for
-  shell — since an invalid mutation breaks
-  collection and reads as a successful RED, while the wrong language's parser
+  shell — since an invalid mutation breaks collection and reads as a successful
+  RED, while the wrong language's parser
   rejects a valid mutation and hides a real survivor. Restore from a file copy
   taken beforehand, never `git checkout` — the work is uncommitted — and make
   the restore ATTEMPT unconditional ON THE RUN'S OUTCOME (`trap restore EXIT`, a
@@ -257,9 +273,13 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   `set -e` a trailing restore is exactly the statement that never runs (the
   `out=$(cmd)` entry in Common Traps is the same mechanism), so the shape that
   reads as careful leaves a deliberately-broken file in an uncommitted worktree
-  on the ordinary path — as well as on interruption or a tool timeout. Refuse to
-  start if the file already differs from the snapshot, and verify the restore by
-  hash rather than assuming it. And restore ONLY what you broke: compare against
+  on the ordinary path — as well as on interruption or a tool timeout. Take
+  that copy ONCE for the whole sweep and refuse to start EACH cycle if the file
+  already differs from it — a copy re-taken immediately before each mutation
+  makes the check vacuous, since the file trivially matches a copy a moment
+  old; the baseline exists to catch a PREVIOUS cycle that failed to restore, or
+  a concurrent edit. Verify the restore by hash rather than assuming it. And
+  restore ONLY what you broke: compare against
   the hash the MUTATION wrote before overwriting, because between the mutation
   and the handler another session, agent or formatter may have edited that file,
   and a blind snapshot restore silently destroys their uncommitted work — a
