@@ -234,13 +234,22 @@ def _check_review_state() -> None:
 
     print(
         "CODE REVIEW PENDING: code changes were made without a review marker. "
-        "Next turn MUST begin by reviewing the STAGED diff and recording evidence — "
-        "the `superpowers` plugin (`/review`, `superpowers:code-reviewer`) where the "
-        "install has it, else `/deep-review`, or review and then "
-        "`python3 scripts/review_state.py mark --agent-output <file>` from the "
-        "worktree the changes are in. UNLESS the staged set is docs/config only — "
+        "Next turn MUST begin by reviewing the BRANCH CHANGESET (merge-base to "
+        "working tree — reviewing only the index leaves earlier commits uncovered) "
+        "and recording evidence: `/review` or `/code-review` or the `superpowers` "
+        "review skills where this install has them, else `/deep-review`, or by hand "
+        "`python3 scripts/review_state.py evidence-path` then `… mark --agent-output "
+        "<that file>` — adding `--clean` if the round found nothing should-fix-or-"
+        "worse, since omitting it counts the round toward the caps. Run both from the "
+        "worktree the changes are in. The MARKER binds to what is STAGED at mark "
+        "time, so mark after staging. UNLESS the staged set is docs/config only — "
         "that needs no review and no marker, and this check cannot tell the "
-        "difference because it hashes the staged diff without classifying paths."
+        "difference because it hashes the staged diff without classifying paths. "
+        "That exemption does NOT apply when the commit itself stages (`git add` in "
+        "the chain, `-am`, a pathspec), at review round 2 or 3, or when the set "
+        "touches anything under a `.github/` directory or a prompt / agent / skill "
+        "surface even when `.md`. The full rules are in the per-prompt reminder; "
+        "this is the short form."
     )
 
 
