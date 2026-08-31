@@ -22,8 +22,12 @@ import pytest
 
 from genesis.observability.snapshots import context_injection as ci
 
-_GENESIS_SLUG = "-home-ubuntu-genesis"
-_FOREIGN_SLUG = "-home-ubuntu-tmp-someone-else"
+# Synthetic slugs. CC derives a project dir by replacing every "/" and "." in
+# the path with "-", so a REAL slug is a home path with the operator's username
+# in it — dash-encoded, which is how one slipped past a "/home/" grep here. The
+# shape is what these tests need; the actual path never is.
+_GENESIS_SLUG = "-srv-checkout"
+_FOREIGN_SLUG = "-srv-someone-elses-project"
 
 
 @pytest.fixture(autouse=True)
