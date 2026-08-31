@@ -313,6 +313,101 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   passed may be testing nothing; a whole suite passing every review round
   while a reviewer keeps finding real spec bugs is the tell that the tests
   encode the same wrong spec as the code.
+- **A RED that comes back GREEN has AT LEAST six causes, and "the test is
+  vacuous" is the LAST one to reach for.** In rough order of how often they
+  actually occur:
+  1. **The run never EXECUTED** — a guard refused it, a lock held it, the tool
+     timed out — so there is no result at all. This is the CONFIDENT FALSE
+     NEGATIVE: a sweep reporting "all mutations survived" is far more often a
+     sweep that never ran. Make the runner ABORT when the test command emits no
+     result line, and treat a SKIPPED/deselected line FOR THE TEST UNDER
+     VERIFICATION the same way — it is a result line, and it still means
+     nothing ran. Scope that check to the target: a suite carrying legitimate
+     `skipif` tests emits SKIPPED lines on every healthy run, so a runner that
+     aborts on ANY of them refuses every run — and the agent then either sits
+     blocked or starts stripping skip markers to unblock itself.
+  2. **The MUTATION silently failed to apply** — the auto-formatter reflows
+     lines and a `str.replace()` anchor written from memory then matches nothing.
+  3. **The test ran against a DIFFERENT COPY of the code** — an installed
+     package shadowing the source tree, a stale `.pyc`, the wrong virtualenv, or
+     (measured, this session) a path relative to a process whose cwd had moved to
+     another worktree. The mutation applied, the run happened, the test is sound,
+     and none of the other causes fits.
+  4. **The mutation was BEHAVIOURALLY NULL** — it applied and parses, so every
+     postcondition below passes, but it changed no behaviour: swapped operands
+     that commute, an edit inside a dead branch, a type annotation Python does
+     not enforce (also measured this session). The remedy is a different
+     MUTATION, not a different test.
+  5. **A SIBLING LAYER still enforces the invariant**, so the green is correct.
+     When two layers produce the same behaviour, mutate the WHOLE mechanism, not
+     one of its halves. (The duplicated-layer anecdote in the review-loop section
+     is the worked example.)
+  6. **A SIBLING TEST LEAKED STATE that masks the mutation** — an undone
+     `monkeypatch`, a stray `os.environ` entry, a mutated singleton or a
+     module-level cache — so the mutated path is never reached in THIS run.
+     It matches none of the five above: the run executed, the mutation applied
+     and is not behaviourally null, the code is the right copy, and no
+     production layer is enforcing anything. MEASURED in this repo: a leaked
+     disable lever made the very lock under test a no-op, and five real
+     failures read as a story about the mechanism instead. The remedy is test
+     ISOLATION (an autouse fixture that clears the lever) — NOT a different
+     mutation, and NOT a different test.
+  Only after all six: the test is vacuous. The list is ordered and still not
+  closed — if none of them fits, the vacuous conclusion is UNPROVEN rather than
+  established: look for the cause you have not modelled before rewriting a test
+  that may be sound, because rewriting a sound test is the expensive mistake
+  here.
+  The PRINCIPLE, which is what to remember:
+  **every injection must prove it applied, by its own postcondition, before any
+  result is read as RED.** Two corollaries follow, and both have bitten:
+  prove it against the value THAT injection was handed, never against the
+  pristine original — with two or more edits, the first edit keeps a whole-file
+  `mutated != original` true while a later one silently misses its anchor, so
+  the partial mutation reads as complete (assert the anchor matched the expected
+  number of times); and prove it with the mutated file's OWN parser —
+  `compile(src, path, "exec")` for Python (NOT `ast.parse`: that only builds a
+  tree, so it accepts context-invalid constructs like a `return` moved outside a
+  function or a `break` outside a loop, and the `SyntaxError` then surfaces at
+  COLLECTION, where a nonzero exit reads as a successful RED), `bash -n` for
+  shell — since an invalid mutation breaks collection and reads as a successful
+  RED, while the wrong language's parser
+  rejects a valid mutation and hides a real survivor. Restore from a file copy
+  taken beforehand, never `git checkout` — the work is uncommitted — and make
+  the restore ATTEMPT unconditional ON THE RUN'S OUTCOME (`trap restore EXIT`, a
+  `finally:`), never the tail of an `&&` chain. Unconditional means it always
+  RUNS, not that it always OVERWRITES: what it writes is still gated on the hash
+  check below. A `trap` that restores blindly is the very thing that destroys a
+  concurrent edit. The expected outcome here is a NONZERO exit, and under
+  `set -e` a trailing restore is exactly the statement that never runs (the
+  `out=$(cmd)` entry in Common Traps is the same mechanism), so the shape that
+  reads as careful leaves a deliberately-broken file in an uncommitted worktree
+  on the ordinary path — as well as on interruption or a tool timeout. Take
+  that copy ONCE for the whole sweep and refuse to start EACH cycle if the file
+  already differs from it — a copy re-taken immediately before each mutation
+  makes the check vacuous, since the file trivially matches a copy a moment
+  old; the baseline exists to catch a PREVIOUS cycle that failed to restore, or
+  a concurrent edit. Verify the restore by hash rather than assuming it. And
+  restore ONLY what you broke: compare against
+  the hash the MUTATION wrote before overwriting, because between the mutation
+  and the handler another session, agent or formatter may have edited that file,
+  and a blind snapshot restore silently destroys their uncommitted work — a
+  final hash check does not catch this, it only confirms the overwrite
+  succeeded. If the file no longer matches what the mutation wrote, PRESERVE it
+  and report the conflict instead. The cleanest way to avoid the window entirely
+  is to mutate inside an isolated worktree nobody else is editing.
+- **Vacuous-test shapes to check for by name** (a list of the common ones, not a
+  definition). The most frequent in practice is the one that never ran at all: a
+  test SKIPPED by a marker, or deselected by a `-k` filter or a wrong path, which
+  reports SKIPPED or "no tests ran" and never goes red — check the count, not just
+  the absence of failures. Beyond that, a test is vacuous when: its
+  assertion is ALSO true on the success path (`assert x.blocked is False` where
+  a successful call also returns False — assert the fact that DISTINGUISHES
+  them); its setup short-circuits the path it names (passing an explicit
+  argument the code prefers over the env var under test); or its fixture never
+  creates the shape it claims (a `bash -c 'sleep 30 # marker'` decoy
+  exec-replaces itself and loses the marker from its argv — add a
+  guard-the-guard assert that the fixture really has the property). Ask of every
+  new test: *would this still pass if the mechanism it names were deleted?*
 - **Contested/subtle specs: write the expectations first.** When what-should-
   happen is itself under discussion (which keys count, which states clear an
   alarm), enumerate the expectation table as failing tests BEFORE implementing
@@ -1000,6 +1095,37 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      cost), name the cap explicitly ("we've hit the 3-round escalation cap"),
      and get a FRESH decision: keep hardening, switch to a robust-by-
      construction redesign, narrow scope, or shelve.
+  **Tabulate findings by CLASS before fixing — but never let that change what
+  COUNTS.**
+  Tabulate the findings with a CLASS column before fixing ANY round's findings,
+  including round ONE. Deferring the tabulation to the second round is what
+  spends a round discovering a shared cause that was visible in the first: if the
+  opening review returns several instances of one generator, an instance-level
+  first pass fixes the ones named and ships the rest as the next round's
+  findings. The tabulation is cheap and the round it saves is not. Findings that look unrelated one at a time routinely share one
+  generator — five across three rounds once reduced to a single defect (two
+  layers that had to agree about every lever and could not), and patching
+  instances twice changed nothing while deleting the second layer removed all
+  five at once. If one class has ≥2 entries, look for the shared GENERATOR and fix
+  that; two findings can land in one superficial class without sharing a cause, so
+  the count is the prompt to look, not the verdict.
+  **Class grouping decides HOW you fix — never whether the round counts.** The
+  counter is deliberately class-blind: `bump_review_round` increments on a
+  distinct staged diff and records no class (or reviewer) identity, and the
+  marking rule below is finding-based — ANY new BLOCKER/SHOULD-FIX/P1/P2 makes
+  the round defect-bearing, including the second instance of a class you have
+  already named. Passing `--clean` to keep a repeat-class round off the counter
+  is a falsification, and worse than miscounting: `--clean` RESETS the streak to
+  zero, so it disarms the cap outright rather than merely under-counting it.
+
+  A corollary that costs a round if missed: when you delete a duplicated layer,
+  verify the class is closed by enumerating the registry for the BEHAVIOUR, not
+  for the deleted file's NAME. A name-scoped guard beneath a class-scoped claim
+  passes happily while a sibling oracle sits on the same event and matcher.
+  (And if the invariant turns out not to be statically checkable, say so and
+  narrow the test to what it can prove — a guard that cries wolf gets deleted by
+  whoever hits it next.)
+
   These three are backstopped by a **machine layer** with **two tiers, not one**.
   The tier you hit FIRST is the one most sessions do not know exists:
 
