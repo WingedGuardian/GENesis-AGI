@@ -357,12 +357,27 @@ async def test_repeated_failures_coalesce_into_one_pending_record(factory):
     is scheduled and cannot run, so the rest must be absorbed rather than queued.
     Driving them through separate loop yields would let the first complete and prove
     nothing.
+
+    WEDGING THE LOOP IS LOAD-BEARING, not decoration. `_drive` deliberately keeps
+    the loop turning while the worker runs, so without the gate below the loop can
+    COMPLETE record #1 between two of the worker's iterations; `pending.done()` is
+    then True and repeat #2 submits legitimately. The assertion became a measure of
+    thread-scheduling luck: green locally, and MEASURED failing in CI on two
+    unrelated branches at `got 2`. The gate holds record #1 open until every repeat
+    has been submitted, which is the only state in which coalescing has anything to
+    do — a real wedge is precisely a loop that cannot drain the pending record.
+    It is released FROM THE WORKER, after the repeats: releasing it from this
+    coroutine would deadlock, since the blocked loop cannot resume to do it.
     """
     calls: list[str] = []
+    released = threading.Event()
 
     class _CountingRuntime:
         def record_job_failure(self, job_name, *args, **kwargs):
             calls.append(job_name)
+            # Runs ON the loop, so this occupies it — the wedge the test models.
+            # Bounded so a regression fails instead of hanging the suite.
+            released.wait(timeout=10)
 
     daemon = factory(interval_seconds=60)
     daemon._loop = asyncio.get_running_loop()
@@ -371,6 +386,7 @@ async def test_repeated_failures_coalesce_into_one_pending_record(factory):
     def _five_failures() -> None:
         for n in range(5):
             daemon._record_failure(rt, RuntimeError(str(n)))
+        released.set()
 
     assert await _drive(_five_failures) is None
     for _ in range(200):
