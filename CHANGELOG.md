@@ -78,6 +78,109 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The Queues card could report "healthy — queues are clear" for counters it
+  never collected.** When the queues section of the health snapshot fails, it is
+  replaced wholesale by an error marker carrying no per-counter detail. The
+  card's verdict only inspected the per-counter error list, so it read every
+  depth as a missing zero and returned a confident green — displayed beside the
+  panel's own "Queue data unavailable" notice, and folded into the overall
+  dashboard status. Unmeasured zeros are now reported as unknown rather than
+  healthy. Relatedly, the "not a confirmed zero" notice was keyed on a list
+  shared by all four queue sources, so an unrelated counter failing printed it
+  above a correctly-counted list of discarded rows; it is now scoped to
+  failures of the count it actually describes.
+
+- **The `/genesis/monitor` page had the same discarded-count bug, plus a worse
+  variant: rows you could not clear.** Its "Clear All Discarded" button was shown
+  only when the 20-row sample held more than one entry, while its label printed
+  the true count — so a backlog whose sample failed to load displayed
+  "Discarded (148)" with no clear control at all. The button now follows the real
+  depth, and appears even when that depth could not be read — it deletes every
+  discarded row regardless, so withholding it was what stranded the backlog. The
+  header labels the sample as truncated. (A queue holding exactly one row still
+  shows no clear-all button — that row is cleared by its own Clear control,
+  which is the intended behaviour.)
+
+- **Dashboard reported the discarded-queue depth as 20 when it was 148.** The
+  Queues panel and the attention strip both rendered `discarded_items.length` —
+  the length of a deliberately capped `LIMIT 20` review sample — instead of
+  `discarded_count`, the true unbounded depth the backend already supplied. Any
+  backlog above 20 therefore displayed as exactly 20, and because the displayed
+  number equalled the cap it looked like a plausible total rather than a
+  truncation. The depth and the review sample are now reconciled ONCE, by the
+  backend, and published as a single object; every surface renders what it is
+  given rather than deciding for itself which of two numbers to believe. So the
+  panel can no longer claim a backlog while showing "no items awaiting review",
+  disable the button that clears it, or report 0 while listing rows. The review
+  list is labelled "showing 20 of N" whenever it is truncated, so the sample
+  cannot be mistaken for the whole queue, and a depth that could not be read is
+  now reported as unknown instead of as an empty queue — with the clear-all
+  control still available, since it removes every row regardless of what was
+  counted.
+
+  **API change:** the health snapshot's `queues` section gains a `discarded`
+  object (`total`, `sample`, `sample_truncated`, `known`). The previous
+  `discarded_count` and `discarded_items` keys remain, and are now derived from
+  that object. `discarded_items` is unchanged. `discarded_count` changes in two
+  states, both toward honesty: when the depth query fails it reports the rows
+  actually in hand rather than 0, and when the depth and the sample disagree it
+  reports the larger rather than the depth alone. Anything reading it as "the
+  queue depth" — including the >100 queue-depth alert — keeps working and
+  under-reports far less in those states: where a failed count previously
+  yielded zero, it now yields the rows actually in hand.
+
+  A depth is reported as EXACT whenever the read that produced it was complete,
+  not merely whenever the count query happened to succeed. A review sample read
+  under a `LIMIT` of one past the cap that comes back short has exhausted the
+  matching rows at its own snapshot, so it is the depth — which means a small
+  queue is now reported exactly even while the count query is failing, instead
+  of as "5+" beside a "queue data unavailable" notice for a number that had in
+  fact just been measured. It also means a count that disagrees with a complete
+  sample no longer influences the total in either direction: a count taken
+  before rows arrived reads low, and one taken before a prune removed them reads
+  high, and neither can be detected by comparing two reads that never shared an
+  instant. Only a TRUNCATED sample still depends on the count, and there the
+  total is published as a floor unless the count is consistent with it. The
+  remaining exposure is stated rather than hidden: with a truncated sample, a
+  prune landing between the two reads can still publish an inflated depth as
+  exact for one cache window; closing that needs both values read under one
+  snapshot and is tracked separately.
+
+  The Queues card's verdict follows the same principle: a diagnostic no longer
+  doubles as an answer to "is this counter known". The card previously read any
+  entry in the section's error list as an uncollected counter, so once a depth
+  could recover from whichever read completed, an exactly-measured queue
+  rendered a precise number beside "some queue counters could not be collected".
+  Errors are not suppressed — they stay in the payload and the panel still shows
+  them — they simply stop deciding a verdict they no longer describe. Counters
+  that publish no exactness of their own are unaffected, and one unrecovered
+  error alongside a recovered one still marks the section unknown.
+
+- **"Clear all reviewed" now says how many rows it will actually delete.** It
+  always deleted every discarded/expired row, not the 20 displayed — harmless
+  while the panel hid the difference, misleading once it reports the true
+  depth. The button reads "Clear all N" with a tooltip stating it is permanent
+  and covers rows not shown.
+
+- **Clearing the queue no longer leaves the dashboard showing the rows it just
+  deleted.** The health snapshot is cached for up to 30s and nothing invalidated
+  it, so the client's immediate refetch re-rendered pre-delete counts: a
+  "Cleared 148 discarded items" toast beside a panel still listing them, with
+  per-row Clear buttons that silently did nothing. Mutations now bust the cache.
+
+  The cache moved into the health service, alongside the computation it caches,
+  and is reached only from the event loop — invalidation raised from a web
+  request is handed to the loop rather than touching shared state across
+  threads. A snapshot whose computation began before a mutation is never
+  published and never handed to a caller that arrived after it, so a cleared
+  queue cannot reappear for the rest of the cache window. On a host that
+  configures no event loop for that hand-off (an embedded plugin host, where
+  invalidation runs on the request thread instead), the cached value is read
+  once and reused rather than tested and then re-read, so an invalidation
+  arriving mid-read can no longer make the endpoint fail outright. Callers that need
+  current data are unaffected: only this endpoint accepts a cached result, and
+  it says so explicitly.
+
 - **A multi-push PR no longer needs `# scheduled-review-override` just because the
   leak-scan routine stamped an earlier commit.** The merge gate now accepts an
   ACCEPTED `leaks` marker on an ancestor of the current head when the `leak-detector`
