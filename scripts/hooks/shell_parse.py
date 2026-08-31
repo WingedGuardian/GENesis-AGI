@@ -557,8 +557,10 @@ _KNOWN_SIGILS = (
     # files, and both are named here rather than left to be discovered.
     #
     # A test derives this set from the guards themselves (an ast walk over
-    # scripts/hooks/), so the next divergence fails a test rather than waiting to
-    # be noticed.
+    # scripts/, NOT just scripts/hooks/ — the hooks-only glob is what let
+    # full-suite-ok stay undeclared, since two consumers live outside that
+    # directory), so the next divergence fails a test rather than waiting to be
+    # noticed.
     "merge-to-main-override",  # git_push_guard: local `git merge` onto main/master
     "full-suite-ok",  # full_suite_guard: run the whole pytest suite locally
 )

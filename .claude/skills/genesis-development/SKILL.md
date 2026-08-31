@@ -1486,8 +1486,11 @@ The review-findings gate specifically:
    **Scope, stated so the log is not read as more complete than it is:** the four
    PR-merge sigils are covered (`# review-override`, `# ci-override`,
    `# stale-review-override`, `# scheduled-review-override`), from the point the
-   PR is resolved onward. A merge rejected before that — no `--admin`, or an
-   unresolvable repo/PR — writes nothing. The command-scoped acks
+   PR is resolved onward. A merge rejected BEFORE that point writes nothing —
+   no `--admin`, an unresolvable repo/PR, a compound carrying two publish/merge
+   operations, or a merge compounded with a local `git merge` into main are the
+   ones measured, and the list is illustrative rather than exhaustive: anything
+   that blocks before the PR resolves leaves no row. The command-scoped acks
    (`# escalation-ack`, `# merge-to-main-override`) are deliberately NOT logged:
    their gate is not evaluated where the sigil is seen, so a row could only say
    the ack was typed, never that it waived anything. Use only when findings are

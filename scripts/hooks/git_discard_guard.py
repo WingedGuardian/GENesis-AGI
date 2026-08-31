@@ -444,10 +444,24 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
         }
         # _write_log_row no longer raises — audit_jsonl converts an OS error to
         # None and reports it — so the old `contextlib.suppress(OSError)` here is
-        # gone rather than left reading as live protection. `or log_path` keeps
-        # the note pointing at the intended path when the write failed.
-        log_path = _snapshot_log_path()
-        log_path = _write_log_row(row) or log_path
+        # gone rather than left reading as live protection.
+        # Say where the row LANDED, or say it did not land — never name a path as
+        # though a row is in it when the write returned None. The recovery note is
+        # what an operator reads while trying to get work back; pointing them at
+        # an empty file is the same false promise this store was built to end.
+        #
+        # And do not name the CAUSE: None means the writer was unimportable, OR
+        # the lock was still busy at its deadline, OR an OS/serialisation error —
+        # three different things. Naming one would be a fresh false statement in
+        # the message this was rewritten to make truthful. The writer reports the
+        # real reason on stderr.
+        written = _write_log_row(row)
+        log_note = (
+            f"(log: {written})"
+            if written
+            else "(NOT logged — see the [audit-log] line on stderr for why; the "
+            "snapshot sha above is the only record, so keep it)"
+        )
         notes.append(
             f"[git-discard-guard] snapshotted the worktree at {cwd} as "
             f"{sha[:12]} (tracked changes only — `git stash create` does NOT "
@@ -457,7 +471,7 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
             f"discarded work in, recover with: git stash apply --index {sha}  "
             f"(--index restores the staged/unstaged split; drop it if the apply "
             f"conflicts). For a DELETED/overwritten file (rm/mv), pull it straight "
-            f"from the snapshot: git checkout {sha[:12]} -- <path>. (log: {log_path})"
+            f"from the snapshot: git checkout {sha[:12]} -- <path>. {log_note}"
         )
     if budget_hit:
         notes.append(

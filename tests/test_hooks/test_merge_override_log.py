@@ -17,6 +17,7 @@ Two constraints are inherited rather than invented, both from
 """
 
 import ast
+import datetime
 import importlib.util
 import json
 import os
@@ -236,6 +237,22 @@ class TestNoCredentialLeak:
         assert row["head"] == ""
         assert row["repo"] == ""
 
+    def test_pr_is_bounded_and_ascii(self, log_path):
+        """`pr` was the one field with no bound, and `str.isdigit()` was the wrong
+        check twice: it accepts non-ASCII digits and imposes no length. That made an
+        arbitrarily long row — and therefore a log-erasing trim — reachable."""
+        _note_and_flush(waived="ci-status", pr="9" * 3000, repo="o/r")
+        assert _rows(log_path)[0]["pr"] == "", "an unbounded pr must not be stored"
+        _mod._PENDING_OVERRIDES.clear()
+        _mod._note_override("ci-override", waived="ci-status", pr="١٢٣٤٥", repo="o/r")
+        _mod._flush_overrides("allowed")
+        assert _rows(log_path)[1]["pr"] == "", "non-ASCII digits must not be stored"
+
+    def test_a_real_pr_number_survives(self, log_path):
+        """Positive control: the bound must not reject the values production sends."""
+        _note_and_flush(waived="ci-status", pr="1553", repo="o/r")
+        assert _rows(log_path)[0]["pr"] == "1553"
+
     def test_a_valid_head_and_repo_survive(self, log_path):
         """Positive control: the shape check must not reject real values."""
         _note_and_flush(waived="ci:red", pr="1", repo="owner/repo-name.x", head=HEAD)
@@ -295,6 +312,71 @@ class TestRetention:
         assert audit_jsonl.append_row(str(log_path), row, maintain=[_boom])
         assert len(_rows(log_path)) == 1
         assert "maintenance failed" in capsys.readouterr().err
+
+    def test_a_relocated_log_stays_relocated_through_a_sweep(self, log_path, tmp_path):
+        """The module documents a symlinked log path as a supported relocation.
+
+        `os.replace` swaps the NAME it is given, so a rewrite aimed at the link
+        deletes the relocation and splits the history: the appended row lands on
+        the external target, every later row on a fresh regular file at the old
+        path. MEASURED before rewrite() resolved the target — one sweep and the
+        path was no longer a symlink.
+        """
+        real = tmp_path / "elsewhere.jsonl"
+        real.write_text('{"ts": "2020-01-01T00:00:00+00:00", "pr": "1"}\n')
+        log_path.parent.mkdir(parents=True)
+        log_path.symlink_to(real)
+        _note_and_flush(waived="ci-status", pr="2", repo="o/r")
+        assert log_path.is_symlink(), "the retention sweep destroyed the relocation"
+        assert [r["pr"] for r in _rows(real)] == ["2"], "rows must land on the target"
+
+    def test_one_oversized_row_cannot_defeat_the_size_bound(self, log_path, monkeypatch):
+        """Halving the LINE COUNT does not bound a file whose bulk is a few rows,
+        and for a single oversized line it is a no-op. MEASURED before retention
+        counted bytes: a 5043-byte one-row file was left untouched at a 200-byte
+        bound, so every later write re-read it."""
+        monkeypatch.setattr(_mod, "_OVERRIDE_LOG_MAX_BYTES", 200)
+        log_path.parent.mkdir(parents=True)
+        # NOW-relative, and that is load-bearing: seeded with a fixed past date the
+        # row aged out and prune_by_age removed it, so the file shrank without the
+        # trim ever running and the test passed against a line-count halving that
+        # cannot bound a single row. Caught by mutation — the row must SURVIVE
+        # retention so the size backstop is the only thing that can act.
+        fresh = datetime.datetime.now(datetime.UTC).isoformat()
+        big = '{"ts": "' + fresh + '", "pr": "' + "9" * 5000 + '"}\n'
+        # TWO oversized rows, and that is load-bearing too: with one, the flush's
+        # own appended row makes the file two lines, so `lines[len//2:]` happens to
+        # drop the big one and a line-count halving passes by luck. Two means any
+        # halving still retains an oversized row — only a byte-aware retention can
+        # meet the bound. Both facts were found by mutation, not by inspection.
+        log_path.write_text(big + big)
+        _note_and_flush(waived="ci-status", pr="1", repo="o/r")
+        assert log_path.stat().st_size <= 200, log_path.stat().st_size
+
+    def test_the_trim_never_empties_the_log(self, log_path, monkeypatch, capsys):
+        """A bound that empties the file has destroyed the thing it was bounding.
+
+        The byte-accumulating retention that replaced line-count halving walks
+        newest-first and stops at the first row that does not fit — so a newest row
+        larger than the bound left NOTHING kept and rewrote the log to zero,
+        destroying every older row AND the row just appended, while append_row
+        still returned success. MEASURED: 20 rows / 890 bytes -> 0 bytes. That is
+        strictly worse than the halving it replaced, which lost at most half.
+        """
+        import audit_jsonl
+
+        log_path.parent.mkdir(parents=True)
+        fresh = datetime.datetime.now(datetime.UTC).isoformat()
+        log_path.write_text("".join(f'{{"ts": "{fresh}", "pr": "{i}"}}\n' for i in range(20)))
+        assert audit_jsonl.append_row(
+            str(log_path),
+            {"ts": fresh, "pr": "9" * 2000},
+            maintain=[audit_jsonl.trim_by_size(1000)],
+        )
+        rows = _rows(log_path)
+        assert rows, "the trim emptied the log it exists to bound"
+        assert rows[-1]["pr"] == "9" * 2000, "the row just written must survive"
+        assert "NOT met" in capsys.readouterr().err, "an unmeetable bound must say so"
 
     def test_unparseable_rows_are_kept_not_dropped(self, log_path):
         log_path.parent.mkdir(parents=True)

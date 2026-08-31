@@ -13,10 +13,14 @@ WHAT THIS GUARANTEES
 * **Own-user-only files, with no umask window.** ``os.open`` applies the mode AT
   create time; ``open()`` + ``chmod`` is briefly group/world-readable per the
   process umask. These logs sit in ``~/.genesis`` beside secrets.
-* **Serialized appends.** The exclusive ``flock`` rides a SIDECAR lock file, not
-  the log fh: a maintainer that calls :func:`rewrite` replaces the log inode, so
-  a lock held on the log itself would ride the ORPHAN inode and a waiter would
-  append to a file nobody reads. The sidecar is never replaced.
+* **Serialized appends, per configured path.** The exclusive ``flock`` rides a
+  SIDECAR lock file, not the log fh: a maintainer that calls :func:`rewrite`
+  replaces the log inode, so a lock held on the log itself would ride the ORPHAN
+  inode and a waiter would append to a file nobody reads. The sidecar is never
+  replaced. LIMIT, since the relocation below is supported: the sidecar is keyed
+  to the path a caller was GIVEN, while data lands on the resolved target — so two
+  different paths pointing at one log serialize on two different sidecars. One
+  configured path is safe; two names for the same log are not.
 * **Bounded waiting.** Acquisition gives up after :data:`LOCK_TIMEOUT_S`. For a
   caller whose return value is a security verdict, an unbounded wait is a
   fail-open bug rather than a latency one — see that constant.
@@ -120,12 +124,20 @@ def rewrite(log_path: str, lines: Sequence[str]) -> None:
     For maintainers only, and only while holding the sidecar lock — see
     :func:`append_row`. The temp file is restricted BEFORE the replace, because
     it becomes the log's inode and so its mode becomes the log's mode.
+
+    Resolves through a SYMLINK before replacing. ``os.replace`` swaps the name it
+    is given, so replacing the link itself would delete the relocation this module
+    documents as supported and silently split the history: the appended row lands
+    on the external target, every later row on a new regular file at the old path.
+    MEASURED before this resolved: after one retention sweep the path was no
+    longer a symlink.
     """
-    tmp = log_path + ".tmp"
+    target = os.path.realpath(log_path)
+    tmp = target + ".tmp"
     with open_own(tmp, append=False) as wr:
         wr.write("".join(line.rstrip("\n") + "\n" for line in lines))
     restrict(tmp)
-    os.replace(tmp, log_path)
+    os.replace(tmp, target)
 
 
 def new_deadline() -> float:
@@ -135,6 +147,11 @@ def new_deadline() -> float:
     that matters is on the CALLER's total delay before it can return its verdict,
     not on each row. Without this, 4 rows under contention cost 2s and an
     unbounded compound could cost far more — MEASURED at 60 pending rows.
+
+    SCOPE, so this is not read as more than it is: the deadline bounds LOCK
+    WAITING only. Maintenance I/O is additional and runs per row — MEASURED at
+    0.216s for 4 rows against a full 1MB log, on top of up to LOCK_TIMEOUT_S of
+    waiting. Immaterial against the merge gate's budget, but it is not covered.
     """
     return time.monotonic() + LOCK_TIMEOUT_S
 
@@ -205,11 +222,17 @@ def append_row(
 
 
 def trim_by_size(max_bytes: int) -> Callable[[str], None]:
-    """Maintainer: when the log exceeds ``max_bytes``, keep the most recent half.
+    """Maintainer: when the log exceeds ``max_bytes``, keep as many of the NEWEST
+    rows as fit within it — never a fixed fraction of the line count.
 
     The size backstop every one of these logs needs regardless of any
     content-based retention, because retention can legitimately keep rows it
     cannot interpret (see :func:`prune_by_age`).
+
+    Two floors, both learned by measurement: an oversized OLD row is dropped
+    (halving a line count cannot bound a file whose bulk is one row), but the
+    NEWEST row is never dropped even if it alone exceeds the bound — see the
+    comment on that branch.
     """
 
     def _trim(log_path: str) -> None:
@@ -217,7 +240,37 @@ def trim_by_size(max_bytes: int) -> Callable[[str], None]:
             return
         with open(log_path, encoding="utf-8") as rd:
             lines = rd.readlines()
-        rewrite(log_path, lines[len(lines) // 2 :])
+        # Retain by accumulated BYTES from the newest end, not by line COUNT.
+        # Halving the line count does not bound a file whose bulk is in a few
+        # rows, and for a single oversized line `lines[len//2:]` is the whole
+        # list — MEASURED: a 5043-byte one-row file was left untouched at a
+        # 200-byte bound, so the "size backstop" bounded nothing and every later
+        # write re-read it. A row that exceeds the budget alone is DROPPED: the
+        # bound is the guarantee, and one unbounded row must not defeat it.
+        kept: list[str] = []
+        used = 0
+        for line in reversed(lines):
+            size = len(line.encode("utf-8"))
+            if used + size > max_bytes:
+                break
+            kept.append(line)
+            used += size
+        kept.reverse()
+        if not kept:
+            # FLOOR. Without it, a newest row larger than the bound leaves `kept`
+            # empty and this rewrites the log to ZERO — destroying every older row
+            # AND the row just appended, while append_row still returns success.
+            # MEASURED before this floor: 20 rows / 890 bytes -> 0 bytes, 0 rows.
+            # That is strictly worse than the line-count halving it replaced, which
+            # lost at most half. A bound that empties the file has destroyed the
+            # thing it was bounding, so the row wins and the bound is reported
+            # unmet instead of silently enforced.
+            kept = lines[-1:]
+            warn(
+                f"{log_path}: newest row alone exceeds {max_bytes} bytes — keeping it; "
+                "the size bound is NOT met"
+            )
+        rewrite(log_path, kept)
 
     return _trim
 

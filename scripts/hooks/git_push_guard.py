@@ -2024,19 +2024,32 @@ _OVERRIDE_LOG_FIELDS = ("ts", "sigil", "outcome", "waived", "pr", "repo", "head"
 #: it is not an override that took effect, and conflating the two would inflate
 #: every count drawn from this file.
 #:
+#: WHAT IT IS NOT: `outcome` is the GUARD'S OVERALL VERDICT on the command, not a
+#: statement that the sigil waived anything. A gate handed `force=True` returns
+#: without evaluating its condition, so a sigil that was not needed — e.g.
+#: `# scheduled-review-override` when every scheduled review is already present —
+#: produces a row identical to one that bypassed a failing gate. Counting
+#: "allowed" rows therefore counts commands that were allowed, and OVERSTATES how
+#: often an escape actually did work. Recording per-gate effectiveness needs each
+#: gate to report what it observed rather than short-circuit, which costs API
+#: calls on a budgeted path; that is filed as a follow-up, not approximated here.
+#:
 #: "asked" is NOT a spelling of "allowed". ``_ask`` returns 0 while emitting a
 #: permissionDecision the HUMAN may still deny, so the exit code alone cannot say
 #: whether the command ran; recording it as "allowed" would have the log assert a
 #: merge that may never have happened — the same conflation this field exists to
 #: prevent, one level down. "error" is the fail-closed wrapper's path.
 #:
-#: HONESTY NOTE: no CURRENTLY-logged sigil can reach "asked". Every logged sigil
-#: is noted inside the `gh pr merge` arm, which returns allow/block and never
-#: asks, and a compound that pairs a merge with a push is refused outright
-#: ("multiple publish/merge operations in one command"). The mapping is kept and
-#: unit-tested because it is three lines and it is the CORRECT answer the moment
-#: a sigil is logged on a path that does ask — at which point silence here would
-#: mean a false "allowed". It is not an observed state today.
+#: "asked" IS reachable, and an earlier version of this note claimed otherwise —
+#: wrongly, on the reasoning that the merge arm never asks. It does not ask, but it
+#: does not RETURN either: it falls through to the deferred approval prompt, and
+#: `gh pr create` is deliberately exempt from the "multiple publish/merge
+#: operations" refusal. MEASURED:
+#:   gh pr merge N --squash --admin --match-head-commit <sha>  # ci-override
+#:     && gh pr create --title x --body y
+#: emits an "ask" and writes the ci-override row with outcome "asked".
+#: Treat an "asked" row as a real, expected state — the command was handed to the
+#: user and may have been denied — not as an anomaly.
 #:
 #: ENFORCED, not just documented: ``_flush_overrides`` drops a row whose outcome
 #: is outside this tuple, the way ``sigil`` is checked against ``_KNOWN_SIGILS``.
@@ -2054,6 +2067,12 @@ _REPO_RE = re.compile(r"^[\w.-]{1,100}/[\w.-]{1,100}$")
 #: MEASURED, a 311-character ``waived`` carrying quotes and a token-shaped string
 #: was written to the row while the docstring claimed every field was shape-checked.
 _WAIVED_RE = re.compile(r"^[a-z][a-z0-9:+-]{0,63}$")
+#: `pr` was the one field with no bound, and `str.isdigit()` was the wrong check
+#: twice over: it accepts non-ASCII digits (MEASURED: Arabic-Indic "١٢٣٤٥٦٧٨٩"
+#: stored verbatim) and imposes no length, so a PR token read off the command line
+#: could write an arbitrarily long row. ASCII digits, and no more than a PR number
+#: could plausibly be.
+_PR_RE = re.compile(r"^[0-9]{1,12}$")
 
 #: Rows noted during this invocation, flushed once the gate's verdict is known.
 #: Module-level because detection is spread across the merge gate while the
@@ -2096,9 +2115,14 @@ def _override_log_path() -> str:
 
     A RELATIVE override is refused in favour of the default: it would resolve
     against the hook's cwd — the repo — putting a durable audit file inside the
-    working tree, where it can be committed. The repo rule is that output lives
-    outside the tree, and ``test_the_live_default_path_is_outside_any_repo``
-    exists to keep the default honest; an env var must not be able to undo it."""
+    working tree, where it can be committed. That is the accident this guards.
+
+    It is NOT a guarantee that the log cannot land in the tree: an ABSOLUTE path
+    inside the repo is accepted as given (MEASURED). Refusing those would mean
+    deciding which absolute paths are "in a repo", which is a worse problem than
+    the one being solved, and an operator who spells out such a path has chosen
+    it. The default is what ``test_the_live_default_path_is_outside_any_repo``
+    keeps honest."""
     override = os.environ.get("GENESIS_MERGE_OVERRIDE_LOG")
     if override and os.path.isabs(override):
         return override
@@ -2162,11 +2186,12 @@ def _note_override(
         {
             "sigil": sigil,
             "waived": waived if _WAIVED_RE.match(waived or "") else "",
-            # Digits-only by construction at every current producer, but checked
+            # Digits-only by construction at every current producer, but bounded
             # anyway — the docstring above claims EVERY field is shape-checked,
             # and `pr` is the field a future caller is most likely to feed from a
-            # branch name.
-            "pr": pr_s if (pr_s := str(pr or "")).isdigit() else "",
+            # branch name. It is also the field that made an unbounded row (and
+            # therefore a log-erasing trim) reachable.
+            "pr": pr_s if _PR_RE.match(pr_s := str(pr or "")) else "",
             "repo": repo if _REPO_RE.match(repo) else "",
             "head": head if _SHA_RE.match(head) else "",
             "actor": _actor(),
