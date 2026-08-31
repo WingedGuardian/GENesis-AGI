@@ -191,7 +191,8 @@ def _check_outcome_verification(assistant_message: str) -> None:
     print(
         "OUTCOME VERIFICATION REMINDER: You're presenting completion options "
         "but haven't mentioned integration or e2e verification beyond unit tests. "
-        "Before the user decides, use superpowers:verification-before-completion — "
+        "Before the user decides: verify before completing (the `superpowers` plugin's "
+        "verification-before-completion skill, where the install has it) — "
         "run the actual verification command, read the full output, THEN claim status. "
         "Evidence before assertions."
     )
@@ -232,8 +233,12 @@ def _check_review_state() -> None:
         return
 
     print(
-        "CODE REVIEW PENDING: Code changes were made without /review. "
-        "Next turn MUST begin with /review + superpowers:code-reviewer agent."
+        "CODE REVIEW PENDING: code changes were made without a review marker. "
+        "Next turn MUST begin by reviewing the STAGED diff and recording evidence — "
+        "the `superpowers` plugin (`/review`, `superpowers:code-reviewer`) where the "
+        "install has it, else `/deep-review`, or review and then "
+        "`python3 scripts/review_state.py mark --agent-output <file>` from the "
+        "worktree the changes are in."
     )
 
 

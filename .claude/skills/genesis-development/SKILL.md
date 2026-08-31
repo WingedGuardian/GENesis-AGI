@@ -799,12 +799,18 @@ path not covered by its own unit test, it needs `/deep-review`. If it only
 touches things with clear, isolated test coverage, code-reviewer inline
 is sufficient."
 
-**There is no `/review` command.** Older text here (and the commit gate's own
-deny message) says "Run /review" — measured, `.claude/commands/` ships
-`deep-review.md` and `audit-changes.md`, and there is no user-level commands
-directory. The real options are **`/deep-review`** (dispatches the adversarial
-pass AND writes the evidence marker) and the built-in `/code-review`.
-`/audit-changes` is a light self-check, not a substitute for either.
+**`/review` is not in this repo — it comes from the optional `superpowers`
+plugin.** Where that plugin is installed, `/review` and
+`superpowers:code-reviewer` are the preferred path. Where it is not, those names
+do not resolve, and older text saying "Run /review" sends you after nothing —
+which is why the enforcement hooks now name the plugin as optional rather than
+assuming it. **Check, don't assume, in either direction**: the plugin is offered
+by the official marketplace, so its presence is per-install, not per-repo.
+
+Always available, plugin or no: **`/deep-review`** (dispatches the adversarial
+pass AND writes the evidence marker), the built-in `/code-review`, and the
+by-hand `scripts/review_state.py evidence-path` → `mark` flow.
+`/audit-changes` is a light self-check, not a substitute for any of them.
 
 The enforcement hooks (`review_enforcement_prompt.py`,
 `review_enforcement_commit.py`) still fire on every change — they are

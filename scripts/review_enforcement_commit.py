@@ -727,7 +727,9 @@ def main() -> None:
         _deny(
             "BLOCKED: --no-verify / -n bypasses review enforcement AND the "
             "native pre-commit guards (secrets, large files, direct-to-main). "
-            "Remove it and establish a review first via /review."
+            "Remove it and establish a review first (`/review` where the optional "
+            "`superpowers` plugin is installed, else `/deep-review`, or review and "
+            "then `python3 scripts/review_state.py mark --agent-output <file>`)."
         )
         return
 
