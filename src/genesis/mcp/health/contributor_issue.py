@@ -319,15 +319,20 @@ async def contributor_issue_propose(
     Args:
         title: issue title (sanitized here; must be public-safe).
         body: issue body / description (sanitized here).
-        labels: GitHub label names (e.g. ["good first issue"]). Optional.
+        labels: GitHub label names. REQUIRED (fail-closed): one ``area:*`` domain
+            label AND one difficulty/environment label (``good first issue`` /
+            ``first-timers-only`` / ``needs-genesis-instance``) — a proposal missing
+            either is ``rejected`` with no row. ``area:other`` is the cross-cutting
+            escape hatch.
         repo: target ``owner/name``. Defaults to this install's public repo.
         source: provenance — "follow_up" (backlog-derived) or "codebase".
         source_follow_up_id: originating follow_up id, for the close-loop link
             (stored on ``source_ref``). Optional.
 
     Returns a status dict: ``held`` (parked + approval created), ``blocked``
-    (sanitizer findings, no row), ``duplicate`` / ``backpressure`` (no row),
-    ``disabled`` (mode off), or ``error``.
+    (sanitizer findings, no row), ``rejected`` (missing a required area:* or
+    difficulty/environment label, no row), ``duplicate`` / ``backpressure`` (no
+    row), ``disabled`` (mode off), or ``error``.
     """
     import genesis.mcp.health_mcp as health_mcp_mod
 
