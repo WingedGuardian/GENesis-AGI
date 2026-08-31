@@ -23,22 +23,22 @@ def _rt(*, bootstrapped=True, bus=True, scheduler=True, running=True):
 
 
 def test_emits_when_scheduler_running():
-    assert OutreachHeartbeat._should_emit(_rt()) is True
+    assert OutreachHeartbeat()._should_emit(_rt()) is True
 
 
 def test_no_emit_when_scheduler_stopped():
     # is_running False → never-started or cleanly-stopped → pulse ceases → goes stale.
-    assert OutreachHeartbeat._should_emit(_rt(running=False)) is False
+    assert OutreachHeartbeat()._should_emit(_rt(running=False)) is False
 
 
 def test_no_emit_when_scheduler_absent():
     # Telegram-less install: scheduler was never constructed/started.
-    assert OutreachHeartbeat._should_emit(_rt(scheduler=False)) is False
+    assert OutreachHeartbeat()._should_emit(_rt(scheduler=False)) is False
 
 
 def test_no_emit_before_bootstrap():
-    assert OutreachHeartbeat._should_emit(_rt(bootstrapped=False)) is False
+    assert OutreachHeartbeat()._should_emit(_rt(bootstrapped=False)) is False
 
 
 def test_no_emit_without_event_bus():
-    assert OutreachHeartbeat._should_emit(_rt(bus=False)) is False
+    assert OutreachHeartbeat()._should_emit(_rt(bus=False)) is False
