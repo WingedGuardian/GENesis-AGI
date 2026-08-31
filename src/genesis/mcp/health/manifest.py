@@ -157,7 +157,14 @@ async def _impl_bootstrap_manifest() -> dict:
 # verdict.
 HEARTBEAT_EXPECTED = {
     "awareness": (300, 360),      # 5 min tick, error at 6 min
-    "surplus": (300, 600),
+    # surplus's event-HB emits at loop-END (surplus/scheduler.py), so a healthy single
+    # dispatch_once (15-30 min) legitimately gaps it — a tight 600s overdue false-fired
+    # "surplus heartbeat overdue" in the morning report / subsystem_heartbeats display.
+    # overdue=3h matches the surplus TILE's job_health stall bound
+    # (observability/liveness.stall_threshold_minutes(5) = 180 min), so display and tile
+    # agree; genuine total cessation is caught far sooner (900s) by the zombie-scheduler
+    # watchdog, which reads job_health (refreshed every dispatch), not this event-HB.
+    "surplus": (300, 10800),      # 5-min loop; overdue at 3h (loop-END HB is load-fragile)
     # inbox checks every 30 min (inbox/types.py check_interval_seconds=1800).
     # overdue=4× (7200s) so one slow/skipped check doesn't false-fire; a 2×
     # (3600s) threshold was too tight. (Assumes the default interval; a custom

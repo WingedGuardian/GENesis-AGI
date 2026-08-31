@@ -105,6 +105,34 @@ async def test_staleness_alive(db):
 
 
 @pytest.mark.asyncio
+async def test_staleness_surplus_long_dispatch_not_false_overdue(db):
+    """A busy-but-healthy surplus refreshes no event-HB mid-dispatch: its loop-END
+    ``Subsystem.SURPLUS`` pulse gaps for the length of a single long ``dispatch_once``
+    (15-30 min, per ``surplus/scheduler.py``). At the old 600s overdue threshold that
+    false-read 'overdue' — crying wolf in the morning report + ``subsystem_heartbeats``
+    display. The threshold is now aligned to the tile's 3h job_health stall bound, so a
+    ~25-min gap reads 'alive'."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    # 1500s: well past the old 600s, comfortably under the 3h (10800s) threshold.
+    await _seed_heartbeat(db, "surplus", age_seconds=25 * 60)
+    hb = await compute_heartbeat_staleness("surplus", db=db, paused=False)
+    assert hb["status"] == "alive"
+
+
+@pytest.mark.asyncio
+async def test_staleness_surplus_overdue_past_3h(db):
+    """The loosening must NOT blind genuine total cessation: a surplus silent past the
+    3h threshold still reads 'overdue'. (In production the 900s watchdog restarts a real
+    death long before this display bound; this is the honest display backstop.)"""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    await _seed_heartbeat(db, "surplus", age_seconds=4 * 3600)  # 14400s > 10800 (3h)
+    hb = await compute_heartbeat_staleness("surplus", db=db, paused=False)
+    assert hb["status"] == "overdue"
+
+
+@pytest.mark.asyncio
 async def test_staleness_no_heartbeat_empty_state(db):
     """No pulse ever (fresh install) → no_heartbeat, never 'stalled'."""
     from genesis.mcp.health.manifest import compute_heartbeat_staleness
@@ -255,7 +283,7 @@ async def test_staleness_paused_downgrades_surplus(db):
     while globally paused is NOT dead → downgraded to 'paused', not 'overdue'."""
     from genesis.mcp.health.manifest import compute_heartbeat_staleness
 
-    await _seed_heartbeat(db, "surplus", age_seconds=2 * 3600)  # > 600 threshold
+    await _seed_heartbeat(db, "surplus", age_seconds=4 * 3600)  # > 10800 (3h) threshold
     hb = await compute_heartbeat_staleness("surplus", db=db, paused=True)
     assert hb["status"] == "paused"
 
@@ -649,7 +677,7 @@ async def test_dashboard_cessation_alerts_warning(db):
 async def test_surplus_dropped_from_alert_set(db):
     """surplus is DROPPED from the alert set (PR-B's tile already covers it) —
     even a badly-overdue surplus emits NO subsystem_stale:surplus."""
-    await _seed_heartbeat(db, "surplus", age_seconds=3 * 3600)  # ≫ 600 threshold
+    await _seed_heartbeat(db, "surplus", age_seconds=4 * 3600)  # ≫ 10800 (3h) threshold
     alerts = await _run_alerts_with_db(db)
     assert not [a for a in _stale(alerts) if a["id"] == "subsystem_stale:surplus"]
 
