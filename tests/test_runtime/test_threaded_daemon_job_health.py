@@ -75,14 +75,20 @@ async def _run_tick_from_worker_thread(daemon, rt) -> None:
         except BaseException as exc:  # noqa: BLE001 - surfaced below
             errors.append(exc)
 
-    thread = threading.Thread(target=_worker, name="tick-worker")
+    # The deadline is DERIVED, not picked: this drives _tick, which waits on
+    # HeartbeatDaemon._TICK_TIMEOUT_S (30s). An outer bound below the inner one
+    # fails a legitimately-slow-but-working tick and blames the wrong thing, so it
+    # must exceed 30s. daemon=True + join-in-finally for the same reason as _drive.
+    thread = threading.Thread(target=_worker, name="tick-worker", daemon=True)
     thread.start()
-    deadline = asyncio.get_running_loop().time() + 10
-    while thread.is_alive():
-        if asyncio.get_running_loop().time() > deadline:
-            raise AssertionError("daemon tick did not complete within 10s")
-        await asyncio.sleep(0.01)
-    thread.join(timeout=5)
+    try:
+        deadline = asyncio.get_running_loop().time() + 45
+        while thread.is_alive():
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("daemon tick did not complete within 45s")
+            await asyncio.sleep(0.01)
+    finally:
+        thread.join(timeout=5)
     if errors:
         raise errors[0]
 
@@ -166,14 +172,19 @@ async def _drive(fn) -> BaseException | None:
         except BaseException as exc:  # noqa: BLE001 - returned to the caller
             captured.append(exc)
 
-    thread = threading.Thread(target=_worker, name="drive-worker")
+    # daemon=True so a worker still stuck at the deadline below can never hold up
+    # interpreter shutdown; the join is in a `finally` so the deadline path still
+    # reaps it rather than walking away from a live thread.
+    thread = threading.Thread(target=_worker, name="drive-worker", daemon=True)
     thread.start()
-    deadline = asyncio.get_running_loop().time() + 15
-    while thread.is_alive():
-        if asyncio.get_running_loop().time() > deadline:
-            raise AssertionError("worker thread did not finish within 15s")
-        await asyncio.sleep(0.01)
-    thread.join(timeout=5)
+    try:
+        deadline = asyncio.get_running_loop().time() + 15
+        while thread.is_alive():
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("worker thread did not finish within 15s")
+            await asyncio.sleep(0.01)
+    finally:
+        thread.join(timeout=5)
     return captured[0] if captured else None
 
 
@@ -346,59 +357,65 @@ async def test_start_captures_the_running_loop(factory):
 async def test_repeated_failures_coalesce_into_one_pending_record(factory):
     """A stalled loop must not queue one failure record per tick.
 
-    Unbounded submission was the previous shape. During a wedge every tick times
-    out and queues another record, so a long stall lands them all at once on
-    recovery -- spiking consecutive_failures, permanently inflating total_failures,
-    and firing a retry per record where a retry registry is wired. "The daemon is
-    failing" is ONE fact however long the stall lasts.
+    Unbounded submission was the previous shape. During a wedge every tick times out
+    and queues another record, so a long stall lands them all at once on recovery --
+    spiking consecutive_failures, permanently inflating total_failures, and firing a
+    retry per record where a retry registry is wired. "The daemon is failing" is ONE
+    fact however long the stall lasts.
 
-    The repeats are submitted from a single worker pass WITHOUT yielding to the
-    loop, which is what a wedge looks like from the daemon's side: the first record
-    is scheduled and cannot run, so the rest must be absorbed rather than queued.
-    Driving them through separate loop yields would let the first complete and prove
-    nothing.
+    NO THREADS, deliberately. This assertion previously drove five failures from a
+    worker thread and wedged the loop with a blocking wait to hold the first record
+    open. That shape was FLAKY IN CI -- measured on the same main SHA, passing at
+    04:32 and failing with "got 2" at 12:15 -- because it depended on the loop
+    losing a race to the worker. Its bound, its thread-leak path and its potential
+    for a worker/loop deadlock were all scaffolding, not coverage.
 
-    WEDGING THE LOOP IS LOAD-BEARING, not decoration. `_drive` deliberately keeps
-    the loop turning while the worker runs, so without the gate below the loop can
-    COMPLETE record #1 between two of the worker's iterations; `pending.done()` is
-    then True and repeat #2 submits legitimately. The assertion became a measure of
-    thread-scheduling luck: green locally, and MEASURED failing in CI on two
-    unrelated branches at `got 2`. The gate holds record #1 open until every repeat
-    has been submitted, which is the only state in which coalescing has anything to
-    do — a real wedge is precisely a loop that cannot drain the pending record.
-    It is released FROM THE WORKER, after the repeats: releasing it from this
-    coroutine would deadlock, since the blocked loop cannot resume to do it.
+    The mechanism here is the event loop's own single-threadedness. ``_record_failure``
+    submits via ``run_coroutine_threadsafe`` and returns WITHOUT waiting, so calling
+    it five times from this coroutine with no ``await`` between the calls leaves the
+    loop no opportunity to run any submitted record: this coroutine is what the loop
+    is currently running. ``self._pending_failure`` therefore cannot become done
+    between the calls, and the coalescing branch is reached BY CONSTRUCTION rather
+    than by winning a race. It cannot flake.
+
+    Nothing is lost by dropping the threads. Production calls ``_record_failure``
+    from exactly ONE place (``_run``'s exception handler) on exactly ONE thread per
+    daemon, so there is no concurrent-caller race for a threaded test to catch; and
+    cross-thread invocation is already covered by
+    ``test_failed_tick_persists_a_failure_row`` and
+    ``test_failure_record_is_not_bounded_by_the_tick_timeout``, which both drive
+    ``_record_failure`` through ``_drive`` from a worker thread.
+
+    The pre-drain assertion is not decoration -- it proves the premise actually held.
+    If a record had run early, the count below could pass for the wrong reason.
     """
     calls: list[str] = []
-    released = threading.Event()
 
     class _CountingRuntime:
         def record_job_failure(self, job_name, *args, **kwargs):
             calls.append(job_name)
-            # Runs ON the loop, so this occupies it — the wedge the test models.
-            # Bounded so a regression fails instead of hanging the suite.
-            released.wait(timeout=10)
 
     daemon = factory(interval_seconds=60)
     daemon._loop = asyncio.get_running_loop()
     rt = _CountingRuntime()
 
-    def _five_failures() -> None:
-        for n in range(5):
-            daemon._record_failure(rt, RuntimeError(str(n)))
-        released.set()
+    for n in range(5):
+        daemon._record_failure(rt, RuntimeError(str(n)))
 
-    assert await _drive(_five_failures) is None
-    for _ in range(200):
-        if calls:
-            break
+    assert not calls, (
+        f"a record ran before the submissions finished, got {len(calls)} -- the "
+        "loop was not held by this coroutine, so this test's premise is broken and "
+        "the coalescing count below would prove nothing"
+    )
+
+    deadline = asyncio.get_running_loop().time() + 10
+    while not calls and asyncio.get_running_loop().time() < deadline:
         await asyncio.sleep(0.01)
-    await asyncio.sleep(0.1)
     await _drain_pending()
 
     assert len(calls) == 1, (
         f"expected the pending record to absorb the repeats, got {len(calls)} "
-        "-- a wedge would queue one per tick and burst on recovery"
+        "-- unbounded submission queues one per tick and bursts on recovery"
     )
 
 
