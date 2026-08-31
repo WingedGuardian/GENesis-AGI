@@ -137,6 +137,59 @@ class TestWriter:
         assert str(log_path) in seen, f"the log itself was never os.open'd: {sorted(seen)}"
         assert seen[str(log_path)] == 0o600, oct(seen[str(log_path)])
 
+    def test_a_reused_temp_file_is_tightened_BEFORE_the_history_is_written(
+        self, log_path, tmp_path
+    ):
+        """`os.open` applies its mode only at CREATE, so a PRE-EXISTING `.tmp` —
+        left by an interrupted run — is truncated with its old mode intact.
+        Restricting it after the write left the whole retained history readable by
+        other local users for the duration of the rewrite. MEASURED at 0644."""
+        import audit_jsonl
+
+        target = tmp_path / "log.jsonl"
+        stale = tmp_path / "log.jsonl.tmp"
+        stale.write_text("stale")
+        stale.chmod(0o644)
+        seen = {}
+        real = audit_jsonl.open_own
+
+        class _SampleOnWrite:
+            """Sample the mode when the DATA is written, not when the file opens.
+
+            Sampling at open time cannot see this fix at all: `restrict` runs
+            after `open_own` returns and before the first write, so an
+            open-time probe reads 0644 whether the bug is present or not.
+            """
+
+            def __init__(self, fh, path):
+                self._fh, self._path = fh, path
+
+            def write(self, data):
+                seen.setdefault("at_write", stat.S_IMODE(os.stat(self._path).st_mode))
+                return self._fh.write(data)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self._fh.__exit__(*exc)
+
+        def spy(path, *, append):
+            fh = real(path, append=append)
+            # Match on the SUFFIX, not the literal string: rewrite() resolves the
+            # target with realpath, so the tmp path it builds can differ textually
+            # from the one this test created while naming the same file.
+            if str(path).endswith(".tmp"):
+                return _SampleOnWrite(fh.__enter__(), path)
+            return fh
+
+        audit_jsonl.open_own = spy
+        try:
+            audit_jsonl.rewrite(str(target), ['{"ts": "x", "pr": "1"}'])
+        finally:
+            audit_jsonl.open_own = real
+        assert seen.get("at_write") == 0o600, oct(seen.get("at_write", -1))
+
     def test_pending_rows_do_not_leak_between_flushes(self, log_path):
         _note_and_flush(waived="ci:red", pr="1", repo="o/r")
         _mod._flush_overrides("allowed")  # nothing pending

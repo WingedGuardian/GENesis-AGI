@@ -135,8 +135,14 @@ def rewrite(log_path: str, lines: Sequence[str]) -> None:
     target = os.path.realpath(log_path)
     tmp = target + ".tmp"
     with open_own(tmp, append=False) as wr:
+        # BEFORE the write, not after. os.open applies its mode only at CREATE, so
+        # a PRE-EXISTING .tmp — left behind by an interrupted run of an older
+        # logger — is truncated with its old mode intact. Restricting afterwards
+        # left the entire retained history readable by other local users for the
+        # duration of the rewrite. MEASURED: with a 0644 .tmp in place, the mode
+        # while the history was being written was 0644.
+        restrict(tmp)
         wr.write("".join(line.rstrip("\n") + "\n" for line in lines))
-    restrict(tmp)
     os.replace(tmp, target)
 
 
