@@ -143,6 +143,22 @@ def test_a_forged_field_separator_cannot_add_tag_fields(monkeypatch, capsys, tmp
     assert tag.count("|") == 2, f"peer value forged a tag field: {tag!r}"
 
 
+def test_the_session_prefix_is_exactly_eight_characters(monkeypatch, capsys, tmp_path):
+    """REGRESSION: sanitizing the id must not shorten the prefix.
+
+    `sanitize_detail(value, 8)` marks truncation, so it returns 7 characters
+    plus an ellipsis -- silently regressing the 8-character prefix every peer
+    line is identified by, and which the repo's short-prefix lookups expect.
+    Sanitize first, THEN slice: the sanitizing is for the forged-separator case,
+    the slice is the display contract, and they are not the same operation.
+    """
+    sid = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
+    lines = _emit(monkeypatch, capsys, tmp_path, {"cc_session_id": sid})
+    tag = next(ln for ln in lines if ln.startswith("[Concurrent |"))
+    assert tag.endswith("| aaaabbbb]"), f"prefix is not the exact 8 chars: {tag!r}"
+    assert "…" not in tag
+
+
 def test_user_summary_is_never_rendered(monkeypatch, capsys, tmp_path):
     """Deliberate omission: another session's raw user text must not surface."""
     row = {"cc_session_id": "deadbeef" * 5, "user_summary": "SECRET-USER-TEXT"}

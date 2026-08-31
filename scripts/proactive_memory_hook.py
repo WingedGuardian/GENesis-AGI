@@ -1475,10 +1475,13 @@ def _heartbeat_read_and_inject(
                 bits.append(gs)
             detail = " · ".join(bits)
 
-            # The 8-char truncation makes a full forged tag impossible, but a
-            # raw value still shatters the line across several; sanitize first,
-            # then truncate.
-            sid_short = sanitize_detail(s.get("cc_session_id", ""), 8)
+            # Sanitize generously, THEN slice: these are two different jobs.
+            # The sanitize handles a forged separator/newline; the slice is the
+            # display contract. Passing 8 as the LIMIT conflates them and gets
+            # both wrong -- sanitize_detail marks truncation, so it returns 7
+            # characters plus an ellipsis and silently regresses the 8-character
+            # prefix every peer line is identified by.
+            sid_short = sanitize_detail(s.get("cc_session_id", ""), 64)[:8]
             tag_parts = ["Concurrent"]
             if parts:
                 tag_parts.append(" ".join(parts))
