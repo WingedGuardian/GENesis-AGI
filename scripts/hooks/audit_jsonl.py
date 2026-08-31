@@ -49,25 +49,33 @@ own writer, which knows its row shape; this module only gets rows to disk safely
 
 KNOWN RESIDUALS, stated rather than implied
 ===========================================
-* No ``O_NOFOLLOW``: a symlink at the log path is followed. That also keeps a
-  deliberately relocated log working, and the threat requires write access to a
-  directory inside the user's own home — at which point the attacker has the home.
-* No ``fsync``: a crash immediately after a write can lose recent rows.
-* :data:`LOG_DIR_MODE` applies only to a directory this module CREATES.
-  ``os.makedirs(exist_ok=True)`` does not tighten an existing one, and the real
-  ``~/.genesis`` is 0755 on a normal install — so the effective protection for
-  contents is the 0600 FILE mode, not the directory. Filenames and sizes in that
-  directory are readable by other local users.
+* The LOG path is opened WITHOUT ``O_NOFOLLOW``, deliberately: a symlink there is
+  the documented relocation. The sidecar and the temp file are not — they must be
+  themselves. A non-regular target (FIFO, socket, device) is refused at open.
+* No ``fsync`` before the atomic replace: a crash there can lose not just recent
+  rows but the whole retained history, since the replace is what publishes it.
+* :data:`LOG_DIR_MODE` binds only to the LEAF directory this module creates —
+  ``os.makedirs`` does not pass the mode to intermediate components, MEASURED as
+  0755/0755/0700 for a three-deep path — and it does not tighten a directory that
+  already exists. The real ``~/.genesis`` is 0755 on a normal install, so the
+  effective protection for contents is the 0600 FILE mode; filenames and sizes in
+  that directory are readable by other local users.
+* Maintenance I/O is per row and OUTSIDE :data:`LOCK_TIMEOUT_S`, which bounds only
+  lock acquisition. MEASURED at 2.5s for 60 rows against a full 1MB log on an
+  uncontended lock. A caller flushing many rows on a budgeted path should know it.
 """
 
 from __future__ import annotations
 
 import contextlib
 import datetime
+import errno
 import fcntl
 import json
 import os
+import stat
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Sequence
 
@@ -93,29 +101,87 @@ LOCK_TIMEOUT_S = 0.5
 _LOCK_POLL_S = 0.02
 
 
-def open_own(path: str, *, append: bool):
+def open_own(path: str, *, append: bool, follow: bool = True):
     """Open ``path`` for writing, creating it 0600 with NO umask window.
 
     ``os.open`` applies the mode at create time, unlike ``open()`` then
-    ``chmod`` (briefly world/group-readable per the process umask). A
-    PRE-EXISTING looser file is a separate problem — :func:`restrict` tightens
-    that.
+    ``chmod`` (briefly world/group-readable per the process umask).
+
+    ``O_NONBLOCK`` is UNCONDITIONAL and is a security control, not a performance
+    one. ``O_WRONLY`` on a FIFO with no reader blocks in the KERNEL, before any
+    lock is attempted — so :data:`LOCK_TIMEOUT_S`, which bounds ``flock``, never
+    applies. MEASURED: with a FIFO at the sidecar path, a caller hung past 12s
+    against that 0.5s bound and had to be killed. For a hook whose return value
+    is a security verdict that is a fail-OPEN, so the open itself must not block.
+    The flag has no effect on a regular file.
+
+    ``follow=False`` adds ``O_NOFOLLOW`` for paths that must be the file itself
+    and never a link to somewhere else — the sidecar lock. The LOG may legitimately
+    be a symlink (documented relocation), so it keeps the default.
+
+    Raises ``OSError`` for a FIFO/socket/device, which the caller reports and
+    drops the row for: this module writes regular files only.
     """
-    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK
+    flags |= os.O_APPEND if append else os.O_TRUNC
+    if not follow:
+        flags |= os.O_NOFOLLOW
     fd = os.open(path, flags, LOG_FILE_MODE)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "audit log target is not a regular file", path)
+    except BaseException:
+        os.close(fd)
+        raise
     return os.fdopen(fd, "a" if append else "w", encoding="utf-8")
 
 
-def restrict(path: str) -> None:
-    """Best-effort chmod to own-user-only; a chmod failure never aborts logging."""
-    with contextlib.suppress(OSError):
-        os.chmod(path, LOG_FILE_MODE)
+def restrict_fd(fh) -> None:
+    """Tighten an ALREADY-OPEN file to own-user-only, via its descriptor.
+
+    By fd, never by path: ``os.chmod(path)`` follows symlinks and is a separate
+    resolution from the open, so a predictable path could be swapped between the
+    two and have an arbitrary file chmodded instead. ``fchmod`` can only ever
+    affect the file this handle already refers to.
+    """
+    with contextlib.suppress(OSError, ValueError):
+        os.fchmod(fh.fileno(), LOG_FILE_MODE)
 
 
 def warn(message: str) -> None:
     """One-line stderr notice. Audit paths report failure — see the module docstring."""
     with contextlib.suppress(Exception):
         print(f"[audit-log] {message}", file=sys.stderr)
+
+
+#: Prefix for :func:`rewrite`'s temp files, and the key the reaper matches on.
+_TEMP_PREFIX = ".audit-"
+#: A temp older than this cannot belong to a live rewrite (which takes milliseconds
+#: and holds the lock throughout), so it is debris from a killed one.
+_TEMP_STALE_S = 300
+
+
+def _reap_stale_temps(directory: str) -> None:
+    """Delete this module's abandoned temp files in ``directory``.
+
+    A unique-name temp fixes the symlink hazard of a predictable one but trades a
+    single reusable file for an unbounded LEAK: the try/except that unlinks on
+    failure cannot run when the process is KILLED, and this module's own docstring
+    notes the harness kills hooks at a wall clock. MEASURED: a SIGKILL mid-rewrite
+    left a temp behind, and nothing in disk-hygiene reaps it.
+
+    Called under the lock, so it cannot race a live rewrite. Best-effort: any error
+    is ignored, because failing to tidy must never cost the caller its row.
+    """
+    with contextlib.suppress(OSError):
+        cutoff = time.time() - _TEMP_STALE_S
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if not entry.name.startswith(_TEMP_PREFIX) or not entry.name.endswith(".tmp"):
+                    continue
+                with contextlib.suppress(OSError):
+                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                        os.unlink(entry.path)
 
 
 def rewrite(log_path: str, lines: Sequence[str]) -> None:
@@ -133,17 +199,30 @@ def rewrite(log_path: str, lines: Sequence[str]) -> None:
     longer a symlink.
     """
     target = os.path.realpath(log_path)
-    tmp = target + ".tmp"
-    with open_own(tmp, append=False) as wr:
-        # BEFORE the write, not after. os.open applies its mode only at CREATE, so
-        # a PRE-EXISTING .tmp — left behind by an interrupted run of an older
-        # logger — is truncated with its old mode intact. Restricting afterwards
-        # left the entire retained history readable by other local users for the
-        # duration of the rewrite. MEASURED: with a 0644 .tmp in place, the mode
-        # while the history was being written was 0644.
-        restrict(tmp)
-        wr.write("".join(line.rstrip("\n") + "\n" for line in lines))
-    os.replace(tmp, target)
+    # A UNIQUE, O_EXCL temp file in the target's own directory — never the
+    # predictable "<log>.tmp". Two reasons, both measured:
+    #   * SYMLINK ATTACK. Anyone able to write the target directory could plant
+    #     <log>.tmp as a symlink; the old code followed it, TRUNCATED the linked
+    #     file, and wrote the retained audit rows into it. MEASURED: a planted
+    #     symlink had its victim file replaced by log content. mkstemp uses
+    #     O_EXCL, so an existing name is never opened, and the name is not
+    #     guessable.
+    #   * REUSED MODE. os.open applies its mode only at CREATE, so a pre-existing
+    #     .tmp was truncated with its old mode intact — MEASURED at 0644 while the
+    #     history was being written. A fresh file is 0600 from birth, and fchmod
+    #     on the fd (not the path) cannot be redirected between the two calls.
+    tmp_dir = os.path.dirname(target) or "."
+    _reap_stale_temps(tmp_dir)
+    fd, tmp = tempfile.mkstemp(dir=tmp_dir, prefix=_TEMP_PREFIX, suffix=".tmp")
+    try:
+        os.fchmod(fd, LOG_FILE_MODE)
+        with os.fdopen(fd, "w", encoding="utf-8") as wr:
+            wr.write("".join(line.rstrip("\n") + "\n" for line in lines))
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)  # never leave a stray temp behind on any failure
+        raise
 
 
 def new_deadline() -> float:
@@ -160,6 +239,23 @@ def new_deadline() -> float:
     waiting. Immaterial against the merge gate's budget, but it is not covered.
     """
     return time.monotonic() + LOCK_TIMEOUT_S
+
+
+def _needs_terminator(log_path: str) -> bool:
+    """Whether a non-empty log's last byte is missing its newline.
+
+    Called under the lock, immediately before an append. Returns False for a
+    missing or empty file, and False on any read error — the append then behaves
+    exactly as it did before this check existed.
+    """
+    try:
+        with open(log_path, "rb") as fh:
+            if fh.seek(0, os.SEEK_END) == 0:
+                return False
+            fh.seek(-1, os.SEEK_END)
+            return fh.read(1) != b"\n"
+    except OSError:
+        return False
 
 
 def _take_lock(lock_fh, log_path: str, deadline: float | None = None) -> bool:
@@ -204,12 +300,27 @@ def append_row(
         # A relative override has an empty dirname — makedirs("") raises.
         os.makedirs(os.path.dirname(log_path) or ".", mode=LOG_DIR_MODE, exist_ok=True)
         lock_path = log_path + ".lock"
-        with open_own(lock_path, append=True) as lock_fh:
-            restrict(lock_path)  # tighten a pre-existing loose sidecar
+        # O_NOFOLLOW on the SIDECAR: its name is predictable, so a symlink planted
+        # there used to be followed — and the chmod that followed it was BY PATH,
+        # which made this an arbitrary-file `chmod 0600` primitive. MEASURED: a
+        # planted link took a 0755 script to 0600, stripping its executable bit,
+        # while the row landed normally and the write reported success.
+        # There is also NOTHING here to tighten: open_own creates the sidecar 0600
+        # at create time and nothing is ever written to it, so the old
+        # restrict(lock_path) had no security value and only carried that risk.
+        with open_own(lock_path, append=True, follow=False) as lock_fh:
             if not _take_lock(lock_fh, log_path, deadline):
                 return None
             with open_own(log_path, append=True) as fh:
-                restrict(log_path)
+                restrict_fd(fh)  # by descriptor: see restrict_fd
+                # Terminate an unterminated tail FIRST. A log whose last line lost
+                # its newline — a crash mid-write, or any other writer — would
+                # otherwise have this row concatenated onto it, producing ONE
+                # invalid line. prune_by_age deliberately KEEPS what it cannot
+                # parse, so the corruption is permanent, and append_row would
+                # still report success: the row is "recorded" and unqueryable.
+                if _needs_terminator(log_path):
+                    fh.write("\n")
                 fh.write(json.dumps(row, sort_keys=sort_keys) + "\n")
             for maintainer in maintain:
                 try:
@@ -244,7 +355,13 @@ def trim_by_size(max_bytes: int) -> Callable[[str], None]:
     def _trim(log_path: str) -> None:
         if os.path.getsize(log_path) <= max_bytes:
             return
-        with open(log_path, encoding="utf-8") as rd:
+        # errors="replace": ONE non-UTF-8 byte otherwise raises here on every
+        # sweep forever, so the bound silently stops being enforced. MEASURED:
+        # with \xff\xfe leading the file, three appends each failed maintenance
+        # and the log passed its own byte bound. A row we cannot decode is kept
+        # as mojibake — same direction as prune_by_age keeping what it cannot
+        # parse: never destroy, never stop.
+        with open(log_path, encoding="utf-8", errors="replace") as rd:
             lines = rd.readlines()
         # Retain by accumulated BYTES from the newest end, not by line COUNT.
         # Halving the line count does not bound a file whose bulk is in a few
@@ -303,7 +420,10 @@ def prune_by_age(days: int, *, ts_key: str = "ts") -> Callable[[str], None]:
         kept: list[str] = []
         total = 0
         unreadable = 0
-        with open(log_path, encoding="utf-8") as fh:
+        # errors="replace" for the same reason as trim_by_size: the decode in
+        # `for line in fh` happens OUTSIDE the per-row try below, so one bad
+        # byte permanently disabled retention itself, not just one row.
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:

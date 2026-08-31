@@ -137,58 +137,58 @@ class TestWriter:
         assert str(log_path) in seen, f"the log itself was never os.open'd: {sorted(seen)}"
         assert seen[str(log_path)] == 0o600, oct(seen[str(log_path)])
 
-    def test_a_reused_temp_file_is_tightened_BEFORE_the_history_is_written(
-        self, log_path, tmp_path
-    ):
-        """`os.open` applies its mode only at CREATE, so a PRE-EXISTING `.tmp` —
-        left by an interrupted run — is truncated with its old mode intact.
-        Restricting it after the write left the whole retained history readable by
-        other local users for the duration of the rewrite. MEASURED at 0644."""
+    def test_a_rewrite_never_touches_the_predictable_temp_name(self, log_path, tmp_path):
+        """A stale `<log>.tmp` must be neither reused nor written to.
+
+        This supersedes an earlier test that checked such a file was *tightened*
+        before the history went into it. Reusing it at all was the defect: the
+        name is predictable, so it could be pre-created — as a plain file with a
+        loose mode, or (worse) as a symlink. The rewrite now creates its own
+        O_EXCL temp, so the stale one is simply never opened.
+        """
         import audit_jsonl
 
         target = tmp_path / "log.jsonl"
         stale = tmp_path / "log.jsonl.tmp"
         stale.write_text("stale")
         stale.chmod(0o644)
-        seen = {}
-        real = audit_jsonl.open_own
+        audit_jsonl.rewrite(str(target), ['{"ts": "x", "pr": "1"}'])
+        assert stale.read_text() == "stale", "the predictable temp name was written to"
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600, "the result must be own-user-only"
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".audit-")]
+        assert not leftovers, f"temp files left behind: {leftovers}"
 
-        class _SampleOnWrite:
-            """Sample the mode when the DATA is written, not when the file opens.
+    def test_a_planted_tmp_symlink_cannot_redirect_the_write(self, log_path, tmp_path):
+        """The temp file must not be a predictable name an attacker can pre-create.
 
-            Sampling at open time cannot see this fix at all: `restrict` runs
-            after `open_own` returns and before the first write, so an
-            open-time probe reads 0644 whether the bug is present or not.
-            """
+        Anyone able to write the target directory could plant `<log>.tmp` as a
+        symlink; the rewrite followed it, TRUNCATED the linked file and wrote the
+        retained audit rows into it. MEASURED: a victim file's contents were
+        replaced by log content. mkstemp is O_EXCL and unguessable.
+        """
+        log_path.parent.mkdir(parents=True)
+        victim = tmp_path / "VICTIM.txt"
+        victim.write_text("important pre-existing content\n")
+        (log_path.parent / (log_path.name + ".tmp")).symlink_to(victim)
+        # A STALE row, so retention actually drops one and therefore calls
+        # rewrite(). Seeding only fresh rows made an earlier version of this test
+        # vacuous: nothing aged out, nothing exceeded the size bound, so rewrite
+        # never ran and the symlink was never reachable. Found by mutation.
+        log_path.write_text('{"ts": "2020-01-01T00:00:00+00:00", "pr": "1"}\n')
+        _note_and_flush(waived="ci-status", pr="2", repo="o/r")
+        assert [r["pr"] for r in _rows(log_path)] == ["2"], "retention must have rewritten"
+        assert victim.read_text() == "important pre-existing content\n"
 
-            def __init__(self, fh, path):
-                self._fh, self._path = fh, path
-
-            def write(self, data):
-                seen.setdefault("at_write", stat.S_IMODE(os.stat(self._path).st_mode))
-                return self._fh.write(data)
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return self._fh.__exit__(*exc)
-
-        def spy(path, *, append):
-            fh = real(path, append=append)
-            # Match on the SUFFIX, not the literal string: rewrite() resolves the
-            # target with realpath, so the tmp path it builds can differ textually
-            # from the one this test created while naming the same file.
-            if str(path).endswith(".tmp"):
-                return _SampleOnWrite(fh.__enter__(), path)
-            return fh
-
-        audit_jsonl.open_own = spy
-        try:
-            audit_jsonl.rewrite(str(target), ['{"ts": "x", "pr": "1"}'])
-        finally:
-            audit_jsonl.open_own = real
-        assert seen.get("at_write") == 0o600, oct(seen.get("at_write", -1))
+    def test_an_unterminated_tail_is_separated_before_appending(self, log_path):
+        """A log whose last line lost its newline — a crash mid-write — would
+        otherwise have the new row concatenated onto it, making ONE invalid line.
+        prune_by_age KEEPS what it cannot parse, so that is permanent, and the
+        write still reports success: the row is 'recorded' and unqueryable."""
+        log_path.parent.mkdir(parents=True)
+        fresh = datetime.datetime.now(datetime.UTC).isoformat()
+        log_path.write_text(f'{{"ts": "{fresh}", "pr": "1"}}')  # no trailing newline
+        _note_and_flush(waived="ci-status", pr="2", repo="o/r")
+        assert [r["pr"] for r in _rows(log_path)] == ["1", "2"]
 
     def test_pending_rows_do_not_leak_between_flushes(self, log_path):
         _note_and_flush(waived="ci:red", pr="1", repo="o/r")
@@ -430,6 +430,25 @@ class TestRetention:
         assert rows, "the trim emptied the log it exists to bound"
         assert rows[-1]["pr"] == "9" * 2000, "the row just written must survive"
         assert "NOT met" in capsys.readouterr().err, "an unmeetable bound must say so"
+
+    def test_one_undecodable_byte_does_not_disable_retention_forever(self, log_path):
+        """The decode in `for line in fh` sits OUTSIDE the per-row try, so a single
+        non-UTF-8 byte raised on every sweep — permanently. MEASURED: three appends
+        each failed maintenance, the log passed its own byte bound, and a 2020 row
+        survived a 1-day window. Isolation saved the ROW; retention itself was dead."""
+        log_path.parent.mkdir(parents=True)
+        with open(log_path, "wb") as fh:
+            # An undecodable line, AND a separate well-formed stale row. The stale
+            # row is the probe: it must be pruned, which can only happen if the
+            # sweep ran at all. The corrupt line must SURVIVE — keeping what it
+            # cannot parse is the deliberate policy, so asserting its removal would
+            # be asserting the opposite of the design.
+            fh.write(b"\xff\xfe not decodable\n")
+            fh.write(b'{"ts": "2020-01-01T00:00:00+00:00", "pr": "999"}\n')
+        _note_and_flush(waived="ci-status", pr="2", repo="o/r")
+        body = log_path.read_text(errors="replace")
+        assert '"pr": "999"' not in body, "the sweep never ran — a stale row survived"
+        assert "not decodable" in body, "an unparseable line must be kept, not destroyed"
 
     def test_unparseable_rows_are_kept_not_dropped(self, log_path):
         log_path.parent.mkdir(parents=True)
@@ -717,6 +736,34 @@ class TestLoggingCannotCostTheVerdict:
             "applied per row, so the delay scales with the row count"
         )
         assert "lock busy" in capsys.readouterr().err
+
+    def test_a_fifo_at_the_lock_path_cannot_hang_the_caller(self, log_path):
+        """LOCK_TIMEOUT_S bounds `flock` — and `open` happens FIRST.
+
+        `O_WRONLY` on a FIFO with no reader blocks in the kernel, before any lock
+        is attempted, so the bound never applies. MEASURED before O_NONBLOCK: a
+        caller hung past 12s against the 0.5s bound and had to be killed. For a
+        hook whose return value is a security verdict, that is the fail-open the
+        bound exists to prevent, reached through a syscall it does not cover.
+        """
+        log_path.parent.mkdir(parents=True)
+        os.mkfifo(str(log_path) + ".lock")
+        started = time.monotonic()
+        _note_and_flush(waived="ci-status", pr="1", repo="o/r")
+        assert time.monotonic() - started < 2.0, "the open blocked; the verdict is at risk"
+
+    def test_a_symlinked_lock_cannot_chmod_an_arbitrary_file(self, log_path, tmp_path):
+        """The sidecar name is predictable and the old chmod was BY PATH, which
+        follows links — an arbitrary-file `chmod 0600` primitive. MEASURED: a
+        planted link took a 0755 script to 0600, stripping its executable bit,
+        while the row landed and the write reported success."""
+        log_path.parent.mkdir(parents=True)
+        victim = tmp_path / "VICTIM.sh"
+        victim.write_text("#!/bin/sh\n")
+        victim.chmod(0o755)
+        (log_path.parent / (log_path.name + ".lock")).symlink_to(victim)
+        _note_and_flush(waived="ci-status", pr="1", repo="o/r")
+        assert stat.S_IMODE(victim.stat().st_mode) == 0o755, "an arbitrary file was chmodded"
 
     def test_the_row_lands_when_the_lock_is_free(self, log_path):
         """Positive control: without it, the test above passes on a broken writer."""
