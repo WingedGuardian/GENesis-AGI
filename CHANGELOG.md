@@ -16,12 +16,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   is shown a `[Concurrent | …]` line per peer. Those lines previously carried a
   digest of the peer's last few tool calls — so a peer read as
   `Bash grep -n "Version History"`, which says nothing about what it is doing.
-  They now carry the peer's model and its topic, taken from that session's
-  charter mission and falling back to its newest in-progress or open ledger
-  item. Both are written by Genesis rather than by you: the raw first user
-  message is deliberately never used, for the same reason the peer's typed
-  prompts are already withheld — another session's user text is
-  decontextualised in yours.
+  They now carry the peer's model and its topic. The topic is the one Genesis
+  already writes for every session when it summarises that session's activity —
+  a summary refreshed on a cycle of a couple of hours, so it describes the
+  session's current work rather than its current minute. Where none has been
+  written — a session too new to have been summarised, or one that has never
+  had a summary at all — it falls back to that session's charter mission, then
+  to its newest in-progress or open ledger item. All of those are written by Genesis rather
+  than by you: the raw first user message is deliberately never used, for the
+  same reason the peer's typed prompts are already withheld — another session's
+  user text is decontextualised in yours.
 - **A session that is working but not being typed into no longer disappears
   from its peers.** Peer lines are hidden once a session's heartbeat is ten
   minutes old, and the heartbeat previously only refreshed when its user typed
@@ -30,17 +34,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   visible. It is throttled to at most one write a minute per session; on every
   other tool call it costs a file stat and the hook's own module load, which is
   a few milliseconds and no database work at all.
-
-### Fixed
-
-- **A partial write to the concurrent-session record no longer erases fields it
-  was not told about.** The row has several writers that each know a different
-  part of it, and all but one of its columns were overwritten unconditionally —
-  so a writer that simply did not know the model wiped the stored one. The
-  model cache holds a bounded number of sessions, so a long-lived session whose
-  entry had aged out would destroy its own model on the next write. Every
-  content column is now preserved when a writer omits it; only the source tag,
-  which has a real default, is still overwritten.
 
 - **Outreach total-cessation monitoring, without the old false-alarm trap.**
   Outreach is now in the `subsystem_stale` alert set (WARNING) alongside
@@ -108,6 +101,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   nothing.
 
 ### Fixed
+
+- **A partial write to the concurrent-session record no longer erases fields it
+  was not told about.** The row has several writers that each know a different
+  part of it, and all but one of its columns were overwritten unconditionally —
+  so a writer that simply did not know the model wiped the stored one. The
+  model cache holds a bounded number of sessions, so a long-lived session whose
+  entry had aged out would destroy its own model on the next write. Every
+  content column is now preserved when a writer omits it; only the source tag,
+  which has a real default, is still overwritten.
 
 - **The Queues card could report "healthy — queues are clear" for counters it
   never collected.** When the queues section of the health snapshot fails, it is

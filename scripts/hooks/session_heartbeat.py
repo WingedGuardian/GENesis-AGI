@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import re
 import sys
 import time
@@ -65,6 +66,7 @@ MODEL_CACHE_FILE = Path.home() / ".genesis" / "cc_session_model.json"
 _LIVE_LEDGER_STATUSES = ("open", "in_progress")
 
 _TOPIC_MAX = 200
+_TAG_GRAMMAR_CHARS = str.maketrans({"[": "", "]": "", "|": "/", "\u00b7": "-"})
 _WHITESPACE_RUN = re.compile(r"\s+")
 
 
@@ -103,7 +105,13 @@ def sanitize_detail(text: str | None, limit: int) -> str:
     """
     if not text:
         return ""
-    flattened = _WHITESPACE_RUN.sub(" ", text.replace("[", "").replace("]", "")).strip()
+    # Strip the characters the TAG GRAMMAR owns, not only the bracket pair.
+    # Brackets alone stop a forged LINE; the grammar is
+    # `[Concurrent | <src> <model> | <id>] <topic> - <digest>`, so a peer value
+    # containing "|" still forges an extra FIELD inside the surviving line --
+    # including the id position, which a reader attributes to the tag itself.
+    # Substituted rather than deleted so the text stays readable.
+    flattened = _WHITESPACE_RUN.sub(" ", text.translate(_TAG_GRAMMAR_CHARS)).strip()
     if limit <= 1:
         # `flattened[: limit - 1] + "…"` is longer than `limit` at 0 and 1
         # (at 0 the slice is [: -1], i.e. almost everything). Unreachable from
@@ -122,6 +130,20 @@ def cached_model(session_id: str) -> str | None:
     Returns None (never "") on any miss so callers can pass it straight to the
     upsert, where COALESCE preserves whatever is already stored.
     """
+    # The ROUTED identity outranks the cache. scripts/gmodel launches a peer
+    # window with os.execve(claude, ..., env) carrying GENESIS_ROSTER_MODEL,
+    # exactly because CC's self-reported model would otherwise say "Claude"
+    # (gmodel:110-112); genesis_session_context.py:194 already gives that var
+    # precedence for this session's own header, but caches only _hook_model
+    # (:288) -- so without this a peer session advertises itself to every OTHER
+    # session as Claude, wrong for precisely the sessions whose model matters.
+    # Read from env rather than a second cache because hooks inherit the
+    # launcher's environment (session_observer_hook.py:25 reads a launcher-set
+    # var the same way). Checked BEFORE the session-id guard: the var describes
+    # THIS process, so it is valid even when the id is missing.
+    roster = os.environ.get("GENESIS_ROSTER_MODEL", "").strip()
+    if roster:
+        return roster
     if not session_id:
         return None
     try:
@@ -166,6 +188,57 @@ def resolve_topic(db_path: Path, session_id: str, *, limit: int = _TOPIC_MAX) ->
         conn = sqlite3.connect(ro_uri(db_path), uri=True, timeout=0.5)
         try:
             conn.execute("PRAGMA busy_timeout=300")
+            # FIRST: the topic Genesis ALREADY extracts. memory/
+            # extraction_job.py writes cc_sessions.topic via
+            # crud.cc_sessions.update_topic_and_keywords.
+            #
+            # The justification is COVERAGE and QUALITY, deliberately NOT
+            # freshness. An earlier draft of this comment claimed the extracted
+            # topic was "~5 min old" -- that was a sample taken shortly after an
+            # extraction run, and it does not hold at steady state: the job runs
+            # on `memory_extraction_hours` (default 2), and re-measured an hour
+            # later the same four sessions were 69-73 minutes stale, heading for
+            # 120. What DOES hold: only 7 of 24 charters carry a mission at all,
+            # and when present it is often the founding blob rather than current
+            # work, so the derivation below degrades to a raw ledger row for most
+            # sessions. A 2-hour-old sentence describing the session beats that,
+            # and beats the NULL every peer sees today.
+            #
+            # Rejected: ordering by recency instead (mission when
+            # session_charters.updated_at is newer). That column is bumped by
+            # set_pointers and by the charter upsert, not only set_mission, so it
+            # is a charter-row timestamp rather than a mission timestamp -- a
+            # pointers edit would promote a stale founding mission over a good
+            # extracted topic. Doing it properly needs a real mission_updated_at.
+            # Cheaper too: the value is already computed.
+            # CONTENT ONLY from this table -- its `model` reads "unknown" for
+            # 705/897 rows and its status/last_activity_at are stale for live
+            # rows, which is exactly why session_heartbeats exists.
+            # Decide table-PRESENCE explicitly instead of inferring it from an
+            # exception class. `sqlite3.Error` is the base of both "no such
+            # table" (this source is absent -- fall through, correct) and
+            # "database is locked" / "disk I/O error" / "malformed image" (the
+            # read FAILED -- must return None so the upsert PRESERVES). Catching
+            # the class to mean the former let a transient failure fall through
+            # to a charter/ledger with nothing to report, return "", and CLEAR a
+            # good stored topic. An absent table is the fresh-install case,
+            # where falling through is right.
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cc_sessions'"
+            ).fetchone():
+                # No local handler: a failure here propagates to the outer
+                # `except` -> None -> PRESERVE, which is the contract.
+                row = conn.execute(
+                    "SELECT topic FROM cc_sessions WHERE cc_session_id = ?"
+                    " AND topic IS NOT NULL AND TRIM(topic) != ''"
+                    # no duplicate ids observed (0 of 734), but newest-wins
+                    # costs nothing and stays correct if that ever changes
+                    " ORDER BY rowid DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                extracted = sanitize_detail(row[0] if row else None, limit)
+                if extracted:
+                    return extracted
             row = conn.execute(
                 "SELECT mission FROM session_charters WHERE session_id = ?",
                 (session_id,),
@@ -254,7 +327,15 @@ def throttle_ok(
             return False
         now = time.time()
         try:
-            if now - stamp.stat().st_mtime < window:
+            # `0 <=` is load-bearing. A BACKWARDS clock step (VM restore, NTP
+            # correction) makes this difference NEGATIVE, and a negative number
+            # is always < window -- so the unguarded form reads "inside the
+            # window" and refuses every write until wall time catches up. A
+            # correction larger than _STALE_THRESHOLD would make an actively
+            # working session vanish from its peers entirely. Same direction the
+            # repo already settled at genesis_urgent_alerts.py:350
+            # ("future marker -> do not suppress; emit").
+            if 0 <= now - stamp.stat().st_mtime < window:
                 return False  # the ONLY cost on ~99% of tool calls
         except OSError:
             pass  # no stamp yet -> fall through and try to claim
@@ -276,7 +357,10 @@ def throttle_ok(
                     last = float(fh.read().strip() or 0.0)
                 except ValueError:
                     last = 0.0  # corrupt stamp -> treat as never claimed
-                if now - last < window:
+                # Same backwards-clock guard as the mtime check above; this
+                # call site needs it independently, since a stamp can carry a
+                # future CLAIM TIME while its mtime is old.
+                if 0 <= now - last < window:
                     return False  # a sibling claimed it between our stat and our lock
                 fh.seek(0)
                 fh.truncate()

@@ -220,8 +220,43 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: d71d1d39 2026-08-18
+verified: 82f84f0a 2026-08-31
 ```
+
+- **Cross-session awareness — how concurrent CC sessions perceive each other.**
+  LIVE. Two DISTINCT stores answer two different questions, and conflating them
+  is the trap: `cc_sessions` (+ a `/proc` walk, `observability/cc_slots.
+  enumerate_cc_slots`) is what the DASHBOARD renders; `session_heartbeats` is
+  what SESSIONS tell each other. They share no source and neither substitutes
+  for the other. `session_heartbeats` has exactly ONE reader in the tree —
+  `scripts/proactive_memory_hook.py`, which prints a `[Concurrent | …]` tag into
+  each peer session's context on UserPromptSubmit — so it is an AGENT-ONLY
+  channel with no human surface. Written by that same hook and refreshed
+  (liveness only, `updated_at`, at most one write per minute per session --
+  the throttle is a stamp FILE whose contents carry the claim time; the flock
+  around it resolves the parallel-tool-call race, it is not itself the
+  throttle) from `scripts/hooks/session_observer_hook.py` on
+  PostToolUse, because `get_active_sync` hides any row older than ten minutes
+  and a heads-down session would otherwise vanish from its peers while busiest.
+  **Field-source rules, each derived from measurement, not assumption:** the
+  rendered `topic` comes FIRST from `cc_sessions.topic` (already extracted by
+  `memory/extraction_job.py` — richer than anything re-derived here, though
+  written on a multi-hour cycle, so it is preferred for COVERAGE and QUALITY
+  and never for freshness), falling back to the session charter's mission and then its newest live
+  ledger item; the raw first user message is NEVER a fallback and the peer's
+  typed prompt is never rendered at all, since another session's user text is
+  decontextualised in yours. `model` comes from the SessionStart cache with
+  `GENESIS_ROSTER_MODEL` taking precedence, NOT from `cc_sessions.model` — on a
+  live install that column is dominated by the literal string `unknown`.
+  Liveness comes ONLY from `session_heartbeats`: `cc_sessions.pid` is unset for
+  most rows and its `status`/`last_activity_at` go stale on running sessions, so
+  it must never be used to decide who is alive. **Every rendered field is
+  peer-authored, so all pass through `sanitize_detail`** — a newline in any of
+  them forges an extra `[Concurrent | …]` line in the reader's context. The
+  writers are partial by design (each knows a different subset), so the upsert
+  COALESCEs content columns; a writer distinguishes "read fine, nothing to
+  report" (empty string — CLEARS) from "could not read" (None — PRESERVES), and
+  collapsing those two is what makes a finished topic immortal.
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
   (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A restricted

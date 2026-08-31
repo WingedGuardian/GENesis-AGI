@@ -142,7 +142,12 @@ def upsert_sync(
         finally:
             conn.close()
     except Exception:
-        pass  # Best-effort — never block the hook
+        # Best-effort — never block the hook. But LOG it: every path in this
+        # feature swallows, and the only other observable is an elapsed-time
+        # metric, which looks healthy whether the write landed or not. Without
+        # this line a heartbeat that fails on every call is indistinguishable
+        # from one that works. debug-level so it costs nothing in normal runs.
+        logger.debug("session heartbeat upsert failed", exc_info=True)
 
 
 def get_active_sync(
@@ -173,4 +178,7 @@ def get_active_sync(
         finally:
             conn.close()
     except Exception:
+        # Same reasoning as the writer above: an empty peer list reads exactly
+        # like "no concurrent sessions", so a broken read is invisible.
+        logger.debug("session heartbeat read failed", exc_info=True)
         return []

@@ -1320,13 +1320,24 @@ def _extract_genesis_summary(session_id: str) -> str | None:
     and produces a compact summary like "Grep observations.py, Read
     essential_knowledge.py, Bash ran tests".
 
-    Returns None if file doesn't exist or is empty.
+    THREE-VALUED, matching resolve_topic, because the upsert COALESCEs on None:
+      * a string -- the digest.
+      * ""       -- read fine, nothing to report. OVERWRITES, clearing a stale
+                    digest. This is the ORDINARY state after the awareness
+                    processor renames + unlinks the file it just consumed
+                    (memory/session_observer.py:261-279, :372-375).
+      * None     -- could NOT read (path rejected, unreadable). PRESERVES.
+    Collapsing the middle case into None makes a consumed digest immortal: peers
+    keep seeing tools from a finished task while the liveness refresh keeps
+    stamping the row as current.
     """
     obs_path = session_path(
         Path.home() / ".genesis" / "sessions", session_id, "tool_observations.jsonl"
     )
-    if obs_path is None or not obs_path.exists():
-        return None
+    if obs_path is None:
+        return None  # path REJECTED -- could not read -- preserve what is stored
+    if not obs_path.exists():
+        return ""  # consumed or never written -- nothing to report -- clear
 
     try:
         # Read last 5 lines efficiently
@@ -1345,7 +1356,7 @@ def _extract_genesis_summary(session_id: str) -> str | None:
                 return None
 
         if not lines:
-            return None
+            return ""  # present but empty -- nothing to report
 
         tools: list[str] = []
         for line in lines:
@@ -1372,7 +1383,8 @@ def _extract_genesis_summary(session_id: str) -> str | None:
             except (json.JSONDecodeError, AttributeError):
                 continue
 
-        return ", ".join(tools[-3:]) if tools else None
+        # "" not None: the file read fine, there was simply nothing summarizable
+        return ", ".join(tools[-3:]) if tools else ""
     except Exception:
         return None
 
@@ -1428,10 +1440,20 @@ def _heartbeat_read_and_inject(
 
         for s in active:
             parts = []
-            src = s.get("source_tag", "")
+            # sanitized like every other rendered field: it sits in the SAME
+            # parts list, on the same line, before the closing bracket. Dead
+            # today (no writer sets it, so it is always "foreground"), which is
+            # exactly why it was missed -- the branch looks harmless until the
+            # first writer tags a row.
+            src = sanitize_detail(s.get("source_tag", ""), 30)
             if src and src != "foreground":
                 parts.append(src)
-            model = s.get("model", "")
+            # sanitize_detail HERE too, not only on topic/genesis_summary
+            # below: model is a peer-authored field rendered into the SAME line,
+            # so a newline in it forges a second "[Concurrent | ...]" tag exactly
+            # as it would there. Missed originally because the rule was applied
+            # field-by-field rather than to the rendered SET.
+            model = sanitize_detail(s.get("model", ""), 40)
             if model:
                 parts.append(model)
 
@@ -1439,8 +1461,9 @@ def _heartbeat_read_and_inject(
             # user_summary intentionally omitted — raw user messages from other
             # sessions are decontextualized noise and risk cross-session
             # contamination (Claude may treat them as input from this user).
-            # topic and genesis_summary ARE rendered, but both are written by
-            # another session's model, so both go through sanitize_detail: a
+            # model, topic and genesis_summary ARE rendered, and every one of
+            # them is written by another session, so all go through
+            # sanitize_detail (see the model call above): a
             # newline plus a forged "[Concurrent | ...]" line would otherwise
             # land verbatim in this session's context.
             bits = []
@@ -1452,7 +1475,10 @@ def _heartbeat_read_and_inject(
                 bits.append(gs)
             detail = " · ".join(bits)
 
-            sid_short = s.get("cc_session_id", "")[:8]
+            # The 8-char truncation makes a full forged tag impossible, but a
+            # raw value still shatters the line across several; sanitize first,
+            # then truncate.
+            sid_short = sanitize_detail(s.get("cc_session_id", ""), 8)
             tag_parts = ["Concurrent"]
             if parts:
                 tag_parts.append(" ".join(parts))

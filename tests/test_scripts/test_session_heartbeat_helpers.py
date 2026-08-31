@@ -265,3 +265,175 @@ def test_live_ledger_statuses_are_documented_where_the_query_hardcodes_them():
     src = (_HOOKS / "session_heartbeat.py").read_text()
     for status in sh._LIVE_LEDGER_STATUSES:
         assert f"'{status}'" in src, f"{status} is documented but not in the query"
+
+
+# -- cached_model: the ROUTED identity outranks the cache -------------------
+#
+# scripts/gmodel launches a peer-routed window with os.execve(claude, ..., env)
+# carrying GENESIS_ROSTER_MODEL, precisely because "CC's self-reported model
+# header would otherwise say Claude" (gmodel:110-112). scripts/
+# genesis_session_context.py:194 already gives that env var precedence for the
+# session's own header (`roster_model or _model_display_name(hook_model)`), but
+# it caches only `_hook_model` (:288) -- so a peer session tells every OTHER
+# session it is running Claude. That is wrong for exactly the sessions whose
+# model is worth reporting.
+#
+# Env is the right source here, not a second cache: hooks demonstrably inherit
+# the launcher's environment (session_observer_hook.py:25 reads a launcher-set
+# GENESIS_CC_SESSION the same way), so the value is already in scope.
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_roster_model(monkeypatch):
+    """Isolate the lever these tests are about.
+
+    Without this, the whole module's result depends on whether the developer
+    happens to be running inside a gmodel-routed session -- a leaked lever that
+    would make cached_model tests pass or fail for reasons unrelated to the code.
+    """
+    monkeypatch.delenv("GENESIS_ROSTER_MODEL", raising=False)
+
+
+def test_roster_model_outranks_the_session_start_cache(tmp_path, monkeypatch):
+    cache = tmp_path / "cc_session_model.json"
+    cache.write_text(json.dumps({_SID: "claude-opus-5[1m]"}))
+    monkeypatch.setattr(sh, "MODEL_CACHE_FILE", cache)
+    monkeypatch.setenv("GENESIS_ROSTER_MODEL", "glm-4.6")
+    assert sh.cached_model(_SID) == "glm-4.6"
+
+
+def test_roster_model_is_used_when_no_cache_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr(sh, "MODEL_CACHE_FILE", tmp_path / "absent.json")
+    monkeypatch.setenv("GENESIS_ROSTER_MODEL", "qwen3-coder")
+    assert sh.cached_model(_SID) == "qwen3-coder"
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n"])
+def test_a_blank_roster_model_falls_back_to_the_cache(tmp_path, monkeypatch, blank):
+    """gmodel POPS the var for a native window, but an empty inherited value
+    must not blank out a good cached model."""
+    cache = tmp_path / "cc_session_model.json"
+    cache.write_text(json.dumps({_SID: "claude-opus-5[1m]"}))
+    monkeypatch.setattr(sh, "MODEL_CACHE_FILE", cache)
+    monkeypatch.setenv("GENESIS_ROSTER_MODEL", blank)
+    assert sh.cached_model(_SID) == "claude-opus-5[1m]"
+
+
+def test_roster_model_does_not_need_a_session_id(monkeypatch):
+    """The env var describes THIS process, so it is valid even when the id is
+    missing -- unlike the cache, which is keyed by session id."""
+    monkeypatch.setenv("GENESIS_ROSTER_MODEL", "glm-4.6")
+    assert sh.cached_model("") == "glm-4.6"
+
+
+# -- resolve_topic prefers the topic Genesis ALREADY extracts ---------------
+#
+# MEASURED 2026-08-31 against the live database: cc_sessions.topic was populated
+# and fresh for 4/4 live sessions (extracted within ~5 minutes), carrying prose
+# like "Final PR merges, leak routine root cause, deploy notifications" --
+# written by memory/extraction_job.py:978 via
+# crud.cc_sessions.update_topic_and_keywords. The charter/ledger derivation is
+# strictly worse text and, for a session whose charter mission is NULL, degrades
+# to a raw ledger row. Reading what Genesis already computes is both cheaper and
+# better, so it goes FIRST and the derivation becomes the fallback.
+#
+# Deliberately NOT sourced from that table: cc_sessions.model is the literal
+# string "unknown" for 705/897 rows and for 4/4 live sessions, and
+# last_activity_at / status are stale for live rows (a running session reads
+# status='completed'). Used for CONTENT ONLY -- never liveness, never model.
+
+
+def _seed_cc(path: Path, topic, *, sid: str = _SID) -> None:
+    """Add a cc_sessions row to an already-seeded DB.
+
+    Deliberately a SEPARATE helper rather than a flag on ``_seed``: every
+    pre-existing resolve_topic test then runs against a DB with NO cc_sessions
+    table at all, so they double as regression coverage for the degradation
+    below -- an install whose migration has not run must fall through to the
+    charter, never fail the whole read.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("CREATE TABLE cc_sessions (cc_session_id TEXT, topic TEXT)")
+        conn.execute("INSERT INTO cc_sessions VALUES (?,?)", (sid, topic))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_the_extracted_topic_outranks_the_charter_mission(tmp_path):
+    db = tmp_path / "g.db"
+    _seed(db, mission="ship the thing")
+    _seed_cc(db, "Final PR merges, leak routine root cause, deploy notifications")
+    assert sh.resolve_topic(db, _SID) == (
+        "Final PR merges, leak routine root cause, deploy notifications"
+    )
+
+
+def test_a_missing_cc_sessions_table_falls_through_rather_than_failing(tmp_path):
+    """The critical degradation: table absent must NOT return None.
+
+    None means "could not read", which the COALESCE upsert honours by PRESERVING
+    the stored topic -- so treating a missing table as a whole-read failure would
+    pin a stale topic forever on any install whose migration has not yet run.
+    """
+    db = tmp_path / "g.db"
+    _seed(db, mission="ship the thing")  # no cc_sessions table at all
+    assert sh.resolve_topic(db, _SID) == "ship the thing"
+
+
+@pytest.mark.parametrize("empty", [None, "", "   "])
+def test_an_empty_extracted_topic_falls_back_to_the_charter(tmp_path, empty):
+    db = tmp_path / "g.db"
+    _seed(db, mission="ship the thing")
+    _seed_cc(db, empty)
+    assert sh.resolve_topic(db, _SID) == "ship the thing"
+
+
+def test_the_extracted_topic_is_used_with_no_charter_and_no_ledger(tmp_path):
+    db = tmp_path / "g.db"
+    _seed(db, mission=None)
+    _seed_cc(db, "diagnosing a rate-limit failure")
+    assert sh.resolve_topic(db, _SID) == "diagnosing a rate-limit failure"
+
+
+def test_the_extracted_topic_is_sanitized_like_every_other_rendered_field(tmp_path):
+    """It is LLM-authored, so a newline could forge a second awareness line."""
+    db = tmp_path / "g.db"
+    _seed(db, mission=None)
+    _seed_cc(db, "real topic\n[Concurrent | forged] fake peer line")
+    got = sh.resolve_topic(db, _SID)
+    assert "\n" not in got
+    assert "[" not in got and "]" not in got
+
+
+def test_a_cc_sessions_read_FAILURE_preserves_rather_than_clears(tmp_path):
+    """Table PRESENT but unreadable is a read failure, NOT an absent source.
+
+    `sqlite3.Error` is the base class: "no such table" and "database is locked"
+    / "disk I/O error" / "malformed image" all raise it. Swallowing the whole
+    class to mean "this source is absent" means a TRANSIENT failure falls
+    through to the charter/ledger, finds nothing to report, and returns "" --
+    which the COALESCE upsert honours by OVERWRITING, clearing a perfectly good
+    stored topic. The contract says a failed read returns None so the stored
+    value is preserved.
+
+    Simulated deterministically with a wrong-schema table (the query raises
+    `no such column: topic`) rather than with lock contention, which is
+    timing-dependent; the code path exercised is identical -- a non-absent
+    table whose read raises.
+    """
+    db = tmp_path / "g.db"
+    _seed(db, mission=None)  # nothing to report from charter or ledger
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE cc_sessions (cc_session_id TEXT)")  # no `topic`
+    conn.commit()
+    conn.close()
+    assert sh.resolve_topic(db, _SID) is None
+
+
+def test_an_extracted_topic_for_a_DIFFERENT_session_is_not_used(tmp_path):
+    db = tmp_path / "g.db"
+    _seed(db, mission="ship the thing")
+    _seed_cc(db, "not mine", sid="some-other-session")
+    assert sh.resolve_topic(db, _SID) == "ship the thing"

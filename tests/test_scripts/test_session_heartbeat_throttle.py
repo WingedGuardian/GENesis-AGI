@@ -150,10 +150,43 @@ def test_different_sessions_never_contend(tmp_path):
 
 def test_the_refused_path_does_not_open_a_database(tmp_path, monkeypatch):
     """The whole design rests on the common path being cheap. If a future edit
-    moves a DB open above the throttle, this fails."""
+    moves a DB open above the throttle, this fails.
+
+    REWRITTEN: the first version of this test could not fail. It only ever
+    called `throttle_ok`, which contains no sqlite code path at all -- so
+    `assert opened == []` was true by construction, and moving `upsert_sync`
+    ABOVE the throttle (the exact regression named in the docstring) left it
+    green. The ordering it guards lives in the CALLER,
+    `session_observer_hook._maybe_refresh_heartbeat`, in a module this file did
+    not even import.
+    """
+    import importlib.util as _iu
     import sqlite3
 
-    assert sh.throttle_ok(_SID, window_s=60.0, sessions_dir=tmp_path) is True
+    spec = _iu.spec_from_file_location("obs_for_test", _HOOKS / "session_observer_hook.py")
+    obs = _iu.module_from_spec(spec)
+    spec.loader.exec_module(obs)
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    # The DB file must EXIST at the path the suite's isolation resolves to, or
+    # `_maybe_refresh_heartbeat` returns at its exists() guard before ever
+    # connecting and the spy below observes nothing -- the test would then pass
+    # whatever the ordering, which is exactly how the previous version of this
+    # test was vacuous. conftest's autouse `_isolate_genesis_db_path` patches
+    # the FUNCTION `genesis.env.genesis_db_path` (NOT the env var, so setenv
+    # here would be inert) to this filename under tmp_path. Creating the file
+    # opts INTO that isolation rather than fighting it -- the real database is
+    # never reachable from here.
+    isolated_db = tmp_path / "isolated-genesis.db"
+    sqlite3.connect(str(isolated_db)).close()
+    from genesis.env import genesis_db_path
+
+    assert Path(genesis_db_path()) == isolated_db, (
+        "conftest's DB isolation moved; this test now points at the wrong file "
+        "and would silently stop covering the ordering it names"
+    )
+
+    obs._maybe_refresh_heartbeat(_SID)  # claims the window
 
     opened: list[str] = []
     real_connect = sqlite3.connect
@@ -163,8 +196,8 @@ def test_the_refused_path_does_not_open_a_database(tmp_path, monkeypatch):
         return real_connect(*a, **k)
 
     monkeypatch.setattr(sqlite3, "connect", _spy)
-    assert sh.throttle_ok(_SID, window_s=60.0, sessions_dir=tmp_path) is False
-    assert opened == [], f"the throttled-off path opened a database: {opened}"
+    obs._maybe_refresh_heartbeat(_SID)  # refused by the throttle
+    assert opened == [], f"a database open moved above the throttle: {opened}"
 
 
 def test_the_refused_path_costs_about_one_stat(tmp_path):
@@ -202,3 +235,34 @@ def test_a_readonly_sessions_dir_fails_closed(tmp_path):
         assert sh.throttle_ok(_SID, window_s=60.0, sessions_dir=ro) is False
     finally:
         os.chmod(ro, 0o700)
+
+
+# --- clock moving BACKWARDS (VM restore, NTP correction) -------------------
+#
+# Both throttle checks compare `now - <stored>` against the window. A backwards
+# clock step makes that difference NEGATIVE, and a negative number is always
+# `< window`, so both checks read "inside the window" and refuse -- suppressing
+# every liveness write until wall time catches up. A correction larger than
+# _STALE_THRESHOLD therefore makes an ACTIVELY WORKING session vanish from its
+# peers entirely. The repo already settled this direction elsewhere:
+# scripts/genesis_urgent_alerts.py:350 guards `if elapsed < 0: return False`
+# with the comment "future marker -> do not suppress; emit".
+
+
+def test_a_future_stamp_mtime_does_not_suppress_the_refresh(tmp_path):
+    """The cheap mtime fast path must treat a FUTURE stamp as claimable."""
+    # content is genuinely old, so only the mtime can refuse this
+    _stamp(tmp_path, repr(time.time() - 7200.0), age_s=-3600.0)
+    assert sh.throttle_ok(_SID, window_s=60.0, sessions_dir=tmp_path) is True
+
+
+def test_a_future_claim_time_does_not_suppress_the_refresh(tmp_path):
+    """The under-lock CONTENT check needs the same guard as the mtime check.
+
+    Guard-the-guard: the mtime is deliberately aged past the window so the fast
+    path CANNOT be what returns True here -- otherwise this would pass without
+    the content check ever being reached, and would keep passing if that second
+    call site were left unfixed.
+    """
+    _stamp(tmp_path, repr(time.time() + 3600.0), age_s=7200.0)
+    assert sh.throttle_ok(_SID, window_s=60.0, sessions_dir=tmp_path) is True
