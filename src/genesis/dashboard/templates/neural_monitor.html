@@ -1626,7 +1626,7 @@ function showDefaultPanel() {
 function normalizeDiscarded(queues) {
     const d = queues && queues.discarded;
     if (!d || typeof d !== 'object') {
-        return { known: false, total: 0, sample: [], truncated: false };
+        return { known: false, total: 0, totalLabel: '0+', sample: [], truncated: false };
     }
     const sample = Array.isArray(d.sample) ? d.sample : [];
     const known = d.known === true && Number.isFinite(d.total);
@@ -1636,7 +1636,10 @@ function normalizeDiscarded(queues) {
     const reported = Number.isFinite(d.total) ? d.total : sample.length;
     const total = Math.max(reported, sample.length);
     const truncated = d.sample_truncated === true || total > sample.length;
-    return { known: known, total: total, sample: sample, truncated: truncated };
+    // See dashboard.js: `total` is a floor when the depth is unknown, so every
+    // render site takes the label and none re-derives the distinction.
+    const totalLabel = known ? String(total) : total + "+";
+    return { known: known, total: total, totalLabel: totalLabel, sample: sample, truncated: truncated };
 }
 
 function renderDiscardedItems(container, queues) {
@@ -1648,11 +1651,9 @@ function renderDiscardedItems(container, queues) {
 
     // Toggle header
     const toggle = el('div', 'discarded-toggle');
-    const toggleText = el('span', null, !d.known
-        ? 'Discarded (depth unavailable' + (items.length ? ', showing ' + items.length : '') + ')'
-        : (d.truncated
-            ? 'Discarded (' + d.total + ', showing ' + items.length + ')'
-            : 'Discarded (' + d.total + ')'));
+    const toggleText = el('span', null, d.truncated
+        ? 'Discarded (' + d.totalLabel + ', showing ' + items.length + ')'
+        : 'Discarded (' + d.totalLabel + ')');
     const arrow = el('span', 'arrow', '\u25B6');
     toggle.appendChild(toggleText);
     toggle.appendChild(arrow);
@@ -1713,7 +1714,7 @@ function renderDiscardedItems(container, queues) {
     // is the defect this page shipped.
     if (!d.known || d.truncated || d.total > 1) {
         const clearAllBtn = el('button', 'clear-btn clear-all-btn',
-            d.known ? 'Clear All Discarded (' + d.total + ')' : 'Clear All Discarded');
+            'Clear All Discarded (' + d.totalLabel + ')');
         clearAllBtn.addEventListener('click', function() {
             clearDiscardedItem('all').then(function() { fetchHealth(); });
         });

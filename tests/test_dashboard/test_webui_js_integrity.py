@@ -345,3 +345,50 @@ def test_queue_verdict_is_unknown_when_the_section_failed():
         "the failed-section check must precede the depth checks, or the verdict "
         "is already decided from counters that were never collected"
     )
+
+
+# `total` is a FLOOR when the depth could not be read: the count contributes
+# nothing, so it collapses to the rows in hand — at most the sample cap.
+# Rendering it bare produced "showing 20 of 20" for a 148-row queue, a total
+# asserted from a number that was never a total.
+#
+# The distinction is therefore made ONCE, in each normaliser, as `totalLabel`
+# ("148" when measured, "20+" when not). Predicates may read `.total`; nothing
+# may render it. That is checkable without knowing which enclosing block a
+# given expression sits in — the first version of this guard tried to decide
+# that from the line alone and flagged two correctly-guarded sites, because the
+# guards were on the enclosing template and two lines further down.
+_RENDERS_RAW_TOTAL = re.compile(r"discarded\.total(?!Label)(?!\s*(?:>|<|===|!==|==)\s*\d)")
+
+
+def test_no_frontend_renders_the_raw_total():
+    """Only `totalLabel` may reach a user; `.total` is for predicates.
+
+    Guards the CLASS rather than the three sites that had it wrong, because the
+    same mistake is available to every new expression that prints the value —
+    and the label makes it unrepresentable rather than merely currently-correct.
+    """
+    offenders = [
+        f"{p.name}:{i}: {ln.strip()[:110]}"
+        for p in _frontend_files()
+        for i, ln in enumerate(p.read_text().splitlines(), 1)
+        if _RENDERS_RAW_TOTAL.search(ln)
+    ]
+    assert not offenders, (
+        "these render the discarded depth directly instead of via `totalLabel`, "
+        "so when the count query fails they state the sample size as a measured "
+        "total:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_every_normaliser_publishes_the_label():
+    """All three copies must expose it, or a surface silently renders undefined."""
+    for path in _raw_discarded_readers():
+        body = _normaliser_body(path)
+        assert "totalLabel" in body, (
+            f"{path.name}'s normaliser does not publish `totalLabel` — any site "
+            "rendering it there would print undefined"
+        )
+        assert "known ? String(total)" in body, (
+            f"{path.name}: the label must distinguish a measured depth from a floor"
+        )

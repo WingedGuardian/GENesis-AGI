@@ -12,14 +12,6 @@ from genesis.dashboard._blueprint import _async_route, blueprint
 logger = logging.getLogger(__name__)
 
 
-# How wide each source is read before grouping. Deliberately far above the
-# display limit (clamped to 200): source rows are GROUPED before display, so a
-# scan capped at the page size makes every derived total a truncated read that
-# looks like a real number. Filling this window is reported as
-# `groups_totals_truncated`, which renders the total as a lower bound.
-_SCAN_CAP = 1000
-
-
 @blueprint.route("/api/genesis/unified-errors")
 @_async_route
 async def unified_errors():
@@ -42,17 +34,6 @@ async def unified_errors():
     grouped = request.args.get("grouped", "true").lower() in ("true", "1", "yes")
     subsystem_filter = request.args.get("subsystem")
     limit = min(request.args.get("limit", 50, type=int), 200)
-    # Source rows are GROUPED before display, so the display limit must not cap
-    # the scan: capping it makes every derived total a truncated read that looks
-    # like a real number. That is the defect this endpoint shipped — the
-    # attention strip rendered "6 active error groups" for any backlog >= 6,
-    # because `limit=6` capped the three source reads the groups were built
-    # from. Scan generously, group, publish true totals, then slice for display.
-    # `limit` is already clamped to <= 200 above, so this max() resolves to
-    # _SCAN_CAP today; it is written as a max so that raising the display clamp
-    # can never quietly leave the scan narrower than the page it must cover.
-    scan_limit = max(limit, _SCAN_CAP)
-    scan_truncated = False
 
     now = datetime.now(UTC)
     thirty_min_ago = (now - timedelta(minutes=30)).isoformat()
@@ -68,9 +49,8 @@ async def unified_errors():
     try:
         if grouped:
             raw_groups = await events_crud.query_grouped_errors(
-                rt.db, since=since, subsystem=subsystem_filter, limit=scan_limit,
+                rt.db, since=since, subsystem=subsystem_filter, limit=limit,
             )
-            scan_truncated = scan_truncated or len(raw_groups) >= scan_limit
             event_count = sum(g["count"] for g in raw_groups)
             for g in raw_groups:
                 groups.append({
@@ -91,15 +71,8 @@ async def unified_errors():
 
     try:
         dl_items = await dl_crud.query_recent(
-            rt.db, since=since, limit=scan_limit,
-            # Only the grouping keys — this runs on the dashboard's
-            # unconditional 15s poll over the shared connection, and the scan is
-            # ~166x wider than the page it feeds. `payload` is ~4.5 KB/row and
-            # is never read here, so selecting it would move megabytes per poll
-            # to build a handful of group headers.
-            columns=("target_provider", "operation_type", "failure_reason", "created_at"),
+            rt.db, since=since, limit=limit,
         )
-        scan_truncated = scan_truncated or len(dl_items) >= scan_limit
         dl_count = len(dl_items)
         if grouped and dl_items:
             dl_groups: dict[str, dict] = {}
@@ -132,9 +105,8 @@ async def unified_errors():
 
     try:
         dw_items = await dw_crud.query_failed(
-            rt.db, since=since, limit=scan_limit,
+            rt.db, since=since, limit=limit,
         )
-        scan_truncated = scan_truncated or len(dw_items) >= scan_limit
         dw_count = len(dw_items)
         if grouped and dw_items:
             dw_groups: dict[str, dict] = {}
@@ -190,17 +162,8 @@ async def unified_errors():
         logger.warning("unified-errors: active_alerts source failed", exc_info=True)
         sources_failed.append("alerts")
 
-    # `groups` is the FULL grouped set (built from a scan_limit-wide read);
-    # `groups[:limit]` is the display page. The totals below therefore describe
-    # the real population, not the page — rendering len(page) as a total is the
-    # defect this endpoint shipped. `groups_totals_truncated` is the loud
-    # marker for the one case the totals are still a lower bound: a source that
-    # filled the entire scan window.
     return jsonify({
         "groups": groups[:limit],
-        "groups_total": len(groups),
-        "groups_active_total": sum(1 for g in groups if g.get("still_active")),
-        "groups_totals_truncated": scan_truncated,
         "active_alerts": active_alerts,
         "totals": {
             "events": event_count,
@@ -233,12 +196,12 @@ async def clear_deferred_item(item_id):
         )
     await rt.db.commit()
     cleared = cur.rowcount
-    # Unconditional by design. The queues snapshot is cached up to 30s, and a
-    # `cleared == 0` result is the STRONGEST signal the caller's view is stale
-    # (it clicked Clear on a row the cache still shows but the DB no longer
-    # has) — precisely when the cache most needs busting. Guarding on `cleared`
-    # would skip the phantom-row case this exists to fix, and `rowcount` is -1
-    # (truthy) on some drivers anyway.
+    # Unconditional by design. The queues snapshot is cached for up to 30s, so
+    # without this the client's immediate refetch re-renders the rows it just
+    # deleted. Deliberately NOT guarded on `cleared`: a zero means the caller
+    # clicked Clear on a row the cached view still shows and the DB no longer
+    # has — the strongest evidence its view is stale, and precisely when the
+    # cache most needs busting. (`rowcount` is also -1 on some drivers.)
     from genesis.dashboard.routes.health import invalidate_snapshot_cache
 
     invalidate_snapshot_cache()

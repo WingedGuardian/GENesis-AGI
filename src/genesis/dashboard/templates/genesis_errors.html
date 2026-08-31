@@ -22,10 +22,6 @@
         groups: [],
         activeAlerts: [],
         totals: { events: 0, dead_letters: 0, deferred_failures: 0 },
-        // The endpoint scans to a fixed ceiling and reports when a source
-        // filled it. Rendering these totals bare made a truncated read look
-        // like a real count -- the same defect the attention strip shipped.
-        totalsTruncated: false,
         partial: false,
         sourcesFailed: [],
         loading: true,
@@ -76,7 +72,6 @@
               this.groups = data.groups || [];
               this.activeAlerts = data.active_alerts || [];
               this.totals = data.totals || { events: 0, dead_letters: 0, deferred_failures: 0 };
-              this.totalsTruncated = data.groups_totals_truncated || false;
               this.partial = data.partial || false;
               this.sourcesFailed = data.sources_failed || [];
               this.error = null;
@@ -671,20 +666,19 @@
       <div class="summary-stat">
         Total:
         <span class="stat-value" :class="{ zero: $store.genesisErrors.totalErrors === 0 }"
-              :title="$store.genesisErrors.totalsTruncated ? 'At least this many — a source filled the scan window, so the true count is higher' : ''"
-              x-text="$store.genesisErrors.totalErrors + ($store.genesisErrors.totalsTruncated ? '+' : '')"></span>
+              x-text="$store.genesisErrors.totalErrors"></span>
       </div>
       <div class="summary-stat">
         Events:
-        <span class="stat-value" :title="$store.genesisErrors.totalsTruncated ? 'At least this many — a source filled the scan window, so the true count is higher' : ''" x-text="$store.genesisErrors.totals.events + ($store.genesisErrors.totalsTruncated ? '+' : '')"></span>
+        <span class="stat-value" x-text="$store.genesisErrors.totals.events"></span>
       </div>
       <div class="summary-stat">
         Dead Letters:
-        <span class="stat-value" :title="$store.genesisErrors.totalsTruncated ? 'At least this many — a source filled the scan window, so the true count is higher' : ''" x-text="$store.genesisErrors.totals.dead_letters + ($store.genesisErrors.totalsTruncated ? '+' : '')"></span>
+        <span class="stat-value" x-text="$store.genesisErrors.totals.dead_letters"></span>
       </div>
       <div class="summary-stat">
         Deferred Failures:
-        <span class="stat-value" :title="$store.genesisErrors.totalsTruncated ? 'At least this many — a source filled the scan window, so the true count is higher' : ''" x-text="$store.genesisErrors.totals.deferred_failures + ($store.genesisErrors.totalsTruncated ? '+' : '')"></span>
+        <span class="stat-value" x-text="$store.genesisErrors.totals.deferred_failures"></span>
       </div>
     </div>
 

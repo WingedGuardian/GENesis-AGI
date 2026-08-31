@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-
 import aiosqlite
 
 
@@ -152,55 +150,15 @@ async def expire_orphans_by_provider(
     return [(row[0], row[1]) for row in rows]
 
 
-# Every column of `dead_letter`, as an ALLOWLIST. `columns=` builds a SQL
-# projection, and identifiers cannot be parameterised — so names are checked
-# against this set rather than interpolated, and an unknown name raises instead
-# of reaching the query. The set is the schema's, not a caller's.
-_COLUMNS = frozenset(
-    {
-        "id",
-        "operation_type",
-        "payload",
-        "target_provider",
-        "failure_reason",
-        "created_at",
-        "retry_count",
-        "last_retry_at",
-        "status",
-    }
-)
-
-
 async def query_recent(
     db: aiosqlite.Connection,
     *,
     since: str | None = None,
     target_provider: str | None = None,
     limit: int = 50,
-    columns: Sequence[str] | None = None,
 ) -> list[dict]:
-    """Return recent dead letter items (any status) within a time window.
-
-    ``columns`` narrows the projection to the named columns; ``None`` (default)
-    selects every column, so existing callers are unaffected. Worth using for a
-    wide scan that only needs a few fields: ``payload`` holds the serialized
-    operation and dominates row size (measured ~4.5 KB average against a live
-    store, versus a few hundred bytes for everything else combined), so a
-    grouping pass that never reads it transfers ~50x more than it uses.
-
-    Raises ``ValueError`` for a column not in the table.
-    """
-    if columns is None:
-        projection = "*"
-    else:
-        requested = list(dict.fromkeys(columns))
-        if not requested:
-            raise ValueError("columns= was empty; pass None to select every column")
-        unknown = [c for c in requested if c not in _COLUMNS]
-        if unknown:
-            raise ValueError(f"unknown dead_letter column(s): {sorted(unknown)}")
-        projection = ", ".join(requested)
-    sql = f"SELECT {projection} FROM dead_letter"
+    """Return recent dead letter items (any status) within a time window."""
+    sql = "SELECT * FROM dead_letter"
     clauses: list[str] = []
     params: list = []
     if since:

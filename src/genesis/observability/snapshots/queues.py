@@ -432,6 +432,7 @@ async def queues(
     discarded_items: list[dict] = []
     discarded_count = 0
     discarded_known = False
+    sample_has_more = False
     if db:
         # TWO independent try blocks, deliberately. Sharing one meant a single
         # unparseable row in the sample loop discarded an already-correct count
@@ -459,9 +460,19 @@ async def queues(
                           error_message, status, created_at, completed_at
                    FROM deferred_work_queue WHERE status IN ('discarded', 'expired')
                    ORDER BY completed_at DESC LIMIT ?""",
-                (_DISCARDED_SAMPLE_CAP,),
+                (_DISCARDED_SAMPLE_CAP + 1,),
             )
-            for row in await cur.fetchall():
+            rows = await cur.fetchall()
+            # One row PAST the cap is a probe, never payload. Its presence is
+            # what establishes truncation, and it does so from the same
+            # statement that produced the sample — so the verdict needs neither
+            # the COUNT to have succeeded nor the two reads to have seen the
+            # same instant. Comparing the count against the sample length
+            # cannot do this: when the count is unavailable the total falls
+            # back to the sample length, so the comparison reads "complete" at
+            # exactly the moment a full sample proves otherwise.
+            sample_has_more = len(rows) > _DISCARDED_SAMPLE_CAP
+            for row in rows[:_DISCARDED_SAMPLE_CAP]:
                 age = (now_dt2 - datetime.fromisoformat(row["created_at"])).total_seconds()
                 discarded_items.append({
                     "id": row["id"],
@@ -488,15 +499,13 @@ async def queues(
         "sample": discarded_items,
         "known": discarded_known,
     }
-    # Truncated if the depth exceeds what was shipped OR the sample filled its
-    # cap. The second half is not redundant: when the COUNT fails, `total` falls
-    # back to the sample length, so `total > len(sample)` is False at exactly the
-    # moment a full sample proves there is more than we can see. A row count that
-    # EQUALS its limit is a truncated read, never a complete one — reporting it
-    # as complete is the original defect wearing the new shape.
+    # Truncated if the known depth exceeds what was shipped, or if the probe row
+    # came back. Treating a FULL sample as truncated outright (the first attempt
+    # at this) was wrong in the other direction: a queue holding exactly the cap
+    # then rendered "showing 20 of 20", asserting rows were withheld when none
+    # were. The probe distinguishes "filled the cap" from "more exist".
     discarded["sample_truncated"] = (
-        discarded["total"] > len(discarded["sample"])
-        or len(discarded["sample"]) >= _DISCARDED_SAMPLE_CAP
+        discarded["total"] > len(discarded["sample"]) or sample_has_more
     )
 
     deferred_processing = 0

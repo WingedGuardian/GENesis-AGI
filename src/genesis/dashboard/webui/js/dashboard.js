@@ -4416,7 +4416,7 @@
           if (!d || typeof d !== "object") {
             // Absent: an older server, or `_or_error` replaced the whole queues
             // section. Either way this is "we do not know", never a clean zero.
-            return { known: false, total: 0, sample: [], truncated: false };
+            return { known: false, total: 0, totalLabel: "0+", sample: [], truncated: false };
           }
           const sample = Array.isArray(d.sample) ? d.sample : [];
           const known = d.known === true && Number.isFinite(d.total);
@@ -4432,7 +4432,14 @@
           // total === sample.length. Fall back to comparing only if the field
           // is missing (an older server).
           const truncated = d.sample_truncated === true || total > sample.length;
-          return { known, total, sample, truncated };
+          // `total` is a FLOOR when the depth could not be read: the count
+          // contributes nothing, so it collapses to the rows in hand. Render
+          // sites take `totalLabel`, never the raw number — the "of 20" half of
+          // "showing 20 of 20" for a 148-row queue came from printing a floor
+          // as though it were a measurement, and every new expression that
+          // printed it could make that mistake again.
+          const totalLabel = known ? String(total) : total + "+";
+          return { known, total, totalLabel, sample, truncated };
         },
 
         get discardedQueueGroups() {
@@ -4533,15 +4540,7 @@
           const allAlerts = this.errorSummary.active_alerts || [];
           const criticalAlerts = allAlerts.filter(a => a.severity === "CRITICAL");
           const warningAlerts = allAlerts.filter(a => a.severity === "WARNING");
-          // Read the uncapped total, never the page length: `groups` is the
-          // display page (limit=6), so counting it renders "6 active error
-          // groups" for any number >= 6. Falls back to the page length only
-          // when the field is absent (older server). `+` when even the server's
-          // scan window filled — the total is then a lower bound, and saying so
-          // is the whole point.
-          const activeGroups = this.errorSummary.groups_active_total
-            ?? (this.errorSummary.groups || []).filter(g => g.still_active).length;
-          const groupsSuffix = this.errorSummary.groups_totals_truncated ? "+" : "";
+          const activeGroups = (this.errorSummary.groups || []).filter(g => g.still_active).length;
           if (criticalAlerts.length > 0) {
             items.push({ level: "critical", title: `${criticalAlerts.length} critical alert${criticalAlerts.length === 1 ? "" : "s"}`, detail: criticalAlerts.map(a => a.message).slice(0, 3).join("; "), href: "/genesis/errors" });
           }
@@ -4549,7 +4548,7 @@
             items.push({ level: "warning", title: `${warningAlerts.length} system warning${warningAlerts.length === 1 ? "" : "s"}`, detail: `${warningAlerts.length} call site${warningAlerts.length === 1 ? "" : "s"} on fallback or degraded`, href: "/genesis/errors" });
           }
           if (activeGroups > 0) {
-            items.push({ level: "warning", title: `${activeGroups}${groupsSuffix} active error group${activeGroups === 1 && !groupsSuffix ? "" : "s"}`, detail: "grouped warnings/errors across events, dead letters, or deferred work", href: "/genesis/errors" });
+            items.push({ level: "warning", title: `${activeGroups} active error group${activeGroups === 1 ? "" : "s"}`, detail: "grouped warnings/errors across events, dead letters, or deferred work", href: "/genesis/errors" });
           }
           if (this.errorSummary.partial) {
             const failed = (this.errorSummary.sources_failed || []).join(", ");
@@ -4559,8 +4558,9 @@
             items.push({ level: "critical", title: `${this.health.queues.dead_letters} dead letters`, detail: "requests exhausted all fallback providers; open the errors view to inspect", href: "/genesis/errors" });
           }
           if (this.discarded.total > 0) {
-            const n = this.discarded.total;
-            items.push({ level: "warning", title: `${n} discarded item${n === 1 ? "" : "s"}`, detail: "work was dropped and can be reviewed or cleared below", href: "#queue-review", tab: "overview", anchor: "queue-review" });
+            // Singular only for a MEASURED one: "1+ discarded item" would be
+            // wrong, since a floor of 1 means one or more.
+            items.push({ level: "warning", title: `${this.discarded.totalLabel} discarded item${this.discarded.total === 1 && this.discarded.known ? "" : "s"}`, detail: "work was dropped and can be reviewed or cleared below", href: "#queue-review", tab: "overview", anchor: "queue-review" });
           }
           // Fallback call sites are already captured in the warningAlerts
           // bucket above (severity=WARNING from health_alerts). The dedicated

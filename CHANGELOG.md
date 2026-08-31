@@ -90,17 +90,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   above a correctly-counted list of discarded rows; it is now scoped to
   failures of the count it actually describes.
 
-- **The attention strip reported "N active error groups" from a page, not a
-  count.** `/api/genesis/unified-errors` was queried with `limit=6` and the strip
-  counted the returned list, so any backlog of six or more displayed as exactly
-  "6" — and the three source reads the groups are built from were each capped by
-  that same limit, so the underlying totals were truncated too. The endpoint now
-  scans to a fixed ceiling far above the display page rather than to the page
-  itself, publishes the resulting totals alongside it, and marks a total as a
-  lower bound (`6+`) whenever a source fills that ceiling — so a number is
-  either the real depth or is visibly flagged as not being one. The scan reads
-  only the columns it groups by, so widening it does not pull row payloads.
-
 - **The `/genesis/monitor` page had the same discarded-count bug, plus a worse
   variant: rows you could not clear.** Its "Clear All Discarded" button was shown
   only when the 20-row sample held more than one entry, while its label printed
@@ -136,8 +125,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   states, both toward honesty: when the depth query fails it reports the rows
   actually in hand rather than 0, and when the depth and the sample disagree it
   reports the larger rather than the depth alone. Anything reading it as "the
-  queue depth" — including the >100 queue-depth alert — keeps working and stops
-  under-reporting in those two states.
+  queue depth" — including the >100 queue-depth alert — keeps working and
+  under-reports far less in those states: where a failed count previously
+  yielded zero, it now yields the rows actually in hand. That is a floor, not
+  the depth, so an alert threshold above the sample cap can still be missed
+  while the count query is failing.
 
 - **"Clear all reviewed" now says how many rows it will actually delete.** It
   always deleted every discarded/expired row, not the 20 displayed — harmless

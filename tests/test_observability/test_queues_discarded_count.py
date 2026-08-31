@@ -239,20 +239,43 @@ class TestDiscardedIsReconciledOnce:
         )
         assert stats["discarded_items"] == stats["discarded"]["sample"]
 
-    async def test_a_full_sample_is_truncated_even_when_the_count_is_unknown(self, db):
-        """A sample that FILLED its cap is a truncated read, never a complete one.
+    async def test_a_queue_exactly_at_the_cap_is_not_truncated(self, db):
+        """Exactly `cap` rows is a COMPLETE read, and must not claim otherwise.
 
-        The subtle case, and the one a comparison alone cannot see. When the
-        COUNT fails, `total` falls back to the sample length — so
-        `total > len(sample)` is False at exactly the moment a full sample
-        proves more rows exist than were shipped. Reporting that as complete is
-        the original defect (a number equal to its own limit read as a real
-        total) reappearing one layer up.
-
-        The producer knows it hit the cap, so it says so; nothing downstream can
-        recover this by comparing the two numbers it was given.
+        The first attempt at the cap-blindness fix treated "the sample filled
+        its cap" as truncation outright, so a queue holding exactly 20 rows
+        rendered "showing 20 of 20" — asserting rows were withheld when none
+        were. Truncation is now decided by fetching ONE row past the cap: if the
+        extra row does not come back, the sample is the whole queue.
         """
-        await _seed(db, discarded=_DISCARDED)          # 25 > the 20-row cap
+        await _seed(db, discarded=q._DISCARDED_SAMPLE_CAP)
+        d = (await q.queues(db, None, None, None))["discarded"]
+
+        assert d["known"] is True
+        assert d["total"] == q._DISCARDED_SAMPLE_CAP
+        assert len(d["sample"]) == q._DISCARDED_SAMPLE_CAP, "the extra probe row must not be shipped"
+        assert d["sample_truncated"] is False, (
+            "a queue holding exactly the cap was reported as truncated — the "
+            "panel would say 'showing 20 of 20' as though rows were withheld"
+        )
+
+    async def test_truncation_is_decided_without_the_count(self, db):
+        """One row past the cap proves truncation, even with the COUNT dead.
+
+        This is the case a comparison cannot see. With the COUNT failing,
+        `total` falls back to the sample length, so `total > len(sample)` is
+        False at exactly the moment more rows exist. The sentinel row settles it
+        from the same statement that produced the sample, so the verdict does
+        not depend on the count being available — or on the count and the sample
+        having been read at the same instant.
+
+        Scope, stated honestly: the OLD cap-equality heuristic also returned
+        True for this input. What only the sentinel can do is tell "filled the
+        cap" apart from "more exist", which is
+        `test_a_queue_exactly_at_the_cap_is_not_truncated`'s job. This test
+        pins the half that survives the count being gone.
+        """
+        await _seed(db, discarded=q._DISCARDED_SAMPLE_CAP + 1)
         real = db.execute
 
         async def _fail_the_count(sql, *a, **k):
@@ -260,19 +283,28 @@ class TestDiscardedIsReconciledOnce:
                 raise RuntimeError("count query exploded")
             return await real(sql, *a, **k)
 
-        monkeypatch_target = _fail_the_count
-        db.execute = monkeypatch_target
+        db.execute = _fail_the_count
         try:
             d = (await q.queues(db, None, None, None))["discarded"]
         finally:
             db.execute = real
 
-        assert d["known"] is False
-        assert d["total"] == len(d["sample"]) == q._DISCARDED_SAMPLE_CAP, (
-            "precondition: this test is only meaningful when the sample fills "
-            "its cap and the total falls back to that same number"
-        )
+        assert d["known"] is False, "the count failed and must be reported unknown"
+        assert len(d["sample"]) == q._DISCARDED_SAMPLE_CAP, "the sample stays capped"
         assert d["sample_truncated"] is True, (
-            "a sample that filled its cap was reported as complete — the panel "
-            "would show 20 rows with no indication that more exist"
+            "more rows exist than were shipped and the count is unavailable — "
+            "the sentinel establishes this without the count, and must"
         )
+
+    async def test_the_sentinel_row_is_never_shipped(self, db):
+        """The probe row is evidence, not payload.
+
+        The sample is fetched at cap+1 to detect truncation; shipping that extra
+        row would silently widen every payload by one and make the rendered
+        "showing N" disagree with the list beneath it.
+        """
+        await _seed(db, discarded=q._DISCARDED_SAMPLE_CAP + 5)
+        d = (await q.queues(db, None, None, None))["discarded"]
+
+        assert len(d["sample"]) == q._DISCARDED_SAMPLE_CAP
+        assert d["sample_truncated"] is True
