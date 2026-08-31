@@ -1390,9 +1390,21 @@ async def _check_context_injection_health(db) -> None:
         from genesis.observability.snapshots.context_injection import (
             context_injection,
             derive_findings,
+            producer_class,
         )
 
         if not _cfg_mod.is_enabled():
+            # Resolve on the way out: an operator who DISABLES the watcher must
+            # not be left with its last critical alert standing forever on the
+            # health and outreach surfaces. Same posture as the follow-up
+            # watchdog, which resolves on this exact transition.
+            await observations.resolve_by_source_and_type(
+                db,
+                source="context_injection_monitor",
+                type="infrastructure_alert",
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes="context-injection watcher disabled",
+            )
             return
         cfg = _cfg_mod.load_config()
         health = await context_injection(
@@ -1409,13 +1421,27 @@ async def _check_context_injection_health(db) -> None:
             )
             return
 
-        # Identity keys on the filing-session COUNT plus the marker parts, so a
-        # persisting incident stays ONE alert while a new session joining it (or
-        # a new part going over) re-alerts. Note it is the COUNT, not the set: a
-        # session recovering while another joins leaves the count unchanged and
-        # does not re-alert — acceptable, since the alert is still live and true.
-        _marker_parts = ",".join(sorted(str(m.get("part", "?")) for m in health.markers))
-        alert_key = f"filings:{health.filing_sessions}:markers:{_marker_parts}"
+        # Identity covers EVERY state the findings can report, so a change in
+        # any of them re-alerts rather than being superseded into silence by an
+        # older alert that happened to hash the same: the session count, the set
+        # of PRODUCERS filing (a new hook joining is new information), and both
+        # degraded flags. Note the count, not the session set: one session
+        # recovering while another joins leaves it unchanged and does not
+        # re-alert — acceptable, since the alert is still live and true.
+        # The producer CLASS, not the excerpt. An unrecognised producer's label
+        # carries the first 80 chars of that hook's output, which for something
+        # like the recall injection varies EVERY prompt — so hashing the label
+        # would supersede-and-recreate a fresh critical alert on every hourly
+        # tick, paging the owner hourly about one standing incident. The excerpt
+        # stays in the alert BODY, where it is informative; the identity keys on
+        # the class, where it must be stable.
+        _producers = ",".join(
+            sorted({producer_class(str(d.get("producer", "?"))) for d in health.fresh_filings})
+        )
+        alert_key = (
+            f"filings:{health.filing_sessions}:by:{_producers}"
+            f":truncated:{health.scan_truncated}:error:{bool(health.error)}"
+        )
         content_hash = hashlib.sha256(f"context_injection:{alert_key}".encode()).hexdigest()
         await observations.supersede_except_hash(
             db,

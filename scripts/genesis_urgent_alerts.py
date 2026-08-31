@@ -42,6 +42,7 @@ from urllib.request import pathname2url
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
 from hook_input import session_path  # noqa: E402
+from hook_output import BoundedStdout  # noqa: E402
 
 # Load secrets.env so USER_TIMEZONE and other env vars are available
 # before any genesis module imports (which may read os.environ at import time).
@@ -129,8 +130,7 @@ def _emit_temporal_context(session_id: str, now: datetime) -> None:
     if last_msg:
         parts.append(f"Last msg: {last_msg}")
 
-    print(f"[{' | '.join(parts)}]")
-    sys.stdout.flush()
+    _say(f"[{' | '.join(parts)}]")
 
 
 def _buffer_message(session_id: str, prompt: str, now: datetime) -> None:
@@ -168,12 +168,11 @@ def _buffer_message(session_id: str, prompt: str, now: datetime) -> None:
 def _check_shelve_hint(prompt: str) -> None:
     """Detect /shelve or /unshelve and emit a soft hint."""
     if _SHELVE_PATTERN.search(prompt):
-        print(
+        _say(
             "The user may be asking to bookmark this session. "
             "If that's their intent, use the bookmark_shelve or "
             "bookmark_unshelve MCP tool."
         )
-        sys.stdout.flush()
 
 
 def _ro_uri(db_path: Path) -> str:
@@ -196,7 +195,26 @@ def _ro_uri(db_path: Path) -> str:
 _TAG_MAX_ROWS = 8
 _TAG_ROW_CHARS = 140
 _TAG_MISSION_CHARS = 80
-_TAG_MAX_BYTES = 1_500
+# Sized so _TAG_MAX_ROWS rows still fit once ids render in FULL: worst case is
+# 8 x (32-hex id + 140 chars + a 32-hex escalation id) = 2,004 bytes MEASURED.
+# At the old 1,500 the trim would quietly drop rows the inventory promised to
+# list — the count-instead-of-inventory defect, reintroduced by its own cap.
+_TAG_MAX_BYTES = 2_200
+
+
+# This hook writes to UserPromptSubmit, which IS a model-facing event: its
+# stdout is subject to the same 10,000-char persistence as SessionStart, and
+# above it the WHOLE turn's injection is filed behind a preview. Nothing here
+# was bounded in total before (per-emitter caps only), and this file grew by up
+# to _TAG_MAX_BYTES per prompt when the count became an inventory. One writer
+# for the whole hook, so the total cannot cross the cap however many emitters
+# fire in one turn.
+_OUT = BoundedStdout(label="urgent-alerts")
+
+
+def _say(text: str) -> None:
+    """Emit one model-facing line, bounded by the shared harness cap."""
+    _OUT.emit(text, block="urgent-alerts")
 
 
 def _escalation_dedup_key(ledger_id: str) -> str:
@@ -314,8 +332,13 @@ def _emit_charter_tag(session_id: str) -> None:
             link = ""
             fid = escalations.get(str(rid))
             if fid:
-                link = f" \u2192 escalated: follow_up {fid[:8]}"
-            body_lines.append(f"- {str(rid)[:8]}{mark} {body}{link}")
+                link = f" \u2192 escalated: follow_up {fid}"
+            # FULL ids, not an 8-char prefix. `session_ledger_update` passes its
+            # argument straight into `WHERE id = ?` with no prefix resolution,
+            # so a prefix shown here returns "No ledger item with id ..." \u2014 an
+            # inventory whose whole purpose is letting the next turn CLOSE a row
+            # must name something that tool accepts.
+            body_lines.append(f"- {rid}{mark} {body}{link}")
 
         # Trim rows to fit the byte cap, then RECOMPUTE the overflow pointer for
         # what actually rendered. A first version popped lines off the end, which
@@ -340,8 +363,7 @@ def _emit_charter_tag(session_id: str) -> None:
         while len(tag.encode("utf-8")) > _TAG_MAX_BYTES and body_lines:
             body_lines.pop()
             tag = _assemble(body_lines)
-        print(tag)
-        sys.stdout.flush()
+        _say(tag)
     except Exception:
         return  # fail-open: a tag miss must never surface as an error
 
@@ -523,82 +545,9 @@ def _emit_staleness_nudge(session_id: str, now: datetime) -> None:
         # prompt — the absent-marker throttle path reads as "not throttled".
         if not _record_staleness_nudge(session_id, now):
             return
-        print(msg)
-        sys.stdout.flush()
+        _say(msg)
     except Exception:
         return  # fail-open: a nudge miss must never surface as an error
-
-
-_MARKER_STEM = "injection_over_budget"
-_LEGACY_MARKER_DIR = _GENESIS_DIR / "session_awareness"
-
-
-def _budget_marker_files(session_id: str) -> list[Path]:
-    """This session's over-budget markers (one file per part; see the emitter).
-
-    Per-(session, part) files rather than one shared JSON: the four parts run
-    concurrently, so a shared dict raced — an under-budget sibling's clear could
-    erase an over-budget part's entry, and a global file let one session silence
-    another. Also sweeps the legacy session-less path so a marker written by an
-    older emitter still screams.
-    """
-    found: list[Path] = []
-    d = _session_dir(session_id)
-    if d is not None:
-        found.extend(sorted(d.glob(f"{_MARKER_STEM}*.json")))
-    found.extend(sorted(_LEGACY_MARKER_DIR.glob(f"{_MARKER_STEM}*.json")))
-    return found
-
-
-def _emit_injection_over_budget_alert(session_id: str) -> None:
-    """SCREAM, every prompt, while the SessionStart injection is over budget.
-
-    The failure this guards is silent by construction: the harness files an
-    over-cap injection and hands the model a 2 KB preview, so identity, the
-    charter, and essential knowledge simply never arrive — and nothing looks
-    wrong. That ran for a MONTH on this install (143 filings, 58 sessions)
-    before anyone noticed. This line is deliberately loud and repeats until the
-    SessionStart hook clears the marker with an under-budget run.
-    """
-    try:
-        wiring: list[str] = []
-        over: list[str] = []
-        for path in _budget_marker_files(session_id):
-            try:
-                info = json.loads(path.read_text())
-            except (OSError, ValueError):
-                # An unreadable marker is still evidence something wrote one.
-                over.append(f"{path.stem} (unreadable)")
-                continue
-            if not isinstance(info, dict):
-                continue
-            part = str(info.get("part") or path.stem)
-            if part == "wiring":
-                wiring.append(str(info.get("reason") or "unknown reason"))
-            else:
-                over.append(
-                    f"{part} ({info.get('chars', '?')}/{info.get('budget', '?')} chars at "
-                    f"{str(info.get('ts', '?'))[:16]})"
-                )
-        if wiring:
-            print(
-                f"[ALERT: session-context hook MIS-WIRED — {'; '.join(wiring)}. Only the "
-                "charter part was emitted, so identity and essential knowledge are MISSING "
-                "from this session. Fix the four --part SessionStart entries in "
-                ".claude/settings.json, then restart the session.]"
-            )
-        if over:
-            print(
-                f"[ALERT: session-context injection OVER BUDGET — part(s) {', '.join(over)}. "
-                "The harness FILES a hook's stdout above its cap and previews ~2 KB, so those "
-                "parts (identity/charter/EK) may be MISSING from this window. Trim "
-                "scripts/genesis_session_context.py's payload; each part's alarm clears on "
-                "its next under-budget session start.]"
-            )
-        if wiring or over:
-            sys.stdout.flush()
-    except Exception:
-        return  # fail-open: the alert must never break the prompt
 
 
 def main() -> None:
@@ -624,11 +573,9 @@ def main() -> None:
     # 1. Temporal context (always, even if no session_id)
     if session_id:
         _emit_temporal_context(session_id, now)
-        # 1a. Injection-over-budget / mis-wire SCREAM (every prompt until cleared)
-        _emit_injection_over_budget_alert(session_id)
-        # 1b. Charter drift tag (chartered sessions only; fail-open)
+        # 1a. Charter drift tag (chartered sessions only; fail-open)
         _emit_charter_tag(session_id)
-        # 1c. MCP stale-code nudge (only when this session's MCP is behind the
+        # 1b. MCP stale-code nudge (only when this session's MCP is behind the
         # last deploy; throttled; fail-open)
         _emit_staleness_nudge(session_id, now)
 

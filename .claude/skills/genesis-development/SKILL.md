@@ -1204,6 +1204,14 @@ Verify before any commit:
   file is a budget decision: put DETAIL in a reference doc and a pointer in the
   injected file. If you add or grow a hook's stdout, measure it against the
   cap; after a CC bump, re-run the probe (`GENESIS_CTX_PROBE_BYTES`).
+  **Emit through `scripts/hooks/hook_output.py`** — the single home of the
+  measured constant, whose `BoundedStdout` enforces the budget at the WRITER so
+  a block that forgets to check cannot overrun (2 of 12 blocks checked when the
+  budget was per-caller), and whose `print_json_bounded` trims named free-text
+  fields while never sacrificing the JSON envelope — an oversized advisory must
+  lose prose, never its `permissionDecision`. Only SessionStart,
+  UserPromptSubmit and UserPromptExpansion carry bare stdout to the model; a
+  Stop hook that `print`s on exit 0 is INERT.
 
 ## Generalizability Gate — build for ANY install, not this one
 

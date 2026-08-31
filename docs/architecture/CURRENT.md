@@ -1045,15 +1045,21 @@ verified: ca875c4b 2026-07-24
   genesis-health (`mcp/health/session_charter_tools.py`), which may create a
   stub row before the first compaction. Read paths:
   `genesis_session_context.py --part charter` re-injects origin + mission +
-  EVERY open ledger row (uncut; structured degrade above 8,000 chars keeps
-  every id + the charter.md path) as the SECOND block of every
-  startup/resume/compact window (NOT clear), and `genesis_urgent_alerts.py`
-  emits a per-turn INVENTORY — `[Ledger open: N | mission: …]` plus one
-  `- <id8> <text>` line per open row (capped visibly), a `mission: UNSET after
-  N compactions` drift label, and `→ escalated: follow_up <id8>` beside a row
-  that has an escalation follow-up (matched on `dedup_key`; the sweep that
-  WRITES those rows is `GROUNDWORK(ledger-escalation)` — NOT built, so this
-  link renders as nothing today). Both mode=ro, fail-open. A count
+  EVERY open ledger row (uncut; structured degrade above `_CHARTER_BLOCK_MAX`
+  = 7,500 chars keeps every id + the charter.md path, and the part's fixed
+  overhead is pinned by a test so a flat cut can never reach the rows) in every
+  startup/resume/compact window (NOT clear) — position within the window is not
+  guaranteed, since CC concatenates parallel hook output in COMPLETION order.
+  A ledger read beyond `_LEDGER_FETCH_MAX` = 200 open rows is ANNOUNCED in the
+  footer, never silently dropped. `genesis_urgent_alerts.py` emits a per-turn
+  INVENTORY — `[Ledger open: N | mission: …]` plus one `- <full-32-hex-id>
+  <text>` line per open row (capped visibly; ids render in FULL because
+  `session_ledger_update` does no prefix resolution, so a truncated id is not
+  actionable), a `mission: UNSET after N compactions` drift label, and
+  `→ escalated: follow_up <id>` beside a row that has an escalation follow-up
+  (matched on `dedup_key`; the sweep that WRITES those rows is
+  `GROUNDWORK(ledger-escalation)` — NOT built, so this link renders as nothing
+  today). Both mode=ro, fail-open. A count
   was the previous tag and a count is indistinguishable from "handled" — a
   session ran a week with its founding asks open behind `open: 6`. Ledger rows
   outrank follow-ups in any status report. Ledger statuses:

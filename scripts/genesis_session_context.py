@@ -29,6 +29,13 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+# The shared hook helpers live in scripts/hooks/; this script runs from scripts/
+# (a different sys.path[0]), so add the hooks dir before importing them. Same
+# idiom as the sibling UserPromptSubmit hook. Unguarded on purpose: a missing
+# helper is a broken checkout and must be loud, not silently unbounded.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_output import HOOK_STDOUT_CAP, BoundedStdout  # noqa: E402
+
 # Load secrets.env so USER_TIMEZONE and other env vars are available
 # before any genesis module imports (which may read os.environ at import time).
 _SECRETS_PATH = Path(__file__).resolve().parent.parent / "secrets.env"
@@ -77,13 +84,76 @@ _SKILLS_DIR = Path(__file__).resolve().parent.parent / "src" / "genesis" / "skil
 #     ALARMS — the per-prompt scream, the awareness watcher over the harness's
 #     own filings — carry the guarantee, never this number. The watcher never
 #     reads this constant, which is what makes it right even when this is wrong.
-_HOOK_STDOUT_CAP = 10_000
+#
+# The constant itself lives in scripts/hooks/hook_output.py — ONE home, shared
+# with every other model-facing hook. A second copy is the drift that already
+# broke a test in this branch when a cap moved in one file and not the other.
+_HOOK_STDOUT_CAP = HOOK_STDOUT_CAP
 _PART_BUDGET = 9_800
 
 _PARTS = ("charter", "identity-core", "identity-user", "knowledge")
 
-# Room reserved for the trailing `_[ctx <part>: N/M chars]_` self-audit line.
-_AUDIT_LINE_RESERVE = 60
+# Room reserved for the trailing `_[ctx <part>: …]_` self-audit line.
+_AUDIT_LINE_RESERVE = 120
+
+# Every part is ALSO written whole to ~/.genesis/sessions/<sid>/context-<part>.md.
+# The harness keeps a filed payload on disk; a hard cut would not, so without
+# this mirror the chokepoint would trade a recoverable failure for an
+# unrecoverable one. With it, a cut is a pointer. Rides the existing per-session
+# store (charter.md, last_prompt_time already live there) — no new store.
+_MIRROR_STEM = "context"
+
+
+def _mirror_path(session_id: str, part: str) -> Path | None:
+    """Where this part's FULL intended text is mirrored, or None if unsafe.
+
+    Uses the shared ``hook_input.session_path`` chokepoint for the id guard
+    rather than re-deriving it (hooks hand-copied that check in three shapes
+    and omitted it in four files before it was centralised).
+    """
+    try:
+        from hook_input import session_path
+    except Exception:
+        return None
+    d = session_path(Path.home() / ".genesis" / "sessions", session_id)
+    return None if d is None else d / f"{_MIRROR_STEM}-{part}.md"
+
+
+# The recovery instruction, first line of every part. It sits INSIDE the
+# harness's 2,000-char preview by construction, which is the one place a
+# filed part is still visible: MEASURED, sessions act on instructions in the
+# preview head (they emitted the status header it asks for) while 0 of 175
+# ever followed the harness's own "Full output saved to:" line.
+def _miswire_alert(miswired: str) -> str:
+    """The in-band mis-wire block. A function so the budget test measures the
+    REAL text rather than an estimate that drifts away from it."""
+    return (
+        "## GENESIS ALERT: SessionStart hook MIS-WIRED\n\n"
+        f"The session-context hook was invoked with {miswired}. Only the CHARTER "
+        "part was emitted — identity (SOUL/USER/STEERING/CONVERSATION), essential "
+        "knowledge, in-flight state and capabilities are MISSING from this window. "
+        "Fix the four `--part` SessionStart entries in `.claude/settings.json` "
+        "(charter, identity-core, identity-user, knowledge), then restart the "
+        "session. Tell the user this happened."
+    )
+
+
+def _recovery_header(part: str, mirror: Path | None) -> str:
+    """The in-band recovery pointer, kept SHORT on purpose.
+
+    It is emitted on every part of every window, so its length is pure overhead
+    four times over — and it competes for the same budget as the charter block,
+    whose degrade floor (every open ledger id) cannot move. The full
+    explanation lives in CLAUDE.md, which is loaded natively and therefore
+    survives exactly the failure this line announces; here we only need to be
+    identifiable, name the mirror, and say what to do first.
+    """
+    where = f" · mirror: {mirror}" if mirror else ""
+    return (
+        f"[genesis-ctx:{part}{where}] If this arrived as a preview or truncation "
+        "notice, Read that path first — CLAUDE.md → Hook Output Persistence."
+    )
+
 
 _CONVERSATION_POINTER = (
     "## Conversation protocol — omitted for size\n\n"
@@ -93,25 +163,71 @@ _CONVERSATION_POINTER = (
     "that file directly when conversation protocol matters."
 )
 
-_emitted_chars = 0
+_OUT: BoundedStdout | None = None
 
 
-def _emit(text: str) -> None:
-    """Print a section and flush immediately so it survives a timeout kill.
+def _writer() -> BoundedStdout:
+    """The part's bounded stdout. Lazily built so direct callers still work."""
+    global _OUT
+    if _OUT is None:
+        _OUT = BoundedStdout(_PART_BUDGET, label="all", reserve=_AUDIT_LINE_RESERVE)
+    return _OUT
+
+
+#: Set by _begin_part so the crash path in main() can still name the part and
+#: reach the right mirror when _emit_body dies before returning them.
+_CURRENT_PART = "charter"
+_CURRENT_SID = ""
+
+
+def _current_part(fallback: str) -> str:
+    return _CURRENT_PART or fallback
+
+
+def _current_session_id(fallback: str) -> str:
+    return _CURRENT_SID or fallback
+
+
+def _begin_part(part: str, mirror: Path | None, session_id: str = "") -> None:
+    """Open a fresh bounded stream for ``part`` and emit its recovery header.
+
+    The ``all`` mode is a MANUAL/test invocation that deliberately emits every
+    part at once; it is never wired as a hook entry, so one entry's cap is the
+    wrong bound for it and cutting there would truncate a legitimate full run.
+    It is bounded at the sum of what the four real entries carry — still a
+    bound, just the honest one — and its audit line reports the true size.
+    """
+    global _OUT, _CURRENT_PART, _CURRENT_SID
+    _CURRENT_PART, _CURRENT_SID = part, session_id
+    budget = _PART_BUDGET * len(_PARTS) if part == "all" else _PART_BUDGET
+    _OUT = BoundedStdout(
+        budget,
+        label=part,
+        reserve=_AUDIT_LINE_RESERVE,
+        mirror_hint=str(mirror) if mirror else "",
+    )
+    _OUT.emit(_recovery_header(part, mirror), block="recovery-header")
+
+
+def _emit(text: str, *, block: str = "") -> None:
+    """Print a section, bounded by the harness cap, flushed immediately.
 
     Streams rather than buffering — the flush-per-section contract is what makes
-    a timeout kill lose only the tail. The counter counts CHARACTERS (the
-    harness's measured unit); `print` adds the newline, so count it.
+    a timeout kill lose only the tail. The BUDGET is enforced here, at the one
+    chokepoint, rather than by each block remembering to call ``_fits``: 2 of 12
+    blocks in the knowledge part remembered, and the other ten are how ~30 KB of
+    identity/charter went missing from 195 windows.
     """
-    global _emitted_chars
-    _emitted_chars += len(text) + 1
-    print(text)
-    sys.stdout.flush()
+    _writer().emit(text, block=block)
 
 
 def _fits(block: str, *, reserve: int = 0) -> bool:
-    """Would emitting ``block`` (plus a divider, plus ``reserve``) stay in budget?"""
-    return _emitted_chars + len(block) + 6 + reserve <= _PART_BUDGET
+    """Would emitting ``block`` (plus a divider, plus ``reserve``) stay in budget?
+
+    For GRACEFUL degrade (a pointer instead of a cut). Not the safety net —
+    ``_emit`` bounds the output whether or not a caller asks.
+    """
+    return _writer().fits(block, reserve=reserve)
 
 
 def _routed_session_notice(model: str | None) -> str | None:
@@ -315,7 +431,7 @@ def _sync_genesis_hooks() -> None:
         )
 
 
-def main() -> None:
+def _emit_body() -> tuple[str, str, str] | None:
     # Harness-cap probe (PR-A0 measurement seam — inert unless the env var is
     # set, which only the probe driver does). The Claude Code harness persists
     # hook stdout above an UNDOCUMENTED size threshold, replacing it with a
@@ -402,6 +518,33 @@ def main() -> None:
     def _in(*parts: str) -> bool:
         return part == "all" or part in parts
 
+    # Open the bounded stream for THIS part. Everything after this point is
+    # budget-enforced on the way out, and the first line emitted is the
+    # recovery header — which lands inside the harness's 2 KB preview by
+    # construction, the one place a filed part is still visible.
+    # A dispatched session gets identity via --system-prompt, so both identity
+    # parts have NO body for it. Decide that BEFORE opening the stream: emitting
+    # a part whose only content is its own recovery header would put two
+    # content-free blocks in every background session's window, each telling the
+    # model to go read a mirror containing just that header.
+    if os.environ.get("GENESIS_CC_SESSION") == "1" and part in _IDENTITY_PARTS:
+        return part, _hook_session_id, miswired
+
+    _begin_part(
+        part,
+        _mirror_path(_hook_session_id, part) if part != "all" else None,
+        _hook_session_id,
+    )
+
+    if miswired:
+        # IN-BAND, not just stderr: a SessionStart hook's stderr on exit 0 goes
+        # to the debug log and NEVER reaches the model (READ from the harness's
+        # attachment renderer — only stdout on SessionStart/UserPromptSubmit/
+        # UserPromptExpansion is injected). A mis-wire that only whispers to a
+        # log is the silent failure this whole change exists to remove, so the
+        # model is told plainly, in the one channel it can see.
+        _emit(_miswire_alert(miswired), block="miswire-alert")
+
     # Phase 6: self-heal Genesis git hooks before doing anything else.
     # Runs on every session start so community installs auto-pick up hook
     # updates without requiring a bootstrap.sh re-run. Charter part only —
@@ -487,7 +630,23 @@ def main() -> None:
                 path = _IDENTITY_DIR / name
                 if not path.exists():
                     continue
-                content = path.read_text(encoding="utf-8").strip()
+                try:
+                    content = path.read_text(encoding="utf-8").strip()
+                except (OSError, UnicodeDecodeError) as exc:
+                    # One damaged file must not cost the whole part. Say WHICH
+                    # file and why, in-band: an identity file that silently
+                    # contributes nothing is the failure this hook exists to
+                    # make impossible, and "absent" and "unreadable" call for
+                    # different fixes.
+                    _emit(
+                        f"## GENESIS ALERT: `{name}` could not be read\n\n"
+                        f"`{type(exc).__name__}: {exc}` — that identity file is MISSING "
+                        "from this window. Read it directly if its content matters, and "
+                        "tell the user it is unreadable.",
+                        block=f"identity-error:{name}",
+                    )
+                    first = False
+                    continue
                 if not content:
                     continue
                 # Room this part still owes AFTER this file: the audit line, and
@@ -505,7 +664,7 @@ def main() -> None:
                     # A never-elided file that alone busts the part budget:
                     # truncate visibly. Losing the tail of one file beats the
                     # harness silently filing the ENTIRE part.
-                    keep = max(0, _PART_BUDGET - _emitted_chars - _tail - 200)
+                    keep = max(0, _PART_BUDGET - _writer().emitted_chars - _tail - 200)
                     content = (
                         content[:keep] + f"\n\n_[{name} truncated at {keep} chars — the full file "
                         "exceeds this hook's stdout budget; read "
@@ -792,8 +951,7 @@ def main() -> None:
     # Knowledge part only — the remaining blocks all belong to it, so parts
     # that are not "knowledge" finish here with their audit + marker.
     if not _in("knowledge"):
-        _finish_part(part, _hook_session_id, miswired)
-        return
+        return part, _hook_session_id, miswired
     if not first:
         _emit("\n\n---\n\n")
 
@@ -885,66 +1043,123 @@ def main() -> None:
         except Exception:
             pass  # Crash reporting itself must not crash the hook
 
-    _finish_part(part, _hook_session_id, miswired)
+    return part, _hook_session_id, miswired
 
 
-# Per-(session, part) over-budget markers. NOT one shared file: the four parts
-# run as four CONCURRENT hook invocations, so a shared dict would be a
-# read-modify-write race in which an under-budget sibling's clear erases an
-# over-budget part's entry — an alarm that races is not an alarm. It was also
-# global, so one session's clean start silenced another session's live loss.
-# One file per writer removes both by construction.
-_MARKER_STEM = "injection_over_budget"
-_MARKER_LEGACY = Path.home() / ".genesis" / "session_awareness" / f"{_MARKER_STEM}.json"
+def main() -> None:
+    """Emit one part, and ALWAYS close it out — audit line, mirror, stderr.
 
-
-def _marker_dir(session_id: str) -> Path | None:
-    """The per-session marker directory, or None when the id is unsafe as a path.
-
-    Uses the shared ``hook_input.session_path`` chokepoint (the sibling
-    UserPromptSubmit hook imports it the same way) rather than re-deriving the
-    id guard here — hooks previously hand-copied that check in three shapes and
-    omitted it in four files.
+    The body is wrapped because a part that dies mid-emission used to leave a
+    recovery header and nothing else: no audit line, no mirror, and a header
+    whose own trigger condition (a persisted-output preview) was not met, so the
+    model had no reason to act. That is the silent-loss shape this change
+    exists to remove, re-created one level down — MEASURED with a non-UTF-8
+    identity file. The audit line is the COMPLETION PROOF, and its absence is
+    not itself a signal, so it must be emitted on every path.
     """
+    part, session_id, miswired = "charter", "", ""
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
-        from hook_input import session_path
-    except Exception:
-        return None
-    return session_path(Path.home() / ".genesis" / "sessions", session_id)
+        result = _emit_body()
+        if result is None:
+            # A deliberate no-op: the eject lever is off, or the probe seam
+            # already wrote its own payload. Nothing was opened, so there is
+            # nothing to close — and emitting an audit line here would put
+            # Genesis output into a session that asked for none.
+            return
+        part, session_id, miswired = result
+    except Exception as exc:  # noqa: BLE001 — a part must never die silently
+        part = _current_part(part)
+        session_id = _current_session_id(session_id)
+        _emit(
+            f"## GENESIS ALERT: context part '{part}' FAILED mid-emission\n\n"
+            f"`{type(exc).__name__}: {exc}` — this window is MISSING the rest of that "
+            "part. Tell the user, and check the hook's stderr for the traceback.",
+            block="part-failure",
+        )
+        import traceback
+
+        traceback.print_exc(file=sys.stderr)
+    finally:
+        # Only if the stream was actually opened. _begin_part is what opens it,
+        # and every early return above happens before that point.
+        if _OUT is not None:
+            _finish_part(part, session_id, miswired)
 
 
-def _marker_path(session_id: str, part: str) -> Path:
-    """Where THIS invocation records its own over-budget state.
+#: Append-only record of mis-wired invocations, read by the awareness watcher.
+#: NOT a revival of the deleted marker layer: nothing clears it, nothing
+#: read-modify-writes it, and it has no per-part lifecycle — a line ages out of
+#: the watcher's lookback on its own. It exists because the in-band alert is
+#: only seen by a model in a window someone reads, and a mis-wire in a `-p` or
+#: unattended session would otherwise have NO observer: a mis-wired part stays
+#: under the cap by design, so the harness never files it and the filings
+#: watcher never sees it.
+_MISWIRE_LOG = Path.home() / ".genesis" / "session_awareness" / "context_miswire.log"
 
-    Falls back to a session-less global path when the id is unusable, so a
-    weird session id degrades to a noisier alarm, never to a silent one.
+
+def _record_miswire(reason: str) -> None:
+    """Append one line about a mis-wired invocation. Fail-open, never fatal."""
+    try:
+        _MISWIRE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _MISWIRE_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now(UTC).isoformat()}\t{reason}\n")
+    except OSError as exc:
+        print(f"[session_context] could not record the mis-wire: {exc}", file=sys.stderr)
+
+
+def _write_mirror(path: Path | None, text: str) -> bool:
+    """Write this part's FULL intended text. Returns True on success.
+
+    Fail-open: a mirror that cannot be written must never break session start.
+    Loud, though — the recovery header points at this path, and a header naming
+    a file that is not there is worse than one that admits the gap.
     """
-    d = _marker_dir(session_id)
-    if d is None:
-        return _MARKER_LEGACY.with_name(f"{_MARKER_STEM}_{part}.json")
-    return d / f"{_MARKER_STEM}_{part}.json"
+    if path is None:
+        return False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return True
+    except OSError as exc:
+        print(
+            f"[session_context] could not mirror part to {path}: {exc}. A truncated "
+            "part would not be recoverable from disk in this session.",
+            file=sys.stderr,
+        )
+        return False
 
 
 def _finish_part(part: str, session_id: str, miswired: str = "") -> None:
-    """Per-part self-audit + over-budget/mis-wire marker. Once per invocation.
+    """Mirror the full text, then close with an honest audit line.
 
-    The audit line makes the state legible IN-BAND every window instead of
-    discoverable months later from filed artifacts; the marker is what the
-    per-prompt tag screams about until a later healthy run of the same part
-    clears it. The manual/test ``all`` mode skips the marker (a manual full run
-    legitimately exceeds one hook's budget and must not raise a false alarm)
-    but keeps the audit line.
+    There is no over-budget MARKER file any more, and nothing screams per
+    prompt. Both were deleted deliberately: a marker records that the emitter
+    knew it was over budget, and after the chokepoint in ``_emit`` the emitter
+    can no longer GO over budget, so the state it recorded became unreachable.
+    The two cases a marker never covered — the harness cap moving BELOW our
+    budget, and any other hook's output being filed — are covered by the
+    recovery header (in-band, inside the harness's own preview) and by the
+    hourly watcher over the harness's filings, neither of which needs state.
+
+    The audit line reports INTENDED vs EMITTED. After a chokepoint a bare
+    "N/budget" is always green and therefore says nothing; the number that
+    carries information is what was dropped, and where to read it.
     """
-    over = _emitted_chars > _PART_BUDGET
-    _emit(f"\n_[ctx {part}: {_emitted_chars}/{_PART_BUDGET} chars]_")
-    if miswired:
-        _write_marker(
-            "wiring",
-            session_id,
-            reason=f"session-context hook invoked with {miswired}",
-            over=True,
+    out = _writer()
+    mirror = _mirror_path(session_id, part) if part != "all" else None
+    wrote_mirror = _write_mirror(mirror, out.intended)
+    cut = out.cut
+    if cut:
+        block, dropped = cut
+        where = f" — full text: {mirror}" if wrote_mirror else " — MIRROR UNAVAILABLE"
+        out.emit_final(
+            f"\n_[ctx {part}: {out.intended_chars} intended / {out.emitted_chars} emitted "
+            f"— CUT {dropped} chars at '{block}'{where}]_"
         )
+    else:
+        out.emit_final(f"\n_[ctx {part}: {out.emitted_chars}/{_PART_BUDGET} chars]_")
+    if miswired:
+        _record_miswire(miswired)
         print(
             f"[session_context] MIS-WIRED: {miswired}. Emitted the charter part only "
             "so this invocation stays under the harness cap; the rest of the context "
@@ -953,56 +1168,12 @@ def _finish_part(part: str, session_id: str, miswired: str = "") -> None:
             file=sys.stderr,
         )
         return
-    if part != "all":
-        _write_marker(part, session_id, reason="", over=over)
-    if over:
+    if cut:
         print(
-            f"[session_context] part '{part}' emitted {_emitted_chars} chars against a "
+            f"[session_context] part '{part}' wanted {out.intended_chars} chars against a "
             f"{_PART_BUDGET}-char budget (the harness FILES hook stdout above "
-            f"{_HOOK_STDOUT_CAP} chars and previews ~2 KB) — this part may not have "
-            "reached the model.",
-            file=sys.stderr,
-        )
-
-
-def _write_marker(part: str, session_id: str, *, reason: str, over: bool) -> None:
-    """Create or remove THIS part's marker file. No shared state, no RMW.
-
-    Fail-open both ways: an unwritable marker must never break session start,
-    and a failed CLEAR leaves a stale alarm (annoying, loud, safe) rather than a
-    silent one.
-    """
-    import json
-
-    path = _marker_path(session_id, part)
-    try:
-        if over:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(
-                    {
-                        "part": part,
-                        "session_id": session_id,
-                        "chars": _emitted_chars,
-                        "budget": _PART_BUDGET,
-                        "reason": reason,
-                        "ts": datetime.now(UTC).isoformat(),
-                    }
-                )
-            )
-        elif path.exists():
-            path.unlink()
-    except OSError as exc:
-        # Fail-open on the WRITE (a marker must never break session start) but
-        # never fail QUIET: an unwritable sessions dir would otherwise take the
-        # per-prompt scream with it, which is the silent-failure class this
-        # whole change exists to remove. The hourly ground-truth watcher still
-        # covers it — this line is what makes the degrade visible NOW rather
-        # than at the next tick.
-        print(
-            f"[session_context] could not record the '{part}' budget marker at {path}: "
-            f"{exc}. The per-prompt alarm for this session is DEGRADED; the hourly "
-            "context-injection watcher is the remaining cover.",
+            f"{_HOOK_STDOUT_CAP} chars and previews ~2 KB) — it was truncated in-band at "
+            f"'{cut[0]}' rather than risking the whole part. Full text: {mirror}.",
             file=sys.stderr,
         )
 
@@ -1278,7 +1449,28 @@ _ORIGIN_CAP = 1_200
 # actionable block in the injection, and a real one (origin + mission + a few
 # open rows) is a fraction of this. When it IS hit the degrade is structured —
 # see _shrink_charter_block — never a mid-row slice.
-_CHARTER_BLOCK_MAX = 8_000
+# Squeezed between two MEASURED constraints, both pinned by
+# test_charter_part_overhead_fits_the_budget:
+#
+#   FLOOR   the tier-4 degrade (bare ids for a full ledger) is 7,174 chars at
+#           _LEDGER_FETCH_MAX rows. Below that the chokepoint would cut ids —
+#           undoing the exact thing _shrink_charter_block exists to protect.
+#   CEILING the part's fixed overhead is 2,098 chars (session-config 660 worst
+#           case + onboarding pointer 607 + recovery header 200 + mis-wire
+#           alert 487 + dividers + audit reserve) against a 9,800 budget.
+#
+# 7,500 sits ~326 above the floor with ~202 to spare under the ceiling. Both
+# numbers are measured from the real functions by the test, not estimated here,
+# because the previous version of this comment was wrong in three places at
+# once (572 / ~160 / "margin 456") and a maintainer reading it would have
+# believed there was room to grow this part when there was none.
+_CHARTER_BLOCK_MAX = 7_500
+
+#: Sanity bound on the ledger read. Not a display cap — every open row renders,
+#: and a 201st is ANNOUNCED rather than dropped (a silent cut here would be the
+#: same defect as the old LIMIT 6, just further out).
+_LEDGER_FETCH_MAX = 200
+_LEDGER_OVERFLOW_NOTE = f"MORE than {_LEDGER_FETCH_MAX} open rows — the rest are not listed above"
 
 
 def _ledger_lines(
@@ -1412,13 +1604,22 @@ def _load_charter_db(session_id: str, db_path: Path | None) -> tuple[dict | None
                     # LIMIT is a sanity bound, not a display cap: every open row
                     # renders. The old LIMIT 6 silently dropped the 7th
                     # agreement, and a dropped row is indistinguishable from a
-                    # session that never made one.
+                    # session that never made one. Fetch ONE past the bound so
+                    # the renderer can SAY that a 201st exists rather than
+                    # reproducing the same silent cut one order of magnitude up.
                     "SELECT id, text, status FROM session_ledger"
                     " WHERE session_id = ? AND status IN ('open','in_progress')"
-                    " ORDER BY created_at LIMIT 200",
-                    (session_id,),
+                    " ORDER BY created_at LIMIT ?",
+                    (session_id, _LEDGER_FETCH_MAX + 1),
                 )
                 items = [dict(r) for r in await cur.fetchall()]
+                if len(items) > _LEDGER_FETCH_MAX:
+                    items = items[:_LEDGER_FETCH_MAX]
+                    # Recorded on the CHARTER, not as a pseudo-row: the block's
+                    # degrade ladder can strip row text down to bare ids, which
+                    # would eat a note carried as a row — reinstating the silent
+                    # cut. The footer survives every tier.
+                    charter["_ledger_overflow"] = True
                 try:
                     # Escalation links (own guard, like the pulse read below):
                     # a row left undisposed long enough becomes a follow-up, and
@@ -1482,13 +1683,27 @@ def _load_charter_db(session_id: str, db_path: Path | None) -> tuple[dict | None
 
 def _load_charter_file(session_id: str, sessions_dir: Path | None) -> dict | None:
     """Legacy fallback: pre-0058 charter.json (still on disk for sessions the
-    one-off backfill has not imported, or when the DB is unreachable)."""
+    one-off backfill has not imported, or when the DB is unreachable).
+
+    Goes through the shared id chokepoint like every other path in this file.
+    It previously joined the raw ``session_id`` — which arrives unvalidated from
+    the hook's stdin JSON — so a traversal id read any reachable charter.json
+    and folded it into the block shown to the model. Read-only and fail-closed
+    on a miss, but a traversal read all the same, and exactly the omission the
+    chokepoint exists to prevent: the guard sat two functions away.
+    """
     import json
 
     base = sessions_dir or (Path.home() / ".genesis" / "sessions")
-    charter_file = base / session_id / "charter.json"
     try:
-        return json.loads(charter_file.read_text(encoding="utf-8"))
+        from hook_input import session_path
+    except Exception:
+        return None
+    session_dir = session_path(base, session_id)
+    if session_dir is None:
+        return None
+    try:
+        return json.loads((session_dir / "charter.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
 
@@ -1588,6 +1803,8 @@ def _charter_emission_block(
         open_n = counts.get("open", 0) + counts.get("in_progress", 0)
         closed_n = sum(counts.values()) - open_n
         footer += f" · ledger: {open_n} open / {closed_n} closed"
+    if charter.get("_ledger_overflow"):
+        footer += f" · {_LEDGER_OVERFLOW_NOTE}"
     footer += f" · full charter: ~/.genesis/sessions/{session_id}/charter.md_"
     block = "\n".join([*lines, "", footer])
     if len(block) > _CHARTER_BLOCK_MAX:

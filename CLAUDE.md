@@ -372,6 +372,37 @@ When a user shares a file path or URL in conversation:
 - Never auto-ingest without explicit user confirmation.
 - The dashboard also supports drag-drop file upload on the Knowledge tab.
 
+## Hook Output Persistence — a withheld hook is a SILENT loss
+
+Claude Code persists a hook's stdout above a size threshold instead of
+delivering it: the full text goes to a file and you get a short preview. It is
+not an error and nothing else announces it. MEASURED on this install: the
+SessionStart injection was withheld from 195 windows across a month — sessions
+ran without identity, charter and essential knowledge and nobody noticed,
+because the preview reads as ordinary furniture at the top of a window.
+
+**If a hook result arrives as a preview + a saved path** (as of CC 2.1.246:
+`<persisted-output>`, `Output too large (N KB). Full output saved to: <path>`,
+`Preview (first 2KB)`), that hook's contribution to this window was withheld:
+
+- **SessionStart** — Read the path the wrapper names **before anything else**,
+  then tell the user it happened. Genesis parts also mirror themselves to
+  `~/.genesis/sessions/<sid>/context-<part>.md` and name it in a
+  `[genesis-ctx:<part> · mirror: …]` header, so read the mirror if the
+  wrapper's path is gone. If neither exists, say which part this window lost.
+- **Any other hook** — that turn ran without what the hook was carrying (a
+  memory recall, a guard advisory). Say so rather than proceeding as if it
+  arrived.
+
+The size threshold is undocumented and **moves between CC versions** — treat
+the wrapper itself as the signal, never a byte count.
+`scripts/hooks/hook_output.py` is the single home of the measured cap and
+bounds the two hooks that carry the most to the model (the SessionStart
+injection and the per-prompt session-state tags); **route any new model-facing
+stdout through it** — the other hooks are not bounded yet. The hourly
+`context_injection_monitor` watches the harness's own filings independently of
+every emitter's arithmetic, so this class cannot go quiet again.
+
 ## Traps
 
 - **Ego** (`src/genesis/ego/`) — Live. Two egos: user (CEO/Opus) and

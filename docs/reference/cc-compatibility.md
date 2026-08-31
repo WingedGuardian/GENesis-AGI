@@ -902,11 +902,53 @@ transcript": with concurrent sessions on the box that picks someone else's, whic
 briefly produced a phantom "the charter part vanished" result here. Attribute a
 probe to its own transcript by before/after set difference.
 
+**Which hook events can put stdout in front of the model at all** (READ from
+the bundle's attachment renderer, 2.1.246, and corroborated by the published
+hooks reference): only **SessionStart**, **UserPromptSubmit**,
+**UserPromptExpansion** — the docs additionally name `PostModelSwitch`. Every
+other event (PreToolUse, PostToolUse, **Stop**, SubagentStop, PreCompact,
+SessionEnd) reaches the model ONLY through JSON `additionalContext` /
+`systemMessage`, and each of those strings is run through the SAME 10,000-char
+persistence path. Two consequences worth stating plainly: a Stop hook that
+`print`s advice on exit 0 is **inert** (its stdout goes to the debug log), and
+an oversized JSON advisory can lose its *decision*, not merely its prose —
+which is why `scripts/hooks/hook_output.py` trims named free-text fields and
+never the envelope.
+
+**Reading a filed payload back is safe and idempotent.** The Read tool's
+`maxResultSizeChars` is `Infinity` (it short-circuits the threshold resolver
+and is exempt from the ~200,000-char per-message aggregate budget), so a 30 KB
+filed part comes back whole, once, and cannot be re-persisted. Its real limits
+are 2,000 lines / 25,000 tokens, and exceeding those is an *error*, not a
+silent wrapper. That is what makes "Read the path the wrapper names" a viable
+recovery instruction rather than a loop.
+
+**Identity via CLAUDE.md `@import` was evaluated as an alternative and
+REJECTED** (measured 2026-08-30, real `claude -p` probes). Imports do work:
+they survive `-p` and `--system-prompt`, and a 14,430-char imported file
+arrives whole. Two disqualifiers: (1) a **missing import is a SILENT skip** —
+no warning, no note — and `src/genesis/identity/USER.md` is gitignored and
+absent on a fresh clone, so every clone would silently lose the user profile,
+which is precisely this class of bug; (2) the only suppression lever,
+`--setting-sources user`, drops project **hooks** along with project CLAUDE.md
+(controlled: with the flag both a project hook sentinel and a CLAUDE.md
+sentinel disappear; without it both appear), so executor/eval lanes — which run
+with a worktree cwd — would lose their guards. `--bare` also skips CLAUDE.md
+auto-discovery but forces `ANTHROPIC_API_KEY`-only auth, which this install
+does not use. CLAUDE.md itself has a 4 MiB ceiling and is dropped whole above
+it (no truncation); the docs recommend under 200 lines for adherence.
+
 Consequence: the SessionStart injection ships as **four hook entries**
-(`--part charter | identity-core | identity-user | knowledge`), each held
-under `_PART_BUDGET = 9_800` with a per-part self-audit line, an over-budget
-marker the per-prompt tag screams about, and an awareness watcher over the
-harness's own filings (`context_injection_monitor`, critical → Telegram).
+(`--part charter | identity-core | identity-user | knowledge`), each held under
+`_PART_BUDGET = 9_800` — enforced at a single chokepoint (`BoundedStdout` in
+`scripts/hooks/hook_output.py`) so a block that forgets to check its budget
+cannot overrun, with the full intended text mirrored to
+`~/.genesis/sessions/<sid>/context-<part>.md` so an in-band cut stays
+recoverable. Each part opens with a `[genesis-ctx:<part> · mirror: …]` recovery
+header, which sits inside the harness's 2 KB preview by construction — the one
+place a filed part is still visible. Backed by an awareness watcher over the
+harness's own filings (`context_injection_monitor`, critical → Telegram) that
+never reads our constant.
 **After any CC bump, re-run the probe** at 9,978 / 9,979 (the exact edge
 including the 22-char probe wrapper) and at two-hook 9 K + 9 K; if either
 moves, `_HOOK_STDOUT_CAP` and the part budgets are the constants to revisit.

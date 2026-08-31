@@ -478,6 +478,13 @@ _FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
         # (It embeds a truncated follow-up snippet; that snippet's own hygiene is
         # a content concern, not an origin one — the OBSERVATION is Genesis's.)
         "follow_up_watchdog",
+        # Context-injection watcher (awareness/loop.py _check_context_injection_health)
+        # — Genesis observing its OWN runtime: whether the harness filed a
+        # SessionStart hook's output instead of delivering it. The evidence is
+        # file sizes, mtimes and first lines of the harness's own persisted
+        # files under ~/.claude/projects; no external text enters the
+        # observation as a CLAIM (a head excerpt is quoted as evidence).
+        "context_injection_monitor",
     }
 )
 

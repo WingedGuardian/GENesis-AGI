@@ -13,11 +13,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
-import json
 import sqlite3
 from pathlib import Path
-
-import pytest
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "scripts"
 
@@ -111,7 +108,7 @@ def _tag_output(monkeypatch, capsys, root: Path) -> str:
 # ── the inventory ───────────────────────────────────────────────────────
 
 
-def test_tag_lists_each_open_row_with_id8(monkeypatch, capsys, tmp_path):
+def test_tag_lists_each_open_row_with_a_usable_id(monkeypatch, capsys, tmp_path):
     root = _seed(
         tmp_path,
         mission="Ship the ledger",
@@ -122,9 +119,9 @@ def test_tag_lists_each_open_row_with_id8(monkeypatch, capsys, tmp_path):
     out = _tag_output(monkeypatch, capsys, root)
     lines = out.strip().splitlines()
     assert lines[0] == "[Ledger open: 3 | mission: Ship the ledger]"
-    assert lines[1] == "- 00000000 reach into the sister machine"
-    assert lines[2] == "- 00000001 [~] infra discrepancy audit"  # in_progress
-    assert lines[3] == "- 00000002 CBM migration plan"
+    assert lines[1] == "- " + "0" * 32 + " reach into the sister machine"
+    assert lines[2] == "- " + "00000001" + "0" * 24 + " [~] infra discrepancy audit"
+    assert lines[3] == "- " + "00000002" + "0" * 24 + " CBM migration plan"
     assert len(lines) == 4
 
 
@@ -156,7 +153,7 @@ def test_tag_shows_escalation_link(monkeypatch, capsys, tmp_path):
     root = _seed(tmp_path, mission="m", open_items=1, texts=["reach into the sister machine"])
     _seed_escalation(root, "00000000" + "0" * 24, "f" * 32)
     out = _tag_output(monkeypatch, capsys, root)
-    assert "- 00000000 reach into the sister machine → escalated: follow_up ffffffff" in out
+    assert "- " + "0" * 32 + " reach into the sister machine → escalated: follow_up " + "f" * 32 in out
 
 
 def test_tag_without_follow_ups_table_still_lists_rows(monkeypatch, capsys, tmp_path):
@@ -176,7 +173,7 @@ def test_tag_without_follow_ups_table_still_lists_rows(monkeypatch, capsys, tmp_
     conn.commit()
     conn.close()
     out = _tag_output(monkeypatch, capsys, root)
-    assert "- 00000000 row" in out
+    assert "- " + "0" * 32 + " row" in out
     assert "escalated:" not in out
 
 
@@ -250,79 +247,6 @@ def test_tag_omitted_locked_db(monkeypatch, capsys, tmp_path):
         blocker.close()
 
 
-# ── the over-budget / mis-wire SCREAM (repeats every prompt until cleared) ──
-
-
-def _mk_marker(root: Path, sid: str, part: str, **payload) -> Path:
-    d = root / ".genesis" / "sessions" / sid
-    d.mkdir(parents=True, exist_ok=True)
-    f = d / f"injection_over_budget_{part}.json"
-    base = {"part": part, "session_id": sid, "chars": 12345, "budget": 9800, "ts": "2026-08-30T17:00"}
-    base.update(payload)
-    f.write_text(json.dumps(base))
-    return f
-
-
-@pytest.fixture
-def _marker_home(monkeypatch, tmp_path):
-    """Point the hook's session/legacy marker dirs at a tmp HOME."""
-    monkeypatch.setattr(_ua, "_GENESIS_DIR", tmp_path / ".genesis")
-    monkeypatch.setattr(_ua, "_LEGACY_MARKER_DIR", tmp_path / ".genesis" / "session_awareness")
-    monkeypatch.setattr(_ua, "_session_dir", lambda sid: tmp_path / ".genesis" / "sessions" / sid)
-    return tmp_path
-
-
-def test_over_budget_marker_screams_every_prompt(capsys, _marker_home):
-    _mk_marker(_marker_home, SID, "knowledge")
-    _ua._emit_injection_over_budget_alert(SID)
-    out = capsys.readouterr().out
-    assert "OVER BUDGET" in out
-    assert "knowledge (12345/9800 chars" in out
-    # Second prompt: still screaming — the marker on disk decides, not memory.
-    _ua._emit_injection_over_budget_alert(SID)
-    assert "OVER BUDGET" in capsys.readouterr().out
-
-
-def test_miswire_marker_screams_as_a_wiring_fault(capsys, _marker_home):
-    """F1: a mis-wired hook is a DIFFERENT fault from an oversized payload and
-    must not be reported as one — its remedy is the settings.json wiring."""
-    _mk_marker(_marker_home, SID, "wiring", reason="no --part argument")
-    _ua._emit_injection_over_budget_alert(SID)
-    out = capsys.readouterr().out
-    assert "MIS-WIRED" in out
-    assert "no --part argument" in out
-    assert "OVER BUDGET" not in out
-
-
-def test_each_part_screams_independently(capsys, _marker_home):
-    """F2: per-(session, part) files — one part's alarm cannot erase another's."""
-    _mk_marker(_marker_home, SID, "knowledge", chars=11000)
-    _mk_marker(_marker_home, SID, "identity-user", chars=10500)
-    _ua._emit_injection_over_budget_alert(SID)
-    out = capsys.readouterr().out
-    assert "knowledge" in out and "identity-user" in out
-
-
-def test_another_sessions_marker_is_not_this_sessions_alarm(capsys, _marker_home):
-    """F2: the marker used to be global, so one session silenced/alarmed another."""
-    _mk_marker(_marker_home, "some-other-session", "knowledge")
-    _ua._emit_injection_over_budget_alert(SID)
-    assert capsys.readouterr().out == ""
-
-
-def test_no_marker_no_scream(capsys, _marker_home):
-    _ua._emit_injection_over_budget_alert(SID)
-    assert capsys.readouterr().out == ""
-
-
-def test_corrupt_marker_still_screams_rather_than_going_quiet(capsys, _marker_home):
-    d = _marker_home / ".genesis" / "sessions" / SID
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "injection_over_budget_knowledge.json").write_text("not json")
-    _ua._emit_injection_over_budget_alert(SID)
-    assert "unreadable" in capsys.readouterr().out
-
-
 # ── parity: the inlined dedup formula equals the package one (F6) ──────────
 
 
@@ -344,16 +268,18 @@ def test_pointer_survives_the_byte_trim(monkeypatch, capsys, tmp_path):
     pointer FIRST — a truncated list that looked complete, i.e. exactly the
     count-instead-of-inventory defect this tag exists to fix.
 
-    The cap only bites once rows carry escalation links (MEASURED: 12 open rows
-    + 8 links -> 7 rows and NO pointer). A first version of this test omitted
-    the links, stayed under the cap, never entered the trim loop, and passed
-    against the broken code — caught by mutation, not by reading it.
+    The byte cap is now sized so a full complement of rows fits (see the test
+    below), so the trim is a BACKSTOP rather than an everyday path — and a
+    backstop that cannot be made to fire is untested code. The cap is therefore
+    lowered here explicitly to drive it, instead of contorting the fixture until
+    it happens to overflow.
     """
+    monkeypatch.setattr(_ua, "_TAG_MAX_BYTES", 700)
     root = _seed(tmp_path, mission="m", open_items=12, texts=["z" * 140] * 12)
     for i in range(_ua._TAG_MAX_ROWS):
         _seed_escalation(root, f"{i:08x}" + "0" * 24, f"{i:032x}")
     out = _tag_output(monkeypatch, capsys, root)
-    assert len(out.encode("utf-8")) <= _ua._TAG_MAX_BYTES
+    assert len(out.encode("utf-8")) <= 700
     rows = [ln for ln in out.splitlines() if ln.startswith("- ")]
     assert rows and len(rows) < _ua._TAG_MAX_ROWS, (
         "this case must actually ENTER the trim loop, or it proves nothing"
@@ -361,3 +287,26 @@ def test_pointer_survives_the_byte_trim(monkeypatch, capsys, tmp_path):
     tail = [ln for ln in out.splitlines() if ln.startswith("…and ")]
     assert tail, "the overflow pointer must survive the trim"
     assert f"…and {12 - len(rows)} more" in tail[0], "and must name the REAL remainder"
+
+
+def test_a_full_complement_of_max_size_rows_fits_the_byte_cap(monkeypatch, capsys, tmp_path):
+    """Ids render in FULL so the next turn can act on them, which made every row
+    24 bytes longer. The cap was raised to match: if it were not, the trim would
+    quietly drop rows the inventory promises to list — the same defect one level
+    up. Worst case MEASURED at 2,004 bytes of rows plus the head line.
+    """
+    root = _seed(
+        tmp_path,
+        mission="m" * _ua._TAG_MISSION_CHARS,
+        open_items=_ua._TAG_MAX_ROWS,
+        texts=["z" * _ua._TAG_ROW_CHARS] * _ua._TAG_MAX_ROWS,
+    )
+    for i in range(_ua._TAG_MAX_ROWS):
+        _seed_escalation(root, f"{i:08x}" + "0" * 24, f"{i:032x}")
+    out = _tag_output(monkeypatch, capsys, root)
+    rows = [ln for ln in out.splitlines() if ln.startswith("- ")]
+    assert len(rows) == _ua._TAG_MAX_ROWS, (
+        f"only {len(rows)} of {_ua._TAG_MAX_ROWS} rows survived the byte cap — "
+        "raise _TAG_MAX_BYTES or the inventory silently under-reports"
+    )
+    assert not [ln for ln in out.splitlines() if ln.startswith("…and ")]

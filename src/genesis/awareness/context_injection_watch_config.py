@@ -78,10 +78,19 @@ def load_config() -> dict[str, Any]:
 
 
 def is_enabled() -> bool:
-    """True unless the env kill switch is set or the config disables it."""
+    """True unless the env kill switch is set or the config EXPLICITLY disables it.
+
+    Only a real boolean turns the watcher off. Plain truthiness would let
+    ``enabled: null`` / ``0`` / ``[]`` — a damaged base file or a half-written
+    local overlay — silence the only alarm for silent context loss, which is the
+    same fail-open shape as the bug this whole watcher exists to catch. Config
+    damage therefore degrades toward WATCHING, consistent with every other knob
+    here falling back to its default rather than to zero.
+    """
     if os.environ.get(_ENV_KILL_SWITCH) == "1":
         return False
-    return bool(load_config().get("enabled", True))
+    value = load_config().get("enabled", True)
+    return value if isinstance(value, bool) else True
 
 
 def knob_int(cfg: dict[str, Any], key: str) -> int:

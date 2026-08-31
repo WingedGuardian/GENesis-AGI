@@ -98,6 +98,27 @@ def _block(db_file: Path) -> str:
 # ── open rows render in full ────────────────────────────────────────────
 
 
+def test_more_rows_than_the_fetch_bound_are_announced_not_dropped(tmp_path):
+    """The sanity bound must not become a silent display cap.
+
+    The old LIMIT 6 dropped the 7th agreement with no marker, which is why the
+    bound was raised — but a raised bound that still cuts silently is the same
+    defect one order of magnitude out. A 201st open row is ANNOUNCED.
+    """
+    db = _make_db(tmp_path)
+    _seed_charter(db, mission="m")
+    _seed_rows(db, [f"row {i}" for i in range(_ctx._LEDGER_FETCH_MAX + 5)])
+    block = _block(db)
+    assert f"MORE than {_ctx._LEDGER_FETCH_MAX} open rows" in block
+
+
+def test_a_ledger_inside_the_fetch_bound_makes_no_overflow_claim(tmp_path):
+    db = _make_db(tmp_path)
+    _seed_charter(db, mission="m")
+    _seed_rows(db, [f"row {i}" for i in range(5)])
+    assert "more than" not in _block(db)
+
+
 def test_seven_open_rows_all_render(tmp_path):
     db = _make_db(tmp_path)
     _seed_charter(db, mission="m")
