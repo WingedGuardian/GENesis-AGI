@@ -6,10 +6,17 @@ because `queues.py` was already correct and these tests pass unchanged on the
 buggy revision.
 
 `queues()` measures discarded work two ways that can disagree: an unbounded
-COUNT of the depth, and a LIMIT-20 review sample. It now reconciles them ONCE
-and publishes a single `discarded` object (`total`, `sample`, `sample_truncated`,
-`known`); the flat `discarded_count` / `discarded_items` keys remain for the
-depth alarm and pass-through consumers, derived from that object.
+COUNT of the depth, and a capped review sample. It publishes a single
+`discarded` object (`total`, `sample`, `sample_truncated`, `known`); the flat
+`discarded_count` / `discarded_items` keys remain for the depth alarm and
+pass-through consumers, derived from that object.
+
+The two are no longer RECONCILED — arithmetic between two reads that never
+shared an instant can detect divergence in only one direction, which is what
+made each fix in this class leave an adjacent cell wrong. Exactness now follows
+from which read was COMPLETE: a sample read at `LIMIT cap+1` that comes back
+short exhausted the matching rows at its own snapshot and is therefore the
+depth, and the COUNT is consulted only when the probe row proves otherwise.
 
 Origin (2026-08-30): the overview panel and the attention strip both rendered
 the sample length, so a queue holding 148 discarded rows reported "20 discarded
@@ -20,8 +27,10 @@ rather than merely currently-correct.
 
 These tests pin the producer's half: that the depth is independent of the sample
 cap, that each of the two queries can fail without corrupting the other's
-result, that `known` distinguishes a measured zero from an unmeasured one, and
-that the flat keys are derived rather than separately computed. The frontend
+result, that `known` describes whether the TOTAL is exact rather than whether
+the count query ran, that a sample which failed part way through is never
+mistaken for a complete short read, and that the flat keys are derived rather
+than separately computed. The frontend
 half — that no surface reads the raw keys, and that all three normalisers agree
 with each other and with expected values — is in
 tests/test_dashboard/test_webui_js_integrity.py.

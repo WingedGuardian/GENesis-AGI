@@ -449,8 +449,11 @@ async def queues(
         except Exception:
             # Recorded rather than swallowed: without this a failed COUNT yields
             # 0, which the dashboard renders as a confident "nothing awaiting
-            # review" for a state nobody measured. `known` carries that
-            # distinction to the UI; the error string keeps it in the payload.
+            # review" for a state nobody measured. The error string keeps that
+            # in the payload. It does NOT by itself make the depth unknown — a
+            # sample that read to completion still establishes an exact one
+            # (see the rule below); the count only carries the depth when the
+            # sample was truncated.
             errors.append("discarded: count query failed")
             logger.warning("Failed to count discarded deferred items", exc_info=True)
 
