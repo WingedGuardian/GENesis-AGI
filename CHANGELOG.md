@@ -146,6 +146,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   exact for one cache window; closing that needs both values read under one
   snapshot and is tracked separately.
 
+  The Queues card's verdict follows the same principle: a diagnostic no longer
+  doubles as an answer to "is this counter known". The card previously read any
+  entry in the section's error list as an uncollected counter, so once a depth
+  could recover from whichever read completed, an exactly-measured queue
+  rendered a precise number beside "some queue counters could not be collected".
+  Errors are not suppressed — they stay in the payload and the panel still shows
+  them — they simply stop deciding a verdict they no longer describe. Counters
+  that publish no exactness of their own are unaffected, and one unrecovered
+  error alongside a recovered one still marks the section unknown.
+
 - **"Clear all reviewed" now says how many rows it will actually delete.** It
   always deleted every discarded/expired row, not the 20 displayed — harmless
   while the panel hid the difference, misleading once it reports the true

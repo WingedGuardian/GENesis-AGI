@@ -3763,7 +3763,26 @@
           if (pe > 100) {
             return { state: "degraded", reason: `embedding queue backed up (${pe} pending)` };
           }
-          if (Array.isArray(queues.errors) && queues.errors.length > 0) {
+          // `errors` is a DIAGNOSTIC channel, not a second answer to "is this
+          // counter known". A counter that publishes its own exactness has
+          // already answered, and letting a stale error string overrule it
+          // renders a precise number beside "some queue counters could not be
+          // collected" — the panel contradicting itself. That is the same
+          // two-independent-descriptions fork removed one level down (the two
+          // flat depth/list keys no surface reads any more), and it reappeared the
+          // moment `known` started recovering from whichever read completed:
+          // a failed COUNT beside a complete sample is now an EXACT depth.
+          //
+          // The diagnostics are not suppressed — they stay in the payload and
+          // the panel still shows them. They just stop deciding a verdict they
+          // no longer describe. Only `discarded` publishes a `known` flag
+          // today, so every other counter's error remains its only unknown
+          // signal and still decides this; one such error beside a recovered
+          // one is enough to keep the section unknown.
+          const unresolved = (Array.isArray(queues.errors) ? queues.errors : []).filter(
+            (e) => !(this.discarded.known && String(e).startsWith("discarded:")),
+          );
+          if (unresolved.length > 0) {
             return { state: "unknown", reason: "some queue counters could not be collected" };
           }
           // Queue honesty is DEPTH-based by design; a drain-liveness verdict is

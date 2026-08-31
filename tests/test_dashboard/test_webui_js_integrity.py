@@ -8,6 +8,7 @@ by its stable indentation convention (members at exactly 8 spaces) and
 assert every member name is unique.
 """
 
+import json
 import re
 import shutil
 import subprocess
@@ -392,3 +393,101 @@ def test_every_normaliser_publishes_the_label():
         assert "known ? String(total)" in body, (
             f"{path.name}: the label must distinguish a measured depth from a floor"
         )
+
+
+def test_a_recovered_exact_depth_is_not_reported_as_an_unknown_counter():
+    """An error string must not outrank a counter that proved itself exact.
+
+    `queues.errors` and `discarded.known` are two independent answers to "is
+    this counter known", which is the same fork — one level up — as the
+    `discarded_count`/`discarded_items` pair this branch removed. When the
+    COUNT query fails but the capped sample reads to completion, the depth is
+    now EXACT and `known` says so, while `errors` still carries the old
+    "count query failed" string. Keying the verdict on the presence of any
+    error then renders an exact number beside "some queue counters could not be
+    collected" — the panel contradicting itself, which is the class of defect
+    this whole branch exists to close.
+
+    Errors stay in the payload: the COUNT really did fail and an operator
+    should see it. What changes is that a diagnostic stops doubling as an
+    exactness signal for the one counter that publishes its own.
+
+    Behavioural, not a source scan: the real function body is executed against
+    real payloads, so a rewrite that keeps the tokens and loses the property
+    still fails.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available")
+
+    js = DASHBOARD_JS.read_text()
+    i = js.index("queuesSemantic() {")
+    body = js[i + len("queuesSemantic() {"): js.index("\n        },", i)]
+    # queuesSemantic() reads `this.discarded`, so the REAL normaliser is wired
+    # in rather than a stand-in — a fake here could satisfy the verdict while
+    # disagreeing with what the panel actually renders.
+    j = js.index("get discarded() {")
+    norm = js[j + len("get discarded() {"): js.index("\n        },", j)]
+
+    # Each case: (label, queues payload, expected state). Every depth is 0 —
+    # a non-zero discarded depth returns "error" several branches earlier, so
+    # only an empty queue reaches the line under test at all.
+    _exact_zero = {"total": 0, "sample": [], "known": True, "sample_truncated": False}
+    _unknown_zero = {"total": 0, "sample": [], "known": False, "sample_truncated": False}
+    cases = [
+        (
+            "count failed, sample proved the depth exactly zero",
+            {"errors": ["discarded: count query failed"], "discarded": _exact_zero},
+            "healthy",
+        ),
+        (
+            "sample failed while the count proved the depth exactly zero",
+            {"errors": ["discarded: sample query failed"], "discarded": _exact_zero},
+            "healthy",
+        ),
+        (
+            "a counter that did NOT recover still decides the verdict",
+            {"errors": ["dead_letter: count query failed"], "discarded": _exact_zero},
+            "unknown",
+        ),
+        (
+            "discarded error while the depth is genuinely not exact",
+            {"errors": ["discarded: count query failed"], "discarded": _unknown_zero},
+            "unknown",
+        ),
+        (
+            "a recovered error does not mask an unrecovered one beside it",
+            {"errors": ["discarded: count query failed", "dead_letter: count query failed"],
+             "discarded": _exact_zero},
+            "unknown",
+        ),
+        (
+            "a failed section still outranks everything",
+            {"status": "error"},
+            "unknown",
+        ),
+    ]
+
+    script = (
+        "function verdict(queues) {\n"
+        "  const self = { health: { queues } };\n"
+        "  Object.defineProperty(self, 'discarded', {\n"
+        "    get: function () { return (function () {" + norm + "\n}).call(self); }\n"
+        "  });\n"
+        "  return (function () {" + body + "\n}).call(self); }\n"
+        "const cases = " + json.dumps(cases) + ";\n"
+        "let bad = 0;\n"
+        "for (const [label, payload, want] of cases) {\n"
+        "  const got = verdict(payload);\n"
+        "  if (!got || got.state !== want) {\n"
+        "    bad++;\n"
+        "    console.log('MISMATCH: ' + label + ' -> ' + JSON.stringify(got) + ' want ' + want);\n"
+        "  }\n"
+        "}\n"
+        "console.log(bad === 0 ? 'OK' : 'FAIL ' + bad);\n"
+    )
+    r = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, f"node failed: {r.stderr[:800]}"
+    assert r.stdout.strip().endswith("OK"), (
+        "queuesSemantic() disagreed with the expected verdicts:\n" + r.stdout
+    )
