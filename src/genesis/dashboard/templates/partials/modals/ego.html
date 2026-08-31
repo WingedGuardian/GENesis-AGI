@@ -6,17 +6,34 @@
     <div class="config-modal" style="max-width: 900px;">
       <div class="config-modal-header">
         <span>Ego — Autonomous Decision Cycle</span>
+        <!-- Health verdict, NOT fetch-load state: the header dot/label/detail
+             render the SAME egoSemantic() verdict as the overview tile, so the
+             two surfaces can never disagree (a green "healthy" here used to mean
+             only "the modal's data loaded"). Load failures still surface in the
+             modal body's error placeholder below; egoSemantic() safely returns
+             "unknown" (gray) before egoStatus resolves — never a false green. -->
         <span class="panel-status">
-          <span class="status-dot" :style="`background:${$store.genesisDashboard.modalStateColor($store.genesisDashboard.egoModal)}`"></span>
-          <span x-text="$store.genesisDashboard.modalStateLabel($store.genesisDashboard.egoModal)"></span>
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.egoSemantic().state)}`"></span>
+          <span x-text="$store.genesisDashboard.egoSemantic().state"></span>
         </span>
         <button @click="$store.genesisDashboard.egoModal.open = false">&times;</button>
       </div>
       <div class="config-modal-body">
         <!-- Status detail -->
-        <template x-if="$store.genesisDashboard.modalStatusDetail($store.genesisDashboard.egoModal)">
+        <template x-if="$store.genesisDashboard.egoSemantic().reason">
           <div class="panel-status-detail" style="margin-bottom: 0.75rem;"
-               x-text="$store.genesisDashboard.modalStatusDetail($store.genesisDashboard.egoModal)"></div>
+               x-text="$store.genesisDashboard.egoSemantic().reason"></div>
+        </template>
+        <!-- Stale-refresh warning: the header dot now shows egoSemantic() health
+             (last-known), NOT whether THIS modal's live refresh succeeded. When
+             the modal's own fetch fails AFTER egoStatus is already populated (the
+             normal path — the overview card loads it before the modal opens), the
+             body error placeholder below is suppressed by its !egoStatus guard, so
+             the refresh failure would otherwise be invisible. Surface it here. -->
+        <template x-if="$store.genesisDashboard.egoModal.fetch.state === 'error' && $store.genesisDashboard.egoStatus">
+          <div class="inline-warning" style="margin-bottom: 0.75rem;">
+            ⚠ Live refresh failed — showing last known state.
+          </div>
         </template>
         <!-- Loading -->
         <div x-show="$store.genesisDashboard.egoModal.fetch.state === 'loading' && !$store.genesisDashboard.egoStatus"
