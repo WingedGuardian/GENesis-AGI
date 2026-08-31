@@ -494,10 +494,29 @@ async def queues(
     # count below the rows in hand (a write landing between the two statements)
     # must not make the panel print a number smaller than the list beneath it.
     # An unknown count contributes nothing rather than a spurious 0.
+    # Depth comes from TWO reads that are not transactional with each other: an
+    # exact COUNT at t1, and the sample at t2 proving "at least this many" — one
+    # more than it ships when the probe row comes back. `known` therefore means
+    # "total is an EXACT depth", NOT "the count query succeeded": a count the
+    # sample contradicts is stale, and a total resting on it is a floor.
+    #
+    # Four defects in this class came from conflating those. Each fix corrected
+    # the cell in front of it and left an adjacent one wrong, because `known`
+    # described one read while `total` composed two. The full cross-product is
+    # enumerated in tests/test_observability/test_queues_discarded_count.py
+    # (test_every_evidence_cell) — a cell nobody considered has to show up as a
+    # missing ROW there rather than as silence.
+    _sample_floor = len(discarded_items) + (1 if sample_has_more else 0)
+    _contradicted = discarded_known and discarded_count < _sample_floor
+    _known = discarded_known and not _contradicted
     discarded = {
-        "total": max(discarded_count if discarded_known else 0, len(discarded_items)),
+        "total": (
+            discarded_count
+            if _known
+            else max(discarded_count if discarded_known else 0, _sample_floor)
+        ),
         "sample": discarded_items,
-        "known": discarded_known,
+        "known": _known,
     }
     # Truncated if the known depth exceeds what was shipped, or if the probe row
     # came back. Treating a FULL sample as truncated outright (the first attempt

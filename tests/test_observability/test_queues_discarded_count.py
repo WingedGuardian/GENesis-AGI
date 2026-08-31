@@ -179,7 +179,13 @@ class TestDiscardedIsReconciledOnce:
             "a failed count was published as a known depth, so the panel would "
             "state a number it never measured"
         )
-        assert d["total"] == len(d["sample"]), "rows already in hand should still be reported"
+        # The floor is the rows in hand PLUS the probe row when it came back:
+        # with the count gone, the sample is the only evidence, and it proved
+        # one more row exists than it shipped. Reporting len(sample) here would
+        # discard evidence the producer holds.
+        assert d["total"] == len(d["sample"]) + 1, (
+            "the probe row proved another row exists; the floor must include it"
+        )
 
     async def test_a_failed_sample_does_not_discard_a_good_count(self, db, monkeypatch):
         """Two independent try blocks, not one.
@@ -308,3 +314,107 @@ class TestDiscardedIsReconciledOnce:
 
         assert len(d["sample"]) == q._DISCARDED_SAMPLE_CAP
         assert d["sample_truncated"] is True
+
+
+# ---------------------------------------------------------------------------
+# The evidence table.
+#
+# Depth comes from TWO reads that are not transactional with each other: an
+# exact `COUNT(*)` at t1, and the sample at t2 which proves "at least
+# len(sample)" — or "at least len(sample) + 1" when the probe row comes back.
+#
+# Four defects in this class all had the same shape: `total` was a composite of
+# those two reads, while `known` described only whether the COUNT query
+# succeeded. So there was always a cell where the composite's real
+# trustworthiness and `known` disagreed, and each fix closed the cell in front
+# of it and left an adjacent one wrong.
+#
+# `known` therefore means "total is an EXACT depth", not "the count query
+# worked". It is false whenever the sample contradicts the count, because a
+# sample proving more rows than the count reported means the count is stale.
+# `total` is the best lower bound the evidence supports.
+#
+# This is the whole cross-product, enumerated. A cell nobody thought of has to
+# be a MISSING ROW here rather than an absence, which is the only structural
+# difference between this and the three fixes that preceded it.
+# ---------------------------------------------------------------------------
+_CAP = q._DISCARDED_SAMPLE_CAP
+
+# (label, rows_in_db, count_query_ok, expected_total, expected_known)
+_EVIDENCE_CELLS = [
+    ("empty queue, count ok",           0,        True,  0,        True),
+    ("below cap, count agrees",         5,        True,  5,        True),
+    ("exactly cap, count agrees",       _CAP,     True,  _CAP,     True),
+    ("above cap, count agrees",         _CAP + 1, True,  _CAP + 1, True),
+    ("far above cap, count agrees",     148,      True,  148,      True),
+    # The count is real but was taken before rows arrived; the sample proves
+    # more exist than it reported. The total is then a floor, not a measurement.
+    ("count stale-low vs sample",       _CAP,     "stale_low", _CAP,     False),
+    ("count stale-low vs probe",        _CAP + 1, "stale_low", _CAP + 1, False),
+    # The count lands EXACTLY on the shipped sample size while the probe proves
+    # another row exists. Comparing the count against the rows shipped says
+    # "no contradiction" here and publishes an exact 20 for a deeper queue; only
+    # comparing against the FLOOR (shipped + probe) catches it. This row was
+    # added because a mutation that made that comparison survived the table —
+    # the hole was in the enumeration, not the code.
+    ("count equals sample, probe proves more", _CAP + 1, "stale_at_cap", _CAP + 1, False),
+    # No count at all: everything rests on the sample.
+    ("count failed, empty",             0,        False, 0,        False),
+    ("count failed, below cap",         5,        False, 5,        False),
+    ("count failed, exactly cap",       _CAP,     False, _CAP,     False),
+    ("count failed, above cap",         _CAP + 1, False, _CAP + 1, False),
+]
+
+
+@pytest.mark.parametrize(
+    "label,rows,count_mode,want_total,want_known",
+    _EVIDENCE_CELLS,
+    ids=[c[0] for c in _EVIDENCE_CELLS],
+)
+async def test_every_evidence_cell(db, label, rows, count_mode, want_total, want_known):
+    """`known` is true iff `total` is an exact depth, across every cell.
+
+    `count_mode` is True (the COUNT runs normally), False (it raises), or
+    "stale_low" (it returns a value from before rows arrived — the interleaving
+    that produced the fourth defect in this class).
+    """
+    await _seed(db, discarded=rows)
+    real = db.execute
+
+    async def _patched(sql, *a, **k):
+        if count_mode is not True and "COUNT(*)" in sql and "discarded" in sql:
+            if count_mode is False:
+                raise RuntimeError("count query exploded")
+            # stale_low: the depth before the most recent arrivals.
+            # stale_at_cap: the depth happens to equal what the sample ships.
+            stale_value = _CAP if count_mode == "stale_at_cap" else max(0, rows - 6)
+
+            class _Stale:
+                async def fetchone(self_inner):
+                    return (stale_value,)
+            return _Stale()
+        return await real(sql, *a, **k)
+
+    db.execute = _patched
+    try:
+        d = (await q.queues(db, None, None, None))["discarded"]
+    finally:
+        db.execute = real
+
+    assert d["total"] == want_total, (
+        f"{label}: total {d['total']} != {want_total} — the reported depth is "
+        "not the best lower bound the evidence supports"
+    )
+    assert d["known"] is want_known, (
+        f"{label}: known={d['known']} but the total is "
+        f"{'exact' if want_known else 'only a floor'} here — `known` must "
+        "describe the total, not merely whether the count query ran"
+    )
+    # The invariant every render site depends on: a total may never be below
+    # the rows actually shipped, and may never claim exactness it lacks.
+    assert d["total"] >= len(d["sample"]), f"{label}: total below the shipped sample"
+    if d["known"]:
+        assert not (d["sample_truncated"] and d["total"] == len(d["sample"])), (
+            f"{label}: claims an exact total equal to the sample while also "
+            "flagging truncation — the two cannot both be true"
+        )
