@@ -965,6 +965,22 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   The second reviewer should see the improved code, not the same unfixed diff
   both would otherwise review; parallel also doubles review spend per baseline.
   (Standing user directive.)
+- **A different model is the real correctness gate; Codex is the default.** A Claude
+  reviewer shares this model's blind spots, so it clears the LOCAL depth gate but is not
+  the cross-model gate. When the GitHub Codex reviewer is unavailable AND the install
+  has an approved alternative external reviewer — a DIFFERENT model, with explicit
+  per-use user approval every time — run it non-interactively over the diff with an
+  adversarial mandate. Which reviewer that is (if any) is install-local and belongs in
+  user-level config, not here.
+  **Unavailable is established by ASKING**: comment `@codex review`, wait, and read the
+  reply. An explicit usage-limits comment is unavailability. Nothing else is — silence
+  is not, and neither is `--check-pr` reporting no review, which says the same thing
+  whether the reviewer is down or was simply never triggered at this head. Nor is a
+  `codex exec` quota error: that is a separate surface on separate quota.
+  Scope what you hand it exactly as `.claude/commands/deep-review.md` §1 specifies.
+  **Verify it saw a diff at all**: a clean verdict that does not demonstrate WHAT it
+  reviewed is void, and a false clean from the cross-model gate is worse than no review.
+  Do not merge on a same-model-only review.
 - **Escalation cap — a HARD BLOCK at 3 rounds that each find NEW defects.**
   A *round* = one review→fix→re-review iteration (local reviewer rounds and
   cloud-bot re-review rounds count together, per change). The cap is enforced
@@ -1423,11 +1439,21 @@ findings below, a gated `gh pr merge`:
   evidence a review had ever run hidden by a drive-by comment. Precedence is the right
   shape for a VERDICT; for a REPORT, hiding a true fact is never correct.
   Or append `# scheduled-review-override` to merge anyway (the conscious "merge without
-  the scheduled reviews" case). Head match is EXACT — no ancestor walk, no delta
+  the scheduled reviews" case). Head match is EXACT for the LLM marker — no delta
   tolerance, unlike the Codex freshness gate, which grants relief on a provably trivial
   delta. That asymmetry is deliberate: the Codex classifier judges code-review
   substantiality by file type and size, and an inferential leak lands in exactly the small
-  doc edit it would wave through. The marker means "ran **clean**", not merely "ran": a
+  doc edit it would wave through. The ONE relief the leaks kind gets is MECHANICAL, not a
+  delta tolerance: an ACCEPTED `leaks` marker on an ANCESTOR commit of head satisfies the
+  gate when the `leak-detector` job of the `CI` workflow is green at head (identity pinned
+  to that (name, workflow) pair; `_MECHANICAL_RESCAN_BY_KIND`), and NEVER when any
+  refused `leaks` marker — or any blocking finding the scan could not credit to a head
+  or kind (a tie, a malformed marker) — exists anywhere in the PR (the head axis is not
+  a time axis — a later acceptance at an older head must not outrank a refusal). `--check-pr` renders a
+  carried marker as `ok (leaks carried from <sha>, leak-detector green at head)`, never
+  as `ok (at head)`. Measured motive: 6 of 10 sampled multi-push PRs were blocked purely
+  because the routine does not re-stamp after a push, and the override had become
+  routine. The marker means "ran **clean**", not merely "ran": a
   review whose body carries a blocking finding (`[P1]`/`HARD BLOCK`/`### ERROR`, unless a
   clean verdict overrides) is rejected, and DISMISSED/PENDING(draft) reviews don't count.
   **ALWAYS end a genuinely-clean scheduled review with an explicit verdict line**
@@ -1477,7 +1503,7 @@ The review-findings gate specifically:
    The override is logged. Use only when findings are intentionally accepted.
 6. **Read the PR's warning comments before merging — not just the hard gate.**
    Beyond Codex, a structural-review bot posts under the repo-owner account
-   (`WingedGuardian`, review state COMMENTED) and emits **SOFT WARNINGs** (PII /
+   (review state COMMENTED) and emits **SOFT WARNINGs** (PII /
    private-text / wording) that the hook does NOT block on and that a naive
    `.comments` scan misses. Check BOTH `gh pr view N --json reviews,comments`
    and `gh api repos/<owner>/<repo>/pulls/N/comments`, and address each soft

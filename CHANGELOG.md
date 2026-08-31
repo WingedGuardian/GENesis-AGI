@@ -152,6 +152,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   current data are unaffected: only this endpoint accepts a cached result, and
   it says so explicitly.
 
+- **A multi-push PR no longer needs `# scheduled-review-override` just because the
+  leak-scan routine stamped an earlier commit.** The merge gate now accepts an
+  ACCEPTED `leaks` marker on an ancestor of the current head when the `leak-detector`
+  job of the `CI` workflow is green at head — the mechanical scanner re-ran on the
+  exact commit being merged, which is the literal-leak guarantee the exact-head rule
+  existed to keep. Measured motive: 6 of 10 sampled multi-push PRs were blocked purely
+  because the routine does not re-stamp after a push, so the override had become the
+  routine path. The relief is deliberately blunt where it matters: ANY refused `leaks`
+  marker anywhere in the PR denies it (a later acceptance at an older head must never
+  outrank a refusal — the head axis is not a time axis), the carried marker must be a
+  verified ancestor (an unreadable compare is "unknown", never "yes"), the scanner is
+  pinned to its named workflow rather than to membership in the required-CI set, and
+  every compare respects the shared merge deadline. `--check-pr` renders a carried
+  marker as `ok (leaks carried from <sha>, leak-detector green at head)`, never as
+  `ok (at head)`. Only the `leaks` kind is mapped; `code-review` gets no mechanical
+  relief. A blocking finding the marker scan cannot credit to a head or a kind (a
+  same-timestamp tie, or a malformed marker with a blocking body) is now returned by
+  the scan as structured residue and denies relief the same way a refusal does — an
+  adversarial audit reproduced that path before the field existed. Measured on the 40
+  most recent marker-carrying PRs: 14 were relief-eligible and the rule denies none of
+  them; 7 carry benign uncountable rows that a blanket rule would have denied.
 - **The ego's self-model stopped presenting stale, thin and arbitrarily-ranked
   rows as present-tense capability.** `capability_map` feeds three ego-prompt
   sections and the capability-improvement scanner. Measurements below come from
