@@ -1134,9 +1134,11 @@ def main() -> None:
             return
         _deny(
             "BLOCKED: Code changes exist without review. "
-            "Run /review and dispatch the genesis-architect agent (adversarial audit) first, "
-            "save it to `python3 scripts/review_state.py evidence-path`, "
-            "then run: python3 scripts/review_state.py mark\n"
+            "Run an adversarial audit first — `/review` where the optional `superpowers` "
+            "plugin is installed, else `/deep-review`, or dispatch the genesis-architect "
+            "agent — save it to `python3 scripts/review_state.py evidence-path`, "
+            "then run: python3 scripts/review_state.py mark --agent-output <that file> "
+            "(add --clean if it found no new should-fix-or-worse finding)\n"
             "If findings are intentionally accepted, append a trailing shell "
             "comment (outside any quotes): '  # review-override'"
         )

@@ -238,7 +238,9 @@ def _check_review_state() -> None:
         "the `superpowers` plugin (`/review`, `superpowers:code-reviewer`) where the "
         "install has it, else `/deep-review`, or review and then "
         "`python3 scripts/review_state.py mark --agent-output <file>` from the "
-        "worktree the changes are in."
+        "worktree the changes are in. UNLESS the staged set is docs/config only — "
+        "that needs no review and no marker, and this check cannot tell the "
+        "difference because it hashes the staged diff without classifying paths."
     )
 
 
