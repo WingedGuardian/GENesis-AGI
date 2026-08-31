@@ -318,6 +318,26 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   alarm), enumerate the expectation table as failing tests BEFORE implementing
   — it forces the spec question to surface at design time instead of review
   round 4.
+- **Corpus replay cannot find a false-POSITIVE class — generate the matrix.**
+  Replaying real recorded inputs proves only that shapes you have ALREADY run
+  still behave; it is structurally blind to a shape you have never typed. A
+  guard change measured "0 false positives across 18k real commands" and still
+  hard-blocked an ordinary command, because the corpus happened to contain no
+  instance of the one shape that mattered: a construct the parser mis-handles
+  that ALSO leaves the guard with no parsed segment. For any classifier
+  or guard, enumerate the CROSS PRODUCT of the axes that actually drive the
+  decision — {operation} × {the constructs your parser can mis-segment} ×
+  {evidence present, absent} × {interactive, unattended} — and assert the invariant per
+  cell, so an untested cell fails
+  loudly instead of silently. Keep the corpus replay as the realism check; the
+  generated matrix is the coverage check FOR THE MODEL YOU DECLARED, which is
+  the most it can be — a construct you never thought of has no cell to skip and
+  so passes in silence, which is the same false confidence one level up. Naming
+  it "the coverage check" without that qualifier is the trap. Discovering new
+  axes is a different instrument: differential or property testing against a
+  canonical parser, which fails on shapes nobody enumerated. Skip a cell only
+  with an explicit reason recorded in the skip, since a silent skip and a hole
+  look identical.
 - **Anti-patterns (binding):** never assert on a mock's behavior when the real
   code path can run; never add test-only methods/branches to production
   classes; fakes implement the real contract (real method names, real return
@@ -471,6 +491,192 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   miss degrades to the status quo instead of a broken guarantee). Do not ship
   the open-set version and plan to harden it later; the review loop IS the
   hardening loop, one bug per round, and it does not converge.
+
+  **Three corollaries, each bought with a non-converging review loop.**
+
+  **(a) NEVER normalize the command text before a blind-spot probe.** A probe
+  whose whole job is "notice that this text is unparseable" must read the RAW
+  command. Preprocessing it can only ever DELETE the evidence the probe exists
+  to find. MEASURED: a normalization step added in good faith — to stop a class
+  of ordinary command from prompting — turned that shape into a silent
+  ALLOW on two independent guards. Ordinary, not adversarial: the shape was one
+  a developer writes without thinking, and the command really executed (verified
+  against a shimmed binary, so the proof was execution rather than parse). The
+  normalizer removed the very evidence the guard keyed on, and its own model of
+  the shell's comment syntax was narrower than the shell's, so it could delete
+  executed code as well. It then turned out not to be load-bearing at all: every
+  case cited to justify it was one where the parser already resolved the
+  operation, so its branch never ran. The fix was a DELETION, and it closed both
+  defects at once. When a guard loop will not converge, look for the component
+  that MODELS shell semantics and remove it — refining it is the loop.
+
+  Scope this to a probe. Normalizing before a *tokenizer whose tokens you are
+  about to use* is a different act with a different fail direction, and a
+  sibling guard does exactly that, deliberately. Before calling any such site an
+  instance of this rule, the question to answer is whether the normalization
+  CAN change the tokenizability verdict or hide a target — and that is a
+  possibility question, so a count cannot answer it. Demand a STRUCTURAL
+  argument. The model is already in the repo, at
+  `scripts/hooks/destructive_command_guard.py:101-120`: its replacements delete a
+  line continuation — which is what the shell does with it — or insert
+  whitespace and separators; none introduces a quote or an escape, so none can
+  corrupt the quote balance shlex decides on. (The deletion removes a backslash,
+  but a backslash-newline is a continuation, not an escape the shell keeps; the
+  one place the shell does keep it, inside single quotes, is an over-block the
+  guard states rather than hides.) That is a `cannot`; a
+  corpus run only ever yields `did not, here`, and by the rule above it is
+  structurally blind to the shape nobody typed. Run the corpus as
+  corroboration, never as the proof, and pair it with a control that DOES flip
+  — an unflipped corpus and an inert measurement look identical.
+
+  State the direction too, not just a total — and then check the direction on
+  the token you did not think of. The same sibling's fold used to split a word
+  the shell joins, and the paragraph that stood here said the verdict could
+  therefore only move toward refusing. That was measured on path operands and
+  was false on the option token: the split could hide the flags, and a spelling
+  the shell runs as a recursive-force removal of a protected path was allowed.
+  A reviewer found it from the diff; the earlier audit had split every position
+  of a path and never the option, and its zero came from benign traffic with no
+  true-positive control. The fold now deletes the sequence, which is what the
+  shell does, and the guard is asserted to give the same answer for the
+  continued and the joined spelling. The general lesson is the one above: the
+  examples you enumerate are a sample, and a direction claim needs the cell that
+  would falsify it.
+
+  Deliberately stated without the triggering shapes. A guard's defeat
+  conditions are not a teaching aid, and this file is public.
+
+  **(b) When the parse is unreliable, ASK — do not BLOCK.** A hard block forces
+  a surgically precise trigger, and precision is exactly what an unreliable
+  parse cannot deliver. Measured over five review rounds: every narrowing
+  conjunct became a new way to STARVE the trigger (an over-strip that ate the
+  evidence; a decoy segment that stood the net down), while every widening
+  hard-blocked benign shapes (`git status # don't commit yet` was refused).
+  Emitting a PreToolUse `ask` inverts the cost of being wrong — a false
+  positive is one confirmation, a miss is the pre-existing status quo — which
+  is what lets the trigger stay broad instead of clever. Measured prompt rate
+  after widening: 0.43% of ~19k real commands.
+
+  This does NOT loosen the fail-closed mandate above, and the two are easy to
+  read as contradicting each other. Rule (b) is scoped to the git-operation
+  blind-spot net — a guard whose trigger is deliberately broad and whose false
+  positive is one confirmation. It is NOT a template for every guard: the
+  protected-paths and destructive-command guards hard-block an unreliable parse
+  even when a person is present, by design, because their false negative is an
+  irreplaceable path or a broad recursive removal and their false positive is a
+  rewrite. Within the net, the two rules are scoped by who is present: `ask` is
+  the interactive form of the refusal, and where a session is unattended
+  fail-closed governs and (c) applies. The operation proceeds unverified in
+  neither case.
+
+  This is the shipped shape now, not an aspiration, and one distinction inside
+  it must stay visible. The shared parser still degrades to a naive split with
+  NO failure signal, so a caller that only asks "did I get a matching segment?"
+  allows. What closes the hole is a separate conjunction AT THE CALLER — no
+  matching segment, AND the raw text is un-tokenizable, AND it names a gated
+  operation — which yields `ask` interactively and a refusal when unattended.
+  The parser's contract did not change and must not: it degrades, the caller
+  chooses the fail direction, exactly as the mandate above requires.
+
+  Earlier revisions of this passage described that net in the present tense
+  while it was still unmerged. Both directions of that error are worth naming,
+  because fixing one produces the other: an unbuilt mechanism written as
+  shipped, and then — once it does ship — a hedge left standing that now
+  understates the tree. A status sentence in a durable document is a claim with
+  a date on it. Re-check it against the code whenever the surrounding work
+  lands, not only when it is first written.
+
+  Corollaries of the corollaries, each measured: a net that returns inline
+  PRE-EMPTS every gate below it (a hard block with no other backstop was
+  observed downgrading to a prompt) — set a reason and DEFER it to the tail
+  where the other decisions are resolved. And an invariant pair of the form
+  "never silently allowed" + "never hard blocked" is satisfied BY a block→ask
+  downgrade, so pin the verdict EXACTLY wherever a hard block is the contract.
+  Read "never hard blocked" here only as the shape of the trap — as an actual
+  invariant it is false unscoped, and (c) below replaces it.
+
+  **(c) The ask-cost argument does NOT survive the move to a refusal.** Rule (b)
+  buys its broad trigger with "a false positive costs one confirmation" — and
+  that is true only where someone can confirm. An unattended session has nobody
+  to answer, so the obvious completion of (b) is a deny leg for that path, and
+  that is where it goes wrong: the SAME broad predicate whose errors were cheap
+  now produces unappealable refusals of ordinary work. MEASURED: sharing one
+  predicate across both legs refused routine, entirely benign commands in
+  unattended sessions, in the one failure direction the design had been chosen
+  to avoid.
+
+  Narrowing the refusal predicate is the obvious repair and it does not
+  converge, for a reason worth stating precisely, because the imprecise version
+  of it is false. The claim is NOT that no raw-text rule could ever work — the
+  raw text does carry quote and comment syntax, and a complete canonical parser
+  could read it, which is what the canonical-parser rule above tells you to
+  reach for. The claim is bounded to a predicate built on the SAME degraded
+  parse that failed: at that point the guard cannot say whether an occurrence of
+  a gated verb is executed or merely quoted, commented, or documented, and that
+  inability is the premise of the net existing. A predicate with no more
+  information than the failure itself cannot both refuse the hidden operation
+  and permit the inert mention. Escaping that needs a different information
+  source — a fuller parser, or enforcement at the execution boundary, where
+  mentions are never classified at all — not a cleverer rule over the same text.
+
+  Three narrowing rounds on one predicate is the signature to STOP and make the
+  policy decision explicitly. The decision taken on the guard this was learned
+  from, and since shipped: the unattended path KEEPS refusing,
+  and the invariant gets scoped rather than deleted. "A benign shape is never
+  hard blocked" was simply false as written; what is true and testable is that
+  it is never hard blocked where a human can approve, and where no one can, the
+  refusal carries an ACTIONABLE stderr — the cause, plus a route that gives the
+  gate MORE information rather than less.
+
+  That last qualifier is load-bearing and the sloppy version of this sentence is
+  a bypass instruction. Telling an operator to find "a rephrasing that avoids
+  the predicate" invites mutating raw text until a degraded predicate stops
+  matching, while the same unverified operation still runs — the fail-closed
+  mandate defeated by its own error message. Only two routes are legitimate, and
+  neither is an evasion. If the text is PROSE that merely mentions a gated verb,
+  take it out of a shell command altogether — write the file with an editor tool
+  — because it was never an operation to gate and never should have been parsed
+  as one. If it IS the operation, express it so the parser can actually read it,
+  which does not dodge the gate but submits to it. A rewrite that suppresses the
+  trigger while still performing the operation is the one thing such a message
+  must never suggest, and a message is not "actionable" if that is what it
+  teaches. (Actionability here is a courtesy to the operator, NOT the
+  RECOVERABILITY of the Decision test above, which is about a MISS degrading to
+  the status quo. Same word, opposite failure direction; do not satisfy the
+  Decision test by printing a nicer error.) State the narrower invariant; do not
+  leave the false one standing, and do not delete the guarantee that still holds.
+
+  Two things keep this from reading as licence. The open-set imprecision is
+  tolerable here ONLY because the verdict is `ask` or `deny` and never `allow` —
+  an imprecise predicate that cannot authorize anything does not violate the
+  Decision test, while the same predicate wired to an allow would. And a broad
+  regex over raw text is admissible ONLY as a mention scan whose outcome is an
+  `ask` where a person is present and a refusal where none is — never an allow;
+  the moment it maps argv to an effect and authorizes on the result, it is the
+  hand-rolled-parser tar pit the mandate above forbids.
+
+  A measurement informed this rather than settling it, and it was afterwards
+  WITHDRAWN — which is the more useful half of the story. The claim was that
+  across a sample of unattended sessions the leg had never fired in either
+  direction. It does not survive: the transcripts it counted no longer existed
+  when someone went to re-derive it, and the sample was far too small to carry
+  a word as strong as "never" even while they did. Absence in a small sample is
+  the expected observation for a rare event, not evidence the event cannot
+  happen; the honest reading is that the leg's rate is LOW, which is a different
+  claim and a weaker one. What was actually being chosen was which promise the
+  suite should make, not which incident to prevent — and that conclusion never
+  rested on the number, which is why it outlived it.
+
+  A note on every number in these three rules, including the ones above. They
+  come from one operator's local session transcripts at one date, and no corpus
+  or harness is checked in, so a reader cannot reproduce or falsify them — the
+  differing denominators are different harvests, not one corpus quoted three
+  ways. That is not a hypothetical weakness: one of them was withdrawn the
+  first time anyone tried, for exactly that reason. Treat them as the scale at
+  which something was observed, never as a published result. A rule that only
+  holds at someone else's numbers is not a rule; each of these should stand on
+  its stated mechanism alone — and if one ever seems to DEPEND on a figure,
+  that dependency is the defect to fix, not the figure to defend.
 
 - **`out=$(cmd)` under `set -e` swallows the failure path — and NO linter catches
   it.** An assignment whose value is a command substitution INHERITS that
@@ -759,6 +965,22 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   The second reviewer should see the improved code, not the same unfixed diff
   both would otherwise review; parallel also doubles review spend per baseline.
   (Standing user directive.)
+- **A different model is the real correctness gate; Codex is the default.** A Claude
+  reviewer shares this model's blind spots, so it clears the LOCAL depth gate but is not
+  the cross-model gate. When the GitHub Codex reviewer is unavailable AND the install
+  has an approved alternative external reviewer — a DIFFERENT model, with explicit
+  per-use user approval every time — run it non-interactively over the diff with an
+  adversarial mandate. Which reviewer that is (if any) is install-local and belongs in
+  user-level config, not here.
+  **Unavailable is established by ASKING**: comment `@codex review`, wait, and read the
+  reply. An explicit usage-limits comment is unavailability. Nothing else is — silence
+  is not, and neither is `--check-pr` reporting no review, which says the same thing
+  whether the reviewer is down or was simply never triggered at this head. Nor is a
+  `codex exec` quota error: that is a separate surface on separate quota.
+  Scope what you hand it exactly as `.claude/commands/deep-review.md` §1 specifies.
+  **Verify it saw a diff at all**: a clean verdict that does not demonstrate WHAT it
+  reviewed is void, and a false clean from the cross-model gate is worse than no review.
+  Do not merge on a same-model-only review.
 - **Escalation cap — a HARD BLOCK at 3 rounds that each find NEW defects.**
   A *round* = one review→fix→re-review iteration (local reviewer rounds and
   cloud-bot re-review rounds count together, per change). The cap is enforced
@@ -1186,20 +1408,52 @@ findings below, a gated `gh pr merge`:
   names the PR's current head — so if any required routine never ran, ran on a stale
   commit, or was rate-limited, the merge blocks (naming the missing kinds). An ADVISORY
   routine still posts its review on the PR to be read/addressed, but its absence does not
-  block. A missing marker has **three causes needing different actions**, and the block
-  message now names which one you are in — do not guess:
-  (1) *no marker at any head* — nothing has run; on a freshly-opened PR a routine may
-  still be in flight, so **waiting is correct**;
-  (2) *a marker at an EARLIER head* — a routine ran, then a push moved the head. Routines
-  are generally not re-run on a push, so waiting is unlikely to help: re-review the
-  current head and post the marker by hand;
-  (3) *a marker AT this head that was REFUSED* — see the clean-verdict rule below.
+  block. The block message is an **inventory**, not a diagnosis: under each missing
+  kind it lists EVERY marker block the scan found that names that kind, with its
+  status, and hides nothing. Run `python3 scripts/hooks/git_push_guard.py --check-pr <N>`
+  — it renders those
+  rows, not just the summary line (whose `present: none` clause reads like "nothing was
+  posted" in every case below, and is the exact wording an operator was once measured
+  acting wrongly on). Row statuses you will see:
+  * *accepted at a DIFFERENT head* — a routine ran, then a push moved the head. Routines
+  are generally not re-run on a push; re-review the current head and post the marker;
+  * *REFUSED* (at this head or another) — the body reads as carrying a blocking finding
+  and no clean-verdict line overrides it; see the clean-verdict rule below. The message
+  deliberately does NOT print the verdict string, because a gate that prints the line
+  that makes it pass is explaining how to get past itself;
+  * *could not be counted: <reason>* — a head that is not full 40-lowercase-hex, an
+  empty or refused field value (quoted back verbatim), an author who is not the repo
+  owner, a dismissed review, a stale unpublished draft;
+  * *unscoped* — blocks naming no REQUIRED kind, listed and credited to nothing:
+  guessing which review a block "meant" would steer you into attesting for one that
+  never ran. A value carrying a `/status` suffix (`kind=leaks/failed`) lands here and
+  is flagged as a run that reported its own failure.
+  The one conditional is a COUNT, keyed on a fact: a kind with no OWNER-authored block at
+  any head gets "a routine may still be in flight — waiting is the right move", because
+  that is the only state where patience can help. A stranger's comment is not evidence
+  about the owner's routine and never silences that note; an owner's block in ANY state
+  (accepted elsewhere, refused, dismissed, stale draft, malformed) is, and does.
+  Why an inventory and not a diagnosis: the previous shape picked one cause per kind and
+  hid the rest, and every one of nine review findings across six rounds was a hidden fact
+  — a refused `[P1]` on an older commit hidden behind a typo at the current one, the only
+  evidence a review had ever run hidden by a drive-by comment. Precedence is the right
+  shape for a VERDICT; for a REPORT, hiding a true fact is never correct.
   Or append `# scheduled-review-override` to merge anyway (the conscious "merge without
-  the scheduled reviews" case). Head match is EXACT — no ancestor walk, no delta
+  the scheduled reviews" case). Head match is EXACT for the LLM marker — no delta
   tolerance, unlike the Codex freshness gate, which grants relief on a provably trivial
   delta. That asymmetry is deliberate: the Codex classifier judges code-review
   substantiality by file type and size, and an inferential leak lands in exactly the small
-  doc edit it would wave through. The marker means "ran **clean**", not merely "ran": a
+  doc edit it would wave through. The ONE relief the leaks kind gets is MECHANICAL, not a
+  delta tolerance: an ACCEPTED `leaks` marker on an ANCESTOR commit of head satisfies the
+  gate when the `leak-detector` job of the `CI` workflow is green at head (identity pinned
+  to that (name, workflow) pair; `_MECHANICAL_RESCAN_BY_KIND`), and NEVER when any
+  refused `leaks` marker — or any blocking finding the scan could not credit to a head
+  or kind (a tie, a malformed marker) — exists anywhere in the PR (the head axis is not
+  a time axis — a later acceptance at an older head must not outrank a refusal). `--check-pr` renders a
+  carried marker as `ok (leaks carried from <sha>, leak-detector green at head)`, never
+  as `ok (at head)`. Measured motive: 6 of 10 sampled multi-push PRs were blocked purely
+  because the routine does not re-stamp after a push, and the override had become
+  routine. The marker means "ran **clean**", not merely "ran": a
   review whose body carries a blocking finding (`[P1]`/`HARD BLOCK`/`### ERROR`, unless a
   clean verdict overrides) is rejected, and DISMISSED/PENDING(draft) reviews don't count.
   **ALWAYS end a genuinely-clean scheduled review with an explicit verdict line**
@@ -1249,7 +1503,7 @@ The review-findings gate specifically:
    The override is logged. Use only when findings are intentionally accepted.
 6. **Read the PR's warning comments before merging — not just the hard gate.**
    Beyond Codex, a structural-review bot posts under the repo-owner account
-   (`WingedGuardian`, review state COMMENTED) and emits **SOFT WARNINGs** (PII /
+   (review state COMMENTED) and emits **SOFT WARNINGs** (PII /
    private-text / wording) that the hook does NOT block on and that a naive
    `.comments` scan misses. Check BOTH `gh pr view N --json reviews,comments`
    and `gh api repos/<owner>/<repo>/pulls/N/comments`, and address each soft

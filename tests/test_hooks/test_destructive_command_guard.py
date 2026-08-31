@@ -12,6 +12,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "hooks"))
 import destructive_command_guard as dg  # noqa: E402
 
@@ -83,3 +85,35 @@ class TestSafetyNoOverBlock:
 
     def test_no_rm_at_all(self):
         assert not _blocks("git status")
+
+
+class TestLineContinuationFoldsAsTheShellFolds:
+    """A backslash-newline is DELETED by the shell, not replaced by whitespace.
+
+    The guard's pre-tokenizer must fold it the same way, or a token the shell
+    reads as one is read here as two — and a verdict taken on the two-token
+    reading is a verdict on a command the shell never runs. Asserted as a
+    PROPERTY over pairs: the guard's answer for the continued form must equal
+    its answer for the form the shell actually executes, in both directions.
+    """
+
+    @pytest.mark.parametrize(
+        ("continued", "joined"),
+        [
+            ("rm -\\\nrf ~/genesis", "rm -rf ~/genesis"),
+            ("rm -r\\\nf /home/u/genesis", "rm -rf /home/u/genesis"),
+            ("rm -rf /home/u/gen\\\nesis", "rm -rf /home/u/genesis"),
+            ("rm -rf /home/u/a/b/c/d\\\n/e", "rm -rf /home/u/a/b/c/d/e"),
+            ("rm -rf /a/b/c/d/e \\\n/f/g", "rm -rf /a/b/c/d/e /f/g"),
+        ],
+    )
+    def test_continued_and_joined_forms_get_the_same_verdict(self, continued, joined):
+        assert dg._rm_violations(continued) == dg._rm_violations(joined), (
+            f"{continued!r} -> {dg._rm_violations(continued)!r}; "
+            f"shell runs {joined!r} -> {dg._rm_violations(joined)!r}"
+        )
+
+    def test_positive_control_the_joined_form_is_refused(self):
+        """Without this, an implementation that returned None for everything
+        would satisfy the equality above."""
+        assert _blocks("rm -rf ~/genesis")
