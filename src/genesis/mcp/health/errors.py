@@ -182,6 +182,73 @@ def _backups_enabled() -> bool:
         return True
 
 
+# How long an alert must have been continuously open before its message carries a
+# duration. Most alerts flap briefly; decorating those is noise. An hour is well
+# above the 5-minute awareness tick and well below any outage worth naming.
+_ONGOING_FLOOR_S = 3600.0
+
+# Marker used to keep the suffix idempotent — `_compute_alerts` recomputes the
+# whole set every tick, so a message must never accrete suffixes.
+_ONGOING_MARK = "(ongoing for "
+
+
+def _ongoing_for(created_at: str | None, now: datetime) -> str | None:
+    """Human duration an alert has been open, or None if it should not be shown.
+
+    Returns None for anything younger than the floor, unparseable, or dated in
+    the future (clock skew). Never raises: this decorates the alert path, and a
+    bad row must cost a suffix, not the whole alert set.
+    """
+    if not created_at:
+        return None
+    try:
+        started = datetime.fromisoformat(str(created_at))
+    except (TypeError, ValueError):
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    elapsed = (now - started).total_seconds()
+    if elapsed < _ONGOING_FLOOR_S:
+        return None
+    hours = int(elapsed // 3600)
+    days, rem = divmod(hours, 24)
+    if days and rem:
+        return f"{days}d {rem}h"
+    if days:
+        return f"{days}d"
+    return f"{hours}h"
+
+
+def _apply_ongoing_duration(
+    alerts: list[dict], open_rows: dict, *, now: datetime | None = None,
+) -> None:
+    """Append "(ongoing for Xd Yh)" to alerts with a durable open row.
+
+    `alert_events` has carried `created_at` with 90-day retention since WS-2 M10
+    and had no production reader — every surface rendered instantaneous state, so
+    a 3-day provider outage read exactly like a 3-minute one (incident
+    2026-08-28/29). Enriching the MESSAGE reaches the dashboard banner, the
+    morning report and the Telegram path at once, because all three render
+    `message`.
+
+    Mutates in place. An alert firing for the FIRST time has no row yet (the
+    awareness tick writes it after this runs), so it simply gets no suffix.
+    """
+    now = now or datetime.now(UTC)
+    for alert in alerts:
+        try:
+            if _ONGOING_MARK in str(alert.get("message", "")):
+                continue  # already decorated this tick
+            row = open_rows.get(alert.get("id", ""))
+            if not row:
+                continue
+            human = _ongoing_for(row.get("created_at"), now)
+            if human:
+                alert["message"] = f"{alert['message']} {_ONGOING_MARK}{human})"
+        except Exception:  # noqa: BLE001 - never break the alert path
+            logger.debug("ongoing-duration decoration failed", exc_info=True)
+
+
 async def _compute_alerts() -> tuple[list[dict], set[str]]:
     """Pure alert computation — recompute the firing alert set from live health.
 
@@ -1297,6 +1364,23 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
                 current_ids.add(alert_id)
         except (json.JSONDecodeError, OSError):
             pass
+
+    # Decorate with how long each alert has been continuously open. The durable
+    # open-set in `alert_events` (written by the awareness tick, 90d retention)
+    # has carried `created_at` since WS-2 M10 with no production reader, so every
+    # surface rendered instantaneous state and a multi-day outage read exactly
+    # like a momentary one. Self-isolating: a failure here costs the duration
+    # suffix, never the alert set.
+    if _service is not None and _service._db is not None:
+        try:
+            from genesis.db.crud import alert_events as _ae_dur
+
+            _open = {
+                r.get("alert_id", ""): r for r in await _ae_dur.list_open(_service._db)
+            }
+            _apply_ongoing_duration(alerts, _open)
+        except Exception:  # noqa: BLE001 - observability must not break on this
+            logger.debug("could not attach ongoing durations to alerts", exc_info=True)
 
     return alerts, current_ids
 

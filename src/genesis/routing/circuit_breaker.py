@@ -155,6 +155,28 @@ class CircuitBreaker:
         """
         if self.state != ProviderState.HALF_OPEN:
             return
+        # A LISTING is not a CALL. For an entitlement or quota failure the
+        # provider's models endpoint answers 200 with the model still listed —
+        # that is precisely what a 403-on-use looks like from outside, so the
+        # probe is not weak evidence here, it is no evidence at all.
+        #
+        # Live incident 2026-08-28/29: `mistral-large-latest` stayed listed while
+        # every real call returned 403 tier_not_allowed. Three probe successes
+        # closed this breaker each cycle, fired `on_recovery`, and
+        # `ProviderEscalation.record_recovery` resolved the provider_failure
+        # observation and cleared its `first_trip_at`. A 3-day outage therefore
+        # rendered as a series of ~40-minute incidents that each "recovered",
+        # and no surface could ever report a multi-day duration.
+        #
+        # Deliberately narrow: TRANSIENT/TIMEOUT still heal on a probe, which is
+        # the low/no-traffic recovery case this path was built for. And this
+        # cannot strand a provider — HALF_OPEN is still `is_available()`, so real
+        # traffic is attempted and a real `record_success()` closes the breaker
+        # exactly as before. Recovery now requires evidence of a working CALL.
+        if self._last_failure_category in (
+            ErrorCategory.PERMANENT, ErrorCategory.QUOTA_EXHAUSTED,
+        ):
+            return
         was_tripped = self._trip_count > 0
         self._consecutive_successes += 1
         if self._consecutive_successes >= self._probe_success_threshold:

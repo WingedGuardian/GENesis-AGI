@@ -1423,7 +1423,7 @@ verified: 3c514f3e 2026-08-10
   sentinel's own `last_probe_at` and fail toward their safe default.
 - **observability/**: event bus dispatches inline AND logs every event;
   persist-queue overflow drops events but emits a rate-limited "dropped"
-  meta-event (WS-17). Two health layers (async probes vs systemd shell-out);
+  meta-event (WS-17). Two health layers (async probes vs systemd shell-out) — a probe may HEAL a breaker only for TRANSIENT/TIMEOUT failures, never for PERMANENT/QUOTA_EXHAUSTED, because a models-listing 200 is exactly what a 403-on-use looks like and a false heal resets the outage clock;
   `/health` is a dashboard route, not an MCP tool; `job_health` state machine
   is runtime-owned. `snapshots/deploy_health.py` = merged-vs-deployed drift
   (never does network I/O; host guardian state comes from

@@ -9,6 +9,56 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **A dead provider could report itself recovered every 40 minutes, so a
+  multi-day outage rendered as a series of short incidents.** The `/v1/models`
+  health probe healed a circuit breaker whenever the model was still *listed* by
+  the provider — but a model can be listed and not callable. When an account
+  loses entitlement to a model, the listing endpoint keeps answering 200 while
+  every real call returns 403, which is exactly the shape the probe read as
+  "recovered". Three probe successes closed the breaker, which fired the recovery
+  hook, which resolved the `provider_failure` observation and cleared the only
+  per-provider "failing since" timestamp Genesis keeps. The next real call failed
+  again and the cycle restarted, so the outage clock never accumulated past one
+  cycle and no surface could report a duration. A probe now heals only
+  `TRANSIENT`/`TIMEOUT` failures — the low-traffic recovery case it was built
+  for. For a permanent or quota failure it takes a real completion to close the
+  breaker, which cannot strand a provider: a half-open breaker is still routed
+  to, so genuine recovery still closes it on the next successful call.
+
+- **Alerts now say how long they have been firing.** `alert_events` has recorded
+  `created_at` for every open alert with 90-day retention since it was
+  introduced, and nothing read it — so a condition three days old was rendered
+  identically to one three minutes old. Alert messages now carry
+  `(ongoing for 3d 4h)` once an alert has been continuously open for more than an
+  hour. Enriching the message rather than adding a widget means the dashboard
+  banner, the morning report and the outreach path all gain the duration at once,
+  since each renders the message. Self-isolating: a failure to compute the
+  duration costs the suffix, never the alert.
+
+- **The dashboard could not display a tripped circuit breaker at all.** The
+  routing API emits breaker state from a lowercase-valued enum, while four
+  frontend comparisons tested against an uppercase literal — a comparison that is
+  never true. The provider dot rendered green, the toggle button read "disable",
+  and the Provider Keys indicator stayed green regardless of the real state, with
+  the "circuit breaker open" tooltip unreachable. All four now route through a
+  single case-insensitive helper, and a guard test scans the frontend directories
+  so a new file cannot reintroduce the comparison.
+
+- **Alert severity dots were always amber, including for critical alerts.** The
+  colour map was keyed lowercase while severities are emitted uppercase, so every
+  lookup missed and fell through to the warning colour. The map now normalises
+  case, covers the full emitted vocabulary, and gives an unrecognised severity its
+  own colour instead of silently painting it as a warning.
+
+- **Grouped error severity was ranked alphabetically, which inverts it.** The
+  severity vocabulary is lowercase, so a plain `MAX()` orders
+  `warning > info > error > debug > critical` — critical sorts lowest. Any group
+  mixing a critical with a warning reported "warning" and rendered amber,
+  silently downgrading the most severe events in the group. Ranking is now
+  explicit.
+
 ### Added
 
 - **Outreach total-cessation monitoring, without the old false-alarm trap.**

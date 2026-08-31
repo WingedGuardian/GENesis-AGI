@@ -137,15 +137,15 @@
             <template x-for="(prov, provName) in ($store.genesisDashboard.routingConfig.providers || {})" :key="provName">
               <div style="display:flex; align-items:center; gap:0.35rem; padding:0.25rem 0.5rem; border-radius:5px; background:rgba(255,255,255,0.04); border:1px solid var(--color-border); font-size:0.72rem;">
                 <span class="status-dot"
-                      :style="`background: ${($store.genesisDashboard.routingConfig.cb_states || {})[provName] === 'OPEN' ? '#d9534f' : '#4caf50'}`"></span>
+                      :style="`background: ${$store.genesisDashboard.breakerIsOpen(provName) ? '#d9534f' : '#4caf50'}`"></span>
                 <span style="font-weight:500; color:#e0e0e0;" x-text="provName"></span>
                 <span style="color:#666; font-size:0.65rem;" x-text="prov.model"></span>
                 <button @click.stop="$store.genesisDashboard.toggleProvider(provName)"
                         style="font-size:0.62rem; padding:1px 6px; border-radius:3px; cursor:pointer; border:1px solid; font-weight:500; margin-left:0.25rem;"
-                        :style="($store.genesisDashboard.routingConfig.cb_states || {})[provName] !== 'OPEN'
+                        :style="!$store.genesisDashboard.breakerIsOpen(provName)
                           ? 'background:transparent; color:#ef9a9a; border-color:#ef9a9a;'
                           : 'background:transparent; color:#81c784; border-color:#81c784;'"
-                        x-text="($store.genesisDashboard.routingConfig.cb_states || {})[provName] !== 'OPEN' ? 'disable' : 'enable'"></button>
+                        x-text="!$store.genesisDashboard.breakerIsOpen(provName) ? 'disable' : 'enable'"></button>
               </div>
             </template>
           </div>

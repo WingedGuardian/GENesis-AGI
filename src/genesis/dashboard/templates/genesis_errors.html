@@ -198,8 +198,22 @@
         },
 
         alertSeverityColor(sev) {
-          const map = { warning: "#f0ad4e", critical: "#ff2d2d" };
-          return map[sev] || "#f0ad4e";
+          // `_compute_alerts()` emits severities UPPERCASE ("CRITICAL",
+          // "WARNING", "INFO", plus a synthetic "RESOLVED"). This map was keyed
+          // lowercase, so every lookup missed and EVERY dot fell through to the
+          // amber default -- a real CRITICAL rendered identically to a WARNING.
+          //
+          // The fallback is deliberately NOT amber either: silently painting an
+          // unrecognised severity as "warning" is the same two-states-render-
+          // identically bug one layer down. An unknown severity is a defect, so
+          // it gets its own colour and is visibly not one of the known states.
+          const map = {
+            critical: "#ff2d2d",
+            warning: "#f0ad4e",
+            info: "#5aa9e6",
+            resolved: "#4ade80",
+          };
+          return map[String(sev ?? "").toLowerCase()] || "#b39ddb";
         },
 
         formatDateTime(isoStr) {

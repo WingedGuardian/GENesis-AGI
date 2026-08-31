@@ -2640,7 +2640,6 @@
           if (keyEntry.status === 'not_set') return 'not_set';
           const provTypes = this._KEY_TO_PROVIDER_TYPES[keyEntry.key];
           if (!provTypes || !this.routingConfig) return keyEntry.status;
-          const cbStates = this.routingConfig.cb_states || {};
           const providers = this.routingConfig.providers || {};
           // Find all routing providers that match this key's provider types
           const matchedProviders = Object.keys(providers).filter(pname => {
@@ -2648,7 +2647,7 @@
             return provTypes.includes(prov.type);
           });
           if (matchedProviders.length === 0) return keyEntry.status;
-          const openCount = matchedProviders.filter(p => cbStates[p] === 'OPEN').length;
+          const openCount = matchedProviders.filter(p => this.breakerIsOpen(p)).length;
           if (openCount === matchedProviders.length) return 'error';
           if (openCount > 0) return 'degraded';
           return 'healthy';
@@ -4467,6 +4466,25 @@
 
         get routingProviderList() {
           return Object.keys(this.routingConfig?.providers || {});
+        },
+
+        // The ONE place that decides whether a breaker is open.
+        //
+        // `routes/routing.py` emits `cb.state.value`, and ProviderState is a
+        // StrEnum with LOWERCASE values ("closed"/"open"/"half_open"). Four
+        // consumers compared against an UPPERCASE literal, never equal —
+        // so the provider dot rendered green, the toggle button read "disable",
+        // and the Provider Keys dot stayed green no matter what the breaker was
+        // actually doing. The dashboard was structurally incapable of showing a
+        // tripped breaker, which is a likelier reason a 3-day provider outage
+        // went unnoticed than any missing alarm.
+        //
+        // Comparing case-insensitively in ONE helper makes that class of bug
+        // unrepresentable at the call sites, rather than fixing it four times
+        // and waiting for a fifth to be written.
+        breakerIsOpen(providerName) {
+          const raw = (this.routingConfig?.cb_states || {})[providerName];
+          return String(raw ?? "").toLowerCase() === "open";
         },
 
         providerCbState(providerName) {

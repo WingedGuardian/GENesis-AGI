@@ -190,6 +190,33 @@ Three IDs whose descriptors collided were renamed to lead with the domain:
 
 Migration `0015_rename_confusable_call_sites` renames existing rows in `call_site_last_run` and `deferred_work_queue` at server start. `cost_events.metadata` historical entries are intentionally untouched (audit log fidelity). The old IDs survive only as `Renamed from …` annotations in `_call_site_meta.py`. Historical planning docs under `docs/plans/2026-03-*` reference the old names by design (snapshots in time).
 
+### 2026-08-31 — Probe healing no longer erases a permanent outage
+
+A provider whose account lost entitlement to a model (403 `tier_not_allowed`)
+stayed *listed* by `GET /v1/models`. `ProviderHealthChecker._sync_to_breakers`
+heals on `model_available is True`, so three probe sweeps closed the breaker,
+fired `on_recovery`, and `ProviderEscalation.record_recovery` resolved the
+`provider_failure` observation and cleared its `first_trip_at` — the only
+per-provider "failing since" timestamp in the system. The next real call failed
+again and the cycle repeated roughly every 40 minutes, so a three-day outage was
+recorded as a series of short incidents that each recovered, and no surface could
+report a duration. Measured on a live install: 33 calls, 33 failures, zero
+successes over 24h, with five separate `provider_failure` observations opened and
+resolved across three days.
+
+`record_probe_success()` now refuses to heal when the last failure category is
+`PERMANENT` or `QUOTA_EXHAUSTED`. Probe healing is unchanged for
+`TRANSIENT`/`TIMEOUT`, which is the low/no-traffic recovery case it exists for.
+This cannot strand a provider: `HALF_OPEN` is still `is_available()`, so real
+traffic is attempted and a real `record_success()` closes the breaker as before —
+recovery now requires evidence of a working *call* rather than a listing.
+
+Related, same incident: alert messages now carry `(ongoing for Xd Yh)` from
+`alert_events.created_at` (90-day retention, previously unread), and four
+frontend comparisons against an uppercase `'OPEN'` were fixed — the routing API
+emits `cb.state.value` from a lowercase `StrEnum`, so the dashboard was
+structurally unable to render a tripped breaker.
+
 ### 2026-05-10 — Silent-drop fix for keyless call sites (PR #308)
 
 Partial API-key configuration is now treated as a first-class normal state, not a load-time filter condition. Previously, the config loader auto-disabled any provider whose API key env var was unset/empty AND filtered those providers out of every chain. Sites whose entire chain was keyless were dropped from `cfg.call_sites` entirely — invisible everywhere downstream (neural monitor, routing API, health snapshot). On a partially-configured install (the normal install state), this masked which sites were unreachable and what env vars would unblock them.

@@ -491,3 +491,59 @@ def test_a_recovered_exact_depth_is_not_reported_as_an_unknown_counter():
     assert r.stdout.strip().endswith("OK"), (
         "queuesSemantic() disagreed with the expected verdicts:\n" + r.stdout
     )
+
+
+def test_no_frontend_file_compares_breaker_state_to_an_uppercase_literal():
+    """Breaker state is emitted LOWERCASE; comparing to 'OPEN' can never match.
+
+    `dashboard/routes/routing.py` emits `cb.state.value`, and `ProviderState` is
+    a StrEnum whose values are "closed"/"open"/"half_open". Four consumers
+    compared against the literal 'OPEN', so the provider dot rendered green, the
+    toggle read "disable", and the Provider Keys dot stayed green regardless of
+    the real breaker state — the dashboard was structurally incapable of showing
+    a tripped provider.
+
+    Scans DIRECTORIES so a newly added file cannot escape the guard.
+    """
+    offenders = []
+    for path in _frontend_files():
+        for i, line in enumerate(path.read_text().splitlines(), 1):
+            if "'OPEN'" in line or '"OPEN"' in line:
+                offenders.append(f"{path.name}:{i}: {line.strip()[:100]}")
+    assert not offenders, (
+        "frontend compares breaker state against an uppercase literal, which "
+        "never matches the lowercase value the API emits:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_breaker_open_helper_is_case_insensitive_and_total():
+    """Behavioural: execute the real helper, don't pattern-match its source."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; the static guard above still applies")
+
+    js = DASHBOARD_JS.read_text()
+    i = js.index("breakerIsOpen(providerName) {")
+    body = js[i + len("breakerIsOpen(providerName) {"): js.index("\n        },", i)]
+
+    cases = [
+        ("lowercase open (what the API actually emits)", "open", True),
+        ("uppercase OPEN (defensive)", "OPEN", True),
+        ("mixed case", "Open", True),
+        ("closed", "closed", False),
+        ("half_open is NOT open", "half_open", False),
+        ("missing provider", None, False),
+    ]
+    script = (
+        "function mk(v){ const self={ routingConfig:{ cb_states: v===null?{}:{p:v} } };\n"
+        "  return (function(providerName){" + body + "\n}).call(self,'p'); }\n"
+        "const cases=" + json.dumps(cases) + ";\n"
+        "let bad=0;\n"
+        "for (const [label,val,want] of cases){ const got=mk(val);\n"
+        "  if (got!==want){ bad++; console.log('MISMATCH: '+label+' -> '+got+' want '+want); } }\n"
+        "console.log(bad===0?'OK':'FAIL');\n"
+    )
+    r = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, f"node failed: {r.stderr[:400]}"
+    assert r.stdout.strip().endswith("OK"), r.stdout
