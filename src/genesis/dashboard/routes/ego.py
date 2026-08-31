@@ -124,11 +124,16 @@ async def ego_status():
                 rt._db,
                 f"last_proactive_fire:{mgr.source_tag}",
             )
+            last_gated = await ego_crud.get_state(
+                rt._db,
+                f"last_gated:{mgr.source_tag}",
+            )
             live = compute_ego_liveness(
                 last_success_at=last_success,
                 last_intent_at=last_intent,
                 current_interval_minutes=mgr.current_interval_minutes,
                 gated=bool(snap.get("gated")),
+                last_gated_at=last_gated,
             )
             snap["last_success_at"] = live.last_success_at
             snap["stalled"] = live.stalled
