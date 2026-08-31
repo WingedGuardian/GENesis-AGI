@@ -260,15 +260,15 @@ def test_ego_directives_kind_seen_as_migration_added():
 
 def test_marketing_prospects_email_index_ddl_parity():
     """The UNIQUE email index DDL must be byte-identical across BOTH build paths
-    (_tables.py INDEXES and migration 0086_marketing_prospects) — opt-out
+    (_tables.py INDEXES and migration 0089_marketing_prospects) — opt-out
     suppression relies on canonical (COLLATE NOCASE) uniqueness on the
     fresh-install AND the upgrade path, so a future collation/uniqueness edit
     can't silently drift one path (marketing cold-send PR1)."""
     tables_ddl = next((s for s in INDEXES if "idx_marketing_prospects_email" in s), None)
     assert tables_ddl is not None, "email index missing from _tables INDEXES"
-    mig_src = (Path(_migrations_pkg.__path__[0]) / "0086_marketing_prospects.py").read_text()
+    mig_src = (Path(_migrations_pkg.__path__[0]) / "0089_marketing_prospects.py").read_text()
     m = re.search(r'"(CREATE UNIQUE INDEX[^"]*idx_marketing_prospects_email[^"]*)"', mig_src)
-    assert m is not None, "email index DDL missing from migration 0086"
+    assert m is not None, "email index DDL missing from migration 0089"
     assert m.group(1) == tables_ddl, (
         f"DDL drift between build paths: _tables={tables_ddl!r} migration={m.group(1)!r}"
     )

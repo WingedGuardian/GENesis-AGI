@@ -1,4 +1,4 @@
-"""Migration 0086 — labeled_surplus threading onto pending_outreach.
+"""Migration 0089 — labeled_surplus threading onto pending_outreach.
 
 Locks two properties of ``up()`` (marketing cold-send PR1, round-3 item E — the
 ``contextlib.suppress`` around the ALTER was removed and replaced with a table-
@@ -23,7 +23,7 @@ import importlib
 import aiosqlite
 import pytest
 
-_MIG = importlib.import_module("genesis.db.migrations.0086_marketing_prospects")
+_MIG = importlib.import_module("genesis.db.migrations.0089_marketing_prospects")
 
 
 async def _columns(conn, table):
@@ -82,7 +82,7 @@ async def test_up_skips_labeled_surplus_when_table_absent(tmp_path):
 async def test_up_propagates_real_alter_error_on_existing_table(tmp_path, monkeypatch):
     # The non-suppression property item E demanded: when the table EXISTS and the
     # ALTER genuinely fails (here a simulated SQLITE_LOCKED), up() must PROPAGATE the
-    # error — NOT swallow it (a swallow would record 0086 applied without the column).
+    # error — NOT swallow it (a swallow would record 0089 applied without the column).
     # Guards against a future regression that re-wraps the ALTER in a suppress.
     conn = await aiosqlite.connect(str(tmp_path / "t.db"))
     try:

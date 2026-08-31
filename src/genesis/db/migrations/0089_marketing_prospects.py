@@ -67,7 +67,7 @@ async def up(db: aiosqlite.Connection) -> None:
     # fail on "no such table". The _has_column guard gives idempotency (fresh installs
     # already carry the column). Crucially this is NOT a blanket error suppress — a
     # real ALTER failure still PROPAGATES: a transient SQLITE_LOCKED reaches the
-    # runner's retry-on-lock loop (a swallowed lock would instead record 0086 as
+    # runner's retry-on-lock loop (a swallowed lock would instead record 0089 as
     # applied WITHOUT the column, breaking every subsequent pending_outreach enqueue),
     # and a genuine schema failure fails the migration loudly.
     if await _has_table(db, "pending_outreach") and not await _has_column(

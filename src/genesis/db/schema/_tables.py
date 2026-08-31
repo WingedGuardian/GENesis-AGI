@@ -798,7 +798,7 @@ TABLES = {
     # Code-resolvable recipient (never the LLM), PERMANENT opt-out suppression, and
     # status-queryable. See db/crud/marketing_prospects.py for the New-Store
     # justification + retention (opted_out rows never pruned; owner-curated + bounded).
-    # DDL byte-identical to migration 0086.
+    # DDL byte-identical to migration 0089.
     "marketing_prospects": """
     CREATE TABLE IF NOT EXISTS marketing_prospects (
         id                TEXT PRIMARY KEY,
