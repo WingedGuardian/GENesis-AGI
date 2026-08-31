@@ -199,13 +199,15 @@ def harvest(
     out: list[tuple[str, str]] = []
 
     # 1. Effective service subnets + timezone + private repo name.
-    #    Precedence mirrors genesis.env: env override > genesis.yaml > default.
     #    We read os.environ directly (rather than importing genesis.env) so
     #    harvest stays home-injectable for tests and free of env.py's config
-    #    cache/defaults — but MUST honor the same overrides, else an install
-    #    using OLLAMA_URL/LM_STUDIO_URL/USER_TIMEZONE gets stale fingerprints
-    #    that fail to block its ACTUAL subnet/timezone. (secrets.env-sourced
-    #    overrides are only seen if bootstrap exported them into the process.)
+    #    cache/defaults. Subnet URLs stay env-first (env IS the runtime override
+    #    for OLLAMA_URL/LM_STUDIO_URL). Timezone is now FILE-authoritative
+    #    (genesis.yaml ``timezone``) with USER_TIMEZONE a deprecated fallback, so
+    #    below we block the UNION of both possible tz sources — either could be the
+    #    effective runtime zone across installs/versions, and missing the effective
+    #    one would leak it. (secrets.env overrides are only seen if bootstrap
+    #    exported them into the process.)
     cfg = _load_yaml(home / ".genesis" / "config" / "genesis.yaml")
     try:
         net = cfg.get("network", {}) if isinstance(cfg, dict) else {}
@@ -218,9 +220,16 @@ def harvest(
             pat = _ip_prefix_pattern(_host_from_url(url))
             if pat:
                 out.append((pat, f"private subnet ({key})"))
-        tz = (os.environ.get("USER_TIMEZONE") or str(cfg.get("timezone", "") or "")).strip()
-        if tz and tz.upper() != "UTC":
-            out.append((_bounded(tz), "install timezone"))
+        # Deterministic order (env then file) with dedup — a set would iterate in
+        # hash-dependent order and break harvest()'s stable-order contract.
+        _tz_seen: set[str] = set()
+        for tz in (
+            (os.environ.get("USER_TIMEZONE") or "").strip(),
+            str(cfg.get("timezone", "") or "").strip(),
+        ):
+            if tz and tz.upper() != "UTC" and tz not in _tz_seen:
+                _tz_seen.add(tz)
+                out.append((_bounded(tz), "install timezone"))
         gh = cfg.get("github", {}) if isinstance(cfg, dict) else {}
         user = str(gh.get("user", "") or "").strip()
         priv = str(gh.get("private_repo", "") or "").strip()

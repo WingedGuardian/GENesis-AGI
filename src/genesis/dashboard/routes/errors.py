@@ -196,4 +196,13 @@ async def clear_deferred_item(item_id):
         )
     await rt.db.commit()
     cleared = cur.rowcount
+    # Unconditional by design. The queues snapshot is cached for up to 30s, so
+    # without this the client's immediate refetch re-renders the rows it just
+    # deleted. Deliberately NOT guarded on `cleared`: a zero means the caller
+    # clicked Clear on a row the cached view still shows and the DB no longer
+    # has — the strongest evidence its view is stale, and precisely when the
+    # cache most needs busting. (`rowcount` is also -1 on some drivers.)
+    from genesis.dashboard.routes.health import invalidate_snapshot_cache
+
+    invalidate_snapshot_cache()
     return jsonify({"cleared": cleared})

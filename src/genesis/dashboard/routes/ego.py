@@ -124,11 +124,16 @@ async def ego_status():
                 rt._db,
                 f"last_proactive_fire:{mgr.source_tag}",
             )
+            last_gated = await ego_crud.get_state(
+                rt._db,
+                f"last_gated:{mgr.source_tag}",
+            )
             live = compute_ego_liveness(
                 last_success_at=last_success,
                 last_intent_at=last_intent,
                 current_interval_minutes=mgr.current_interval_minutes,
                 gated=bool(snap.get("gated")),
+                last_gated_at=last_gated,
             )
             snap["last_success_at"] = live.last_success_at
             snap["stalled"] = live.stalled
@@ -176,7 +181,11 @@ async def ego_status():
         ego_heartbeat_stale = status == "overdue"
         ego_heartbeat_age_s = hb.get("age_seconds")
         # unknown (unparseable/future ts) can't confirm liveness → error, not healthy.
-        ego_heartbeat_error = status == "unknown"
+        # never_started (#10): compute_heartbeat_staleness now resolves the manifest-
+        # informed "failed to start / never pulsed" verdict itself → error, not healthy
+        # (this is the case the no_heartbeat boot-grace block below used to catch before
+        # compute owned it; keep flagging it so a dead-at-boot ego tile is never green).
+        ego_heartbeat_error = status in ("unknown", "never_started")
         # no_heartbeat = NO pulse on record. ego emits a "start" pulse at bootstrap
         # (cadence.py:302), so past a short boot-grace window this is a real absence
         # (never-started / lost), NOT a healthy tile. Within the grace window (just
