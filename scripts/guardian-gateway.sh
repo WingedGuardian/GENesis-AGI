@@ -73,15 +73,51 @@ fi
 
 STATE_DIR="${HOME}/.local/state/genesis-guardian"
 
+# Write the gateway pause file with a bounded TTL (arg = seconds ahead). The
+# Guardian (check.py::_gateway_pause_active) stands down while this is present and
+# unexpired, and IGNORES it once expires_at passes — so a deploy killed before
+# `resume` runs self-heals rather than muting the watchdog. The cap mirrors the
+# guardian's gateway_pause_max_ahead_s (3600). Distinct from the container-side
+# ~/.genesis/paused.json (the shared runtime kill switch).
+_write_gateway_pause() {
+    local ttl="$1"
+    mkdir -p "$STATE_DIR"
+    local now_epoch expires_epoch now_iso expires_iso
+    now_epoch=$(date -u +%s)
+    expires_epoch=$((now_epoch + ttl))
+    now_iso=$(date -u -d "@${now_epoch}" +%Y-%m-%dT%H:%M:%SZ)
+    expires_iso=$(date -u -d "@${expires_epoch}" +%Y-%m-%dT%H:%M:%SZ)
+    printf '{"paused": true, "reason": "deploy", "since": "%s", "expires_at": "%s"}' \
+        "$now_iso" "$expires_iso" > "$STATE_DIR/paused.json"
+    printf '{"ok": true, "action": "pause", "expires_at": "%s"}\n' "$expires_iso"
+}
+
 case "${SSH_ORIGINAL_COMMAND:-}" in
     restart-timer)
         systemctl --user restart genesis-guardian.timer
         echo '{"ok": true, "action": "restart-timer"}'
         ;;
     pause)
-        mkdir -p "$STATE_DIR"
-        printf '{"paused": true, "since": "%s"}' "$(date -Is)" > "$STATE_DIR/paused.json"
-        echo '{"ok": true, "action": "pause"}'
+        _write_gateway_pause 1800
+        ;;
+    pause\ *)
+        # pause <ttl_seconds> — deploy sets a generous TTL; EXIT-trap resume ends
+        # it early on success. Validate strictly (mirrors the redeploy arg guard).
+        _PAUSE_TTL="${SSH_ORIGINAL_COMMAND#pause }"
+        case "$_PAUSE_TTL" in
+            ''|*[!0-9]*)
+                echo '{"ok": false, "action": "pause", "error": "invalid ttl (want positive integer seconds)"}' >&2
+                exit 1
+                ;;
+        esac
+        # Force base-10: a leading-zero value (e.g. 0888) would be read as octal
+        # by bash arithmetic and abort under set -e.
+        _PAUSE_TTL=$((10#$_PAUSE_TTL))
+        if [ "$_PAUSE_TTL" -lt 1 ] || [ "$_PAUSE_TTL" -gt 3600 ]; then
+            echo '{"ok": false, "action": "pause", "error": "ttl out of range (1-3600)"}' >&2
+            exit 1
+        fi
+        _write_gateway_pause "$_PAUSE_TTL"
         ;;
     resume)
         rm -f "$STATE_DIR/paused.json"

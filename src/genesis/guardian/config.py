@@ -334,6 +334,11 @@ class GuardianConfig:
     check_interval_s: int = 30
     state_dir: str = "~/.local/state/genesis-guardian"
     maintenance_file: str = "/var/lib/guardian-snapshots/.guardian-maintenance"
+    # Safety cap for the gateway pause file (`<state_dir>/paused.json`, written by
+    # the gateway `pause` verb across a deploy): the Guardian ignores a pause whose
+    # `expires_at` is more than this far in the future (a bad writer / clock skew
+    # must not mute the watchdog for hours). Keep >= the gateway's own ttl cap.
+    gateway_pause_max_ahead_s: int = 3600
     # Container-swap invariant reconciler (swap_watch): re-assert
     # limits.memory.swap=true + live cgroup activation each tick. Kill switch
     # for hosts where swap-off is a deliberate operator choice.
