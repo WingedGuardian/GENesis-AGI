@@ -40,6 +40,11 @@ from pathlib import Path
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
 from hook_input import session_path  # noqa: E402
+from session_heartbeat import (  # noqa: E402
+    cached_model,
+    resolve_topic,
+    sanitize_detail,
+)
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_DIR / "src"
@@ -1385,12 +1390,19 @@ def _heartbeat_write(
     try:
         user_summary = prompt[:120].replace("\n", " ").strip()
         genesis_summary = _extract_genesis_summary(session_id)
+        # Both resolve to None on any miss, and the upsert COALESCEs — so a cache
+        # eviction or an unreadable charter leaves the stored value alone rather
+        # than wiping it.
+        model = cached_model(session_id)
+        topic = resolve_topic(db_path, session_id)
 
         from genesis.db.crud.session_heartbeats import upsert_sync
 
         upsert_sync(
             str(db_path),
             cc_session_id=session_id,
+            model=model,
+            topic=topic,
             user_summary=user_summary,
             genesis_summary=genesis_summary,
         )
@@ -1424,12 +1436,21 @@ def _heartbeat_read_and_inject(
                 parts.append(model)
 
             detail = ""
-            genesis_summary = s.get("genesis_summary", "")
             # user_summary intentionally omitted — raw user messages from other
             # sessions are decontextualized noise and risk cross-session
             # contamination (Claude may treat them as input from this user).
-            if genesis_summary:
-                detail = genesis_summary[:80]
+            # topic and genesis_summary ARE rendered, but both are written by
+            # another session's model, so both go through sanitize_detail: a
+            # newline plus a forged "[Concurrent | ...]" line would otherwise
+            # land verbatim in this session's context.
+            bits = []
+            topic = sanitize_detail(s.get("topic", ""), 90)
+            if topic:
+                bits.append(topic)
+            gs = sanitize_detail(s.get("genesis_summary", ""), 80)
+            if gs:
+                bits.append(gs)
+            detail = " · ".join(bits)
 
             sid_short = s.get("cc_session_id", "")[:8]
             tag_parts = ["Concurrent"]
