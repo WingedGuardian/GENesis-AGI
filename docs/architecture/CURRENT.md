@@ -1300,7 +1300,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: d2d501b1 2026-08-31
+verified: 5edb3256 2026-09-01
 ```
 
 - **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
@@ -1308,14 +1308,17 @@ verified: d2d501b1 2026-08-31
   free-only. Per-provider circuit breaker (3 failures, exponential backoff
   capped 30 min — 4h for QUOTA_EXHAUSTED; 429 = backpressure, NOT a breaker
   failure; state persisted cross-process to
-  `~/.genesis/circuit_breaker_state.json`). A health PROBE may heal a breaker
-  only when the TRIPPING failure is in `_PROBE_HEALABLE` (TRANSIENT/TIMEOUT) —
-  an ALLOWLIST, so a new ErrorCategory is un-healable by default. A breaker that
-  never tripped is always healable (`record_failure` records a category on every
-  failure, including sub-threshold ones on a healthy provider — gating on the
-  category alone strands them). A models-listing 200 is exactly what a
-  403-on-use, an exhausted quota, or a truncated completion looks like from
-  outside, and a false heal resets the outage clock. Consequence to know before touching it: the heal
+  `~/.genesis/circuit_breaker_state.json`). **Probe/call evidence symmetry** —
+  a probe may only undo what a probe did: `probe_suspect()` downgrades CLOSED to
+  HALF_OPEN on a failed probe and a clean probe may clear THAT, but a breaker
+  opened by a real call failure (`_opened_by_call`) is closed only by a real
+  `record_success`. A models-listing 200 evidences *reachable*, never *working* —
+  it is what a 403-on-use, an exhausted quota or a truncated completion looks
+  like from outside. The probe heal deliberately does NOT fire `on_recovery`
+  (which resolves the `provider_failure` observation and clears `first_trip_at`),
+  so a listing can no longer erase an outage clock. This does not hold a provider
+  out of rotation: OPEN auto-transitions to HALF_OPEN on backoff, HALF_OPEN is
+  `is_available()`, so the next real call IS the retry. Supersedes PR #705. Consequence to know before touching it: the heal
   branch also zeroes `_trip_count`, so refusing it leaves the backoff climbing
   to the cap instead of resetting — a dead provider is retried less often, and a
   quota-dead one may wait the full 4h. `last_failure_category` is restored from

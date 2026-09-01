@@ -137,7 +137,9 @@
             <template x-for="(prov, provName) in ($store.genesisDashboard.routingConfig.providers || {})" :key="provName">
               <div style="display:flex; align-items:center; gap:0.35rem; padding:0.25rem 0.5rem; border-radius:5px; background:rgba(255,255,255,0.04); border:1px solid var(--color-border); font-size:0.72rem;">
                 <span class="status-dot"
-                      :style="`background: ${(s => s === 'open' ? '#d9534f' : s === 'half_open' ? '#facc15' : '#4caf50')($store.genesisDashboard.breakerState(provName))}`"></span>
+                      :title="$store.genesisDashboard.breakerTooltip(provName)"
+                      :style="`background: ${({failing:'#d9534f', unverified:'transparent', healthy:'#4caf50'})[$store.genesisDashboard.breakerVerdict(provName)]};
+                               box-shadow: ${$store.genesisDashboard.breakerVerdict(provName) === 'unverified' ? 'inset 0 0 0 2px #facc15' : 'none'}`"></span>
                 <span style="font-weight:500; color:#e0e0e0;" x-text="provName"></span>
                 <span style="color:#666; font-size:0.65rem;" x-text="prov.model"></span>
                 <button @click.stop="$store.genesisDashboard.toggleProvider(provName)"

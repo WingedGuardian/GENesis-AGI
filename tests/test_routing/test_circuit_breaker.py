@@ -524,8 +524,29 @@ def _half_open_breaker(probe_threshold=3, **kw):
     return cb, t
 
 
-def test_probe_success_heals_half_open_after_threshold():
-    cb, _ = _half_open_breaker(probe_threshold=3)
+def _probe_suspected_breaker(probe_threshold=3, **kw):
+    """A breaker in HALF_OPEN because a PROBE suspected it — no call failed, so
+    it never tripped and `_opened_by_call` is False. This is the only state a
+    clean probe may clear under evidence symmetry."""
+    cb = CircuitBreaker(
+        _provider("p1"), failure_threshold=2, open_duration_s=10,
+        clock=lambda: 0.0, probe_success_threshold=probe_threshold, **kw,
+    )
+    assert cb.probe_suspect() is True
+    assert cb.state == ProviderState.HALF_OPEN
+    assert cb._opened_by_call is False
+    return cb
+
+
+def test_probe_success_heals_a_probe_suspected_breaker_after_threshold():
+    """CHANGED from `test_probe_success_heals_half_open_after_threshold`.
+
+    That test drove HALF_OPEN with real call failures and expected a probe to
+    close it — PR #705's behaviour. Under evidence symmetry a probe may only
+    undo a probe-caused suspicion; the call-tripped case is covered by
+    `test_a_call_tripped_breaker_is_not_probe_healed`.
+    """
+    cb = _probe_suspected_breaker(probe_threshold=3)
     cb.record_probe_success()
     assert cb.state == ProviderState.HALF_OPEN  # 1 < 3
     cb.record_probe_success()
@@ -533,6 +554,21 @@ def test_probe_success_heals_half_open_after_threshold():
     cb.record_probe_success()
     assert cb.state == ProviderState.CLOSED     # 3 → healed
     assert cb.trip_count == 0
+
+
+def test_a_call_tripped_breaker_is_not_probe_healed():
+    """The inverse, and the whole point: real failures need a real success."""
+    cb, _ = _half_open_breaker(probe_threshold=3)
+    assert cb._opened_by_call is True
+    for _ in range(10):
+        cb.record_probe_success()
+    assert cb.state == ProviderState.HALF_OPEN, (
+        "a listing probe closed a breaker that real calls opened"
+    )
+    cb.record_success()
+    cb.record_success()  # success_threshold=2
+    assert cb.state == ProviderState.CLOSED
+    assert cb._opened_by_call is False
 
 
 def test_probe_success_noop_when_closed():
@@ -555,38 +591,79 @@ def test_probe_success_noop_when_open_not_expired():
     assert cb.state == ProviderState.OPEN
 
 
-def test_probe_success_fires_on_recovery():
-    """On full recovery the breaker fires on_recovery — this is what drives
-    #698's escalation observation-resolve, so a probe-healed provider does not
-    leave a stale 'provider_failure' observation."""
+def test_probe_success_never_fires_on_recovery():
+    """INVERTED from `test_probe_success_fires_on_recovery` (PR #705).
+
+    #705 wired `on_recovery` into the probe path deliberately, so "a probe-healed
+    provider does not leave a stale 'provider_failure' observation". That hook
+    resolves the observation and clears `first_trip_at` — the only per-provider
+    "failing since" timestamp — and it fired on evidence (a 200 from
+    /v1/models) that says nothing about whether calls work. Measured over the
+    2026-08-28/29 outage: five separate observations, four auto-resolved that
+    way, so no surface could report the real 3-day duration.
+
+    The call is now GONE from the probe path rather than guarded. Reaching a
+    probe heal means the breaker was probe-suspected, which never trips and so
+    never escalates — there is no observation to resolve. `record_success`
+    still fires it, which is the correct and only path.
+    """
+    recovered = []
+    cb = CircuitBreaker(
+        _provider("p1"), failure_threshold=2, open_duration_s=1000,
+        clock=lambda: 0.0, probe_success_threshold=2,
+        on_recovery=lambda n: recovered.append(n),
+    )
+    # CLOSED but still carrying a trip count — a real success while the open
+    # window has not expired. `was_tripped` reads trip_count, so before this
+    # change the probe heal below DID fire on_recovery from here.
+    #
+    # DEFENSIVE: both production callers guard on `is_available()`, so nothing
+    # reaches this state today. Exercised directly because it is the only state
+    # that tells the two close paths apart.
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    cb.record_success()
+    assert cb.state == ProviderState.CLOSED
+    assert cb.trip_count > 0
+
+    cb.probe_suspect()
+    cb.record_probe_success()
+    cb.record_probe_success()
+    assert cb.state == ProviderState.CLOSED
+    assert recovered == [], "a probe fired on_recovery and could erase an outage record"
+
+
+def test_real_success_still_fires_on_recovery():
+    """The path that SHOULD resolve the observation is untouched."""
     recovered = []
     t = [0.0]
     cb = CircuitBreaker(
         _provider("p1"), failure_threshold=2, open_duration_s=10,
-        clock=lambda: t[0], probe_success_threshold=2,
-        on_recovery=lambda name: recovered.append(name),
+        clock=lambda: t[0], on_recovery=lambda name: recovered.append(name),
     )
     cb.record_failure(ErrorCategory.TRANSIENT)
     cb.record_failure(ErrorCategory.TRANSIENT)
     t[0] = 100.0
     assert cb.state == ProviderState.HALF_OPEN
-    cb.record_probe_success()
-    assert recovered == []  # below threshold — no recovery yet
-    cb.record_probe_success()
+    cb.record_success()
+    assert recovered == []  # below success_threshold
+    cb.record_success()
     assert cb.state == ProviderState.CLOSED
     assert recovered == ["p1"]
 
 
 def test_real_failure_after_probe_heal_can_retrip():
-    """A provider healed via probe must still re-trip on real failures —
-    healing must not disable failure tracking."""
-    cb, _ = _half_open_breaker(probe_threshold=2)
+    """A probe-healed provider must still re-trip on real failures — healing
+    must not disable failure tracking. Driven from a probe-caused suspicion now,
+    since that is the only heal a probe can perform."""
+    cb = _probe_suspected_breaker(probe_threshold=2)
     cb.record_probe_success()
     cb.record_probe_success()
     assert cb.state == ProviderState.CLOSED
     cb.record_failure(ErrorCategory.TRANSIENT)
     cb.record_failure(ErrorCategory.TRANSIENT)  # failure_threshold=2
     assert cb.state == ProviderState.OPEN
+    assert cb._opened_by_call is True
 
 
 # --- Coverage-based degradation (essential_sites map injected) ---

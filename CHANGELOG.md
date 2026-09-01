@@ -2807,12 +2807,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   duration. Measured over one real three-day outage: five separate failure
   records, each starting the clock again. A probe now heals only
   `TRANSIENT`/`TIMEOUT` failures — the low-traffic recovery case it was built
-  for. Permanent, quota-exhausted, and degraded failures (malformed or truncated
-  responses) all need real completions to close the breaker — reachability is
-  only evidence of recovery when the failure was itself about reachability. This
-  does not strand a provider: a half-open breaker is still routed to, so genuine
-  recovery still closes it once the configured success threshold (default 2) is
-  met.
+  for — and only for the case a probe can actually speak to. The rule is
+  symmetry: a health probe may undo a health probe's own suspicion, and nothing
+  else. If real calls broke a provider, a real call has to prove it fixed.
+
+  This does not take a provider out of rotation. A tripped provider is
+  automatically put back on probation once its backoff window passes, and a
+  provider on probation is still called — so the next real request to it *is*
+  the retry, and a success clears it. What changed is only that Genesis no
+  longer announces a recovery it has not actually seen.
 
   **What this changes for you:** a provider that is genuinely dead is now retried
   progressively less often instead of every couple of minutes, settling at once
@@ -2842,11 +2845,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   and the Provider Keys indicator stayed green regardless of the real state, with
   the "circuit breaker open" tooltip unreachable. All four now route through a
   single case-insensitive helper, and a guard test scans the frontend directories
-  so a new file cannot reintroduce the comparison. A provider parked in the
-  half-open state now shows amber rather than green, on the dashboard dot and on
-  the Provider Keys indicator — matching what the backend already considered a
-  degraded call site, and newly relevant because a dead provider can now sit in
-  that state instead of cycling.
+  so a new file cannot reintroduce the comparison.
+
+- **The dashboard now tells "broken" apart from "not proven working yet."** A
+  provider is shown three ways instead of two: red when real calls are failing
+  and it is not being used, hollow amber when it is still in rotation but has
+  not completed a call since its last trouble, and green when it is healthy.
+  Hovering says which, and why — real calls failed, or only a health check
+  could not reach it. Previously a provider awaiting its next call looked
+  identical to one actively failing, which overstated the problem; that state
+  is now common enough to be worth naming, since recovery waits for a real call.
 
 - **Alert severity dots were always amber, including for critical alerts.** The
   colour map was keyed lowercase while severities are emitted uppercase, so every

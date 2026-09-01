@@ -23,27 +23,6 @@ _STATE_FILE = Path.home() / ".genesis" / "circuit_breaker_state.json"
 _MAX_OPEN_S = 1800  # 30-minute cap on escalating backoff
 _MAX_QUOTA_OPEN_S = 14400  # 4-hour cap for quota/billing exhaustion
 
-# Failure categories a free LISTING probe may heal — an ALLOWLIST, deliberately,
-# not a blocklist of the categories it may not.
-#
-# The probe answers exactly one question: is the endpoint reachable and is the
-# model listed? That is genuine (if weak) evidence ONLY where the recorded
-# failure was itself about reachability. It says nothing about whether a
-# completion would succeed, so it must not clear PERMANENT (403 entitlement),
-# QUOTA_EXHAUSTED (billing) or DEGRADED (malformed/partial/truncated responses —
-# `retry.py::classify_error`, recorded by the router like any other health
-# failure). An allowlist also fails safe: a category added to ErrorCategory
-# later defaults to "needs a real completion" instead of silently becoming
-# probe-healable, which is how the DEGRADED gap got here in the first place.
-#
-# `None` is handled SEPARATELY at the call site and is healable. That is not a
-# loophole, it is the main recovery path: `probe_suspect()` moves a CLOSED
-# breaker to HALF_OPEN on a failed probe WITHOUT recording any failure category,
-# so a provider that never actually failed a call has `None` here and must be
-# able to heal — otherwise a single probe blip strands a healthy low-traffic
-# provider forever. An earlier revision of this allowlist folded `None` in with
-# the blocked categories and the anti-stranding regression test caught it.
-_PROBE_HEALABLE = frozenset({ErrorCategory.TRANSIENT, ErrorCategory.TIMEOUT})
 
 
 class CircuitBreaker:
@@ -85,6 +64,11 @@ class CircuitBreaker:
         self._opened_at: float = 0.0
         self._trip_count: int = 0
         self._last_failure_category: ErrorCategory | None = None
+        # True when the failure that OPENED this breaker was a real CALL.
+        # The probe-heal rule reads exactly this and nothing else — see
+        # `record_probe_success`. Moves in lockstep with the OPEN transitions:
+        # set at every trip, cleared at every close.
+        self._opened_by_call: bool = False
 
     @property
     def consecutive_failures(self) -> int:
@@ -142,8 +126,24 @@ class CircuitBreaker:
                 self._state = ProviderState.CLOSED
                 self._consecutive_successes = 0
                 self._trip_count = 0  # recovered — reset backoff
+                self._opened_by_call = False
         else:
+            # The ordinary path: a successful call on an already-CLOSED
+            # breaker. Clearing the flag here is a no-op in that case (it is
+            # already False) and is kept DEFENSIVELY for the other state this
+            # branch accepts — an OPEN breaker whose window has not expired,
+            # which closes WITHOUT resetting `_trip_count`, leaving a CLOSED
+            # breaker carrying a non-zero trip count and, without this line, a
+            # stale `_opened_by_call=True` that would refuse probe healing
+            # forever.
+            #
+            # VERIFIED not reachable through either production caller today:
+            # `router.py:293` and `memory/retrieval.py:1617` both skip on
+            # `is_available()`, which is False while OPEN. Stated as defence,
+            # not as a live path — this class of unverified "the real path is"
+            # claim is what generated the bugs this redesign removes.
             self._state = ProviderState.CLOSED
+            self._opened_by_call = False
         if self._state != old:
             self._notify_change()
         # Notify recovery listeners when provider fully recovers
@@ -164,83 +164,43 @@ class CircuitBreaker:
         return False
 
     def record_probe_success(self) -> None:
-        """A free health probe (GET /v1/models returned 200 with this provider's
-        model listed) confirmed reachability while the breaker is HALF_OPEN.
+        """A free health probe reported this provider reachable, with its model
+        listed, while the breaker is HALF_OPEN.
 
-        Advances toward recovery with the STRICTER ``probe_success_threshold``
-        (a probe is weaker evidence than a real completion), so a low/no-traffic
-        fallback provider can heal instead of being stuck in HALF_OPEN forever.
-        No-op outside HALF_OPEN (uses the ``state`` property so an OPEN breaker
-        whose window has expired transitions to HALF_OPEN first). On full
-        recovery it fires ``on_recovery`` — exactly like ``record_success`` — so
-        the provider's lingering ``provider_failure`` observation auto-resolves.
+        EVIDENCE SYMMETRY — the one rule this method enforces:
+        **a probe may only undo what a probe did.**
 
-        **Healing is CONDITIONAL.** A probe heals only a breaker whose tripping
-        failure is in ``_PROBE_HEALABLE`` (TRANSIENT/TIMEOUT) — everything else
-        needs a real ``record_success()``, because a 200 from the models-listing
-        endpoint is exactly what a 403-on-use, an exhausted quota, or a stream
-        of truncated completions looks like from outside. A breaker that never
-        TRIPPED is always healable, whatever category its sub-threshold failures
-        recorded. See the guard below for the full rationale and its measured
-        cost to the retry schedule.
+        `probe_suspect()` moves a CLOSED breaker to HALF_OPEN on a failed or
+        rate-limited probe. That suspicion is the only thing a clean probe is
+        entitled to clear. A breaker opened by a real CALL failure is cleared
+        only by a real `record_success()`.
+
+        Why, concretely: a `GET /v1/models` answering 200 is evidence of
+        *reachable*, never of *working*. It is exactly what a 403-on-use, an
+        exhausted quota, or a stream of truncated completions looks like from
+        outside. Live incident 2026-08-28/29: `mistral-large-latest` stayed
+        listed while every real call returned 403, so probes "confirmed health"
+        repeatedly. MEASURED over that 3-day outage: FIVE separate
+        `provider_failure` observations, each with a fresh `first_trip_at`,
+        four auto-resolved by a false heal — so no surface could ever report the
+        real age of the outage.
+
+        This does NOT hold a provider out of rotation. A call-tripped breaker
+        still leaves OPEN on its own backoff (`state` auto-transitions to
+        HALF_OPEN when the window expires), and HALF_OPEN is `is_available()`,
+        so the next real call routed to it IS the retry. What the probe no
+        longer does is declare victory before that call happens.
+
+        Supersedes PR #705 (2026-06-19), which introduced probe healing so "a
+        low/no-traffic fallback can heal instead of being stuck in HALF_OPEN
+        forever". That concern was about the DASHBOARD state, not routing —
+        HALF_OPEN was already routable. The cost of #705's approach was that a
+        probe could resolve an outage record it had no evidence about.
         """
         if self.state != ProviderState.HALF_OPEN:
             return
-        # A LISTING is not a CALL. For an entitlement or quota failure the
-        # provider's models endpoint answers 200 with the model still listed —
-        # that is precisely what a 403-on-use looks like from outside, so the
-        # probe is not weak evidence here, it is no evidence at all.
-        #
-        # Live incident 2026-08-28/29: `mistral-large-latest` stayed listed while
-        # every real call returned 403 tier_not_allowed. Three probe successes
-        # closed this breaker each cycle, fired `on_recovery`, and
-        # `ProviderEscalation.record_recovery` resolved the provider_failure
-        # observation and cleared its `first_trip_at`. MEASURED over the live
-        # 3-day outage: FIVE separate `provider_failure` observations, each with
-        # a fresh `first_trip_at`, four of them auto-resolved this way. The
-        # longest duration any surface could report was therefore the time since
-        # the last false heal, never the real age of the outage.
-        #
-        # Deliberately narrow: TRANSIENT/TIMEOUT still heal on a probe, which is
-        # the low/no-traffic recovery case this path was built for.
-        #
-        # This does not strand a provider: HALF_OPEN is still `is_available()`,
-        # so real traffic is attempted and a real `record_success()` still closes
-        # the breaker once `success_threshold` (default 2) is met. Recovery now
-        # requires evidence of a working CALL rather than a listing.
-        #
-        # It DOES change the retry schedule, and that is the honest cost. The
-        # heal branch below also resets `_trip_count` (the backoff counter), so
-        # returning early leaves the counter climbing. MEASURED on the live
-        # incident before this fix: consecutive trips ran 5/5/10/20/35/65/128
-        # minutes apart, matching `_effective_open_duration()`'s
-        # 120*2^(n-1) plus call latency, and the counter was reset only every
-        # ~9-12h. (Why that interval and not the ~15min a probe sweep takes is
-        # INFERRED, not measured: a sweep only heals while the breaker sits
-        # HALF_OPEN, and real traffic re-trips it within minutes, so the probe
-        # plausibly only wins once the window is hours long. Consistent with
-        # every timestamp; no probe-success log line proves it.) The backoff
-        # escalated; what changes is that it now STAYS at the cap
-        # (_MAX_OPEN_S 30m, or _MAX_QUOTA_OPEN_S 4h for quota) instead of
-        # periodically resetting to the 120s base. A dead provider is therefore
-        # retried less often, which is the intent; the cost is that a provider
-        # whose quota resets is re-tried up to 4h later. Parsing the provider's
-        # own retry hint is the exact fix for that and is tracked separately.
-        # `_trip_count > 0` is load-bearing, not belt-and-braces. `record_failure`
-        # sets the category on EVERY failure, before the threshold check, so a
-        # provider with one or two sub-threshold failures carries a non-healable
-        # category while still CLOSED and perfectly healthy. Without this term a
-        # single probe blip (`probe_suspect()` fires on an unreachable OR
-        # rate-limited probe) would strand such a provider in HALF_OPEN with no
-        # traffic to rescue it — and `snapshots/call_sites.py` renders HALF_OPEN
-        # as degraded, so it would raise a permanent false "degraded" alert that
-        # this branch's own duration suffix would then age forever.
-        # The question is therefore whether a non-healable category actually
-        # TRIPPED this breaker, not whether one was merely recorded.
-        cat = self._last_failure_category
-        if self._trip_count > 0 and cat is not None and cat not in _PROBE_HEALABLE:
+        if self._opened_by_call:
             return
-        was_tripped = self._trip_count > 0
         self._consecutive_successes += 1
         if self._consecutive_successes >= self._probe_success_threshold:
             old = self._state
@@ -248,11 +208,18 @@ class CircuitBreaker:
             self._consecutive_successes = 0
             self._consecutive_failures = 0
             self._last_failure_category = None
-            self._trip_count = 0  # recovered — reset backoff
+            self._trip_count = 0
+            self._opened_by_call = False
             if self._state != old:
                 self._notify_change()
-            if was_tripped and self._on_recovery:
-                self._on_recovery(self._provider.name)
+            # NO `on_recovery` here, by construction rather than by guard.
+            # That hook is what resolves the `provider_failure` observation and
+            # clears its `first_trip_at`. Reaching this line means the breaker
+            # was opened by a PROBE, which never trips and so never escalates —
+            # there is no outage record to resolve. Firing it would let a
+            # listing probe close a record it has no evidence about, which is
+            # the defect this whole change removes. `record_success` still
+            # fires it, which is the correct and only path.
 
     def record_failure(self, category: ErrorCategory) -> bool:
         """Record a failed call. Returns True if this failure caused the breaker to trip OPEN."""
@@ -264,6 +231,7 @@ class CircuitBreaker:
             self._state = ProviderState.OPEN
             self._opened_at = self._clock()
             self._consecutive_failures = 0
+            self._opened_by_call = True  # a real call opened this
             self._notify_change()
             return True
         if self.state == ProviderState.HALF_OPEN:
@@ -271,6 +239,7 @@ class CircuitBreaker:
             self._state = ProviderState.OPEN
             self._opened_at = self._clock()
             self._consecutive_failures = 0
+            self._opened_by_call = True  # a real call opened this
             self._notify_change()
             return True
         return False
@@ -338,6 +307,7 @@ class CircuitBreakerRegistry:
                 "consecutive_failures": cb._consecutive_failures,
                 "trip_count": cb._trip_count,
                 "last_failure_category": cb._last_failure_category.value if cb._last_failure_category else None,
+                "opened_by_call": cb._opened_by_call,
             }
         try:
             atomic_write_text(self._state_file, json.dumps(data, indent=2))
@@ -386,6 +356,14 @@ class CircuitBreakerRegistry:
                     # blip, with no traffic to rescue it. Reachable in normal
                     # operation because `.state` mutates OPEN -> HALF_OPEN when
                     # merely READ, and `save_state` serialises every breaker.
+                    # Restored under the SAME condition as the category, and
+                    # for the same reason: it qualifies an OPEN breaker. A
+                    # non-OPEN save restores CLOSED, where "a call opened this"
+                    # is not a fact about anything — carrying it would be the
+                    # poison pill in a new field.
+                    cb._opened_by_call = bool(
+                        info.get("opened_by_call")
+                    ) and saved_state == ProviderState.OPEN.value
                     saved_cat = info.get("last_failure_category")
                     cb._last_failure_category = (
                         ErrorCategory(saved_cat)

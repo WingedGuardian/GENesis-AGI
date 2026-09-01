@@ -2655,11 +2655,14 @@
           // would paint the key green for a provider that never completes a
           // call — the same "degraded renders as healthy" bug this change fixes
           // one layer down.
-          const states = matchedProviders.map(p => this.breakerState(p));
-          const openCount = states.filter(s => s === 'open').length;
-          const degradedCount = states.filter(s => s === 'half_open').length;
-          if (openCount === matchedProviders.length) return 'error';
-          if (openCount + degradedCount > 0) return 'degraded';
+          const verdicts = matchedProviders.map(p => this.breakerVerdict(p));
+          const failing = verdicts.filter(v => v === 'failing').length;
+          const unverified = verdicts.filter(v => v === 'unverified').length;
+          if (failing === matchedProviders.length) return 'error';
+          // Unverified still counts as degraded here: this indicator's
+          // vocabulary is healthy/degraded/error only, and 'not proven healthy'
+          // belongs on the cautious side of a two-way split.
+          if (failing + unverified > 0) return 'degraded';
           return 'healthy';
         },
         secretStatusColor(status) {
@@ -4502,6 +4505,46 @@
 
         breakerIsOpen(providerName) {
           return this.breakerState(providerName) === "open";
+        },
+
+        // Three-state verdict for rendering. HALF_OPEN is PROBATION, not
+        // failure: any failure while half-open trips it straight back to open,
+        // so a half-open breaker has had no failure since it entered that
+        // state. Painting it the same amber as "failing right now" overstated
+        // the problem — and after the probe-heal change a provider can sit
+        // half-open indefinitely, so this stopped being a rare case.
+        //   failing    — open: real calls failing, not routed to at all
+        //   unverified — half-open: routable, awaiting its next trial
+        //   healthy    — closed
+        // Falls back to the 2-state reading when `cb_detail` is absent (an
+        // older server, or a cached payload), so it can never render worse
+        // than before.
+        breakerVerdict(providerName) {
+          const state = this.breakerState(providerName);
+          if (state === "open") return "failing";
+          if (state === "half_open") return "unverified";
+          return "healthy";
+        },
+
+        // WHY it is unverified — "call" (real calls failed) or "probe" (a health
+        // probe could not reach it). Null when not applicable or unknown.
+        breakerOpenedBy(providerName) {
+          const d = (this.routingConfig?.cb_detail || {})[providerName];
+          return d && typeof d === "object" ? (d.opened_by ?? null) : null;
+        },
+
+        breakerTooltip(providerName) {
+          const verdict = this.breakerVerdict(providerName);
+          if (verdict === "healthy") return "Circuit breaker closed — provider healthy";
+          const by = this.breakerOpenedBy(providerName);
+          if (verdict === "failing") {
+            return by === "probe"
+              ? "Circuit breaker OPEN — health probe could not reach this provider"
+              : "Circuit breaker OPEN — real calls are failing; not being routed to";
+          }
+          return by === "call"
+            ? "Unverified — real calls failed; still in rotation and will be retried on the next call"
+            : "Unverified — a health probe could not reach it; awaiting the next probe";
         },
 
         providerCbState(providerName) {

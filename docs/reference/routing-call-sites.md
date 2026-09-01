@@ -207,16 +207,33 @@ across three days. The false heals were roughly 9-12h apart, not per probe
 cycle — between them the breaker's backoff escalated normally (consecutive trips
 5/5/10/20/35/65/128 minutes apart, matching `120 * 2^(trip-1)`).
 
-`record_probe_success()` now heals only when the failure that TRIPPED the
-breaker is in `_PROBE_HEALABLE` — an allowlist of `TRANSIENT`/`TIMEOUT`, the
-low/no-traffic recovery case probe healing exists for. Everything else
-(`PERMANENT`, `QUOTA_EXHAUSTED`, `DEGRADED`) needs a real completion, and a
-category added to `ErrorCategory` later is un-healable by default rather than
-silently probe-healable. Two qualifiers matter: a breaker that never tripped is
-always healable, because `record_failure` records a category on every failure
-including sub-threshold ones that leave a healthy provider CLOSED; and the
-category is restored from disk only when the saved state was OPEN, so a
-qualifier cannot outlive the state it describes.
+The fix is **evidence symmetry**: a probe may only undo what a probe did.
+`probe_suspect()` moves CLOSED to HALF_OPEN on a failed or rate-limited probe,
+and a clean probe may clear exactly that. A breaker opened by a real call
+failure carries `_opened_by_call`, and only a real `record_success()` closes it.
+
+No category allowlist is involved, which is the point — five successive review
+rounds each added a qualifier to a category-based predicate before it was clear
+that the predicate was asking the wrong question. The rule now names the thing
+it actually depends on.
+
+`record_probe_success` also no longer fires `on_recovery`. That hook resolves
+the `provider_failure` observation and clears `first_trip_at`; reaching a probe
+heal means the breaker was probe-suspected, which never trips and so never
+escalates, so there is nothing to resolve. Removing the call rather than
+guarding it means a later loosening cannot silently restore the clock-erase.
+
+**This does not hold a provider out of rotation.** An OPEN breaker
+auto-transitions to HALF_OPEN when its backoff window expires, and HALF_OPEN is
+`is_available()` — so the next real call routed to that provider IS the retry,
+and a success closes it. What the probe no longer does is declare recovery
+before that call happens. The visible cost is that a provider nobody is calling
+shows as *unverified* rather than green until it is next used, which is what the
+dashboard now says.
+
+Supersedes PR #705 (2026-06-19), which added probe healing so "a low/no-traffic
+fallback can heal instead of being stuck in HALF_OPEN forever" — a concern about
+the rendered state, not routing.
 This does not strand a provider: `HALF_OPEN` is still `is_available()`, so real
 traffic is attempted and a real `record_success()` closes the breaker as before —
 recovery now requires evidence of a working *call* rather than a listing.

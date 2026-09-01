@@ -596,16 +596,20 @@ def test_secret_health_counts_half_open_as_degraded():
         pytest.skip("node not available")
 
     js = DASHBOARD_JS.read_text()
-    i = js.index("secretHealthStatus(keyEntry) {")
-    body = js[i + len("secretHealthStatus(keyEntry) {"): js.index("\n        },", i)]
 
+    def _body(sig):
+        i = js.index(sig)
+        return js[i + len(sig): js.index("\n        },", i)]
+
+    # Every helper in the chain is the REAL extracted body — a hand-copied stub
+    # would let this pass against a broken production helper.
     script = (
         "const ctx = {\n"
         "  _KEY_TO_PROVIDER_TYPES: { K: ['t'] },\n"
         "  routingConfig: { providers: { p1: {type:'t'}, p2: {type:'t'} }, cb_states: {} },\n"
-        "  breakerState(n) { return String(this.routingConfig.cb_states[n] ?? '').toLowerCase(); },\n"
-        "  breakerIsOpen(n) { return this.breakerState(n) === 'open'; },\n"
-        "  secretHealthStatus(keyEntry) {" + body + "\n  },\n"
+        "  breakerState(providerName) {" + _body("breakerState(providerName) {") + "\n  },\n"
+        "  breakerVerdict(providerName) {" + _body("breakerVerdict(providerName) {") + "\n  },\n"
+        "  secretHealthStatus(keyEntry) {" + _body("secretHealthStatus(keyEntry) {") + "\n  },\n"
         "};\n"
         "const cases = [\n"
         "  [{p1:'closed',   p2:'closed'},    'healthy'],\n"
@@ -628,4 +632,69 @@ def test_secret_health_counts_half_open_as_degraded():
     assert r.stdout.strip().endswith("OK"), (
         "secretHealthStatus disagreed with the backend's own OPEN-or-HALF_OPEN "
         "= degraded rule:\n" + r.stdout
+    )
+
+
+def test_breaker_verdict_is_three_state_and_degrades_safely():
+    """HALF_OPEN is probation, not failure — and the helper must survive an
+    absent `cb_detail` (older server or cached payload) by falling back to the
+    two-state reading rather than throwing or rendering healthy.
+
+    Executes the REAL extracted bodies, chained the way the store chains them.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available")
+
+    js = DASHBOARD_JS.read_text()
+
+    def body(sig):
+        i = js.index(sig)
+        return js[i + len(sig): js.index("\n        },", i)]
+
+    state_b = body("breakerState(providerName) {")
+    verdict_b = body("breakerVerdict(providerName) {")
+    openedby_b = body("breakerOpenedBy(providerName) {")
+    tooltip_b = body("breakerTooltip(providerName) {")
+
+    script = (
+        "const ctx = {\n"
+        "  routingConfig: {},\n"
+        "  breakerState(providerName) {" + state_b + "\n  },\n"
+        "  breakerVerdict(providerName) {" + verdict_b + "\n  },\n"
+        "  breakerOpenedBy(providerName) {" + openedby_b + "\n  },\n"
+        "  breakerTooltip(providerName) {" + tooltip_b + "\n  },\n"
+        "};\n"
+        "const cases = [\n"
+        "  [{cb_states:{p:'closed'}}, 'healthy'],\n"
+        "  [{cb_states:{p:'open'}}, 'failing'],\n"
+        "  [{cb_states:{p:'half_open'}}, 'unverified'],\n"
+        # case-insensitive input, and unknown/absent config
+        "  [{cb_states:{p:'HALF_OPEN'}}, 'unverified'],\n"
+        "  [{cb_states:{}}, 'healthy'],\n"
+        "  [{}, 'healthy'],\n"
+        "];\n"
+        "let bad = 0;\n"
+        "for (const [cfg, want] of cases) {\n"
+        "  ctx.routingConfig = cfg;\n"
+        "  const got = ctx.breakerVerdict('p');\n"
+        "  if (got !== want) { bad++; console.log('VERDICT FAIL', JSON.stringify(cfg), 'want', want, 'got', got); }\n"
+        "}\n"
+        # opened_by plumbing, then the absent-cb_detail fallback
+        "ctx.routingConfig = {cb_states:{p:'half_open'}, cb_detail:{p:{state:'half_open', opened_by:'call'}}};\n"
+        "if (ctx.breakerOpenedBy('p') !== 'call') { bad++; console.log('OPENEDBY FAIL call'); }\n"
+        "if (!ctx.breakerTooltip('p').includes('real calls failed')) { bad++; console.log('TOOLTIP FAIL call'); }\n"
+        "ctx.routingConfig = {cb_states:{p:'half_open'}, cb_detail:{p:{state:'half_open', opened_by:'probe'}}};\n"
+        "if (!ctx.breakerTooltip('p').includes('health probe')) { bad++; console.log('TOOLTIP FAIL probe'); }\n"
+        # No cb_detail at all: still 'unverified', and must not throw.
+        "ctx.routingConfig = {cb_states:{p:'half_open'}};\n"
+        "if (ctx.breakerVerdict('p') !== 'unverified') { bad++; console.log('FALLBACK FAIL verdict'); }\n"
+        "if (ctx.breakerOpenedBy('p') !== null) { bad++; console.log('FALLBACK FAIL openedBy'); }\n"
+        "try { ctx.breakerTooltip('p'); } catch (e) { bad++; console.log('FALLBACK THREW', e.message); }\n"
+        "console.log(bad === 0 ? 'OK' : 'FAIL ' + bad);\n"
+    )
+    r = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, f"node failed: {r.stderr[:800]}"
+    assert r.stdout.strip().endswith("OK"), (
+        "breakerVerdict/breakerOpenedBy/breakerTooltip disagreed:\n" + r.stdout
     )
