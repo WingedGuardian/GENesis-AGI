@@ -34,7 +34,7 @@ from pathlib import Path
 # idiom as the sibling UserPromptSubmit hook. Unguarded on purpose: a missing
 # helper is a broken checkout and must be loud, not silently unbounded.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
-from hook_output import HOOK_STDOUT_CAP, BoundedStdout, emit_cost  # noqa: E402
+from hook_output import HOOK_STDOUT_CAP, BoundedStdout, emit_cost, utf16_len  # noqa: E402
 
 # Load secrets.env so USER_TIMEZONE and other env vars are available
 # before any genesis module imports (which may read os.environ at import time).
@@ -93,6 +93,19 @@ _PART_BUDGET = 9_800
 
 _PARTS = ("charter", "identity-core", "identity-user", "knowledge")
 
+
+def _part_budget(part: str) -> int:
+    """Budget for ``part``. ONE home, because two callers must agree.
+
+    ``--part all`` is a manual/test path that emits every part through a single
+    stream, so it gets the sum. `_begin_part` sized the writer this way while
+    `_audit_line` printed the per-part constant as its denominator, so an `all`
+    run reported a true numerator over a false denominator — e.g. `25000/9800`,
+    on the line `main()`'s docstring calls the COMPLETION PROOF.
+    """
+    return _PART_BUDGET * len(_PARTS) if part == "all" else _PART_BUDGET
+
+
 #: Cap on the block label quoted in a cut audit line, so its worst case is
 #: BOUNDED rather than however long the longest block name happens to get.
 _AUDIT_BLOCK_LABEL_MAX = 40
@@ -118,7 +131,7 @@ def _audit_line(
     this line "the COMPLETION PROOF"; it was landing mangled.
     """
     if cut is None:
-        return f"\n_[ctx {part}: {emitted}/{_PART_BUDGET} chars]_"
+        return f"\n_[ctx {part}: {emitted}/{_part_budget(part)} chars]_"
     block, dropped = cut
     return (
         f"\n_[ctx {part}: {intended} intended / {emitted} emitted "
@@ -284,7 +297,7 @@ def _begin_part(part: str, mirror: Path | None, session_id: str = "") -> None:
     """
     global _OUT, _CURRENT_PART, _CURRENT_SID
     _CURRENT_PART, _CURRENT_SID = part, session_id
-    budget = _PART_BUDGET * len(_PARTS) if part == "all" else _PART_BUDGET
+    budget = _part_budget(part)
     _OUT = BoundedStdout(
         budget,
         label=part,
@@ -663,7 +676,14 @@ def _emit_body() -> tuple[str, str, str] | None:
     # Runs on every session start so community installs auto-pick up hook
     # updates without requiring a bootstrap.sh re-run. Charter part only —
     # four concurrent invocations must not race four sync subprocesses.
-    if _in("charter"):
+    #
+    # `not miswired` is part of that guarantee, not belt-and-braces: a mis-wire
+    # FALLS BACK to the charter part, so two mis-spelled settings entries mean
+    # two concurrent invocations that both believe they are the charter, and the
+    # race this gate exists to prevent happens anyway. The degraded path is
+    # exactly when a stray subprocess is least welcome, and a session that is
+    # mis-wired has a louder problem to report than un-synced git hooks.
+    if _in("charter") and not miswired:
         _sync_genesis_hooks()
 
     # Bridge-dispatched sessions get identity via --system-prompt; skip those
@@ -782,10 +802,18 @@ def _emit_body() -> tuple[str, str, str] | None:
                 # hand-written `+ 6` here undershot the real `+ 9` by 3, and the
                 # miss lands exactly on the CONVERSATION.md degrade this reserve
                 # exists to protect.
+                # `utf16_len`, not `len`, for the same reason `emit_cost` is used
+                # beside it: this reserve is compared against a budget billed in
+                # code units. Both operands are ASCII constants today, so the two
+                # agree exactly and nothing changes now — but a reserve that
+                # measures in one unit what it protects in another is the defect
+                # this file already paid for once, and leaving two of the three
+                # branches on `len` would leave the comment above true of only
+                # one of them.
                 _reserve = (
-                    emit_cost(_CONVERSATION_POINTER) + len("\n\n---\n\n")
+                    emit_cost(_CONVERSATION_POINTER) + utf16_len("\n\n---\n\n")
                     if _next == "CONVERSATION.md"
-                    else len(_TRUNCATION_NOTICE_TAIL)
+                    else utf16_len(_TRUNCATION_NOTICE_TAIL)
                     if _next
                     else 0
                 )
@@ -1620,6 +1648,12 @@ _ORIGIN_CAP = 1_200
 # (and re-check the part arithmetic pin) before growing either string.
 _CHARTER_BLOCK_MAX = 7_500
 
+#: Cap on the session id where it is RENDERED (the footer and the tier-4 note).
+#: 64 is comfortably above the 36-char UUID the harness actually sends, and far
+#: enough below the tier-4 margin that the ladder's "un-cuttable" claim does not
+#: rest on an unvalidated external input. Never applied to a lookup.
+_SESSION_ID_DISPLAY_CAP = 64
+
 #: Sanity bound on the ledger read. Not a display cap — every open row renders,
 #: and a 201st is ANNOUNCED rather than dropped (a silent cut here would be the
 #: same defect as the old LIMIT 6, just further out).
@@ -1692,12 +1726,12 @@ def _shrink_charter_block(
 
     # Tier 2: drop origin/mission/pointers/pulse; rows stay whole.
     tier2 = _assemble(_ledger_lines(ledger, escalations), ledger_header)
-    if len(tier2) <= _CHARTER_BLOCK_MAX:
+    if utf16_len(tier2) <= _CHARTER_BLOCK_MAX:
         return tier2
 
     # Tier 3: id FIRST, text trimmed to a lead fragment.
     tier3 = _assemble(_ledger_lines(ledger, escalations, text_cap=140), ledger_header)
-    if len(tier3) <= _CHARTER_BLOCK_MAX:
+    if utf16_len(tier3) <= _CHARTER_BLOCK_MAX:
         return tier3
 
     # Tier 4: ids only. Nothing else survives, but nothing is INVISIBLE — every
@@ -1888,6 +1922,18 @@ def _charter_emission_block(
     """
     if not session_id or source == "clear":
         return ""
+    # Bound the id BEFORE it reaches any rendered string. It is an external input
+    # (the harness supplies it) and it lands in two budget-critical places: the
+    # footer, and the tier-4 note in `_shrink_charter_block` — the one tier with
+    # no ceiling check, which returns unconditionally on the argument that bare
+    # ids always fit. MEASURED: with a 36-char UUID the tier-4 floor is 7,419
+    # against the 7,500 ceiling (margin 81); with a 200-char id it is 7,747 —
+    # 247 OVER, which then eats the charter part's own margin and lets the writer
+    # cut into the ledger ids that the tier ladder exists to protect. Reachability
+    # is low (CC sends a UUID), but "un-cuttable by construction" cannot rest on
+    # an unvalidated input. The clamp is applied AFTER the lookups below, so a
+    # long id still resolves to its real charter — this bounds what is RENDERED,
+    # not what is queried.
     # The DB lookup binds session_id as a SQL PARAMETER, so it is safe for any id;
     # only the legacy charter.json fallback interpolates it into a PATH. Guarding
     # above both would drop a canonical, DB-backed charter (and its ledger) for an
@@ -1898,6 +1944,7 @@ def _charter_emission_block(
         ledger = []
     if charter is None:
         return ""
+    session_id = session_id[:_SESSION_ID_DISPLAY_CAP]
     origin = str(charter.get("origin_prompt") or "").strip()
     if not origin:
         return ""
@@ -1966,7 +2013,18 @@ def _charter_emission_block(
         footer += f" · {_LEDGER_OVERFLOW_NOTE}"
     footer += f" · full charter: ~/.genesis/sessions/{session_id}/charter.md_"
     block = "\n".join([*lines, "", footer])
-    if len(block) > _CHARTER_BLOCK_MAX:
+    # Measured in UTF-16 code units, the unit `_PART_BUDGET` is enforced in.
+    # `_CHARTER_BLOCK_MAX` exists ONLY to keep this block inside that budget, and
+    # the charter carries the most user-authored text in the injection — mission,
+    # origin prompt, ledger rows, all typed by a human who may well use an emoji.
+    # Sized with `len`, a charter of 7,500 codepoints could cost up to 15,000
+    # units, pass this ceiling, and void the part's arithmetic pin — the pin that
+    # makes the charter un-cuttable BY CONSTRUCTION. It would then be the writer's
+    # cut path, not this structured degrade, that decided which agreements
+    # survived. (The `text_cap`/`_ORIGIN_CAP` trims below stay in CODEPOINTS on
+    # purpose: those are display trims — "140 characters of lead text" is a
+    # statement about what a reader sees, not about budget.)
+    if utf16_len(block) > _CHARTER_BLOCK_MAX:
         # Structured degrade, not a slice: a flat cut lands mid-row and takes
         # every id after it with no marker, so the block stops naming the
         # agreements it exists to name while still LOOKING complete.

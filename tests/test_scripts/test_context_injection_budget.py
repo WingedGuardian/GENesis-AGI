@@ -58,7 +58,12 @@ def test_cap_constants_pin_the_measurement():
 
 
 def test_conversation_md_ceiling():
-    size = len((_IDENTITY_DIR / "CONVERSATION.md").read_text())
+    # `utf16_len`, not `len`: this ceiling's whole job is to gate a tracked file
+    # against a part budget the writer enforces in UTF-16 code units. Measured in
+    # codepoints it is PERMISSIVE — a 6,500-codepoint astral file costs up to
+    # 13,000 units, passes here, and blows the part. A guard that measures in a
+    # different unit from the thing it guards has stopped guarding it.
+    size = _ctx.utf16_len((_IDENTITY_DIR / "CONVERSATION.md").read_text())
     assert size <= 6_500, (
         f"CONVERSATION.md is {size} chars (ceiling 6,500). It shares a 9,800-char "
         "hook budget with the install-local USER.md. Protocol DETAIL belongs in "
@@ -67,7 +72,8 @@ def test_conversation_md_ceiling():
 
 
 def test_identity_core_ceiling():
-    size = sum(len((_IDENTITY_DIR / n).read_text()) for n in ("SOUL.md", "STEERING.md"))
+    # Same unit as the budget it guards — see test_conversation_md_ceiling.
+    size = sum(_ctx.utf16_len((_IDENTITY_DIR / n).read_text()) for n in ("SOUL.md", "STEERING.md"))
     assert size <= 9_000, (
         f"SOUL.md + STEERING.md = {size} chars (ceiling 9,000) against the "
         "identity-core part's 9,800-char budget. Trim before shipping — over the "
@@ -210,7 +216,11 @@ def test_huge_user_md_elides_conversation_to_pointer(monkeypatch, capsys, tmp_pa
     assert "U" * 8_000 in out
     assert "C" * 5_000 not in out
     assert "omitted for size" in out
-    assert len(out) <= _ctx._PART_BUDGET + 200
+    # The writer's contract is `<= budget`, so assert exactly that. The old
+    # `+ 200` equalled HOOK_STDOUT_CAP, i.e. this assertion could not fail for
+    # ANY overrun below the harness cliff — vacuous in precisely the range these
+    # two pressure tests exist to cover.
+    assert _ctx.utf16_len(out) <= _ctx._PART_BUDGET
 
 
 def test_conversation_sized_to_the_real_room_is_not_elided(monkeypatch, capsys, tmp_path):
@@ -258,7 +268,9 @@ def test_oversized_user_md_truncates_loudly_never_silently(monkeypatch, capsys, 
     (ident / "USER.md").write_text("U" * 15_000)
     out = _direct_part(monkeypatch, capsys, ident, "identity-user")
     assert "truncated at" in out
-    assert len(out) <= _ctx._PART_BUDGET + 200
+    # See the sibling elide test: `+ 200` was HOOK_STDOUT_CAP, so this could not
+    # fail below the cliff. The writer guarantees `<= budget`.
+    assert _ctx.utf16_len(out) <= _ctx._PART_BUDGET
 
 
 def test_normal_user_and_conversation_render_whole(monkeypatch, capsys, tmp_path):
@@ -284,18 +296,24 @@ def test_charter_part_overhead_fits_the_budget():
     part fails HERE instead of silently truncating an agreement.
     """
     session_config = max(
-        len(_ctx._session_config_block("high", m, ""))
+        _ctx.emit_cost(_ctx._session_config_block("high", m, ""))
         for m in ("claude-opus-5[1m]", "claude-zeta-9-preview-20261231[1m]", "")
     )
     # MEASURED from the shipped string, never hand-copied: this test's whole job
     # is to fail when the part grows, and a copied length lets an ordinary prose
     # edit to that block overrun the budget with this test still green.
-    onboarding = len(_ctx._ONBOARDING_BLOCK)
+    onboarding = _ctx.emit_cost(_ctx._ONBOARDING_BLOCK)
     # A PRODUCTION-shaped mirror path: the real one carries a 36-char session
     # UUID under the user's home, and the header interpolates it. A short
     # fixture path understated this by ~25 chars against a margin measured in
     # the low hundreds.
-    header = len(
+    # Every term below is billed with `emit_cost` — the writer's own cost
+    # function — not `len`. Two reasons, both measured: the unit must match the
+    # budget (UTF-16 code units), and each block pays for the newline `print`
+    # appends, which a bare `len` omits. Counting with `len` and charging the
+    # newline for only the dividers reported 5 units MORE headroom than exists,
+    # on a margin of 48.
+    header = _ctx.emit_cost(
         _ctx._recovery_header(
             "charter",
             Path.home() / ".genesis" / "sessions" / str(uuid.uuid4()) / "context-charter.md",
@@ -303,7 +321,9 @@ def test_charter_part_overhead_fits_the_budget():
     )
     # The mis-wire alert fires ON this part, so the worst case includes it —
     # measured from the real function, never an estimate that can drift.
-    miswire = len(_ctx._miswire_alert("no --part argument (settings.json wiring is out of date)"))
+    miswire = _ctx.emit_cost(
+        _ctx._miswire_alert("no --part argument (settings.json wiring is out of date)")
+    )
     dividers = 8 * 3  # "\n\n---\n\n" plus print()'s newline, three possible
     total = (
         session_config

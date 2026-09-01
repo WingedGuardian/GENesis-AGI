@@ -20,6 +20,11 @@
 #   8b. Retention prune of ~/.genesis/sessions/<id>/ (>60d, whole dirs)
 #      (per-session state + SessionStart context mirrors; age far exceeds any
 #      live session, which rewrites last_prompt_time every prompt)
+#      COUPLING: observability/snapshots/context_injection.py uses a NON-EMPTY
+#      ~/.genesis/sessions as its proof that CC has ever run here — the guard
+#      that stops a blind scan reporting a false all-clear. Emptying this
+#      directory silently disarms that guard, so 60d is load-bearing for the
+#      injection watcher too, not only for disk. Read that code before lowering.
 #   9. Retention prune of ~/.genesis/output/retrieval_efficacy/*.md (>45d)
 #      (WS2-0 retrieval-efficacy report; dated md per run — file-age prune)
 #  10. Retention prune of ego_proposal_revisions (ego_reconcile config window)

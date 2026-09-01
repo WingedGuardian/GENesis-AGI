@@ -53,6 +53,18 @@ _DIVIDER_COST = 8
 _NEWLINE_COST = 1
 
 
+def utf16_len(text: str) -> int:
+    """Length of ``text`` in UTF-16 CODE UNITS — the unit the harness counts.
+
+    The unit primitive, exported so that sizing done OUTSIDE this module (a
+    sub-budget such as the charter block's ceiling) can be measured in the same
+    unit the writer enforces. A sub-budget checked with ``len`` against a parent
+    budget enforced in code units is not a smaller budget — it is a budget that
+    silently stops bounding anything once astral text arrives.
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
 def emit_cost(text: str) -> int:
     """What writing ``text`` actually costs the budget.
 
@@ -74,7 +86,7 @@ def emit_cost(text: str) -> int:
     (MEASURED: 0 astral characters across SOUL/STEERING/USER/CONVERSATION/EK) —
     but USER.md is hand-edited and essential_knowledge.md is LLM-regenerated.
     """
-    return len(text.encode("utf-16-le")) // 2 + _NEWLINE_COST
+    return utf16_len(text) + _NEWLINE_COST
 
 
 def clip_to_cost(text: str, max_units: int) -> str:
@@ -142,9 +154,13 @@ class BoundedStdout:
         stream: Any = None,
     ) -> None:
         """
-        :param budget: hard ceiling in CHARACTERS for everything written here.
+        :param budget: hard ceiling for everything written here, in the unit
+            :func:`emit_cost` bills — UTF-16 CODE UNITS, which is what the
+            harness compares. Every size decision in this class must use that
+            function (or its slicing companion :func:`clip_to_cost`) rather than
+            ``len``, or the two disagree on astral text.
         :param label: what this stream IS (e.g. a part name) — named in the marker.
-        :param reserve: characters held back from :meth:`emit` for the caller's
+        :param reserve: code units held back from :meth:`emit` for the caller's
             closing line, which is written with :meth:`emit_final`.
         :param mirror_hint: path (as text) where the full intended output lives.
         :param stream: output stream; defaults to ``sys.stdout`` at call time so
@@ -162,7 +178,11 @@ class BoundedStdout:
     # ── state ──────────────────────────────────────────────────────────
     @property
     def emitted_chars(self) -> int:
-        """Characters actually written to the stream."""
+        """What has actually been written, in :func:`emit_cost`'s UTF-16 units.
+
+        Named ``_chars`` for its callers' sake; the unit is code units, and for
+        the all-BMP text every emitter carries today the two are identical.
+        """
         return self._emitted
 
     @property
@@ -293,7 +313,11 @@ class BoundedStdout:
             # then render with the real, smaller value — so the emitted line is
             # never longer than what was budgeted for.
             widest = notice.replace("{kept}", str(self.room))
-            keep = max(0, self.room - reserve - div_cost - _NEWLINE_COST - len(widest))
+            # `emit_cost`, not `len`: the notice is CALLER-supplied text, so it
+            # is the likeliest of these strings to carry an astral character.
+            # Under-billing it would size `keep` too large and turn a graceful
+            # degrade into the hard cut below.
+            keep = max(0, self.room - reserve - div_cost - emit_cost(widest))
             rendered = notice.replace("{kept}", str(keep))
             # keep == 0 still emits the notice ALONE. The notice names the file
             # and where to read it, so it is worth more than the same number of
@@ -388,7 +412,14 @@ class BoundedStdout:
         marker = self._cut_marker(block)
         # Both writes cost their length PLUS the newline print() adds, so the
         # room for content is what is left after the marker and BOTH newlines.
-        content_room = room - len(marker) - 2
+        # Measured with `emit_cost` (which carries one of those newlines) rather
+        # than `len`: this is the ONE path that calls `_write` directly instead
+        # of going through `emit`, so nothing downstream re-checks the budget. A
+        # marker billed in codepoints while the harness counts UTF-16 units
+        # would leave `content_room` too large by the number of astral chars in
+        # the mirror path or block label, and the pair would overrun the cap
+        # while every check above reported success.
+        content_room = room - emit_cost(marker) - _NEWLINE_COST
         kept = ""
         if content_room > 0:
             kept = clip_to_cost(text, content_room)

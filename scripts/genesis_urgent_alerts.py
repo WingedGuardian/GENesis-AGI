@@ -593,6 +593,22 @@ def main() -> None:
     if prompt:
         _check_shelve_hint(prompt)
 
+    # A cut here has no mirror to point at — this hook writes no per-part file —
+    # so the in-band marker degrades to "(no mirror)" and the tail is simply
+    # gone. Say so on stderr rather than losing it silently: silent truncation of
+    # model-facing output is the exact failure this module was written for, and a
+    # consumer that adopts the writer without adopting its mirror contract keeps
+    # only half the protection. Latent today (this hook's realistic total is a
+    # few KB), but the charter tag is now an inventory that grows with the
+    # ledger — the same direction that took SessionStart over the cliff.
+    # A durable mirror for this hook is tracked separately.
+    if _OUT.cut:
+        block, dropped = _OUT.cut
+        print(
+            f"[urgent_alerts] output CUT at {block!r} — {dropped} chars dropped with no mirror",
+            file=sys.stderr,
+        )
+
 
 if __name__ == "__main__":
     main()

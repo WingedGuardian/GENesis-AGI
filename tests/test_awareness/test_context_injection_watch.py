@@ -842,6 +842,51 @@ def test_a_scope_narrowing_is_blindness_too(tmp_path, monkeypatch):
     assert any("CANNOT BE TREATED AS ALL-CLEAR" in f for f in ci.derive_findings(h))
 
 
+def test_a_renamed_tool_results_directory_is_blindness_too(tmp_path, monkeypatch):
+    """The quietest of the three: our slugs match, but the leaf directory moved.
+
+    `tool-results` is CC's name, not this repo's — the same class of dependency
+    as the slug encoding above, and it can change in exactly the CC update this
+    watcher exists to survive. Root probe passes, the project matches our
+    prefixes, the traversal succeeds and finds nothing, and `derive_findings`
+    returns an all-clear that RESOLVES a live critical alert. Two granularities
+    of blindness checking cannot see this; it needs the third.
+    """
+    home = tmp_path / "inuse"
+    (home / ".genesis" / "sessions" / "sess-a").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    # Our own slug, a real session — but CC now writes the results elsewhere.
+    projects = tmp_path / "projects"
+    renamed = projects / _GENESIS_SLUG / "sess-1" / "tool-outputs"
+    renamed.mkdir(parents=True)
+    (renamed / "hook-9-stdout.txt").write_text("x")
+
+    h = _collect(projects)
+    assert h.errors, "a scan that found no tool-results anywhere is not an all-clear"
+    assert any("CANNOT BE TREATED AS ALL-CLEAR" in f for f in ci.derive_findings(h))
+
+
+def test_an_empty_tool_results_directory_is_the_healthy_state(tmp_path, monkeypatch):
+    """The control the finding above must not swallow: present but empty = FINE.
+
+    An in-scope session holding a `tool-results` directory with no hook filings
+    in it is the state this whole branch is trying to achieve. If the blindness
+    check cannot tell that from a renamed directory, it pages forever and the
+    alarm gets muted — which is how the original failure stayed invisible.
+    """
+    home = tmp_path / "inuse"
+    (home / ".genesis" / "sessions" / "sess-a").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    projects = tmp_path / "projects"
+    (projects / _GENESIS_SLUG / "sess-1" / "tool-results").mkdir(parents=True)
+
+    h = _collect(projects)
+    assert not h.errors, f"an empty tool-results directory is healthy, not blind: {h.errors}"
+    assert not ci.derive_findings(h)
+
+
 def test_a_moving_tally_alone_never_re_alerts():
     """The churn property: a STANDING incident must not re-page as it ages.
 
@@ -863,6 +908,41 @@ def test_a_moving_tally_alone_never_re_alerts():
     # …but a new PRODUCER carries a different remedy and must re-alert.
     h.note_filing(Path("/p/hook-2-stdout.txt"), size=1, age_h=0.1, producer=ci.OTHER_HOOK)
     assert ci.alert_identity(h) != before
+
+
+def test_the_error_overflow_tally_is_not_in_the_identity():
+    """The tally property again, on the input the previous test does not cover.
+
+    `test_a_moving_tally_alone_never_re_alerts` moves `filing_sessions` — one
+    field, a SAMPLE of the identity's inputs, not a population check. The error
+    list is another, and `bound_errors` appends an overflow entry carrying a
+    COUNT into exactly the list `alert_identity` hashes. So a standing condition
+    that leaves 52 paths unreadable one hour and 53 the next produces a
+    byte-identical alert body with a different hash, and `supersede_except_hash`
+    re-pages it at `critical` — the Telegram path, hourly, for one incident.
+
+    Both directions, as above: the overflow's PRESENCE is still a real state
+    change and must re-alert the first time it appears.
+    """
+    over, under = ci.InjectionHealth(), ci.InjectionHealth()
+    for i in range(ci._MAX_ERRORS + 3):
+        over.add_error(Path(f"/p/{i}"), "unreadable")
+    for i in range(ci._MAX_ERRORS + 2):
+        under.add_error(Path(f"/p/{i}"), "unreadable")
+    over.bound_errors(ci._MAX_ERRORS)
+    under.bound_errors(ci._MAX_ERRORS)
+
+    assert over.errors != under.errors, "fixture is inert: the tallies must differ"
+    assert ci.alert_identity(over) == ci.alert_identity(under), (
+        "a moving overflow tally re-pages a standing condition at critical"
+    )
+
+    # Control: crossing INTO the bounded state is a real change and must alert.
+    unbounded = ci.InjectionHealth()
+    for i in range(ci._MAX_ERRORS):
+        unbounded.add_error(Path(f"/p/{i}"), "unreadable")
+    unbounded.bound_errors(ci._MAX_ERRORS)
+    assert ci.alert_identity(unbounded) != ci.alert_identity(over)
 
 
 def test_a_fresh_miswire_beside_unchanged_filings_re_alerts():

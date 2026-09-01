@@ -193,6 +193,12 @@ _MAX_LISTED_ERRORS = 3
 #: check that runs hourly.
 _MAX_ERRORS = 50
 
+#: Marks the single overflow entry `bound_errors` appends when it truncates.
+#: ONE home, because two places depend on it: the writer that renders it and
+#: `alert_identity`, which must EXCLUDE it — it carries a count, and a count in
+#: the identity re-pages a standing condition every time the count moves.
+_ERROR_OVERFLOW_PREFIX = "…and "
+
 
 def _default_projects_dirs() -> tuple[Path, ...]:
     """Every tree that may hold this install's CC session data.
@@ -310,7 +316,7 @@ class InjectionHealth:
         """
         if len(self._errors) > limit:
             dropped = len(self._errors) - limit
-            self._errors[limit:] = [f"…and {dropped} more unreadable path(s)"]
+            self._errors[limit:] = [f"{_ERROR_OVERFLOW_PREFIX}{dropped} more unreadable path(s)"]
 
 
 def _slug(path: Path) -> str:
@@ -534,6 +540,11 @@ def _note_blind_scan(
     scan is a BLIND scan. With no session state either, CC has genuinely never
     run on this box and silence is the correct reading.
     """
+    # COUPLING, deliberately named: `scripts/disk_hygiene.sh` prunes this
+    # directory at 60 days, so that threshold is load-bearing for THIS check too
+    # — empty it and every blindness report below turns back into a silent
+    # all-clear. 60d is far past any live session, so the two do not collide
+    # today; lowering it without reading this is how they would.
     if not reads.listdir(_genesis_sessions_dir()):
         return  # CC has never run here — nothing to be blind to
     extra = f" (of {len(projects_dirs)} configured)" if len(projects_dirs) > 1 else ""
@@ -642,6 +653,7 @@ def _collect_sync(
     fresh: list[tuple[float, Path, int]] = []
     roots_usable = 0
     in_scope_projects = 0
+    tool_results_seen = 0
     for root in projects_dirs:
         if not _probe_root(root, reads, health):
             continue
@@ -655,7 +667,16 @@ def _collect_sync(
                 if not in_scope:
                     scope.enter_context(reads.unreported())
                 for session in reads.listdir(project):
-                    for f in reads.listdir(session / "tool-results"):
+                    tool_results = session / "tool-results"
+                    if in_scope:
+                        # UNREPORTED: this probe only feeds the blindness counter
+                        # below, and the `listdir` on the very same path reports
+                        # any real read failure a line later. Without this, an
+                        # unreadable tree records every path TWICE and the
+                        # operator-facing error list doubles for one cause.
+                        with reads.unreported():
+                            tool_results_seen += int(reads.is_dir(tool_results)[0])
+                    for f in reads.listdir(tool_results):
                         if not (f.name.startswith("hook-") and f.name.endswith("-stdout.txt")):
                             continue
                         st = reads.stat(f)
@@ -672,16 +693,34 @@ def _collect_sync(
                         # — including one skipped as stale or foreign.
                         fresh.append((st.st_mtime, f, st.st_size))
 
-    # Two granularities of the SAME blindness. A root that vanished is the
-    # obvious one; a root that is fine while nothing inside it matches this
-    # install's slugs is the quiet one — the slug encoding belongs to CC, not to
-    # this repo, so it can change under us. Either way the scan had nothing in
-    # view, and a scan with nothing in view must not RESOLVE a live alert.
+    # THREE granularities of the SAME blindness, one per CC-owned convention
+    # this scan rests on. A root that vanished is the obvious one; a root that is
+    # fine while nothing inside it matches this install's slugs is the quiet one
+    # (the slug encoding belongs to CC); and a matching project tree that holds
+    # no `tool-results` directory at all is the quietest — that directory NAME is
+    # also CC's, and if it is renamed the traversal still succeeds, finds
+    # nothing, and `derive_findings` returns an all-clear that RESOLVES a live
+    # alert. That is the module's own generator — a verifier that cannot tell "I
+    # did not check" from "I checked and it is fine" — one layer below where the
+    # first two granularities close it. Either way the scan had nothing in view,
+    # and a scan with nothing in view must not resolve anything.
+    #
+    # The leaf pattern (`hook-*-stdout.txt`) is deliberately NOT covered here: an
+    # in-scope session legitimately holds a `tool-results` directory with no hook
+    # filings in it, which is the HEALTHY state and must stay distinguishable
+    # from blindness. Naming the limit rather than guessing at it.
     if not roots_usable:
         _note_blind_scan(projects_dirs, reads, health, what="was not a usable scan root")
     elif not in_scope_projects:
         _note_blind_scan(
             projects_dirs, reads, health, what="held no project directory belonging to this install"
+        )
+    elif not tool_results_seen:
+        _note_blind_scan(
+            projects_dirs,
+            reads,
+            health,
+            what="held no tool-results directory under any session of this install",
         )
 
     fresh.sort(key=lambda t: t[0], reverse=True)  # newest first
@@ -756,7 +795,17 @@ def alert_identity(health: InjectionHealth) -> str:
         f":by:{producers}"
         f":miswired:{'yes' if health.miswires else 'no'}"
         f":truncated:{health.scan_truncated}"
-        f":errors:{'|'.join(sorted(health.errors))}"
+        # The overflow line `bound_errors` appends carries a COUNT, and a count
+        # in the identity is exactly what this function exists to keep out: two
+        # ticks at 52 and 53 unreadable paths produce a byte-identical alert body
+        # with a different hash, so `supersede_except_hash` re-pages at
+        # `critical` — the Telegram path — for one standing condition. The bound
+        # was added for hashing cost and quietly reintroduced the failure the
+        # docstring above argues against. Hash the real errors, and carry the
+        # overflow as presence, not as a tally.
+        f":errors:{'|'.join(sorted(e for e in health.errors if not e.startswith(_ERROR_OVERFLOW_PREFIX)))}"
+        f":errors_bounded:"
+        f"{'yes' if any(e.startswith(_ERROR_OVERFLOW_PREFIX) for e in health.errors) else 'no'}"
     )
 
 

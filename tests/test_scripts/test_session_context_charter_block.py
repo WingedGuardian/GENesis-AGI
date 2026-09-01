@@ -167,6 +167,43 @@ def test_pathological_charter_keeps_every_open_id_and_charter_md_path(tmp_path):
     assert not block.rstrip().endswith("x" * 10)
 
 
+def test_the_ceiling_holds_in_the_unit_the_part_budget_is_billed_in(tmp_path):
+    """`_CHARTER_BLOCK_MAX` must be measured the way `_PART_BUDGET` is enforced.
+
+    The ceiling exists for exactly one reason: to keep this block inside the
+    charter part's budget, which `BoundedStdout` enforces in UTF-16 CODE UNITS.
+    Sized with `len`, a charter of astral text passes the ceiling at up to HALF
+    its real cost — and the part's arithmetic pin, which assumes the charter
+    contributes at most `_CHARTER_BLOCK_MAX`, is void. The writer's cut path then
+    decides which agreements survive, in place of the structured degrade whose
+    whole purpose is that no open row is ever invisible.
+
+    This is the likeliest astral text in the whole injection: mission, origin and
+    ledger rows are typed by a human.
+
+    The fixture is MEASURED, not estimated, because it only discriminates inside
+    a window: the undegraded block must be UNDER the ceiling in codepoints and
+    OVER it in code units. These rows give **5,573 codepoints / 10,373 units**
+    against a 7,500 ceiling — 1,927 under by the old measure, 2,873 over by the
+    real one. A first attempt at 10x700 came to 7,773 codepoints, 273 PAST the
+    ceiling, so the degrade fired either way and the mutation survived: the test
+    passed while testing nothing, and the fixture was the reason, not the
+    assertion.
+    """
+    db = _make_db(tmp_path)
+    _seed_charter(db, mission="m", origin="o")
+    ids = _seed_rows(db, ["\U0001f3af" * 480 for _ in range(10)])
+    block = _block(db)
+
+    assert _ctx.utf16_len(block) <= _ctx._CHARTER_BLOCK_MAX + 400, (
+        f"{_ctx.utf16_len(block)} code units against a {_ctx._CHARTER_BLOCK_MAX} "
+        "ceiling — the block was sized in codepoints"
+    )
+    # The degrade must have run PROPERLY, not merely produced something smaller.
+    for row_id in ids:
+        assert row_id in block, f"degrade dropped open row id {row_id[:8]}"
+
+
 # ── mission drift ───────────────────────────────────────────────────────
 
 

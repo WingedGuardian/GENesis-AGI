@@ -404,3 +404,49 @@ def test_clip_to_cost_never_splits_a_surrogate_pair(sink):
     assert _units(clipped) <= 5
     clipped.encode("utf-8")  # a lone surrogate would raise here
     assert clipped == "\U0001f3af" * 2
+
+
+def test_an_astral_mirror_path_does_not_push_the_cut_pair_over_the_cap(sink):
+    """The MARKER's own size is a budget input, so it must be billed in units too.
+
+    `_cut_here` is the one path that calls `_write` directly instead of going
+    through `emit`, so nothing downstream re-checks its arithmetic: it sizes the
+    content against the marker itself. Measuring the marker with `len` while the
+    harness counts UTF-16 units leaves room for exactly as many extra units as
+    the marker has astral characters, and the content+marker pair then overruns
+    the cap while every check reports success.
+
+    The astral characters here are in the MIRROR PATH — a real possibility, since
+    the path embeds a session id and a part name that Genesis does not control
+    character-by-character. Overrun before the fix is one unit per astral char.
+    """
+    hint = "~/.genesis/sessions/" + "\U0001f3af" * 30 + "/context-knowledge.md"
+    out = _writer(sink, budget=9_800, mirror_hint=hint)
+    out.emit("A" * 20_000, block="essential-knowledge")
+
+    rendered = sink.getvalue()
+    assert _units(rendered) <= 9_800, (
+        f"{_units(rendered)} units over a 9,800 budget — the marker was billed in codepoints"
+    )
+    assert hint in rendered, "the cut marker lost its mirror pointer"
+
+
+def test_an_astral_notice_still_degrades_gracefully_instead_of_cutting(sink):
+    """A caller-supplied notice is the likeliest of these strings to carry astral text.
+
+    `emit_or_degrade` sizes `keep` against the widest rendering of the notice.
+    Billing that with `len` makes `keep` too large by the notice's astral count,
+    so the write it then composes overruns and trips the HARD CUT path — turning
+    the graceful degrade this function exists to provide into the loss it exists
+    to avoid. The verdict is the assertion: "truncated" is the degrade,
+    "cut" means the budget arithmetic was wrong.
+    """
+    out = _writer(sink, budget=400, mirror_hint="~/.genesis/sessions/s1/x.md")
+    verdict = out.emit_or_degrade(
+        "B" * 2_000,
+        block="conversation",
+        notice="\n_[kept {kept} of it \U0001f3af\U0001f3af\U0001f3af\U0001f3af\U0001f3af]_",
+    )
+
+    assert verdict == "truncated", f"graceful degrade became {verdict!r}"
+    assert _units(sink.getvalue()) <= 400
