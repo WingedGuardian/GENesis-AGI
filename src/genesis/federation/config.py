@@ -106,7 +106,11 @@ def effective_mode() -> str:
     if _kill_switch_on():
         return "off"
     cfg = load_config()
-    if not cfg.get("enabled", True):
+    # Fail-CLOSED on the master switch: only a real boolean True keeps it on. A
+    # hand-edited `enabled: "false"` (string), a 0/1, or any non-bool is truthy
+    # and would otherwise leave a cross-owner channel ACTIVE against the user's
+    # apparent intent — degrade every non-True value to off.
+    if cfg.get("enabled", True) is not True:
         return "off"
     mode = cfg.get("mode")
     if mode is False:

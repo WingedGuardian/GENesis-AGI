@@ -73,3 +73,19 @@ async def test_stored_envelope_is_a_copy():
     env["payload"] = "MUTATED"  # mutate caller's dict after send
     got = await t.poll("mbB")
     assert got[0]["envelope"]["payload"] == "x"  # transport kept its own copy
+
+
+@pytest.mark.asyncio
+async def test_nested_payload_is_deep_copied_both_ways():
+    """A real relay serializes; the mock must too — mutating a NESTED payload
+    dict after send() (or mutating a POLLED envelope) must not change stored or
+    future-delivered messages, or PR2 E2E tests built on it would be unsound."""
+    t = MockTransport()
+    env = {"envelope_id": "e1", "payload": {"ct": ["a"], "meta": {"k": 1}}}
+    await t.send("mbB", env)
+    env["payload"]["meta"]["k"] = 999  # mutate caller's nested dict after send
+    got1 = await t.poll("mbB")
+    assert got1[0]["envelope"]["payload"]["meta"]["k"] == 1  # storage unaffected
+    got1[0]["envelope"]["payload"]["ct"].append("MUT")  # mutate a polled copy
+    got2 = await t.poll("mbB")
+    assert got2[0]["envelope"]["payload"]["ct"] == ["a"]  # future re-delivery unaffected

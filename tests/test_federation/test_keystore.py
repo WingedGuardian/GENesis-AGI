@@ -3,6 +3,7 @@ and the derived write-cap seal key."""
 
 from __future__ import annotations
 
+import os
 import stat
 
 import pytest
@@ -56,3 +57,27 @@ def test_generated_signing_key_actually_signs():
     idn = keystore.load_or_create_identity()
     sig = crypto.sign(idn.signing_key, context="msg", message=b"hi")
     assert crypto.verify(idn.signing_key.verify_key, context="msg", message=b"hi", signature=sig)
+
+
+def test_load_retightens_loose_permissions():
+    """A keyfile that a restore/copy left group/other-readable is tightened back
+    to 0600 on load, before its secret is read."""
+    keystore.load_or_create_identity()  # creates at 0600
+    path = keystore.identity_key_path()
+    os.chmod(path, 0o644)  # simulate a permissive restore/copy
+    idn = keystore.load_or_create_identity()  # load must re-tighten
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert len(idn.verify_key_bytes) == 32  # still loads correctly
+
+
+def test_exclusive_create_refuses_to_clobber_existing():
+    """The exclusive create claims identity.key itself — a second creator can't
+    overwrite the first identity (the concurrent-first-pairing race)."""
+    keystore.load_or_create_identity()  # creates identity.key
+    path = keystore.identity_key_path()
+    original = path.read_bytes()
+    # a second exclusive-create attempt must NOT clobber — returns False
+    assert keystore._exclusive_create_0600(path, b"different-identity") is False
+    assert path.read_bytes() == original  # original untouched
+    # and no stray temp file was left behind
+    assert not list(path.parent.glob("*.tmp.*"))

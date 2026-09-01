@@ -17,6 +17,7 @@ cursor and calls ``ack`` so the relay may reclaim delivered items.
 from __future__ import annotations
 
 import asyncio
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -74,7 +75,11 @@ class MockTransport(Transport):
                 return envelope_id
             cursor = self._next_cursor.get(mailbox_id, 0) + 1
             self._next_cursor[mailbox_id] = cursor
-            box.append(_Stored(cursor=cursor, envelope_id=envelope_id, envelope=dict(envelope)))
+            # deep-copy so a caller mutating a NESTED payload dict after send()
+            # cannot alter the stored message (a real serialized relay wouldn't).
+            box.append(
+                _Stored(cursor=cursor, envelope_id=envelope_id, envelope=copy.deepcopy(envelope))
+            )
             return envelope_id
 
     async def poll(self, mailbox_id: str, after_cursor: str | None = None) -> list[dict]:
@@ -82,7 +87,7 @@ class MockTransport(Transport):
         async with self._lock:
             box = self._mailboxes.get(mailbox_id, [])
             return [
-                {"cursor": str(item.cursor), "envelope": dict(item.envelope)}
+                {"cursor": str(item.cursor), "envelope": copy.deepcopy(item.envelope)}
                 for item in box
                 if item.cursor > after
             ]

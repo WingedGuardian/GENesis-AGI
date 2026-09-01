@@ -72,3 +72,16 @@ def test_shipped_config_default_is_off():
 
     shipped = yaml.safe_load(fedconfig._base_path().read_text())
     assert shipped.get("mode") in (False, "off")
+
+
+def test_non_boolean_enabled_degrades_to_off(cfg_file):
+    """A truthy non-boolean `enabled` (e.g. the string "false") must NOT keep the
+    master switch on — that would leave a cross-owner channel active against the
+    user's apparent intent."""
+    # NB: bare `yes`/`on` are YAML-1.1 booleans (true) — use quoted strings + ints
+    for enabled in ('"false"', '"true"', "0", "1", '"on"'):
+        cfg_file(f"enabled: {enabled}\nmode: propose_only\n")
+        assert fedconfig.effective_mode() == "off", f"enabled: {enabled} should be off"
+    # a real boolean true still activates
+    cfg_file("enabled: true\nmode: propose_only\n")
+    assert fedconfig.effective_mode() == "propose_only"

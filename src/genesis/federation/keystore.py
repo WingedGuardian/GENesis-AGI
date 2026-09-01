@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -96,16 +97,16 @@ def _deserialize(raw: bytes) -> Identity:
     )
 
 
-def _atomic_write_0600(path: Path, payload: bytes) -> None:
-    """Write ``payload`` to ``path`` at mode 0600 via a temp file + rename, so a
-    reader never sees a half-written keyfile and the secret is never world-
-    readable even momentarily."""
+def _exclusive_create_0600(path: Path, payload: bytes) -> bool:
+    """Create ``path`` with ``payload`` at mode 0600, EXCLUSIVELY on the FINAL
+    path. Returns True if THIS call created it, False if it already existed (a
+    concurrent creator won). Crash-safe AND race-safe: the content is fully
+    written + fsync'd into a private 0600 temp, then **hard-linked** into place —
+    ``os.link`` fails with ``FileExistsError`` if the destination exists, so two
+    concurrent first-pairings can't both "win" and clobber each other's identity
+    (which ``os.replace`` would, silently orphaning the loser's keys)."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # mkdir's mode is ignored if the dir already exists (and umask masks it on
-    # create) — chmod defensively so an already-present federation/ dir created
-    # loosely by something else never leaves the keyfile in a group/world-listable
-    # directory.
-    os.chmod(path.parent, 0o700)
+    os.chmod(path.parent, 0o700)  # mkdir mode is ignored if the dir already exists
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC, 0o600)
     try:
@@ -113,23 +114,39 @@ def _atomic_write_0600(path: Path, payload: bytes) -> None:
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(str(tmp), str(path))
+        try:
+            os.link(str(tmp), str(path))  # atomic; raises FileExistsError if it exists
+        except FileExistsError:
+            return False
+        return True
     finally:
         if tmp.exists():
             tmp.unlink()
 
 
+def _load_existing_identity(path: Path) -> Identity:
+    """Read an EXISTING identity keyfile, enforcing its at-rest protection before
+    exposing the secret: reject a non-regular file (a symlink/fifo swap), and if a
+    restore/copy left group/other permission bits set, TIGHTEN it back to 0600
+    (self-heal) rather than reading a world/group-readable private seed."""
+    st = path.lstat()
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"federation identity keyfile is not a regular file: {path}")
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        os.chmod(path, 0o600)
+    return _deserialize(path.read_bytes())
+
+
 def load_or_create_identity() -> Identity:
     """Return this install's federation identity, generating + persisting it on
-    first call. Idempotent and race-tolerant: a concurrent creator loses the
-    ``O_EXCL`` race and re-reads the winner's keyfile."""
+    first call. Idempotent and race-safe: a concurrent creator that loses the
+    exclusive-link race re-reads the winner's keyfile; an existing keyfile has its
+    0600 protection re-validated before its secret is read."""
     path = identity_key_path()
     if path.exists():
-        return _deserialize(path.read_bytes())
+        return _load_existing_identity(path)
     identity = Identity(signing_key=SigningKey.generate(), enc_private=PrivateKey.generate())
-    try:
-        _atomic_write_0600(path, _serialize(identity))
-    except FileExistsError:
-        # lost the create race — another process wrote it first; use theirs.
-        return _deserialize(path.read_bytes())
-    return identity
+    if _exclusive_create_0600(path, _serialize(identity)):
+        return identity
+    # lost the create race — another process created it first; use theirs.
+    return _load_existing_identity(path)

@@ -104,6 +104,19 @@ async def set_contact_state(
 # messages (hash-chained transcript)
 # ---------------------------------------------------------------------------
 
+_DIRECTIONS = ("in", "out")
+
+# HITL states whose message body is safe to prune. A NON-terminal outbound
+# message (proposed/held/approved-but-undelivered) still needs its plaintext/
+# ciphertext to be sent once the owner approves — pruning it would lose the
+# payload permanently. Only genuinely-done rows are prunable.
+_PRUNABLE_HITL_STATES = ("sent", "rejected", "quarantined", "received")
+
+
+def _require_direction(direction: str) -> None:
+    if direction not in _DIRECTIONS:
+        raise ValueError(f"direction must be one of {_DIRECTIONS}, got {direction!r}")
+
 
 async def append_message(
     db: aiosqlite.Connection,
@@ -125,28 +138,37 @@ async def append_message(
     delivered_at: str | None = None,
 ) -> str:
     """Append a transcript message AND advance the contact's per-direction chain
-    head, atomically (single commit). ``direction`` is 'in' or 'out'; the matching
-    ``last_seq_{sent,recv}`` + ``{send,recv}_chain_head`` columns move to ``seq`` /
-    ``payload_hash`` so the next :func:`chain_tip` reads this row.
+    head via a **compare-and-swap**, atomically (single commit).
 
-    The head UPDATE runs FIRST and a zero-row result raises ``ValueError`` — so an
-    unknown ``contact_id`` fails LOUD and identically regardless of whether this
-    connection has ``PRAGMA foreign_keys`` on (get_db) or off (the MCP-server
-    connections), instead of silently inserting an orphan message whose head never
-    moved. Any failure rolls the whole thing back — the head can never point at a
-    message that was not written, nor a message exist past an unmoved head.
+    The head UPDATE is a CAS: it moves ``last_seq_{sent,recv}`` + ``{send,recv}_
+    chain_head`` to ``(seq, payload_hash)`` ONLY when the stored tip currently
+    equals ``(seq - 1, prev_hash)`` — i.e. this message links strictly onto the
+    current tip. A zero-row result raises ``ValueError`` and rolls the whole thing
+    back, so an unknown contact, an out-of-order append (seq 2 before seq 1), or a
+    stale-tip writer can NEVER move the head backward or attach a row to the wrong
+    predecessor — which ``UNIQUE(contact,direction,seq)`` alone does not prevent
+    (it only rejects a duplicate seq). Genesis (first message) is ``seq = 1``,
+    ``prev_hash = None``, matched against the fresh contact's ``(0, NULL)`` tip.
+    The CAS also subsumes the unknown-contact check (no matching row → 0 rows),
+    uniformly regardless of ``PRAGMA foreign_keys``.
     """
-    if direction not in ("in", "out"):
-        raise ValueError(f"direction must be 'in' or 'out', got {direction!r}")
+    _require_direction(direction)
     col_seq = "last_seq_sent" if direction == "out" else "last_seq_recv"
     col_head = "send_chain_head" if direction == "out" else "recv_chain_head"
     try:
+        # CAS: only advance if the stored tip is exactly (seq-1, prev_hash).
+        # `IS ?` compares NULL correctly (genesis prev_hash=None ↔ head IS NULL).
         cur = await db.execute(
-            f"UPDATE federation_contacts SET {col_seq} = ?, {col_head} = ? WHERE contact_id = ?",
-            (seq, payload_hash, contact_id),
+            f"UPDATE federation_contacts SET {col_seq} = ?, {col_head} = ? "
+            f"WHERE contact_id = ? AND {col_seq} = ? AND {col_head} IS ?",
+            (seq, payload_hash, contact_id, seq - 1, prev_hash),
         )
         if cur.rowcount == 0:
-            raise ValueError(f"append_message: unknown contact_id {contact_id!r}")
+            raise ValueError(
+                f"append_message: chain-tip CAS failed for contact {contact_id!r} "
+                f"direction={direction} (expected prior seq={seq - 1}, "
+                f"prev_hash={prev_hash!r}) — unknown contact, out-of-order, or fork"
+            )
         await db.execute(
             """INSERT INTO federation_messages
                  (msg_id, contact_id, direction, seq, prev_hash, payload_hash,
@@ -184,6 +206,7 @@ async def chain_tip(
     """Return ``(last_seq, chain_head)`` for the contact's direction, read from
     the contact row (the atomic head). ``(0, None)`` if the contact is unknown or
     the chain is empty — the correct genesis state for a first message."""
+    _require_direction(direction)  # never silently alias a typo to the inbound chain
     col_seq = "last_seq_sent" if direction == "out" else "last_seq_recv"
     col_head = "send_chain_head" if direction == "out" else "recv_chain_head"
     cursor = await db.execute(
@@ -209,22 +232,28 @@ async def list_messages(
     contact_id: str,
     *,
     direction: str | None = None,
+    after_seq: int = 0,
     limit: int = 200,
 ) -> list[dict]:
     """Transcript for a contact in chain order (seq ASC), optionally one
-    direction. ``msg_id`` (ULID) breaks ties deterministically."""
-    if direction is None:
-        cursor = await db.execute(
-            "SELECT * FROM federation_messages WHERE contact_id = ? "
-            "ORDER BY seq ASC, msg_id ASC LIMIT ?",
-            (contact_id, limit),
-        )
-    else:
-        cursor = await db.execute(
-            "SELECT * FROM federation_messages WHERE contact_id = ? AND direction = ? "
-            "ORDER BY seq ASC, msg_id ASC LIMIT ?",
-            (contact_id, direction, limit),
-        )
+    direction. ``msg_id`` (ULID) breaks ties deterministically.
+
+    Paginate with ``after_seq``: pass the ``seq`` of the last row you saw to get
+    the next window (rows with ``seq > after_seq``). Without it, rows past
+    ``limit`` would be permanently unreachable — a long transcript would hide its
+    newest entries from audit/display consumers."""
+    if direction is not None:
+        _require_direction(direction)
+    where = "contact_id = ? AND seq > ?"
+    params: list = [contact_id, after_seq]
+    if direction is not None:
+        where += " AND direction = ?"
+        params.append(direction)
+    params.append(limit)
+    cursor = await db.execute(
+        f"SELECT * FROM federation_messages WHERE {where} ORDER BY seq ASC, msg_id ASC LIMIT ?",
+        tuple(params),
+    )
     return [dict(r) for r in await cursor.fetchall()]
 
 
@@ -251,14 +280,19 @@ async def prune_bodies(db: aiosqlite.Connection, *, before: str) -> int:
     """Retention: null the prunable bodies (plaintext/ciphertext/nonce) of
     messages created strictly before ``before`` (ISO ts), PRESERVING the chain
     skeleton (seq/prev_hash/payload_hash) so a pruned transcript still verifies.
-    Rows are never deleted — a gap would break verification. Returns the number
-    of rows pruned. Idempotent (already-pruned rows are skipped)."""
+
+    Only messages in a TERMINAL hitl_state (``_PRUNABLE_HITL_STATES``) are pruned
+    — a ``held``/``approved``-but-undelivered outbound message still needs its
+    payload to be sent once the owner approves, so pruning it (even when old)
+    would lose the message permanently. Rows are never deleted — a gap would break
+    verification. Returns the number of rows pruned. Idempotent."""
+    placeholders = ", ".join("?" for _ in _PRUNABLE_HITL_STATES)
     cursor = await db.execute(
         "UPDATE federation_messages "
         "SET plaintext = NULL, ciphertext = NULL, nonce = NULL "
-        "WHERE created_at < ? "
+        f"WHERE created_at < ? AND hitl_state IN ({placeholders}) "
         "AND (plaintext IS NOT NULL OR ciphertext IS NOT NULL OR nonce IS NOT NULL)",
-        (before,),
+        (before, *_PRUNABLE_HITL_STATES),
     )
     await db.commit()
     return cursor.rowcount

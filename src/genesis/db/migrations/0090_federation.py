@@ -62,7 +62,9 @@ _MESSAGES_DDL = """
         hitl_state      TEXT NOT NULL DEFAULT 'proposed'
                             CHECK (hitl_state IN ('proposed', 'held', 'approved',
                                                   'sent', 'rejected', 'quarantined', 'received')),
-        approval_id     TEXT,                       -- FK approval_requests.id (outbound holds)
+        approval_id     TEXT UNIQUE,                 -- FK approval_requests.id; UNIQUE = one
+                                                    -- approval releases at most one message
+                                                    -- (nullable: many inbound/unheld rows are NULL)
         created_at      TEXT NOT NULL,
         delivered_at    TEXT,
         -- one message per (contact, direction, seq): a duplicate seq would fork

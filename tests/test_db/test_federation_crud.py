@@ -118,21 +118,146 @@ async def test_append_rejects_bad_direction(db):
         )
 
 
+async def _append_chain(db, contact_id, direction, seqs, *, hitl_state="received"):
+    """Append a strictly-linked run of messages (CAS requires in-order + prev)."""
+    prev = None
+    for i in seqs:
+        h = f"h{direction}{i}"
+        await fed.append_message(
+            db,
+            msg_id=f"m{direction}{i}",
+            contact_id=contact_id,
+            direction=direction,
+            seq=i,
+            prev_hash=prev,
+            payload_hash=h,
+            created_at="2026-08-31T00:00:00Z",
+            hitl_state=hitl_state,
+        )
+        prev = h
+
+
 @pytest.mark.asyncio
 async def test_list_messages_orders_by_seq(db):
     await _contact(db)
-    for i, mid in ((2, "m2"), (1, "m1"), (3, "m3")):
+    await _append_chain(db, "c1", "in", (1, 2, 3))
+    assert [m["msg_id"] for m in await fed.list_messages(db, "c1")] == ["min1", "min2", "min3"]
+
+
+@pytest.mark.asyncio
+async def test_list_messages_pagination(db):
+    await _contact(db)
+    await _append_chain(db, "c1", "in", (1, 2, 3))
+    first = await fed.list_messages(db, "c1", limit=2)
+    assert [m["msg_id"] for m in first] == ["min1", "min2"]
+    # rows past the limit are reachable via after_seq — never permanently hidden
+    rest = await fed.list_messages(db, "c1", after_seq=first[-1]["seq"])
+    assert [m["msg_id"] for m in rest] == ["min3"]
+
+
+@pytest.mark.asyncio
+async def test_direction_is_validated_everywhere(db):
+    await _contact(db)
+    for bad in ("incoming", "sideways", ""):
+        with pytest.raises(ValueError):
+            await fed.chain_tip(db, "c1", direction=bad)
+        with pytest.raises(ValueError):
+            await fed.list_messages(db, "c1", direction=bad)
+
+
+@pytest.mark.asyncio
+async def test_append_cas_rejects_out_of_order_and_wrong_prev(db):
+    """The chain-tip CAS: an append that does not link strictly onto the current
+    tip (skipped seq, repeated seq, or wrong prev_hash) is rejected and rolled
+    back — the head can never move backward or fork."""
+    await _contact(db)
+    await fed.append_message(
+        db,
+        msg_id="m1",
+        contact_id="c1",
+        direction="out",
+        seq=1,
+        prev_hash=None,
+        payload_hash="h1",
+        created_at="2026-08-31T00:00:00Z",
+        hitl_state="held",
+    )
+    # skip seq 2
+    with pytest.raises(ValueError):
         await fed.append_message(
             db,
-            msg_id=mid,
+            msg_id="m3",
             contact_id="c1",
-            direction="in",
-            seq=i,
-            payload_hash=f"h{i}",
-            created_at="2026-08-31T00:00:00Z",
-            hitl_state="received",
+            direction="out",
+            seq=3,
+            prev_hash="h1",
+            payload_hash="h3",
+            created_at="2026-08-31T00:00:02Z",
+            hitl_state="held",
         )
-    assert [m["msg_id"] for m in await fed.list_messages(db, "c1")] == ["m1", "m2", "m3"]
+    # correct seq but wrong prev_hash
+    with pytest.raises(ValueError):
+        await fed.append_message(
+            db,
+            msg_id="m2",
+            contact_id="c1",
+            direction="out",
+            seq=2,
+            prev_hash="WRONG",
+            payload_hash="h2",
+            created_at="2026-08-31T00:00:02Z",
+            hitl_state="held",
+        )
+    # rollback left the tip at m1 and wrote nothing
+    assert await fed.chain_tip(db, "c1", direction="out") == (1, "h1")
+    assert await fed.get_message(db, "m3") is None and await fed.get_message(db, "m2") is None
+    # the correct next link succeeds
+    await fed.append_message(
+        db,
+        msg_id="m2",
+        contact_id="c1",
+        direction="out",
+        seq=2,
+        prev_hash="h1",
+        payload_hash="h2",
+        created_at="2026-08-31T00:00:03Z",
+        hitl_state="held",
+    )
+    assert await fed.chain_tip(db, "c1", direction="out") == (2, "h2")
+
+
+@pytest.mark.asyncio
+async def test_approval_id_is_unique(db):
+    """One owner approval can release at most one outbound message."""
+    import sqlite3
+
+    await _contact(db)
+    await fed.append_message(
+        db,
+        msg_id="m1",
+        contact_id="c1",
+        direction="out",
+        seq=1,
+        prev_hash=None,
+        payload_hash="h1",
+        approval_id="ap1",
+        created_at="2026-08-31T00:00:00Z",
+        hitl_state="held",
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        await fed.append_message(
+            db,
+            msg_id="m2",
+            contact_id="c1",
+            direction="out",
+            seq=2,
+            prev_hash="h1",
+            payload_hash="h2",
+            approval_id="ap1",  # same approval → rejected
+            created_at="2026-08-31T00:00:01Z",
+            hitl_state="held",
+        )
+    assert await fed.get_message(db, "m2") is None  # rolled back
 
 
 @pytest.mark.asyncio
@@ -187,14 +312,30 @@ async def test_prune_bodies_preserves_chain_skeleton(db):
         created_at="2026-08-31T00:00:00Z",
         hitl_state="received",
     )
+    # an OLD but still-HELD outbound (non-terminal) message: its body must NOT be
+    # pruned or the payload is lost when the owner later approves the send.
+    await fed.append_message(
+        db,
+        msg_id="pending",
+        contact_id="c1",
+        direction="out",
+        seq=1,
+        prev_hash=None,
+        payload_hash="hp1",
+        plaintext="dont-lose-me",
+        created_at="2026-08-01T00:00:00Z",
+        hitl_state="held",
+    )
     pruned = await fed.prune_bodies(db, before="2026-08-15T00:00:00Z")
-    assert pruned == 1
+    assert pruned == 1  # only the terminal 'old' row
     old = await fed.get_message(db, "old")
     assert old is not None  # never deleted
     assert old["plaintext"] is None and old["ciphertext"] is None and old["nonce"] is None
     assert old["seq"] == 1 and old["payload_hash"] == "h1"  # skeleton intact
     new = await fed.get_message(db, "new")
     assert new["plaintext"] == "keep"  # newer row untouched
+    pending = await fed.get_message(db, "pending")
+    assert pending["plaintext"] == "dont-lose-me"  # non-terminal body PRESERVED though old
     # idempotent: re-running prunes nothing more
     assert await fed.prune_bodies(db, before="2026-08-15T00:00:00Z") == 0
 
@@ -216,39 +357,6 @@ async def test_append_to_unknown_contact_raises(db):
         )
     # nothing was left behind (the transaction rolled back)
     assert await fed.get_message(db, "m1") is None
-
-
-@pytest.mark.asyncio
-async def test_duplicate_seq_is_rejected_and_rolls_back(db):
-    """UNIQUE(contact_id, direction, seq) prevents a chain fork; the failed insert
-    rolls back so the head still reflects the first message."""
-    import sqlite3
-
-    await _contact(db)
-    await fed.append_message(
-        db,
-        msg_id="m1",
-        contact_id="c1",
-        direction="out",
-        seq=1,
-        payload_hash="h1",
-        created_at="2026-08-31T00:00:00Z",
-        hitl_state="held",
-    )
-    with pytest.raises(sqlite3.IntegrityError):
-        await fed.append_message(
-            db,
-            msg_id="m2",
-            contact_id="c1",
-            direction="out",
-            seq=1,  # dup seq
-            payload_hash="h2",
-            created_at="2026-08-31T00:00:01Z",
-            hitl_state="held",
-        )
-    # the rollback undid the second head-advance: tip still points at m1
-    assert await fed.chain_tip(db, "c1", direction="out") == (1, "h1")
-    assert await fed.get_message(db, "m2") is None
 
 
 def _norm_ddl(ddl: str) -> str:

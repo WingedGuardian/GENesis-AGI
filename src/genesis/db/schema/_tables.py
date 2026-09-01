@@ -859,7 +859,7 @@ TABLES = {
             hitl_state      TEXT NOT NULL DEFAULT 'proposed'
                                 CHECK (hitl_state IN ('proposed', 'held', 'approved',
                                                       'sent', 'rejected', 'quarantined', 'received')),
-            approval_id     TEXT,
+            approval_id     TEXT UNIQUE,
             created_at      TEXT NOT NULL,
             delivered_at    TEXT,
             UNIQUE (contact_id, direction, seq),
