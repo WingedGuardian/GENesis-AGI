@@ -10,7 +10,24 @@ import pytest
 from genesis.db.crud import cc_sessions as cc_crud
 
 
-async def _mk_session(db, *, sid, proposal_id, output, transcript, started_at):
+async def _mk_session(
+    db,
+    *,
+    sid,
+    proposal_id,
+    output,
+    transcript,
+    started_at,
+    caller_context=None,
+    origin_caller_context=None,
+):
+    md = {
+        "caller_context": caller_context or f"ego_proposal:{proposal_id}",
+        "output_text": output,
+        "transcript_path": transcript,
+    }
+    if origin_caller_context is not None:
+        md["origin_caller_context"] = origin_caller_context
     await cc_crud.create(
         db,
         id=sid,
@@ -19,13 +36,7 @@ async def _mk_session(db, *, sid, proposal_id, output, transcript, started_at):
         started_at=started_at,
         last_activity_at=started_at,
         source_tag="ego_dispatch",
-        metadata=json.dumps(
-            {
-                "caller_context": f"ego_proposal:{proposal_id}",
-                "output_text": output,
-                "transcript_path": transcript,
-            }
-        ),
+        metadata=json.dumps(md),
     )
 
 
@@ -67,6 +78,55 @@ async def test_newest_session_wins(db):
     out = await cc_crud.dispatch_info_for_proposals(db, ["pB"])
     assert out["pB"]["session_id"] == "new"
     assert out["pB"]["output_excerpt"] == "NEW"
+
+
+@pytest.mark.asyncio
+async def test_resumed_session_matched_via_origin_caller_context(db):
+    """A rate-limit-resumed dispatch has caller_context='rate_limit_resume:<park>'
+    and carries the original 'ego_proposal:<id>' on origin_caller_context. The
+    debrief join must find it via the origin (else the dashboard card is blank for
+    exactly the resumed case). Pre-fix the WHERE matched only caller_context, so
+    the resume-prefix row was excluded → KeyError here."""
+    await _mk_session(
+        db,
+        sid="resumed",
+        proposal_id="pR",
+        output="finding after resume",
+        transcript="/x/r.jsonl",
+        started_at="2026-08-03T00:00:00+00:00",
+        caller_context="rate_limit_resume:park-1",
+        origin_caller_context="ego_proposal:pR",
+    )
+    out = await cc_crud.dispatch_info_for_proposals(db, ["pR"])
+    assert out["pR"]["session_id"] == "resumed"
+    assert out["pR"]["output_excerpt"] == "finding after resume"
+
+
+@pytest.mark.asyncio
+async def test_resumed_supersedes_original_parked(db):
+    """When both the original parked dispatch and its later resume exist for one
+    proposal, newest-wins surfaces the resume (the session that produced output)."""
+    await _mk_session(
+        db,
+        sid="parked",
+        proposal_id="pS",
+        output="",  # parked original produced nothing before the limit
+        transcript=None,
+        started_at="2026-08-01T00:00:00+00:00",
+    )
+    await _mk_session(
+        db,
+        sid="resumed",
+        proposal_id="pS",
+        output="real finding",
+        transcript="/x/s.jsonl",
+        started_at="2026-08-04T00:00:00+00:00",
+        caller_context="rate_limit_resume:park-2",
+        origin_caller_context="ego_proposal:pS",
+    )
+    out = await cc_crud.dispatch_info_for_proposals(db, ["pS"])
+    assert out["pS"]["session_id"] == "resumed"
+    assert out["pS"]["output_excerpt"] == "real finding"
 
 
 @pytest.mark.asyncio
