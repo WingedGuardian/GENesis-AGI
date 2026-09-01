@@ -16,6 +16,17 @@ claimed twice, or vanished; stale stamps only warn. After changing a
 subsystem's capabilities, update its entry and bump its stamp (PR-template
 checkbox).
 
+**Stamp a commit that SURVIVES THE MERGE — a default-branch commit, never your
+feature-branch HEAD.** Squash-merge discards branch commits, so a branch-head
+sha is unresolvable forever the moment the PR lands. That is not hypothetical:
+two stamps already name dead feature-branch heads, and because
+`check_subsystem_map.check_staleness` returns on the FIRST sha it cannot
+resolve, those two silently disabled the freshness check for ALL fourteen
+entries — reporting it as "shallow or incomplete git history", a cause that is
+not the cause. Stamp the `origin/main` tip you verified against.
+And bump ONLY when you re-verified: the stamp asserts "verified at this
+commit", so bumping on faith writes a false claim into permanent record.
+
 **Naming trap.** The `capability_map` DB table and `ego/capability_aggregator.py`
 are the ego's per-domain *self-confidence model* — completely unrelated to this
 document. Everything here is "subsystem map".
@@ -220,7 +231,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 82f84f0a 2026-08-31
+verified: 975d3944 2026-08-31
 ```
 
 - **Cross-session awareness — how concurrent CC sessions perceive each other.**
@@ -239,10 +250,25 @@ verified: 82f84f0a 2026-08-31
   PostToolUse, because `get_active_sync` hides any row older than ten minutes
   and a heads-down session would otherwise vanish from its peers while busiest.
   **Field-source rules, each derived from measurement, not assumption:** the
-  rendered `topic` comes FIRST from `cc_sessions.topic` (already extracted by
-  `memory/extraction_job.py` — richer than anything re-derived here, though
-  written on a multi-hour cycle, so it is preferred for COVERAGE and QUALITY
-  and never for freshness), falling back to the session charter's mission and then its newest live
+  rendered `topic` is whichever of two sources is the more RECENT statement of
+  what the session is doing: `cc_sessions.topic` (written by
+  `memory/extraction_job.py` on a multi-hour cycle) or the charter's mission
+  (set the moment a session declares a pivot), decided by comparing
+  `cc_sessions.topic_updated_at` against `session_charters.mission_updated_at`
+  (migration 0090). BOTH columns are new, and the second one is why:
+  `last_extracted_at` is a PASS watermark the extraction job advances even on
+  passes that write no topic (219 of 899 live rows carry a watermark with no
+  topic), so using it as the topic's age would commit on that side the exact
+  defect `mission_updated_at` exists to avoid. That column exists because `updated_at` CANNOT answer it — it is a row
+  timestamp that `set_pointers` and the charter upsert also bump, so a pointer
+  edit would promote a stale founding mission. Timestamps are compared PARSED, not
+  lexically — for heterogeneous offsets and naive stamps, NOT for the
+  microsecond reason an earlier draft gave (measured: 0 disagreements over
+  200,000 same-format pairs). When the comparison is impossible — a pre-0090 row whose
+  mission age is genuinely unknown, an unparseable stamp, or no extraction to
+  compare against — the extracted summary keeps precedence, which is both the
+  safe direction and the pre-0090 behaviour, so the migration is inert until a
+  mission is next set. Then the mission regardless of age, then its newest live
   ledger item; the raw first user message is NEVER a fallback and the peer's
   typed prompt is never rendered at all, since another session's user text is
   decontextualised in yours. `model` comes from the SessionStart cache with

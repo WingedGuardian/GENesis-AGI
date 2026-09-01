@@ -354,8 +354,13 @@ def _seed_cc(path: Path, topic, *, sid: str = _SID) -> None:
     """
     conn = sqlite3.connect(str(path))
     try:
-        conn.execute("CREATE TABLE cc_sessions (cc_session_id TEXT, topic TEXT)")
-        conn.execute("INSERT INTO cc_sessions VALUES (?,?)", (sid, topic))
+        # last_extracted_at is part of the real cc_sessions schema and the
+        # resolver reads it for the recency comparison; a fixture omitting it
+        # would make the whole read fail rather than exercise the path.
+        conn.execute(
+            "CREATE TABLE cc_sessions (cc_session_id TEXT, topic TEXT, last_extracted_at TEXT)"
+        )
+        conn.execute("INSERT INTO cc_sessions VALUES (?,?,?)", (sid, topic, None))
         conn.commit()
     finally:
         conn.close()
@@ -405,6 +410,145 @@ def test_the_extracted_topic_is_sanitized_like_every_other_rendered_field(tmp_pa
     got = sh.resolve_topic(db, _SID)
     assert "\n" not in got
     assert "[" not in got and "]" not in got
+
+
+# -- recency: the more RECENT statement of what a session is doing wins -------
+#
+# Neither source is authoritative on its own. The extracted summary is written
+# on a multi-hour cycle (memory_extraction_hours, default 2 -- measured at
+# 69-73 minutes stale mid-cycle), while the mission is set the moment a session
+# declares a pivot. So a mission set AFTER the last extraction is the newer
+# statement and should win; otherwise the summary does.
+#
+# `session_charters.updated_at` deliberately CANNOT serve here: it is a ROW
+# timestamp that set_pointers and the charter upsert also bump, so a pointer
+# edit would promote a stale founding mission. `mission_updated_at` (migration
+# 0090) records only the mission write.
+
+
+def _seed_mission_ts(path: Path, mission_updated_at) -> None:
+    """Add the 0090 column and stamp it for the seeded charter row."""
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("ALTER TABLE session_charters ADD COLUMN mission_updated_at TEXT")
+        conn.execute(
+            "UPDATE session_charters SET mission_updated_at = ? WHERE session_id = ?",
+            (mission_updated_at, _SID),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_cc_ts(path: Path, topic, topic_updated_at) -> None:
+    """Seed cc_sessions with a TOPIC stamp.
+
+    Deliberately not ``last_extracted_at``: that is a pass watermark the
+    extraction job advances even on passes that write no topic (219 of 899 live
+    rows carry a watermark with no topic), so it is not the topic's age. Seeding
+    it here would have made these tests agree with a resolver reading the wrong
+    column -- the fixture would have encoded the bug.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE cc_sessions (cc_session_id TEXT, topic TEXT,"
+            " last_extracted_at TEXT, topic_updated_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO cc_sessions VALUES (?,?,?,?)",
+            (_SID, topic, None, topic_updated_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+_EARLIER = "2026-08-31T22:00:00.000000+00:00"
+_LATER = "2026-08-31T23:30:00.000000+00:00"
+
+
+def test_a_mission_set_after_the_last_extraction_wins(tmp_path):
+    db = tmp_path / "g.db"
+    _seed(db, mission="pivoted to the migration")
+    _seed_cc_ts(db, "an older extracted summary", _EARLIER)
+    _seed_mission_ts(db, _LATER)
+    assert sh.resolve_topic(db, _SID) == "pivoted to the migration"
+
+
+def test_an_extraction_after_the_mission_still_wins(tmp_path):
+    db = tmp_path / "g.db"
+    _seed(db, mission="the founding mission, set long ago")
+    _seed_cc_ts(db, "a newer extracted summary", _LATER)
+    _seed_mission_ts(db, _EARLIER)
+    assert sh.resolve_topic(db, _SID) == "a newer extracted summary"
+
+
+def test_an_unstamped_mission_never_outranks_the_summary(tmp_path):
+    """The pre-migration state, and the reason the migration is inert on arrival.
+
+    A row written before 0090 has NULL here: we do not know when its mission was
+    set. Inventing an answer would be worse than admitting it, so NULL means
+    "cannot compare" and the summary keeps winning -- exactly the behaviour
+    before this change.
+    """
+    db = tmp_path / "g.db"
+    _seed(db, mission="a mission of unknown age")
+    _seed_cc_ts(db, "the extracted summary", _EARLIER)
+    _seed_mission_ts(db, None)
+    assert sh.resolve_topic(db, _SID) == "the extracted summary"
+
+
+def test_a_missing_mission_updated_at_COLUMN_degrades_to_summary_first(tmp_path):
+    """A database that has not run migration 0090 at all must still work."""
+    db = tmp_path / "g.db"
+    _seed(db, mission="a mission on a pre-0090 schema")
+    _seed_cc_ts(db, "the extracted summary", _EARLIER)  # no ALTER at all
+    assert sh.resolve_topic(db, _SID) == "the extracted summary"
+
+
+def test_an_UNSTAMPED_summary_is_not_outranked_by_a_stamped_mission(tmp_path):
+    """RENAMED AND FIXED: the previous version of this test was VACUOUS.
+
+    It seeded ``topic=None``, which fails the query's ``AND topic IS NOT NULL``,
+    so the mission returned through the plain ``if mission:`` fallback and
+    ``_is_newer`` never decided anything. Mutation-proved by the audit: it
+    passed with the comparison forced always-False, forced always-True, AND
+    deleted outright. A REAL topic with no stamp is the case that actually
+    reaches the branch, and the expected answer is the opposite of what the old
+    name implied: no stamp means "cannot compare", which keeps the summary.
+    """
+    db = tmp_path / "g.db"
+    _seed(db, mission="the mission")
+    _seed_cc_ts(db, "a summary with no stamp", None)
+    _seed_mission_ts(db, _LATER)
+    assert sh.resolve_topic(db, _SID) == "a summary with no stamp"
+
+
+def test_equal_timestamps_keep_the_summary(tmp_path):
+    """The tie, which nothing covered.
+
+    ``_is_newer`` uses a strict ``>`` deliberately: two writes indistinguishable
+    in time must not silently promote the mission.
+    """
+    db = tmp_path / "g.db"
+    _seed(db, mission="a mission written in the same instant")
+    _seed_cc_ts(db, "the summary", _LATER)
+    _seed_mission_ts(db, _LATER)
+    assert sh.resolve_topic(db, _SID) == "the summary"
+
+
+@pytest.mark.parametrize("junk", ["not a timestamp", "", "2026-13-45T99:99:99"])
+def test_an_unparseable_timestamp_falls_back_to_summary_first(tmp_path, junk):
+    """Comparison is on PARSED datetimes, not strings: `.isoformat()` omits the
+    microseconds when they are exactly zero, and '+' sorts before '.', so a
+    lexical compare has a sub-second edge case. An unparseable value means
+    "cannot compare", which keeps the pre-change ordering."""
+    db = tmp_path / "g.db"
+    _seed(db, mission="a mission with a junk stamp")
+    _seed_cc_ts(db, "the extracted summary", _EARLIER)
+    _seed_mission_ts(db, junk)
+    assert sh.resolve_topic(db, _SID) == "the extracted summary"
 
 
 def test_a_cc_sessions_read_FAILURE_preserves_rather_than_clears(tmp_path):

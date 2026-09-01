@@ -616,11 +616,26 @@ async def update_topic_and_keywords(
     *,
     topic: str,
     keywords: str,
+    topic_updated_at: str | None = None,
 ) -> bool:
-    """Update the session topic and keywords index."""
+    """Update the session topic and keywords index.
+
+    Stamps ``topic_updated_at`` alongside. ``last_extracted_at`` is NOT a
+    substitute and must not be used as the topic's age: it is written by
+    ``update_extraction_watermark``, a different function, and the extraction
+    job advances it unconditionally while calling THIS function only when it
+    actually has a topic. MEASURED on a live install: 219 of 899 rows carry a
+    watermark with no topic. The concurrent-session peer line compares this
+    stamp against the charter's ``mission_updated_at`` to decide which is the
+    more recent account of what a session is doing; using the watermark there
+    would let a pass that produced no topic suppress a genuinely newer mission.
+    """
+    from datetime import UTC, datetime  # local, matching this module's idiom
+
+    stamp = topic_updated_at or datetime.now(UTC).isoformat()
     cursor = await db.execute(
-        "UPDATE cc_sessions SET topic = ?, keywords = ? WHERE id = ?",
-        (topic, keywords, id),
+        "UPDATE cc_sessions SET topic = ?, keywords = ?, topic_updated_at = ? WHERE id = ?",
+        (topic, keywords, stamp, id),
     )
     await db.commit()
     return cursor.rowcount > 0

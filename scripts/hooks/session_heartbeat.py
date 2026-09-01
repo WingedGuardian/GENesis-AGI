@@ -155,6 +155,44 @@ def cached_model(session_id: str) -> str | None:
     return str(data.get(session_id) or "") or None
 
 
+def _is_newer(a: str | None, b: str | None) -> bool:
+    """True iff timestamp ``a`` parses, ``b`` parses, and a > b.
+
+    PARSED, not string-compared -- but NOT for the reason an earlier version of
+    this docstring gave. It claimed that because ``.isoformat()`` omits the
+    microseconds at exactly zero, and "+" sorts before ".", a lexical compare
+    would misorder a whole-second stamp against a same-second one. Both facts
+    are true and the CONSEQUENCE IS NOT: the whole-second stamp really is the
+    earlier instant, so the two orderings agree. MEASURED over 200,000 random
+    same-format pairs mixing zero and non-zero microseconds: 0 disagreements.
+    The claim is corrected rather than deleted because a maintainer who fails to
+    reproduce a stated bug reasonably concludes the guard is unnecessary.
+
+    The real divergence is a HETEROGENEOUS OFFSET -- "…T00:30:00+00:00" against
+    "…T01:00:00+01:00", where the second is the earlier instant but sorts later
+    lexically -- and a naive stamp, where a string compare silently succeeds
+    against an aware one. Parsing catches the first and raises TypeError on the
+    second, which lands in the False branch below. Nothing here writes an offset
+    other than UTC today; this is defence against a future writer that does.
+
+    Returns False whenever either side is missing or unparseable. That is the
+    conservative direction on purpose: "cannot compare" must leave the previous
+    ordering (extracted summary first) intact rather than promote a mission of
+    unknown age.
+    """
+    if not a or not b:
+        return False
+    try:
+        from datetime import datetime  # lazy: never needed on the PostToolUse path
+
+        # STRICT `>`: on an exact tie the summary keeps precedence. A tie
+        # means the two writes are indistinguishable in time, and the tie-break
+        # should not silently promote the mission.
+        return datetime.fromisoformat(a) > datetime.fromisoformat(b)
+    except (TypeError, ValueError):
+        return False
+
+
 def resolve_topic(db_path: Path, session_id: str, *, limit: int = _TOPIC_MAX) -> str | None:
     """What this session is WORKING ON: charter mission, else newest live ledger item.
 
@@ -223,27 +261,65 @@ def resolve_topic(db_path: Path, session_id: str, *, limit: int = _TOPIC_MAX) ->
             # to a charter/ledger with nothing to report, return "", and CLEAR a
             # good stored topic. An absent table is the fresh-install case,
             # where falling through is right.
+            extracted = ""
+            extracted_at = None
             if conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cc_sessions'"
             ).fetchone():
                 # No local handler: a failure here propagates to the outer
                 # `except` -> None -> PRESERVE, which is the contract.
+                # topic_updated_at, NOT last_extracted_at. The watermark is
+                # advanced by a DIFFERENT crud function on every extraction
+                # pass, including passes that write no topic (measured: 219/899
+                # live rows carry a watermark with no topic) -- using it as the
+                # topic's age would commit, on this side of the comparison,
+                # exactly the defect mission_updated_at exists to avoid.
+                # Column-probed like the charter side: absent -> NULL -> "cannot
+                # compare" -> summary first, the pre-migration behaviour.
+                cc_cols = {r[1] for r in conn.execute("PRAGMA table_info(cc_sessions)")}
+                topic_ts = "topic_updated_at" if "topic_updated_at" in cc_cols else "NULL"
                 row = conn.execute(
-                    "SELECT topic FROM cc_sessions WHERE cc_session_id = ?"
+                    f"SELECT topic, {topic_ts} FROM cc_sessions"  # noqa: S608 - literal, ours
+                    " WHERE cc_session_id = ?"
                     " AND topic IS NOT NULL AND TRIM(topic) != ''"
                     # no duplicate ids observed (0 of 734), but newest-wins
                     # costs nothing and stays correct if that ever changes
                     " ORDER BY rowid DESC LIMIT 1",
                     (session_id,),
                 ).fetchone()
-                extracted = sanitize_detail(row[0] if row else None, limit)
-                if extracted:
-                    return extracted
+                if row:
+                    extracted = sanitize_detail(row[0], limit)
+                    extracted_at = row[1]
+
+            # `mission_updated_at` arrives with migration 0090; a database that
+            # has not run it yet must still work, so the column is selected only
+            # when present. Absent -> None -> "cannot compare" -> summary first,
+            # which is the behaviour before that migration.
+            charter_cols = {r[1] for r in conn.execute("PRAGMA table_info(session_charters)")}
             row = conn.execute(
-                "SELECT mission FROM session_charters WHERE session_id = ?",
+                "SELECT mission, mission_updated_at FROM session_charters WHERE session_id = ?"
+                if "mission_updated_at" in charter_cols
+                else "SELECT mission, NULL FROM session_charters WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
             mission = sanitize_detail(row[0] if row else None, limit)
+            mission_at = row[1] if row else None
+
+            # RECENCY decides between the two, not a fixed preference. The
+            # summary is written on a multi-hour cycle; the mission is set the
+            # moment a session declares a pivot. Whichever is the more recent
+            # STATEMENT of what the session is doing wins. When the comparison
+            # is impossible -- no stamp (a pre-0090 row, whose mission age is
+            # genuinely unknown), an unparseable stamp, or no extraction to
+            # compare against -- `_is_newer` returns False and the summary keeps
+            # precedence, which is both the safe direction and the prior
+            # behaviour. `updated_at` is NOT usable for this: set_pointers and
+            # the charter upsert bump it too, so a pointer edit would promote a
+            # stale founding mission.
+            if mission and _is_newer(mission_at, extracted_at):
+                return mission
+            if extracted:
+                return extracted
             if mission:
                 return mission
             # Statuses written out literally rather than interpolated from the

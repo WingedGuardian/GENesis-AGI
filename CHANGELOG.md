@@ -16,13 +16,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   is shown a `[Concurrent | …]` line per peer. Those lines previously carried a
   digest of the peer's last few tool calls — so a peer read as
   `Bash grep -n "Version History"`, which says nothing about what it is doing.
-  They now carry the peer's model and its topic. The topic is the one Genesis
-  already writes for every session when it summarises that session's activity —
-  a summary refreshed on a cycle of a couple of hours, so it describes the
-  session's current work rather than its current minute. Where none has been
-  written — a session too new to have been summarised, or one that has never
-  had a summary at all — it falls back to that session's charter mission, then
-  to its newest in-progress or open ledger item. All of those are written by Genesis rather
+  They now carry the peer's model and its topic. The topic is whichever is the
+  more recent account of what that session is doing: the summary Genesis
+  already writes when it summarises a session's activity, refreshed on a cycle
+  of a couple of hours, or the session's own mission, set the moment its
+  purpose changes. A mission declared after the last summary wins; otherwise
+  the summary does. Sessions whose mission predates this release keep showing
+  the summary, because there is no honest way to know when an older mission was
+  set. Where neither exists it falls back to the session's newest in-progress
+  or open ledger item. All of those are written by Genesis rather
   than by you: the raw first user message is deliberately never used, for the
   same reason the peer's typed prompts are already withheld — another session's
   user text is decontextualised in yours.
