@@ -244,6 +244,20 @@ def _apply_ongoing_duration(
 
     Mutates in place. An alert firing for the FIRST time has no row yet (the
     awareness tick writes it after this runs), so it simply gets no suffix.
+
+    KNOWN LIMIT, declined deliberately rather than patched (Codex P2): the only
+    writer of `alert_events` is the awareness tick, so if that loop dies no new
+    open rows appear and alerts first detected afterwards stay undecorated no
+    matter how long they persist. The fail-soft behaviour is correct — no suffix
+    is the honest output when the outage clock has no data.
+
+    A fallback start time was considered and rejected: the only clock available
+    without that writer is "when this process first saw the alert", which resets
+    on every restart. That is precisely the flapping this whole change removes,
+    and a duration that silently understates the outage is worse than none
+    because it reads as current. A second persistence path would be a new store
+    for data one tick already owns. The dead-writer condition is separately
+    visible (`awareness:tick_overdue`), which is the right place to surface it.
     """
     now = now or datetime.now(UTC)
     for alert in alerts:

@@ -23,6 +23,28 @@ _STATE_FILE = Path.home() / ".genesis" / "circuit_breaker_state.json"
 _MAX_OPEN_S = 1800  # 30-minute cap on escalating backoff
 _MAX_QUOTA_OPEN_S = 14400  # 4-hour cap for quota/billing exhaustion
 
+# Failure categories a free LISTING probe may heal — an ALLOWLIST, deliberately,
+# not a blocklist of the categories it may not.
+#
+# The probe answers exactly one question: is the endpoint reachable and is the
+# model listed? That is genuine (if weak) evidence ONLY where the recorded
+# failure was itself about reachability. It says nothing about whether a
+# completion would succeed, so it must not clear PERMANENT (403 entitlement),
+# QUOTA_EXHAUSTED (billing) or DEGRADED (malformed/partial/truncated responses —
+# `retry.py::classify_error`, recorded by the router like any other health
+# failure). An allowlist also fails safe: a category added to ErrorCategory
+# later defaults to "needs a real completion" instead of silently becoming
+# probe-healable, which is how the DEGRADED gap got here in the first place.
+#
+# `None` is handled SEPARATELY at the call site and is healable. That is not a
+# loophole, it is the main recovery path: `probe_suspect()` moves a CLOSED
+# breaker to HALF_OPEN on a failed probe WITHOUT recording any failure category,
+# so a provider that never actually failed a call has `None` here and must be
+# able to heal — otherwise a single probe blip strands a healthy low-traffic
+# provider forever. An earlier revision of this allowlist folded `None` in with
+# the blocked categories and the anti-stranding regression test caught it.
+_PROBE_HEALABLE = frozenset({ErrorCategory.TRANSIENT, ErrorCategory.TIMEOUT})
+
 
 class CircuitBreaker:
     """Per-provider circuit breaker with CLOSED → OPEN → HALF_OPEN state machine.
@@ -202,9 +224,8 @@ class CircuitBreaker:
         # retried less often, which is the intent; the cost is that a provider
         # whose quota resets is re-tried up to 4h later. Parsing the provider's
         # own retry hint is the exact fix for that and is tracked separately.
-        if self._last_failure_category in (
-            ErrorCategory.PERMANENT, ErrorCategory.QUOTA_EXHAUSTED,
-        ):
+        cat = self._last_failure_category
+        if cat is not None and cat not in _PROBE_HEALABLE:
             return
         was_tripped = self._trip_count > 0
         self._consecutive_successes += 1

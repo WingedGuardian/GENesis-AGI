@@ -254,3 +254,52 @@ def test_a_restart_does_not_carry_a_stale_category_onto_a_closed_breaker(tmp_pat
         "a healthy provider could not heal after a restart — stranded in "
         "HALF_OPEN with no traffic to rescue it"
     )
+
+
+def test_degraded_responses_are_not_healed_by_a_listing_probe():
+    """Codex P2, confirmed: DEGRADED was missing from the original two-value guard.
+
+    `retry.py::classify_error` returns DEGRADED for malformed/partial/truncated
+    completions, and `router.py` records it on the breaker like any other health
+    failure (only RATE_LIMITED and BAD_REQUEST bypass it). So a provider whose
+    completions come back truncated could still be healed by three clean
+    model-listing probes — the same false-heal this change exists to remove,
+    reached through a category the first fix did not enumerate.
+
+    The guard is an ALLOWLIST now rather than a blocklist, so the question is
+    "does reachability actually evidence recovery here?" — true only for
+    TRANSIENT/TIMEOUT — and a category added later is blocked by default.
+    """
+    reg, prov = _half_open_with(ErrorCategory.DEGRADED)
+    checker = ProviderHealthChecker(_config(prov), breakers=reg)
+    _clean_probe(checker)
+    for _ in range(5):
+        checker._sync_to_breakers()
+    assert reg.get("free-1").state == ProviderState.HALF_OPEN, (
+        "a listing probe healed a DEGRADED provider — reachability is not "
+        "evidence that completions have stopped being malformed"
+    )
+
+
+def test_the_probe_heal_allowlist_is_the_complete_reachability_set():
+    """Lock the WHOLE set, not one member at a time.
+
+    Enumerated against ErrorCategory so a new member cannot silently join the
+    healable set: a probe answers "is the endpoint reachable and the model
+    listed", which evidences recovery only for failures that were themselves
+    about reachability.
+    """
+    from genesis.routing.circuit_breaker import _PROBE_HEALABLE
+
+    assert set(_PROBE_HEALABLE) == {ErrorCategory.TRANSIENT, ErrorCategory.TIMEOUT}
+    not_healable = set(ErrorCategory) - _PROBE_HEALABLE
+    assert not_healable == {
+        ErrorCategory.DEGRADED,
+        ErrorCategory.PERMANENT,
+        ErrorCategory.QUOTA_EXHAUSTED,
+        ErrorCategory.RATE_LIMITED,
+        ErrorCategory.BAD_REQUEST,
+    }, (
+        "ErrorCategory changed — decide explicitly whether a LISTING probe is "
+        "evidence of recovery for the new member, then update this assertion"
+    )

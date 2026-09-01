@@ -2647,9 +2647,19 @@
             return provTypes.includes(prov.type);
           });
           if (matchedProviders.length === 0) return keyEntry.status;
-          const openCount = matchedProviders.filter(p => this.breakerIsOpen(p)).length;
+          // HALF_OPEN counts as degraded, matching the backend's own rule
+          // (observability/snapshots/call_sites.py treats OPEN *or* HALF_OPEN as
+          // a degraded call site). This matters now that a probe no longer heals
+          // a permanent/quota failure: such a breaker can sit HALF_OPEN
+          // indefinitely on a low-traffic provider, and counting only 'open'
+          // would paint the key green for a provider that never completes a
+          // call — the same "degraded renders as healthy" bug this change fixes
+          // one layer down.
+          const states = matchedProviders.map(p => this.breakerState(p));
+          const openCount = states.filter(s => s === 'open').length;
+          const degradedCount = states.filter(s => s === 'half_open').length;
           if (openCount === matchedProviders.length) return 'error';
-          if (openCount > 0) return 'degraded';
+          if (openCount + degradedCount > 0) return 'degraded';
           return 'healthy';
         },
         secretStatusColor(status) {

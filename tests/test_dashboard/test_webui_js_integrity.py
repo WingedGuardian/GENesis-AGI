@@ -575,3 +575,57 @@ def test_breaker_open_helper_is_case_insensitive_and_total():
     r = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, f"node failed: {r.stderr[:400]}"
     assert r.stdout.strip().endswith("OK"), r.stdout
+
+
+def test_secret_health_counts_half_open_as_degraded():
+    """Codex P2, confirmed: HALF_OPEN was rendering the provider key GREEN.
+
+    `observability/snapshots/call_sites.py` treats a first-chain provider in
+    OPEN *or* HALF_OPEN as a degraded call site. `secretHealthStatus` counted
+    only 'open', so a provider parked in HALF_OPEN painted the Provider Keys
+    indicator healthy.
+
+    That was latent before this change and is live after it: refusing to
+    probe-heal a permanent/quota failure means such a breaker can sit HALF_OPEN
+    indefinitely on a low-traffic provider. It is the same "degraded renders as
+    healthy" defect this PR fixes one layer down, so shipping the fix without
+    this would have re-created the bug in the surface meant to reveal it.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available")
+
+    js = DASHBOARD_JS.read_text()
+    i = js.index("secretHealthStatus(keyEntry) {")
+    body = js[i + len("secretHealthStatus(keyEntry) {"): js.index("\n        },", i)]
+
+    script = (
+        "const ctx = {\n"
+        "  _KEY_TO_PROVIDER_TYPES: { K: ['t'] },\n"
+        "  routingConfig: { providers: { p1: {type:'t'}, p2: {type:'t'} }, cb_states: {} },\n"
+        "  breakerState(n) { return String(this.routingConfig.cb_states[n] ?? '').toLowerCase(); },\n"
+        "  breakerIsOpen(n) { return this.breakerState(n) === 'open'; },\n"
+        "  secretHealthStatus(keyEntry) {" + body + "\n  },\n"
+        "};\n"
+        "const cases = [\n"
+        "  [{p1:'closed',   p2:'closed'},    'healthy'],\n"
+        "  [{p1:'half_open',p2:'closed'},    'degraded'],\n"
+        "  [{p1:'HALF_OPEN',p2:'closed'},    'degraded'],\n"
+        "  [{p1:'open',     p2:'closed'},    'degraded'],\n"
+        "  [{p1:'open',     p2:'open'},      'error'],\n"
+        "  [{p1:'half_open',p2:'half_open'}, 'degraded'],\n"
+        "];\n"
+        "let bad = 0;\n"
+        "for (const [states, want] of cases) {\n"
+        "  ctx.routingConfig.cb_states = states;\n"
+        "  const got = ctx.secretHealthStatus({key:'K', status:'validated'});\n"
+        "  if (got !== want) { bad++; console.log('FAIL', JSON.stringify(states), 'want', want, 'got', got); }\n"
+        "}\n"
+        "console.log(bad === 0 ? 'OK' : 'FAIL ' + bad);\n"
+    )
+    r = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, f"node failed: {r.stderr[:800]}"
+    assert r.stdout.strip().endswith("OK"), (
+        "secretHealthStatus disagreed with the backend's own OPEN-or-HALF_OPEN "
+        "= degraded rule:\n" + r.stdout
+    )

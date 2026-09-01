@@ -2807,10 +2807,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   duration. Measured over one real three-day outage: five separate failure
   records, each starting the clock again. A probe now heals only
   `TRANSIENT`/`TIMEOUT` failures — the low-traffic recovery case it was built
-  for. For a permanent or quota failure it takes real completions to close the
-  breaker. This does not strand a provider: a half-open breaker is still routed
-  to, so genuine recovery still closes it once the configured success threshold
-  (default 2) is met.
+  for. Permanent, quota-exhausted, and degraded failures (malformed or truncated
+  responses) all need real completions to close the breaker — reachability is
+  only evidence of recovery when the failure was itself about reachability. This
+  does not strand a provider: a half-open breaker is still routed to, so genuine
+  recovery still closes it once the configured success threshold (default 2) is
+  met.
 
   **What this changes for you:** a provider that is genuinely dead is now retried
   progressively less often instead of every couple of minutes, settling at once
@@ -2840,7 +2842,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   and the Provider Keys indicator stayed green regardless of the real state, with
   the "circuit breaker open" tooltip unreachable. All four now route through a
   single case-insensitive helper, and a guard test scans the frontend directories
-  so a new file cannot reintroduce the comparison.
+  so a new file cannot reintroduce the comparison. A provider parked in the
+  half-open state now shows amber rather than green, on the dashboard dot and on
+  the Provider Keys indicator — matching what the backend already considered a
+  degraded call site, and newly relevant because a dead provider can now sit in
+  that state instead of cycling.
 
 - **Alert severity dots were always amber, including for critical alerts.** The
   colour map was keyed lowercase while severities are emitted uppercase, so every

@@ -1309,9 +1309,11 @@ verified: d2d501b1 2026-08-31
   capped 30 min — 4h for QUOTA_EXHAUSTED; 429 = backpressure, NOT a breaker
   failure; state persisted cross-process to
   `~/.genesis/circuit_breaker_state.json`). A health PROBE may heal a breaker
-  only for TRANSIENT/TIMEOUT — never PERMANENT/QUOTA_EXHAUSTED, where a
-  models-listing 200 is exactly what a 403-on-use looks like and a false heal
-  resets the outage clock. Consequence to know before touching it: the heal
+  only for the categories in `_PROBE_HEALABLE` (TRANSIENT/TIMEOUT, plus a
+  breaker with no recorded failure) — an ALLOWLIST, so a new ErrorCategory is
+  un-healable by default. A models-listing 200 is exactly what a 403-on-use (or
+  a truncated completion) looks like from outside, and a false heal resets the
+  outage clock. Consequence to know before touching it: the heal
   branch also zeroes `_trip_count`, so refusing it leaves the backoff climbing
   to the cap instead of resetting — a dead provider is retried less often, and a
   quota-dead one may wait the full 4h. `last_failure_category` is restored from
