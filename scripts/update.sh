@@ -65,6 +65,20 @@ VENV_DIR="$GENESIS_ROOT/.venv"
 STARTED_AT="$(date -Iseconds)"
 STATE_FILE="$HOME/.genesis/update_state.json"
 
+# Guardian pause across the deploy's server restart (PR-2). We pause the host
+# Guardian's gateway before the stop and resume on EXIT, so a deploy doesn't trip
+# it to confirmed_dead and fire false down/recovered alerts. Coords are resolved
+# lazily inside _guardian_pause and stashed here for resume (kept SEPARATE from the
+# HOST_IP/SSH_KEY globals _sync_deploy_targets owns).
+_GUARDIAN_PAUSED=""
+_GUARDIAN_HOST=""
+_GUARDIAN_KEY=""
+# Generous TTL: the EXIT-trap resume ends the pause early on success, so this only
+# matters if the deploy is SIGKILLed (the host's expires_at then self-heals after
+# this long). The bound is the server-DOWN window (~3-15 min), not the total pause
+# (the long host-sync runs server-up); capped at the guardian's 3600.
+GUARDIAN_PAUSE_TTL=1800
+
 # ── Update state file helper ────────────────────────────
 # Written at each phase boundary so crash recovery knows where we stopped.
 _write_state() {
@@ -697,6 +711,50 @@ _start_genesis_server() {
     echo "nohup" > "$HOME/.genesis/server-start-mode"
 }
 
+# ── Guardian pause / resume across the server restart (PR-2) ─────────────────
+# Pause the host Guardian's gateway before we stop genesis-server, so the deploy
+# restart doesn't trip it to confirmed_dead / fire false down+recovered alerts.
+# BEST-EFFORT ONLY: at the pause site `set -e` is live and the ERR trap is not yet
+# armed, so a bare SSH failure would ABORT the deploy — every SSH is
+# `timeout … || true` (version-verb style, NOT fetch style, which exit 1s). Host
+# coords are resolved lazily here (no hoisted resolver → nothing enters the
+# phase-order chain) into separate globals. The `pause` verb only stands the
+# Guardian down once PR-1's gateway is on the host; against an old gateway it
+# errors and we proceed unpaused (safe, dark). No-op when no host is configured.
+_guardian_pause() {
+    local cfg="$HOME/.genesis/guardian_remote.yaml"
+    [ -f "$cfg" ] || return 0
+    local hip hus key
+    hip=$("$VENV_DIR/bin/python" -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_ip',''))" 2>/dev/null || true)
+    hus=$("$VENV_DIR/bin/python" -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_user','ubuntu'))" 2>/dev/null || echo ubuntu)
+    key="$HOME/.ssh/genesis_guardian_ed25519"
+    [ -n "$hip" ] && [ -f "$key" ] || return 0
+    _GUARDIAN_HOST="${hus:-ubuntu}@${hip}"
+    _GUARDIAN_KEY="$key"
+    # Only mark paused (and arm the resume) if the gateway ACCEPTED the verb.
+    # Against an OLD gateway (no `pause <ttl>` grammar — needs PR-1 deployed) or an
+    # unreachable host this fails; we then proceed unpaused with a VISIBLE warning
+    # instead of a misleading "paused" + silence. The `if` is set -e-safe (a failing
+    # condition never aborts), so a denied/unreachable pause can't abort the deploy.
+    if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+        "$_GUARDIAN_HOST" "pause $GUARDIAN_PAUSE_TTL" >/dev/null 2>&1; then
+        _GUARDIAN_PAUSED=1
+        echo "  Guardian paused across the restart (ttl ${GUARDIAN_PAUSE_TTL}s)"
+        # Resume on ANY exit, COMPOSED with the temp-copy self-delete (never
+        # replace it — a resume-only re-arm would leak the mktemp copy each deploy).
+        trap '_guardian_resume; rm -f "${BASH_SOURCE[0]}" 2>/dev/null' EXIT
+    else
+        echo "  WARNING: guardian pause not accepted (old gateway or host unreachable) — proceeding unpaused" >&2
+    fi
+}
+
+_guardian_resume() {
+    [ "${_GUARDIAN_PAUSED:-}" = 1 ] || return 0
+    _GUARDIAN_PAUSED=""
+    timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+        "$_GUARDIAN_HOST" resume >/dev/null 2>&1 || true
+}
+
 # ── Pre-update DB snapshot ────────────────────────────────
 # Flush the WAL and create a clean backup before stopping services.
 # If the server is killed mid-write during the update, this backup
@@ -748,6 +806,9 @@ done
 # Now stop them. From here a SIG* runs _on_signal_prestop, which restarts
 # WERE_RUNNING (populated above) — so an interrupt mid-stop restores the server.
 if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
+    # Pause the host Guardian BEFORE the stop so it never sees the restart as an
+    # outage. Best-effort; on success it arms the EXIT-trap resume.
+    _guardian_pause
     _stop_genesis_server
     # Disarm systemd's on-failure auto-restart so a stale-code instance can't come
     # back during the merge/migration window. The ERR-trap rollback is not armed
@@ -1647,6 +1708,12 @@ fi
 
 # ── Success: disarm trap ──────────────────────────────────
 trap - ERR INT TERM
+
+# Resume the Guardian now — BEFORE the multi-minute host-sync below — not just on
+# EXIT, else it stays stood-down through the whole guardian/CC/Node sync (server
+# up + health-verified). The EXIT-trap resume stays the backstop; this is
+# idempotent (the flag is cleared on first resume).
+_guardian_resume
 
 _sync_deploy_targets
 
