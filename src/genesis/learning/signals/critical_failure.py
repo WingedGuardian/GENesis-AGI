@@ -33,14 +33,43 @@ _WEDGED_AGE_S = 1.0
 # watchdog + the stall-stack sampler.
 _STALE_CEILING_S = 30.0
 
+# The loop-lag sampler republishes a cleared (lagging=False) sample ~one 0.5s
+# interval after a stall ends, so reading the single latest sample just after a
+# stall can miss it (measured: 4 false 1.0s on 2026-08-24/25 lost that race by
+# 1.9-147ms). We also accept loop_health.recently_lagging() within this window as
+# LIVE starvation evidence. ~3x the 0.5s sampler interval: long enough to cover
+# the cleared-republish gap plus scheduling jitter. It DOES widen the already-
+# accepted masking residual (see _starvation_suppressed) from ~0.5s to <=window_s
+# — a real lag that cleared up to window_s before a genuinely-hung dependency's
+# timeout can suppress that timeout for the tick — but bounded and self-healing:
+# the next tick with a healthy loop and no fresh lag re-probes and fires 1.0. Only
+# the sampler ever records lag, so this never fabricates starvation.
+_RECENT_LAG_WINDOW_S = 1.5
+
+# The generic explainer used on a healthy (0.0) reading and appended after the
+# specific failing-probe names on a genuine DOWN/DEGRADED reading. Kept as a module
+# constant so the genuine-failure path and the default path stay in sync (and so the
+# #1390 invariants — mentions probes, distinguishes CLOUD LLM-provider status — hold
+# on every non-suppressed reading).
+_DEFAULT_NOTE = (
+    "0.0=DB/Qdrant (+Ollama if enabled) health probes all healthy. "
+    "0.5=a probe DEGRADED, 1.0=a probe DOWN. This tracks LOCAL "
+    "infrastructure/service health (including the local Ollama if "
+    "enabled), NOT cloud LLM-provider availability. A DOWN caused "
+    "purely by probe timeouts while the event loop is starved is "
+    "suppressed (the reading then carries a SUPPRESSED baseline_note)."
+)
+
 
 class CriticalFailureCollector:
     """Runs health probes: 1.0 if any DOWN, 0.5 if any DEGRADED, 0.0 if all HEALTHY.
 
     Loop-starvation guard: a DOWN whose probes *all* timed out, while the event
-    loop is demonstrably starved (a WEDGED or fresh+lagging loop-health sample),
-    is reclassified to 0.0 — a probe timing out because the loop couldn't
-    schedule it is not an infrastructure outage. Fail-closed: a hard-error DOWN,
+    loop is demonstrably starved (a WEDGED, fresh+lagging, or recently-lagging
+    loop-health sample — the last closes a TOCTOU race where the sampler already
+    republished a cleared sample), is reclassified to 0.0 — a probe timing out
+    because the loop couldn't schedule it is not an infrastructure outage.
+    Fail-closed: a hard-error DOWN,
     a mixed batch with any non-timeout DOWN, a healthy loop, or absent
     loop-health evidence all keep 1.0; and any error in the suppression check
     keeps the un-suppressed value (the ``_safe_collect`` wrapper would otherwise
@@ -55,10 +84,12 @@ class CriticalFailureCollector:
         *,
         wedged_age_s: float = _WEDGED_AGE_S,
         stale_ceiling_s: float = _STALE_CEILING_S,
+        recent_lag_window_s: float = _RECENT_LAG_WINDOW_S,
     ) -> None:
         self._probes = probes
         self._wedged_age_s = wedged_age_s
         self._stale_ceiling_s = stale_ceiling_s
+        self._recent_lag_window_s = recent_lag_window_s
 
     async def collect(self) -> SignalReading:
         if not self._probes:
@@ -75,12 +106,65 @@ class CriticalFailureCollector:
         else:
             value = 0.0
 
+        confirmed_down = ", ".join(
+            r.name
+            for r in results
+            if r.status == ProbeStatus.DOWN and not r.timed_out
+        )
+        timed_out_down = ", ".join(
+            r.name
+            for r in results
+            if r.status == ProbeStatus.DOWN and r.timed_out
+        )
+        degraded_names = ", ".join(
+            r.name for r in results if r.status == ProbeStatus.DEGRADED
+        )
+
         if value == 1.0:
             suppressed = self._starvation_suppressed(results)
             if suppressed is not None:
                 return suppressed
+            # A DOWN forces 1.0. Name the full failing set, but keep three DISTINCT
+            # groups: a hard-error DOWN is a confirmed outage; a probe that merely
+            # TIMED OUT is NOT the same claim — when a hard-error DOWN co-occurs with a
+            # timeout, starvation suppression short-circuits without evaluating loop
+            # health, so the timed-out probe's health is indeterminate. Lumping it into
+            # "DOWN" would misground the reflection (Codex P2). A co-occurring DEGRADED
+            # probe is also named so the mixed case never drops a contributing probe.
+            return self._reading(
+                value,
+                baseline_note=self._genuine_note(
+                    confirmed_down, timed_out_down, degraded_names
+                ),
+            )
+
+        if value == 0.5:
+            return self._reading(
+                value, baseline_note=self._genuine_note("", "", degraded_names)
+            )
 
         return self._reading(value)
+
+    def _genuine_note(
+        self, down_names: str, timed_out_names: str, degraded_names: str
+    ) -> str:
+        """Name the specific probe(s) that failed, ahead of the default explainer.
+
+        The failing-probe identity goes in ``baseline_note`` — the only field the tick
+        serializer AND the reflection prompt formatter retain (``metadata`` is dropped
+        by both) — so a reflection can state WHICH service failed instead of guessing
+        "(DB, Qdrant, or Ollama)". Three distinct groups are named when present so no
+        contributing probe is dropped AND a confirmed (hard-error) DOWN is never
+        conflated with a mere probe TIMEOUT (whose health may be indeterminate).
+        """
+        groups = []
+        if down_names:
+            groups.append(f"DOWN: {down_names}")
+        if timed_out_names:
+            groups.append(f"TIMED OUT: {timed_out_names}")
+        if degraded_names:
+            groups.append(f"DEGRADED: {degraded_names}")
+        return f"Probe(s) {'; '.join(groups)}. {_DEFAULT_NOTE}"
 
     def _starvation_suppressed(
         self, results: list[ProbeResult]
@@ -111,7 +195,15 @@ class CriticalFailureCollector:
             # in that case, symmetrically for lagging True and False.
             fresh_lagging = age <= self._wedged_age_s and sample.lagging
             loop_wedged = self._wedged_age_s < age <= self._stale_ceiling_s
-            if not fresh_lagging and not loop_wedged:
+            # Third live-evidence path: the sampler OBSERVED lag within the recent
+            # window but has since republished a cleared sample (the TOCTOU race
+            # that fired the 4 measured false positives). Only the sampler records
+            # lag, so this never fabricates starvation; it does extend the accepted
+            # masking residual (below) to <=_RECENT_LAG_WINDOW_S, still bounded and
+            # self-healing. A genuine outage (healthy loop, no recent lag) fails all
+            # three paths and keeps 1.0.
+            recently_lagging = loop_health.recently_lagging(self._recent_lag_window_s)
+            if not fresh_lagging and not loop_wedged and not recently_lagging:
                 return None
             probes_named = ",".join(r.name for r in down)
             # Preserve a genuine DEGRADED (e.g. a 503 — the service RESPONDED, not
@@ -124,10 +216,17 @@ class CriticalFailureCollector:
                 for r in results
                 if not (r.status == ProbeStatus.DOWN and r.timed_out)
             ]
+            # Value is decoupled from the name-join: a DEGRADED probe drives residual
+            # 0.5 regardless of its name (an empty name must never flip 0.5 -> 0.0).
             residual = (
                 0.5
                 if any(r.status == ProbeStatus.DEGRADED for r in non_suppressed)
                 else 0.0
+            )
+            residual_degraded = ", ".join(
+                r.name
+                for r in non_suppressed
+                if r.status == ProbeStatus.DEGRADED
             )
             # Accepted residual: if a dependency is GENUINELY timing out
             # (blackholed/overloaded) at the same instant the loop is wedged, this
@@ -150,8 +249,14 @@ class CriticalFailureCollector:
             # tick serializer + reflection prompt formatter actually retain
             # (metadata is dropped by both) — so a suppressed reading is never
             # mistaken for a genuinely-healthy 0.0.
+            # Name the residual DEGRADED probe(s) too — a suppressed reading that says
+            # only "a degraded probe remains" leaves the reflection unable to identify
+            # WHICH service degraded (same identity-preservation invariant as the
+            # genuine path).
             remainder = (
-                "a genuinely-degraded probe remains" if residual else "no other fault"
+                f"a genuinely-degraded probe remains: {residual_degraded}"
+                if residual
+                else "no other fault"
             )
             return self._reading(
                 residual,
@@ -191,14 +296,6 @@ class CriticalFailureCollector:
             value=value,
             source="health_probes",
             collected_at=datetime.now(UTC).isoformat(),
-            baseline_note=baseline_note
-            or (
-                "0.0=DB/Qdrant (+Ollama if enabled) health probes all healthy. "
-                "0.5=a probe DEGRADED, 1.0=a probe DOWN. This tracks LOCAL "
-                "infrastructure/service health (including the local Ollama if "
-                "enabled), NOT cloud LLM-provider availability. A DOWN caused "
-                "purely by probe timeouts while the event loop is starved is "
-                "suppressed (the reading then carries a SUPPRESSED baseline_note)."
-            ),
+            baseline_note=baseline_note or _DEFAULT_NOTE,
             metadata=metadata,
         )

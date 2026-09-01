@@ -723,8 +723,9 @@ class GenesisEgoContextBuilder:
 
         try:
             from genesis.db.crud import capability_map as cap_crud
+            from genesis.ego import _capability_render as _cap_render
 
-            entries = await cap_crud.get_all(self._db)
+            entries = await cap_crud.get_prompt_rows(self._db)
         except Exception:
             logger.warning("Failed to query capability performance", exc_info=True)
             lines.append(
@@ -732,50 +733,124 @@ class GenesisEgoContextBuilder:
             )
             return "\n".join(lines)
 
-        if not entries:
-            lines.append("*No performance data yet.*\n")
-            return "\n".join(lines)
-
         _TREND_ICONS = {"improving": "+", "declining": "-", "stable": "="}
 
         # Focused deficiency: a capability_improvement cycle targets a specific
-        # weak domain (self._focus_id). get_all is confidence-DESC and only the
-        # top 15 render below, so a low-confidence target is otherwise absent —
-        # surface its full row explicitly so the advisory names a deficiency the
-        # ego can actually see.
+        # weak domain (self._focus_id). The table below is confidence-DESC and
+        # capped at 15, so a low-confidence target is otherwise absent — surface
+        # its full row explicitly so the advisory names a deficiency the ego can
+        # actually see.
+        #
+        # Read it with get_by_domain rather than scanning `entries`:
+        # get_prompt_rows drops rows that are stale or below the sample floor,
+        # and the focus domain is precisely the kind that is. Scanning that list
+        # would lose the line exactly when the cycle exists to address it. This
+        # is also what keeps a scanner target visible when the operator tunes
+        # capability_improvement_min_sample_size below MIN_SAMPLE_SIZE.
+        #
+        # It is resolved BEFORE the empty-table check on purpose: if the bars
+        # filter every row away, the focused deficiency is the one thing that
+        # still must reach the ego.
         focus_id = getattr(self, "_focus_id", None)
-        focused = (
-            next((e for e in entries if e.get("domain") == focus_id), None)
-            if focus_id
-            else None
-        )
+        focused = None
+        if focus_id:
+            try:
+                focused = await cap_crud.get_by_domain(self._db, focus_id)
+            except Exception:
+                logger.warning(
+                    "Failed to read focused capability domain", exc_info=True
+                )
+
+        # Two DIFFERENT states reach here and must not produce the same
+        # sentence: a genuinely empty map, and a full map whose every row failed
+        # a bar. Each message is a false claim in the other's situation, so the
+        # count decides which is rendered.
+        #
+        # Computed BEFORE the focus branch, and rendered in whichever arm runs,
+        # because the cell where `entries` is empty AND a focus row exists is
+        # reachable: gating the sentence on `focused is None` while gating the
+        # table on `entries` left that cell rendering neither, so the section
+        # silently withheld the row count it exists to state.
+        _empty_note = None
+        if not entries:
+            _empty_note = _cap_render.empty_state_note(
+                await _cap_render.safe_count(self._db),
+                unusable=await _cap_render.safe_count_unusable(self._db),
+                empty="*No performance data yet — the map is empty.*\n",
+                filtered="*No qualifying capability rows ({total} present; "
+                         "stale or thin rows are not shown).*\n",
+                unknown="*No qualifying capability rows (count unavailable — "
+                        "see logs).*\n",
+            )
+            if focused is None:
+                lines.append(_empty_note)
+                return "\n".join(lines)
+
         if focused is not None:
             _fc = focused.get("confidence", 0.0)
             _ft = focused.get("trend", "stable")
             _fs = focused.get("sample_size", 0)
             _fe = (focused.get("evidence_summary") or "")[:120].replace("|", "/")
+            # Stamp the age. This is the ONE row shown unfiltered, so without a
+            # date it is also the one row most likely to be read as a
+            # present-tense claim on months-old evidence — the exact failure
+            # this section's filtering exists to remove.
+            _fu = (focused.get("updated_at") or "")[:10]
+            _fstamp = f", last vouched {_fu}" if _fu else ""
             lines.append(
                 f"**Focused deficiency — {focus_id}**: {_fc:.0%} confidence "
-                f"({_ft}, {_fs} samples). {_fe}\n"
+                f"({_ft}, {_fs} samples{_fstamp}). {_fe}\n"
             )
 
-        lines.append("| Domain | Confidence | Trend | Samples | Evidence |")
-        lines.append("|--------|-----------|-------|---------|----------|")
-        for e in entries[:15]:
-            domain = e.get("domain", "?")
-            conf = e.get("confidence", 0.0)
-            trend = e.get("trend", "stable")
-            samples = e.get("sample_size", 0)
-            evidence = (e.get("evidence_summary") or "")[:80].replace("|", "/")
-            icon = _TREND_ICONS.get(trend, "=")
+        # Guarded: reachable with entries empty but a focus row present, and a
+        # headers-only table reads as "these columns have no values" rather than
+        # "nothing qualified". When there is no table, the withheld-count note
+        # takes its place so the section never goes silent about the real state.
+        if not entries and _empty_note is not None:
+            lines.append(_empty_note)
+        if entries:
+            # Honour the depth we ACCEPT. Taking the keyword and rendering the
+            # full table anyway is worse than not offering it: the dispatcher
+            # believes it asked for the cheap form and is silently billed for
+            # fifteen rows. The sibling `_own_goals_section` in this file has
+            # always branched here; this one only declared the parameter.
+            #
+            # Figures are stated as the QUALIFYING SUBSET, never as whole-map
+            # facts -- this branch renders no table, so the sentence is the
+            # entire claim and an unqualified count would be read as the map.
+            if depth == "light":
+                _light_clause = _cap_render.unusable_note(
+                    await _cap_render.safe_count_unusable(self._db)
+                )
+                lines.append(
+                    _cap_render.qualifying_subset_line(entries, _light_clause)
+                    + "\n"
+                )
+                return "\n".join(lines)
+
+            lines.append("| Domain | Confidence | Trend | Samples | Evidence |")
+            lines.append("|--------|-----------|-------|---------|----------|")
+            for e in entries[:15]:
+                domain = e.get("domain", "?")
+                conf = e.get("confidence", 0.0)
+                trend = e.get("trend", "stable")
+                samples = e.get("sample_size", 0)
+                evidence = (e.get("evidence_summary") or "")[:80].replace("|", "/")
+                icon = _TREND_ICONS.get(trend, "=")
+                lines.append(
+                    f"| {domain} | {conf:.0%} | {icon} | {samples} | {evidence} |"
+                )
+
+            _clause = _cap_render.unusable_note(
+                await _cap_render.safe_count_unusable(self._db)
+            )
+            if _clause:
+                lines.append(f"*{_clause.strip()}*")
+
             lines.append(
-                f"| {domain} | {conf:.0%} | {icon} | {samples} | {evidence} |"
+                "\nDeclining domains may need investigation. Improving domains "
+                "indicate effective maintenance patterns.\n"
             )
-
-        lines.append(
-            "\nDeclining domains may need investigation. Improving domains "
-            "indicate effective maintenance patterns.\n"
-        )
         return "\n".join(lines)
 
 

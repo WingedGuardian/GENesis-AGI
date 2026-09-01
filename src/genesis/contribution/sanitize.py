@@ -35,6 +35,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from fnmatch import fnmatch
@@ -464,6 +465,23 @@ def _check_fingerprints(
     return hits
 
 
+def _resolve_detect_secrets() -> str | None:
+    """Resolve the detect-secrets executable regardless of the process PATH.
+
+    detect-secrets is a declared CORE dependency, installed into the SAME venv as the
+    running interpreter. But the sanitizer can run in a process whose PATH lacks that
+    venv's bin — e.g. a Claude-Code-spawned MCP child inherits CC's PATH, not the
+    server unit's ``PATH=<venv>/bin:...`` — so a bare ``shutil.which`` returns None
+    and the floor fail-closed BLOCKS every contribution even though the binary IS
+    installed. Prefer the interpreter-relative path (``sys.executable``'s bin dir),
+    then fall back to PATH.
+    """
+    candidate = Path(sys.executable).parent / "detect-secrets"
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    return shutil.which("detect-secrets")
+
+
 def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
     """Run `detect-secrets scan --string` on every added line.
 
@@ -473,8 +491,13 @@ def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
     without secret-scanning. bootstrap.sh installs detect-secrets as
     part of the Genesis venv; a missing binary means the install is
     broken and the user must repair it before contributing.
+
+    Resolution is PATH-independent (see ``_resolve_detect_secrets``): the tool can
+    run in a process whose PATH lacks the venv bin, and a bare PATH lookup there
+    would fail-closed-BLOCK every contribution despite the binary being installed.
     """
-    if shutil.which("detect-secrets") is None:
+    ds_bin = _resolve_detect_secrets()
+    if ds_bin is None:
         return True, [
             Finding(
                 kind=FindingKind.SECRET,
@@ -500,20 +523,42 @@ def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
     hits: list[Finding] = []
     for file, line_no, text in parsed.added_lines:
         if not text.strip():
+            # Load-bearing (not just an optimization): `detect-secrets scan
+            # --string=` with an EMPTY value scans the whole CWD tree instead of
+            # the string, which would misfire + mis-parse. Skipping blank lines
+            # keeps `text` non-empty when `--string={text}` is built below.
             continue
         try:
+            # Use the `--string=<value>` form (NOT `--string <value>`): a line
+            # whose content starts with `-` — a Markdown `---` rule, a `--flag`
+            # example, both common in issue/PR prose — would otherwise be read by
+            # argparse as an unknown OPTION ("unrecognized arguments", exit 2),
+            # which the nonzero-exit branch below turns into a spurious
+            # fail-closed BLOCK. Binding the value with `=` makes argparse take
+            # it literally even when it starts with a dash; scan semantics are
+            # identical for every other input.
             proc = subprocess.run(
-                ["detect-secrets", "scan", "--string", text],
+                [ds_bin, "scan", f"--string={text}"],
                 capture_output=True,
                 text=True,
                 timeout=5,
                 check=False,
             )
-        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        except Exception as exc:  # noqa: BLE001 — REQUIRED fail-closed floor: ANY scan failure BLOCKs
             # Fail CLOSED: the REQUIRED secret-scan floor could not run on this
-            # line, so we cannot assert it is secret-free — BLOCK rather than
-            # let an unscanned line pass (the old `continue` was a fail-OPEN hole
-            # through a fail-CLOSED component).
+            # line, so we cannot assert it is secret-free — BLOCK rather than let
+            # an unscanned line pass (the old `continue` was a fail-OPEN hole
+            # through a fail-CLOSED component). Deliberately broad, NOT an
+            # enumerated subtype list — the floor's contract is "any inability to
+            # scan == BLOCK", so timeouts, E2BIG/resource errors (OSError, e.g. a
+            # >128 KB line over MAX_ARG_STRLEN), a NUL byte in the line (ValueError
+            # from execve/text-decode), permission errors, etc. ALL fail closed.
+            # Enumerating subtypes one at a time is whack-a-mole (this is the 2nd
+            # such miss). KeyboardInterrupt/SystemExit are not Exception subclasses
+            # → still propagate; the Finding message carries type(exc).__name__ for
+            # operator triage. (STDIN-feeding to remove the 128 KB argv blind spot
+            # entirely — so oversized lines get scanned rather than BLOCKed — is a
+            # separate hardening follow-up.)
             hits.append(
                 Finding(
                     kind=FindingKind.SECRET,

@@ -13,6 +13,17 @@ from genesis.dashboard._blueprint import _async_route, blueprint
 
 logger = logging.getLogger(__name__)
 
+# IANA timezone names for the dashboard timezone dropdown, computed ONCE at import
+# (``available_timezones()`` scans the tz database on disk — ~600 entries — so it
+# must not run per request). Sorted for stable rendering; validation of a chosen
+# value still happens via ``ZoneInfo(...)`` in the POST handler.
+try:
+    from zoneinfo import available_timezones as _available_timezones
+
+    _TIMEZONE_OPTIONS: list[str] = sorted(_available_timezones())
+except Exception:  # pragma: no cover — zoneinfo/tzdata always present on our stack
+    _TIMEZONE_OPTIONS = []
+
 
 def _parse_approval_rows(rows: list[dict]) -> list[dict]:
     now = datetime.now(UTC)
@@ -284,21 +295,25 @@ def essential_knowledge_endpoint():
 @blueprint.route("/api/genesis/settings/timezone", methods=["GET", "POST"])
 @_async_route
 async def settings_timezone():
-    """Get or set the user's display timezone.
+    """Get or set the user's display + schedule timezone.
 
-    GET: returns {"timezone": <IANA tz name>} — whatever the user configured
-         (defaults to "UTC" if unset).
+    genesis.yaml ``timezone`` is the authoritative source (``user_timezone()``
+    reads it first; ``USER_TIMEZONE`` env is only a deprecated fallback), so this
+    write actually takes effect.
+
+    GET: returns {"timezone": <current IANA tz>, "options": [<IANA tz>, ...]} —
+         the current value plus the full zone list for the dropdown.
     POST: {"timezone": <IANA tz name>} → validates, writes to genesis.yaml,
-          invalidates caches. Takes effect immediately for display;
-          scheduler CronTrigger timezone updates on next restart.
+          invalidates caches + reloads. Takes effect immediately for display;
+          scheduler CronTrigger timezones re-bind on the next restart.
     """
     from genesis.env import user_timezone
 
     if request.method == "GET":
-        return jsonify({"timezone": user_timezone()})
+        return jsonify({"timezone": user_timezone(), "options": _TIMEZONE_OPTIONS})
 
     payload = request.get_json(silent=True) or {}
-    new_tz = payload.get("timezone", "").strip()
+    new_tz = (payload.get("timezone") or "").strip()  # tolerate {"timezone": null}
     if not new_tz:
         return jsonify({"error": "timezone is required"}), 400
 
@@ -319,6 +334,11 @@ async def settings_timezone():
             with cfg_path.open() as fh:
                 existing = yaml.safe_load(fh) or {}
         existing["timezone"] = new_tz
+        # Ensure the config dir exists — on an install that never ran
+        # setup-local-config, ~/.genesis/config/ may be absent and the dropdown
+        # is the first thing to create genesis.yaml. 0o700 matches the personal
+        # config-dir posture (genesis.yaml holds no secrets, but stay tight).
+        cfg_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         tmp_fd, tmp_path = tempfile.mkstemp(
             dir=str(cfg_path.parent), suffix=".yaml.tmp",
         )
@@ -328,7 +348,9 @@ async def settings_timezone():
                 yaml.dump(existing, f, default_flow_style=False)
             os.replace(tmp_path, str(cfg_path))
         except Exception:
-            os.unlink(tmp_path)
+            import contextlib
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)  # don't mask the original error if cleanup fails
             raise
     except Exception as exc:
         logger.error("Failed to write timezone config: %s", exc, exc_info=True)

@@ -153,6 +153,7 @@ class EgoCadenceManager:
         # floor throttles overnight ticks relative to this.
         self._last_proactive_fire_at: datetime | None = None
 
+
         # Prevent concurrent cycles (interval + morning could overlap)
         self._lock = asyncio.Lock()
 
@@ -1165,6 +1166,11 @@ class EgoCadenceManager:
                 await asyncio.sleep(2)  # Brief batch window
                 status = await self._process_signals()
                 if status == "gated":
+                    # Record the gate-hold moment so the liveness gate-RELEASE
+                    # grace excuses the unblocked cycle's catch-up window (the
+                    # instant `gated` flips False at approval, `last_success`
+                    # still trails until the cycle completes).
+                    await self._mark_gated()
                     # Signals remain queued (pre-drain gate) or were requeued
                     # (dispatch block). The notify event is still set, so wait
                     # out a retry window instead of spinning — a resolved
@@ -1587,6 +1593,34 @@ class EgoCadenceManager:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=UTC)
         self._last_proactive_fire_at = parsed
+
+    async def _mark_gated(self) -> None:
+        """Record 'the consumer was held on a gate just now' to
+        ``ego_state last_gated:<tag>`` — read directly from the DB by the
+        dashboard + awareness liveness surfaces to grant the gate-RELEASE
+        grace. Persisted (not just in-memory), so the grace survives restarts.
+
+        SAFETY INVARIANT (load-bearing — do NOT break): this must fire ONLY
+        from the top of the consumer loop on a "gated" return. That is what
+        keeps the grace from ever masking a REAL deadlock: a wedged cycle
+        blocks inside the cycle lock (``_process_signals`` → ``run_unified_cycle``)
+        and never loops back here, so ``last_gated`` stops refreshing and the
+        grace expires — the stall then fires one interval late, never *never*.
+        A future change that refreshes this from inside a running cycle, or via
+        a watchdog that re-pumps the loop, would VOID the no-masking guarantee.
+
+        Best-effort — a persistence failure must never break the loop.
+        """
+        try:
+            from genesis.db.crud import ego as ego_crud
+
+            await ego_crud.set_state(
+                self._db,
+                key=f"last_gated:{self._session._source_tag}",
+                value=datetime.now(UTC).isoformat(),
+            )
+        except Exception:
+            logger.debug("Failed to persist last gated-at", exc_info=True)
 
     async def _update_interval(self, *, had_proposals: bool) -> None:
         """Adjust cycle interval based on productivity and user recency.

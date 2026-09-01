@@ -657,6 +657,19 @@ class StandaloneAdapter:
         except Exception:
             logger.exception("Failed to register dashboard blueprint")
 
+        # Outreach liveness heartbeat — a dedicated daemon (NOT gated on dashboard
+        # registration) so outreach is monitored independent of Telegram channel
+        # registration. It self-gates to pulse only while the outreach scheduler is
+        # running (see outreach/heartbeat.py), so it is a no-op until/unless outreach
+        # actually runs; the cessation alert is enable-gated on Telegram being
+        # configured, so a dashboard-only install stays benign.
+        try:
+            from genesis.outreach.heartbeat import OutreachHeartbeat
+
+            OutreachHeartbeat(interval_seconds=60).start()
+        except Exception:
+            logger.exception("Failed to start outreach heartbeat")
+
         # Terminal WebSocket
         try:
             from genesis.dashboard.routes.terminal import register_terminal_ws

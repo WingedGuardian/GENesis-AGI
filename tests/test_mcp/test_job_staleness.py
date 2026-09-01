@@ -25,6 +25,10 @@ _OK_RECENT = "2026-06-25T00:00:00+00:00"  # 3.0 days before _RUN   → below thr
 _OK_HEALTHY = _RUN                          # 0.0 days               → healthy
 # A recent last_run (well within the never-succeeded alarm's 35d recency window),
 # computed once at import — always inside the window, so no wall-clock flakiness.
+# frozen-clock-ok: ~7-day margin — seeded 1h back. The BINDING constraint is the
+# now-7d cutoff built in test_get_never_succeeded_jobs_recency_bound below, not the
+# wider 35-day `recent_since` window in the health-alerts impl; both are eternity
+# next to a suite run, but 7d is the one that would break first.
 _RECENT = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 

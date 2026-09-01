@@ -468,6 +468,17 @@ class TestStandaloneServiceDetection:
 class TestHeartbeatQueriesWithDB:
     """Test that heartbeat queries work when DB is connected."""
 
+    @pytest.fixture(autouse=True)
+    def _no_real_bootstrap_manifest(self):
+        """Hermetic: compute_heartbeat_staleness reads ~/.genesis/bootstrap_manifest.json
+        for the never_started verdict (#10). This box HAS that file; CI does not. Patch
+        it to None so a no-pulse subsystem reads the fresh-install empty state
+        (no_heartbeat), the behavior these DB-pulse tests assert — never the real file."""
+        from unittest.mock import patch
+
+        with patch("genesis.mcp.health.manifest._read_persisted_manifest", return_value=None):
+            yield
+
     async def test_heartbeats_find_events_in_db(self, db) -> None:
         """With a real DB containing heartbeat events, subsystem_heartbeats
         should return alive status."""

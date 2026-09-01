@@ -13,6 +13,13 @@ import pytest
 from genesis.contribution import sanitize
 from genesis.contribution.findings import FindingKind, Severity
 
+# Captured at import time — BEFORE the autouse stub below patches them — so a
+# test can restore the genuine binary lookup + subprocess runner and exercise
+# the REAL detect-secrets CLI. The `--string` argv bug lives in argparse and is
+# invisible to a mocked subprocess.
+_REAL_WHICH = sanitize.shutil.which
+_REAL_RUN = sanitize.subprocess.run
+
 
 @pytest.fixture(autouse=True)
 def no_external_scanners(monkeypatch):
@@ -46,6 +53,10 @@ def no_external_scanners(monkeypatch):
 
     monkeypatch.setattr(sanitize.shutil, "which", mock_which)
     monkeypatch.setattr(sanitize.subprocess, "run", mock_run)
+    # The floor now resolves the binary PATH-independently (venv-relative), so
+    # cmd[0] would be an absolute path and bypass the mock_run guard above. Pin
+    # the resolver to the bare name so the stub keeps intercepting.
+    monkeypatch.setattr(sanitize, "_resolve_detect_secrets", lambda: "detect-secrets")
 
 
 @pytest.fixture
@@ -335,7 +346,8 @@ def test_detect_secrets_runs_when_available(clean_diff, monkeypatch):
 def test_detect_secrets_missing_is_blocking_p1_1(clean_diff, monkeypatch):
     """P1-1 regression: missing detect-secrets binary must fail CLOSED,
     not silently skip. This is the sanitizer's required floor."""
-    monkeypatch.setattr(sanitize.shutil, "which", lambda name: None)
+    # Resolution is now PATH-independent, so drive the resolver, not shutil.which.
+    monkeypatch.setattr(sanitize, "_resolve_detect_secrets", lambda: None)
     r = sanitize.scan_diff(clean_diff)
     assert r.ok is False
     blocking = r.blocking()
@@ -343,6 +355,47 @@ def test_detect_secrets_missing_is_blocking_p1_1(clean_diff, monkeypatch):
         f.scanner == "detect-secrets" and f.detail == "missing_binary"
         for f in blocking
     ), f"expected missing_binary block, got: {blocking}"
+
+
+def test_detect_secrets_oversized_line_fails_closed(clean_diff, monkeypatch):
+    """E2BIG regression: a single added line over Linux MAX_ARG_STRLEN (~128 KB)
+    makes `detect-secrets scan --string <text>` raise OSError from execve. The
+    required floor must fail CLOSED (scan_error BLOCK), not propagate an uncaught
+    OSError that would let the line pass unscanned. (Verify-RED: reverting the
+    OSError addition to the except tuple makes this raise instead of BLOCK.)"""
+
+    def raise_e2big(cmd, *a, **k):
+        if cmd and cmd[0] == "detect-secrets":
+            raise OSError(7, "Argument list too long")
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    # autouse fixture pins _resolve_detect_secrets -> "detect-secrets", so
+    # cmd[0] == "detect-secrets" here.
+    monkeypatch.setattr(sanitize.subprocess, "run", raise_e2big)
+    r = sanitize.scan_diff(clean_diff)
+    assert r.ok is False
+    assert any(
+        f.scanner == "detect-secrets" and f.detail == "scan_error" for f in r.blocking()
+    ), f"expected scan_error BLOCK on OSError, got: {r.blocking()}"
+
+
+def test_detect_secrets_nul_byte_line_fails_closed(clean_diff, monkeypatch):
+    """A NUL byte in an added line makes `subprocess.run(..., text=True)` raise
+    ValueError('embedded null byte') from execve — NOT an OSError. The required
+    floor must still fail CLOSED (scan_error BLOCK). (Verify-RED: an enumerated
+    OSError-only except tuple lets this ValueError propagate uncaught.)"""
+
+    def raise_nul(cmd, *a, **k):
+        if cmd and cmd[0] == "detect-secrets":
+            raise ValueError("embedded null byte")
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    monkeypatch.setattr(sanitize.subprocess, "run", raise_nul)
+    r = sanitize.scan_diff(clean_diff)
+    assert r.ok is False
+    assert any(
+        f.scanner == "detect-secrets" and f.detail == "scan_error" for f in r.blocking()
+    ), f"expected scan_error BLOCK on ValueError, got: {r.blocking()}"
 
 
 def test_rename_only_forbidden_path_blocks_codex_p1():
@@ -676,6 +729,67 @@ def test_scan_prose_clean_ok(tmp_path):
     assert r.blocking() == []
 
 
+def _use_real_detect_secrets(monkeypatch):
+    """Override the autouse stub so the REAL detect-secrets binary runs.
+
+    The `--string` argv bug lives in argparse's handling of the invocation, so
+    a mocked subprocess cannot exercise it — these tests must hit the real CLI.
+    detect-secrets is a core dependency (pyproject), so it is present in CI;
+    skip defensively if it is genuinely absent."""
+    real = _REAL_WHICH("detect-secrets")
+    if not real:
+        pytest.skip("detect-secrets binary not installed")
+    monkeypatch.setattr(
+        sanitize.shutil,
+        "which",
+        lambda name: real
+        if name == "detect-secrets"
+        else (None if name in ("gitleaks", "betterleaks") else _REAL_WHICH(name)),
+    )
+    monkeypatch.setattr(sanitize.subprocess, "run", _REAL_RUN)
+
+
+def test_scan_prose_markdown_dash_lines_not_falsely_blocked(tmp_path, monkeypatch):
+    """Regression: a Markdown horizontal rule (`---`) or a `--flag` line in a
+    contributor issue body must NOT trip a spurious detect-secrets fail-closed
+    BLOCK. Before the fix, `detect-secrets scan --string ---` made argparse read
+    `---` as an unknown option (exit 2), which the nonzero-exit path turned into
+    a BLOCK. Uses the real binary — the mocked subprocess hides this bug."""
+    _use_real_detect_secrets(monkeypatch)
+    fp = tmp_path / "fp.txt"
+    fp.write_text("")  # present-but-empty (a MISSING file fails closed)
+    body = (
+        "Add a SQLite fallback to the loader.\n\n"
+        "---\n\n"
+        "Run the tool with `--verbose` to see the trace.\n"
+    )
+    r = sanitize.scan_prose(body, fingerprint_file=fp)
+    assert r.ok is True, [f"{f.scanner}:{f.message}" for f in r.blocking()]
+    assert r.blocking() == []
+
+
+def test_scan_prose_secret_on_dash_leading_token_still_detected(tmp_path, monkeypatch):
+    """Fail-open guard for the `--string=VALUE` fix. The secret sits on a SINGLE,
+    dash-LEADING token (`-AKIA…`) — exactly the shape argparse misread as an
+    option under the old `--string VALUE` form (exit 2 → crash). We assert the
+    genuine-detection finding ('Potential secret …'), NOT merely `ok is False`:
+    the crash path ALSO yields `ok is False` (fail-closed BLOCK, message
+    'exited N …'), so only the message distinguishes a real scan from the old
+    misparse. Under the old form this assertion fails (message is the crash
+    text); under the fix it passes (AWSKeyDetector genuinely fires)."""
+    _use_real_detect_secrets(monkeypatch)
+    fp = tmp_path / "fp.txt"
+    fp.write_text("")
+    # Leading '-' → one argv token the pre-fix form rejected as an unknown option.
+    body = "Example (never paste real keys):\n\n-AKIAIOSFODNN7EXAMPLE\n"
+    r = sanitize.scan_prose(body, fingerprint_file=fp)
+    assert r.ok is False
+    assert any(
+        f.scanner == "detect-secrets" and "Potential secret" in f.message
+        for f in r.blocking()
+    ), [f"{f.scanner}:{f.message}" for f in r.blocking()]
+
+
 def test_scan_prose_blocks_personal_email(tmp_path):
     r = sanitize.scan_prose(
         "Ping alice.jones@gmail.com for context.",
@@ -719,7 +833,9 @@ def test_scan_prose_scans_all_lines_not_just_first(tmp_path):
 def test_scan_prose_detect_secrets_missing_fails_closed(tmp_path):
     """detect-secrets is the required floor — if the binary is absent, the
     prose scan fails CLOSED (ok=False), never open."""
-    with patch.object(sanitize.shutil, "which", return_value=None):
+    # Resolution is PATH-independent now; force the resolver (not shutil.which) to
+    # None to simulate the absent binary, overriding the autouse fixture's pin.
+    with patch.object(sanitize, "_resolve_detect_secrets", return_value=None):
         r = sanitize.scan_prose(
             "totally benign text", fingerprint_file=tmp_path / "no-fp.txt"
         )

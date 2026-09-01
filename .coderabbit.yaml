@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit review configuration.
+#
+# This file exists so the review behaviour is declared IN THE REPOSITORY rather
+# than living only in a dashboard nobody can read from a checkout. Several of the
+# values below match CodeRabbit's own defaults; they are written out anyway,
+# because "the default happens to be what we want" and "we decided this" are
+# different states, and only the second survives someone changing a default.
+#
+# Config on the DEFAULT branch governs every pull request. A copy on a feature
+# branch does not take effect for that branch's own PR.
+
+language: en-US
+
+reviews:
+  # chill = balanced. `assertive` produces more findings, most of them nitpicks;
+  # this repo already runs a separate cross-model review, so the value here is
+  # a second independent perspective, not volume.
+  profile: chill
+
+  auto_review:
+    # Declared explicitly. CodeRabbit's default is already true, but the point of
+    # this file is that the answer does not depend on a dashboard toggle.
+    enabled: true
+    # Re-review on each push. Without it, a review describes the first commit of
+    # a PR and silently stops describing the branch after that — the same
+    # stale-evidence failure the merge gate guards against elsewhere.
+    auto_incremental_review: true
+    # Drafts are work in progress by definition; reviewing them trains people to
+    # ignore the reviewer.
+    drafts: false
+
+  # Excluded from review, not from the repo. Each of these is either machine-
+  # generated or binary, so a reviewer comment on it can never be actionable.
+  path_filters:
+    - "!src/genesis/dashboard/webui/vendor/**"
+    - "!**/*.min.js"
+    - "!**/*.min.css"
+    - "!docs/images/**"
+    - "!**/package-lock.json"
+
+  # The walkthrough is read at merge time; keep it to substance.
+  poem: false
+  high_level_summary: true
+
+  # Do NOT auto-approve when comments are resolved. Merges in this repo require a
+  # human approval by policy, and a bot approval that satisfies a required-review
+  # rule would quietly remove that.
+  request_changes_workflow: false

@@ -629,20 +629,24 @@ def main() -> None:
             lines = ["## Genesis Capabilities\n"]
             for cname, cinfo in caps.items():
                 cstatus = cinfo.get("status", "unknown")
-                cdesc = cinfo.get("description", cname)
+                cdesc = cinfo.get("description") or ""
+                # Drop the description when it's absent or merely repeats the
+                # capability name: a registry entry with no real description
+                # renders as "reflex: reflex" (or, namespaced, "module:architect:
+                # architect") — pure noise. The name still lists.
+                _cname_tail = cname.split(":")[-1]
+                desc_part = f": {cdesc}" if cdesc and cdesc not in (cname, _cname_tail) else ""
                 if cstatus == "active":
-                    lines.append(f"- **{cname}**: {cdesc}")
+                    lines.append(f"- **{cname}**{desc_part}")
                 else:
                     cerr = cinfo.get("error", "")
                     suffix = f" — Error: {cerr}" if cerr else ""
-                    lines.append(f"- **{cname}** [{cstatus}]: {cdesc}{suffix}")
+                    lines.append(f"- **{cname}** [{cstatus}]{desc_part}{suffix}")
+            # The full MCP tool list is injected separately by CC; a hardcoded
+            # partial list here is redundant + goes stale, so only the Skill
+            # Library pointer (not injected elsewhere) is kept.
             lines.append(
-                "\n**MCP Tools:** memory_recall/memory_store, "
-                "health_status/health_errors/health_alerts, "
-                "session_config, "
-                "outreach_queue/outreach_digest, recon tools, "
-                "bookmark_shelve/bookmark_unshelve.\n\n"
-                "**Skill Library:** Browse `src/genesis/skills/` or "
+                "\n**Skill Library:** Browse `src/genesis/skills/` or "
                 "`~/.genesis/skill-library/` for specialized skills "
                 "(research, outreach, browser automation, etc.). "
                 "The skill injection hook nudges you when one matches."
@@ -1056,15 +1060,18 @@ def _charter_emission_block(
     window — but NOT on clear: /clear is an explicit fresh start, and
     re-asserting the old origin would fight the user.
 
-    Returns "" when there is no charter, the session_id is missing/unsafe,
-    or nothing is readable (fail-open — charter is advisory).
+    Returns "" when there is no charter or nothing is readable (fail-open —
+    charter is advisory). An id that is unsafe as a PATH COMPONENT still gets its
+    canonical DB-backed charter; only the legacy file fallback is skipped.
     """
     if not session_id or source == "clear":
         return ""
-    if "/" in session_id or ".." in session_id:
-        return ""
+    # The DB lookup binds session_id as a SQL PARAMETER, so it is safe for any id;
+    # only the legacy charter.json fallback interpolates it into a PATH. Guarding
+    # above both would drop a canonical, DB-backed charter (and its ledger) for an
+    # id that merely fails the path rule.
     charter, ledger = _load_charter_db(session_id, db_path)
-    if charter is None:
+    if charter is None and "/" not in session_id and ".." not in session_id:
         charter = _load_charter_file(session_id, sessions_dir)
         ledger = []
     if charter is None:

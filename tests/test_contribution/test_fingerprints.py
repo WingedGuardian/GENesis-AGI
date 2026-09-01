@@ -72,6 +72,9 @@ def _no_external_scanners(monkeypatch):
 
     monkeypatch.setattr(sanitize.shutil, "which", mock_which)
     monkeypatch.setattr(sanitize.subprocess, "run", mock_run)
+    # Floor now resolves the binary PATH-independently (absolute venv path), which
+    # would bypass the mock_run guard — pin it to the bare name so the stub holds.
+    monkeypatch.setattr(sanitize, "_resolve_detect_secrets", lambda: "detect-secrets")
 
 
 def _harvest(home, **kw):
@@ -122,10 +125,44 @@ def test_harvest_env_override_precedence(tmp_path, monkeypatch):
     monkeypatch.setenv("OLLAMA_URL", "http://198.51.100.9:11434")  # RFC 5737 doc IP
     monkeypatch.setenv("USER_TIMEZONE", "Asia/Tokyo")
     pats = {p for p, _ in _harvest(home)}
+    # Subnet URLs stay env-first (env IS the runtime override for OLLAMA_URL).
     assert r"\b198\.51\.100\." in pats  # env override wins
     assert r"\b10\.5\.6\." not in pats  # stale yaml value not used
-    assert r"\bAsia/Tokyo\b" in pats
-    assert r"\bEurope/Berlin\b" not in pats
+    # Timezone is now file-authoritative with env a deprecated fallback, so the
+    # scrubber blocks the UNION of both possible sources — either could be the
+    # effective runtime zone across installs, and missing the effective one leaks it.
+    assert r"\bAsia/Tokyo\b" in pats  # env value blocked
+    assert r"\bEurope/Berlin\b" in pats  # file value ALSO blocked (union)
+
+
+def test_harvest_blocks_file_tz_when_env_unset(tmp_path):
+    # USER_TIMEZONE cleared by the _stable_hostname autouse fixture → the file must still
+    # be blocked (it is the effective runtime zone under file-first resolution).
+    home = _fake_home(tmp_path, genesis_cfg={"timezone": "Europe/Berlin"})
+    pats = {p for p, _ in _harvest(home)}
+    assert r"\bEurope/Berlin\b" in pats
+
+
+def test_harvest_tz_union_deterministic_order(tmp_path, monkeypatch):
+    # P3 (Codex): when env and file differ, the two tz patterns must emit in a
+    # STABLE order (env then file) — a set would iterate hash-dependently and
+    # break harvest()'s stable-order contract.
+    home = _fake_home(tmp_path, genesis_cfg={"timezone": "Europe/Berlin"})
+    monkeypatch.setenv("USER_TIMEZONE", "Asia/Tokyo")
+    tz_pats = [p for p, c in _harvest(home) if c == "install timezone"]
+    assert tz_pats == [r"\bAsia/Tokyo\b", r"\bEurope/Berlin\b"]
+
+
+def test_harvest_tz_union_no_utc_and_dedups(tmp_path, monkeypatch):
+    # UTC on either side is never emitted; when both agree the pattern dedups.
+    home = _fake_home(tmp_path, genesis_cfg={"timezone": "UTC"})
+    monkeypatch.setenv("USER_TIMEZONE", "Europe/Berlin")
+    pats = [p for p, c in _harvest(home) if c == "install timezone"]
+    assert pats == [r"\bEurope/Berlin\b"]  # UTC file value dropped, only the real one
+    # Both sources the same real zone → a single (deduped) pattern.
+    home2 = _fake_home(tmp_path / "x", genesis_cfg={"timezone": "Europe/Berlin"})
+    pats2 = [p for p, c in _harvest(home2) if c == "install timezone"]
+    assert pats2 == [r"\bEurope/Berlin\b"]
 
 
 def test_bounded_helper_edges():
