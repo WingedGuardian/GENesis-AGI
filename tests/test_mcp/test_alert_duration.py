@@ -170,3 +170,72 @@ class TestSuffixIsRefreshedNotFrozen:
         assert alerts[0]["message"] == (
             "Call site x is DOWN (all providers exhausted) (ongoing for 6h)"
         )
+
+
+class TestWiredIntoComputeAlerts:
+    """The decoration is reached by the REAL `_compute_alerts` path.
+
+    Everything above tests the two helpers directly, which proves the logic and
+    not that anything calls it. That gap is real rather than theoretical: the
+    duration block is guarded by `if _service and _service._db:`, and the
+    existing health-MCP mock sets `_db = None`, so every pre-existing test in
+    this area skips the block entirely.
+
+    This is the PR's actual thesis end to end — breaker stays tripped, call site
+    stays degraded, the `alert_events` row stays open, and the age accumulates —
+    so it is the assertion a future refactor would otherwise break silently.
+    """
+
+    async def _fire(self, empty_db, *, created_at: str, site: str = "42_probe_site"):
+        from unittest.mock import AsyncMock
+
+        from genesis.mcp import health as health_mcp
+        from genesis.mcp.health import errors as errors_mod
+
+        alert_id = f"call_site:{site}"
+        await empty_db.execute(
+            "INSERT INTO alert_events (id, alert_id, source, severity, message, created_at) "
+            "VALUES (?, ?, 'call_site', 'WARNING', ?, ?)",
+            ("ae-1", alert_id, f"Call site {site} is degraded (using fallback provider)",
+             created_at),
+        )
+        await empty_db.commit()
+
+        svc = AsyncMock()
+        svc.snapshot = AsyncMock(return_value={
+            "call_sites": {site: {"status": "degraded", "active_provider": "fallback-1"}},
+            "cc_sessions": {}, "infrastructure": {}, "queues": {}, "cost": {},
+        })
+        svc._dead_letter = None
+        svc._breakers = None
+        svc._routing_config = None
+        svc._db = empty_db
+
+        # Inject through the REAL entry point (`init_health_mcp`) rather than
+        # poking a module global — `errors.py` resolves the service off the
+        # package at call time, so a monkeypatched attribute on `errors` is not
+        # the object the code reads.
+        prev = health_mcp._service
+        health_mcp.init_health_mcp(svc)
+        try:
+            alerts, _ids = await errors_mod._compute_alerts()
+        finally:
+            health_mcp._service = prev
+        return next((a for a in alerts if a.get("id") == alert_id), None)
+
+    async def test_an_open_row_gives_the_call_site_alert_a_duration(self, empty_db):
+        old = (datetime.now(UTC) - timedelta(days=3, hours=4)).isoformat()
+        alert = await self._fire(empty_db, created_at=old)
+        assert alert is not None, "the degraded call site produced no alert at all"
+        assert "(ongoing for 3d" in alert["message"], (
+            "the duration never reached the alert through _compute_alerts — the "
+            f"decoration is not wired. Got: {alert['message']!r}"
+        )
+
+    async def test_a_young_row_is_not_decorated_through_the_real_path(self, empty_db):
+        """Guards against the wiring test passing for the wrong reason: if the
+        suffix appeared regardless of age, the test above would still be green."""
+        young = (datetime.now(UTC) - timedelta(minutes=4)).isoformat()
+        alert = await self._fire(empty_db, created_at=young)
+        assert alert is not None
+        assert "ongoing for" not in alert["message"]

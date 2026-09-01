@@ -152,6 +152,13 @@ class CircuitBreaker:
         whose window has expired transitions to HALF_OPEN first). On full
         recovery it fires ``on_recovery`` — exactly like ``record_success`` — so
         the provider's lingering ``provider_failure`` observation auto-resolves.
+
+        **Healing is CONDITIONAL on the failure category.** A probe never heals
+        a breaker whose last failure was ``PERMANENT`` or ``QUOTA_EXHAUSTED``:
+        for those, a 200 from the models-listing endpoint is exactly what a
+        403-on-use looks like from outside, so it is not weak evidence, it is
+        none. Those need a real ``record_success()``. See the guard below for
+        the full rationale and its measured cost to the retry schedule.
         """
         if self.state != ProviderState.HALF_OPEN:
             return
