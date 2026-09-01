@@ -33,6 +33,11 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+# The shared hook-input helper lives in scripts/hooks/; this script runs from
+# scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_input import session_path  # noqa: E402
+
 _FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _GENESIS_DIR = Path.home() / ".genesis"
 _RESUME_SIGNAL_FILE = _GENESIS_DIR / "last_resume_signal.json"
@@ -75,12 +80,15 @@ def main() -> None:
     if not session_id:
         return
 
-    # Read last user message from session-scoped buffer
-    session_dir = _GENESIS_DIR / "sessions" / session_id
-    messages_file = session_dir / "messages.jsonl"
-
+    # Read last user message from session-scoped buffer. The id is a PATH
+    # COMPONENT only here, so an unsafe id skips this read — it must NOT skip
+    # the giving-up-pattern check below, which is session-independent (it needs
+    # only the assistant message from the hook payload).
     last_user_msg = ""
-    if messages_file.exists():
+    messages_file = session_path(
+        _GENESIS_DIR / "sessions", session_id, "messages.jsonl"
+    )
+    if messages_file is not None and messages_file.exists():
         try:
             lines = messages_file.read_text().strip().splitlines()
             if lines:
@@ -183,7 +191,8 @@ def _check_outcome_verification(assistant_message: str) -> None:
     print(
         "OUTCOME VERIFICATION REMINDER: You're presenting completion options "
         "but haven't mentioned integration or e2e verification beyond unit tests. "
-        "Before the user decides, use superpowers:verification-before-completion — "
+        "Before the user decides: verify before completing (the `superpowers` plugin's "
+        "verification-before-completion skill, where the install has it) — "
         "run the actual verification command, read the full output, THEN claim status. "
         "Evidence before assertions."
     )
@@ -224,8 +233,23 @@ def _check_review_state() -> None:
         return
 
     print(
-        "CODE REVIEW PENDING: Code changes were made without /review. "
-        "Next turn MUST begin with /review + superpowers:code-reviewer agent."
+        "CODE REVIEW PENDING: code changes were made without a review marker. "
+        "Next turn MUST begin by reviewing the BRANCH CHANGESET (merge-base to "
+        "working tree — reviewing only the index leaves earlier commits uncovered) "
+        "and recording evidence: `/review` or `/code-review` or the `superpowers` "
+        "review skills where this install has them, else `/deep-review`, or by hand "
+        "`python3 scripts/review_state.py evidence-path` then `… mark --agent-output "
+        "<that file>` — adding `--clean` if the round found nothing should-fix-or-"
+        "worse, since omitting it counts the round toward the caps. Run both from the "
+        "worktree the changes are in. The MARKER binds to what is STAGED at mark "
+        "time, so mark after staging. UNLESS the staged set is docs/config only — "
+        "that needs no review and no marker, and this check cannot tell the "
+        "difference because it hashes the staged diff without classifying paths. "
+        "That exemption does NOT apply when the commit itself stages (`git add` in "
+        "the chain, `-am`, a pathspec), at review round 2 or 3, or when the set "
+        "touches anything under a `.github/` directory or a prompt / agent / skill "
+        "surface even when `.md`. The full rules are in the per-prompt reminder; "
+        "this is the short form."
     )
 
 

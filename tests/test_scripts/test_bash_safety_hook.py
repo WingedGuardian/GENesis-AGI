@@ -98,6 +98,103 @@ def test_no_allowlist_still_blocks_destructive(cmd):
     assert _run(cmd).returncode == 2
 
 
+# --- git clean: widened, dry-run-aware floor (2026-08-24 FIX 1) ---
+
+
+class TestGitCleanFloor:
+    """`git clean` is UNrecoverable (`git stash create` can't capture untracked
+    files), so it keeps a real block — but a quote-NAIVE regex mis-fires on
+    `git checkout clean-branch` etc., so bash_safety DELEGATES clean to the
+    precise, quote-aware git_discard_guard.py (a closed-set whitelist) and
+    propagates ONLY its exit-2 clean block; a coarse regex survives just as the
+    python-LESS fallback. These run with real python3, so they exercise the
+    delegated (authoritative) path. The guard's closed-set whitelist OVER-BLOCKS
+    exotic-but-safe dry-run forms (`-nf`, `-n -f`) — safe direction, escapable
+    with `# discard-override`; see test_git_discard_guard.py for the guard logic."""
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git clean -f",
+            "git clean -fd",
+            "git clean -fdx",
+            "git clean --force",
+            "git clean -xf",
+            "git clean -x -f",
+            "git clean",  # bare
+            "git clean -d",  # no dry-run token
+            "git clean -f .",  # path arg
+            "git clean -f -e keepme",  # exclude flag
+            "git -C /tmp clean -f",  # -C before the verb
+            "git clean -nd && git clean -f",  # 2nd segment
+            "git clean -nd & git clean -f",  # & background — 2nd segment
+            "git clean -f -e -n",  # exotic exclude value — guard blocks
+            "git clean -f -- -nine",  # exotic dash-named pathspec — guard blocks
+            "git clean -nf",  # dry-run cluster: guard OVER-blocks (safe)
+            "git clean -n -f",  # dry-run + force: over-block (safe)
+        ],
+    )
+    def test_clean_non_dry_run_blocked(self, cmd):
+        assert _run(cmd).returncode == 2
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git clean -n",
+            "git clean -nd",
+            "git clean -dn",
+            "git clean --dry-run",
+            "git clean -nd && echo ok",
+            "git clean -f  # discard-override",  # sanctioned escape honored
+            # false-blocks a naive `clean` match would cause — the guard allows:
+            "git checkout clean-branch",
+            "git diff clean.py",
+            'git commit -m "clean up the repo"',
+        ],
+    )
+    def test_clean_dry_run_or_non_subcommand_allowed(self, cmd):
+        assert _run(cmd).returncode == 0
+
+
+class TestGitCleanFailsClosedOnGuardCrash:
+    """architect SHOULD-FIX (2026-08-24): bash_safety delegates clean to the
+    guard and propagates ONLY exit 2. A PRESENT-but-CRASHING guard (rc != 0,2 —
+    e.g. a partially-synced scripts/hooks/ missing a sibling module) must NOT
+    leave the UNrecoverable clean verb fail-OPEN: the coarse fallback runs on a
+    crash too (clean fails CLOSED), while the recoverable verbs stay advisory
+    (the fallback only ever matches `git clean`)."""
+
+    def _run_broken(self, tmp_path: Path, cmd: str) -> subprocess.CompletedProcess:
+        scripts = tmp_path / "scripts"
+        (scripts / "hooks").mkdir(parents=True)
+        shutil.copy(HOOK, scripts / "bash_safety_hook.sh")
+        # a guard that raises at import time -> python exits 1 (a crash, not 2)
+        (scripts / "hooks" / "git_discard_guard.py").write_text(
+            "import _genesis_nonexistent_module_xyz_  # noqa\n"
+        )
+        payload = json.dumps({"tool_input": {"command": cmd}, "tool_name": "Bash"})
+        env = dict(os.environ)
+        env.pop("GENESIS_BASH_ALLOWLIST", None)
+        return subprocess.run(
+            ["bash", str(scripts / "bash_safety_hook.sh")],
+            input=payload,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=_OUTSIDE,
+        )
+
+    @pytest.mark.parametrize("cmd", ["git clean -f", "git clean --force", "git clean -fd"])
+    def test_clean_still_blocked_on_crash(self, tmp_path, cmd):
+        assert self._run_broken(tmp_path, cmd).returncode == 2
+
+    @pytest.mark.parametrize(
+        "cmd", ["git checkout foo", "git reset --soft HEAD~1", "git clean -nd", "git clean -f  # discard-override"]
+    )
+    def test_non_destructive_advisory_on_crash(self, tmp_path, cmd):
+        assert self._run_broken(tmp_path, cmd).returncode != 2
+
+
 # --- rm delegation: FP cluster fixed, real dangers still block ---
 
 

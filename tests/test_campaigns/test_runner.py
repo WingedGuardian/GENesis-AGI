@@ -362,11 +362,20 @@ class TestParkAwareSessionStatus:
     async def _seed_failed_parked_session(self, db, park_status: str):
         from genesis.db.crud import cc_sessions
 
+        # Seed the park NOW-RELATIVE, not with an absolute literal. _check_session_status
+        # ages the park's created_at against the REAL wall clock (runner.py:430,
+        # `datetime.now(UTC) - created > _PARK_WAIT_BOUND`, bound = 7 days) and there is no
+        # injectable now, so a fixed seed like "2026-08-17" silently works only until the
+        # calendar crosses the bound, then flips these "still running" tests to failing (a
+        # wall-clock time-bomb). A recent seed keeps the park within its wait window on any
+        # run date. (The over-bound tests below deliberately UPDATE created_at to an old
+        # value afterward, so this recent default does not affect them.)
+        recent = datetime.now(UTC).isoformat()
         await cc_sessions.create(
             db, id="camp-sess-1", session_type="background_task",
             model="sonnet", effort="medium", source_tag="campaign",
-            started_at="2026-08-17T10:00:00+00:00",
-            last_activity_at="2026-08-17T10:00:00+00:00",
+            started_at=recent,
+            last_activity_at=recent,
         )
         await db.execute(
             "UPDATE cc_sessions SET status='failed', metadata=? WHERE id=?",
@@ -376,8 +385,7 @@ class TestParkAwareSessionStatus:
             """INSERT INTO cc_rate_limit_parks
                (id, kind, dedup_key, payload_json, status, created_at, updated_at)
                VALUES (?, 'direct_session', 'dk1', '{}', ?, ?, ?)""",
-            ("rlp-test0001", park_status,
-             "2026-08-17T10:00:00+00:00", "2026-08-17T10:00:00+00:00"),
+            ("rlp-test0001", park_status, recent, recent),
         )
         await db.commit()
 

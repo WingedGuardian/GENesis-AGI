@@ -195,7 +195,18 @@ def persist_job_health(rt: GenesisRuntime, job_name: str, entry: dict, now: str)
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        logger.debug("No event loop — job health for %s persisted in-memory only", job_name)
+        # WARNING, not debug: this is a SILENT data-loss path — the in-memory
+        # entry is updated and the DB row never is, so job_health (which reads
+        # sqlite) shows the job as if it had never run. A threaded caller that
+        # records health without a running loop hit exactly this and went
+        # unnoticed until an unrelated E2E check missed the row. If this fires,
+        # the caller must record from a live loop (see the heartbeat daemons'
+        # _tick), not lower this log level.
+        logger.warning(
+            "job health for %s NOT persisted (no running event loop) — "
+            "in-memory only; the job_health table will not reflect this run",
+            job_name,
+        )
         return
 
     from genesis.util.tasks import tracked_task

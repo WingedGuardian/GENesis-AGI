@@ -205,3 +205,32 @@ def test_format_injection_singular_plural_and_overflow():
     with_overflow = pr_watch.format_injection(["a (Jul 1)", "+4 more"])
     assert "5 external-PR updates " in with_overflow
     assert "+4 more" in with_overflow
+
+
+# ── select_to_surface parameterization (open-PR lane reuse, not fork) ────────
+
+
+def test_select_to_surface_custom_id_getter_and_renderer():
+    """The open-PR lane reuses this surface/seen-map logic with its own id-getter
+    (pr number) and renderer — proving it is parameterized, not forked."""
+    items = [{"number": 1379, "stale_days": 12}, {"number": 1223, "stale_days": 9}]
+    lines, new = pr_watch.select_to_surface(
+        items,
+        {},
+        NOW,
+        10,
+        5,
+        id_getter=lambda p: str(p["number"]),
+        renderer=lambda p: f"#{p['number']} ({p['stale_days']}d)",
+    )
+    assert lines == ["#1379 (12d)", "#1223 (9d)"]
+    # seen-map keyed on the custom id
+    assert set(new.keys()) == {"1379", "1223"}
+
+
+def test_select_to_surface_defaults_unchanged():
+    """Omitting id_getter/renderer preserves the steward-notification behavior."""
+    notifs = [{"id": 7, "topic": "PR steward: merged", "delivered_at": NOW.isoformat()}]
+    lines, new = pr_watch.select_to_surface(notifs, {}, NOW, 10, 5)
+    assert set(new.keys()) == {"7"}
+    assert lines and lines[0].startswith("PR steward: merged")

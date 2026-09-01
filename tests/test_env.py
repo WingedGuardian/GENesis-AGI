@@ -144,3 +144,121 @@ def test_pid_file_takes_precedence_but_either_signal_counts(home: Path):
     (home / "update_in_progress.pid").write_text(str(os.getpid()))
     _write_state(home, phase="done", pid=1)  # JSON path alone would be False
     assert update_in_progress() is True
+
+
+class TestUserTimezonePrecedence:
+    """genesis.yaml ``timezone`` is authoritative; ``USER_TIMEZONE`` env is a
+    DEPRECATED fallback consulted only when the file has no timezone key.
+
+    ``_local_config`` reads ``Path.home()/.genesis/config/genesis.yaml`` (NOT
+    ``GENESIS_HOME``), so we patch ``Path.home`` rather than reuse the ``home``
+    fixture. Every case invalidates the module cache after mutating state.
+    """
+
+    @staticmethod
+    def _write_cfg(home_dir: Path, *, timezone: str | None) -> None:
+        cfg_dir = home_dir / ".genesis" / "config"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        body = "github:\n  user: someone\n"
+        if timezone is not None:
+            body = f"timezone: {timezone}\n" + body
+        (cfg_dir / "genesis.yaml").write_text(body)
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        from genesis.env import _invalidate_local_config
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv("USER_TIMEZONE", raising=False)
+        _invalidate_local_config()
+        yield
+        _invalidate_local_config()
+
+    def test_file_wins_over_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        # The flip: genesis.yaml outranks a DIFFERENT USER_TIMEZONE env value.
+        from genesis.env import _invalidate_local_config, user_timezone
+
+        self._write_cfg(tmp_path, timezone="Europe/Paris")
+        monkeypatch.setenv("USER_TIMEZONE", "Asia/Tokyo")
+        _invalidate_local_config()
+        assert user_timezone() == "Europe/Paris"
+
+    def test_env_fallback_when_file_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # No genesis.yaml at all → env fallback preserves behavior (no regression).
+        from genesis.env import _invalidate_local_config, user_timezone
+
+        monkeypatch.setenv("USER_TIMEZONE", "Asia/Tokyo")
+        _invalidate_local_config()
+        assert user_timezone() == "Asia/Tokyo"
+
+    def test_env_fallback_when_file_has_no_timezone_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from genesis.env import _invalidate_local_config, user_timezone
+
+        self._write_cfg(tmp_path, timezone=None)
+        monkeypatch.setenv("USER_TIMEZONE", "Asia/Tokyo")
+        _invalidate_local_config()
+        assert user_timezone() == "Asia/Tokyo"
+
+    def test_utc_when_neither_present(self, tmp_path: Path):
+        from genesis.env import _invalidate_local_config, user_timezone
+
+        _invalidate_local_config()
+        assert user_timezone() == "UTC"
+
+    def test_blank_file_value_falls_through_to_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # A whitespace-only file timezone must not shadow the env fallback with "".
+        self._write_cfg(tmp_path, timezone='"   "')
+        monkeypatch.setenv("USER_TIMEZONE", "Asia/Tokyo")
+        from genesis.env import _invalidate_local_config, user_timezone
+
+        _invalidate_local_config()
+        assert user_timezone() == "Asia/Tokyo"
+
+    def test_blank_file_and_no_env_is_utc(self, tmp_path: Path):
+        self._write_cfg(tmp_path, timezone='"   "')
+        from genesis.env import _invalidate_local_config, user_timezone
+
+        _invalidate_local_config()
+        assert user_timezone() == "UTC"
+
+    @pytest.mark.parametrize("scalar", ["no", "false", "0"])
+    def test_falsy_yaml_scalar_falls_through_to_env(
+        self, scalar: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # YAML footgun: `timezone: no` -> False, `0` -> int. These are NOT valid
+        # zones and must fall through to the env fallback, not shadow it with
+        # "False"/"0" (which would crash CronTrigger consumers).
+        self._write_cfg(tmp_path, timezone=scalar)
+        monkeypatch.setenv("USER_TIMEZONE", "Europe/Paris")
+        from genesis.env import _invalidate_local_config, user_timezone
+
+        _invalidate_local_config()
+        assert user_timezone() == "Europe/Paris"
+
+    def test_invalid_file_zone_falls_through_to_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # A typo written to genesis.yaml (e.g. by setup-local-config's free-form
+        # prompt) must not be returned unvalidated and crash CronTrigger consumers.
+        self._write_cfg(tmp_path, timezone="Amrica/Chicago")  # typo (invalid)
+        monkeypatch.setenv("USER_TIMEZONE", "Europe/Paris")
+        from genesis.env import _invalidate_local_config, user_timezone
+
+        _invalidate_local_config()
+        assert user_timezone() == "Europe/Paris"
+
+    def test_invalid_file_and_invalid_env_is_utc(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._write_cfg(tmp_path, timezone="Amrica/Chicago")
+        monkeypatch.setenv("USER_TIMEZONE", "Not/AZone")
+        from genesis.env import _invalidate_local_config, user_timezone
+
+        _invalidate_local_config()
+        assert user_timezone() == "UTC"

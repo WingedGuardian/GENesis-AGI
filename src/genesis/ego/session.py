@@ -1175,10 +1175,14 @@ class EgoSession:
                                 rd.get("id"), exc_info=True,
                             )
 
-            # 10d. Process deferred intentions (both egos)
+            # 10d. Process deferred intentions (both egos). Called even when
+            # the output drops the intentions block — expiry and the
+            # implicit-keep aging sweep must run every cycle so max_cycles
+            # is a mechanical TTL, not one dependent on LLM compliance.
             intentions_data = parsed.get("intentions")
-            if intentions_data and isinstance(intentions_data, dict):
-                await self._process_intentions(intentions_data)
+            if not isinstance(intentions_data, dict):
+                intentions_data = {}
+            await self._process_intentions(intentions_data)
 
             # 10e. Additive ego autonomy — the genesis ego's OWN goal lane
             # (origin='genesis_ego'). Both handlers hard-gate on source_tag
@@ -1219,6 +1223,11 @@ class EgoSession:
                 "Ego output could not be parsed — cycle %s stored with no proposals",
                 cycle.id,
             )
+            # Age intentions on a parse-failure cycle too: expiry and the
+            # implicit-keep sweep must run EVERY cycle so max_cycles is a
+            # mechanical TTL, not one dependent on the LLM emitting parseable
+            # output. (The parsed path runs this at step 10d above.)
+            await self._process_intentions({})
 
         logger.info(
             "Ego cycle %s completed (cost=$%.4f, proposals=%d, tokens=%d+%d)",
@@ -2767,6 +2776,7 @@ class EgoSession:
                 )
 
             # 2. Review existing intentions (filtered to this ego's source)
+            reviewed_ids: list[str] = []
             reviews = intentions_data.get("review", [])
             if isinstance(reviews, list):
                 for entry in reviews:
@@ -2776,6 +2786,7 @@ class EgoSession:
                     action = entry.get("action")
                     if not iid or action not in ("keep", "fire", "withdraw", "renew"):
                         continue
+                    reviewed_ids.append(iid)
 
                     if action == "keep":
                         new_count = await ego_intentions.increment_cycle_count(
@@ -2802,6 +2813,20 @@ class EgoSession:
                         )
                         if ok:
                             logger.info("Intention %s renewed (counter reset)", iid)
+
+            # 2b. Implicit-keep: age every active row the review output did
+            # NOT mention (kept rows were bumped explicitly; fired/withdrawn
+            # rows are no longer active; renewed rows are excluded so their
+            # reset sticks). Without this, an unmentioned row never ages and
+            # max_cycles depends on LLM compliance instead of mechanics.
+            bumped = await ego_intentions.increment_unreviewed(
+                self._db, self._source_tag, reviewed_ids,
+            )
+            if bumped:
+                logger.debug(
+                    "Implicit-keep aged %d unreviewed intention(s) for %s",
+                    bumped, self._source_tag,
+                )
 
             # 3. Create new intentions
             new_intentions = intentions_data.get("new", [])

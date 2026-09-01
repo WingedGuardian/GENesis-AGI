@@ -271,6 +271,42 @@ UNMAPPED_BY_DESIGN: dict[str, str] = {
         "IS restartable). It stays a user-visible WARNING health alert for a "
         "human to fix at the source; the firefighter is never woken for it."
     ),
+    "subsystem_stale:": (
+        "A heartbeat-emitting subsystem (ego/inbox/dashboard — surplus and "
+        "outreach are deliberately excluded: surplus is covered by its own "
+        "dashboard tile, outreach's pulse is config-gated) stopped pulsing — total "
+        "cessation of its scheduler/loop. The cause is heterogeneous and NOT "
+        "reliably restart-fixable: the motivating case was an ego cadence DEADLOCK "
+        "(a pending-approval pre-flight, fixed in code by #1422), where a "
+        "container.services restart would not clear it and could restart-loop "
+        "(contrast awareness:tick_overdue / job_stale:, which are genuine "
+        "restartable wedges). So it stays a user-visible health alert (ego "
+        "CRITICAL, the rest WARNING) + a red ego tile for a human to diagnose the "
+        "specific cause; the firefighter is never woken for it. (This is a "
+        "surfacing signal — PR-C adds no autonomous remediation authority.)"
+    ),
+    "subsystem_heartbeat_unknown:": (
+        "A heartbeat-emitting subsystem's last pulse row is UNREADABLE (corrupt "
+        "timestamp or a materially-future one from a backward clock jump) — so its "
+        "liveness cannot be confirmed. Surface-only (WARNING), never restart-fixable "
+        "by the firefighter: a corrupt row / clock skew is a data-integrity anomaly, "
+        "not a wedged service. Auto-resolves when a fresh parseable pulse lands. "
+        "Distinct from subsystem_stale: (which asserts a probable DEATH) — this "
+        "asserts only that we cannot tell."
+    ),
+    "subsystem_never_started:": (
+        "A heartbeat-emitting subsystem (ego/inbox) that its persisted bootstrap "
+        "manifest shows FAILED TO INITIALIZE, or that registered ok but has never "
+        "emitted a single pulse past a boot grace (#10) — it is not running at all. "
+        "By construction NOT restart-remediable: a never-started subsystem is a "
+        "config/code defect (a raised init, a missing prerequisite), and a "
+        "container.services restart would either reproduce the same failure or "
+        "restart-loop (contrast job_stale:, a recoverable wedge). Gated on "
+        "_subsystem_enabled, so a deliberately-disabled/unconfigured subsystem never "
+        "raises it. Surface-only (ego CRITICAL, else WARNING) + a red ego tile for a "
+        "human to fix at the source; auto-resolves when the subsystem finally pulses. "
+        "Distinct from subsystem_stale: (a once-live scheduler that DIED)."
+    ),
 }
 
 

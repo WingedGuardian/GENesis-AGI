@@ -592,6 +592,13 @@ class DirectSessionRequest:
     notify_on_failure_only: bool = False
     source_tag: str = "direct_session"
     caller_context: str | None = None  # "follow_up:<id>", "schedule:<id>"
+    # The ORIGINAL caller_context of a dispatch that was rate-limit parked, carried
+    # across resume. A resumed session's caller_context is rewritten to
+    # "rate_limit_resume:<park_id>" (for park-lineage), which severs the
+    # "ego_proposal:<id>" linkage that proposal-outcome recording + dispatch
+    # follow-through gate on. This preserves the origin so both survive a
+    # park→resume (see rate_limit_park.effective_caller_context). None otherwise.
+    origin_caller_context: str | None = None
     planning_instruction: str | None = None  # opt-in: prepended to prompt
     skills: list[str] | None = None  # explicit skill injection (overrides auto-detect)
     tool_exceptions: tuple[str, ...] = ()  # tools to UN-block from the profile disallow list
@@ -890,12 +897,13 @@ class DirectSessionRunner:
 
             # Post-execution audit: verify protected paths, feed autonomy signals.
             # Only for ego dispatches (caller_context starts with "ego_proposal:").
-            # Runs inline (cheap) — transcript parsing is I/O-bound but fast.
-            if (
-                self._auditor is not None
-                and request.caller_context
-                and request.caller_context.startswith("ego_proposal:")
-            ):
+            # Resolve across a park→resume (resume-prefix → the preserved origin),
+            # else a resumed ego dispatch is silently NOT audited. Runs inline
+            # (cheap) — transcript parsing is I/O-bound but fast.
+            _audit_ctx = rate_limit_park.effective_caller_context(
+                request.caller_context, request.origin_caller_context
+            )
+            if self._auditor is not None and _audit_ctx and _audit_ctx.startswith("ego_proposal:"):
                 try:
                     metadata = {}
                     db = getattr(self._rt, "_db", None)
@@ -912,7 +920,7 @@ class DirectSessionRunner:
                         transcript_path=metadata.get("transcript_path", ""),
                         tools_summary=metadata.get("tools_summary"),
                         session_success=result.success,
-                        caller_context=request.caller_context,
+                        caller_context=_audit_ctx,
                     )
                 except Exception:
                     logger.debug(
@@ -1114,10 +1122,26 @@ class DirectSessionRunner:
         result: DirectSessionResult,
     ) -> None:
         """Feed session outcome back to ego proposal for feedback loop."""
-        if not request.caller_context or not request.caller_context.startswith("ego_proposal:"):
+        # Resolve the ORIGINAL context: a park→resume rewrites caller_context to
+        # "rate_limit_resume:<park_id>", so gate on the preserved origin instead
+        # (else a resumed dispatch's outcome is silently dropped — #1487/837f8b63).
+        ctx = rate_limit_park.effective_caller_context(
+            request.caller_context, request.origin_caller_context
+        )
+        if not ctx or not ctx.startswith("ego_proposal:"):
             return
-        proposal_id = request.caller_context.split(":", 1)[1]
+        proposal_id = ctx.split(":", 1)[1]
         advisories: list[str] = []
+        # WS-3: a dispatch outcome inherits the SESSION's provenance. A
+        # research/interact/etc. dispatch is external_untrusted — its output can
+        # echo web/browser content, and these outcome memories are now
+        # default-recallable (source_subsystem dropped), so an unstamped one
+        # would default to first_party and bypass recall-time external-content
+        # handling (a laundered indirect prompt injection). Stamp it with the
+        # SAME origin the session's own memories carry (see _PROFILE_ORIGIN use
+        # at session launch). memory_class="fact" pins these as operational
+        # facts so a summary echoing MUST/NEVER isn't misfiled as a rule.
+        dispatch_origin = _PROFILE_ORIGIN.get(request.profile)
         try:
             from genesis.db.crud.ego import (
                 mark_proposal_verification_failed,
@@ -1154,9 +1178,10 @@ class DirectSessionRunner:
                                 source="ego_dispatch_verification",
                                 tags=["ego", "verification_failure"],
                                 memory_type="episodic",
+                                memory_class="fact",
+                                origin_class=dispatch_origin,
                                 wing="autonomy",
                                 room="ego",
-                                source_subsystem="ego",
                             )
                     except Exception:
                         logger.debug(
@@ -1188,22 +1213,33 @@ class DirectSessionRunner:
                 success=result.success,
                 summary=summary,
             )
-            # On failure: create observation so ego sees it next cycle
-            if not result.success:
-                try:
-                    store = getattr(self._rt, "_memory_store", None)
-                    if store is not None:
-                        await store.store(
-                            content=(f"Ego dispatch FAILED for proposal {proposal_id}: {summary}"),
-                            source="ego_dispatch_outcome",
-                            tags=["ego", "dispatch_failure"],
-                            memory_type="episodic",
-                            wing="autonomy",
-                            room="ego",
-                            source_subsystem="ego",
-                        )
-                except Exception:
-                    logger.debug("Failed to store failure observation", exc_info=True)
+            # Record the dispatch outcome (BOTH polarities) as a retrievable
+            # memory so the ego and later CC sessions can recall what happened to
+            # a dispatch — not just failures. Stored WITHOUT source_subsystem: a
+            # dispatch outcome is operational history, not internal decisional
+            # output, so it must stay in default recall / the proactive hook
+            # (classified in test_store_subsystem_coverage's USER_CONTEXT_ALLOWLIST).
+            try:
+                store = getattr(self._rt, "_memory_store", None)
+                if store is not None:
+                    if result.success:
+                        content = f"Ego dispatch SUCCEEDED for proposal {proposal_id}: {summary}"
+                        outcome_tag = "dispatch_success"
+                    else:
+                        content = f"Ego dispatch FAILED for proposal {proposal_id}: {summary}"
+                        outcome_tag = "dispatch_failure"
+                    await store.store(
+                        content=content,
+                        source="ego_dispatch_outcome",
+                        tags=["ego", outcome_tag],
+                        memory_type="episodic",
+                        memory_class="fact",
+                        origin_class=dispatch_origin,
+                        wing="autonomy",
+                        room="ego",
+                    )
+            except Exception:
+                logger.debug("Failed to store dispatch outcome observation", exc_info=True)
         except Exception:
             logger.warning(
                 "Failed to record proposal outcome for %s",
@@ -1464,6 +1500,7 @@ class DirectSessionRunner:
             {
                 "profile": request.profile,
                 "caller_context": request.caller_context,
+                "origin_caller_context": request.origin_caller_context,
                 "output_text": result.output_text[:20000],
                 "tools_summary": tool_counts,
                 "cc_session_id": result.cc_session_id,

@@ -43,7 +43,20 @@ def pulse_root(tmp_path, monkeypatch) -> Path:
     root = tmp_path / "repo_pulse"
     monkeypatch.setattr(rpw, "_pulse_root", lambda: root)
     monkeypatch.setattr(rpw, "load_config", lambda: dict(DEFAULTS))
+    # The open-PR lane writes a HOME-anchored cache; redirect it into tmp so the
+    # lane (which now runs on every non-debounced worker run) never touches $HOME.
+    monkeypatch.setattr(rpw, "open_prs_cache_path", lambda: root / "open_prs.json")
     return root
+
+
+def test_pulse_root_honors_genesis_home(monkeypatch, tmp_path):
+    """The worker's state root must anchor on genesis_home() (honors GENESIS_HOME)
+    — the SAME resolver the reader hook uses — so a relocated install keeps the
+    lock/cursor + open-PR cache together instead of writing to a bare Path.home()
+    the hook would never read."""
+    relocated = tmp_path / "relocated_home"
+    monkeypatch.setenv("GENESIS_HOME", str(relocated))
+    assert rpw._pulse_root() == relocated / "repo_pulse"
 
 
 @pytest.fixture
@@ -82,6 +95,20 @@ def _gh(prs, *, limit_hit=False, error=None, repo="owner/repo"):
             "prs": sorted(prs, key=lambda p: p["mergedAt"]),
             "limit_hit": limit_hit,
         }
+
+    fake.calls = calls
+    return fake
+
+
+def _open_gh(prs, *, limit_hit=False, error=None, repo="owner/repo"):
+    """Fake list_open_prs — canned open-PR listing; records calls."""
+    calls: list[dict] = []
+
+    async def fake(**kwargs):
+        calls.append(kwargs)
+        if error is not None:
+            return {"error": error}
+        return {"repo": repo, "prs": list(prs), "limit_hit": limit_hit}
 
     fake.calls = calls
     return fake
@@ -152,8 +179,11 @@ def _write_cursor_file(root: Path, **data):
     (root / rpw.CURSOR_FILENAME).write_text(json.dumps(base))
 
 
-async def _run(db_path, monkeypatch, *, gh, headless=None, force=True, **kw):
+async def _run(db_path, monkeypatch, *, gh, headless=None, force=True, open_gh=None, **kw):
     monkeypatch.setattr(rpw, "list_merged_prs", gh)
+    # The open-PR lane runs on every non-debounced worker run — default it to an
+    # empty valid listing so unrelated tests never reach the real gh CLI.
+    monkeypatch.setattr(rpw, "list_open_prs", open_gh or _open_gh([]))
     monkeypatch.setattr(rpw, "run_headless_json", headless or _headless([]))
     return await rpw.run_pulse_worker(trigger="manual", force=force, db_path=db_path, **kw)
 
@@ -775,6 +805,191 @@ async def test_followup_proposal_survives_reconcile_while_open(
     assert anns[0]["status"] == "proposed"  # SURVIVES — the BLOCKER fix
 
 
+# ── issue-close lane (WS-A): contributor-PR close reconciliation ───────────
+# A contributor PR that CLOSES a Genesis-posted issue (Closes #N) resolves the
+# follow_up that spawned the issue — riding the same absorb+annotate machinery.
+
+CLOSE_REPO = "owner/repo"  # matches _gh's default fake repo slug
+
+
+async def _seed_posted_issue(
+    db_path, *, issue_number=101, source_ref=FU, repo=CLOSE_REPO, status="posted"
+):
+    """Create pending_issue_posts (absent from the base fixture) + one row."""
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.execute(TABLES["pending_issue_posts"])
+        await db.execute(
+            "INSERT INTO pending_issue_posts "
+            "(id, request_id, repo, title, body, source, source_ref, cell_domain, "
+            " cell_verb, cell_risk_class, held_at, mode, status, issue_number) "
+            "VALUES (?, ?, ?, 't', 'b', 'follow_up', ?, 'github', 'issue_create', "
+            " 'bulk', '2026-07-10T00:00:00', 'live', ?, ?)",
+            (
+                f"pp-{issue_number}",
+                f"req-{issue_number}",
+                repo,
+                source_ref,
+                status,
+                issue_number if status == "posted" else None,
+            ),
+        )
+        await db.commit()
+
+
+def _close_ref(number, repo=CLOSE_REPO):
+    owner, _, name = repo.partition("/")
+    return {
+        "number": number,
+        "repository": {"name": name, "owner": {"login": owner}},
+        "url": f"https://github.com/{repo}/issues/{number}",
+    }
+
+
+def _pr_closes(number=1300, base="main", refs=None, merged=MERGED_NEW):
+    pr = _pr(number=number, title="fix: contributor patch", merged=merged)
+    pr["baseRefName"] = base
+    pr["closingIssuesReferences"] = refs if refs is not None else [_close_ref(101)]
+    return pr
+
+
+@pytest.fixture
+def default_branch_main(monkeypatch):
+    async def fake(*a, **k):
+        return "main"
+
+    monkeypatch.setattr(rpw, "resolve_default_branch", fake)
+
+
+@pytest.mark.asyncio
+async def test_issue_close_absorbs_in_live(
+    pulse_root, db_path, monkeypatch, live_mode, default_branch_main
+):
+    await _seed_followup(db_path)
+    await _seed_posted_issue(db_path, issue_number=101, source_ref=FU)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr_closes(refs=[_close_ref(101)])]))
+    assert out["status"] == "ok"
+    row = await _followup_row(db_path)
+    assert row["status"] == "completed"
+    assert "PR #1300" in row["resolution_notes"]
+    assert "[repo-pulse issue-close]" in row["resolution_notes"]
+    anns = await _anns(db_path, target_kind="follow_up")
+    assert len(anns) == 1
+    assert anns[0]["status"] == "applied"
+    assert anns[0]["rationale"] == "issue-close (Closes #N)"
+
+
+@pytest.mark.asyncio
+async def test_issue_close_pinned_is_proposal(
+    pulse_root, db_path, monkeypatch, live_mode, default_branch_main
+):
+    await _seed_followup(db_path, pinned=1)
+    await _seed_posted_issue(db_path)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr_closes()]))
+    assert out["status"] == "ok"
+    assert (await _followup_row(db_path))["status"] == "pending"  # never auto-resolved
+    anns = await _anns(db_path, target_kind="follow_up")
+    assert anns[0]["status"] == "proposed"
+    assert "pinned" in anns[0]["rationale"]
+
+
+@pytest.mark.asyncio
+async def test_issue_close_propose_only(pulse_root, db_path, monkeypatch, default_branch_main):
+    monkeypatch.setattr(rpw, "effective_mode", lambda: "propose_only")
+    await _seed_followup(db_path)
+    await _seed_posted_issue(db_path)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr_closes()]))
+    assert out["status"] == "ok"
+    assert (await _followup_row(db_path))["status"] == "pending"
+    anns = await _anns(db_path, target_kind="follow_up")
+    assert anns[0]["status"] == "proposed"
+    assert "propose_only" in anns[0]["rationale"]
+
+
+@pytest.mark.asyncio
+async def test_issue_close_non_default_branch_no_absorb(
+    pulse_root, db_path, monkeypatch, live_mode, default_branch_main
+):
+    await _seed_followup(db_path)
+    await _seed_posted_issue(db_path)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr_closes(base="release/2.0")]))
+    assert out["status"] == "ok"
+    assert (await _followup_row(db_path))["status"] == "pending"  # branch guard held
+    assert await _anns(db_path, target_kind="follow_up") == []
+
+
+@pytest.mark.asyncio
+async def test_issue_close_missing_table_skips_not_fails(
+    pulse_root, db_path, monkeypatch, live_mode
+):
+    # pending_issue_posts absent (pre-#1341 install) -> lane skips, run still ok.
+    await _seed_followup(db_path)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr_closes()]))
+    assert out["status"] == "ok"
+    assert (await _followup_row(db_path))["status"] == "pending"
+    assert await _anns(db_path, target_kind="follow_up") == []
+
+
+@pytest.mark.asyncio
+async def test_issue_close_dedup_guard_across_runs(
+    pulse_root, db_path, monkeypatch, default_branch_main
+):
+    # propose_only keeps the follow_up OPEN, so a re-covered window re-matches it —
+    # the annotation_exists guard must prevent a duplicate annotation.
+    monkeypatch.setattr(rpw, "effective_mode", lambda: "propose_only")
+    await _seed_followup(db_path)
+    await _seed_posted_issue(db_path)
+    await _run(db_path, monkeypatch, gh=_gh([_pr_closes(number=1300)]))
+    await _run(db_path, monkeypatch, gh=_gh([_pr_closes(number=1300, merged=MERGED_NEXT)]))
+    anns = await _anns(db_path, target_kind="follow_up")
+    assert len(anns) == 1  # same (tier, target_kind, item_id, pr_number) key -> guarded
+
+
+@pytest.mark.asyncio
+async def test_issue_close_posted_index_read_failure_fails_run(
+    pulse_root, db_path, monkeypatch, live_mode, default_branch_main
+):
+    # A GENUINE posted-index read failure (None, not {}) must FAIL the run and
+    # keep the cursor — never a false absorb, never a silent skip.
+    await _seed_followup(db_path)
+    await _seed_posted_issue(db_path)
+
+    async def _boom(*a, **k):
+        return None
+
+    monkeypatch.setattr(rpw, "_load_posted_index", _boom)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr_closes()]))
+    assert out["status"] == "failed"
+    assert out["detail"] == "posted_index_read_failed"
+    assert (await _followup_row(db_path))["status"] == "pending"  # no absorb
+    assert await _anns(db_path, target_kind="follow_up") == []
+    assert not _cursor(pulse_root).get("last_merged_at")  # cursor not advanced
+
+
+@pytest.mark.asyncio
+async def test_issue_close_default_branch_unresolved_fails_run(
+    pulse_root, db_path, monkeypatch, live_mode
+):
+    # The default branch can't be confirmed (resolve_default_branch -> None). The
+    # lane must NOT fall through to an end-of-run ok that advances the cursor PAST
+    # the skipped closing PR (permanently dropping the close event) — it FAILS the
+    # run and keeps the cursor so the window re-covers next run.
+    _write_cursor_file(pulse_root, last_merged_at=MERGED_OLD)
+    await _seed_followup(db_path)
+    await _seed_posted_issue(db_path, issue_number=101, source_ref=FU)
+
+    async def _unresolved(*a, **k):
+        return None
+
+    monkeypatch.setattr(rpw, "resolve_default_branch", _unresolved)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr_closes(refs=[_close_ref(101)])]))
+    assert out["status"] == "failed"
+    assert out["detail"] == "default_branch_unresolved"
+    assert (await _followup_row(db_path))["status"] == "pending"  # no absorb
+    assert await _anns(db_path, target_kind="follow_up") == []
+    # cursor NOT advanced past the skipped closing PR (stays at the seeded value)
+    assert _cursor(pulse_root)["last_merged_at"] == MERGED_OLD
+
+
 @pytest.mark.asyncio
 async def test_followup_proposal_confirmed_when_completed_with_pr(
     pulse_root, db_path, monkeypatch, live_mode
@@ -816,3 +1031,55 @@ async def test_followup_absorb_and_annotation_are_atomic(
     anns = await _anns(db_path, target_kind="follow_up")
     assert len(anns) == 1
     assert anns[0]["status"] == "applied"
+
+
+# ── Open-PR lane (session-manager PR-4c) ────────────────────────────────────
+
+
+def _openpr(number=1379, updated="2026-08-01T00:00:00Z"):
+    return {
+        "number": number,
+        "title": "t",
+        "url": f"https://x/pull/{number}",
+        "isDraft": False,
+        "mergeable": "MERGEABLE",
+        "updatedAt": updated,
+        "author": {"login": "human", "is_bot": False},
+    }
+
+
+@pytest.mark.asyncio
+async def test_open_pr_lane_writes_snapshot(pulse_root, db_path, monkeypatch, live_mode):
+    open_gh = _open_gh([_openpr(1379), _openpr(1223)])
+    await _run(db_path, monkeypatch, gh=_gh([_pr()]), open_gh=open_gh)
+    cache = pulse_root / "open_prs.json"
+    assert cache.exists()
+    data = json.loads(cache.read_text())
+    assert {p["number"] for p in data["prs"]} == {1379, 1223}
+    assert data["repo"] == "owner/repo"
+    assert data["computed_at"]  # stamped for the hook's freshness TTL
+    assert open_gh.calls  # the lane actually fetched
+
+
+@pytest.mark.asyncio
+async def test_open_pr_lane_disabled_writes_no_snapshot(
+    pulse_root, db_path, monkeypatch, live_mode
+):
+    monkeypatch.setattr(rpw, "load_config", lambda: dict(DEFAULTS, open_pr_enabled=False))
+    open_gh = _open_gh([_openpr()])
+    await _run(db_path, monkeypatch, gh=_gh([_pr()]), open_gh=open_gh)
+    assert not (pulse_root / "open_prs.json").exists()
+    assert not open_gh.calls  # lane skipped before any fetch
+
+
+@pytest.mark.asyncio
+async def test_open_pr_lane_failure_keeps_merged_lane_and_records(
+    pulse_root, db_path, monkeypatch, live_mode
+):
+    # A gh failure in the open-PR lane must NOT skip the merged lanes or _record_run.
+    open_gh = _open_gh([], error="HTTP 502")
+    await _run(db_path, monkeypatch, gh=_gh([_pr(body="no marker")]), open_gh=open_gh)
+    runs = await _runs(db_path)
+    assert runs, "merged lane must still record a run row despite the open-PR failure"
+    assert not (pulse_root / "open_prs.json").exists()  # no cache written on error
+    assert any("open_pr_lane" in (r.get("detail") or "") for r in runs)

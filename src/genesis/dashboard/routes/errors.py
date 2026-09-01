@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
+
+logger = logging.getLogger(__name__)
 
 
 @blueprint.route("/api/genesis/unified-errors")
@@ -20,7 +23,10 @@ async def unified_errors():
 
     rt = GenesisRuntime.instance()
     if not rt.is_bootstrapped or rt.db is None:
-        return jsonify({"groups": [], "active_alerts": [], "totals": {"events": 0, "dead_letters": 0, "deferred_failures": 0}})
+        # Backend not ready / DB unavailable: no error data could be loaded, so this
+        # is NOT a clean "0 errors" — flag it partial so the Errors tab shows the
+        # degraded banner instead of "data is clean".
+        return jsonify({"groups": [], "active_alerts": [], "totals": {"events": 0, "dead_letters": 0, "deferred_failures": 0}, "partial": True, "sources_failed": ["backend unavailable"]})
 
     since = request.args.get("since")
     if not since:
@@ -35,6 +41,9 @@ async def unified_errors():
     event_count = 0
     dl_count = 0
     dw_count = 0
+    # Each data source is queried independently; a failed source must be SURFACED
+    # (partial/sources_failed) so a DB/FTS outage can't read as a clean "0 errors".
+    sources_failed: list[str] = []
 
     groups: list[dict] = []
     try:
@@ -57,7 +66,8 @@ async def unified_errors():
                     "still_active": g["last_seen"] >= thirty_min_ago,
                 })
     except Exception:
-        pass
+        logger.warning("unified-errors: events source failed", exc_info=True)
+        sources_failed.append("events")
 
     try:
         dl_items = await dl_crud.query_recent(
@@ -90,7 +100,8 @@ async def unified_errors():
                 g["still_active"] = g["last_seen"] >= thirty_min_ago
             groups.extend(dl_groups.values())
     except Exception:
-        pass
+        logger.warning("unified-errors: dead_letters source failed", exc_info=True)
+        sources_failed.append("dead_letters")
 
     try:
         dw_items = await dw_crud.query_failed(
@@ -124,7 +135,8 @@ async def unified_errors():
                 g["still_active"] = g["last_seen"] >= thirty_min_ago
             groups.extend(dw_groups.values())
     except Exception:
-        pass
+        logger.warning("unified-errors: deferred_work source failed", exc_info=True)
+        sources_failed.append("deferred_work")
 
     try:
         cursor = await rt.db.execute("SELECT error_group_key, resolved_by, resolved_at, notes FROM resolved_errors")
@@ -137,7 +149,8 @@ async def unified_errors():
                 g["resolved_by"] = r["resolved_by"]
                 g["resolved_at"] = r["resolved_at"]
     except Exception:
-        pass
+        logger.warning("unified-errors: resolutions overlay failed", exc_info=True)
+        sources_failed.append("resolutions")
 
     groups.sort(key=lambda g: g["last_seen"], reverse=True)
 
@@ -146,7 +159,8 @@ async def unified_errors():
         from genesis.mcp.health_mcp import _impl_health_alerts
         active_alerts = await _impl_health_alerts(active_only=True)
     except Exception:
-        pass
+        logger.warning("unified-errors: active_alerts source failed", exc_info=True)
+        sources_failed.append("alerts")
 
     return jsonify({
         "groups": groups[:limit],
@@ -156,6 +170,8 @@ async def unified_errors():
             "dead_letters": dl_count,
             "deferred_failures": dw_count,
         },
+        "partial": bool(sources_failed),
+        "sources_failed": sources_failed,
     })
 
 
@@ -180,4 +196,13 @@ async def clear_deferred_item(item_id):
         )
     await rt.db.commit()
     cleared = cur.rowcount
+    # Unconditional by design. The queues snapshot is cached for up to 30s, so
+    # without this the client's immediate refetch re-renders the rows it just
+    # deleted. Deliberately NOT guarded on `cleared`: a zero means the caller
+    # clicked Clear on a row the cached view still shows and the DB no longer
+    # has — the strongest evidence its view is stale, and precisely when the
+    # cache most needs busting. (`rowcount` is also -1 on some drivers.)
+    from genesis.dashboard.routes.health import invalidate_snapshot_cache
+
+    invalidate_snapshot_cache()
     return jsonify({"cleared": cleared})

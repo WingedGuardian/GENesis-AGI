@@ -168,8 +168,9 @@ class TestManualMode:
         result = run("manual")
         assert result.returncode == 0, result.stderr
         assert "-s cc-2" in _new_session_line(log)
-        # Only the numeric slot counts: cap line reads 1/<max>, not 2/<max>.
-        assert "cap: 1/" in result.stderr
+        # Only the numeric slot counts: the header reads `live: 1`, not `live: 2`
+        # (the retired cc-manual-* stray is excluded from the count).
+        assert "live: 1" in result.stderr
 
     def test_exotic_arg_survives_quoting(self, door):
         run, log, _sessions, _listing = door

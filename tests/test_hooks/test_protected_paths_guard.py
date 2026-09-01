@@ -289,3 +289,40 @@ class TestPayloadEdges:
             env=env,
         )
         assert r.returncode == 0
+
+
+class TestQuotedParenRedirectTargetRegression:
+    """Codex P1 (2026-08-26): shell_parse's quote-blind ``$()`` balancer
+    (``_redirect_target_end``) mis-bounded a ``$(…)`` redirect target whose body
+    held a QUOTED or ESCAPED ``)``, dumping back into the quote-aware outer word-
+    scan mid-string so a following ``&& rm <protected>`` was consumed INTO the
+    redirect target — ``analyze()`` then emitted no ``rm`` segment and this guard
+    went blind. Verified against the real guard: pre-fix these PASS THROUGH
+    (returncode 0); the ``rm`` after the redirect MUST be seen and blocked."""
+
+    def test_single_quoted_paren_target_then_rm_dir_blocks(self, fake_home):
+        r = _run(f"echo ok 2>$(printf ')') && rm -rf {H}/genesis/data", fake_home)
+        assert r.returncode != 0, (
+            f"protected-dir rm slipped past guard: out={r.stdout!r} err={r.stderr!r}"
+        )
+
+    def test_codex_exact_db_file_deletion_blocks(self, fake_home):
+        # Codex's exact reported command form (a specific protected FILE).
+        r = _run(f"echo ok 2>$(printf ')') && rm {H}/genesis/data/genesis.db", fake_home)
+        assert r.returncode != 0, (
+            f"production-DB deletion slipped past guard: out={r.stdout!r} err={r.stderr!r}"
+        )
+
+    def test_double_quoted_paren_target_then_rm_ancestor_blocks(self, fake_home):
+        r = _run(f'echo ok 2>$(echo ")") && rm -rf {H}/genesis', fake_home)
+        assert r.returncode != 0, (
+            f"protected-ancestor rm slipped past guard: out={r.stdout!r} err={r.stderr!r}"
+        )
+
+    def test_quoted_paren_target_without_protected_rm_still_allowed(self, fake_home):
+        # The fix must SPLIT the segment correctly, NOT over-block: no protected
+        # target here, so the command stays allowed (guards against over-gating).
+        r = _run("echo ok 2>$(printf ')') && echo done", fake_home)
+        assert r.returncode == 0, (
+            f"benign command wrongly blocked: out={r.stdout!r} err={r.stderr!r}"
+        )

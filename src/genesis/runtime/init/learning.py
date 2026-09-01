@@ -381,12 +381,9 @@ def build_learning_collectors(rt: GenesisRuntime) -> list:
             rt._db,
             pipeline_getter=lambda: rt._outreach_pipeline,
         ),
-        CCVersionCollector(
-            rt._db,
-            router=rt._router,
-            pipeline_getter=lambda: rt._outreach_pipeline,
-            memory_store_getter=lambda: rt._memory_store,
-        ),
+        # Detect-and-record only — no router/pipeline/memory_store: this
+        # collector deliberately runs no impact analysis (see its docstring).
+        CCVersionCollector(rt._db),
         ProcessHealthCollector(),
         UserGoalStalenessCollector(rt._db),
         UserSessionPatternCollector(rt._db),
