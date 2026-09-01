@@ -44,10 +44,13 @@
              so the 'loading' spinner below (gated on !egoStatus) stays hidden. Cover
              BOTH so a slow live fetch over shown data isn't invisible — the header
              dot shows last-known health, not refresh progress. Restores the progress
-             cue the semantic-verdict header replaced. aria-live announces it. -->
-        <div x-show="$store.genesisDashboard.egoModal.fetch.state === 'refreshing' || ($store.genesisDashboard.egoModal.fetch.state === 'loading' && $store.genesisDashboard.egoStatus)"
-             aria-live="polite"
-             style="text-align: right; font-size: 0.72rem; color: var(--color-text-secondary); margin-bottom: 0.5rem;">↻ Refreshing…</div>
+             cue the semantic-verdict header replaced. The aria-live region is
+             PERMANENT and its TEXT toggles (empty when idle → no visual footprint):
+             a live region must stay in the DOM to announce a change; toggling the
+             node's display via x-show would not announce reliably. -->
+        <div aria-live="polite"
+             x-text="($store.genesisDashboard.egoModal.fetch.state === 'refreshing' || ($store.genesisDashboard.egoModal.fetch.state === 'loading' && $store.genesisDashboard.egoStatus)) ? '↻ Refreshing…' : ''"
+             style="text-align: right; font-size: 0.72rem; color: var(--color-text-secondary);"></div>
         <!-- Loading -->
         <div x-show="$store.genesisDashboard.egoModal.fetch.state === 'loading' && !$store.genesisDashboard.egoStatus"
              style="text-align: center; padding: 2rem; color: var(--color-text-secondary);">Loading...</div>
