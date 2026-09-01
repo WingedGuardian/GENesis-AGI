@@ -709,6 +709,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Contributor-issue privacy scan no longer over-blocks legitimate Markdown.**
+  The `scan_prose` secret-scan floor ran `detect-secrets scan --string <line>` per
+  line; argparse then misread any line whose content starts with `-` (a Markdown
+  `---` horizontal rule, a `--flag` example — both common in issue/PR prose) as an
+  unknown option (exit 2), which the fail-closed nonzero-exit branch turned into a
+  spurious BLOCK. Switched to the `--string=<value>` form so the value binds
+  literally even when it starts with a dash; secret detection is unchanged for all
+  other input. Locked with real-binary regression tests (a `---`/`--flag` body
+  scans clean; a planted key still BLOCKs).
 - **A transient `git ls-remote` failure no longer re-prompts an already-approved
   branch push.** The push-approval hook prompts only on a branch's FIRST push; a
   re-push of fixes to the same, already-published branch should be silent. But the
