@@ -29,6 +29,7 @@ from datetime import UTC, datetime
 from genesis.db.crud import approval_requests as approval_crud
 from genesis.db.crud import capability_grants as cg
 from genesis.db.crud import pending_email_sends as pes
+from genesis.outreach.marketing_config import effective_mode as _marketing_mode
 from genesis.outreach.types import OutreachStatus
 
 logger = logging.getLogger(__name__)
@@ -157,6 +158,24 @@ async def drain_pending_email_sends(rt: object) -> int:
                 logger.warning(
                     "Held BULK email %s recipient no longer authorized "
                     "(opted-out/uncurated) — not delivered, marked rejected",
+                    row["id"],
+                )
+                continue
+            # Marketing kill-switch re-check — the LAST gate before the pipeline
+            # hand-off (Codex finding F9). The `off` lever / env kill-switch is the
+            # owner's emergency stop; it gates enqueue, but an already-HELD+APPROVED
+            # BULK cold-marketing send must ALSO be halted if the owner flips off
+            # before it goes out. Placed HERE (no `await` between this read and the
+            # deliver below) so a mid-run toggle during the opt-out/curation awaits
+            # above cannot slip a send past the stop (TOCTOU-closed). Fail-SAFE: pause
+            # on anything but an affirmatively-armed mode. PAUSE = leave held, approval
+            # unconsumed, nothing sent → a re-enable resumes it. Scoped to BULK (the
+            # marketing path); non-marketing sends untouched. A FINANCIAL-classified
+            # marketing pitch is the send-provenance edge tracked in follow-up df805eba.
+            if row["cell_risk_class"] == "bulk" and _marketing_mode() not in ("observe", "live"):
+                logger.info(
+                    "Held BULK email %s paused — marketing lever not armed (kill-switch); "
+                    "left held, resumes when re-enabled",
                     row["id"],
                 )
                 continue

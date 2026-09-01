@@ -31,7 +31,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   prospect is refused before delivery regardless of how the pitch classified (a
   money-pattern body that lands as FINANCIAL no longer bypasses the bulk-only
   opt-out check); and the `pending_outreach.labeled_surplus` migration no longer
-  swallows ALTER errors (a transient lock is retried, a real failure fails loud).
+  swallows ALTER errors (a transient lock is retried, a real failure fails loud); and an
+  already-approved cold send is halted at delivery if the lever is flipped to `off` / the
+  kill switch is set before it goes out (the outer off-switch is now honored deliver-side,
+  not only at enqueue — the held send is paused and resumes if you re-enable).
 - **Outreach total-cessation monitoring, without the old false-alarm trap.**
   Outreach is now in the `subsystem_stale` alert set (WARNING) alongside
   ego/inbox/dashboard. Previously it was excluded because its heartbeat was

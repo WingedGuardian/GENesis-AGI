@@ -13,6 +13,7 @@ import json
 import aiosqlite
 import pytest
 
+from genesis.autonomy import email_gate_watcher as egw
 from genesis.autonomy.approval import ApprovalManager
 from genesis.autonomy.email_gate_watcher import drain_pending_email_sends
 from genesis.db.crud import approval_requests as ac
@@ -96,7 +97,8 @@ async def test_approved_hold_is_sent(db):
 
 
 @pytest.mark.asyncio
-async def test_approved_bulk_hold_sends_and_increments_owner_success(db):
+async def test_approved_bulk_hold_sends_and_increments_owner_success(db, monkeypatch):
+    monkeypatch.setattr(egw, "_marketing_mode", lambda: "live")  # armed — kill-switch not active
     # (e) approve→drain for a BULK (cold marketing) hold: deliver_approved sends
     # once and the BULK cell's successes increments with origin_class="owner".
     # The recipient must still be a curated, non-opted-out prospect at send time
@@ -129,7 +131,40 @@ async def test_approved_bulk_hold_sends_and_increments_owner_success(db):
 
 
 @pytest.mark.asyncio
-async def test_approved_bulk_hold_opted_out_after_hold_not_delivered(db):
+async def test_approved_bulk_hold_kill_switch_off_not_delivered(db):
+    # F9 (Codex): the marketing kill-switch (lever `off` / env-kill) must halt an
+    # already-approved BULK cold-marketing hold at DELIVERY too — not just at enqueue.
+    # With effective_mode()=='off' (the shipped default here) the approved BULK hold is
+    # PAUSED: left held, approval NOT consumed, nothing sent — so a re-enable resumes it
+    # and the owner's outer off-switch is honored deliver-side. Non-marketing behavior
+    # is unchanged (only cell_risk_class=='bulk' is gated on the marketing lever).
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await pes.create(
+        db,
+        id="pb",
+        request_id=rid,
+        validated_recipient="prospect@example.com",
+        category="notification",
+        message="cold pitch",
+        held_at=_TS,
+        cell_domain="email",
+        cell_verb="send",
+        cell_risk_class="bulk",
+    )
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+    # effective_mode() defaults to 'off' (shipped config, no overlay) → kill-switch active.
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 0
+    assert pipe.calls == []  # NOT delivered — kill-switch honored at delivery
+    assert (await pes.get_by_id(db, "pb"))["status"] == "held"  # paused, not consumed
+    assert (await ac.get_by_id(db, rid))["consumed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_approved_bulk_hold_opted_out_after_hold_not_delivered(db, monkeypatch):
+    monkeypatch.setattr(egw, "_marketing_mode", lambda: "live")  # armed — isolate the opt-out path
     # Opt-out re-check at approved-send time: a prospect who opts out AFTER the
     # bulk hold is enqueued but BEFORE the owner approves must NOT be delivered on
     # the gate_cleared resume path (the g2 scope guard is bypassed there). The
@@ -161,7 +196,8 @@ async def test_approved_bulk_hold_opted_out_after_hold_not_delivered(db):
 
 
 @pytest.mark.asyncio
-async def test_approved_bulk_hold_not_curated_after_hold_not_delivered(db):
+async def test_approved_bulk_hold_not_curated_after_hold_not_delivered(db, monkeypatch):
+    monkeypatch.setattr(egw, "_marketing_mode", lambda: "live")  # armed — isolate the curation path
     # Companion: recipient removed from (or never present in) the curated set at
     # approve time → not authorized → not delivered, marked rejected.
     rid = await _approval(db, status="approved")
