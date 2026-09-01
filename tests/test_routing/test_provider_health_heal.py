@@ -303,3 +303,60 @@ def test_the_probe_heal_allowlist_is_the_complete_reachability_set():
         "ErrorCategory changed — decide explicitly whether a LISTING probe is "
         "evidence of recovery for the new member, then update this assertion"
     )
+
+
+def test_sub_threshold_failures_do_not_poison_the_probe_heal_guard():
+    """Cross-model review (Kimi K3), reproduced: the guard stranded HEALTHY providers.
+
+    `record_failure` sets `_last_failure_category` on EVERY failure
+    (circuit_breaker.py:246), before the threshold check — so one or two 403s
+    below `failure_threshold=3` leave "permanent" sitting on a breaker that
+    never tripped and is still CLOSED. `probe_suspect()` then moves CLOSED ->
+    HALF_OPEN on any failed or rate-limited probe WITHOUT clearing it
+    (`provider_health.py` routes both there), and the guard refused to heal.
+
+    With no real traffic — exactly the population `record_probe_success` exists
+    to rescue — the provider is stranded in HALF_OPEN until the process
+    restarts. `snapshots/call_sites.py:162` renders HALF_OPEN as degraded, so
+    this branch's own duration suffix would then report `(ongoing for 9d)` for a
+    provider that is completely fine. That is the same false-degraded-forever
+    failure this branch exists to remove, recreated one layer over.
+
+    The fix is to ask whether a non-healable category actually TRIPPED the
+    breaker (`_trip_count > 0`), rather than whether one was merely recorded.
+    Clearing the category in `probe_suspect()` was the other candidate and was
+    rejected: `_effective_open_duration()` also reads it to pick the 4h quota
+    cap, so clearing it there would silently shorten a quota-dead provider's
+    backoff — trading this bug for a quieter one.
+    """
+    prov = _provider("free-1")
+    reg = CircuitBreakerRegistry({"free-1": prov}, clock=lambda: 0.0, persist=False)
+    cb = reg.get("free-1")
+
+    # Two sub-threshold PERMANENT failures: below failure_threshold=3, so the
+    # breaker never trips and stays CLOSED — but the category is now set.
+    for _ in range(2):
+        cb.record_failure(ErrorCategory.PERMANENT)
+    assert cb.state == ProviderState.CLOSED, "precondition: sub-threshold, still closed"
+    assert cb._last_failure_category == ErrorCategory.PERMANENT
+    assert cb._trip_count == 0, "precondition: never tripped"
+
+    # A probe blip (unreachable, or a 429 on the listing endpoint) suspects it.
+    checker = ProviderHealthChecker(_config(prov), breakers=reg)
+    checker._results = {
+        "free-1": ProviderProbeResult(
+            provider_name="free-1", reachable=False, configured=True,
+            error="ConnectionError",
+        ),
+    }
+    checker._sync_to_breakers()
+    assert reg.get("free-1").state == ProviderState.HALF_OPEN
+
+    # Clean probes must now heal it: nothing ever tripped this breaker.
+    _clean_probe(checker)
+    for _ in range(3):
+        checker._sync_to_breakers()
+    assert reg.get("free-1").state == ProviderState.CLOSED, (
+        "a healthy provider was stranded in HALF_OPEN by a category from "
+        "sub-threshold failures that never tripped the breaker"
+    )

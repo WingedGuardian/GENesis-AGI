@@ -175,12 +175,14 @@ class CircuitBreaker:
         recovery it fires ``on_recovery`` — exactly like ``record_success`` — so
         the provider's lingering ``provider_failure`` observation auto-resolves.
 
-        **Healing is CONDITIONAL on the failure category.** A probe never heals
-        a breaker whose last failure was ``PERMANENT`` or ``QUOTA_EXHAUSTED``:
-        for those, a 200 from the models-listing endpoint is exactly what a
-        403-on-use looks like from outside, so it is not weak evidence, it is
-        none. Those need a real ``record_success()``. See the guard below for
-        the full rationale and its measured cost to the retry schedule.
+        **Healing is CONDITIONAL.** A probe heals only a breaker whose tripping
+        failure is in ``_PROBE_HEALABLE`` (TRANSIENT/TIMEOUT) — everything else
+        needs a real ``record_success()``, because a 200 from the models-listing
+        endpoint is exactly what a 403-on-use, an exhausted quota, or a stream
+        of truncated completions looks like from outside. A breaker that never
+        TRIPPED is always healable, whatever category its sub-threshold failures
+        recorded. See the guard below for the full rationale and its measured
+        cost to the retry schedule.
         """
         if self.state != ProviderState.HALF_OPEN:
             return
@@ -224,8 +226,19 @@ class CircuitBreaker:
         # retried less often, which is the intent; the cost is that a provider
         # whose quota resets is re-tried up to 4h later. Parsing the provider's
         # own retry hint is the exact fix for that and is tracked separately.
+        # `_trip_count > 0` is load-bearing, not belt-and-braces. `record_failure`
+        # sets the category on EVERY failure, before the threshold check, so a
+        # provider with one or two sub-threshold failures carries a non-healable
+        # category while still CLOSED and perfectly healthy. Without this term a
+        # single probe blip (`probe_suspect()` fires on an unreachable OR
+        # rate-limited probe) would strand such a provider in HALF_OPEN with no
+        # traffic to rescue it — and `snapshots/call_sites.py` renders HALF_OPEN
+        # as degraded, so it would raise a permanent false "degraded" alert that
+        # this branch's own duration suffix would then age forever.
+        # The question is therefore whether a non-healable category actually
+        # TRIPPED this breaker, not whether one was merely recorded.
         cat = self._last_failure_category
-        if cat is not None and cat not in _PROBE_HEALABLE:
+        if self._trip_count > 0 and cat is not None and cat not in _PROBE_HEALABLE:
             return
         was_tripped = self._trip_count > 0
         self._consecutive_successes += 1
@@ -353,7 +366,18 @@ class CircuitBreakerRegistry:
                         cb._trip_count = min(cb._trip_count, 3)
                     # The category QUALIFIES a failing breaker, so it must be
                     # restored under the same condition as the state it
-                    # describes. Restoring it unconditionally onto a breaker that
+                    # describes.
+                    #
+                    # KNOWN, ACCEPTED side effect on the OTHER reader of this
+                    # field: `_effective_open_duration()` consults it to pick
+                    # the 4h quota cap. A QUOTA_EXHAUSTED provider persisted as
+                    # half_open therefore restarts on the 30-minute cap until it
+                    # re-fails and re-classifies — a shorter retry interval, not
+                    # a longer one, so it errs toward re-trying a provider that
+                    # may have recovered. Restoring the category unconditionally
+                    # to preserve the cap is NOT the fix: `_trip_count` is also
+                    # restored unconditionally, so that would hand the heal
+                    # guard a tripped-looking breaker and strand it. Restoring it unconditionally onto a breaker that
                     # comes back CLOSED (anything not saved as OPEN) leaves a
                     # dead fact from a previous process — and once
                     # `record_probe_success` began consulting it, that stale

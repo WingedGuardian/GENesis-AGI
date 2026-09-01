@@ -207,9 +207,16 @@ across three days. The false heals were roughly 9-12h apart, not per probe
 cycle — between them the breaker's backoff escalated normally (consecutive trips
 5/5/10/20/35/65/128 minutes apart, matching `120 * 2^(trip-1)`).
 
-`record_probe_success()` now refuses to heal when the last failure category is
-`PERMANENT` or `QUOTA_EXHAUSTED`. Probe healing is unchanged for
-`TRANSIENT`/`TIMEOUT`, which is the low/no-traffic recovery case it exists for.
+`record_probe_success()` now heals only when the failure that TRIPPED the
+breaker is in `_PROBE_HEALABLE` — an allowlist of `TRANSIENT`/`TIMEOUT`, the
+low/no-traffic recovery case probe healing exists for. Everything else
+(`PERMANENT`, `QUOTA_EXHAUSTED`, `DEGRADED`) needs a real completion, and a
+category added to `ErrorCategory` later is un-healable by default rather than
+silently probe-healable. Two qualifiers matter: a breaker that never tripped is
+always healable, because `record_failure` records a category on every failure
+including sub-threshold ones that leave a healthy provider CLOSED; and the
+category is restored from disk only when the saved state was OPEN, so a
+qualifier cannot outlive the state it describes.
 This does not strand a provider: `HALF_OPEN` is still `is_available()`, so real
 traffic is attempted and a real `record_success()` closes the breaker as before —
 recovery now requires evidence of a working *call* rather than a listing.
