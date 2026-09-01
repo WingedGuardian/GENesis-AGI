@@ -204,7 +204,7 @@ def test_staleness_warns_past_threshold(monkeypatch):
     def fake_git(args: list[str]) -> str | None:
         if args[:2] == ["rev-parse", "--is-shallow-repository"]:
             return "false"
-        if args[0] == "cat-file":
+        if args[0] == "merge-base":
             return ""
         if args[0] == "rev-list":
             return "999"
@@ -222,7 +222,7 @@ def test_staleness_quiet_under_threshold(monkeypatch):
     def fake_git(args: list[str]) -> str | None:
         if args[:2] == ["rev-parse", "--is-shallow-repository"]:
             return "false"
-        if args[0] == "cat-file":
+        if args[0] == "merge-base":
             return ""
         if args[0] == "rev-list":
             return "3"
@@ -230,6 +230,37 @@ def test_staleness_quiet_under_threshold(monkeypatch):
 
     monkeypatch.setattr(csm, "_git", fake_git)
     assert csm.check_staleness(entries, threshold=20) == []
+
+
+def test_staleness_unresolvable_stamp_warns_and_keeps_checking(monkeypatch):
+    # One entry's stamp is unresolvable (a pre-squash orphan); the other is stale.
+    # The unresolvable stamp must NOT disable policing for the rest — it warns and
+    # continues, so the stale entry is still caught. (Regression: a single dead stamp
+    # used to `return None` and skip the whole staleness check for every entry.)
+    # Two entries with DISTINCT stamps so one can be singled out as unresolvable.
+    map_text = (
+        "# Genesis\n\n## Memory\n\n```yaml subsystem-map\n"
+        "entry: memory\nmodules: [memory]\nverified: aaaaaaaa 2026-07-07\n```\n\n"
+        "## Platform\n\n```yaml subsystem-map\n"
+        "entry: platform\nmodules: [db]\nverified: bbbbbbbb 2026-07-07\n```\n"
+    )
+    entries, _ = csm.parse_map(map_text)
+    bad = entries[0].verified_sha  # "aaaaaaaa" — distinct from entry[1]'s stamp
+
+    def fake_git(args: list[str]) -> str | None:
+        if args[:2] == ["rev-parse", "--is-shallow-repository"]:
+            return "false"
+        if args[0] == "merge-base":
+            return None if bad in args else ""  # sha is a distinct element of the git args
+        if args[0] == "rev-list":
+            return "999"
+        raise AssertionError(f"unexpected git call: {args}")
+
+    monkeypatch.setattr(csm, "_git", fake_git)
+    warnings = csm.check_staleness(entries, threshold=20)
+    assert warnings is not None
+    assert any("unresolvable" in w and bad in w for w in warnings)  # the orphan is surfaced
+    assert any(entries[1].name in w and "commits touched" in w for w in warnings)  # stale still caught
 
 
 def test_staleness_degrades_on_shallow_history(monkeypatch):
@@ -244,18 +275,24 @@ def test_staleness_degrades_on_shallow_history(monkeypatch):
     assert csm.check_staleness(entries, threshold=20) is None
 
 
-def test_staleness_degrades_on_unknown_sha(monkeypatch):
+def test_staleness_all_stamps_unresolvable_warns_never_blanket_none(monkeypatch):
+    # Every stamp unresolvable → one warning per entry, never a blanket None that
+    # would mask real staleness for the whole file. (A shallow clone is the only
+    # genuine None case — see test_staleness_degrades_on_shallow_history.)
     entries, _ = csm.parse_map(MAP_TWO_ENTRIES)
 
     def fake_git(args: list[str]) -> str | None:
         if args[:2] == ["rev-parse", "--is-shallow-repository"]:
             return "false"
-        if args[0] == "cat-file":
+        if args[0] == "merge-base":
             return None  # sha not present locally
         raise AssertionError(f"unexpected git call: {args}")
 
     monkeypatch.setattr(csm, "_git", fake_git)
-    assert csm.check_staleness(entries, threshold=20) is None
+    warnings = csm.check_staleness(entries, threshold=20)
+    assert warnings is not None
+    assert len(warnings) == 2
+    assert all("unresolvable" in w for w in warnings)
 
 
 # --- main (integration over a synthetic repo) ---

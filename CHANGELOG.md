@@ -11,6 +11,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Contributor issues are labeled by domain and difficulty, enforced at the source.**
+  Every issue the Contributor Work-Log proposes must now carry an `area:*` domain
+  label (memory/dashboard/runtime/guardian/autonomy/channels/knowledge/eval, or
+  `area:other`) and a difficulty/environment label (`good first issue`,
+  `first-timers-only`, `needs-genesis-instance`, or `help wanted`) —
+  `contributor_issue_propose` rejects a proposal missing either (fail-closed, after
+  the privacy scan). The public PR template now prompts for a `Closes #NNN` keyword,
+  and CONTRIBUTING documents that a bare `#NNN` won't auto-close the linked issue.
+
 - **Concurrent-session awareness now says what a peer is working on, and which
   model it runs.** When several Claude Code sessions share an install, each one
   is shown a `[Concurrent | …]` line per peer. Those lines previously carried a
