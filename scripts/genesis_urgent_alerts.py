@@ -271,8 +271,14 @@ def _emit_charter_tag(session_id: str) -> None:
             if row is None:
                 return
             rows = conn.execute(
+                # ORDER BY created_at, id — see the same query in
+                # genesis_session_context.py. `created_at` ties (rows added in
+                # the same second), and at the LIMIT a tie makes the rendered
+                # SUBSET arbitrary: the inventory can list a different set of
+                # rows on each prompt while the ledger has not changed. The id
+                # is unique, so it settles the order.
                 "SELECT id, text, status FROM session_ledger WHERE session_id = ?"
-                " AND status IN ('open','in_progress') ORDER BY created_at LIMIT ?",
+                " AND status IN ('open','in_progress') ORDER BY created_at, id LIMIT ?",
                 (session_id, _TAG_MAX_ROWS),
             ).fetchall()
             (open_n,) = conn.execute(

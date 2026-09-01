@@ -1355,6 +1355,27 @@ Verify before any commit:
   UserPromptSubmit and UserPromptExpansion carry bare stdout to the model; a
   Stop hook that `print`s on exit 0 is INERT.
 
+  **NEVER compute characters at the call site — say what the DEGRADE looks
+  like.** `out.emit_or_degrade(text, block=…, pointer=…, notice=…, reserve=…)`
+  settles every number (the divider, `print`'s newline, the closing-line
+  reserve, what is already emitted) and returns which branch it took. There is
+  no `fits()` for emitters to call any more, deliberately: five review findings
+  in one cycle were a caller re-deriving what the writer already knew — the
+  audit reserve counted twice, a `fits` that undercharged by one and approved
+  blocks the writer then destroyed, a 120-char reserve for a 206-char line, a
+  pointer reserved in a part that cannot emit one, a `keep` derived from the
+  budget constant instead of the room. The arithmetic was never hard; having it
+  in six places was. An AST test bans `.room`/`.fits` from the emitter so the
+  next "just one `fits` call" cannot reintroduce the class.
+
+  The general shape, which is the transferable part: when several call sites
+  must each remember to do something — bound their output, report a failed
+  read, escape untrusted text — that is a CONVENTION, and conventions are what
+  reviewers keep finding one instance of at a time. Move the obligation into a
+  chokepoint the callers cannot bypass, then LOCK the chokepoint with a test
+  that fails when someone routes around it. A chokepoint nobody is forced
+  through is a convention with better documentation.
+
 ## Generalizability Gate — build for ANY install, not this one
 
 Genesis is a public, cloneable system. Every change must work on ANY user's

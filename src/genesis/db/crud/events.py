@@ -168,6 +168,11 @@ async def prune(
 ) -> int:
     """Delete events older than the given ISO timestamp. Returns count deleted.
 
+    *older_than* is an ISO cutoff, NOT a day count. The DELETE compares it
+    lexically, which is chronological ONLY because every ``events.timestamp`` is
+    written as a UTC isoformat string — a row in another format or a local
+    offset would sort wrongly and be pruned (or spared) silently.
+
     If *event_type* is provided, only events of that type are pruned.
 
     *keep_latest_per_subsystem* (heartbeat GC): retain the single most-recent row

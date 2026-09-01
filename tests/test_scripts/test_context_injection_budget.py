@@ -22,6 +22,10 @@ import sys
 import uuid
 from pathlib import Path
 
+import pytest
+
+from tests.conftest import require_access_denied
+
 _ROOT = Path(__file__).resolve().parent.parent.parent
 _SCRIPTS_DIR = _ROOT / "scripts"
 _IDENTITY_DIR = _ROOT / "src" / "genesis" / "identity"
@@ -113,13 +117,18 @@ def test_identity_parts_fit_their_budgets_with_real_files(tmp_path):
     for part in ("identity-core", "identity-user"):
         out = _run_part(part, tmp_path / part)
         assert len(out) <= _ctx._PART_BUDGET, (part, len(out))
-        assert f"_[ctx {part}:" in out
+        # endswith, not a prefix `in`: a 16-char prefix check cannot see a line
+        # that was truncated after character 17, which is exactly how the
+        # undersized audit reserve stayed invisible.
+        assert out.rstrip("\n").splitlines()[-1].endswith("]_"), out[-120:]
 
 
 def test_each_part_emits_its_audit_line(tmp_path):
     for part in ("charter", "identity-core", "identity-user", "knowledge"):
         out = _run_part(part, tmp_path / part)
-        assert f"_[ctx {part}:" in out, f"{part} missing its self-audit line"
+        audit = out.rstrip("\n").splitlines()[-1]
+        assert audit.startswith(f"_[ctx {part}:"), f"{part} missing its self-audit line"
+        assert audit.endswith("]_"), f"{part} audit line was truncated: {audit!r}"
 
 
 def _run_raw(tmp_path: Path, *args: str, sid: str = "11111111-2222-3333-4444-555555555555"):
@@ -180,6 +189,11 @@ def _direct_part(monkeypatch, capsys, identity_dir: Path, part: str) -> str:
     monkeypatch.setattr(_ctx, "_mirror_path", lambda sid, part: identity_dir / f"{sid}-{part}.md")
     # A test must not rewrite the developer's / CI's real git hooks (F13c).
     monkeypatch.setattr(_ctx, "_sync_genesis_hooks", lambda: None)
+    # …nor spawn the repo-pulse worker. `main()` starts it for real on the
+    # charter path, so `--part all` forked a background subprocess against the
+    # live repo on every run of this file — a side effect a budget test has no
+    # business having, and one that only shows up as flakiness under load.
+    monkeypatch.setattr(_ctx, "_spawn_repo_pulse_worker", lambda *a, **k: None)
     monkeypatch.setattr(_ctx.sys, "argv", ["x", "--part", part])
     monkeypatch.setattr(_ctx.sys, "stdin", __import__("io").StringIO("{}"))
     _ctx._OUT = None
@@ -197,6 +211,45 @@ def test_huge_user_md_elides_conversation_to_pointer(monkeypatch, capsys, tmp_pa
     assert "C" * 5_000 not in out
     assert "omitted for size" in out
     assert len(out) <= _ctx._PART_BUDGET + 200
+
+
+def test_conversation_sized_to_the_real_room_is_not_elided(monkeypatch, capsys, tmp_path):
+    """The audit-line headroom is reserved ONCE, by the writer.
+
+    ``_begin_part`` constructs the writer with ``reserve=_AUDIT_LINE_RESERVE``,
+    so ``room`` already excludes it. The call site subtracted it a SECOND time,
+    which made a 120-character band just under the ceiling read as "does not
+    fit": CONVERSATION.md was replaced by a pointer, or the file before it
+    truncated, for output that would have arrived whole. Degrading is the right
+    move under real pressure and a silent loss without it.
+
+    Calibrated at runtime rather than hard-coded, so the test tracks the budget
+    constants instead of pinning a number that drifts the next time one moves.
+    """
+    ident = tmp_path / "identity"
+    ident.mkdir()
+    (ident / "USER.md").write_text("U" * 200)
+
+    # Pass 1: measure what one character of CONVERSATION.md costs in situ.
+    (ident / "CONVERSATION.md").write_text("C")
+    baseline = len(_direct_part(monkeypatch, capsys, ident, "identity-user"))
+    free = _ctx._PART_BUDGET - baseline
+    assert free > _ctx._AUDIT_LINE_RESERVE, "fixture too large to probe the band"
+
+    # Pass 2: land inside the true room but within the audit reserve of it —
+    # exactly the band the double-count wrongly excluded.
+    #
+    # `free` is measured against the BUDGET, while `fits` measures against the
+    # ceiling (budget minus the reserve), and the baseline already spent the
+    # audit line out of that reserve. So `free - _AUDIT_LINE_RESERVE` sits a
+    # little under the true room — inside it by the audit line's own length,
+    # and more than a reserve below where the double-counted check would allow.
+    body = "C" * (free - _ctx._AUDIT_LINE_RESERVE)
+    (ident / "CONVERSATION.md").write_text(body)
+    out = _direct_part(monkeypatch, capsys, ident, "identity-user")
+    assert body in out, "CONVERSATION.md was degraded though it fitted"
+    assert "omitted for size" not in out
+    assert len(out) <= _ctx._PART_BUDGET
 
 
 def test_oversized_user_md_truncates_loudly_never_silently(monkeypatch, capsys, tmp_path):
@@ -234,7 +287,10 @@ def test_charter_part_overhead_fits_the_budget():
         len(_ctx._session_config_block("high", m, ""))
         for m in ("claude-opus-5[1m]", "claude-zeta-9-preview-20261231[1m]", "")
     )
-    onboarding = 607  # the fixed pointer text emitted when the setup floor is unmet
+    # MEASURED from the shipped string, never hand-copied: this test's whole job
+    # is to fail when the part grows, and a copied length lets an ordinary prose
+    # edit to that block overrun the budget with this test still green.
+    onboarding = len(_ctx._ONBOARDING_BLOCK)
     # A PRODUCTION-shaped mirror path: the real one carries a 36-char session
     # UUID under the user's home, and the header interpolates it. A short
     # fixture path understated this by ~25 chars against a margin measured in
@@ -272,18 +328,43 @@ def test_charter_ceiling_stays_above_the_degrade_floor():
     what that tier costs for a full ledger, the chokepoint would cut INTO the
     ids — undoing the degrade the block exists for, and silently. Measured from
     the real function at the real fetch bound.
+
+    PRODUCTION SHAPE, not a convenient one. The first version passed
+    `footer="_footer_"` (8 chars) and `session_id="sid"` (3) while production
+    interpolates a 36-char UUID into BOTH the note and the footer, and the
+    worst case — tier 4 is only reached with a full ledger, which is also when
+    the overflow note is set — makes the footer ~191. That understated the
+    floor by 245 chars and left the real margin at 81, not the 326 the source
+    comment claimed. The sibling test 40 lines up already carried this exact
+    lesson in its own comment ("a short fixture path understated this by ~25
+    chars"); it was not carried across.
     """
+    sid = str(uuid.uuid4())
     rows = [{"id": f"{i:032x}", "text": "t" * 300, "status": "open"} for i in range(200)]
     assert len(rows) == _ctx._LEDGER_FETCH_MAX
+    footer = (
+        f"_Compactions: 99 · ledger: {_ctx._LEDGER_FETCH_MAX} open / 999 closed"
+        f" · {_ctx._LEDGER_OVERFLOW_NOTE}"
+        f" · full charter: ~/.genesis/sessions/{sid}/charter.md_"
+    )
     floor = len(
         _ctx._shrink_charter_block(
-            "## Session Charter", "**Ledger (open):**", rows, {}, "_footer_", "sid"
+            "## Session Charter (persists across compaction)",
+            "**Ledger (open) — close via session_ledger_update:**",
+            rows,
+            {},
+            footer,
+            sid,
         )
     )
     assert floor <= _ctx._CHARTER_BLOCK_MAX, (
         f"tier-4 degrade needs {floor} chars but the ceiling is "
         f"{_ctx._CHARTER_BLOCK_MAX} — a full ledger would lose row ids to the cut."
     )
+    # The margin is the number a future editor needs; assert it is real, and
+    # report it, so "there is room" is never inferred from a bare pass.
+    margin = _ctx._CHARTER_BLOCK_MAX - floor
+    assert margin >= 50, f"only {margin} chars of headroom above the tier-4 floor ({floor})"
 
 
 # ── the chokepoint, and the mirror that makes a cut recoverable ────────
@@ -372,9 +453,191 @@ def test_the_audit_line_reports_what_was_dropped(monkeypatch, capsys, tmp_path):
     _ctx._emit("Z" * 3_000, block="in-flight")
     _ctx._finish_part("knowledge", "sid")
     out = capsys.readouterr().out
-    assert "intended" in out and "emitted" in out
-    assert "CUT" in out
-    assert str(mirror) in out
+    # Asserted on the LAST line, not anywhere in the output. `str(mirror)` is
+    # also satisfied by the recovery header that `_begin_part` emits first, and
+    # "CUT" by the cut marker — so the previous `in out` form passed while the
+    # audit line itself was truncated. It named the audit line and pinned none
+    # of it.
+    audit = out.rstrip("\n").splitlines()[-1]
+    assert audit.startswith("_[ctx knowledge:"), audit
+    assert audit.endswith("]_"), audit
+    assert "intended" in audit and "emitted" in audit and "CUT" in audit
+    assert str(mirror) in audit
+
+
+def test_unreadable_essential_knowledge_is_loud_like_an_identity_file(
+    monkeypatch, capsys, tmp_path
+):
+    """The class is "a maintained file this window needed and could not read".
+
+    This diff made an unreadable IDENTITY file emit a loud in-band alert and
+    left essential knowledge on `pass  # advisory`. That asymmetry is not a
+    considered exception — CLAUDE.md's own account of the incident names the
+    loss as "identity, charter AND essential knowledge". `.exists()` has already
+    passed by then, so reaching the handler means permissions or I/O, which is
+    something an operator can act on, unlike absence.
+    """
+    home = tmp_path / "home"
+    (home / ".genesis").mkdir(parents=True)
+    ek = home / ".genesis" / "essential_knowledge.md"
+    ek.write_text("L1 CONTEXT")
+    ek.chmod(0o000)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    try:
+        require_access_denied(ek)
+        ident = tmp_path / "identity"
+        ident.mkdir()
+        out = _direct_part(monkeypatch, capsys, ident, "knowledge")
+        assert "GENESIS ALERT: essential knowledge could not be read" in out
+        assert "L1 context is MISSING" in out
+    finally:
+        ek.chmod(0o644)
+
+
+#: Every script that writes model-facing stdout through `BoundedStdout`. The
+#: lock below covers ALL of them: it used to read one, while this same branch
+#: created a second emitter — so the class was half-locked and read as locked.
+_EMITTERS = ("genesis_session_context.py", "genesis_urgent_alerts.py")
+
+#: Names that denote a BUDGET. Subtracting from one of these is a caller
+#: computing "how much room is left" — the re-derivation the chokepoint deletes.
+_BUDGET_NAMES = {
+    "_PART_BUDGET",
+    "HOOK_STDOUT_CAP",
+    "_HOOK_STDOUT_CAP",
+    "DEFAULT_BUDGET",
+    "_TAG_MAX_BYTES",
+}
+
+
+def _budget_offenders(src: str) -> list[str]:
+    """Budget DECISIONS taken outside the writer, in ``src``.
+
+    Shared by the lock and by the lock's own positive control, so the control
+    exercises the same detector the lock trusts.
+
+    Two shapes, because banning names alone left the behaviour reachable:
+    the writer's decision inputs (`.room`, `.fits`, `_fits`, `_tail`), and any
+    subtraction FROM a budget constant, which is the same arithmetic spelled by
+    hand. Deliberately NOT banned: reading `emitted_chars`/`intended_chars` to
+    REPORT, multiplying a budget to CONSTRUCT a writer, and adding lengths to
+    derive a reserve — reading what happened is not the defect; branching on
+    what is left is.
+    """
+    import ast
+
+    tree = ast.parse(src)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in {"room", "fits"}:
+            offenders.append(f"line {node.lineno}: .{node.attr}")
+        elif isinstance(node, ast.Name) and node.id in {"_fits", "_tail"}:
+            offenders.append(f"line {node.lineno}: {node.id}")
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub):
+            left = {n.id for n in ast.walk(node.left) if isinstance(n, ast.Name)}
+            if left & _BUDGET_NAMES:
+                offenders.append(f"line {node.lineno}: hand-derived room from a budget constant")
+    return offenders
+
+
+def test_no_budget_arithmetic_outside_the_writer():
+    """THE LOCK for the budget chokepoint. A chokepoint without one is a convention.
+
+    Five review findings in this module were a caller re-deriving what the
+    writer already knows: the audit reserve counted twice, a `fits` that
+    undercharged by one, a reserve of 120 for a 206-char line, a pointer
+    reserved in a part that cannot emit it, a `keep` computed from the budget
+    constant instead of the room. Fixing those five left the SHAPE that
+    produced them — a caller allowed to do the arithmetic — completely intact.
+
+    So the arithmetic is now unrepresentable here rather than merely correct:
+    the emitter asks `emit_or_degrade` what happened and never asks how many
+    characters are left. This test is what keeps it that way, because the next
+    person to need "just one `fits` call" will otherwise reintroduce the class.
+
+    SCOPE, stated rather than implied: this bans the DECISION inputs — how much
+    room is left, and whether something fits. It deliberately allows
+    `emitted_chars` / `intended_chars`, which the audit line REPORTS. Reading
+    what happened is not the defect; branching on how much space remains is.
+    """
+    offenders: list[str] = []
+    for name in _EMITTERS:
+        offenders += [f"{name} {o}" for o in _budget_offenders((_SCRIPTS_DIR / name).read_text())]
+    assert not offenders, (
+        "budget arithmetic leaked back into an emitter: "
+        + "; ".join(offenders)
+        + ". Say what the degrade LOOKS like via emit_or_degrade(pointer=…, "
+        "notice=…) and let the writer settle the numbers."
+    )
+
+
+def test_the_budget_lock_can_itself_fail():
+    """The lock's POSITIVE CONTROL — it must flag each way back to the class.
+
+    Banning two attribute NAMES is not banning the behaviour: a hand
+    re-derivation like `_PART_BUDGET - _AUDIT_LINE_RESERVE - emitted` is exactly
+    the defect the chokepoint exists to delete, and the name-only version of
+    this lock stayed GREEN on it. Asserting the detector fires is what makes the
+    green above mean something — otherwise "no offenders" and "no detector" are
+    the same result.
+    """
+    evasions = {
+        "room attribute": "def f(w):\n    return w.room > 10\n",
+        "fits helper": "def f(t):\n    return _fits(t)\n",
+        "hand re-derivation": "def f(emitted):\n    return _PART_BUDGET - _AUDIT_LINE_RESERVE - emitted\n",
+        "cap re-derivation": "def f(used):\n    return HOOK_STDOUT_CAP - used\n",
+    }
+    for label, sample in evasions.items():
+        assert _budget_offenders(sample), f"detector is blind to: {label}"
+
+    # The other direction — these must NOT be flagged, or the lock is a nuisance
+    # that gets deleted by whoever hits it next.
+    allowed = {
+        "reporting emitted": "def f(w):\n    return f'{w.emitted_chars}/{_PART_BUDGET}'\n",
+        "constructing the writer": "def f():\n    return _PART_BUDGET * len(_PARTS)\n",
+        "deriving a reserve": "X = len(_audit_line('p', 1, 1)) + _NEWLINE_COST\n",
+    }
+    for label, sample in allowed.items():
+        assert not _budget_offenders(sample), f"false positive on: {label}"
+
+
+def test_the_audit_reserve_fits_the_line_it_reserves_for(tmp_path):
+    """The reserve is DERIVED from the renderer, and must stay ahead of it.
+
+    Rebuilds the same worst case `_AUDIT_LINE_RESERVE` is computed from, so the
+    constant and the line cannot drift. This is the pin the old round number
+    lacked: 120 was chosen once and the line grew past it, and because
+    `_cut_here` fills the ceiling by construction, `room` at `emit_final` time
+    is ALWAYS exactly the reserve — so being short by any amount truncates
+    deterministically rather than occasionally.
+    """
+    worst = _ctx._audit_line(
+        "identity-user",
+        99_999,
+        99_999,
+        cut=("x" * _ctx._AUDIT_BLOCK_LABEL_MAX, 99_999),
+        where=(
+            f" — full text: {Path.home()}/.genesis/sessions/{'0' * 36}/context-identity-user.md"
+        ),
+    )
+    assert len(worst) + 1 <= _ctx._AUDIT_LINE_RESERVE, (
+        f"reserve {_ctx._AUDIT_LINE_RESERVE} < worst-case audit line {len(worst)} + newline"
+    )
+
+
+def test_the_block_label_in_an_audit_line_is_bounded(tmp_path, monkeypatch, capsys):
+    """A block label is a developer string, so its length is not bounded by
+    anything — and it lands inside the line the reserve was measured for."""
+    mirror = tmp_path / "k.md"
+    monkeypatch.setattr(_ctx, "_PART_BUDGET", 900)
+    monkeypatch.setattr(_ctx, "_mirror_path", lambda sid, part: mirror)
+    _ctx._OUT = None
+    _ctx._begin_part("knowledge", mirror)
+    _ctx._emit("Z" * 3_000, block="b" * 500)
+    _ctx._finish_part("knowledge", "sid")
+    audit = capsys.readouterr().out.rstrip("\n").splitlines()[-1]
+    assert audit.endswith("]_"), audit
+    assert "b" * (_ctx._AUDIT_BLOCK_LABEL_MAX + 1) not in audit
 
 
 def test_a_healthy_audit_line_does_not_claim_a_cut(monkeypatch, capsys, tmp_path):
@@ -395,6 +658,19 @@ def test_an_unwritable_mirror_is_loud_not_silent(monkeypatch, capsys, tmp_path):
     blocked = tmp_path / "blocked"
     blocked.mkdir()
     os.chmod(blocked, 0o500)  # readable, NOT writable — the file lands HERE
+    # Mode bits do not stop root or anything holding CAP_DAC_OVERRIDE, and CI
+    # containers routinely run as root. There the write SUCCEEDS, no warning is
+    # emitted, and the assertion below fails for a reason that has nothing to
+    # do with the behaviour under test. Prove the premise before relying on it.
+    try:
+        probe = blocked / ".write-probe"
+        probe.write_text("x")
+        probe.unlink()
+    except OSError:
+        pass  # genuinely unwritable — the premise holds
+    else:
+        os.chmod(blocked, 0o755)
+        pytest.skip("this process writes through mode bits (root / CAP_DAC_OVERRIDE)")
     monkeypatch.setattr(_ctx, "_mirror_path", lambda sid, part: blocked / f"{part}.md")
     _ctx._OUT = None
     try:

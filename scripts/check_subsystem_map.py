@@ -172,15 +172,69 @@ def _git(args: list[str]) -> str | None:
 def check_staleness(entries: list[Entry], threshold: int) -> list[str] | None:
     """Per-entry commits-since-stamp warnings; None = history unavailable (skip)."""
     if _git(["rev-parse", "--is-shallow-repository"]) != "false":
-        return None
+        return None  # genuinely cannot count anything — the ONLY global skip
+
+    # Resolved once, and only used when it resolves: with BOTH the stamp and this
+    # ref known to exist, a failing `merge-base --is-ancestor` can only mean "not
+    # an ancestor" rather than "something was missing".
+    default_ref = next(
+        (
+            ref
+            for ref in ("origin/main", "origin/master")
+            if _git(["rev-parse", "--verify", f"{ref}^{{commit}}"]) is not None
+        ),
+        None,
+    )
+
     warnings: list[str] = []
     for entry in entries:
-        if _git(["cat-file", "-e", f"{entry.verified_sha}^{{commit}}"]) is None:
-            return None  # stamped sha not in local history — can't count honestly
         paths = [f"src/genesis/{m}" for m in entry.modules]
+        # An unresolvable stamp is ONE entry's problem, reported and stepped
+        # over. It used to `return None`, which abandoned the pass for EVERY
+        # entry — so two orphan shas (branch commits discarded by squash-merge)
+        # silenced staleness for the whole file while the run still printed
+        # CLEAN. A checker that reports success while checking nothing is the
+        # exact failure this file's own guard exists to catch.
+        if _git(["cat-file", "-e", f"{entry.verified_sha}^{{commit}}"]) is None:
+            warnings.append(
+                f"entry '{entry.name}': verified stamp {entry.verified_sha} is not a commit in "
+                "this history, so its staleness CANNOT be counted — re-verify the entry and "
+                "stamp it with a commit that survives merge (the default-branch tip you "
+                "verified against, never a feature-branch HEAD)"
+            )
+            continue
+
+        # The half above is a POST-MORTEM: by the time a stamp is unresolvable
+        # the damage is done. This is the pre-mortem, and it is the one that can
+        # still be acted on — a stamp that exists HERE but is not an ancestor of
+        # the default branch is a feature-branch commit. It resolves perfectly
+        # while the PR is open and dies the instant that PR is squash-merged,
+        # becoming the unresolvable stamp above.
+        #
+        # MEASURED 2026-08-31: a live PR carried exactly this shape and would
+        # have minted the third orphan within hours. The reason a prose rule is
+        # not enough: an adversarial reviewer RECOMMENDED that sha, correctly
+        # reasoning about ancestry at review time while nobody was reasoning
+        # about what survives the merge. A rule a careful reader can be argued
+        # out of needs a mechanical check, and this is it.
+        if default_ref is not None and (
+            _git(["merge-base", "--is-ancestor", entry.verified_sha, default_ref]) is None
+        ):
+            warnings.append(
+                f"entry '{entry.name}': verified stamp {entry.verified_sha} is not an ancestor "
+                f"of {default_ref} — a feature-branch commit, which squash-merge DISCARDS, so "
+                "this stamp goes unresolvable the moment it lands and takes the staleness "
+                f"signal down with it. Re-stamp with the {default_ref} commit you verified "
+                "against."
+            )
+            continue
         count_out = _git(["rev-list", "--count", f"{entry.verified_sha}..HEAD", "--", *paths])
         if count_out is None:
-            return None
+            warnings.append(
+                f"entry '{entry.name}': could not count commits since {entry.verified_sha} — "
+                "staleness unknown for this entry"
+            )
+            continue
         if int(count_out) > threshold:
             warnings.append(
                 f"entry '{entry.name}': {count_out} commits touched its modules since "
@@ -222,8 +276,9 @@ def main() -> int:
     stale = check_staleness(entries, STALE_COMMIT_THRESHOLD)
     if stale is None:
         print(
-            "subsystem-map guard: staleness check SKIPPED (shallow or incomplete git "
-            "history — CI needs fetch-depth: 0)"
+            "subsystem-map guard: staleness check SKIPPED — this is a SHALLOW clone, "
+            "so no entry can be counted (CI needs fetch-depth: 0). An unresolvable "
+            "stamp no longer skips the pass; it is reported per entry."
         )
     else:
         for warning in stale:
@@ -231,9 +286,19 @@ def main() -> int:
 
     if errors or cov.unmapped or cov.vanished or cov.duplicates:
         return 1
+    # CLEAN is a verdict about COVERAGE only. Say so when staleness could not be
+    # checked or did have something to say, so the summary line cannot be read
+    # as "everything here was verified" — the reading that let a silently
+    # skipped staleness pass sit under a green line for weeks.
+    if stale is None:
+        staleness = " — staleness NOT checked (shallow clone)"
+    elif stale:
+        staleness = f" — but {len(stale)} staleness warning(s) above"
+    else:
+        staleness = ""
     print(
-        f"Subsystem-map guard: CLEAN ({len(entries)} entries cover "
-        f"{len(live_modules(SRC_ROOT))} top-level modules)"
+        f"Subsystem-map guard: coverage CLEAN ({len(entries)} entries cover "
+        f"{len(live_modules(SRC_ROOT))} top-level modules){staleness}"
     )
     return 0
 

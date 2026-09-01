@@ -17,6 +17,9 @@
 #      (WS-5 Discord observe-only gate log; bounds the shadow store)
 #   8. Retention prune of session_ledger_shadow_* (>45d) → scripts/prune_ledger_shadow.py
 #      (session-manager PR-3 ambient extractor shadow store; runs + events)
+#   8b. Retention prune of ~/.genesis/sessions/<id>/ (>60d, whole dirs)
+#      (per-session state + SessionStart context mirrors; age far exceeds any
+#      live session, which rewrites last_prompt_time every prompt)
 #   9. Retention prune of ~/.genesis/output/retrieval_efficacy/*.md (>45d)
 #      (WS2-0 retrieval-efficacy report; dated md per run — file-age prune)
 #  10. Retention prune of ego_proposal_revisions (ego_reconcile config window)
@@ -146,6 +149,36 @@ main() {
     echo "--- ego proposal-revision audit retention prune (ego_reconcile config) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_proposal_revisions.py" \
         || echo "prune_proposal_revisions exited $?"
+
+    echo "--- session state retention prune (>60d) ---"
+    # ~/.genesis/sessions/<id>/ holds per-session state (charter.md,
+    # last_prompt_time, cursors) and now the SessionStart context mirrors — up to
+    # four per session, so this store grew from kilobytes to tens of kilobytes
+    # per session and had no prune at all (MEASURED 2026-08-31: 588 dirs, 17 MB,
+    # oldest from April).
+    #
+    # Whole directories, by DIRECTORY mtime, at 60 days.
+    #
+    # Be precise about what that predicate measures, because the obvious claim
+    # is false: a directory's mtime tracks entry creation/removal, NOT in-place
+    # rewrites of the files inside it. `last_prompt_time` is written with
+    # Path.write_text (truncate-in-place), so a live session does NOT keep
+    # bumping its directory's mtime. "It cannot take a running session because
+    # the dir mtime is minutes old" would be wrong.
+    #
+    # What actually makes this safe is the MARGIN, measured on the live store:
+    # dir mtime trails the newest contained file by at most ~1 day (588 dirs
+    # sampled), against a 60-day threshold — ~57x the worst observed skew. Of
+    # the 161 dirs older than 60d, none held a file newer than 60d.
+    #
+    # So: if this threshold is ever lowered toward that skew, switch the
+    # predicate to the newest CONTAINED file's mtime rather than trusting the
+    # directory's.
+    if [ -d "$HOME/.genesis/sessions" ]; then
+        find "$HOME/.genesis/sessions" -mindepth 1 -maxdepth 1 -type d \
+            -mtime +60 -exec rm -rf {} + 2>/dev/null \
+            || echo "sessions prune exited $?"
+    fi
 
     echo "--- retrieval-efficacy report retention prune (>45d) ---"
     # WS2-0: retrieval_efficacy_report.py writes a dated md per run; bound the

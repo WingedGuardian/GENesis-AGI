@@ -985,7 +985,11 @@ Consequence: the SessionStart injection ships as **four hook entries**
 (`--part charter | identity-core | identity-user | knowledge`), each held under
 `_PART_BUDGET = 9_800` — enforced at a single chokepoint (`BoundedStdout` in
 `scripts/hooks/hook_output.py`) so a block that forgets to check its budget
-cannot overrun, with the full intended text mirrored to
+cannot overrun. The DEGRADE decisions live there too: a caller says what the
+fallback looks like (`emit_or_degrade(pointer=…, notice=…)`) and never computes
+characters, because every number it used to compute by hand — the divider,
+`print`'s newline, the closing-line reserve, the room remaining — was found
+wrong by review at least once. The full intended text is mirrored to
 `~/.genesis/sessions/<sid>/context-<part>.md` so an in-band cut stays
 recoverable. Each part opens with a `[genesis-ctx:<part> · mirror: …]` recovery
 header, which sits inside the harness's 2 KB preview by construction — the one
@@ -994,7 +998,11 @@ harness's own filings (`context_injection_monitor`, critical → Telegram) that
 never reads our constant.
 **After any CC bump, re-run the probe** at 9,978 / 9,979 (the exact edge
 including the 22-char probe wrapper) and at two-hook 9 K + 9 K; if either
-moves, `_HOOK_STDOUT_CAP` and the part budgets are the constants to revisit.
+moves, the constants to revisit are `HOOK_STDOUT_CAP` in
+`scripts/hooks/hook_output.py` — its ONE home, which every emitter reads — and
+the part budgets. Do NOT edit `genesis_session_context._HOOK_STDOUT_CAP`: it is
+a re-export assigned from that constant, so changing it moves nothing while
+looking like it did.
 
 Measurement traps met while establishing this, so the next person does not
 repeat them: (1) the `Output too large (NNkB)` parenthetical is the OUTPUT's

@@ -34,7 +34,7 @@ from pathlib import Path
 # idiom as the sibling UserPromptSubmit hook. Unguarded on purpose: a missing
 # helper is a broken checkout and must be loud, not silently unbounded.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
-from hook_output import HOOK_STDOUT_CAP, BoundedStdout  # noqa: E402
+from hook_output import HOOK_STDOUT_CAP, BoundedStdout, emit_cost  # noqa: E402
 
 # Load secrets.env so USER_TIMEZONE and other env vars are available
 # before any genesis module imports (which may read os.environ at import time).
@@ -93,8 +93,57 @@ _PART_BUDGET = 9_800
 
 _PARTS = ("charter", "identity-core", "identity-user", "knowledge")
 
-# Room reserved for the trailing `_[ctx <part>: …]_` self-audit line.
-_AUDIT_LINE_RESERVE = 120
+#: Cap on the block label quoted in a cut audit line, so its worst case is
+#: BOUNDED rather than however long the longest block name happens to get.
+_AUDIT_BLOCK_LABEL_MAX = 40
+
+
+def _audit_line(
+    part: str,
+    intended: int,
+    emitted: int,
+    *,
+    cut: tuple[str, int] | None = None,
+    where: str = "",
+) -> str:
+    """The trailing `_[ctx <part>: …]_` self-audit line. ONE renderer.
+
+    Exists so :data:`_AUDIT_LINE_RESERVE` can be MEASURED from it instead of
+    guessed. The reserve was 120 while the cut variant is ~206 chars in
+    production shape (36-char session id, real mirror path, a block label like
+    `identity:CONVERSATION.md`) — and `room` at that moment is ALWAYS exactly
+    the reserve, because `_cut_here` fills to the ceiling by construction. So
+    the audit line was deterministically truncated on the one path where it
+    carries information, losing its trailing `]_`. `main()`'s docstring calls
+    this line "the COMPLETION PROOF"; it was landing mangled.
+    """
+    if cut is None:
+        return f"\n_[ctx {part}: {emitted}/{_PART_BUDGET} chars]_"
+    block, dropped = cut
+    return (
+        f"\n_[ctx {part}: {intended} intended / {emitted} emitted "
+        f"— CUT {dropped} chars at '{block[:_AUDIT_BLOCK_LABEL_MAX]}'{where}]_"
+    )
+
+
+# Room reserved for the trailing `_[ctx <part>: …]_` self-audit line — DERIVED
+# from the renderer above at its realistic worst case, not a round number.
+# Pinned by test_the_audit_reserve_fits_the_line_it_reserves_for, which rebuilds
+# this same worst case, so the two cannot drift.
+_AUDIT_LINE_RESERVE = (
+    len(
+        _audit_line(
+            "identity-user",
+            99_999,
+            99_999,
+            cut=("x" * _AUDIT_BLOCK_LABEL_MAX, 99_999),
+            where=(
+                f" — full text: {Path.home()}/.genesis/sessions/{'0' * 36}/context-identity-user.md"
+            ),
+        )
+    )
+    + 16  # slack for a longer home path than this box's
+)
 
 # Every part is ALSO written whole to ~/.genesis/sessions/<sid>/context-<part>.md.
 # The harness keeps a filed payload on disk; a hard cut would not, so without
@@ -122,8 +171,11 @@ def _mirror_path(session_id: str, part: str) -> Path | None:
 # The recovery instruction, first line of every part. It sits INSIDE the
 # harness's 2,000-char preview by construction, which is the one place a
 # filed part is still visible: MEASURED, sessions act on instructions in the
-# preview head (they emitted the status header it asks for) while 0 of 175
-# ever followed the harness's own "Full output saved to:" line.
+# preview head (they emitted the status header it asks for) while 0 of THIS
+# PROJECT'S 175 transcripts ever followed the harness's own "Full output saved
+# to:" line. (Population named on purpose — a nearby docstring cites 143 files
+# and 195 wrappers from two other instruments, and an unlabelled number invites
+# the reader to reconcile figures that were never the same denominator.)
 def _miswire_alert(miswired: str) -> str:
     """The in-band mis-wire block. A function so the budget test measures the
     REAL text rather than an estimate that drifts away from it."""
@@ -162,6 +214,39 @@ _CONVERSATION_POINTER = (
     "cap (over it, the WHOLE output is filed away behind a 2 KB preview). Read "
     "that file directly when conversation protocol matters."
 )
+
+#: The tail a truncated identity file appends (see the truncation branch). Sized
+#: generously; only its LENGTH is used, as a reserve.
+_TRUNCATION_NOTICE_TAIL = (
+    "\n\n_[CONVERSATION.md truncated at 99999 chars — the full file exceeds this "
+    "hook's stdout budget; read src/genesis/identity/CONVERSATION.md directly.]_"
+)
+
+#: Room a part must hold back for the degrade of the file STILL TO COME in it.
+#: Emitted by the charter part while the setup floor is unmet. A module
+#: constant, not an inline literal, so `test_charter_part_overhead_fits_the_budget`
+#: can MEASURE it instead of hand-copying its length — that test guards the
+#: charter part's un-cuttability with margin in the low hundreds, and a copied
+#: number lets an ordinary prose edit here overrun the part with the test green.
+_ONBOARDING_BLOCK = (
+    "## FIRST-RUN ONBOARDING REQUIRED\n\n"
+    "Genesis is **not fully functional yet** — the setup floor is "
+    "unmet (it needs Claude Code logged in, at least one LLM/routing "
+    "API key, and at least one embedding key). **Before doing "
+    "anything else**, run the onboarding flow to finish configuring "
+    "the system.\n\n"
+    "The onboarding skill is at: "
+    "`src/genesis/skills/onboarding/SKILL.md`\n\n"
+    "Read the skill file and follow its steps. Do not skip this — the "
+    "user needs a working system before Genesis can be useful.\n\n"
+    "If the user's first message is unrelated to setup, acknowledge it "
+    "but explain that you need to complete onboarding first."
+)
+
+#: Ceiling for the cap-measurement probe seam (GENESIS_CTX_PROBE_BYTES). Far
+#: above any real probe — the threshold being measured is ~10k — and it exists
+#: only so an env typo cannot allocate its way to an OOM inside a hook.
+_PROBE_MAX_CHARS = 200_000
 
 _OUT: BoundedStdout | None = None
 
@@ -221,13 +306,16 @@ def _emit(text: str, *, block: str = "") -> None:
     _writer().emit(text, block=block)
 
 
-def _fits(block: str, *, reserve: int = 0) -> bool:
-    """Would emitting ``block`` (plus a divider, plus ``reserve``) stay in budget?
-
-    For GRACEFUL degrade (a pointer instead of a cut). Not the safety net —
-    ``_emit`` bounds the output whether or not a caller asks.
-    """
-    return _writer().fits(block, reserve=reserve)
+# `_fits` is GONE, deliberately, and test_no_budget_arithmetic_outside_the_writer
+# keeps it gone. Every degrade decision now goes through
+# `_writer().emit_or_degrade(...)`, where the caller says what the fallback LOOKS
+# like and the writer settles every number.
+#
+# Why the helper had to go rather than be used more carefully: it invited its
+# callers to compute a `reserve`, and each computed one was found wrong by
+# review — the audit reserve counted twice, a pointer reserved in a part that
+# cannot emit one, a `keep` derived from the budget constant instead of the
+# room. The arithmetic was never hard; having it in six places was.
 
 
 def _routed_session_notice(model: str | None) -> str | None:
@@ -292,9 +380,18 @@ def _cache_session_model(session_id: str, model: str) -> None:
 
     Written whenever CC provides `model` (startup/compact) so that a later
     `claude --resume` — where CC OMITS `model` — can recover it. Insertion-order
-    eviction keeps the map at `_MODEL_CACHE_MAX` most-recent sessions. Written
-    atomically (tmp + os.replace) so a concurrent reader never sees a partial
-    file. Fail-open: any error is swallowed (header degrades to env derivation).
+    eviction keeps the map at `_MODEL_CACHE_MAX` most-recent sessions.
+
+    Written via a PID-UNIQUE tmp + `os.replace`, which buys two different
+    things. A reader never sees a partial file (rename is atomic). Concurrent
+    WRITERS no longer destroy each other: with one shared `<name>.tmp` the
+    interleaving installed a truncated file, and the loser's `os.replace` raised
+    `FileNotFoundError` into the suppressor — so the next read hit invalid JSON
+    and reset the whole map to `{}`. Last-writer-wins on the CONTENT is still
+    possible and is harmless here (each session writes its own key, and a lost
+    entry only degrades that header to env derivation); losing the FILE was not.
+
+    Fail-open: any error is swallowed (header degrades to env derivation).
     """
     if not session_id or not model:
         return
@@ -315,7 +412,7 @@ def _cache_session_model(session_id: str, model: str) -> None:
         while len(data) > _MODEL_CACHE_MAX:
             data.pop(next(iter(data)))  # evict oldest (insertion order)
         _MODEL_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _tmp = _MODEL_CACHE_FILE.with_name(_MODEL_CACHE_FILE.name + ".tmp")
+        _tmp = _MODEL_CACHE_FILE.with_name(f"{_MODEL_CACHE_FILE.name}.{os.getpid()}.tmp")
         _tmp.write_text(json.dumps(data))
         os.replace(_tmp, _MODEL_CACHE_FILE)
 
@@ -442,7 +539,12 @@ def _emit_body() -> tuple[str, str, str] | None:
     _probe = os.environ.get("GENESIS_CTX_PROBE_BYTES")
     if _probe:
         try:
-            _n = int(_probe)
+            # Clamped: this is a measurement seam, and the value comes from the
+            # environment. Unbounded, `_ch * _n` lets a fat-fingered zero
+            # allocate its way to an OOM inside a SessionStart hook — the one
+            # place a failure costs the whole window. The ceiling is far above
+            # any real probe (the cap being measured is ~10k).
+            _n = max(0, min(int(_probe), _PROBE_MAX_CHARS))
         except ValueError:
             return
         _ch = "é" if os.environ.get("GENESIS_CTX_PROBE_MODE") == "multibyte" else "A"
@@ -476,11 +578,9 @@ def _emit_body() -> tuple[str, str, str] | None:
     # `claude --resume` of a session whose model we saw still gets the right
     # header. Any cache miss falls through to env-line derivation — no worse
     # than before.
-    _hook_model = str(_hook_input.get("model", "") or "")
-    if _hook_model:
-        _cache_session_model(_hook_session_id, _hook_model)
-    elif _hook_session_id:
-        _hook_model = _cached_session_model(_hook_session_id)
+    # …resolved BELOW, once the part is known: only the charter part renders the
+    # session-config header, so only it needs the model — and only it may write
+    # the cache.
 
     # ── Which PART of the injection this invocation emits ──────────────
     # The harness budget is PER HOOK ENTRY (measured — see the cap comment at
@@ -517,6 +617,20 @@ def _emit_body() -> tuple[str, str, str] | None:
 
     def _in(*parts: str) -> bool:
         return part == "all" or part in parts
+
+    # Gated on the part, NOT run unconditionally: this block used to sit above
+    # the dispatch, so the 4-entry wiring had all four processes concurrently
+    # read-modify-writing one JSON map. With a shared tmp name the interleaving
+    # installed a truncated file and the loser's `os.replace` raised into the
+    # suppressor, wiping the whole cache on the next read. Only the charter part
+    # renders the header that consumes this, so only the charter part does it.
+    _hook_model = ""
+    if _in("charter"):
+        _hook_model = str(_hook_input.get("model", "") or "")
+        if _hook_model:
+            _cache_session_model(_hook_session_id, _hook_model)
+        elif _hook_session_id:
+            _hook_model = _cached_session_model(_hook_session_id)
 
     # Open the bounded stream for THIS part. Everything after this point is
     # budget-enforced on the way out, and the first line emitted is the
@@ -649,30 +763,46 @@ def _emit_body() -> tuple[str, str, str] | None:
                     continue
                 if not content:
                     continue
-                # Room this part still owes AFTER this file: the audit line, and
-                # the elision pointer for any file still to come in this part.
-                # Without the second term an oversized USER.md truncates to
-                # exactly the budget and the CONVERSATION pointer that follows
-                # pushes the part over — a marker + scream for a window that
-                # actually lost nothing. Loud-but-wrong is still wrong.
-                _tail = _AUDIT_LINE_RESERVE + (
-                    len(_CONVERSATION_POINTER) + 6 if _idx + 1 < len(_files) else 0
+                # NO ARITHMETIC HERE, deliberately. This block used to compute a
+                # tail reserve, a `keep`, and two `_fits` calls, and every one of
+                # those numbers was found wrong by review: the audit reserve
+                # double-counted, the CONVERSATION pointer reserved inside a part
+                # that cannot emit it, `keep` derived from the budget constant
+                # rather than the room. The writer knows all of it; the caller's
+                # only job is to say what the degrade LOOKS like.
+                #
+                # The still-to-come reserve is the one thing the writer cannot
+                # know — it is about the NEXT file — so it is passed, and it is
+                # that file's own degrade, per part: identity-user can swap
+                # CONVERSATION.md for a pointer, identity-core can only truncate.
+                _next = _files[_idx + 1] if _idx + 1 < len(_files) else ""
+                # Charged with the WRITER's own cost function, not a hand
+                # guess: the pointer costs its length plus the newline `emit`
+                # adds, plus the divider the next file emits ahead of it. The
+                # hand-written `+ 6` here undershot the real `+ 9` by 3, and the
+                # miss lands exactly on the CONVERSATION.md degrade this reserve
+                # exists to protect.
+                _reserve = (
+                    emit_cost(_CONVERSATION_POINTER) + len("\n\n---\n\n")
+                    if _next == "CONVERSATION.md"
+                    else len(_TRUNCATION_NOTICE_TAIL)
+                    if _next
+                    else 0
                 )
-                if name == "CONVERSATION.md" and not _fits(content, reserve=_AUDIT_LINE_RESERVE):
-                    content = _CONVERSATION_POINTER
-                elif not _fits(content, reserve=_tail):
-                    # A never-elided file that alone busts the part budget:
-                    # truncate visibly. Losing the tail of one file beats the
-                    # harness silently filing the ENTIRE part.
-                    keep = max(0, _PART_BUDGET - _writer().emitted_chars - _tail - 200)
-                    content = (
-                        content[:keep] + f"\n\n_[{name} truncated at {keep} chars — the full file "
-                        "exceeds this hook's stdout budget; read "
-                        f"src/genesis/identity/{name} directly.]_"
-                    )
-                if not first:
-                    _emit("\n\n---\n\n")
-                _emit(content)
+                _writer().emit_or_degrade(
+                    content,
+                    block=f"identity:{name}",
+                    divider="" if first else "\n\n---\n\n",
+                    # CONVERSATION.md is the one identity file with a pointer to
+                    # fall back to; the rest are never elided, only truncated.
+                    pointer=_CONVERSATION_POINTER if name == "CONVERSATION.md" else "",
+                    notice=(
+                        f"\n\n_[{name} truncated at {{kept}} chars — the full file exceeds "
+                        f"this hook's stdout budget; read src/genesis/identity/{name} "
+                        "directly.]_"
+                    ),
+                    reserve=_reserve,
+                )
                 first = False
 
     # 1.5. First-run onboarding detection
@@ -694,20 +824,7 @@ def _emit_body() -> tuple[str, str, str] | None:
             if onboarding_skill.exists():
                 if not first:
                     _emit("\n\n---\n\n")
-                _emit(
-                    "## FIRST-RUN ONBOARDING REQUIRED\n\n"
-                    "Genesis is **not fully functional yet** — the setup floor is "
-                    "unmet (it needs Claude Code logged in, at least one LLM/routing "
-                    "API key, and at least one embedding key). **Before doing "
-                    "anything else**, run the onboarding flow to finish configuring "
-                    "the system.\n\n"
-                    "The onboarding skill is at: "
-                    "`src/genesis/skills/onboarding/SKILL.md`\n\n"
-                    "Read the skill file and follow its steps. Do not skip this — the "
-                    "user needs a working system before Genesis can be useful.\n\n"
-                    "If the user's first message is unrelated to setup, acknowledge it "
-                    "but explain that you need to complete onboarding first."
-                )
+                _emit(_ONBOARDING_BLOCK)
                 first = False
 
     # Load last session data once — used for cognitive state tier + temporal awareness
@@ -751,8 +868,25 @@ def _emit_body() -> tuple[str, str, str] | None:
                     _emit(ek_content)
                     first = False
                     _ek_emitted = True
-            except OSError:
-                pass  # Essential knowledge is advisory — silent failure is correct
+            except (OSError, UnicodeDecodeError) as exc:
+                # Loud, for the same reason the identity files above are loud —
+                # and this diff made THOSE loud while leaving this one silent,
+                # which is the asymmetry rather than a considered exception.
+                # `.exists()` already passed, so reaching here means permissions
+                # or I/O, not absence: a condition an operator can act on.
+                # CLAUDE.md's own account of this incident names the loss as
+                # "identity, charter AND essential knowledge" — so EK is inside
+                # the class this PR just made audible everywhere else.
+                # (`_load_inflight_block` stays advisory-silent: it is derived
+                # state that regenerates, not a file someone maintains.)
+                _emit(
+                    "## GENESIS ALERT: essential knowledge could not be read\n\n"
+                    f"`{type(exc).__name__}: {exc}` — L1 context is MISSING from this "
+                    "window. Read ~/.genesis/essential_knowledge.md directly if it "
+                    "matters, and tell the user it is unreadable.",
+                    block="essential-knowledge-error",
+                )
+                first = False
 
         # In-flight working state (advisory): active autonomy tasks, live
         # worktrees, and recently-touched plan files — computed fresh here
@@ -909,18 +1043,19 @@ def _emit_body() -> tuple[str, str, str] | None:
                         "\nUse `codebase_navigate` MCP tool for drill-down "
                         "(L1: modules in a package, L2: symbols in a module)."
                     )
-                    _l0_block = "\n".join(lines)
-                    if not _fits(_l0_block):
-                        # Elidable: the package index is a convenience view of
-                        # data `codebase_navigate` serves on demand.
-                        _l0_block = (
+                    # Elidable: the package index is a convenience view of data
+                    # `codebase_navigate` serves on demand. The writer decides
+                    # whether it fits — this block states only the alternative.
+                    _writer().emit_or_degrade(
+                        "\n".join(lines),
+                        block="codebase-l0",
+                        divider="" if first else "\n\n---\n\n",
+                        pointer=(
                             "## Codebase\n\nPackage index omitted for byte budget — "
                             "use the `codebase_navigate` MCP tool (L0: packages, "
                             "L1: modules, L2: symbols)."
-                        )
-                    if not first:
-                        _emit("\n\n---\n\n")
-                    _emit(_l0_block)
+                        ),
+                    )
                     first = False
         except Exception:
             pass  # Codebase index is advisory — silent failure is correct
@@ -1002,7 +1137,7 @@ def _emit_body() -> tuple[str, str, str] | None:
             # injects the real MCP tool list separately anyway (see the comment
             # above). Degrade to the fallback pointer before touching anything
             # per-session.
-            _emit(_caps_block if _fits(_caps_block) else _mcp_fallback)
+            _writer().emit_or_degrade(_caps_block, block="capabilities", pointer=_mcp_fallback)
         except Exception:
             _emit(_mcp_fallback)
     else:
@@ -1098,11 +1233,19 @@ _MISWIRE_LOG = Path.home() / ".genesis" / "session_awareness" / "context_miswire
 
 
 def _record_miswire(reason: str) -> None:
-    """Append one line about a mis-wired invocation. Fail-open, never fatal."""
+    """Append ONE line about a mis-wired invocation. Fail-open, never fatal.
+
+    The reason is collapsed to a single line first. It is built from `sys.argv`,
+    and this log is TAB-DELIMITED and line-oriented: a newline inside it would
+    append a second entry that the collector's parser then reads as a genuine,
+    separately-timestamped mis-wire. The read side escapes what it renders, so
+    this forges the log's STRUCTURE rather than a rendered line — normalised at
+    the write, where the record's one-line-per-event shape is decided.
+    """
     try:
         _MISWIRE_LOG.parent.mkdir(parents=True, exist_ok=True)
         with _MISWIRE_LOG.open("a", encoding="utf-8") as fh:
-            fh.write(f"{datetime.now(UTC).isoformat()}\t{reason}\n")
+            fh.write(f"{datetime.now(UTC).isoformat()}\t{' '.join(str(reason).split())}\n")
     except OSError as exc:
         print(f"[session_context] could not record the mis-wire: {exc}", file=sys.stderr)
 
@@ -1153,11 +1296,10 @@ def _finish_part(part: str, session_id: str, miswired: str = "") -> None:
         block, dropped = cut
         where = f" — full text: {mirror}" if wrote_mirror else " — MIRROR UNAVAILABLE"
         out.emit_final(
-            f"\n_[ctx {part}: {out.intended_chars} intended / {out.emitted_chars} emitted "
-            f"— CUT {dropped} chars at '{block}'{where}]_"
+            _audit_line(part, out.intended_chars, out.emitted_chars, cut=cut, where=where)
         )
     else:
-        out.emit_final(f"\n_[ctx {part}: {out.emitted_chars}/{_PART_BUDGET} chars]_")
+        out.emit_final(_audit_line(part, out.emitted_chars, out.emitted_chars))
     if miswired:
         _record_miswire(miswired)
         print(
@@ -1459,11 +1601,23 @@ _ORIGIN_CAP = 1_200
 #           case + onboarding pointer 607 + recovery header 200 + mis-wire
 #           alert 487 + dividers + audit reserve) against a 9,800 budget.
 #
-# 7,500 sits ~326 above the floor with ~202 to spare under the ceiling. Both
-# numbers are measured from the real functions by the test, not estimated here,
-# because the previous version of this comment was wrong in three places at
-# once (572 / ~160 / "margin 456") and a maintainer reading it would have
-# believed there was room to grow this part when there was none.
+# 7,500 sits **81** chars above the tier-4 floor — MEASURED 2026-08-31 at
+# production shape (36-char session id in both the note and the footer, the
+# overflow note set, since tier 4 is only reached with a full ledger). It is
+# NOT the ~326 an earlier version of this comment claimed: that number came
+# from a test fixture passing `footer="_footer_"` and `session_id="sid"`, which
+# understated the footer by 245 chars.
+#
+# So this comment has now been wrong TWICE in the same way — a number derived
+# from a convenient fixture and then written down as if measured from
+# production. The fixture is fixed and the margin is asserted (>= 50) by
+# test_charter_ceiling_stays_above_the_degrade_floor, which reports the real
+# figure on failure. Do not re-derive it here; read it from the test.
+#
+# 81 chars is TIGHT. One more sentence in _LEDGER_OVERFLOW_NOTE or the footer
+# breaches it, and the failure mode is the chokepoint cutting into ledger row
+# ids — undoing the exact thing the tier-4 degrade exists for. Grow the ceiling
+# (and re-check the part arithmetic pin) before growing either string.
 _CHARTER_BLOCK_MAX = 7_500
 
 #: Sanity bound on the ledger read. Not a display cap — every open row renders,
@@ -1607,9 +1761,14 @@ def _load_charter_db(session_id: str, db_path: Path | None) -> tuple[dict | None
                     # session that never made one. Fetch ONE past the bound so
                     # the renderer can SAY that a 201st exists rather than
                     # reproducing the same silent cut one order of magnitude up.
+                    # ORDER BY created_at, id: `created_at` is not unique (rows
+                    # added in the same second tie), and SQLite may return tied
+                    # rows in any order — so at the bound the SUBSET is
+                    # arbitrary and can differ between two renders of an
+                    # unchanged ledger. The id breaks the tie deterministically.
                     "SELECT id, text, status FROM session_ledger"
                     " WHERE session_id = ? AND status IN ('open','in_progress')"
-                    " ORDER BY created_at LIMIT ?",
+                    " ORDER BY created_at, id LIMIT ?",
                     (session_id, _LEDGER_FETCH_MAX + 1),
                 )
                 items = [dict(r) for r in await cur.fetchall()]

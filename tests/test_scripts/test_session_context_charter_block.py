@@ -113,10 +113,18 @@ def test_more_rows_than_the_fetch_bound_are_announced_not_dropped(tmp_path):
 
 
 def test_a_ledger_inside_the_fetch_bound_makes_no_overflow_claim(tmp_path):
+    """The only guard against claiming overflow that did not happen.
+
+    Asserted against the lowercase literal `"more than"` until 2026-08-31 while
+    the shipped constant reads `"MORE than …"`. `in` is case-sensitive, so the
+    assertion was true whether or not the note fired — it would have passed with
+    the overflow note on EVERY render. Bound to the constant now, so the two
+    cannot drift apart again.
+    """
     db = _make_db(tmp_path)
     _seed_charter(db, mission="m")
     _seed_rows(db, [f"row {i}" for i in range(5)])
-    assert "more than" not in _block(db)
+    assert _ctx._LEDGER_OVERFLOW_NOTE not in _block(db)
 
 
 def test_seven_open_rows_all_render(tmp_path):
@@ -205,6 +213,41 @@ def test_missing_follow_ups_table_renders_block_without_link(tmp_path):
     block = _block(db)
     assert row_id in block
     assert "escalated:" not in block
+
+
+def test_tied_timestamps_render_a_stable_subset(tmp_path, monkeypatch):
+    """The same tie-break defect as the per-turn tag, in the other hook.
+
+    Both hooks page the ledger with ``ORDER BY created_at LIMIT n``, and
+    ``created_at`` is not unique — rows added in the same second tie, and
+    SQLite may return tied rows in any order. At the bound the SUBSET is then
+    arbitrary: two renders of an UNCHANGED ledger can list different rows,
+    while the overflow footer still claims the rest are merely "more". Fixed in
+    both places, so tested in both — one hook's green says nothing about the
+    other's query.
+
+    Rows are inserted in DESCENDING id order so insertion order and id order
+    disagree; without the tiebreak the assertion has something to fail on.
+    """
+    monkeypatch.setattr(_ctx, "_LEDGER_FETCH_MAX", 3)
+    db = _make_db(tmp_path)
+    _seed_charter(db, mission="m")
+    conn = sqlite3.connect(db)
+    for i in reversed(range(_ctx._LEDGER_FETCH_MAX + 4)):
+        conn.execute(
+            "INSERT INTO session_ledger (id, session_id, text, status, added_by, created_at)"
+            " VALUES (?, ?, ?, 'open', 'foreground', '2026-07-13T00:00:00+00:00')",
+            (f"{i:032x}", SID, f"row {i}"),
+        )
+    conn.commit()
+    conn.close()
+
+    block = _block(db)
+    for i in range(_ctx._LEDGER_FETCH_MAX):
+        assert f"{i:032x}" in block, f"the lowest-id rows must be the ones rendered ({i})"
+    # The note is a module-level f-string, so it carries the SHIPPED bound, not
+    # the patched one. Assert the constant rather than a re-interpolation of it.
+    assert _ctx._LEDGER_OVERFLOW_NOTE in block
 
 
 def test_hook_dedup_formula_matches_package_formula():

@@ -1393,9 +1393,9 @@ async def _check_context_injection_health(db) -> None:
     try:
         from genesis.awareness import context_injection_watch_config as _cfg_mod
         from genesis.observability.snapshots.context_injection import (
+            alert_identity,
             context_injection,
             derive_findings,
-            producer_class,
         )
 
         if not _cfg_mod.is_enabled():
@@ -1426,27 +1426,13 @@ async def _check_context_injection_health(db) -> None:
             )
             return
 
-        # Identity covers EVERY state the findings can report, so a change in
-        # any of them re-alerts rather than being superseded into silence by an
-        # older alert that happened to hash the same: the session count, the set
-        # of PRODUCERS filing (a new hook joining is new information), and both
-        # degraded flags. Note the count, not the session set: one session
-        # recovering while another joins leaves it unchanged and does not
-        # re-alert — acceptable, since the alert is still live and true.
-        # The producer CLASS, not the excerpt. An unrecognised producer's label
-        # carries the first 80 chars of that hook's output, which for something
-        # like the recall injection varies EVERY prompt — so hashing the label
-        # would supersede-and-recreate a fresh critical alert on every hourly
-        # tick, paging the owner hourly about one standing incident. The excerpt
-        # stays in the alert BODY, where it is informative; the identity keys on
-        # the class, where it must be stable.
-        _producers = ",".join(
-            sorted({producer_class(str(d.get("producer", "?"))) for d in health.fresh_filings})
-        )
-        alert_key = (
-            f"filings:{health.filing_sessions}:by:{_producers}"
-            f":truncated:{health.scan_truncated}:error:{bool(health.error)}"
-        )
+        # The identity is owned by the module that owns the state. Assembling it
+        # here meant this call site had to name every field, and it silently
+        # missed one (mis-wires): a fresh mis-wire beside an unchanged filing
+        # count hashed the same, so supersede_except_hash kept the OLD alert and
+        # skip_if_duplicate dropped the new content — the alert looked live while
+        # never reporting the condition or its remedy.
+        alert_key = alert_identity(health)
         content_hash = hashlib.sha256(f"context_injection:{alert_key}".encode()).hexdigest()
         await observations.supersede_except_hash(
             db,
@@ -1474,7 +1460,12 @@ async def _check_context_injection_health(db) -> None:
             skip_if_duplicate=True,
         )
     except Exception:
-        logger.debug("Failed context-injection health check", exc_info=True)
+        # WARNING, not debug. This check is the only ground-truth witness for
+        # the silent-context-loss class, and a crash here is indistinguishable
+        # from "nothing to report" on every surface the operator can see. At
+        # debug level the watcher can stop running indefinitely with no trace —
+        # the failure mode it exists to catch, applied to itself.
+        logger.warning("Failed context-injection health check", exc_info=True)
 
 
 def _created_before(row: dict, cutoff: datetime) -> bool:

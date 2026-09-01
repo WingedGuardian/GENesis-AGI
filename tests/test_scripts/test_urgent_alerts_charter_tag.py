@@ -153,7 +153,9 @@ def test_tag_shows_escalation_link(monkeypatch, capsys, tmp_path):
     root = _seed(tmp_path, mission="m", open_items=1, texts=["reach into the sister machine"])
     _seed_escalation(root, "00000000" + "0" * 24, "f" * 32)
     out = _tag_output(monkeypatch, capsys, root)
-    assert "- " + "0" * 32 + " reach into the sister machine → escalated: follow_up " + "f" * 32 in out
+    assert (
+        "- " + "0" * 32 + " reach into the sister machine → escalated: follow_up " + "f" * 32 in out
+    )
 
 
 def test_tag_without_follow_ups_table_still_lists_rows(monkeypatch, capsys, tmp_path):
@@ -310,3 +312,36 @@ def test_a_full_complement_of_max_size_rows_fits_the_byte_cap(monkeypatch, capsy
         "raise _TAG_MAX_BYTES or the inventory silently under-reports"
     )
     assert not [ln for ln in out.splitlines() if ln.startswith("…and ")]
+
+
+def test_tied_timestamps_render_a_STABLE_subset(monkeypatch, capsys, tmp_path):
+    """``created_at`` is not unique, and at the row cap a tie decides WHICH rows.
+
+    Ledger rows added in the same second share a timestamp; SQLite may return
+    tied rows in any order, and without a unique tiebreak the LIMIT then keeps
+    an arbitrary subset. The inventory would list a different set of agreements
+    on different prompts while the ledger had not changed — an inventory that
+    moves under the reader is worse than a count, because it still looks
+    authoritative.
+
+    Rows are inserted in DESCENDING id order so insertion order (what an
+    unqualified sort falls back to) and id order disagree, which is what makes
+    the assertion able to fail.
+    """
+    root = _seed(tmp_path, mission="m", open_items=0)
+    conn = sqlite3.connect(root / "data" / "genesis.db")
+    total = _ua._TAG_MAX_ROWS + 4
+    for i in reversed(range(total)):
+        conn.execute(
+            "INSERT INTO session_ledger (id, session_id, text, status, added_by, created_at)"
+            " VALUES (?, ?, ?, 'open', 'foreground', '2026-07-13T00:00:00+00:00')",
+            (f"{i:08x}" + "0" * 24, SID, f"row {i}"),
+        )
+    conn.commit()
+    conn.close()
+
+    out = _tag_output(monkeypatch, capsys, root)
+    shown = [line for line in out.splitlines() if line.startswith("- ")]
+    assert len(shown) == _ua._TAG_MAX_ROWS
+    expected = [f"{i:08x}" + "0" * 24 for i in range(_ua._TAG_MAX_ROWS)]
+    assert [line.split()[1] for line in shown] == expected

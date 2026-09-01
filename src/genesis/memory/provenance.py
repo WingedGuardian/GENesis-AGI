@@ -481,9 +481,18 @@ _FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
         # Context-injection watcher (awareness/loop.py _check_context_injection_health)
         # — Genesis observing its OWN runtime: whether the harness filed a
         # SessionStart hook's output instead of delivering it. The evidence is
-        # file sizes, mtimes and first lines of the harness's own persisted
-        # files under ~/.claude/projects; no external text enters the
-        # observation as a CLAIM (a head excerpt is quoted as evidence).
+        # file sizes, mtimes and PATHS of the harness's own persisted files
+        # under ~/.claude/projects — filesystem metadata Genesis observed. No
+        # byte of a filed hook's CONTENT reaches the observation: the collector
+        # attributes each filing from a closed set of labels it authors itself
+        # (context_injection._attribute). That is what makes first_party true
+        # here rather than merely convenient. An earlier version quoted the
+        # first 80 characters of an unrecognised hook's output — sanitised and
+        # framed "unverified", which changes neither where the text came from
+        # nor the origin stamped on the row, so it would have carried external
+        # text past the trusted-only SAFE_SURFACING_ORIGINS filters used by
+        # reflection and perception. If a future change puts hook content back
+        # in this observation, this source must LOSE its place in this list.
         "context_injection_monitor",
     }
 )
