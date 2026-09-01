@@ -72,6 +72,7 @@ def request_from_payload(payload: dict):
         notify=payload.get("notify", True),
         notify_on_failure_only=payload.get("notify_on_failure_only", False),
         caller_context=payload.get("caller_context"),
+        origin_caller_context=payload.get("origin_caller_context"),
         roster_model=payload.get("roster_model"),
         system_prompt=payload.get("system_prompt"),
         source_tag=payload.get("source_tag") or "direct_session",

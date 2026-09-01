@@ -592,6 +592,13 @@ class DirectSessionRequest:
     notify_on_failure_only: bool = False
     source_tag: str = "direct_session"
     caller_context: str | None = None  # "follow_up:<id>", "schedule:<id>"
+    # The ORIGINAL caller_context of a dispatch that was rate-limit parked, carried
+    # across resume. A resumed session's caller_context is rewritten to
+    # "rate_limit_resume:<park_id>" (for park-lineage), which severs the
+    # "ego_proposal:<id>" linkage that proposal-outcome recording + dispatch
+    # follow-through gate on. This preserves the origin so both survive a
+    # park→resume (see rate_limit_park.effective_caller_context). None otherwise.
+    origin_caller_context: str | None = None
     planning_instruction: str | None = None  # opt-in: prepended to prompt
     skills: list[str] | None = None  # explicit skill injection (overrides auto-detect)
     tool_exceptions: tuple[str, ...] = ()  # tools to UN-block from the profile disallow list
@@ -890,12 +897,13 @@ class DirectSessionRunner:
 
             # Post-execution audit: verify protected paths, feed autonomy signals.
             # Only for ego dispatches (caller_context starts with "ego_proposal:").
-            # Runs inline (cheap) — transcript parsing is I/O-bound but fast.
-            if (
-                self._auditor is not None
-                and request.caller_context
-                and request.caller_context.startswith("ego_proposal:")
-            ):
+            # Resolve across a park→resume (resume-prefix → the preserved origin),
+            # else a resumed ego dispatch is silently NOT audited. Runs inline
+            # (cheap) — transcript parsing is I/O-bound but fast.
+            _audit_ctx = rate_limit_park.effective_caller_context(
+                request.caller_context, request.origin_caller_context
+            )
+            if self._auditor is not None and _audit_ctx and _audit_ctx.startswith("ego_proposal:"):
                 try:
                     metadata = {}
                     db = getattr(self._rt, "_db", None)
@@ -912,7 +920,7 @@ class DirectSessionRunner:
                         transcript_path=metadata.get("transcript_path", ""),
                         tools_summary=metadata.get("tools_summary"),
                         session_success=result.success,
-                        caller_context=request.caller_context,
+                        caller_context=_audit_ctx,
                     )
                 except Exception:
                     logger.debug(
@@ -1122,9 +1130,15 @@ class DirectSessionRunner:
         result: DirectSessionResult,
     ) -> None:
         """Feed session outcome back to ego proposal for feedback loop."""
-        if not request.caller_context or not request.caller_context.startswith("ego_proposal:"):
+        # Resolve the ORIGINAL context: a park→resume rewrites caller_context to
+        # "rate_limit_resume:<park_id>", so gate on the preserved origin instead
+        # (else a resumed dispatch's outcome is silently dropped — #1487/837f8b63).
+        ctx = rate_limit_park.effective_caller_context(
+            request.caller_context, request.origin_caller_context
+        )
+        if not ctx or not ctx.startswith("ego_proposal:"):
             return
-        proposal_id = request.caller_context.split(":", 1)[1]
+        proposal_id = ctx.split(":", 1)[1]
         advisories: list[str] = []
         # WS-3: a dispatch outcome inherits the SESSION's provenance. A
         # research/interact/etc. dispatch is external_untrusted — its output can
@@ -1512,6 +1526,7 @@ class DirectSessionRunner:
             {
                 "profile": request.profile,
                 "caller_context": request.caller_context,
+                "origin_caller_context": request.origin_caller_context,
                 "output_text": result.output_text[:20000],
                 "tools_summary": tool_counts,
                 "cc_session_id": result.cc_session_id,
