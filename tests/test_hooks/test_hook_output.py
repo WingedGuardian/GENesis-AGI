@@ -339,3 +339,68 @@ def test_a_marker_too_big_to_fit_still_names_the_mirror(sink):
     rendered = sink.getvalue()
     assert "context-knowledge.md" in rendered, rendered
     assert len(rendered) <= 75, "the marker must not overshoot the budget it is trimmed for"
+
+
+def _units(s: str) -> int:
+    """What the harness counts: UTF-16 code units."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+@pytest.mark.parametrize(
+    "label,text",
+    [
+        ("astral only", "\U0001f3af" * 20_000),
+        ("astral + bmp", "a\U0001f3af" * 10_000),
+        ("bmp control", "A" * 20_000),
+    ],
+)
+def test_the_budget_holds_in_the_units_the_harness_counts(sink, label, text):
+    """The writer's ONE guarantee, measured in the harness's own unit.
+
+    `emit_cost` bills UTF-16 code units; every slice used to cut by CODEPOINTS.
+    For astral text (emoji, rarer CJK) that is a silent 2x overrun — the writer
+    keeps N characters believing they cost N, and they cost 2N.
+
+    MEASURED before the fix: 19,384 units emitted against a 10,000 cap while the
+    writer reported itself within budget. The harness then files the whole part,
+    which is the exact silent context loss this module exists to prevent, and the
+    cut marker naming the mirror is destroyed along with it — so the reader loses
+    both the content AND the pointer to it.
+
+    Found by a cross-model reviewer AFTER the unit fix landed: correcting the
+    accounting without correcting the slicing left the two disagreeing, which is
+    worse than having them consistently wrong. The BMP row is the control — it
+    must be unaffected, or the fix is just a smaller budget.
+    """
+    out = _writer(sink, budget=9_800, mirror_hint="~/.genesis/sessions/s1/context-knowledge.md")
+    out.emit(text, block="essential-knowledge")
+    rendered = sink.getvalue()
+
+    assert _units(rendered) <= 9_800, f"{label}: {_units(rendered)} units over a 9,800 budget"
+    assert "context-knowledge.md" in rendered, f"{label}: the cut marker lost its mirror pointer"
+
+
+def test_emit_final_also_bills_and_slices_in_the_same_unit(sink):
+    """The closing line is the COMPLETION PROOF — it must not overshoot either.
+
+    Same class as the cut path: `emit_final` sliced codepoints against a unit
+    budget, so an astral audit line could push the part over the cap on the one
+    write whose whole job is to report what happened.
+    """
+    out = _writer(sink, budget=300, reserve=200, mirror_hint="~/.genesis/sessions/s1/x.md")
+    out.emit("B" * 400, block="b")
+    out.emit_final("\U0001f3af" * 500)
+    assert _units(sink.getvalue()) <= 300
+
+
+def test_clip_to_cost_never_splits_a_surrogate_pair(sink):
+    """An odd unit budget must not cut an astral character in half.
+
+    Counting whole characters makes this structural: a 2-unit character is
+    either kept whole or dropped. Slicing the encoded bytes would produce a lone
+    surrogate, which is unencodable and would crash the write.
+    """
+    clipped = _ho.clip_to_cost("\U0001f3af" * 10, 5)  # odd budget, 2-unit chars
+    assert _units(clipped) <= 5
+    clipped.encode("utf-8")  # a lone surrogate would raise here
+    assert clipped == "\U0001f3af" * 2

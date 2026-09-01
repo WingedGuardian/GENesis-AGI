@@ -77,6 +77,35 @@ def emit_cost(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2 + _NEWLINE_COST
 
 
+def clip_to_cost(text: str, max_units: int) -> str:
+    """Longest prefix of ``text`` costing at most ``max_units`` UTF-16 units.
+
+    THE COMPANION TO :func:`emit_cost`, and the two must always be used
+    together: billing in UTF-16 code units while slicing by CODEPOINTS is a
+    silent 2x overrun for astral characters (emoji, rarer CJK). The writer keeps
+    N characters believing they cost N, and they cost 2N.
+
+    MEASURED: a part of astral text emitted 19,384 units against a 10,000 cap
+    while the writer reported itself within budget — the harness then files the
+    whole part, which is the exact silent context loss this module exists to
+    prevent, and the cut marker naming the mirror is lost along with it. Found
+    by a cross-model reviewer after the unit fix landed: correcting the
+    accounting without correcting the slicing left the two disagreeing, which is
+    worse than having them consistently wrong.
+
+    Counts whole characters, so it can never split a surrogate pair.
+    """
+    if max_units <= 0:
+        return ""
+    total = 0
+    for i, ch in enumerate(text):
+        cost = 2 if ord(ch) > 0xFFFF else 1
+        if total + cost > max_units:
+            return text[:i]
+        total += cost
+    return text
+
+
 #: Default headroom under the cap. The cap is the cliff, not the target: a
 #: hook that lands exactly on it has no room for a version that lowers it
 #: slightly, and none for the closing line most emitters append.
@@ -270,7 +299,7 @@ class BoundedStdout:
             # and where to read it, so it is worth more than the same number of
             # raw characters — and dropping to the raw text here would discard
             # the one line that tells the reader what is missing.
-            _write(text[:keep] + rendered)
+            _write(clip_to_cost(text, keep) + rendered)
             if self.closed:
                 # The notice itself overran and tripped the cut path: the stream
                 # is now closed and every later block will be dropped silently.
@@ -316,7 +345,7 @@ class BoundedStdout:
         room = self._budget - self._emitted
         if room <= 0:
             return
-        self._write(text if emit_cost(text) <= room else text[: max(0, room - 1)])
+        self._write(text if emit_cost(text) <= room else clip_to_cost(text, max(0, room - 1)))
 
     # ── internals ──────────────────────────────────────────────────────
     def _write(self, text: str) -> None:
@@ -362,7 +391,7 @@ class BoundedStdout:
         content_room = room - len(marker) - 2
         kept = ""
         if content_room > 0:
-            kept = text[:content_room]
+            kept = clip_to_cost(text, content_room)
             self._write(kept)
             self._write(marker)
         else:
@@ -380,7 +409,7 @@ class BoundedStdout:
             if emit_cost(short) <= room_now:
                 self._write(short)
             elif room_now > 1:
-                self._write(short[: room_now - 1])
+                self._write(clip_to_cost(short, room_now - 1))
         self._cut = (block or self._label, len(text) - len(kept))
 
 
@@ -475,7 +504,7 @@ def print_json_bounded(
         # Never stack notes when a second pass is needed.
         base = current[: -len(note)] if current.endswith(note) else current
         keep = max(0, len(base) - over - len(note) - 8)
-        _set(key, base[:keep] + note)
+        _set(key, clip_to_cost(base, keep) + note)
     blob = json.dumps(payload)
     fits = emit_cost(blob) <= budget
     if not fits:
