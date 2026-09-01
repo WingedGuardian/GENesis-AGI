@@ -175,6 +175,10 @@ class EgoSession:
         self._autonomous_dispatcher = None
         self._proposal_gate = None
         self._outreach_pipeline = None
+        # Questions channel (ask-user): reply → reactive signal routing +
+        # strong refs for the in-flight delivery tasks.
+        self._reply_signal_sink = None
+        self._question_tasks: set[asyncio.Task] = set()
         self._mcp_config_path = mcp_config_path
         self._call_site = call_site or _DEFAULT_CALL_SITE
         self._focus_summary_key = focus_summary_key or _DEFAULT_FOCUS_SUMMARY_KEY
@@ -1055,6 +1059,13 @@ class EgoSession:
             notifications = parsed.get("notifications", [])
             if isinstance(notifications, list) and notifications:
                 await self._process_notifications(notifications)
+
+            # 9a2. Process questions (ask-user channel — direct delivery with
+            # reply capture, NO approval gate; the reply returns as a reactive
+            # signal next cycle)
+            questions = parsed.get("questions", [])
+            if isinstance(questions, list) and questions:
+                await self._process_questions(questions)
 
             # 9b. Process tabled/withdrawn proposal IDs
             tabled_ids = parsed.get("tabled", [])
@@ -2747,6 +2758,305 @@ class EgoSession:
                 "Submitted %d/%d ego notification(s) to outreach pipeline",
                 submitted,
                 len(notifications),
+            )
+
+    # -- Ego questions (ask-user channel) -----------------------------------
+
+    # User attention is the scarce resource this cap protects — an ego cycle
+    # that wants to ask more than this has an attention-budget problem, not a
+    # channel problem.
+    _MAX_QUESTIONS_PER_CYCLE = 2
+
+    def set_reply_signal_sink(self, sink) -> None:
+        """Wire the callable that routes a captured user reply back to this
+        ego as a reactive signal (init wires it to the cadence manager's
+        ``push_reactive_event``)."""
+        self._reply_signal_sink = sink
+
+    def _emit_question_signal(self, *, kind: str, summary: str, urgency: str) -> None:
+        """Wake THIS ego with the OUTCOME of a question it asked — answer,
+        no-reply, or not-delivered. The durable ego_question observation is the
+        record; this reactive signal ensures a cycle actually RUNS to see it,
+        because the 4h context section is opportunistic (a cycle may not fire
+        inside the window) and the failure outcomes have no other wake path
+        (Codex #1499 P1-c-3)."""
+        sink = self._reply_signal_sink
+        if sink is None:
+            return
+        priority = {"low": "low", "normal": "medium", "high": "high"}.get(urgency, "low")
+        try:
+            sink({
+                "type": kind,
+                "summary": summary,
+                "priority": priority,
+                "source": "ego_question",
+            })
+        except Exception:
+            logger.warning(
+                "Reply signal sink failed for ego question (%s)", kind, exc_info=True,
+            )
+
+    async def _process_questions(self, questions: list[dict]) -> None:
+        """Deliver ego questions to the user with reply capture.
+
+        Questions are direct asks — no approval gate (asking the user for
+        input is NOTIFY_USER-class, not an external effect). Validated
+        questions are handed to ONE background task that delivers them
+        SEQUENTIALLY through the outreach pipeline's send-and-wait path
+        (governance still applies: dedup, rate limit, quiet hours) so the
+        ego cycle never blocks. Sequential matters: two concurrent waiters
+        in the same chat/topic make a standalone (non-quote) reply
+        ambiguous — ``resolve_scoped_pending`` resolves only when exactly
+        one waiter is eligible, so parallel questions would BOTH time out
+        even though the user answered. A captured reply becomes an
+        observation + a reactive signal to THIS ego; a timeout or an
+        undelivered question becomes a low-priority observation.
+
+        Known limit (accepted): the reply waiter is in-memory — a server
+        restart mid-wait orphans the question, and a late reply falls
+        through to normal conversation triage.
+        """
+        if self._outreach_pipeline is None:
+            logger.warning(
+                "OutreachPipeline not available — skipping %d question(s)",
+                len(questions),
+            )
+            return
+        if not hasattr(self._outreach_pipeline, "submit_and_wait"):
+            logger.warning(
+                "Outreach pipeline lacks submit_and_wait — skipping questions"
+            )
+            return
+        # submit_and_wait silently degrades to fire-and-forget when no reply
+        # waiter is wired (returns immediately, reply always None) — a question
+        # would be "sent" yet unanswerable. Skip rather than mislead the ego with
+        # an instant no_reply (Codex #1499 P2#10).
+        _supports = getattr(self._outreach_pipeline, "supports_reply_wait", None)
+        if callable(_supports) and _supports() is False:
+            logger.warning(
+                "Outreach pipeline has no reply-wait infra — skipping %d question(s)",
+                len(questions),
+            )
+            return
+
+        accepted: list[tuple[str, str]] = []
+        for q in questions:
+            if not isinstance(q, dict):
+                continue
+            raw = q.get("content")
+            # The output parser accepts any JSON value here — a non-string
+            # (dict/number/list) would blow up .strip(); skip it rather than raise.
+            if not isinstance(raw, str):
+                continue
+            content = raw.strip()
+            # Strip one layer of matched wrapping quotes (same LLM quirk as
+            # notifications).
+            if len(content) >= 2 and (content[0], content[-1]) in (
+                ('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"),
+            ):
+                content = content[1:-1].strip()
+            if not content:
+                continue
+            if len(content) > 1000:
+                content = content[:1000]
+            if len(accepted) >= self._MAX_QUESTIONS_PER_CYCLE:
+                logger.warning(
+                    "Question cap (%d/cycle) reached — dropping: %s",
+                    self._MAX_QUESTIONS_PER_CYCLE, content[:80],
+                )
+                continue
+            urgency = q.get("urgency", "normal")
+            if urgency not in ("low", "normal", "high"):
+                urgency = "normal"
+            accepted.append((content, urgency))
+
+        if not accepted:
+            return
+
+        from genesis.util.tasks import tracked_task
+
+        task = tracked_task(
+            self._deliver_questions_sequentially(accepted),
+            name=f"ego-questions-{self._source_tag}",
+            logger=logger,
+        )
+        # Strong refs until done: a bare task result can be GC'd mid-wait.
+        self._question_tasks.add(task)
+        task.add_done_callback(self._question_tasks.discard)
+        logger.info(
+            "Spawned question task for %d ego question(s)", len(accepted)
+        )
+
+    async def _deliver_questions_sequentially(
+        self, items: list[tuple[str, str]],
+    ) -> None:
+        """Deliver questions one at a time — question 2 goes out only after
+        question 1's reply arrived or timed out (standalone-reply ambiguity,
+        see ``_process_questions``)."""
+        for content, urgency in items:
+            await self._deliver_question_and_route(content, urgency)
+
+    async def _deliver_question_and_route(
+        self, content: str, urgency: str,
+    ) -> None:
+        """Deliver one question, await the reply, route the outcome.
+
+        Runs as a fire-and-forget task — every failure mode is contained
+        here (logged, never raised into the event loop).
+        """
+        import uuid
+        from datetime import UTC, datetime
+
+        from genesis.db.crud import observations as obs_crud
+        from genesis.outreach.reply_waiter import DEFAULT_REPLY_TIMEOUT_S
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+        try:
+            salience = {"low": 0.3, "normal": 0.6, "high": 0.9}.get(urgency, 0.6)
+            # Per-question correlation id → a UNIQUE outreach topic, so the
+            # pipeline in-flight de-dup guard (_awaited_dup_key keys on
+            # signal_type+topic) never collapses two DISTINCT questions that share
+            # a 100-char lead-in. Questions are never de-duped by design
+            # (governance _DEDUP_WINDOWS["ego_question"]=0); this closes the
+            # in-flight path too (Codex #1499 P2#7).
+            q_id = uuid.uuid4().hex[:8]
+            # The waiter is quote-reply-only (standalone_resolvable=False below),
+            # so the DELIVERED text must tell the user to reply-to-this-message —
+            # a plain next-DM answer would hit no waiter. `content` stays clean
+            # (it is what the outcome observations record); the instruction lives
+            # only in the outreach context (Codex #1499 P2#8).
+            delivered_text = f"{content}\n\n(Reply to this message to answer.)"
+            request = OutreachRequest(
+                category=OutreachCategory.NOTIFICATION,
+                # `topic` is an internal correlation/de-dup key, NOT display text
+                # (the user sees `context`); it only surfaces as a subject line on
+                # email-ish channels, and questions are telegram-only.
+                topic=f"{content[:80]} · {q_id}",
+                context=delivered_text,
+                salience_score=salience,
+                signal_type="ego_question",
+                channel="telegram",
+                # The ego composed the question — deliver it exactly.
+                verbatim=True,
+            )
+            result, reply = await self._outreach_pipeline.submit_and_wait(
+                request,
+                timeout_s=DEFAULT_REPLY_TIMEOUT_S,
+                # Quote-reply-only: the question is delivered into the owner's
+                # general DM, where an unrelated standalone message would
+                # otherwise be silently consumed as the answer (resolve_scoped_
+                # pending resolves the single pending waiter for ANY bare text in
+                # that chat). Requiring an explicit Telegram quote-reply also
+                # removes cross-cycle waiter ambiguity, so questions no longer
+                # need serialized delivery for correctness.
+                standalone_resolvable=False,
+            )
+            if result.status.value != "delivered":
+                # Not a silent drop: the contract promises delivery, so the
+                # ego must be able to SEE that governance (quiet hours,
+                # quota, dedup) held the question back and reason about a
+                # retry. Ego-authored content → first_party.
+                logger.info(
+                    "Ego question not delivered (%s): %s",
+                    result.status.value, content[:80],
+                )
+                await obs_crud.create(
+                    self._db,
+                    id=str(uuid.uuid4()),
+                    source="ego_question",
+                    type="not_delivered",
+                    origin_class="first_party",
+                    content=(
+                        f"Ego question NOT delivered "
+                        f"(status={result.status.value}"
+                        + (f", reason: {result.error}" if result.error else "")
+                        + f"): {content}"
+                    ),
+                    priority="low",
+                    category="ego_question",
+                    created_at=datetime.now(UTC).isoformat(),
+                )
+                self._emit_question_signal(
+                    kind="question_not_delivered",
+                    summary=(
+                        f"Your question was NOT delivered "
+                        f"(status={result.status.value}) — reconsider/retry: {content[:70]}"
+                    ),
+                    urgency=urgency,
+                )
+                return
+
+            if reply:
+                # origin_class="owner": the waiter resolves ONLY the owner's
+                # explicit Telegram quote-reply (standalone_resolvable=False
+                # above) — stamped explicitly at the write site, never
+                # allowlisted, because the content embeds user text. This
+                # observation is the DURABLE channel the asking ego reads the
+                # answer from (see UserEgoContextBuilder._ego_question_section /
+                # the genesis observations section).
+                try:
+                    await obs_crud.create(
+                        self._db,
+                        id=str(uuid.uuid4()),
+                        source="ego_question",
+                        type="user_reply",
+                        origin_class="owner",
+                        content=(
+                            f"Ego asked: {content}\nUser replied: {reply}"
+                        ),
+                        priority="high" if urgency == "high" else "medium",
+                        category="ego_question",
+                        created_at=datetime.now(UTC).isoformat(),
+                    )
+                except Exception:
+                    # The durable record failed (e.g. SQLite briefly
+                    # unavailable). The reactive signal below still fires, but its
+                    # summary is NOT rendered into the ego prompt (FocusResult
+                    # carries no summary field) — so on this rare path the answer
+                    # would otherwise be lost entirely. Log the FULL reply so it
+                    # is at least recoverable from the operational log, and the
+                    # ego is still woken (it can re-ask if it can't find it).
+                    logger.warning(
+                        "Failed to persist ego_question reply observation for "
+                        "%r — captured reply (recoverable here): %r",
+                        content[:120],
+                        reply[:500],
+                        exc_info=True,
+                    )
+                self._emit_question_signal(
+                    kind="user_reply",
+                    summary=(
+                        f"User answered your question "
+                        f"({content[:60]}): {reply[:120]}"
+                    ),
+                    urgency=urgency,
+                )
+            else:
+                await obs_crud.create(
+                    self._db,
+                    id=str(uuid.uuid4()),
+                    source="ego_question",
+                    type="no_reply",
+                    origin_class="first_party",
+                    content=(
+                        f"Ego question unanswered after "
+                        f"{int(DEFAULT_REPLY_TIMEOUT_S / 3600)}h: {content}"
+                    ),
+                    priority="low",
+                    category="ego_question",
+                    created_at=datetime.now(UTC).isoformat(),
+                )
+                self._emit_question_signal(
+                    kind="question_no_reply",
+                    summary=(
+                        f"Your question went unanswered after "
+                        f"{int(DEFAULT_REPLY_TIMEOUT_S / 3600)}h: {content[:70]}"
+                    ),
+                    urgency=urgency,
+                )
+        except Exception:
+            logger.warning(
+                "Ego question delivery failed: %s", content[:80], exc_info=True,
             )
 
     # -- Deferred intentions ------------------------------------------------
