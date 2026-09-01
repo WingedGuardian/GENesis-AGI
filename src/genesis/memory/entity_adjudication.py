@@ -24,6 +24,7 @@ Every verdict is deduped and recorded in ``entity_adjudications`` (order-indepen
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import hashlib
 import json
@@ -349,6 +350,9 @@ async def run_adjudication_drain(
     during the shadow period (with a staleness guard). Phase 1 then judges pending
     queue rows. Emits one aggregate observation if anything changed.
     """
+    # A negative budget is a SQLite LIMIT of -1 = UNLIMITED; clamp to 0 so an
+    # invalid budget bounds work to nothing rather than draining everything.
+    budget = max(int(budget), 0)
     counts = {
         "judged": 0,
         "distinct": 0,
@@ -545,12 +549,8 @@ async def _apply_proposed_backlog(
     """
     proposals = await adj_crud.list_proposed_merges(db, limit=budget, approved_only=True)
     for p in proposals:
-        # Per-row isolation: one row that raises must not abort the whole approved
-        # batch, and a partial merge_entity transaction must be rolled back so a
-        # later commit (by this loop or a concurrent coroutine on the shared
-        # connection) can't flush it as half-applied corruption. merge_entity
-        # commits on success, so applied rows are already durable; a failure raises
-        # BEFORE its commit, and db.rollback() discards only that partial.
+        pair_key = p["pair_key"]
+        # ── Pre-checks (identity/staleness) — no destructive writes yet ──
         try:
             # A `stale` verdict is not a dead end: the reconcile sweep's dedup set
             # (settled_pair_keys) excludes stale, so a stale pair is re-enqueued on
@@ -560,26 +560,74 @@ async def _apply_proposed_backlog(
             ent_a = await _resolve_active(db, p["entity_a"])
             ent_b = await _resolve_active(db, p["entity_b"])
             if ent_a is None or ent_b is None or ent_a["entity_id"] == ent_b["entity_id"]:
-                await adj_crud.mark_stale(db, pair_key=p["pair_key"])
+                await adj_crud.mark_stale(db, pair_key=pair_key)
                 counts["stale"] += 1
                 continue
             # norm_name drift → the thing we judged is not the thing we'd merge now.
             if ent_a["norm_name"] != p.get("norm_a") or ent_b["norm_name"] != p.get("norm_b"):
-                await adj_crud.mark_stale(db, pair_key=p["pair_key"])
+                await adj_crud.mark_stale(db, pair_key=pair_key)
                 counts["stale"] += 1
                 continue
-            survivor_id, loser_id = await _pick_survivor(db, ent_a, ent_b)
-            await entities_crud.merge_entity(db, loser_id=loser_id, survivor_id=survivor_id)
-            await adj_crud.mark_applied(
-                db, pair_key=p["pair_key"], loser_id=loser_id, survivor_id=survivor_id
+            # Honor the STORED, human-approved direction. Do NOT recompute the
+            # survivor from CURRENT mention counts (_pick_survivor): counts can
+            # shift between approval and apply, and recomputing could tombstone
+            # the very entity the human chose to KEEP. Require the approved pair to
+            # still be exactly the live resolved pair; any drift → stale (re-review),
+            # never a silent re-pick.
+            survivor_id = p.get("survivor_id")
+            loser_id = p.get("loser_id")
+            if (
+                not survivor_id
+                or not loser_id
+                or {survivor_id, loser_id} != {ent_a["entity_id"], ent_b["entity_id"]}
+            ):
+                await adj_crud.mark_stale(db, pair_key=pair_key)
+                counts["stale"] += 1
+                continue
+        except Exception:
+            logger.exception("entity apply pre-check failed: %s", pair_key)
+            counts["errors"] = counts.get("errors", 0) + 1
+            continue
+
+        # ── Apply under a per-row SAVEPOINT (unique name) ──
+        # A failure rolls back ONLY this row's writes via ROLLBACK TO — NEVER
+        # db.rollback() on the shared SerializedConnection, which would discard
+        # unrelated concurrent uncommitted writes (no_rollback_shared_connection).
+        # The name is unique per row so two appliers sharing one connection (e.g.
+        # concurrent entity_adjudication_apply MCP calls) can never RELEASE/
+        # ROLLBACK TO each other's savepoint (SQLite targets the most-recent of a
+        # given name). uuid-derived → a safe SQL identifier, not caller input.
+        sp = f"entity_apply_{uuid.uuid4().hex[:12]}"
+        await db.execute(f"SAVEPOINT {sp}")
+        try:
+            # Atomic claim (TOCTOU + double-apply defense): flip proposed_merge→merge
+            # ONLY while it is still proposed_merge AND approved. Of two concurrent
+            # appliers — or an apply racing a reject — exactly one wins (rowcount 1);
+            # the loser skips instead of double-merging. The stored direction is
+            # applied verbatim.
+            claimed = await adj_crud.claim_approved_for_apply(
+                db,
+                pair_key=pair_key,
+                loser_id=loser_id,
+                survivor_id=survivor_id,
+                _commit=False,
             )
+            if not claimed:
+                await db.execute(f"RELEASE {sp}")
+                counts["skipped"] = counts.get("skipped", 0) + 1
+                continue
+            await entities_crud.merge_entity(
+                db, loser_id=loser_id, survivor_id=survivor_id, _commit=False
+            )
+            await db.execute(f"RELEASE {sp}")
+            await db.commit()
             counts["merged"] += 1
             _note_merge(example_merges, ent_a, ent_b)
         except Exception:
-            logger.exception(
-                "entity apply row failed, rolling back partial merge: %s", p.get("pair_key")
-            )
-            await db.rollback()
+            logger.exception("entity apply row failed, rolling back partial merge: %s", pair_key)
+            with contextlib.suppress(Exception):
+                await db.execute(f"ROLLBACK TO {sp}")
+                await db.execute(f"RELEASE {sp}")
             counts["errors"] = counts.get("errors", 0) + 1
             continue
 
@@ -595,6 +643,9 @@ async def apply_approved_merges(db: aiosqlite.Connection, *, budget: int = 50) -
     (``_apply_proposed_backlog``, which lists only approved rows). Returns a counts
     summary: {'merged': N, 'stale': M}.
     """
+    # Clamp a negative budget to 0 (a negative SQLite LIMIT is UNLIMITED — the
+    # apply(budget=-1) unbounded-apply bug). Defense-in-depth with the crud clamp.
+    budget = max(int(budget), 0)
     counts = {"merged": 0, "stale": 0}
     example_merges: list[str] = []
     await _apply_proposed_backlog(db, counts, example_merges, budget=budget)

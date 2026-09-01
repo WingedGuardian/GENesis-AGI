@@ -34,6 +34,16 @@ _EXPECTED_COLUMNS = {
     "applied_at",
 }
 
+# The canonical _tables.py schema is the CUMULATIVE column set: migration 0065's
+# original columns PLUS approved_at/approved_by, which a LATER migration
+# (0090_entity_adjudication_approval) adds for the human-approval gate. Migration
+# 0065 is frozen history and must never be edited retroactively
+# (numbered_migration_self_contained), so its up() still builds only
+# _EXPECTED_COLUMNS — the parity check below asserts the canonical set is exactly
+# 0065's set plus these two approval columns, not that the two are identical.
+_APPROVAL_COLUMNS = {"approved_at", "approved_by"}
+_CANONICAL_COLUMNS = _EXPECTED_COLUMNS | _APPROVAL_COLUMNS
+
 _BASE_ROW = {
     "id": "a-1",
     "pair_key": "e1|e2",
@@ -113,7 +123,14 @@ async def test_pair_key_unique(tmp_path):
 
 @pytest.mark.asyncio
 async def test_fresh_canonical_parity(tmp_path):
-    """_tables.py and the migration must build the identical column set."""
+    """Canonical _tables.py = migration 0065's columns PLUS the approval columns.
+
+    The fresh-install DDL carries the cumulative schema (0065 + the later
+    0090 approval-gate migration), so it is NOT identical to frozen 0065 — it is
+    exactly 0065's set plus approved_at/approved_by. Asserting the precise
+    relationship (rather than equality) catches both a canonical schema that drops
+    a 0065 column AND an approval column that never reached _tables.py.
+    """
     from genesis.db.schema import TABLES
 
     async with aiosqlite.connect(str(tmp_path / "t.db")) as db:
@@ -122,7 +139,9 @@ async def test_fresh_canonical_parity(tmp_path):
     async with aiosqlite.connect(str(tmp_path / "m.db")) as db:
         await M65.up(db)
         migrated_cols = await _columns(db)
-    assert fresh_cols == migrated_cols == _EXPECTED_COLUMNS
+    assert migrated_cols == _EXPECTED_COLUMNS
+    assert fresh_cols == _CANONICAL_COLUMNS
+    assert fresh_cols == migrated_cols | _APPROVAL_COLUMNS
 
 
 @pytest.mark.asyncio

@@ -167,6 +167,11 @@ async def list_proposed_merges(
     from being applied, even after the drainer flips to ``live``. ``False`` (the
     review surface) lists ALL proposals so a human can triage them.
     """
+    # Clamp negative limit to 0. A negative SQLite LIMIT means UNLIMITED, so an
+    # unclamped negative here would make the gated apply path (approved_only=True)
+    # drain EVERY approved merge in one call regardless of the caller's budget —
+    # the apply(budget=-1) unbounded-apply bug. 0 = apply nothing (safe).
+    limit = max(int(limit), 0)
     clause = "verdict = 'proposed_merge'"
     if approved_only:
         clause += " AND approved_at IS NOT NULL"
@@ -234,6 +239,9 @@ async def list_for_review(
         clause = "verdict = 'proposed_merge'"
     else:
         raise ValueError(f"list_for_review: unknown status {status!r}")
+    # A negative SQLite LIMIT means UNLIMITED — clamp to 0 (return nothing) so a
+    # negative limit can never silently dump the whole table.
+    limit = max(int(limit), 0)
     cursor = await db.execute(
         f"SELECT {', '.join(_COLS)} FROM entity_adjudications "
         f"WHERE {clause} ORDER BY created_at ASC LIMIT ?",
@@ -259,6 +267,42 @@ async def mark_applied(
     )
     if _commit:
         await db.commit()
+
+
+async def claim_approved_for_apply(
+    db: aiosqlite.Connection,
+    *,
+    pair_key: str,
+    loser_id: str,
+    survivor_id: str,
+    _commit: bool = True,
+) -> bool:
+    """Atomically CLAIM an approved proposed_merge for application.
+
+    A single conditional UPDATE — verdict flips ``proposed_merge`` → ``merge``
+    ONLY while it is still ``proposed_merge`` AND ``approved_at IS NOT NULL``.
+    That predicate is the lock: SQLite serialises the write, so of two concurrent
+    appliers (or an apply racing a reject) exactly one sees ``rowcount == 1`` and
+    wins; the loser sees 0 and must NOT apply. This closes the read-then-apply
+    TOCTOU where two processes both merged the same pair, or a reject landing
+    after the read still applied the stale row. The caller runs the destructive
+    ``merge_entity`` under the SAME savepoint so a failure rolls the claim back.
+
+    ``loser_id``/``survivor_id`` are the STORED, human-approved direction — the
+    caller passes the row's own values, never a freshly recomputed pick.
+    Returns True iff this caller won the claim.
+    """
+    now = datetime.now(UTC).isoformat()
+    cursor = await db.execute(
+        "UPDATE entity_adjudications SET verdict = 'merge', loser_id = ?, "
+        "survivor_id = ?, applied_at = ? "
+        "WHERE pair_key = ? AND verdict = 'proposed_merge' "
+        "AND approved_at IS NOT NULL",
+        (loser_id, survivor_id, now, pair_key),
+    )
+    if _commit:
+        await db.commit()
+    return cursor.rowcount == 1
 
 
 async def mark_stale(db: aiosqlite.Connection, *, pair_key: str, _commit: bool = True) -> None:

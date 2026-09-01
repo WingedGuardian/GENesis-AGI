@@ -525,9 +525,22 @@ async def prune_merge_journal(
     ``scripts/disk_hygiene.sh``). The window is generous (180d default) because the
     journal is a safety net for ``unmerge_entity`` — it must outlive the "did we
     mis-merge?" discovery window, not just an audit horizon. ``now`` is injected
-    (never wall-clock here) for deterministic tests. No-ops before migration 0086
-    (table-existence guard). Returns rows deleted.
+    (never wall-clock here) for deterministic tests. No-ops before the
+    approval-gate migration (table-existence guard). Returns rows deleted.
+
+    Rejects a sub-1-day retention window: with ``older_than_days <= 0`` the cutoff
+    lands at or in the FUTURE relative to ``now`` (a negative subtracts a negative,
+    pushing it forward), so ``merged_at < cutoff`` would match EVERY row and wipe
+    the entire reversibility journal — the one store ``unmerge_entity`` depends on.
+    A retention window that destroys the whole safety net is always a bug, so fail
+    loud rather than silently deleting it.
     """
+    if older_than_days < 1:
+        raise ValueError(
+            f"prune_merge_journal: retention window must be >= 1 day, got "
+            f"{older_than_days!r}; a sub-1 window sets the cutoff at/after now and "
+            f"would delete the ENTIRE entity_merge_journal (reversibility safety net)."
+        )
     cur = await db.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='entity_merge_journal'"
     )

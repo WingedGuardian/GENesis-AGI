@@ -707,3 +707,141 @@ async def test_maybe_run_sweep_low_water_gate(db):
         await _enqueue(db, f"x{i}", f"y{i}")
     out = await adj.maybe_run_sweep(db, drain_budget=2, slice_size=100, enqueue_cap=50)
     assert out is None  # skipped: queue too deep
+
+
+# ── safety-critical apply-path rails (remediation) ───────────────────────────
+
+
+async def _add_mentions(db, entity_id, n):
+    """Give an entity ``n`` distinct mentions so count_entity_mentions() diverges."""
+    for i in range(n):
+        await entities_crud.upsert_mention(
+            db,
+            memory_id=f"mem-{entity_id}-{i}",
+            entity_id=entity_id,
+            provenance="EXTRACTED",
+            confidence=0.7,
+        )
+
+
+@pytest.mark.asyncio
+async def test_apply_honors_stored_direction_not_recomputed_survivor(db):
+    """apply must tombstone the STORED loser — never re-pick from live mention counts.
+
+    The human approved survivor=a / loser=b. Then b accrues MORE mentions than a,
+    so a survivor RECOMPUTED from current counts (_pick_survivor) would flip the
+    direction and tombstone `a` — the entity the human chose to KEEP. Honoring the
+    stored direction keeps `a` active and merges `b`. (Verified-RED: with the old
+    recompute this asserts the opposite outcome and fails.)
+    """
+    a = await _mk_entity(db, "keep", "keep")
+    b = await _mk_entity(db, "keepp", "keepp")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,  # stored, human-approved direction: keep a, drop b
+        survivor_id=a,
+        norm_a="keep",
+        norm_b="keepp",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="jay")
+    # Counts now DISAGREE with the stored direction: b is better-attested.
+    await _add_mentions(db, b, 3)
+    assert await entities_crud.count_entity_mentions(
+        db, b
+    ) > await entities_crud.count_entity_mentions(db, a)
+
+    counts = await adj.apply_approved_merges(db, budget=10)
+
+    assert counts["merged"] == 1
+    assert await _status(db, a) == "active"  # the human's survivor is kept
+    assert await _status(db, b) == "merged"  # the stored loser is tombstoned
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["survivor_id"] == a and row["loser_id"] == b
+
+
+@pytest.mark.asyncio
+async def test_claim_approved_for_apply_is_atomic_single_winner(db):
+    """The conditional claim flips proposed_merge→merge exactly once.
+
+    A second claim (concurrent double-apply) loses; a claim after a reject also
+    loses. This is the TOCTOU / double-apply lock at the SQL boundary.
+    """
+    a = await _mk_entity(db, "cl", "cl")
+    b = await _mk_entity(db, "cll", "cll")
+    pk = adj_crud.pair_key(a, b)
+    await adj_crud.record_verdict(
+        db, entity_a=a, entity_b=b, verdict="proposed_merge", loser_id=b, survivor_id=a
+    )
+    await adj_crud.approve(db, pair_key=pk, approved_by="jay")
+
+    first = await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=b, survivor_id=a)
+    second = await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=b, survivor_id=a)
+    assert first is True and second is False
+    assert (await adj_crud.get_by_pair(db, a, b))["verdict"] == "merge"
+
+
+@pytest.mark.asyncio
+async def test_claim_fails_after_reject(db):
+    """A reject landing before the claim (read-then-apply TOCTOU) blocks the apply."""
+    a = await _mk_entity(db, "rj", "rj")
+    b = await _mk_entity(db, "rjj", "rjj")
+    pk = adj_crud.pair_key(a, b)
+    await adj_crud.record_verdict(
+        db, entity_a=a, entity_b=b, verdict="proposed_merge", loser_id=b, survivor_id=a
+    )
+    await adj_crud.approve(db, pair_key=pk, approved_by="jay")
+    await adj_crud.reject(db, pair_key=pk, reason="not the same")
+    claimed = await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=b, survivor_id=a)
+    assert claimed is False
+    assert await _status(db, b) == "active"  # never merged
+
+
+@pytest.mark.asyncio
+async def test_apply_negative_budget_applies_nothing(db):
+    """A negative budget (SQLite LIMIT -1 = unlimited) must apply NOTHING, not everything."""
+    a = await _mk_entity(db, "nb", "nb")
+    b = await _mk_entity(db, "nbb", "nbb")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="nb",
+        norm_b="nbb",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="jay")
+
+    counts = await adj.apply_approved_merges(db, budget=-1)
+
+    assert counts["merged"] == 0
+    assert await _status(db, b) == "active"  # the approved merge was NOT bulk-applied
+    # And the crud query itself refuses to dump the table on a negative limit.
+    assert await adj_crud.list_proposed_merges(db, limit=-1, approved_only=True) == []
+
+
+@pytest.mark.asyncio
+async def test_apply_stale_when_stored_direction_absent(db):
+    """A proposal missing a stored survivor/loser can't be honored → marked stale."""
+    a = await _mk_entity(db, "sd", "sd")
+    b = await _mk_entity(db, "sdd", "sdd")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=None,
+        survivor_id=None,
+        norm_a="sd",
+        norm_b="sdd",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="jay")
+
+    counts = await adj.apply_approved_merges(db, budget=10)
+
+    assert counts["merged"] == 0 and counts["stale"] == 1
+    assert await _status(db, b) == "active"

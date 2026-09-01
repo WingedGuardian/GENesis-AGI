@@ -105,7 +105,7 @@ async def test_prune_merge_journal_by_age(db):
 
 @pytest.mark.asyncio
 async def test_prune_merge_journal_noops_when_table_absent():
-    """Prune no-ops (returns 0) before migration 0086 lands — table-existence guard."""
+    """Prune no-ops (returns 0) before the approval-gate migration lands — table-existence guard."""
     conn = await aiosqlite.connect(":memory:")
     try:
         deleted = await ec.prune_merge_journal(
@@ -114,3 +114,26 @@ async def test_prune_merge_journal_noops_when_table_absent():
         assert deleted == 0
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_days", [-1, -365, 0])
+async def test_prune_merge_journal_rejects_sub_one_retention(db, bad_days):
+    """A sub-1-day retention window must be REFUSED, not applied.
+
+    With ``older_than_days <= 0`` the cutoff lands at/after ``now`` (a negative
+    subtracts a negative), so ``merged_at < cutoff`` would match EVERY row and
+    delete the whole reversibility journal. The prune must raise instead of
+    executing that DELETE, and every existing snapshot must survive.
+    """
+    await db.execute(
+        "INSERT INTO entity_merge_journal (id, loser_id, survivor_id, merged_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("keep", "L1", "S1", "2020-01-01T00:00:00+00:00"),
+    )
+    await db.commit()
+    with pytest.raises(ValueError, match="retention window|>= 1"):
+        await ec.prune_merge_journal(db, older_than_days=bad_days, now="2026-08-25T12:00:00+00:00")
+    # The DELETE must never have run — the journal is intact.
+    cur = await db.execute("SELECT id FROM entity_merge_journal")
+    assert {r[0] for r in await cur.fetchall()} == {"keep"}
