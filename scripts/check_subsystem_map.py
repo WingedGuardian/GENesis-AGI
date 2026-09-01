@@ -188,6 +188,18 @@ def check_staleness(entries: list[Entry], threshold: int) -> list[str] | None:
 
     warnings: list[str] = []
     for entry in entries:
+        # MERGE NOTE: origin/main landed an equivalent ancestry check from
+        # another session while this branch was open — same bug, found
+        # independently, which is worth recording. The two are RECONCILED here
+        # rather than one being dropped: that version anchored the check to
+        # HEAD, this one anchors it to the DEFAULT BRANCH (below), and the
+        # difference matters in both directions. Against HEAD it cannot see the
+        # case the check exists for — a feature-branch commit IS an ancestor of
+        # its own HEAD, so the pre-squash orphan passes while the PR is open and
+        # dies the moment it merges. Against HEAD it also warns spuriously on any
+        # branch forked BEFORE a stamp main later added, which is noise on an
+        # advisory signal. Its `cat-file` observation is kept as the post-mortem
+        # immediately below, and its wording is folded into the messages.
         paths = [f"src/genesis/{m}" for m in entry.modules]
         # An unresolvable stamp is ONE entry's problem, reported and stepped
         # over. It used to `return None`, which abandoned the pass for EVERY
@@ -197,10 +209,10 @@ def check_staleness(entries: list[Entry], threshold: int) -> list[str] | None:
         # exact failure this file's own guard exists to catch.
         if _git(["cat-file", "-e", f"{entry.verified_sha}^{{commit}}"]) is None:
             warnings.append(
-                f"entry '{entry.name}': verified stamp {entry.verified_sha} is not a commit in "
-                "this history, so its staleness CANNOT be counted — re-verify the entry and "
-                "stamp it with a commit that survives merge (the default-branch tip you "
-                "verified against, never a feature-branch HEAD)"
+                f"entry '{entry.name}': verified stamp {entry.verified_sha} is unresolvable — "
+                "not a commit in this history, so its staleness CANNOT be counted. Re-verify "
+                "the entry and stamp it with a commit that survives merge (the default-branch "
+                "tip you verified against, never a feature-branch HEAD)"
             )
             continue
 
@@ -276,9 +288,9 @@ def main() -> int:
     stale = check_staleness(entries, STALE_COMMIT_THRESHOLD)
     if stale is None:
         print(
-            "subsystem-map guard: staleness check SKIPPED — this is a SHALLOW clone, "
-            "so no entry can be counted (CI needs fetch-depth: 0). An unresolvable "
-            "stamp no longer skips the pass; it is reported per entry."
+            "subsystem-map guard: staleness check SKIPPED (shallow clone, or a git "
+            "call failed/timed out). A full clone (fetch-depth: 0) fixes the shallow case; "
+            "an unresolvable stamp no longer skips the whole check (it warns per-entry)."
         )
     else:
         for warning in stale:

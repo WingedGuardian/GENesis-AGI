@@ -1215,6 +1215,15 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   approval gate) is a STOP-and-discuss, never an auto-fix. Chasing a reviewer's
   green checkmark with a change you believe is wrong is a discipline failure.
   No performative agreement — state the verified fix, or the reasoned pushback.
+- **Waiving the review GATE is not waiving the FINDINGS.** When the user says
+  "skip the review" for a trivial change, that waives the blocking *ceremony*
+  (the gate and its `*-override` sigils — note `# review-override` is the one
+  that waives the findings scan) — it NEVER licenses ignoring a reviewer's
+  *substantive* findings. Read Codex's inline findings
+  (even non-blocking P2s) BEFORE merging even when the gate is waived, and
+  engage each on merits: verify it, then fix or consciously accept with a
+  stated reason. Merging past unread findings on a "skip review" is a trust
+  breach, not obedience. (Origin: #1439 merged past 3 correct Codex P2s.)
 
 ## The Gate Machinery — the sequence, and why it bites
 

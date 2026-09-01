@@ -29,12 +29,28 @@
              the modal's own fetch fails AFTER egoStatus is already populated (the
              normal path — the overview card loads it before the modal opens), the
              body error placeholder below is suppressed by its !egoStatus guard, so
-             the refresh failure would otherwise be invisible. Surface it here. -->
-        <template x-if="$store.genesisDashboard.egoModal.fetch.state === 'error' && $store.genesisDashboard.egoStatus">
+             the refresh failure would otherwise be invisible. Surface it here.
+             A refresh failure AFTER a prior success sets fetch.state='stale' (only a
+             first-ever load failure is 'error'), so match BOTH — checking only
+             'error' let the common stale case slip through silently. -->
+        <template x-if="($store.genesisDashboard.egoModal.fetch.state === 'error' || $store.genesisDashboard.egoModal.fetch.state === 'stale') && $store.genesisDashboard.egoStatus">
           <div class="inline-warning" style="margin-bottom: 0.75rem;">
             ⚠ Live refresh failed — showing last known state.
           </div>
         </template>
+        <!-- In-flight cue over already-visible data: a re-open sets
+             fetch.state='refreshing' (a load with a prior success); a first open
+             sets 'loading' but egoStatus is already populated by the overview card,
+             so the 'loading' spinner below (gated on !egoStatus) stays hidden. Cover
+             BOTH so a slow live fetch over shown data isn't invisible — the header
+             dot shows last-known health, not refresh progress. Restores the progress
+             cue the semantic-verdict header replaced. The aria-live region is
+             PERMANENT and its TEXT toggles (empty when idle → no visual footprint):
+             a live region must stay in the DOM to announce a change; toggling the
+             node's display via x-show would not announce reliably. -->
+        <div aria-live="polite"
+             x-text="($store.genesisDashboard.egoModal.fetch.state === 'refreshing' || ($store.genesisDashboard.egoModal.fetch.state === 'loading' && $store.genesisDashboard.egoStatus)) ? '↻ Refreshing…' : ''"
+             style="text-align: right; font-size: 0.72rem; color: var(--color-text-secondary);"></div>
         <!-- Loading -->
         <div x-show="$store.genesisDashboard.egoModal.fetch.state === 'loading' && !$store.genesisDashboard.egoStatus"
              style="text-align: center; padding: 2rem; color: var(--color-text-secondary);">Loading...</div>

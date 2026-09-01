@@ -510,7 +510,13 @@ _EGO_REDIRECT_SOURCE_PREFIX = "ego_domain_redirect:"
 #: currently UNWIRED (no caller) and stays fail-closed NULL until a wiring commit
 #: stamps it channel-aware. Listed here so the source-coverage guardrail treats
 #: them as consciously-classified, not accidentally-omitted.
-_USER_CONTENT_OBS_SOURCES: frozenset[str] = frozenset({"conversation_intent", "user_reply"})
+#: ``ego_question`` (ego/session.py questions channel) stamps per-row:
+#: ``user_reply`` rows are ``owner`` (the waiter resolves only the owner's
+#: Telegram reply in the delivered chat's own thread), ``no_reply``/
+#: ``not_delivered`` rows are ``first_party`` (pure ego-authored content).
+_USER_CONTENT_OBS_SOURCES: frozenset[str] = frozenset(
+    {"conversation_intent", "user_reply", "ego_question"}
+)
 
 #: Genesis-ANALYSIS sources whose trust follows the ANALYZED session's channel,
 #: NOT the source string: the learning triage pipeline writes these ABOUT a

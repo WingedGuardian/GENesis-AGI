@@ -252,7 +252,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: d71d1d39 2026-08-18
+verified: 975d3944 2026-08-31
 ```
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
@@ -446,7 +446,14 @@ verified: d71d1d39 2026-08-18
   re-run self-validates (re-limit → its own catch re-parks with backoff); exhausted
   parks escalate to `needs_user` with a governed (`rate_limit_park` signal) alert.
   Lever `cc_rate_limit_resume` (off|propose_only|**live**, default live) +
-  `GENESIS_RATE_LIMIT_RESUME_DISABLED`.
+  `GENESIS_RATE_LIMIT_RESUME_DISABLED`. Because the resume rewrites `caller_context`
+  to `rate_limit_resume:<park_id>` (needed for that re-limit lineage), the ORIGINAL
+  dispatch context (`ego_proposal:<id>`) is preserved separately on
+  `DirectSessionRequest.origin_caller_context` — threaded park payload → queue →
+  request → session metadata — and the three ego-dispatch consumers (proposal-outcome
+  recording, the post-exec auditor gate, the on-end follow-through hook) resolve back
+  to it via `rate_limit_park.effective_caller_context`, so a resumed ego dispatch's
+  outcome, audit, and follow-through survive the park→resume (closed 837f8b63).
 
 ## 3. Autonomy & egress gating
 
@@ -457,7 +464,7 @@ gated — that contract is one-directional.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: d8204a0c 2026-08-25
+verified: 84c7259d 2026-08-31
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -477,7 +484,11 @@ verified: d8204a0c 2026-08-25
 - **The Contributor Work-Log posts public GitHub issues, gated like email.** A
   server-side MCP tool (`contributor_issue_propose`, genesis-health) sanitizes a
   curator-drafted issue via the fail-closed `contribution/sanitize.py scan_prose`
-  (title+body+labels — every string that egresses), then HOLDS it: the
+  (title+body+labels — every string that egresses) and enforces the label policy
+  ON THE CONFIGURED PUBLIC TRACKER (fail-closed, AFTER the scan: a proposal missing
+  an `area:*` domain label or a difficulty/environment label —
+  `_AREA_LABELS`/`_ENV_DIFFICULTY_LABELS` — is `rejected` with no row; a
+  human-approved cross-repo post is not subject to the policy), then HOLDS it: the
   `approval_requests` row FIRST, then `pending_issue_posts` (mirroring the email
   gate). By default each hold is per-item owner-approved on the dashboard (excluded
   from `approve_all_pending`, like email). **Autonomous posture (opt-in,
@@ -497,6 +508,27 @@ verified: d8204a0c 2026-08-25
   the drain, incl. approved held rows). Terminal rows pruned >30d via
   `scripts/prune_contributor_issue_posts.py`; held rows never pruned. The
   curator campaigns are LOCAL user data (uncommitted).
+- **Cold marketing-email substrate (PR1) — gated like email, recipient resolved
+  in CODE.** The `marketing_send` MCP tool (genesis-outreach) stages a cold
+  marketing email to a recipient resolved from the owner-curated
+  `marketing_prospects` store by `prospect_id` — the tool takes NO address
+  parameter, so the LLM never supplies a recipient. It refuses unless the
+  `marketing_outreach` lever (`outreach/marketing_config.py`, default `off`,
+  invalid→off, env kill `GENESIS_MARKETING_OUTREACH_DISABLED`) is enabled, the
+  prospect exists, is not opted-out (PERMANENT suppression, never pruned), and its
+  address is RFC-shaped; then enqueues to `pending_outreach` with
+  `labeled_surplus=True` (threaded through the queue so the drain rebuilds a BULK
+  request). Every staged send still converges on the same `_deliver` →
+  `EmailAutonomyGate` chokepoint: the BULK capability cell ships at ASK, so
+  everything HOLDS for owner approval (ships INERT). A GRANTED bulk cell adds a
+  deterministic scope guard (`_scope_guard_trip` g2): the autonomous recipient
+  MUST be a curated, non-opted-out `marketing_prospects` row (authorization is
+  DECOUPLED from send-lifecycle status, so a `contacted` follow-up still sends) —
+  an unknown / opted-out recipient trips (`recipient_not_curated` / `opted_out`)
+  → demote + hold (fail-closed). PR2 will wire graduation, send-time contact
+  stamping, AND a hard per-window cap on hold-creation (the ASK-state
+  approval-flood guard) alongside the batch-approval card — `marketing_send` has
+  no autonomous caller until then.
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
   PII scan for EXTERNAL channels and `content`-category drafts only. Never
   applied to owner channels — don't add them.
@@ -731,7 +763,7 @@ them.
 ```yaml subsystem-map
 entry: ego-self-model
 modules: [ego, identity, deliberation]
-verified: 94be12b3 2026-08-06
+verified: 975d3944 2026-08-31
 ```
 
 - **Two egos, both LIVE**: user ego (CEO, Opus, MCP profile `user_reflection`)
@@ -739,6 +771,16 @@ verified: 94be12b3 2026-08-06
   (~108K). `EgoCadenceManager`: adaptive proactive cycles, morning-report cron,
   30-min mechanical sweep, goal-staleness scans. Review cadence + budget
   controls before adding call sites.
+- **Questions channel (`questions[]` in both output contracts)**: the ego can
+  ASK the user directly — no approval gate (asking is NOTIFY_USER-class).
+  `_process_questions` → ONE sequential background task → outreach
+  `submit_and_wait` (NOTIFICATION category, governance applies); reply →
+  `origin_class="owner"` observation + reactive signal to the ASKING ego
+  (`set_reply_signal_sink` → cadence `push_reactive_event`); timeout/
+  undelivered → first-party observation. Reply waiter is in-memory — restart
+  mid-wait orphans the question (accepted; late reply falls to triage).
+  Sequential delivery is load-bearing: two concurrent waiters in one chat
+  make standalone replies unresolvable (`resolve_scoped_pending`).
 - **`capability_aggregator.py` → `capability_map` table** = per-domain
   self-confidence from up to 6 sources (inverse-confidence weighted; the
   Outcome-Bus feed is flag-gated, default OFF). Reads split by intent: `get_all` and
@@ -862,6 +904,16 @@ verified: 159698d4 2026-07-16
   monitors the host Guardian every awareness tick, incl. git-SHA code-drift
   detection). Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **autonomy zombie-scheduler watchdog** (`autonomy/watchdog.py`, run out-of-process
+  by `genesis-watchdog.timer` every 300s via `watchdog_runner.py`; distinct from the
+  container `watchdog.py` above): reads `~/.genesis/status.json` (written by the runtime's
+  `status_writer_loop`) and RESTARTS the bridge/runtime on status-file staleness, or a
+  specific scheduler on a stale `scheduler_heartbeats` entry (`awareness`/`surplus`,
+  `job_health.last_run` age > 900s) — the "zombie scheduler, alive but not dispatching"
+  case. Restart is deferred while `heavy_workload` is set (dream cycle), during a boot
+  stabilization window, or a network outage; repeated restarts (flap) or max-restarts
+  escalate to a durable owner/Telegram alert. This is why a wedged/dead surplus needs no
+  `subsystem_stale` alert (§9): it is detected and self-healed here at 900s.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
   skill). Known wart: the watchdog's stale-alert wording inverts when the
@@ -993,6 +1045,24 @@ verified: 84c7259d 2026-08-31
   in-memory, per-process, one-generation `_alert_history` dict so incident
   history survives restart. It does NOT drive the ego cadence (ego has its own
   scheduler). Trap: PEP 562 lazy `__init__` — don't eager-import `loop.py`.
+- **Subsystem-cessation alerts (the honest-liveness family, `_compute_alerts`)**:
+  three durable `subsystem_stale`-family alerts so a dead scheduler cannot read
+  healthy. `subsystem_stale:<name>` (ego CRITICAL; inbox/dashboard/outreach WARNING)
+  fires when a subsystem's heartbeat — the freshest valid pulse across the durable
+  `events` table and the in-memory event-bus ring — goes overdue past its per-subsystem
+  `HEARTBEAT_EXPECTED` threshold (via `mcp/health/manifest.py::compute_heartbeat_staleness`);
+  `subsystem_never_started:<name>`
+  tells a FAILED / never-pulsed start (cross-referenced against the persisted bootstrap
+  manifest, past a boot grace) from a fresh install; `subsystem_heartbeat_unknown` covers
+  a corrupt/unreadable pulse. Pause-gated subsystems (`surplus`, `inbox`) downgrade
+  overdue→`paused` while globally paused; conditional-pulse ones (`outreach`, whose
+  channel-independent daemon pulses only while its scheduler runs) are exempt from the
+  never-started inference. **surplus is EXCLUDED** from `subsystem_stale`: its wedged/dead
+  state is owned by the PR-B dashboard tile (a `job_health.surplus_dispatch` signal) and
+  the zombie-scheduler watchdog (§8), and its loop-END event-HB is load-fragile — a healthy
+  15-30 min dispatch legitimately gaps it, so its `HEARTBEAT_EXPECTED` overdue is a generous
+  3h (matching the tile) to avoid crying wolf. reflection/awareness ride the awareness tick's
+  own `tick_overdue`.
 - **scheduled-job telemetry (WS-2 M9)**: `runtime/_job_health.py` keeps the
   cumulative `job_health` row AND now appends per-run `job_run_events` (era
   attribution the cumulative row can't give). Writes are debounced off the
@@ -1171,6 +1241,14 @@ verified: 84c7259d 2026-08-31
   evidence via `ledger_update`; bare hex → proposal; `annotation_exists`
   re-absorb guard protects reopened items), the **fuzzy tier** (headless
   Haiku, echo-numbers-only fail-closed parse) is proposal-only in EVERY mode.
+  Two sibling reconciliation lanes ride the SAME merged PRs to resolve standalone
+  `follow_ups` (target_kind='follow_up', migration 0084): the **follow-up marker
+  lane** (#1397) auto-absorbs a follow_up whose id is cited `Follow-up: <id>` in
+  OUR own PR body; the **issue-close lane** (WS-A) resolves the follow_up that
+  spawned a Genesis-posted contributor issue when a contributor's PR CLOSES that
+  issue (`Closes #N` → `closingIssuesReferences`, joined via
+  `pending_issue_posts.source_ref`; default-branch + same-repo scoped). Both reuse
+  `absorb_followup` + the annotation store + the `annotation_exists` re-absorb guard.
   Store: `repo_pulse_runs`/`_annotations` (migration 0062,
   `UNIQUE(tier,item_id,pr_number)` dedupe; CRUD `db/crud/repo_pulse.py`).
   Cursor (`cursor.json`, gh-format mergedAt watermark) advances monotonically

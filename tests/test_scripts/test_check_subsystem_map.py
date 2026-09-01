@@ -206,7 +206,7 @@ def test_staleness_warns_past_threshold(monkeypatch):
             return "false"
         if args[:2] == ["rev-parse", "--verify"]:
             return None  # no default ref here — the ancestry check stays out of it
-        if args[0] == "cat-file":
+        if args[0] in ("cat-file", "merge-base"):
             return ""
         if args[0] == "rev-list":
             return "999"
@@ -226,7 +226,7 @@ def test_staleness_quiet_under_threshold(monkeypatch):
             return "false"
         if args[:2] == ["rev-parse", "--verify"]:
             return None  # no default ref here — the ancestry check stays out of it
-        if args[0] == "cat-file":
+        if args[0] in ("cat-file", "merge-base"):
             return ""
         if args[0] == "rev-list":
             return "3"
@@ -234,6 +234,50 @@ def test_staleness_quiet_under_threshold(monkeypatch):
 
     monkeypatch.setattr(csm, "_git", fake_git)
     assert csm.check_staleness(entries, threshold=20) == []
+
+
+def test_staleness_unresolvable_stamp_warns_and_keeps_checking(monkeypatch):
+    # One entry's stamp is unresolvable (a pre-squash orphan); the other is stale.
+    # The unresolvable stamp must NOT disable policing for the rest — it warns and
+    # continues, so the stale entry is still caught. (Regression: a single dead stamp
+    # used to `return None` and skip the whole staleness check for every entry.)
+    # Two entries with DISTINCT stamps so one can be singled out as unresolvable.
+    map_text = (
+        "# Genesis\n\n## Memory\n\n```yaml subsystem-map\n"
+        "entry: memory\nmodules: [memory]\nverified: aaaaaaaa 2026-07-07\n```\n\n"
+        "## Platform\n\n```yaml subsystem-map\n"
+        "entry: platform\nmodules: [db]\nverified: bbbbbbbb 2026-07-07\n```\n"
+    )
+    entries, _ = csm.parse_map(map_text)
+    bad = entries[0].verified_sha  # "aaaaaaaa" — distinct from entry[1]'s stamp
+
+    def fake_git(args: list[str]) -> str | None:
+        if args[:2] == ["rev-parse", "--is-shallow-repository"]:
+            return "false"
+        if args[:2] == ["rev-parse", "--verify"]:
+            # MERGE: the resolved implementation resolves a DEFAULT REF once
+            # before the loop, so the ancestry check can ask "would squash-merge
+            # discard this stamp?" rather than "is it an ancestor of HEAD?" —
+            # HEAD cannot answer that, because a feature-branch commit is always
+            # an ancestor of its own HEAD. This stub is taught that call rather
+            # than the assertion being loosened: returning None keeps the
+            # ancestry branch out of THIS test, which is about the post-mortem.
+            return None
+        if args[0] in ("cat-file", "merge-base"):
+            # SUBSTRING, not element equality: `cat-file` is passed the sha with
+            # a `^{commit}` suffix, so the sha is not a distinct element of argv
+            # the way it is for `merge-base`. Matching on equality here silently
+            # made every stamp resolvable and the test asserted nothing.
+            return None if any(bad in a for a in args) else ""
+        if args[0] == "rev-list":
+            return "999"
+        raise AssertionError(f"unexpected git call: {args}")
+
+    monkeypatch.setattr(csm, "_git", fake_git)
+    warnings = csm.check_staleness(entries, threshold=20)
+    assert warnings is not None
+    assert any("unresolvable" in w and bad in w for w in warnings)  # the orphan is surfaced
+    assert any(entries[1].name in w and "commits touched" in w for w in warnings)  # stale still caught
 
 
 def test_staleness_degrades_on_shallow_history(monkeypatch):
@@ -315,6 +359,13 @@ def test_an_unknown_sha_is_reported_and_never_counted(monkeypatch):
     The guarantee it existed to protect is unchanged and asserted more strictly
     here: the fake RAISES on `rev-list`, so any attempt to invent a count for an
     unresolvable sha fails the test rather than merely being unasserted.
+
+    Merge note: origin/main added the same test independently, as
+    `test_staleness_all_stamps_unresolvable_warns_never_blanket_none`. Kept as
+    one test under this name; its point is folded in — every stamp unresolvable
+    yields one warning PER ENTRY, never a blanket None that would mask real
+    staleness for the whole file. A shallow clone remains the only genuine None
+    case (see test_staleness_degrades_on_shallow_history).
     """
     entries, _ = csm.parse_map(MAP_TWO_ENTRIES)
 
@@ -323,7 +374,7 @@ def test_an_unknown_sha_is_reported_and_never_counted(monkeypatch):
             return "false"
         if args[:2] == ["rev-parse", "--verify"]:
             return None  # no default ref here — the ancestry check stays out of it
-        if args[0] == "cat-file":
+        if args[0] in ("cat-file", "merge-base"):
             return None  # sha not present locally
         raise AssertionError(f"must not count commits for an unresolvable sha: {args}")
 
@@ -331,6 +382,8 @@ def test_an_unknown_sha_is_reported_and_never_counted(monkeypatch):
     warnings = csm.check_staleness(entries, threshold=20)
     assert warnings is not None, "one unresolvable stamp must not abandon the pass"
     assert len(warnings) == 2, warnings
+    # Assertion messages carried through from this side; the substring matches the
+    # wording the resolved implementation actually emits.
     assert all("CANNOT be counted" in w for w in warnings), warnings
 
 
