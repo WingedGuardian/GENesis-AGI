@@ -6,6 +6,9 @@
 # into ~/.ssh/config on client devices.
 #
 # Usage: ./scripts/generate-ssh-config.sh
+#
+# Setup + troubleshooting (esp. flaky SSH after a Windows reboot, and the boot
+# self-heal helper): docs/reference/tailscale-ssh-access.md
 
 set -euo pipefail
 
@@ -91,3 +94,8 @@ echo "" >&2
 echo "Windows one-click: create a shortcut whose target is" >&2
 echo "    wt.exe ssh ${TS_HOSTNAME}-lobby     (or:  ssh.exe ${TS_HOSTNAME}-lobby)" >&2
 echo "then pin it to the taskbar — double-click reattaches the whole fleet." >&2
+echo "" >&2
+echo "These aliases are keyed on the Tailscale IP, so they don't need MagicDNS." >&2
+echo "Key any hosts YOU add to ~/.ssh/config on the peer's Tailscale IP too. If SSH" >&2
+echo "is flaky right after a Windows reboot, see the boot self-heal + troubleshooting" >&2
+echo "in docs/reference/tailscale-ssh-access.md." >&2

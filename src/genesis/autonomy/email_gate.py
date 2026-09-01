@@ -126,35 +126,57 @@ class EmailAutonomyGate:
         state = CellState(cell["state"]) if cell else CellState.ASK
 
         if state == CellState.GRANTED:
-            # WS-8 PR-D auto-revert net: deterministic pre-send scope guards.
-            # A trip = scope drift inside the grant → demote (record a correction,
-            # which regresses GRANTED→ASK) AND hold THIS send for owner approval.
+            # WS-8 PR-D auto-revert net: deterministic pre-send scope guards run
+            # FIRST, in EVERY marketing posture — a trip = scope drift inside the
+            # grant (uncurated/opted-out recipient, rate-limit burst) → demote
+            # (record a correction, which regresses GRANTED→ASK) AND hold THIS
+            # send. This drift detector must not be short-circuited by the posture
+            # gate below: a bad recipient is bad regardless of observe/live.
             trip = await self._scope_guard_trip(request, recipient, domain, verb, risk)
-            if trip is None:
-                return GateDecision(
-                    allow=True,
-                    reason="granted",
-                    cell=(domain, verb, risk),
+            if trip is not None:
+                logger.warning(
+                    "Email scope guard '%s' tripped on GRANTED cell %s:%s:%s "
+                    "(recipient=%s) — demoting + holding",
+                    trip,
+                    domain,
+                    verb,
+                    risk,
+                    recipient,
                 )
-            logger.warning(
-                "Email scope guard '%s' tripped on GRANTED cell %s:%s:%s "
-                "(recipient=%s) — demoting + holding",
-                trip,
-                domain,
-                verb,
-                risk,
-                recipient,
+                await cg.record_correction(
+                    self._db,
+                    domain=domain,
+                    verb=verb,
+                    risk_class=risk,
+                    updated_at=now,
+                    # WS-3 gate-3: Genesis's own deterministic scope guard tripped.
+                    origin_class="first_party",
+                )
+                return await self._hold(request, message_text, classification, recipient, now)
+
+            # Scope guards passed. Marketing posture gate: a GRANTED BULK cell may
+            # autonomously send ONLY when the owner has affirmatively set the
+            # marketing lever to `live`. In `observe`/`off` the cell may be granted
+            # but autonomy is withheld → HOLD each send for owner approval, WITHOUT
+            # demoting (an observe posture is a legitimate owner choice, not scope
+            # drift, so flipping to `live` later resumes autonomy with no re-grant).
+            # Keyed on `risk == BULK` (survives the enqueue→drain rebuild, unlike
+            # signal_type). BULK is marketing-only today (the sole labeled_surplus
+            # email path — see the g2 NOTE in _scope_guard_trip); a future
+            # non-marketing BULK path must add its own discriminator here.
+            if risk == RiskClass.BULK.value:
+                from genesis.outreach.marketing_config import (
+                    effective_mode as _marketing_mode,
+                )
+
+                if _marketing_mode() != "live":
+                    return await self._hold(request, message_text, classification, recipient, now)
+
+            return GateDecision(
+                allow=True,
+                reason="granted",
+                cell=(domain, verb, risk),
             )
-            await cg.record_correction(
-                self._db,
-                domain=domain,
-                verb=verb,
-                risk_class=risk,
-                updated_at=now,
-                # WS-3 gate-3: Genesis's own deterministic scope guard tripped.
-                origin_class="first_party",
-            )
-            return await self._hold(request, message_text, classification, recipient, now)
 
         # 4. ASK / NOT_DETERMINED / DENIED → hold for owner approval.
         return await self._hold(request, message_text, classification, recipient, now)
@@ -188,6 +210,35 @@ class EmailAutonomyGate:
             thread_id = getattr(request, "thread_id", None)
             if not await self._recipient_in_thread(thread_id, recipient):
                 return "recipient_mismatch"
+
+        # g2 (primary for BULK cold marketing): the recipient MUST be an active,
+        # non-opted-out prospect in the owner-curated marketing_prospects store.
+        # This is the sole autonomous net once the BULK cell is GRANTED — it binds
+        # every autonomous cold send to the owner's vetted, opt-out-respecting set,
+        # resolved deterministically in CODE (never the LLM).  Fail-closed: an
+        # unknown / opted-out / blank recipient trips (hold + demote), so a
+        # granted bulk cell can never fan out to an address the owner didn't curate.
+        if risk == RiskClass.BULK.value:
+            from genesis.db.crud import marketing_prospects as mp
+
+            # Authorization = CURATED (row exists) AND NOT opted-out, DECOUPLED from
+            # the send-lifecycle status (active/contacted/replied). A contacted
+            # prospect is STILL an authorized recipient (a follow-up touch); only
+            # opt-out revokes authorization. An "active"-status predicate here would
+            # demote the GRANTED cell the instant a send stamps a prospect
+            # 'contacted'. Fail-closed: blank / not-curated / opted-out → trip
+            # (hold + demote). NOTE: the BULK cell is keyed by risk_class only; the
+            # only labeled_surplus EMAIL path today is marketing, so the cell is
+            # marketing-scoped in practice. If another labeled_surplus email path is
+            # ever added, give it its own discriminator so a grant here can't
+            # authorize its (non-prospect) recipients.
+            if not recipient:
+                return "recipient_not_curated"
+            row = await mp.get_by_email(self._db, recipient)
+            if row is None:
+                return "recipient_not_curated"
+            if row.get("opted_out"):
+                return "opted_out"
 
         # g3 (primary): a burst of autonomous sends for one cell = a runaway loop.
         since = (datetime.now(UTC) - _RATE_LIMIT_WINDOW).isoformat()

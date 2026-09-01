@@ -36,11 +36,18 @@ def test_dashboard_page_without_template(client):
 
 
 def test_dashboard_page_contains_operator_controls(client):
-    """Dashboard HTML includes the queue, routing, and budget controls."""
+    """Dashboard HTML includes the queue, routing, and budget controls.
+
+    These assert that each control is PRESENT, so they anchor on the handler or
+    the stable heading rather than on display text. The clear-all check used to
+    match the literal "Clear all reviewed" and broke when that button began
+    reporting how many rows it deletes — a label change, not a missing control,
+    but indistinguishable from one at the assertion.
+    """
     resp = client.get("/genesis")
     assert resp.status_code == 200
     page = resp.get_data(as_text=True)
-    assert "Clear all reviewed" in page
+    assert "clearAllDiscardedItems()" in page
     assert "Reload routing config" in page
     assert "Approval Queue" in page
     assert "Save budget" in page

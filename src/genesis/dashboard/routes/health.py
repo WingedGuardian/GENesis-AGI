@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import time
 from pathlib import Path
 
-from flask import jsonify, request
+from flask import current_app, jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
 
@@ -20,15 +20,81 @@ logger = logging.getLogger(__name__)
 # backstop, well under browser/proxy timeouts.
 _HEALTH_SNAPSHOT_TIMEOUT_S = 15.0
 
-# Snapshot cache — the full snapshot is ~2s; cache it briefly so frequent
-# dashboard/Guardian polls are served instantly without recomputing every time.
-# Defense-in-depth atop the call_sites + gather speedups: even if the snapshot
-# ever regresses, the cache (plus the route timeout) keeps /health responsive
-# and cuts repeated load. Bridge status and the healthy/unhealthy verdict are
-# still computed fresh per request; only the expensive snapshot() is cached.
-_snapshot_cache: dict | None = None
-_snapshot_cache_ts: float = 0.0
+# How stale a /api/genesis/health response may be. The full snapshot is ~2s and
+# every open dashboard tab polls this endpoint every 15s, so it is served from a
+# short-lived cache; the Guardian probe reads the same endpoint. Bridge status
+# and the healthy/unhealthy verdict are still computed fresh per request.
+#
+# The cache itself lives in HealthDataService, NOT here. It used to be three
+# module globals in this file plus a generation counter, with a separate
+# staleness flag inside the service — one concern split across two modules and
+# two threads, which is what produced a defect in three consecutive review
+# rounds. The service owns all of it now and is touched only from the event
+# loop; this module owns only the freshness POLICY, which is what a route
+# should decide.
 _SNAPSHOT_CACHE_TTL_S = 30.0
+
+
+def invalidate_snapshot_cache() -> None:
+    """Force the next /api/genesis/health to recompute, from any thread.
+
+    Call after any mutation to the data the snapshot reads. Without it a
+    ``DELETE`` plus the client's immediate refetch is answered from the cache,
+    so the UI shows a success toast beside the counts it just cleared (observed
+    2026-08-30: "Cleared 148" next to "showing 20 of 148").
+
+    Dropping a cached value is only half of it — a computation already in flight
+    began from pre-mutation state — so this delegates to
+    ``HealthDataService.invalidate()``, which drops the cache AND disowns that
+    compute. Keeping both halves in the service is what lets a single object own
+    the whole freshness contract.
+
+    MARSHALLING is this function's real job. The dashboard is threaded WSGI
+    Flask, so a mutating route reaches this from a request thread: an async
+    route arrives via the worker thread that bridges with
+    ``run_coroutine_threadsafe``, and a sync route (``routes/providers.py``
+    toggles breakers in a plain ``def``) has no running loop at all. Hopping
+    onto the runtime loop here means every field the service owns is read and
+    written from exactly one thread — which is what removes the cross-thread
+    hazards, rather than defending against them field by field.
+
+    The hop is ordered, not merely eventual: ``call_soon_threadsafe`` appends to
+    the loop's ready queue before this returns, and the client's next request is
+    dispatched by a later ``call_soon_threadsafe``, so the invalidation runs
+    first. Best-effort by design — this runs AFTER the caller's mutation has
+    committed, so it must never turn completed work into a 500.
+    """
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    health_data = getattr(rt, "health_data", None)
+    if health_data is None or not hasattr(health_data, "invalidate"):
+        return
+
+    target = None
+    try:
+        target = current_app.config.get("GENESIS_EVENT_LOOP")
+    except RuntimeError:
+        target = None          # outside an app context (tests, direct calls)
+
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+
+    if target is None or target is running:
+        # Already on the runtime loop, or no loop is configured (unit tests, a
+        # non-served runtime). A direct call is correct in both cases.
+        health_data.invalidate()
+        return
+
+    try:
+        target.call_soon_threadsafe(health_data.invalidate)
+    except RuntimeError:
+        # Loop closed mid-shutdown. Nothing is running on it, so nobody can be
+        # served a stale snapshot; invalidate directly rather than raising into
+        # a route whose mutation already committed.
+        health_data.invalidate()
 
 
 @blueprint.route("/api/genesis/health")
@@ -41,15 +107,10 @@ async def health_snapshot():
     if not rt.is_bootstrapped or rt.health_data is None:
         return jsonify({"status": "unhealthy", "error": "not bootstrapped"}), 503
 
-    global _snapshot_cache, _snapshot_cache_ts
-    now_mono = time.monotonic()
-    if _snapshot_cache is not None and (now_mono - _snapshot_cache_ts) < _SNAPSHOT_CACHE_TTL_S:
-        snapshot = dict(_snapshot_cache)
-    else:
-        fresh = await rt.health_data.snapshot()
-        _snapshot_cache = fresh
-        _snapshot_cache_ts = now_mono
-        snapshot = dict(fresh)
+    # dict() copy, not the shared object: `bridge` and `status` below are
+    # per-request and must never be written into the cached snapshot other
+    # callers read.
+    snapshot = dict(await rt.health_data.snapshot(max_age_s=_SNAPSHOT_CACHE_TTL_S))
 
     status_path = Path.home() / ".genesis" / "status.json"
     bridge_health = None

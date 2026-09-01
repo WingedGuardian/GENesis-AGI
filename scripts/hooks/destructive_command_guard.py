@@ -100,12 +100,24 @@ def _rm_violations(cmd: str) -> list[str] | None:
     """Reasons to block, or None when the command cannot be tokenized."""
     # Line-continuations and bare newlines must be handled BEFORE shlex, which
     # drops a bare newline as whitespace (so a following command would fold into
-    # the first rm's operands). These replacements only ever insert spaces/`;`,
-    # never quote or escape characters, so they cannot corrupt shlex's quote
-    # balance. Redirections are NOT stripped here — they are recognized at the
-    # token level after shlex (see _REDIR_TOKEN), so shlex stays the sole
-    # authority on quoting/escaping.
-    cmd = cmd.replace("\\\n", " ").replace("\n", " ; ")
+    # the first rm's operands) and keeps an escaped newline INSIDE the token.
+    #
+    # A backslash-newline is folded to NOTHING, because that is what the shell
+    # does: it is deleted, and the characters either side of it become one word.
+    # An earlier version folded it to a space, which SPLITS a word the shell
+    # joins. Measured: that let a continuation placed inside an option token turn
+    # a recursive-force removal of a protected path into two tokens the guard
+    # recognized as neither, and the command was allowed. The guard must read
+    # the command the shell will run, not a nearby one. (Inside single quotes
+    # the shell keeps the sequence literally; folding it there only changes the
+    # spelling of one operand, never its depth or its flags.)
+    #
+    # These replacements delete a continuation or insert whitespace/`;`, never
+    # quote or escape characters, so they cannot corrupt shlex's quote balance.
+    # Redirections are NOT stripped here — they are recognized at the token
+    # level after shlex (see _REDIR_TOKEN), so shlex stays the sole authority on
+    # quoting/escaping.
+    cmd = cmd.replace("\\\n", "").replace("\n", " ; ")
     # Space glued command separators (`x;y`, `a&&b`) into standalone tokens so
     # the operand loop stops at them; a redirection `&` is preserved.
     spaced = _SEPARATOR_SPACING.sub(r" \1 ", cmd)
@@ -117,7 +129,18 @@ def _rm_violations(cmd: str) -> list[str] | None:
     violations: list[str] = []
     i = 0
     while i < len(tokens):
-        if os.path.basename(tokens[i]) != "rm":
+        # Resolve `rm` through a shell subshell opener GLUED to the command
+        # (`(rm`). This guard scans every token, so SPACED control forms
+        # (`( rm`, `then rm`, `{ rm`) already tokenize `rm` standalone; only the
+        # glued opener hid it (`basename("(rm") == "(rm"`), a `(rm -rf /)` bypass.
+        # Strip AT MOST ONE leading `(`: a single `(rm` is a real subshell rm
+        # (block), but a doubled `((rm` is bash ARITHMETIC (`((…))` evaluates an
+        # expression, runs no command) → leaving it as `(rm` (basename != rm)
+        # correctly skips it. A glued trailing `)` on the target needs no handling
+        # — it keeps a dangerous target shallow (`/)` → depth 1), which
+        # _check_target blocks.
+        core = tokens[i][1:] if tokens[i].startswith("(") else tokens[i]
+        if os.path.basename(core) != "rm":
             i += 1
             continue
 

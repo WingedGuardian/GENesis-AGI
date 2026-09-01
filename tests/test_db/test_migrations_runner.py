@@ -10,6 +10,21 @@ import pytest
 from genesis.db.migrations.runner import MigrationRunner
 
 
+@pytest.fixture(autouse=True)
+def _isolate_real_migration_filesystem(tmp_path, monkeypatch):
+    """This suite runs REAL migrations (via run_pending on the real dir), and
+    migration 0086 is the only one that touches a real user file — it seeds
+    ``~/.genesis/config/genesis.yaml`` from ``USER_TIMEZONE`` (env, else parsed
+    from ``secrets.env`` on the update.sh CLI path). Sandbox HOME + SECRETS_PATH to
+    tmp and clear USER_TIMEZONE so the runner suite can never read the install's
+    real secrets.env or write its real config (it no-ops here). Scoped to THIS
+    file to avoid disturbing suites that manage their own secrets.env (e.g. backup).
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SECRETS_PATH", str(tmp_path / "isolated-secrets.env"))
+    monkeypatch.delenv("USER_TIMEZONE", raising=False)
+
+
 @pytest.fixture()
 async def db(tmp_path):
     db_path = tmp_path / "test.db"

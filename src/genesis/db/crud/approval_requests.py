@@ -20,7 +20,9 @@ import aiosqlite
 #           manual:* (operator sessions), "user" (autonomy/approval.py default)
 #   system: "system" (approval.py cancel()), timeout_auto_expire
 #           (approval_gate.py), alarm_cleared (sentinel/dispatcher.py),
-#           cleanup:* (housekeeping jobs)
+#           cleanup:* (housekeeping jobs), genesis:* (autonomous Genesis-vetted
+#           self-approvals, e.g. genesis:contributor-worklog in
+#           mcp/health/contributor_issue.py when require_approval is off)
 #   blank/None → system: bulk expiry (expire_timed_out below) never writes
 #           resolved_by — no human acted on those rows.
 HUMAN_RESOLVER_PREFIXES: tuple[str, ...] = (
@@ -35,6 +37,7 @@ SYSTEM_RESOLVER_PREFIXES: tuple[str, ...] = (
     "timeout_auto_expire",
     "cleanup:",
     "alarm_cleared",
+    "genesis:",  # autonomous Genesis-vetted self-approval (NOT human-earned authority)
 )
 
 

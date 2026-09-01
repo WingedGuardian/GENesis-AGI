@@ -1617,14 +1617,43 @@ function showDefaultPanel() {
 
 // ── Discarded items — iLO-style expand/clear ────────────────────────
 
+// The ONE reader of the discarded payload on this page. Mirrors the accessor in
+// dashboard.js, deliberately identically: the backend reconciles the uncapped
+// depth and the LIMIT-20 sample into a single object, so no render surface picks
+// between two numbers that can disagree. Normalises only for TRANSPORT damage —
+// an older server with no object, a queues section replaced by an error marker,
+// a non-numeric total — never to re-derive what the backend already decided.
+function normalizeDiscarded(queues) {
+    const d = queues && queues.discarded;
+    if (!d || typeof d !== 'object') {
+        return { known: false, total: 0, totalLabel: '0+', sample: [], truncated: false };
+    }
+    const sample = Array.isArray(d.sample) ? d.sample : [];
+    const known = d.known === true && Number.isFinite(d.total);
+    // max() floor: never print a number below the rows on screen. Prefer the
+    // producer's truncation verdict — it knows the sample hit its cap, which is
+    // invisible here when a failed count leaves total === sample.length.
+    const reported = Number.isFinite(d.total) ? d.total : sample.length;
+    const total = Math.max(reported, sample.length);
+    const truncated = d.sample_truncated === true || total > sample.length;
+    // See dashboard.js: `total` is a floor when the depth is unknown, so every
+    // render site takes the label and none re-derives the distinction.
+    const totalLabel = known ? String(total) : total + "+";
+    return { known: known, total: total, totalLabel: totalLabel, sample: sample, truncated: truncated };
+}
+
 function renderDiscardedItems(container, queues) {
-    const items = queues.discarded_items || [];
-    const count = queues.discarded_count || items.length;
-    if (count === 0) return;
+    const d = normalizeDiscarded(queues);
+    const items = d.sample;
+    // Render whenever rows exist OR the depth is unknown. Returning early on a
+    // zero we never measured is how a backlog once rendered as nothing at all.
+    if (d.known && d.total === 0) return;
 
     // Toggle header
     const toggle = el('div', 'discarded-toggle');
-    const toggleText = el('span', null, 'Discarded (' + count + ')');
+    const toggleText = el('span', null, d.truncated
+        ? 'Discarded (' + d.totalLabel + ', showing ' + items.length + ')'
+        : 'Discarded (' + d.totalLabel + ')');
     const arrow = el('span', 'arrow', '\u25B6');
     toggle.appendChild(toggleText);
     toggle.appendChild(arrow);
@@ -1658,8 +1687,8 @@ function renderDiscardedItems(container, queues) {
         if (item.attempts > 0) meta.push(item.attempts + ' attempts');
         meta.push('age: ' + formatAge(item.age_s));
         if (item.discarded_at) {
-            const d = new Date(item.discarded_at);
-            meta.push('at ' + d.toLocaleTimeString());
+            const dt = new Date(item.discarded_at);
+            meta.push('at ' + dt.toLocaleTimeString());
         }
         card.appendChild(el('div', 'di-row', meta.join(' | ')));
 
@@ -1675,9 +1704,17 @@ function renderDiscardedItems(container, queues) {
         details.appendChild(card);
     }
 
-    // Clear All button
-    if (items.length > 1) {
-        const clearAllBtn = el('button', 'clear-btn clear-all-btn', 'Clear All Discarded (' + count + ')');
+    // Clear All button.
+    //
+    // Shown whenever the delete would do more than the per-row controls already
+    // offer — more rows exist than are listed, more than one row is listed, or
+    // the depth could not be read at all. That last case matters: the DELETE
+    // removes every discarded/expired row regardless, so withholding the control
+    // because the COUNT failed leaves a backlog with no way to clear it, which
+    // is the defect this page shipped.
+    if (!d.known || d.truncated || d.total > 1) {
+        const clearAllBtn = el('button', 'clear-btn clear-all-btn',
+            'Clear All Discarded (' + d.totalLabel + ')');
         clearAllBtn.addEventListener('click', function() {
             clearDiscardedItem('all').then(function() { fetchHealth(); });
         });

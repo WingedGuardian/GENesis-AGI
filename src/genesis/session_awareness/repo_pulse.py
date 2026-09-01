@@ -24,8 +24,14 @@ Two tiers, two postures:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
+from datetime import datetime
+from pathlib import Path
+
+from genesis.env import genesis_home
+from genesis.session_awareness.pr_watch import _parse_ts
 
 PULSE_MODEL = "claude-haiku-4-5-20251001"  # arbiter/extractor smoke-tested contract
 # 240s (was 120): live E2E measured 67s/122s/84s per call with TTFT alone
@@ -199,6 +205,76 @@ def match_followup(prs: list[dict], followups: list[dict]) -> list[dict]:
     return matches
 
 
+def _ref_repo(ref: dict) -> str:
+    """``owner/name`` of a ``closingIssuesReferences`` entry, or '' if malformed.
+
+    Matches the JSON shape ``gh pr list --json closingIssuesReferences`` returns:
+    ``{"number": N, "repository": {"name": ..., "owner": {"login": ...}}, "url": ...}``.
+    """
+    repository = ref.get("repository") or {}
+    owner = (repository.get("owner") or {}).get("login") or ""
+    name = repository.get("name") or ""
+    return f"{owner}/{name}" if owner and name else ""
+
+
+def match_closed_issues(
+    prs: list[dict],
+    posted_index: dict[int, str],
+    followup_index: dict[str, dict],
+    *,
+    run_repo: str,
+    default_branch: str,
+) -> list[dict]:
+    """Deterministic 'a contributor PR closed a Genesis-posted issue' matches (WS-A).
+
+    The contributor analogue of ``match_followup``. A merged PR carrying a
+    ``Closes #N`` keyword (→ GitHub's ``closingIssuesReferences``) that closes an
+    issue Genesis posted for a follow_up resolves that follow_up — closing the
+    tracking loop the ``Follow-up: <id>`` marker lane can't (contributors cite the
+    ISSUE, not our internal follow_up id). Keyed on the closed issue number:
+    ``posted_index`` maps ``issue_number → follow_up id`` (POSTED, follow_up-sourced
+    rows only), ``followup_index`` maps ``id → open follow_up row``. ``via='closes'``
+    is absorb-eligible — a ``Closes`` keyword is an explicit completion signal (like
+    a ``Follow-up:`` marker), not a bare mention.
+
+    Two safety filters, both verified against the real gh JSON shape:
+    - **default-branch only** — GitHub auto-closes a linked issue only when the PR
+      merges to the default branch, so a PR merged to a release/feature branch that
+      carries ``Closes #N`` (and does NOT close the issue) must not absorb the
+      follow_up. Gate on ``pr['baseRefName'] == default_branch``.
+    - **same-repo only** — ``closingIssuesReferences`` can name a foreign repo
+      (``Closes owner/other#5``); a foreign ``#N`` must not collide with a
+      same-numbered local issue. Keep only refs whose repository == ``run_repo``.
+
+    One match per ``(follow_up, pr)`` pair; result dicts share ``match_followup``'s
+    ``{item, pr, via}`` shape so the worker treats every exact lane uniformly. Pure
+    over dicts — the DB reads that build the two indexes live in the worker.
+    """
+    if not run_repo or not default_branch:
+        return []  # unresolved scoping → never match (fail-safe; worker also gates)
+    matches: list[dict] = []
+    for pr in prs:
+        if str(pr.get("baseRefName") or "") != default_branch:
+            continue
+        seen_items: set[str] = set()
+        for ref in pr.get("closingIssuesReferences") or []:
+            if not isinstance(ref, dict):
+                continue  # defensive: drop a malformed ref (gh JSON-shape drift)
+            if _ref_repo(ref) != run_repo:
+                continue
+            number = ref.get("number")
+            if not isinstance(number, int) or isinstance(number, bool):
+                continue
+            followup_id = posted_index.get(number)
+            if not followup_id:
+                continue
+            item = followup_index.get(str(followup_id))
+            if item is not None and item["id"] not in seen_items:
+                seen_items.add(item["id"])
+                matches.append({"item": item, "pr": pr, "via": "closes"})
+    return matches
+
+
 def build_fuzzy_prompt(
     open_items: list[dict], prs: list[dict]
 ) -> tuple[str, list[dict], list[dict]]:
@@ -318,3 +394,110 @@ def _parse_match(match: object, n_items: int, n_prs: int) -> dict | None:
         "confidence": round(float(confidence), 4),
         "reason": reason.strip()[:300],
     }
+
+
+# ── Open-PR lane (session-manager PR-4c): age-stale open-PR surface ──────────
+# The worker fetches the open-PR set into a home-anchored cache; the SessionStart
+# hook reads it, computes staleness client-side, and surfaces the age-stale ones
+# passively inline. Pure functions (no I/O) live here; the cache/seen PATHS are
+# home-anchored so the worker (writer) and hook (reader) agree without threading
+# the worker's state root through the hook.
+
+
+def _pulse_home() -> Path:
+    """Repo-pulse state dir (matches the worker's ``_pulse_root``). Anchored on
+    the canonical ``genesis_home()`` — which honors ``GENESIS_HOME`` — so a
+    relocated install keeps its runtime state together and the worker (writer)
+    and hook (reader) resolve the SAME directory (a bare ``Path.home()`` would
+    split them apart whenever ``GENESIS_HOME`` is set)."""
+    return genesis_home() / "repo_pulse"
+
+
+def open_prs_cache_path() -> Path:
+    """Worker-owned raw open-PR snapshot (fetch cache)."""
+    return _pulse_home() / "open_prs.json"
+
+
+def open_prs_seen_path() -> Path:
+    """Hook-owned seen-map for the open-PR surface (self-pruning sidecar)."""
+    return _pulse_home() / "open_prs_seen.json"
+
+
+def _is_bot_author(author: dict) -> bool:
+    """Whether a PR author is a bot — trust gh's ``is_bot`` flag, fall back to a
+    ``[bot]`` login suffix (dependabot/renovate)."""
+    if not isinstance(author, dict):
+        return False
+    if author.get("is_bot"):
+        return True
+    return str(author.get("login") or "").endswith("[bot]")
+
+
+def select_stalled_open_prs(prs: list[dict], *, now: datetime, stale_days: int) -> list[dict]:
+    """Annotate open PRs with ``stale_days`` (``updatedAt`` vs the INJECTED
+    ``now`` — no wall-clock read) and keep those idle for >= ``stale_days``,
+    stalest first. A row with an unparseable ``updatedAt`` is skipped (can't age
+    it). Purely age + list-fields — NO CI/review inference (honest to what
+    ``gh pr list`` returns)."""
+    out: list[dict] = []
+    for pr in prs:
+        if not isinstance(pr, dict) or not isinstance(pr.get("number"), int):
+            continue
+        updated = _parse_ts(pr.get("updatedAt"))
+        if updated is None:
+            continue
+        age_days = (now - updated).total_seconds() / 86400.0
+        if age_days < stale_days:
+            continue
+        author = pr.get("author") if isinstance(pr.get("author"), dict) else {}
+        out.append(
+            {
+                "number": pr["number"],
+                "title": str(pr.get("title") or ""),
+                "url": str(pr.get("url") or ""),
+                "stale_days": int(age_days),
+                "is_draft": bool(pr.get("isDraft")),
+                "mergeable": pr.get("mergeable"),
+                "is_bot": _is_bot_author(author),
+                "author_login": str(author.get("login") or ""),
+            }
+        )
+    out.sort(key=lambda p: p["stale_days"], reverse=True)
+    return out
+
+
+def format_open_pr_clause(pr: dict) -> str:
+    """One open PR → a short clause, e.g. ``#1379 (12d, dependabot, draft)``.
+    NEVER prints CI state or 'ready to merge' — age + coarse tags only."""
+    tags: list[str] = []
+    if pr.get("is_bot"):
+        login = str(pr.get("author_login") or "").lower()
+        tags.append("dependabot" if "dependabot" in login else "bot")
+    if pr.get("is_draft"):
+        tags.append("draft")
+    suffix = f", {', '.join(tags)}" if tags else ""
+    return f"#{pr['number']} ({pr['stale_days']}d{suffix})"
+
+
+def format_open_pr_injection(lines: list[str], stale_days: int, *, capped: bool = False) -> str:
+    """The single inline line for the open-PR surface. Empty -> ''. The header
+    count is the TRUE total (shown clauses + any '+N more' overflow). When ``capped``
+    (the worker's fetch hit its limit, so the open set is only partially known) the
+    count is rendered as a floor (``≥N``) — an honest lower bound, never a silent
+    exact count. NEVER says 'ready to merge' — a visibility nudge, not a merge signal."""
+    if not lines:
+        return ""
+    shown = [ln for ln in lines if not ln.startswith("+")]
+    overflow = 0
+    for ln in lines:
+        if ln.startswith("+") and ln.endswith(" more"):
+            with contextlib.suppress(ValueError):
+                overflow = int(ln[1 : -len(" more")])
+    total = len(shown) + overflow
+    noun = "PR" if total == 1 else "PRs"
+    count = f"≥{total}" if capped else str(total)
+    return (
+        f"[Open PRs] {count} open {noun} idle ≥{stale_days}d — "
+        + " · ".join(lines)
+        + '. Ask "show PRs" to review.'
+    )

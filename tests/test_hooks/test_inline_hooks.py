@@ -456,67 +456,10 @@ class TestBashHookRmRf:
         assert result.returncode == 0, result.stderr
 
 
-# ---------------------------------------------------------------------------
-# Bash hook: piped background command (empty-output trap)
-# ---------------------------------------------------------------------------
-
-
-class TestBashHookBackgroundPipe:
-    """Block a real pipe in a run_in_background command (produces empty output).
-
-    Regression: the check was `grep -qF "|"`, which also matched the `|` inside
-    a logical-OR `||` — so a backgrounded `a || b` was falsely blocked once
-    #1227 revived the guard. The fix strips `||` before testing for a pipe.
-    """
-
-    def test_logical_or_background_allowed(self, bash_hook_command: str) -> None:
-        """`grep ... || echo` with run_in_background=true -> allowed (no pipe)."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "grep -q foo file || echo none", "run_in_background": True},
-        )
-        assert result.returncode == 0, result.stderr
-
-    def test_logical_or_foreground_allowed(self, bash_hook_command: str) -> None:
-        """`a || b` foreground -> allowed (the guard only fires on background)."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "a || b", "run_in_background": False},
-        )
-        assert result.returncode == 0
-
-    def test_real_pipe_background_blocked(self, bash_hook_command: str) -> None:
-        """A genuine pipe with run_in_background=true -> BLOCKED (empty output)."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "cat x | grep y", "run_in_background": True},
-        )
-        assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
-
-    def test_pipe_both_streams_background_blocked(self, bash_hook_command: str) -> None:
-        """`|&` (pipe stdout+stderr) with run_in_background=true -> BLOCKED."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "make |& tee log", "run_in_background": True},
-        )
-        assert result.returncode == 2
-
-    def test_logical_or_then_pipe_background_blocked(self, bash_hook_command: str) -> None:
-        """`a || b | c` background -> BLOCKED (a real pipe survives the || strip)."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "a || b | c", "run_in_background": True},
-        )
-        assert result.returncode == 2
-
-    def test_real_pipe_foreground_allowed(self, bash_hook_command: str) -> None:
-        """A pipe in the FOREGROUND is fine — the trap is background-only."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "cat x | grep y", "run_in_background": False},
-        )
-        assert result.returncode == 0
+# NOTE: the run_in_background pipe check moved OUT of the inline mega-guard into a
+# dedicated Python hook (scripts/hooks/background_pipe_guard.py, quote/redirect-aware
+# via shell_parse.has_top_level_pipe) — see tests/test_hooks/test_background_pipe_guard.py.
+# The inline guard no longer reads run_in_background.
 
 
 # ---------------------------------------------------------------------------
@@ -609,26 +552,23 @@ class TestBashHookGitPushForce:
 
 
 class TestBashHookGitResetHard:
-    """Block git reset --hard."""
+    """The inline blob is the dependency-free BLOCK FLOOR for `git reset --hard`
+    (2026-08-24 recoverability redesign): deciding destructiveness from argv is an
+    open-set parser problem, so the Python guard (git_discard_guard.py) no longer
+    blocks — it only SNAPSHOTS for recovery. The crude substring block is an honest
+    best-effort speed-bump that holds even on a fresh checkout with no venv. These
+    assert the inline guard OWNS reset --hard (returncode 2)."""
 
-    def test_git_reset_hard_blocked(self, bash_hook_command: str) -> None:
-        """git reset --hard -> BLOCKED."""
+    def test_git_reset_hard_inline_blocked(self, bash_hook_command: str) -> None:
         result = run_hook(bash_hook_command, {"command": "git reset --hard"})
         assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
-        assert "git stash" in result.stderr  # suggests alternative
 
-    def test_git_reset_hard_with_ref_blocked(self, bash_hook_command: str) -> None:
-        """git reset --hard HEAD~3 -> BLOCKED."""
+    def test_git_reset_hard_with_ref_inline_blocked(self, bash_hook_command: str) -> None:
         result = run_hook(bash_hook_command, {"command": "git reset --hard HEAD~3"})
         assert result.returncode == 2
 
-    def test_git_reset_hard_origin_blocked(self, bash_hook_command: str) -> None:
-        """git reset --hard origin/main -> BLOCKED."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "git reset --hard origin/main"},
-        )
+    def test_git_reset_hard_origin_inline_blocked(self, bash_hook_command: str) -> None:
+        result = run_hook(bash_hook_command, {"command": "git reset --hard origin/main"})
         assert result.returncode == 2
 
     def test_git_reset_soft_allowed(self, bash_hook_command: str) -> None:
@@ -653,38 +593,35 @@ class TestBashHookGitResetHard:
 
 
 class TestBashHookGitClean:
-    """Block git clean with force flags."""
+    """The inline blob NO LONGER owns `git clean` (2026-08-24 recoverability
+    redesign). clean is UNrecoverable (`git stash create` can't capture untracked
+    files), so it needs a REAL block — but deciding a clean's destructiveness from
+    a quote-NAIVE inline regex mis-fires on `git checkout clean-branch`,
+    `git commit -m "clean up"`, etc. So clean is now owned by the precise,
+    quote-aware tracked guard git_discard_guard.py (invoked via
+    bash_safety_hook.sh globally + the project git_discard_guard hook), EXACTLY as
+    force-push and worktree-remove were moved out of this blob to their tracked
+    guards. The inline blob must NOT block clean (returncode 0) — see
+    tests/test_scripts/test_bash_safety_hook.py::TestGitCleanFloor for the real
+    enforcement, and test_git_discard_guard.py for the guard's closed-set logic."""
 
-    def test_git_clean_f_blocked(self, bash_hook_command: str) -> None:
-        """git clean -f -> BLOCKED."""
-        result = run_hook(bash_hook_command, {"command": "git clean -f"})
-        assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
-
-    def test_git_clean_fd_blocked(self, bash_hook_command: str) -> None:
-        """git clean -fd -> BLOCKED."""
-        result = run_hook(bash_hook_command, {"command": "git clean -fd"})
-        assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
-
-    def test_git_clean_fdx_blocked(self, bash_hook_command: str) -> None:
-        """git clean -fdx -> BLOCKED (contains 'git clean -fd')."""
-        result = run_hook(bash_hook_command, {"command": "git clean -fdx"})
-        assert result.returncode == 2
-
-    def test_git_clean_fx_blocked(self, bash_hook_command: str) -> None:
-        """git clean -fx -> BLOCKED (contains 'git clean -f')."""
-        result = run_hook(bash_hook_command, {"command": "git clean -fx"})
-        assert result.returncode == 2
-
-    def test_git_clean_n_allowed(self, bash_hook_command: str) -> None:
-        """git clean -n -> allowed (dry run, no -f)."""
-        result = run_hook(bash_hook_command, {"command": "git clean -n"})
-        assert result.returncode == 0
-
-    def test_git_clean_nd_allowed(self, bash_hook_command: str) -> None:
-        """git clean -nd -> allowed (dry run with directories)."""
-        result = run_hook(bash_hook_command, {"command": "git clean -nd"})
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git clean -f",
+            "git clean -fd",
+            "git clean --force",
+            "git clean -xf",
+            "git clean -f .",
+            "git clean",
+            # the false-blocks a naive inline `clean` match WOULD have caused:
+            "git checkout clean-branch",
+            "git diff clean.py",
+            'git commit -m "clean up the repo"',
+        ],
+    )
+    def test_git_clean_not_inline_blocked(self, bash_hook_command: str, cmd: str) -> None:
+        result = run_hook(bash_hook_command, {"command": cmd})
         assert result.returncode == 0
 
 
@@ -761,17 +698,9 @@ class TestBashHookErrorMessages:
         assert "worktree" in result.stderr.lower()
 
     # (force-push is no longer owned by the inline guard — its PR-suggesting
-    # message now lives in git_push_guard.py / bash_safety_hook.sh.)
-
-    def test_reset_hard_suggests_stash(self, bash_hook_command: str) -> None:
-        result = run_hook(bash_hook_command, {"command": "git reset --hard"})
-        assert result.returncode == 2
-        assert "stash" in result.stderr
-
-    def test_git_clean_suggests_user(self, bash_hook_command: str) -> None:
-        result = run_hook(bash_hook_command, {"command": "git clean -f"})
-        assert result.returncode == 2
-        assert "user" in result.stderr.lower()
+    # message now lives in git_push_guard.py / bash_safety_hook.sh. reset --hard /
+    # git clean messages likewise moved to git_discard_guard.py in the 2026-08
+    # git-discard consolidation — see test_git_discard_guard.py for those.)
 
     def test_rm_rf_suggests_confirm(self, rm_rf_hook_command: str) -> None:
         """rm -rf on shallow path suggests asking the user to confirm."""
@@ -793,11 +722,17 @@ class TestBashHookEdgeCases:
         result = run_hook(bash_hook_command, {"command": ""})
         assert result.returncode == 0
 
+    # These verify the inline blob matches a blocked pattern regardless of command
+    # STRUCTURE (multiline/chained/piped/subshell). The vehicle is an inline-OWNED
+    # block — a pip-install-to-worktree (reset --hard moved to git_discard_guard.py
+    # in the 2026-08 consolidation, so it is no longer an inline-owned vehicle).
+    _INLINE_BLOCKED = "pip install -e .claude/worktrees/foo"
+
     def test_multiline_command_with_blocked(self, bash_hook_command: str) -> None:
-        """Multiline command containing git reset --hard -> BLOCKED."""
+        """Multiline command containing an inline-owned block -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
-            {"command": "echo hello\ngit reset --hard\necho done"},
+            {"command": f"echo hello\n{self._INLINE_BLOCKED}\necho done"},
         )
         assert result.returncode == 2
 
@@ -810,29 +745,26 @@ class TestBashHookEdgeCases:
         assert result.returncode == 2
 
     def test_chained_command_with_blocked(self, bash_hook_command: str) -> None:
-        """Command chained with && containing an inline-owned blocked op -> BLOCKED.
-
-        (Uses `git reset --hard`, still owned by the inline guard; force-push
-        moved to git_push_guard/bash_safety.)"""
+        """Command chained with && containing an inline-owned block -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
-            {"command": "ls -la && git reset --hard"},
+            {"command": f"ls -la && {self._INLINE_BLOCKED}"},
         )
         assert result.returncode == 2
 
     def test_piped_command_with_blocked(self, bash_hook_command: str) -> None:
-        """Piped command containing an inline-owned blocked op -> BLOCKED."""
+        """Piped command containing an inline-owned block -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
-            {"command": "echo yes | git reset --hard"},
+            {"command": f"echo yes | {self._INLINE_BLOCKED}"},
         )
         assert result.returncode == 2
 
     def test_subshell_with_blocked(self, bash_hook_command: str) -> None:
-        """Subshell containing blocked op -> BLOCKED."""
+        """Subshell containing an inline-owned block -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
-            {"command": "$(git reset --hard)"},
+            {"command": f"$({self._INLINE_BLOCKED})"},
         )
         assert result.returncode == 2
 
@@ -1139,8 +1071,8 @@ class TestSettingsStructure:
         assert "rm" in combined and "rf" in combined  # rm -rf in the destructive guard
         assert "git push" in combined  # git_push_guard.py
         assert "--force" in combined or "force" in combined
-        assert "git reset --hard" in combined  # inline blob (kept)
-        assert "git clean" in combined  # inline blob (kept)
+        assert "git reset --hard" in combined  # git_discard_guard.py (referenced)
+        assert "git clean" in combined  # git_discard_guard.py (referenced)
 
     def test_webfetch_hook_checks_youtube(self, webfetch_hook_command: str) -> None:
         """WebFetch hook command contains YouTube pattern check."""

@@ -611,7 +611,13 @@ async def run_extraction_cycle(
                     score_struggle,
                 )
 
-                spine, haystack = build_spine_and_haystack(transcript_path)
+                # Offload the synchronous transcript read+parse to a thread —
+                # `build_spine_and_haystack` iterates a whole JSONL file
+                # (`for line in f`), which wedged the event loop ~1s at a time
+                # from this background extraction job (recall 503s correlated).
+                spine, haystack = await asyncio.to_thread(
+                    build_spine_and_haystack, transcript_path
+                )
                 struggle_score = score_struggle(spine)
                 struggle_triggered = struggle_score >= STRUGGLE_THRESHOLD
                 if (
@@ -788,7 +794,12 @@ async def _drain_procedure_rebuilds(
 
         await queue.mark_processing(item_id)  # increments attempts
         try:
-            spine, haystack = build_spine_and_haystack(transcript_path)
+            # Offload the synchronous transcript read+parse off the event loop
+            # (see the run_extraction_cycle call site) — a whole-file JSONL
+            # parse must not wedge the loop from this background job.
+            spine, haystack = await asyncio.to_thread(
+                build_spine_and_haystack, transcript_path
+            )
             score = score_struggle(spine)
             stored_ids = await asyncio.wait_for(
                 judge_multi_procedure(

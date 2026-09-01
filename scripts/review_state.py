@@ -403,11 +403,6 @@ def mark_reviewed(
         )
     except OSError as e:
         depth_msg = f"evidence unreadable ({e})"
-    # Fix B (e1372b30): if the hand-written SUMMARY didn't pass, a real adversarial
-    # audit may still have run — its file:line findings live in THIS session's
-    # genesis-architect transcript, not the terse summary. Consult it under the SAME
-    # structural bar. Additive (only ever GRANTS recognition a real audit earned) and
-    # fail-closed (any error → summary answer stands).
 
     # Authoritative evidence present — write the per-worktree marker.
     state_file = _state_file(cwd)

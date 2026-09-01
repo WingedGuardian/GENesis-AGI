@@ -217,3 +217,64 @@ async def test_get_daily_cost(db):
     )
     cost = await crud.get_daily_cost(db, "c12", "2026-06-07")
     assert abs(cost - 0.30) < 0.001
+
+
+# --- campaign-name hygiene: strip (never reject) control chars at the write boundary ---
+# The stored name is the single source the job_id (f"campaign_{name}"), log lines, the
+# job_health.job_name column, and (via JobHealthCollector) the reflection note all derive
+# from. An accidental newline/control char there garbles all of them. Strip it once at the
+# DB write; NON-restrictive — any printable name (punctuation, spaces, caps, emoji) is kept.
+
+
+async def test_create_campaign_strips_control_chars_from_name(db):
+    from genesis.db.crud import campaigns as crud
+
+    await crud.create_campaign(
+        db, id="c-strip", name="weekly\ndigest\t2026",
+        strategy_doc_path="/tmp/s.md", cron_cadence="0 */8 * * *",
+        created_at="2026-06-07T00:00:00Z",
+    )
+    row = await crud.get_campaign_by_name(db, "weekly digest 2026")
+    assert row is not None, "name should be stored single-line/stripped"
+    assert row["name"] == "weekly digest 2026"
+    assert "\n" not in row["name"] and "\t" not in row["name"]
+
+
+async def test_create_campaign_preserves_printable_name(db):
+    # Option A is hygiene, NOT an allowlist — expressive printable names are untouched.
+    from genesis.db.crud import campaigns as crud
+
+    await crud.create_campaign(
+        db, id="c-keep", name="Q3 Launch: AGI! 🚀",
+        strategy_doc_path="/tmp/s.md", cron_cadence="0 */8 * * *",
+        created_at="2026-06-07T00:00:00Z",
+    )
+    row = await crud.get_campaign_by_name(db, "Q3 Launch: AGI! 🚀")
+    assert row is not None and row["name"] == "Q3 Launch: AGI! 🚀"
+
+
+async def test_update_campaign_strips_control_chars_from_name(db):
+    from genesis.db.crud import campaigns as crud
+
+    await crud.create_campaign(
+        db, id="c-upd", name="orig",
+        strategy_doc_path="/tmp/s.md", cron_cadence="0 */8 * * *",
+        created_at="2026-06-07T00:00:00Z",
+    )
+    await crud.update_campaign(db, "c-upd", name="new\nname")
+    row = await crud.get_campaign_by_name(db, "new name")
+    assert row is not None and row["name"] == "new name"
+
+
+async def test_update_campaign_non_name_fields_unaffected(db):
+    # A rename-strip must not touch other updated fields.
+    from genesis.db.crud import campaigns as crud
+
+    await crud.create_campaign(
+        db, id="c-upd2", name="keeps",
+        strategy_doc_path="/tmp/s.md", cron_cadence="0 */8 * * *",
+        created_at="2026-06-07T00:00:00Z",
+    )
+    await crud.update_campaign(db, "c-upd2", status="paused")
+    row = await crud.get_campaign_by_name(db, "keeps")
+    assert row is not None and row["status"] == "paused"
