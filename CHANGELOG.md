@@ -11,6 +11,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Contributor-issue close loop.** When an external contributor's merged PR
+  closes a GitHub issue Genesis posted from the Contributor Work-Log (via a
+  `Closes #N` keyword), the repo-pulse worker now auto-resolves the originating
+  follow-up — so shipped contributor work no longer lingers as a false TODO.
+  Scoped to default-branch merges and same-repo references; idempotent, and
+  fails closed on any ambiguity (empty/unresolvable state no-ops; a genuine read
+  failure fails the run and preserves the cursor to re-cover). Gated by the same
+  `repo_pulse` lever. Hardened: the originating follow-up id is resolved to its
+  canonical form at proposal time (a prefix/tagged/uppercase handle resolves to
+  the full id; an ambiguous or unknown handle is rejected rather than stored as a
+  ref the join can never match); and only issues Genesis actually CREATED are
+  treated as authoritative close-links — any issue Genesis merely ADOPTED (a
+  pre-existing open issue with a coincidental same title, or one re-found after a
+  crash) is recorded as adopted and excluded from the join, so a PR closing it never
+  falsely resolves a follow-up. (Adopt provenance no longer relies on issue
+  authorship, which cannot be trusted on a single-account install.)
 - **Contributor issues are labeled by domain and difficulty, enforced at the source.**
   Every issue the Contributor Work-Log proposes must now carry an `area:*` domain
   label (memory/dashboard/runtime/guardian/autonomy/channels/knowledge/eval, or
@@ -39,7 +55,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   init *failure* still surfaces); a *wedged-but-alive* loop is job_health's domain. The
   new `subsystem_stale:outreach` id is handled generically by the existing consumers
   (morning-report dedup by prefix, the Sentinel `subsystem_stale:` disposition).
-
 - **Session-start surface for age-stale open PRs.** The repo-pulse worker now
   also caches the open-PR set each boundary, and a SessionStart hook lists the
   ones idle past a threshold (default 7 days) as one passive inline line —

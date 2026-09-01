@@ -1134,6 +1134,14 @@ verified: ca875c4b 2026-07-24
   evidence via `ledger_update`; bare hex → proposal; `annotation_exists`
   re-absorb guard protects reopened items), the **fuzzy tier** (headless
   Haiku, echo-numbers-only fail-closed parse) is proposal-only in EVERY mode.
+  Two sibling reconciliation lanes ride the SAME merged PRs to resolve standalone
+  `follow_ups` (target_kind='follow_up', migration 0084): the **follow-up marker
+  lane** (#1397) auto-absorbs a follow_up whose id is cited `Follow-up: <id>` in
+  OUR own PR body; the **issue-close lane** (WS-A) resolves the follow_up that
+  spawned a Genesis-posted contributor issue when a contributor's PR CLOSES that
+  issue (`Closes #N` → `closingIssuesReferences`, joined via
+  `pending_issue_posts.source_ref`; default-branch + same-repo scoped). Both reuse
+  `absorb_followup` + the annotation store + the `annotation_exists` re-absorb guard.
   Store: `repo_pulse_runs`/`_annotations` (migration 0062,
   `UNIQUE(tier,item_id,pr_number)` dedupe; CRUD `db/crud/repo_pulse.py`).
   Cursor (`cursor.json`, gh-format mergedAt watermark) advances monotonically
