@@ -5,12 +5,15 @@ Two surfaces, one shared signal (``compute_heartbeat_staleness``):
     heartbeat-emitting subsystem's last durable ``heartbeat`` event is older
     than its per-subsystem overdue threshold (its scheduler/loop stopped — a
     silent death the failure-gap job alarms cannot see). The alert set is
-    ``ego`` (CRITICAL) + ``inbox`` + ``dashboard`` (WARNING). **surplus** is
+    ``ego`` (CRITICAL) + ``inbox`` + ``dashboard`` + ``outreach`` (WARNING).
+    Outreach now has a DEDICATED, channel-independent heartbeat daemon
+    (``outreach/heartbeat.py``, pulses only while its scheduler is running) +
+    an enable-gate (``_outreach_enabled`` = Telegram configured), so it is
+    monitored without the old false-alarm trap (a Telegram-less install is
+    ``_subsystem_enabled('outreach') == False`` → benign). **surplus** stays
     dropped (PR-B's shipped tile already flips red on a wedged/dead surplus via
-    its job_health signal) and **outreach** is dropped (its pulse is
-    config-gated — never fires on a Telegram-less install). reflection/awareness
-    stay excluded (reflection's pulse tracks the awareness loop; awareness has
-    ``awareness:tick_overdue``).
+    its job_health signal). reflection/awareness stay excluded (reflection's
+    pulse tracks the awareness loop; awareness has ``awareness:tick_overdue``).
   - ``compute_heartbeat_staleness`` — the pure per-subsystem verdict the alert
     AND the ego dashboard tile both read, so the two can never disagree. It is
     pause-aware for the pause-gated subsystems ({surplus, inbox}, whose pulse
@@ -48,6 +51,34 @@ async def _seed_heartbeat(db, subsystem: str, age_seconds: float) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_real_bootstrap_manifest(tmp_path):
+    """Hermetic default: no persisted bootstrap manifest.
+
+    ``compute_heartbeat_staleness`` reads ``~/.genesis/bootstrap_manifest.json``
+    (via ``_read_persisted_manifest`` → ``_MANIFEST_FILE``) to compute the
+    never_started verdict. This box HAS that file from its running server; CI does
+    not. Point ``_MANIFEST_FILE`` at an ABSENT path so the REAL reader returns None
+    (fresh-install empty state, benign) unless a test explicitly injects a manifest
+    — install-agnostic + no cross-test leakage. Patching the file path (not the
+    reader) keeps the real read+parse chain live for the integration test."""
+    from genesis.mcp.health import manifest as _m
+
+    absent = tmp_path / "no_such_bootstrap_manifest.json"  # intentionally does not exist
+    with patch.object(_m, "_MANIFEST_FILE", absent):
+        yield
+
+
+def _manifest(mapping: dict[str, str], *, persisted_age_s: float = 0.0) -> dict:
+    """A persisted-manifest dict as ``_read_persisted_manifest`` would return it."""
+    return {
+        "bootstrapped": False,
+        "manifest": mapping,
+        "source": "persisted_manifest",
+        "persisted_at": _iso_ago(persisted_age_s),
+    }
+
+
 # ── compute_heartbeat_staleness (the shared signal) ──────────────────────────
 
 
@@ -71,6 +102,34 @@ async def test_staleness_alive(db):
     await _seed_heartbeat(db, "surplus", age_seconds=10)
     hb = await compute_heartbeat_staleness("surplus", db=db)
     assert hb["status"] == "alive"
+
+
+@pytest.mark.asyncio
+async def test_staleness_surplus_long_dispatch_not_false_overdue(db):
+    """A busy-but-healthy surplus refreshes no event-HB mid-dispatch: its loop-END
+    ``Subsystem.SURPLUS`` pulse gaps for the length of a single long ``dispatch_once``
+    (15-30 min, per ``surplus/scheduler.py``). At the old 600s overdue threshold that
+    false-read 'overdue' — crying wolf in the morning report + ``subsystem_heartbeats``
+    display. The threshold is now aligned to the tile's 3h job_health stall bound, so a
+    ~25-min gap reads 'alive'."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    # 1500s: well past the old 600s, comfortably under the 3h (10800s) threshold.
+    await _seed_heartbeat(db, "surplus", age_seconds=25 * 60)
+    hb = await compute_heartbeat_staleness("surplus", db=db, paused=False)
+    assert hb["status"] == "alive"
+
+
+@pytest.mark.asyncio
+async def test_staleness_surplus_overdue_past_3h(db):
+    """The loosening must NOT blind genuine total cessation: a surplus silent past the
+    3h threshold still reads 'overdue'. (In production the 900s watchdog restarts a real
+    death long before this display bound; this is the honest display backstop.)"""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    await _seed_heartbeat(db, "surplus", age_seconds=4 * 3600)  # 14400s > 10800 (3h)
+    hb = await compute_heartbeat_staleness("surplus", db=db, paused=False)
+    assert hb["status"] == "overdue"
 
 
 @pytest.mark.asyncio
@@ -224,7 +283,7 @@ async def test_staleness_paused_downgrades_surplus(db):
     while globally paused is NOT dead → downgraded to 'paused', not 'overdue'."""
     from genesis.mcp.health.manifest import compute_heartbeat_staleness
 
-    await _seed_heartbeat(db, "surplus", age_seconds=2 * 3600)  # > 600 threshold
+    await _seed_heartbeat(db, "surplus", age_seconds=4 * 3600)  # > 10800 (3h) threshold
     hb = await compute_heartbeat_staleness("surplus", db=db, paused=True)
     assert hb["status"] == "paused"
 
@@ -330,18 +389,51 @@ async def test_no_resume_event_no_grace(db):
 # ── #973 disabled-subsystem suppression ──────────────────────────────────────
 
 
-def test_subsystem_enabled_defaults_true_and_reads_ego_config():
-    """_subsystem_enabled defaults True (fail toward surfacing) and honors ego's
-    disable switch (#973)."""
+def test_subsystem_enabled_reads_ego_and_inbox_config():
+    """_subsystem_enabled defaults True (fail toward surfacing) but honors the ego AND
+    inbox disable switches — a disabled/unconfigured subsystem must not alarm (#973 +
+    never-started gating)."""
     from types import SimpleNamespace as _NS
 
     from genesis.mcp.health import manifest as _m
 
-    assert _m._subsystem_enabled("inbox") is True  # no disable switch → True
+    # A subsystem with no disable switch still defaults True.
+    assert _m._subsystem_enabled("dashboard") is True
+    # ego honors its config switch.
     with patch("genesis.ego.config.load_ego_config", return_value=_NS(enabled=False)):
         assert _m._subsystem_enabled("ego") is False
     with patch("genesis.ego.config.load_ego_config", return_value=_NS(enabled=True)):
         assert _m._subsystem_enabled("ego") is True
+    # inbox now honors config presence + .enabled (was unconditionally True before).
+    with patch("genesis.mcp.health.manifest._inbox_enabled", return_value=False):
+        assert _m._subsystem_enabled("inbox") is False
+    with patch("genesis.mcp.health.manifest._inbox_enabled", return_value=True):
+        assert _m._subsystem_enabled("inbox") is True
+
+
+def test_inbox_enabled_reads_config(tmp_path):
+    """_inbox_enabled: no yaml → False (unconfigured); present + enabled honored."""
+    from types import SimpleNamespace as _NS
+
+    from genesis.mcp.health import manifest as _m
+
+    # No config/inbox_monitor.yaml under the (empty) repo root → not configured.
+    with patch("genesis.env.repo_root", return_value=tmp_path):
+        assert _m._inbox_enabled() is False
+    # Present + enabled=True → True; enabled=False → False.
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "inbox_monitor.yaml").write_text("inbox:\n  enabled: true\n")
+    with (
+        patch("genesis.env.repo_root", return_value=tmp_path),
+        patch("genesis.inbox.config.load_inbox_config", return_value=_NS(enabled=True)),
+    ):
+        assert _m._inbox_enabled() is True
+    with (
+        patch("genesis.env.repo_root", return_value=tmp_path),
+        patch("genesis.inbox.config.load_inbox_config", return_value=_NS(enabled=False)),
+    ):
+        assert _m._inbox_enabled() is False
 
 
 @pytest.mark.asyncio
@@ -355,6 +447,99 @@ async def test_disabled_ego_suppresses_cessation_alert(db):
     ):
         alerts = await _run_alerts_with_db(db)
     assert not [a for a in _stale(alerts) if a["id"] == "subsystem_stale:ego"]
+
+
+@pytest.mark.asyncio
+async def test_enabled_outreach_cessation_alerts_warning(db):
+    """An ENABLED outreach whose dedicated heartbeat stopped (pulse 50h old, past the
+    48h overdue threshold) → subsystem_stale:outreach WARNING. Proves outreach is now
+    in the alert set (previously excluded as a false-alarm trap)."""
+    await _seed_heartbeat(db, "outreach", age_seconds=50 * 3600)
+    with patch(
+        "genesis.mcp.health.manifest._subsystem_enabled",
+        side_effect=lambda n: n == "outreach",
+    ):
+        alerts = await _run_alerts_with_db(db)
+    stale = _stale(alerts)
+    assert any(a["id"] == "subsystem_stale:outreach" for a in stale), stale
+    o = next(a for a in stale if a["id"] == "subsystem_stale:outreach")
+    assert o["severity"] == "WARNING"
+    assert "outreach" in o["message"]
+
+
+@pytest.mark.asyncio
+async def test_disabled_outreach_suppresses_cessation_alert(db):
+    """A Telegram-less install (outreach not enabled) must NOT raise
+    subsystem_stale:outreach even with a stale retained pulse — the absent/stopped
+    scheduler is intentional, not a death. Mirrors the disabled-ego guard."""
+    await _seed_heartbeat(db, "outreach", age_seconds=50 * 3600)
+    with patch(
+        "genesis.mcp.health.manifest._subsystem_enabled",
+        side_effect=lambda n: n != "outreach",
+    ):
+        alerts = await _run_alerts_with_db(db)
+    assert not [a for a in _stale(alerts) if a["id"] == "subsystem_stale:outreach"]
+
+
+def test_subsystem_enabled_reads_outreach_telegram_config(tmp_path):
+    """_subsystem_enabled('outreach') gates on whether Telegram is configured (the
+    same side-effect-free loader the bridge + onboarding-readiness use): no/placeholder
+    token → not enabled (dashboard-only install, benign); a valid token + numeric
+    allowed-user → enabled (outreach is supposed to run → monitor it)."""
+    from genesis.mcp.health import manifest as _m
+
+    not_configured = tmp_path / "secrets_none.env"
+    not_configured.write_text("TELEGRAM_BOT_TOKEN=\n")
+    with patch("genesis.env.secrets_path", return_value=not_configured):
+        assert _m._subsystem_enabled("outreach") is False
+
+    configured = tmp_path / "secrets_ok.env"
+    configured.write_text("TELEGRAM_BOT_TOKEN=123456:ABCDEF\nTELEGRAM_ALLOWED_USERS=42\n")
+    with patch("genesis.env.secrets_path", return_value=configured):
+        assert _m._subsystem_enabled("outreach") is True
+
+    # Fail CLOSED (→ benign) when the secrets file is absent — never manufacture a
+    # permanent outreach cessation alert from a read error.
+    missing = tmp_path / "does_not_exist.env"
+    with patch("genesis.env.secrets_path", return_value=missing):
+        assert _m._subsystem_enabled("outreach") is False
+
+
+@pytest.mark.asyncio
+async def test_enabled_outreach_no_pulse_is_benign_not_never_started(db):
+    """BLOCKER regression: outreach IS a bootstrap-manifest entry (records 'ok' =
+    scheduler CONSTRUCTED, not running). A Telegram-configured install whose scheduler
+    never .start()s (revoked token / Telegram unreachable at boot) has manifest 'ok' +
+    ZERO pulses past grace — that must be a BENIGN no_heartbeat, NOT a permanent
+    subsystem_never_started:outreach. Outreach's pulse only begins after channel
+    registration, so 'ok' ≠ 'should be pulsing' (the _CONDITIONAL_PULSE_SUBSYSTEMS
+    exemption). Without the exemption this returns never_started → RED."""
+    from genesis.mcp.health import manifest as _m
+
+    mf = _manifest({"outreach": "ok"}, persisted_age_s=3600)  # ≫ ~180s grace
+    with (
+        patch.object(_m, "_read_persisted_manifest", return_value=mf),
+        patch.object(_m, "_subsystem_enabled", side_effect=lambda n: n == "outreach"),
+    ):
+        verdict = await _m.compute_heartbeat_staleness("outreach", db=db, paused=False)
+    assert verdict["status"] == "no_heartbeat", verdict
+
+
+@pytest.mark.asyncio
+async def test_outreach_init_failure_still_never_started(db):
+    """The conditional-pulse exemption covers ONLY the ok-but-silent case: a genuine
+    outreach init FAILURE (manifest 'failed:'/'degraded' — the scheduler could not even
+    be constructed) still surfaces as never_started (init-failed)."""
+    from genesis.mcp.health import manifest as _m
+
+    mf = _manifest({"outreach": "failed: boom"}, persisted_age_s=3600)
+    with (
+        patch.object(_m, "_read_persisted_manifest", return_value=mf),
+        patch.object(_m, "_subsystem_enabled", side_effect=lambda n: n == "outreach"),
+    ):
+        verdict = await _m.compute_heartbeat_staleness("outreach", db=db, paused=False)
+    assert verdict["status"] == "never_started", verdict
+    assert verdict.get("reason") == "init-failed"
 
 
 # ── loosened thresholds (near-zero false-reds) ───────────────────────────────
@@ -418,6 +603,15 @@ async def _run_alerts_with_db(db, *, paused: bool = False):
         patch("genesis.mcp.health_mcp._alert_history", {}),
         patch("genesis.mcp.health_mcp._event_bus", None),
         patch("genesis.mcp.health.manifest._read_global_paused", return_value=paused),
+        # Hermetic default: treat inbox as configured+enabled so existing
+        # subsystem_stale:inbox tests don't depend on the repo's inbox_monitor.yaml.
+        # A test wanting a disabled inbox overrides this or patches _subsystem_enabled.
+        patch("genesis.mcp.health.manifest._inbox_enabled", return_value=True),
+        # Hermetic default: treat outreach as NOT enabled (Telegram-less) so existing
+        # tests don't depend on this box's secrets.env / raise a spurious
+        # subsystem_stale:outreach. A test wanting outreach monitored overrides this
+        # or patches _subsystem_enabled.
+        patch("genesis.mcp.health.manifest._outreach_enabled", return_value=False),
     ):
         from genesis.mcp.health.errors import _impl_health_alerts
 
@@ -483,18 +677,14 @@ async def test_dashboard_cessation_alerts_warning(db):
 async def test_surplus_dropped_from_alert_set(db):
     """surplus is DROPPED from the alert set (PR-B's tile already covers it) —
     even a badly-overdue surplus emits NO subsystem_stale:surplus."""
-    await _seed_heartbeat(db, "surplus", age_seconds=3 * 3600)  # ≫ 600 threshold
+    await _seed_heartbeat(db, "surplus", age_seconds=4 * 3600)  # ≫ 10800 (3h) threshold
     alerts = await _run_alerts_with_db(db)
     assert not [a for a in _stale(alerts) if a["id"] == "subsystem_stale:surplus"]
 
 
-@pytest.mark.asyncio
-async def test_outreach_dropped_from_alert_set(db):
-    """outreach is DROPPED (config-gated pulse → false-alarm trap) — even a
-    3-day-old outreach heartbeat emits NO subsystem_stale:outreach."""
-    await _seed_heartbeat(db, "outreach", age_seconds=3 * 86400)  # ≫ 172800 threshold
-    alerts = await _run_alerts_with_db(db)
-    assert not [a for a in _stale(alerts) if a["id"] == "subsystem_stale:outreach"]
+# NOTE: outreach is no longer "dropped" — it is now in the alert set, enable-gated on
+# Telegram config. The enabled→WARNING and disabled→suppressed cases are covered by
+# test_enabled_outreach_cessation_alerts_warning + test_disabled_outreach_suppresses_cessation_alert.
 
 
 @pytest.mark.asyncio
@@ -661,6 +851,37 @@ async def test_read_error_preserves_open_unknown_alert(db):
 
 
 @pytest.mark.asyncio
+async def test_read_error_preserves_open_never_started_alert(db):
+    """SF-2: the fail-open guard must preserve the subsystem_never_started family too —
+    an open never_started alert (CRITICAL ego) must not flap (auto-resolve then reopen)
+    on a transient staleness-read-failure tick."""
+    from genesis.db.crud import alert_events as ae_crud
+
+    await ae_crud.reconcile_open_set(
+        db,
+        active=[
+            {
+                "alert_id": "subsystem_never_started:ego",
+                "source": "health",
+                "severity": "CRITICAL",
+                "message": "ego never started",
+            }
+        ],
+        now=datetime.now(UTC).isoformat(),
+    )
+
+    async def _raise_for_ego(name, **kwargs):
+        if name == "ego":
+            raise aiosqlite.OperationalError("boom")
+        return {"status": "alive", "last_seen": _iso_ago(10), "age_seconds": 10.0}
+
+    alerts, current_ids = await _compute_alerts_with_hb_side_effect(db, _raise_for_ego)
+    alert_ids = {a["id"] for a in alerts}
+    assert "subsystem_never_started:ego" in alert_ids  # preserved, not flapped
+    assert "subsystem_never_started:ego" in current_ids
+
+
+@pytest.mark.asyncio
 async def test_freshest_ignores_corrupt_future_db_row(db):
     """N-2: a corrupt FUTURE db heartbeat must not mask a valid fresh ring pulse —
     the subsystem reads alive, not a false unknown."""
@@ -750,3 +971,290 @@ async def test_gc_keeps_only_newest_and_still_prunes_older(db):
     )
     assert len(ego_rows) == 1  # only the newest ego pulse kept
     assert len(surplus_rows) == 1  # the sole surplus pulse kept
+
+
+# ── never_started detection (failed-start / started-but-silent) #10 ───────────
+
+_GRACE_EGO_S = 300 + 60  # HEARTBEAT_EXPECTED["ego"][0] + 60
+
+
+async def _compute(name, db):
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    # paused=False keeps the never_started verdict deterministic without touching the
+    # real ~/.genesis/paused.json (a pause test calls compute directly with paused=True).
+    return await compute_heartbeat_staleness(name, db=db, paused=False)
+
+
+def _patch_manifest(mapping, *, persisted_age_s=0.0):
+    return patch(
+        "genesis.mcp.health.manifest._read_persisted_manifest",
+        return_value=_manifest(mapping, persisted_age_s=persisted_age_s),
+    )
+
+
+@pytest.mark.asyncio
+async def test_never_started_ego_ok_but_silent_past_grace(db):
+    """manifest ego=ok, no pulse, past interval+60 grace → never_started/started-silent."""
+    with _patch_manifest({"ego": "ok"}, persisted_age_s=_GRACE_EGO_S + 60):
+        hb = await _compute("ego", db)
+    assert hb["status"] == "never_started"
+    assert hb.get("reason") == "started-silent"
+
+
+@pytest.mark.asyncio
+async def test_never_started_ego_within_grace_is_benign(db):
+    """Just after boot (within grace), an unpulsed ego is benign, not never_started."""
+    with _patch_manifest({"ego": "ok"}, persisted_age_s=10):
+        hb = await _compute("ego", db)
+    assert hb["status"] == "no_heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_never_started_inbox_degraded_enabled(db):
+    """A configured+enabled inbox recorded 'degraded' (init failed/short-circuited) →
+    never_started/init-failed immediately (no grace)."""
+    with (
+        _patch_manifest({"inbox": "degraded"}),
+        patch("genesis.mcp.health.manifest._inbox_enabled", return_value=True),
+    ):
+        hb = await _compute("inbox", db)
+    assert hb["status"] == "never_started"
+    assert hb.get("reason") == "init-failed"
+
+
+@pytest.mark.asyncio
+async def test_never_started_inbox_failed_prefix_enabled(db):
+    """manifest stores 'failed: <msg>' with a prefix — matched via startswith."""
+    with (
+        _patch_manifest({"inbox": "failed: boom"}),
+        patch("genesis.mcp.health.manifest._inbox_enabled", return_value=True),
+    ):
+        hb = await _compute("inbox", db)
+    assert hb["status"] == "never_started"
+    assert hb.get("reason") == "init-failed"
+
+
+@pytest.mark.asyncio
+async def test_degraded_disabled_inbox_is_benign(db):
+    """A DISABLED/unconfigured inbox is ALSO 'degraded' — must stay benign, not alarm."""
+    with (
+        _patch_manifest({"inbox": "degraded"}),
+        patch("genesis.mcp.health.manifest._inbox_enabled", return_value=False),
+    ):
+        hb = await _compute("inbox", db)
+    assert hb["status"] == "no_heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_never_started_absent_from_manifest_is_benign(db):
+    """A subsystem not present in the manifest → fresh-install empty state, benign."""
+    with _patch_manifest({}):  # no ego key
+        hb = await _compute("ego", db)
+    assert hb["status"] == "no_heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_never_started_manifest_none_is_benign(db):
+    """No persisted manifest at all (missing/unreadable) → benign (protect fresh installs)."""
+    with patch("genesis.mcp.health.manifest._read_persisted_manifest", return_value=None):
+        hb = await _compute("ego", db)
+    assert hb["status"] == "no_heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_never_started_persisted_at_none_is_benign_no_crash(db):
+    """manifest ok but persisted_at missing (older build/partial write) → benign, no crash."""
+    bad = {
+        "bootstrapped": False,
+        "manifest": {"ego": "ok"},
+        "source": "persisted_manifest",
+        "persisted_at": None,
+    }
+    with patch("genesis.mcp.health.manifest._read_persisted_manifest", return_value=bad):
+        hb = await _compute("ego", db)
+    assert hb["status"] == "no_heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_never_started_persisted_at_unparseable_is_benign(db):
+    bad = {"manifest": {"ego": "ok"}, "persisted_at": "not-a-date"}
+    with patch("genesis.mcp.health.manifest._read_persisted_manifest", return_value=bad):
+        hb = await _compute("ego", db)
+    assert hb["status"] == "no_heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_inbox_ok_silent_uses_overdue_grace_no_flap(db):
+    """inbox emits no boot pulse; its first real pulse is ~1800s in. A no-pulse read at
+    2000s (past interval+60=1860 but within overdue_s=7200) must stay benign — no flap."""
+    with (
+        _patch_manifest({"inbox": "ok"}, persisted_age_s=2000),
+        patch("genesis.mcp.health.manifest._inbox_enabled", return_value=True),
+    ):
+        hb = await _compute("inbox", db)
+    assert hb["status"] == "no_heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_inbox_ok_silent_past_overdue_grace_never_started(db):
+    with (
+        _patch_manifest({"inbox": "ok"}, persisted_age_s=8000),  # > overdue_s 7200
+        patch("genesis.mcp.health.manifest._inbox_enabled", return_value=True),
+    ):
+        hb = await _compute("inbox", db)
+    assert hb["status"] == "never_started"
+    assert hb.get("reason") == "started-silent"
+
+
+@pytest.mark.asyncio
+async def test_paused_inbox_ok_silent_is_benign(db):
+    """inbox is pause-gated (its pulse stops behind ``if paused: return``) and emits no
+    boot pulse — a globally-PAUSED Genesis legitimately has zero inbox pulses, so an
+    ok-but-silent inbox past its grace must NOT false-fire never_started while paused."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    with (
+        _patch_manifest({"inbox": "ok"}, persisted_age_s=8000),  # > overdue_s
+        patch("genesis.mcp.health.manifest._inbox_enabled", return_value=True),
+    ):
+        hb = await compute_heartbeat_staleness("inbox", db=db, paused=True)
+    assert hb["status"] == "no_heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_not_paused_inbox_ok_silent_still_never_started(db):
+    """The pause suppression is pause-specific — NOT paused, same shape → never_started."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    with (
+        _patch_manifest({"inbox": "ok"}, persisted_age_s=8000),
+        patch("genesis.mcp.health.manifest._inbox_enabled", return_value=True),
+    ):
+        hb = await compute_heartbeat_staleness("inbox", db=db, paused=False)
+    assert hb["status"] == "never_started"
+
+
+@pytest.mark.asyncio
+async def test_paused_inbox_degraded_still_never_started(db):
+    """Pause excuses only a stopped PULSE, never a real init fault. A paused inbox whose
+    manifest shows 'degraded' (init failed/short-circuited) must STILL surface
+    never_started/init-failed — pause is applied after boot and cannot cause it."""
+    from genesis.mcp.health.manifest import compute_heartbeat_staleness
+
+    with (
+        _patch_manifest({"inbox": "degraded"}),
+        patch("genesis.mcp.health.manifest._inbox_enabled", return_value=True),
+    ):
+        hb = await compute_heartbeat_staleness("inbox", db=db, paused=True)
+    assert hb["status"] == "never_started"
+    assert hb.get("reason") == "init-failed"
+
+
+@pytest.mark.asyncio
+async def test_pulse_present_overrides_never_started(db):
+    """never_started only fires with NO usable pulse — a recent pulse → alive even if
+    the manifest says degraded."""
+    await _seed_heartbeat(db, "inbox", age_seconds=10)
+    with (
+        _patch_manifest({"inbox": "degraded"}),
+        patch("genesis.mcp.health.manifest._inbox_enabled", return_value=True),
+    ):
+        hb = await _compute("inbox", db)
+    assert hb["status"] == "alive"
+
+
+@pytest.mark.asyncio
+async def test_never_started_integration_real_manifest_file(db, tmp_path):
+    """E2E through the REAL _read_persisted_manifest file read (NOT mocked): a real
+    bootstrap_manifest.json on disk with ego=ok + an old persisted_at and no pulse →
+    never_started/started-silent. Proves the file → JSON parse → verdict chain end to
+    end (the unit tests inject the manifest dict; this exercises the actual reader,
+    confirming the on-disk key shape {manifest, persisted_at} matches the verdict)."""
+    import json as _json
+
+    from genesis.mcp.health import manifest as _m
+
+    manifest_file = tmp_path / "bootstrap_manifest.json"
+    manifest_file.write_text(
+        _json.dumps({"manifest": {"ego": "ok"}, "persisted_at": _iso_ago(_GRACE_EGO_S + 120)})
+    )
+    with patch.object(_m, "_MANIFEST_FILE", manifest_file):  # real reader, real file
+        hb = await _m.compute_heartbeat_staleness("ego", db=db, paused=False)
+    assert hb["status"] == "never_started"
+    assert hb.get("reason") == "started-silent"
+
+
+@pytest.mark.asyncio
+async def test_never_started_integration_real_manifest_degraded_inbox(db, tmp_path):
+    """E2E real-file read: inbox recorded 'degraded' (the real failed/short-circuited
+    init shape) + enabled → never_started/init-failed, straight off disk."""
+    import json as _json
+
+    from genesis.mcp.health import manifest as _m
+
+    manifest_file = tmp_path / "bootstrap_manifest.json"
+    manifest_file.write_text(
+        _json.dumps({"manifest": {"inbox": "degraded"}, "persisted_at": _iso_ago(100)})
+    )
+    with (
+        patch.object(_m, "_MANIFEST_FILE", manifest_file),
+        patch("genesis.mcp.health.manifest._inbox_enabled", return_value=True),
+    ):
+        hb = await _m.compute_heartbeat_staleness("inbox", db=db, paused=False)
+    assert hb["status"] == "never_started"
+    assert hb.get("reason") == "init-failed"
+
+
+@pytest.mark.asyncio
+async def test_alert_never_started_ego_critical(db):
+    with _patch_manifest({"ego": "ok"}, persisted_age_s=_GRACE_EGO_S + 60):
+        alerts = await _run_alerts_with_db(db)
+    a = next((a for a in alerts if a["id"] == "subsystem_never_started:ego"), None)
+    assert a is not None
+    assert a["severity"] == "CRITICAL"
+
+
+@pytest.mark.asyncio
+async def test_alert_never_started_inbox_warning(db):
+    # _run_alerts_with_db defaults _inbox_enabled True.
+    with _patch_manifest({"inbox": "degraded"}):
+        alerts = await _run_alerts_with_db(db)
+    a = next((a for a in alerts if a["id"] == "subsystem_never_started:inbox"), None)
+    assert a is not None
+    assert a["severity"] == "WARNING"
+
+
+@pytest.mark.asyncio
+async def test_never_started_alert_absent_when_healthy(db):
+    """No manifest (autouse None) + fresh pulses → zero never_started alerts."""
+    await _seed_heartbeat(db, "ego", age_seconds=10)
+    await _seed_heartbeat(db, "inbox", age_seconds=10)
+    alerts = await _run_alerts_with_db(db)
+    assert not [a for a in alerts if str(a["id"]).startswith("subsystem_never_started:")]
+
+
+@pytest.mark.asyncio
+async def test_never_started_resolves_on_pulse(db):
+    """Once the subsystem pulses, compute flips to alive → no never_started alert (the
+    reconcile writer then stamps resolved_at). Auto-resolve is by absence from the set."""
+    await _seed_heartbeat(db, "ego", age_seconds=10)  # ego has now pulsed
+    with _patch_manifest({"ego": "ok"}, persisted_age_s=_GRACE_EGO_S + 60):
+        alerts = await _run_alerts_with_db(db)
+    assert not [a for a in alerts if a["id"] == "subsystem_never_started:ego"]
+
+
+def test_heartbeat_status_set_is_closed():
+    """Lock the full status set so a new status can't ship while a consumer that
+    switches on status silently mis-renders it."""
+    from genesis.mcp.health.manifest import _HEARTBEAT_STATUSES
+
+    assert {
+        "alive",
+        "overdue",
+        "paused",
+        "resuming",
+        "no_heartbeat",
+        "unknown",
+        "never_started",
+    } == _HEARTBEAT_STATUSES

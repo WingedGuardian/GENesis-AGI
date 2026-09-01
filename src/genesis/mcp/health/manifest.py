@@ -157,7 +157,14 @@ async def _impl_bootstrap_manifest() -> dict:
 # verdict.
 HEARTBEAT_EXPECTED = {
     "awareness": (300, 360),      # 5 min tick, error at 6 min
-    "surplus": (300, 600),
+    # surplus's event-HB emits at loop-END (surplus/scheduler.py), so a healthy single
+    # dispatch_once (15-30 min) legitimately gaps it — a tight 600s overdue false-fired
+    # "surplus heartbeat overdue" in the morning report / subsystem_heartbeats display.
+    # overdue=3h matches the surplus TILE's job_health stall bound
+    # (observability/liveness.stall_threshold_minutes(5) = 180 min), so display and tile
+    # agree; genuine total cessation is caught far sooner (900s) by the zombie-scheduler
+    # watchdog, which reads job_health (refreshed every dispatch), not this event-HB.
+    "surplus": (300, 10800),      # 5-min loop; overdue at 3h (loop-END HB is load-fragile)
     # inbox checks every 30 min (inbox/types.py check_interval_seconds=1800).
     # overdue=4× (7200s) so one slow/skipped check doesn't false-fire; a 2×
     # (3600s) threshold was too tight. (Assumes the default interval; a custom
@@ -169,7 +176,7 @@ HEARTBEAT_EXPECTED = {
     # A real reflection outage surfaces faster via the awareness heartbeat
     # (6 min), the cc resilience axis, and the deferred-work backlog.
     "reflection": (600, 14400),
-    "outreach": (86400, 172800),
+    "outreach": (120, 600),       # 60s daemon-thread pulse (outreach/heartbeat.py); overdue at 10×
     "dashboard": (120, 600),      # 60s daemon-thread pulse; overdue at 10× (was 4×)
     "ego": (300, 14400),          # 5-min liveness pulse (ego_heartbeat job), overdue at 4h
 }
@@ -182,6 +189,28 @@ HEARTBEAT_EXPECTED = {
 # pulse THROUGH pause, so they are NOT here — an overdue-while-paused for them is
 # a genuine scheduler death that must still surface. See compute_heartbeat_staleness.
 _PAUSE_GATED_HEARTBEATS = frozenset({"surplus", "inbox"})
+
+# Subsystems whose heartbeat only begins after a RUNTIME precondition (not just a
+# successful init), so a bootstrap-manifest ``"ok"`` (init constructed the object)
+# does NOT imply the subsystem should be pulsing yet. For these, an ``ok``-but-never-
+# pulsed state is a benign non-death — the started-silent never_started inference is
+# INVALID (their died-after-running case is caught by ``subsystem_stale`` via the
+# dedicated heartbeat instead). A genuine init FAILURE (``failed:``/``degraded``) still
+# surfaces as never_started. Currently: outreach — its scheduler is constructed at boot
+# but only ``.start()``s once a messaging channel registers, which may never happen even
+# on a Telegram-configured install (revoked token, Telegram unreachable at boot).
+_CONDITIONAL_PULSE_SUBSYSTEMS = frozenset({"outreach"})
+
+# The complete set of statuses ``compute_heartbeat_staleness`` can return. Every
+# consumer that switches on the status string (the alert loop in errors.py, the ego
+# dashboard tile/route, morning_report, the subsystem_heartbeats MCP tool) must handle
+# ALL of these. Locked by test_heartbeat_status_set_is_closed: the test pins this set to
+# a literal, so adding a status forces a deliberate edit here + in the test — a prompt to
+# audit the consumers. (It is a forcing function, not a proof that every consumer branches
+# on each member.)
+_HEARTBEAT_STATUSES = frozenset(
+    {"alive", "overdue", "paused", "resuming", "no_heartbeat", "unknown", "never_started"}
+)
 
 # How many recent heartbeat rows to scan for the newest USABLE pulse. >1 so a few
 # unparseable / materially-future rows (which sort FIRST under the events table's
@@ -220,20 +249,84 @@ def _read_global_paused() -> bool:
         return False
 
 
+def _inbox_enabled() -> bool:
+    """Is the inbox monitor configured AND enabled? Mirrors ``runtime/init/inbox.py``:
+    no ``config/inbox_monitor.yaml`` → unconfigured → not enabled; else ``config.enabled``.
+
+    Load-bearing for the never_started verdict: inbox init SWALLOWS its own exceptions
+    (``runtime/init/inbox.py:68``) and returns early when disabled/unconfigured, so a
+    disabled, an unconfigured, AND a genuinely-crashed inbox ALL record the same
+    ``degraded`` manifest value. Gating the never_started alarm on this lets a
+    configured+enabled inbox that failed to start surface, while a deliberately-off or
+    unconfigured inbox (also ``degraded``) stays benign."""
+    from genesis.env import repo_root
+
+    config_path = repo_root() / "config" / "inbox_monitor.yaml"
+    if not config_path.exists():
+        return False
+    from genesis.inbox.config import load_inbox_config
+
+    return bool(load_inbox_config(config_path).enabled)
+
+
+def _outreach_enabled() -> bool:
+    """Is a messaging channel (Telegram) configured — i.e. is outreach *supposed* to run?
+
+    The outreach scheduler only ``.start()``s once a messaging channel registers
+    (``runtime/_job_health.py`` → only Telegram registers), so a Telegram-less
+    (dashboard-only) install legitimately never runs outreach and must NOT alarm.
+    Uses the SAME side-effect-free loader the bridge + onboarding-readiness T2 signal
+    use (``channels.bridge_config.build_bridge_config`` over the parsed secrets), so
+    the "would Telegram start?" answer can't drift between them.
+
+    Fails CLOSED (→ False, benign) on any read/parse error — the conservative direction
+    for a false-alarm-prone subsystem (the OPPOSITE of ``_subsystem_enabled``'s default
+    True), so a missing/malformed secrets file never manufactures a permanent outreach
+    cessation alert on an install that isn't even running outreach."""
+    try:
+        import os
+
+        from genesis.channels.bridge_config import (
+            build_bridge_config,
+            parse_secrets_env_text,
+        )
+        from genesis.env import secrets_path
+
+        path = str(secrets_path())
+        if not os.path.exists(path):
+            return False
+        with open(path) as f:
+            return build_bridge_config(parse_secrets_env_text(f.read())) is not None
+    except Exception as exc:
+        # Log the exception TYPE only, never exc_info/message: a malformed non-token
+        # field in secrets.env (DAY_BOUNDARY_HOUR, or a TELEGRAM_ALLOWED_USERS entry
+        # that passes .isdigit() but not int()) can embed its raw value in the
+        # exception text — keep it out of the log. Broad catch is deliberate (fail
+        # CLOSED → False for EVERY error, so nothing bubbles to _subsystem_enabled's
+        # default-True). The token itself never reaches here (build_bridge_config
+        # returns None cleanly on a missing/placeholder token, no raise).
+        logger.debug("outreach-enabled read failed (%s); treating as not-enabled", type(exc).__name__)
+        return False
+
+
 def _subsystem_enabled(name: str) -> bool:
     """Best-effort: is this subsystem configured to run?
 
-    A subsystem DISABLED after it had already pulsed keeps a retained final heartbeat
-    that would otherwise age into a PERMANENT cessation alert (a disabled ego → a
-    permanent CRITICAL) — its stale pulse is intentional, not a death. Defaults True
-    (fail toward surfacing); only subsystems with a real disable switch are checked.
-    (Generalizing to inbox/dashboard + the never-started case is the bootstrap-manifest
-    follow-up.)"""
+    A subsystem DISABLED (or unconfigured) must not raise a cessation/never-started
+    alert: a disabled subsystem's stopped or absent pulse is intentional, not a death.
+    Covers ego (``ego`` config ``.enabled``), inbox (``inbox_monitor.yaml`` present +
+    ``.enabled``), and outreach (a messaging channel / Telegram configured); every other
+    name defaults True (fail toward surfacing — only subsystems with a real disable
+    switch are checked)."""
     try:
         if name == "ego":
             from genesis.ego.config import load_ego_config
 
             return bool(load_ego_config().enabled)
+        if name == "inbox":
+            return _inbox_enabled()
+        if name == "outreach":
+            return _outreach_enabled()
     except Exception:
         logger.debug("subsystem-enabled read failed for %s", name, exc_info=True)
     return True
@@ -294,6 +387,92 @@ async def _post_resume_grace_active(db, *, name: str, now: datetime, interval_s:
     except (aiosqlite.Error, ImportError, AttributeError, TimeoutError):
         logger.debug("post-resume grace check failed for %s", name, exc_info=True)
         return False
+
+
+# Subsystems that emit NO bootstrap "start" pulse — their first heartbeat lands a
+# full check-interval after boot, so "manifest ok + no pulse yet" is the HONEST state
+# until then. Use the overdue threshold (not interval+60) as the never_started grace
+# for these to avoid a boot-time flap. ego/awareness/surplus emit a start pulse at
+# bootstrap, so the tighter interval+60 grace is safe for them.
+_NO_BOOT_PULSE_SUBSYSTEMS = frozenset({"inbox"})
+
+
+def _never_started_grace_s(name: str) -> float:
+    """Grace before a manifest-``ok`` but never-pulsed subsystem reads never_started.
+
+    Mirrors the ego dashboard tile (``interval_s + 60``) for start-pulse subsystems;
+    for a no-boot-pulse subsystem (inbox) uses the overdue threshold so a healthy one
+    that simply hasn't reached its first check interval is not falsely flagged."""
+    interval_s, overdue_s = HEARTBEAT_EXPECTED[name]
+    if name in _NO_BOOT_PULSE_SUBSYSTEMS:
+        return float(overdue_s)
+    return float(interval_s + 60)
+
+
+def _never_started_verdict(
+    name: str, *, now: datetime, paused: bool | None = None
+) -> dict:
+    """No usable pulse exists for *name*: decide fresh-install empty-state (benign
+    ``no_heartbeat``) vs a genuine failed / never-pulsed start (``never_started``),
+    using the persisted bootstrap manifest (``_read_persisted_manifest``).
+
+    Fails BENIGN (``no_heartbeat``) whenever never_started cannot be confidently
+    established — a deliberately-disabled/unconfigured subsystem, an absent/unreadable
+    manifest, a subsystem absent from the manifest, an unparseable boot timestamp, a
+    still-within-grace ``ok``, or a paused pause-gated subsystem whose ONLY silence is a
+    stopped pulse (``ok``) — so a fresh install is never spuriously alarmed. A genuine
+    init fault (``failed:``/``degraded``) alarms even while paused, since pause cannot
+    cause it. The boot manifest is written cross-process by ``runtime/_capabilities.py``
+    (this MCP process does not bootstrap), so this is the only liveness-independent
+    signal that tells "failed to start" from "freshly installed, never run"."""
+    benign = {"status": "no_heartbeat", "last_seen": None}
+    # Deliberately-off / unconfigured (ego config, or inbox with no yaml / disabled) —
+    # its absent pulse is intentional, not a death.
+    if not _subsystem_enabled(name):
+        return benign
+    mf = _read_persisted_manifest()
+    if not mf:
+        return benign  # no manifest at all (missing/unreadable) → protect fresh installs
+    st = (mf.get("manifest") or {}).get(name)
+    if not isinstance(st, str):
+        return benign  # subsystem absent from the manifest → fresh / unknown
+    # init raised or short-circuited: recorded as "failed: <msg>" (prefix) or "degraded".
+    # A real init fault is INDEPENDENT of pause — pause is a runtime toggle applied AFTER
+    # bootstrap, so it cannot cause an init failure — so surface it even while paused
+    # (suppressing it would silence a genuinely-broken start behind an operator pause).
+    if st.startswith("failed") or st == "degraded":
+        return {"status": "never_started", "last_seen": None, "reason": "init-failed"}
+    # Registered ok but has never pulsed: a death only once past a boot grace (its first
+    # pulse may legitimately still be pending just after boot).
+    if st == "ok":
+        # ONLY the ok-but-silent pulse is excused by pause: a pause-gated subsystem
+        # (surplus/inbox) emits its pulse after its loop's ``if paused: return`` guard,
+        # so a globally-paused Genesis legitimately has zero pulses for it — intentional
+        # silence, not a never-started death. Mirrors the overdue-branch pause downgrade.
+        # (ego/dashboard pulse THROUGH pause, so they are never suppressed.)
+        if name in _PAUSE_GATED_HEARTBEATS:
+            is_paused = paused if paused is not None else _read_global_paused()
+            if is_paused:
+                return benign
+        # Conditional-pulse subsystems (outreach): manifest "ok" means the object was
+        # constructed, NOT that it should be pulsing — its pulse only begins after a
+        # runtime precondition (channel registration) that may never occur. So an
+        # ok-but-never-pulsed state is benign, not a started-silent death (which would
+        # reintroduce a permanent unresolvable alert on a Telegram-configured install
+        # whose scheduler never starts). A genuine init FAILURE for it still alarms via
+        # the ``failed:``/``degraded`` branch above.
+        if name in _CONDITIONAL_PULSE_SUBSYSTEMS:
+            return benign
+        persisted_at = parse_iso_utc(mf.get("persisted_at"))
+        if persisted_at is None:
+            return benign  # can't establish the grace clock → benign
+        if (now - persisted_at).total_seconds() > _never_started_grace_s(name):
+            return {
+                "status": "never_started",
+                "last_seen": None,
+                "reason": "started-silent",
+            }
+    return benign  # within grace, or an unrecognized manifest status → benign
 
 
 async def compute_heartbeat_staleness(
@@ -407,9 +586,13 @@ async def compute_heartbeat_staleness(
 
     if last_ts is None or last_dt is None:
         # No usable pulse. A candidate WAS present but unusable → unknown (can't
-        # confirm liveness); nothing at all → no_heartbeat (fresh-install empty-state).
-        status = "unknown" if (saw_db or saw_ring) else "no_heartbeat"
-        return {"status": status, "last_seen": None}
+        # confirm liveness). Nothing at all → either a fresh-install empty-state
+        # (no_heartbeat, benign) OR a subsystem that failed to start / registered
+        # but never pulsed (never_started) — distinguished via the persisted boot
+        # manifest (#10). Fail benign whenever never_started can't be established.
+        if saw_db or saw_ring:
+            return {"status": "unknown", "last_seen": None}
+        return _never_started_verdict(name, now=_now, paused=paused)
 
     age_s = (_now - last_dt).total_seconds()
 

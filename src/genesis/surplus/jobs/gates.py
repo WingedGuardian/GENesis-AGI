@@ -285,7 +285,9 @@ async def _run_maintenance_gc(db: aiosqlite.Connection) -> None:
             keep_latest_per_subsystem=True,
         )
         if hb_purged:
-            logger.info("Pruned %d heartbeat events older than 7d", hb_purged)
+            # Count spans both retention (>7d, below the per-subsystem anchor) and
+            # implausibly-future corrupt rows the keep-latest GC also removes.
+            logger.info("Pruned %d stale/corrupt heartbeat events", hb_purged)
     except Exception:
         logger.warning("GC: heartbeat event rotation failed", exc_info=True)
 

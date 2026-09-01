@@ -223,6 +223,17 @@ _NO_OUTREACH_EXTRAS = [
     "mcp__genesis-outreach__outreach_digest",
 ]
 
+# Cold-marketing actuator. marketing_send resolves its recipient in-code from the
+# owner-curated marketing_prospects store and enqueues a BULK cold send — it must be
+# reachable ONLY from the `campaign` profile (the intended autonomous marketing
+# caller). Deny it in every other profile: mandatorily for the untrusted-inbound
+# perimeter profiles (mail, community-responder), where an injected inbound message
+# could otherwise reach the actuator, and belt-and-suspenders on profiles that don't
+# mount genesis-outreach today (guards an MCP-config fallback-to-full).
+_NO_MARKETING_SEND = [
+    "mcp__genesis-outreach__marketing_send",
+]
+
 # The venv Python interpreter running genesis-server. Exposed to profile
 # overlays (see _load_profile_overlays) so a locally-defined Bash profile can
 # allowlist exactly this path and run `<this> -m <module>`. Using
@@ -239,9 +250,16 @@ PROFILES: dict[str, list[str]] = {
         + _NO_FOLLOW_UPS
         + _NO_OUTREACH_ENGAGEMENT
         + _NO_RECON_WRITES
+        + _NO_MARKETING_SEND
     ),
-    "interact": (_UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES),
-    "research": (_UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION),
+    "interact": (
+        _UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES + _NO_MARKETING_SEND
+    ),
+    "research": (
+        _UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION + _NO_MARKETING_SEND
+    ),
+    # `campaign` is the ONLY profile that may call marketing_send — the intended
+    # autonomous cold-marketing caller. Every other profile denies it above/below.
     "campaign": (_UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION),
     # ── Steward profile ──────────────────────────────────────────
     # For the upstream-PR stewardship campaign. UNIQUE among profiles: it
@@ -251,7 +269,10 @@ PROFILES: dict[str, list[str]] = {
     # stay blocked — the campaign comments/reopens/closes PRs and ESCALATES
     # code fixes rather than editing/pushing itself.
     "steward": (
-        [t for t in _UNIVERSAL_DISALLOW if t != "Bash"] + _NO_BROWSER_INTERACTION + _NO_FILE_WRITE
+        [t for t in _UNIVERSAL_DISALLOW if t != "Bash"]
+        + _NO_BROWSER_INTERACTION
+        + _NO_FILE_WRITE
+        + _NO_MARKETING_SEND
     ),
     # ── Community responder profile ─────────────────────────────
     # Reactive community responder: reads a community's channels and replies
@@ -259,7 +280,11 @@ PROFILES: dict[str, list[str]] = {
     # outreach (no memory server). Belt-and-suspenders: block memory writes at
     # tool level too, in case MCP config generation fails and falls back to full.
     "community-responder": (
-        _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION + _NO_MEMORY_WRITES + _NO_FOLLOW_UPS
+        _UNIVERSAL_DISALLOW
+        + _NO_BROWSER_INTERACTION
+        + _NO_MEMORY_WRITES
+        + _NO_FOLLOW_UPS
+        + _NO_MARKETING_SEND
     ),
     # ── Perimeter profile ────────────────────────────────────────
     # For sessions that process untrusted inbound content (email
@@ -277,6 +302,7 @@ PROFILES: dict[str, list[str]] = {
         + _NO_RECON_WRITES
         + _NO_WEB_TOOLS
         + _NO_OUTREACH_EXTRAS
+        + _NO_MARKETING_SEND
     ),
 }
 
@@ -472,6 +498,7 @@ class ProfileOverlayContext:
     no_outreach_engagement: list[str]
     no_recon_writes: list[str]
     no_web_tools: list[str]
+    no_marketing_send: list[str]
     venv_python: str
 
     def add_profile(
@@ -522,6 +549,7 @@ def _load_profile_overlays() -> None:
         no_outreach_engagement=_NO_OUTREACH_ENGAGEMENT,
         no_recon_writes=_NO_RECON_WRITES,
         no_web_tools=_NO_WEB_TOOLS,
+        no_marketing_send=_NO_MARKETING_SEND,
         venv_python=_VENV_PYTHON,
     )
     try:
@@ -592,6 +620,13 @@ class DirectSessionRequest:
     notify_on_failure_only: bool = False
     source_tag: str = "direct_session"
     caller_context: str | None = None  # "follow_up:<id>", "schedule:<id>"
+    # The ORIGINAL caller_context of a dispatch that was rate-limit parked, carried
+    # across resume. A resumed session's caller_context is rewritten to
+    # "rate_limit_resume:<park_id>" (for park-lineage), which severs the
+    # "ego_proposal:<id>" linkage that proposal-outcome recording + dispatch
+    # follow-through gate on. This preserves the origin so both survive a
+    # park→resume (see rate_limit_park.effective_caller_context). None otherwise.
+    origin_caller_context: str | None = None
     planning_instruction: str | None = None  # opt-in: prepended to prompt
     skills: list[str] | None = None  # explicit skill injection (overrides auto-detect)
     tool_exceptions: tuple[str, ...] = ()  # tools to UN-block from the profile disallow list
@@ -890,12 +925,13 @@ class DirectSessionRunner:
 
             # Post-execution audit: verify protected paths, feed autonomy signals.
             # Only for ego dispatches (caller_context starts with "ego_proposal:").
-            # Runs inline (cheap) — transcript parsing is I/O-bound but fast.
-            if (
-                self._auditor is not None
-                and request.caller_context
-                and request.caller_context.startswith("ego_proposal:")
-            ):
+            # Resolve across a park→resume (resume-prefix → the preserved origin),
+            # else a resumed ego dispatch is silently NOT audited. Runs inline
+            # (cheap) — transcript parsing is I/O-bound but fast.
+            _audit_ctx = rate_limit_park.effective_caller_context(
+                request.caller_context, request.origin_caller_context
+            )
+            if self._auditor is not None and _audit_ctx and _audit_ctx.startswith("ego_proposal:"):
                 try:
                     metadata = {}
                     db = getattr(self._rt, "_db", None)
@@ -912,7 +948,7 @@ class DirectSessionRunner:
                         transcript_path=metadata.get("transcript_path", ""),
                         tools_summary=metadata.get("tools_summary"),
                         session_success=result.success,
-                        caller_context=request.caller_context,
+                        caller_context=_audit_ctx,
                     )
                 except Exception:
                     logger.debug(
@@ -968,13 +1004,18 @@ class DirectSessionRunner:
             )
             try:
                 await self._store_result(session_id, request, cancel_result)
-                # Feed the outcome back to an ego proposal, matching the
-                # generic failure path below.
-                await self._record_proposal_outcome(request, cancel_result)
+                # Write the terminal 'failed' status BEFORE the outcome embed:
+                # _record_proposal_outcome vectorizes (Qdrant), and a slow embed
+                # during the ~10s shutdown grace could push fail() past DB close,
+                # leaving the row 'active' across a restart. _store_result stays
+                # first so the on-end hook fail() fires sees full metadata.
                 await self._session_manager.fail(
                     session_id,
                     reason="cancelled",
                 )
+                # Feed the outcome back to an ego proposal, matching the
+                # generic failure path below.
+                await self._record_proposal_outcome(request, cancel_result)
             except Exception:
                 logger.error(
                     "Failed to record session %s cancellation",
@@ -1069,14 +1110,17 @@ class DirectSessionRunner:
             tools_called=telemetry,
         )
 
-        # Best-effort: persist failure and notify
+        # Best-effort: persist failure and notify. Terminal status BEFORE the
+        # outcome embed (same ordering as the cancel handler): _record_proposal_outcome
+        # vectorizes, and the status write must not be stranded behind a slow embed.
+        # _store_result stays first so the on-end hook fail() fires sees full metadata.
         try:
             await self._store_result(session_id, request, error_result)
-            await self._record_proposal_outcome(request, error_result)
             await self._session_manager.fail(
                 session_id,
                 reason=str(exc)[:500],
             )
+            await self._record_proposal_outcome(request, error_result)
         except Exception:
             logger.error(
                 "Failed to record session %s failure",
@@ -1114,12 +1158,29 @@ class DirectSessionRunner:
         result: DirectSessionResult,
     ) -> None:
         """Feed session outcome back to ego proposal for feedback loop."""
-        if not request.caller_context or not request.caller_context.startswith("ego_proposal:"):
+        # Resolve the ORIGINAL context: a park→resume rewrites caller_context to
+        # "rate_limit_resume:<park_id>", so gate on the preserved origin instead
+        # (else a resumed dispatch's outcome is silently dropped — #1487/837f8b63).
+        ctx = rate_limit_park.effective_caller_context(
+            request.caller_context, request.origin_caller_context
+        )
+        if not ctx or not ctx.startswith("ego_proposal:"):
             return
-        proposal_id = request.caller_context.split(":", 1)[1]
+        proposal_id = ctx.split(":", 1)[1]
         advisories: list[str] = []
+        # WS-3: a dispatch outcome inherits the SESSION's provenance. A
+        # research/interact/etc. dispatch is external_untrusted — its output can
+        # echo web/browser content, and these outcome memories are now
+        # default-recallable (source_subsystem dropped), so an unstamped one
+        # would default to first_party and bypass recall-time external-content
+        # handling (a laundered indirect prompt injection). Stamp it with the
+        # SAME origin the session's own memories carry (see _PROFILE_ORIGIN use
+        # at session launch). memory_class="fact" pins these as operational
+        # facts so a summary echoing MUST/NEVER isn't misfiled as a rule.
+        dispatch_origin = _PROFILE_ORIGIN.get(request.profile)
         try:
             from genesis.db.crud.ego import (
+                get_proposal,
                 mark_proposal_verification_failed,
                 update_proposal_outcome,
             )
@@ -1154,9 +1215,10 @@ class DirectSessionRunner:
                                 source="ego_dispatch_verification",
                                 tags=["ego", "verification_failure"],
                                 memory_type="episodic",
+                                memory_class="fact",
+                                origin_class=dispatch_origin,
                                 wing="autonomy",
                                 room="ego",
-                                source_subsystem="ego",
                             )
                     except Exception:
                         logger.debug(
@@ -1188,22 +1250,50 @@ class DirectSessionRunner:
                 success=result.success,
                 summary=summary,
             )
-            # On failure: create observation so ego sees it next cycle
-            if not result.success:
-                try:
-                    store = getattr(self._rt, "_memory_store", None)
-                    if store is not None:
-                        await store.store(
-                            content=(f"Ego dispatch FAILED for proposal {proposal_id}: {summary}"),
-                            source="ego_dispatch_outcome",
-                            tags=["ego", "dispatch_failure"],
-                            memory_type="episodic",
-                            wing="autonomy",
-                            room="ego",
-                            source_subsystem="ego",
+            # Record the dispatch outcome (BOTH polarities) as a retrievable
+            # memory so the ego and later CC sessions can recall what happened to
+            # a dispatch — not just failures. Stored WITHOUT source_subsystem: a
+            # dispatch outcome is operational history, not internal decisional
+            # output, so it must stay in default recall / the proactive hook
+            # (classified in test_store_subsystem_coverage's USER_CONTEXT_ALLOWLIST).
+            try:
+                store = getattr(self._rt, "_memory_store", None)
+                if store is not None:
+                    # Prepend a human subject from the proposal so the memory has
+                    # task terms to recall on, not just the opaque UUID (#1487 :1212).
+                    # One cheap read; the row is not otherwise loaded on this path.
+                    # Its own try: a subject-fetch failure must degrade to no subject,
+                    # NOT skip the (more valuable) outcome memory itself.
+                    _subj = ""
+                    try:
+                        _prop = await get_proposal(db, proposal_id)
+                        _subj = ((_prop.get("content") if _prop else None) or "").strip()[:80]
+                    except Exception:
+                        logger.debug("Failed to fetch proposal subject", exc_info=True)
+                    _subj_tag = f" ({_subj})" if _subj else ""
+                    if result.success:
+                        content = (
+                            f"Ego dispatch SUCCEEDED for proposal "
+                            f"{proposal_id}{_subj_tag}: {summary}"
                         )
-                except Exception:
-                    logger.debug("Failed to store failure observation", exc_info=True)
+                        outcome_tag = "dispatch_success"
+                    else:
+                        content = (
+                            f"Ego dispatch FAILED for proposal {proposal_id}{_subj_tag}: {summary}"
+                        )
+                        outcome_tag = "dispatch_failure"
+                    await store.store(
+                        content=content,
+                        source="ego_dispatch_outcome",
+                        tags=["ego", outcome_tag],
+                        memory_type="episodic",
+                        memory_class="fact",
+                        origin_class=dispatch_origin,
+                        wing="autonomy",
+                        room="ego",
+                    )
+            except Exception:
+                logger.debug("Failed to store dispatch outcome observation", exc_info=True)
         except Exception:
             logger.warning(
                 "Failed to record proposal outcome for %s",
@@ -1332,6 +1422,12 @@ class DirectSessionRunner:
             # invariant (GENESIS_SESSION_ID is always a foreground row) depends
             # on direct_session_run staying unreachable from background sessions.
             exceptions.discard("mcp__genesis-health__direct_session_run")
+            # Same protection for the cold-marketing actuator: a tool_exception
+            # must never re-enable marketing_send on a non-campaign profile
+            # (esp. the untrusted-inbound mail/community-responder perimeter). The
+            # profile disallow lists are the belt; this keeps the exception
+            # mechanism from becoming a hole in them, regardless of caller.
+            exceptions -= set(_NO_MARKETING_SEND)
             disallowed = [t for t in disallowed if t not in exceptions]
 
         # Give background sessions access to Genesis MCP servers. Profile
@@ -1464,6 +1560,7 @@ class DirectSessionRunner:
             {
                 "profile": request.profile,
                 "caller_context": request.caller_context,
+                "origin_caller_context": request.origin_caller_context,
                 "output_text": result.output_text[:20000],
                 "tools_summary": tool_counts,
                 "cc_session_id": result.cc_session_id,

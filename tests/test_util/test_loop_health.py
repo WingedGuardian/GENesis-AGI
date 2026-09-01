@@ -34,6 +34,18 @@ def _isolate_module_state(monkeypatch):
     test order (and the sampler integration tests sharing the process) can
     never leak a sample into these units."""
     monkeypatch.setattr(loop_health, "_latest", None)
+    monkeypatch.setattr(loop_health, "_last_lagging_monotonic", None)
+
+
+def _lagging_sample(sampled_monotonic: float) -> LoopHealthSample:
+    return LoopHealthSample(
+        drift_ms=3000.0,
+        peak_ms=3000.0,
+        lagging=True,
+        threshold_ms=250.0,
+        executor=None,
+        sampled_monotonic=sampled_monotonic,
+    )
 
 
 def test_read_before_any_publish_is_none():
@@ -87,3 +99,43 @@ def test_age_s_defaults_to_monotonic_clock():
     first = loop_health.age_s(s)
     second = loop_health.age_s(s)
     assert 0.0 <= first <= second < 60.0
+
+
+# --- recent-lag memory (closes the cleared-republish TOCTOU race) ---
+
+
+def test_recently_lagging_false_when_never_lagged():
+    assert loop_health.recently_lagging(2.0) is False
+
+
+def test_publish_lagging_records_recent_lag_within_window():
+    loop_health.publish(_lagging_sample(sampled_monotonic=500.0))
+    # lag observed at t=500; a read 1.0s later is within a 2.0s window, outside 0.5s
+    assert loop_health.recently_lagging(2.0, now=501.0) is True
+    assert loop_health.recently_lagging(0.5, now=501.0) is False
+
+
+def test_publish_non_lagging_does_not_record_recent_lag():
+    loop_health.publish(_sample())  # lagging=False
+    assert loop_health.recently_lagging(9999.0, now=1e12) is False
+
+
+def test_recent_lag_survives_cleared_republish():
+    """The exact race: a lagging sample, then a cleared republish ~0.5s later.
+
+    read() shows the cleared (lagging=False) sample, but recently_lagging still
+    reports the just-observed lag — so a consumer reading just after the swap
+    still sees live starvation evidence.
+    """
+    loop_health.publish(_lagging_sample(sampled_monotonic=500.0))
+    cleared = LoopHealthSample(
+        drift_ms=1.0,
+        peak_ms=0.0,
+        lagging=False,
+        threshold_ms=250.0,
+        executor=None,
+        sampled_monotonic=500.5,
+    )
+    loop_health.publish(cleared)
+    assert loop_health.read().lagging is False  # latest sample is the cleared one
+    assert loop_health.recently_lagging(1.5, now=500.6) is True  # lag was 0.6s ago

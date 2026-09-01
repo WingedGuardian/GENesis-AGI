@@ -23,12 +23,20 @@ def _iso(minutes_ago: float) -> str:
     return (NOW - timedelta(minutes=minutes_ago)).isoformat()
 
 
-def _live(*, success_min_ago, intent_min_ago, interval=90, gated=False):
+def _live(
+    *,
+    success_min_ago,
+    intent_min_ago,
+    interval=90,
+    gated=False,
+    gated_min_ago=None,
+):
     return compute_ego_liveness(
         last_success_at=None if success_min_ago is None else _iso(success_min_ago),
         last_intent_at=None if intent_min_ago is None else _iso(intent_min_ago),
         current_interval_minutes=interval,
         gated=gated,
+        last_gated_at=None if gated_min_ago is None else _iso(gated_min_ago),
         now=NOW,
     )
 
@@ -79,7 +87,8 @@ def test_transient_lag_under_threshold_not_stalled():
 
 
 def test_floor_applies_to_short_cadence():
-    """A 90m interval yields the 3h floor (4*90m=6h dominates here actually)."""
+    """A 90m interval yields a 6h threshold (4*90m=360m dominates the 3h floor);
+    the floor only wins for cadences shorter than 45m."""
     assert stall_threshold_minutes(90) == max(90 * 4, STALL_FLOOR_MINUTES)
 
 
@@ -97,3 +106,121 @@ def test_degenerate_interval_uses_floor():
     threshold."""
     assert stall_threshold_minutes(0) == STALL_FLOOR_MINUTES
     assert stall_threshold_minutes(-5) == STALL_FLOOR_MINUTES
+
+
+# ---------------------------------------------------------------------------
+# Grace after gate-release — the CLI-approval-release race (C5b)
+#
+# A long CLI-approval hold suppresses stalled via `gated` while it lasts. The
+# false-positive is the RACE at release: `gated` flips False the instant the
+# approval resolves, but `last_success` can't advance until the now-unblocked
+# cycle completes (dispatch + runtime). In that window: not-gated + stale
+# completion + old intent → a false "stalled". Grace = one cadence interval
+# after the ego was last gate-held covers the release→completion gap; a
+# never-gated real deadlock is unaffected.
+# ---------------------------------------------------------------------------
+
+
+def test_recent_gate_release_not_stalled():
+    """Release race: approval just resolved (gated_min_ago=1), completion still
+    stale (6h), intent recent — WITHOUT the grace this reads stalled. Within one
+    interval of the gate release → NOT stalled."""
+    v = _live(
+        success_min_ago=6 * 60 + 30,
+        intent_min_ago=5,
+        interval=90,
+        gated_min_ago=1,
+    )
+    assert v.stalled is False
+
+
+def test_gate_release_grace_expired_is_stalled():
+    """Long after the gate released (2 intervals), a still-stale completion is a
+    genuine stall — grace does not mask a real problem indefinitely."""
+    v = _live(
+        success_min_ago=6 * 60 + 30,
+        intent_min_ago=5,
+        interval=90,
+        gated_min_ago=180,
+    )
+    assert v.stalled is True
+    assert v.reason and "actively cycling" in v.reason
+
+
+def test_never_gated_deadlock_still_stalled():
+    """A real deadlock (never gate-held: last_gated_at None) still fires — the
+    grace only applies to a recently-gated ego."""
+    v = _live(
+        success_min_ago=3 * 24 * 60,
+        intent_min_ago=5,
+        gated_min_ago=None,
+    )
+    assert v.stalled is True
+
+
+def test_gate_release_grace_scales_with_interval():
+    """Grace tracks the cadence interval: the genesis ego (240m) gets a 240m
+    grace, so a release 3h ago is still within grace."""
+    v = _live(
+        success_min_ago=20 * 60,
+        intent_min_ago=5,
+        interval=240,
+        gated_min_ago=180,
+    )
+    assert v.stalled is False  # 180m since release < 240m grace
+
+
+def test_recent_gate_release_healthy_stays_healthy():
+    """Grace never FLIPS a healthy ego to stalled — a recently-gated ego that
+    also completed recently is simply not stalled (lag small)."""
+    v = _live(
+        success_min_ago=40,
+        intent_min_ago=50,
+        interval=90,
+        gated_min_ago=1,
+    )
+    assert v.stalled is False
+
+
+def test_future_last_gated_fails_toward_detection():
+    """A last_gated in the FUTURE (clock skew / corrupt row) must NOT grant
+    grace — a safety monitor fails toward detection, so a real stall fires."""
+    v = _live(
+        success_min_ago=3 * 24 * 60,
+        intent_min_ago=5,
+        interval=90,
+        gated_min_ago=-30,  # 30m in the FUTURE
+    )
+    assert v.stalled is True
+
+
+def test_grace_floor_protects_short_cadence():
+    """A 30m cadence would give a 30m grace — shorter than a cycle can take. The
+    floor (60m) protects it: a release 45m ago is still within grace, one 70m ago
+    (past the floor) is a genuine stall."""
+    within = _live(
+        success_min_ago=6 * 60 + 30,
+        intent_min_ago=5,
+        interval=30,
+        gated_min_ago=45,
+    )
+    assert within.stalled is False  # 45m < 60m floor
+    expired = _live(
+        success_min_ago=6 * 60 + 30,
+        intent_min_ago=5,
+        interval=30,
+        gated_min_ago=70,
+    )
+    assert expired.stalled is True  # 70m > 60m floor
+
+
+def test_degenerate_interval_with_gate_release_uses_floor():
+    """A degenerate (0) interval + last_gated collapses grace to the floor, not
+    zero — a recently-released ego is still excused, never false-fired."""
+    v = _live(
+        success_min_ago=6 * 60 + 30,
+        intent_min_ago=5,
+        interval=0,
+        gated_min_ago=30,
+    )
+    assert v.stalled is False  # 30m < 60m floor (interval 0 → floor)

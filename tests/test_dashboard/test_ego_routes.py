@@ -453,6 +453,22 @@ class TestEgoStatusHeartbeat:
         assert data["ego_heartbeat_stale"] is False
         assert data["ego_heartbeat_error"] is True
 
+    def test_never_started_is_error(self, client):
+        """compute now owns the manifest-informed never_started verdict (#10); the
+        tile must flag it as error (not green) — the case the no_heartbeat boot-grace
+        block used to catch before compute owned it."""
+        resp = _status_response(
+            client,
+            hb_return={
+                "status": "never_started",
+                "last_seen": None,
+                "reason": "started-silent",
+            },
+        )
+        data = resp.get_json()
+        assert data["ego_heartbeat_stale"] is False
+        assert data["ego_heartbeat_error"] is True
+
     def test_no_heartbeat_degraded_boot_is_error(self, client):
         """No boot stamp (degraded boot) → no grace → fail-loud to error (P2-5)."""
         resp = _status_response(
