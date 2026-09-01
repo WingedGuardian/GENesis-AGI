@@ -255,6 +255,59 @@ frontend comparisons against an uppercase `'OPEN'` were fixed — the routing AP
 emits `cb.state.value` from a lowercase `StrEnum`, so the dashboard was
 structurally unable to render a tripped breaker.
 
+**Two follow-on defects in the new field, both of the same shape**, found in
+review after the redesign landed. Neither was in the heal guard — the guard was
+correct — but both were something that changed breaker state without keeping
+`_opened_by_call` in step, i.e. the field was a CONVENTION that every mutation
+site had to remember:
+
+- **The persisted schema had no migration.** A state file written before the
+  field existed carries no key, and `.get()` read that absence as "a probe
+  opened it" — the one origin a saved-OPEN row cannot have, since
+  `probe_suspect()` only ever produced HALF_OPEN and a non-OPEN save restores as
+  CLOSED. Measured against a live install mid-outage: the affected provider was
+  persisted OPEN with no key, so the first post-deploy probe could have healed
+  it once more and the fix would have failed on the very incident that motivated
+  it. A saved-OPEN row with no recorded origin now defaults to call-opened. An
+  explicit value in a new-format file is preserved.
+- **The dashboard toggle assigned breaker fields directly**, so it left the flag
+  wrong in both directions: disabling a provider left it probe-clearable (a
+  health check could undo an operator's decision), and re-enabling one left a
+  stale "real calls failed here" mark that refused probe healing until real
+  traffic or a restart.
+
+The fix for the second is a chokepoint rather than two patches:
+`CircuitBreaker.force_open()` / `force_close()` set the state and its origin
+together, `providers.py` calls those, and a guard test fails any module outside
+`circuit_breaker.py` that changes breaker private state. That is what stops the
+next persisted field repeating this.
+
+Be precise about what the guard is worth, because two successive audits found
+defects in it rather than in the rule. It parses the source (`ast`) rather than
+matching text, and the rule it enforces is *assigning a guarded private
+attribute on some other object* — so it catches `breakers.get(name)._state = …`,
+`cb._trip_count += 1` and `setattr(cb, "_state", …)` whatever the receiver is
+called, while a class assigning its own `self._state` (several unrelated state
+machines here do) is correctly ignored. Comments, docstrings and keyword
+arguments cannot trigger it, because none of them is an assignment.
+
+The regex versions failed twice in different directions — first blind to
+`breakers.get(name)._state`, then, once keyed on the attribute, over-matching
+every unrelated `self._state` in the tree and needing a file filter that turned
+out to exclude `dashboard/routes/routing.py`, the module most likely to hold the
+next offender. Parsing removes the need for that filter.
+
+It scans `src/genesis` and `scripts/`, and pins the files that actually hold
+breaker objects so a refactor cannot quietly drop one out of scope. What it
+still cannot see: `__dict__` writes, `object.__setattr__`, and dynamically built
+attribute names. The measured present population is zero external assigners.
+
+The premise of the migration was measured the same way: across all 18 historical
+versions of `probe_suspect` in this repository, ZERO reference `ProviderState.OPEN`,
+and no version of `load_state` has ever restored a saved non-OPEN state. So a
+persisted OPEN with no recorded origin really does have only two possible causes,
+both of which must refuse a probe heal.
+
 ### 2026-05-10 — Silent-drop fix for keyless call sites (PR #308)
 
 Partial API-key configuration is now treated as a first-class normal state, not a load-time filter condition. Previously, the config loader auto-disabled any provider whose API key env var was unset/empty AND filtered those providers out of every chain. Sites whose entire chain was keyless were dropped from `cfg.call_sites` entirely — invisible everywhere downstream (neural monitor, routing API, health snapshot). On a partially-configured install (the normal install state), this masked which sites were unreachable and what env vars would unblock them.

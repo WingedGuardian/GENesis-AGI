@@ -1300,7 +1300,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: 5edb3256 2026-09-01
+verified: daa2d79d 2026-09-01
 ```
 
 - **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
@@ -1323,7 +1323,26 @@ verified: 5edb3256 2026-09-01
   to the cap instead of resetting — a dead provider is retried less often, and a
   quota-dead one may wait the full 4h. `last_failure_category` is restored from
   disk ONLY when the saved state was OPEN — a qualifier must not outlive the
-  state it qualifies, or it poisons the heal guard for a healthy provider. Degradation levels are
+  state it qualifies, or it poisons the heal guard for a healthy provider. The
+  same rule governs `_opened_by_call`, with one asymmetry that decides the
+  first cycle after any upgrade: a file written before the field existed has NO
+  key, and a saved-OPEN row with no recorded origin defaults to **call**-opened,
+  because legacy `probe_suspect()` produced HALF_OPEN and never OPEN — so a
+  probe cannot have been the cause. Reading that absence as "probe" would hand
+  the first post-upgrade probe a breaker real calls had opened. The ONLY
+  external mutator of breaker state is the dashboard toggle
+  (`dashboard/routes/providers.py`), and it goes through `force_open()` /
+  `force_close()` rather than assigning private fields, so the origin flag
+  cannot drift out of step with the state. Both are COMPLETE transitions --
+  they notify (which is what the registry wires to `save_state`) and clear the
+  qualifiers they invalidate. They are complete with respect to
+  BREAKER FIELDS only — neither fires `on_recovery`, so an operator re-enable
+  deliberately leaves the `provider_failure` observation open. A guard test in
+  `tests/test_routing/test_circuit_breaker.py` parses the tree for assignment to
+  breaker private state on a non-`self` receiver; it cannot see `__dict__` or
+  `object.__setattr__` writes. KNOWN LIMIT:
+  `_opened_by_call` is two-valued while the question now has three answers
+  (call / probe / operator), so the dashboard mislabels an operator disable. Degradation levels are
   hand-curated: L2 sheds nice-to-haves; **L3 keeps ONLY micro-reflection,
   embeddings, tagging** — changing those sets changes what survives an outage.
   Some call sites alias another site's chain — don't assume 1:1.

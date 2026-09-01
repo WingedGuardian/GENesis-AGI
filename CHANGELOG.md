@@ -2824,6 +2824,32 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   again, using the next provider in the chain until then. Reading the retry delay
   the provider itself reports is the exact fix and is tracked as follow-up work.
 
+- **Disabling a provider from the dashboard now holds against health checks,
+  and re-enabling one actually clears it.** The toggle used to reach into the
+  breaker and set its fields directly, which left the new "who broke this"
+  record out of step in both directions: a provider switched off by hand could
+  be quietly switched back on by a routine health check, and a provider
+  switched back on kept a stale "real calls failed here" mark that made it
+  refuse to go green again until real traffic arrived. Both transitions are now
+  operations the breaker performs on itself, so the state and the reason for it
+  are set together, with a test that scans for code setting breaker state from
+  outside. (A disabled provider still returns to rotation when its
+  backoff window elapses — that is separate, and tracked.)
+
+- **Removed a provider toggle that could never work.** The Tool Providers card
+  on the Overview tab carried disable/enable buttons that posted the tool
+  provider's name to an endpoint which only knows routing-provider names. The
+  two are different namespaces, so every click returned "not found" and popped
+  an error. The working toggle is on the Internals tab and is unaffected.
+
+- **Upgrading in the middle of an outage no longer forgets that the outage is
+  real.** The saved breaker file written by the previous version has no record
+  of what broke a provider, and reading that silence as "a health check did it"
+  would have let the first health check after the upgrade close a breaker that
+  real calls had opened — losing the outage exactly once, at the worst moment.
+  A saved-as-failing provider with no recorded cause is now treated as broken by
+  real calls, which is the only thing it can have been.
+
 - **Alerts now say how long they have been firing.** `alert_events` has recorded
   `created_at` for every open alert with 90-day retention since it was
   introduced, and nothing read it — so a condition three days old was rendered

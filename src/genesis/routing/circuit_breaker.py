@@ -247,6 +247,97 @@ class CircuitBreaker:
             return True
         return False
 
+    # ---- operator transitions -------------------------------------------
+    # The dashboard's provider toggle is the ONLY caller outside this class
+    # that changes breaker state. It used to assign the private fields
+    # directly, which made `_opened_by_call` a CONVENTION: every external
+    # mutation site had to remember to maintain it, and the first one written
+    # did not. These two methods exist so the flag cannot be forgotten -- the
+    # state and its origin are set together, by construction. A guard test
+    # pins the rule that no module outside this file assigns breaker state
+    # (best-effort: it is a source scan, so it catches the shapes people
+    # actually write, not every shape that is possible).
+    #
+    # They are complete WITH RESPECT TO BREAKER FIELDS -- not the raw
+    # assignments they replaced: each notifies, and each clears the qualifiers
+    # it invalidates. Deliberately NOT complete beyond this object: neither
+    # fires `on_recovery`, so an operator re-enable leaves the
+    # `provider_failure` observation open and leaves `escalation._state`
+    # (trip count + `first_trip_at`) accumulating across the reset. That is
+    # arguably right under evidence symmetry -- an operator clicking a button
+    # is not evidence the provider works -- but it IS a behaviour a caller
+    # must know about, so it is stated rather than left to be discovered. That
+    # matters because `_notify_change` is what the registry wires to
+    # `save_state` -- without it the caller has to remember to persist, which
+    # is the same class of obligation these methods exist to delete.
+    #
+    # KNOWN LIMIT, not fixed here: `_opened_by_call` is a two-valued answer to
+    # a now three-valued question (call / probe / operator). The dashboard
+    # renders an operator disable as "real calls are failing", which is wrong.
+    # An origin enum is the right model and is tracked as its own change --
+    # this method records the operator case as call-origin only because that
+    # produces the correct HEAL rule, not the correct LABEL.
+
+    def force_open(self) -> None:
+        """Operator disable: hold this provider OPEN by explicit human action.
+
+        Sets `_opened_by_call`, so a listing probe may not close it. Under
+        evidence symmetry a probe may only undo a probe's own suspicion, and
+        an operator taking a provider out of rotation is not one -- it is at
+        least as strong a statement as a failed call.
+
+        `_trip_count = 99` is the pre-existing "stay open" idiom: it drives
+        `_effective_open_duration()` to its cap. NOTE a pre-existing limit this
+        does NOT fix -- that cap is 30 minutes, after which `.state`
+        auto-transitions to HALF_OPEN and the provider is routable again, and
+        a restart caps `_trip_count` to 3 (`load_state`) AND resets
+        `_opened_at` to now -- so a restart shortens the remaining window to 8
+        minutes but re-starts its clock, which can EXTEND the total hold (a
+        restart 29 minutes in yields ~37). Soft in both directions. Tracked
+        as follow-up `506fc0f2`. The flag stops a PROBE from closing the
+        breaker; it does not stop the window from expiring.
+        """
+        self._state = ProviderState.OPEN
+        self._opened_at = self._clock()
+        self._trip_count = 99
+        self._opened_by_call = True
+        # An operator disable is not a failure, so it must not inherit the
+        # last failure's category: `_effective_open_duration()` reads it to
+        # pick the 4h quota cap, which would make the hold length depend on
+        # unrelated history (4h if the last failure happened to be
+        # QUOTA_EXHAUSTED, 30 min otherwise). Two other readers see the
+        # erasure: `vitals.py` (`last_failure`) and `api_keys.py` (`reason`)
+        # lose the last real diagnostic for a provider an operator disables,
+        # and `save_state` persists that. Accepted: the category described a
+        # failure, and this transition is not one.
+        self._last_failure_category = None
+        self._consecutive_failures = 0
+        self._consecutive_successes = 0
+        self._notify_change()
+
+    def force_close(self) -> None:
+        """Operator re-enable: return this provider to a clean CLOSED.
+
+        Clears `_opened_by_call` with the counters AND the failure category,
+        so "clean" is literal rather than aspirational. Leaving it True would put
+        "a real call opened this" on a breaker a human has just declared
+        healthy -- the poison pill in the new field. The next probe blip would
+        move it to HALF_OPEN, every clean probe would then be refused, and the
+        dashboard would read "unverified" until real traffic or a restart,
+        in defiance of the explicit reset.
+        """
+        self._state = ProviderState.CLOSED
+        self._consecutive_failures = 0
+        self._consecutive_successes = 0
+        self._trip_count = 0
+        self._opened_by_call = False
+        # A qualifier must not outlive the state it qualifies -- the same rule
+        # `load_state` applies to a restored breaker. Leaving the category set
+        # would render a stale `last_failure` / `reason` on a breaker a human
+        # just declared healthy (`vitals.py`, `api_keys.py` both read it).
+        self._last_failure_category = None
+        self._notify_change()
+
 
 class CircuitBreakerRegistry:
     """Registry of circuit breakers, one per provider."""
@@ -364,15 +455,56 @@ class CircuitBreakerRegistry:
                     # non-OPEN save restores CLOSED, where "a call opened this"
                     # is not a fact about anything — carrying it would be the
                     # poison pill in a new field.
-                    cb._opened_by_call = bool(
-                        info.get("opened_by_call")
-                    ) and saved_state == ProviderState.OPEN.value
-                    saved_cat = info.get("last_failure_category")
-                    cb._last_failure_category = (
-                        ErrorCategory(saved_cat)
-                        if saved_cat and saved_state == ProviderState.OPEN.value
-                        else None
+                    # MIGRATION, and it decides the first post-deploy cycle:
+                    # a file written before this field existed has no key at
+                    # all, and `.get()` would read that absence as "a probe
+                    # opened it" -- the one origin a legacy OPEN row CANNOT
+                    # have. In every version that wrote a keyless file,
+                    # `probe_suspect()` produced HALF_OPEN and nothing else,
+                    # and a non-OPEN save restores CLOSED, so a persisted OPEN
+                    # can only have come from a real call trip or an operator
+                    # disable. Both must read True. MEASURED against this
+                    # deploy's own live state file: the provider in the
+                    # motivating outage is persisted OPEN with no key, so
+                    # defaulting to False would have left it probe-healable for
+                    # one more cycle -- the fix failing its own acceptance bar.
+                    # An explicit False in a NEW-format file is preserved.
+                    # `null` is treated as ABSENT, not as False: `save_state`
+                    # only ever writes a bool, so a null reaching here came
+                    # from a hand-edit or a torn write, and reading it as False
+                    # would hand back exactly the probe-healable value this
+                    # migration exists to prevent.
+                    saved_origin = info.get("opened_by_call")
+                    cb._opened_by_call = (
+                        (True if saved_origin is None else bool(saved_origin))
+                        if saved_state == ProviderState.OPEN.value
+                        else False
                     )
+                    saved_cat = info.get("last_failure_category")
+                    try:
+                        cb._last_failure_category = (
+                            ErrorCategory(saved_cat)
+                            if saved_cat
+                            and saved_state == ProviderState.OPEN.value
+                            else None
+                        )
+                    except ValueError:
+                        # A category this build does not know -- a file written
+                        # by a NEWER build, i.e. the rollback path. Scoped to
+                        # this ONE breaker on purpose: the enclosing try wraps
+                        # the whole loop, so an unscoped raise here would drop
+                        # every LATER provider's restored state to CLOSED with
+                        # no origin, which is "forget the outage" -- exactly
+                        # what this branch exists to prevent, triggered by a
+                        # rollback. `ErrorCategory` has gained members before
+                        # (TIMEOUT, RATE_LIMITED, BAD_REQUEST), so this is a
+                        # shape that has actually occurred.
+                        logger.warning(
+                            "Unknown failure category %r for provider %s; "
+                            "restoring state without it",
+                            saved_cat, name,
+                        )
+                        cb._last_failure_category = None
             logger.info("Circuit breaker state restored from %s", self._state_file)
         except Exception:
             logger.warning("Failed to load circuit breaker state", exc_info=True)

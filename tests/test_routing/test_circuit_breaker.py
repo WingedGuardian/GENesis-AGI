@@ -775,3 +775,318 @@ def test_chain_has_available_false_for_empty_or_unknown():
     reg = CircuitBreakerRegistry({"a": _provider("a")})
     assert reg.chain_has_available([]) is False
     assert reg.chain_has_available(["nonexistent"]) is False
+
+
+# --- Origin flag: schema migration and operator transitions ---
+#
+# `_opened_by_call` is a NEW persisted field. Two ways to get it wrong, both
+# found by review rather than by me, and both of the same shape: something
+# that changes breaker state without maintaining the flag. The migration below
+# covers the file written by a version that predates the field; the operator
+# transitions cover the only external mutation site in the tree.
+
+
+def _write_state(tmp_path, rows):
+    import json
+
+    (tmp_path / "cb_state.json").write_text(json.dumps(rows))
+
+
+def _restore(tmp_path, rows, name="x"):
+    """Load `rows` through the real load_state and return the breaker."""
+    import genesis.routing.circuit_breaker as cb_mod
+
+    original = cb_mod._STATE_FILE
+    cb_mod._STATE_FILE = tmp_path / "cb_state.json"
+    try:
+        _write_state(tmp_path, rows)
+        reg = CircuitBreakerRegistry({name: _provider(name)}, clock=lambda: 0)
+        return reg.get(name)
+    finally:
+        cb_mod._STATE_FILE = original
+
+
+def test_a_legacy_open_row_without_the_origin_flag_restores_as_call_opened(tmp_path):
+    """A state file written before `opened_by_call` existed has no such key,
+    and reading that absence as False is the one origin the row cannot have.
+
+    In every version that wrote a keyless file, `probe_suspect()` produced
+    HALF_OPEN and never OPEN, and a non-OPEN save restored as CLOSED. So a
+    persisted OPEN can ONLY have come from a real call trip or an operator
+    disable — both of which must refuse probe healing.
+
+    Not hypothetical: MEASURED against this deploy's own live state file, the
+    provider in the motivating outage is persisted OPEN with no key. Defaulting
+    to False would have left the very breaker this branch exists to protect
+    probe-healable for one more cycle, so the fix would have failed its own
+    acceptance bar on the incident that motivated it.
+    """
+    cb = _restore(tmp_path, {"x": {"state": "open", "trip_count": 2}})
+    assert cb._state == ProviderState.OPEN
+    assert cb._opened_by_call is True, (
+        "a legacy OPEN row has no origin recorded; it must default to "
+        "call-opened, because a probe could never have opened it"
+    )
+
+
+def test_a_legacy_row_saved_closed_never_gains_the_origin_flag(tmp_path):
+    """The migration default must not leak onto a breaker that is not OPEN.
+
+    Boundary in the other direction: `_opened_by_call` qualifies an OPEN
+    breaker. Defaulting a CLOSED row to True would be the poison pill in the
+    new field — a healthy provider that refuses probe healing forever after
+    the next blip. Pins the `saved_state == open` condition, not just the
+    default value.
+    """
+    cb = _restore(tmp_path, {"x": {"state": "closed", "trip_count": 0}})
+    assert cb._state == ProviderState.CLOSED
+    assert cb._opened_by_call is False
+
+
+def test_an_explicit_probe_origin_on_an_open_row_survives_the_migration(tmp_path):
+    """A NEW-format file states the origin; the default must not overwrite it.
+
+    Precisely what this pins, since the obvious wording overstates it: no
+    `save_state` can currently produce `{"state": "open", "opened_by_call":
+    false}` -- every path that sets OPEN also sets the flag True -- so this is
+    NOT protecting existing data. It pins the migration's SHAPE: a default must
+    fill an absent key, never override a present one. Written as an
+    unconditional True it would pass every other test here and silently
+    misreport any future OPEN-with-probe-origin state.
+    """
+    cb = _restore(
+        tmp_path,
+        {"x": {"state": "open", "trip_count": 1, "opened_by_call": False}},
+    )
+    assert cb._state == ProviderState.OPEN
+    assert cb._opened_by_call is False
+
+
+def test_operator_disable_refuses_probe_healing():
+    """`force_open()` records the disable as call-origin, so a listing probe
+    cannot quietly undo an explicit human decision.
+
+    Evidence symmetry says a probe may only clear a probe's own suspicion. An
+    operator taking a provider out of rotation is not one — it is at least as
+    strong a statement as a failed call. Before the chokepoint the dashboard
+    assigned the private fields directly and left the flag False, so three
+    clean probes closed the breaker the user had just disabled.
+    """
+    t = [0.0]
+    cb = CircuitBreaker(
+        _provider("p1"), failure_threshold=2, open_duration_s=10,
+        clock=lambda: t[0], probe_success_threshold=3,
+    )
+    cb.force_open()
+    assert cb._state == ProviderState.OPEN
+    assert cb._trip_count == 99
+    assert cb._opened_by_call is True
+
+    t[0] = 10_000.0  # past any window; .state auto-transitions to HALF_OPEN
+    assert cb.state == ProviderState.HALF_OPEN
+    for _ in range(5):
+        cb.record_probe_success()
+    assert cb.state == ProviderState.HALF_OPEN, (
+        "probes must not close a breaker a human disabled on purpose"
+    )
+    assert cb._trip_count == 99, "a probe must not reset the operator's hold"
+
+
+def test_operator_re_enable_clears_the_origin_flag():
+    """`force_close()` must clear `_opened_by_call` along with the counters.
+
+    Leaving it True puts "a real call opened this" on a breaker a human has
+    just declared healthy. The next probe blip moves it to HALF_OPEN, every
+    clean probe is then refused, and the dashboard reads "unverified" until
+    real traffic or a restart — in defiance of the explicit reset.
+    """
+    cb = CircuitBreaker(
+        _provider("p1"), failure_threshold=2, open_duration_s=10,
+        clock=lambda: 0.0, probe_success_threshold=3,
+    )
+    cb.record_failure(ErrorCategory.PERMANENT)
+    cb.record_failure(ErrorCategory.PERMANENT)  # trips OPEN, flag True
+    assert cb._opened_by_call is True
+
+    cb.force_close()
+    assert cb._state == ProviderState.CLOSED
+    assert cb._trip_count == 0
+    assert cb._opened_by_call is False
+
+    # A later probe blip must now be clearable, exactly as for any healthy
+    # provider — this is what the stale flag would have prevented.
+    assert cb.probe_suspect() is True
+    for _ in range(3):
+        cb.record_probe_success()
+    assert cb.state == ProviderState.CLOSED
+
+
+def test_operator_transitions_persist_through_the_change_hook_alone():
+    """The dashboard route no longer calls `save_state()` itself, so the
+    operator's decision reaches disk ONLY via `_notify_change`.
+
+    That is the point of making these complete transitions -- a caller should
+    not have to remember to persist -- but it turns a belt-and-braces double
+    write into a single dependency, so it gets a test rather than an
+    assumption. Without this, unwiring `on_state_change` would silently mean a
+    provider a human disabled comes back on the next restart, with nothing
+    failing anywhere.
+    """
+    import json
+    import pathlib
+    import tempfile
+
+    d = pathlib.Path(tempfile.mkdtemp())
+    state_file = d / "cb.json"
+    reg = CircuitBreakerRegistry(
+        {"p1": _provider("p1")}, state_file=state_file, persist=True
+    )
+    cb = reg.get("p1")
+    assert not state_file.exists()
+
+    cb.force_open()  # no explicit save_state anywhere in this test
+    assert state_file.exists(), "operator disable never reached disk"
+    row = json.loads(state_file.read_text())["p1"]
+    assert row["state"] == "open"
+    assert row["trip_count"] == 99
+    assert row["opened_by_call"] is True
+
+    cb.force_close()
+    row = json.loads(state_file.read_text())["p1"]
+    assert row["state"] == "closed"
+    assert row["opened_by_call"] is False
+    assert row["trip_count"] == 0
+
+
+def test_no_module_outside_the_breaker_assigns_its_private_state():
+    """LOCK: breaker state may only be changed by the breaker's own methods.
+
+    Two review findings on this branch had ONE shape between them -- something
+    changed breaker state without maintaining `_opened_by_call`. That is a
+    CONVENTION: every external mutation site has to remember a rule, and the
+    only one that existed did not. `force_open()`/`force_close()` move the
+    obligation into the class; this test stops a new caller reintroducing it.
+
+    This is an AST check, not a regex, because two successive audits found
+    defects in the regex versions rather than in the rule -- first a receiver
+    blind spot (it matched `cb.` but not `breakers.get(name).`), then an
+    over-match onto unrelated classes' own `self._state`, plus comment,
+    docstring and keyword-argument false positives. Parsing removes that whole
+    class: a comment is not an assignment, a keyword argument is not an
+    attribute, and the receiver is a node rather than a name to be spelled.
+
+    The rule enforced is precise: **assigning a guarded private attribute on
+    some OTHER object**. A class assigning its own `self._state` is its own
+    business -- several unrelated state machines here do exactly that -- so
+    `self`/`cls` receivers are excluded by construction rather than by hoping
+    a file filter never admits them.
+
+    HONEST SCOPE: it sees `.py` under `src/genesis` and `scripts/`. It cannot
+    see a mutation routed through `__dict__`, `object.__setattr__`, or a
+    dynamically built attribute name.
+    """
+    import ast
+    import pathlib
+
+    roots = [
+        pathlib.Path(__file__).resolve().parents[2] / "src" / "genesis",
+        pathlib.Path(__file__).resolve().parents[2] / "scripts",
+    ]
+    owner = roots[0] / "routing" / "circuit_breaker.py"
+    assert owner.is_file(), f"guard is blind: {owner} not found"
+
+    FIELDS = {
+        "_state", "_opened_by_call", "_opened_at", "_trip_count",
+        "_consecutive_failures", "_consecutive_successes",
+        "_last_failure_category",
+    }
+
+    def _receiver_is_self(node):
+        return isinstance(node, ast.Name) and node.id in ("self", "cls")
+
+    def offenders_in(tree):
+        out = []
+        for node in ast.walk(tree):
+            targets = []
+            if isinstance(node, ast.Assign):
+                targets = list(node.targets)
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                targets = [node.target]
+            for t in targets:
+                for sub in ([*t.elts] if isinstance(t, ast.Tuple) else [t]):
+                    if (isinstance(sub, ast.Attribute) and sub.attr in FIELDS
+                            and not _receiver_is_self(sub.value)):
+                        out.append((sub.lineno, sub.attr))
+            # setattr(x, "_state", ...) on a non-self receiver
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "setattr" and len(node.args) >= 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and node.args[1].value in FIELDS
+                    and not _receiver_is_self(node.args[0])):
+                out.append((node.lineno, f"setattr {node.args[1].value}"))
+        return out
+
+    # ANCHOR — shapes the guard MUST catch. Replaces a file-count check, which
+    # only proved files were opened, not that the check still fires.
+    must_catch = [
+        "cb._state = 1",
+        "breakers.get(name)._state = 1",
+        "provider_breaker._trip_count = 0",
+        "cb._trip_count += 1",
+        "cbs[name]._opened_by_call = True",
+        "cb._state, cb._trip_count = 1, 99",
+        'setattr(cb, "_state", 1)',
+    ]
+    for src in must_catch:
+        assert offenders_in(ast.parse(src)), f"guard has gone blind on: {src}"
+    # ...and shapes it must NOT catch, incl. an unrelated class's own state and
+    # the prose/kwarg forms that defeated the regex versions.
+    must_ignore = [
+        "self._state = NetworkStatus.OFFLINE",
+        "self._consecutive_failures = 0",
+        "foo(_state=1)",
+        "_state = compute()",
+        "if cb.state == 1: pass",
+        "assert cb._trip_count == 0",
+        "opened = cb._opened_by_call",
+        '"""docs: cb._state = ProviderState.OPEN is forbidden."""',
+    ]
+    for src in must_ignore:
+        assert not offenders_in(ast.parse(src)), f"guard over-matches: {src}"
+
+    offenders, scanned = [], set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*.py")):
+            if path == owner:
+                continue
+            try:
+                tree = ast.parse(path.read_text())
+            except SyntaxError:
+                continue
+            rel = str(path.relative_to(root.parent))
+            scanned.add(rel)
+            for lineno, attr in offenders_in(tree):
+                offenders.append(f"{rel}:{lineno}: assigns {attr}")
+
+    # Pin the files that actually hold breaker objects, so a refactor cannot
+    # quietly drop one out of scope (the failure mode of the previous version,
+    # whose substring filter excluded routing.py entirely).
+    must_scan = {
+        "genesis/dashboard/routes/providers.py",
+        "genesis/dashboard/routes/routing.py",
+        "genesis/observability/snapshots/api_keys.py",
+        "genesis/observability/provider_health.py",
+        "genesis/routing/router.py",
+        "genesis/dashboard/routes/vitals.py",
+    }
+    missing = must_scan - scanned
+    assert not missing, f"guard went blind on breaker-handling files: {missing}"
+
+    assert not offenders, (
+        "these modules change circuit-breaker private state on another object. "
+        "Use the breaker's own transitions (force_open / force_close) so a new "
+        "persisted field cannot be silently forgotten:\n  "
+        + "\n  ".join(offenders)
+    )
