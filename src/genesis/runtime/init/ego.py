@@ -301,7 +301,20 @@ async def init(rt: GenesisRuntime) -> None:
                         )
                     except (ValueError, TypeError):
                         _meta = {}
-                    caller_ctx = _meta.get("caller_context", "")
+                    # A park→resume rewrites caller_context to
+                    # "rate_limit_resume:<park_id>"; resolve back to the ORIGINAL
+                    # "ego_proposal:<id>" preserved on origin_caller_context so a
+                    # resumed dispatch's goal-progress + follow-through fire
+                    # (closes 837f8b63 — see rate_limit_park.effective_caller_context).
+                    from genesis.cc.rate_limit_park import effective_caller_context
+
+                    caller_ctx = (
+                        effective_caller_context(
+                            _meta.get("caller_context", ""),
+                            _meta.get("origin_caller_context"),
+                        )
+                        or ""
+                    )
 
                     await obs_crud.create(
                         rt._db,
@@ -372,18 +385,14 @@ async def init(rt: GenesisRuntime) -> None:
                             _err = (_meta.get("error") or "").strip()
                             _out = _err or (_meta.get("output_text") or "")
                             # A rate/quota-parked dispatch stamps park_id into
-                            # metadata (direct_session.py) and is NOT terminal.
-                            # Recording a follow-through now would misreport it
-                            # as failed, so the parked case is passed to the
-                            # helper to withhold. KNOWN GAP, tracked in follow-up
-                            # 837f8b63: the resume does NOT re-fire this, because
-                            # rate_limit_resume rewrites caller_context to
-                            # `rate_limit_resume:<park_id>`, severing the
-                            # `ego_proposal:` linkage this block gates on — so the
-                            # parked class stays uncovered until that reconnection
-                            # lands. Removing B2b's premature "failed" review is
-                            # still strictly better than shipping a false one.
-                            # behavioral-lint: ignore no-hide-problems
+                            # metadata (direct_session.py) and is NOT terminal, so
+                            # the parked ORIGINAL session withholds its follow-through
+                            # here (recording one now would misreport it as failed).
+                            # The RESUMED session re-fires it: caller_ctx is resolved
+                            # from origin_caller_context above, so the `ego_proposal:`
+                            # linkage survives the resume (closes 837f8b63). The
+                            # resumed session carries no park_id, so `_parked` is False
+                            # for it and the follow-through fires on real completion.
                             _parked = bool(_meta.get("park_id"))
                             _iid = await record_dispatch_followthrough(
                                 rt._db,
