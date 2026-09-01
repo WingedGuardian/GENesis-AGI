@@ -168,6 +168,9 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "sentinel_escalated": timedelta(days=7),
     "guardian_diagnosis": timedelta(days=7),
     "infrastructure_drift": timedelta(days=7),
+    # entity-resolution adjudication run summaries — a per-run diagnostic
+    # observation (memory/entity_adjudication.py), same class as guardian_diagnosis.
+    "entity_adjudication": timedelta(days=7),
     # ── 14-day (learning artifacts & assessments — also the DEFAULT) ───
     "build_state": timedelta(days=14),
     "project_context": timedelta(days=14),

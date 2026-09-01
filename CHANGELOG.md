@@ -11,6 +11,54 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Gated autonomous cold marketing outreach (inert by default).** Genesis can
+  now stage cold marketing emails to an owner-curated prospect list via the new
+  `marketing_send` tool. The recipient is resolved in code from a private
+  `marketing_prospects` store (by id — the tool never accepts a raw address),
+  respects permanent opt-outs, and every send still holds at the email
+  authorization gate for your approval. It ships OFF: nothing sends until you set
+  the `marketing_outreach` lever to `observe`/`live` (kill switch:
+  `GENESIS_MARKETING_OUTREACH_DISABLED=1`). Autonomous cold sending requires BOTH
+  affirmatively setting the lever to `live` AND the BULK capability cell earning a
+  grant through your approvals — in `observe` (or `off`) every cold send holds for
+  your explicit approval even after the cell is granted. Manage prospects and
+  opt-outs in the `marketing_prospects` table. Hardened: the `marketing_send`
+  actuator is reachable only from the `campaign` session profile (every other
+  profile — including the untrusted-inbound `mail`/`community-responder` perimeter
+  — denies it, so an injected inbound message can't reach it); arming `live` is
+  overlay-file-only and cannot be set through `settings_update` (a model can't
+  self-elevate past the observe gate); a held send to a permanently opted-out
+  prospect is refused before delivery regardless of how the pitch classified (a
+  money-pattern body that lands as FINANCIAL no longer bypasses the bulk-only
+  opt-out check); and the `pending_outreach.labeled_surplus` migration no longer
+  swallows ALTER errors (a transient lock is retried, a real failure fails loud); and an
+  already-approved cold send is halted at delivery if the lever is flipped to `off` / the
+  kill switch is set before it goes out (the outer off-switch is now honored deliver-side,
+  not only at enqueue — the held send is paused and resumes if you re-enable).
+- **Contributor-issue close loop.** When an external contributor's merged PR
+  closes a GitHub issue Genesis posted from the Contributor Work-Log (via a
+  `Closes #N` keyword), the repo-pulse worker now auto-resolves the originating
+  follow-up — so shipped contributor work no longer lingers as a false TODO.
+  Scoped to default-branch merges and same-repo references; idempotent, and
+  fails closed on any ambiguity (empty/unresolvable state no-ops; a genuine read
+  failure fails the run and preserves the cursor to re-cover). Gated by the same
+  `repo_pulse` lever. Hardened: the originating follow-up id is resolved to its
+  canonical form at proposal time (a prefix/tagged/uppercase handle resolves to
+  the full id; an ambiguous or unknown handle is rejected rather than stored as a
+  ref the join can never match); and only issues Genesis actually CREATED are
+  treated as authoritative close-links — any issue Genesis merely ADOPTED (a
+  pre-existing open issue with a coincidental same title, or one re-found after a
+  crash) is recorded as adopted and excluded from the join, so a PR closing it never
+  falsely resolves a follow-up. (Adopt provenance no longer relies on issue
+  authorship, which cannot be trusted on a single-account install.)
+- **Contributor issues are labeled by domain and difficulty, enforced at the source.**
+  Every issue the Contributor Work-Log proposes must now carry an `area:*` domain
+  label (memory/dashboard/runtime/guardian/autonomy/channels/knowledge/eval, or
+  `area:other`) and a difficulty/environment label (`good first issue`,
+  `first-timers-only`, `needs-genesis-instance`, or `help wanted`) —
+  `contributor_issue_propose` rejects a proposal missing either (fail-closed, after
+  the privacy scan). The public PR template now prompts for a `Closes #NNN` keyword,
+  and CONTRIBUTING documents that a bare `#NNN` won't auto-close the linked issue.
 - **Outreach total-cessation monitoring, without the old false-alarm trap.**
   Outreach is now in the `subsystem_stale` alert set (WARNING) alongside
   ego/inbox/dashboard. Previously it was excluded because its heartbeat was
@@ -31,7 +79,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   init *failure* still surfaces); a *wedged-but-alive* loop is job_health's domain. The
   new `subsystem_stale:outreach` id is handled generically by the existing consumers
   (morning-report dedup by prefix, the Sentinel `subsystem_stale:` disposition).
-
 - **Session-start surface for age-stale open PRs.** The repo-pulse worker now
   also caches the open-PR set each boundary, and a SessionStart hook lists the
   ones idle past a threshold (default 7 days) as one passive inline line —
@@ -77,6 +124,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   nothing.
 
 ### Fixed
+
+- **The morning report no longer cries "surplus heartbeat overdue" during a long
+  healthy dispatch.** Surplus emits its subsystem heartbeat only at the end of a
+  dispatch cycle, and a single healthy dispatch can run 15-30 minutes — longer than
+  the old 10-minute overdue threshold — so a busy-but-healthy surplus was flagged
+  "heartbeat overdue" in the morning report and the subsystem-heartbeats view. The
+  threshold is loosened to 3 hours, matching the surplus dashboard tile's own
+  liveness bound; a genuinely dead surplus is still caught within ~15 minutes by the
+  scheduler watchdog, which reads a separate, per-dispatch signal.
 
 - **The Queues card could report "healthy — queues are clear" for counters it
   never collected.** When the queues section of the health snapshot fails, it is

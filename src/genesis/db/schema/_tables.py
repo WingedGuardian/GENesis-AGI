@@ -285,7 +285,8 @@ TABLES = {
             delivered           INTEGER NOT NULL DEFAULT 0,
             delivered_at        TEXT,
             thread_id           TEXT,
-            validated_recipient TEXT
+            validated_recipient TEXT,
+            labeled_surplus     INTEGER NOT NULL DEFAULT 0
         )
     """,
     "brainstorm_log": """
@@ -790,8 +791,28 @@ TABLES = {
             issue_url           TEXT,
             posted_at           TEXT,
             rejected_at         TEXT,
-            dry_run_at          TEXT
+            dry_run_at          TEXT,
+            adopted             INTEGER NOT NULL DEFAULT 0
         )
+    """,
+    # Marketing cold-send substrate — owner-curated cold-outreach target inventory.
+    # Code-resolvable recipient (never the LLM), PERMANENT opt-out suppression, and
+    # status-queryable. See db/crud/marketing_prospects.py for the New-Store
+    # justification + retention (opted_out rows never pruned; owner-curated + bounded).
+    # DDL byte-identical to migration 0089.
+    "marketing_prospects": """
+    CREATE TABLE IF NOT EXISTS marketing_prospects (
+        id                TEXT PRIMARY KEY,
+        email             TEXT NOT NULL,
+        name              TEXT,
+        company           TEXT,
+        status            TEXT NOT NULL DEFAULT 'active',   -- active | contacted | replied
+        opted_out         INTEGER NOT NULL DEFAULT 0,       -- 1 = PERMANENT suppression (never pruned)
+        source            TEXT,
+        created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
+        last_contacted_at TEXT
+    )
     """,
     # WS-8 PR-D autonomous-send ledger — one row per email sent autonomously
     # under a GRANTED capability cell (i.e. the gate allowed it without holding
@@ -2427,6 +2448,10 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_autonomous_email_sends_cell "
     "ON autonomous_email_sends(cell_domain, cell_verb, cell_risk_class, sent_at)",
     "CREATE INDEX IF NOT EXISTS idx_autonomous_email_sends_sent ON autonomous_email_sends(sent_at)",
+    # Marketing cold-send prospect inventory — email lookup + active-set scan
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_marketing_prospects_email ON marketing_prospects(email COLLATE NOCASE)",
+    "CREATE INDEX IF NOT EXISTS idx_marketing_prospects_active "
+    "ON marketing_prospects(status, opted_out)",
     # task states (Phase 9)
     "CREATE INDEX IF NOT EXISTS idx_task_states_session ON task_states(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_task_states_phase ON task_states(current_phase)",

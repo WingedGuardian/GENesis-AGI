@@ -70,6 +70,11 @@ async def _redispatch(db, park: dict) -> None:
         delivery_mode="result",
         origin_session_id=park["origin_session_id"],
         caller_context=f"{park_helpers._RESUME_PREFIX}{park['id']}",
+        # Carry the ORIGINAL dispatch context (e.g. "ego_proposal:<id>") across
+        # the resume: caller_context above is the resume prefix (for park-lineage),
+        # so proposal-outcome recording + dispatch follow-through resolve back to
+        # this to survive the park→resume (see effective_caller_context).
+        origin_caller_context=payload.get("origin_caller_context"),
     )
 
 

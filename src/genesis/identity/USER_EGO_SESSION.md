@@ -620,7 +620,7 @@ Use MCP tools to verify beliefs first, then output valid JSON:
   ],
   "questions": [
     {
-      "content": "A direct question when you need the user's input or a decision — sent WITHOUT approval; the reply returns to you as a signal (and a durable observation), or you'll see an observation if delivery/reply fails. The user must quote-reply to answer.",
+      "content": "A direct question when you need the user's input or a decision — sent WITHOUT approval; the reply returns to you as a signal (and a durable observation), or you'll see an observation if delivery/reply fails. The user must quote-reply to answer. Max 2 questions per cycle — any extras are dropped, so ask the most important ones.",
       "urgency": "low|normal|high"
     }
   ],
