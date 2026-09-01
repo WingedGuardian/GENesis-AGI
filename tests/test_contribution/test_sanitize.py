@@ -53,6 +53,10 @@ def no_external_scanners(monkeypatch):
 
     monkeypatch.setattr(sanitize.shutil, "which", mock_which)
     monkeypatch.setattr(sanitize.subprocess, "run", mock_run)
+    # The floor now resolves the binary PATH-independently (venv-relative), so
+    # cmd[0] would be an absolute path and bypass the mock_run guard above. Pin
+    # the resolver to the bare name so the stub keeps intercepting.
+    monkeypatch.setattr(sanitize, "_resolve_detect_secrets", lambda: "detect-secrets")
 
 
 @pytest.fixture
@@ -342,7 +346,8 @@ def test_detect_secrets_runs_when_available(clean_diff, monkeypatch):
 def test_detect_secrets_missing_is_blocking_p1_1(clean_diff, monkeypatch):
     """P1-1 regression: missing detect-secrets binary must fail CLOSED,
     not silently skip. This is the sanitizer's required floor."""
-    monkeypatch.setattr(sanitize.shutil, "which", lambda name: None)
+    # Resolution is now PATH-independent, so drive the resolver, not shutil.which.
+    monkeypatch.setattr(sanitize, "_resolve_detect_secrets", lambda: None)
     r = sanitize.scan_diff(clean_diff)
     assert r.ok is False
     blocking = r.blocking()
@@ -350,6 +355,47 @@ def test_detect_secrets_missing_is_blocking_p1_1(clean_diff, monkeypatch):
         f.scanner == "detect-secrets" and f.detail == "missing_binary"
         for f in blocking
     ), f"expected missing_binary block, got: {blocking}"
+
+
+def test_detect_secrets_oversized_line_fails_closed(clean_diff, monkeypatch):
+    """E2BIG regression: a single added line over Linux MAX_ARG_STRLEN (~128 KB)
+    makes `detect-secrets scan --string <text>` raise OSError from execve. The
+    required floor must fail CLOSED (scan_error BLOCK), not propagate an uncaught
+    OSError that would let the line pass unscanned. (Verify-RED: reverting the
+    OSError addition to the except tuple makes this raise instead of BLOCK.)"""
+
+    def raise_e2big(cmd, *a, **k):
+        if cmd and cmd[0] == "detect-secrets":
+            raise OSError(7, "Argument list too long")
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    # autouse fixture pins _resolve_detect_secrets -> "detect-secrets", so
+    # cmd[0] == "detect-secrets" here.
+    monkeypatch.setattr(sanitize.subprocess, "run", raise_e2big)
+    r = sanitize.scan_diff(clean_diff)
+    assert r.ok is False
+    assert any(
+        f.scanner == "detect-secrets" and f.detail == "scan_error" for f in r.blocking()
+    ), f"expected scan_error BLOCK on OSError, got: {r.blocking()}"
+
+
+def test_detect_secrets_nul_byte_line_fails_closed(clean_diff, monkeypatch):
+    """A NUL byte in an added line makes `subprocess.run(..., text=True)` raise
+    ValueError('embedded null byte') from execve — NOT an OSError. The required
+    floor must still fail CLOSED (scan_error BLOCK). (Verify-RED: an enumerated
+    OSError-only except tuple lets this ValueError propagate uncaught.)"""
+
+    def raise_nul(cmd, *a, **k):
+        if cmd and cmd[0] == "detect-secrets":
+            raise ValueError("embedded null byte")
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    monkeypatch.setattr(sanitize.subprocess, "run", raise_nul)
+    r = sanitize.scan_diff(clean_diff)
+    assert r.ok is False
+    assert any(
+        f.scanner == "detect-secrets" and f.detail == "scan_error" for f in r.blocking()
+    ), f"expected scan_error BLOCK on ValueError, got: {r.blocking()}"
 
 
 def test_rename_only_forbidden_path_blocks_codex_p1():
@@ -787,7 +833,9 @@ def test_scan_prose_scans_all_lines_not_just_first(tmp_path):
 def test_scan_prose_detect_secrets_missing_fails_closed(tmp_path):
     """detect-secrets is the required floor — if the binary is absent, the
     prose scan fails CLOSED (ok=False), never open."""
-    with patch.object(sanitize.shutil, "which", return_value=None):
+    # Resolution is PATH-independent now; force the resolver (not shutil.which) to
+    # None to simulate the absent binary, overriding the autouse fixture's pin.
+    with patch.object(sanitize, "_resolve_detect_secrets", return_value=None):
         r = sanitize.scan_prose(
             "totally benign text", fingerprint_file=tmp_path / "no-fp.txt"
         )

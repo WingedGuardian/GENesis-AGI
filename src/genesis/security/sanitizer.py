@@ -33,6 +33,44 @@ def strip_boundary_markers(text: str) -> str:
     return _BOUNDARY_MARKER_RE.sub("", text)
 
 
+# Any maximal run of characters that break — or conceal a break in — a single line
+# of text. Covers C0 (\x00-\x1f, incl. \t \n \r), C1 (\x7f-\x9f, incl. DEL/NEL), the
+# Unicode line/paragraph separators (U+2028/U+2029) that Python's str.splitlines()
+# also treats as line boundaries, and the zero-width / bidi format controls
+# (ZWSP, LRM/RLM, the LRE..RLO and LRI..PDI overrides, BOM) that can visually reorder
+# or hide injected text ("Trojan-source" concealment). Distinct from
+# ContentSanitizer/wrap_content, which delimits a BLOCK of untrusted content; this
+# normalizes a short SCALAR that flows verbatim into a line-parsed prompt.
+_CONTROL_RUN_RE = re.compile(
+    "["
+    r"\x00-\x1f\x7f-\x9f"  # C0 + C1 control chars (incl. tab/newline/CR, NEL)
+    r"\u2028\u2029"  # LINE / PARAGRAPH SEPARATOR (str.splitlines boundaries)
+    r"\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff"  # zero-width / bidi format
+    "]+"
+)
+
+
+def strip_control_chars(s: str) -> str:
+    """Collapse runs of line-breaking / line-concealing characters to a single space
+    and trim the result — guaranteeing single-line, boundary-clean output.
+
+    Signal free-text (``name``/``source``/``baseline_note``) is rendered one line per
+    signal into a reflection/ego prompt that instructs the model "these are the ONLY
+    signals you may cite"; a newline (or a Unicode line separator, or a bidi override)
+    would forge or conceal an authoritative signal line. Applying this at the value's
+    construction point closes the **line-forging** class (structural: no injected value
+    can create a new prompt line) for every render path and enforces the one-line
+    invariant.
+
+    Scope note: this does NOT resist *semantic* injection via purely-printable text
+    placed on a signal's own legitimate line (e.g. a crafted job name). That is
+    defended at the input boundary — content-shape validation of the untrusted source
+    (campaign-name validation), not here. A clean string is returned unchanged (modulo
+    surrounding-whitespace trim).
+    """
+    return _CONTROL_RUN_RE.sub(" ", s).strip()
+
+
 class ContentSource(enum.Enum):
     """Origin of third-party content entering the system."""
 

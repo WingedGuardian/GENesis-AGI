@@ -9,6 +9,622 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **Gated autonomous cold marketing outreach (inert by default).** Genesis can
+  now stage cold marketing emails to an owner-curated prospect list via the new
+  `marketing_send` tool. The recipient is resolved in code from a private
+  `marketing_prospects` store (by id — the tool never accepts a raw address),
+  respects permanent opt-outs, and every send still holds at the email
+  authorization gate for your approval. It ships OFF: nothing sends until you set
+  the `marketing_outreach` lever to `observe`/`live` (kill switch:
+  `GENESIS_MARKETING_OUTREACH_DISABLED=1`). Autonomous cold sending requires BOTH
+  affirmatively setting the lever to `live` AND the BULK capability cell earning a
+  grant through your approvals — in `observe` (or `off`) every cold send holds for
+  your explicit approval even after the cell is granted. Manage prospects and
+  opt-outs in the `marketing_prospects` table. Hardened: the `marketing_send`
+  actuator is reachable only from the `campaign` session profile (every other
+  profile — including the untrusted-inbound `mail`/`community-responder` perimeter
+  — denies it, so an injected inbound message can't reach it); arming `live` is
+  overlay-file-only and cannot be set through `settings_update` (a model can't
+  self-elevate past the observe gate); a held send to a permanently opted-out
+  prospect is refused before delivery regardless of how the pitch classified (a
+  money-pattern body that lands as FINANCIAL no longer bypasses the bulk-only
+  opt-out check); and the `pending_outreach.labeled_surplus` migration no longer
+  swallows ALTER errors (a transient lock is retried, a real failure fails loud); and an
+  already-approved cold send is halted at delivery if the lever is flipped to `off` / the
+  kill switch is set before it goes out (the outer off-switch is now honored deliver-side,
+  not only at enqueue — the held send is paused and resumes if you re-enable).
+- **Contributor-issue close loop.** When an external contributor's merged PR
+  closes a GitHub issue Genesis posted from the Contributor Work-Log (via a
+  `Closes #N` keyword), the repo-pulse worker now auto-resolves the originating
+  follow-up — so shipped contributor work no longer lingers as a false TODO.
+  Scoped to default-branch merges and same-repo references; idempotent, and
+  fails closed on any ambiguity (empty/unresolvable state no-ops; a genuine read
+  failure fails the run and preserves the cursor to re-cover). Gated by the same
+  `repo_pulse` lever. Hardened: the originating follow-up id is resolved to its
+  canonical form at proposal time (a prefix/tagged/uppercase handle resolves to
+  the full id; an ambiguous or unknown handle is rejected rather than stored as a
+  ref the join can never match); and only issues Genesis actually CREATED are
+  treated as authoritative close-links — any issue Genesis merely ADOPTED (a
+  pre-existing open issue with a coincidental same title, or one re-found after a
+  crash) is recorded as adopted and excluded from the join, so a PR closing it never
+  falsely resolves a follow-up. (Adopt provenance no longer relies on issue
+  authorship, which cannot be trusted on a single-account install.)
+- **Contributor issues are labeled by domain and difficulty, enforced at the source.**
+  Every issue the Contributor Work-Log proposes must now carry an `area:*` domain
+  label (memory/dashboard/runtime/guardian/autonomy/channels/knowledge/eval, or
+  `area:other`) and a difficulty/environment label (`good first issue`,
+  `first-timers-only`, `needs-genesis-instance`, or `help wanted`) —
+  `contributor_issue_propose` rejects a proposal missing either (fail-closed, after
+  the privacy scan). The public PR template now prompts for a `Closes #NNN` keyword,
+  and CONTRIBUTING documents that a bare `#NNN` won't auto-close the linked issue.
+- **Outreach total-cessation monitoring, without the old false-alarm trap.**
+  Outreach is now in the `subsystem_stale` alert set (WARNING) alongside
+  ego/inbox/dashboard. Previously it was excluded because its heartbeat was
+  *emergent* — a side-effect of an outreach job succeeding — and the outreach
+  scheduler only starts once a messaging channel (Telegram) registers, so a
+  Telegram-less install never pulsed and naively adding it would fire a permanent
+  unresolvable alert. Two pieces close that trap: (1) a dedicated,
+  channel-independent heartbeat daemon (`outreach/heartbeat.py`) that pulses **only
+  while the outreach scheduler is actually running** (`is_running`) — so a
+  never-started/stopped scheduler goes stale instead of reading a false `alive`; and
+  (2) an enable-gate (`_subsystem_enabled('outreach')` = Telegram configured, via the
+  same side-effect-free `build_bridge_config` loader onboarding-readiness uses) so a
+  dashboard-only install is benign. Documented boundary: a Telegram-configured install
+  whose scheduler *never once started* (registration failed) emits no pulse and stays
+  a benign `no_heartbeat` — outreach IS a bootstrap-manifest entry (`ok` = scheduler
+  *constructed*, not running), so it is explicitly exempted from the started-silent
+  `never_started` inference (a constructed-but-not-started scheduler is benign; a genuine
+  init *failure* still surfaces); a *wedged-but-alive* loop is job_health's domain. The
+  new `subsystem_stale:outreach` id is handled generically by the existing consumers
+  (morning-report dedup by prefix, the Sentinel `subsystem_stale:` disposition).
+- **Session-start surface for age-stale open PRs.** The repo-pulse worker now
+  also caches the open-PR set each boundary, and a SessionStart hook lists the
+  ones idle past a threshold (default 7 days) as one passive inline line —
+  `[Open PRs] 3 open PRs idle ≥7d — #1379 (12d) · #1223 (12d, dependabot) …`.
+  Visibility only: no CI/review state, never "ready to merge", no Telegram, no
+  follow-up rows, no auto-merge. Age-based by design (no `reviewDecision`/status
+  reducer — those carry no signal for owner PRs that sit at `REVIEW_REQUIRED`
+  forever). Levers under the `repo_pulse` settings domain (`open_pr_enabled`,
+  `open_pr_stale_days`, `max_open_prs`, `open_pr_resurface_days`,
+  `open_pr_max_surface`); `GENESIS_REPO_PULSE_DISABLED` / `enabled: false` stop it.
+  Robustness (review round): the fetch now sorts `sort:updated-asc` so a capped
+  window (>`max_open_prs` open PRs) keeps the STALEST end — the lane's target —
+  instead of gh's newest-first default that would drop aged PRs indefinitely; the
+  cache/seen sidecars anchor on `genesis_home()` (honors `GENESIS_HOME`) so a
+  relocated install keeps writer + reader in sync; and the hook's
+  `GENESIS_REPO_PULSE_DISABLED` gate matches the exact `1` the worker honors (a
+  looser truthy set would half-disable the subsystem). `mode: off` / `enabled:
+  false` are full-worker stops (all lanes); `open_pr_enabled` is the lane-only knob.
+  The surface's freshness TTL now derives from `min_interval_minutes` (2×, 1-day
+  floor) so a large debounce (≥1 day) can't expire the cache before the worker is
+  allowed to refresh it and silently suppress the surface for the whole window.
+
+- **The Contributor Work-Log can post curated newcomer issues autonomously
+  (opt-in).** A new `require_approval: false` lever lets the curator's
+  privacy-vetted issues post without a per-item approval prompt — Genesis is the
+  gate (the fail-closed privacy scan still runs on every draft, and the row never
+  surfaces as an approval request). A cautious-rollout `max_posts_per_day` cap
+  limits how many issues post per rolling 24h, so a bad batch surfaces one at a
+  time rather than all at once; `mode: off` (or `GENESIS_CONTRIBUTOR_WORKLOG_DISABLED`)
+  halts posting — re-checked immediately before each create — and freezes the queue.
+  Ships SAFE — `require_approval` defaults true, and it is overlay-file-only (not a
+  one-call settings/dashboard toggle), so a fresh install always requires human approval.
+
+- **A per-prompt nudge when a session's memory MCP is running stale code.** Each
+  Claude Code session's MCP subprocesses snapshot their code at spawn and never
+  reload, so a deploy landing mid-session leaves recall — and its current security
+  read-exclusions — on the old code until the session restarts (there is no
+  auto-restart). The UserPromptSubmit hook now emits a one-line nudge when this
+  session's MCP predates the last successful deploy, reusing the exact
+  `commit_identity.is_stale` verdict the dashboard stale-code badge uses (a session
+  *ahead* of the deploy, e.g. a manual `git pull`, is never flagged). Throttled per
+  session and fail-open: a fresh session stays silent, and any read/parse miss emits
+  nothing.
+
+### Fixed
+
+- **The morning report no longer cries "surplus heartbeat overdue" during a long
+  healthy dispatch.** Surplus emits its subsystem heartbeat only at the end of a
+  dispatch cycle, and a single healthy dispatch can run 15-30 minutes — longer than
+  the old 10-minute overdue threshold — so a busy-but-healthy surplus was flagged
+  "heartbeat overdue" in the morning report and the subsystem-heartbeats view. The
+  threshold is loosened to 3 hours, matching the surplus dashboard tile's own
+  liveness bound; a genuinely dead surplus is still caught within ~15 minutes by the
+  scheduler watchdog, which reads a separate, per-dispatch signal.
+
+- **The Queues card could report "healthy — queues are clear" for counters it
+  never collected.** When the queues section of the health snapshot fails, it is
+  replaced wholesale by an error marker carrying no per-counter detail. The
+  card's verdict only inspected the per-counter error list, so it read every
+  depth as a missing zero and returned a confident green — displayed beside the
+  panel's own "Queue data unavailable" notice, and folded into the overall
+  dashboard status. Unmeasured zeros are now reported as unknown rather than
+  healthy. Relatedly, the "not a confirmed zero" notice was keyed on a list
+  shared by all four queue sources, so an unrelated counter failing printed it
+  above a correctly-counted list of discarded rows; it is now scoped to
+  failures of the count it actually describes.
+
+- **The `/genesis/monitor` page had the same discarded-count bug, plus a worse
+  variant: rows you could not clear.** Its "Clear All Discarded" button was shown
+  only when the 20-row sample held more than one entry, while its label printed
+  the true count — so a backlog whose sample failed to load displayed
+  "Discarded (148)" with no clear control at all. The button now follows the real
+  depth, and appears even when that depth could not be read — it deletes every
+  discarded row regardless, so withholding it was what stranded the backlog. The
+  header labels the sample as truncated. (A queue holding exactly one row still
+  shows no clear-all button — that row is cleared by its own Clear control,
+  which is the intended behaviour.)
+
+- **Dashboard reported the discarded-queue depth as 20 when it was 148.** The
+  Queues panel and the attention strip both rendered `discarded_items.length` —
+  the length of a deliberately capped `LIMIT 20` review sample — instead of
+  `discarded_count`, the true unbounded depth the backend already supplied. Any
+  backlog above 20 therefore displayed as exactly 20, and because the displayed
+  number equalled the cap it looked like a plausible total rather than a
+  truncation. The depth and the review sample are now reconciled ONCE, by the
+  backend, and published as a single object; every surface renders what it is
+  given rather than deciding for itself which of two numbers to believe. So the
+  panel can no longer claim a backlog while showing "no items awaiting review",
+  disable the button that clears it, or report 0 while listing rows. The review
+  list is labelled "showing 20 of N" whenever it is truncated, so the sample
+  cannot be mistaken for the whole queue, and a depth that could not be read is
+  now reported as unknown instead of as an empty queue — with the clear-all
+  control still available, since it removes every row regardless of what was
+  counted.
+
+  **API change:** the health snapshot's `queues` section gains a `discarded`
+  object (`total`, `sample`, `sample_truncated`, `known`). The previous
+  `discarded_count` and `discarded_items` keys remain, and are now derived from
+  that object. `discarded_items` is unchanged. `discarded_count` changes in two
+  states, both toward honesty: when the depth query fails it reports the rows
+  actually in hand rather than 0, and when the depth and the sample disagree it
+  reports the larger rather than the depth alone. Anything reading it as "the
+  queue depth" — including the >100 queue-depth alert — keeps working and
+  under-reports far less in those states: where a failed count previously
+  yielded zero, it now yields the rows actually in hand.
+
+  A depth is reported as EXACT whenever the read that produced it was complete,
+  not merely whenever the count query happened to succeed. A review sample read
+  under a `LIMIT` of one past the cap that comes back short has exhausted the
+  matching rows at its own snapshot, so it is the depth — which means a small
+  queue is now reported exactly even while the count query is failing, instead
+  of as "5+" beside a "queue data unavailable" notice for a number that had in
+  fact just been measured. It also means a count that disagrees with a complete
+  sample no longer influences the total in either direction: a count taken
+  before rows arrived reads low, and one taken before a prune removed them reads
+  high, and neither can be detected by comparing two reads that never shared an
+  instant. Only a TRUNCATED sample still depends on the count, and there the
+  total is published as a floor unless the count is consistent with it. The
+  remaining exposure is stated rather than hidden: with a truncated sample, a
+  prune landing between the two reads can still publish an inflated depth as
+  exact for one cache window; closing that needs both values read under one
+  snapshot and is tracked separately.
+
+  The Queues card's verdict follows the same principle: a diagnostic no longer
+  doubles as an answer to "is this counter known". The card previously read any
+  entry in the section's error list as an uncollected counter, so once a depth
+  could recover from whichever read completed, an exactly-measured queue
+  rendered a precise number beside "some queue counters could not be collected".
+  Errors are not suppressed — they stay in the payload and the panel still shows
+  them — they simply stop deciding a verdict they no longer describe. Counters
+  that publish no exactness of their own are unaffected, and one unrecovered
+  error alongside a recovered one still marks the section unknown.
+
+- **"Clear all reviewed" now says how many rows it will actually delete.** It
+  always deleted every discarded/expired row, not the 20 displayed — harmless
+  while the panel hid the difference, misleading once it reports the true
+  depth. The button reads "Clear all N" with a tooltip stating it is permanent
+  and covers rows not shown.
+
+- **Clearing the queue no longer leaves the dashboard showing the rows it just
+  deleted.** The health snapshot is cached for up to 30s and nothing invalidated
+  it, so the client's immediate refetch re-rendered pre-delete counts: a
+  "Cleared 148 discarded items" toast beside a panel still listing them, with
+  per-row Clear buttons that silently did nothing. Mutations now bust the cache.
+
+  The cache moved into the health service, alongside the computation it caches,
+  and is reached only from the event loop — invalidation raised from a web
+  request is handed to the loop rather than touching shared state across
+  threads. A snapshot whose computation began before a mutation is never
+  published and never handed to a caller that arrived after it, so a cleared
+  queue cannot reappear for the rest of the cache window. On a host that
+  configures no event loop for that hand-off (an embedded plugin host, where
+  invalidation runs on the request thread instead), the cached value is read
+  once and reused rather than tested and then re-read, so an invalidation
+  arriving mid-read can no longer make the endpoint fail outright. Callers that need
+  current data are unaffected: only this endpoint accepts a cached result, and
+  it says so explicitly.
+
+- **A multi-push PR no longer needs `# scheduled-review-override` just because the
+  leak-scan routine stamped an earlier commit.** The merge gate now accepts an
+  ACCEPTED `leaks` marker on an ancestor of the current head when the `leak-detector`
+  job of the `CI` workflow is green at head — the mechanical scanner re-ran on the
+  exact commit being merged, which is the literal-leak guarantee the exact-head rule
+  existed to keep. Measured motive: 6 of 10 sampled multi-push PRs were blocked purely
+  because the routine does not re-stamp after a push, so the override had become the
+  routine path. The relief is deliberately blunt where it matters: ANY refused `leaks`
+  marker anywhere in the PR denies it (a later acceptance at an older head must never
+  outrank a refusal — the head axis is not a time axis), the carried marker must be a
+  verified ancestor (an unreadable compare is "unknown", never "yes"), the scanner is
+  pinned to its named workflow rather than to membership in the required-CI set, and
+  every compare respects the shared merge deadline. `--check-pr` renders a carried
+  marker as `ok (leaks carried from <sha>, leak-detector green at head)`, never as
+  `ok (at head)`. Only the `leaks` kind is mapped; `code-review` gets no mechanical
+  relief. A blocking finding the marker scan cannot credit to a head or a kind (a
+  same-timestamp tie, or a malformed marker with a blocking body) is now returned by
+  the scan as structured residue and denies relief the same way a refusal does — an
+  adversarial audit reproduced that path before the field existed. Measured on the 40
+  most recent marker-carrying PRs: 14 were relief-eligible and the rule denies none of
+  them; 7 carry benign uncountable rows that a blanket rule would have denied.
+- **A malformed Claude Code pin on `main` no longer wedges every merge in the
+  repository, and a pin blob that cannot be decoded at the head now blocks.** Two
+  fixes to the CC pin-receipt merge gate, one narrow and one broad.
+
+  The narrow one: the gate splits its fail direction between facts about a PR's
+  CONTENT (block) and failures of its own PLUMBING (note, do not block). A pin blob
+  over GitHub's 1MB inline limit (the contents API answers `"encoding": "none"` with
+  no content) and a blob whose base64 will not decode are both statements about what
+  the PR contains, yet both were classified as plumbing — so a PR moving the pin
+  forward while carrying either one skipped the receipt requirement entirely. They
+  now have their own `undecodable` outcome and block at the head. Genuine plumbing
+  failures (no repo slug, transport error, a non-JSON body, an unresolvable ref) stay
+  non-blocking: refusing every merge whenever a read comes back unusable once walled
+  off 50 merge-gate cases at a stroke.
+
+  The broad one: **the base branch no longer decides anything by itself.** Previously
+  an empty, whitespace-only, unassigned, doubly-assigned or absent pin file on the
+  base branch blocked *every* pull request — including PRs that never touch
+  `cc_version.sh`, including a fully compliant pin bump carrying both receipts, and
+  including the pull request that would have repaired the pin. The gate has no
+  override sigil by design, so there was no in-band recovery: one bad commit to `main`
+  stopped all merges.
+
+  A base whose pin is *faulty* is now treated as a missing INPUT rather than as an
+  answer. Direction is then unknowable, and both of the obvious responses are wrong:
+  blocking wedges the repository, while passing lets a PR that repairs the base and
+  bundles a forward release in the same change ship with no receipts at all — a case
+  CI cannot see, because that PR's merge tree contains the *repaired* file, so
+  `cc-node-lockstep` passes and the check is green. So the gate asks for the receipts
+  in place of the comparison it could not run, and marks the verdict as having
+  verified nothing about direction. Receipts are a line in the PR body, so this
+  refuses a merge, never the repository's ability to repair itself.
+
+  A base the gate simply could not *read* — an API timeout, a non-JSON body, an
+  unresolvable ref — stays non-blocking, as it always has. That distinction is the
+  gate's CONTENT-versus-PLUMBING axis applied to the base side, and it has to be
+  carried explicitly: both cases yield no base text, so deriving it from the text
+  alone would let one transient network blip demand release receipts from every open
+  PR.
+
+  A pin file that is not valid UTF-8 now lands on the CONTENT side of that axis
+  rather than crashing the check. The CI adapter reads the base with `git show`,
+  which decodes as it reads, and the decode error is not one of the error types that
+  read was catching — so a single stray byte in `cc_version.sh` ended the run with a
+  traceback instead of a verdict, and took the `--advisory` mode's "never exits
+  non-zero" guarantee with it. Reading it as CONTENT is what keeps that byte from
+  buying a free pass: the *plumbing* classification would have waved the pin through
+  unreceipted. The equivalent head-side read already did this; only the base-side one
+  was missed.
+
+  A base pin that is not **installable** yields no reference value either. `npm
+  install @anthropic-ai/claude-code@2.1.0250` does not resolve, so that version never
+  ran anywhere — and both the unchanged and the *backward* exemptions rest on the
+  claim that it did. Measured: `2.1.0250 → 2.1.246` passed with an empty body as a
+  "rollback" to a version that had never existed. A non-canonical base now takes the
+  unknown-direction path, so the canonical repair stays mergeable but has to be
+  attested like every other unverifiable direction.
+
+  A receipt written **beside** one of the PR template's `<!-- -->` prompts now
+  counts. The body scanner discarded the rest of any line a comment appeared on —
+  opening or closing — so an author filling in this repo's own template put both
+  receipts where GitHub renders them and the gate reported them missing, through a
+  check with no override sigil.
+
+  Whether a PR touched the pin at all is decided from the PR's own **changed-file
+  list**, which GitHub computes against the merge base — the same thing the merge
+  uses. Comparing the head tree against the base *tip* gets one class wrong: a PR that
+  branched before the base's latest pin change still carries the older blob, so the
+  tips differ even though the merge keeps the base's version and never touches the
+  file. With a malformed new base pin that demanded receipts from exactly the stale,
+  unrelated PRs this fix exists to unblock. The **blob SHA** is the fallback when that
+  list is unavailable or truncated — never the file CONTENTS, which are both empty
+  whenever a read fails, so two *different* oversized blobs compared equal and
+  reported an untouched pin.
+
+  Two rules now follow from the merge being the publication, since `origin` is the
+  public repo. A pin present but unreadable at the head blocks. And the head pin must
+  be canonical `X.Y.Z` **whenever the PR wrote it** — `npm install …@2.1.0218` does
+  not resolve — while a non-canonical pin *inherited* unchanged does not block, which
+  is what makes the canonical repair of a malformed pin (`2.1.0218` → `2.1.218`)
+  expressible at all. It was previously refused as "incomparable", leaving a malformed
+  pin unmergeable by anyone.
+
+- **The ego's self-model stopped presenting stale, thin and arbitrarily-ranked
+  rows as present-tense capability.** `capability_map` feeds three ego-prompt
+  sections and the capability-improvement scanner. Measurements below come from
+  two live installs, distinguished as **A** (627 rows) and **B** (2102 rows) —
+  they differ because the flag-gated Outcome-Bus feed is on for A only.
+
+  *Thin rows.* Sources 5 and 6 already refused to emit a signal below 3 samples;
+  the journal / proposals / autonomy / procedural sources had no floor. Since
+  `procedural_memory.task_type` is a per-item slug rather than a category, that
+  left the large majority of the map as one-procedure "domains" — 596 of 597 on
+  A, 2066 of 2067 on B. On B they reached the ego: two single-procedure rows sat
+  in the rendered top-15, outranking a domain with n=70. The floor now applies
+  to the COMBINED sample size in `compute_capability_map`, and again on read, so
+  rows written before it existed are not still surfaced.
+
+  *Stale rows.* `updated_at` records when the AGGREGATOR last wrote a row, not
+  the age of its evidence. Only 3 of the 6 sources are time-windowed
+  (ego_proposals / cc_sessions / outcome_events, 30d); intervention_journal,
+  autonomy_state and procedural_memory are not, so domains fed only by those
+  never age — correct for present-tense state such as lifetime counters and
+  currently-stored procedures, and a documented wart for the journal's
+  historical events. The honest uniform reading is "the aggregator stopped
+  vouching for this row N days ago". For windowed-source domains the effect was
+  real and measured **on B**: a 43-day-old `1.0` at #2 in the rendered
+  self-model, and a **93-day-old** `0.0` row at the top of `get_weakest`,
+  steering the improvement scanner at a domain with no qualifying evidence since
+  May. Prompt-facing reads now exclude rows more than 14 days behind the
+  freshest. **On A the window excludes nothing** — maximum observed lag there is
+  6 days.
+
+  *Arbitrary ranking.* Confidence is a ratio, so well-exercised domains pile up
+  at exactly `1.0` — 19 such rows on A, more than filling a 15-row table. With
+  no secondary sort key SQLite returned an arbitrary 15, and an `n=3` row
+  displaced one with `n=3276`. Both bars are powerless here because every tied
+  row clears them; on A the top-15 was byte-identical before and after
+  filtering. The prompt read and `get_weakest` now break ties on
+  `sample_size DESC`, which is what actually changes A's rendered table
+  (`code_index` n=94 and `model_eval` n=44 replace four n=3 rows). Confidence
+  remains the primary key, so a very-high-n domain scoring slightly below `1.0`
+  can still fall outside the top-15; reworking the primary ranking is out of
+  scope here.
+
+  *Anchor safety.* The window anchors on the freshest USABLE row — date-shaped,
+  parseable, not in the future. Anchoring on the freshest row rather than
+  wall-clock means a totally dead refresh job ages the table uniformly and hides
+  **nothing**, instead of blanking the self-model the moment the scheduler
+  breaks. The other direction matters too: `MAX()` is unbounded above, so a
+  single row stamped ahead of real time would otherwise define the window for
+  every other row and hide all of them silently — and self-perpetuatingly, since
+  nothing rewrites a domain that has stopped being emitted. Future rows are
+  therefore EXCLUDED from the anchor rather than the anchor being clamped after
+  the fact: clamping leaves a uniformly-old table entirely outside the window. A
+  partial refresh outage remains uncovered and is tracked separately.
+
+  *Reads split by intent.* `get_all` and `get_by_domain` stay raw accessors;
+  `get_prompt_rows` and `get_weakest` carry the policy, so a future non-prompt
+  consumer cannot inherit ego-prompt filtering by accident. A new `count_all`
+  lets a renderer tell "the map is empty" apart from "every row was filtered" —
+  two states that must not produce the same sentence, since each is a false
+  claim in the other's situation. All three renderers now distinguish them and
+  name the real row count when rows were withheld.
+
+  *Anchor totality.* A `COALESCE` fallback to wall-clock is retained as
+  belt-and-braces. It is not an active guard: the anchor subquery filters on the
+  same predicate as the outer read, so it yields NULL only when no row passes
+  the outer predicate either and the result is empty regardless. It is kept so
+  the two cannot silently diverge later without a fallback already in place.
+
+  Three consequences are deliberate. **(1)** The light-depth "avg confidence"
+  figure moves sharply — `0.06 → 0.94` on A. The old number was not a capability
+  average at all: dominated by hundreds of zero-confidence one-sample rows, it
+  reported roughly "what share of stored procedure slugs carry confidence".
+  That branch renders no table, so it now states both figures as the qualifying
+  subset rather than as whole-map facts — left unqualified it read "31 domains
+  tracked (avg 94%)" over a 627-domain map averaging 6%.
+  **(2)** "N domains tracked" drops for the same reason (`627 → 31` on A,
+  `2102 → 19` on B); the renderers show a top-15/top-12, so those tables stay
+  full. **(3)** The focused-deficiency line reads `get_by_domain` — deliberately
+  unfiltered, since a capability-improvement cycle targets a domain *because* it
+  is weak — and is resolved BEFORE the empty-table check, so it survives even
+  when every row is filtered out. It now also stamps the row's last-vouched
+  date, because an unlabelled unfiltered row is exactly the present-tense claim
+  on old evidence this work removes elsewhere. All three renderers' empty states
+  now say rows were filtered rather than claiming no data exists; the base
+  builder additionally stopped rendering a query failure as an empty map.
+
+  *Withheld rows are named at every depth, and light means light.* The
+  dropped-row report reached the empty and deep exits but not the light one —
+  where it matters most, because that branch renders no table and so leaves the
+  reader nothing else to notice a loss by (the same call is what LOGS, so an
+  operator got no signal either). Separately, the Genesis renderer ACCEPTED a
+  `depth="light"` request and rendered the full fifteen-row table anyway: the
+  caller believed it had asked for the cheap form and was billed for the
+  expensive one. Both now honour it, sharing one sentence rather than two
+  copies — on a branch with no table the sentence is the entire claim, so a
+  figure qualified in one renderer and unqualified in the other is the same
+  "one field, two truth claims" defect from the other side. Neither was
+  reachable through today's focus profiles: of the seven,
+  `capability_performance` is `deep` in three and `skip` in four, and the
+  fallback used for an unknown focus type is `deep` — never `light` anywhere,
+  and the compaction layer only ever upgrades a section's depth. So this is a
+  latent fix, not a live one. What made both survive review is the more useful finding: the
+  render-state matrix built to catch exactly this class enumerated depth
+  *beside* its cross product instead of *inside* it, so all of its cells ran at
+  one depth. Depth is now an axis of the product.
+
+  *A negative window is refused instead of silently disabling de-duplication.*
+  `intervention_journal.aggregate_by_type` rendered a negative day count as the
+  SQLite modifier `'--N days'`, which SQLite rejects, yielding NULL; the
+  comparison against NULL is then NULL rather than false, so the exclusion held
+  for every row and every proposal was counted twice again — from a call that
+  returned a perfectly healthy-looking result. The sibling windowed API already
+  refused this loudly; the two no longer disagree. No shipped caller passes a
+  negative value, so this closes a trap rather than a live bug.
+
+  Nothing is deleted: rows below either bar stay in the table and stop being
+  RENDERED as present-tense capability. They are still read deliberately — by
+  `get_by_domain` for the focused-deficiency line, and by `count_all` to say how
+  many were withheld — and they simply stop being refreshed.
+
+- **A test no longer reads the wall clock once at import and races the suite.**
+  `test_surplus_liveness.py` captured `datetime.now(UTC)` at module import and
+  seeded a heartbeat 30 minutes ahead of it; production ages that seed against
+  the *live* clock with a 5-minute future-skew tolerance, so the assertion only
+  held while under 25 minutes had elapsed since import — the whole suite's
+  runtime, not the test's. Past that edge it failed, and a re-run went green,
+  so it read as a flake; a 31-run survey put it at roughly 3% of runs. The seed
+  is now computed when the helper is called, shrinking the margin from the
+  suite's runtime to one test's. Measured on both sides of the boundary against
+  real production code: the case passes with 16 minutes of simulated elapsed
+  time and fails at 26.
+- **New `frozen-clock-check` CI guard for the whole class.** This was the third
+  recurrence; the two earlier sweeps each enumerated absolute date *literals* and
+  declared the class closed, so a clock frozen at import walked through both.
+  `scripts/check_frozen_clock.py` keys on *when the clock is read* rather than
+  how a date is spelled, and fails in seconds as its own job instead of surfacing
+  deep inside the suite. It flags wall-clock calls evaluated in a module body,
+  class body, default argument, decorator argument, or any fixture whose scope is
+  broader than `function` — including inside module-level `if`/`try`/`with`/`for`/
+  `while` bodies, comprehensions, and a generator expression's leftmost iterable,
+  which is evaluated at creation. It ignores the call-time forms that are the fix:
+  function and lambda bodies, the defaults and decorators of a `def` nested in one,
+  a generator expression's element, `skipif`/`xfail` conditions (import-time by
+  contract), and `if __name__ == "__main__":` blocks. Escape hatch
+  `# frozen-clock-ok: <why, with the measured margin>` on the flagged statement or
+  the comment block above it; the reason must state a magnitude, and a span needs
+  as many waivers as it has flagged calls, so one waiver cannot cover two sites. This closes the
+  mechanically-decidable sub-shape only — an absolute date literal is a bomb only
+  relative to a production threshold, which is not statically decidable, and no
+  claim is made that the literal population is clean.
+
+- **SSH slot cap no longer collapses below the running session count.** The
+  interactive-slot launcher (`scripts/cc-slot.sh`) sized its cap from
+  *instantaneous free RAM* (`(MemAvailable − reserve) / per_session`), so each
+  running session lowered free RAM and thus lowered the cap *below* the number
+  already running — locking the operator out of a new session (and even
+  misreporting "3/2 active") while other apps' memory use silently ate slots too.
+  The cap is now a stable function of the box's TOTAL RAM (a new pure, unit-tested
+  `genesis.cc.session_cap` helper), so it scales per install, does not shrink as
+  sessions run, and ignores unrelated apps. It is **container-aware** — it uses the
+  cgroup memory limit and CPU affinity, not host `/proc` values, so a container that
+  sees host RAM is sized for its real limit (not the host). Live free RAM is used
+  only as an OOM circuit-breaker, and a new session only starts when there is room
+  for a full session (never over-committing a swapless box). Any interactive SSH
+  login (a slot hostname or a plain shell running `claude`, from a LAN/Tailscale IP)
+  is the operator and gets an emergency slot above the safe cap; the cap itself
+  never turns it away — when the box is full or memory is tight it offers to reattach
+  or end a chosen session to make room (the ended session's transcript persists,
+  resume with `claude --resume`), and an ATTACHED session needs an explicit confirm
+  before it's ended. Two honest corners still decline: a non-interactive login
+  (no terminal to prompt on) is guided to reattach, and a genuine OOM-floor breach
+  with no slot to trade is refused rather than risking an OOM. The dashboard web
+  terminal / local console (no `SSH_CONNECTION`) is held to the safe cap. Reattaching
+  always works. Tunable via `~/.genesis/cc-slot.env`
+  (`GENESIS_CC_SYSTEM_RESERVE_MB` / `_PER_SESSION_MB` / `_OOM_FLOOR_MB` /
+  `_EMERGENCY_SLOTS`); the gate fails open so it can never strand you. See
+  `docs/reference/tailscale-ssh-access.md`.
+- **Heartbeat GC no longer lets a clock-skewed future row starve a subsystem's
+  liveness signal.** The `keep_latest_per_subsystem` heartbeat GC
+  (`db/crud/events.py::prune`) kept the row equal to the per-subsystem
+  `MAX(timestamp)`. Because `timestamp` is ISO **text**, a corrupt/clock-skewed
+  future row (e.g. `2099-…`) sorts as that MAX and survived the retention window
+  forever, while genuine pulses aged out and were deleted — leaving
+  `compute_heartbeat_staleness` with only the future row, which it rejects as
+  materially-future, degrading the verdict to a permanent `unknown` (a false
+  "can't tell" for a subsystem that may be perfectly healthy or truthfully
+  stale). The GC now uses two distinct future bounds: (a) it deletes only
+  *implausibly*-far-future rows (> 1 day ahead — corrupt beyond any clock-skew
+  recovery), and (b) it anchors the "keep newest" on the newest row within the
+  read-side display tolerance (`observability.liveness.FUTURE_SKEW_TOLERANCE_MINUTES`),
+  so the preserved pulse is one the staleness read accepts (`alive`/`overdue`). The
+  wide destructive horizon is deliberate: a *modestly*-future row ages into validity
+  instead of being destroyed, and a **backward** clock skew at GC time cannot delete
+  genuinely-recent pulses. A write-time clamp was considered and rejected: the only
+  production trigger is host clock skew, against which a clamp is ineffective (at
+  write time `now()` *is* the skewed value), so the retention layer — re-evaluated at
+  GC time — is the layer that actually closes the hole.
+
+- **The run_in_background pipe guard no longer false-blocks a `|` inside a quoted
+  argument.** The old inline check (`${CMD//||/ }` then `grep -qF "|"`) blocked any
+  literal `|`, so backgrounding `gh api … --jq '.[] | .x'` or `grep -F '|' file`
+  was wrongly rejected. It's now a small Python hook (`background_pipe_guard.py`)
+  using the canonical quote/redirect-aware parser (`shell_parse.has_top_level_pipe`),
+  so only a genuine top-level pipe — whose backgrounded stdout really is swallowed —
+  blocks; a `|` in quotes, a `||`, or a `>|` redirect does not. (Convenience guard:
+  a `|` inside a heredoc body or `case` pattern is a documented residual that may
+  still over-block — never a security bypass.)
+
+- **A dead subsystem scheduler no longer reads "healthy" on the dashboard.** When
+  a background subsystem's scheduler/loop stops firing entirely (total cessation),
+  its heartbeat pulse goes silent — but nothing turned that into a signal, so the
+  Ego tile (and the rollup badge) could show green while the egos were dead, and no
+  alert was raised. Now the Errors view raises a `subsystem_stale:<name>` alert when
+  the ego (→ critical), inbox, or dashboard (→ warning) scheduler goes overdue past
+  its threshold, and the Ego tile flips to error ("scheduler stopped — no heartbeat
+  in Nh"), failing loud (`unknown`) if the signal can't be read. The alert is
+  pause-aware — a deliberately paused Genesis no longer false-alarms — and never
+  fires on a merely idle or freshly-booted install. This complements the existing
+  "running-but-failing" job alarms, which cannot see a job that has stopped running
+  at all. (Surplus already surfaces a wedged/dead loop via its own dashboard tile;
+  outreach total-cessation is tracked separately, since its heartbeat only runs once
+  a messaging channel is configured.)
+
+- **A subsystem that never started no longer reads "healthy" either.** The
+  total-cessation alert above catches a scheduler that ran and then *died*; a
+  subsystem that *failed to start* (its bootstrap init raised, or it registered but
+  never emitted a single pulse) has no heartbeat at all — which looked identical to
+  a fresh, never-run install, so it stayed silent. Now the health check cross-
+  references the persisted bootstrap manifest: an enabled ego (→ critical) or inbox
+  (→ warning) that the manifest shows failed to initialize, or that registered but
+  never pulsed past a boot grace, raises a distinct `subsystem_never_started:<name>`
+  alert and flips the Ego tile to error. It fails benign in every ambiguous case —
+  a fresh install, a deliberately disabled or unconfigured subsystem, or an
+  unreadable manifest never false-alarm — so the only new signal is a genuinely
+  broken start. (Covers ego + inbox; a never-started dashboard thread is out of
+  scope — it isn't a bootstrap-manifest entry.)
+
+- **Worktree sessions now run the main-tree hook scripts, not their branch-frozen
+  copies.** The `genesis-hook` launcher resolved each hook from the *current*
+  worktree, so a git-tracked hook (security gates included) ran whatever version
+  its branch had frozen — a worktree could silently enforce an outdated/weaker
+  gate until it rebased (measured: 60 of 70 worktrees ran a stale, warn-only
+  `full_suite_guard`). The launcher now resolves the hook script from the main
+  worktree (reusing the `git rev-parse --git-common-dir` plumbing already used for
+  the venv), so every session runs the current hook + policy. Escape hatch:
+  `GENESIS_HOOK_DEV_LOCAL=1` runs the worktree's own copy for testing a hook change
+  live. Forward-looking: a worktree benefits once it carries the fixed launcher
+  (new or rebased); pre-fix branches keep running their frozen launcher until they
+  rebase, and the stale count decays as the reaper reaps and branches rebase.
+
+- **The merge gate no longer blocks on a review finding that lands on a
+  documentation file.** An inline `[P1]` finding anchored to a doc path
+  (`CHANGELOG`, `README`, `LICENSE`/`NOTICE`, `docs/**`, `*.rst`) is now surfaced
+  to stderr but does not block the merge — a changelog typo or README nit is not a
+  code defect. Safe by default: any non-doc path, a missing path, or an
+  executable/source file even under `docs/` (e.g. `docs/conf.py`) still blocks,
+  and the PR-level review-body gate is unchanged. Applies to `git_push_guard`'s
+  inline-findings scan on both the `--check-pr` and merge paths.
+- **The dashboard Surplus health tile no longer reads green while the surplus
+  scheduler is wedged.** Its verdict previously came from an activity proxy that
+  shows "idle" for a stalled scheduler, so a stuck surplus loop appeared healthy —
+  the same class of false-green just fixed for the ego tiles. It now reports a
+  genuine stall (no completed dispatch cycle for hours, when not paused) as an
+  error, and fails loud (`unknown`) if the liveness data can't be read, never green.
+  Thresholds are conservative (3h floor) so a normal quiet system never false-alarms.
+
+- **The Errors view no longer shows a clean "0 errors" when a data source is
+  actually down.** The unified-errors endpoint queried each source (events, dead
+  letters, deferred work, resolutions, alerts) behind a silent catch, so a DB/FTS
+  outage returned HTTP 200 with zero counts and read as "data is clean". It now
+  reports which sources failed (`partial` / `sources_failed`); the Errors tab shows
+  a "data may be incomplete" banner and suppresses the clean-state check, and the
+  overview attention list flags the degrade.
+- **Operational Vitals no longer reports embedding throughput as `0` on a query
+  failure.** A failed SQLite read for "Points written/24h" / "Pending queue"
+  previously wrote a literal `0`, indistinguishable from a real zero. It now
+  degrades to `—` with a `throughput_error` reason, distinct from Qdrant
+  reachability.
+- **A scheduler-heartbeat probe that cannot evaluate now surfaces a WARNING event
+  instead of failing silent.** The probe's exception path previously returned
+  `healthy` with no signal; it now emits a WARNING (visible on the Errors tab)
+  while deliberately keeping the probe result `healthy`, so the remediation engine
+  does not treat "can't evaluate" as a downed scheduler and page hourly.
+
 ### Changed
 
 - **Executor Gate 2 (`17_executor_review`) leads with paid DeepSeek V4-pro.**
@@ -19,6 +635,50 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   gate; the other repointed sites stay on free flash.
 
 ### Security
+
+- **A malformed Claude Code session id can no longer create directories outside
+  the session tree.** Hooks store per-session state under
+  `~/.genesis/sessions/<session-id>/`, interpolating the id straight into the
+  path — and two sites create the directory. An id containing `/` or `..` therefore
+  escaped that tree, and the guard against it had been hand-copied into some hooks
+  in three different shapes while being omitted from eight call sites across four
+  files. The path-building sites now go through one shared helper
+  (`hook_input.session_path`), which returns nothing for an unsafe id so the caller
+  skips exactly the filesystem operation and nothing else; a site that needs only
+  the yes/no answer calls the shared validator directly. Normal sessions are
+  unaffected. This is the hook contract, not a repo-wide one: several other hooks
+  and a number of paths under `src/` still carry their own hand-written check —
+  including one file this change otherwise touches — and consolidating those is
+  separate work. An id that fails the check falls back to
+  the shared `unknown` key — itself a directory, so such sessions share one bucket
+  rather than escaping the tree.
+
+- **Hook-surface PRs can no longer merge without a current GitHub Codex review.**
+  The merge gate's review-freshness check now treats any unreviewed delta touching
+  the enforcement-hook surface (`scripts/hooks/**`, the global bash safety hook,
+  the review-scope/state modules, hook wiring in `.claude/settings.json`,
+  `.claude/hooks/**`) as substantial — a small touch-up to a guard can no longer
+  slip through the review-trivial narrowing. The `# stale-review-override` escape
+  additionally requires recorded fallback-review evidence keyed to the PR's exact
+  head sha on this surface (fail-closed on unreadable diff or head), with the
+  block message documenting the authorized fallback procedure. Rationale: the hook
+  surface is the code the gates themselves run on — an unreviewed merge there
+  disarms every other gate. The genesis-development skill now also mandates
+  `git_push_guard.py --check-pr <N>` (the merge gate's own code path) as the only
+  way to report a PR's review-findings status.
+
+- **A leading shell redirect can no longer slip the push/commit approval gates.**
+  The shared command parser now recognizes shell redirections (`2>/dev/null`,
+  `> out.log`, `2>&1`, `&>log`, `>| f`, `< in`, `<<<`) and consumes the operator
+  and its target instead of leaking them into the parsed argv. Previously a
+  *leading* redirect (`git 2>/dev/null push --force`, `git 2>&1 commit --no-verify`)
+  made the parser read the redirect token as the git subcommand, so the push and
+  commit gates never recognized the command and skipped their approval checks. The
+  redirect target is measured as one complete shell word, so an escaped or
+  concatenated-quote space inside it (`git 2>err\ log push`,
+  `git 2>pre"a b"post push`) no longer hides the subcommand either. As
+  a bonus, a targeted local `pytest` run that redirects output
+  (`pytest tests/x.py 2>&1`) is no longer misclassified as a whole-suite run.
 
 - **Observation content can no longer launder untrusted origin into privileged
   cognitive surfaces.** Observation rows now carry a definite origin stamped at the
@@ -58,7 +718,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   literally even when it starts with a dash; secret detection is unchanged for all
   other input. Locked with real-binary regression tests (a `---`/`--flag` body
   scans clean; a planted key still BLOCKs).
-
+- **A transient `git ls-remote` failure no longer re-prompts an already-approved
+  branch push.** The push-approval hook prompts only on a branch's FIRST push; a
+  re-push of fixes to the same, already-published branch should be silent. But the
+  "already on the remote?" check was a live `git ls-remote` that fail-closes to a
+  prompt on any network hiccup, so a flaky network re-prompted every re-push. A new
+  stdlib allowlist (`scripts/hooks/push_allowlist.py`, state in
+  `~/.genesis/pushed_branches.json`) caches the confirmed-on-remote fact locally so
+  re-pushes are decided OFFLINE. It is keyed on (branch, remote push-URL set) — never
+  the remote name — so the same branch name on a different repo is never conflated,
+  and it is written ONLY on a live ls-remote HIT (which proves the branch is already
+  on the remote), so it can never authorize a genuine first push. Corrupt/absent
+  state and any error fail OPEN to the existing prompt path; entries expire after 90
+  days (a recorded branch stays trusted for that window even if its remote copy is
+  later deleted).
 - **A scheduled job that has run repeatedly but never once succeeded now raises a
   health alert.** Such a job was invisible to every alarm: the "silently failing"
   check needs a prior success to measure a gap against, and the consecutive-failure
@@ -195,6 +868,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Page-top backup-health banner (server-authoritative).** The dashboard now
+  surfaces a page-top banner when backups need attention — unconfigured, never run,
+  last run failed, timer stopped, overdue, replication incomplete, or an unreadable
+  status record — and stays hidden when healthy. The health verdict
+  (`{state, code, reason}`) is computed once on the server in
+  `routes/backup.py::_backup_health` and added to `/api/genesis/backup/status`; the
+  client only renders it. Computing it server-side removes the client-side
+  fetch-coordination and clock-skew failure modes entirely, keys "configured" and
+  the off-site-incomplete check on current signals (a real `.git` clone, the
+  resolved Tier-2 backend) rather than a stale status record, treats a malformed
+  status record as unreadable instead of healthy, and does not false-flag a valid
+  custom schedule as overdue. The failure reason rendered on the (unauthenticated)
+  status route is sanitized to strip home-directory paths.
 - **One-click "lobby" terminal door — reattach the whole CC fleet after a client
   reboot.** `generate-ssh-config.sh` now emits a dedicated `Host <host>-lobby`
   block (placed ahead of the numeric-slot wildcard, since ssh takes the first

@@ -16,6 +16,17 @@ from unittest.mock import patch
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _hermetic_pr_files(monkeypatch):
+    """Hermetic default for the hook-surface override gate's changed-files read:
+    without this, force-path tests hit a LIVE `gh api pulls/N/files` call —
+    green locally (gh authenticated; PR "1" of the cwd repo answers) and red in
+    CI (call fails -> fail-closed block). Tests override per-case."""
+    monkeypatch.setenv(
+        "_TEST_GH_PR_FILES", '{"filename": "src/benign.py", "previous_filename": null}'
+    )
+
 # Resolve the hook script path
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts" / "hooks"
 _GUARD = _SCRIPTS / "git_push_guard.py"
@@ -77,6 +88,10 @@ def guard_module():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+# (The required-CI-workflow seam pin lives in tests/test_hooks/conftest.py —
+# one shared autouse fixture, not a per-file replica.)
 
 
 def _rc(code: int) -> subprocess.CompletedProcess:
@@ -1183,14 +1198,17 @@ class TestCheckInlineReviewFindings:
             ),
         )
 
-    def _codex(self, cid, body, reply_to=None):
-        return {
+    def _codex(self, cid, body, reply_to=None, path=None):
+        d = {
             "id": cid,
             "reply_to": reply_to,
             "login": "chatgpt-codex-connector[bot]",
             "type": "Bot",
             "body": body,
         }
+        if path is not None:
+            d["path"] = path
+        return d
 
     def test_inline_p1_blocks_with_title(self, guard_module):
         with self._mock(guard_module, [self._codex(1, _P1_BODY)]):
@@ -1310,6 +1328,155 @@ class TestCheckInlineReviewFindings:
             block, _ = guard_module._check_inline_review_findings("100")
         # type=User AND not in the inline bot set → not an automated finding
         assert block is False
+
+    # ── doc-path allowlist (ledger 54eb3752) ─────────────────────────────
+    # A P1 whose inline finding sits on a DOCUMENTATION file does not block the
+    # merge; a code file — including a code file UNDER docs/ — still blocks. Safe
+    # default: any path not on the explicit allowlist blocks.
+    def test_inline_p1_on_changelog_does_not_block(self, guard_module, capsys):
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="CHANGELOG.md")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+        assert "documentation" in capsys.readouterr().err.lower()
+
+    def test_inline_p1_on_readme_does_not_block(self, guard_module):
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="README.md")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_inline_p1_under_docs_dir_does_not_block(self, guard_module):
+        with self._mock(
+            guard_module, [self._codex(1, _P1_BODY, path="docs/architecture/x.md")]
+        ):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_inline_p1_on_rst_does_not_block(self, guard_module):
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="guide.rst")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_inline_p1_on_code_path_still_blocks(self, guard_module):
+        with self._mock(
+            guard_module, [self._codex(1, _P1_BODY, path="src/genesis/foo.py")]
+        ):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "Make queue claim atomic" in msg
+
+    def test_inline_p1_on_random_md_still_blocks(self, guard_module):
+        # Safe default: a non-allowlisted *.md (not CHANGELOG/README, not under
+        # docs/) is NOT a doc → still blocks.
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="NOTES.md")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_inline_p1_on_code_under_docs_still_blocks(self, guard_module):
+        # docs/conf.py is executable Python — a finding there must still block.
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="docs/conf.py")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_inline_p1_missing_path_still_blocks(self, guard_module):
+        # A finding with no path (malformed/absent) fails SAFE → blocks.
+        with self._mock(guard_module, [self._codex(1, _P1_BODY)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_mixed_doc_and_code_p1_blocks_naming_code(self, guard_module):
+        comments = [
+            self._codex(1, _P1_BODY, path="CHANGELOG.md"),
+            self._codex(
+                2,
+                "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-red)"
+                "</sub></sub>  Real code defect in router**\n\nDetails.",
+                path="src/genesis/router.py",
+            ),
+        ]
+        with self._mock(guard_module, comments):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "Real code defect in router" in msg
+        assert "Make queue claim atomic" not in msg  # the doc P1 is not listed
+
+    def test_jq_projects_path(self, guard_module):
+        # The test seam bypasses jq, so lock the projection by asserting the argv
+        # the production fetch sends includes `path: .path`.
+        with self._mock(guard_module, []) as run_mock:
+            guard_module._check_inline_review_findings("100")
+        argv = run_mock.call_args[0][0]
+        assert any("path: .path" in tok for tok in argv)
+
+    # Fail-closed allowlist (security review HIGH): a NON-prose extension under
+    # docs/ must still block — the exemption is an allowlist of doc extensions,
+    # NOT a denylist of a few known code extensions.
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "docs/build.rs",       # Rust source
+            "docs/config.yaml",    # CI/build config
+            "docs/notebook.ipynb", # Jupyter (contains code)
+            "docs/init.sql",       # SQL
+            "docs/Script.java",    # Java
+            "docs/deploy.ps1",     # PowerShell
+            "docs/Makefile",       # extensionless build file (now fail-closed)
+        ],
+    )
+    def test_inline_p1_non_prose_under_docs_still_blocks(self, guard_module, path):
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path=path)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block, f"{path!r} under docs/ is not prose — must block"
+
+    def test_inline_p1_trailing_newline_path_blocks(self, guard_module):
+        # Security review LOW: a trailing newline must not defeat the exemption.
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="docs/conf.py\n")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_inline_p1_on_license_no_ext_does_not_block(self, guard_module):
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="LICENSE")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "docs/requirements.txt",   # pip deps (repo classifies as config)
+            "docs/constraints.txt",    # pip constraints
+            "docs/CMakeLists.txt",     # CMake build
+            "docs/meson_options.txt",  # Meson build
+            "docs/guide.txt",          # plain .txt is ambiguous → fail-closed
+        ],
+    )
+    def test_inline_p1_txt_manifest_or_ambiguous_under_docs_blocks(
+        self, guard_module, path
+    ):
+        # Codex P1: `.txt` is NOT an unambiguous doc extension — a build/dep
+        # manifest carries it too. Only a known doc STEM (LICENSE.txt) is prose.
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path=path)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block, f"{path!r} is an ambiguous .txt — must block"
+
+    @pytest.mark.parametrize("path", ["LICENSE.txt", "README.txt", "docs/README.txt"])
+    def test_inline_p1_known_stem_txt_does_not_block(self, guard_module, path):
+        # A doc-named STEM pins the file as prose, so .txt is safe there.
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path=path)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "docs/guide\x7f.md",  # DEL
+            "docs/guide\x85.md",  # NEL (C1) — gh --jq emits literally
+            "docs/guide\x9f.md",  # C1 upper bound
+        ],
+    )
+    def test_inline_p1_c1_del_control_char_path_blocks(self, guard_module, path):
+        # Codex P2: reject the COMPLETE control range (DEL + C1), not just C0.
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path=path)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
 
 
 class TestResolvePrNumber:
@@ -1470,8 +1637,8 @@ class TestPrCiStatus:
         self._set(
             monkeypatch,
             [
-                {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"},
-                {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "lint", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
             ],
         )
         assert guard_module._pr_ci_status("1") == ("green", [])
@@ -1510,7 +1677,7 @@ class TestPrCiStatus:
         self._set(
             monkeypatch,
             [
-                {"name": "test", "conclusion": "SUCCESS"},
+                {"name": "test", "workflowName": "CI", "conclusion": "SUCCESS"},
                 {"name": "opt", "conclusion": "SKIPPED"},
                 {"name": "info", "conclusion": "NEUTRAL"},
             ],
@@ -1521,8 +1688,18 @@ class TestPrCiStatus:
         self._set(monkeypatch, [{"context": "legacy-ci", "state": "FAILURE"}])
         assert guard_module._pr_ci_status("1") == ("red", ["legacy-ci"])
 
-    def test_empty_is_unknown(self, guard_module, monkeypatch):
+    def test_empty_rollup_is_absent(self, guard_module, monkeypatch):
+        # A READABLE, genuinely-empty rollup ("[]") = zero checks = CI has not run.
+        # This is DISTINCT from "unknown" (could not read): it is a definite fact,
+        # so it is "absent" — the canonical-repo merge arm fail-CLOSES on it.
         monkeypatch.setenv("_TEST_GH_CI_ROLLUP", "[]")
+        assert guard_module._pr_ci_status("1") == ("absent", [])
+
+    def test_no_output_is_unknown(self, guard_module, monkeypatch):
+        # An EMPTY string (gh produced no output) is NOT a readable empty list — we
+        # cannot tell zero-checks from a silent read failure, so it stays fail-open
+        # "unknown", never "absent".
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", "")
         assert guard_module._pr_ci_status("1") == ("unknown", [])
 
     def test_garbage_is_unknown(self, guard_module, monkeypatch):
@@ -1531,8 +1708,206 @@ class TestPrCiStatus:
 
     def test_non_ci_payload_is_unknown_fail_open(self, guard_module, monkeypatch):
         # e.g. a review-comment mock other tests inject — must not be read as red.
+        # A NON-empty payload with no CI-shaped entries stays "unknown" (we saw
+        # something but recognized no CI verdict) — NOT "absent" (which is zero checks).
         self._set(monkeypatch, [{"login": "codex", "body": "FAILURE somewhere"}])
         assert guard_module._pr_ci_status("1") == ("unknown", [])
+
+
+class TestPrCiStatusRequiredWorkflows:
+    """Required-CI-workflow identity (closes the #1484 P2 partial-rollup residual):
+    a NON-empty rollup whose present checks are all green must still assert that every
+    REQUIRED workflow (rollup ``workflowName``, config-driven, default ``CI``) actually
+    contributed a verdict — otherwise a workflow-specific trigger drop (e.g. only a
+    green CodeQL, the CI suite absent) reads green and merges an untested PR. Missing
+    required workflow(s) → the new ``"incomplete"`` state, carrying the missing names."""
+
+    @staticmethod
+    def _set(monkeypatch, checks):
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps(checks))
+
+    def test_codeql_only_is_incomplete(self, guard_module, monkeypatch):
+        # THE Codex-P2 payload: a lone green CodeQL, the CI suite entirely absent.
+        self._set(monkeypatch, [
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("incomplete", ["CI"])
+
+    def test_red_beats_incomplete(self, guard_module, monkeypatch):
+        # A red check blocks as red even when the required workflow is ALSO missing —
+        # red carries the more actionable verdict (and blocks regardless).
+        self._set(monkeypatch, [
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "FAILURE"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["Analyze (python)"])
+
+    def test_pending_beats_incomplete(self, guard_module, monkeypatch):
+        self._set(monkeypatch, [
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "IN_PROGRESS", "conclusion": None},
+        ])
+        assert guard_module._pr_ci_status("1") == ("pending", ["Analyze (python)"])
+
+    def test_required_present_only_as_skipped_is_incomplete(self, guard_module, monkeypatch):
+        # A required suite whose every entry SKIPPED tested nothing — skipped entries
+        # do not count as "ran". (On the canonical repo ci.yml has no paths filters,
+        # so a fully-skipped suite is anomalous, and # ci-override is the escape.)
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SKIPPED"},
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("incomplete", ["CI"])
+
+    def test_statuscontext_only_is_incomplete(self, guard_module, monkeypatch):
+        # Legacy StatusContexts have no workflowName and can never satisfy a required
+        # workflow identity — fail-closed on the canonical (Actions-only) repo.
+        self._set(monkeypatch, [{"context": "legacy-ci", "state": "SUCCESS"}])
+        assert guard_module._pr_ci_status("1") == ("incomplete", ["CI"])
+
+    def test_statuscontext_green_with_workflowname_does_not_vouch(
+        self, guard_module, monkeypatch
+    ):
+        # Hardening (architect NOTE): a StatusContext-shaped green (state=SUCCESS)
+        # gluing on a workflowName key must NOT satisfy the required identity — only
+        # a CheckRun-shaped pass (conclusion=SUCCESS) vouches, by construction, not
+        # merely because gh's current schema lacks the field on StatusContexts.
+        self._set(monkeypatch, [{"context": "x", "state": "SUCCESS", "workflowName": "CI"}])
+        assert guard_module._pr_ci_status("1") == ("incomplete", ["CI"])
+
+    def test_match_is_case_insensitive(self, guard_module, monkeypatch):
+        monkeypatch.setenv("_TEST_REQUIRED_CI_WORKFLOWS", "ci")
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_multi_required_one_missing_names_it(self, guard_module, monkeypatch):
+        monkeypatch.setenv("_TEST_REQUIRED_CI_WORKFLOWS", "CI,CodeQL")
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("incomplete", ["CodeQL"])
+
+    def test_multi_required_all_present_is_green(self, guard_module, monkeypatch):
+        monkeypatch.setenv("_TEST_REQUIRED_CI_WORKFLOWS", "CI,CodeQL")
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_blank_seam_falls_back_to_default(self, guard_module, monkeypatch):
+        # "" parses to an empty list = invalid = fail CLOSED to the default ("CI").
+        # There is deliberately NO disable value — an empty required set would turn
+        # the identity check off entirely.
+        monkeypatch.setenv("_TEST_REQUIRED_CI_WORKFLOWS", "")
+        self._set(monkeypatch, [
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("incomplete", ["CI"])
+
+    def test_absent_still_wins_over_incomplete(self, guard_module, monkeypatch):
+        # An EMPTY rollup is "absent" (zero checks), never "incomplete" (partial).
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", "[]")
+        assert guard_module._pr_ci_status("1") == ("absent", [])
+
+
+class TestRequiredCiWorkflowsConfig:
+    """_required_ci_workflows(): config-driven required set, fail-CLOSED to the
+    default ("CI") on ANY malformed/ambiguous input — mirroring
+    _required_scheduled_review_kinds. These tests exercise the real file path, so
+    they delete the seam and point HOME at a tmp dir."""
+
+    @staticmethod
+    def _with_yaml(monkeypatch, tmp_path, text: str | None):
+        monkeypatch.delenv("_TEST_REQUIRED_CI_WORKFLOWS", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        if text is not None:
+            cfg = tmp_path / ".genesis" / "config"
+            cfg.mkdir(parents=True)
+            (cfg / "genesis.yaml").write_text(text)
+
+    def test_valid_config_replaces_default(self, guard_module, monkeypatch, tmp_path):
+        self._with_yaml(monkeypatch, tmp_path, "merge_gate:\n  required_ci_workflows: [My Suite]\n")
+        assert guard_module._required_ci_workflows() == ("My Suite",)
+
+    def test_multiple_deduped_order_preserved(self, guard_module, monkeypatch, tmp_path):
+        self._with_yaml(
+            monkeypatch, tmp_path,
+            "merge_gate:\n  required_ci_workflows: [CodeQL, CI, CodeQL]\n",
+        )
+        assert guard_module._required_ci_workflows() == ("CodeQL", "CI")
+
+    def test_missing_file_falls_back_to_default(self, guard_module, monkeypatch, tmp_path):
+        self._with_yaml(monkeypatch, tmp_path, None)
+        assert guard_module._required_ci_workflows() == ("CI",)
+
+    def test_missing_key_falls_back_to_default(self, guard_module, monkeypatch, tmp_path):
+        self._with_yaml(monkeypatch, tmp_path, "merge_gate:\n  required_scheduled_reviews: [leaks]\n")
+        assert guard_module._required_ci_workflows() == ("CI",)
+
+    def test_empty_list_is_invalid_no_disable(self, guard_module, monkeypatch, tmp_path):
+        # [] would DISABLE the identity check — fail closed to the default instead.
+        self._with_yaml(monkeypatch, tmp_path, "merge_gate:\n  required_ci_workflows: []\n")
+        assert guard_module._required_ci_workflows() == ("CI",)
+
+    def test_non_list_is_invalid(self, guard_module, monkeypatch, tmp_path):
+        self._with_yaml(monkeypatch, tmp_path, "merge_gate:\n  required_ci_workflows: CI\n")
+        assert guard_module._required_ci_workflows() == ("CI",)
+
+    def test_non_string_element_is_invalid(self, guard_module, monkeypatch, tmp_path):
+        self._with_yaml(monkeypatch, tmp_path, "merge_gate:\n  required_ci_workflows: [123]\n")
+        assert guard_module._required_ci_workflows() == ("CI",)
+
+    def test_blank_element_is_invalid(self, guard_module, monkeypatch, tmp_path):
+        self._with_yaml(monkeypatch, tmp_path, 'merge_gate:\n  required_ci_workflows: [" "]\n')
+        assert guard_module._required_ci_workflows() == ("CI",)
+
+    def test_duplicate_merge_gate_key_is_invalid(self, guard_module, monkeypatch, tmp_path):
+        # yaml.safe_load keeps the LAST duplicate silently — the line-scan guard must
+        # reject the ambiguous file rather than honor whichever copy wins.
+        self._with_yaml(
+            monkeypatch, tmp_path,
+            "merge_gate:\n  required_ci_workflows: [CI]\n"
+            "merge_gate:\n  required_ci_workflows: [Decoy]\n",
+        )
+        # yaml would honor the LAST copy ([Decoy]); fail-closed rejects the whole
+        # ambiguous file and returns the DEFAULT instead — never the decoy.
+        assert guard_module._required_ci_workflows() == ("CI",)
+
+    def test_duplicate_workflows_key_is_invalid(self, guard_module, monkeypatch, tmp_path):
+        self._with_yaml(
+            monkeypatch, tmp_path,
+            "merge_gate:\n  required_ci_workflows: [CI]\n  required_ci_workflows: [Decoy]\n",
+        )
+        assert guard_module._required_ci_workflows() == ("CI",)
+
+    def test_seam_overrides_file(self, guard_module, monkeypatch, tmp_path):
+        self._with_yaml(monkeypatch, tmp_path, "merge_gate:\n  required_ci_workflows: [FileSuite]\n")
+        monkeypatch.setenv("_TEST_REQUIRED_CI_WORKFLOWS", "SeamSuite")
+        assert guard_module._required_ci_workflows() == ("SeamSuite",)
+
+    def test_discarded_declared_policy_prints_note(self, guard_module, monkeypatch, tmp_path, capsys):
+        # Architect SHOULD-FIX: free-text config can EXPAND the required set, so a
+        # silent fallback-to-default would NARROW a declared stricter policy with no
+        # signal. A present-but-invalid key must say so on stderr.
+        self._with_yaml(monkeypatch, tmp_path, "merge_gate:\n  required_ci_workflows: []\n")
+        assert guard_module._required_ci_workflows() == ("CI",)
+        assert "required_ci_workflows" in capsys.readouterr().err
+
+    def test_key_absent_is_silent(self, guard_module, monkeypatch, tmp_path, capsys):
+        # The normal install (no key configured) must NOT warn — the default is the
+        # intended policy, not a substitution.
+        self._with_yaml(monkeypatch, tmp_path, "merge_gate:\n  required_scheduled_reviews: [leaks]\n")
+        assert guard_module._required_ci_workflows() == ("CI",)
+        assert capsys.readouterr().err == ""
+
+    def test_duplicate_key_prints_note(self, guard_module, monkeypatch, tmp_path, capsys):
+        self._with_yaml(
+            monkeypatch, tmp_path,
+            "merge_gate:\n  required_ci_workflows: [CI]\n  required_ci_workflows: [Decoy]\n",
+        )
+        assert guard_module._required_ci_workflows() == ("CI",)
+        assert "required_ci_workflows" in capsys.readouterr().err
 
 
 class TestPrCiStatusCancelSibling:
@@ -1551,6 +1926,9 @@ class TestPrCiStatusCancelSibling:
     def test_cancel_with_success_sibling_is_green(self, guard_module, monkeypatch):
         # The ec925917 incident: concurrency-cancelled CodeQL dups (older) + their
         # successful re-runs (newer, same name + workflowName). Must read green.
+        # (Required-identity policy pinned to the fixture's actual workflow so the
+        # incident payload stays byte-faithful — CodeQL-only was the real rollup.)
+        monkeypatch.setenv("_TEST_REQUIRED_CI_WORKFLOWS", "CodeQL")
         self._set(monkeypatch, [
             {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
             {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
@@ -1751,6 +2129,11 @@ class TestCiGateEndToEnd:
             "_check_scheduled_claude_reviewed_head",
             lambda n, head=None, repo=None, force=False, strict=False: None,
         )
+        # The pin-receipt gate is downstream too. Without this it runs for real
+        # against the cwd repo's PR — whose tree predates scripts/lib/cc_version.sh,
+        # so the read is a genuine 404 and the gate correctly BLOCKS, which has
+        # nothing to do with the invariant under test here.
+        monkeypatch.setattr(guard_module, "_check_pin_receipts", lambda n, repo=None: (False, ""))
 
     def test_red_ci_blocks_exit_2(self, guard_module, monkeypatch, capsys):
         monkeypatch.setenv(
@@ -1793,13 +2176,72 @@ class TestCiGateEndToEnd:
 
     def test_green_ci_allowed(self, guard_module, monkeypatch):
         monkeypatch.setenv(
-            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "test", "conclusion": "SUCCESS"}])
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps([{"name": "test", "workflowName": "CI", "conclusion": "SUCCESS"}]),
         )
         self._patch_merge_ok(guard_module, monkeypatch)
         monkeypatch.setattr(
             guard_module,
             "read_payload",
             lambda: self._payload("gh pr merge 5 --squash --admin"),
+        )
+        assert guard_module.main() == 0
+
+    def test_incomplete_ci_blocks_exit_2(self, guard_module, monkeypatch, capsys):
+        # The #1484-P2 payload end-to-end: a lone green CodeQL (CI suite missing)
+        # must BLOCK the merge, naming the missing required workflow. Canonical
+        # scoping engages because an unresolved merge repo fails CLOSED.
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps([
+                {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            ]),
+        )
+        self._patch_merge_ok(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("gh pr merge 5 --squash --admin"),
+        )
+        rc = guard_module.main()
+        err = capsys.readouterr().err
+        assert rc == 2
+        assert "required CI workflow" in err
+        assert "CI" in err  # the missing workflow is named
+
+    def test_incomplete_ci_with_override_allowed(self, guard_module, monkeypatch, capsys):
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps([
+                {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            ]),
+        )
+        self._patch_merge_ok(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("gh pr merge 5 --squash --admin  # ci-override"),
+        )
+        assert guard_module.main() == 0
+        assert "consciously accepted" in capsys.readouterr().err
+
+    def test_incomplete_ci_off_canonical_fails_open(self, guard_module, monkeypatch):
+        # Off the canonical repo the identity check must NOT block — another repo's
+        # CI may legitimately be named differently (or not exist at all).
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/canonical-repo")
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps([
+                {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            ]),
+        )
+        self._patch_merge_ok(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload(
+                "gh pr merge 5 --repo octo/other-repo --squash --admin"
+            ),
         )
         assert guard_module.main() == 0
 
@@ -1830,7 +2272,7 @@ class TestCiStatusUnfinishedStates:
     def test_completed_null_conclusion_not_pending(self, guard_module, monkeypatch):
         self._set(monkeypatch, [
             {"name": "test", "status": "COMPLETED", "conclusion": None},
-            {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "lint", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
         ])
         assert guard_module._pr_ci_status("1") == ("green", [])
 
@@ -1880,7 +2322,8 @@ class TestMergeableAllowlist:
     def _patch_downstream(self, guard_module, monkeypatch):
         # Everything AFTER mergeability passes, so only mergeability decides.
         monkeypatch.setenv(
-            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "test", "conclusion": "SUCCESS"}])
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps([{"name": "test", "workflowName": "CI", "conclusion": "SUCCESS"}]),
         )
         for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
             monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None: (False, ""))
@@ -1897,6 +2340,11 @@ class TestMergeableAllowlist:
             "_check_scheduled_claude_reviewed_head",
             lambda n, head=None, repo=None, force=False, strict=False: None,
         )
+        # The pin-receipt gate is downstream too. Without this it runs for real
+        # against the cwd repo's PR — whose tree predates scripts/lib/cc_version.sh,
+        # so the read is a genuine 404 and the gate correctly BLOCKS, which has
+        # nothing to do with the invariant under test here.
+        monkeypatch.setattr(guard_module, "_check_pin_receipts", lambda n, repo=None: (False, ""))
 
     @pytest.mark.parametrize("bad", [None, "", "UNKNOWN", "SOMETHING_NEW"])
     def test_non_mergeable_blocks(self, guard_module, monkeypatch, bad):
@@ -1954,7 +2402,8 @@ class TestRepoDerivationGate:
 
     def _patch_ok(self, guard_module, monkeypatch):
         monkeypatch.setenv(
-            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "test", "conclusion": "SUCCESS"}])
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps([{"name": "test", "workflowName": "CI", "conclusion": "SUCCESS"}]),
         )
         monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
         for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
@@ -1972,6 +2421,11 @@ class TestRepoDerivationGate:
             "_check_scheduled_claude_reviewed_head",
             lambda n, head=None, repo=None, force=False, strict=False: None,
         )
+        # The pin-receipt gate is downstream too. Without this it runs for real
+        # against the cwd repo's PR — whose tree predates scripts/lib/cc_version.sh,
+        # so the read is a genuine 404 and the gate correctly BLOCKS, which has
+        # nothing to do with the invariant under test here.
+        monkeypatch.setattr(guard_module, "_check_pin_receipts", lambda n, repo=None: (False, ""))
 
     def test_derived_repo_threads_into_gates(self, guard_module, monkeypatch):
         seen = {}
@@ -2162,7 +2616,8 @@ class TestGateOrdering:
         calls: list[str] = []
         monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
         monkeypatch.setenv(
-            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "test", "conclusion": "SUCCESS"}])
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps([{"name": "test", "workflowName": "CI", "conclusion": "SUCCESS"}]),
         )
         monkeypatch.setattr(
             guard_module,
@@ -2182,6 +2637,9 @@ class TestGateOrdering:
                 None,
             )[1],
         )
+        # Downstream of the ordering under test, and it would otherwise run live
+        # against a PR whose tree predates scripts/lib/cc_version.sh (a real 404).
+        monkeypatch.setattr(guard_module, "_check_pin_receipts", lambda n, repo=None: (False, ""))
         monkeypatch.setattr(
             guard_module,
             "_check_pr_review_findings",
@@ -2250,7 +2708,8 @@ class TestLowBFreshnessBackstop:
         reached = {"body": False}
         monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
         monkeypatch.setenv(
-            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "test", "conclusion": "SUCCESS"}])
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps([{"name": "test", "workflowName": "CI", "conclusion": "SUCCESS"}]),
         )
         monkeypatch.setattr(
             guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")

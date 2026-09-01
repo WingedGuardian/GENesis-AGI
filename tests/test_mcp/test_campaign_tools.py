@@ -236,6 +236,39 @@ class TestCampaignCreateValidation:
             ct_mod._runner = old_runner
 
     @pytest.mark.asyncio
+    async def test_create_strips_name_and_uniqueness_uses_stripped(self, _test_db):
+        """Entry-strip: the uniqueness pre-check and the stored value AGREE, so two
+        names differing only in control chars cannot both be created — the second is
+        rejected cleanly instead of hitting a UNIQUE-constraint crash on the stripped
+        stored value."""
+        old_db, old_runner = ct_mod._db, ct_mod._runner
+        try:
+            ct_mod._db = _test_db
+            ct_mod._runner = None
+            r1 = await ct_mod._impl_campaign_create(
+                name="dup\ncampaign",
+                strategy_doc_path="/tmp/s.md",
+                cron_cadence="0 */8 * * *",
+            )
+            assert "error" not in r1, r1
+            assert r1["name"] == "dup campaign"  # stored value is stripped
+            cursor = await _test_db.execute(
+                "SELECT COUNT(*) AS n FROM campaigns WHERE name = ?", ("dup campaign",)
+            )
+            assert (await cursor.fetchone())["n"] == 1
+            # A second name that collapses to the SAME stripped value is rejected
+            # cleanly (the pre-check now runs on the stripped name).
+            r2 = await ct_mod._impl_campaign_create(
+                name="dup\tcampaign",
+                strategy_doc_path="/tmp/s.md",
+                cron_cadence="0 */8 * * *",
+            )
+            assert "error" in r2 and "already exists" in r2["error"], r2
+        finally:
+            ct_mod._db = old_db
+            ct_mod._runner = old_runner
+
+    @pytest.mark.asyncio
     async def test_create_accepts_valid_profile(self, _test_db):
         """A valid profile passes validation and flows through to creation."""
         from unittest.mock import AsyncMock
@@ -278,6 +311,89 @@ class TestWiredDbPath:
                 result = await ct_mod._impl_campaign_status("test-campaign")
             mock_get.assert_not_called()
             assert result["name"] == "test-campaign"
+        finally:
+            ct_mod._db = old_db
+            ct_mod._runner = old_runner
+
+
+class TestLastTick:
+    """`last_tick` surfaces the most recent tick of ANY outcome. `last_run_at`
+    only advances on substantive runs, so an idle-skipping campaign (skips every
+    cadence via a pre-check) shows a stale `last_run` and reads as stalled — the
+    tick fields make "active, idle-skipping" visible."""
+
+    @staticmethod
+    async def _seed_old_run_and_recent_skip(db):
+        # Old substantive success + a RECENT skip (the real idle-gated pattern).
+        await db.execute(
+            "INSERT INTO campaign_runs "
+            "(id, campaign_id, started_at, outcome, skip_reason, cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("run-old", "test-id-1", "2026-06-01T10:00:00+00:00", "success", None, 0.5),
+        )
+        await db.execute(
+            "INSERT INTO campaign_runs "
+            "(id, campaign_id, started_at, outcome, skip_reason, cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "run-skip", "test-id-1", "2026-08-25T22:00:00+00:00",
+                "skip", "no new github activity", 0.0,
+            ),
+        )
+        # last_run_at only advanced on the substantive run.
+        await db.execute(
+            "UPDATE campaigns SET last_run_at = ? WHERE id = ?",
+            ("2026-06-01T10:00:00+00:00", "test-id-1"),
+        )
+        await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_status_surfaces_last_tick_when_idle_skipping(self, _test_db):
+        await self._seed_old_run_and_recent_skip(_test_db)
+        old_db, old_runner = ct_mod._db, ct_mod._runner
+        try:
+            ct_mod._db = _test_db
+            ct_mod._runner = None
+            with patch.object(ct_mod, "_get_db") as mock_get:
+                result = await ct_mod._impl_campaign_status("test-campaign")
+            mock_get.assert_not_called()
+            assert result["last_run"] == "2026-06-01T10:00:00+00:00"  # stale
+            assert result["last_tick"] == "2026-08-25T22:00:00+00:00"  # fresh
+            assert result["last_tick_outcome"] == "skip"
+            assert result["last_skip_reason"] == "no new github activity"
+        finally:
+            ct_mod._db = old_db
+            ct_mod._runner = old_runner
+
+    @pytest.mark.asyncio
+    async def test_list_surfaces_last_tick(self, _test_db):
+        await self._seed_old_run_and_recent_skip(_test_db)
+        old_db, old_runner = ct_mod._db, ct_mod._runner
+        try:
+            ct_mod._db = _test_db
+            ct_mod._runner = None
+            with patch.object(ct_mod, "_get_db"):
+                result = await ct_mod._impl_campaign_list()
+            c = result["campaigns"][0]
+            assert c["last_run"] == "2026-06-01T10:00:00+00:00"
+            assert c["last_tick"] == "2026-08-25T22:00:00+00:00"
+            assert c["last_tick_outcome"] == "skip"
+            assert c["last_skip_reason"] == "no new github activity"
+        finally:
+            ct_mod._db = old_db
+            ct_mod._runner = old_runner
+
+    @pytest.mark.asyncio
+    async def test_last_tick_none_when_no_runs(self, _test_db):
+        # A brand-new campaign with zero runs: tick fields are None, not a crash.
+        old_db, old_runner = ct_mod._db, ct_mod._runner
+        try:
+            ct_mod._db = _test_db
+            ct_mod._runner = None
+            with patch.object(ct_mod, "_get_db"):
+                result = await ct_mod._impl_campaign_status("test-campaign")
+            assert result["last_tick"] is None
+            assert result["last_tick_outcome"] is None
         finally:
             ct_mod._db = old_db
             ct_mod._runner = old_runner

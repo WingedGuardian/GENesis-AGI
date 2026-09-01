@@ -34,6 +34,7 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 
 _LEGACY_INPUT_ENV = "CLAUDE_TOOL_INPUT"
 _LEGACY_RESULT_ENV = "CLAUDE_TOOL_USE_RESULT"
@@ -113,19 +114,108 @@ def tool_response(payload: dict) -> dict:
     return _loads(os.environ.get(_LEGACY_RESULT_ENV, ""))
 
 
+# A CC session id becomes a filesystem PATH COMPONENT in a dozen hooks (the
+# per-session state dir ``~/.genesis/sessions/<id>/``), and two of those sites
+# ``mkdir(parents=True)`` — so an id carrying ``/`` or ``..`` does not merely
+# read the wrong file, it CREATES directories outside the session tree.
+#
+# The allow-list is deliberately WIDER than the hex-UUID shape CC usually emits.
+# Measured 2026-08-27: 875 distinct ids across ~/.claude/projects/*/ and both
+# ``cc_sessions`` id columns — all 875 pass this pattern, and two are NOT hex
+# UUIDs (a ``wt-``-prefixed id, and a non-session directory entry). The observed
+# set already contains more than one shape, so a UUID regex would be a bet on a
+# format that has already varied; this pattern lets a future CC id format through
+# instead of breaking every hook at once, while still rejecting ``/``, ``\\``,
+# ``.``, NUL and control characters.
+#
+# The 255 bound is the FILESYSTEM's, not an arbitrary cap: ext4 and friends limit
+# a single name to 255 bytes, and every character this pattern admits is one byte
+# in UTF-8. A tighter bound would reject ids that are perfectly valid path
+# components — the previously-hand-rolled checks had no length limit at all, so
+# anything shorter silently regresses an id that used to work.
+#
+# ``\A…\Z`` rather than ``^…$``: ``$`` also matches BEFORE a trailing newline,
+# so ``^[A-Za-z0-9_-]+$`` accepts ``"abc\n"`` — itself a valid path component,
+# which would silently create a stray directory.
+_SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,255}\Z")
+
+
+def is_safe_session_id(value: object) -> bool:
+    """Whether *value* is safe to interpolate as ONE filesystem path component.
+
+    The single source of truth for this check. Hooks previously hand-copied it
+    in three different shapes (``"/" in sid``, plus-``"\\"``, and a regex) and
+    omitted it entirely in four files; use this instead of re-deriving it.
+
+    Non-strings and the empty string are unsafe (an empty component would
+    collapse a per-session path onto its parent).
+    """
+    return isinstance(value, str) and bool(_SESSION_ID_RE.match(value))
+
+
 def session_id(payload: dict, default: str = "unknown") -> str:
-    """The CC session id.
+    """The CC session id, validated as a filesystem-safe path component.
 
     New shape carries it as a top-level ``session_id``; the legacy contract
     used the ``CLAUDE_SESSION_ID`` env var. Falls back to ``default`` so a
     per-session sentinel never silently collapses to one global key.
+
+    An id that fails :func:`is_safe_session_id` is REJECTED (never returned),
+    because callers interpolate the result into a path. A present, NON-EMPTY but
+    invalid id is anomalous — the one case that warns — while an absent id (and
+    an empty string, which is treated as absent) is normal and silent.
     """
-    if isinstance(payload, dict):
-        sid = payload.get("session_id")
-        if isinstance(sid, str) and sid:
+    if isinstance(payload, dict) and "session_id" in payload:
+        sid = payload["session_id"]
+        # Authority is decided by PRESENCE of the key, not by the TYPE of its
+        # value. An earlier revision gated this branch on `isinstance(sid, str)`,
+        # which closed the case of a present unsafe STRING and left every other
+        # present-but-unusable value — JSON `null`, a number, a list — falling
+        # through to the env var below. That fallback then answers with a
+        # stale/legacy CLAUDE_SESSION_ID, i.e. a DIFFERENT session's id, and
+        # callers read or create that session's sentinels. Same defect, one
+        # sub-case wider.
+        #
+        # The empty string is the single documented exception: it means "no id
+        # supplied", so it is treated as absent and stays silent, as it always has.
+        if is_safe_session_id(sid):
             return sid
+        if sid != "":
+            print(
+                "WARNING: rejecting unsafe session_id (not a safe path component)",
+                file=sys.stderr,
+            )
+            return default
     env_sid = os.environ.get("CLAUDE_SESSION_ID", "")
-    return env_sid or default
+    if is_safe_session_id(env_sid):
+        return env_sid
+    return default
+
+
+def session_path(base: Path, session_id: str, *parts: str) -> Path | None:
+    """``base / session_id / *parts`` — or ``None`` when the id is unsafe.
+
+    THIS is the API to reach for. ``is_safe_session_id`` returns a bool, which
+    invites each caller to decide what to skip on a rejection — and that decision
+    is an open set: the id is only ever dangerous as a PATH COMPONENT, never as a
+    bound SQL parameter, a JSON value or a dict key, so a caller that treats a
+    rejection as "skip this hook" disables unrelated work. Returning the path (or
+    ``None``) removes that decision: non-path uses never touch the guard, and a
+    session path cannot be built without passing it.
+
+    Containment is guaranteed for *session_id*. ``*parts`` are trusted literals
+    supplied by the caller — ``Path.joinpath`` resets to root on an absolute
+    component, so never pass untrusted data there.
+
+    Callers skip exactly the filesystem operation and nothing else::
+
+        p = session_path(_GENESIS_DIR / "sessions", sid, "messages.jsonl")
+        if p is not None and p.exists():
+            ...
+    """
+    if not is_safe_session_id(session_id):
+        return None
+    return base.joinpath(session_id, *parts)
 
 
 def run_guard(main_fn, name: str) -> None:

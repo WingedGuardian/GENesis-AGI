@@ -6,9 +6,16 @@ GitHub issue and calls this tool. Here — NOT in the untrusted curator subproce
 — the draft passes the fail-closed prose sanitizer
 (:func:`genesis.contribution.scan_prose`), and only if clean is it parked in
 ``pending_issue_posts`` (status='held') with a linked ``approval_requests`` row.
-The owner reviews the FULL body + approves/rejects per item on the dashboard; a
-separate poster drain (``contributor_issue_watcher``) posts it below the gate on
-approval (in ``live`` mode) or dry-runs it (in ``propose_only``).
+By default the owner reviews the FULL body + approves/rejects per item on the
+dashboard; a separate poster drain (``contributor_issue_watcher``) posts it below
+the gate on approval (in ``live`` mode) or dry-runs it (in ``propose_only``).
+
+Autonomous posture (this install's opt-in): when ``require_approval`` is false,
+this tool resolves its OWN approval server-side (``resolved_by=
+"genesis:contributor-worklog"``) so the drain posts without a human — Genesis is
+the vetting authority (``scan_prose`` here + the curator's rewrite + the
+``max_posts_per_day`` drain cap). The row never sits ``pending``, so nothing
+surfaces as an owner approval request.
 
 Mirrors the WS-8 email autonomy gate exactly (two-row create, approval FIRST so
 a crash never orphans a hold). DB access mirrors ``evo_run`` — the long-lived
@@ -34,20 +41,74 @@ from genesis.autonomy.contributor_worklog_config import (
     knob_int,
     load_config,
     normalize_title,
+    require_approval,
 )
+from genesis.autonomy.types import ApprovalStatus
 from genesis.contribution import scan_prose
 from genesis.contribution.findings import Severity
 from genesis.db.crud import pending_issue_posts as pip
+from genesis.db.crud._id_resolve import PASSTHROUGH, RESOLVED, resolve_unique_prefix
 from genesis.env import github_public_repo, github_user
 from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
+
+# Label policy (fail-closed). Every proposed contributor issue must carry a
+# domain label (``area:*``) AND a difficulty/environment label, so the public
+# tracker stays navigable by domain and newcomers can find right-sized work.
+# Enforced in ``_impl`` below, AFTER the privacy scan (so a private-data proposal
+# reports ``blocked`` — the security verdict — rather than ``rejected``).
+#
+# PRODUCER: the labels are emitted by the curator's PROMPT — the install-local
+# contributor-worklog strategy doc, not any in-repo default (campaigns are user
+# data; see the module docstring). This validator is the machine BACKSTOP so a
+# drifting prompt can't silently ship unlabeled issues; a rejected proposal's
+# ``reason`` enumerates the valid labels, so an LLM curator that loops on error
+# self-corrects. ``area:other`` is the escape hatch for a genuinely cross-cutting
+# issue, so a valid proposal is never wrongly rejected. Keep in sync with the
+# GitHub label set (created via ``gh label create``).
+_AREA_LABELS = frozenset(
+    {
+        "area:memory",
+        "area:dashboard",
+        "area:runtime",
+        "area:guardian",
+        "area:autonomy",
+        "area:channels",
+        "area:knowledge",
+        "area:eval",
+        "area:other",
+    }
+)
+# A contributor-lane label. ``help wanted`` is kept as the lane for experienced /
+# community clone-only work — beyond a newcomer ice-breaker but not needing a
+# running instance. Without it such a task has no truthful label and would be
+# forced to mislabel as beginner or be excluded (per Codex review, 2026-08-31).
+_ENV_DIFFICULTY_LABELS = frozenset(
+    {
+        "good first issue",
+        "first-timers-only",
+        "needs-genesis-instance",
+        "help wanted",
+    }
+)
 
 
 def _default_repo() -> str:
     owner = github_user()
     name = github_public_repo()
     return f"{owner}/{name}" if owner else name
+
+
+def _canonical_repo(repo: str) -> str:
+    """``owner/name`` lowercased, with any leading gh host segment dropped.
+
+    The repo validator admits gh's ``host/owner/repo`` form and GitHub slugs are
+    case-insensitive, so a case/host variant of the tracker (``wingedguardian/...``,
+    ``github.com/Owner/Name``) is the SAME repo. The label-policy scope check
+    compares canonical forms so such a variant can't skip the teeth."""
+    parts = [p for p in (repo or "").split("/") if p]
+    return "/".join(parts[-2:]).casefold()
 
 
 async def _impl_contributor_issue_propose(
@@ -73,9 +134,52 @@ async def _impl_contributor_issue_propose(
         return {"status": "error", "reason": f"source must be follow_up|codebase, got {source!r}"}
 
     repo = (repo or "").strip() or _default_repo()
-    if "/" not in repo:
+    # Autonomous posture (require_approval off): the untrusted curator's repo
+    # override loses its human-review backstop, so pin the destination to this
+    # install's configured public repo — Genesis vets DESTINATION, not just content.
+    human_required = require_approval()
+    if not human_required:
+        default_repo = _default_repo()
+        if repo != default_repo:
+            logger.warning(
+                "contributor_issue_propose: autonomous mode ignores curator repo "
+                "override %r → pinning to %r",
+                repo,
+                default_repo,
+            )
+            repo = default_repo
+    # Validate the FINAL repo value — AFTER any autonomous pin — so a malformed
+    # destination is rejected here instead of creating a hold the drain would send to
+    # an invalid ``gh --repo`` and retry forever (consuming max_held). Require every
+    # slash-separated component non-empty: ``owner/`` , ``/repo`` , ``/`` , ``a//b``
+    # are all rejected, while ``owner/name`` (and gh's ``host/owner/repo``) pass.
+    _parts = repo.split("/")
+    if len(_parts) < 2 or not all(_parts):
         return {"status": "error", "reason": f"repo must be owner/name, got {repo!r}"}
     source_ref = (source_follow_up_id or "").strip() or None
+    # Resolve/validate the follow_up id at proposal time. The curator passes full
+    # ids today (no active bug), but a tagged ("id:…")/prefix/uppercase handle would
+    # be stored VERBATIM and the close-loop join (repo_pulse keys canonical full
+    # ids) would silently miss. Resolve any provided ref against follow_ups:
+    # RESOLVED → the canonical full id; PASSTHROUGH → normalized (full-length /
+    # non-hex ids are trusted as-is, matching the resolver contract — a wrong-but-
+    # full id is out of scope here); AMBIGUOUS / NOT_FOUND → REJECT rather than
+    # persist a ref the close-loop can never match. Applies whenever a ref is
+    # present (a codebase proposal has none, so it is untouched).
+    if source_ref is not None:
+        matches, outcome = await resolve_unique_prefix(
+            db, table="follow_ups", id_column="id", raw_id=source_ref
+        )
+        if outcome in (RESOLVED, PASSTHROUGH):
+            source_ref = matches[0]
+        else:  # AMBIGUOUS | NOT_FOUND — do not persist an unmatchable close-loop ref
+            return {
+                "status": "error",
+                "reason": (
+                    f"source_follow_up_id {source_ref!r} did not resolve to a unique "
+                    f"follow_up ({outcome})"
+                ),
+            }
     label_list = [str(x).strip() for x in (labels or []) if str(x).strip()]
 
     # 1) Privacy sanitizer at the TRUSTED server boundary (fail-closed). A
@@ -93,6 +197,35 @@ async def _impl_contributor_issue_propose(
         ]
         logger.warning("contributor_issue_propose BLOCKED %d finding(s): %s", len(reasons), reasons)
         return {"status": "blocked", "reasons": reasons, "scanners_run": scan.scanners_run}
+
+    # 1b) Label policy (fail-closed) — require a domain (area:*) AND a
+    #     difficulty/environment label. SCOPED to the configured public tracker
+    #     (`_default_repo()`), where the area:*/difficulty taxonomy is defined: a
+    #     human-approved cross-repo post to a repo without these labels is left to
+    #     the human, since mandating labels that don't exist there would fail at
+    #     `gh issue create` and strand the hold (retry-forever, consuming max_held).
+    #     AFTER the privacy scan so a private-data proposal reports `blocked`
+    #     (security), not `rejected` (policy). No row on rejection; the curator gets
+    #     a clear reason and self-corrects. Match on CANONICAL repo form so a
+    #     case/host variant of the tracker can't slip past the scope (Kimi review).
+    if _canonical_repo(repo) == _canonical_repo(_default_repo()):
+        label_set = set(label_list)
+        if not (label_set & _AREA_LABELS):
+            return {
+                "status": "rejected",
+                "reason": (
+                    "missing an area:* label — every issue needs one domain label "
+                    f"({', '.join(sorted(_AREA_LABELS))})"
+                ),
+            }
+        if not (label_set & _ENV_DIFFICULTY_LABELS):
+            return {
+                "status": "rejected",
+                "reason": (
+                    "missing a difficulty/environment label — every issue needs one "
+                    f"({', '.join(sorted(_ENV_DIFFICULTY_LABELS))})"
+                ),
+            }
 
     # 2) Backpressure + DB-side dedup (GitHub open-issue dedup is done at post
     #    time in the drain — the curator profile has no gh).
@@ -140,7 +273,12 @@ async def _impl_contributor_issue_propose(
         db,
         id=pending_id,
         request_id=request_id,
-        repo=repo,
+        # Belt-and-suspenders for the WS-A close-loop join: store the repo in a
+        # deterministic canonical form (lowercase) so a config-vs-gh casing
+        # divergence can't strand the mapping. gh treats owner/name as
+        # case-insensitive, so a lowercased slug still posts correctly. The
+        # primary defense is the COLLATE NOCASE read in posted_index_for_repo.
+        repo=repo.lower(),
         title=title,
         body=body,
         labels=json.dumps(label_list) if label_list else None,
@@ -161,20 +299,54 @@ async def _impl_contributor_issue_propose(
         mode,
         source,
     )
+
+    # Autonomous (Genesis-vetted) posture — resolve our OWN approval server-side so
+    # the drain treats the hold as approved without a human in the loop. FAIL-CLOSED:
+    # only an explicit ``require_approval: false`` in this install's overlay reaches
+    # here; every other value keeps the human gate (require_approval() default True).
+    # scan_prose already passed above (the fail-closed privacy gate); the curator
+    # LLM's self-vetting + the ``max_posts_per_day`` drain cap are the remaining
+    # backstops. The row never sits ``pending``, so it never surfaces as an approval
+    # request on the dashboard / morning report. This is a POSTURE flag, NOT the stop
+    # switch — the brake is ``mode: off`` / the env kill (freezes the drain).
+    auto_approved = not human_required
+    # Fail-safe: if resolve() reports the row was not pending (impossible for a
+    # just-created timeout_seconds=None request, but guard anyway), leave it for a
+    # human rather than claim auto_approved — DB state and the returned message must
+    # never diverge. Short-circuit: resolve() is not called when the human gate is on.
+    if auto_approved and not await approval.resolve(
+        request_id,
+        status=ApprovalStatus.APPROVED,
+        resolved_by="genesis:contributor-worklog",
+    ):
+        logger.warning(
+            "contributor_issue_propose: auto-approve resolve failed for %s — left pending",
+            request_id,
+        )
+        auto_approved = False
+
+    if auto_approved:
+        message = (
+            "Auto-approved (Genesis-vetted); will post autonomously on the next "
+            "drain tick (live mode, within the daily cap)."
+            if mode == "live"
+            else "Auto-approved (Genesis-vetted) but propose_only — dry-run terminal, "
+            "not posted. Flip the lever to live to post."
+        )
+    else:
+        message = "Issue draft held for owner approval on the dashboard. " + (
+            "It will post on approval (live mode)."
+            if mode == "live"
+            else "On approval it is dry-run only (propose_only) — flip to live to post."
+        )
     return {
         "status": "held",
         "pending_id": pending_id,
         "request_id": request_id,
         "repo": repo,
         "mode": mode,
-        "message": (
-            "Issue draft held for owner approval on the dashboard. "
-            + (
-                "It will post on approval (live mode)."
-                if mode == "live"
-                else "On approval it is dry-run only (propose_only) — flip to live to post."
-            )
-        ),
+        "auto_approved": auto_approved,
+        "message": message,
     }
 
 
@@ -197,15 +369,21 @@ async def contributor_issue_propose(
     Args:
         title: issue title (sanitized here; must be public-safe).
         body: issue body / description (sanitized here).
-        labels: GitHub label names (e.g. ["good first issue"]). Optional.
+        labels: GitHub label names. On the configured public TRACKER repo this is
+            REQUIRED (fail-closed): one ``area:*`` domain label AND one difficulty/
+            environment label (``good first issue`` / ``first-timers-only`` /
+            ``needs-genesis-instance`` / ``help wanted``) — a proposal missing either
+            is ``rejected`` with no row. ``area:other`` is the cross-cutting escape
+            hatch. A post to a DIFFERENT repo is not subject to this policy.
         repo: target ``owner/name``. Defaults to this install's public repo.
         source: provenance — "follow_up" (backlog-derived) or "codebase".
         source_follow_up_id: originating follow_up id, for the close-loop link
             (stored on ``source_ref``). Optional.
 
     Returns a status dict: ``held`` (parked + approval created), ``blocked``
-    (sanitizer findings, no row), ``duplicate`` / ``backpressure`` (no row),
-    ``disabled`` (mode off), or ``error``.
+    (sanitizer findings, no row), ``rejected`` (missing a required area:* or
+    difficulty/environment label, no row), ``duplicate`` / ``backpressure`` (no
+    row), ``disabled`` (mode off), or ``error``.
     """
     import genesis.mcp.health_mcp as health_mcp_mod
 

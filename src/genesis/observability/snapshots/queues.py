@@ -270,6 +270,11 @@ async def _resolve_dead_letter_storm(db: aiosqlite.Connection | None) -> None:
         )
 
 
+# How many discarded/expired rows the review sample carries. The panel shows a
+# sample, not the queue: the depth is counted separately and can be far larger.
+_DISCARDED_SAMPLE_CAP = 20
+
+
 async def queues(
     db: aiosqlite.Connection | None,
     deferred_queue: DeferredWorkQueue | None,
@@ -415,24 +420,63 @@ async def queues(
         except Exception:
             logger.warning("Failed to query deferred item details", exc_info=True)
 
+    # Discarded/expired review work is reported as ONE reconciled object.
+    #
+    # The depth is an uncapped COUNT and the review list is a LIMIT-20 SAMPLE,
+    # so the two can disagree in both directions. Publishing them as separate
+    # fields pushed that reconciliation onto every render surface, and each of
+    # the four decided independently — which is how a 148-deep queue displayed
+    # as 20, how a populated backlog lost its clear-all button, and how a panel
+    # came to claim "no items awaiting review" above rows it was listing.
+    # Deciding it once, here, leaves the frontends nothing to choose between.
     discarded_items: list[dict] = []
     discarded_count = 0
+    discarded_known = False
+    sample_has_more = False
+    sample_ok = False
     if db:
+        # TWO independent try blocks, deliberately. Sharing one meant a single
+        # unparseable row in the sample loop discarded an already-correct count
+        # and the panel reported the queue as empty. They answer different
+        # questions and fail independently.
         try:
-            now_dt2 = datetime.now(UTC)
             cur = await db.execute(
                 "SELECT COUNT(*) FROM deferred_work_queue WHERE status IN ('discarded', 'expired')"
             )
             row = await cur.fetchone()
             discarded_count = row[0] if row else 0
+            discarded_known = True
+        except Exception:
+            # Recorded rather than swallowed: without this a failed COUNT yields
+            # 0, which the dashboard renders as a confident "nothing awaiting
+            # review" for a state nobody measured. The error string keeps that
+            # in the payload. It does NOT by itself make the depth unknown — a
+            # sample that read to completion still establishes an exact one
+            # (see the rule below); the count only carries the depth when the
+            # sample was truncated.
+            errors.append("discarded: count query failed")
+            logger.warning("Failed to count discarded deferred items", exc_info=True)
 
+        try:
+            now_dt2 = datetime.now(UTC)
             cur = await db.execute(
                 """SELECT id, work_type, call_site_id, deferred_reason, attempts,
                           error_message, status, created_at, completed_at
                    FROM deferred_work_queue WHERE status IN ('discarded', 'expired')
-                   ORDER BY completed_at DESC LIMIT 20"""
+                   ORDER BY completed_at DESC LIMIT ?""",
+                (_DISCARDED_SAMPLE_CAP + 1,),
             )
-            for row in await cur.fetchall():
+            rows = await cur.fetchall()
+            # One row PAST the cap is a probe, never payload. Its presence is
+            # what establishes truncation, and it does so from the same
+            # statement that produced the sample — so the verdict needs neither
+            # the COUNT to have succeeded nor the two reads to have seen the
+            # same instant. Comparing the count against the sample length
+            # cannot do this: when the count is unavailable the total falls
+            # back to the sample length, so the comparison reads "complete" at
+            # exactly the moment a full sample proves otherwise.
+            sample_has_more = len(rows) > _DISCARDED_SAMPLE_CAP
+            for row in rows[:_DISCARDED_SAMPLE_CAP]:
                 age = (now_dt2 - datetime.fromisoformat(row["created_at"])).total_seconds()
                 discarded_items.append({
                     "id": row["id"],
@@ -445,8 +489,76 @@ async def queues(
                     "age_s": round(age),
                     "discarded_at": row["completed_at"],
                 })
+            # Set only after the loop COMPLETES. A row that fails to parse part
+            # way through leaves items in hand at a length under the cap, which
+            # is indistinguishable from a complete short read by length alone.
+            sample_ok = True
         except Exception:
+            errors.append("discarded: sample query failed")
             logger.warning("Failed to query discarded deferred items", exc_info=True)
+
+    # `known` means "total is an EXACT depth", NOT "the count query succeeded",
+    # and WHICH READ WAS COMPLETE is what decides it — never arithmetic between
+    # two reads that never shared an instant.
+    #
+    # The two statements are not transactional with each other, so reconciling
+    # them can only ever catch divergence in one direction: a count taken before
+    # rows arrived reads LOW and the sample contradicts it, but a count taken
+    # before a prune reads HIGH and nothing in the sample can contradict that at
+    # all. Five defects in this class came from trying anyway — each fix
+    # corrected the cell in front of it and left an adjacent one wrong, because
+    # `known` described one read while `total` composed two.
+    #
+    # The rule below replaces that reconciliation with a property of a single
+    # statement: a sample read at LIMIT cap+1 that comes back SHORT has
+    # exhausted the matching rows at its own snapshot, so it IS the depth. The
+    # COUNT is consulted only when the probe row proves the sample was
+    # truncated — the one case where the rows in hand are merely a floor.
+    #
+    # KNOWN RESIDUE, stated rather than hidden: in exactly that truncated case
+    # the total still rests on a non-transactional COUNT, so a prune landing
+    # between the two statements can publish an inflated depth as exact for one
+    # cache window. Closing it needs both values read under one snapshot; that
+    # is measured and decided separately, not patched here.
+    #
+    # The full cross-product is enumerated in
+    # tests/test_observability/test_queues_discarded_count.py
+    # (test_every_evidence_cell) — a cell nobody considered has to show up as a
+    # missing ROW there rather than as silence.
+    _sample_floor = len(discarded_items) + (1 if sample_has_more else 0)
+    if sample_ok and not sample_has_more:
+        # A sample read at LIMIT cap+1 that came back SHORT exhausted the
+        # matching rows at its own statement's snapshot. That is an exact depth
+        # from a single read, so no COUNT can improve on it — not one that
+        # failed, not one lagging low, and not one lagging HIGH (a prune landing
+        # between the two statements lowers the truth while leaving the count
+        # untouched, which comparing the two reads cannot detect at all).
+        _known = True
+        _total = len(discarded_items)
+    else:
+        # The probe fired, or the sample did not finish: the rows in hand are a
+        # floor, and the COUNT is the only depth evidence there is. A count the
+        # floor contradicts is stale, so the total rests on it as a floor too.
+        _contradicted = discarded_known and discarded_count < _sample_floor
+        _known = discarded_known and not _contradicted
+        _total = (
+            discarded_count
+            if _known
+            else max(discarded_count if discarded_known else 0, _sample_floor)
+        )
+    discarded = {
+        "total": _total,
+        "sample": discarded_items,
+        "known": _known,
+    }
+    # Truncated if the known depth exceeds what was shipped, or if the probe row
+    # came back. Treating a FULL sample as truncated outright (the first attempt
+    # at this) was wrong in the other direction: a queue holding exactly the cap
+    # then rendered "showing 20 of 20", asserting rows were withheld when none
+    # were. The probe distinguishes "filled the cap" from "more exist".
+    discarded["sample_truncated"] = (
+        discarded["total"] > len(discarded["sample"]) or sample_has_more
+    )
 
     deferred_processing = 0
     deferred_stuck = 0
@@ -516,8 +628,15 @@ async def queues(
         "embedded_total": embedded_total,
         "embedding_last_error": embedding_last_error,
         "deferred_items": deferred_items,
-        "discarded_count": discarded_count,
-        "discarded_items": discarded_items,
+        # ONE reconciled object; the flat keys below are DERIVED from it, never
+        # computed separately, so the backend cannot regrow the fork this change
+        # removed from the frontend.
+        "discarded": discarded,
+        # Retained for consumers that predate the object: the >100 depth alarm
+        # in mcp/health/errors.py (which requires a plain int) and pass-through
+        # readers such as health_status.
+        "discarded_count": discarded["total"],
+        "discarded_items": discarded["sample"],
         # WS-17: cumulative count of events dropped because the event-bus
         # persistence queue was full (0 when persistence/bus is unavailable).
         # NOTE: a cumulative counter, not an instantaneous depth — deliberately

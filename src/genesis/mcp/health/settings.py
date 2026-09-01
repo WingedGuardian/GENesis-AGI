@@ -146,6 +146,27 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         config_filename="contributor_worklog.yaml",
         readonly=False,
         needs_restart=False,  # drain re-reads each tick
+        # require_approval is overlay-only (the validator rejects it): strip it from
+        # the settings GET too, so a whole-config dashboard PUT can never echo it back
+        # and 422 the entire save. Disabling this approval gate must be a deliberate
+        # overlay-file edit, never a UI round-trip.
+        hidden_fields=frozenset({"require_approval"}),
+    ),
+    "marketing_outreach": SettingsDomain(
+        name="marketing_outreach",
+        description=(
+            "Autonomous COLD marketing-outreach substrate — master `enabled` + "
+            "`mode` off/observe/live. Gates the `marketing_send` tool, which "
+            "stages a cold email to a recipient resolved IN CODE from the "
+            "owner-curated marketing_prospects store (never the LLM). off "
+            "(default, shipped) refuses to stage any send; every staged send "
+            "still holds at the WS-8 email autonomy gate (BULK cell at ASK). "
+            "Invalid mode degrades to off (least authority). Read live per tool "
+            "call — no restart. Kill switch: GENESIS_MARKETING_OUTREACH_DISABLED=1."
+        ),
+        config_filename="marketing_outreach.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per tool call by marketing_config
     ),
     "memory_integrity": SettingsDomain(
         name="memory_integrity",
@@ -1286,13 +1307,13 @@ def _validate_repo_pulse(changes: dict) -> list[str]:
     from genesis.session_awareness.repo_pulse_config import _INT_KNOBS, MODES
 
     errors: list[str] = []
-    valid_keys = ("enabled", "mode", *_INT_KNOBS, "inject_confidence_floor")
+    valid_keys = ("enabled", "open_pr_enabled", "mode", *_INT_KNOBS, "inject_confidence_floor")
     for key, value in changes.items():
         if key not in valid_keys:
             errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
-        elif key == "enabled":
+        elif key in ("enabled", "open_pr_enabled"):
             if not isinstance(value, bool):
-                errors.append("'enabled' must be a boolean")
+                errors.append(f"'{key}' must be a boolean")
         elif key == "mode":
             if value not in MODES:
                 errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
@@ -1314,18 +1335,64 @@ def _validate_contributor_worklog(changes: dict) -> list[str]:
     from genesis.autonomy.contributor_worklog_config import _INT_KNOBS, MODES
 
     errors: list[str] = []
-    valid_keys = ("enabled", "mode", *_INT_KNOBS)
+    _BOOL_KEYS = ("enabled",)
+    # NOTE: `require_approval` is DELIBERATELY not settings-writable. It disables an
+    # approval gate on irreversible public posting, so flipping it must be a
+    # conscious config-file edit (the gitignored ~/.genesis overlay), never a single
+    # unconfirmed settings_update() / dashboard PUT. Rejecting it here (as an unknown
+    # key) closes both mutation paths; the overlay is read directly by require_approval().
+    valid_keys = (*_BOOL_KEYS, "mode", *_INT_KNOBS)
     for key, value in changes.items():
         if key not in valid_keys:
             errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
-        elif key == "enabled":
+        elif key in _BOOL_KEYS:
             if not isinstance(value, bool):
-                errors.append("'enabled' must be a boolean")
+                errors.append(f"'{key}' must be a boolean")
         elif key == "mode":
             if value not in MODES:
                 errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
         elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_marketing_outreach(changes: dict) -> list[str]:
+    """Validate marketing-outreach lever changes (see
+    genesis.outreach.marketing_config).
+
+    ``mode`` accepts ``off``/``observe`` here, but ``live`` is REJECTED — arming
+    autonomous cold sending is deliberately overlay-file-only. A settings_update
+    (MCP tool or dashboard PUT) is reachable by a foreground/injected model, so
+    letting it flip ``mode`` to ``live`` would let the model self-elevate past the
+    observe gate. The owner arms live by editing
+    ``config/marketing_outreach.local.yaml`` directly (filesystem access, not
+    model-reachable); ``marketing_config.load_config`` still merges that overlay so
+    an owner-set ``live`` takes effect. Mirrors ``_validate_memory_recall``'s
+    reservation of ``entity_lane.mode: live``. (Rejecting the value unconditionally
+    is safe because ``marketing_outreach`` is not a dashboard FORM domain — there is
+    no whole-config PUT that would re-echo an already-set ``live`` and 422 the save;
+    if it is ever added to ``_FORM_DOMAINS``, make this transition-aware or hide
+    ``mode`` first.)
+    """
+    from genesis.outreach.marketing_config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled" and not isinstance(value, bool):
+            errors.append("'enabled' must be a boolean")
+        elif key == "mode":
+            if value == "live":
+                errors.append(
+                    "'mode' cannot be set to 'live' via settings — the live gate is "
+                    "overlay-file-only. Edit config/marketing_outreach.local.yaml "
+                    "directly to arm autonomous cold sending. 'off' and 'observe' "
+                    "are settable here."
+                )
+            elif value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
     return errors
 
 
@@ -1642,6 +1709,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "ws2_ledger": _validate_ws2_ledger,
     "repo_pulse": _validate_repo_pulse,
     "contributor_worklog": _validate_contributor_worklog,
+    "marketing_outreach": _validate_marketing_outreach,
     "pr_watch": _validate_pr_watch,
     "skill_evolution_gate": _validate_skill_evolution_gate,
     "cc_roster": _validate_cc_roster,

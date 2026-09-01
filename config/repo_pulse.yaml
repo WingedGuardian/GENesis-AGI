@@ -47,3 +47,41 @@ max_proposals_per_run: 10
 # Proposals below this confidence are stored but never surfaced at charter
 # injection (the dashboard still shows them).
 inject_confidence_floor: 0.7
+
+# ── Open-PR lane (session-manager PR-4c) ────────────────────────────────────
+# An age-based, passive inline surface: the worker fetches the OPEN-PR set into
+# ~/.genesis/repo_pulse/open_prs.json each non-debounced boundary, and the
+# SessionStart hook (surface_open_prs.py) shows the age-stale ones as one line.
+# It is visibility-only — NO CI/review state, never "ready to merge", no
+# Telegram, no follow-up rows, no auto-merge.
+#
+# What stops this lane, by lever:
+#   GENESIS_REPO_PULSE_DISABLED=1 — hook-level kill of the SessionStart surface.
+#   open_pr_enabled: false        — disables ONLY this lane; the merged-PR lanes
+#                                   keep running (the lane-specific knob).
+#   enabled: false / mode: off    — FULL-worker stops: the worker exits before
+#                                   any lane runs, so the open-PR cache stops
+#                                   refreshing too (and the surface goes quiet
+#                                   once the cache ages past its freshness TTL).
+# So `open_pr_enabled` is independent of the fuzzy/exact MERGED tiers, but not of
+# the master/mode switches. There is no "merged-off but open-PR-on" combination
+# in v1 — `mode: off` is a full stop, not a merged-only lever.
+
+# Lane-specific master switch (separate from the fuzzy/exact merged-PR tiers
+# above; the enabled/mode full-worker stops still apply on top).
+open_pr_enabled: true
+
+# A PR whose last update (updatedAt) is at least this many days ago is "stale"
+# and eligible to surface.
+open_pr_stale_days: 7
+
+# gh --limit for the open-PR fetch (separate from max_prs, which is merged-only).
+max_open_prs: 50
+
+# Keep surfacing a still-stale PR for this many days AFTER it is first shown, then
+# go quiet (until it leaves the stalled set and returns as a fresh episode). This
+# is a nag-window duration, NOT a re-appear-after delay.
+open_pr_resurface_days: 7
+
+# Max PRs listed inline per session (the rest collapse to "+N more").
+open_pr_max_surface: 5
