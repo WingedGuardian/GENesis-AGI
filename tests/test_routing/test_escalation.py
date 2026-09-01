@@ -274,3 +274,197 @@ class TestCircuitBreakerRecoveryCallback:
         )
         cb.record_success()
         assert recoveries == []
+
+
+class TestDeadProviderNotification:
+    """One Telegram when a provider has been down long enough to matter, then quiet.
+
+    The gap this closes: a provider dead for days produced NO user-facing ping.
+    `_create_observation` writes `priority="high"`, but the Telegram job
+    (`outreach/scheduler.py::_critical_observations_job`) polls only for
+    `priority="critical"`; the sibling `call_site:` alert is a WARNING, and
+    `outreach/health_outreach.py` sends only whitelisted CRITICALs. So the
+    dashboard knew and nothing reached the user.
+
+    Deliberately NOT solved by raising the existing observation to critical: it
+    fires at ~10 minutes (5 trips), which would page on every transient blip —
+    the alert fatigue that made the original incident inaudible.
+    """
+
+    async def _seed_failure_obs(self, escalation, empty_db, provider, oid, *, age_s: int):
+        """An unresolved provider_failure row aged `age_s` seconds.
+
+        Its created_at is the outage clock — the same row `_resolve_observation`
+        clears on recovery, so the age is real elapsed downtime rather than
+        anything this class tracks in memory.
+        """
+        await empty_db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, content, priority, resolved, content_hash, created_at) "
+            "VALUES (?, 'routing', 'provider_failure', ?, 'high', 0, ?, "
+            "datetime('now', ?))",
+            (
+                oid,
+                f"{provider} failing",
+                escalation._provider_content_hash(provider),
+                f"-{age_s} seconds",
+            ),
+        )
+        await empty_db.commit()
+
+    async def _criticals(self, empty_db, provider, escalation):
+        cur = await empty_db.execute(
+            "SELECT id, priority, content, resolved FROM observations "
+            "WHERE content_hash = ? ORDER BY created_at",
+            (escalation._notify_content_hash(provider),),
+        )
+        return await cur.fetchall()
+
+    async def test_no_notification_before_the_floor(self, escalation, empty_db):
+        """Under an hour is a blip. Most breaker trips resolve themselves."""
+        await self._seed_failure_obs(escalation, empty_db, "prov-y", "pf-y", age_s=600)
+        await escalation._maybe_notify("prov-y")
+        assert await self._criticals(empty_db, "prov-y", escalation) == []
+
+    async def test_one_notification_past_the_floor(self, escalation, empty_db):
+        await self._seed_failure_obs(escalation, empty_db, "prov-y", "pf-y", age_s=7200)
+        await escalation._maybe_notify("prov-y")
+        rows = await self._criticals(empty_db, "prov-y", escalation)
+        assert len(rows) == 1
+        assert rows[0]["priority"] == "critical"
+        assert "prov-y" in rows[0]["content"]
+
+    async def test_repeated_trips_do_not_re_notify(self, escalation, empty_db):
+        """The whole point of 'then quiet'."""
+        await self._seed_failure_obs(escalation, empty_db, "prov-y", "pf-y", age_s=7200)
+        for _ in range(5):
+            await escalation._maybe_notify("prov-y")
+        assert len(await self._criticals(empty_db, "prov-y", escalation)) == 1
+
+    async def test_a_restart_does_not_re_notify(self, escalation, event_bus, empty_db):
+        """In-memory state is lost on restart; the DEDUP must not be.
+
+        `skip_if_duplicate` keys on an UNRESOLVED row, so the still-open
+        notification suppresses a second one even from a process that has never
+        seen this provider before.
+        """
+        await self._seed_failure_obs(escalation, empty_db, "prov-y", "pf-y", age_s=7200)
+        await escalation._maybe_notify("prov-y")
+        fresh = ProviderEscalation(db=empty_db, event_bus=event_bus)
+        await fresh._maybe_notify("prov-y")
+        assert len(await self._criticals(empty_db, "prov-y", escalation)) == 1
+
+    async def test_recovery_then_re_death_notifies_again(self, escalation, empty_db):
+        """A genuine recovery must re-arm the notification.
+
+        Otherwise the FIRST outage in a provider's life is the only one the user
+        ever hears about.
+        """
+        await self._seed_failure_obs(escalation, empty_db, "prov-y", "pf-y", age_s=7200)
+        await escalation._maybe_notify("prov-y")
+        await escalation._resolve_observation("prov-y")
+        rows = await self._criticals(empty_db, "prov-y", escalation)
+        assert all(r["resolved"] == 1 for r in rows), "recovery left the notify row open"
+
+        await self._seed_failure_obs(escalation, empty_db, "prov-y", "pf-y2", age_s=7200)
+        await escalation._maybe_notify("prov-y")
+        assert len(await self._criticals(empty_db, "prov-y", escalation)) == 2
+
+    async def test_no_failure_record_means_no_notification(self, escalation, empty_db):
+        """No outage clock to read → say nothing. Absence of evidence is not an outage."""
+        await escalation._maybe_notify("prov-nothing")
+        assert await self._criticals(empty_db, "prov-nothing", escalation) == []
+
+    async def test_another_providers_outage_does_not_notify_for_this_one(
+        self, escalation, empty_db
+    ):
+        """The age must come from THIS provider's row, not the oldest row present."""
+        await self._seed_failure_obs(escalation, empty_db, "prov-old", "pf-old", age_s=99999)
+        await self._seed_failure_obs(escalation, empty_db, "prov-new", "pf-new", age_s=60)
+        await escalation._maybe_notify("prov-new")
+        assert await self._criticals(empty_db, "prov-new", escalation) == []
+
+    async def test_a_too_young_outage_does_not_suppress_the_later_notification(
+        self, escalation, empty_db
+    ):
+        """The trap in the obvious wiring.
+
+        If the in-memory `notified` flag were set whenever `_maybe_notify` RAN
+        rather than when it WROTE, a provider checked at 20 minutes would be
+        marked notified and never checked again — so the outage that later
+        crosses the floor would be silent, which is the exact failure this whole
+        feature exists to remove.
+        """
+        await self._seed_failure_obs(escalation, empty_db, "prov-z", "pf-z1", age_s=600)
+        escalation._state["prov-z"] = {
+            "trip_count": 9, "first_trip_at": None, "escalated": True,
+        }
+        await escalation._maybe_notify("prov-z")
+        assert await self._criticals(empty_db, "prov-z", escalation) == []
+        assert not escalation._state["prov-z"].get("notified"), (
+            "a below-floor check marked the provider notified; the real outage "
+            "would never be reported"
+        )
+
+        # Same provider, now genuinely old.
+        await empty_db.execute("DELETE FROM observations WHERE id = 'pf-z1'")
+        await empty_db.commit()
+        await self._seed_failure_obs(escalation, empty_db, "prov-z", "pf-z2", age_s=7200)
+        await escalation._maybe_notify("prov-z")
+        assert len(await self._criticals(empty_db, "prov-z", escalation)) == 1
+        assert escalation._state["prov-z"]["notified"] is True
+
+    async def test_breaker_trips_drive_the_notification_end_to_end(
+        self, escalation, empty_db
+    ):
+        """WIRING: a real `breaker.tripped` event must reach `_maybe_notify`.
+
+        Everything above calls the method directly, which proves the logic and
+        not that anything invokes it. This drives the actual event-bus handler.
+        """
+        import asyncio
+
+        await self._seed_failure_obs(escalation, empty_db, "prov-w", "pf-w", age_s=7200)
+        for _ in range(_TRIP_THRESHOLD + 1):
+            await escalation._on_event(_make_event("prov-w"))
+
+        # Await the named tasks rather than spinning sleep(0): these do real
+        # aiosqlite I/O on a worker thread, which loop-only yields cannot settle.
+        # Matches test_record_recovery_schedules_resolve_task.
+        pending = [
+            t for t in asyncio.all_tasks()
+            if t.get_name() in ("escalation-notify-prov-w", "escalation-obs-prov-w")
+        ]
+        assert any(t.get_name() == "escalation-notify-prov-w" for t in pending), (
+            "a breaker-trip event did not schedule the notification check"
+        )
+        await asyncio.gather(*pending)
+        rows = await self._criticals(empty_db, "prov-w", escalation)
+        assert len(rows) == 1, "a breaker-trip event did not produce a notification"
+        assert rows[0]["priority"] == "critical"
+
+    async def test_a_duplicate_failure_row_does_not_reset_the_outage_clock(
+        self, escalation, empty_db
+    ):
+        """Two unresolved records for one provider → the OLDEST is the clock.
+
+        `skip_if_duplicate` matches on (source, content_hash, resolved,
+        origin_class), so a row written under a different origin_class — or one
+        that predates this process — does not suppress a second. Reading an
+        arbitrary row then picks whichever the query happens to return first; if
+        that is the newest, the outage reads as seconds old and the user is
+        never told. That is the same clock-destruction this change exists to
+        remove, one layer up.
+
+        Found by the end-to-end wiring test rather than by design: driving the
+        real event path produced exactly this two-row state, because
+        `_create_observation` fires on the same trip.
+        """
+        await self._seed_failure_obs(escalation, empty_db, "prov-d", "pf-d-old", age_s=7200)
+        await self._seed_failure_obs(escalation, empty_db, "prov-d", "pf-d-new", age_s=5)
+        await escalation._maybe_notify("prov-d")
+        rows = await self._criticals(empty_db, "prov-d", escalation)
+        assert len(rows) == 1, (
+            "a fresh duplicate failure row reset the outage clock and suppressed "
+            "the notification"
+        )

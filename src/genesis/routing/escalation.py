@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 # 5 trips ≈ 10 minutes of cycling (120s open duration × 5 cycles).
 _TRIP_THRESHOLD = 5
 
+# How long a provider must have been continuously failing before the user is
+# told. The escalation observation above fires at ~10 minutes, which is the
+# right threshold for a DASHBOARD row and far too eager for a notification —
+# most breaker trips resolve themselves. An hour matches the floor the alert
+# duration decorator uses (`mcp/health/errors.py::_ONGOING_FLOOR_S`), so the two
+# user-facing surfaces agree on what counts as "worth naming".
+_NOTIFY_AFTER_S = 3600.0
+
 
 class ProviderEscalation:
     """Track per-provider failures and escalate to observations."""
@@ -68,6 +76,21 @@ class ProviderEscalation:
             tracked_task(
                 self._create_observation(provider, state),
                 name=f"escalation-obs-{provider}",
+                event_bus=self._event_bus,
+                subsystem=Subsystem.ROUTING,
+            )
+
+        # Once escalated, every further trip re-checks whether the outage is now
+        # old enough to be worth telling the user about. Re-checking (rather than
+        # deciding once at escalation time) is the point: at escalation the
+        # outage is ~10 minutes old and below the floor, and post-fix the breaker
+        # backs off to a trip every 30min-4h, so this runs a handful of times a
+        # day at most. Deferred like the write above — `_on_event` runs inside
+        # `emit()` and must stay fast.
+        if state["escalated"] and not state.get("notified"):
+            tracked_task(
+                self._maybe_notify(provider),
+                name=f"escalation-notify-{provider}",
                 event_bus=self._event_bus,
                 subsystem=Subsystem.ROUTING,
             )
@@ -172,17 +195,26 @@ class ProviderEscalation:
         """
         from genesis.db.crud import observations
 
-        content_hash = self._provider_content_hash(provider)
+        # BOTH rows: the escalation record and the user-notification record.
+        # Leaving the notify row open would make the first outage in a
+        # provider's life the only one the user ever hears about, because
+        # `skip_if_duplicate` suppresses on an unresolved row of the same hash.
+        content_hashes = (
+            self._provider_content_hash(provider),
+            self._notify_content_hash(provider),
+        )
         try:
-            resolved = await observations.resolve_by_content_hash(
-                self._db,
-                source="routing",
-                content_hash=content_hash,
-                resolved_at=self._clock().isoformat(),
-                resolution_notes=(
-                    f"auto-resolved: provider '{provider}' recovered (circuit breaker closed)"
-                ),
-            )
+            resolved = 0
+            for content_hash in content_hashes:
+                resolved += await observations.resolve_by_content_hash(
+                    self._db,
+                    source="routing",
+                    content_hash=content_hash,
+                    resolved_at=self._clock().isoformat(),
+                    resolution_notes=(
+                        f"auto-resolved: provider '{provider}' recovered (circuit breaker closed)"
+                    ),
+                )
             if resolved:
                 logger.info(
                     "Auto-resolved %d provider_failure observation(s) for recovered provider '%s'",
@@ -195,6 +227,126 @@ class ProviderEscalation:
                 provider,
                 exc_info=True,
             )
+
+    def _outage_started_at(self, row: dict) -> datetime | None:
+        """Parse an observation's ``created_at`` into an aware UTC datetime.
+
+        Handles both shapes that reach this table: ``create()`` writes an
+        ISO string with an offset, while SQLite's ``datetime('now')`` DEFAULT
+        writes a naive UTC string. A naive value is therefore UTC, not local.
+        """
+        raw = row.get("created_at")
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(raw))
+        except (TypeError, ValueError):
+            return None
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+
+    async def _maybe_notify(self, provider: str) -> None:
+        """Tell the user ONCE that a provider has been dead long enough to matter.
+
+        Reads the age off the unresolved ``provider_failure`` row rather than
+        this object's in-memory state, for two reasons: that row IS the outage
+        clock (the same one `_resolve_observation` clears on recovery), and it
+        survives a restart, which the in-memory dict does not.
+
+        Delivery reuses the existing fire-once path rather than adding one — a
+        ``priority="critical"`` observation is picked up by
+        `outreach/scheduler.py::_critical_observations_job`, batched into a
+        single message, and `mark_surfaced` guarantees it is never re-sent.
+        `skip_if_duplicate` keys on an UNRESOLVED row with the same hash, so a
+        second notification cannot be written while the first is still open —
+        including from a freshly restarted process.
+        """
+        from genesis.db.crud import observations
+
+        failure_hash = self._provider_content_hash(provider)
+        try:
+            rows = await observations.query(
+                self._db,
+                source="routing",
+                type="provider_failure",
+                resolved=False,
+                limit=100,
+            )
+        except Exception:
+            logger.error(
+                "could not read the outage clock for provider '%s'", provider, exc_info=True
+            )
+            return
+
+        # The outage started at the EARLIEST unresolved record, not an arbitrary
+        # one. More than one can exist despite `skip_if_duplicate`: that check
+        # matches on (source, content_hash, resolved, origin_class), so a row
+        # written through a different origin_class — or present before this
+        # provider was first seen by THIS process — does not suppress a second.
+        # Taking the newest would reset the outage clock on every duplicate,
+        # which is the exact failure this whole change exists to remove.
+        starts = [
+            s
+            for r in rows
+            if r.get("content_hash") == failure_hash
+            and (s := self._outage_started_at(r)) is not None
+        ]
+        if not starts:
+            # No unresolved failure record → nothing to measure an outage from.
+            # Absence of evidence is not an outage; say nothing.
+            return
+        started = min(starts)
+        elapsed = (self._clock() - started).total_seconds()
+        if elapsed < _NOTIFY_AFTER_S:
+            return
+
+        hours = elapsed / 3600.0
+        human = f"{hours / 24:.1f} days" if hours >= 24 else f"{hours:.1f} hours"
+        try:
+            obs_id = await observations.create(
+                self._db,
+                id=str(uuid.uuid4()),
+                source="routing",
+                type="provider_failure",
+                content=json.dumps(
+                    {
+                        "provider": provider,
+                        "outage_started_at": started.isoformat(),
+                        "message": (
+                            f"Provider '{provider}' has been failing every call for "
+                            f"{human} and has not recovered. Calls are falling back to "
+                            f"other providers in each chain. If this provider is a paid "
+                            f"or entitlement-gated model, the account may need attention."
+                        ),
+                    }
+                ),
+                priority="critical",
+                category="system_health",
+                created_at=self._clock().isoformat(),
+                content_hash=self._notify_content_hash(provider),
+                skip_if_duplicate=True,
+            )
+        except Exception:
+            logger.error(
+                "failed to write dead-provider notification for '%s'", provider, exc_info=True
+            )
+            return
+
+        if obs_id:
+            logger.warning(
+                "Notified user: provider '%s' has been failing for %s", provider, human
+            )
+        # Set the in-memory suppressor ONLY on a real write. Setting it on the
+        # too-young path would make a provider that is currently 20 minutes down
+        # never notify at all, because the outage crosses the floor later and
+        # this process would already have stopped checking. The durable dedup is
+        # `skip_if_duplicate`; this flag only spares a DB read per trip.
+        tracked = self._state.get(provider)
+        if tracked is not None and obs_id:
+            tracked["notified"] = True
+
+    @staticmethod
+    def _notify_content_hash(provider: str) -> str:
+        return hashlib.sha256(f"provider_dead_notify:{provider}".encode()).hexdigest()
 
     @staticmethod
     def _provider_content_hash(provider: str) -> str:

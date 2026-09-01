@@ -1300,7 +1300,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: 409338c9 2026-08-07
+verified: 975d3944 2026-09-01
 ```
 
 - **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
@@ -1312,6 +1312,18 @@ verified: 409338c9 2026-08-07
   hand-curated: L2 sheds nice-to-haves; **L3 keeps ONLY micro-reflection,
   embeddings, tagging** — changing those sets changes what survives an outage.
   Some call sites alias another site's chain — don't assume 1:1.
+- **routing/escalation.py**: breaker trips → a high-priority `provider_failure`
+  observation at 5 trips (~10 min), carrying `first_trip_at` — the only
+  per-provider "failing since" timestamp. Once the outage passes
+  `_NOTIFY_AFTER_S` (1h) it ALSO writes a `priority="critical"` observation on a
+  separate `provider_dead_notify:<name>` content hash, which the existing
+  fire-once path (`outreach/scheduler.py::_critical_observations_job` +
+  `mark_surfaced`) turns into exactly ONE Telegram. The age is read off the
+  unresolved observation, not in-memory state, so it survives a restart; the
+  EARLIEST unresolved row wins, because a duplicate would otherwise reset the
+  outage clock. Recovery resolves BOTH hashes, which is what re-arms the
+  notification for a genuine second outage. Do not raise the 10-minute
+  observation to critical instead — it would page on every transient blip.
 - **providers/**: the `ToolProvider` registry for NON-LLM tools (search,
   embeddings, STT/TTS, crawl, probes). Adapters register GATED ON ENV KEYS —
   silent non-registration is by design (absence ≠ bug). LLM breaker/health

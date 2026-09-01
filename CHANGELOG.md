@@ -2801,6 +2801,26 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   noise with the new `scripts/backfill_source_subsystem.py`, then
   `scripts/cleanup_subsystem_qdrant.py` — both dry-run by default; add `--apply` to commit.
 
+### Added
+
+- **You now get one Telegram when a model provider has been dead for an hour.**
+  Genesis already detected a provider failing every call and already showed it on
+  the dashboard — but nothing ever told you. The record it wrote was
+  high-priority, and only *critical* ones reach Telegram; the matching call-site
+  alert is a warning, which the outreach path filters out. So a provider could be
+  down for days while the only trace was a dashboard panel nobody was looking at.
+
+  One message, then quiet: it names the provider and how long it has been failing,
+  and does not repeat. The hour is deliberate — the underlying record is written
+  after about ten minutes, which is right for a dashboard row and far too eager
+  for a notification, since most breaker trips resolve themselves. If the provider
+  genuinely recovers and later dies again, you are told again.
+
+  Nothing new was added to receive it: this reuses the existing critical-record
+  path, so there is no new alert type, no new table, and no new setting to
+  configure. The duration is read from the stored outage record rather than from
+  memory, so it survives a restart mid-outage without re-notifying.
+
 ## [v3.0b17] - 2026-07-06
 
 ### Added
