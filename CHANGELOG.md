@@ -9,6 +9,26 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **A session slot that lost its Claude Code now recovers itself.** Every
+  interactive entrance — the SSH slot hostnames, manual SSH, the dashboard web
+  terminal — lands on the same persistent tmux slot. If a slot ended up alive but
+  sitting at a plain shell prompt, it stayed that way forever: connecting again
+  simply reattached to that prompt, the launcher never relaunched Claude Code, and
+  the door reported success anyway. That is because attaching to an existing tmux
+  session silently discards the command it was given. The door now checks whether
+  Claude Code is actually running in the slot and relaunches it in place when it
+  is not, telling you it did so. If it cannot tell, it attaches exactly as before
+  — it will never type into a session that is in use.
+- **Launching Claude Code by hand inside a slot no longer produces a degraded
+  session.** The `claude` shell wrapper only did its work outside tmux, so running
+  `claude` from a slot's prompt skipped the permission mode, the temp directories
+  Claude Code expects, and the exit capture that makes the next crash
+  diagnosable — you had to remember the flags yourself. It now applies the same
+  environment in place, and still steps aside for `--print`, `--version` and
+  `GENESIS_NO_TMUX_WRAP=1`.
+
 ### Added
 
 - **Gated autonomous cold marketing outreach (inert by default).** Genesis can

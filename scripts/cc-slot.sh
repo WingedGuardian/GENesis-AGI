@@ -346,12 +346,66 @@ _cap_fail_open() {
 existing=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
            | grep -cE "^${SESSION_PREFIX}-[0-9]+$" || true)
 
+# Verdict for a slot: ALIVE | POISONED | UNKNOWN (empty on any failure). One
+# definition, two call sites — the decision below and the RE-CHECK immediately
+# before typing — so they can never drift into disagreeing.
+_probe_liveness() {
+    local out=""
+    [ -x "${GENESIS_ROOT}/.venv/bin/python" ] || { printf '%s' ""; return 0; }
+    out=$(timeout 15 "${GENESIS_ROOT}/.venv/bin/python" \
+        -m genesis.cc.slot_liveness "$@" 2>/dev/null | sed -n '1p' || true)
+    printf '%s' "$out"
+}
+
 # Reattaching to existing session — always allow ('=' = exact-name match)
 _SESSION_EXISTS=0
+_HEAL=0
+_HEAL_PANE=""
 if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
-    _SESSION_EXISTS=1  # bypass cap check; also skips the OAuth gate below —
-                       # attach does NOT re-run the pane command, so any token
-                       # injection would be moot (and would waste a probe).
+    _SESSION_EXISTS=1  # bypass the CAP gate: attaching adds no session, so the
+                       # slot's RAM footprint is already counted. It no longer
+                       # implies skipping the OAuth gate — see the _HEAL branch,
+                       # which starts a FRESH claude and therefore needs the same
+                       # token treatment a create does.
+    #
+    # Name existence is NOT liveness. `tmux new-session -A` ATTACHES to an
+    # existing session and silently DISCARDS the shell-command argument, so a
+    # slot sitting at a bare shell prompt stays that way forever: every later
+    # connection re-attaches to the same prompt and the launch command never
+    # runs. Probe for a real claude and relaunch into the pane if there is none.
+    #
+    # `list-panes -s` covers EVERY window (a slot grows windows via Ctrl-b c)
+    # and lists them in window index order, so the first row is the pane of the
+    # LOWEST SURVIVING window index — where the canonical launch lives, and the
+    # right heal target. (Not necessarily window 1: if window 1 was killed the
+    # first row is window 2's pane.)
+    _panes=$(tmux list-panes -s -t "=$SESSION_NAME" \
+        -F '#{pane_id} #{pane_pid} #{pane_current_command}' 2>/dev/null || true)
+    if [ -n "$_panes" ]; then
+        _first_pane=$(printf '%s\n' "$_panes" | head -1 | cut -d' ' -f1)
+        _pane_pids=$(printf '%s\n' "$_panes" | cut -d' ' -f2 | tr '\n' ' ')
+        # The verdict is delegated to a pure, unit-tested helper. It reads
+        # /proc for an interactive claude descending from any pane pid —
+        # NOT `#{pane_current_command}`, which reports "bash" for the canonical
+        # `bash -c "… claude …; trailer"` pane while claude IS running (no job
+        # control, so tmux resolves the fg group to the shell). Keying on that
+        # would classify a healthy slot as broken and type into a live session.
+        _live_out=$(_probe_liveness $_pane_pids)
+        # Fail toward SPARING: only an explicit POISONED heals. Anything else —
+        # ALIVE, UNKNOWN, a broken venv, a timeout, an empty read — attaches,
+        # which is the pre-existing behaviour and costs nothing. The opposite
+        # error types a command into a running session.
+        # A pane id is `%<digits>`. stderr is discarded above, so any stray
+        # stdout would otherwise become a send-keys target.
+        case "$_first_pane" in
+            %[0-9]*) ;;
+            *) _first_pane="" ;;
+        esac
+        if [ "$_live_out" = "POISONED" ] && [ -n "$_first_pane" ]; then
+            _HEAL=1
+            _HEAL_PANE="$_first_pane"
+        fi
+    fi
 else
     # New session → consult the capacity gate (SSH_CONNECTION classifies origin
     # inside the Python helper). `timeout` bounds a hung import; trailing
@@ -437,7 +491,8 @@ fi
 _OAUTH_SRC=""
 _slot_oauth_mode="${GENESIS_CC_SLOT_OAUTH:-conditional}"
 _slot_oauth_mode="${_slot_oauth_mode,,}"   # normalize; the gate is the value authority
-if [ "$_SESSION_EXISTS" = "0" ] && [ "$_slot_oauth_mode" != "off" ] && [ "$_HAS_BARE" = "0" ]; then
+if { [ "$_SESSION_EXISTS" = "0" ] || [ "$_HEAL" = "1" ]; } \
+   && [ "$_slot_oauth_mode" != "off" ] && [ "$_HAS_BARE" = "0" ]; then
     # The gate both DECIDES and AUTHORS the notice: on inject it exits 0 and
     # prints the mode-appropriate human notice to stdout — captured here so the
     # notice text lives in ONE place (no bash/gate divergence), and so lever
@@ -485,9 +540,96 @@ fi
 # python path, home-anchored token file), and if the repo is gone that python is too
 # → the read silently no-ops before cd fails. Do NOT move it after the `&&`
 # (test_cd_guard_skips_claude_on_bad_cd).
+# ONE builder for the pane command. The create path hands it to tmux and the
+# heal path types it into an existing pane — they must never drift, or a healed
+# slot would run a different claude (no OAuth prefix, no permission flag, no
+# exit-capture trailer) and would re-poison itself on the next exit.
+#
+# `command claude`, not bare `claude`, and that word is load-bearing: an
+# identical STRING is not identical EXECUTION. tmux runs the create path under a
+# non-interactive `sh -c` with no rc files, whereas the heal path is typed into
+# an INTERACTIVE shell that has sourced ~/.bashrc — where `claude` resolves to
+# the bashrc wrapper FUNCTION, which would re-derive the environment itself and
+# invoke cc_exit_capture a second time. MEASURED: the function does interpose.
+# `command` bypasses it, so both paths run the same binary with the same argv.
+# `\$` defers to the pane shell and resolves identically under tmux's `sh -c`
+# and an interactive bash.
+_PANE_CMD="${_OAUTH_SRC}cd ${GENESIS_ROOT} && command claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+
+if [ "$_HEAL" = "1" ]; then
+    # SERIALIZE per slot. Every door converges here, so two of them (the
+    # dashboard web terminal and an SSH login, or an SSH retry) can hold the
+    # same POISONED verdict concurrently, both heal, and the second one type
+    # into the claude the first just started. A read cannot claim; this can.
+    # Best-effort: a missing flock or an unwritable lock path must not stop a
+    # legitimate heal.
+    # NOTE the shape: `exec` applies its redirections to the SHELL, so a
+    # `2>/dev/null` on the exec line would silence this script's stderr for the
+    # REST OF THE RUN — every later notice, including the heal message, would
+    # vanish while the heal itself still happened. Probe writability with an
+    # ordinary command first (safe to silence), and exec only once it is known
+    # to succeed.
+    _lock="${HOME}/.genesis/cc-slot-heal-${SLOT}.lock"
+    if command -v flock >/dev/null 2>&1 \
+       && mkdir -p "${HOME}/.genesis" 2>/dev/null \
+       && : >>"$_lock" 2>/dev/null; then
+        exec 9>>"$_lock"
+        flock -w 45 9 2>/dev/null || true
+    fi
+
+    # SAFETY GATE — asked BEFORE any keystroke, including the C-c.
+    # The liveness probe answers "is claude running here"; it does NOT answer
+    # "is it safe to type here". MEASURED: send-keys C-c KILLS a running
+    # foreground job, so a pane with no claude but an active build, ssh session
+    # or editor must be left strictly alone.
+    #
+    # `#{pane_current_command}` is the right signal for THIS question even
+    # though it is the wrong one for liveness. Its error direction here is
+    # harmless: a false "bash" only ever permits a heal the liveness probe has
+    # already blessed, and a non-shell reading only ever suppresses one.
+    _first_cmd=$(printf '%s\n' "$_panes" | head -1 | cut -d' ' -f3)
+    case "$_first_cmd" in
+        bash | -bash | sh | -sh | zsh | -zsh | dash | fish | ksh) ;;
+        *)
+            echo "cc-slot: ${SESSION_NAME} has no claude, but its pane is running '${_first_cmd}' — attaching without touching it." >&2
+            _HEAL=0
+            ;;
+    esac
+fi
+
+if [ "$_HEAL" = "1" ]; then
+    # RE-CHECK. The verdict above was taken before the OAuth gate, which is
+    # allowed up to 30s — ample for a second door (or the operator in another
+    # terminal) to have started claude in this very pane meanwhile. Typing into
+    # a live Claude Code TUI is the one failure this whole change must never
+    # cause, so the verdict is confirmed HERE, immediately before the keystrokes,
+    # and anything other than a still-POISONED answer stands down.
+    _recheck=$(_probe_liveness $_pane_pids)
+    if [ "$_recheck" != "POISONED" ]; then
+        echo "cc-slot: ${SESSION_NAME} came alive while preparing — attaching instead." >&2
+        _HEAL=0
+    fi
+fi
+
+if [ "$_HEAL" = "1" ]; then
+    echo "cc-slot: ${SESSION_NAME} is running no claude — relaunching it in the existing pane." >&2
+    # C-c interrupts a stray foreground process and abandons a half-typed line;
+    # the brief pause lets the shell reprint its prompt (C-c also flushes the
+    # tty input queue); C-u clears anything left on it. `-l` sends the payload
+    # literally so no character is interpreted as a key name.
+    tmux send-keys -t "$_HEAL_PANE" C-c 2>/dev/null || true
+    sleep 0.3 || true
+    tmux send-keys -t "$_HEAL_PANE" C-u 2>/dev/null || true
+    tmux send-keys -t "$_HEAL_PANE" -l "$_PANE_CMD" 2>/dev/null || true
+    tmux send-keys -t "$_HEAL_PANE" Enter 2>/dev/null || true
+fi
+
+# Exactly ONE new-session on every path (create, alive-attach, heal-attach).
+# On an attach `-A` discards the command argument harmlessly; the heal above is
+# purely a prelude to it.
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
     -e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" \
     -e "LANG=$LANG" \
-    "${_OAUTH_SRC}cd ${GENESIS_ROOT} && claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+    "$_PANE_CMD"

@@ -70,14 +70,14 @@ def test_no_token_leak_via_tmux_e(script_text):
 
 def test_pane_command_interpolates_oauth_prefix(script_text):
     # The token-prep prefix runs BEFORE cd, leaving the `cd && claude` guard intact.
-    assert "${_OAUTH_SRC}cd ${GENESIS_ROOT} && claude " in script_text
+    assert "${_OAUTH_SRC}cd ${GENESIS_ROOT} && command claude " in script_text
 
 
 def test_claude_stays_under_cd_guard(script_text):
     # `_OAUTH_SRC` ends in `;`. Placing it AFTER the `&&` (`cd $ROOT && <prefix>;
     # claude`) would bind the `&&` to the prefix only and run claude even if cd
     # fails. Keeping the prefix BEFORE cd preserves the original `cd && claude` guard.
-    assert "${_OAUTH_SRC}cd ${GENESIS_ROOT} && claude " in script_text
+    assert "${_OAUTH_SRC}cd ${GENESIS_ROOT} && command claude " in script_text
     assert "&& { ${_OAUTH_SRC}claude" not in script_text  # not the brace-group shape
 
 
@@ -145,12 +145,71 @@ printf 'TOKEN=[%s]\\n' "${{CLAUDE_CODE_OAUTH_TOKEN:-}}"
 
 
 def _extract_launch_line(script_text: str) -> str:
-    """The tmux pane-command argument (the `"${_OAUTH_SRC}cd ${GENESIS_ROOT} && …"`
-    string)."""
+    """The pane-command string, as the `_PANE_CMD=…` assignment's right-hand side.
+
+    It is built ONCE into a variable and used twice — handed to tmux on the
+    create path, and typed into the pane on the heal path — so that a healed
+    slot cannot drift into running a different claude. Returns the quoted value
+    so callers can splice it straight into a harness.
+    """
     for line in script_text.splitlines():
-        if line.lstrip().startswith('"${_OAUTH_SRC}cd ${GENESIS_ROOT} &&'):
-            return line.strip()
-    raise AssertionError("could not find the exec-tmux pane command in cc-slot.sh")
+        stripped = line.strip()
+        if stripped.startswith('_PANE_CMD="${_OAUTH_SRC}cd ${GENESIS_ROOT} &&'):
+            return stripped[len("_PANE_CMD=") :]
+    raise AssertionError("could not find the _PANE_CMD pane command in cc-slot.sh")
+
+
+def test_pane_command_is_built_once_and_reused(script_text):
+    """The create and heal paths must share ONE builder.
+
+    If the heal path ever grows its own copy of the launch string, a healed slot
+    silently loses the OAuth prefix / permission flag / exit-capture trailer and
+    re-poisons itself the next time claude exits.
+    """
+    assert script_text.count('_PANE_CMD="${_OAUTH_SRC}cd ${GENESIS_ROOT} &&') == 1
+    # Used by the exec (create) and by send-keys (heal) — and nowhere else.
+    assert script_text.count('"$_PANE_CMD"') == 2
+
+
+def test_pane_command_bypasses_the_bashrc_wrapper_function(tmp_path, script_text):
+    """A shared STRING is not shared EXECUTION.
+
+    tmux runs the create path under a non-interactive `sh -c` (no rc files); the
+    heal path is typed into an INTERACTIVE shell that has sourced ~/.bashrc,
+    where `claude` is a wrapper FUNCTION. If the payload said bare `claude` the
+    function would interpose on the heal path only — re-deriving the environment
+    and invoking cc_exit_capture twice — so the two paths would diverge despite
+    passing the string-identity check above.
+    """
+    launch = _extract_launch_line(script_text)
+    marker = tmp_path / "wrapper_ran.txt"
+    binv = tmp_path / "bin"
+    binv.mkdir()
+    real = binv / "claude"
+    real.write_text("#!/usr/bin/env bash\nexit 0\n")
+    real.chmod(0o755)
+
+    harness = f"""
+set -u
+export PATH={str(binv)!r}:/usr/bin:/bin
+GENESIS_ROOT={str(tmp_path)!r}
+_OAUTH_SRC=""
+CC_PERM_FLAG=""
+CLAUDE_ARGS_Q=""
+SLOT="test"
+mkdir -p {str(tmp_path)!r}/scripts
+printf '#!/usr/bin/env bash\\nexit 0\\n' > {str(tmp_path)!r}/scripts/cc_exit_capture.sh
+chmod +x {str(tmp_path)!r}/scripts/cc_exit_capture.sh
+# Stand in for the bashrc wrapper an interactive shell would have defined.
+claude() {{ echo "WRAPPER" > {str(marker)!r}; }}
+pane_cmd={launch}
+eval "$pane_cmd"
+"""
+    subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=30)
+    assert not marker.exists(), (
+        "the pane command resolved to the bashrc wrapper function; "
+        "the heal path would diverge from the create path"
+    )
 
 
 def _run_cd_guard(script_text: str, root: str, canary: Path, fakebin: Path):

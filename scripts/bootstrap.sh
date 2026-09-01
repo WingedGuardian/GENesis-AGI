@@ -875,7 +875,9 @@ read -r -d '' TMUX_WRAP_BLOCK <<'WRAPEOF' || true
 # Interactive `claude` outside tmux lands in a persistent cc-N tmux slot
 # (lowest free; attach-or-create via scripts/cc-slot.sh manual). A dropped
 # SSH or closed browser tab just detaches the session — reattach with
-# `tmux attach -t cc-N`. Opt out: GENESIS_NO_TMUX_WRAP=1.
+# `tmux attach -t cc-N`. Inside tmux the slot env (permission flag, temp dirs,
+# exit capture) is applied in place rather than nesting a session.
+# Opt out: GENESIS_NO_TMUX_WRAP=1.
 claude() {
     local arg
     for arg in "$@"; do
@@ -883,6 +885,43 @@ claude() {
             -p|--print|--version|-v|--help|-h) command claude "$@"; return $? ;;
         esac
     done
+    if [ -t 0 ] && [ -t 1 ] && [ -n "${TMUX:-}" ] && [ -z "${GENESIS_NO_TMUX_WRAP:-}" ]; then
+        # ALREADY inside tmux — typically relaunching by hand in a slot pane
+        # whose claude has exited. Before this branch that case fell straight
+        # through to a bare `command claude`, so a hand-typed relaunch was a
+        # second-class session: no permission flag (the operator had to
+        # remember it), not the temp dirs CC expects, and no exit capture — so
+        # the NEXT crash in that pane left no trace, which is the whole reason
+        # the capture exists.
+        #
+        # It applies that environment in place rather than calling cc-slot.sh,
+        # because cc-slot.sh's job is to allocate and attach a SLOT; there is
+        # already one here. (It is not a recursion guard — the slot branch below
+        # is gated on TMUX being empty, so it never ran in here to begin with.)
+        local _perm _slot _ec
+        _slot="${GENESIS_SLOT:-manual}"
+        case "${GENESIS_CC_PERMISSION_MODE:-auto}" in
+            bypass|dangerous|skip) _perm="--dangerously-skip-permissions" ;;
+            *)                     _perm="--permission-mode auto" ;;
+        esac
+        for arg in "$@"; do
+            case "$arg" in
+                --dangerously-skip-permissions|--permission-mode|--permission-mode=*)
+                    _perm="" ;;
+            esac
+        done
+        # chmod matches cc-slot.sh: this dir holds CC session state, and on a
+        # fresh install this may be what creates it — at the ambient umask it
+        # would land world-readable.
+        mkdir -p "$HOME/.genesis/cc-tmp" 2>/dev/null
+        chmod 700 "$HOME/.genesis/cc-tmp" 2>/dev/null || true
+        TMPDIR="$HOME/.genesis/cc-tmp" CLAUDE_CODE_TMPDIR="$HOME/.genesis/cc-tmp" \
+            command claude ${_perm:+$_perm} "$@"
+        _ec=$?
+        [ -x "$HOME/genesis/scripts/cc_exit_capture.sh" ] \
+            && "$HOME/genesis/scripts/cc_exit_capture.sh" "$_slot" "$_ec" >/dev/null 2>&1
+        return $_ec
+    fi
     if [ -t 0 ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ -z "${GENESIS_NO_TMUX_WRAP:-}" ] \
         && [ -x "$HOME/genesis/scripts/cc-slot.sh" ] \
         && command -v tmux >/dev/null 2>&1; then

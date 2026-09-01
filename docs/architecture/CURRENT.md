@@ -220,8 +220,31 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 975d3944 2026-08-31
+verified: 85f91765 2026-09-01
 ```
+
+- **The interactive slot door SELF-HEALS a session that lost its claude.**
+  `scripts/cc-slot.sh` is the one door every interactive entrance converges on
+  (SSH slot hostnames, manual SSH, the dashboard web terminal). It attaches with
+  `tmux new-session -A`, and the trap there is easy to re-introduce: when the
+  session already exists tmux ATTACHES and **silently discards the shell-command
+  argument**, so the launch command never runs. A slot alive but sitting at a
+  bare shell was therefore permanently stuck — every later connection landed at
+  that prompt while the door reported success. It now probes for a live claude
+  and types the canonical launch line into the pane when there is none.
+  The probe is `cc/slot_liveness.py`, and it does NOT read
+  `#{pane_current_command}`: that reports `bash` for the canonical
+  `bash -c "… claude …; trailer"` pane WHILE claude runs (the launcher dropped
+  `exec` so the exit-capture trailer can fire, so without job control tmux
+  resolves the tty's foreground group to the shell). Keying on it would classify
+  healthy slots as broken and type into a live session. It walks `/proc`
+  ancestry from each pane pid instead — `comm` or `argv[0]`, excluding headless
+  `claude -p` — and is deliberately biased toward reporting ALIVE, since a false
+  ALIVE costs a plain attach while a false POISONED types into a running TUI.
+  Only an explicit POISONED heals; UNKNOWN, a broken venv, a timeout or an empty
+  read all attach. The pane command is built ONCE (`_PANE_CMD`) and shared by
+  the create and heal paths, so a healed slot cannot drift into a claude without
+  the OAuth prefix, permission flag or exit-capture trailer.
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
   (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A restricted
