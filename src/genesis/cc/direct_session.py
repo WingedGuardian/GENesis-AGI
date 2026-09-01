@@ -223,6 +223,17 @@ _NO_OUTREACH_EXTRAS = [
     "mcp__genesis-outreach__outreach_digest",
 ]
 
+# Cold-marketing actuator. marketing_send resolves its recipient in-code from the
+# owner-curated marketing_prospects store and enqueues a BULK cold send — it must be
+# reachable ONLY from the `campaign` profile (the intended autonomous marketing
+# caller). Deny it in every other profile: mandatorily for the untrusted-inbound
+# perimeter profiles (mail, community-responder), where an injected inbound message
+# could otherwise reach the actuator, and belt-and-suspenders on profiles that don't
+# mount genesis-outreach today (guards an MCP-config fallback-to-full).
+_NO_MARKETING_SEND = [
+    "mcp__genesis-outreach__marketing_send",
+]
+
 # The venv Python interpreter running genesis-server. Exposed to profile
 # overlays (see _load_profile_overlays) so a locally-defined Bash profile can
 # allowlist exactly this path and run `<this> -m <module>`. Using
@@ -239,9 +250,16 @@ PROFILES: dict[str, list[str]] = {
         + _NO_FOLLOW_UPS
         + _NO_OUTREACH_ENGAGEMENT
         + _NO_RECON_WRITES
+        + _NO_MARKETING_SEND
     ),
-    "interact": (_UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES),
-    "research": (_UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION),
+    "interact": (
+        _UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES + _NO_MARKETING_SEND
+    ),
+    "research": (
+        _UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION + _NO_MARKETING_SEND
+    ),
+    # `campaign` is the ONLY profile that may call marketing_send — the intended
+    # autonomous cold-marketing caller. Every other profile denies it above/below.
     "campaign": (_UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION),
     # ── Steward profile ──────────────────────────────────────────
     # For the upstream-PR stewardship campaign. UNIQUE among profiles: it
@@ -251,7 +269,10 @@ PROFILES: dict[str, list[str]] = {
     # stay blocked — the campaign comments/reopens/closes PRs and ESCALATES
     # code fixes rather than editing/pushing itself.
     "steward": (
-        [t for t in _UNIVERSAL_DISALLOW if t != "Bash"] + _NO_BROWSER_INTERACTION + _NO_FILE_WRITE
+        [t for t in _UNIVERSAL_DISALLOW if t != "Bash"]
+        + _NO_BROWSER_INTERACTION
+        + _NO_FILE_WRITE
+        + _NO_MARKETING_SEND
     ),
     # ── Community responder profile ─────────────────────────────
     # Reactive community responder: reads a community's channels and replies
@@ -259,7 +280,11 @@ PROFILES: dict[str, list[str]] = {
     # outreach (no memory server). Belt-and-suspenders: block memory writes at
     # tool level too, in case MCP config generation fails and falls back to full.
     "community-responder": (
-        _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION + _NO_MEMORY_WRITES + _NO_FOLLOW_UPS
+        _UNIVERSAL_DISALLOW
+        + _NO_BROWSER_INTERACTION
+        + _NO_MEMORY_WRITES
+        + _NO_FOLLOW_UPS
+        + _NO_MARKETING_SEND
     ),
     # ── Perimeter profile ────────────────────────────────────────
     # For sessions that process untrusted inbound content (email
@@ -277,6 +302,7 @@ PROFILES: dict[str, list[str]] = {
         + _NO_RECON_WRITES
         + _NO_WEB_TOOLS
         + _NO_OUTREACH_EXTRAS
+        + _NO_MARKETING_SEND
     ),
 }
 
@@ -472,6 +498,7 @@ class ProfileOverlayContext:
     no_outreach_engagement: list[str]
     no_recon_writes: list[str]
     no_web_tools: list[str]
+    no_marketing_send: list[str]
     venv_python: str
 
     def add_profile(
@@ -522,6 +549,7 @@ def _load_profile_overlays() -> None:
         no_outreach_engagement=_NO_OUTREACH_ENGAGEMENT,
         no_recon_writes=_NO_RECON_WRITES,
         no_web_tools=_NO_WEB_TOOLS,
+        no_marketing_send=_NO_MARKETING_SEND,
         venv_python=_VENV_PYTHON,
     )
     try:
@@ -1368,6 +1396,12 @@ class DirectSessionRunner:
             # invariant (GENESIS_SESSION_ID is always a foreground row) depends
             # on direct_session_run staying unreachable from background sessions.
             exceptions.discard("mcp__genesis-health__direct_session_run")
+            # Same protection for the cold-marketing actuator: a tool_exception
+            # must never re-enable marketing_send on a non-campaign profile
+            # (esp. the untrusted-inbound mail/community-responder perimeter). The
+            # profile disallow lists are the belt; this keeps the exception
+            # mechanism from becoming a hole in them, regardless of caller.
+            exceptions -= set(_NO_MARKETING_SEND)
             disallowed = [t for t in disallowed if t not in exceptions]
 
         # Give background sessions access to Genesis MCP servers. Profile

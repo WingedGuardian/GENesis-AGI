@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import UTC, datetime
 
@@ -14,6 +15,16 @@ from fastmcp import FastMCP
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("genesis-outreach")
+
+# Pragmatic RFC-shape email check (matches the codebase's contribution.sanitize
+# pattern). Full RFC 5322 is not needed and no validator lib ships; this rejects
+# the common invalids (blank, no @, no TLD, whitespace) that must never reach an
+# adapter. Anchored + length-bounded; consecutive dots rejected.
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+def _is_valid_email(addr: str) -> bool:
+    return bool(_EMAIL_RE.match(addr)) and ".." not in addr and len(addr) <= 254
 
 _pipeline = None
 _engagement = None
@@ -118,6 +129,7 @@ async def outreach_send(
                 deliver_after=preferred_timing,
                 thread_id=thread_id,
                 validated_recipient=validated_recipient,
+                labeled_surplus=labeled_surplus,
             )
             return json.dumps({
                 "status": "queued",
@@ -169,6 +181,100 @@ async def outreach_send(
                 "This action is governed by Genesis owner authorization and was "
                 "not performed. This is expected, routine behavior, not an error "
                 "or failure, and not something to work around."
+            ),
+        })
+    return json.dumps({
+        "outreach_id": result.outreach_id,
+        "status": result.status.value,
+        "channel": result.channel,
+        "error": result.error,
+    })
+
+
+@mcp.tool()
+async def marketing_send(prospect_id: str, subject: str, body: str) -> str:
+    """Stage a COLD marketing email to a curated prospect. Returns a neutral
+    queued/refused JSON status.
+
+    Safety contract (why there is NO recipient parameter):
+      - The recipient is resolved IN CODE from ``marketing_prospects`` by
+        ``prospect_id`` — the LLM never supplies or influences the address.
+      - The tool refuses unless the ``marketing_outreach`` lever is enabled, the
+        prospect exists, is not opted out, and its address is RFC-shaped.
+      - A staged send is enqueued with ``labeled_surplus=True`` so it classifies
+        BULK at the WS-8 email autonomy gate — which ships at ASK and HOLDS every
+        cold send for owner approval. This tool never sends directly.
+    """
+    # (a) Outer lever: refuse entirely when off (env kill / disabled / invalid).
+    from genesis.outreach.marketing_config import effective_mode
+
+    if effective_mode() == "off":
+        return json.dumps({"status": "refused", "reason": "marketing_outreach_disabled"})
+
+    if _db is None:
+        return json.dumps({"status": "refused", "reason": "no_database"})
+
+    # (b) Resolve the recipient IN CODE — never from the caller.
+    from genesis.db.crud import marketing_prospects as mp
+
+    prospect = await mp.get_by_id(_db, prospect_id)
+    if prospect is None:
+        return json.dumps({"status": "refused", "reason": "prospect_not_found"})
+    if prospect.get("opted_out"):
+        return json.dumps({"status": "refused", "reason": "prospect_opted_out"})
+    recipient = (prospect.get("email") or "").strip()
+    if not recipient or not _is_valid_email(recipient):
+        return json.dumps({"status": "refused", "reason": "invalid_recipient"})
+
+    # (c) Compose + stage. category=NOTIFICATION (external informational outreach,
+    # no category-level approval gate — the email autonomy gate is the authority);
+    # labeled_surplus=True → BULK classification at the gate.
+    from genesis.outreach.types import OutreachCategory
+
+    subject = (subject or "").strip()
+    body = body or ""
+    message = f"{subject}\n\n{body}" if subject else body
+
+    if not _pipeline:
+        # Subprocess (standalone MCP) path — enqueue for the genesis-server drain,
+        # which rebuilds the request with labeled_surplus preserved (mirrors
+        # outreach_send's enqueue). The BULK flag survives via pending_outreach.
+        from genesis.db.crud import pending_outreach
+
+        await pending_outreach.ensure_table(_db)  # idempotent safety net
+        pending_id = await pending_outreach.enqueue(
+            _db,
+            message=message,
+            category=OutreachCategory.NOTIFICATION.value,
+            channel="email",
+            validated_recipient=recipient,
+            labeled_surplus=True,
+        )
+        return json.dumps({"status": "queued", "pending_id": pending_id})
+
+    # In-process pipeline path (server-hosted). Same neutral outcome contract as
+    # outreach_send: a HELD gate decision is reported as a terminal non-action.
+    from genesis.outreach.types import OutreachRequest, OutreachStatus
+
+    req = OutreachRequest(
+        category=OutreachCategory.NOTIFICATION,
+        topic=subject[:100] if subject else message[:100],
+        context=message,
+        salience_score=0.5,
+        signal_type="marketing_cold",
+        channel="email",
+        labeled_surplus=True,
+        validated_recipient=recipient,
+        verbatim=True,
+    )
+    result = await _pipeline.submit(req)
+    if result.status == OutreachStatus.HELD:
+        return json.dumps({
+            "status": "not_performed",
+            "reason": "owner_authorization",
+            "message": (
+                "This marketing send is governed by Genesis owner authorization and "
+                "was not performed. This is expected, routine behavior, not an error."
             ),
         })
     return json.dumps({
