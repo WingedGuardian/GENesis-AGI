@@ -220,7 +220,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: d71d1d39 2026-08-18
+verified: 975d3944 2026-08-31
 ```
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
@@ -414,7 +414,14 @@ verified: d71d1d39 2026-08-18
   re-run self-validates (re-limit → its own catch re-parks with backoff); exhausted
   parks escalate to `needs_user` with a governed (`rate_limit_park` signal) alert.
   Lever `cc_rate_limit_resume` (off|propose_only|**live**, default live) +
-  `GENESIS_RATE_LIMIT_RESUME_DISABLED`.
+  `GENESIS_RATE_LIMIT_RESUME_DISABLED`. Because the resume rewrites `caller_context`
+  to `rate_limit_resume:<park_id>` (needed for that re-limit lineage), the ORIGINAL
+  dispatch context (`ego_proposal:<id>`) is preserved separately on
+  `DirectSessionRequest.origin_caller_context` — threaded park payload → queue →
+  request → session metadata — and the three ego-dispatch consumers (proposal-outcome
+  recording, the post-exec auditor gate, the on-end follow-through hook) resolve back
+  to it via `rate_limit_park.effective_caller_context`, so a resumed ego dispatch's
+  outcome, audit, and follow-through survive the park→resume (closed 837f8b63).
 
 ## 3. Autonomy & egress gating
 
@@ -699,7 +706,7 @@ them.
 ```yaml subsystem-map
 entry: ego-self-model
 modules: [ego, identity, deliberation]
-verified: 94be12b3 2026-08-06
+verified: 975d3944 2026-08-31
 ```
 
 - **Two egos, both LIVE**: user ego (CEO, Opus, MCP profile `user_reflection`)

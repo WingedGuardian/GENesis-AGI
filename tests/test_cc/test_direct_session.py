@@ -616,6 +616,57 @@ async def test_record_outcome_failure_memory_is_recallable(db):
     )
 
 
+# --- park→resume proposal-lineage survival (PR-3) ---
+#
+# A rate-limit-parked ego dispatch resumes with caller_context rewritten to
+# "rate_limit_resume:<park_id>" (needed for park-lineage), which severs the
+# "ego_proposal:<id>" linkage the outcome-recording guard checks. The ORIGINAL
+# context rides across on origin_caller_context; the guard must fall back to it,
+# else a resumed dispatch's outcome (proposal update + recallable memory) is
+# silently dropped — exactly the #1487 P2 / #1496 / 837f8b63 gap.
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_survives_park_resume(db):
+    """A resumed dispatch (caller_context='rate_limit_resume:<pid>' +
+    origin_caller_context='ego_proposal:<id>') still records its outcome."""
+    from genesis.db.crud.ego import create_proposal, get_proposal
+
+    store = _RecordingStore()
+    await create_proposal(
+        db, id="prop-resumed", action_type="dispatch", content="x", status="executed"
+    )
+    req = DirectSessionRequest(
+        prompt="t",
+        caller_context="rate_limit_resume:park-xyz",
+        origin_caller_context="ego_proposal:prop-resumed",
+    )
+    res = DirectSessionResult(session_id="s-res", success=True, output_text="done after resume")
+    await _recording_runner(db, store)._record_proposal_outcome(req, res)
+
+    prop = await get_proposal(db, "prop-resumed")
+    assert "|completed:" in (prop["user_response"] or ""), (
+        "a resumed dispatch's proposal outcome must be recorded, not dropped"
+    )
+    succ = [c for c in store.calls if "dispatch_success" in (c.get("tags") or [])]
+    assert len(succ) == 1 and "prop-resumed" in succ[0].get("content", ""), (
+        "a resumed dispatch must write its recallable outcome memory"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_plain_resume_prefix_without_origin_is_noop(db):
+    """A resume-prefixed context with NO origin (a non-ego parked job) must NOT
+    be misread as a proposal — the guard still early-returns."""
+    store = _RecordingStore()
+    req = DirectSessionRequest(
+        prompt="t", caller_context="rate_limit_resume:park-abc", origin_caller_context=None
+    )
+    res = DirectSessionResult(session_id="s-none", success=True, output_text="x")
+    await _recording_runner(db, store)._record_proposal_outcome(req, res)
+    assert store.calls == [], "a non-ego resumed job must not record a proposal outcome"
+
+
 # --- WS-3 provenance: dispatch outcomes inherit the SESSION's origin (Codex #1487) ---
 #
 # A research/interact/etc. dispatch is external_untrusted — its output can echo
