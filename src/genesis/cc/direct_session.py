@@ -1004,13 +1004,18 @@ class DirectSessionRunner:
             )
             try:
                 await self._store_result(session_id, request, cancel_result)
-                # Feed the outcome back to an ego proposal, matching the
-                # generic failure path below.
-                await self._record_proposal_outcome(request, cancel_result)
+                # Write the terminal 'failed' status BEFORE the outcome embed:
+                # _record_proposal_outcome vectorizes (Qdrant), and a slow embed
+                # during the ~10s shutdown grace could push fail() past DB close,
+                # leaving the row 'active' across a restart. _store_result stays
+                # first so the on-end hook fail() fires sees full metadata.
                 await self._session_manager.fail(
                     session_id,
                     reason="cancelled",
                 )
+                # Feed the outcome back to an ego proposal, matching the
+                # generic failure path below.
+                await self._record_proposal_outcome(request, cancel_result)
             except Exception:
                 logger.error(
                     "Failed to record session %s cancellation",
@@ -1105,14 +1110,17 @@ class DirectSessionRunner:
             tools_called=telemetry,
         )
 
-        # Best-effort: persist failure and notify
+        # Best-effort: persist failure and notify. Terminal status BEFORE the
+        # outcome embed (same ordering as the cancel handler): _record_proposal_outcome
+        # vectorizes, and the status write must not be stranded behind a slow embed.
+        # _store_result stays first so the on-end hook fail() fires sees full metadata.
         try:
             await self._store_result(session_id, request, error_result)
-            await self._record_proposal_outcome(request, error_result)
             await self._session_manager.fail(
                 session_id,
                 reason=str(exc)[:500],
             )
+            await self._record_proposal_outcome(request, error_result)
         except Exception:
             logger.error(
                 "Failed to record session %s failure",
@@ -1172,6 +1180,7 @@ class DirectSessionRunner:
         dispatch_origin = _PROFILE_ORIGIN.get(request.profile)
         try:
             from genesis.db.crud.ego import (
+                get_proposal,
                 mark_proposal_verification_failed,
                 update_proposal_outcome,
             )
@@ -1250,11 +1259,28 @@ class DirectSessionRunner:
             try:
                 store = getattr(self._rt, "_memory_store", None)
                 if store is not None:
+                    # Prepend a human subject from the proposal so the memory has
+                    # task terms to recall on, not just the opaque UUID (#1487 :1212).
+                    # One cheap read; the row is not otherwise loaded on this path.
+                    # Its own try: a subject-fetch failure must degrade to no subject,
+                    # NOT skip the (more valuable) outcome memory itself.
+                    _subj = ""
+                    try:
+                        _prop = await get_proposal(db, proposal_id)
+                        _subj = ((_prop.get("content") if _prop else None) or "").strip()[:80]
+                    except Exception:
+                        logger.debug("Failed to fetch proposal subject", exc_info=True)
+                    _subj_tag = f" ({_subj})" if _subj else ""
                     if result.success:
-                        content = f"Ego dispatch SUCCEEDED for proposal {proposal_id}: {summary}"
+                        content = (
+                            f"Ego dispatch SUCCEEDED for proposal "
+                            f"{proposal_id}{_subj_tag}: {summary}"
+                        )
                         outcome_tag = "dispatch_success"
                     else:
-                        content = f"Ego dispatch FAILED for proposal {proposal_id}: {summary}"
+                        content = (
+                            f"Ego dispatch FAILED for proposal {proposal_id}{_subj_tag}: {summary}"
+                        )
                         outcome_tag = "dispatch_failure"
                     await store.store(
                         content=content,
