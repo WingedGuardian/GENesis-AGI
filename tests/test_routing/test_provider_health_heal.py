@@ -418,9 +418,12 @@ def test_degraded_responses_are_not_healed_by_a_listing_probe():
     model-listing probes — the same false-heal this change exists to remove,
     reached through a category the first fix did not enumerate.
 
-    The guard is an ALLOWLIST now rather than a blocklist, so the question is
-    "does reachability actually evidence recovery here?" — true only for
-    TRANSIENT/TIMEOUT — and a category added later is blocked by default.
+    Superseded twice since: first by a category ALLOWLIST, then by dropping
+    categories from the question entirely. The guard now asks only whether a
+    real CALL opened this breaker (`_opened_by_call`), so DEGRADED needs no
+    enumerating — no category does. This test survives unchanged because the
+    OUTCOME it pins is the same, which is the point: the rule got simpler and
+    the guarantee did not.
     """
     reg, prov = _half_open_with(ErrorCategory.DEGRADED)
     checker = ProviderHealthChecker(_config(prov), breakers=reg)
@@ -501,12 +504,13 @@ def test_sub_threshold_failures_do_not_poison_the_probe_heal_guard():
     provider that is completely fine. That is the same false-degraded-forever
     failure this branch exists to remove, recreated one layer over.
 
-    The fix is to ask whether a non-healable category actually TRIPPED the
-    breaker (`_trip_count > 0`), rather than whether one was merely recorded.
-    Clearing the category in `probe_suspect()` was the other candidate and was
-    rejected: `_effective_open_duration()` also reads it to pick the 4h quota
-    cap, so clearing it there would silently shorten a quota-dead provider's
-    backoff — trading this bug for a quieter one.
+    The first fix asked whether a non-healable category had actually TRIPPED
+    the breaker (`_trip_count > 0`). That worked, but it was the fifth condition
+    stacked onto one predicate — the signal that the predicate was asking the
+    wrong question. The rule now reads `_opened_by_call`, set at the trip
+    itself, so "was it a real call?" is a fact recorded once rather than
+    inferred from two other fields. This test is unchanged and still passes:
+    sub-threshold failures never trip, so they never set the flag.
     """
     prov = _provider("free-1")
     reg = CircuitBreakerRegistry({"free-1": prov}, clock=lambda: 0.0, persist=False)

@@ -1439,9 +1439,10 @@ verified: d2d501b1 2026-08-31
 - **observability/**: event bus dispatches inline AND logs every event;
   persist-queue overflow drops events but emits a rate-limited "dropped"
   meta-event (WS-17). Two health layers (async probes vs systemd shell-out) — a
-  probe HEALS a breaker only for TRANSIENT/TIMEOUT, never for
-  PERMANENT/QUOTA_EXHAUSTED (a models-listing 200 is exactly what a 403-on-use
-  looks like, and a false heal resets the outage clock);
+  probe may HEAL only a breaker that a PROBE downgraded (`probe_suspect`);
+  one opened by a real call failure needs a real success, whatever the failure
+  category (a models-listing 200 is exactly what a 403-on-use looks like, and a
+  false heal resets the outage clock — measured live twice);
   `/health` is a dashboard route, not an MCP tool; `job_health` state machine
   is runtime-owned. `snapshots/deploy_health.py` = merged-vs-deployed drift
   (never does network I/O; host guardian state comes from

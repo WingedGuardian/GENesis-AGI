@@ -2806,11 +2806,9 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   restarted, so the outage clock never accumulated and no surface could report a
   duration. Measured over one real multi-day outage: eight separate failure
   records, every one of them closed automatically while the provider was in fact
-  answering nothing at all. A probe now heals only
-  `TRANSIENT`/`TIMEOUT` failures — the low-traffic recovery case it was built
-  for — and only for the case a probe can actually speak to. The rule is
-  symmetry: a health probe may undo a health probe's own suspicion, and nothing
-  else. If real calls broke a provider, a real call has to prove it fixed.
+  answering nothing at all. The rule now is symmetry: a health probe may undo
+  a health probe's own suspicion, and nothing else. If real calls broke a
+  provider, a real call has to prove it fixed.
 
   This does not take a provider out of rotation. A tripped provider is
   automatically put back on probation once its backoff window passes, and a
