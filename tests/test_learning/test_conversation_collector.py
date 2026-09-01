@@ -1,11 +1,36 @@
 """Tests for ConversationCollector — counts interactions since last reflection."""
 
+import threading
 from datetime import UTC, datetime
 
 import pytest
 
 from genesis.db.crud import awareness_ticks, cc_sessions
 from genesis.learning.signals.conversation import ConversationCollector
+
+
+@pytest.mark.asyncio
+async def test_count_jsonl_turns_runs_off_the_event_loop(db, monkeypatch):
+    """The sync glob+getmtime+read scan must be offloaded to a worker thread.
+
+    Measured (2026-08-24/25 stall-stack dumps) blocking the event loop 2.6-3.6s
+    under btrfs write contention over the multi-GB transcript dir, tripping false
+    critical_failure=1.0 alarms. It must run via asyncio.to_thread, not on the loop.
+    """
+    loop_thread_id = threading.get_ident()
+    captured: dict[str, int] = {}
+
+    def _spy(self, cutoff):
+        captured["thread_id"] = threading.get_ident()
+        return 0
+
+    monkeypatch.setattr(ConversationCollector, "_count_jsonl_turns", _spy)
+    await ConversationCollector(db).collect()
+    assert "thread_id" in captured, "_count_jsonl_turns was not invoked"
+    assert captured["thread_id"] != loop_thread_id, (
+        "_count_jsonl_turns ran on the event-loop thread — it must be offloaded "
+        "to a worker thread via asyncio.to_thread"
+    )
 
 
 @pytest.mark.asyncio
