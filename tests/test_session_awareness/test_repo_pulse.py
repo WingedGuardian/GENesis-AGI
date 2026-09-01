@@ -336,6 +336,95 @@ def test_followup_marker_must_be_line_anchored():
         assert [m["via"] for m in rp.match_followup([_pr(body=body)], [_fu()])] == ["marker"], body
 
 
+# ── issue-close lane (WS-A): match_closed_issues ─────────────────────────
+# A contributor PR that CLOSES a Genesis-posted issue (Closes #N ->
+# closingIssuesReferences) resolves the follow_up that spawned the issue.
+# Synthetic repo slug throughout — never the real install slug.
+
+WS_REPO = "acme/widgets"
+
+
+def _iref(number, repo=WS_REPO):
+    owner, _, name = repo.partition("/")
+    return {
+        "number": number,
+        "repository": {"name": name, "owner": {"login": owner}},
+        "url": f"https://github.com/{repo}/issues/{number}",
+    }
+
+
+def _pr_closes(number=1200, base="main", refs=None, title="fix: contributor patch"):
+    pr = _pr(number=number, title=title, body="Closes #42")
+    pr["baseRefName"] = base
+    pr["closingIssuesReferences"] = refs if refs is not None else [_iref(42)]
+    return pr
+
+
+def _closed(prs, posted, fu_rows, *, repo=WS_REPO, default_branch="main"):
+    followup_index = {str(f["id"]): f for f in fu_rows}
+    return rp.match_closed_issues(
+        prs, dict(posted), followup_index, run_repo=repo, default_branch=default_branch
+    )
+
+
+def test_closes_default_branch_resolves_followup():
+    m = _closed([_pr_closes()], {42: FOLLOWUP}, [_fu()])
+    assert len(m) == 1
+    assert m[0]["via"] == "closes"
+    assert m[0]["item"]["id"] == FOLLOWUP
+    assert m[0]["pr"]["number"] == 1200
+
+
+def test_closes_non_default_branch_no_match():
+    # GitHub auto-closes only on default-branch merge; a release-branch PR
+    # carrying Closes #N must NOT absorb the follow_up.
+    assert _closed([_pr_closes(base="release/2.0")], {42: FOLLOWUP}, [_fu()]) == []
+
+
+def test_closes_cross_repo_ref_ignored():
+    # A foreign `Closes owner/other#42` must not collide with our local #42.
+    foreign = _pr_closes(refs=[_iref(42, repo="other/project")])
+    assert _closed([foreign], {42: FOLLOWUP}, [_fu()]) == []
+
+
+def test_closes_untracked_issue_no_match():
+    # issue not in posted_index (a Cat-1 codebase issue never indexed) -> no match.
+    assert _closed([_pr_closes()], {99: FOLLOWUP}, [_fu()]) == []
+    assert _closed([_pr_closes()], {}, [_fu()]) == []
+
+
+def test_closes_followup_not_open_no_match():
+    # posted_index resolves an id, but that follow_up is not open -> no match.
+    assert _closed([_pr_closes()], {42: FOLLOWUP}, []) == []
+
+
+def test_closes_empty_or_missing_refs_no_match():
+    assert _closed([_pr_closes(refs=[])], {42: FOLLOWUP}, [_fu()]) == []
+    bare = _pr(number=1201)  # no baseRefName / closingIssuesReferences keys
+    assert _closed([bare], {42: FOLLOWUP}, [_fu()]) == []
+
+
+def test_closes_dedupes_and_multi():
+    fu2 = "9999888877776666555544443333222f"
+    same = _pr_closes(refs=[_iref(42), _iref(43)])
+    assert len(_closed([same], {42: FOLLOWUP, 43: FOLLOWUP}, [_fu()])) == 1  # same fu -> 1
+    two = _closed([same], {42: FOLLOWUP, 43: fu2}, [_fu(), _fu(fu_id=fu2)])
+    assert {t["item"]["id"] for t in two} == {FOLLOWUP, fu2}  # distinct fus -> 2
+
+
+def test_closes_empty_default_branch_or_repo_is_safe():
+    # defensive: unresolved default branch / run_repo -> no matches.
+    assert _closed([_pr_closes()], {42: FOLLOWUP}, [_fu()], default_branch="") == []
+    assert _closed([_pr_closes()], {42: FOLLOWUP}, [_fu()], repo="") == []
+
+
+def test_closes_malformed_refs_dropped_not_crash():
+    # a non-dict ref entry (gh JSON-shape drift) is skipped, not a crash; a valid
+    # sibling in the same list still matches.
+    pr = _pr_closes(refs=["not-a-dict", None, _iref(42)])
+    assert len(_closed([pr], {42: FOLLOWUP}, [_fu()])) == 1
+
+
 # ── Open-PR lane (session-manager PR-4c): stalled-selection + formatting ─────
 
 NOW = datetime(2026, 8, 21, tzinfo=UTC)

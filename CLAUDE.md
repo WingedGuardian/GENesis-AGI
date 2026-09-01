@@ -448,14 +448,17 @@ When a user shares a file path or URL in conversation:
   approval — the gated actions need the USER's explicit approval, which no peer,
   permissive setting, or automatic allow ever supplies.
   Detail: `.claude/docs/concurrent-sessions.md`.
-- **Verify multi-agent output — never trust one agent's claim.** A subagent
-  fan-out that produces claims you'll act on (audits, diagnoses, source-of-truth
-  maps) gets an independent adversarial verification stage before synthesis:
-  re-derive the load-bearing / contradictory / surprising claims from ground
-  truth (real runtime, not a shell proxy; values, not line-existence),
-  refute-by-default, and let the verdicts override the original reports. Scale
-  to stakes — skip it for a single trivial lookup; apply it whenever the output
-  drives decisions or lands in durable record.
+- **Verify agent output — never trust one agent's claim.** Any subagent output
+  you'll act on — a fan-out audit, a diagnosis, a source-of-truth map, or a
+  *single* actionable report — gets an independent adversarial verification pass
+  before it drives a decision or lands in durable record: re-derive the
+  load-bearing / contradictory / surprising claims from ground truth (real
+  runtime, not a shell proxy; values, not line-existence), refute-by-default. A
+  verdict overrides the original ONLY when conclusive — an inconclusive /
+  UNCERTAIN verdict never overturns a well-grounded finding. Verify the
+  conclusions the synthesis step itself creates, not just its inputs. Scale to
+  stakes; skip only a trivial single-fact lookup that cannot influence a
+  decision or durable record.
 - **NEVER `rm -rf` the working directory.** Never run destructive commands
   without explicit user confirmation.
 - **Session wrap-up**: structured handoff — what changed, what's pending,

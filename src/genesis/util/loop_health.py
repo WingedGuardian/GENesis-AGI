@@ -48,12 +48,41 @@ class LoopHealthSample:
 
 
 _latest: LoopHealthSample | None = None
+# Monotonic timestamp of the most recent LAGGING sample the sampler published.
+# The sampler republishes a cleared (lagging=False) sample ~one interval after a
+# stall ends, so the single ``_latest`` reference reads healthy microseconds after
+# a real stall. This retains a short memory of the last lagging observation so a
+# just-expired stall still counts as live evidence (see :func:`recently_lagging`).
+_last_lagging_monotonic: float | None = None
 
 
 def publish(sample: LoopHealthSample) -> None:
     """Store the latest sample (called from the loop thread, every interval)."""
-    global _latest
+    global _latest, _last_lagging_monotonic
     _latest = sample
+    if sample.lagging:
+        _last_lagging_monotonic = sample.sampled_monotonic
+
+
+def recently_lagging(window_s: float, *, now: float | None = None) -> bool:
+    """True if the sampler published a LAGGING sample within the last ``window_s``.
+
+    Closes a TOCTOU race in starvation classification: because the sampler
+    republishes a cleared (``lagging=False``) sample ~one interval (0.5s) after a
+    stall ends, a consumer that reads only the single latest sample just after a
+    stall sees the loop "healthy" and misses the real, just-observed stall. This
+    reports whether lag was observed recently enough to still be live evidence.
+
+    Only the sampler ever records a lagging observation, so this never fabricates
+    starvation. It is bounded by ``window_s`` so an old, unrelated lag cannot
+    suppress a genuine later timeout. ``now`` is injectable for deterministic
+    tests; defaults to :func:`time.monotonic`. Diagnostic-only, like the rest of
+    this module — it informs a fail-closed suppression decision, never forces one.
+    """
+    if _last_lagging_monotonic is None:
+        return False
+    ref = time.monotonic() if now is None else now
+    return (ref - _last_lagging_monotonic) <= window_s
 
 
 def read() -> LoopHealthSample | None:

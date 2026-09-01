@@ -220,7 +220,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: d71d1d39 2026-08-18
+verified: 975d3944 2026-08-31
 ```
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
@@ -414,7 +414,14 @@ verified: d71d1d39 2026-08-18
   re-run self-validates (re-limit → its own catch re-parks with backoff); exhausted
   parks escalate to `needs_user` with a governed (`rate_limit_park` signal) alert.
   Lever `cc_rate_limit_resume` (off|propose_only|**live**, default live) +
-  `GENESIS_RATE_LIMIT_RESUME_DISABLED`.
+  `GENESIS_RATE_LIMIT_RESUME_DISABLED`. Because the resume rewrites `caller_context`
+  to `rate_limit_resume:<park_id>` (needed for that re-limit lineage), the ORIGINAL
+  dispatch context (`ego_proposal:<id>`) is preserved separately on
+  `DirectSessionRequest.origin_caller_context` — threaded park payload → queue →
+  request → session metadata — and the three ego-dispatch consumers (proposal-outcome
+  recording, the post-exec auditor gate, the on-end follow-through hook) resolve back
+  to it via `rate_limit_park.effective_caller_context`, so a resumed ego dispatch's
+  outcome, audit, and follow-through survive the park→resume (closed 837f8b63).
 
 ## 3. Autonomy & egress gating
 
@@ -469,6 +476,27 @@ verified: 84c7259d 2026-08-31
   the drain, incl. approved held rows). Terminal rows pruned >30d via
   `scripts/prune_contributor_issue_posts.py`; held rows never pruned. The
   curator campaigns are LOCAL user data (uncommitted).
+- **Cold marketing-email substrate (PR1) — gated like email, recipient resolved
+  in CODE.** The `marketing_send` MCP tool (genesis-outreach) stages a cold
+  marketing email to a recipient resolved from the owner-curated
+  `marketing_prospects` store by `prospect_id` — the tool takes NO address
+  parameter, so the LLM never supplies a recipient. It refuses unless the
+  `marketing_outreach` lever (`outreach/marketing_config.py`, default `off`,
+  invalid→off, env kill `GENESIS_MARKETING_OUTREACH_DISABLED`) is enabled, the
+  prospect exists, is not opted-out (PERMANENT suppression, never pruned), and its
+  address is RFC-shaped; then enqueues to `pending_outreach` with
+  `labeled_surplus=True` (threaded through the queue so the drain rebuilds a BULK
+  request). Every staged send still converges on the same `_deliver` →
+  `EmailAutonomyGate` chokepoint: the BULK capability cell ships at ASK, so
+  everything HOLDS for owner approval (ships INERT). A GRANTED bulk cell adds a
+  deterministic scope guard (`_scope_guard_trip` g2): the autonomous recipient
+  MUST be a curated, non-opted-out `marketing_prospects` row (authorization is
+  DECOUPLED from send-lifecycle status, so a `contacted` follow-up still sends) —
+  an unknown / opted-out recipient trips (`recipient_not_curated` / `opted_out`)
+  → demote + hold (fail-closed). PR2 will wire graduation, send-time contact
+  stamping, AND a hard per-window cap on hold-creation (the ASK-state
+  approval-flood guard) alongside the batch-approval card — `marketing_send` has
+  no autonomous caller until then.
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
   PII scan for EXTERNAL channels and `content`-category drafts only. Never
   applied to owner channels — don't add them.
@@ -703,7 +731,7 @@ them.
 ```yaml subsystem-map
 entry: ego-self-model
 modules: [ego, identity, deliberation]
-verified: 94be12b3 2026-08-06
+verified: 975d3944 2026-08-31
 ```
 
 - **Two egos, both LIVE**: user ego (CEO, Opus, MCP profile `user_reflection`)
@@ -1127,6 +1155,14 @@ verified: 1d75bc21 2026-08-31
   evidence via `ledger_update`; bare hex → proposal; `annotation_exists`
   re-absorb guard protects reopened items), the **fuzzy tier** (headless
   Haiku, echo-numbers-only fail-closed parse) is proposal-only in EVERY mode.
+  Two sibling reconciliation lanes ride the SAME merged PRs to resolve standalone
+  `follow_ups` (target_kind='follow_up', migration 0084): the **follow-up marker
+  lane** (#1397) auto-absorbs a follow_up whose id is cited `Follow-up: <id>` in
+  OUR own PR body; the **issue-close lane** (WS-A) resolves the follow_up that
+  spawned a Genesis-posted contributor issue when a contributor's PR CLOSES that
+  issue (`Closes #N` → `closingIssuesReferences`, joined via
+  `pending_issue_posts.source_ref`; default-branch + same-repo scoped). Both reuse
+  `absorb_followup` + the annotation store + the `annotation_exists` re-absorb guard.
   Store: `repo_pulse_runs`/`_annotations` (migration 0062,
   `UNIQUE(tier,item_id,pr_number)` dedupe; CRUD `db/crud/repo_pulse.py`).
   Cursor (`cursor.json`, gh-format mergedAt watermark) advances monotonically

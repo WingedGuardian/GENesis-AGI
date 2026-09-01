@@ -22,6 +22,14 @@ from genesis.db.crud import ego_intentions
 
 logger = logging.getLogger(__name__)
 
+# A proposal with NULL ego_source routes its follow-through to the GENESIS ego,
+# by the locked B2b design decision — deliberately NOT the user ego. This is an
+# ONGOING branch, not a legacy artifact: ego_source is a bare
+# `ALTER TABLE ego_proposals ADD COLUMN ego_source TEXT` (db/schema/_migrations.py,
+# no DEFAULT, no backfill), so proposals created without it are NULL by design
+# (see tests/ego/test_realist.py::test_ego_source_null_by_default). Routing this
+# operational bookkeeping onto the user ego's board would be a behavior change,
+# not a fix.
 _FALLBACK_EGO_SOURCE = "genesis_ego_cycle"
 
 _TRIGGER = "Next ego cycle — review this dispatch outcome and decide follow-through."
@@ -90,9 +98,16 @@ async def record_dispatch_followthrough(
     # status + the ego's own (first-party) proposal summary anchor the review;
     # the ego reads the full outcome via the execution_outcome observation + the
     # recallable dispatch memory.
+    # Status is authoritative EXCEPT the one misleading case: a session that
+    # reported "completed" but whose deliverables failed post-dispatch
+    # verification (failed=True + status="completed") — a bare [completed] would
+    # misreport it. Only override THAT case; keep every genuine terminal status
+    # (timeout/error/cancelled) intact, since the reviewing ego uses the specific
+    # outcome to choose step-2 vs retry vs close.
+    _state = "failed" if (failed and (status or "").lower() == "completed") else status
     content = (
         f"Review dispatch outcome for proposal {proposal_id[:8]} "
-        f"[{status}]: {prop_summary}"
+        f"[{_state}]: {prop_summary}"
         ". Decide follow-through: step-2, retry, or close."
     )
     if outcome:
