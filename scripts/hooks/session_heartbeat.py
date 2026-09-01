@@ -411,6 +411,14 @@ def throttle_ok(
             # working session vanish from its peers entirely. Same direction the
             # repo already settled at genesis_urgent_alerts.py:350
             # ("future marker -> do not suppress; emit").
+            #
+            # `now` is read before this stat() too, so a sibling refreshing the
+            # stamp in between yields a negative difference and this check falls
+            # through. That staleness is DELIBERATELY tolerated here and is not
+            # the defect fixed below: the cost is one open+flock, and the
+            # under-lock check is authoritative. Do not "fix" it by re-reading
+            # the clock -- that adds a syscall to the ~99% path whose whole job
+            # is to stay cheap.
             if 0 <= now - stamp.stat().st_mtime < window:
                 return False  # the ONLY cost on ~99% of tool calls
         except OSError:
@@ -433,6 +441,30 @@ def throttle_ok(
                     last = float(fh.read().strip() or 0.0)
                 except ValueError:
                     last = 0.0  # corrupt stamp -> treat as never claimed
+                # RE-READ THE CLOCK, and read it HERE. The `now` captured before
+                # the flock is stale by exactly the interval this branch exists
+                # to judge. A sibling that won the lock wrote ITS OWN, later
+                # timestamp, so a loser's pre-lock `now` sits MICROSECONDS
+                # BEHIND it and ``now - last`` goes NEGATIVE -- whereupon the
+                # backwards-clock guard below reads "not inside the window" and
+                # the loser claims too, the flock excluding nothing in the one
+                # case it exists for. MEASURED: a sibling winning by 50us
+                # produced a second winner every time, and CI caught it as
+                # "expected exactly one winner, got 2". A clock read taken AFTER
+                # the lock is never EARLIER than a write that completed under it,
+                # so the race yields a NON-NEGATIVE difference (refused) while a
+                # genuine backwards step still yields a negative one (claimed) --
+                # both properties, one clock read.
+                #
+                # Non-negative, NOT positive: time.time() is a double whose ULP
+                # at epoch magnitude is ~2.4e-07s, so two reads closer together
+                # than that return the SAME float and the difference is exactly
+                # 0.0. `0 <=` is therefore load-bearing for the RACE as well as
+                # for the backwards step below. Tightening it to `0 <` reopens
+                # the tie SILENTLY -- that mutant passed every test in
+                # tests/test_scripts/test_session_heartbeat_throttle.py until the
+                # tie case was written for it.
+                now = time.time()
                 # Same backwards-clock guard as the mtime check above; this
                 # call site needs it independently, since a stamp can carry a
                 # future CLAIM TIME while its mtime is old.

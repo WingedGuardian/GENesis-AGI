@@ -7,6 +7,7 @@ window even when Claude Code issues tool calls in parallel.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import multiprocessing as mp
 import os
@@ -48,12 +49,21 @@ def test_the_window_reopens_once_it_has_elapsed(tmp_path):
     assert sh.throttle_ok(_SID, window_s=0.05, sessions_dir=tmp_path) is True
 
 
-def _stamp(tmp_path: Path, body: str, *, age_s: float) -> Path:
-    """Write a stamp whose MTIME is ``age_s`` old, independent of its content."""
+def _stamp(tmp_path: Path, body: str, *, age_s: float, now: float | None = None) -> Path:
+    """Write a stamp whose MTIME is ``age_s`` old, independent of its content.
+
+    ``now`` overrides the reference point the age is measured back from. Any
+    test that installs a fake clock MUST pass its own base. Aged against the
+    REAL clock instead, the mtime lands in the fake base's future, the cheap
+    mtime check falls through on its SIGN guard rather than on the age, and
+    ``age_s`` becomes decorative -- MEASURED: 0.0 and 3600.0 then produce
+    identical verdicts across the whole mutation matrix, so a test whose
+    docstring credits the aging is crediting the wrong mechanism.
+    """
     p = tmp_path / _SID / "heartbeat.stamp"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(body)
-    old = time.time() - age_s
+    old = (time.time() if now is None else now) - age_s
     os.utime(p, (old, old))
     return p
 
@@ -135,6 +145,121 @@ def test_parallel_tool_calls_in_one_session_produce_exactly_one_winner(tmp_path)
         with mp.Pool(n) as pool:
             wins = pool.map(_claim, [(str(tmp_path), _SID, barrier)] * n)
     assert sum(wins) == 1, f"expected exactly one winner, got {sum(wins)}"
+
+
+class _SequencedClock:
+    """Hands out scripted readings in order, then holds the last one.
+
+    A FROZEN clock cannot test the branch below. Freezing makes the pre-lock and
+    the under-lock reading identical, which models the OLD code no matter what
+    the new code does -- the first version of this probe froze the clock and
+    reported the bug as still present after it had been fixed. Holding (rather
+    than raising) past the end means an extra clock read cannot be mistaken for
+    a defect.
+    """
+
+    def __init__(self, readings: list[float]) -> None:
+        self._it = iter(readings)
+        self._last = readings[-1]
+        self.reads = 0
+
+    def time(self) -> float:
+        # The COUNT is the instrument. throttle_ok reads the clock once before
+        # the cheap mtime check and once more under the lock, so reads == 2 is
+        # proof the under-lock branch was actually reached -- which a verdict
+        # alone cannot give, because the fast path and the branch under test
+        # both refuse with False.
+        self.reads += 1
+        with contextlib.suppress(StopIteration):
+            self._last = next(self._it)
+        return self._last
+
+
+def test_the_race_loser_is_refused_though_its_clock_read_predates_the_winner(tmp_path, monkeypatch):
+    """The deterministic half of the parallel test above, which is a RACE.
+
+    CI caught this as "expected exactly one winner, got 2" on a commit that had
+    already been green -- ordering-dependent, so neither its red nor its green is
+    evidence. This models the interleaving instead of running it.
+
+    The loser reads the clock BEFORE the flock; the winner then takes the lock
+    and writes its own, later claim time. If the loser compares that stale
+    reading against the winner's stamp, ``now - last`` is NEGATIVE by
+    microseconds, the backwards-clock guard reads it as "not inside the window",
+    and the loser claims too -- the flock excluding nothing in the one case it
+    exists for. The fix is to read the clock UNDER the lock, where a completed
+    write is always in the past.
+
+    The mtime is aged against the FAKE clock's base (``now=base``), which is
+    what makes the aging load-bearing: the cheap mtime check runs first and
+    would otherwise refuse before this branch is reached. Aged against the real
+    clock the mtime would land in ``base``'s future and the check would fall
+    through on its sign guard instead, leaving ``age_s`` decorative.
+
+    ``throttle_ok`` fails CLOSED to False, which is also what this test asserts,
+    so the verdict alone proves nothing: MEASURED, a broken double (a class with
+    no ``.time`` attribute at all) returns False here, and so does the mtime fast
+    path when the aging is wrong. The read COUNT is what closes that -- two reads
+    means the under-lock branch really ran. Without it, aging the stamp to 0s
+    left all three tests green while none of them reached the branch (MEASURED).
+    """
+    base = time.time()
+    won_by = 0.000_050  # the sibling beat us to the lock by 50us
+    _stamp(tmp_path, repr(base + won_by), age_s=3600.0, now=base)
+    clock = _SequencedClock([base, base + 0.000_200])
+    monkeypatch.setattr(sh, "time", clock)
+    assert sh.throttle_ok(_SID, window_s=60.0, sessions_dir=tmp_path) is False
+    assert clock.reads == 2, (
+        f"refused after {clock.reads} clock read(s): the mtime fast path "
+        "short-circuited and the under-lock branch under test never ran"
+    )
+
+
+def test_a_clock_tie_with_the_winner_is_still_refused(tmp_path, monkeypatch):
+    """`0 <=`, not `0 <`: the two clock reads can land on the SAME float.
+
+    time.time() returns a double whose ULP at epoch magnitude is ~2.4e-07s, so
+    two reads closer together than that are EQUAL and the race difference is
+    exactly 0.0 rather than positive. Without this case the tightening
+    ``0 <= `` -> ``0 < `` passed all 21 other tests in this file (MEASURED) while
+    silently reopening the race at the tie -- the loser would fall through and
+    claim a window the winner already holds.
+    """
+    base = time.time()
+    won_by = 0.000_050
+    _stamp(tmp_path, repr(base + won_by), age_s=3600.0, now=base)
+    # the post-lock read lands on exactly the winner's claim time
+    clock = _SequencedClock([base, base + won_by])
+    monkeypatch.setattr(sh, "time", clock)
+    assert sh.throttle_ok(_SID, window_s=60.0, sessions_dir=tmp_path) is False
+    assert clock.reads == 2, (
+        f"refused after {clock.reads} clock read(s): the mtime fast path "
+        "short-circuited and the tie was never compared"
+    )
+
+
+def test_a_genuinely_future_stamp_still_claims_under_the_same_clock(tmp_path, monkeypatch):
+    """Guard-the-guard for the test above: the two properties must BOTH hold.
+
+    Refusing the race loser must not be bought by dropping the backwards-clock
+    guard. A stamp an hour ahead is a real clock step (VM restore, NTP
+    correction), not a sibling -- an unguarded comparison reads it as "inside the
+    window" and refuses every write until wall time catches up, which would make
+    an actively working session vanish from its peers entirely. Same sequenced
+    clock, so a fix that simply deleted the guard turns this red.
+
+    This one needs no read-count assertion: the mtime fast path can only refuse
+    or fall through, so a True verdict is itself proof the under-lock branch ran.
+    That is also why it is the case that validates the fake clock -- a broken
+    double turns it red, where the two above fail closed to the value they
+    assert. It therefore stays even though
+    ``test_a_future_claim_time_does_not_suppress_the_refresh`` also covers the
+    guard.
+    """
+    base = time.time()
+    _stamp(tmp_path, repr(base + 3600.0), age_s=7200.0, now=base)
+    monkeypatch.setattr(sh, "time", _SequencedClock([base, base + 0.000_200]))
+    assert sh.throttle_ok(_SID, window_s=60.0, sessions_dir=tmp_path) is True
 
 
 def test_different_sessions_never_contend(tmp_path):
