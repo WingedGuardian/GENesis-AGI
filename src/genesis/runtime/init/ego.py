@@ -303,24 +303,37 @@ async def init(rt: GenesisRuntime) -> None:
                         _meta = {}
                     caller_ctx = _meta.get("caller_context", "")
 
-                    await obs_crud.create(
-                        rt._db,
-                        id=str(uuid.uuid4()),
-                        source="ego_dispatch",
-                        type="execution_outcome",
-                        content=(
-                            f"Ego dispatch session {session_id[:8]} "
-                            f"completed: status={status}, cost=${cost:.4f}. "
-                            f"Context: {caller_ctx}"
-                        ),
-                        priority="medium",
-                        category="ego_dispatch",
-                        created_at=datetime.now(UTC).isoformat(),
-                    )
-                    logger.info(
-                        "Recorded ego dispatch outcome for session %s",
-                        session_id[:8],
-                    )
+                    # Own try/except: this observation is telemetry. A write
+                    # failure here must NOT skip the follow-through block below
+                    # (the "every terminal dispatch gets one forced review"
+                    # guarantee) — previously a bare create() inside the outer try
+                    # jumped straight to the outer except on failure.
+                    try:
+                        await obs_crud.create(
+                            rt._db,
+                            id=str(uuid.uuid4()),
+                            source="ego_dispatch",
+                            type="execution_outcome",
+                            content=(
+                                f"Ego dispatch session {session_id[:8]} "
+                                f"completed: status={status}, cost=${cost:.4f}. "
+                                f"Context: {caller_ctx}"
+                            ),
+                            priority="medium",
+                            category="ego_dispatch",
+                            created_at=datetime.now(UTC).isoformat(),
+                        )
+                        logger.info(
+                            "Recorded ego dispatch outcome for session %s",
+                            session_id[:8],
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to write ego dispatch execution_outcome "
+                            "observation for %s — continuing to follow-through",
+                            session_id[:8],
+                            exc_info=True,
+                        )
 
                     # Write goal progress if proposal is linked to a goal
                     if "ego_proposal:" in caller_ctx:
