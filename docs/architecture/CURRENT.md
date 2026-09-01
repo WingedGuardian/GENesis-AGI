@@ -1211,8 +1211,33 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: fbcf8ee4 2026-07-21
+verified: 0d27905a 2026-09-01
 ```
+
+- **The graders are TOLD the response status; they must never infer it.** The
+  triage/outcome/delta graders each judge an `InteractionSummary`, and the
+  summarizer (`learning/triage/summarizer.py`) sizes `response_text` for them.
+  If it hands over a bare prefix, a response that stops mid-word is
+  indistinguishable from one the model abandoned — and the resulting verdict is
+  written to permanent record via `observation_writer` (tagged
+  `source_subsystem=reflection`, alongside the other self-observation sources).
+  So: `_MAX_RESPONSE_TEXT` is a SAFETY VALVE sized above real traffic, not a
+  working limit; anything elided is elided from the MIDDLE with an explicit
+  marker and the ENDING preserved, because the ending is what "did generation
+  finish" is judged from.
+- **A note about the response is emitted only on a POSITIVE signal.** The first
+  fix here asserted the opposite of `CCOutput.bg_truncated` as fact
+  ("COMPLETE — the model finished normally") and told the grader not to disagree.
+  That flag is one stderr substring match (`cc/invoker.py:123-128`) whose producer
+  documents the match as version-drift tolerant, and a hand-built `CCOutput`
+  (e.g. `mail/monitor.py`) simply defaults it — so its `False` means "that
+  substring was absent", never "the model finished normally". Restating it as a
+  fact was the original defect with its sign flipped. `learning/response_context.py`
+  is now the single place that decides what the graders are told: silence by
+  default, a narrow note when the runtime really did kill background work, and a
+  note about elision only when a marker is actually present. It also fences
+  `response_text`, which is unbounded untrusted content sitting next to
+  authoritative lines.
 
 - **learning/** is the de-facto cron host: `rt._learning_scheduler` registers
   ~20+ jobs well beyond learning (recovery orchestrator, reapers, email-gate

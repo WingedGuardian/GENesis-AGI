@@ -77,6 +77,12 @@ class InteractionSummary:
     token_count: int
     channel: str
     timestamp: datetime
+    # True only when the RUNTIME cut the response short (CCOutput.bg_truncated),
+    # never when this pipeline elided it for size. The graders are asked to judge
+    # a response, and "did the model stop early" is a question they must answer
+    # from evidence rather than infer from a fragment we handed them.
+    # Last, with a default: this dataclass is constructed positionally by callers.
+    response_truncated: bool = False
 
 
 @dataclass(frozen=True)

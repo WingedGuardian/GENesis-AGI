@@ -88,10 +88,70 @@ class TestBuildSummary:
         s = build_summary(_make_output(), "s", long, "terminal")
         assert len(s.user_text) == 500
 
-    def test_response_text_truncation(self):
-        long = "y" * 2000
-        s = build_summary(_make_output(text=long), "s", "hi", "terminal")
-        assert len(s.response_text) == 1000
+    def test_ordinary_response_reaches_the_grader_whole(self):
+        """An ordinary reply must not be cut.
+
+        The graders are asked to judge a response; if the pipeline hands them a
+        fragment that stops mid-word, the honest reading of that fragment is
+        that generation was cut off — and that verdict then lands in permanent
+        memory as a fact about the model. Sizing is MEASURED, not guessed: over
+        30 days of real outbound messages, mean length 1033 and max 6006, so a
+        limit of 1000 silently truncated about two in five graded responses.
+        """
+        body = "y" * 3213  # the length of the reply that first exposed this
+        s = build_summary(_make_output(text=body), "s", "hi", "terminal")
+        assert s.response_text == body
+        assert s.response_text.endswith(body[-40:]), "the ENDING must survive"
+
+    def test_response_truncated_flag_reflects_real_truncation_only(self):
+        """`response_truncated` reports what the RUNTIME did, never what this
+        summarizer did. CCOutput.bg_truncated is the real signal."""
+        s = build_summary(_make_output(text="short"), "s", "hi", "terminal")
+        assert s.response_truncated is False
+        s2 = build_summary(
+            _make_output(text="short", bg_truncated=True), "s", "hi", "terminal"
+        )
+        assert s2.response_truncated is True
+
+    def test_summarizer_slicing_never_sets_the_truncated_flag(self):
+        """A response elided by THIS code is not a truncated response."""
+        s = build_summary(_make_output(text="z" * 40000), "s", "hi", "terminal")
+        assert s.response_truncated is False
+
+    def test_response_at_exactly_the_valve_is_untouched(self):
+        from genesis.learning.triage.summarizer import _MAX_RESPONSE_TEXT
+
+        body = "E" * _MAX_RESPONSE_TEXT
+        s = build_summary(_make_output(text=body), "s", "hi", "terminal")
+        assert s.response_text == body
+
+    def test_one_char_over_the_valve_reports_a_positive_elided_count(self):
+        """Just past the valve is where an over-generous head+tail would render
+        a NEGATIVE count — the existing 30k-char test would not notice."""
+        import re
+
+        from genesis.learning.triage.summarizer import _MAX_RESPONSE_TEXT
+
+        s = build_summary(
+            _make_output(text="E" * (_MAX_RESPONSE_TEXT + 1)), "s", "hi", "terminal"
+        )
+        m = re.search(r"\[(-?\d+) characters elided", s.response_text)
+        assert m, s.response_text[:200]
+        assert int(m.group(1)) > 0, f"negative elided count: {m.group(1)}"
+
+    def test_oversized_response_is_elided_with_a_marker_and_keeps_its_tail(self):
+        """Past the safety valve, elide the MIDDLE and say so.
+
+        A grader asked "was this cut off?" answers from the ENDING, so the tail
+        is the part that must survive; and the marker tells it the gap was
+        imposed here rather than by the model.
+        """
+        head, tail = "H" * 30000, "T" * 30
+        s = build_summary(_make_output(text=head + tail), "s", "hi", "terminal")
+        assert len(s.response_text) < len(head + tail)
+        assert "elided" in s.response_text
+        assert s.response_text.endswith(tail), "the ENDING was dropped"
+        assert s.response_text.startswith("H")
 
     def test_tool_detection_tool_colon(self):
         out = _make_output(text="Tool: Read\nTool: Edit\nresult")

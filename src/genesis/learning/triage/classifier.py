@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 from typing import Any, Protocol
 
+from genesis.learning.response_context import response_lines
 from genesis.learning.types import InteractionSummary, TriageDepth, TriageResult
 
 _DEFAULT_CALIBRATION = (
@@ -22,6 +23,8 @@ class _Router(Protocol):
     async def route_call(
         self, call_site_id: str, messages: list[dict[str, Any]], **kwargs: Any
     ) -> Any: ...
+
+
 
 
 class TriageClassifier:
@@ -116,7 +119,7 @@ class TriageClassifier:
             f"Tokens: {summary.token_count}",
             f"Tools used: {', '.join(summary.tool_calls) or 'none'}",
             f"User: {summary.user_text}",
-            f"Response: {summary.response_text}",
+            *response_lines(summary),
             "",
             'Respond with JSON: {"depth": <int 0-4>, "rationale": "<brief reason>"}',
         ])

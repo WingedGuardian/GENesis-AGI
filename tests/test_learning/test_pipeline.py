@@ -45,6 +45,9 @@ class FakeCCOutput:
     error_message: str | None = None
     model_requested: str = ""
     downgraded: bool = False
+    # Mirrors the real CCOutput field: a fake that omits part of the contract
+    # makes the pipeline pass here while failing against the real object.
+    bg_truncated: bool = False
 
 
 @dataclass
