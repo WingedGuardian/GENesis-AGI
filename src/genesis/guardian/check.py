@@ -349,7 +349,10 @@ def _gateway_pause_active(
         # Valid JSON can still be a non-object (e.g. `123`, `[..]`); `.get` on
         # those raises AttributeError, which must NOT escape into run_check
         # (it would abort the cycle, withhold the heartbeat, and read as DOWN).
-        if not isinstance(data, dict) or not data.get("paused"):
+        # `paused` must be the literal boolean True — a truthy-but-non-bool value
+        # ("false", 1, "yes", {}) is malformed and must NEVER mute the watchdog
+        # (e.g. an operator hand-editing "paused":"false" to cancel a pause).
+        if not isinstance(data, dict) or data.get("paused") is not True:
             return False
         expires_raw = data.get("expires_at")
         if not expires_raw:

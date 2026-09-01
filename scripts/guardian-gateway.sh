@@ -91,8 +91,13 @@ _write_gateway_pause() {
     expires_epoch=$((now_epoch + ttl))
     now_iso=$(date -u -d "@${now_epoch}" +%Y-%m-%dT%H:%M:%SZ)
     expires_iso=$(date -u -d "@${expires_epoch}" +%Y-%m-%dT%H:%M:%SZ)
+    # Atomic write (temp + mv): a guardian read racing the write must never see
+    # truncated JSON. The fail direction is already safe (ValueError -> not
+    # paused), but a torn read at deploy start could still cost one tick.
+    local tmp="$STATE_DIR/paused.json.tmp.$$"
     printf '{"paused": true, "reason": "deploy", "since": "%s", "expires_at": "%s"}' \
-        "$now_iso" "$expires_iso" > "$STATE_DIR/paused.json"
+        "$now_iso" "$expires_iso" > "$tmp"
+    mv -f "$tmp" "$STATE_DIR/paused.json"
     printf '{"ok": true, "action": "pause", "expires_at": "%s"}\n' "$expires_iso"
 }
 

@@ -29,6 +29,10 @@ _GATEWAY = Path(__file__).resolve().parents[2] / "scripts" / "guardian-gateway.s
 
 def _run_gateway(cmd: str, home: Path) -> subprocess.CompletedProcess:
     env = {**os.environ, "HOME": str(home), "SSH_ORIGINAL_COMMAND": cmd}
+    # The gateway honors GUARDIAN_STATE_DIR; a dev running the guardian locally
+    # has it set, and inheriting it would make `pause` write to the REAL state
+    # dir (standing down a live guardian) instead of the test's HOME.
+    env.pop("GUARDIAN_STATE_DIR", None)
     return subprocess.run(
         ["bash", str(_GATEWAY)], env=env, capture_output=True, text=True, timeout=30
     )
@@ -36,7 +40,10 @@ def _run_gateway(cmd: str, home: Path) -> subprocess.CompletedProcess:
 
 def _cfg(tmp_path: Path) -> GuardianConfig:
     # state_dir drives config.state_path; the gateway writes paused.json there.
-    return GuardianConfig(state_dir=str(tmp_path))
+    # Point maintenance_file at an absent path so run_check can't take the
+    # maintenance stand-down branch on a box where the real flag exists (that
+    # would make the gateway-pause stand-down tests vacuous).
+    return GuardianConfig(state_dir=str(tmp_path), maintenance_file=str(tmp_path / "no-maint"))
 
 
 def _write_pause(
@@ -92,6 +99,26 @@ def test_paused_false_not_active(tmp_path: Path) -> None:
     assert _gateway_pause_active(_cfg(tmp_path), now=NOW) is False
 
 
+@pytest.mark.parametrize("paused_val", ["false", "true", "0", 1, "yes"])
+def test_paused_truthy_non_bool_not_active(tmp_path: Path, paused_val) -> None:
+    """SF-1 regression: `paused` must be the literal boolean True. A truthy-but-
+    non-bool value (a string "false" an operator hand-edited to cancel a pause, or
+    a stringified "true") must NOT stand the guardian down — the old `not data.get
+    ("paused")` truthiness check treated "false"/1/"yes" as paused and MUTED the
+    watchdog. This REDs on that check and passes only under `is not True`."""
+    (tmp_path / "paused.json").write_text(
+        json.dumps(
+            {
+                "paused": paused_val,
+                "reason": "deploy",
+                "since": "2026-08-31T00:00:00Z",
+                "expires_at": (NOW + timedelta(minutes=10)).isoformat(),
+            }
+        )
+    )
+    assert _gateway_pause_active(_cfg(tmp_path), now=NOW) is False
+
+
 def test_malformed_json_fails_safe(tmp_path: Path) -> None:
     (tmp_path / "paused.json").write_text("{not valid json")
     # Never crash the check cycle on a bad file; treat as not-paused.
@@ -133,10 +160,35 @@ def test_gateway_pause_verb_writes_file_guardian_honors(tmp_path: Path) -> None:
 
 
 def test_gateway_bare_pause_uses_default_ttl(tmp_path: Path) -> None:
+    # SF-7a: the bare `pause` must set a REAL 1800s window, not merely stamp
+    # *some* expires_at — a writer bug that collapsed the window to ~0 would
+    # pass a presence check yet leave the guardian effectively un-paused.
+    # since/expires_at derive from one `date +%s`, so the delta is exact.
     r = _run_gateway("pause", tmp_path)
     assert r.returncode == 0, r.stderr
     data = json.loads((_gateway_state_dir(tmp_path) / "paused.json").read_text())
-    assert data.get("expires_at")
+    since = datetime.fromisoformat(data["since"])
+    expires = datetime.fromisoformat(data["expires_at"])
+    assert (expires - since).total_seconds() == 1800
+
+
+def test_gateway_pause_ttl_cap_boundary(tmp_path: Path) -> None:
+    """SF-7b: the range guard is `1 <= ttl <= 3600` — 3600 is the INCLUSIVE cap
+    (accepted, writes a real 3600s window), 3601 is one past it (rejected), and 0
+    is below the floor (rejected). Locks the exact boundary so a `<`/`<=` slip in
+    the shell guard can't silently widen or narrow the accepted range."""
+    ok = _run_gateway("pause 3600", tmp_path)
+    assert ok.returncode == 0, ok.stderr
+    data = json.loads((_gateway_state_dir(tmp_path) / "paused.json").read_text())
+    since = datetime.fromisoformat(data["since"])
+    expires = datetime.fromisoformat(data["expires_at"])
+    assert (expires - since).total_seconds() == 3600
+    # one past the cap, and below the floor: both rejected, no file written
+    for bad in ("pause 3601", "pause 0"):
+        (_gateway_state_dir(tmp_path) / "paused.json").unlink(missing_ok=True)
+        r = _run_gateway(bad, tmp_path)
+        assert r.returncode == 1, f"{bad!r} should be rejected: {r.stdout} {r.stderr}"
+        assert not (_gateway_state_dir(tmp_path) / "paused.json").exists()
 
 
 def test_gateway_pause_rejects_non_integer_ttl(tmp_path: Path) -> None:
@@ -171,31 +223,35 @@ def test_non_object_json_fails_safe_no_crash(tmp_path: Path, body: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_stand_down_still_writes_heartbeat(tmp_path: Path, monkeypatch) -> None:
-    """SF-3: a stand-down must still heartbeat (Guardian is alive, just not
-    watching) so the container watchdog doesn't read it as DOWN and restart it.
+@pytest.mark.parametrize("trigger", ["gateway_pause", "maintenance"])
+async def test_stand_down_still_writes_heartbeat(tmp_path: Path, monkeypatch, trigger) -> None:
+    """BOTH stand-down branches (gateway pause AND maintenance) must still write
+    the heartbeat — the Guardian is alive, just not watching — so the container
+    watchdog doesn't read it as DOWN and restart it. Deleting the heartbeat from
+    EITHER branch must fail here (SF-4).
 
-    Fully isolated (P1): the heartbeat is spied and _check_cycle is tripwired, so
-    if the stand-down ever regressed, the test fails LOUDLY instead of running the
-    real production cycle (incus snapshot prune / swap reconcile / live alerts)
-    against the host it happens to run on.
+    Fully isolated: the heartbeat is spied and _check_cycle + the alert drain are
+    tripwired, so a regression fails LOUDLY instead of running the real production
+    cycle (incus snapshot prune / swap reconcile / live alerts) against the host.
     """
     calls: list[bool] = []
 
     async def _spy(config) -> None:  # real path uses incus; unavailable in CI
         calls.append(True)
 
-    async def _tripwire(*a, **k):  # first heavy production call after stand-down
+    async def _tripwire(*a, **k):  # first heavy production calls after stand-down
         raise AssertionError("run_check reached the production cycle — stand-down failed")
 
     monkeypatch.setattr("genesis.guardian.check._write_guardian_heartbeat", _spy)
-    # Tripwire the FIRST two production calls after the stand-down (the alert
-    # drain runs before _check_cycle), so a regression can't slip past either.
     monkeypatch.setattr("genesis.guardian.check._check_cycle", _tripwire)
     monkeypatch.setattr("genesis.guardian.check._drain_host_alert_queue", _tripwire)
-    _write_pause(tmp_path, expires_at=(datetime.now(UTC) + timedelta(minutes=10)).isoformat())
-    await run_check(_cfg(tmp_path))
-    assert calls == [True], "stand-down must write exactly one heartbeat"
+    cfg = _cfg(tmp_path)
+    if trigger == "gateway_pause":
+        _write_pause(tmp_path, expires_at=(datetime.now(UTC) + timedelta(minutes=10)).isoformat())
+    else:  # maintenance: create the (otherwise-absent) maintenance flag
+        Path(cfg.maintenance_file).write_text("")
+    await run_check(cfg)
+    assert calls == [True], f"{trigger} stand-down must write exactly one heartbeat"
     assert not (tmp_path / "state.json").exists(), "must still stand down"
 
 
@@ -213,6 +269,21 @@ def test_config_allowlist_honors_gateway_pause_cap(tmp_path: Path) -> None:
     cfg_yaml = tmp_path / "guardian.yaml"
     cfg_yaml.write_text("gateway_pause_max_ahead_s: 1200\n")
     assert load_config(cfg_yaml).gateway_pause_max_ahead_s == 1200
+
+
+def test_load_config_honors_state_dir_env(tmp_path: Path, monkeypatch) -> None:
+    """SF-6: the READER side of the env redirect. The gateway (writer) honors
+    GUARDIAN_STATE_DIR; load_config (the guardian's own config) must resolve the
+    SAME dir from that env, or writer and reader land on different paused.json
+    files and the stand-down silently never fires. Empty YAML so env is the only
+    source of state_dir; _finalize -> _env_override applies the override."""
+    cfg_yaml = tmp_path / "guardian.yaml"
+    cfg_yaml.write_text("")
+    custom = tmp_path / "reader-state"
+    monkeypatch.setenv("GUARDIAN_STATE_DIR", str(custom))
+    cfg = load_config(cfg_yaml)
+    assert cfg.state_dir == str(custom)
+    assert cfg.state_path == custom
 
 
 def test_gateway_honors_state_dir_env(tmp_path: Path) -> None:
