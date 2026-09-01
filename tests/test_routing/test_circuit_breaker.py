@@ -599,8 +599,9 @@ def test_probe_success_never_fires_on_recovery():
     resolves the observation and clears `first_trip_at` — the only per-provider
     "failing since" timestamp — and it fired on evidence (a 200 from
     /v1/models) that says nothing about whether calls work. Measured over the
-    2026-08-28/29 outage: five separate observations, four auto-resolved that
-    way, so no surface could report the real 3-day duration.
+    outage that began 2026-08-27: eight separate observations, ALL of them
+    auto-resolved that way while the provider returned zero successes, so no
+    surface could report the real duration.
 
     The call is now GONE from the probe path rather than guarded. Reaching a
     probe heal means the breaker was probe-suspected, which never trips and so

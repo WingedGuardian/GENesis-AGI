@@ -202,8 +202,10 @@ again and the cycle repeated, so a multi-day outage was recorded as a series of
 short incidents that each recovered, and no surface could report a duration.
 Measured on a live install: 32 calls, 32 failures, zero successes over 23h (a
 sibling provider on the same key and code path succeeded 351/352 in the same
-window), with five separate `provider_failure` observations opened and resolved
-across three days. The false heals were roughly 9-12h apart, not per probe
+window), with EIGHT separate `provider_failure` observations opened and
+auto-resolved between 2026-08-27 and 2026-08-31 — re-measured 2026-09-01, when
+all eight read `resolved=1` while the provider was still returning
+`tier_not_allowed` on every call. The false heals were roughly 9-12h apart, not per probe
 cycle — between them the breaker's backoff escalated normally (consecutive trips
 5/5/10/20/35/65/128 minutes apart, matching `120 * 2^(trip-1)`).
 

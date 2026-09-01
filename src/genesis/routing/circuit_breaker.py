@@ -180,10 +180,13 @@ class CircuitBreaker:
         exhausted quota, or a stream of truncated completions looks like from
         outside. Live incident 2026-08-28/29: `mistral-large-latest` stayed
         listed while every real call returned 403, so probes "confirmed health"
-        repeatedly. MEASURED over that 3-day outage: FIVE separate
-        `provider_failure` observations, each with a fresh `first_trip_at`,
-        four auto-resolved by a false heal — so no surface could ever report the
-        real age of the outage.
+        repeatedly. MEASURED 2026-09-01 over the outage that began 08-27:
+        EIGHT separate `provider_failure` observations, each with a fresh
+        `first_trip_at`, and ALL EIGHT auto-resolved by a false heal — while
+        `activity_log` for the same provider read 20 calls, 20 failures, ZERO
+        successes, last error still `tier_not_allowed`. Every record of the
+        outage had been closed by a listing probe while the provider was
+        completely dead, so no surface could report its real age.
 
         This does NOT hold a provider out of rotation. A call-tripped breaker
         still leaves OPEN on its own backoff (`state` auto-transitions to

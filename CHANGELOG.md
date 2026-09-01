@@ -2804,8 +2804,9 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `provider_failure` record and cleared the only per-provider "failing since"
   timestamp Genesis keeps; the next real call failed again and the cycle
   restarted, so the outage clock never accumulated and no surface could report a
-  duration. Measured over one real three-day outage: five separate failure
-  records, each starting the clock again. A probe now heals only
+  duration. Measured over one real multi-day outage: eight separate failure
+  records, every one of them closed automatically while the provider was in fact
+  answering nothing at all. A probe now heals only
   `TRANSIENT`/`TIMEOUT` failures — the low-traffic recovery case it was built
   for — and only for the case a probe can actually speak to. The rule is
   symmetry: a health probe may undo a health probe's own suspicion, and nothing

@@ -147,13 +147,16 @@ def test_entitlement_failure_is_not_healed_by_a_listing_probe():
     and `ProviderEscalation.record_recovery` RESOLVED the provider_failure
     observation and cleared its `first_trip_at`.
 
-    MEASURED over the live 3-day outage: FIVE separate `provider_failure`
-    observations, each carrying a fresh `first_trip_at`, four auto-resolved this
-    way. So the longest duration any surface could report was the time since the
-    last false heal, never the real age of the outage. The reset cadence was
-    ~9-12h, NOT once per probe cycle: `events` shows consecutive trips
-    5/5/10/20/35/65/128 min apart, i.e. the backoff escalated normally between
-    resets.
+    MEASURED 2026-09-01 over the outage that began 08-27: EIGHT separate
+    `provider_failure` observations, each carrying a fresh `first_trip_at`, and
+    ALL EIGHT auto-resolved this way — while `activity_log` for the same
+    provider read 20 calls, 20 failures, ZERO successes and the last error was
+    still `tier_not_allowed`. So every record of a live, total outage had been
+    closed by a listing probe, and no surface could report its real age.
+
+    The reset cadence was ~9-12h, NOT once per probe cycle: `events` shows
+    consecutive trips 5/5/10/20/35/65/128 min apart, i.e. the backoff escalated
+    normally between resets.
 
     A listing probe is weaker evidence than a real completion for ANY failure,
     but for a PERMANENT one it is not evidence at all — the endpoint being up is
