@@ -1223,6 +1223,11 @@ class EgoSession:
                 "Ego output could not be parsed — cycle %s stored with no proposals",
                 cycle.id,
             )
+            # Age intentions on a parse-failure cycle too: expiry and the
+            # implicit-keep sweep must run EVERY cycle so max_cycles is a
+            # mechanical TTL, not one dependent on the LLM emitting parseable
+            # output. (The parsed path runs this at step 10d above.)
+            await self._process_intentions({})
 
         logger.info(
             "Ego cycle %s completed (cost=$%.4f, proposals=%d, tokens=%d+%d)",
