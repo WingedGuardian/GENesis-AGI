@@ -47,6 +47,10 @@ def live(monkeypatch):
 
 async def _propose(db, **kw):
     kw.setdefault("repo", _REPO)
+    # Default to a policy-valid label set (area:* + a difficulty label) so tests
+    # exercising OTHER concerns (dedup, backpressure, mode) reach the code path
+    # they target. Tests of the label policy itself pass `labels=` explicitly.
+    kw.setdefault("labels", ["good first issue", "area:runtime"])
     return await ci._impl_contributor_issue_propose(db, **kw)
 
 
@@ -59,7 +63,7 @@ async def test_held_creates_row_and_approval(db, live):
         db,
         title="Add a test for parser.chunk empty input",
         body="No test covers the empty-input branch of chunk(); add one.",
-        labels=["good first issue", "help wanted"],
+        labels=["good first issue", "area:runtime"],
         source="follow_up",
         source_follow_up_id="fu-123",
     )
@@ -72,7 +76,7 @@ async def test_held_creates_row_and_approval(db, live):
     assert row["title"] == "Add a test for parser.chunk empty input"
     assert row["source"] == "follow_up"
     assert row["source_ref"] == "fu-123"
-    assert json.loads(row["labels"]) == ["good first issue", "help wanted"]
+    assert json.loads(row["labels"]) == ["good first issue", "area:runtime"]
     assert row["cell_domain"] == "github"
     assert row["request_id"] == res["request_id"]
     assert row["mode"] == "live"  # lever mode STAMPED at propose time (dry-run-terminal invariant)
@@ -85,7 +89,7 @@ async def test_held_creates_row_and_approval(db, live):
     assert appr["status"] == "pending"
     ctx = json.loads(appr["context"])
     assert ctx["repo"] == _REPO
-    assert ctx["labels"] == ["good first issue", "help wanted"]
+    assert ctx["labels"] == ["good first issue", "area:runtime"]
     assert ctx["source_follow_up_id"] == "fu-123"
     assert ctx["cell"] == ["github", "issue_create", "bulk"]
 
@@ -160,7 +164,11 @@ async def test_autonomous_pins_repo_to_default(db, live, monkeypatch):
     monkeypatch.setattr(ci, "require_approval", lambda: False)
     monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)
     res = await ci._impl_contributor_issue_propose(
-        db, title="Redirect attempt", body="A clean body.", repo="attacker/other-repo"
+        db,
+        title="Redirect attempt",
+        body="A clean body.",
+        labels=["good first issue", "area:runtime"],
+        repo="attacker/other-repo",
     )
     assert res["status"] == "held"
     assert res["repo"] == _REPO  # pinned, not attacker/other-repo
@@ -190,7 +198,11 @@ async def test_human_posture_keeps_curator_repo(db, live, monkeypatch):
     reviews the destination before it posts, so no pin is needed."""
     monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)
     res = await ci._impl_contributor_issue_propose(
-        db, title="Other repo task", body="A clean body.", repo="WingedGuardian/GENesis-Voice"
+        db,
+        title="Other repo task",
+        body="A clean body.",
+        labels=["good first issue", "area:runtime"],
+        repo="WingedGuardian/GENesis-Voice",
     )
     assert res["status"] == "held"
     assert res["repo"] == "WingedGuardian/GENesis-Voice"  # not pinned under human review
@@ -314,6 +326,115 @@ async def test_malformed_repo_components_rejected(db, live):
     for bad in ("owner/", "/repo", "/", "a//b"):
         res = await ci._impl_contributor_issue_propose(db, title="t title", body="b body", repo=bad)
         assert res["status"] == "error", bad
+    assert await pip.list_held(db) == []
+
+
+# ── label policy (fail-closed): area:* + difficulty/env on every proposal ──
+
+
+@pytest.mark.asyncio
+async def test_rejected_missing_area_label(db, live, monkeypatch):
+    """A proposal with a difficulty label but NO area:* domain label is rejected
+    with no row — the public tracker must stay navigable by domain."""
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)  # teeth scoped to the tracker
+    res = await ci._impl_contributor_issue_propose(
+        db, title="A clean title", body="A clean body.", labels=["good first issue"], repo=_REPO
+    )
+    assert res["status"] == "rejected"
+    assert "area" in res["reason"].lower()
+    assert await pip.list_held(db) == []
+    cur = await db.execute("SELECT COUNT(*) FROM approval_requests")
+    assert (await cur.fetchone())[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_rejected_missing_env_label(db, live, monkeypatch):
+    """An area:* label but NO difficulty/environment label is rejected — every
+    issue must declare a lane (good first issue / needs-genesis-instance / …)."""
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)  # teeth scoped to the tracker
+    res = await ci._impl_contributor_issue_propose(
+        db, title="A clean title", body="A clean body.", labels=["area:runtime"], repo=_REPO
+    )
+    assert res["status"] == "rejected"
+    assert "difficulty" in res["reason"].lower() or "environment" in res["reason"].lower()
+    assert await pip.list_held(db) == []
+    cur = await db.execute("SELECT COUNT(*) FROM approval_requests")
+    assert (await cur.fetchone())[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_rejected_no_labels(db, live, monkeypatch):
+    """No labels at all → rejected (missing area is reported first)."""
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)  # teeth scoped to the tracker
+    res = await ci._impl_contributor_issue_propose(
+        db, title="A clean title", body="A clean body.", labels=[], repo=_REPO
+    )
+    assert res["status"] == "rejected"
+    assert await pip.list_held(db) == []
+
+
+@pytest.mark.asyncio
+async def test_area_other_is_a_valid_domain(db, live, monkeypatch):
+    """area:other is the escape hatch for a genuinely cross-cutting issue, so a
+    well-formed proposal is never wrongly rejected."""
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)  # teeth scoped to the tracker
+    res = await ci._impl_contributor_issue_propose(
+        db,
+        title="A cross-cutting clean title",
+        body="A clean body.",
+        labels=["good first issue", "area:other"],
+        repo=_REPO,
+    )
+    assert res["status"] == "held"
+
+
+@pytest.mark.asyncio
+async def test_label_policy_scoped_to_tracker_repo(db, live, monkeypatch):
+    """The label teeth is scoped to the configured tracker (`_default_repo()`),
+    where the area:* taxonomy exists. A human-approved post to a DIFFERENT repo is
+    NOT subjected to the policy (those labels may not exist there) — so an unlabeled
+    cross-repo proposal is held, not rejected."""
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)
+    res = await ci._impl_contributor_issue_propose(
+        db,
+        title="A clean cross-repo task",
+        body="A clean body.",
+        labels=[],  # no area/difficulty labels ...
+        repo="WingedGuardian/GENesis-Voice",  # ... but a NON-tracker repo → teeth skipped
+    )
+    assert res["status"] == "held"
+
+
+@pytest.mark.asyncio
+async def test_label_policy_matches_tracker_by_canonical_repo(db, live, monkeypatch):
+    """The scope check normalizes the repo (drops a gh `host/` prefix, casefolds), so
+    a case/host VARIANT of the tracker is still policed — it can't skip the teeth by
+    using a non-canonical slug for the same repo (Kimi review, 2026-08-31)."""
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)  # WingedGuardian/GENesis-AGI
+    res = await ci._impl_contributor_issue_propose(
+        db,
+        title="A clean title",
+        body="A clean body.",
+        labels=[],  # unlabeled ...
+        repo="github.com/wingedguardian/genesis-agi",  # ... host-prefixed + lowercase variant → still the tracker
+    )
+    assert res["status"] == "rejected"
+    assert await pip.list_held(db) == []
+
+
+@pytest.mark.asyncio
+async def test_privacy_block_precedes_label_policy(db, live):
+    """Placement invariant: the label policy runs AFTER the privacy scan, so a
+    proposal that is BOTH label-invalid AND carries a private identifier reports
+    `blocked` (the security verdict), never `rejected` (the policy one)."""
+    res = await ci._impl_contributor_issue_propose(
+        db,
+        title="Fix the box",
+        body="On the host at 192.168.1.42 the poller hangs.",
+        labels=[],  # also label-invalid, but security must win
+        repo=_REPO,
+    )
+    assert res["status"] == "blocked"
     assert await pip.list_held(db) == []
 
 
