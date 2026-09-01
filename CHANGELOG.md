@@ -9,6 +9,35 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **Captured session output no longer persists API keys in plaintext.** When an
+  interactive session exits, Genesis records a tail of the terminal scrollback to
+  `~/.genesis/logs/cc_exit_<slot>.log` so a crash can be diagnosed afterwards.
+  That tail is raw terminal output, so anything the session printed — including a
+  credential a CLI echoed to the screen — was written verbatim. The tail is now
+  scrubbed before it is stored, and if the scrubber cannot run the tail is
+  withheld entirely rather than written raw; the exit status and crash diagnosis
+  are always recorded either way.
+- **Credential detection now recognises modern key formats.** The shared
+  secret-detection patterns required an unbroken run of letters and digits after a
+  vendor prefix, so any key that namespaces itself with internal separators —
+  which most current formats do — stopped matching a few characters in and were
+  treated as ordinary text, so they were never redacted from captured telemetry.
+  Redaction now handles them, along with several provider prefixes, JWTs, webhook
+  URLs and bot tokens that had no coverage at all. Coverage is by shape, so it is
+  not complete: keys that are a bare run of letters and digits with no vendor
+  prefix stay indistinguishable from an ordinary hash and are still only caught
+  in their labelled or ``KEY=VALUE`` forms. The reference-capture path keeps a
+  deliberately narrower rule, so that an ordinary hyphenated name is never stored
+  as though it were a credential.
+- **Secret scrubbing no longer stalls on long machine output.** Two detection
+  patterns backtracked quadratically against a long unbroken alphanumeric run
+  (a base64 blob or a minified bundle in captured output), taking tens of seconds
+  on input a session produces routinely. The repeats with real-world ceilings are
+  now bounded, which removes the stall while leaving long secret *values* fully
+  covered.
+
 ### Added
 
 - **Gated autonomous cold marketing outreach (inert by default).** Genesis can

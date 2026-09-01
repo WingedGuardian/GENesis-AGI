@@ -32,6 +32,27 @@ if [ -z "${HOME:-}" ]; then
 fi
 [ -n "${HOME:-}" ] || exit 0
 
+# Scrub filter for the pane tail. secret_scrub is stdlib-only by design, so ANY
+# python3 can run it — deliberately NOT the venv interpreter, which may be
+# absent or broken on the path a dying session takes. Resolved relative to this
+# script so a worktree checkout scrubs with its own copy.
+#
+# Returns non-zero (emitting nothing) when it cannot scrub, which the caller
+# turns into a withheld-tail marker. It must NEVER pass input through on error.
+_CC_HOOKS_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/hooks"
+
+_cc_scrub_stdin() {
+    [ -r "${_CC_HOOKS_DIR}/secret_scrub.py" ] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    # Read BYTES and decode leniently: the tail exists to capture a CRASHING
+    # session, which is exactly the kind that emits a stray non-UTF-8 byte, and
+    # a strict decode would discard the entire diagnostic over one of them.
+    python3 -c 'import sys
+sys.path.insert(0, sys.argv[1])
+from secret_scrub import scrub
+sys.stdout.write(scrub(sys.stdin.buffer.read().decode("utf-8", "replace")))' "$_CC_HOOKS_DIR"
+}
+
 log_dir="${HOME}/.genesis/logs"
 log="${log_dir}/cc_exit_${slot}.log"
 mkdir -p "$log_dir" 2>/dev/null || exit 0
@@ -54,7 +75,27 @@ mkdir -p "$log_dir" 2>/dev/null || exit 0
     # Guarded on TMUX_PANE so the script is harmless when run outside tmux.
     if [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1; then
         echo "  --- pane tail (last 200 lines) ---"
-        tmux capture-pane -p -t "$TMUX_PANE" -S -200 2>/dev/null | sed 's/^/  | /'
+        # The tail is RAW terminal output: whatever the session printed, a
+        # freshly-minted credential included. Scrub it through the same
+        # stdlib-only helper the capture hooks use (no venv needed — it imports
+        # nothing outside the standard library, so a broken venv cannot break
+        # this path). FAIL CLOSED: if the scrubber cannot run, WITHHOLD the tail
+        # rather than write it raw. secret_scrub.scrub() already withholds its
+        # own content on an internal error; this mirrors that choice one level
+        # up, for the case where python itself is unavailable. The exit-status
+        # lines above are always written either way, so the primary diagnostic
+        # (why did the session die) survives even with no tail at all.
+        if _tail=$(tmux capture-pane -p -t "$TMUX_PANE" -S -200 2>/dev/null) \
+           && [ -n "$_tail" ]; then
+            # Deliberately if/else, not `A && B || C`: in the chain form a
+            # failure in the PRINT step (disk full, SIGPIPE) also fires C and
+            # appends a "withheld" marker after a half-written tail.
+            if _scrubbed=$(printf '%s\n' "$_tail" | _cc_scrub_stdin 2>/dev/null); then
+                printf '%s\n' "$_scrubbed" | sed 's/^/  | /'
+            else
+                echo "  | [tail withheld: scrubber unavailable]"
+            fi
+        fi
     fi
     echo
 } >> "$log" 2>/dev/null || exit 0
