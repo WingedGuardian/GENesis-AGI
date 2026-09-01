@@ -393,6 +393,11 @@ When a user shares a file path or URL in conversation:
 - **Code review after code changes.** Codex will review your output.
   Protocol in genesis-development skill.
 - **Commit continuously**: uncommitted = invisible = lost.
+- **Bias toward closing open work before opening new — softly (≈51/49).** Not a
+  gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
+  everything before starting the next thing. Just lean, gently, toward landing or
+  closing open PRs over opening more — so work doesn't pile up and go stale on the
+  repo instead of getting done.
 - **Procedure recall is automatic** — the proactive hook surfaces relevant
   procedures. Store new procedures immediately when you discover them.
 - **Never insert directly into `task_states`.** Use `task_submit` MCP
@@ -420,6 +425,10 @@ When a user shares a file path or URL in conversation:
   echoes `input_value`, which holds the proof; read it, and check whether the
   same tool succeeded earlier in the session, before concluding anything about
   the tool.
+- **AskUserQuestion — always pass ≥2 questions.** Never call `AskUserQuestion`
+  with a single question — a Claude Code rendering bug rejects single-question
+  calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
+  second question to satisfy the tool. Every time, no exceptions.
 - **Plan mode by default** for any task with 3+ steps or architectural
   decisions. If something goes sideways — STOP and re-plan.
 - **Use subagents** to keep main context clean. One concern per subagent.

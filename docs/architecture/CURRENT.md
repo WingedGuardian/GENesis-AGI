@@ -425,7 +425,7 @@ gated — that contract is one-directional.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: d8204a0c 2026-08-25
+verified: 84c7259d 2026-08-31
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -445,7 +445,11 @@ verified: d8204a0c 2026-08-25
 - **The Contributor Work-Log posts public GitHub issues, gated like email.** A
   server-side MCP tool (`contributor_issue_propose`, genesis-health) sanitizes a
   curator-drafted issue via the fail-closed `contribution/sanitize.py scan_prose`
-  (title+body+labels — every string that egresses), then HOLDS it: the
+  (title+body+labels — every string that egresses) and enforces the label policy
+  ON THE CONFIGURED PUBLIC TRACKER (fail-closed, AFTER the scan: a proposal missing
+  an `area:*` domain label or a difficulty/environment label —
+  `_AREA_LABELS`/`_ENV_DIFFICULTY_LABELS` — is `rejected` with no row; a
+  human-approved cross-repo post is not subject to the policy), then HOLDS it: the
   `approval_requests` row FIRST, then `pending_issue_posts` (mirroring the email
   gate). By default each hold is per-item owner-approved on the dashboard (excluded
   from `approve_all_pending`, like email). **Autonomous posture (opt-in,
@@ -830,6 +834,16 @@ verified: 159698d4 2026-07-16
   monitors the host Guardian every awareness tick, incl. git-SHA code-drift
   detection). Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **autonomy zombie-scheduler watchdog** (`autonomy/watchdog.py`, run out-of-process
+  by `genesis-watchdog.timer` every 300s via `watchdog_runner.py`; distinct from the
+  container `watchdog.py` above): reads `~/.genesis/status.json` (written by the runtime's
+  `status_writer_loop`) and RESTARTS the bridge/runtime on status-file staleness, or a
+  specific scheduler on a stale `scheduler_heartbeats` entry (`awareness`/`surplus`,
+  `job_health.last_run` age > 900s) — the "zombie scheduler, alive but not dispatching"
+  case. Restart is deferred while `heavy_workload` is set (dream cycle), during a boot
+  stabilization window, or a network outage; repeated restarts (flap) or max-restarts
+  escalate to a durable owner/Telegram alert. This is why a wedged/dead surplus needs no
+  `subsystem_stale` alert (§9): it is detected and self-healed here at 900s.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
   skill). Known wart: the watchdog's stale-alert wording inverts when the
@@ -958,6 +972,24 @@ verified: ca875c4b 2026-07-24
   in-memory, per-process, one-generation `_alert_history` dict so incident
   history survives restart. It does NOT drive the ego cadence (ego has its own
   scheduler). Trap: PEP 562 lazy `__init__` — don't eager-import `loop.py`.
+- **Subsystem-cessation alerts (the honest-liveness family, `_compute_alerts`)**:
+  three durable `subsystem_stale`-family alerts so a dead scheduler cannot read
+  healthy. `subsystem_stale:<name>` (ego CRITICAL; inbox/dashboard/outreach WARNING)
+  fires when a subsystem's heartbeat — the freshest valid pulse across the durable
+  `events` table and the in-memory event-bus ring — goes overdue past its per-subsystem
+  `HEARTBEAT_EXPECTED` threshold (via `mcp/health/manifest.py::compute_heartbeat_staleness`);
+  `subsystem_never_started:<name>`
+  tells a FAILED / never-pulsed start (cross-referenced against the persisted bootstrap
+  manifest, past a boot grace) from a fresh install; `subsystem_heartbeat_unknown` covers
+  a corrupt/unreadable pulse. Pause-gated subsystems (`surplus`, `inbox`) downgrade
+  overdue→`paused` while globally paused; conditional-pulse ones (`outreach`, whose
+  channel-independent daemon pulses only while its scheduler runs) are exempt from the
+  never-started inference. **surplus is EXCLUDED** from `subsystem_stale`: its wedged/dead
+  state is owned by the PR-B dashboard tile (a `job_health.surplus_dispatch` signal) and
+  the zombie-scheduler watchdog (§8), and its loop-END event-HB is load-fragile — a healthy
+  15-30 min dispatch legitimately gaps it, so its `HEARTBEAT_EXPECTED` overdue is a generous
+  3h (matching the tile) to avoid crying wolf. reflection/awareness ride the awareness tick's
+  own `tick_overdue`.
 - **scheduled-job telemetry (WS-2 M9)**: `runtime/_job_health.py` keeps the
   cumulative `job_health` row AND now appends per-run `job_run_events` (era
   attribution the cumulative row can't give). Writes are debounced off the

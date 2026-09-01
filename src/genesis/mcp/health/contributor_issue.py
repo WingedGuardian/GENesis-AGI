@@ -53,11 +53,62 @@ from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
 
+# Label policy (fail-closed). Every proposed contributor issue must carry a
+# domain label (``area:*``) AND a difficulty/environment label, so the public
+# tracker stays navigable by domain and newcomers can find right-sized work.
+# Enforced in ``_impl`` below, AFTER the privacy scan (so a private-data proposal
+# reports ``blocked`` — the security verdict — rather than ``rejected``).
+#
+# PRODUCER: the labels are emitted by the curator's PROMPT — the install-local
+# contributor-worklog strategy doc, not any in-repo default (campaigns are user
+# data; see the module docstring). This validator is the machine BACKSTOP so a
+# drifting prompt can't silently ship unlabeled issues; a rejected proposal's
+# ``reason`` enumerates the valid labels, so an LLM curator that loops on error
+# self-corrects. ``area:other`` is the escape hatch for a genuinely cross-cutting
+# issue, so a valid proposal is never wrongly rejected. Keep in sync with the
+# GitHub label set (created via ``gh label create``).
+_AREA_LABELS = frozenset(
+    {
+        "area:memory",
+        "area:dashboard",
+        "area:runtime",
+        "area:guardian",
+        "area:autonomy",
+        "area:channels",
+        "area:knowledge",
+        "area:eval",
+        "area:other",
+    }
+)
+# A contributor-lane label. ``help wanted`` is kept as the lane for experienced /
+# community clone-only work — beyond a newcomer ice-breaker but not needing a
+# running instance. Without it such a task has no truthful label and would be
+# forced to mislabel as beginner or be excluded (per Codex review, 2026-08-31).
+_ENV_DIFFICULTY_LABELS = frozenset(
+    {
+        "good first issue",
+        "first-timers-only",
+        "needs-genesis-instance",
+        "help wanted",
+    }
+)
+
 
 def _default_repo() -> str:
     owner = github_user()
     name = github_public_repo()
     return f"{owner}/{name}" if owner else name
+
+
+def _canonical_repo(repo: str) -> str:
+    """``owner/name`` lowercased, with any leading gh host segment dropped.
+
+    The repo validator admits gh's ``host/owner/repo`` form and GitHub slugs are
+    case-insensitive, so a case/host variant of the tracker (``wingedguardian/...``,
+    ``github.com/Owner/Name``) is the SAME repo. The label-policy scope check
+    compares canonical forms so such a variant can't skip the teeth."""
+    parts = [p for p in (repo or "").split("/") if p]
+    return "/".join(parts[-2:]).casefold()
 
 
 async def _impl_contributor_issue_propose(
@@ -146,6 +197,35 @@ async def _impl_contributor_issue_propose(
         ]
         logger.warning("contributor_issue_propose BLOCKED %d finding(s): %s", len(reasons), reasons)
         return {"status": "blocked", "reasons": reasons, "scanners_run": scan.scanners_run}
+
+    # 1b) Label policy (fail-closed) — require a domain (area:*) AND a
+    #     difficulty/environment label. SCOPED to the configured public tracker
+    #     (`_default_repo()`), where the area:*/difficulty taxonomy is defined: a
+    #     human-approved cross-repo post to a repo without these labels is left to
+    #     the human, since mandating labels that don't exist there would fail at
+    #     `gh issue create` and strand the hold (retry-forever, consuming max_held).
+    #     AFTER the privacy scan so a private-data proposal reports `blocked`
+    #     (security), not `rejected` (policy). No row on rejection; the curator gets
+    #     a clear reason and self-corrects. Match on CANONICAL repo form so a
+    #     case/host variant of the tracker can't slip past the scope (Kimi review).
+    if _canonical_repo(repo) == _canonical_repo(_default_repo()):
+        label_set = set(label_list)
+        if not (label_set & _AREA_LABELS):
+            return {
+                "status": "rejected",
+                "reason": (
+                    "missing an area:* label — every issue needs one domain label "
+                    f"({', '.join(sorted(_AREA_LABELS))})"
+                ),
+            }
+        if not (label_set & _ENV_DIFFICULTY_LABELS):
+            return {
+                "status": "rejected",
+                "reason": (
+                    "missing a difficulty/environment label — every issue needs one "
+                    f"({', '.join(sorted(_ENV_DIFFICULTY_LABELS))})"
+                ),
+            }
 
     # 2) Backpressure + DB-side dedup (GitHub open-issue dedup is done at post
     #    time in the drain — the curator profile has no gh).
@@ -289,15 +369,21 @@ async def contributor_issue_propose(
     Args:
         title: issue title (sanitized here; must be public-safe).
         body: issue body / description (sanitized here).
-        labels: GitHub label names (e.g. ["good first issue"]). Optional.
+        labels: GitHub label names. On the configured public TRACKER repo this is
+            REQUIRED (fail-closed): one ``area:*`` domain label AND one difficulty/
+            environment label (``good first issue`` / ``first-timers-only`` /
+            ``needs-genesis-instance`` / ``help wanted``) — a proposal missing either
+            is ``rejected`` with no row. ``area:other`` is the cross-cutting escape
+            hatch. A post to a DIFFERENT repo is not subject to this policy.
         repo: target ``owner/name``. Defaults to this install's public repo.
         source: provenance — "follow_up" (backlog-derived) or "codebase".
         source_follow_up_id: originating follow_up id, for the close-loop link
             (stored on ``source_ref``). Optional.
 
     Returns a status dict: ``held`` (parked + approval created), ``blocked``
-    (sanitizer findings, no row), ``duplicate`` / ``backpressure`` (no row),
-    ``disabled`` (mode off), or ``error``.
+    (sanitizer findings, no row), ``rejected`` (missing a required area:* or
+    difficulty/environment label, no row), ``duplicate`` / ``backpressure`` (no
+    row), ``disabled`` (mode off), or ``error``.
     """
     import genesis.mcp.health_mcp as health_mcp_mod
 

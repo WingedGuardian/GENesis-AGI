@@ -4,8 +4,9 @@
 
 ## Related issue
 
-<!-- If this PR resolves a tracked issue, link it with a closing keyword so the
-     issue auto-closes on merge (and its originating work-log item reconciles).
+<!-- If this PR resolves a tracked issue, link it with a CLOSING KEYWORD so the
+     issue closes automatically when this merges to the default branch. A bare
+     "#123" only cross-links — "Closes #123" (or Fixes/Resolves #123) closes it.
      Delete this section if there's no linked issue. -->
 
 Closes #
