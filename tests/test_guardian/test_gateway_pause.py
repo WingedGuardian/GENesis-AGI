@@ -203,6 +203,18 @@ def test_gateway_pause_rejects_ttl_over_cap(tmp_path: Path) -> None:
     assert not (_gateway_state_dir(tmp_path) / "paused.json").exists()
 
 
+@pytest.mark.parametrize("overflow", ["18446744073709551617", "18446744073709555216"])
+def test_gateway_pause_rejects_overflow_ttl(tmp_path: Path, overflow: str) -> None:
+    """F6: a TTL beyond 64-bit must be rejected BEFORE `$((10#…))` wraps it into
+    the accepted range. Under fixed-width bash arithmetic `18446744073709551617`
+    wraps to 1 and `18446744073709555216` wraps to 3600 — both all-digit, both
+    passing the lexical guard, both silently accepted without the magnitude check.
+    The guard must reject them (rc 1, no file written)."""
+    r = _run_gateway(f"pause {overflow}", tmp_path)
+    assert r.returncode == 1, f"overflow ttl should be rejected: {r.stdout} {r.stderr}"
+    assert not (_gateway_state_dir(tmp_path) / "paused.json").exists()
+
+
 def test_gateway_resume_removes_pause_file(tmp_path: Path) -> None:
     assert _run_gateway("pause 600", tmp_path).returncode == 0
     assert (_gateway_state_dir(tmp_path) / "paused.json").exists()
@@ -234,10 +246,10 @@ async def test_stand_down_still_writes_heartbeat(tmp_path: Path, monkeypatch, tr
     tripwired, so a regression fails LOUDLY instead of running the real production
     cycle (incus snapshot prune / swap reconcile / live alerts) against the host.
     """
-    calls: list[bool] = []
+    calls: list[str | None] = []
 
-    async def _spy(config) -> None:  # real path uses incus; unavailable in CI
-        calls.append(True)
+    async def _spy(config, standdown=None) -> None:  # real path uses incus; CI-absent
+        calls.append(standdown)
 
     async def _tripwire(*a, **k):  # first heavy production calls after stand-down
         raise AssertionError("run_check reached the production cycle — stand-down failed")
@@ -251,8 +263,62 @@ async def test_stand_down_still_writes_heartbeat(tmp_path: Path, monkeypatch, tr
     else:  # maintenance: create the (otherwise-absent) maintenance flag
         Path(cfg.maintenance_file).write_text("")
     await run_check(cfg)
-    assert calls == [True], f"{trigger} stand-down must write exactly one heartbeat"
+    # Exactly one heartbeat, carrying the trigger's stand-down marker (F5) so
+    # probe_guardian reports DEGRADED, not HEALTHY, for the skipped cycle.
+    assert calls == [trigger], f"{trigger} stand-down must write one heartbeat marked '{trigger}'"
     assert not (tmp_path / "state.json").exists(), "must still stand down"
+
+
+def test_heartbeat_payload_marks_standdown() -> None:
+    """F5: the payload carries a `standdown` reason only when standing down; the
+    normal end-of-cycle heartbeat omits it (→ probe_guardian stays HEALTHY)."""
+    from genesis.guardian.check import _heartbeat_payload
+
+    assert _heartbeat_payload("gateway_pause")["standdown"] == "gateway_pause"
+    assert _heartbeat_payload("maintenance")["standdown"] == "maintenance"
+    assert "standdown" not in _heartbeat_payload()
+    assert "standdown" not in _heartbeat_payload(None)
+    # Always alive + timestamped regardless of stand-down.
+    assert _heartbeat_payload()["guardian_alive"] is True
+    assert "timestamp" in _heartbeat_payload("maintenance")
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_write_timeout_reaps_child(tmp_path: Path, monkeypatch) -> None:
+    """SF-5: when the incus heartbeat write times out, the child must be killed
+    AND reaped (proc.kill + awaited proc.wait) — else a wedged incus/container
+    orphans a process on every stand-down tick during a long pause. The function
+    must swallow the timeout (never raise into run_check, which would withhold the
+    heartbeat and read as DOWN)."""
+    from genesis.guardian import check as check_mod
+
+    class FakeProc:
+        def __init__(self) -> None:
+            self.killed = False
+            self.waited = False
+            self.returncode = None
+
+        async def communicate(self, input=None):  # noqa: A002 - matches asyncio API
+            raise TimeoutError  # simulate wait_for(communicate) timing out
+
+        def kill(self) -> None:
+            self.killed = True
+
+        async def wait(self) -> int:
+            self.waited = True
+            return 0
+
+    fake = FakeProc()
+
+    async def _fake_exec(*a, **k):
+        return fake
+
+    monkeypatch.setattr(check_mod.asyncio, "create_subprocess_exec", _fake_exec)
+
+    cfg = GuardianConfig(state_dir=str(tmp_path))
+    await check_mod._write_guardian_heartbeat(cfg)  # must NOT raise
+    assert fake.killed, "timed-out heartbeat child must be killed"
+    assert fake.waited, "killed child must be reaped (awaited), not left as a zombie"
 
 
 def test_gateway_pause_leading_zero_ttl_is_base10(tmp_path: Path) -> None:
@@ -284,6 +350,28 @@ def test_load_config_honors_state_dir_env(tmp_path: Path, monkeypatch) -> None:
     cfg = load_config(cfg_yaml)
     assert cfg.state_dir == str(custom)
     assert cfg.state_path == custom
+
+
+def test_load_config_warns_on_cap_below_caller_ttl(tmp_path: Path, caplog) -> None:
+    """F4: a gateway_pause_max_ahead_s below the 1800s default caller TTL silently
+    disables the deploy stand-down — the pause file is rejected as too-far-ahead,
+    so `pause` reports success while run_check keeps monitoring. load_config must
+    WARN on that misconfiguration; the default (3600) must stay silent."""
+    import logging
+
+    low_yaml = tmp_path / "low.yaml"
+    low_yaml.write_text("gateway_pause_max_ahead_s: 600\n")
+    with caplog.at_level(logging.WARNING, logger="genesis.guardian.config"):
+        cfg = load_config(low_yaml)
+    assert cfg.gateway_pause_max_ahead_s == 600  # value still applied (not clamped)
+    assert "below the 1800" in caplog.text
+
+    caplog.clear()
+    ok_yaml = tmp_path / "ok.yaml"
+    ok_yaml.write_text("gateway_pause_max_ahead_s: 3600\n")
+    with caplog.at_level(logging.WARNING, logger="genesis.guardian.config"):
+        load_config(ok_yaml)
+    assert "below the 1800" not in caplog.text
 
 
 def test_gateway_honors_state_dir_env(tmp_path: Path) -> None:

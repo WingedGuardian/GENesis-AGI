@@ -336,8 +336,13 @@ class GuardianConfig:
     maintenance_file: str = "/var/lib/guardian-snapshots/.guardian-maintenance"
     # Safety cap for the gateway pause file (`<state_dir>/paused.json`, written by
     # the gateway `pause` verb across a deploy): the Guardian ignores a pause whose
-    # `expires_at` is more than this far in the future (a bad writer / clock skew
-    # must not mute the watchdog for hours). Keep >= the gateway's own ttl cap.
+    # `expires_at` is more than this far ahead (a bad writer / clock skew must not
+    # mute the watchdog for hours). Setting it below a pause's TTL does NOT tighten
+    # the pause — it makes that pause be rejected as too-far-ahead, silently
+    # disabling the stand-down. The automated deploy caller (update.sh) writes 1800,
+    # so load_config warns below 1800 (the deploy stand-down itself would break).
+    # A cap in [1800, 3600) still silently drops any MANUAL `pause >cap` (the gateway
+    # accepts up to 3600) — keep the 3600 default unless you accept that edge.
     gateway_pause_max_ahead_s: int = 3600
     # Container-swap invariant reconciler (swap_watch): re-assert
     # limits.memory.swap=true + live cgroup activation each tick. Kill switch
@@ -588,7 +593,22 @@ def _apply_provisioning_override(config: GuardianConfig) -> None:
 def _finalize(config: GuardianConfig) -> GuardianConfig:
     """Apply the provisioning override then env overrides (env wins)."""
     _apply_provisioning_override(config)
-    return _env_override(config)
+    config = _env_override(config)
+    # The gateway pause cap is an anti-absurdity guard (a bad writer/clock must
+    # never mute the watchdog for hours), NOT a policy knob to tighten below the
+    # caller TTLs. A cap under 1800 — the default TTL update.sh writes — makes
+    # even a bare `pause` file be rejected as too-far-ahead, so the gateway
+    # reports success while run_check keeps monitoring: the deploy stand-down
+    # silently never engages. Fail direction is safe (monitor, not mute), but the
+    # feature is disabled, so warn loudly rather than fail silently.
+    if config.gateway_pause_max_ahead_s < 1800:
+        logger.warning(
+            "gateway_pause_max_ahead_s=%ds is below the 1800s default deploy "
+            "pause TTL — pause files will be rejected as too-far-ahead and the "
+            "deploy stand-down will NOT engage. Set it >= the largest caller TTL.",
+            config.gateway_pause_max_ahead_s,
+        )
+    return config
 
 
 def load_config(path: Path | None = None) -> GuardianConfig:

@@ -837,12 +837,17 @@ verified: 84c7259d 2026-08-31
 - **Planned-maintenance stand-down** (`check.py::_gateway_pause_active`): reads a
   self-expiring `<state_dir>/paused.json` — written by the gateway `pause [ttl]`
   verb, bounded by `expires_at` and capped by `gateway_pause_max_ahead_s` — and
-  stands the whole check cycle down beside the indefinite `maintenance_file`. So a
-  `scripts/update.sh` deploy pauses the Guardian across the server restart instead
-  of escalating to `confirmed_dead` and firing a false down/recovered alert. The
-  TTL means a deploy killed before its `resume` self-heals rather than muting the
-  watchdog. Distinct from the container `~/.genesis/paused.json` runtime kill
-  switch (that pauses all of Genesis; this is host-side and Guardian-only).
+  stands the whole check cycle down beside the indefinite `maintenance_file`. This
+  is the *capability* a deploy uses to pause the Guardian across the server restart
+  — instead of escalating to `confirmed_dead` and firing a false down/recovered
+  alert — so that a paused restart is silent; the `scripts/update.sh` caller that
+  actually writes the pause across its stop/restart lands as a separate change (a
+  deploy on the old caller simply runs unpaused, as today). The TTL means a deploy
+  killed before its `resume` self-heals rather than muting the watchdog. During
+  stand-down the heartbeat carries a `standdown` marker so `probe_guardian` reports
+  DEGRADED (alive, not watching) rather than HEALTHY. Distinct from the container
+  `~/.genesis/paused.json` runtime kill switch (that pauses all of Genesis; this is
+  host-side and Guardian-only).
 - Provisioning verbs are EXECUTE-ONLY — approval is the CALLER's
   responsibility (container obtains it via Telegram before invoking). Two
   families: Proxmox VM grows (`provision-grow-disk/-memory`, hypervisor API) and

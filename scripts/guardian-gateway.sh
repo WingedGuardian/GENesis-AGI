@@ -119,6 +119,18 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
                 exit 1
                 ;;
         esac
+        # Reject oversized magnitudes BEFORE base-10 conversion. Bash arithmetic
+        # uses fixed-width integers with NO overflow check, so a value beyond
+        # 64-bit (e.g. `pause 18446744073709551617`) silently WRAPS into the
+        # accepted range and reports success. Max valid is 3600 (4 digits): strip
+        # leading zeros, then reject anything longer than 4 digits — the numeric
+        # range check below catches 4-digit overshoot (e.g. 3601).
+        _TTL_MAG="${_PAUSE_TTL#"${_PAUSE_TTL%%[!0]*}"}"
+        [ -z "$_TTL_MAG" ] && _TTL_MAG=0
+        if [ "${#_TTL_MAG}" -gt 4 ]; then
+            echo '{"ok": false, "action": "pause", "error": "ttl out of range (1-3600)"}' >&2
+            exit 1
+        fi
         # Force base-10: a leading-zero value (e.g. 0888) would be read as octal
         # by bash arithmetic and abort under set -e.
         _PAUSE_TTL=$((10#$_PAUSE_TTL))

@@ -278,17 +278,37 @@ async def _maybe_propose_provisioning(
         logger.warning("autonomous pool-grow proposal failed", exc_info=True)
 
 
-async def _write_guardian_heartbeat(config: GuardianConfig) -> None:
-    """Write heartbeat file into the container so Genesis knows Guardian is alive.
+def _heartbeat_payload(standdown: str | None = None) -> dict:
+    """Build the Guardian heartbeat payload.
 
-    Uses stdin pipe instead of heredoc to avoid shell injection.
+    ``standdown`` names the active stand-down (``"gateway_pause"`` /
+    ``"maintenance"``) so health surfaces can tell an intentional, alive-but-not-
+    watching Guardian (DEGRADED) from a fully-monitoring one (HEALTHY). The
+    process is alive either way — the container watchdog stays quiet — but
+    ``probe_guardian`` must not report HEALTHY while a check cycle is skipped.
+    Absent/None on the normal end-of-cycle heartbeat.
     """
     uptime_s = (datetime.now(UTC) - _STARTED_AT).total_seconds()
-    heartbeat = json.dumps({
+    payload: dict = {
         "guardian_alive": True,
         "timestamp": datetime.now(UTC).isoformat(),
         "uptime_s": round(uptime_s),
-    })
+    }
+    if standdown:
+        payload["standdown"] = standdown
+    return payload
+
+
+async def _write_guardian_heartbeat(
+    config: GuardianConfig, standdown: str | None = None
+) -> None:
+    """Write heartbeat file into the container so Genesis knows Guardian is alive.
+
+    ``standdown`` (when set) marks the heartbeat as an intentional stand-down so
+    ``probe_guardian`` reports DEGRADED rather than HEALTHY for the skipped cycle.
+    Uses stdin pipe instead of heredoc to avoid shell injection.
+    """
+    heartbeat = json.dumps(_heartbeat_payload(standdown))
 
     try:
         # Use stdin pipe — avoids heredoc injection risk
@@ -401,7 +421,7 @@ async def run_check(config: GuardianConfig | None = None) -> None:
             "Maintenance mode active — standing down (remove %s to resume)",
             maintenance_path,
         )
-        await _write_guardian_heartbeat(config)
+        await _write_guardian_heartbeat(config, standdown="maintenance")
         return
 
     # Gateway-driven, self-expiring stand-down (a deploy pauses us across the
@@ -409,7 +429,7 @@ async def run_check(config: GuardianConfig | None = None) -> None:
     # stand-down, but bounded by expires_at so a killed deploy can't mute us.
     if _gateway_pause_active(config):
         logger.info("Gateway pause active — standing down (deploy in progress)")
-        await _write_guardian_heartbeat(config)
+        await _write_guardian_heartbeat(config, standdown="gateway_pause")
         return
 
     state_path = config.state_path / "state.json"
