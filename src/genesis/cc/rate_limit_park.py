@@ -61,6 +61,25 @@ def parse_park_id(caller_context: str | None) -> str | None:
     return None
 
 
+def effective_caller_context(
+    caller_context: str | None, origin_caller_context: str | None
+) -> str | None:
+    """The caller_context to use for downstream lineage/proposal linkage.
+
+    A resumed session's ``caller_context`` is ``rate_limit_resume:<park_id>``
+    (needed so a re-limit updates its own park), which no longer carries the
+    original ``ego_proposal:<id>`` that proposal-outcome recording and dispatch
+    follow-through gate on. The original rides across on ``origin_caller_context``;
+    prefer it whenever the live context is a resume prefix, so both consumers
+    survive a park→resume. A non-resume context (the ordinary case) is returned
+    unchanged, and a resume with no preserved origin falls back to the prefix
+    (a non-ego parked job — correctly not treated as a proposal downstream).
+    """
+    if caller_context and caller_context.startswith(_RESUME_PREFIX):
+        return origin_caller_context or caller_context
+    return caller_context
+
+
 def _enum_str(value: object, default: str) -> str:
     """Normalise a CCModel/EffortLevel enum-or-string to its wire string."""
     if value is None:
@@ -257,6 +276,15 @@ async def park_direct_session(
             "skills": list(skills) if skills is not None else None,
             "tool_exceptions": list(tool_exceptions),
             "planning_instruction": getattr(request, "planning_instruction", None),
+            # Preserve the ORIGINAL context across resume so proposal-outcome
+            # recording + dispatch follow-through survive (see
+            # effective_caller_context). This branch is only reached when
+            # lineage_id is None, so caller_context is the genuine original
+            # (never a resume prefix); a re-limit reuses this row's payload
+            # unchanged, so the origin persists across the whole re-park chain.
+            "origin_caller_context": (
+                getattr(request, "origin_caller_context", None) or caller_context
+            ),
         }
         return await parks.upsert_open_park(
             db,

@@ -217,6 +217,33 @@ class TestRecordDispatchFollowthrough:
         assert row["priority"] == "high"
 
     @pytest.mark.asyncio
+    async def test_caption_renders_derived_failed_not_raw_status(self, db):
+        """A verification-failed-but-session-completed dispatch must render the
+        DERIVED [failed] in the review caption, not the misleading raw
+        [completed] (#1496 P2 dispatch_followthrough.py:95)."""
+        from genesis.db.crud import ego_intentions
+        from genesis.ego.dispatch_followthrough import record_dispatch_followthrough
+
+        await db.execute(
+            """INSERT INTO ego_proposals
+               (id, action_type, content, status, created_at, ego_source)
+               VALUES (?, 'implement', 'Ship X', 'failed', ?, 'genesis_ego_cycle')""",
+            (PROPOSAL_ID, datetime.now(UTC).isoformat()),
+        )
+        await db.commit()
+        await record_dispatch_followthrough(
+            db,
+            proposal_id=PROPOSAL_ID,
+            session_id="sess1234abcd",
+            status="completed",  # session completed, but proposal verification-failed
+            outcome="",
+            failed=False,
+        )
+        row = (await ego_intentions.list_active(db, "genesis_ego_cycle"))[0]
+        assert "[failed]" in row["content"], row["content"]
+        assert "[completed]" not in row["content"], row["content"]
+
+    @pytest.mark.asyncio
     async def test_parked_dispatch_skips_followthrough(self, db):
         """A rate/quota-parked dispatch is NOT terminal — no follow-through now;
         the resumed session's on_end fires the real one (Codex #1496 P2)."""

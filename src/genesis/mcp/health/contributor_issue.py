@@ -47,6 +47,7 @@ from genesis.autonomy.types import ApprovalStatus
 from genesis.contribution import scan_prose
 from genesis.contribution.findings import Severity
 from genesis.db.crud import pending_issue_posts as pip
+from genesis.db.crud._id_resolve import PASSTHROUGH, RESOLVED, resolve_unique_prefix
 from genesis.env import github_public_repo, github_user
 from genesis.mcp.health import mcp
 
@@ -156,6 +157,29 @@ async def _impl_contributor_issue_propose(
     if len(_parts) < 2 or not all(_parts):
         return {"status": "error", "reason": f"repo must be owner/name, got {repo!r}"}
     source_ref = (source_follow_up_id or "").strip() or None
+    # Resolve/validate the follow_up id at proposal time. The curator passes full
+    # ids today (no active bug), but a tagged ("id:…")/prefix/uppercase handle would
+    # be stored VERBATIM and the close-loop join (repo_pulse keys canonical full
+    # ids) would silently miss. Resolve any provided ref against follow_ups:
+    # RESOLVED → the canonical full id; PASSTHROUGH → normalized (full-length /
+    # non-hex ids are trusted as-is, matching the resolver contract — a wrong-but-
+    # full id is out of scope here); AMBIGUOUS / NOT_FOUND → REJECT rather than
+    # persist a ref the close-loop can never match. Applies whenever a ref is
+    # present (a codebase proposal has none, so it is untouched).
+    if source_ref is not None:
+        matches, outcome = await resolve_unique_prefix(
+            db, table="follow_ups", id_column="id", raw_id=source_ref
+        )
+        if outcome in (RESOLVED, PASSTHROUGH):
+            source_ref = matches[0]
+        else:  # AMBIGUOUS | NOT_FOUND — do not persist an unmatchable close-loop ref
+            return {
+                "status": "error",
+                "reason": (
+                    f"source_follow_up_id {source_ref!r} did not resolve to a unique "
+                    f"follow_up ({outcome})"
+                ),
+            }
     label_list = [str(x).strip() for x in (labels or []) if str(x).strip()]
 
     # 1) Privacy sanitizer at the TRUSTED server boundary (fail-closed). A
@@ -249,7 +273,12 @@ async def _impl_contributor_issue_propose(
         db,
         id=pending_id,
         request_id=request_id,
-        repo=repo,
+        # Belt-and-suspenders for the WS-A close-loop join: store the repo in a
+        # deterministic canonical form (lowercase) so a config-vs-gh casing
+        # divergence can't strand the mapping. gh treats owner/name as
+        # case-insensitive, so a lowercased slug still posts correctly. The
+        # primary defense is the COLLATE NOCASE read in posted_index_for_repo.
+        repo=repo.lower(),
         title=title,
         body=body,
         labels=json.dumps(label_list) if label_list else None,
