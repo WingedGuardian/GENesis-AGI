@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from genesis.guardian.check import _gateway_pause_active, run_check
-from genesis.guardian.config import GuardianConfig
+from genesis.guardian.config import GuardianConfig, load_config
 
 _GATEWAY = Path(__file__).resolve().parents[2] / "scripts" / "guardian-gateway.sh"
 
@@ -104,24 +104,11 @@ def test_naive_expires_at_treated_as_utc(tmp_path: Path) -> None:
     assert _gateway_pause_active(_cfg(tmp_path), now=NOW) is True
 
 
-@pytest.mark.asyncio
-async def test_run_check_stands_down_when_pause_active(tmp_path: Path) -> None:
-    """Wiring: with a live gateway pause, run_check returns BEFORE it builds the
-    state machine, so no state.json is ever written (real side-effect, not a mock)."""
-    _write_pause(tmp_path, expires_at=(datetime.now(UTC) + timedelta(minutes=10)).isoformat())
-    await run_check(_cfg(tmp_path))
-    assert not (tmp_path / "state.json").exists(), "stand-down must skip the state machine"
-
-
-@pytest.mark.asyncio
-async def test_run_check_does_not_stand_down_when_expired(tmp_path: Path) -> None:
-    """Guard-the-guard: an EXPIRED pause must NOT stand the cycle down — otherwise
-    the stand-down test above could pass vacuously. run_check proceeds far enough
-    to create state.json (health probes fail against a dead endpoint, which is
-    fine — we only assert the cycle did NOT early-return)."""
-    _write_pause(tmp_path, expires_at=(datetime.now(UTC) - timedelta(minutes=10)).isoformat())
-    await run_check(_cfg(tmp_path))
-    assert (tmp_path / "state.json").exists(), "expired pause must not skip the cycle"
+# NOTE: run_check stand-down is tested via test_stand_down_still_writes_heartbeat
+# below (fully isolated: it tripwires _check_cycle so a regression can NEVER reach
+# the real production cycle — incus snapshot prune / swap reconcile / live alerts).
+# The "expired pause does not stand down" gate is covered by test_expired_not_active
+# at the unit level, without running run_check against the host.
 
 
 # ── gateway verb round-trip: the writer + the reader must agree ──────────────
@@ -186,13 +173,26 @@ def test_non_object_json_fails_safe_no_crash(tmp_path: Path, body: str) -> None:
 @pytest.mark.asyncio
 async def test_stand_down_still_writes_heartbeat(tmp_path: Path, monkeypatch) -> None:
     """SF-3: a stand-down must still heartbeat (Guardian is alive, just not
-    watching) so the container watchdog doesn't read it as DOWN and restart it."""
+    watching) so the container watchdog doesn't read it as DOWN and restart it.
+
+    Fully isolated (P1): the heartbeat is spied and _check_cycle is tripwired, so
+    if the stand-down ever regressed, the test fails LOUDLY instead of running the
+    real production cycle (incus snapshot prune / swap reconcile / live alerts)
+    against the host it happens to run on.
+    """
     calls: list[bool] = []
 
     async def _spy(config) -> None:  # real path uses incus; unavailable in CI
         calls.append(True)
 
+    async def _tripwire(*a, **k):  # first heavy production call after stand-down
+        raise AssertionError("run_check reached the production cycle — stand-down failed")
+
     monkeypatch.setattr("genesis.guardian.check._write_guardian_heartbeat", _spy)
+    # Tripwire the FIRST two production calls after the stand-down (the alert
+    # drain runs before _check_cycle), so a regression can't slip past either.
+    monkeypatch.setattr("genesis.guardian.check._check_cycle", _tripwire)
+    monkeypatch.setattr("genesis.guardian.check._drain_host_alert_queue", _tripwire)
     _write_pause(tmp_path, expires_at=(datetime.now(UTC) + timedelta(minutes=10)).isoformat())
     await run_check(_cfg(tmp_path))
     assert calls == [True], "stand-down must write exactly one heartbeat"
@@ -205,3 +205,27 @@ def test_gateway_pause_leading_zero_ttl_is_base10(tmp_path: Path) -> None:
     r = _run_gateway("pause 0888", tmp_path)
     assert r.returncode == 0, r.stderr
     assert (_gateway_state_dir(tmp_path) / "paused.json").exists()
+
+
+def test_config_allowlist_honors_gateway_pause_cap(tmp_path: Path) -> None:
+    """P2: a YAML-set gateway_pause_max_ahead_s must reach the config (be in the
+    load_config top-level allowlist), else the documented cap can't be tuned."""
+    cfg_yaml = tmp_path / "guardian.yaml"
+    cfg_yaml.write_text("gateway_pause_max_ahead_s: 1200\n")
+    assert load_config(cfg_yaml).gateway_pause_max_ahead_s == 1200
+
+
+def test_gateway_honors_state_dir_env(tmp_path: Path) -> None:
+    """P2: the gateway must write where the reader looks — GUARDIAN_STATE_DIR
+    redirects both (writer here, reader via GuardianConfig.state_dir)."""
+    custom = tmp_path / "custom-state"
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "GUARDIAN_STATE_DIR": str(custom),
+        "SSH_ORIGINAL_COMMAND": "pause 300",
+    }
+    r = subprocess.run(["bash", str(_GATEWAY)], env=env, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert (custom / "paused.json").exists()
+    assert _gateway_pause_active(GuardianConfig(state_dir=str(custom))) is True

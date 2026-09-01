@@ -610,7 +610,7 @@ def load_config(path: Path | None = None) -> GuardianConfig:
         "container_name", "container_ip", "container_user",
         "health_api_port", "check_interval_s", "state_dir",
         "host_ip", "host_user", "maintenance_file",
-        "swap_reconcile_enabled",
+        "swap_reconcile_enabled", "gateway_pause_max_ahead_s",
     }
     top_kwargs = {k: v for k, v in raw.items() if k in top_fields}
 

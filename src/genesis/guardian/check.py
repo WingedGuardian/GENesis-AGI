@@ -311,6 +311,16 @@ async def _write_guardian_heartbeat(config: GuardianConfig) -> None:
             )
     except TimeoutError:
         logger.error("Guardian heartbeat write timed out", exc_info=True)
+        # wait_for cancelled communicate() but left the child running — kill and
+        # reap it, or a wedged incus/container orphans a process every tick (the
+        # stand-down paths call this each cycle during a long pause).
+        try:
+            proc.kill()
+            # Bound the reap: a D-state (uninterruptible) incus child could defer
+            # SIGKILL, so don't let the wait stall the tick indefinitely.
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except (TimeoutError, ProcessLookupError, OSError):
+            pass
     except OSError as exc:
         logger.error("Guardian heartbeat write failed: %s", exc)
 

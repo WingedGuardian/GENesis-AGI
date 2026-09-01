@@ -71,7 +71,11 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 
-STATE_DIR="${HOME}/.local/state/genesis-guardian"
+# Honor the GUARDIAN_STATE_DIR override (the same env the guardian config reads,
+# config.py) so the pause file the gateway writes lands where _gateway_pause_active
+# looks. Default matches GuardianConfig.state_dir. (A guardian.yaml-only override
+# with no env is a pre-existing gateway limitation shared by the status verb.)
+STATE_DIR="${GUARDIAN_STATE_DIR:-${HOME}/.local/state/genesis-guardian}"
 
 # Write the gateway pause file with a bounded TTL (arg = seconds ahead). The
 # Guardian (check.py::_gateway_pause_active) stands down while this is present and
