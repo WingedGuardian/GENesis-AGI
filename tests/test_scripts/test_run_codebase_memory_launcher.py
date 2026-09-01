@@ -208,12 +208,119 @@ def _user_scope_works() -> bool:
         return False
 
 
+def _run(argv: list[str], env: dict[str, str] | None = None) -> str:
+    """Run *argv*, render rc/stdout/stderr on one line. Diagnostic use only.
+
+    ``errors="replace"`` because the default is strict decoding against the
+    locale: in a C/POSIX locale that is ASCII, and one non-ASCII byte on a
+    child's stderr would raise UnicodeDecodeError from inside the failure
+    message, losing the assertion it was added to explain.
+    """
+    try:
+        r = subprocess.run(
+            argv, capture_output=True, text=True, timeout=15, env=env, errors="replace",
+        )
+    except Exception as exc:  # noqa: BLE001 - a raising diagnostic destroys the evidence
+        return f"<{type(exc).__name__}: {exc}>"
+    out = (r.stdout or "").strip().replace("\n", " | ")
+    err = (r.stderr or "").strip().replace("\n", " | ")
+    return f"rc={r.returncode} out={out!r} err={err!r}"
+
+
+def _read(path: str) -> str:
+    try:
+        return Path(path).read_text(errors="replace").strip() or "<empty>"
+    except Exception as exc:  # noqa: BLE001 - same reason as _run
+        return f"<unreadable: {exc}>"
+
+
+def _cgroup_levels(rel: str) -> list[str]:
+    """controllers/subtree_control at every level of *rel*, root first."""
+    lines, node = [], "/sys/fs/cgroup"
+    for part in [""] + [p for p in rel.split("/") if p]:
+        node = f"{node}/{part}" if part else node
+        lines.append(
+            f"  {node}: controllers={_read(node + '/cgroup.controllers')} "
+            f"subtree_control={_read(node + '/cgroup.subtree_control')}"
+        )
+    return lines
+
+
+def _scope_diagnostics(launcher_env: dict[str, str], res) -> str:
+    """Why a real MemoryMax scope did not take -- in the failure message itself.
+
+    Written because this test failed three times on one branch (13 of 14 recent
+    CI runs across eight branches passed it) and reported only
+    ``assert 'max' == '2147483648'`` -- a verdict with no cause in it. The
+    failure does not reproduce on the development box, so the evidence has to
+    come from CI, and a diagnostic that cannot discriminate between the live
+    hypotheses wastes the cycle it costs.
+
+    The four hypotheses it must separate:
+      1. the launcher's probe failed and it took the silent ``ulimit -v``
+         fallback  -> the probe's own CG:/ULIMIT_V: line says so outright;
+      2. the probe failed because of the ENV this test hands it rather than
+         anything wrong with the machine -> the same probe is run twice, once
+         under the launcher's env and once under pytest's, and a disagreement
+         is the answer. MEASURED on systemd 255: a set-but-EMPTY
+         DBUS_SESSION_BUS_ADDRESS gives "Failed to connect to bus: Connection
+         refused" where an ABSENT one succeeds, and an empty XDG_RUNTIME_DIR
+         gives "No such file or directory" -- so ``os.environ.get(k, "")``
+         below forwards a value strictly WORSE than the key's absence;
+      3. the scope was created but MemoryMax did not apply -> CG: names a
+         transient scope while memory.max still reads max;
+      4. the memory controller is not delegated on the branch the scope is
+         created in -> that branch is ``user@UID.service/app.slice``, NOT this
+         process's own, and both are walked because they differ (measured).
+    """
+    uid = os.getuid()
+    scope_branch = f"user.slice/user-{uid}.slice/user@{uid}.service/app.slice"
+    with_props = [
+        "systemd-run", "--user", "--scope", "--quiet",
+        "-p", "MemoryMax=2G", "-p", "MemorySwapMax=0", "--", "/bin/true",
+    ]
+    plain = ["systemd-run", "--user", "--scope", "--quiet", "--", "/bin/true"]
+    shown = {
+        k: (v if k in ("PATH", "CODEBASE_MEMORY_MCP_BIN") else repr(v))
+        for k, v in launcher_env.items()
+        if k != "PATH"
+    }
+    own = _read("/proc/self/cgroup")
+    # Anchor on the unified line the way the probe itself does; a bare
+    # split("::") picks the wrong line on a hybrid hierarchy and yields
+    # authoritative-looking garbage in a message whose whole job is to be trusted.
+    rel = next((ln[3:] for ln in own.splitlines() if ln.startswith("0::")), "")
+    return "\n".join(
+        [
+            "",
+            "--- scope diagnostics (this assertion cannot explain itself alone) ---",
+            f"launcher stderr : {(res.stderr or '').strip()!r}",
+            f"launcher env    : {shown}",
+            f"probe+props, LAUNCHER env : {_run(with_props, env=launcher_env)}",
+            f"probe+props, pytest   env : {_run(with_props)}",
+            f"probe plain, pytest   env : {_run(plain)}   (what the skipif gate asks)",
+            f"systemd         : {_run(['systemctl', '--version'])}",
+            f"/proc/self/cgroup: {own}",
+            "pytest's own branch:",
+            *_cgroup_levels(rel),
+            f"the branch --user scopes are created in ({scope_branch}):",
+            *_cgroup_levels(scope_branch),
+            "--- end diagnostics ---",
+        ]
+    )
+
+
 @pytest.mark.skipif(not _user_scope_works(), reason="no usable systemd user manager")
 def test_real_scope_applies_memory_max(tmp_path):
     probe = _write_exec(
         tmp_path / "cgprobe",
         "#!/usr/bin/env bash\n"
         'cg="$(sed -n \'s/^0:://p\' /proc/self/cgroup)"\n'
+        # On stderr, so stdout stays exactly the one value the assertion reads.
+        # This is the single datum that separates "took the ulimit fallback"
+        # from "scope taken but MemoryMax did not apply" -- the launcher picks
+        # between them silently.
+        'printf \'CG:%s ULIMIT_V:%s\\n\' "$cg" "$(ulimit -v)" >&2\n'
         'cat "/sys/fs/cgroup${cg}/memory.max"\n',
     )
     env = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"],
@@ -224,7 +331,18 @@ def test_real_scope_applies_memory_max(tmp_path):
         ["bash", str(_LAUNCHER)], env=env, capture_output=True, text=True, timeout=30,
     )
     assert res.returncode == 0, res.stderr
-    assert res.stdout.strip() == str(2 * 1024**3)  # MemoryMax=2G
+    # The VERDICT is unchanged -- only the message is, and only on the failing
+    # branch, so a passing run pays nothing for any of it.
+    expected = str(2 * 1024**3)  # MemoryMax=2G
+    got = res.stdout.strip()
+    if got != expected:
+        raise AssertionError(
+            f"cgroup memory.max is {got!r}, expected {expected!r}. A value of "
+            f"'max' is consistent with EITHER the launcher's silent ulimit "
+            f"fallback OR a scope whose MemoryMax did not apply; the CG:/"
+            f"ULIMIT_V: line below says which."
+            + _scope_diagnostics(env, res)
+        )
 
 
 # ── _register_mcp drift-healing (sources the REAL shared lib) ─────────────
