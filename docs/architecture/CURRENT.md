@@ -497,7 +497,7 @@ Note: the *learning* package hosts the other big scheduler (see entry 10).
 ```yaml subsystem-map
 entry: scheduling-background
 modules: [surplus, scheduler, follow_ups]
-verified: 0e65071c 2026-07-21
+verified: 1d75bc21 2026-08-31
 ```
 
 - **Surplus generators are deliberately BLIND to `infrastructure_alert`
@@ -639,7 +639,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 0017242d 2026-08-11
+verified: 1d75bc21 2026-08-31
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -897,7 +897,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: ca875c4b 2026-07-24
+verified: 1d75bc21 2026-08-31
 ```
 
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
@@ -1151,7 +1151,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: fbcf8ee4 2026-07-21
+verified: 1d75bc21 2026-08-31
 ```
 
 - **learning/** is the de-facto cron host: `rt._learning_scheduler` registers
@@ -1362,7 +1362,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: 3c514f3e 2026-08-10
+verified: 1d75bc21 2026-08-31
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
@@ -1397,8 +1397,8 @@ verified: 3c514f3e 2026-08-10
   framed, refreshed on return to Overview) is **PR-B2b** — shipped.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
-  schema paths coexist: base DDL (`schema/_tables.py`, ~113 CREATE TABLE; docs
-  still say "60+") plus versioned `migrations/` 0001..0060 run ONCE at startup
+  schema paths coexist: base DDL (`schema/_tables.py`, ~117 CREATE TABLE; docs
+  still say "60+") plus versioned `migrations/` 0001..0088 run ONCE at startup
   before any other init step touches data; a failed migration ABORTS bootstrap.
   EVERY table must be in BOTH paths (fresh-install DDL + its numbered
   migration) — the `test_db/test_schema.py` allow-list enforces it. Migration
@@ -1611,7 +1611,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 9037d45b 2026-07-07
+verified: 1d75bc21 2026-08-31
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
