@@ -286,6 +286,31 @@ def _current_session_id(fallback: str) -> str:
     return _CURRENT_SID or fallback
 
 
+def _stake_mirror(path: Path, part: str) -> bool:
+    """Create the mirror up front so the recovery header can name it honestly.
+
+    Writes a PLACEHOLDER, not an empty file: if the hook dies between here and
+    `_write_mirror`, a reader who followed the header finds a file that explains
+    what happened rather than a zero-byte one that reads as "your context was
+    empty". Overwritten with the full text at completion.
+
+    Returns False (never raises) when the path cannot be written, so the caller
+    drops the mirror from the header instead of advertising it.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"[genesis-ctx:{part}] placeholder — the SessionStart hook opened this "
+            "mirror but did not finish writing it. The window that produced it lost "
+            f"the '{part}' part of its context; nothing here is that content.\n",
+            encoding="utf-8",
+        )
+        return True
+    except OSError as exc:
+        print(f"[genesis-ctx] cannot stake mirror {path}: {exc}", file=sys.stderr)
+        return False
+
+
 def _begin_part(part: str, mirror: Path | None, session_id: str = "") -> None:
     """Open a fresh bounded stream for ``part`` and emit its recovery header.
 
@@ -298,6 +323,18 @@ def _begin_part(part: str, mirror: Path | None, session_id: str = "") -> None:
     global _OUT, _CURRENT_PART, _CURRENT_SID
     _CURRENT_PART, _CURRENT_SID = part, session_id
     budget = _part_budget(part)
+    # CLAIM ONLY WHAT EXISTS. The header is emitted FIRST and the full text is
+    # mirrored LAST, so a header naming a path whose write later fails (session
+    # dir unwritable, disk full, removed concurrently) sends the reader to a file
+    # that is not there — and it does so on the one path where the reader has
+    # already lost the content and has nothing else to go on. Stake the file now:
+    # if the placeholder cannot be written, the mirror is dropped from the header
+    # and the part says plainly that this window lost it. TOCTOU remains (the
+    # disk can fill between here and the final write), which is why
+    # `_write_mirror` still fails loudly — but the header is now honest at the
+    # moment it makes its claim, instead of asserting a file nobody has touched.
+    if mirror is not None and not _stake_mirror(mirror, part):
+        mirror = None
     _OUT = BoundedStdout(
         budget,
         label=part,
@@ -1661,6 +1698,23 @@ _LEDGER_FETCH_MAX = 200
 _LEDGER_OVERFLOW_NOTE = f"MORE than {_LEDGER_FETCH_MAX} open rows — the rest are not listed above"
 
 
+def _row_one_line(text: object) -> str:
+    """Ledger text as ONE line, at RENDER time.
+
+    `db/crud/session_charters._one_line` owns this rule and applies it on WRITE,
+    which cannot reach rows already at rest. On any install upgraded across that
+    change, a legacy row still carries its embedded newline — and this renderer
+    emits one line PER ROW, so such a row renders as two and the second is
+    indistinguishable from a genuine ledger row in Genesis's own voice. A write
+    chokepoint bounds new data; only the renderer bounds what is already stored.
+
+    Inlined rather than imported: this hook is stdlib-only by design so a broken
+    venv can never wedge a session. Same formula as the write side; a parity test
+    pins them together.
+    """
+    return " ".join(str(text or "").split())
+
+
 def _ledger_lines(
     ledger: list[dict], escalations: dict, *, text_cap: int | None = None
 ) -> list[str]:
@@ -1680,7 +1734,7 @@ def _ledger_lines(
     for item in ledger:
         mark = "~" if item.get("status") == "in_progress" else " "
         row_id = str(item.get("id", ""))
-        text = str(item.get("text", ""))
+        text = _row_one_line(item.get("text", ""))
         link = ""
         esc = escalations.get(row_id)
         if esc:

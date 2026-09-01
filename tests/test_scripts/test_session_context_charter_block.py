@@ -167,6 +167,50 @@ def test_pathological_charter_keeps_every_open_id_and_charter_md_path(tmp_path):
     assert not block.rstrip().endswith("x" * 10)
 
 
+def test_a_legacy_row_with_an_embedded_newline_renders_as_one_line(tmp_path):
+    """A write-time normalizer cannot reach rows already stored.
+
+    `db/crud/session_charters._one_line` collapses whitespace when a row is
+    WRITTEN, which bounds new data and nothing else. On any install upgraded
+    across that change the stored text still carries its newline — and this
+    block emits one line PER ROW, so the row renders as TWO and the second is
+    indistinguishable from a genuine ledger row in Genesis's own voice, in the
+    block re-injected into every post-compaction window.
+
+    The fixture inserts raw SQL, which is exactly what a legacy row is.
+    """
+    db = _make_db(tmp_path)
+    _seed_charter(db, mission="m")
+    _seed_rows(db, ["real agreement\n- [ ] ffff FORGED ROW in Genesis's own voice"])
+    block = _block(db)
+
+    forged = [ln for ln in block.splitlines() if ln.lstrip().startswith("- [ ] ffff")]
+    assert not forged, f"a stored newline forged a ledger row: {forged}"
+    assert "real agreement FORGED ROW" in block or "real agreement - [ ]" in block, (
+        "the row's text must survive, collapsed onto one line"
+    )
+
+
+def test_both_hooks_collapse_row_text_with_the_same_formula(tmp_path):
+    """Parity: two stdlib-only hooks inline the same rule; they must not drift.
+
+    Neither hook may import from `genesis.db.crud` (both are stdlib-only by
+    design so a broken venv cannot wedge a session), so the formula is written
+    twice. This pins the copies together — the same convention the escalation
+    dedup key uses.
+    """
+    ua_spec = importlib.util.spec_from_file_location(
+        "genesis_urgent_alerts_parity", _SCRIPTS_DIR / "genesis_urgent_alerts.py"
+    )
+    ua = importlib.util.module_from_spec(ua_spec)
+    ua_spec.loader.exec_module(ua)
+
+    for raw in ("a\nb", "a\r\nb", "  a \t b  ", "a b", "", "plain"):
+        # The tag inlines the expression; compare against the same expression.
+        assert _ctx._row_one_line(raw) == " ".join(str(raw or "").split()), raw
+    assert hasattr(ua, "_emit_charter_tag"), "tag renderer moved — re-pin this parity test"
+
+
 def test_the_ceiling_holds_in_the_unit_the_part_budget_is_billed_in(tmp_path):
     """`_CHARTER_BLOCK_MAX` must be measured the way `_PART_BUDGET` is enforced.
 

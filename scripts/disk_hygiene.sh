@@ -176,13 +176,23 @@ main() {
     # sampled), against a 60-day threshold — ~57x the worst observed skew. Of
     # the 161 dirs older than 60d, none held a file newer than 60d.
     #
-    # So: if this threshold is ever lowered toward that skew, switch the
-    # predicate to the newest CONTAINED file's mtime rather than trusting the
-    # directory's.
+    # That margin is a SNAPSHOT, though, and it is not what the safety should
+    # rest on: a session resumed after a long dormancy has an old directory
+    # mtime and a brand-new last_prompt_time, and deleting it takes a LIVE
+    # session's state. So take the predicate the paragraph above prescribes
+    # instead of the margin that made it unnecessary — a directory is pruned
+    # only when it contains NO file modified inside the window. Costs one extra
+    # stat pass over ~160 candidate dirs, once a day.
     if [ -d "$HOME/.genesis/sessions" ]; then
-        find "$HOME/.genesis/sessions" -mindepth 1 -maxdepth 1 -type d \
-            -mtime +60 -exec rm -rf {} + 2>/dev/null \
-            || echo "sessions prune exited $?"
+        find "$HOME/.genesis/sessions" -mindepth 1 -maxdepth 1 -type d -mtime +60 2>/dev/null |
+            while IFS= read -r _sess_dir; do
+                # -print -quit: stop at the FIRST recent file; no need to walk
+                # the rest of the directory to know it must be kept.
+                if [ -n "$(find "$_sess_dir" -type f -mtime -60 -print -quit 2>/dev/null)" ]; then
+                    continue
+                fi
+                rm -rf "$_sess_dir" || echo "sessions prune failed for $_sess_dir"
+            done
     fi
 
     echo "--- retrieval-efficacy report retention prune (>45d) ---"

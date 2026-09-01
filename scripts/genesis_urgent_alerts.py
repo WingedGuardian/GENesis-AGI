@@ -332,7 +332,15 @@ def _emit_charter_tag(session_id: str) -> None:
         body_lines = []
         for rid, text, status in rows:
             mark = " [~]" if status == "in_progress" else ""
-            body = str(text or "")
+            # Collapse whitespace at RENDER. `db/crud/session_charters._one_line`
+            # applies this on WRITE, which cannot reach rows already at rest: on
+            # an install upgraded across that change a legacy row still carries
+            # its embedded newline, and this tag emits one line PER ROW — so the
+            # row renders as two and the second reads as a genuine ledger row in
+            # Genesis's own voice. Inlined because this hook is stdlib-only by
+            # design; same formula as the write side and as the charter block's
+            # `_row_one_line`, pinned by a parity test.
+            body = " ".join(str(text or "").split())
             if len(body) > _TAG_ROW_CHARS:
                 body = body[:_TAG_ROW_CHARS] + "\u2026"
             link = ""
