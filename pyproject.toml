@@ -36,6 +36,9 @@ dependencies = [
     "urllib3>=2.7.0",  # via qdrant-client/requests — CVE-2026-44431/44432 (auth-header leak, decompression DoS)
     "idna>=3.15",  # via httpx/requests — CVE-2026-45409 (quadratic-processing DoS)
     "certifi>=2026.5.20",  # via httpx/curl_cffi — current CA bundle
+    "pynacl>=1.5",  # federation relay E2E crypto (Ed25519 sign + X25519 Box + SecretBox). Currently
+    # also transitive via paramiko; declared directly so the federation subsystem can't lose it if
+    # paramiko is ever swapped. Ships manylinux wheels (libsodium bundled) — no build/native toolchain.
 ]
 
 [project.optional-dependencies]
