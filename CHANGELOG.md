@@ -211,27 +211,31 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   adversarial audit reproduced that path before the field existed. Measured on the 40
   most recent marker-carrying PRs: 14 were relief-eligible and the rule denies none of
   them; 7 carry benign uncountable rows that a blanket rule would have denied.
-- **A refused Bash command now names the file writes it discarded.** A PreToolUse
-  block cancels the WHOLE Bash call, not the step the guard objected to — so a
-  command shaped `python3 - <<PY …writes a file… PY && git commit`, refused for the
-  commit, also lost the write, and the message named only the commit. It read as
-  "the commit didn't happen" rather than "and the edit you just made never
-  happened". Guards now emit a footnote naming what went with the refusal
-  (`scripts/hooks/discarded_write.py`), wired at each guard's own refusal point —
-  the guard about to refuse is the only thing that knows a block is happening, so
-  no separate predictor exists to drift out of sync with the guards it models.
-  Measured across every transcript on one box: of 790 real blocks, the note fires
-  on 204 and is silent on the rest. Supporting this, `shell_parse.Segment` gained
-  an additive `writes` field reporting OUTPUT-redirect targets (`> f`, `>> f`,
-  `&> f`), which the parser already parsed correctly but discarded — without it
-  `cat > file <<'EOF'`, the most common write idiom, was invisible because a bare
-  `cat` looks read-only. Input redirects, descriptor duplications (`2>&1`, `>&-`),
-  null sinks and process substitutions are excluded — but `>&word` for a
-  non-numeric word is a real write in bash and is counted as one, as is a digit
-  filename after a plain `>`. The note is strictly cosmetic and cannot
-  change a verdict: every import is guarded so a broken helper cannot fail-open a
-  security gate, and exit codes are asserted unchanged in both directions —
-  including with the helper made deliberately unreachable.
+- **A refused command now says the WHOLE command was discarded, not just the step
+  it named.** A PreToolUse block cancels the entire Bash call, not the step the
+  guard objected to — so `cat > config.py <<'EOF' … EOF && git commit`, refused for
+  the commit, also loses the write, and the message mentioned only the commit. It
+  read as "the commit didn't happen" rather than "and the edit you just made never
+  happened". Measured on one box: of 722 multi-segment Bash calls a hook actually
+  blocked, 288 carried a write nobody was told about. Every guard now emits a
+  footnote at its own refusal point (`scripts/hooks/discarded_write.py`) — the guard
+  about to refuse is the only thing that knows a block is happening, so no separate
+  predictor exists to drift out of sync with the guards it models. Approval prompts
+  carry the same warning in the dialog itself, since declining also skips every
+  other step in the command, which is exactly what a "block the push?" prompt hides.
+  The note names nothing: it states the one fact true of every block. An earlier
+  design worked out WHICH files were lost, and naming a file means mapping argv to
+  effect — which of `sed`'s spellings mean in-place, which operands are the program
+  — a set with no closed boundary that produced fourteen review findings, nearly all
+  of them one more spelling. It was also quadratic in the step count, which made a
+  cosmetic helper into a fail-OPEN: a long command cost enough time to exceed the
+  shell hook's registration timeout, and a hook killed before its `exit 2` lets the
+  refused command run. The reader has their own command on screen, which is what
+  they must re-read before re-running it anyway. Strictly cosmetic and unable to
+  change a verdict: every import is guarded, exit codes are asserted unchanged in
+  both directions including with the helper made deliberately unreachable, and a
+  test derives each consumer's fallback from its own imports so the two cannot
+  drift.
 - **A malformed Claude Code pin on `main` no longer wedges every merge in the
   repository, and a pin blob that cannot be decoded at the head now blocks.** Two
   fixes to the CC pin-receipt merge gate, one narrow and one broad.

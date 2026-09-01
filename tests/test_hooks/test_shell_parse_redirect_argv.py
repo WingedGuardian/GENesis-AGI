@@ -116,16 +116,15 @@ def test_analyze_depth0_raw_equals_split_segments(cmd):
 def test_a_write_only_redirect_does_not_break_the_split_segments_invariant(cmd):
     """A redirection with NO command writes but executes nothing.
 
-    Bash really does create the target — VERIFIED with `bash -c '> wo.txt'` — so the
-    write is recorded, but the segment has no command text. Emitting it from
-    `analyze` put an empty string in front of the consumers that match these values
-    against a fresh `split_segments`, silently breaking the invariant above; the
-    CORPUS contains no such command, so the parametrised test stayed green while the
-    contract was violated. The write reaches callers through `write_targets`.
+    Bash really does create the target — VERIFIED with `bash -c '> wo.txt'` — but the
+    segment has no command text, so `analyze` must not emit it: doing so put an empty
+    string in front of the consumers that match these values against a fresh
+    `split_segments`, silently breaking the invariant above. The CORPUS contains no
+    such command, so the parametrised test stayed green while the contract was
+    violated — which is why this case is pinned separately.
     """
     assert [s.raw for s in sp.analyze(cmd) if s.depth == 0] == sp.split_segments(cmd)
     assert "" not in sp.split_segments(cmd), "an empty segment must never reach consumers"
-    assert sp.write_targets(cmd), "the orphan write must still be reachable"
 
 
 # ── (3) argv is redirect-stripped; nested command stays visible ─────────────

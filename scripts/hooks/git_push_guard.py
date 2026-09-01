@@ -119,6 +119,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hook_input import field, read_payload, run_guard  # noqa: E402
 
 try:  # A refusal discards the WHOLE Bash call, so name any write it took with it.
+    from discarded_write import prompt_note as _prompt_discarded  # noqa: E402
     from discarded_write import remember as _remember_command  # noqa: E402
     from discarded_write import warn as _warn_discarded  # noqa: E402
 except Exception:  # noqa: BLE001
@@ -134,6 +135,10 @@ except Exception:  # noqa: BLE001
 
     def _warn_discarded(_command=None):
         """No-op stand-in. See ``_remember_command``."""
+
+    def _prompt_discarded(_command=None):
+        """No-op stand-in returning no note. See ``_remember_command``."""
+        return None
 
 
 # SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
@@ -5057,7 +5062,16 @@ def _ask(reason: str) -> int:
     permission prompt and runs the tool only on explicit approval — a gate the
     agent cannot self-satisfy. Verified to render in a wrapped child session
     2026-07-27.
+
+    The collateral note goes INTO ``reason``, not to stderr: the operator is reading
+    a dialog, and stderr is not part of it. Declining drops every other step in the
+    command too, which is exactly the fact a "block the push?" prompt hides. Appended
+    defensively — ``_prompt_discarded`` is the no-op stand-in when the cosmetic helper
+    is unimportable, and a note must never be able to cost this gate its prompt.
     """
+    extra = _prompt_discarded()
+    if extra:
+        reason = f"{reason}\n\n{extra}"
     print(
         json.dumps(
             {

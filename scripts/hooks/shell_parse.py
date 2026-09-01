@@ -134,9 +134,6 @@ class Segment:
     redirects: list[str] = field(
         default_factory=list
     )  # expansion redirect targets excised from argv
-    writes: list[str] = field(
-        default_factory=list
-    )  # OUTPUT-redirect targets (`> f`, `>> f`, `&> f`) this segment writes to
 
 
 def _redirect_operator_len(command: str, i: int) -> int | None:
@@ -169,33 +166,6 @@ def _redirect_operator_len(command: str, i: int) -> int | None:
 
 _TARGET_STOP = (" ", "\t", "\n", ";", "|", "&", "<", ">", "(", ")")
 
-#: Sinks that are written but hold nothing — naming them as a lost write is noise.
-_NULL_SINKS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"})
-
-
-def _is_write_redirect(op: str, target: str) -> bool:
-    """Whether a redirection creates or truncates a FILE.
-
-    Writes: ``>`` ``>>`` ``>|`` ``&>`` ``&>>``. Not writes: every input form
-    (``<`` ``<<`` ``<<<`` ``<&``).
-
-    ``>&`` needs the TARGET to decide, which is why this is not operator-only.
-    ``>&1`` and ``>&-`` duplicate or close a descriptor, but ``>&word`` for a
-    NON-numeric word opens that file exactly as ``&>word`` does — VERIFIED against
-    bash: ``bash -c 'echo hi >&f.log'`` creates f.log containing "hi". Treating
-    every ``>&`` as a duplication would silently miss that write.
-
-    Conversely a DIGIT target is only special after ``>&``: ``echo x > 1`` writes a
-    file named ``1``, so digits are excluded here and not by the caller.
-    """
-    if op.startswith("&>"):  # &> and &>> both open the target
-        return True
-    if not op.startswith(">"):
-        return False
-    if op == ">&":
-        return not (target.isdigit() or target == "-")
-    return True  # >, >>, >|
-
 
 class _ParsedSegment(NamedTuple):
     """A split segment with two text views.
@@ -206,18 +176,12 @@ class _ParsedSegment(NamedTuple):
     ``argv_src`` is ``raw`` with every redirect operator+target removed — the string
     ``analyze`` tokenizes into argv, so a redirect target can never spoof the
     subcommand. ``redirects`` are the expansion operator-target words excised from
-    ``argv_src`` (observability). ``writes`` are the OUTPUT-redirect targets (``> f``,
-    ``>> f``, ``>| f``, ``&> f``) — the files this segment CREATES OR TRUNCATES. They
-    are recorded here because both text views drop them, so a consumer that needs to
-    know a command wrote a file has no other way to see it (a note that names what a
-    refused command discarded). Input redirects (``<``, ``<<``, ``<<<``) and fd
-    duplications (``2>&1``) are NOT writes and are excluded.
+    ``argv_src`` (observability).
     """
 
     raw: str
     argv_src: str
     redirects: tuple[str, ...]
-    writes: tuple[str, ...] = ()
 
 
 def _command_sub_end(command: str, i: int, n: int) -> int:
@@ -344,11 +308,10 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
     other direction (locked by the ``$(;)``/``$(&&)``/``$(|)`` cases in the redirect-argv
     test's EXPLOITS).
     """
-    pairs: list[tuple[str, str, list[str], list[str]]] = []
+    pairs: list[tuple[str, str, list[str]]] = []
     raw_buf: list[str] = []
     argv_buf: list[str] = []
     redirs: list[str] = []
-    wr: list[str] = []
     i, n = 0, len(command)
     quote: str | None = None
     while i < n:
@@ -373,8 +336,8 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
             continue
         two = command[i : i + 2]
         if two in ("&&", "||"):
-            pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs), list(wr)))
-            raw_buf, argv_buf, redirs, wr = [], [], [], []
+            pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
+            raw_buf, argv_buf, redirs = [], [], []
             i += 2
             continue
         op_len = _redirect_operator_len(command, i)
@@ -407,24 +370,6 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
             if j < n and t not in _TARGET_STOP:
                 j = _redirect_target_end(command, j0, n)
             target = command[j0:j]
-            # An OUTPUT redirect is the only evidence that this segment wrote a file:
-            # the target is about to be dropped from both text views, so record it
-            # first.
-            #
-            # Both decisions below read the target UNQUOTED, because bash accepts a
-            # quoted redirect target and resolves it to the same file: `> "/dev/null"`
-            # is the same sink as `> /dev/null`, and comparing the raw span would
-            # report the quoted form as a discarded write. The same normalization is
-            # what makes `>&"1"` read as the descriptor dup it is. The RAW span is
-            # what gets recorded — consistent with `redirects`, which also keeps raw
-            # text; consumers that display it strip quotes themselves.
-            unquoted = target.strip().strip("\"'")
-            if (
-                target
-                and unquoted not in _NULL_SINKS
-                and _is_write_redirect(command[i : i + op_len], unquoted)
-            ):
-                wr.append(target)
             if "$" in target or "`" in target:
                 # Expansion-carrying target: KEEP in raw (nested command stays visible
                 # to the destructive guard via _substitutions), EXCLUDE from argv_src so
@@ -439,63 +384,26 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
             i = j
             continue
         if c in (";", "|", "&", "\n"):
-            pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs), list(wr)))
-            raw_buf, argv_buf, redirs, wr = [], [], [], []
+            pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
+            raw_buf, argv_buf, redirs = [], [], []
             i += 1
             continue
         raw_buf.append(c)
         argv_buf.append(c)
         i += 1
-    pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs), list(wr)))
+    pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
     return [
-        _ParsedSegment(raw=r.strip(), argv_src=a.strip(), redirects=tuple(d), writes=tuple(w))
-        for (r, a, d, w) in pairs
-        # Raw-empty segments are kept ONLY when they carry a write. Bash permits a
-        # redirection with no command and still creates or truncates the target —
-        # VERIFIED: `bash -c '> wo.txt'` creates wo.txt — so `> /tmp/result && git
-        # push` has a real write in a segment whose raw text is empty once the
-        # redirect is consumed. Filtering on raw alone discarded it silently.
-        #
-        # `split_segments` drops these again, so the stable list[str] API its four
-        # consumers iterate (the commit gate, the invalidator, two push-guard call
-        # sites) stays byte-identical, along with the golden corpus locking it. The
-        # segment is visible only to consumers that read `writes`.
-        if r.strip() or w
+        _ParsedSegment(raw=r.strip(), argv_src=a.strip(), redirects=tuple(d))
+        for (r, a, d) in pairs
+        if r.strip()  # filter on RAW — keeps the exact set/alignment split_segments had
     ]
 
 
 def split_segments(command: str) -> list[str]:
     """Executed-segment raw strings — a thin, byte-identical view over
     ``parse_segments`` (all redirect/quote/comment semantics live there). Kept as the
-    stable ``list[str]`` API the cwd/occurrence consumers iterate.
-
-    Empty-raw entries are dropped here. ``parse_segments`` retains a segment that is
-    nothing but a redirection (``> f``) because it carries a real WRITE, but such a
-    segment has no command text — emitting ``""`` into this list would hand every
-    consumer a segment that executes nothing, and they match these strings against a
-    fresh re-split. The write is reachable through ``Segment.writes`` instead."""
-    return [p.raw for p in parse_segments(command) if p.raw]
-
-
-def write_targets(command: str) -> list[str]:
-    """Every OUTPUT-redirect target in *command*, in order, including orphans.
-
-    Additive, and deliberately its own entry point rather than a widening of
-    ``analyze``. A redirection with no command (``> f && …``) really does create or
-    truncate its target — VERIFIED: ``bash -c '> wo.txt'`` creates wo.txt — but it
-    executes nothing, so it is not a Segment any consumer should iterate: emitting
-    it from ``analyze`` broke the documented invariant that a depth-0 ``Segment.raw``
-    is exactly an element of a fresh ``split_segments`` (the corpus happened not to
-    cover the case, so the suite stayed green while the contract was violated).
-
-    Callers that want "what files does this command write" ask HERE; callers that
-    want "what does this command execute" keep asking ``analyze``. Never raises —
-    the module's fail-open contract.
-    """
-    try:
-        return [t for seg in parse_segments(command) for t in seg.writes]
-    except Exception:  # noqa: BLE001 — degrade, never crash a guard
-        return []
+    stable ``list[str]`` API the cwd/occurrence consumers iterate."""
+    return [p.raw for p in parse_segments(command)]
 
 
 def has_top_level_pipe(command: str, *, count_substitutions: bool = False) -> bool:
@@ -867,12 +775,6 @@ def analyze(command: str) -> list[Segment]:
     """
     out: list[Segment] = []
     for seg in parse_segments(command):
-        if not seg.raw:
-            # A redirection with no command carries a WRITE but executes nothing, and
-            # emitting it here would break the invariant the cwd/occurrence consumers
-            # rely on — that a depth-0 `Segment.raw` is exactly an element of a fresh
-            # `split_segments`. Its write reaches consumers through `write_targets`.
-            continue
         raw = seg.raw
         override = _has_trailing_override(raw)
         # argv is tokenized from the redirect-STRIPPED source, so a redirect target
@@ -880,14 +782,7 @@ def analyze(command: str) -> list[Segment]:
         argv = _strip_wrappers(_argv(seg.argv_src))
         exe = _basename(argv[0]) if argv else ""
         out.append(
-            Segment(
-                exe=exe,
-                argv=argv,
-                override=override,
-                raw=raw,
-                redirects=list(seg.redirects),
-                writes=list(seg.writes),
-            )
+            Segment(exe=exe, argv=argv, override=override, raw=raw, redirects=list(seg.redirects))
         )
         nested = []
         if exe in _NESTED:
@@ -907,7 +802,6 @@ def analyze(command: str) -> list[Segment]:
                         raw=inner.raw,
                         depth=inner.depth + 1,
                         redirects=inner.redirects,
-                        writes=inner.writes,
                     )
                 )
     return out

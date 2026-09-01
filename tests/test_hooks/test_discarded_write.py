@@ -1,454 +1,291 @@
-"""The discarded-write note: name what a refusal threw away besides the refused step.
+"""The refusal note: a block discards the WHOLE command, and says so.
 
-A PreToolUse block discards the WHOLE Bash call. A write chained with a step a
-guard refuses is therefore lost SILENTLY — the refusal names only the step it
-objected to, so the write reads as having happened.
+An earlier version of this module worked out WHICH files the refused command would
+have written. That did not converge — naming a file means mapping argv to effect,
+which has no closed boundary, and three review rounds produced fourteen findings
+that were overwhelmingly one more option spelling or operand class. Worse, assembling
+the list was quadratic in the segment count and MEASURED as a fail-OPEN: it SIGKILLed
+`bash_safety_hook.sh` past its registration timeout, and a non-2 exit lets the refused
+command RUN.
 
-These tests pin BOTH directions, because a detector that fires on everything
-passes every "must fire" case while being worthless:
-
-  * the shapes that really do carry a discarded write are named, including the
-    exact command that motivated this;
-  * the far larger set of refusals that lost NOTHING stays silent, and each
-    scoping decision that keeps it that way is pinned on its own, so widening one
-    fails here rather than in a session's ergonomics.
-
-The module is COSMETIC — it may never change a verdict — so the fail-open
-properties are asserted directly rather than assumed.
+So the note now states the one thing true of every block, needing no knowledge of any
+tool: the entire command was discarded. These tests pin that contract and — more
+importantly — pin the two properties that make it safe to sit inside a security hook:
+it never changes a verdict, and it never costs measurable time.
 """
 
 from __future__ import annotations
 
-import importlib.util
+import ast
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
-_WORKTREE = Path(__file__).resolve().parent.parent.parent
-_HELPER = _WORKTREE / "scripts" / "hooks" / "discarded_write.py"
+_HOOKS = Path(__file__).resolve().parents[2] / "scripts" / "hooks"
+sys.path.insert(0, str(_HOOKS))
+import discarded_write as dw  # noqa: E402
 
-sys.path.insert(0, str(_WORKTREE / "scripts" / "hooks"))
-_spec = importlib.util.spec_from_file_location("discarded_write", _HELPER)
-_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_mod)
-
-# The command that motivated all of this: an inline script wrote a file, the
-# commit behind it was refused, and the write vanished with no mention.
-_MOTIVATING = 'python3 - <<PY\nopen("f","w").write("x")\nPY\ngit commit -m "wip"'
-
-
-# ── the shapes that DO carry a discarded write ───────────────────────────────
-
-
-def test_the_motivating_defect_is_named():
-    """The whole point. An inline heredoc script ahead of a refused commit."""
-    assert _mod.discarded_writes(_MOTIVATING) == ["an inline python3 script"]
-
-
-def test_a_redirect_target_is_named_exactly():
-    """`shell_parse` erases redirect targets from both text views; the note is the
-    reason they are now recorded, so this is the load-bearing case."""
-    assert _mod.discarded_writes("echo hi > /tmp/f.txt && git commit -m x") == ["/tmp/f.txt"]
-
-
-def test_an_append_redirect_is_a_write():
-    assert _mod.discarded_writes("echo hi >> /tmp/f.log && git push") == ["/tmp/f.log"]
-
-
-def test_a_heredoc_written_through_cat_is_named():
-    """`cat > file <<'EOF'` is the most common write idiom in this repo, and was
-    invisible before redirect targets were recorded — bare `cat` looks read-only."""
-    cmd = "cat > /tmp/msg.txt <<'EOF'\nsubject\nEOF\ngit commit -F /tmp/msg.txt"
-    assert "/tmp/msg.txt" in _mod.discarded_writes(cmd)
-
-
-def test_a_write_executable_is_named():
-    assert _mod.discarded_writes("cp a b && git push") == ["cp a b"]
-
-
-def test_an_in_place_edit_names_the_COMMAND_not_a_derived_file_list():
-    """The note shows the command, not which of its operands are files.
-
-    Deciding that means knowing which options consume a value — unbounded, and it
-    shipped two defects across two review rounds: first the in-place SPELLINGS were
-    missed, then the fix reported `-e`'s VALUE as an edited file. The raw text is
-    correct under any flag, including ones that do not exist yet.
-    """
-    assert _mod.discarded_writes("sed -i s/a/b/ f.py && git commit -m x") == ["sed -i s/a/b/ f.py"]
+# ── when the note appears ────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
     "cmd",
     [
-        "sed -i s/a/b/ f.py",
-        "sed -i.bak s/a/b/ f.py",
-        "sed -ibak s/a/b/ f.py",  # suffix attaches with NO separator
-        "sed -Ei s/a/b/ f.py",  # clustered short options
-        "sed --in-place s/a/b/ f.py",
-        "sed --in-place=.bak s/a/b/ f.py",
-        "perl -pi -e s/a/b/ f.py",  # perl's clustered form
+        "cat > config.py <<'EOF'\nx = 1\nEOF\ngit commit -m x",
+        "sed -i 's/a/b/' f.py && git commit -m x",
+        'python3 -c \'open("f","w").write("x")\' ; git push',
+        "cd /wt && git push",
+        "ruff check . && pytest -q",
+        "a | b",
     ],
 )
-def test_every_in_place_spelling_is_recognised(cmd):
-    """GNU sed documents `-i[SUFFIX], --in-place[=SUFFIX]`, and the suffix attaches
-    with no separator. Recognising only `-i` and `-i.` missed the long forms, the
-    separator-less suffix, and every CLUSTER — so an ordinary `sed --in-place`
-    before a refused push reported that nothing was lost."""
-    assert _mod.discarded_writes(f"{cmd} && git push"), f"missed an in-place form: {cmd}"
+def test_a_multi_step_command_gets_the_note(cmd):
+    """Every shape carrying more than one step, whatever the steps ARE.
 
-
-def test_an_in_place_PROGRAM_is_never_reported_as_an_edited_file():
-    """The defect the redesign removes, in both spellings a program can arrive in.
-
-    An earlier revision listed `-e`'s expression and `-f`'s script FILE among the
-    edited files — and a test in this suite asserted that second one as correct,
-    which is how it survived a review round. Showing the command cannot get this
-    wrong, so the assertion is that no operand is singled out at all.
+    The point of the rewrite: `sed -i`, a heredoc write, an inline python script and a
+    bare `cd` are all covered without the module knowing anything about sed, python or
+    cd. The old version needed a rule per tool and missed the ones it had no rule for.
     """
-    for cmd in ("sed -i -e s/a/b/ f.py", "sed -i -f prog.sed f.py"):
-        (phrase,) = _mod.discarded_writes(f"{cmd} && git push")
-        assert phrase == cmd, "the note must be the command, not a parsed file list"
-        assert " on " not in phrase, "no operand may be presented as the edited file"
-
-
-def test_a_quoted_in_place_LOOKALIKE_is_not_a_write():
-    """`--` ends option scanning, so an argument that merely contains `-i` is data."""
-    assert _mod.discarded_writes("sed -- s/-i/x/ f.py && git push") == []
-
-
-def test_a_write_AFTER_the_refused_step_is_still_named():
-    """Ordering is irrelevant: the whole call is discarded, so a write behind the
-    refused step is lost exactly as thoroughly as one in front of it."""
-    assert _mod.discarded_writes("git push && cp a b") == ["cp a b"]
-
-
-# ── the far larger set that lost NOTHING ─────────────────────────────────────
-
-
-def test_a_single_step_is_silent():
-    """The refused step IS the entire call — there is no collateral to report."""
-    assert _mod.discarded_writes("git push") == []
-
-
-def test_a_single_step_that_WRITES_is_still_silent():
-    """The suppression has to hold for a lone step that writes, which is the only
-    case that distinguishes it — a lone `git push` writes nothing, so it stays
-    silent either way and pins nothing. (Mutation-found: the obvious test passed
-    against a build with the suppression removed.)"""
-    assert _mod.discarded_writes("echo x > /tmp/f") == []
-    assert _mod.discarded_writes("cp a b") == []
-
-
-def test_a_compound_with_no_write_is_silent():
-    assert _mod.discarded_writes("cd /x && git push") == []
-    assert _mod.discarded_writes("cd /x && pytest tests/t.py") == []
-
-
-def test_dev_null_is_not_a_lost_write():
-    """`2>/dev/null` opens a sink that holds nothing. Reporting it as lost data
-    would fire on a large share of ordinary commands."""
-    assert _mod.discarded_writes("cat f 2>/dev/null && git push") == []
-
-
-@pytest.mark.parametrize("sink", ['"/dev/null"', "'/dev/null'", "/dev/null"])
-def test_a_QUOTED_null_sink_is_still_not_a_write(sink):
-    """bash accepts a quoted redirect target and resolves it to the same file, so
-    `> "/dev/null"` is the same sink as `> /dev/null`. Comparing the raw span
-    reported the quoted form as a discarded write."""
-    assert _mod.discarded_writes(f"printf x > {sink} && git push") == []
-
-
-def test_a_QUOTED_real_path_is_still_named():
-    """The unquoting must not swallow ordinary quoted paths, which is how a path
-    containing a space is written in the first place."""
-    (phrase,) = _mod.discarded_writes('cp a b > "/tmp/out file.txt" && git push')
-    assert "/tmp/out file.txt" in phrase
-
-
-def test_a_redirect_does_not_MASK_the_command_side_write():
-    """`cp a b 2>err.log` writes BOTH. An early return on the redirect target
-    reported only `err.log` and stayed silent about the copy — hiding the more
-    important write exactly when stderr was redirected, which is common."""
-    (phrase,) = _mod.discarded_writes("cp a b 2>err.log && git push")
-    assert "err.log" in phrase, "the redirect target must still be named"
-    assert "cp a b" in phrase, "the command-side write must not be masked by it"
-
-
-def test_a_write_ONLY_redirect_segment_is_not_dropped():
-    """`> /tmp/result` is a redirection with no command, and bash still creates the
-    file — VERIFIED with `bash -c '> wo.txt'`. The segment's raw text is empty once
-    the redirect is consumed, so filtering segments on raw alone discarded the write
-    silently."""
-    assert _mod.discarded_writes("> /tmp/result && git push") == ["/tmp/result"]
-
-
-def test_a_QUOTED_fd_digit_is_still_a_duplication():
-    """The same normalization is what lets `>&"1"` read as the dup it is."""
-    assert _mod.discarded_writes('make 2>&"1" && git push') == []
-
-
-def test_an_fd_duplication_is_not_a_write():
-    """`2>&1` points a descriptor at another descriptor; it opens no file."""
-    assert _mod.discarded_writes("make 2>&1 && git push") == []
-
-
-def test_an_input_redirect_is_not_a_write():
-    assert _mod.discarded_writes("diff < a.txt && git push") == []
-
-
-def test_fd_duplication_to_a_DIGIT_target_is_not_a_write():
-    """`>&1` / `2>&1` / `>&-` duplicate or close a descriptor; they open no file."""
-    assert _mod.discarded_writes("echo x >&2 && git push") == []
-    assert _mod.discarded_writes("make 2>&1 && git push") == []
-    assert _mod.discarded_writes("echo x >&- && git push") == []
-
-
-def test_a_redirect_to_a_NON_digit_target_after_ampersand_IS_a_write():
-    """`>&word` for a non-numeric word OPENS that file, exactly as `&>word` does.
-
-    VERIFIED against bash: `bash -c 'echo hi >&f.log'` creates f.log containing
-    "hi". An earlier version of this file asserted the OPPOSITE — it was written
-    to kill a mutant, and pinned incorrect shell semantics while doing so, which
-    would have made a genuine silent data loss report "nothing was discarded"."""
-    assert _mod.discarded_writes("echo x >&err.log && git push") == ["err.log"]
-    assert _mod.discarded_writes("echo x 1>&err.log && git push") == ["err.log"]
-
-
-def test_a_DIGIT_filename_after_a_plain_redirect_is_still_a_write():
-    """`echo x > 1` writes a file named `1`. Digits are only special after `>&`,
-    so excluding them globally would lose this."""
-    assert _mod.discarded_writes("echo x > 1 && git push") == ["1"]
-
-
-def test_a_heredoc_feeding_the_REFUSED_step_is_silent():
-    """`git commit -F - <<MSG` loses a commit message, not a file. The note claims
-    writes that hit the filesystem, and must stay truthful about that."""
-    assert _mod.discarded_writes("git commit -F - <<MSG\nsubject\nMSG") == []
-
-
-def test_an_interpreter_running_a_FILE_is_not_an_inline_script():
-    """`python3 script.py` re-runs for free — the file still exists. Only inline
-    code (`-`, `-c`, `-e`) is unrecoverable once the call is discarded."""
-    assert _mod.discarded_writes("python3 script.py && git push") == []
-
-
-def test_a_redirect_mentioned_inside_quotes_is_not_a_write():
-    """Quote-awareness comes from the shared parser; a raw scan for `>` would fire
-    on every commit message containing one."""
-    assert _mod.discarded_writes('git commit -m "use a > b" && git push') == []
-
-
-# ── fail-open properties: this must never change a verdict ───────────────────
-
-
-def test_an_unparseable_command_is_silent_not_an_exception():
-    assert _mod.discarded_writes("cmd 'unterminated && git commit -m x") == []
-
-
-def test_empty_and_whitespace_commands_are_silent():
-    assert _mod.discarded_writes("") == []
-    assert _mod.discarded_writes("   \n  ") == []
+    assert dw.note(cmd) is not None, cmd
 
 
 @pytest.mark.parametrize(
-    "hostile",
+    "cmd",
     [
-        "\x00\x01\x02",
-        ">" * 5000,
-        "a" * 20000,
-        "cat > " + "x" * 5000 + " && git push",
-        "$(`\\'\"" * 200,
+        "git push",
+        "git commit -m 'a && b'",  # separator INSIDE a quoted string is not a step
+        "echo 'a | b'",
+        "pytest tests/foo.py",
+        "",
+        "   ",
     ],
 )
-def test_hostile_input_never_raises(hostile):
-    """A cosmetic helper that raised would take its guard's exit code with it."""
-    assert isinstance(_mod.discarded_writes(hostile), list)
+def test_a_single_step_command_stays_silent(cmd):
+    """The refused step IS the whole call, so nothing was carried alongside it.
 
-
-def test_a_heredoc_body_phantom_is_not_displayed():
-    """`shell_parse` does not understand heredocs: body lines are parsed as if they
-    were commands, so a `>` in ordinary prose yields a phantom redirect whose
-    target is a run of body text. MEASURED on the block corpus: one such phantom
-    was a 500-character blob spanning newlines. Dumping that into a refusal is
-    worse than saying nothing."""
-    cmd = "python3 - <<PY\ntext = 'a > " + "b" * 400 + "'\nPY\ngit commit -m x"
-    for phrase in _mod.discarded_writes(cmd):
-        assert len(phrase) <= 200, f"phantom blob leaked into the note: {phrase[:80]!r}"
-        assert "\n" not in phrase
-
-
-def test_an_overlong_target_is_DROPPED_not_truncated():
-    """It has to disappear, not be shortened. A truncated 400-character blob still
-    reads as a filename and is still wrong; only dropping it is honest. Asserting a
-    length bound instead would pass against a build with no cap at all, because the
-    per-entry display truncation shortens it anyway. (Mutation-found.)"""
-    assert _mod.discarded_writes("cat > " + "x" * 200 + " && git push") == []
-
-
-def test_a_target_spanning_a_NEWLINE_is_dropped():
-    """Reachable via an expansion target: `> "$(echo a\\nb)"` really does yield a
-    multi-line target, and that is the shape of the 500-character blob measured on
-    the block corpus."""
-    assert _mod.discarded_writes('cat > "$(echo a\nb)" && git push') == []
-
-
-def test_an_absurdly_nested_command_is_bounded_not_parsed():
-    """`analyze` is superlinear in nested `$(…)` — MEASURED 2.9s at 800 levels.
-    That cost would be paid on a BLOCK path, and a hook killed at its timeout has
-    not reached its `exit 2`, which CC reads as non-blocking: the refused command
-    runs. A cosmetic note must not be able to buy that."""
-    import time
-
-    cmd = ("$(" * 4000) + (")" * 4000) + " > f && git push"
-    start = time.monotonic()
-    assert _mod.discarded_writes(cmd) == []
-    assert time.monotonic() - start < 1.0, "bound must be an O(n) scan, not a parse"
-
-
-def test_an_absurdly_long_command_is_bounded_not_parsed():
-    cmd = "cp " + ("x" * 200_000) + " /dest && git push"
-    start = __import__("time").monotonic()
-    assert _mod.discarded_writes(cmd) == []
-    assert __import__("time").monotonic() - start < 1.0
-
-
-def test_an_IN_BOUNDS_command_cannot_exhaust_the_hook_timeout():
-    """The bounds cap the PARSE; the note ASSEMBLY had to be bounded separately.
-
-    This is a security regression test, not a performance one. The shape below sits
-    INSIDE both input bounds (63,012 chars, zero substitutions) and cost 2.5s before
-    the accumulation cap, because de-duplication was O(len(found)) per candidate
-    while the cap applied only at the return. `bash_safety_hook.sh` paid that TWICE
-    per block and is registered with a 5-SECOND timeout, so the hook was SIGKILLed
-    before reaching `exit 2` — and Claude Code reads any non-2 exit as NON-blocking,
-    so the refused `rm -rf` ran. Differential at the time: origin/main refused it
-    rc=2 in 2.884s; this branch rc=-9 at 5.005s.
-
-    The two bound tests below do NOT cover this: their inputs are REJECTED by the
-    early returns, so they time a path that does no work and would pass against a
-    build with no downstream cost control at all — which was the build under review.
+    The quoted cases matter most: a naive substring check for `&&` would fire on them
+    and make the note noise on ordinary commits. Segmentation is the shell's own, so
+    a separator inside quotes is correctly not a step.
     """
-    import time
-
-    cmd = ("rm -rf bt && " + " ".join(f">q{i:04d}" for i in range(9000)))[:65536]
-    assert len(cmd) < _mod._MAX_COMMAND_CHARS, "the shape must be INSIDE the bounds"
-    assert cmd.count("$(") + cmd.count("`") < _mod._MAX_SUBSTITUTIONS
-
-    start = time.monotonic()
-    result = _mod.discarded_writes(cmd)
-    elapsed = time.monotonic() - start
-
-    assert len(result) <= _mod._MAX_NAMED, "output must stay capped"
-    assert elapsed < 0.5, (
-        f"in-bounds command took {elapsed:.3f}s — this is paid twice inside a 5s "
-        "hook budget, and a hook killed before its exit 2 does not block"
-    )
+    assert dw.note(cmd) is None, cmd
 
 
-def test_the_bounds_sit_above_every_real_command_observed():
-    """Sized from the corpus this was measured on: longest command 14,682 chars,
-    most substitutions in one command 150. A bound that clipped ordinary work
-    would make the note silently useless exactly when it is wanted."""
-    assert _mod._MAX_COMMAND_CHARS > 14_682
-    assert _mod._MAX_SUBSTITUTIONS > 150
-    ordinary = "cp a b && echo $(date) $(hostname) > /tmp/f && git push"
-    assert _mod.discarded_writes(ordinary), "a normal command must still be read"
+@pytest.mark.parametrize("cmd", ["> /tmp/result && git push", "echo a && >q0 >q1"])
+def test_a_bare_redirect_step_is_a_KNOWN_and_measured_miss(cmd):
+    """Documented gap, pinned so it is a decision rather than a surprise.
+
+    Both splitters drop a segment that redirects but executes nothing, so a command
+    whose only collateral is a bare `> f` gets no note even though bash really does
+    create the file. Catching it needs the write-detection layer this rewrite deleted,
+    and that layer is what produced the review loop and the measured fail-open.
+
+    MEASURED over 1,468 real Bash commands from this box's transcripts: 2 matched a
+    generous bare-redirect pattern (0.14%), and inspecting both showed they were
+    pattern false positives — an ordinary `cat > f <<EOF` and a line continuation.
+    The real rate is indistinguishable from zero, and the failure direction is
+    silence, which is the pre-feature status quo.
+    """
+    assert dw.note(cmd) is None
 
 
-def test_every_note_stays_short_enough_to_read():
-    """A refusal message people stop reading is a refusal message that does not work."""
-    cmd = "cp " + " ".join(f"/tmp/file{i}.txt" for i in range(50)) + " /dest && git push"
-    assert len(_mod.note(cmd) or "") < 800
+def test_the_note_says_the_whole_command_went_not_which_files():
+    """The contract that replaced the file list — it must not creep back.
 
-
-# ── the rendered note and the two entry points ───────────────────────────────
-
-
-def test_the_note_says_the_WHOLE_command_was_discarded():
-    """The misreading this exists to correct is 'only the refused step failed'."""
-    text = _mod.note(_MOTIVATING)
+    A future 'small improvement' that names a path is the start of the argv-to-effect
+    modelling this module deleted, so the absence is asserted rather than assumed.
+    """
+    text = dw.note("cat > cfg.py <<'EOF'\nx\nEOF\ngit commit -m x")
+    assert text is not None
     assert "ENTIRE command was discarded" in text
-    assert "did NOT happen" in text
-    assert "an inline python3 script" in text
+    assert "cfg.py" not in text, "the note must not name files — that is the deleted design"
 
 
-def test_the_rerun_guidance_does_not_strip_a_write_of_its_CONDITION():
-    """A note that induces the WRONG action is worse than no note.
-
-    `test -f approved && cp draft final && git push` names `cp draft final`. Told
-    to "re-run them as their own command", a reader performs the copy even when
-    `approved` is absent — which the original shell would never have done. The
-    guidance must carry the prerequisite, not detach it."""
-    text = _mod.note("test -f approved && cp draft final && git push")
-    assert "cp draft final" in text
-    lowered = text.lower()
-    assert "keeping" in lowered and "guarded" in lowered, (
-        "the rerun guidance must tell the reader to preserve what guarded the write"
-    )
-    assert "as their own command" not in lowered, (
-        "the detached-rerun phrasing is what made this unsafe for a conditional write"
-    )
+# ── the approval-prompt variant ──────────────────────────────────────────────
 
 
-def test_no_note_when_nothing_was_discarded():
-    assert _mod.note("cd /x && git push") is None
+def test_the_prompt_note_warns_about_DECLINING_not_about_a_discard():
+    """A prompt has not thrown anything away yet, so the tense must differ.
+
+    The refusal note is past ("was discarded"); the prompt note is conditional
+    ("declining also skips…"). Saying "was discarded" in a dialog where nothing has
+    happened yet would be plainly false, so the two strings are asserted distinct.
+    """
+    prompt = dw.prompt_note("cat > f <<'EOF'\nx\nEOF\ngit push")
+    assert prompt is not None
+    assert "Declining" in prompt
+    assert "was discarded" not in prompt
+    assert prompt != dw.note("cat > f <<'EOF'\nx\nEOF\ngit push")
 
 
-def test_warn_prints_to_stderr(capsys):
-    _mod.warn(_MOTIVATING)
-    assert "did NOT happen" in capsys.readouterr().err
+def test_the_prompt_note_is_silent_on_a_single_step_command():
+    assert dw.prompt_note("git push") is None
 
 
-def test_warn_is_silent_when_there_is_nothing_to_say(capsys):
-    _mod.warn("cd /x && git push")
-    assert capsys.readouterr().err == ""
+def test_the_prompt_note_uses_the_remembered_command():
+    dw._COMMAND = None
+    assert dw.prompt_note() is None, "no remembered command must not invent a note"
+    dw.remember("cd /x && git push")
+    assert dw.prompt_note() is not None
+    dw._COMMAND = None
 
 
-def test_remember_then_warn_with_no_argument(capsys):
-    """Guards hand over the command where they already extract it, because the
-    payload read CONSUMES stdin and cannot be repeated further down."""
-    _mod.remember(_MOTIVATING)
-    _mod.warn()
-    assert "did NOT happen" in capsys.readouterr().err
+def test_the_prompt_note_is_fail_open_on_a_broken_parser(monkeypatch):
+    """It is appended to a permission dialog, so a raise here would cost the gate
+    its prompt — the one failure a cosmetic helper must never cause."""
+
+    def boom(_):
+        raise RuntimeError("parser exploded")
+
+    monkeypatch.setattr(dw, "split_segments", boom)
+    assert dw.prompt_note("a && b") is None
 
 
-def test_remember_ignores_junk(capsys):
-    _mod.remember(None)
-    _mod.remember("")
-    _mod.warn("cd /x && git push")
-    assert capsys.readouterr().err == ""
+# ── it can never change a verdict ────────────────────────────────────────────
 
 
-# ── the CLI, which is how the shell hooks reach this same implementation ─────
+def test_every_entry_point_is_fail_open_on_a_broken_parser(monkeypatch):
+    """A cosmetic helper must never raise into the guard that called it.
+
+    Mutating split_segments to raise stands in for any parser failure. The module's
+    whole safety argument is that its worst case is silence, so this is the test that
+    licenses calling it from inside a security gate.
+    """
+
+    def boom(_):
+        raise RuntimeError("parser exploded")
+
+    monkeypatch.setattr(dw, "split_segments", boom)
+    assert dw.carried_more_than_the_refused_step("a && b") is False
+    assert dw.note("a && b") is None
+    dw.warn("a && b")  # must not raise
 
 
-def _cli(command: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [sys.executable, str(_HELPER), "--command", command],
+def test_warn_never_raises_on_junk_input():
+    for junk in (None, "", "   ", "\x00\xff", "a" * 200_000):
+        dw.warn(junk)  # no assertion: not raising IS the contract
+
+
+def test_remember_then_warn_uses_the_remembered_command(capsys):
+    dw.remember("cat > f <<'EOF'\nx\nEOF\ngit commit -m x")
+    dw.warn()
+    assert "ENTIRE command was discarded" in capsys.readouterr().err
+    dw._COMMAND = None
+
+
+def test_remember_ignores_junk_so_a_stale_command_is_never_printed():
+    dw._COMMAND = None
+    for junk in (None, "", "   ", 42):
+        dw.remember(junk)
+    assert dw._COMMAND is None
+
+
+# ── it can never cost the hook its exit code ─────────────────────────────────
+
+
+def test_the_shape_that_once_sigkilled_the_hook_is_now_instant():
+    """The acceptance replay of the fail-OPEN this rewrite exists to remove.
+
+    MEASURED before: `rm -rf x && >q0000 >q0001 …` at ~63k chars sat inside every
+    input bound and cost 2.5s to assemble a file list; bash_safety_hook.sh pays that
+    TWICE per block against a 5-second registration, so the hook was SIGKILLed before
+    its `exit 2` and the refused `rm -rf` RAN. There is no assembly any more, so the
+    cost is one segmentation pass. A generous bound catches a regression to
+    superlinear behaviour without being flaky on a loaded box.
+    """
+    cmd = " && ".join(f"touch q{i:04d}" for i in range(4000))
+    started = time.monotonic()
+    result = dw.note(cmd)
+    elapsed = time.monotonic() - started
+    assert result is not None, "a 4000-step command certainly carried collateral"
+    assert elapsed < 1.0, f"took {elapsed:.2f}s — the quadratic assembly is back"
+
+
+def test_an_oversized_command_is_refused_before_parsing():
+    """Past the input bound the answer is silence, not a slow parse."""
+    assert dw.note("a && " + "x" * (dw._MAX_COMMAND_CHARS + 1)) is None
+
+
+def test_a_substitution_bomb_is_refused_before_parsing():
+    assert dw.note("a && " + "$(x)" * (dw._MAX_SUBSTITUTIONS + 1)) is None
+
+
+# ── every consumer's guarded import must match its own fallback ──────────────
+
+
+def test_each_guarded_import_has_a_stand_in_for_every_name_it_imports():
+    """The asymmetry class, caught end-to-end and pinned here.
+
+    Every consumer wraps ``from discarded_write import …`` in try/except and defines
+    no-op stand-ins in the except branch, because an unguarded import failure aborts
+    the guard's module load and CC reads the non-2 exit as NON-blocking — the gate
+    vanishes. The failure mode is subtle in the OTHER direction: adding a name to the
+    import without adding its stand-in leaves the fallback fine and the HAPPY path
+    broken, or vice versa.
+
+    MEASURED, this session: the auto-formatter removed a freshly-added import line
+    (its usage was added in a later edit, so the import was momentarily unused) while
+    the hand-written stand-in survived. `git_push_guard` then raised NameError on
+    every push. It failed CLOSED, so nothing was let through — but every push was
+    blocked, and no unit test saw it because they exercise this module directly
+    rather than through a consumer's import.
+
+    Derived by ast over the real consumers, so a new one is covered automatically.
+    """
+    scripts = _HOOKS.parent
+    checked = 0
+    for path in sorted(scripts.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            imported = {
+                (alias.asname or alias.name)
+                for stmt in node.body
+                if isinstance(stmt, ast.ImportFrom) and stmt.module == "discarded_write"
+                for alias in stmt.names
+            }
+            if not imported:
+                continue
+            checked += 1
+            defined = {
+                stmt.name
+                for handler in node.handlers
+                for stmt in handler.body
+                if isinstance(stmt, ast.FunctionDef)
+            }
+            missing = imported - defined
+            assert not missing, f"{path.name}: imported but no fallback stand-in: {missing}"
+    assert checked >= 4, f"the walk found only {checked} guarded imports — it went blind"
+
+
+# ── the CLI the shell hook calls ─────────────────────────────────────────────
+
+
+def test_cli_prints_the_note_to_stderr_and_always_exits_zero():
+    """`bash_safety_hook.sh` calls this; a non-zero exit here would perturb the
+    caller's own verdict, which is the one thing a cosmetic helper must not do."""
+    proc = subprocess.run(
+        [sys.executable, str(_HOOKS / "discarded_write.py"), "--command", "cd /x && git push"],
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=30,
     )
+    assert proc.returncode == 0
+    assert "ENTIRE command was discarded" in proc.stderr
+    assert proc.stdout == "", "stdout belongs to the calling hook's own protocol"
 
 
-def test_cli_prints_the_note_to_stderr():
-    res = _cli(_MOTIVATING)
-    assert "did NOT happen" in res.stderr
-
-
-def test_cli_always_exits_zero_so_it_cannot_perturb_the_caller():
-    """The shell hook's OWN exit code is the verdict. If this CLI could exit
-    non-zero it would be able to turn a block into an allow under `set -e`."""
-    assert _cli(_MOTIVATING).returncode == 0
-    assert _cli("cd /x && git push").returncode == 0
-    assert _cli("").returncode == 0
-
-
-def test_cli_is_silent_when_nothing_was_discarded():
-    assert _cli("cd /x && git push").stderr == ""
-
-
-def test_cli_writes_nothing_to_stdout():
-    """Shell hooks may capture stdout; the note belongs on stderr only."""
-    assert _cli(_MOTIVATING).stdout == ""
+def test_cli_is_silent_and_zero_for_a_single_step_command():
+    proc = subprocess.run(
+        [sys.executable, str(_HOOKS / "discarded_write.py"), "--command", "git push"],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=30,
+    )
+    assert proc.returncode == 0
+    assert proc.stderr == ""
