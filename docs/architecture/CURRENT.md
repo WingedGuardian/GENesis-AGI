@@ -525,7 +525,7 @@ Note: the *learning* package hosts the other big scheduler (see entry 10).
 ```yaml subsystem-map
 entry: scheduling-background
 modules: [surplus, scheduler, follow_ups]
-verified: 1d75bc21 2026-08-31
+verified: 50b79ffb 2026-09-01
 ```
 
 - **Surplus generators are deliberately BLIND to `infrastructure_alert`
@@ -667,7 +667,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 1d75bc21 2026-08-31
+verified: 50b79ffb 2026-09-01
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -925,7 +925,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 1d75bc21 2026-08-31
+verified: 50b79ffb 2026-09-01
 ```
 
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
@@ -1187,7 +1187,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 1d75bc21 2026-08-31
+verified: 50b79ffb 2026-09-01
 ```
 
 - **learning/** is the de-facto cron host: `rt._learning_scheduler` registers
@@ -1272,8 +1272,12 @@ verified: 1d75bc21 2026-08-31
   (calibration + bench both use it — don't add inline copies).
 - **feedback/**: the Outcome Bus (`outcome_events`) — **write-path LIVE
   (harvest 8:45/20:45 + the first real-time emits: task executor COMPLETED/
-  FAILED, WS-2 P1b), read-path DARK** until the P2 grader lands. Tier
-  taxonomy is load-bearing: Tier-1 ground truth outranks user approval.
+  FAILED, WS-2 P1b); read-path PARTIAL** — the ego-ECE calibration consumer is
+  LIVE (`feedback/calibration.py::compute_ego_calibration` reads T1 ground-truth
+  rows via `outcome_events.calibration_pairs(tier=1)`, scheduled from
+  `runtime/init/learning.py` → one `ego_calibration_snapshots` row per run); the
+  broader grading/reinforcement read path stays DARK until the P2 grader lands.
+  Tier taxonomy is load-bearing: Tier-1 ground truth outranks user approval.
   `record_outcome` must never raise. Deliberately "observation, not
   reinforcement" — don't rename toward RL.
 - **calibration/**: Bayesian prediction-calibration primitives, currently
@@ -1398,7 +1402,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: 1d75bc21 2026-08-31
+verified: 50b79ffb 2026-09-01
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
@@ -1433,15 +1437,21 @@ verified: 1d75bc21 2026-08-31
   framed, refreshed on return to Overview) is **PR-B2b** — shipped.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
-  schema paths coexist: base DDL (`schema/_tables.py`, ~117 CREATE TABLE; docs
-  still say "60+") plus versioned `migrations/` 0001..0088 run ONCE at startup
+  schema paths coexist: base DDL (`schema/_tables.py`, 118 CREATE TABLE; docs
+  still say "60+") plus versioned `migrations/` 0001..0089 run ONCE at startup
   before any other init step touches data; a failed migration ABORTS bootstrap.
   EVERY table must be in BOTH paths (fresh-install DDL + its numbered
-  migration) — the `test_db/test_schema.py` allow-list enforces it. Migration
-  atomicity is hand-rolled (BEGIN IMMEDIATE + a proxy that blocks stray
-  commits/DDL autocommit) with a post-commit reconcile and SQLITE_LOCKED
-  retry (2026-06-25 incident guard). No TABLES-vs-sqlite_master parity test
-  exists.
+  migration) — a design CONVENTION whose TABLE-set parity is NOT test-enforced:
+  `test_db/test_schema.py`'s `EXPECTED_TABLES` allow-list only pins the DDL
+  path's table SET (its `db` fixture builds via `create_all_tables` +
+  `seed_data`, never the numbered migrations), and no test asserts DDL-vs-
+  migration table-set parity (nor declared-TABLES-vs-sqlite_master). The one
+  base-path guard that DOES exist (`test_schema_base_path_parity.py`) is
+  narrower — every `INDEXES`-referenced column a numbered migration adds must
+  ALSO be mirrored into `_migrate_add_columns` (the #1123/#1127 legacy-index
+  crash class), not table presence. Migration atomicity is hand-rolled
+  (BEGIN IMMEDIATE + a proxy that blocks stray commits/DDL autocommit) with a
+  post-commit reconcile and SQLITE_LOCKED retry (2026-06-25 incident guard).
   **DATA migrations (WS-C, `db/data_migrations/`) are the OPPOSITE contract:**
   non-schema backfills (Qdrant payloads, entity graphs) that run POST-boot as a
   background `tracked_task` (kicked from `runtime/_core`), never abort boot, are
@@ -1519,28 +1529,36 @@ verified: 1d75bc21 2026-08-31
   model; owner/first-party never recorded). The gate set is CI-locked in
   `test_recall_inject_coverage.py` (a new inject site or a removed emit fails).
   **Gate 1 (procedure) is LIVE in SHADOW** — `record_would_block(gate="procedure")`
-  fires at the two promotion paths that have a trustworthy SOURCE-origin signal:
+  fires at the three promotion paths that have a trustworthy SOURCE-origin signal:
   the judge convergence (`judge._store_judged_procedure`, covering BOTH the
   struggle and rebuild callers) classifies by a coarse tool-name ingest scan over
   the real transcript spine (`provenance.origin_from_tool_names` — external-ingest
   tool → `external_untrusted`; over-observes by design since fetched content lives
   in tool RESULTS the spine doesn't carry); the autonomy retrospective
   (`executor/trace.py`) classifies by `initiated_by` (Genesis's own execution =
-  first_party/owner; the trace has no source-tool spine). Two promotion paths are
-  DEFERRED (classified `deferred-with-reason`, no emit): the deprecated
-  auto-extractor (`extractor.py` — its only signals are replay tools or a
-  hyphen-truncating prose scrape, both undercount) and `procedure_store` (an MCP
-  tool needing the caller's session origin — the session-origin PR's env; it
-  wires that emit). CI-locked in `test_procedure_gate_coverage.py`.
+  first_party/owner; the trace has no source-tool spine); and `procedure_store`
+  (`mcp/memory/procedural.py`) classifies by the CALLER session's origin
+  (`session_origin_from_env()`, coalesced to first_party when the env is unset —
+  an unset env is not a dispatched session; skipped duplicate teaches emit
+  nothing). One promotion path remains DEFERRED (classified
+  `deferred-with-reason`, no emit): the deprecated auto-extractor (`extractor.py`
+  — its only signals are replay tools or a hyphen-truncating prose scrape, both
+  undercount). CI-locked in `test_procedure_gate_coverage.py`.
   **Gates 2-3 (identity/autonomy) are LIVE in SHADOW.** Gate 2: the steering
   write (`learning/pipeline.py`) emits with a CHANNEL allow-map origin
   (`_CHANNEL_ORIGIN`: terminal/telegram/whatsapp/web = owner; voice + unknown
   channels fail CLOSED to external_untrusted — the polarity fix for the
   fail-open `_AUTONOMOUS_CHANNELS` deny-list, so a deny-list escape is now
   OBSERVED), and the USER_KNOWLEDGE synthesis (`runtime/init/learning.py`)
-  emits first_party-by-authorship (FLIP BLOCKER: observations carry no
-  origin_class, so externally-planted user-facts remain first_party until
-  delta-level provenance lands). Gate 3: the emit lives INSIDE
+  emits with REAL propagated provenance — it aggregates the accepted deltas'
+  stored `origin_class` (`external_untrusted` iff ANY contributing delta is
+  external, else `first_party`), no longer hardcoding first_party-by-authorship.
+  The reflection writer (`perception/writer.py`) stamps each user-model-delta
+  observation with `origin_class=run_origin`, a RUN-LEVEL aggregate
+  (`reflection_window_origin` → `external_untrusted` iff any external session
+  overlapped the window). Residual: provenance is run-level, not per-delta (a
+  per-delta signal is still future work); NULL/legacy deltas read first_party.
+  Gate 3: the emit lives INSIDE
   `db/crud/capability_grants.py` (record_success/record_correction/apply_event
   — `origin_class` is a REQUIRED kwarg so every future caller must state
   provenance); all six live callers thread owner/first_party → zero rows today
@@ -1647,7 +1665,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 1d75bc21 2026-08-31
+verified: 50b79ffb 2026-09-01
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -1659,8 +1677,11 @@ verified: 1d75bc21 2026-08-31
 - **skills/**: skills are directories with SKILL.md — registration is catalog
   generation (`scripts/generate_skill_catalog.py` scans `.claude/skills/`,
   `src/genesis/skills/`, `~/.genesis/skill-library/` →
-  `~/.genesis/skill_catalog.json`, self-heals hourly), consumed by the
-  injection hook and by autonomous-session resources. Skill refinement is
+  `~/.genesis/skill_catalog.json`; refresh is prompt-hook-triggered, NOT a
+  scheduler — `skill_injection_hook._ensure_catalog_fresh` spawns a detached
+  regen when the catalog is missing or >1h stale, `_CATALOG_MAX_AGE_S=3600`,
+  serving the next prompt), consumed by the injection hook and by
+  autonomous-session resources. Skill refinement is
   propose-only: `learning/skills/applicator.py` STAGES a proposal for human/CC
   review and never writes a skill file. Recording it as a tracked
   cognitive-file modification is DEFERRED — no ledger pre-image is captured
