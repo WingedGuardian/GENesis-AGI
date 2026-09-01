@@ -78,6 +78,118 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The morning report no longer cries "surplus heartbeat overdue" during a long
+  healthy dispatch.** Surplus emits its subsystem heartbeat only at the end of a
+  dispatch cycle, and a single healthy dispatch can run 15-30 minutes — longer than
+  the old 10-minute overdue threshold — so a busy-but-healthy surplus was flagged
+  "heartbeat overdue" in the morning report and the subsystem-heartbeats view. The
+  threshold is loosened to 3 hours, matching the surplus dashboard tile's own
+  liveness bound; a genuinely dead surplus is still caught within ~15 minutes by the
+  scheduler watchdog, which reads a separate, per-dispatch signal.
+
+- **The Queues card could report "healthy — queues are clear" for counters it
+  never collected.** When the queues section of the health snapshot fails, it is
+  replaced wholesale by an error marker carrying no per-counter detail. The
+  card's verdict only inspected the per-counter error list, so it read every
+  depth as a missing zero and returned a confident green — displayed beside the
+  panel's own "Queue data unavailable" notice, and folded into the overall
+  dashboard status. Unmeasured zeros are now reported as unknown rather than
+  healthy. Relatedly, the "not a confirmed zero" notice was keyed on a list
+  shared by all four queue sources, so an unrelated counter failing printed it
+  above a correctly-counted list of discarded rows; it is now scoped to
+  failures of the count it actually describes.
+
+- **The `/genesis/monitor` page had the same discarded-count bug, plus a worse
+  variant: rows you could not clear.** Its "Clear All Discarded" button was shown
+  only when the 20-row sample held more than one entry, while its label printed
+  the true count — so a backlog whose sample failed to load displayed
+  "Discarded (148)" with no clear control at all. The button now follows the real
+  depth, and appears even when that depth could not be read — it deletes every
+  discarded row regardless, so withholding it was what stranded the backlog. The
+  header labels the sample as truncated. (A queue holding exactly one row still
+  shows no clear-all button — that row is cleared by its own Clear control,
+  which is the intended behaviour.)
+
+- **Dashboard reported the discarded-queue depth as 20 when it was 148.** The
+  Queues panel and the attention strip both rendered `discarded_items.length` —
+  the length of a deliberately capped `LIMIT 20` review sample — instead of
+  `discarded_count`, the true unbounded depth the backend already supplied. Any
+  backlog above 20 therefore displayed as exactly 20, and because the displayed
+  number equalled the cap it looked like a plausible total rather than a
+  truncation. The depth and the review sample are now reconciled ONCE, by the
+  backend, and published as a single object; every surface renders what it is
+  given rather than deciding for itself which of two numbers to believe. So the
+  panel can no longer claim a backlog while showing "no items awaiting review",
+  disable the button that clears it, or report 0 while listing rows. The review
+  list is labelled "showing 20 of N" whenever it is truncated, so the sample
+  cannot be mistaken for the whole queue, and a depth that could not be read is
+  now reported as unknown instead of as an empty queue — with the clear-all
+  control still available, since it removes every row regardless of what was
+  counted.
+
+  **API change:** the health snapshot's `queues` section gains a `discarded`
+  object (`total`, `sample`, `sample_truncated`, `known`). The previous
+  `discarded_count` and `discarded_items` keys remain, and are now derived from
+  that object. `discarded_items` is unchanged. `discarded_count` changes in two
+  states, both toward honesty: when the depth query fails it reports the rows
+  actually in hand rather than 0, and when the depth and the sample disagree it
+  reports the larger rather than the depth alone. Anything reading it as "the
+  queue depth" — including the >100 queue-depth alert — keeps working and
+  under-reports far less in those states: where a failed count previously
+  yielded zero, it now yields the rows actually in hand.
+
+  A depth is reported as EXACT whenever the read that produced it was complete,
+  not merely whenever the count query happened to succeed. A review sample read
+  under a `LIMIT` of one past the cap that comes back short has exhausted the
+  matching rows at its own snapshot, so it is the depth — which means a small
+  queue is now reported exactly even while the count query is failing, instead
+  of as "5+" beside a "queue data unavailable" notice for a number that had in
+  fact just been measured. It also means a count that disagrees with a complete
+  sample no longer influences the total in either direction: a count taken
+  before rows arrived reads low, and one taken before a prune removed them reads
+  high, and neither can be detected by comparing two reads that never shared an
+  instant. Only a TRUNCATED sample still depends on the count, and there the
+  total is published as a floor unless the count is consistent with it. The
+  remaining exposure is stated rather than hidden: with a truncated sample, a
+  prune landing between the two reads can still publish an inflated depth as
+  exact for one cache window; closing that needs both values read under one
+  snapshot and is tracked separately.
+
+  The Queues card's verdict follows the same principle: a diagnostic no longer
+  doubles as an answer to "is this counter known". The card previously read any
+  entry in the section's error list as an uncollected counter, so once a depth
+  could recover from whichever read completed, an exactly-measured queue
+  rendered a precise number beside "some queue counters could not be collected".
+  Errors are not suppressed — they stay in the payload and the panel still shows
+  them — they simply stop deciding a verdict they no longer describe. Counters
+  that publish no exactness of their own are unaffected, and one unrecovered
+  error alongside a recovered one still marks the section unknown.
+
+- **"Clear all reviewed" now says how many rows it will actually delete.** It
+  always deleted every discarded/expired row, not the 20 displayed — harmless
+  while the panel hid the difference, misleading once it reports the true
+  depth. The button reads "Clear all N" with a tooltip stating it is permanent
+  and covers rows not shown.
+
+- **Clearing the queue no longer leaves the dashboard showing the rows it just
+  deleted.** The health snapshot is cached for up to 30s and nothing invalidated
+  it, so the client's immediate refetch re-rendered pre-delete counts: a
+  "Cleared 148 discarded items" toast beside a panel still listing them, with
+  per-row Clear buttons that silently did nothing. Mutations now bust the cache.
+
+  The cache moved into the health service, alongside the computation it caches,
+  and is reached only from the event loop — invalidation raised from a web
+  request is handed to the loop rather than touching shared state across
+  threads. A snapshot whose computation began before a mutation is never
+  published and never handed to a caller that arrived after it, so a cleared
+  queue cannot reappear for the rest of the cache window. On a host that
+  configures no event loop for that hand-off (an embedded plugin host, where
+  invalidation runs on the request thread instead), the cached value is read
+  once and reused rather than tested and then re-read, so an invalidation
+  arriving mid-read can no longer make the endpoint fail outright. Callers that need
+  current data are unaffected: only this endpoint accepts a cached result, and
+  it says so explicitly.
+
 - **A multi-push PR no longer needs `# scheduled-review-override` just because the
   leak-scan routine stamped an earlier commit.** The merge gate now accepts an
   ACCEPTED `leaks` marker on an ancestor of the current head when the `leak-detector`
@@ -120,6 +232,88 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   change a verdict: every import is guarded so a broken helper cannot fail-open a
   security gate, and exit codes are asserted unchanged in both directions —
   including with the helper made deliberately unreachable.
+- **A malformed Claude Code pin on `main` no longer wedges every merge in the
+  repository, and a pin blob that cannot be decoded at the head now blocks.** Two
+  fixes to the CC pin-receipt merge gate, one narrow and one broad.
+
+  The narrow one: the gate splits its fail direction between facts about a PR's
+  CONTENT (block) and failures of its own PLUMBING (note, do not block). A pin blob
+  over GitHub's 1MB inline limit (the contents API answers `"encoding": "none"` with
+  no content) and a blob whose base64 will not decode are both statements about what
+  the PR contains, yet both were classified as plumbing — so a PR moving the pin
+  forward while carrying either one skipped the receipt requirement entirely. They
+  now have their own `undecodable` outcome and block at the head. Genuine plumbing
+  failures (no repo slug, transport error, a non-JSON body, an unresolvable ref) stay
+  non-blocking: refusing every merge whenever a read comes back unusable once walled
+  off 50 merge-gate cases at a stroke.
+
+  The broad one: **the base branch no longer decides anything by itself.** Previously
+  an empty, whitespace-only, unassigned, doubly-assigned or absent pin file on the
+  base branch blocked *every* pull request — including PRs that never touch
+  `cc_version.sh`, including a fully compliant pin bump carrying both receipts, and
+  including the pull request that would have repaired the pin. The gate has no
+  override sigil by design, so there was no in-band recovery: one bad commit to `main`
+  stopped all merges.
+
+  A base whose pin is *faulty* is now treated as a missing INPUT rather than as an
+  answer. Direction is then unknowable, and both of the obvious responses are wrong:
+  blocking wedges the repository, while passing lets a PR that repairs the base and
+  bundles a forward release in the same change ship with no receipts at all — a case
+  CI cannot see, because that PR's merge tree contains the *repaired* file, so
+  `cc-node-lockstep` passes and the check is green. So the gate asks for the receipts
+  in place of the comparison it could not run, and marks the verdict as having
+  verified nothing about direction. Receipts are a line in the PR body, so this
+  refuses a merge, never the repository's ability to repair itself.
+
+  A base the gate simply could not *read* — an API timeout, a non-JSON body, an
+  unresolvable ref — stays non-blocking, as it always has. That distinction is the
+  gate's CONTENT-versus-PLUMBING axis applied to the base side, and it has to be
+  carried explicitly: both cases yield no base text, so deriving it from the text
+  alone would let one transient network blip demand release receipts from every open
+  PR.
+
+  A pin file that is not valid UTF-8 now lands on the CONTENT side of that axis
+  rather than crashing the check. The CI adapter reads the base with `git show`,
+  which decodes as it reads, and the decode error is not one of the error types that
+  read was catching — so a single stray byte in `cc_version.sh` ended the run with a
+  traceback instead of a verdict, and took the `--advisory` mode's "never exits
+  non-zero" guarantee with it. Reading it as CONTENT is what keeps that byte from
+  buying a free pass: the *plumbing* classification would have waved the pin through
+  unreceipted. The equivalent head-side read already did this; only the base-side one
+  was missed.
+
+  A base pin that is not **installable** yields no reference value either. `npm
+  install @anthropic-ai/claude-code@2.1.0250` does not resolve, so that version never
+  ran anywhere — and both the unchanged and the *backward* exemptions rest on the
+  claim that it did. Measured: `2.1.0250 → 2.1.246` passed with an empty body as a
+  "rollback" to a version that had never existed. A non-canonical base now takes the
+  unknown-direction path, so the canonical repair stays mergeable but has to be
+  attested like every other unverifiable direction.
+
+  A receipt written **beside** one of the PR template's `<!-- -->` prompts now
+  counts. The body scanner discarded the rest of any line a comment appeared on —
+  opening or closing — so an author filling in this repo's own template put both
+  receipts where GitHub renders them and the gate reported them missing, through a
+  check with no override sigil.
+
+  Whether a PR touched the pin at all is decided from the PR's own **changed-file
+  list**, which GitHub computes against the merge base — the same thing the merge
+  uses. Comparing the head tree against the base *tip* gets one class wrong: a PR that
+  branched before the base's latest pin change still carries the older blob, so the
+  tips differ even though the merge keeps the base's version and never touches the
+  file. With a malformed new base pin that demanded receipts from exactly the stale,
+  unrelated PRs this fix exists to unblock. The **blob SHA** is the fallback when that
+  list is unavailable or truncated — never the file CONTENTS, which are both empty
+  whenever a read fails, so two *different* oversized blobs compared equal and
+  reported an untouched pin.
+
+  Two rules now follow from the merge being the publication, since `origin` is the
+  public repo. A pin present but unreadable at the head blocks. And the head pin must
+  be canonical `X.Y.Z` **whenever the PR wrote it** — `npm install …@2.1.0218` does
+  not resolve — while a non-canonical pin *inherited* unchanged does not block, which
+  is what makes the canonical repair of a malformed pin (`2.1.0218` → `2.1.218`)
+  expressible at all. It was previously refused as "incomparable", leaving a malformed
+  pin unmergeable by anyone.
 
 - **The ego's self-model stopped presenting stale, thin and arbitrarily-ranked
   rows as present-tense capability.** `capability_map` feeds three ego-prompt

@@ -1118,6 +1118,16 @@ class DirectSessionRunner:
             return
         proposal_id = request.caller_context.split(":", 1)[1]
         advisories: list[str] = []
+        # WS-3: a dispatch outcome inherits the SESSION's provenance. A
+        # research/interact/etc. dispatch is external_untrusted — its output can
+        # echo web/browser content, and these outcome memories are now
+        # default-recallable (source_subsystem dropped), so an unstamped one
+        # would default to first_party and bypass recall-time external-content
+        # handling (a laundered indirect prompt injection). Stamp it with the
+        # SAME origin the session's own memories carry (see _PROFILE_ORIGIN use
+        # at session launch). memory_class="fact" pins these as operational
+        # facts so a summary echoing MUST/NEVER isn't misfiled as a rule.
+        dispatch_origin = _PROFILE_ORIGIN.get(request.profile)
         try:
             from genesis.db.crud.ego import (
                 mark_proposal_verification_failed,
@@ -1154,9 +1164,10 @@ class DirectSessionRunner:
                                 source="ego_dispatch_verification",
                                 tags=["ego", "verification_failure"],
                                 memory_type="episodic",
+                                memory_class="fact",
+                                origin_class=dispatch_origin,
                                 wing="autonomy",
                                 room="ego",
-                                source_subsystem="ego",
                             )
                     except Exception:
                         logger.debug(
@@ -1188,22 +1199,33 @@ class DirectSessionRunner:
                 success=result.success,
                 summary=summary,
             )
-            # On failure: create observation so ego sees it next cycle
-            if not result.success:
-                try:
-                    store = getattr(self._rt, "_memory_store", None)
-                    if store is not None:
-                        await store.store(
-                            content=(f"Ego dispatch FAILED for proposal {proposal_id}: {summary}"),
-                            source="ego_dispatch_outcome",
-                            tags=["ego", "dispatch_failure"],
-                            memory_type="episodic",
-                            wing="autonomy",
-                            room="ego",
-                            source_subsystem="ego",
-                        )
-                except Exception:
-                    logger.debug("Failed to store failure observation", exc_info=True)
+            # Record the dispatch outcome (BOTH polarities) as a retrievable
+            # memory so the ego and later CC sessions can recall what happened to
+            # a dispatch — not just failures. Stored WITHOUT source_subsystem: a
+            # dispatch outcome is operational history, not internal decisional
+            # output, so it must stay in default recall / the proactive hook
+            # (classified in test_store_subsystem_coverage's USER_CONTEXT_ALLOWLIST).
+            try:
+                store = getattr(self._rt, "_memory_store", None)
+                if store is not None:
+                    if result.success:
+                        content = f"Ego dispatch SUCCEEDED for proposal {proposal_id}: {summary}"
+                        outcome_tag = "dispatch_success"
+                    else:
+                        content = f"Ego dispatch FAILED for proposal {proposal_id}: {summary}"
+                        outcome_tag = "dispatch_failure"
+                    await store.store(
+                        content=content,
+                        source="ego_dispatch_outcome",
+                        tags=["ego", outcome_tag],
+                        memory_type="episodic",
+                        memory_class="fact",
+                        origin_class=dispatch_origin,
+                        wing="autonomy",
+                        room="ego",
+                    )
+            except Exception:
+                logger.debug("Failed to store dispatch outcome observation", exc_info=True)
         except Exception:
             logger.warning(
                 "Failed to record proposal outcome for %s",

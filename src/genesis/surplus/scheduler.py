@@ -826,9 +826,12 @@ class SurplusScheduler:
         except Exception:
             pass
         try:
-            # Record heartbeat at loop entry so the watchdog sees liveness
-            # even when a single dispatch_once() blocks for 15-30 minutes
-            # (sequential task execution + intake pipeline overhead).
+            # Refresh job_health at loop entry (and before each dispatch, below) so the
+            # 900s zombie-scheduler watchdog sees liveness across a SEQUENCE of moderate
+            # dispatches. KNOWN GAP: this does NOT refresh DURING one dispatch_once that
+            # itself blocks 15-30 min — last_run then gaps, and unless heavy_workload is set
+            # (only the dream jobs set it) the watchdog could restart a healthy-but-slow
+            # surplus. Latent — no such restart observed to date; tracked as a follow-up.
             try:
                 from genesis.runtime import GenesisRuntime
 
@@ -837,8 +840,9 @@ class SurplusScheduler:
                 pass
 
             for _ in range(3):
-                # Refresh heartbeat before each dispatch so slow or
-                # failing tasks don't trip the 900s watchdog threshold.
+                # Refresh before each dispatch so a SEQUENCE of slow/failing tasks
+                # doesn't trip the 900s watchdog (does NOT cover the single-long-dispatch
+                # gap noted at loop entry).
                 with contextlib.suppress(Exception):
                     GenesisRuntime.instance().record_job_success("surplus_dispatch")
                 if not await self.dispatch_once():

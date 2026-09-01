@@ -302,8 +302,9 @@ not judgment.
 
 **And verify COVERAGE separately from accuracy — they fail differently.** Re-deriving the findings
 the agent returned can only catch findings that are *wrong*; it cannot detect releases the agent
-never opened. From CC **2.1.246 onward** (the current pin is 2.1.218 — check which version the delegating
-session is actually running) a subagent that hits `maxTurns` returns **partial output without
+never opened. From CC **2.1.246 onward** — which the pin now is, though an install may be running
+something else, so check what the delegating session is ACTUALLY on rather than assuming the
+pin — a subagent that hits `maxTurns` returns **partial output without
 failing**, so a silent stop two-thirds through the range is indistinguishable from a genuinely short
 report. Close that by construction: enumerate every `## ` release heading in `(pinned, target]`
 yourself (`grep -n '^## ' ~/tmp/cc_changelog.md`), and require the agent to acknowledge each release
