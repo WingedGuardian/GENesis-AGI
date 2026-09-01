@@ -93,6 +93,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The morning report no longer cries "surplus heartbeat overdue" during a long
+  healthy dispatch.** Surplus emits its subsystem heartbeat only at the end of a
+  dispatch cycle, and a single healthy dispatch can run 15-30 minutes — longer than
+  the old 10-minute overdue threshold — so a busy-but-healthy surplus was flagged
+  "heartbeat overdue" in the morning report and the subsystem-heartbeats view. The
+  threshold is loosened to 3 hours, matching the surplus dashboard tile's own
+  liveness bound; a genuinely dead surplus is still caught within ~15 minutes by the
+  scheduler watchdog, which reads a separate, per-dispatch signal.
+
 - **The Queues card could report "healthy — queues are clear" for counters it
   never collected.** When the queues section of the health snapshot fails, it is
   replaced wholesale by an error marker carrying no per-counter detail. The
