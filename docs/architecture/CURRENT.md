@@ -971,9 +971,10 @@ verified: ca875c4b 2026-07-24
 - **Subsystem-cessation alerts (the honest-liveness family, `_compute_alerts`)**:
   three durable `subsystem_stale`-family alerts so a dead scheduler cannot read
   healthy. `subsystem_stale:<name>` (ego CRITICAL; inbox/dashboard/outreach WARNING)
-  fires when a subsystem's durable `events`-table heartbeat goes overdue past its
-  per-subsystem `HEARTBEAT_EXPECTED` threshold (via
-  `mcp/health/manifest.py::compute_heartbeat_staleness`); `subsystem_never_started:<name>`
+  fires when a subsystem's heartbeat — the freshest valid pulse across the durable
+  `events` table and the in-memory event-bus ring — goes overdue past its per-subsystem
+  `HEARTBEAT_EXPECTED` threshold (via `mcp/health/manifest.py::compute_heartbeat_staleness`);
+  `subsystem_never_started:<name>`
   tells a FAILED / never-pulsed start (cross-referenced against the persisted bootstrap
   manifest, past a boot grace) from a fresh install; `subsystem_heartbeat_unknown` covers
   a corrupt/unreadable pulse. Pause-gated subsystems (`surplus`, `inbox`) downgrade
