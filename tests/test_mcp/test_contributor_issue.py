@@ -406,6 +406,23 @@ async def test_label_policy_scoped_to_tracker_repo(db, live, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_label_policy_matches_tracker_by_canonical_repo(db, live, monkeypatch):
+    """The scope check normalizes the repo (drops a gh `host/` prefix, casefolds), so
+    a case/host VARIANT of the tracker is still policed — it can't skip the teeth by
+    using a non-canonical slug for the same repo (Kimi review, 2026-08-31)."""
+    monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)  # WingedGuardian/GENesis-AGI
+    res = await ci._impl_contributor_issue_propose(
+        db,
+        title="A clean title",
+        body="A clean body.",
+        labels=[],  # unlabeled ...
+        repo="github.com/wingedguardian/genesis-agi",  # ... host-prefixed + lowercase variant → still the tracker
+    )
+    assert res["status"] == "rejected"
+    assert await pip.list_held(db) == []
+
+
+@pytest.mark.asyncio
 async def test_privacy_block_precedes_label_policy(db, live):
     """Placement invariant: the label policy runs AFTER the privacy scan, so a
     proposal that is BOTH label-invalid AND carries a private identifier reports
