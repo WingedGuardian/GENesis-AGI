@@ -610,6 +610,38 @@ if [ -d "$_EVAL_DIR" ]; then
     fi
 fi
 
+# --- 6d. Hook audit stores (Tier 1) ---
+# The merge gate's override records: which merges bypassed which gate, and on what
+# stated grounds. One small file per flush, own-user-only, and SELF-CONTAINED —
+# every field (sigil, waived gate, PR, repo, head sha) means the same thing on a
+# restored install, so the trail survives a rebuild intact. Plain copy, like the
+# infrastructure profile above: the backups repo is private, and the writer
+# refuses to persist command text, so these rows carry no credential material.
+#
+# The git-discard store is DELIBERATELY not here, and that is the whole reason this
+# block names one store instead of globbing ~/.genesis. Its recovery payload is a
+# `git stash create` sha that exists ONLY in the local repo's object store: such
+# objects are never pushed, git prunes unreachable ones (default two weeks), and
+# this script captures no object store at all. Restoring it onto a rebuilt
+# container yields a list of pointers to nothing — a trail that LOOKS recoverable
+# while every recovery attempt fails, which is worse than an absent one. At a live
+# install, of 76 recorded shas one was already unresolvable in the repo that wrote
+# it. Making it genuinely restorable means backing up the objects, not the records.
+_OVERRIDE_STORE="$HOME/.genesis/merge_overrides"
+if [ -d "$_OVERRIDE_STORE" ]; then
+    log "Backing up hook audit stores..."
+    mkdir -p audit/merge_overrides
+    _AUDIT_COUNT=0
+    while IFS= read -r -d '' _f; do
+        if cp "$_f" "audit/merge_overrides/$(basename "$_f")"; then
+            _AUDIT_COUNT=$(( _AUDIT_COUNT + 1 ))
+        else
+            log "WARNING: failed to copy $(basename "$_f")"
+        fi
+    done < <(find "$_OVERRIDE_STORE" -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
+    log "Hook audit stores: $_AUDIT_COUNT file(s)"
+fi
+
 # --- 7. Secrets (encrypted with GPG symmetric) ---
 log "Backing up secrets (encrypted)..."
 mkdir -p secrets
@@ -926,7 +958,7 @@ fi
 backend_cleanup
 
 # --- Ensure .gitignore excludes Tier 2 files ---
-# Tier 1 (git): memory/, config_overrides/, secrets/, infrastructure/
+# Tier 1 (git): memory/, config_overrides/, secrets/, infrastructure/, audit/
 # Tier 2 (off-site): data/, transcripts/
 if ! grep -q '^data/$' .gitignore 2>/dev/null; then
     cat >> .gitignore << 'GITIGNORE'

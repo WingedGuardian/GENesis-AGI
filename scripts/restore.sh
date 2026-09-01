@@ -807,6 +807,40 @@ else
     log "Overlays: no backup directory"
 fi
 
+# ── 6d. Hook audit stores ────────────────────────────────────────────
+# NEVER overwrite a live record, even under --force. Restoring is purely ADDITIVE
+# and that is a property of the store's shape rather than a rule we enforce: each
+# file is named from the writing instant plus pid, so a backup file and a live one
+# cannot collide unless they ARE the same record. The explicit existence test below
+# fills the gaps a rebuild left and cannot destroy anything a running install has
+# written since — deliberately not `cp -n`, whose skip is indistinguishable from a
+# copy in its exit status and which coreutils warns may change behaviour.
+log "--- Hook audit stores ---"
+_AUDIT_SRC="$BACKUP_DIR/audit/merge_overrides"
+_AUDIT_DST="$HOME/.genesis/merge_overrides"
+if [ ! -d "$_AUDIT_SRC" ]; then
+    log "Audit stores: no backup payload"
+elif $DRY_RUN; then
+    log "Audit stores: would restore $(find "$_AUDIT_SRC" -maxdepth 1 -type f -name '*.jsonl' 2>/dev/null | wc -l) file(s) → $_AUDIT_DST"
+else
+    mkdir -p "$_AUDIT_DST" && chmod 0700 "$_AUDIT_DST"
+    _AUDIT_RESTORED=0
+    while IFS= read -r -d '' _f; do
+        # 0600 to match the writer's own guarantee; umask alone would not promise it.
+        _dst="$_AUDIT_DST/$(basename "$_f")"
+        # Count only REAL copies. `cp -n` exits 0 when it SKIPS an existing file, so
+        # counting its status reported every skipped file as restored. Test the
+        # destination's absence instead, which is the condition actually meant.
+        if [ ! -e "$_dst" ]; then
+            if cp "$_f" "$_dst" 2>/dev/null; then
+                chmod 0600 "$_dst" 2>/dev/null || true
+                _AUDIT_RESTORED=$(( _AUDIT_RESTORED + 1 ))
+            fi
+        fi
+    done < <(find "$_AUDIT_SRC" -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
+    log "Audit stores: $_AUDIT_RESTORED file(s) restored → $_AUDIT_DST (existing left untouched)"
+fi
+
 # ── 7. Secrets ───────────────────────────────────────────────────────
 log "--- Secrets ---"
 SECRETS_SRC="$BACKUP_DIR/secrets/secrets.env.gpg"

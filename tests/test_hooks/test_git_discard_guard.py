@@ -68,15 +68,27 @@ def repo(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def snap_log(tmp_path: Path, monkeypatch) -> Path:
-    log = tmp_path / "snapshots.jsonl"
-    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_LOG", str(log))
-    return log
+    """The recovery STORE — a directory, one file per snapshot."""
+    store = tmp_path / "snapshots"
+    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_DIR", str(store))
+    return store
 
 
-def _rows(log: Path) -> list[dict]:
-    if not log.exists():
+def _snap_files(store: Path) -> list[Path]:
+    """Record files, oldest first. REGULAR files only, without following links —
+    a reader must skip anything else, exactly as ``trim_dir_by_size`` does."""
+    if not store.exists():
         return []
-    return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+    return sorted(f for f in store.glob("*.jsonl") if f.is_file() and not f.is_symlink())
+
+
+def _rows(store: Path) -> list[dict]:
+    return [
+        json.loads(line)
+        for f in _snap_files(store)
+        for line in f.read_text().splitlines()
+        if line.strip()
+    ]
 
 
 # ── the guard never blocks the RECOVERABLE verbs ─────────────────────────────
@@ -516,35 +528,77 @@ def test_log_row_has_no_command(repo, snap_log):
     row = _rows(snap_log)[0]
     assert set(row) == {"ts", "cwd", "sha"}
     assert "SECRET-TOKEN-XYZ" not in json.dumps(row)
-    assert "SECRET-TOKEN-XYZ" not in snap_log.read_text()
+    assert not any("SECRET-TOKEN-XYZ" in f.read_text() for f in _snap_files(snap_log))
 
 
-def test_log_and_lock_are_own_user_only(repo, snap_log):
+def test_store_and_records_are_own_user_only(repo, snap_log):
+    """The store sits in ~/.genesis beside secrets, so both levels matter.
+
+    There is no sidecar lock any more: one file per snapshot means nothing is
+    shared, so nothing needs serialising and there is no second file to protect.
+    """
     (repo / "tracked.py").write_text("dirty\n")
     _gd._record_snapshots("git checkout -- tracked.py", {"cwd": str(repo)})
-    assert stat.S_IMODE(snap_log.stat().st_mode) == 0o600
-    lock = Path(str(snap_log) + ".lock")
-    assert lock.exists() and stat.S_IMODE(lock.stat().st_mode) == 0o600
+    assert stat.S_IMODE(snap_log.stat().st_mode) == 0o700
+    files = _snap_files(snap_log)
+    assert files, "no record file was written"
+    for f in files:
+        assert stat.S_IMODE(f.stat().st_mode) == 0o600, f
+    assert not list(snap_log.glob("*.lock")), "the sidecar lock should be gone"
 
 
-def test_relative_log_override(repo, tmp_path, monkeypatch):
+def test_a_relative_store_override_is_REFUSED(repo, tmp_path, monkeypatch, capsys):
+    """A relative override would put durable recovery records inside the repo.
+
+    It resolves against the hook's cwd, so `rel_store` lands in whatever tree the
+    guarded command ran in — where it can be committed, and where a worktree removal
+    destroys it. The store's own docstring already claimed it "lives outside any
+    repo"; this is what makes that true.
+
+    An earlier version of this test asserted the OPPOSITE, pinning the permissive
+    behaviour, while the sibling merge-override store refused the same input. The
+    asymmetry was the defect, not the refusal.
+
+    Tests the RESOLVER rather than driving a write, deliberately: the refusal falls
+    back to the live default, so a test that wrote here would put a record in the
+    operator's real recovery store.
+    """
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_LOG", "rel.jsonl")
-    (repo / "tracked.py").write_text("dirty\n")
-    _gd._record_snapshots("git checkout -- tracked.py", {"cwd": str(repo)})
-    assert len(_rows(tmp_path / "rel.jsonl")) == 1
+    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_DIR", "rel_store")
+    resolved = _gd._snapshot_dir()
+    assert os.path.isabs(resolved), resolved
+    assert not resolved.endswith("rel_store"), "the relative override was honoured"
+    assert "must be an absolute path" in capsys.readouterr().err
+    assert not (tmp_path / "rel_store").exists()
 
 
-def test_log_trim_keeps_newest_half(repo, tmp_path, monkeypatch):
-    log = tmp_path / "snap.jsonl"
-    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_LOG", str(log))
-    monkeypatch.setattr(_gd, "_SNAPSHOT_LOG_MAX_BYTES", 2000)
-    log.write_text("\n".join(f'{{"ts":"old","sha":"{i:040d}"}}' for i in range(50)) + "\n")
+def test_the_hook_writes_but_never_maintains_the_store(repo, tmp_path, monkeypatch):
+    """Retention moved OFF the hook path, and this is what keeps it off.
+
+    The previous design self-trimmed on every write: a guard about to refuse a
+    destructive command was also rewriting a file, and that retention engine was
+    the source of most of this writer's defects. The hook now only ever ADDS.
+    Pre-existing records must survive a new snapshot untouched — asserted by
+    content, not by count, so a trim that rewrote them would fail here.
+    """
+    store = tmp_path / "store"
+    monkeypatch.setenv("GENESIS_DISCARD_SNAPSHOT_DIR", str(store))
+    store.mkdir()
+    seeded = {}
+    for i in range(50):
+        f = store / f"20200101T000000_{i:06d}Z-1-0.jsonl"
+        f.write_text(f'{{"ts":"old","sha":"{i:040d}"}}\n')
+        seeded[f] = f.read_text()
+
     (repo / "tracked.py").write_text("dirty\n")
     _gd._record_snapshots("git checkout -- tracked.py", {"cwd": str(repo)})
-    rows = _rows(log)
-    assert rows and rows[-1]["cwd"] == str(repo)
-    assert len(rows) < 50  # the trim actually fired
+
+    for f, body in seeded.items():
+        assert f.exists(), f"the hook deleted a pre-existing record: {f.name}"
+        assert f.read_text() == body, f"the hook rewrote a pre-existing record: {f.name}"
+    rows = _rows(store)
+    assert len(rows) == 51, "the new snapshot must be ADDED, not merged into a rewrite"
+    assert rows[-1]["cwd"] == str(repo)
 
 
 def test_recovery_note_returned(repo, snap_log):
