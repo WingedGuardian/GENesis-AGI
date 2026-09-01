@@ -1300,7 +1300,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: 409338c9 2026-08-07
+verified: d2d501b1 2026-08-31
 ```
 
 - **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
@@ -1308,7 +1308,15 @@ verified: 409338c9 2026-08-07
   free-only. Per-provider circuit breaker (3 failures, exponential backoff
   capped 30 min — 4h for QUOTA_EXHAUSTED; 429 = backpressure, NOT a breaker
   failure; state persisted cross-process to
-  `~/.genesis/circuit_breaker_state.json`). Degradation levels are
+  `~/.genesis/circuit_breaker_state.json`). A health PROBE may heal a breaker
+  only for TRANSIENT/TIMEOUT — never PERMANENT/QUOTA_EXHAUSTED, where a
+  models-listing 200 is exactly what a 403-on-use looks like and a false heal
+  resets the outage clock. Consequence to know before touching it: the heal
+  branch also zeroes `_trip_count`, so refusing it leaves the backoff climbing
+  to the cap instead of resetting — a dead provider is retried less often, and a
+  quota-dead one may wait the full 4h. `last_failure_category` is restored from
+  disk ONLY when the saved state was OPEN — a qualifier must not outlive the
+  state it qualifies, or it poisons the heal guard for a healthy provider. Degradation levels are
   hand-curated: L2 sheds nice-to-haves; **L3 keeps ONLY micro-reflection,
   embeddings, tagging** — changing those sets changes what survives an outage.
   Some call sites alias another site's chain — don't assume 1:1.
@@ -1330,7 +1338,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: 3c514f3e 2026-08-10
+verified: d2d501b1 2026-08-31
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
@@ -1423,7 +1431,10 @@ verified: 3c514f3e 2026-08-10
   sentinel's own `last_probe_at` and fail toward their safe default.
 - **observability/**: event bus dispatches inline AND logs every event;
   persist-queue overflow drops events but emits a rate-limited "dropped"
-  meta-event (WS-17). Two health layers (async probes vs systemd shell-out) — a probe may HEAL a breaker only for TRANSIENT/TIMEOUT failures, never for PERMANENT/QUOTA_EXHAUSTED, because a models-listing 200 is exactly what a 403-on-use looks like and a false heal resets the outage clock;
+  meta-event (WS-17). Two health layers (async probes vs systemd shell-out) — a
+  probe HEALS a breaker only for TRANSIENT/TIMEOUT, never for
+  PERMANENT/QUOTA_EXHAUSTED (a models-listing 200 is exactly what a 403-on-use
+  looks like, and a false heal resets the outage clock);
   `/health` is a dashboard route, not an MCP tool; `job_health` state machine
   is runtime-owned. `snapshots/deploy_health.py` = merged-vs-deployed drift
   (never does network I/O; host guardian state comes from

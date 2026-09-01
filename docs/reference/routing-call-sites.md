@@ -198,18 +198,30 @@ heals on `model_available is True`, so three probe sweeps closed the breaker,
 fired `on_recovery`, and `ProviderEscalation.record_recovery` resolved the
 `provider_failure` observation and cleared its `first_trip_at` — the only
 per-provider "failing since" timestamp in the system. The next real call failed
-again and the cycle repeated roughly every 40 minutes, so a three-day outage was
-recorded as a series of short incidents that each recovered, and no surface could
-report a duration. Measured on a live install: 33 calls, 33 failures, zero
-successes over 24h, with five separate `provider_failure` observations opened and
-resolved across three days.
+again and the cycle repeated, so a multi-day outage was recorded as a series of
+short incidents that each recovered, and no surface could report a duration.
+Measured on a live install: 32 calls, 32 failures, zero successes over 23h (a
+sibling provider on the same key and code path succeeded 351/352 in the same
+window), with five separate `provider_failure` observations opened and resolved
+across three days. The false heals were roughly 9-12h apart, not per probe
+cycle — between them the breaker's backoff escalated normally (consecutive trips
+5/5/10/20/35/65/128 minutes apart, matching `120 * 2^(trip-1)`).
 
 `record_probe_success()` now refuses to heal when the last failure category is
 `PERMANENT` or `QUOTA_EXHAUSTED`. Probe healing is unchanged for
 `TRANSIENT`/`TIMEOUT`, which is the low/no-traffic recovery case it exists for.
-This cannot strand a provider: `HALF_OPEN` is still `is_available()`, so real
+This does not strand a provider: `HALF_OPEN` is still `is_available()`, so real
 traffic is attempted and a real `record_success()` closes the breaker as before —
 recovery now requires evidence of a working *call* rather than a listing.
+
+It does change the retry schedule, which is the deliberate cost. The heal branch
+also reset `_trip_count`, so refusing it leaves the backoff climbing: a dead
+provider's open window now settles at the cap (30 min, or 4 h when the failure is
+classified `QUOTA_EXHAUSTED`) instead of dropping back to the 120 s base every
+9-12 h. That is the intent for a genuinely dead provider, but it means a provider
+whose *quota* resets may not be retried for up to 4 h. Reading the provider's own
+retry hint (`Retry-After`, or the interval named in a 429 body) is the exact fix
+and is tracked separately — until then the cap is the bound.
 
 Related, same incident: alert messages now carry `(ongoing for Xd Yh)` from
 `alert_events.created_at` (90-day retention, previously unread), and four

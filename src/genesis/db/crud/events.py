@@ -439,7 +439,11 @@ async def query_grouped_errors(
                         WHEN 3 THEN 'warning'
                         WHEN 2 THEN 'info'
                         WHEN 1 THEN 'debug'
-                        ELSE MIN(severity)  -- unknown value: surface it, never NULL
+                        -- Defensive only: the WHERE clause above filters to
+                        -- warning/error/critical, so this branch is unreachable
+                        -- today. It exists so widening that filter cannot
+                        -- silently yield NULL here.
+                        ELSE MIN(severity)
                    END AS worst_severity,
                    COUNT(*) AS count,
                    MIN(timestamp) AS first_seen,

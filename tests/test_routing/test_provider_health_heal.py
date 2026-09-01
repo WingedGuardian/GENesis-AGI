@@ -122,11 +122,17 @@ def test_entitlement_failure_is_not_healed_by_a_listing_probe():
 
     Live incident 2026-08-28/29: `mistral-large-latest` stayed listed by
     `GET /v1/models` while every real call returned 403 `tier_not_allowed`. The
-    probe therefore "confirmed health" three times per cycle, closed the breaker,
-    fired on_recovery, and `ProviderEscalation.record_recovery` RESOLVED the
-    provider_failure observation and cleared its `first_trip_at`. A 3-day
-    permanent outage was rendered as a series of ~40-minute incidents that each
-    recovered, which is why nothing ever reported a multi-day duration.
+    probe therefore "confirmed health", closed the breaker, fired on_recovery,
+    and `ProviderEscalation.record_recovery` RESOLVED the provider_failure
+    observation and cleared its `first_trip_at`.
+
+    MEASURED over the live 3-day outage: FIVE separate `provider_failure`
+    observations, each carrying a fresh `first_trip_at`, four auto-resolved this
+    way. So the longest duration any surface could report was the time since the
+    last false heal, never the real age of the outage. The reset cadence was
+    ~9-12h, NOT once per probe cycle: `events` shows consecutive trips
+    5/5/10/20/35/65/128 min apart, i.e. the backoff escalated normally between
+    resets.
 
     A listing probe is weaker evidence than a real completion for ANY failure,
     but for a PERMANENT one it is not evidence at all — the endpoint being up is
@@ -147,10 +153,11 @@ def test_quota_exhausted_is_not_healed_by_a_listing_probe():
     """The live category for the real incident.
 
     `classify_error` maps a 403 whose body contains a quota keyword to
-    QUOTA_EXHAUSTED (`retry.py`), and the persisted breaker state for
-    `mistral-large-free` reads exactly that. So this is the case that actually
-    fired in production, and it must not heal on a listing either: an exhausted
-    or entitlement-blocked account still serves `/v1/models` perfectly.
+    QUOTA_EXHAUSTED (`retry.py`), and on the install where this was diagnosed the
+    persisted breaker state for the affected provider carried exactly that
+    category. So this is the case that actually fired, and it must not heal on a
+    listing either: an exhausted or entitlement-blocked account still serves
+    `/v1/models` perfectly.
     """
     reg, prov = _half_open_with(ErrorCategory.QUOTA_EXHAUSTED)
     checker = ProviderHealthChecker(_config(prov), breakers=reg)
@@ -165,8 +172,13 @@ def test_a_real_success_still_heals_an_entitlement_failure():
 
     Blocking the PROBE must not make a dead provider unrecoverable. HALF_OPEN is
     still `is_available()`, so real traffic is attempted; when access is restored
-    a real completion closes the breaker exactly as before. Without this test the
-    fix above could pass while permanently stranding a recovered provider.
+    a real completion closes the breaker exactly as before.
+
+    Scope note, stated honestly: this also passes with the guard removed, because
+    it exercises `record_success`, which the guard does not touch, and it gives
+    the provider TRAFFIC. It pins the recovery CONTRACT, not the guard. The
+    no-traffic stranding risk — the one that actually bites — is covered by the
+    restart test at the bottom of this file.
     """
     reg, prov = _half_open_with(ErrorCategory.PERMANENT)
     cb = reg.get("free-1")
@@ -188,3 +200,57 @@ def test_transient_failure_is_still_healed_by_a_probe():
     for _ in range(3):
         checker._sync_to_breakers()
     assert reg.get("free-1").state == ProviderState.CLOSED
+
+
+def test_a_restart_does_not_carry_a_stale_category_onto_a_closed_breaker(tmp_path):
+    """A qualifier must not outlive the state it qualifies.
+
+    `load_state` restores `_state` only when the saved value was OPEN, but
+    restored `_last_failure_category` UNCONDITIONALLY. So a breaker persisted
+    while HALF_OPEN came back CLOSED still carrying "permanent" — and the
+    probe-heal guard then read that dead fact from a previous process forever.
+
+    That is reachable in normal operation: the `.state` property mutates
+    OPEN -> HALF_OPEN as a side effect of being READ (every routing decision
+    reads it), and `save_state` serialises every breaker whenever any one of
+    them changes.
+
+    Consequence, and the reason this test exists: the guard would strand a
+    HEALTHY provider in HALF_OPEN indefinitely once a probe blip suspected it,
+    with no real traffic to heal it — which is precisely the case
+    `record_probe_success` was written to rescue, and precisely what the guard's
+    own comment claims cannot happen.
+    """
+    import json
+
+    state_file = tmp_path / "cb.json"
+    state_file.write_text(json.dumps({
+        "free-1": {
+            "state": "half_open",           # what a live read leaves behind
+            "consecutive_failures": 0,
+            "trip_count": 1,
+            "last_failure_category": "permanent",
+        }
+    }))
+    prov = _provider("free-1")
+    reg = CircuitBreakerRegistry(
+        {"free-1": prov}, clock=lambda: 0.0, state_file=state_file, persist=False,
+    )
+    cb = reg.get("free-1")
+    assert cb.state == ProviderState.CLOSED, "precondition: a non-OPEN save restores CLOSED"
+    assert cb._last_failure_category is None, (
+        "a category was carried onto a CLOSED breaker — it qualifies a FAILING "
+        "breaker, and surviving the state it describes makes it a poison pill "
+        "that permanently disables probe healing"
+    )
+
+    # And the behaviour that guard-poisoning would break: a probe blip must
+    # still be able to heal a provider that is not actually failing.
+    cb.probe_suspect()
+    assert cb.state == ProviderState.HALF_OPEN
+    for _ in range(3):
+        cb.record_probe_success()
+    assert cb.state == ProviderState.CLOSED, (
+        "a healthy provider could not heal after a restart — stranded in "
+        "HALF_OPEN with no traffic to rescue it"
+    )

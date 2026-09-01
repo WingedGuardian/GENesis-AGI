@@ -145,6 +145,10 @@ _RAW_KEYS = ("discarded_count", "discarded_items")
 
 _NORMALISER_MARKS = ("Array.isArray", "Number.isFinite")
 
+# Deliberate escape hatch for the uppercase-'OPEN' ban below. Spelled as a
+# constant so `grep -r` finds every exemption in one shot.
+_ALLOW_UPPERCASE_OPEN = "guard-allow-uppercase-open"
+
 
 def _frontend_files() -> list[Path]:
     out: list[Path] = []
@@ -504,15 +508,34 @@ def test_no_frontend_file_compares_breaker_state_to_an_uppercase_literal():
     a tripped provider.
 
     Scans DIRECTORIES so a newly added file cannot escape the guard.
+
+    The ban is UNSCOPED on purpose. An earlier revision required the offending
+    line to also match /cb_state|cbState|breaker/, reasoning that an unscoped
+    ban would trip on an unrelated uppercase literal. MEASURED across the exact
+    directories this scans: zero occurrences of 'OPEN' or "OPEN" of any kind.
+    The false positive was hypothetical and the blindness it bought was real —
+    the natural two-line reintroduction
+
+        const s = (this.routingConfig?.cb_states || {})[p];
+        if (s === 'OPEN') { ... }
+
+    puts the comparison on a line with no breaker context, and the scoped guard
+    passed it. A genuine future false positive gets an explicit, greppable
+    exemption via the allowlist token below, so an exemption is a deliberate act
+    rather than a silent hole.
     """
     offenders = []
     for path in _frontend_files():
         for i, line in enumerate(path.read_text().splitlines(), 1):
+            if _ALLOW_UPPERCASE_OPEN in line:
+                continue  # deliberate, greppable exemption
             if "'OPEN'" in line or '"OPEN"' in line:
                 offenders.append(f"{path.name}:{i}: {line.strip()[:100]}")
     assert not offenders, (
-        "frontend compares breaker state against an uppercase literal, which "
-        "never matches the lowercase value the API emits:\n  "
+        "frontend contains an uppercase 'OPEN' literal. Breaker state is emitted "
+        "LOWERCASE ('open'/'half_open'/'closed'), so a comparison against it can "
+        "never match. If this literal is genuinely unrelated to breaker state, "
+        f"add the token {_ALLOW_UPPERCASE_OPEN!r} in a comment on that line:\n  "
         + "\n  ".join(offenders)
     )
 
@@ -524,6 +547,10 @@ def test_breaker_open_helper_is_case_insensitive_and_total():
         pytest.skip("node not available; the static guard above still applies")
 
     js = DASHBOARD_JS.read_text()
+    # breakerIsOpen delegates to breakerState, so BOTH real bodies are wired —
+    # extracting one and stubbing the other would test a fake.
+    j = js.index("breakerState(providerName) {")
+    state_body = js[j + len("breakerState(providerName) {"): js.index("\n        },", j)]
     i = js.index("breakerIsOpen(providerName) {")
     body = js[i + len("breakerIsOpen(providerName) {"): js.index("\n        },", i)]
 
@@ -536,7 +563,8 @@ def test_breaker_open_helper_is_case_insensitive_and_total():
         ("missing provider", None, False),
     ]
     script = (
-        "function mk(v){ const self={ routingConfig:{ cb_states: v===null?{}:{p:v} } };\n"
+        "function mk(v){ const self={ routingConfig:{ cb_states: v===null?{}:{p:v} },\n"
+        "    breakerState(n){ return (function(providerName){" + state_body + "\n}).call(this,n); } };\n"
         "  return (function(providerName){" + body + "\n}).call(self,'p'); }\n"
         "const cases=" + json.dumps(cases) + ";\n"
         "let bad=0;\n"

@@ -199,7 +199,9 @@
 
         alertSeverityColor(sev) {
           // `_compute_alerts()` emits severities UPPERCASE ("CRITICAL",
-          // "WARNING", "INFO", plus a synthetic "RESOLVED"). This map was keyed
+          // "WARNING", "INFO"). RESOLVED is synthesised by `_impl_health_alerts`
+          // only when active_only=False, which this page never requests — the
+          // key below is defensive, not reachable today. This map was keyed
           // lowercase, so every lookup missed and EVERY dot fell through to the
           // amber default -- a real CRITICAL rendered identically to a WARNING.
           //

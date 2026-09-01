@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import UTC, datetime
 
 from genesis.mcp.health import mcp  # noqa: E402
@@ -187,9 +188,19 @@ def _backups_enabled() -> bool:
 # above the 5-minute awareness tick and well below any outage worth naming.
 _ONGOING_FLOOR_S = 3600.0
 
-# Marker used to keep the suffix idempotent — `_compute_alerts` recomputes the
-# whole set every tick, so a message must never accrete suffixes.
+# `_compute_alerts` recomputes the whole set every tick, so a message must never
+# accrete suffixes. Stripping any existing one before recomputing gives BOTH
+# idempotence and freshness — a skip-if-present guard would give only the first.
+# That matters because the fail-open re-emit path below copies the message
+# STORED in `alert_events`, which is captured at first fire and never rewritten:
+# skipping a decorated message would pin the displayed age to whenever the row
+# was written. A stale duration is worse than none, since it reads as current.
+# Anchored at end-of-string so a legitimate parenthetical in the message body
+# (e.g. "DOWN (all providers exhausted)") is untouched.
 _ONGOING_MARK = "(ongoing for "
+# Derived from the mark so the two cannot drift: changing the mark without
+# this would silently stop the strip and let suffixes accrete.
+_ONGOING_RE = re.compile(rf"\s*{re.escape(_ONGOING_MARK)}[^)]*\)\s*$")
 
 
 def _ongoing_for(created_at: str | None, now: datetime) -> str | None:
@@ -237,14 +248,23 @@ def _apply_ongoing_duration(
     now = now or datetime.now(UTC)
     for alert in alerts:
         try:
-            if _ONGOING_MARK in str(alert.get("message", "")):
-                continue  # already decorated this tick
-            row = open_rows.get(alert.get("id", ""))
-            if not row:
+            raw = alert.get("message")
+            if raw is None:
+                # No message to decorate. Skipping rather than writing is
+                # deliberate: this function widened from "only touch decorated
+                # alerts that have a row" to "always rewrite", and without this
+                # guard a messageless alert would gain `message=""` — which
+                # `outreach/morning_report.py` renders as blank instead of
+                # falling back to its own "Unknown". Not reachable from the
+                # current append sites (all pass a literal message); the guard
+                # keeps the widening from carrying a latent regression.
                 continue
-            human = _ongoing_for(row.get("created_at"), now)
-            if human:
-                alert["message"] = f"{alert['message']} {_ONGOING_MARK}{human})"
+            # Strip FIRST, unconditionally: an alert whose row has gone must
+            # not keep a suffix describing an age nothing can still vouch for.
+            base = _ONGOING_RE.sub("", str(raw)).strip()
+            row = open_rows.get(alert.get("id", ""))
+            human = _ongoing_for(row.get("created_at"), now) if row else None
+            alert["message"] = f"{base} {_ONGOING_MARK}{human})".strip() if human else base
         except Exception:  # noqa: BLE001 - never break the alert path
             logger.debug("ongoing-duration decoration failed", exc_info=True)
 
@@ -1380,7 +1400,9 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
             }
             _apply_ongoing_duration(alerts, _open)
         except Exception:  # noqa: BLE001 - observability must not break on this
-            logger.debug("could not attach ongoing durations to alerts", exc_info=True)
+            # ERROR, not debug: nothing else reports this path failing, so a
+            # debug-level swallow means durations silently stop forever.
+            logger.error("could not attach ongoing durations to alerts", exc_info=True)
 
     return alerts, current_ids
 

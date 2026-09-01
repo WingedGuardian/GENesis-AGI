@@ -164,15 +164,37 @@ class CircuitBreaker:
         # every real call returned 403 tier_not_allowed. Three probe successes
         # closed this breaker each cycle, fired `on_recovery`, and
         # `ProviderEscalation.record_recovery` resolved the provider_failure
-        # observation and cleared its `first_trip_at`. A 3-day outage therefore
-        # rendered as a series of ~40-minute incidents that each "recovered",
-        # and no surface could ever report a multi-day duration.
+        # observation and cleared its `first_trip_at`. MEASURED over the live
+        # 3-day outage: FIVE separate `provider_failure` observations, each with
+        # a fresh `first_trip_at`, four of them auto-resolved this way. The
+        # longest duration any surface could report was therefore the time since
+        # the last false heal, never the real age of the outage.
         #
         # Deliberately narrow: TRANSIENT/TIMEOUT still heal on a probe, which is
-        # the low/no-traffic recovery case this path was built for. And this
-        # cannot strand a provider — HALF_OPEN is still `is_available()`, so real
-        # traffic is attempted and a real `record_success()` closes the breaker
-        # exactly as before. Recovery now requires evidence of a working CALL.
+        # the low/no-traffic recovery case this path was built for.
+        #
+        # This does not strand a provider: HALF_OPEN is still `is_available()`,
+        # so real traffic is attempted and a real `record_success()` still closes
+        # the breaker once `success_threshold` (default 2) is met. Recovery now
+        # requires evidence of a working CALL rather than a listing.
+        #
+        # It DOES change the retry schedule, and that is the honest cost. The
+        # heal branch below also resets `_trip_count` (the backoff counter), so
+        # returning early leaves the counter climbing. MEASURED on the live
+        # incident before this fix: consecutive trips ran 5/5/10/20/35/65/128
+        # minutes apart, matching `_effective_open_duration()`'s
+        # 120*2^(n-1) plus call latency, and the counter was reset only every
+        # ~9-12h. (Why that interval and not the ~15min a probe sweep takes is
+        # INFERRED, not measured: a sweep only heals while the breaker sits
+        # HALF_OPEN, and real traffic re-trips it within minutes, so the probe
+        # plausibly only wins once the window is hours long. Consistent with
+        # every timestamp; no probe-success log line proves it.) The backoff
+        # escalated; what changes is that it now STAYS at the cap
+        # (_MAX_OPEN_S 30m, or _MAX_QUOTA_OPEN_S 4h for quota) instead of
+        # periodically resetting to the 120s base. A dead provider is therefore
+        # retried less often, which is the intent; the cost is that a provider
+        # whose quota resets is re-tried up to 4h later. Parsing the provider's
+        # own retry hint is the exact fix for that and is tracked separately.
         if self._last_failure_category in (
             ErrorCategory.PERMANENT, ErrorCategory.QUOTA_EXHAUSTED,
         ):
@@ -301,8 +323,23 @@ class CircuitBreakerRegistry:
                     # Cap=3 → max backoff = min(120*2^2, 1800) = 480s (8 min).
                     if saved_state == ProviderState.OPEN.value:
                         cb._trip_count = min(cb._trip_count, 3)
+                    # The category QUALIFIES a failing breaker, so it must be
+                    # restored under the same condition as the state it
+                    # describes. Restoring it unconditionally onto a breaker that
+                    # comes back CLOSED (anything not saved as OPEN) leaves a
+                    # dead fact from a previous process — and once
+                    # `record_probe_success` began consulting it, that stale
+                    # value permanently disabled probe healing for a provider
+                    # that is not failing at all: stuck HALF_OPEN after any probe
+                    # blip, with no traffic to rescue it. Reachable in normal
+                    # operation because `.state` mutates OPEN -> HALF_OPEN when
+                    # merely READ, and `save_state` serialises every breaker.
                     saved_cat = info.get("last_failure_category")
-                    cb._last_failure_category = ErrorCategory(saved_cat) if saved_cat else None
+                    cb._last_failure_category = (
+                        ErrorCategory(saved_cat)
+                        if saved_cat and saved_state == ProviderState.OPEN.value
+                        else None
+                    )
             logger.info("Circuit breaker state restored from %s", self._state_file)
         except Exception:
             logger.warning("Failed to load circuit breaker state", exc_info=True)

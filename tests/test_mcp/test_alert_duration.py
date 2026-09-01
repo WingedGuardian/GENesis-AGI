@@ -3,11 +3,23 @@
 The 2026-08-28/29 provider outage was invisible for 3 days not because nothing
 detected it but because every surface renders instantaneous state. `alert_events`
 has carried `created_at`/`resolved_at` with 90-day retention the whole time and
-had ZERO production readers (`list_recent()` is called only by tests).
+nothing read the TIMESTAMPS — before this change its only production reader was
+`_compute_alerts`' fail-open re-emit, which takes only `severity`/`message`.
+(Enumerated: outside `db/crud/alert_events.py`, the table is touched by
+`awareness/loop.py` as the writer, `runtime/init/learning.py` as the 90-day
+pruner, and `mcp/health/errors.py` as that reader. Nothing else.)
 
-Enriching the alert MESSAGE is deliberate: the dashboard banner, the morning
-report and the Telegram path all render `message`, so one change gives every
-surface a duration without adding a widget to any of them.
+Enriching the alert MESSAGE rather than adding a widget means every surface that
+renders `message` gains the duration at once — the dashboard banner, the morning
+report (`outreach/morning_report.py:947`) and the Telegram path
+(`outreach/health_outreach.py:82`).
+
+What that does NOT do, stated because it is easy to over-read: those two
+non-dashboard surfaces FILTER before they render. The morning report drops
+`call_site:`-prefixed WARNINGs by construction, and the Telegram path takes only
+CRITICAL ids on an escalation whitelist. The alert this incident actually raises
+is a `call_site:` WARNING, so for that alert the duration lands on the dashboard
+only. Reaching the user is a separate mechanism, not a consequence of this one.
 """
 
 from __future__ import annotations
@@ -75,8 +87,86 @@ class TestApplyOngoingDuration:
         _apply_ongoing_duration(alerts, rows, now=_NOW)
         assert alerts[0]["message"].count("ongoing for") == 1
 
+    def test_an_alert_without_a_message_is_left_alone(self):
+        """The widening from "only rewrite decorated alerts" to "always rewrite"
+        must not invent a message. `outreach/morning_report.py` falls back to
+        "Unknown" when the key is ABSENT but renders an empty string as blank,
+        so writing `message=""` here would silently blank a real alert row."""
+        alerts = [{"id": "a", "severity": "CRITICAL"}]
+        rows = {"a": {"created_at": _ago(days=2)}}
+        _apply_ongoing_duration(alerts, rows, now=_NOW)
+        assert "message" not in alerts[0]
+
+        explicit_none = [{"id": "a", "severity": "CRITICAL", "message": None}]
+        _apply_ongoing_duration(explicit_none, rows, now=_NOW)
+        assert explicit_none[0]["message"] is None, (
+            "an explicit None was stringified into the literal 'None'"
+        )
+
     def test_a_broken_row_never_raises_into_the_alert_path(self):
         alerts = [{"id": "a", "severity": "CRITICAL", "message": "Down"}]
         _apply_ongoing_duration(alerts, {"a": {}}, now=_NOW)
         _apply_ongoing_duration(alerts, {"a": None}, now=_NOW)
         assert alerts[0]["message"] == "Down"
+
+
+class TestSuffixIsRefreshedNotFrozen:
+    """A persisted message must not freeze its duration.
+
+    `_compute_alerts` has a fail-open path that re-emits durable alerts straight
+    from `alert_events` open rows, copying the STORED message.
+
+    Scope note, corrected after review — the stored message cannot ACTUALLY
+    carry a suffix today, and the earlier version of this docstring claimed it
+    could. Traced: `_apply_ongoing_duration` runs at the END of
+    `_compute_alerts`, and `reconcile_open_set` writes rows with
+    `INSERT OR IGNORE` (`db/crud/alert_events.py:47`), so a row's message is
+    captured once at first fire and never rewritten. At first fire there is no
+    open row yet, so no suffix is applied. The stored string is therefore always
+    clean.
+
+    The strip-then-recompute rule is kept anyway, and this test with it, for two
+    reasons that do not depend on that false premise: it makes the decoration
+    idempotent within a tick regardless of how many times it runs, and it keeps
+    the invariant true by CONSTRUCTION rather than by an ordering coincidence in
+    a different module. A skip-if-decorated guard would be correct only for as
+    long as nobody makes the writer update `message` — and a stale duration is
+    worse than none, because it reads as current.
+    """
+
+    def test_a_stale_suffix_is_replaced_with_the_current_duration(self):
+        alerts = [{
+            "id": "a", "severity": "CRITICAL",
+            # As re-emitted from a durable row written hours ago.
+            "message": "Provider down (ongoing for 1h)",
+        }]
+        rows = {"a": {"created_at": _ago(days=3, hours=4)}}
+        _apply_ongoing_duration(alerts, rows, now=_NOW)
+        assert alerts[0]["message"] == "Provider down (ongoing for 3d 4h)"
+        assert alerts[0]["message"].count("ongoing for") == 1
+
+    def test_repeated_application_is_still_idempotent(self):
+        alerts = [{"id": "a", "severity": "CRITICAL", "message": "Down"}]
+        rows = {"a": {"created_at": _ago(days=1)}}
+        for _ in range(4):
+            _apply_ongoing_duration(alerts, rows, now=_NOW)
+        assert alerts[0]["message"] == "Down (ongoing for 1d)"
+
+    def test_a_stale_suffix_is_removed_when_the_alert_is_now_too_young(self):
+        """Re-emitted row whose age no longer qualifies: drop the suffix, don't keep a lie."""
+        alerts = [{"id": "a", "severity": "WARNING", "message": "Blip (ongoing for 9d)"}]
+        rows = {"a": {"created_at": _ago(minutes=5)}}
+        _apply_ongoing_duration(alerts, rows, now=_NOW)
+        assert alerts[0]["message"] == "Blip"
+
+    def test_parentheses_elsewhere_in_the_message_survive(self):
+        """The strip must be anchored, not a greedy match on any parenthetical."""
+        alerts = [{
+            "id": "a", "severity": "CRITICAL",
+            "message": "Call site x is DOWN (all providers exhausted)",
+        }]
+        rows = {"a": {"created_at": _ago(hours=6)}}
+        _apply_ongoing_duration(alerts, rows, now=_NOW)
+        assert alerts[0]["message"] == (
+            "Call site x is DOWN (all providers exhausted) (ongoing for 6h)"
+        )

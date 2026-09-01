@@ -4468,7 +4468,10 @@
           return Object.keys(this.routingConfig?.providers || {});
         },
 
-        // The ONE place that decides whether a breaker is open.
+        // The one place IN THIS STORE that reads breaker state. (The two
+        // neural-monitor pages parse `cb_states` in their own plain <script>
+        // blocks and are already lowercase-correct; they are not reachable from
+        // here, so this is not a global chokepoint.)
         //
         // `routes/routing.py` emits `cb.state.value`, and ProviderState is a
         // StrEnum with LOWERCASE values ("closed"/"open"/"half_open"). Four
@@ -4482,9 +4485,13 @@
         // Comparing case-insensitively in ONE helper makes that class of bug
         // unrepresentable at the call sites, rather than fixing it four times
         // and waiting for a fifth to be written.
-        breakerIsOpen(providerName) {
+        breakerState(providerName) {
           const raw = (this.routingConfig?.cb_states || {})[providerName];
-          return String(raw ?? "").toLowerCase() === "open";
+          return String(raw ?? "").toLowerCase();
+        },
+
+        breakerIsOpen(providerName) {
+          return this.breakerState(providerName) === "open";
         },
 
         providerCbState(providerName) {
