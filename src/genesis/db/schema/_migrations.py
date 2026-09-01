@@ -2061,7 +2061,7 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     # upsert bump it too), and cc_sessions.last_extracted_at is a PASS
     # watermark the extraction job advances even when it writes no topic
     # (measured: 219/899 live rows carry a watermark with no topic). Mirrored
-    # in migration 0090 for the standalone runner; added here so an existing DB
+    # in migration 0091 for the standalone runner; added here so an existing DB
     # gets them on the base create_all_tables path (schema_both_build_paths).
     await _try_alter(
         db,

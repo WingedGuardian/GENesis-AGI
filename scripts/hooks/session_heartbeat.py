@@ -291,7 +291,7 @@ def resolve_topic(db_path: Path, session_id: str, *, limit: int = _TOPIC_MAX) ->
                     extracted = sanitize_detail(row[0], limit)
                     extracted_at = row[1]
 
-            # `mission_updated_at` arrives with migration 0090; a database that
+            # `mission_updated_at` arrives with migration 0091; a database that
             # has not run it yet must still work, so the column is selected only
             # when present. Absent -> None -> "cannot compare" -> summary first,
             # which is the behaviour before that migration.
@@ -309,7 +309,7 @@ def resolve_topic(db_path: Path, session_id: str, *, limit: int = _TOPIC_MAX) ->
             # summary is written on a multi-hour cycle; the mission is set the
             # moment a session declares a pivot. Whichever is the more recent
             # STATEMENT of what the session is doing wins. When the comparison
-            # is impossible -- no stamp (a pre-0090 row, whose mission age is
+            # is impossible -- no stamp (a pre-0091 row, whose mission age is
             # genuinely unknown), an unparseable stamp, or no extraction to
             # compare against -- `_is_newer` returns False and the summary keeps
             # precedence, which is both the safe direction and the prior

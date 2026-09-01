@@ -255,7 +255,7 @@ verified: 975d3944 2026-08-31
   `memory/extraction_job.py` on a multi-hour cycle) or the charter's mission
   (set the moment a session declares a pivot), decided by comparing
   `cc_sessions.topic_updated_at` against `session_charters.mission_updated_at`
-  (migration 0090). BOTH columns are new, and the second one is why:
+  (migration 0091). BOTH columns are new, and the second one is why:
   `last_extracted_at` is a PASS watermark the extraction job advances even on
   passes that write no topic (219 of 899 live rows carry a watermark with no
   topic), so using it as the topic's age would commit on that side the exact
@@ -264,10 +264,10 @@ verified: 975d3944 2026-08-31
   edit would promote a stale founding mission. Timestamps are compared PARSED, not
   lexically — for heterogeneous offsets and naive stamps, NOT for the
   microsecond reason an earlier draft gave (measured: 0 disagreements over
-  200,000 same-format pairs). When the comparison is impossible — a pre-0090 row whose
+  200,000 same-format pairs). When the comparison is impossible — a pre-0091 row whose
   mission age is genuinely unknown, an unparseable stamp, or no extraction to
   compare against — the extracted summary keeps precedence, which is both the
-  safe direction and the pre-0090 behaviour, so the migration is inert until a
+  safe direction and the pre-0091 behaviour, so the migration is inert until a
   mission is next set. Then the mission regardless of age, then its newest live
   ledger item; the raw first user message is NEVER a fallback and the peer's
   typed prompt is never rendered at all, since another session's user text is

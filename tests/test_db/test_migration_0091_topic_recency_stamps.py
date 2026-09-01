@@ -1,4 +1,4 @@
-"""Migration 0090: the two timestamps the peer-line topic recency comparison needs.
+"""Migration 0091: the two timestamps the peer-line topic recency comparison needs.
 
 Both columns exist because neither table had a timestamp meaning what the
 comparison requires:
@@ -20,11 +20,11 @@ import importlib
 import aiosqlite
 import pytest
 
-m0090 = importlib.import_module("genesis.db.migrations.0090_topic_recency_stamps")
+m0091 = importlib.import_module("genesis.db.migrations.0091_topic_recency_stamps")
 
 
 async def _legacy_db() -> aiosqlite.Connection:
-    """Pre-0090 shapes for both tables."""
+    """Pre-0091 shapes for both tables."""
     db = await aiosqlite.connect(":memory:")
     await db.execute(
         """CREATE TABLE session_charters (
@@ -55,7 +55,7 @@ async def _cols(db: aiosqlite.Connection, table: str) -> set[str]:
 async def test_up_adds_both_columns():
     db = await _legacy_db()
     try:
-        await m0090.up(db)
+        await m0091.up(db)
         assert "mission_updated_at" in await _cols(db, "session_charters")
         assert "topic_updated_at" in await _cols(db, "cc_sessions")
     finally:
@@ -66,8 +66,8 @@ async def test_up_adds_both_columns():
 async def test_up_is_idempotent():
     db = await _legacy_db()
     try:
-        await m0090.up(db)
-        await m0090.up(db)  # duplicate ADDs must not raise
+        await m0091.up(db)
+        await m0091.up(db)  # duplicate ADDs must not raise
         assert "mission_updated_at" in await _cols(db, "session_charters")
         assert "topic_updated_at" in await _cols(db, "cc_sessions")
     finally:
@@ -80,7 +80,7 @@ async def test_up_is_a_noop_when_the_tables_do_not_exist():
     the tables exist must not fail the whole migration run."""
     db = await aiosqlite.connect(":memory:")
     try:
-        await m0090.up(db)  # must not raise
+        await m0091.up(db)  # must not raise
     finally:
         await db.close()
 
@@ -91,7 +91,7 @@ async def test_a_partially_applied_run_completes():
     db = await _legacy_db()
     try:
         await db.execute("ALTER TABLE session_charters ADD COLUMN mission_updated_at TEXT")
-        await m0090.up(db)
+        await m0091.up(db)
         assert "topic_updated_at" in await _cols(db, "cc_sessions")
     finally:
         await db.close()
@@ -117,7 +117,7 @@ async def test_existing_rows_read_null_rather_than_a_backfilled_time():
             "topic, last_extracted_at) VALUES ('s1', 'foreground', 'opus', '2026-01-01', "
             "'2026-01-01', 'a topic of unknown age', '2026-06-01')"
         )
-        await m0090.up(db)
+        await m0091.up(db)
         cur = await db.execute(
             "SELECT mission_updated_at FROM session_charters WHERE session_id='s1'"
         )
@@ -132,8 +132,8 @@ async def test_existing_rows_read_null_rather_than_a_backfilled_time():
 async def test_down_drops_both_columns():
     db = await _legacy_db()
     try:
-        await m0090.up(db)
-        await m0090.down(db)
+        await m0091.up(db)
+        await m0091.down(db)
         assert "mission_updated_at" not in await _cols(db, "session_charters")
         assert "topic_updated_at" not in await _cols(db, "cc_sessions")
     finally:
@@ -149,7 +149,7 @@ async def test_set_mission_stamps_the_mission_column():
 
     db = await _legacy_db()
     try:
-        await m0090.up(db)
+        await m0091.up(db)
         await db.execute(
             "INSERT INTO session_charters (session_id, created_at) VALUES ('s1', '2026-01-01')"
         )
@@ -171,7 +171,7 @@ async def test_update_topic_and_keywords_stamps_the_topic_column():
 
     db = await _legacy_db()
     try:
-        await m0090.up(db)
+        await m0091.up(db)
         await db.execute(
             "INSERT INTO cc_sessions (id, session_type, model, started_at, last_activity_at) "
             "VALUES ('s1', 'foreground', 'opus', '2026-01-01', '2026-01-01')"
@@ -203,7 +203,7 @@ async def test_the_watermark_write_does_NOT_stamp_the_topic():
 
     db = await _legacy_db()
     try:
-        await m0090.up(db)
+        await m0091.up(db)
         await db.execute(
             "INSERT INTO cc_sessions (id, session_type, model, started_at, last_activity_at) "
             "VALUES ('s1', 'foreground', 'opus', '2026-01-01', '2026-01-01')"

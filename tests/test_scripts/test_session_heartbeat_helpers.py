@@ -423,11 +423,11 @@ def test_the_extracted_topic_is_sanitized_like_every_other_rendered_field(tmp_pa
 # `session_charters.updated_at` deliberately CANNOT serve here: it is a ROW
 # timestamp that set_pointers and the charter upsert also bump, so a pointer
 # edit would promote a stale founding mission. `mission_updated_at` (migration
-# 0090) records only the mission write.
+# 0091) records only the mission write.
 
 
 def _seed_mission_ts(path: Path, mission_updated_at) -> None:
-    """Add the 0090 column and stamp it for the seeded charter row."""
+    """Add the 0091 column and stamp it for the seeded charter row."""
     conn = sqlite3.connect(str(path))
     try:
         conn.execute("ALTER TABLE session_charters ADD COLUMN mission_updated_at TEXT")
@@ -487,7 +487,7 @@ def test_an_extraction_after_the_mission_still_wins(tmp_path):
 def test_an_unstamped_mission_never_outranks_the_summary(tmp_path):
     """The pre-migration state, and the reason the migration is inert on arrival.
 
-    A row written before 0090 has NULL here: we do not know when its mission was
+    A row written before 0091 has NULL here: we do not know when its mission was
     set. Inventing an answer would be worse than admitting it, so NULL means
     "cannot compare" and the summary keeps winning -- exactly the behaviour
     before this change.
@@ -500,9 +500,9 @@ def test_an_unstamped_mission_never_outranks_the_summary(tmp_path):
 
 
 def test_a_missing_mission_updated_at_COLUMN_degrades_to_summary_first(tmp_path):
-    """A database that has not run migration 0090 at all must still work."""
+    """A database that has not run migration 0091 at all must still work."""
     db = tmp_path / "g.db"
-    _seed(db, mission="a mission on a pre-0090 schema")
+    _seed(db, mission="a mission on a pre-0091 schema")
     _seed_cc_ts(db, "the extracted summary", _EARLIER)  # no ALTER at all
     assert sh.resolve_topic(db, _SID) == "the extracted summary"
 
