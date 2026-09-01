@@ -175,8 +175,21 @@ def check_staleness(entries: list[Entry], threshold: int) -> list[str] | None:
         return None
     warnings: list[str] = []
     for entry in entries:
-        if _git(["cat-file", "-e", f"{entry.verified_sha}^{{commit}}"]) is None:
-            return None  # stamped sha not in local history — can't count honestly
+        if _git(["merge-base", "--is-ancestor", entry.verified_sha, "HEAD"]) is None:
+            # Stamp is not an ancestor of HEAD (git merge-base --is-ancestor exits
+            # non-zero) — almost always a pre-squash feature-branch HEAD that squash-merge
+            # discarded. This is the ancestry check the stamp actually needs: a bare
+            # `cat-file -e` would PASS an orphan that still exists locally and then miscount
+            # `<sha>..HEAD`, so local and CI would disagree. Warn and keep policing the
+            # OTHER entries — a single dead stamp must NOT return None here, because that
+            # returns None for the WHOLE file, silently drops every entry's freshness
+            # check, and the caller then misreports it as a shallow clone.
+            warnings.append(
+                f"entry '{entry.name}': verified stamp {entry.verified_sha} "
+                f"({entry.verified_date}) is unresolvable (not an ancestor of HEAD) — "
+                f"likely a pre-squash orphan; re-verify and re-stamp to a default-branch commit"
+            )
+            continue
         paths = [f"src/genesis/{m}" for m in entry.modules]
         count_out = _git(["rev-list", "--count", f"{entry.verified_sha}..HEAD", "--", *paths])
         if count_out is None:
@@ -222,8 +235,9 @@ def main() -> int:
     stale = check_staleness(entries, STALE_COMMIT_THRESHOLD)
     if stale is None:
         print(
-            "subsystem-map guard: staleness check SKIPPED (shallow or incomplete git "
-            "history — CI needs fetch-depth: 0)"
+            "subsystem-map guard: staleness check SKIPPED (shallow clone, or a git "
+            "call failed/timed out). A full clone (fetch-depth: 0) fixes the shallow case; "
+            "an unresolvable stamp no longer skips the whole check (it warns per-entry)."
         )
     else:
         for warning in stale:
