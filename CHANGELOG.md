@@ -9,6 +9,29 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **Captured session output is now redacted before it is stored.** When an
+  interactive session exits, Genesis records a tail of the terminal scrollback to
+  `~/.genesis/logs/cc_exit_<slot>.log` so a crash can be diagnosed afterwards.
+  That tail is raw terminal output, so it passes through the secret scrubber on
+  the way in; if the scrubber cannot run, the tail is withheld rather than stored
+  unscrubbed. The exit status and crash diagnosis are recorded either way, so the
+  log keeps its diagnostic value.
+- **Credential detection covers modern key formats.** The shared
+  secret-detection patterns expected an unbroken run of letters and digits after a
+  vendor prefix, which most current key formats no longer are. Detection now
+  handles them, along with several provider prefixes, JWTs, webhook URLs and bot
+  tokens. Detection is shape-based and therefore not exhaustive; the labelled and
+  `KEY=VALUE` forms remain the broadest net. The reference-capture path keeps a
+  deliberately narrower rule, so an ordinary hyphenated name is never stored as
+  though it were a credential.
+- **Secret scrubbing no longer stalls on long machine output.** Two detection
+  patterns backtracked quadratically against a long unbroken alphanumeric run
+  (a base64 blob or a minified bundle), taking tens of seconds on input a session
+  produces routinely. The repeats with real-world ceilings are now bounded, which
+  removes the stall while leaving long values fully covered.
+
 ### Added
 
 - **Gated autonomous cold marketing outreach (inert by default).** Genesis can

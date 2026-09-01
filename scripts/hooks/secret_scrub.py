@@ -36,20 +36,69 @@ import re
 
 _REDACTED = "[REDACTED]"
 
-# ── Detection patterns (mirror of reference_extraction.py) ───────────────────
+# ── Detection patterns ───────────────────────────────────────────────────────
+#
+# THREE files carry credential-detection patterns, and they are NOT all the
+# same by design. Enumerated, with what each does on a match:
+#   * this file                              — REDACTS captured telemetry
+#   * ``src/genesis/security/output_scanner.py``  — FLAGS outbound content
+#   * ``src/genesis/memory/reference_extraction.py`` — WRITES a stored reference
+# The first two favour recall: over-matching costs a redaction or a flag. The
+# third acts on a match by creating a record the user sees, so it favours
+# precision and deliberately keeps a NARROWER class (its own comment explains
+# the split). Duplicated rather than imported so this hook stays stdlib-only.
+# Change a shape here, decide explicitly for the other two — do not paste.
+#
+# The STRUCTURED class is redaction-only and has no twin: it exists because a
+# captured terminal stream carries credentials with no label and no vendor
+# prefix, which is not a shape the capture-side classifier needs to recognise.
 
 # Known key prefixes — format-only, near-certain real credentials. The whole
 # match is the secret, so it is redacted wholesale.
+# The character class after a prefix MUST admit ``-`` and ``_``: modern keys
+# namespace themselves with interior separators (``sk-ant-…``, ``sk-or-v1-…``,
+# ``sk-proj-…``), so an [A-Za-z0-9]-only class stops at the first hyphen — only
+# a few characters in — and never reaches the length floor. The token then
+# passes through whole. Prefixes are anchored on the left (?<![A-Za-z0-9_-]) so
+# a longer surrounding word cannot part-match into one.
 _KNOWN_KEY_PREFIX_PATTERN = re.compile(
-    r"(?:"
-    r"ghp_[A-Za-z0-9]{30,}"  # GitHub personal access token
-    r"|gho_[A-Za-z0-9]{30,}"  # GitHub OAuth token
-    r"|sk-[A-Za-z0-9]{20,}"  # OpenAI / Anthropic
+    r"(?<![A-Za-z0-9_-])(?:"
+    r"gh[pousr]_[A-Za-z0-9]{30,}"  # GitHub PAT / OAuth / user / server / refresh
+    r"|github_pat_[A-Za-z0-9_]{30,}"  # GitHub fine-grained PAT
+    r"|glpat-[A-Za-z0-9_\-]{15,}"  # GitLab PAT
+    r"|sk-[A-Za-z0-9_\-]{20,}"  # OpenAI / Anthropic / OpenRouter / compatible
+    r"|gsk_[A-Za-z0-9]{20,}"  # Groq
+    r"|nvapi-[A-Za-z0-9_\-]{20,}"  # NVIDIA NIM
+    r"|tvly-[A-Za-z0-9_\-]{20,}"  # Tavily
+    r"|fc-[A-Za-z0-9]{24,}"  # Firecrawl (longer floor: short prefix)
+    r"|hf_[A-Za-z0-9]{20,}"  # HuggingFace
+    r"|xai-[A-Za-z0-9]{20,}"  # xAI
     r"|xoxb-[A-Za-z0-9\-]{20,}"  # Slack bot token
     r"|xoxp-[A-Za-z0-9\-]{20,}"  # Slack user token
     r"|AKIA[A-Z0-9]{12,}"  # AWS access key id
     r"|AIza[A-Za-z0-9_\-]{30,}"  # Google API key
     r"|di-[A-Za-z0-9]{20,}"  # DeepInfra
+    r"|eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"  # JWT
+    r")",
+)
+
+# Structured credentials — identified by SHAPE, not by a vendor prefix. Both
+# carry their secret as a positional path/field component, so no label pattern
+# ever sees them and no prefix class can match them.
+_STRUCTURED_CREDENTIAL_PATTERN = re.compile(
+    r"(?:"
+    # Discord webhook: the trailing path segment IS the credential.
+    r"https://(?:canary\.|ptb\.)?discord(?:app)?\.com/api/(?:v\d+/)?webhooks/"
+    r"\d{15,}/[A-Za-z0-9_\-]{40,}"
+    # Telegram bot token: <bot-id>:<secret>. The anchor rejects only a preceding
+    # DIGIT — enough to stop a match starting mid-way through a longer digit
+    # run, which is all it needs to do. It must NOT reject a preceding letter:
+    # the form Genesis itself builds is ``…/bot<id>:<secret>``, where the id is
+    # preceded by "bot", and a word-boundary-style anchor silently passes the
+    # whole token through. The floor is set from the vendor's DOCUMENTED
+    # example (34 chars), not from one locally observed token, so a shorter
+    # legitimate token cannot slip under it.
+    r"|(?<!\d)\d{6,}:[A-Za-z0-9_\-]{30,}"
     r")",
 )
 
@@ -81,8 +130,15 @@ _SINGLE_CREDENTIAL_PATTERN = re.compile(
 # Credentials embedded in a URL's userinfo section (the user/password pair that
 # can precede an "@" host separator). Only fires when an "@" follows, so a plain
 # host-and-port URL never matches.
+# The SCHEME and HOST repeats are bounded; the PASSWORD repeat deliberately is
+# not. A greedy unbounded repeat followed by a required literal backtracks
+# quadratically over a long unbroken run — ordinary machine output (base64
+# blobs, minified bundles) hits this, and the scrubber runs on captured tool
+# output. Bounding only the parts with real-world ceilings (RFC 1035 caps a
+# hostname at 253 chars; a URL scheme is a handful) removes the blowup WITHOUT
+# introducing a fail-open: a long password still matches and is still redacted.
 _URL_CREDENTIAL_PATTERN = re.compile(
-    r"(?P<pre>[a-zA-Z][a-zA-Z0-9+.\-]*://[^:/@\s]+:)(?P<pw>[^@/\s]+)(?P<at>@)",
+    r"(?P<pre>[a-zA-Z][a-zA-Z0-9+.\-]{0,32}://[^:/@\s]{1,253}:)(?P<pw>[^@/\s]+)(?P<at>@)",
 )
 
 # .env-style UPPER_SNAKE=value. The bare pattern over-redacts (PYTHONPATH=…,
@@ -90,8 +146,11 @@ _URL_CREDENTIAL_PATTERN = re.compile(
 # is captured whole (so a multi-word secret like KEY='a b c' is not left with
 # its tail exposed after the first space); an unquoted value is a 6+ run of
 # non-space so short non-secret values aren't touched.
+# The KEY repeat is bounded for the same reason as the URL host above (see that
+# comment): an environment-variable NAME has a small real ceiling, while the
+# VALUE repeat stays unbounded so no long secret escapes redaction.
 _ENV_ASSIGNMENT_PATTERN = re.compile(
-    r"(?P<key>[A-Z][A-Z0-9_]{2,})"
+    r"(?P<key>[A-Z][A-Z0-9_]{2,64})"
     r"(?P<sep>\s*=\s*)"
     r"(?P<val>\"[^\"]*\"|'[^']*'|[^\s]{6,})",
 )
@@ -151,6 +210,7 @@ def scrub(text: str) -> str:
         return text
     try:
         text = _KNOWN_KEY_PREFIX_PATTERN.sub(_REDACTED, text)
+        text = _STRUCTURED_CREDENTIAL_PATTERN.sub(_REDACTED, text)
         text = _redact_value_group(_CREDENTIAL_TOKEN_PATTERN, text, "token")
         text = _redact_value_group(_SINGLE_CREDENTIAL_PATTERN, text, "value")
         text = _redact_value_group(_URL_CREDENTIAL_PATTERN, text, "pw")

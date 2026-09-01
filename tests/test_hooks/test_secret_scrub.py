@@ -213,3 +213,153 @@ class TestReviewFixes:
         # The secret-key-name gate still applies: a quoted value under a benign
         # key (no KEY/SECRET/TOKEN/… in the name) must NOT be redacted.
         assert s.scrub("MESSAGE='hello world foo'") == "MESSAGE='hello world foo'"
+
+
+# ── scrub: bare-value credential shapes (the captured-output case) ────────
+
+
+class TestScrubRedactsBareProviderTokens:
+    """Credential shapes that arrive with NO label.
+
+    Captured terminal output is the motivating case: a token printed by a CLI
+    lands in the capture as a naked value, so only its SHAPE can save it. The
+    labeled/assignment patterns never see it. Values here are synthetic.
+    """
+
+    def test_anthropic_setup_token(self):
+        # ``sk-`` keys carry interior hyphens; an [A-Za-z0-9]-only class stops
+        # at the first one, far short of any length floor, and passes it through.
+        assert R in s.scrub("sk-ant-oat01-" + "A" * 40)
+
+    def test_openrouter_key(self):
+        assert R in s.scrub("sk-or-v1-" + "b" * 48)
+
+    def test_openai_project_key(self):
+        assert R in s.scrub("sk-proj-" + "c" * 40)
+
+    def test_groq_key(self):
+        assert R in s.scrub("gsk_" + "d" * 40)
+
+    def test_nvidia_nim_key(self):
+        assert R in s.scrub("nvapi-" + "e" * 40)
+
+    def test_tavily_key(self):
+        assert R in s.scrub("tvly-" + "f" * 32)
+
+    def test_github_fine_grained_pat(self):
+        assert R in s.scrub("github_pat_" + "g" * 40)
+
+    def test_jwt(self):
+        assert R in s.scrub("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhIn0." + "h" * 40)
+
+    def test_bare_token_alone_on_its_own_line(self):
+        # The captured-output shape: no label, no assignment, just the value
+        # surrounded by prose the tool printed around it.
+        out = s.scrub("Your token (valid for 1 year):\n\nsk-ant-oat01-" + "Z" * 40 + "\n")
+        assert R in out
+        assert "Z" * 40 not in out
+
+
+class TestScrubRedactsStructuredCredentials:
+    """Credentials identified by STRUCTURE rather than a vendor prefix."""
+
+    def test_discord_webhook_url(self):
+        out = s.scrub("https://discord.com/api/webhooks/123456789012345678/" + "A" * 60)
+        assert R in out
+        assert "A" * 60 not in out
+
+    def test_discord_webhook_url_alt_host(self):
+        out = s.scrub("https://discordapp.com/api/webhooks/987654321098765432/" + "B" * 60)
+        assert R in out
+
+    def test_telegram_bot_token_bare(self):
+        out = s.scrub("1234567890:AA" + "C" * 33)
+        assert R in out
+        assert "C" * 33 not in out
+
+    def test_telegram_bot_token_in_api_url(self):
+        # The form Genesis itself constructs (guardian alert, backup.sh,
+        # install.sh) and therefore the form most likely to reach a pane tail.
+        # A left anchor that rejects any preceding word character kills this,
+        # because the id is preceded by the literal "bot".
+        url = "https://api.telegram.org/bot7891234567:AAG1a2b3c4d5" + "e" * 24 + "/sendMessage"
+        out = s.scrub(url)
+        assert R in out, "token unredacted in the vendor's own URL form"
+        assert "AAG1a2b3c4d5" not in out
+
+    def test_telegram_bot_token_at_vendor_documented_length(self):
+        # Telegram's public Bot API example carries a 34-char secret half. A
+        # floor derived from one locally-observed token has no margin and
+        # silently passes anything shorter.
+        doc_shape = "110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
+        assert len(doc_shape.split(":")[1]) == 34
+        assert R in s.scrub(doc_shape)
+
+
+class TestScrubKeepsHyphenatedLookalikes:
+    """The widened classes must not eat ordinary hyphenated text."""
+
+    def test_short_sk_fragment(self):
+        assert R not in s.scrub("sk-1")
+
+    def test_hyphenated_prose(self):
+        text = "a well-documented self-healing check-and-repair reconciliation pass"
+        assert R not in s.scrub(text)
+
+    def test_branch_name(self):
+        assert R not in s.scrub("fix/scrub-capture-hygiene-and-more-words-here")
+
+    def test_timestamps_and_ports_are_not_telegram_tokens(self):
+        # Discriminating negatives for the digits:secret shape — these carry the
+        # colon-separated form and must still survive.
+        for benign in (
+            "elapsed 18:13",
+            "2026-09-01T12:34:56Z",
+            "port 8080:8080 mapped",
+            "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        ):
+            assert R not in s.scrub(benign), benign
+
+    def test_uuid_is_not_a_provider_token(self):
+        assert R not in s.scrub("bed2f4dd-4224-4fe3-94b2-e18c9f99e0e3")
+
+    def test_git_sha_is_not_a_token(self):
+        assert R not in s.scrub("0400c706186786ccc92e8a8d7904773e7ed5f8b1")
+
+    def test_timestamp_pair_is_not_a_telegram_token(self):
+        assert R not in s.scrub("elapsed 18:13")
+
+    def test_plain_discord_url_without_token(self):
+        assert R not in s.scrub("https://discord.com/channels/123/456")
+
+
+# ── scrub: bounded work on hostile input ─────────────────────────────────
+
+
+class TestScrubDoesNotBacktrackCatastrophically:
+    """``scrub`` runs inside a PostToolUse hook and on captured terminal tails,
+    so its input is arbitrary machine output — long unbroken alphanumeric runs
+    (base64 blobs, minified bundles, hex dumps) are ordinary, not adversarial.
+
+    Greedy unbounded quantifiers followed by a required literal backtrack
+    quadratically on exactly that shape. The threshold is deliberately loose:
+    the unfixed patterns take ~30s on this input, so a multi-second ceiling
+    separates linear from quadratic without being sensitive to machine speed.
+    """
+
+    def test_long_alphanumeric_run_completes_promptly(self):
+        import time
+
+        blob = "eyJ" + "A" * 40000
+        start = time.perf_counter()
+        s.scrub(blob)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 5.0, f"scrub took {elapsed:.1f}s — quadratic backtracking"
+
+    def test_long_value_still_redacted_after_bounding(self):
+        # Guard the fix did not over-correct into a fail-open: bounding the KEY
+        # must not stop a long VALUE from being redacted.
+        assert R in s.scrub("API_SECRET=" + "y" * 9000)
+
+    def test_long_url_password_still_redacted_after_bounding(self):
+        assert R in s.scrub("https://user:" + "p" * 900 + "@host.example/path")
