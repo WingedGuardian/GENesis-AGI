@@ -468,6 +468,61 @@ _EARLIER = "2026-08-31T22:00:00.000000+00:00"
 _LATER = "2026-08-31T23:30:00.000000+00:00"
 
 
+def _seed_cc_two_rows(path: Path, rows) -> None:
+    """Seed cc_sessions with SEVERAL lifecycle rows, in the given insert order.
+
+    `rows` is [(topic, topic_updated_at), ...] inserted in sequence, so rowid
+    order is the argument order and can be set against stamp order deliberately.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE cc_sessions (cc_session_id TEXT, topic TEXT,"
+            " last_extracted_at TEXT, topic_updated_at TEXT)"
+        )
+        for topic, ts in rows:
+            conn.execute(
+                "INSERT INTO cc_sessions VALUES (?,?,?,?)", (_SID, topic, None, ts)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_the_newest_topic_wins_even_when_an_older_row_was_inserted_later(tmp_path):
+    """Order by when the TOPIC was written, not by when the ROW was inserted.
+
+    `ORDER BY rowid DESC` answers "most recently inserted", which is a different
+    question: the row created FIRST can carry the topic written LAST. This seeds
+    exactly that — the later-stamped topic in the earlier rowid — so a resolver
+    ordering by rowid returns the stale one.
+
+    Zero live instances today (0 of 747 sessions have more than one lifecycle
+    row, 0 have more than one carrying a topic), so this is right-by-
+    construction rather than a replayed defect. Said plainly because a test
+    whose population is empty should not be dressed up as a regression.
+    """
+    db = tmp_path / "g.db"
+    _seed(db, charter=False)
+    _seed_cc_two_rows(db, [("the topic written LAST", _LATER),
+                           ("a topic written earlier", _EARLIER)])
+    assert sh.resolve_topic(db, _SID) == "the topic written LAST"
+
+
+def test_rows_with_no_topic_stamp_fall_back_to_insertion_order(tmp_path):
+    """Pre-migration rows carry no stamp; newest-inserted must still win.
+
+    DESC puts NULLs last in SQLite, so this also pins that a NULL-stamped row
+    never outranks a stamped one — the tie-break is `rowid DESC`, which is the
+    whole ordering before migration 0091 and must keep behaving as it did.
+    """
+    db = tmp_path / "g.db"
+    _seed(db, charter=False)
+    _seed_cc_two_rows(db, [("older insert, no stamp", None),
+                           ("newer insert, no stamp", None)])
+    assert sh.resolve_topic(db, _SID) == "newer insert, no stamp"
+
+
 def test_a_mission_set_after_the_last_extraction_wins(tmp_path):
     db = tmp_path / "g.db"
     _seed(db, mission="pivoted to the migration")

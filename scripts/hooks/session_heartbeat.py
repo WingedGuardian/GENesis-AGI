@@ -277,14 +277,29 @@ def resolve_topic(db_path: Path, session_id: str, *, limit: int = _TOPIC_MAX) ->
                 # Column-probed like the charter side: absent -> NULL -> "cannot
                 # compare" -> summary first, the pre-migration behaviour.
                 cc_cols = {r[1] for r in conn.execute("PRAGMA table_info(cc_sessions)")}
-                topic_ts = "topic_updated_at" if "topic_updated_at" in cc_cols else "NULL"
+                has_ts = "topic_updated_at" in cc_cols
+                topic_ts = "topic_updated_at" if has_ts else "NULL"
+                # Order by WHEN THE TOPIC WAS WRITTEN, falling back to insertion
+                # order. rowid alone answers "most recently INSERTED row", which
+                # is a different question: a row created first can carry the
+                # topic written last. That distinction has no live instances --
+                # 0 of 747 sessions have more than one lifecycle row, and 0 have
+                # more than one row carrying a topic -- but the column exists
+                # precisely to date the topic, so using it costs nothing and is
+                # right by construction rather than by the population happening
+                # to be degenerate.
+                #
+                # DESC puts NULLs last in SQLite, so rows stamped by a real
+                # write win over pre-migration rows; `rowid DESC` then breaks
+                # ties and is the whole ordering before migration 0091, where
+                # the column does not exist and this degrades to the old
+                # behaviour exactly.
+                order = "topic_updated_at DESC, rowid DESC" if has_ts else "rowid DESC"
                 row = conn.execute(
                     f"SELECT topic, {topic_ts} FROM cc_sessions"  # noqa: S608 - literal, ours
                     " WHERE cc_session_id = ?"
                     " AND topic IS NOT NULL AND TRIM(topic) != ''"
-                    # no duplicate ids observed (0 of 734), but newest-wins
-                    # costs nothing and stays correct if that ever changes
-                    " ORDER BY rowid DESC LIMIT 1",
+                    f" ORDER BY {order} LIMIT 1",  # noqa: S608 - literal, ours
                     (session_id,),
                 ).fetchone()
                 if row:
