@@ -466,11 +466,14 @@ async def test_absent_module_is_clean_noop_no_error(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_registry_unavailable_is_clean_noop(db, monkeypatch):
+async def test_registry_unavailable_with_enabled_lever_is_failure(db, monkeypatch):
+    # Codex #1590: an enabled lever + a None module REGISTRY (a Genesis-side wiring failure,
+    # distinct from the remote's per-module health being down) is silently dead → a
+    # job-health FAILURE (errors=1), not a green no-op. Reached only past the both-off return.
     _cfg(monkeypatch, mode="live")
     mon, pipe = _mon(db, _FakeModule(), registry_none=True)
     result = await mon.gather()
-    assert result.mode == "live" and result.errors == 0 and pipe.sent == []
+    assert result.mode == "live" and result.errors == 1 and pipe.sent == []
 
 
 @pytest.mark.asyncio
@@ -1311,6 +1314,20 @@ async def test_bite_relay_skips_falsy_id_entry(db, monkeypatch):
     assert result.bites == 1 and len(pipe.sent) == 1
     assert "Good" in pipe.sent[0][0] and "Malformed" not in pipe.sent[0][0]
     assert result.errors >= 1  # the id-less entry is surfaced, not silently dropped
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_whitespace_id_is_malformed(db, monkeypatch):
+    # Codex #1590: a whitespace-only id passes the literal-empty check, but _bite_hash .strip()s
+    # the key so " "/"\t"/etc. all collapse to the SAME empty-key hash for a stage → the first
+    # marker would suppress every later whitespace-id advance. Surface as malformed + skip.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": [{"id": "  ", "name": "Blank"}, _entry(9, "Good")]})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.bites == 1 and len(pipe.sent) == 1  # only the real-id sibling nudges
+    assert "Good" in pipe.sent[0][0] and "Blank" not in pipe.sent[0][0]
+    assert result.errors >= 1  # the whitespace id is surfaced, not silently collided
 
 
 @pytest.mark.asyncio

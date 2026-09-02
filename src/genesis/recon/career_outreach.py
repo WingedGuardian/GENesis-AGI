@@ -427,8 +427,18 @@ class CareerOutreachMonitor:
         conf = cfg.load_config()
         reg = self._module_registry()
         if reg is None:
-            logger.debug("career outreach: module registry unavailable — skip")
-            return CareerOutreachResult(mode=mode, bite_mode=bite_mode)
+            # We only reach here with a lever ENABLED (the both-off case returned above).
+            # A None module registry is a Genesis-side WIRING failure (runtime not fully
+            # initialized), NOT the remote's availability (that is the per-module health
+            # clean-skip) — so an enabled relay with no registry is silently dead. Surface
+            # a job-health FAILURE rather than a green no-op.
+            logger.warning(
+                "career outreach: module registry unavailable while a lever is enabled "
+                "(mode=%s bite_mode=%s) — recording a job-health failure",
+                mode,
+                bite_mode,
+            )
+            return CareerOutreachResult(mode=mode, bite_mode=bite_mode, errors=1)
 
         auto = await self._run_autorun(mode, conf, reg) if mode != "off" else None
         bite = await self._run_bite_relay(bite_mode, conf, reg) if bite_mode != "off" else None
@@ -656,10 +666,13 @@ class CareerOutreachMonitor:
                 malformed += 1  # present-but-wrong-type entry → surface, never silent-drop
                 continue
             company_id = entry.get("id")
-            if company_id is None or company_id == "":
-                # No stable key → cannot dedup/deliver safely. Surface as MALFORMED (a
-                # schema drift that renamed/removed `id` would otherwise drop EVERY advance
-                # while job-health stays green), then skip this entry (fail-safe).
+            if company_id is None or str(company_id).strip() == "":
+                # No stable key → cannot dedup/deliver safely. Also catch a WHITESPACE-only
+                # id: _bite_hash .strip()s the key, so " "/"\t"/etc. all collapse to the SAME
+                # empty-key hash for a stage → the first marker would suppress every later
+                # whitespace-id advance. Surface as MALFORMED (a schema drift that renamed/
+                # removed `id`, or emits a blank placeholder, would otherwise drop EVERY
+                # advance while job-health stays green), then skip this entry (fail-safe).
                 malformed += 1
                 continue
             # Bound + sanitize the external name. strip_control_chars collapses the
