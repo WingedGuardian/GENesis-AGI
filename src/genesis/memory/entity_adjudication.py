@@ -30,10 +30,12 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from genesis.db.connection import _is_lock_error, get_raw_db
 from genesis.db.crud import deferred_work as dw_crud
 from genesis.db.crud import entities as entities_crud
 from genesis.db.crud import entity_adjudications as adj_crud
@@ -533,6 +535,125 @@ async def _process_row(
     await dw_crud.update_status(db, item_id, status="completed", completed_at=_now())
 
 
+# Per-row apply retries a transient SQLite write-lock (SQLITE_BUSY): an OWNED
+# get_raw_db() connection has no built-in lock retry (unlike SerializedConnection), and a
+# rolled-back transaction wrote nothing so re-running a whole row is idempotent.
+_APPLY_MAX_ATTEMPTS = 3
+_APPLY_RETRY_BACKOFF_S = 0.2
+
+
+async def _apply_one_proposal(
+    p: dict[str, Any],
+    counts: dict[str, int],
+    example_merges: list[str],
+) -> None:
+    """Apply ONE approved proposal under its OWN dedicated connection + transaction.
+
+    Uses an OWNED ``get_raw_db()`` connection (NOT the shared ``SerializedConnection``)
+    so a ``BEGIN IMMEDIATE`` … ``COMMIT`` envelope gives real single-writer isolation
+    across the identity re-read + claim + destructive merge. On the shared connection the
+    lock is released after every call (``connection.py:106-121``), so a foreign
+    ``commit()`` between the claim and the merge could durably commit a partial merge, and
+    nested savepoints can cross-release (Codex #6/#8). This is deliberately NOT the
+    migration runner's shared-conn ``BEGIN IMMEDIATE``: that stays atomic only because
+    migrations run as the SOLE DB user (``runtime/init/db.py:30-34``); entity apply runs
+    concurrently with the whole live system, so it needs its own connection.
+
+    Identity/staleness is re-checked INSIDE the transaction, after the write lock is held,
+    closing the check-then-apply TOCTOU (#8); ``claim_approved_for_apply`` is the atomic
+    winner-take-all (#5); and ``except BaseException`` rolls the OWNED txn back on
+    ``CancelledError`` too (#7) without ever touching another coroutine's writes.
+    """
+    # Resolve the DB path LAZILY (function-scope import) so tests' conftest redirect of
+    # env.genesis_db_path() applies — a module-frozen DEFAULT_DB_PATH would open the real
+    # install DB (or a stray worktree DB). Canonical pattern: mcp/health/web_tools.py:700.
+    from genesis.env import genesis_db_path
+
+    pair_key = p["pair_key"]
+    survivor_id = p.get("survivor_id")
+    loser_id = p.get("loser_id")
+
+    for attempt in range(_APPLY_MAX_ATTEMPTS):
+        try:
+            async with get_raw_db(genesis_db_path()) as own:
+                try:
+                    await own.execute("BEGIN IMMEDIATE")
+
+                    # Re-read identities INSIDE the write-locked transaction so no other
+                    # writer can drift them before our claim+merge commit (#8). A `stale`
+                    # verdict is not a dead end: the reconcile sweep re-enqueues it (it is
+                    # excluded from settled_pair_keys) to be re-adjudicated with current
+                    # identities; mark_stale also VOIDS the human approval, since the
+                    # thing they approved changed and must be re-reviewed before it applies.
+                    ent_a = await _resolve_active(own, p["entity_a"])
+                    ent_b = await _resolve_active(own, p["entity_b"])
+                    is_stale = (
+                        ent_a is None
+                        or ent_b is None
+                        or ent_a["entity_id"] == ent_b["entity_id"]
+                        # norm_name drift → the thing we judged is not the thing we'd
+                        # merge now.
+                        or ent_a["norm_name"] != p.get("norm_a")
+                        or ent_b["norm_name"] != p.get("norm_b")
+                        # Honor the STORED, human-approved direction. Do NOT recompute the
+                        # survivor from CURRENT mention counts: counts can shift between
+                        # approval and apply, and recomputing could tombstone the very
+                        # entity the human chose to KEEP. Require the approved pair to still
+                        # be exactly the live resolved pair; any drift → stale (re-review),
+                        # never a silent re-pick.
+                        or not survivor_id
+                        or not loser_id
+                        or {survivor_id, loser_id} != {ent_a["entity_id"], ent_b["entity_id"]}
+                    )
+                    if is_stale:
+                        await adj_crud.mark_stale(own, pair_key=pair_key, _commit=False)
+                        await own.commit()
+                        counts["stale"] += 1
+                        return
+
+                    # Atomic claim: flip proposed_merge→merge ONLY while it is still
+                    # proposed_merge AND approved. Of two concurrent appliers — or an apply
+                    # racing a reject landing after our batch read — exactly one wins
+                    # (rowcount 1); the loser skips instead of double-merging (#5).
+                    claimed = await adj_crud.claim_approved_for_apply(
+                        own,
+                        pair_key=pair_key,
+                        loser_id=loser_id,
+                        survivor_id=survivor_id,
+                        _commit=False,
+                    )
+                    if not claimed:
+                        await own.commit()  # nothing written; release the write lock
+                        counts["skipped"] = counts.get("skipped", 0) + 1
+                        return
+
+                    await entities_crud.merge_entity(
+                        own, loser_id=loser_id, survivor_id=survivor_id, _commit=False
+                    )
+                    await own.commit()
+                    counts["merged"] += 1
+                    _note_merge(example_merges, ent_a, ent_b)
+                    return
+                except BaseException:
+                    # Roll the OWNED transaction back on ANY exit — including
+                    # CancelledError (Python 3.12 makes it a BaseException that bypasses
+                    # `except Exception`), so a cancelled apply leaves no claim or partial
+                    # destructive merge (#7). Owned connection → this can never discard
+                    # another coroutine's uncommitted writes.
+                    with contextlib.suppress(Exception):
+                        await own.rollback()
+                    raise
+        except sqlite3.OperationalError as exc:
+            # BEGIN IMMEDIATE / COMMIT on the owned connection can hit SQLITE_BUSY under
+            # write contention (get_raw_db lacks the shared conn's built-in lock retry).
+            # The rolled-back txn wrote nothing, so retrying the whole row is idempotent;
+            # give the lock a bounded, backing-off chance to clear before giving up.
+            if _is_lock_error(exc) and attempt < _APPLY_MAX_ATTEMPTS - 1:
+                await asyncio.sleep(_APPLY_RETRY_BACKOFF_S * (2**attempt))
+                continue
+            raise
+
+
 async def _apply_proposed_backlog(
     db: aiosqlite.Connection,
     counts: dict[str, int],
@@ -542,92 +663,21 @@ async def _apply_proposed_backlog(
 ) -> None:
     """Live-mode Phase 0: apply proposed_merge verdicts stored during shadow.
 
-    Human-approval gate: ONLY rows a human approved (``approved_at IS NOT NULL``)
-    are applied — so flipping the drainer to ``live`` can never bulk-auto-apply the
-    un-reviewed shadow backlog. Staleness guard: an identity that drifted since the
-    proposal (one side merged/renamed/gone) is marked ``stale`` and NOT applied.
+    Human-approval gate: ONLY rows a human approved (``approved_at IS NOT NULL``) are
+    applied — so flipping the drainer to ``live`` can never bulk-auto-apply the un-reviewed
+    shadow backlog. Each row is applied on its OWN connection under a single
+    ``BEGIN IMMEDIATE`` transaction (:func:`_apply_one_proposal`); the shared ``db`` here
+    is used only for the initial batch READ.
     """
     proposals = await adj_crud.list_proposed_merges(db, limit=budget, approved_only=True)
     for p in proposals:
-        pair_key = p["pair_key"]
-        # ── Pre-checks (identity/staleness) — no destructive writes yet ──
         try:
-            # A `stale` verdict is not a dead end: the reconcile sweep's dedup set
-            # (settled_pair_keys) excludes stale, so a stale pair is re-enqueued on
-            # the next sweep pass and re-adjudicated with its current identities.
-            # (mark_stale also VOIDS the human approval — the thing they approved
-            # changed, so it must be re-reviewed before it can apply again.)
-            ent_a = await _resolve_active(db, p["entity_a"])
-            ent_b = await _resolve_active(db, p["entity_b"])
-            if ent_a is None or ent_b is None or ent_a["entity_id"] == ent_b["entity_id"]:
-                await adj_crud.mark_stale(db, pair_key=pair_key)
-                counts["stale"] += 1
-                continue
-            # norm_name drift → the thing we judged is not the thing we'd merge now.
-            if ent_a["norm_name"] != p.get("norm_a") or ent_b["norm_name"] != p.get("norm_b"):
-                await adj_crud.mark_stale(db, pair_key=pair_key)
-                counts["stale"] += 1
-                continue
-            # Honor the STORED, human-approved direction. Do NOT recompute the
-            # survivor from CURRENT mention counts (_pick_survivor): counts can
-            # shift between approval and apply, and recomputing could tombstone
-            # the very entity the human chose to KEEP. Require the approved pair to
-            # still be exactly the live resolved pair; any drift → stale (re-review),
-            # never a silent re-pick.
-            survivor_id = p.get("survivor_id")
-            loser_id = p.get("loser_id")
-            if (
-                not survivor_id
-                or not loser_id
-                or {survivor_id, loser_id} != {ent_a["entity_id"], ent_b["entity_id"]}
-            ):
-                await adj_crud.mark_stale(db, pair_key=pair_key)
-                counts["stale"] += 1
-                continue
+            await _apply_one_proposal(p, counts, example_merges)
         except Exception:
-            logger.exception("entity apply pre-check failed: %s", pair_key)
-            counts["errors"] = counts.get("errors", 0) + 1
-            continue
-
-        # ── Apply under a per-row SAVEPOINT (unique name) ──
-        # A failure rolls back ONLY this row's writes via ROLLBACK TO — NEVER
-        # db.rollback() on the shared SerializedConnection, which would discard
-        # unrelated concurrent uncommitted writes (no_rollback_shared_connection).
-        # The name is unique per row so two appliers sharing one connection (e.g.
-        # concurrent entity_adjudication_apply MCP calls) can never RELEASE/
-        # ROLLBACK TO each other's savepoint (SQLite targets the most-recent of a
-        # given name). uuid-derived → a safe SQL identifier, not caller input.
-        sp = f"entity_apply_{uuid.uuid4().hex[:12]}"
-        await db.execute(f"SAVEPOINT {sp}")
-        try:
-            # Atomic claim (TOCTOU + double-apply defense): flip proposed_merge→merge
-            # ONLY while it is still proposed_merge AND approved. Of two concurrent
-            # appliers — or an apply racing a reject — exactly one wins (rowcount 1);
-            # the loser skips instead of double-merging. The stored direction is
-            # applied verbatim.
-            claimed = await adj_crud.claim_approved_for_apply(
-                db,
-                pair_key=pair_key,
-                loser_id=loser_id,
-                survivor_id=survivor_id,
-                _commit=False,
-            )
-            if not claimed:
-                await db.execute(f"RELEASE {sp}")
-                counts["skipped"] = counts.get("skipped", 0) + 1
-                continue
-            await entities_crud.merge_entity(
-                db, loser_id=loser_id, survivor_id=survivor_id, _commit=False
-            )
-            await db.execute(f"RELEASE {sp}")
-            await db.commit()
-            counts["merged"] += 1
-            _note_merge(example_merges, ent_a, ent_b)
-        except Exception:
-            logger.exception("entity apply row failed, rolling back partial merge: %s", pair_key)
-            with contextlib.suppress(Exception):
-                await db.execute(f"ROLLBACK TO {sp}")
-                await db.execute(f"RELEASE {sp}")
+            # Per-row isolation: the row's OWN transaction already rolled back, so nothing
+            # partial persists. CancelledError is deliberately NOT caught here — it
+            # propagates (the row's txn was already rolled back in _apply_one_proposal).
+            logger.exception("entity apply row failed: %s", p.get("pair_key"))
             counts["errors"] = counts.get("errors", 0) + 1
             continue
 

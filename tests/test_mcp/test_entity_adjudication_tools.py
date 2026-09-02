@@ -43,11 +43,15 @@ async def _seed_proposal(db, name_a, norm_a, name_b, norm_b):
 
 async def _with_db(fn):
     import genesis.mcp.memory_mcp as mod
+    from genesis.db.schema import create_all_tables
+    from genesis.env import genesis_db_path
 
-    async with aiosqlite.connect(":memory:") as db:
+    # File-backed (NOT :memory:) so the apply path's OWNED get_raw_db(genesis_db_path())
+    # connection sees the same data — an :memory: db is private to one connection.
+    # genesis_db_path() is redirected to tmp by the autouse conftest fixture.
+    async with aiosqlite.connect(str(genesis_db_path())) as db:
         db.row_factory = aiosqlite.Row
-        from genesis.db.schema import create_all_tables
-
+        await db.execute("PRAGMA journal_mode=WAL")
         await create_all_tables(db)
         await db.commit()
         old = (mod._store, mod._db, mod._retriever)

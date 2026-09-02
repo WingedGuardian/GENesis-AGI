@@ -63,6 +63,70 @@ async def _status(db, eid):
     return (await cur.fetchone())[0]
 
 
+@pytest.fixture
+async def file_db():
+    """File-backed DB at the conftest-redirected ``genesis_db_path()``.
+
+    The live apply path opens its OWN connection via ``get_raw_db(genesis_db_path())``;
+    an ``:memory:`` database is private to a single connection, so the shared ``db``
+    fixture cannot be seen by that owned connection. This fixture seeds the SAME file the
+    owned connection will open, so apply-path tests exercise the real two-connection
+    isolation. (The autouse ``_isolate_genesis_db_path`` conftest fixture has already
+    redirected ``genesis_db_path()`` to ``tmp_path/isolated-genesis.db``.)
+    """
+    import aiosqlite
+
+    from genesis.db.connection import SerializedConnection
+    from genesis.db.schema import create_all_tables, seed_data
+    from genesis.env import genesis_db_path
+
+    conn = await aiosqlite.connect(str(genesis_db_path()))
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.execute("PRAGMA foreign_keys=ON")
+    await create_all_tables(conn)
+    await seed_data(conn)
+    await conn.commit()
+    wrapped = SerializedConnection(conn)
+    try:
+        yield wrapped
+    finally:
+        await wrapped.close()
+
+
+async def _status_fresh(eid):
+    """Read entity status on a FRESH connection to the file DB — proves COMMITTED state,
+    independent of any open txn on the fixture/owned connection."""
+    import aiosqlite
+
+    from genesis.env import genesis_db_path
+
+    conn = await aiosqlite.connect(str(genesis_db_path()))
+    try:
+        cur = await conn.execute("SELECT status FROM entities WHERE entity_id=?", (eid,))
+        row = await cur.fetchone()
+        return row[0] if row else None
+    finally:
+        await conn.close()
+
+
+async def _verdict_fresh(pair_key):
+    """Read an adjudication verdict on a FRESH connection (committed state)."""
+    import aiosqlite
+
+    from genesis.env import genesis_db_path
+
+    conn = await aiosqlite.connect(str(genesis_db_path()))
+    try:
+        cur = await conn.execute(
+            "SELECT verdict FROM entity_adjudications WHERE pair_key=?", (pair_key,)
+        )
+        row = await cur.fetchone()
+        return row[0] if row else None
+    finally:
+        await conn.close()
+
+
 # ── digit guard ──────────────────────────────────────────────────────────────
 
 
@@ -335,7 +399,8 @@ async def test_live_merge_race_guard_falls_back_to_proposed(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_live_phase0_applies_proposed_backlog(db):
+async def test_live_phase0_applies_proposed_backlog(file_db):
+    db = file_db  # apply path opens its own get_raw_db conn → needs a file-backed DB
     a = await _mk_entity(db, "kappa", "kappa")
     b = await _mk_entity(db, "kappaa", "kappaa")
     # a proposal recorded during a prior shadow run
@@ -358,7 +423,8 @@ async def test_live_phase0_applies_proposed_backlog(db):
 
 
 @pytest.mark.asyncio
-async def test_live_phase0_stale_on_norm_drift(db):
+async def test_live_phase0_stale_on_norm_drift(file_db):
+    db = file_db
     a = await _mk_entity(db, "lambda", "lambda")
     b = await _mk_entity(db, "lambdaa", "lambdaa")
     await adj_crud.record_verdict(
@@ -403,8 +469,9 @@ async def test_live_backlog_skips_unapproved(db):
 
 
 @pytest.mark.asyncio
-async def test_apply_approved_merges_applies_and_stamps(db):
+async def test_apply_approved_merges_applies_and_stamps(file_db):
     """apply_approved_merges (mode-independent) applies an approved proposal + journals it."""
+    db = file_db
     a = await _mk_entity(db, "nu", "nu")
     b = await _mk_entity(db, "nuu", "nuu")
     await adj_crud.record_verdict(
@@ -489,10 +556,11 @@ async def test_reapprove_not_clobbered_by_readjudication(db):
 
 
 @pytest.mark.asyncio
-async def test_stale_voids_approval_no_silent_reapply(db):
+async def test_stale_voids_approval_no_silent_reapply(file_db):
     """BLOCKER regression: a drifted APPROVED proposal is marked stale AND loses its
     approval, so it cannot silently re-apply after re-adjudication under norms the
     human never saw. mark_stale is the only transition that re-opens an approved row."""
+    db = file_db
     a = await _mk_entity(db, "john smith", "john smith")
     b = await _mk_entity(db, "jon smith", "jon smith")
     await adj_crud.record_verdict(
@@ -537,9 +605,10 @@ async def test_stale_voids_approval_no_silent_reapply(db):
 
 
 @pytest.mark.asyncio
-async def test_apply_batch_isolates_failing_row(db, monkeypatch):
+async def test_apply_batch_isolates_failing_row(file_db, monkeypatch):
     """A row that raises in merge_entity is rolled back + skipped; other approved rows
     in the same batch still apply, and the failed row's partial write is discarded."""
+    db = file_db
     g1 = await _mk_entity(db, "good a", "good a")
     g2 = await _mk_entity(db, "good b", "good b")
     await adj_crud.record_verdict(
@@ -725,7 +794,7 @@ async def _add_mentions(db, entity_id, n):
 
 
 @pytest.mark.asyncio
-async def test_apply_honors_stored_direction_not_recomputed_survivor(db):
+async def test_apply_honors_stored_direction_not_recomputed_survivor(file_db):
     """apply must tombstone the STORED loser — never re-pick from live mention counts.
 
     The human approved survivor=a / loser=b. Then b accrues MORE mentions than a,
@@ -734,6 +803,7 @@ async def test_apply_honors_stored_direction_not_recomputed_survivor(db):
     stored direction keeps `a` active and merges `b`. (Verified-RED: with the old
     recompute this asserts the opposite outcome and fails.)
     """
+    db = file_db
     a = await _mk_entity(db, "keep", "keep")
     b = await _mk_entity(db, "keepp", "keepp")
     await adj_crud.record_verdict(
@@ -825,8 +895,9 @@ async def test_apply_negative_budget_applies_nothing(db):
 
 
 @pytest.mark.asyncio
-async def test_apply_stale_when_stored_direction_absent(db):
+async def test_apply_stale_when_stored_direction_absent(file_db):
     """A proposal missing a stored survivor/loser can't be honored → marked stale."""
+    db = file_db
     a = await _mk_entity(db, "sd", "sd")
     b = await _mk_entity(db, "sdd", "sdd")
     await adj_crud.record_verdict(
@@ -845,3 +916,86 @@ async def test_apply_stale_when_stored_direction_absent(db):
 
     assert counts["merged"] == 0 and counts["stale"] == 1
     assert await _status(db, b) == "active"
+
+
+# ── owned-connection isolation: foreign commit + CancelledError (#6/#7) ────────
+
+
+@pytest.mark.asyncio
+async def test_apply_foreign_commit_cannot_flush_partial_merge(file_db, monkeypatch):
+    """#6: the apply runs on its OWN connection, so a foreign commit landing mid-merge
+    (the MCP middleware, or another coroutine on the shared conn) can NOT durably commit
+    THIS row's partial merge. Verified-RED against the shared-connection SAVEPOINT code —
+    there the foreign commit flushes the open savepoint's partial write."""
+    db = file_db
+    a = await _mk_entity(db, "iso keep", "iso keep")
+    b = await _mk_entity(db, "iso lose", "iso lose")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="iso keep",
+        norm_b="iso lose",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="test")
+
+    async def _foreign_commit_then_fail(conn, *, loser_id, survivor_id, _commit=True):
+        # Partial destructive write, THEN a foreign commit on the SHARED conn, THEN fail.
+        await conn.execute(
+            "UPDATE entities SET status='merged', merged_into=? WHERE entity_id=?",
+            (survivor_id, loser_id),
+        )
+        await db.commit()  # foreign commit — would flush a shared-conn savepoint's partial
+        raise RuntimeError("merge failed after a foreign commit")
+
+    monkeypatch.setattr(entities_crud, "merge_entity", _foreign_commit_then_fail)
+
+    counts = await adj.apply_approved_merges(db, budget=10)
+
+    assert counts.get("errors", 0) == 1
+    # Read on a FRESH connection: the partial merge must NOT have survived.
+    assert await _status_fresh(b) != "merged"
+
+
+@pytest.mark.asyncio
+async def test_apply_cancelled_mid_merge_rolls_back(file_db, monkeypatch):
+    """#7: a CancelledError during merge_entity is a BaseException that bypasses
+    `except Exception`; the owned transaction must still roll back so NO claim and NO
+    partial merge survive — even if a commit follows. Verified-RED against the
+    `except Exception` + shared-conn savepoint code (the claim + partial stay in the open
+    savepoint and a following commit flushes them)."""
+    import asyncio
+
+    db = file_db
+    a = await _mk_entity(db, "cx keep", "cx keep")
+    b = await _mk_entity(db, "cx lose", "cx lose")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="cx keep",
+        norm_b="cx lose",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="test")
+
+    async def _partial_then_cancel(conn, *, loser_id, survivor_id, _commit=True):
+        await conn.execute(
+            "UPDATE entities SET status='merged', merged_into=? WHERE entity_id=?",
+            (survivor_id, loser_id),
+        )
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(entities_crud, "merge_entity", _partial_then_cancel)
+
+    with pytest.raises(asyncio.CancelledError):
+        await adj.apply_approved_merges(db, budget=10)
+    await db.commit()  # a following commit must NOT flush a leaked partial/claim
+
+    assert await _status_fresh(b) != "merged"  # loser not tombstoned
+    assert await _verdict_fresh(adj_crud.pair_key(a, b)) == "proposed_merge"  # claim rolled back
