@@ -223,6 +223,18 @@ modules: [cc]
 verified: 975d3944 2026-08-31
 ```
 
+- **Roster peer availability is OBSERVATION, never a gate** (`cc/peer_availability.py`,
+  recorded from the failover loop in `cc/conversation.py`). `roster.failover_chain`
+  admits a peer on CREDENTIAL PRESENCE — "is `auth_env` set" — so a quota-blocked
+  standby is indistinguishable from a healthy one in every self-report. This module
+  records what the last real attempt showed, and the failover path still tries every
+  peer in order regardless: a stale "unavailable" that suppressed a peer would drop a
+  WORKING backup exactly when the home model is down. Two invariants worth keeping:
+  only a PROVIDER REFUSAL (rate-limit/quota) is evidence about a peer — a local fault
+  (offline, our timeout, an MCP crash, a stale session) is a `CCError` on the same
+  branch but never reaches the provider, and `note_failure` declines it; and records
+  refresh ONLY while the home model is down, so they are last-observed facts carrying
+  `observed_at`/`age_seconds`, never current state.
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
   (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A restricted
   session escapes its tool restrictions if it can spawn a child that inherits a fresh,

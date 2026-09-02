@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from genesis.cc import fallback_state, roster
+from genesis.cc import fallback_state, peer_availability, roster
 from genesis.cc.conversation import ConversationLoop
 from genesis.cc.exceptions import CCError, CCNetworkOfflineError, CCRateLimitError
 from genesis.cc.invoker import CCInvoker
@@ -285,3 +285,118 @@ async def test_run_failover_peer_offline_propagates_without_fresh_retry(loop, in
             on_event=None,
         )
     assert invoker.run.call_count == 1  # no fresh retry
+
+
+# ── peer-availability recording (advisory observation on the failover path) ──
+# These live here, not in test_peer_availability.py, because this is where the
+# behaviour can actually break: roster.py never references peer_availability, so
+# a test asserting "selection is unchanged" is tautological by construction.
+
+
+@pytest.mark.asyncio
+async def test_blocked_peer_is_still_attempted(loop, invoker, db):
+    """THE SAFETY PROPERTY: the record is advisory and must never suppress a peer.
+
+    A stale or wrong "unavailable" record that removed a peer from the attempt
+    would drop a WORKING backup at exactly the moment the home model is down,
+    turning a recoverable outage into a degraded one. Pre-mark the only peer as
+    blocked, then require that it is still invoked AND still serves the turn.
+    """
+    peer_availability.note_failure("glm-5.2", CCRateLimitError("earlier 429"))
+    assert peer_availability.read_peer("glm-5.2").available is False
+
+    invoker.run = AsyncMock(side_effect=[
+        CCRateLimitError("limit"), _output(text="GLM reply", session_id="glm-1"),
+    ])
+    result = await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
+
+    assert "GLM reply" in result, "a peer recorded as blocked was skipped — gating regression"
+    assert invoker.run.await_count == 2  # home, then the 'blocked' peer
+    # ...and serving the turn clears the stale block.
+    assert peer_availability.read_peer("glm-5.2").available is True
+
+
+@pytest.mark.asyncio
+async def test_peer_quota_refusal_is_recorded(loop, invoker):
+    # Home AND peer rate-limited → the peer's refusal is real evidence about it.
+    invoker.run = AsyncMock(side_effect=CCRateLimitError("limit"))
+    await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
+    st = peer_availability.read_peer("glm-5.2")
+    assert st is not None and st.available is False
+    assert st.reason == peer_availability.QUOTA
+
+
+@pytest.mark.asyncio
+async def test_local_fault_does_not_mark_the_peer_down(loop, invoker):
+    """A dead local network never reaches the provider — blaming the peer would
+    mark the standby fleet down for a blip that had nothing to do with it."""
+    invoker.run = AsyncMock(side_effect=[
+        CCRateLimitError("limit"), CCNetworkOfflineError("no route"),
+    ])
+    await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
+    assert peer_availability.read_peer("glm-5.2") is None
+
+
+@pytest.mark.asyncio
+async def test_successful_peer_is_recorded_available(loop, invoker):
+    invoker.run = AsyncMock(side_effect=[
+        CCRateLimitError("limit"), _output(text="GLM reply", session_id="glm-1"),
+    ])
+    await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
+    st = peer_availability.read_peer("glm-5.2")
+    assert st is not None and st.available is True
+
+
+# Captured at import, BEFORE the `loop` fixture monkeypatches it, so one test
+# below can exercise the REAL selection path instead of a stub.
+_REAL_FAILOVER_INVOCATIONS = roster.failover_invocations
+
+
+@pytest.mark.asyncio
+async def test_blocked_peer_survives_the_real_selection_path(loop, invoker, monkeypatch):
+    """The advisory property, without stubbing the place a gate would go.
+
+    The shared fixture monkeypatches ``roster.failover_invocations`` — the most
+    natural home for a suppression gate — so a test resting on it cannot observe
+    a gate added there. This one restores the real function and drives it from a
+    fake roster, so selection genuinely runs while the peer is recorded blocked.
+    """
+    fake_roster = {
+        "default": "claude",
+        "models": {
+            "claude": {"native_subscription": True, "failover_order": 0},
+            "glm-5.2": {
+                "anthropic_base_url": "https://glm.invalid/anthropic",
+                "auth_env": "FAKE_PEER_KEY",
+                "model_id": "glm-5.2",
+                "failover_order": 1,
+            },
+        },
+    }
+    monkeypatch.setenv("FAKE_PEER_KEY", "token-value-long-enough")
+    monkeypatch.setattr(roster, "failover_invocations", _REAL_FAILOVER_INVOCATIONS)
+    monkeypatch.setattr(roster, "load_roster", lambda *a, **k: fake_roster)
+
+    peer_availability.note_failure("glm-5.2", CCRateLimitError("earlier 429"))
+    assert peer_availability.read_peer("glm-5.2").available is False
+
+    invoker.run = AsyncMock(side_effect=[
+        CCRateLimitError("limit"), _output(text="GLM reply", session_id="glm-1"),
+    ])
+    result = await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
+
+    assert "GLM reply" in result, "blocked peer was suppressed by real selection — gating regression"
+    assert peer_availability.read_peer("glm-5.2").available is True
+
+
+@pytest.mark.asyncio
+async def test_degenerate_empty_success_does_not_clear_a_block(loop, invoker):
+    """A silent cap returns a non-error output with NO text. Treating that as
+    'available' would erase a real prior block — deleting the one signal an
+    operator would act on."""
+    peer_availability.note_failure("glm-5.2", CCRateLimitError("earlier 429"))
+    invoker.run = AsyncMock(side_effect=[
+        CCRateLimitError("limit"), _output(text="", session_id="glm-1"),
+    ])
+    await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
+    assert peer_availability.read_peer("glm-5.2").available is False

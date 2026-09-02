@@ -1079,7 +1079,7 @@ class ConversationLoop:
         path. Returns the formatted reply on success, or None to fall through to
         contingency. Never raises (failover must not break the turn)."""
         try:
-            from genesis.cc import fallback_state
+            from genesis.cc import fallback_state, peer_availability
             home = roster.active_model()
             # A resume turn carries no system prompt (identity lives in the home CC
             # session being resumed). The peer runs a FRESH session, so re-assemble
@@ -1107,11 +1107,29 @@ class ConversationLoop:
                         peer_name, peer_inv, sticky=sticky,
                         on_event=on_event, streamed=streamed,
                     )
-                except (CCRateLimitError, CCQuotaExhaustedError):
+                except (CCRateLimitError, CCQuotaExhaustedError) as exc:
+                    # Provider refused on a usage ceiling — real evidence about the
+                    # peer. Recording is advisory and never changes which peers are
+                    # tried; it exists so a blocked standby is VISIBLE, since the
+                    # roster admits a peer on credential presence alone.
+                    peer_availability.note_failure(peer_name, exc)
                     continue  # this peer is also down → try the next one
-                except CCError:
+                except CCError as exc:
                     logger.warning("failover peer %s failed", peer_name, exc_info=True)
+                    # Routed through the SAME classifier on purpose: a local fault
+                    # (offline — which never left the box — our own timeout, an MCP
+                    # server crash, a stale sticky session) is a CCError here too,
+                    # but is not evidence about the peer. note_failure declines it,
+                    # so one local blip can't mark the whole standby fleet down.
+                    peer_availability.note_failure(peer_name, exc)
                     continue
+                # Clear any stale block ONLY on a genuine answer. The invoker
+                # returns normally in two degenerate cases — a silent cap yields
+                # an empty non-error output — and treating those as "available"
+                # would erase a real prior block, deleting the one signal an
+                # operator would act on.
+                if not output.is_error and (output.text or "").strip():
+                    peer_availability.note_success(peer_name)
                 # Success on this peer. Record the account-wide flag + this session's
                 # sticky peer session (only with a real session id, else continuity
                 # can't resume). Home identity in cc_sessions stays on Claude.
