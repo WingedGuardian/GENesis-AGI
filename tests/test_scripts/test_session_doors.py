@@ -45,10 +45,29 @@ if [[ "$args" == *has-session* ]]; then
     exit 1
 fi
 if [[ "$args" == *list-panes* ]]; then
-    # 'pane_id pane_pid' rows, one per pane. Absent file -> no output, which
-    # exercises the probe's "cannot enumerate" path.
-    [[ -f "$FAKE_TMUX_PANES" ]] && cat "$FAKE_TMUX_PANES"
+    # 'pane_id pane_pid pane_current_command' rows, one per pane. Absent file
+    # -> no output, which exercises the probe's "cannot enumerate" path.
+    # FAKE_TMUX_PANES2, when set, is served from the SECOND call on — this is
+    # how "the pane changed between the decision and the keystrokes" is
+    # reproduced.
+    n=0; [[ -f "$FAKE_TMUX_PANES_N" ]] && n=$(cat "$FAKE_TMUX_PANES_N")
+    echo $(( n + 1 )) > "$FAKE_TMUX_PANES_N"
+    if [[ $n -ge 1 && -n "${FAKE_TMUX_PANES2:-}" && -f "$FAKE_TMUX_PANES2" ]]; then
+        cat "$FAKE_TMUX_PANES2"
+    elif [[ -f "$FAKE_TMUX_PANES" ]]; then
+        cat "$FAKE_TMUX_PANES"
+    fi
     exit 0
+fi
+if [[ "$args" == *send-keys* && -n "${FAKE_TMUX_SENDKEYS_FAIL:-}" ]]; then
+    # Undeliverable keystrokes (pane died, server gone). Logged above, so the
+    # tests can still see the attempt.
+    exit 1
+fi
+if [[ "$args" == *new-session* && -n "${FAKE_TMUX_FDS:-}" ]]; then
+    # Record which files the exec'd tmux client inherits open descriptors to;
+    # a leaked heal-lock fd would hold the flock for the whole session.
+    for f in /proc/$$/fd/*; do readlink "$f"; done >> "$FAKE_TMUX_FDS" 2>/dev/null
 fi
 if [[ "$args" == *list-sessions* ]]; then
     # The listing file stores 'name|attached|activity' lines; emit the shape
@@ -84,6 +103,13 @@ def door(tmp_path):
     fake_py = venv_bin / "python"
     fake_py.write_text(
         "#!/usr/bin/env bash\n"
+        'if [[ "$*" == *slot_liveness* && "$*" == *--idle* ]]; then\n'
+        # The idleness probe is a separate question with its own fake answer.
+        # Default IDLE so heal tests exercise the keystroke path; "EMPTY"
+        # models a probe that produced no verdict at all.
+        '  case "${FAKE_IDLE:-IDLE}" in EMPTY) ;; *) echo "${FAKE_IDLE:-IDLE}"; echo "note";; esac\n'
+        "  exit 0\n"
+        "fi\n"
         'if [[ "$*" == *slot_liveness* ]]; then\n'
         # FAKE_LIVENESS may be a comma-separated SEQUENCE; each call consumes
         # the next entry (last one repeats). This is how the probe/re-probe
@@ -116,7 +142,17 @@ def door(tmp_path):
             "FAKE_TMUX_PANES": str(panes),
             "FAKE_LIVENESS": os.environ.get("_TEST_FAKE_LIVENESS", ""),
             "FAKE_LIVENESS_N": str(tmp_path / "liveness_calls.txt"),
+            "FAKE_IDLE": os.environ.get("_TEST_FAKE_IDLE", ""),
+            "FAKE_TMUX_PANES_N": str(tmp_path / "panes_calls.txt"),
+            "FAKE_TMUX_PANES2": os.environ.get("_TEST_FAKE_PANES2", ""),
+            "FAKE_TMUX_SENDKEYS_FAIL": os.environ.get("_TEST_FAKE_SENDKEYS_FAIL", ""),
+            "FAKE_TMUX_FDS": str(tmp_path / "tmux_fds.txt"),
         }
+        # Per-invocation call counters: two run() calls in one test must not
+        # leak sequence positions (FAKE_LIVENESS / FAKE_TMUX_PANES2) into
+        # each other.
+        (tmp_path / "liveness_calls.txt").unlink(missing_ok=True)
+        (tmp_path / "panes_calls.txt").unlink(missing_ok=True)
         # Deliberately NOT inheriting os.environ: the test itself may run
         # inside a cc slot, whose GENESIS_CC_PERMISSION_MODE / TMUX would
         # contaminate the branch under test.
@@ -128,6 +164,8 @@ def door(tmp_path):
             timeout=30,
         )
 
+    run.fds_file = tmp_path / "tmux_fds.txt"
+    run.panes2 = tmp_path / "panes2.txt"
     return run, log, sessions, listing, panes
 
 
@@ -311,15 +349,34 @@ class TestSlotHeal:
     tests/test_cc/test_slot_liveness.py); these lock what the DOOR does with it.
     """
 
-    def _run_with(self, door, verdict, panes_text="%0 4242 bash\n", session="cc-4"):
+    def _run_with(
+        self,
+        door,
+        verdict,
+        panes_text="%0 4242 bash\n",
+        session="cc-4",
+        idle=None,
+        panes2_text=None,
+        sendkeys_fail=False,
+    ):
         run, log, sessions, _listing, panes = door
         sessions.write_text(f"{session}\n")
         panes.write_text(panes_text)
         os.environ["_TEST_FAKE_LIVENESS"] = verdict
+        if idle is not None:
+            os.environ["_TEST_FAKE_IDLE"] = idle
+        if panes2_text is not None:
+            run.panes2.write_text(panes2_text)
+            os.environ["_TEST_FAKE_PANES2"] = str(run.panes2)
+        if sendkeys_fail:
+            os.environ["_TEST_FAKE_SENDKEYS_FAIL"] = "1"
         try:
             proc = run(f"genesis-3-{session.split('-')[1]}")
         finally:
             os.environ.pop("_TEST_FAKE_LIVENESS", None)
+            os.environ.pop("_TEST_FAKE_IDLE", None)
+            os.environ.pop("_TEST_FAKE_PANES2", None)
+            os.environ.pop("_TEST_FAKE_SENDKEYS_FAIL", None)
         return proc, log.read_text()
 
     def test_poisoned_slot_is_healed_with_the_full_launch_line(self, door):
@@ -429,12 +486,24 @@ class TestSlotHeal:
         proc, _log = self._run_with(door, "POISONED", panes_text="%0 4242 rsync\n")
         assert "running 'rsync'" in proc.stderr, proc.stderr
 
-    @pytest.mark.parametrize("shell", ["bash", "-bash", "sh", "zsh", "dash", "fish"])
+    @pytest.mark.parametrize("shell", ["bash", "-bash", "sh", "zsh", "dash", "ksh"])
     def test_shell_panes_still_heal(self, door, shell):
         # Login shells arrive with a leading dash; missing them would make the
         # gate refuse to heal the exact shape that motivated this change.
         _proc, log = self._run_with(door, "POISONED", panes_text=f"%0 4242 {shell}\n")
         assert "send-keys" in log, f"refused to heal an idle {shell} pane:\n{log}"
+
+    def test_fish_pane_is_spared_not_relaunched(self, door):
+        # The typed payload (`export K=V;`, `__ec=$?`) is POSIX and a parse
+        # error in fish — a broken relaunch is worse than a plain attach.
+        _proc, log = self._run_with(door, "POISONED", panes_text="%0 4242 fish\n")
+        assert "send-keys" not in log, f"typed a POSIX payload into fish:\n{log}"
+
+    def test_process_name_containing_a_space_is_spared(self, door):
+        # pane_current_command is the row REMAINDER, not its first token —
+        # a renamed process reporting "bash x" must not pass as "bash".
+        _proc, log = self._run_with(door, "POISONED", panes_text="%0 4242 bash x\n")
+        assert "send-keys" not in log, f"first-token match let a masquerade through:\n{log}"
 
     def test_malformed_pane_id_is_never_a_send_keys_target(self, door):
         _proc, log = self._run_with(door, "POISONED", panes_text="garbage 4242 bash\n")
@@ -459,6 +528,105 @@ class TestSlotHeal:
     def test_still_heals_when_the_recheck_agrees(self, door):
         _proc, log = self._run_with(door, "POISONED,POISONED")
         assert "send-keys" in log, f"re-check wrongly blocked a real heal:\n{log}"
+
+    # ── G1: idleness is CURRENT state, established immediately before keys ──
+
+    def test_shell_running_a_script_is_spared_despite_its_name(self, door):
+        """`bash script.sh` reports pane_current_command == "bash", so the name
+        whitelist alone would C-c a running job. Child-presence is the signal
+        that tells an idle prompt from a busy shell — only IDLE may be typed at.
+        """
+        _proc, log = self._run_with(door, "POISONED", idle="BUSY")
+        assert "send-keys" not in log, f"typed over a running shell job:\n{log}"
+
+    def test_busy_shell_stand_down_is_announced(self, door):
+        proc, _log = self._run_with(door, "POISONED", idle="BUSY")
+        assert "mid-job" in proc.stderr, proc.stderr
+
+    def test_idle_probe_without_a_verdict_spares(self, door):
+        # Broken venv / timeout / crashed probe -> no IDLE affirmation -> no keys.
+        proc, log = self._run_with(door, "POISONED", idle="EMPTY")
+        assert "send-keys" not in log, f"typed on an absent idle verdict:\n{log}"
+        # And the message must not claim knowledge the probe never produced —
+        # "mid-job" here sends an operator debugging a never-healing slot to
+        # inspect a job that does not exist.
+        assert "could not be established" in proc.stderr, proc.stderr
+        assert "mid-job" not in proc.stderr, proc.stderr
+
+    def test_unknown_idleness_spares(self, door):
+        _proc, log = self._run_with(door, "POISONED", idle="UNKNOWN")
+        assert "send-keys" not in log
+
+    def test_safety_gate_reads_fresh_pane_state_not_the_decision_snapshot(self, door):
+        """The pane list is captured when the heal is DECIDED, but the OAuth
+        gate is allowed up to 30s before any keystroke — ample for the operator
+        to have started vim in the pane. The safety gate must re-read the pane
+        immediately before typing; acting on the stale snapshot C-c's whatever
+        is running now.
+        """
+        _proc, log = self._run_with(
+            door, "POISONED",
+            panes_text="%0 4242 bash\n",
+            panes2_text="%0 4242 vim\n",
+        )
+        assert "send-keys" not in log, f"acted on the stale pane snapshot:\n{log}"
+
+    def test_pane_replaced_mid_flight_is_not_typed_into(self, door):
+        # The first window's pane id changed between decision and action —
+        # the layout moved under us; whatever is there now was never probed.
+        _proc, log = self._run_with(
+            door, "POISONED",
+            panes_text="%0 4242 bash\n",
+            panes2_text="%9 5555 bash\n",
+        )
+        assert "send-keys" not in log, f"typed into a pane never probed:\n{log}"
+
+    # ── G2: the heal path must be EQUIVALENT to the create path ─────────────
+
+    def test_healed_pane_receives_the_create_paths_env(self, door):
+        """`tmux new-session` passes GENESIS_SLOT / GENESIS_CC_PERMISSION_MODE /
+        CLAUDE_CODE_TMPDIR / LANG via `-e`; a healed pane keeps whatever stale
+        environment the old shell had unless the heal carries the same set.
+        """
+        _proc, log = self._run_with(door, "POISONED")
+        literal = [ln for ln in log.splitlines() if "send-keys" in ln and " -l " in ln]
+        assert literal, f"no literal payload sent:\n{log}"
+        payload = literal[0]
+        for var in ("GENESIS_SLOT=4", "GENESIS_CC_PERMISSION_MODE=",
+                    "CLAUDE_CODE_TMPDIR=", "LANG="):
+            assert f"export {var}" in payload, (
+                f"healed pane not given {var!r}:\n{payload}"
+            )
+
+    def test_create_path_still_passes_env_via_dash_e(self, door):
+        # Guards the refactor that unifies the two paths' env source.
+        run, log, _sessions, _listing, _panes = door
+        result = run("manual")
+        assert result.returncode == 0, result.stderr
+        line = _new_session_line(log)
+        for var in ("GENESIS_SLOT=1", "GENESIS_CC_PERMISSION_MODE=",
+                    "CLAUDE_CODE_TMPDIR=", "LANG="):
+            assert f"-e {var}" in line, line
+
+    def test_heal_lock_fd_is_not_inherited_by_the_tmux_client(self, door):
+        """`exec tmux` replaces the shell, and an un-CLOEXEC'd lock fd rides
+        along into the attached client — holding the per-slot flock for the
+        whole session, so every later door to this slot stalls the full
+        `flock -w 45` for nothing.
+        """
+        run, _log, _sessions, _listing, _panes = door
+        _proc, log = self._run_with(door, "POISONED")
+        assert "send-keys" in log  # the heal (and so the lock) happened
+        fds = run.fds_file.read_text() if run.fds_file.exists() else ""
+        assert fds.strip(), "fd recording never ran — shim regression"
+        assert "cc-slot-heal" not in fds, (
+            f"heal lock fd leaked into the tmux client:\n{fds}"
+        )
+
+    def test_undeliverable_keystrokes_are_reported_not_claimed(self, door):
+        proc, log = self._run_with(door, "POISONED", sendkeys_fail=True)
+        assert "send-keys" in log  # the attempt was made…
+        assert "could not be delivered" in proc.stderr, proc.stderr
 
 
 
@@ -499,7 +667,7 @@ class TestWrapperInsideTmux:
 
         script = f"""
 set -u
-unset TMPDIR CLAUDE_CODE_TMPDIR GENESIS_CC_PERMISSION_MODE
+unset TMPDIR CLAUDE_CODE_TMPDIR GENESIS_CC_PERMISSION_MODE GENESIS_SLOT GENESIS_NO_TMUX_WRAP
 export PATH={str(binv)!r}:/usr/bin:/bin
 export HOME={str(home)!r}
 {env_extra}

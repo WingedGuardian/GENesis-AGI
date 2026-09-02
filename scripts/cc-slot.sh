@@ -556,6 +556,25 @@ fi
 # and an interactive bash.
 _PANE_CMD="${_OAUTH_SRC}cd ${GENESIS_ROOT} && command claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
 
+# ONE env source for both paths. `tmux new-session -e` seeds a FRESH pane's
+# environment; a healed pane keeps whatever its old shell had, so the heal
+# types the SAME set as `export`s ahead of the command — otherwise a healed
+# claude runs with a stale GENESIS_SLOT / permission mode / TMPDIR, the exact
+# create-vs-heal drift the single _PANE_CMD builder exists to prevent. LANG
+# stays LAST: a doors test parses the create line from its final -e.
+_PANE_ENV=(
+    "GENESIS_SLOT=${SLOT}"
+    "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}"
+    "CLAUDE_CODE_TMPDIR=${CLAUDE_CODE_TMPDIR}"
+    "LANG=${LANG:-}"
+)
+_PANE_ENV_FLAGS=()
+_HEAL_ENV_EXPORTS=""
+for _kv in "${_PANE_ENV[@]}"; do
+    _PANE_ENV_FLAGS+=(-e "$_kv")
+    _HEAL_ENV_EXPORTS+="export $(printf '%q' "$_kv"); "
+done
+
 if [ "$_HEAL" = "1" ]; then
     # SERIALIZE per slot. Every door converges here, so two of them (the
     # dashboard web terminal and an SSH login, or an SSH retry) can hold the
@@ -570,41 +589,90 @@ if [ "$_HEAL" = "1" ]; then
     # ordinary command first (safe to silence), and exec only once it is known
     # to succeed.
     _lock="${HOME}/.genesis/cc-slot-heal-${SLOT}.lock"
+    _LOCK_HELD=0
     if command -v flock >/dev/null 2>&1 \
        && mkdir -p "${HOME}/.genesis" 2>/dev/null \
        && : >>"$_lock" 2>/dev/null; then
         exec 9>>"$_lock"
+        _LOCK_HELD=1
         flock -w 45 9 2>/dev/null || true
     fi
 
+    # FRESH pane state — everything below reads CURRENT reality, not the
+    # snapshot the heal was DECIDED on. The OAuth gate is allowed up to 30s
+    # between decision and keystrokes, ample for the operator to have started
+    # vim in the pane (or killed the window); a gate that consults the old
+    # snapshot approves typing into a pane it never looked at.
+    _panes_now=$(tmux list-panes -s -t "=$SESSION_NAME" \
+        -F '#{pane_id} #{pane_pid} #{pane_current_command}' 2>/dev/null || true)
+    _fresh_row=$(printf '%s\n' "$_panes_now" | head -1)
+    _fresh_pane=${_fresh_row%% *}
+    _fresh_pid=$(printf '%s\n' "$_fresh_row" | cut -d' ' -f2)
+    # Full remainder after id+pid, NOT field 3: a process name containing a
+    # space ("bash x") must not pass the whitelist on its first token. A row
+    # with no third field leaves the whole row here, which no shell name
+    # matches — the sparing direction.
+    _fresh_cmd=${_fresh_row#* * }
+    _pane_pids_now=$(printf '%s\n' "$_panes_now" | cut -d' ' -f2 | tr '\n' ' ')
+    if [ -z "$_panes_now" ] || [ "$_fresh_pane" != "$_HEAL_PANE" ]; then
+        # Gone, or the first window's pane is no longer the one we probed —
+        # whatever sits there now was never blessed by any verdict.
+        echo "cc-slot: ${SESSION_NAME}'s pane changed while preparing — attaching instead." >&2
+        _HEAL=0
+    fi
+fi
+
+if [ "$_HEAL" = "1" ]; then
     # SAFETY GATE — asked BEFORE any keystroke, including the C-c.
     # The liveness probe answers "is claude running here"; it does NOT answer
     # "is it safe to type here". MEASURED: send-keys C-c KILLS a running
     # foreground job, so a pane with no claude but an active build, ssh session
     # or editor must be left strictly alone.
     #
-    # `#{pane_current_command}` is the right signal for THIS question even
-    # though it is the wrong one for liveness. Its error direction here is
-    # harmless: a false "bash" only ever permits a heal the liveness probe has
-    # already blessed, and a non-shell reading only ever suppresses one.
-    _first_cmd=$(printf '%s\n' "$_panes" | head -1 | cut -d' ' -f3)
-    case "$_first_cmd" in
-        bash | -bash | sh | -sh | zsh | -zsh | dash | fish | ksh) ;;
+    # Two complementary signals, each covering the other's blind spot; BOTH
+    # must approve. `#{pane_current_command}` catches a pane whose process is
+    # not a shell at all (an exec'd vim has no children and would pass the
+    # child check). Child-presence catches a busy SHELL: `bash script.sh`,
+    # rsync, an editor — all children of the pane process, all reported merely
+    # as their leader's name here. Error directions stay harmless: a false
+    # "bash"/IDLE only ever permits a heal the liveness probe already blessed
+    # twice, and a false BUSY only ever suppresses one.
+    # No fish: the typed payload (`export K=V;`, `__ec=$?`) is POSIX and a
+    # parse error there — a fish pane gets a plain attach instead of a broken
+    # relaunch. dash/ksh/zsh parse it fine.
+    case "$_fresh_cmd" in
+        bash | -bash | sh | -sh | zsh | -zsh | dash | ksh) ;;
         *)
-            echo "cc-slot: ${SESSION_NAME} has no claude, but its pane is running '${_first_cmd}' — attaching without touching it." >&2
+            echo "cc-slot: ${SESSION_NAME} has no claude, but its pane is running '${_fresh_cmd}' — attaching without touching it." >&2
             _HEAL=0
             ;;
     esac
 fi
 
 if [ "$_HEAL" = "1" ]; then
-    # RE-CHECK. The verdict above was taken before the OAuth gate, which is
-    # allowed up to 30s — ample for a second door (or the operator in another
-    # terminal) to have started claude in this very pane meanwhile. Typing into
-    # a live Claude Code TUI is the one failure this whole change must never
-    # cause, so the verdict is confirmed HERE, immediately before the keystrokes,
-    # and anything other than a still-POISONED answer stands down.
-    _recheck=$(_probe_liveness $_pane_pids)
+    _idle=$(_probe_liveness --idle "$_fresh_pid")
+    if [ "$_idle" != "IDLE" ]; then
+        if [ "$_idle" = "BUSY" ]; then
+            echo "cc-slot: ${SESSION_NAME} has no claude, but its shell is mid-job — attaching without touching it." >&2
+        else
+            echo "cc-slot: ${SESSION_NAME} has no claude, but its idleness could not be established — attaching without touching it." >&2
+        fi
+        _HEAL=0
+    fi
+fi
+
+if [ "$_HEAL" = "1" ]; then
+    # RE-CHECK liveness, immediately before the keystrokes, against the FRESH
+    # pane pids. Typing into a live Claude Code TUI is the one failure this
+    # whole change must never cause, so the verdict is confirmed HERE, and
+    # anything other than a still-POISONED answer stands down. (This also
+    # closes the released-lock race: a second door serialized behind the flock
+    # re-runs these gates and finds the first door's claude as a fresh child.
+    # ACCEPTED RESIDUAL: a few ms between door 1's Enter and its bash forking
+    # claude, versus door 2's ~100ms of python probe spawns — both probes
+    # landing inside that window needs scheduler starvation of the pane shell;
+    # not closable without tmux-side atomicity.)
+    _recheck=$(_probe_liveness $_pane_pids_now)
     if [ "$_recheck" != "POISONED" ]; then
         echo "cc-slot: ${SESSION_NAME} came alive while preparing — attaching instead." >&2
         _HEAL=0
@@ -617,19 +685,42 @@ if [ "$_HEAL" = "1" ]; then
     # the brief pause lets the shell reprint its prompt (C-c also flushes the
     # tty input queue); C-u clears anything left on it. `-l` sends the payload
     # literally so no character is interpreted as a key name.
-    tmux send-keys -t "$_HEAL_PANE" C-c 2>/dev/null || true
-    sleep 0.3 || true
-    tmux send-keys -t "$_HEAL_PANE" C-u 2>/dev/null || true
-    tmux send-keys -t "$_HEAL_PANE" -l "$_PANE_CMD" 2>/dev/null || true
-    tmux send-keys -t "$_HEAL_PANE" Enter 2>/dev/null || true
+    #
+    # Every send is CHECKED: an undeliverable keystroke (pane died, server
+    # gone) must not be shrugged past, or the door claims a heal that never
+    # reached the pane and the operator attaches expecting claude. On the
+    # first failure no further keys are sent (a best-effort C-u sweeps any
+    # half-typed payload) and the failure is said out loud.
+    _heal_sent=1
+    tmux send-keys -t "$_HEAL_PANE" C-c 2>/dev/null || _heal_sent=0
+    if [ "$_heal_sent" = "1" ]; then
+        sleep 0.3 || true
+        tmux send-keys -t "$_HEAL_PANE" C-u 2>/dev/null || _heal_sent=0
+    fi
+    if [ "$_heal_sent" = "1" ]; then
+        tmux send-keys -t "$_HEAL_PANE" -l "${_HEAL_ENV_EXPORTS}${_PANE_CMD}" 2>/dev/null || _heal_sent=0
+    fi
+    if [ "$_heal_sent" = "1" ]; then
+        tmux send-keys -t "$_HEAL_PANE" Enter 2>/dev/null || _heal_sent=0
+    fi
+    if [ "$_heal_sent" != "1" ]; then
+        tmux send-keys -t "$_HEAL_PANE" C-u 2>/dev/null || true
+        echo "cc-slot: heal keystrokes could not be delivered — attaching without a relaunch." >&2
+    fi
+fi
+
+# The heal lock's fd has no FD_CLOEXEC, and `exec tmux` replaces this shell —
+# an open fd 9 would ride into the attached CLIENT and hold the per-slot flock
+# for the whole session, stalling every later door's `flock -w 45` for
+# nothing. The serialization the lock exists for (two doors healing the same
+# pane) ends at the keystrokes above, so release it here.
+if [ "${_LOCK_HELD:-0}" = "1" ]; then
+    exec 9>&-
 fi
 
 # Exactly ONE new-session on every path (create, alive-attach, heal-attach).
 # On an attach `-A` discards the command argument harmlessly; the heal above is
 # purely a prelude to it.
 exec tmux -u new-session -A -s "$SESSION_NAME" \
-    -e "GENESIS_SLOT=${SLOT}" \
-    -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
-    -e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" \
-    -e "LANG=$LANG" \
+    "${_PANE_ENV_FLAGS[@]}" \
     "$_PANE_CMD"

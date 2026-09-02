@@ -220,7 +220,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 85f91765 2026-09-01
+verified: 061bad39 2026-09-02
 ```
 
 - **The interactive slot door SELF-HEALS a session that lost its claude.**
@@ -242,9 +242,20 @@ verified: 85f91765 2026-09-01
   `claude -p` — and is deliberately biased toward reporting ALIVE, since a false
   ALIVE costs a plain attach while a false POISONED types into a running TUI.
   Only an explicit POISONED heals; UNKNOWN, a broken venv, a timeout or an empty
-  read all attach. The pane command is built ONCE (`_PANE_CMD`) and shared by
-  the create and heal paths, so a healed slot cannot drift into a claude without
-  the OAuth prefix, permission flag or exit-capture trailer.
+  read all attach — and a walk that ends INCONCLUSIVELY (hop bound hit, stat
+  unreadable mid-chain) answers UNKNOWN, never POISONED. A POISONED verdict
+  still only ever earns an attempt: immediately before any keystroke the door
+  re-reads the pane list FRESH (the OAuth gate allows up to 30s between
+  decision and action) and requires BOTH a shell foreground name and a
+  childless pane process (`slot_liveness --idle`) — an idle prompt has no
+  children, while `bash script.sh`, an editor, or rsync all do, and
+  `send-keys C-c` would kill them. The pane command is built ONCE (`_PANE_CMD`)
+  and shared by the create and heal paths, so a healed slot cannot drift into a
+  claude without the OAuth prefix, permission flag or exit-capture trailer; the
+  heal also exports the same env set the create path passes via
+  `new-session -e` (one `_PANE_ENV` source), closes its per-slot lock fd before
+  the client `exec` (an inherited fd would hold the flock for the whole
+  session), and reports undeliverable keystrokes instead of claiming a heal.
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
   (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A restricted

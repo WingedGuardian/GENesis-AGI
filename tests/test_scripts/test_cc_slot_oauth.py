@@ -168,7 +168,11 @@ def test_pane_command_is_built_once_and_reused(script_text):
     """
     assert script_text.count('_PANE_CMD="${_OAUTH_SRC}cd ${GENESIS_ROOT} &&') == 1
     # Used by the exec (create) and by send-keys (heal) — and nowhere else.
-    assert script_text.count('"$_PANE_CMD"') == 2
+    # The heal usage rides behind the env exports derived from the SAME
+    # _PANE_ENV array the create path hands to `new-session -e`, so the two
+    # paths still share one command builder AND one env source.
+    assert script_text.count('"$_PANE_CMD"') == 1  # create: exec tmux
+    assert script_text.count('"${_HEAL_ENV_EXPORTS}${_PANE_CMD}"') == 1  # heal: send-keys
 
 
 def test_pane_command_bypasses_the_bashrc_wrapper_function(tmp_path, script_text):

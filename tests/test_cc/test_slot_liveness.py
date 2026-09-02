@@ -14,7 +14,15 @@ from pathlib import Path
 
 import pytest
 
-from genesis.cc.slot_liveness import ALIVE, POISONED, UNKNOWN, liveness
+from genesis.cc.slot_liveness import (
+    ALIVE,
+    BUSY,
+    IDLE,
+    POISONED,
+    UNKNOWN,
+    idleness,
+    liveness,
+)
 
 
 def _mkproc(root: Path, pid: int, comm: str, ppid: int, cmdline: list[str] | None = None):
@@ -117,18 +125,22 @@ class TestSparesOnAmbiguity:
         (d / "cmdline").unlink()
         assert liveness([1000], proc) == ALIVE
 
-    def test_malformed_stat_does_not_crash(self, proc):
+    def test_malformed_stat_reads_unknown_not_poisoned(self, proc):
+        # An unparseable ancestry is an ANSWER WITHHELD, not a death
+        # certificate: the walk that broke might have been the one that
+        # would have reached the pane.
         _mkproc(proc, 1100, "bash", 1)
         d = _mkproc(proc, 1101, "claude", 1100, ["claude"])
         (d / "stat").write_text("garbage without parens\n")
-        assert liveness([1100], proc) in (ALIVE, POISONED)
+        assert liveness([1100], proc) == UNKNOWN
 
-    def test_ancestry_cycle_terminates(self, proc):
-        # A malformed tree must not spin forever.
+    def test_ancestry_cycle_terminates_and_spares(self, proc):
+        # A malformed tree must not spin forever — and exhausting the hop
+        # bound proves NOTHING about the pane, so it must not read POISONED.
         _mkproc(proc, 1200, "bash", 1201)
         _mkproc(proc, 1201, "bash", 1200)
         _mkproc(proc, 1202, "claude", 1200, ["claude"])
-        assert liveness([9999], proc) == POISONED
+        assert liveness([9999], proc) == UNKNOWN
 
     def test_comm_containing_spaces_and_parens_parses(self, proc):
         # /proc/<pid>/stat's comm field is parenthesised and may contain both;
@@ -173,3 +185,107 @@ class TestClaudeIdentification:
         _mkproc(proc, 1800, "bash", 1)
         _mkproc(proc, 1801, "node", 1800, ["/usr/local/bin/claude", "-p", "x"])
         assert liveness([1800], proc) == POISONED
+
+
+class TestInconclusiveWalksSpare:
+    """A walk that ends without REACHING a conclusion (hop bound hit, stat
+    unreadable mid-chain) must never be read as POISONED — the broken walk is
+    exactly the one that might have connected claude to the pane."""
+
+    def test_chain_longer_than_the_hop_limit_is_unknown(self, proc):
+        from genesis.cc.slot_liveness import _MAX_ANCESTRY_HOPS
+
+        depth = _MAX_ANCESTRY_HOPS + 3
+        _mkproc(proc, 2000, "bash", 1)  # the pane, far above the bound
+        prev = 2000
+        for i in range(depth):
+            pid = 2001 + i
+            _mkproc(proc, pid, "bash", prev)
+            prev = pid
+        _mkproc(proc, 2999, "claude", prev, ["claude"])
+        assert liveness([2000], proc) == UNKNOWN
+
+    def test_unreadable_ancestor_mid_walk_is_unknown(self, proc):
+        _mkproc(proc, 2100, "bash", 1)      # the pane
+        _mkproc(proc, 2101, "bash", 2100)   # intermediate, about to vanish
+        d = _mkproc(proc, 2102, "claude", 2101, ["claude"])
+        import shutil
+
+        shutil.rmtree(proc / "2101")        # ancestry now unresolvable
+        assert d.exists()
+        assert liveness([2100], proc) == UNKNOWN
+
+    def test_vanished_candidate_is_conclusive_not_inconclusive(self, proc):
+        """A claude that EXITED between enumeration and its walk is
+        conclusively not the slot's claude. Scoring it UNKNOWN would let
+        routine box-wide claude churn (any interactive claude anywhere
+        exiting mid-probe) suppress every heal."""
+        from genesis.cc.slot_liveness import _walk_verdict
+
+        _mkproc(proc, 2400, "bash", 1)
+        # pid 2499 has NO /proc entry at walk time — the post-enumeration exit.
+        assert _walk_verdict(proc, 2499, {2400}) == POISONED
+
+    def test_present_but_unparseable_candidate_stays_unknown(self, proc):
+        from genesis.cc.slot_liveness import _walk_verdict
+
+        _mkproc(proc, 2500, "bash", 1)
+        d = _mkproc(proc, 2501, "claude", 2500, ["claude"])
+        (d / "stat").write_text("garbage without parens\n")
+        assert _walk_verdict(proc, 2501, {2500}) == UNKNOWN
+
+    def test_conclusive_walks_still_read_poisoned(self, proc):
+        # Every walk reaching init cleanly IS a conclusion; sparing must not
+        # swallow the real verdict or no slot ever heals.
+        _mkproc(proc, 2200, "bash", 1)      # the pane, childless
+        _mkproc(proc, 2300, "bash", 1)      # someone else's tree
+        _mkproc(proc, 2301, "claude", 2300, ["claude"])
+        assert liveness([2200], proc) == POISONED
+
+
+class TestIdleness:
+    """`idleness()`'s question is "is it SAFE TO TYPE here": the pane process
+    must be sitting at a prompt with no running job. Only IDLE permits
+    keystrokes; every ambiguity answers BUSY/UNKNOWN and costs a plain attach."""
+
+    def test_shell_with_no_children_is_idle(self, proc):
+        _mkproc(proc, 3000, "bash", 1)
+        assert idleness(3000, proc) == IDLE
+
+    def test_shell_with_a_foreground_child_is_busy(self, proc):
+        # `bash script.sh`, rsync, vim — anything running is a child of the
+        # pane shell, and C-c would kill it.
+        _mkproc(proc, 3100, "bash", 1)
+        _mkproc(proc, 3101, "rsync", 3100, ["rsync", "-a", "x", "y"])
+        assert idleness(3100, proc) == BUSY
+
+    def test_child_named_like_a_shell_is_still_busy(self, proc):
+        # The pane_current_command whitelist reads `bash script.sh` as "bash";
+        # child-presence is the signal that catches it.
+        _mkproc(proc, 3200, "bash", 1)
+        _mkproc(proc, 3201, "bash", 3200, ["bash", "script.sh"])
+        assert idleness(3200, proc) == BUSY
+
+    def test_missing_pane_process_is_unknown(self, proc):
+        proc.mkdir(parents=True, exist_ok=True)
+        assert idleness(4242, proc) == UNKNOWN
+
+    def test_unenumerable_proc_is_unknown(self, tmp_path):
+        assert idleness(1, tmp_path / "no-such-proc") == UNKNOWN
+
+    def test_vanished_sibling_does_not_block_idle(self, proc):
+        # Processes exit between the directory listing and the stat read all
+        # the time. A vanished entry (dir present, stat gone — the shape a
+        # mid-read exit leaves) cannot be a LIVE child of the pane, so it must
+        # not withhold IDLE or busy boxes would never heal.
+        _mkproc(proc, 3300, "bash", 1)
+        (proc / "3301").mkdir()  # digit-named, but its stat never materialises
+        assert idleness(3300, proc) == IDLE
+
+    def test_unparseable_sibling_stat_is_unknown(self, proc):
+        # A stat we can read but not parse might BE the pane's child; typing
+        # over it is the expensive error, so withhold the IDLE verdict.
+        _mkproc(proc, 3400, "bash", 1)
+        d = _mkproc(proc, 3401, "mystery", 999)
+        (d / "stat").write_text("garbage without parens\n")
+        assert idleness(3400, proc) == UNKNOWN

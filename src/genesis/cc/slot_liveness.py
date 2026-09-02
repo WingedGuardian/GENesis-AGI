@@ -56,6 +56,11 @@ ALIVE = "ALIVE"
 POISONED = "POISONED"
 UNKNOWN = "UNKNOWN"
 
+# Idleness verdicts (`--idle`): "is it SAFE TO TYPE here", the second question
+# the door asks after liveness says POISONED. Only IDLE permits keystrokes.
+IDLE = "IDLE"
+BUSY = "BUSY"
+
 # A pane shell -> claude is one hop; a hand-typed `bash` in between makes two.
 # The bound only stops a cycle in a malformed /proc from spinning.
 _MAX_ANCESTRY_HOPS = 40
@@ -145,18 +150,100 @@ def liveness(pane_pids: list[int], proc_root: Path = Path("/proc")) -> str:
     if pids is None:
         return UNKNOWN
     targets = set(pane_pids)
+    # POISONED requires every walk to CONCLUDE (reach init without meeting a
+    # pane pid). A walk cut short — hop bound hit, stat unreadable mid-chain —
+    # proves nothing, and the broken walk is exactly the one that might have
+    # connected claude to the pane; treating it as death is the expensive
+    # error. Such runs answer UNKNOWN, which costs a plain attach. One
+    # deliberately ACCEPTED consequence: a single process with an unresolvable
+    # ancestry (a stat cycle, a >hop-bound chain) suppresses heals box-wide for
+    # as long as it lives — that is the fail-direction's price, not a bug.
+    inconclusive = False
     for pid in pids:
         if pid in targets:
             return ALIVE  # the pane process IS claude (legacy `exec` shape)
-        cur, hops = pid, 0
-        while hops < _MAX_ANCESTRY_HOPS:
-            parent = _ppid_of(proc_root, cur)
-            if parent is None or parent <= 1:
-                break
-            if parent in targets:
-                return ALIVE
-            cur, hops = parent, hops + 1
-    return POISONED
+        verdict = _walk_verdict(proc_root, pid, targets)
+        if verdict == ALIVE:
+            return ALIVE
+        if verdict == UNKNOWN:
+            inconclusive = True
+    return UNKNOWN if inconclusive else POISONED
+
+
+def _walk_verdict(proc_root: Path, pid: int, targets: set[int]) -> str:
+    """One candidate's ancestry, resolved to ALIVE / POISONED / UNKNOWN.
+
+    POISONED here means "this candidate is conclusively NOT the pane's claude"
+    — it contributes to (never decides) the session verdict. A candidate that
+    VANISHED since enumeration (its /proc dir is gone at hop 0) is exactly as
+    conclusive as one that walked to init: an exited process cannot be the
+    slot's live claude, and scoring it UNKNOWN would let routine box-wide
+    claude churn suppress every heal. A candidate still PRESENT but with an
+    unreadable/unparseable stat stays UNKNOWN — it might be ours.
+    """
+    cur, hops = pid, 0
+    while True:
+        if hops >= _MAX_ANCESTRY_HOPS:
+            return UNKNOWN
+        parent = _ppid_of(proc_root, cur)
+        if parent is None:
+            if hops == 0 and not (proc_root / str(cur)).exists():
+                return POISONED  # exited between enumeration and walk
+            return UNKNOWN
+        if parent <= 1:
+            return POISONED  # walked to init: a real conclusion
+        if parent in targets:
+            return ALIVE
+        cur, hops = parent, hops + 1
+
+
+def idleness(pane_pid: int, proc_root: Path = Path("/proc")) -> str:
+    """Is the pane process sitting at a prompt, with no running job?
+
+    Liveness answers "is claude here"; this answers the door's SECOND question
+    before it may type: `send-keys C-c` kills whatever foreground job the pane
+    shell is running, and the shell's NAME cannot tell an idle prompt from
+    `bash script.sh` (both report "bash"). Child-presence can: an idle
+    interactive shell has no children, while every running job — vim, rsync,
+    a nested shell, a build — is a child of the pane process.
+
+    Same fail direction as liveness: only an affirmative IDLE permits
+    keystrokes. A shell that merely holds a BACKGROUND job also reads BUSY —
+    over-sparing, but the cost is a plain attach.
+
+    A sibling entry that vanishes between the listing and the read (dir or
+    stat already gone) cannot be a LIVE child and is skipped; one whose stat
+    is present but unreadable/unparseable might BE the pane's child, so it
+    withholds the IDLE verdict instead.
+    """
+    if pane_pid <= 0:
+        return UNKNOWN
+    if _read(proc_root / str(pane_pid) / "stat") is None:
+        return UNKNOWN  # the pane process itself is not observable
+    try:
+        entries = [p for p in proc_root.iterdir() if p.name.isdigit()]
+    except OSError:
+        return UNKNOWN
+    inconclusive = False
+    for entry in entries:
+        if entry.name == str(pane_pid):
+            continue
+        try:
+            raw = (entry / "stat").read_bytes()
+        except FileNotFoundError:
+            continue  # exited between listing and read — not a live child
+        except OSError:
+            inconclusive = True
+            continue
+        try:
+            after = raw[raw.rindex(b")") + 1 :].split()
+            ppid = int(after[1])
+        except (ValueError, IndexError):
+            inconclusive = True
+            continue
+        if ppid == pane_pid:
+            return BUSY
+    return UNKNOWN if inconclusive else IDLE
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -169,14 +256,20 @@ def main(argv: list[str] | None = None) -> int:
     """
     args = list(sys.argv[1:] if argv is None else argv)
     try:
-        pids = [int(p) for p in args if p.strip().isdigit()]
-        verdict = liveness(pids)
+        if args and args[0] == "--idle":
+            rest = [a for a in args[1:] if a.strip().isdigit()]
+            verdict = idleness(int(rest[0])) if rest else UNKNOWN
+        else:
+            pids = [int(p) for p in args if p.strip().isdigit()]
+            verdict = liveness(pids)
     except Exception:  # noqa: BLE001 - a crash here must not break the door
         verdict = UNKNOWN
     notes = {
         ALIVE: "an interactive claude is running in this slot",
         POISONED: "no interactive claude is running in this slot",
-        UNKNOWN: "could not determine slot liveness; treating it as running",
+        UNKNOWN: "could not determine the slot's state; leaving it untouched",
+        IDLE: "the pane shell is at a prompt with no running job",
+        BUSY: "the pane shell is running a job; typing would interrupt it",
     }
     print(verdict)
     print(notes[verdict])
