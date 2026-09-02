@@ -122,6 +122,36 @@ returned 0 in-server and **three** features shipped green but inert since
 July; the module's docstring claim "same-uid reads succeed" was a shell-tested
 falsehood. The fix routed around the ptrace-gated read entirely.)
 
+**The config twin of that rule: a setting's EFFECT scope and its SOURCE scope are
+different questions, and only the second one is obvious.** Ask "which sessions /
+processes does this file actually bind?" — never "is this file read?". Config is
+read per-process from wherever that process happens to sit, so a value whose
+effect is machine-wide but whose source is per-session binds a minority and does
+nothing for the rest, while looking correct everywhere you check. It is not
+"ignored", which is why grepping for the key and finding it loaded proves
+nothing: the file loads, for the sessions that read it.
+
+The tell is a mismatch between the two scopes. Before shipping any config, name
+the set of processes the value must govern, then name the set that will actually
+load the file — if the second is smaller, the config is wrong however well it
+works in your session. This is the same shape as the deploy-path question in the
+Generalizability Gate ("how does this reach other installs?"), one level down:
+how does this reach other SESSIONS?
+
+Genesis has bitten itself with this twice, both in Claude Code's own settings:
+auto-updater suppression (2026-06-01) and transcript retention (2026-06-21, found
+2026-09-02 after it had silently deleted 198 local sessions over 73 days). Both
+shipped in the repo's `.claude/settings.json`, which CC merges only for sessions
+launched inside the project — while the behaviour each controls spans the whole
+machine. Full write-up, and the rule for which settings can never live at project
+level: `docs/reference/cc-compatibility.md`. The mechanical tripwire is
+`tests/test_scripts/test_cc_user_level_settings.py`, which fails CI if one of an
+ENUMERATED list of client-scope keys reappears in project settings — reach for a
+check like that rather than trusting the next author to remember, but note what
+such a check can and cannot be: it is a list, so it catches the shape that bit
+you and not the class. Say so where you claim it, or the next reader treats a
+tripwire as a proof.
+
 ### Acceptance Bar + Measured Rate — the primary methodology
 
 **Use this as often as it applies. It is the default way to build anything here,

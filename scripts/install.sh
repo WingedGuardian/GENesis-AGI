@@ -1403,15 +1403,14 @@ if "attribution" not in data:
     data["attribution"] = {"commit": "", "pr": "", "sessionUrl": False}
     changed = True
 if changed:
-    # os.replace installs a NEW inode, so carry the mode across: this file can
-    # hold API keys in `env`, and silently widening 0600 -> 0644 on every run
-    # would be a privacy regression.
-    _mode = os.stat(path).st_mode & 0o777
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    # Truncate IN PLACE, deliberately not atomic. A temp-file + os.replace
+    # installs a NEW inode, which silently discards the target's mode (this file
+    # can hold API keys in `env`), its ownership (root's, under sudo) and its
+    # symlink-ness (a dotfiles-managed settings.json is commonly a symlink — the
+    # rename replaces the LINK, forking the source of truth with no signal).
+    # See _write_json in scripts/setup_claude_config.py for the full reasoning.
+    with open(path, "w") as f:
         json.dump(data, f, indent=2)
-    os.chmod(tmp, _mode)
-    os.replace(tmp, path)
     print("merged")
 else:
     print("unchanged")
@@ -1420,7 +1419,10 @@ PYEOF
         echo "    + CC user-level defaults set in $_settings_file"
     else
         echo "    WARNING: Could not merge CC settings into $_settings_file"
-        echo "    Add manually:  {\"cleanupPeriodDays\": 180, \"attribution\": {\"commit\": \"\", \"pr\": \"\", \"sessionUrl\": false}, \"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\", \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
+        echo "    MERGE these keys into the existing file (do not replace it — it may"
+        echo "    hold API keys under env):  cleanupPeriodDays: 180 · attribution:"
+        echo "    {commit:'', pr:'', sessionUrl:false} · env.DISABLE_AUTOUPDATER: '1'"
+        echo "    · env.DISABLE_UPDATES: '1' · env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: '2'"
     fi
 fi
 # END cc-user-settings

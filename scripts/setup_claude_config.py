@@ -15,7 +15,6 @@ import argparse
 import json
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 # Distinguishes "key absent" from "key present and falsy" (0, "", False).
@@ -84,33 +83,30 @@ def check_venv(genesis_root: Path) -> None:
 _USER_LEVEL_SECTION = "user_level_defaults"
 
 
-def _write_json_atomic(path: Path, data: dict) -> None:
-    """Write JSON via temp-file + rename, preserving the target's mode.
+def _write_json(path: Path, data: dict) -> None:
+    """Write JSON by truncating the file IN PLACE. Deliberately not atomic.
 
-    ~/.claude/settings.json is read by every CC session on the machine, so a
-    partial write from an interrupted run would break all of them. The rename
-    installs a NEW inode, which is why the mode has to be carried across
-    explicitly: this file routinely holds an `env` block with API keys, and a
-    silent 0600 -> 0644 on every update would be a privacy regression. A unique
-    temp name (rather than a fixed `.tmp`) avoids leaving a predictable turd
-    behind if we are killed mid-write, and fsync makes the rename durable.
+    An earlier revision of this used temp-file + rename. Don't reintroduce it
+    without reading this: `os.replace` installs a NEW inode, and that silently
+    discards three properties of the target that matter more here than
+    atomicity does.
+
+      * mode — this file routinely holds an `env` block with API keys, and the
+        rename reset 0600 to the umask default on every run;
+      * ownership — under sudo the new inode is root's, leaving the operator's
+        CC unable to write its own settings;
+      * symlink-ness — a dotfiles-managed settings.json is commonly a symlink.
+        The rename replaced the LINK with a regular file, so the managed copy
+        silently kept the old value and the next `stow`/`chezmoi` restored it,
+        reintroducing whatever the setting was fixing. No signal, no error.
+
+    An in-place truncate keeps all three for free, because the inode never
+    changes. What it gives up is a torn file if the process is killed between
+    truncate and write — a narrow window on a small file, and the behaviour
+    this script had for years. That trade is the right way round: a torn file
+    is loud and fixable, a silently-forked source of truth is neither.
     """
-    try:
-        mode = path.stat().st_mode & 0o777
-    except FileNotFoundError:
-        mode = 0o600
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(json.dumps(data, indent=2) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp, mode)
-        tmp.replace(path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    path.write_text(json.dumps(data, indent=2) + "\n")
 
 
 def _load_user_settings(path: Path) -> dict | None:
@@ -188,9 +184,17 @@ def _apply_user_level_defaults(settings: dict, section: dict) -> list[str]:
                     settings[key] = target
                     changes.append(f"  {key}: {'<unset>' if have is _MISSING else have}"
                                    f" -> {target} (operator override)")
-            elif have is _MISSING:
+            # An explicit `null` must heal exactly like an absent key. CC resolves
+            # the value with `?? Y` (nullish-coalescing, Y=30), so `null` IS the
+            # 30-day default — the precise state this module exists to prevent.
+            # Leaving it alone would fail OPEN on the one key that matters, and
+            # would disagree with the two shell writers, which use `.get()` and
+            # heal it. MEASURED before the fix: shells -> 180, this path -> null.
+            elif have is _MISSING or have is None:
                 settings[key] = target
-                changes.append(f"  {key}: <unset> -> {target}")
+                changes.append(
+                    f"  {key}: {'<unset>' if have is _MISSING else 'null'} -> {target}"
+                )
             elif not isinstance(have, int) or isinstance(have, bool):
                 print(f"WARNING: {key} is {have!r}, not an integer — left alone.")
             elif have < target:
@@ -267,7 +271,7 @@ def _ensure_user_cc_defaults(genesis_root: Path, dry_run: bool) -> None:
         print("  (dry run — not written)")
         return
     settings_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_json_atomic(settings_path, current)
+    _write_json(settings_path, current)
     print("  Written.")
 
 
@@ -309,7 +313,7 @@ def configure_global_settings(genesis_root: Path, dry_run: bool) -> None:
             print(c)
         if not dry_run:
             global_settings_path.parent.mkdir(parents=True, exist_ok=True)
-            _write_json_atomic(global_settings_path, current)
+            _write_json(global_settings_path, current)
             print("  Written.")
     else:
         print("~/.claude/settings.json: already matches manifest")

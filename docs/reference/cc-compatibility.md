@@ -895,9 +895,15 @@ bootstrap — the `Already up to date` fast path and a merge-conflict exit skip 
 both no-ops here), `scripts/install.sh` (fresh container — note install.sh does
 **not** call bootstrap) and `scripts/host-setup.sh` (host VM, no venv). CC's own
 client-scope key list is enumerated in
-`tests/test_scripts/test_cc_user_level_settings.py`, which fails CI if any of them
-reappears in the repo's project settings — the chokepoint that makes a third
-instance impossible.
+`tests/test_scripts/test_cc_user_level_settings.py`, which fails CI if any of
+**those enumerated keys** reappears in the repo's project settings.
+
+That lock is narrower than the class, and the gap is worth knowing: it covers the
+25 enumerated top-level scalars, so it would NOT have caught the auto-updater
+instance (which lives under `env`, still shipped at project level and also seeded
+user-level) and it deliberately does not cover `attribution` (an identical object
+at both levels caps nothing — see the manifest's own note). Treat it as a tripwire
+on the shape that bit us, not as proof the class is closed.
 
 > **On a CC pin bump:** that key list (`CC_CLIENT_SCOPE_KEYS`) is a hand-transcribed
 > snapshot of the client-scope keys in the CC binary. It will go stale the way

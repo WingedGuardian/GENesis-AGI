@@ -1398,27 +1398,26 @@ if "attribution" not in data:
     data["attribution"] = {"commit": "", "pr": "", "sessionUrl": False}
     changed = True
 if changed:
-    # os.replace installs a NEW inode, so carry the mode across: this file can
-    # hold API keys in `env`, and silently widening 0600 -> 0644 on every run
-    # would be a privacy regression.
-    _mode = os.stat(path).st_mode & 0o777
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    # Truncate IN PLACE, deliberately not atomic. A temp-file + os.replace
+    # installs a NEW inode, which silently discards the target's mode (this file
+    # can hold API keys in `env`), its ownership (root's, under sudo) and its
+    # symlink-ness (a dotfiles-managed settings.json is commonly a symlink — the
+    # rename replaces the LINK, forking the source of truth with no signal).
+    # See _write_json in scripts/setup_claude_config.py for the full reasoning.
+    with open(path, "w") as f:
         json.dump(data, f, indent=2)
-    os.chmod(tmp, _mode)
-    os.replace(tmp, path)
 PYEOF
     then
-        # os.replace above installs a new inode owned by whoever ran the merge.
-        # Under sudo that is root, and the operator's CC then cannot write its
-        # own settings (it persists /config changes, model switches, viewMode
-        # there). Same reason the [ ! -f ] branch chowns, and the same trap the
-        # mkdir comment above documents for the directory.
-        chown "$_host_user:" "$_host_settings_file" 2>/dev/null || true
+        # No chown needed: the merge truncates in place, so the inode — and with
+        # it the operator's ownership — is preserved even under sudo. Only the
+        # [ ! -f ] branch above creates a new file, and that one chowns.
         echo "  + CC user-level defaults set in $_host_settings_file"
     else
         echo "  WARNING: Could not merge CC settings into $_host_settings_file"
-        echo "  Add manually:  {\"cleanupPeriodDays\": 180, \"attribution\": {\"commit\": \"\", \"pr\": \"\", \"sessionUrl\": false}, \"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\"}}"
+        echo "  MERGE these keys into the existing file (do not replace it — it may"
+        echo "  hold API keys under env):  cleanupPeriodDays: 180 · attribution:"
+        echo "  {commit:'', pr:'', sessionUrl:false} · env.DISABLE_AUTOUPDATER: '1'"
+        echo "  · env.DISABLE_UPDATES: '1'"
     fi
 fi
 # END host-cc-user-settings

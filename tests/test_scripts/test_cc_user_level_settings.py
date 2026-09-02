@@ -243,8 +243,57 @@ def test_dry_run_writes_nothing(setup_mod, fake_home):
 
 
 def test_missing_manifest_warns_and_returns(setup_mod, fake_home, capsys):
+    """Must hit the GUARD, not the outer handler — both print 'WARNING'.
+
+    Asserting only on the word was blind: deleting the manifest_path.exists()
+    guard makes yaml raise FileNotFoundError, the broad `except Exception`
+    catches it, and a different WARNING satisfies the assertion. Caught by
+    mutation; the negative assertion is what distinguishes the two paths.
+    """
     setup_mod.ensure_user_cc_defaults(Path("/nonexistent/genesis/root"), dry_run=False)
-    assert "WARNING" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "settings manifest not found" in out
+    assert "could not apply user-level CC defaults" not in out
+
+
+def test_floor_heals_an_explicit_null(setup_mod, fake_home):
+    """CC resolves `cleanupPeriodDays: null` via `?? 30` — a null IS the bug.
+
+    An absent key and an explicit null must therefore behave identically. They
+    did not: the sentinel distinguished them and this path left null alone while
+    both shell writers healed it.
+    """
+    _settings_file(fake_home).write_text(json.dumps({"cleanupPeriodDays": None}))
+    setup_mod.ensure_user_cc_defaults(REPO_ROOT, dry_run=False)
+    assert _settings(fake_home)["cleanupPeriodDays"] == _retention_floor()
+
+
+@pytest.mark.parametrize("raw", ["[]", "null", '"a string"', "42"])
+def test_valid_json_that_is_not_an_object_is_refused(setup_mod, fake_home, raw):
+    """Reached by configure_global_settings too, which has no wrapper."""
+    target = _settings_file(fake_home)
+    target.write_text(raw)
+    assert setup_mod._load_user_settings(target) is None
+    assert target.read_text() == raw
+
+
+def test_write_preserves_a_symlinked_target(setup_mod, fake_home):
+    """A dotfiles-managed settings.json is commonly a symlink.
+
+    Writing by temp-file + rename replaced the LINK with a regular file, leaving
+    the managed copy stale — the source of truth forks silently and the next
+    `stow`/`chezmoi` restores the old value. In-place truncation keeps the link.
+    """
+    real = fake_home / "dotfiles-settings.json"
+    real.write_text(json.dumps({"cleanupPeriodDays": 30}))
+    link = _settings_file(fake_home)
+    link.unlink(missing_ok=True)
+    link.symlink_to(real)
+
+    setup_mod.ensure_user_cc_defaults(REPO_ROOT, dry_run=False)
+
+    assert link.is_symlink(), "the symlink was replaced by a regular file"
+    assert json.loads(real.read_text())["cleanupPeriodDays"] == _retention_floor()
 
 
 def test_never_raises_when_the_write_fails(setup_mod, fake_home, monkeypatch):
@@ -260,7 +309,7 @@ def test_never_raises_when_the_write_fails(setup_mod, fake_home, monkeypatch):
     def boom(*_args, **_kwargs):
         raise OSError("ENOSPC")
 
-    monkeypatch.setattr(setup_mod, "_write_json_atomic", boom)
+    monkeypatch.setattr(setup_mod, "_write_json", boom)
     _settings_file(fake_home).unlink(missing_ok=True)
     setup_mod.ensure_user_cc_defaults(REPO_ROOT, dry_run=False)  # must not raise
 
@@ -396,13 +445,53 @@ def test_shell_paths_refuse_env_override_below_one(script, marker, tmp_path):
     assert json.loads(target.read_text())["cleanupPeriodDays"] == _retention_floor()
 
 
+@pytest.mark.parametrize("mode", [0o600, 0o640])
 @pytest.mark.parametrize(("script", "marker"), SHELL_PATHS)
-def test_shell_paths_preserve_file_mode(script, marker, tmp_path):
+def test_shell_paths_preserve_file_mode(script, marker, mode, tmp_path):
+    """Two modes, because a single value can be the one the writer produces anyway."""
     target = tmp_path / "settings.json"
     target.write_text(json.dumps({"cleanupPeriodDays": 1}))
-    os.chmod(target, 0o600)
+    os.chmod(target, mode)
     assert _run(script, marker, target).returncode == 0
-    assert target.stat().st_mode & 0o777 == 0o600
+    assert target.stat().st_mode & 0o777 == mode
+
+
+@pytest.mark.parametrize(("script", "marker"), SHELL_PATHS)
+def test_shell_paths_heal_an_explicit_null(script, marker, tmp_path):
+    """Parity with the python path — CC reads `null` as its 30-day default."""
+    target = tmp_path / "settings.json"
+    target.write_text(json.dumps({"cleanupPeriodDays": None}))
+    assert _run(script, marker, target).returncode == 0
+    assert json.loads(target.read_text())["cleanupPeriodDays"] == _retention_floor()
+
+
+@pytest.mark.parametrize(("script", "marker"), SHELL_PATHS)
+def test_shell_paths_preserve_a_symlinked_target(script, marker, tmp_path):
+    real = tmp_path / "dotfiles-settings.json"
+    real.write_text(json.dumps({"cleanupPeriodDays": 30}))
+    link = tmp_path / "settings.json"
+    link.symlink_to(real)
+    assert _run(script, marker, link).returncode == 0
+    assert link.is_symlink(), "the symlink was replaced by a regular file"
+    assert json.loads(real.read_text())["cleanupPeriodDays"] == _retention_floor()
+
+
+@pytest.mark.parametrize("raw", ["[]", "null", "42"])
+@pytest.mark.parametrize(("script", "marker"), SHELL_PATHS)
+def test_shell_paths_refuse_a_non_object_file(script, marker, raw, tmp_path):
+    target = tmp_path / "settings.json"
+    target.write_text(raw)
+    assert _run(script, marker, target).returncode == 2
+    assert target.read_text() == raw
+
+
+@pytest.mark.parametrize(("script", "marker"), SHELL_PATHS)
+def test_shell_paths_leave_no_temp_file_behind(script, marker, tmp_path):
+    """In-place writing means there is no temp file to leak or strand."""
+    target = tmp_path / "settings.json"
+    target.write_text("{}")
+    assert _run(script, marker, target).returncode == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["settings.json"]
 
 
 @pytest.mark.parametrize(("script", "marker"), SHELL_PATHS)
