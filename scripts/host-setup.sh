@@ -1307,10 +1307,19 @@ fi
 # scripts/lib/cc_version.sh (sourced above). CC_SHADOW_SCAN=0 opts out.
 cc_shadow_scan || true
 
-# Suppress CC auto-updater via user-level ~/.claude/settings.json on the host.
-# The repo's .claude/settings.json doesn't apply when CC runs outside the project
-# directory, and CC's auto-updater silently bumps the version in that context.
-# See docs/reference/cc-compatibility.md for the discovery.
+# BEGIN host-cc-user-settings
+# Seed the host's user-level ~/.claude/settings.json with the CC settings that
+# govern GLOBAL behaviour and therefore cannot live in the repo's project
+# settings (CC merges those only for sessions launched inside the project):
+#   - auto-updater suppression: the updater runs in contexts where repo settings
+#     don't apply, and silently bumps the pinned version.
+#   - cleanupPeriodDays: CC's retention sweep walks EVERY directory under
+#     ~/.claude/projects but takes its retention value from the launching
+#     session's settings, so a session started outside the repo prunes at CC's
+#     30-day default — deleting transcripts belonging to every other project.
+# The container gets these via scripts/setup_claude_config.py (bootstrap); the
+# host has no Genesis venv and never runs bootstrap, so it is seeded here.
+# See docs/reference/cc-compatibility.md.
 _host_user="${SUDO_USER:-$(whoami)}"
 _host_home=$(eval echo "~$_host_user")
 _host_settings_file="$_host_home/.claude/settings.json"
@@ -1324,6 +1333,12 @@ fi
 if [ ! -f "$_host_settings_file" ]; then
     cat > "$_host_settings_file" <<'CCSETTINGS'
 {
+  "cleanupPeriodDays": 180,
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
+  },
   "env": {
     "DISABLE_AUTOUPDATER": "1",
     "DISABLE_UPDATES": "1"
@@ -1334,7 +1349,7 @@ CCSETTINGS
     echo "  + Created $_host_settings_file with auto-updater suppression"
 else
     if python3 - "$_host_settings_file" <<'PYEOF' 2>/dev/null
-import json, sys
+import json, os, sys
 path = sys.argv[1]
 try:
     with open(path) as f:
@@ -1351,16 +1366,62 @@ for key in ("DISABLE_AUTOUPDATER", "DISABLE_UPDATES"):
     if env.get(key) != "1":
         env[key] = "1"
         changed = True
+# Transcript retention. A FLOOR, not a preference — a higher value you chose is
+# kept, a lower one is raised. Keep in step with config/cc-global-settings.yaml
+# (the container's source of truth); a test locks the two together.
+# GENESIS_CC_RETENTION_DAYS names an exact value and is authoritative; values
+# below 1 are refused (CC's schema rejects them, and a negative would put the
+# sweep's cutoff in the future — i.e. older than everything).
+_floor = 180
+_forced = False
+_env = os.environ.get("GENESIS_CC_RETENTION_DAYS", "")
+if _env:
+    try:
+        _n = int(_env)
+    except ValueError:
+        _n = 0
+    if _n >= 1:
+        _floor, _forced = _n, True
+_have = data.get("cleanupPeriodDays")
+if _forced:
+    if _have != _floor:
+        data["cleanupPeriodDays"] = _floor
+        changed = True
+elif _have is None:
+    data["cleanupPeriodDays"] = _floor
+    changed = True
+elif isinstance(_have, int) and not isinstance(_have, bool) and _have < _floor:
+    data["cleanupPeriodDays"] = _floor
+    changed = True
+# Suppress AI-authorship trailers. Set-if-absent; any value here is deliberate.
+if "attribution" not in data:
+    data["attribution"] = {"commit": "", "pr": "", "sessionUrl": False}
+    changed = True
 if changed:
-    with open(path, "w") as f:
+    # os.replace installs a NEW inode, so carry the mode across: this file can
+    # hold API keys in `env`, and silently widening 0600 -> 0644 on every run
+    # would be a privacy regression.
+    _mode = os.stat(path).st_mode & 0o777
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
+    os.chmod(tmp, _mode)
+    os.replace(tmp, path)
 PYEOF
     then
-        echo "  + Auto-updater suppression set in $_host_settings_file"
+        # os.replace above installs a new inode owned by whoever ran the merge.
+        # Under sudo that is root, and the operator's CC then cannot write its
+        # own settings (it persists /config changes, model switches, viewMode
+        # there). Same reason the [ ! -f ] branch chowns, and the same trap the
+        # mkdir comment above documents for the directory.
+        chown "$_host_user:" "$_host_settings_file" 2>/dev/null || true
+        echo "  + CC user-level defaults set in $_host_settings_file"
     else
-        echo "  WARNING: Could not merge auto-updater settings into $_host_settings_file"
+        echo "  WARNING: Could not merge CC settings into $_host_settings_file"
+        echo "  Add manually:  {\"cleanupPeriodDays\": 180, \"attribution\": {\"commit\": \"\", \"pr\": \"\", \"sessionUrl\": false}, \"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\"}}"
     fi
 fi
+# END host-cc-user-settings
 
 # ── Shared user-level CLAUDE.md on the host (D16) ──────────────
 # Auto-loaded by every `claude` session on the host (operator + Guardian

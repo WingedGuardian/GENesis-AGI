@@ -1323,11 +1323,18 @@ fi
 # repo settings don't apply, so we set these at the user level. (The host VM's own
 # recovery `claude -p` is single-brain and never nests, so host-setup.sh deliberately
 # does NOT set the nesting default.) See docs/reference/cc-compatibility.md.
+# BEGIN cc-user-settings
 _settings_file="$HOME/.claude/settings.json"
 mkdir -p "$HOME/.claude"
 if [ ! -f "$_settings_file" ]; then
     cat > "$_settings_file" <<'CCSETTINGS'
 {
+  "cleanupPeriodDays": 180,
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
+  },
   "env": {
     "DISABLE_AUTOUPDATER": "1",
     "DISABLE_UPDATES": "1",
@@ -1335,11 +1342,11 @@ if [ ! -f "$_settings_file" ]; then
   }
 }
 CCSETTINGS
-    echo "    + Created $_settings_file with auto-updater suppression + subagent-nesting default"
+    echo "    + Created $_settings_file with CC user-level defaults"
 else
     # Merge — preserves any existing env vars and other top-level keys.
     if python3 - "$_settings_file" <<'PYEOF' 2>/dev/null
-import json, sys
+import json, os, sys
 path = sys.argv[1]
 try:
     with open(path) as f:
@@ -1362,20 +1369,61 @@ for key in ("DISABLE_AUTOUPDATER", "DISABLE_UPDATES"):
 if "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH" not in env:
     env["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] = "2"
     changed = True
+# Transcript retention. A FLOOR, not a preference: CC's sweep walks every
+# directory under ~/.claude/projects but takes its retention value from whichever
+# session runs it, so one session at CC's 30-day default deletes transcripts
+# belonging to every project. A higher value you chose is kept as-is.
+# Keep in step with config/cc-global-settings.yaml (locked by a test).
+# GENESIS_CC_RETENTION_DAYS names an exact value and is authoritative; values
+# below 1 are refused (CC's schema rejects them, and a negative would put the
+# sweep's cutoff in the future — i.e. older than everything).
+_floor = 180
+_forced = False
+_env = os.environ.get("GENESIS_CC_RETENTION_DAYS", "")
+if _env:
+    try:
+        _n = int(_env)
+    except ValueError:
+        _n = 0
+    if _n >= 1:
+        _floor, _forced = _n, True
+_have = data.get("cleanupPeriodDays")
+if _forced:
+    if _have != _floor:
+        data["cleanupPeriodDays"] = _floor
+        changed = True
+elif _have is None:
+    data["cleanupPeriodDays"] = _floor
+    changed = True
+elif isinstance(_have, int) and not isinstance(_have, bool) and _have < _floor:
+    data["cleanupPeriodDays"] = _floor
+    changed = True
+# Suppress AI-authorship trailers. Set-if-absent; any value here is deliberate.
+if "attribution" not in data:
+    data["attribution"] = {"commit": "", "pr": "", "sessionUrl": False}
+    changed = True
 if changed:
-    with open(path, "w") as f:
+    # os.replace installs a NEW inode, so carry the mode across: this file can
+    # hold API keys in `env`, and silently widening 0600 -> 0644 on every run
+    # would be a privacy regression.
+    _mode = os.stat(path).st_mode & 0o777
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
+    os.chmod(tmp, _mode)
+    os.replace(tmp, path)
     print("merged")
 else:
     print("unchanged")
 PYEOF
     then
-        echo "    + Auto-updater suppression + subagent-nesting default set in $_settings_file"
+        echo "    + CC user-level defaults set in $_settings_file"
     else
-        echo "    WARNING: Could not merge auto-updater settings into $_settings_file"
-        echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\", \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
+        echo "    WARNING: Could not merge CC settings into $_settings_file"
+        echo "    Add manually:  {\"cleanupPeriodDays\": 180, \"attribution\": {\"commit\": \"\", \"pr\": \"\", \"sessionUrl\": false}, \"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\", \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
     fi
 fi
+# END cc-user-settings
 
 # Login guidance (interactive only)
 if should_prompt && command -v claude &>/dev/null; then

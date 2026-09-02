@@ -850,6 +850,64 @@ automation, CC silently bumps versions out from under us — we discovered this 
 the host VM was running 2.1.119 despite the 2.1.87 script pin, and again mid-session
 when the container auto-updated from 2.1.159 to 2.1.160.
 
+#### The same trap, a second time: transcript retention (2026-09-02)
+
+The rule above was written on 2026-06-01. Twenty days later `cleanupPeriodDays: 180`
+shipped in the **repo's** `.claude/settings.json` anyway (`394781bf`), on the
+explicit assumption that "project-level settings.json is honored by CC and ships
+with the repo, so every install inherits it." That is true and still useless, and
+the distinction is the whole lesson:
+
+- Project settings **are** loaded, and they **override** user settings. MEASURED on
+  2.1.246 with an isolated `CLAUDE_CONFIG_DIR` probe: user `model=haiku` +
+  project `model=sonnet-5` resolved to `claude-sonnet-5`.
+- But they are loaded **only for sessions launched inside that project** (git-root
+  detection). Genesis routinely runs CC elsewhere: dispatched sessions use
+  `~/.genesis/background-sessions` as their cwd (`src/genesis/cc/invoker.py`), and
+  worktrees, `~/tmp` and one-off directories are each their own "project" — 44 of
+  them on the reference install.
+
+For a setting whose EFFECT is machine-wide, that combination is silent data loss.
+MEASURED from `claude.exe` 2.1.246: `var Y = 30` is the retention default;
+`D()` computes `now − (X().cleanupPeriodDays ?? Y)`; and `kr()` — the transcript
+sweep — does `readdir(projectsRoot)` and walks **every** project directory,
+unlinking any `*.jsonl` older than that cutoff. So one session started outside the
+repo prunes at 30 days and deletes transcripts belonging to every other project,
+while a repo-launched session reads 180, finds nothing older left, and reports
+clean. 198 sessions were destroyed this way over 73 days before anyone noticed
+(all recovered from the encrypted backup — `scripts/backup.sh` keeps transcripts
+forever, which is why this was survivable).
+
+**Confirmed by a controlled comparison, not just by reading the binary.** A
+sibling install of this same system — same repo, same CC version, also carrying
+the repo's project-level 180, also running the sweep — was unaffected over the
+same period, holding transcripts **103 days old**. The single differing variable:
+it had `cleanupPeriodDays` at the USER level, hand-set at some point. That is
+simultaneously the proof of the mechanism and the proof that the user-level fix
+works in production; this change turns that one machine's hand-repair into a
+mechanism every install gets.
+
+**The rule, stated so it generalises:** a setting that configures the Claude Code
+*client* rather than *this project* belongs in `config/cc-global-settings.yaml`
+under `user_level_defaults`, never in `.claude/settings.json`. It is applied by
+`scripts/setup_claude_config.py` (bootstrap, so any `update.sh` that reaches
+bootstrap — the `Already up to date` fast path and a merge-conflict exit skip it,
+both no-ops here), `scripts/install.sh` (fresh container — note install.sh does
+**not** call bootstrap) and `scripts/host-setup.sh` (host VM, no venv). CC's own
+client-scope key list is enumerated in
+`tests/test_scripts/test_cc_user_level_settings.py`, which fails CI if any of them
+reappears in the repo's project settings — the chokepoint that makes a third
+instance impossible.
+
+> **On a CC pin bump:** that key list (`CC_CLIENT_SCOPE_KEYS`) is a hand-transcribed
+> snapshot of the client-scope keys in the CC binary. It will go stale the way
+> version pins do — re-derive it when bumping the pin, or the lock silently stops
+> covering newly-added client-scope settings.
+
+Retention specifically is a `floor`, not a preference: an install already carrying
+a too-low value heals on the next update, a higher value you chose is kept, and
+`GENESIS_CC_RETENTION_DAYS` is the supported way to deliberately go lower.
+
 ### Cache Inflation (since ~2.1.100, accepted)
 
 CC sends ~20K extra `cache_creation` tokens per payload by design. This is accepted

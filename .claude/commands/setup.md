@@ -62,9 +62,16 @@ Most repairs (hooks or MCP servers not firing) only need the Claude Code config
 re-rendered, which is safe on a running system:
 
 ```bash
-python scripts/setup_claude_config.py          # .mcp.json only
-python scripts/setup_claude_config.py --global  # also update ~/.claude/settings.json
+python scripts/setup_claude_config.py          # .mcp.json + user-level CC defaults
+python scripts/setup_claude_config.py --global  # ALSO force model/effortLevel from the manifest
 ```
+
+The plain form also reports (and repairs) the user-level CC defaults that cannot
+live in the repo's project settings — transcript retention and AI-authorship
+attribution. It prints the live values every run; if `cleanupPeriodDays` is
+missing or below the floor, that is the repair, and it is safe to re-run. Prefer
+the plain form: `--global` FORCE-sets `model` and `effortLevel` from the manifest
+and will overwrite a deliberate choice.
 
 For a full install/config + service re-render (this also finishes an interrupted
 install), run `./scripts/bootstrap.sh`. It refuses to run while genesis-server is

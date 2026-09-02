@@ -261,6 +261,31 @@ these are the GATES that make it enforceable:
   evidence) is a phase that FINISHES before any fix is proposed — never propose
   fixes in the same breath as the symptom. "It's probably X, let me fix that"
   = investigation skipped.
+- **A root cause is VERIFIED TO CERTAINTY, or it is not a root cause.** Never
+  speculated, never inherited as hearsay. A mechanism you have not tested is a
+  HYPOTHESIS, and saying it in the grammar of a diagnosis is the failure — worse
+  than saying nothing, because the fix then gets designed against fiction and
+  looks correct while the real cause keeps firing. Three rules make it
+  enforceable:
+  1. **Name the artifact that would falsify it, then go get that artifact.** A
+     cause is verified when a specific query, file, timestamp or run comes back
+     the way the cause predicts and could have come back otherwise. "Consistent
+     with" is not verification — a wrong cause is usually consistent too.
+  2. **A subagent's or reviewer's stated mechanism is a LEAD, at their stated
+     confidence, and it does not become fact by being repeated.** Confidence
+     does not survive the retelling: an 70%-hedged claim relayed without its
+     hedge reads as established, and the next decision is built on it. Re-derive
+     it from ground truth before it drives any change or lands in durable record.
+  3. **Enumerate the population, not a sample, and report the outliers.** N
+     instances explained by a mechanism is a claim about those N. Sweep every
+     instance; if k of N do not fit, SAY "k of N unexplained" rather than
+     generalising from the majority — the outlier is where the second bug lives.
+  (Origin, 2026-09-02: an AI-attribution leak into the public repo was relayed as
+  "dispatched sessions don't load project settings", which was a 70% hypothesis
+  restated as cause. Measured: 10 of 11 leaking commits came from worktrees whose
+  checkout PREDATED the setting — a stale-checkout problem with nothing to do
+  with settings scope — and 1 of 11 remains unexplained. The fix aimed at the
+  speculated cause would have shipped clean and changed nothing.)
 - **Fix-attempt cap: 3 failed fixes → STOP and question the architecture.**
   The debugging twin of the review escalation cap, with the same mechanics
   (count attempts visibly; the cap consumes standing approval). Each failed fix

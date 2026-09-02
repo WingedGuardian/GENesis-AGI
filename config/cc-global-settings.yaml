@@ -1,7 +1,15 @@
 # Genesis Claude Code Global Settings Manifest
 #
 # Documents the intended ~/.claude/settings.json configuration.
-# Applied via: python scripts/setup_claude_config.py --global
+#
+# TWO triggers, and which one applies is declared per key — do not add a key
+# without choosing one, or it will silently do nothing:
+#
+#   * top-level scalars below  — applied ONLY by
+#     `python scripts/setup_claude_config.py --global` (force-set: the manifest
+#     value wins over yours).
+#   * `user_level_defaults`    — applied on EVERY setup run, no flag needed,
+#     by ensure_user_cc_defaults(). Each entry carries its own `policy`.
 #
 # For non-Genesis use (public repo): sonnet is a viable, lower-cost starter model.
 
@@ -10,6 +18,80 @@ effortLevel: "medium"
 voiceEnabled: true
 autoDreamEnabled: true
 skipDangerousModePermissionPrompt: true
+
+# ---------------------------------------------------------------------------
+# Settings that configure the Claude Code CLIENT rather than a project, and so
+# CANNOT be shipped in the repo's own .claude/settings.json.
+#
+# CC merges project settings only for sessions launched inside that project
+# (git-root detection). Genesis routinely runs CC elsewhere — dispatched
+# sessions use ~/.genesis/background-sessions as their cwd (see
+# src/genesis/cc/invoker.py), and worktrees, ~/tmp and one-off dirs are all
+# their own "projects". A client-wide setting parked in project settings
+# therefore binds a minority of sessions and silently does nothing for the rest.
+#
+# This bit twice. See docs/reference/cc-compatibility.md.
+#
+# policy:
+#   floor          — raise a lower value to `value`; leave a higher one alone.
+#                    For settings where too-low means irreversible data loss.
+#   set_if_absent  — write `value` only when the key is missing entirely.
+# ---------------------------------------------------------------------------
+user_level_defaults:
+
+  # How long CC keeps session transcripts before deleting them.
+  # CC's retention sweep walks EVERY directory under ~/.claude/projects but
+  # takes its retention value from whichever session happens to run it, so one
+  # session started outside the repo prunes at CC's 30-day default and deletes
+  # transcripts belonging to every other project. 198 sessions were lost this
+  # way before this entry existed.
+  #
+  # `floor`, not `set_if_absent`: retention is a data-loss floor, not a
+  # preference, so an install already carrying a too-low value must heal. A
+  # HIGHER value you set is always kept — raise this to 365 if you want a year
+  # and your disk allows. To go LOWER deliberately, set GENESIS_CC_RETENTION_DAYS;
+  # that is the supported way to say "I mean it" and have it survive updates.
+  #
+  # Why 180 and not longer: encrypted backups keep transcripts FOREVER
+  # (scripts/backup.sh), so this governs only how far `/resume` reaches without a
+  # restore — a convenience cache, not a safety property. Nothing is lost at the
+  # floor; it just needs restoring.
+  #
+  # Disk cost, MEASURED across two installs of the same system: 14-51 MB/day
+  # depending on workload — so 180 days is ~2.5-9 GB locally, and a year is
+  # double that. Budget from your own rate, not from one number:
+  #   du -sh ~/.claude/projects   # divide by the age of the oldest transcript
+  # Neither install has ever had a transcript reach 180 days, so this is a
+  # generous bound in practice rather than a binding one.
+  cleanupPeriodDays:
+    policy: floor
+    value: 180
+    env_override: GENESIS_CC_RETENTION_DAYS
+
+  # Suppress AI-authorship trailers on commits and PRs.
+  #
+  # Shipped in .claude/settings.json since #1450, and DELIBERATELY LEFT THERE as
+  # well as here — unlike cleanupPeriodDays, which had to be removed. The two
+  # differ because of what a project-level copy DOES:
+  #   * cleanupPeriodDays is numeric and project settings override user settings,
+  #     so a project copy CAPS the user-level value. It had to go.
+  #   * attribution is an identical object either way, so a project copy caps
+  #     nothing and is pure belt-and-braces. It is worth keeping precisely
+  #     because of the measured failure below.
+  #
+  # MEASURED 2026-09-02: of 11 commits that leaked `Co-authored-by: Claude` after
+  # #1450 landed, 10 came from branches whose CHECKOUT predated the setting —
+  # a stale worktree, not a settings-scope problem. A user-level copy is immune
+  # to that, since ~/.claude/settings.json is not part of any checkout. (1 of the
+  # 11 is unexplained; do not assume this list is closed.)
+  #
+  # `set_if_absent`: it is an object, and any value you have set is deliberate.
+  attribution:
+    policy: set_if_absent
+    value:
+      commit: ""
+      pr: ""
+      sessionUrl: false
 
 # Plugin tiers — Genesis strongly recommends Tier 1, Tier 2+ are helpful.
 plugins:
