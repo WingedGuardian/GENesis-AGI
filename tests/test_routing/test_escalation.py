@@ -468,3 +468,43 @@ class TestDeadProviderNotification:
             "a fresh duplicate failure row reset the outage clock and suppressed "
             "the notification"
         )
+
+    async def test_a_failed_resolve_leaves_the_notification_re_armable(
+        self, escalation, empty_db, monkeypatch
+    ):
+        """A partial resolve must fail VISIBLY, never silently.
+
+        REGRESSION (#1573 Codex P2). Recovery resolves two hashes in two
+        separately committed statements. Failure-first meant a failure on the
+        second statement left the NOTIFY row unresolved — and `skip_if_duplicate`
+        keys on an unresolved row of the same hash, so that provider could never
+        notify again until some later recovery happened to succeed. Silent.
+
+        Notify-first inverts which row survives: the FAILURE row stays open,
+        which the dashboard shows as a provider still failing and the next
+        recovery clears. Visible beats silent at identical cost.
+        """
+        import genesis.db.crud.observations as obs_crud
+
+        await self._seed_failure_obs(escalation, empty_db, "prov-f", "pf-f", age_s=7200)
+        await escalation._maybe_notify("prov-f")
+        assert len(await self._criticals(empty_db, "prov-f", escalation)) == 1
+
+        calls = {"n": 0}
+        real = obs_crud.resolve_by_content_hash
+
+        async def flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("simulated transient failure on the second resolve")
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(obs_crud, "resolve_by_content_hash", flaky)
+        await escalation._resolve_observation("prov-f")
+        assert calls["n"] == 2, "precondition: both resolve statements were attempted"
+
+        # The provider is still dead. It must still be able to tell the user.
+        await escalation._maybe_notify("prov-f")
+        assert len(await self._criticals(empty_db, "prov-f", escalation)) == 2, (
+            "a half-completed resolve permanently silenced this provider"
+        )

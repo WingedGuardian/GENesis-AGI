@@ -1300,7 +1300,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: 975d3944 2026-09-01
+verified: 6f3310e5 2026-09-02
 ```
 
 - **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
@@ -1321,9 +1321,18 @@ verified: 975d3944 2026-09-01
   `mark_surfaced`) turns into exactly ONE Telegram. The age is read off the
   unresolved observation, not in-memory state, so it survives a restart; the
   EARLIEST unresolved row wins, because a duplicate would otherwise reset the
-  outage clock. Recovery resolves BOTH hashes, which is what re-arms the
-  notification for a genuine second outage. Do not raise the 10-minute
+  outage clock. Recovery resolves BOTH hashes — **notify hash FIRST**: the two
+  are separately committed (this connection has no transactions), so a failure
+  between them must leave the VISIBLE row open (a provider shown as failing when
+  it is not, which the next recovery clears) rather than the SILENT one (an open
+  notify row makes `skip_if_duplicate` suppress this provider's notifications
+  until some later recovery happens to succeed). Do not raise the 10-minute
   observation to critical instead — it would page on every transient blip.
+  Two KNOWN GAPS are documented in-code at the sites, not fixed: the row is
+  stamped at the 5th trip rather than the first (duration short by the ramp),
+  and the notification re-check is gated on in-memory `escalated` (a restart
+  mid-outage waits for 5 fresh trips). Both have attempted fixes that were
+  reverted for creating worse failures; see the code comments before retrying.
 - **providers/**: the `ToolProvider` registry for NON-LLM tools (search,
   embeddings, STT/TTS, crawl, probes). Adapters register GATED ON ENV KEYS —
   silent non-registration is by design (absence ≠ bug). LLM breaker/health

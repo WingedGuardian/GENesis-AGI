@@ -30,9 +30,11 @@ _TRIP_THRESHOLD = 5
 # How long a provider must have been continuously failing before the user is
 # told. The escalation observation above fires at ~10 minutes, which is the
 # right threshold for a DASHBOARD row and far too eager for a notification —
-# most breaker trips resolve themselves. An hour matches the floor the alert
-# duration decorator uses (`mcp/health/errors.py::_ONGOING_FLOOR_S`), so the two
-# user-facing surfaces agree on what counts as "worth naming".
+# most breaker trips resolve themselves well inside an hour, so anything shorter
+# pages on noise. An earlier version of this comment cited an
+# `_ONGOING_FLOOR_S` constant in the health subsystem as precedent; no such
+# symbol exists anywhere in the repo, so the hour stands on the reasoning above
+# rather than on a borrowed threshold.
 _NOTIFY_AFTER_S = 3600.0
 
 
@@ -87,6 +89,13 @@ class ProviderEscalation:
         # backs off to a trip every 30min-4h, so this runs a handful of times a
         # day at most. Deferred like the write above — `_on_event` runs inside
         # `emit()` and must stay fast.
+        #
+        # KNOWN GAP, deliberately not fixed here: `escalated` is in-memory, so a
+        # restart mid-outage waits for 5 FRESH trips before re-checking. Dropping
+        # this conjunct was tried and REVERTED — it lets a SINGLE trip on a
+        # provider with a stranded unresolved row page the user with a multi-day
+        # outage claim. Closing it safely needs a startup reconcile that resolves
+        # rows for providers whose breakers are not open; see the follow-up.
         if state["escalated"] and not state.get("notified"):
             tracked_task(
                 self._maybe_notify(provider),
@@ -162,6 +171,18 @@ class ProviderEscalation:
                 content=content,
                 priority="high",
                 category="system_health",
+                # KNOWN GAP, deliberately not fixed here: this stamps the row
+                # when the 5th trip lands, so the duration every consumer reads
+                # is short by the escalation ramp (~15-30 min, more under
+                # backoff). `first_trip_at` — the true start — is carried in the
+                # content JSON below but read by nothing. Backdating this column
+                # to it was tried and REVERTED: the anchor is written once per
+                # state entry (:72) and cleared only by `record_recovery`, so a
+                # flapping provider (success_threshold=2 means one clean call
+                # does not clear a trip) keeps a weeks-old anchor and the row is
+                # then born already past the 1h notification floor — a critical
+                # page with a fabricated multi-day duration. Fixing this needs
+                # the anchor bounded first; see the follow-up.
                 created_at=self._clock().isoformat(),
                 content_hash=content_hash,
                 skip_if_duplicate=True,
@@ -199,9 +220,18 @@ class ProviderEscalation:
         # Leaving the notify row open would make the first outage in a
         # provider's life the only one the user ever hears about, because
         # `skip_if_duplicate` suppresses on an unresolved row of the same hash.
+        # NOTIFY FIRST, deliberately. These are two separately committed
+        # statements — there is no transaction facility on this connection
+        # (`SerializedConnection.__aenter__` is a no-op) — so one can succeed
+        # and the next fail. Order decides which row survives that. Notify-row
+        # open = `skip_if_duplicate` (which keys on an UNRESOLVED row of the
+        # same hash) silences this provider until some later recovery happens
+        # to succeed: silent. Failure-row open = the dashboard shows a provider
+        # as failing when it is not, and the next recovery clears it: visible.
+        # Visible beats silent at identical cost.
         content_hashes = (
-            self._provider_content_hash(provider),
             self._notify_content_hash(provider),
+            self._provider_content_hash(provider),
         )
         try:
             resolved = 0
