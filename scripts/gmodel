@@ -9,8 +9,10 @@
 <name> is either:
   • a Claude tier — opus / sonnet / haiku — → native `claude --model <tier>` on
     your Max subscription (OAuth); or
-  • a roster model from config/cc_roster.yaml — `claude` (a peer runs on that
-    provider's native Anthropic endpoint + its API key).
+  • a roster model — `claude`, plus any peer you declared in
+    ~/.genesis/config/cc_roster.local.yaml (a peer runs on that provider's
+    native Anthropic endpoint + its API key). The shipped
+    config/cc_roster.yaml declares no peers; it documents the fields.
 
 Anthropic always runs on Max (native OAuth — `ANTHROPIC_API_KEY` is dropped so a
 stray key can't silently switch you to per-token billing). A session is pinned to
@@ -58,7 +60,12 @@ def _list_models() -> int:
     default = roster.active_model(r)
     models = r.get("models") or {}
     if not models:
-        print("No roster models configured (config/cc_roster.yaml).", file=sys.stderr)
+        print(
+            "No roster models configured. Declare peers in "
+            "~/.genesis/config/cc_roster.local.yaml "
+            "(config/cc_roster.yaml ships none by design).",
+            file=sys.stderr,
+        )
         return 1
     print("Models (gmodel <name> to launch):\n")
     print("  claude tiers:  opus  sonnet  haiku   (native Max, via --model)\n")

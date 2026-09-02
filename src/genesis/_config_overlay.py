@@ -11,9 +11,12 @@ to avoid circular imports from any config loader.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 def _user_config_dir() -> Path:
@@ -57,6 +60,20 @@ def merge_local_overlay(base: dict, base_path: Path) -> dict:
     try:
         local = yaml.safe_load(local_path.read_text()) or {}
     except Exception:
+        # NEVER silent. Returning `base` is the right FALLBACK, but an unlogged
+        # one is indistinguishable from a clean load — the caller sees a valid
+        # config and cannot tell that every override in this file was dropped.
+        # That is load-bearing for configs whose overlay is the SOLE home of a
+        # setting (cc_roster peers, for one): a single YAML typo silently
+        # yields "no peers configured", and the discovery moment is the
+        # subscription cap. The base-file loader in genesis.cc.roster already
+        # warns on the same failure; this is the matching half.
+        logger.warning(
+            "Failed to parse config overlay %s — IGNORING it; every setting in "
+            "this file is NOT in effect. Fix the YAML and reload.",
+            local_path,
+            exc_info=True,
+        )
         return base
     return _deep_merge(base, local)
 

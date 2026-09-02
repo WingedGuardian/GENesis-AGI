@@ -214,7 +214,11 @@ def test_no_unisolated_local_yaml_resolver():
         "ledger/learned_knobs.py",  # _user_config_dir()/<stem>.local.yaml (user-dir-always)
     }
     # Files that merely MENTION ".local.yaml" in a message/help string.
-    prose_mentions = {"mcp/health/reflex_status.py"}
+    # cc/conversation.py: a WARNING emitted when CC failover finds no usable
+    # roster peer, telling the operator where to declare one. It reads the
+    # roster through genesis.cc.roster (which routes via merge_local_overlay);
+    # the path appears only in the human-facing message text.
+    prose_mentions = {"mcp/health/reflex_status.py", "cc/conversation.py"}
     accounted = independent_resolvers | shared_seam_users | prose_mentions
 
     found: set[str] = set()
@@ -298,3 +302,35 @@ def test_repo_sibling_overlay_is_neutralized_on_real_tree():
         f"repo-relative overlay {sib.name} leaked into a test merge — the "
         "_sandboxed_resolve neutralizer in conftest is not covering it"
     )
+
+
+def test_broken_overlay_warns_and_falls_back(tmp_path, monkeypatch, caplog):
+    """A malformed overlay must FALL BACK LOUDLY, never silently.
+
+    Regression guard for a silent-degradation path: `merge_local_overlay`
+    swallowed every parse error and returned `base` with no log line, so a
+    broken overlay was indistinguishable from a clean load. That is
+    load-bearing wherever the overlay is the SOLE home of a setting —
+    cc_roster peers, for one, where a single YAML typo yields "no fallback
+    peer configured" and the discovery moment is the subscription cap.
+    """
+    import logging
+
+    from genesis import _config_overlay as ov
+
+    base_path = tmp_path / "cc_roster.yaml"
+    base_path.write_text("default: claude\n")
+    user_dir = tmp_path / "user"
+    user_dir.mkdir()
+    (user_dir / "cc_roster.local.yaml").write_text("models:\n  bad: [unclosed\n")
+    monkeypatch.setattr(ov, "_user_config_dir", lambda: user_dir)
+
+    base = {"default": "claude", "models": {"claude": {"native_subscription": True}}}
+    with caplog.at_level(logging.WARNING, logger="genesis._config_overlay"):
+        out = ov.merge_local_overlay(base, base_path)
+
+    assert out == base  # fell back
+    assert caplog.records, "a broken overlay must not fail silently"
+    msg = caplog.records[0].getMessage()
+    assert "cc_roster.local.yaml" in msg  # names the offending file
+    assert "NOT in effect" in msg  # states the consequence

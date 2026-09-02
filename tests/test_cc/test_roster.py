@@ -239,3 +239,31 @@ def test_apply_routing_env_auth_token_only_still_drops_api_key():
     R.apply_routing_env(env, base_url=None, auth_token="zk-secret", model_id=None)
     assert "ANTHROPIC_API_KEY" not in env
     assert env["ANTHROPIC_AUTH_TOKEN"] == "zk-secret"
+
+
+def test_shipped_config_ships_no_peers():
+    """DELIVERABLE LOCK: config/cc_roster.yaml ships INFRASTRUCTURE, not peers.
+
+    A peer pins a `model_id`, and model ids go EOL — this file shipped
+    `glm-5.2` past its replacement by `glm-5.3`. A stale pinned peer fails at
+    the one moment it is needed (when the subscription caps) and fails while
+    LOOKING configured, which is worse than an empty roster failing honestly.
+    So peers are declared per-install in ~/.genesis/config/cc_roster.local.yaml.
+
+    Asserts on the SHIPPED FILE directly rather than the merged roster, so
+    neither a developer's real overlay nor the repo-relative fallback can mask
+    a regression. Without this, re-adding a peer to the shipped config would
+    break nothing — every other roster test writes its own synthetic yaml.
+    """
+    import yaml
+
+    from genesis.cc.roster import _CONFIG_DIR, _ROSTER_FILE
+
+    base = yaml.safe_load((_CONFIG_DIR / _ROSTER_FILE).read_text())
+    assert base["default"] == "claude"
+    assert set(base["models"]) == {"claude"}, (
+        "config/cc_roster.yaml must ship no peers — declare them in "
+        "~/.genesis/config/cc_roster.local.yaml. See the file header for why "
+        "(version churn: a stale pinned model_id fails exactly when needed)."
+    )
+    assert base["models"]["claude"].get("native_subscription") is True

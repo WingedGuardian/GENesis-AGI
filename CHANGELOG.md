@@ -123,6 +123,42 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   session and fail-open: a fresh session stays silent, and any read/parse miss emits
   nothing.
 
+### Changed
+
+- **The Claude Code model roster now ships infrastructure, not a preconfigured
+  provider.** `config/cc_roster.yaml` previously shipped a `glm-5.2` peer pointed at
+  `open.bigmodel.cn`, which requires Chinese real-name identity verification (实名认证)
+  to buy a Coding Plan — so on any install outside China the documented rate-limit
+  fallback could not be provisioned at all. The base config now ships only the native `claude` entry
+  plus commented examples for both Z.AI platforms (`api.z.ai` international,
+  `open.bigmodel.cn` China) and several other Anthropic-compatible providers.
+
+  **If you were using the shipped peer, you must now declare it yourself** in
+  `~/.genesis/config/cc_roster.local.yaml`, which is deep-merged over the base file
+  and is where the `cc_roster` settings domain already writes:
+
+  ```yaml
+  models:
+    glm-5.3:
+      anthropic_base_url: "https://api.z.ai/api/anthropic"
+      auth_env: ZAI_CODING_API_KEY
+      model_id: glm-5.3
+      failover_order: 1
+  ```
+
+  This matters because the failure is quiet: an overlay setting `default: glm-5.2`
+  with no matching entry does not error — it falls back to native Claude, so a
+  subscription-cap fallback you believed was configured would simply not engage.
+
+  `secrets.env.example` now documents both Z.AI keys and which endpoint each one
+  serves: a Coding Plan key (`ZAI_CODING_API_KEY`) is required for a roster peer
+  because Claude Code speaks the Anthropic protocol, while a general/prepaid key
+  (`ZHIPU_API_KEY`) works only on `/api/paas/v4`. Using the general key on a coding
+  endpoint returns `1113 Insufficient balance` even when the account is funded.
+
+  The `validated:` field is unchanged but now documented as advisory only — no code
+  reads it. Stale stamps were dropped rather than carried forward unverified.
+
 ### Fixed
 
 - **The morning report no longer cries "surplus heartbeat overdue" during a long

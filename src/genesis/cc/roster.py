@@ -1,6 +1,6 @@
 """Model roster — first-class model-diversification policy layer.
 
-Maps roster names (e.g. "glm-5.2") to the CCInvocation overrides that point a
+Maps roster names ("claude", or a peer from the local overlay) to the
 Claude Code subprocess at a non-Anthropic provider's native Anthropic-compatible
 endpoint. This is the POLICY layer.
 
