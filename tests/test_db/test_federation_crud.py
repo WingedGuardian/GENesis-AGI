@@ -138,7 +138,8 @@ async def _append_chain(db, contact_id, direction, seqs, *, hitl_state="received
 
 
 @pytest.mark.asyncio
-async def test_list_messages_orders_by_seq(db):
+async def test_list_messages_ordered_by_msg_id_within_direction(db):
+    # within one direction, msg_id (ULID) order coincides with chain/seq order
     await _contact(db)
     await _append_chain(db, "c1", "in", (1, 2, 3))
     assert [m["msg_id"] for m in await fed.list_messages(db, "c1")] == ["min1", "min2", "min3"]
@@ -150,9 +151,141 @@ async def test_list_messages_pagination(db):
     await _append_chain(db, "c1", "in", (1, 2, 3))
     first = await fed.list_messages(db, "c1", limit=2)
     assert [m["msg_id"] for m in first] == ["min1", "min2"]
-    # rows past the limit are reachable via after_seq — never permanently hidden
-    rest = await fed.list_messages(db, "c1", after_seq=first[-1]["seq"])
+    # rows past the limit are reachable via after_msg_id — never permanently hidden
+    rest = await fed.list_messages(db, "c1", after_msg_id=first[-1]["msg_id"])
     assert [m["msg_id"] for m in rest] == ["min3"]
+
+
+@pytest.mark.asyncio
+async def test_combined_transcript_is_chronological_not_seq_interleaved(db):
+    """direction=None orders by msg_id (ULID/time), NOT by seq — the in/out seq
+    sequences are independent, so a seq-sort would scramble the conversation."""
+    await _contact(db)
+    # interleave in time: out#1, in#1, out#2 (ULID-ish ids sort chronologically)
+    await fed.append_message(
+        db,
+        msg_id="01out1",
+        contact_id="c1",
+        direction="out",
+        seq=1,
+        prev_hash=None,
+        payload_hash="ho1",
+        created_at="2026-08-31T00:00:01Z",
+        hitl_state="held",
+    )
+    await fed.append_message(
+        db,
+        msg_id="02in1",
+        contact_id="c1",
+        direction="in",
+        seq=1,
+        prev_hash=None,
+        payload_hash="hi1",
+        created_at="2026-08-31T00:00:02Z",
+        hitl_state="received",
+    )
+    await fed.append_message(
+        db,
+        msg_id="03out2",
+        contact_id="c1",
+        direction="out",
+        seq=2,
+        prev_hash="ho1",
+        payload_hash="ho2",
+        created_at="2026-08-31T00:00:03Z",
+        hitl_state="held",
+    )
+    # chronological — NOT out-1, out-2, in-1 (which a seq-sort would produce)
+    assert [m["msg_id"] for m in await fed.list_messages(db, "c1")] == ["01out1", "02in1", "03out2"]
+
+
+@pytest.mark.asyncio
+async def test_inbound_append_forces_external_untrusted_origin(db):
+    """Peer content is untrusted: an inbound append with origin_class omitted is
+    forced to external_untrusted so a later memory write stays quarantined."""
+    await _contact(db)
+    await fed.append_message(
+        db,
+        msg_id="i1",
+        contact_id="c1",
+        direction="in",
+        seq=1,
+        prev_hash=None,
+        payload_hash="h1",
+        created_at="2026-08-31T00:00:00Z",
+        hitl_state="received",
+    )
+    row = await fed.get_message(db, "i1")
+    assert row["origin_class"] == "external_untrusted"
+    # an explicit value is respected; outbound is left untouched (owner-authored)
+    await fed.append_message(
+        db,
+        msg_id="o1",
+        contact_id="c1",
+        direction="out",
+        seq=1,
+        prev_hash=None,
+        payload_hash="ho",
+        created_at="2026-08-31T00:00:00Z",
+        hitl_state="held",
+    )
+    assert (await fed.get_message(db, "o1"))["origin_class"] is None
+
+
+def test_inbound_origin_class_matches_provenance_constant():
+    """The literal used at the db boundary must equal the canonical provenance
+    enum value, or the injection-boundary tag would silently not match."""
+    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
+
+    assert fed._INBOUND_ORIGIN_CLASS == ORIGIN_EXTERNAL_UNTRUSTED
+
+
+@pytest.mark.asyncio
+async def test_set_hitl_state_terminal_is_immutable(db):
+    """A terminal row (sent/rejected) can't be transitioned again — a racing
+    worker must not resurrect a rejected message or unsend a delivered one."""
+    await _contact(db)
+    await fed.append_message(
+        db,
+        msg_id="m1",
+        contact_id="c1",
+        direction="out",
+        seq=1,
+        prev_hash=None,
+        payload_hash="h1",
+        created_at="2026-08-31T00:00:00Z",
+        hitl_state="held",
+    )
+    assert await fed.set_hitl_state(db, "m1", hitl_state="rejected")
+    # rejected is terminal — a stale approve/send worker can't move it
+    assert await fed.set_hitl_state(db, "m1", hitl_state="approved") is False
+    assert await fed.set_hitl_state(db, "m1", hitl_state="sent") is False
+    assert (await fed.get_message(db, "m1"))["hitl_state"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_set_hitl_state_expected_current_cas(db):
+    """expected_current makes the transition a compare-and-swap — only applies if
+    the row is still in the expected state (two racing workers can't both win)."""
+    await _contact(db)
+    await fed.append_message(
+        db,
+        msg_id="m1",
+        contact_id="c1",
+        direction="out",
+        seq=1,
+        prev_hash=None,
+        payload_hash="h1",
+        created_at="2026-08-31T00:00:00Z",
+        hitl_state="held",
+    )
+    # wrong expected state → no-op
+    assert (
+        await fed.set_hitl_state(db, "m1", hitl_state="sent", expected_current="approved") is False
+    )
+    assert (await fed.get_message(db, "m1"))["hitl_state"] == "held"
+    # correct expected state → applies
+    assert await fed.set_hitl_state(db, "m1", hitl_state="approved", expected_current="held")
 
 
 @pytest.mark.asyncio

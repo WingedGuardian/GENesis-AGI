@@ -4,11 +4,21 @@
 The persistence layer is deliberately thin: chain math (``payload_hash``,
 ``seq`` assignment) and crypto live in ``genesis.federation.crypto`` /
 ``outbound`` / ``inbound``. This module only stores and queries rows — with one
-exception that MUST be atomic: :func:`append_message` advances the contact's
-per-direction chain head in the SAME transaction as the message insert, so a
-crash can never leave the head pointing at a message that was not written (or a
-message written past a head that never moved) — either would fork the chain and
-break verification.
+exception that must be atomic: :func:`append_message` advances the contact's
+per-direction chain head in the SAME transaction as the message insert.
+
+CONCURRENCY PRECONDITION (must hold before PR2 wires the loops):
+:func:`append_message` is CRASH-atomic within one coroutine, but it is NOT
+concurrency-atomic on Genesis's shared ``SerializedConnection`` — that wrapper
+acquires its lock PER CALL (execute/commit/rollback each lock-and-release), so a
+PEER coroutine that commits (or rolls back) the shared connection's open
+transaction BETWEEN this function's CAS-UPDATE and INSERT would fork the chain
+(head advanced with no row, or a row past an unmoved head) — the very thing this
+design exists to prevent. Before PR2 runs the poll-loop and approval-drain
+concurrently with other writers, the CAS+INSERT MUST be wrapped in a
+transaction-scoped lock (a ``SerializedConnection.transaction()`` context that
+holds the lock across the whole txn) OR the federation loops MUST use a dedicated
+connection. Tracked as a hard PR2 precondition; see the follow-up.
 
 Row shape is a plain ``dict`` (``aiosqlite.Row`` → ``dict``); BLOB columns come
 back as ``bytes``.
@@ -112,6 +122,18 @@ _DIRECTIONS = ("in", "out")
 # payload permanently. Only genuinely-done rows are prunable.
 _PRUNABLE_HITL_STATES = ("sent", "rejected", "quarantined", "received")
 
+# HITL states a message can never LEAVE — the owner's decision (rejected) and a
+# completed delivery (sent) are final. set_hitl_state refuses to transition out
+# of these so a racing worker can't resurrect a rejected message or unsend one.
+_TERMINAL_HITL_STATES = ("sent", "rejected")
+
+# Peer-sourced content is untrusted. Every inbound row is forced to this
+# provenance so a downstream memory write is quarantined (wrapped as external),
+# never resolved to first_party. MUST equal
+# genesis.memory.provenance.ORIGIN_EXTERNAL_UNTRUSTED (locked by a test) — kept
+# as a literal here to avoid the db-layer importing the memory layer upward.
+_INBOUND_ORIGIN_CLASS = "external_untrusted"
+
 
 def _require_direction(direction: str) -> None:
     if direction not in _DIRECTIONS:
@@ -138,7 +160,10 @@ async def append_message(
     delivered_at: str | None = None,
 ) -> str:
     """Append a transcript message AND advance the contact's per-direction chain
-    head via a **compare-and-swap**, atomically (single commit).
+    head via a **compare-and-swap**, in one transaction (single commit).
+    (CRASH-atomic within this coroutine; see the module docstring's CONCURRENCY
+    PRECONDITION — the CAS+INSERT is NOT yet concurrency-atomic on the shared
+    connection, which PR2 must ensure before wiring concurrent loops.)
 
     The head UPDATE is a CAS: it moves ``last_seq_{sent,recv}`` + ``{send,recv}_
     chain_head`` to ``(seq, payload_hash)`` ONLY when the stored tip currently
@@ -153,6 +178,11 @@ async def append_message(
     uniformly regardless of ``PRAGMA foreign_keys``.
     """
     _require_direction(direction)
+    # inbound peer content is untrusted — force the quarantine provenance when the
+    # caller omits it, so a later memory write is wrapped as external rather than
+    # falling through derive_origin_class() to first_party (losing the boundary).
+    if direction == "in" and origin_class is None:
+        origin_class = _INBOUND_ORIGIN_CLASS
     col_seq = "last_seq_sent" if direction == "out" else "last_seq_recv"
     col_head = "send_chain_head" if direction == "out" else "recv_chain_head"
     try:
@@ -232,26 +262,31 @@ async def list_messages(
     contact_id: str,
     *,
     direction: str | None = None,
-    after_seq: int = 0,
+    after_msg_id: str = "",
     limit: int = 200,
 ) -> list[dict]:
-    """Transcript for a contact in chain order (seq ASC), optionally one
-    direction. ``msg_id`` (ULID) breaks ties deterministically.
+    """Transcript for a contact in CHRONOLOGICAL order (by ``msg_id``, a
+    time-sortable ULID), optionally one direction.
 
-    Paginate with ``after_seq``: pass the ``seq`` of the last row you saw to get
-    the next window (rows with ``seq > after_seq``). Without it, rows past
-    ``limit`` would be permanently unreachable — a long transcript would hide its
-    newest entries from audit/display consumers."""
+    Ordering by ``msg_id`` rather than ``seq`` is what keeps the combined
+    (both-direction) view coherent: the inbound and outbound ``seq`` sequences are
+    INDEPENDENT, so a seq-sort interleaves them wrong (outbound 1,2 + inbound 1 →
+    out-1, in-1, out-2). Within a single direction the ULID order still matches the
+    append (chain) order.
+
+    Paginate with ``after_msg_id``: pass the ``msg_id`` of the last row you saw to
+    get the next window (rows with ``msg_id > after_msg_id``). Without it, rows
+    past ``limit`` would be permanently unreachable by audit/display consumers."""
     if direction is not None:
         _require_direction(direction)
-    where = "contact_id = ? AND seq > ?"
-    params: list = [contact_id, after_seq]
+    where = "contact_id = ? AND msg_id > ?"
+    params: list = [contact_id, after_msg_id]
     if direction is not None:
         where += " AND direction = ?"
         params.append(direction)
     params.append(limit)
     cursor = await db.execute(
-        f"SELECT * FROM federation_messages WHERE {where} ORDER BY seq ASC, msg_id ASC LIMIT ?",
+        f"SELECT * FROM federation_messages WHERE {where} ORDER BY msg_id ASC LIMIT ?",
         tuple(params),
     )
     return [dict(r) for r in await cursor.fetchall()]
@@ -262,15 +297,30 @@ async def set_hitl_state(
     msg_id: str,
     *,
     hitl_state: str,
+    expected_current: str | None = None,
     delivered_at: str | None = None,
 ) -> bool:
     """Transition an outbound message's HITL state (held→approved→sent, or
-    →rejected). When ``delivered_at`` is given it is stamped too. Returns whether
-    a row changed."""
+    →rejected). When ``delivered_at`` is given it is stamped too. Returns whether a
+    row changed.
+
+    Two guards make this race-safe for PR2's approval gate:
+    - a TERMINAL row (``sent``/``rejected``) can never be transitioned again, so a
+      stale send-worker can't resurrect a message the owner rejected, nor unsend a
+      delivered one — whichever call commits last would otherwise erase the
+      owner's decision;
+    - ``expected_current`` (optional) makes the update a compare-and-swap: it only
+      applies when the row is still in that state, so two workers racing the same
+      transition don't both "succeed"."""
+    conds = ["msg_id = ?", f"hitl_state NOT IN ({', '.join('?' for _ in _TERMINAL_HITL_STATES)})"]
+    params: list = [msg_id, *_TERMINAL_HITL_STATES]
+    if expected_current is not None:
+        conds.append("hitl_state = ?")
+        params.append(expected_current)
     cursor = await db.execute(
-        "UPDATE federation_messages SET hitl_state = ?, "
-        "delivered_at = COALESCE(?, delivered_at) WHERE msg_id = ?",
-        (hitl_state, delivered_at, msg_id),
+        "UPDATE federation_messages SET hitl_state = ?, delivered_at = COALESCE(?, delivered_at) "
+        f"WHERE {' AND '.join(conds)}",
+        (hitl_state, delivered_at, *params),
     )
     await db.commit()
     return cursor.rowcount > 0
@@ -281,8 +331,9 @@ async def prune_bodies(db: aiosqlite.Connection, *, before: str) -> int:
     messages created strictly before ``before`` (ISO ts), PRESERVING the chain
     skeleton (seq/prev_hash/payload_hash) so a pruned transcript still verifies.
 
-    Only messages in a TERMINAL hitl_state (``_PRUNABLE_HITL_STATES``) are pruned
-    — a ``held``/``approved``-but-undelivered outbound message still needs its
+    Only messages whose body is done being needed (``_PRUNABLE_HITL_STATES`` —
+    sent/rejected/quarantined/received; a superset of the two truly-terminal
+    states) are pruned — a ``held``/``approved``-but-undelivered outbound still needs its
     payload to be sent once the owner approves, so pruning it (even when old)
     would lose the message permanently. Rows are never deleted — a gap would break
     verification. Returns the number of rows pruned. Idempotent."""

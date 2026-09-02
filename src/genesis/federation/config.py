@@ -33,7 +33,7 @@ from typing import Any
 
 import yaml
 
-from genesis._config_overlay import merge_local_overlay
+from genesis._config_overlay import _resolve_overlay_path, merge_local_overlay
 from genesis.env import repo_root
 
 logger = logging.getLogger(__name__)
@@ -88,11 +88,38 @@ def load_config() -> dict[str, Any]:
         pass  # shipped default may be absent; DEFAULTS (off) is correct
     except Exception:
         logger.warning("federation base config unreadable at %s", base_path)
+    # FAIL-CLOSED on a corrupt/unreadable overlay. The overlay is where the user's
+    # own `mode: off` would live, so if we can't reliably read it we must NOT fall
+    # back to an active base config. NB: merge_local_overlay() SWALLOWS a YAML
+    # parse error and returns base (fail-open), so we validate the overlay
+    # OURSELVES first — a present-but-unparseable overlay, or one that isn't a
+    # mapping, forces off. (An absent overlay, or an empty one parsing to None, is
+    # a legitimate no-op.)
+    overlay_path = _resolve_overlay_path(base_path)
+    if overlay_path.exists():
+        try:
+            parsed = yaml.safe_load(overlay_path.read_text())
+        except Exception:
+            logger.warning("federation overlay is malformed YAML — forcing off (fail-closed)")
+            return _forced_off(merged, base)
+        if parsed is not None and not isinstance(parsed, dict):
+            logger.warning("federation overlay is not a mapping — forcing off (fail-closed)")
+            return _forced_off(merged, base)
     try:
         base = merge_local_overlay(base, base_path)
     except Exception:
-        logger.warning("federation overlay merge failed", exc_info=True)
+        logger.warning("federation overlay merge failed — forcing off (fail-closed)", exc_info=True)
+        return _forced_off(merged, base)
     merged.update(base)
+    return merged
+
+
+def _forced_off(merged: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
+    """Return a config that resolves to ``off`` regardless of the base file — the
+    fail-closed result when the local overlay cannot be trusted."""
+    merged.update(base)
+    merged["enabled"] = False
+    merged["mode"] = "off"
     return merged
 
 

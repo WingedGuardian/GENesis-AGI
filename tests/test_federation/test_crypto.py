@@ -198,3 +198,25 @@ def test_verify_and_decrypt_happy_and_bad_sig():
         ciphertext=ct,
     )
     assert bad is None
+
+
+def test_verify_and_decrypt_propagates_on_corrupt_ciphertext():
+    """A VALID signature over a CORRUPT ciphertext propagates CryptoError (a real
+    anomaly worth surfacing), rather than being swallowed as None."""
+    sender_sk = SigningKey.generate()
+    a, b = PrivateKey.generate(), PrivateKey.generate()
+    nonce, ct = crypto.encrypt(b, a.public_key, b"hello")
+    signed = b"envelope"
+    sig = crypto.sign(sender_sk, context="msg", message=signed)
+    corrupt = bytes([ct[0] ^ 0x01]) + ct[1:]
+    with pytest.raises(nacl.exceptions.CryptoError):
+        crypto.verify_and_decrypt(
+            sender_sk.verify_key,
+            a,
+            b.public_key,
+            context="msg",
+            signed_message=signed,
+            signature=sig,
+            nonce=nonce,
+            ciphertext=corrupt,
+        )

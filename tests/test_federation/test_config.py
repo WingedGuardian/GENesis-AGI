@@ -9,15 +9,23 @@ from genesis.federation import config as fedconfig
 
 @pytest.fixture
 def cfg_file(monkeypatch, tmp_path):
-    """Point the lever at an isolated tmp base config (no .local overlay beside
-    it) and ensure the kill switch is off unless a test sets it."""
-    path = tmp_path / "federation.yaml"
-    monkeypatch.setattr(fedconfig, "_base_path", lambda: path)
+    """Point the lever at an isolated tmp base config AND an isolated overlay dir
+    (so a real ~/.genesis/config/federation.local.yaml can never leak into the
+    test — hermetic). Returns a base-writer with a ``.overlay(text)`` helper.
+    Kill switch is cleared unless a test sets it."""
+    from genesis import _config_overlay
+
+    base = tmp_path / "federation.yaml"
+    overlay_dir = tmp_path / "overlay"
+    overlay_dir.mkdir()
+    monkeypatch.setattr(fedconfig, "_base_path", lambda: base)
+    monkeypatch.setattr(_config_overlay, "_user_config_dir", lambda: overlay_dir)
     monkeypatch.delenv(fedconfig._DISABLE_ENV, raising=False)
 
     def _write(text: str):
-        path.write_text(text)
+        base.write_text(text)
 
+    _write.overlay = lambda text: (overlay_dir / "federation.local.yaml").write_text(text)
     return _write
 
 
@@ -84,4 +92,31 @@ def test_non_boolean_enabled_degrades_to_off(cfg_file):
         assert fedconfig.effective_mode() == "off", f"enabled: {enabled} should be off"
     # a real boolean true still activates
     cfg_file("enabled: true\nmode: propose_only\n")
+    assert fedconfig.effective_mode() == "propose_only"
+
+
+def test_overlay_corrupt_yaml_forces_off(cfg_file):
+    """A present-but-unparseable overlay must force off — NOT silently fall back to
+    an active base config (the overlay is where the user's own `mode: off` lives).
+    merge_local_overlay swallows the parse error and returns base, so the loader
+    must validate the overlay itself; this writes a REAL malformed file."""
+    cfg_file("enabled: true\nmode: live\n")  # base config is ACTIVE
+    cfg_file.overlay("mode: {unclosed brace and : : :")  # malformed YAML
+    assert fedconfig.effective_mode() == "off"
+
+
+def test_overlay_non_mapping_forces_off(cfg_file):
+    """An overlay that parses to a non-mapping (list/scalar) also forces off."""
+    cfg_file("enabled: true\nmode: live\n")
+    cfg_file.overlay("- just\n- a\n- list\n")
+    assert fedconfig.effective_mode() == "off"
+
+
+def test_overlay_valid_dict_applies(cfg_file):
+    """A valid overlay is honored — the user can turn the channel off (or on) via
+    their local overlay without editing the committed base."""
+    cfg_file("enabled: true\nmode: live\n")
+    cfg_file.overlay("mode: off\n")
+    assert fedconfig.effective_mode() == "off"
+    cfg_file.overlay("mode: propose_only\n")
     assert fedconfig.effective_mode() == "propose_only"

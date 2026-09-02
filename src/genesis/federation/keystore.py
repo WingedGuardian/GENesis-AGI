@@ -118,6 +118,15 @@ def _exclusive_create_0600(path: Path, payload: bytes) -> bool:
             os.link(str(tmp), str(path))  # atomic; raises FileExistsError if it exists
         except FileExistsError:
             return False
+        # fsync the DIRECTORY so the new directory entry is durable — fsyncing the
+        # file alone doesn't guarantee the link/rename survives a crash or power
+        # loss, and a keyfile that vanishes on reboot regenerates a DIFFERENT
+        # identity, orphaning peer relationships + caps sealed under the old key.
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
         return True
     finally:
         if tmp.exists():
