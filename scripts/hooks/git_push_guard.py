@@ -1241,7 +1241,8 @@ def _check_inline_review_findings(
     score — P1 = 1.0, P2 = 0.5 — and the gate blocks when the score >= 1.0 (any P1, OR
     >= 2 P2s). A finding is EXCLUDED from the score when its thread has a MAINTAINER
     reply (engagement = consciously accepted) or its path is documentation
-    (``_is_doc_path``). P2s are always printed to stderr one per line. An UNREADABLE or
+    (``_is_doc_path``). Exclusion is from the SCORE only, never from VISIBILITY: every P2
+    is surfaced on stderr — scored P2s as a WARNING, doc-path P2s as a NOTE. An UNREADABLE or
     INCOMPLETE scan (gh error/timeout/malformed/clipped budget) ALWAYS blocks
     (fail-closed — see ``_scan_unreadable``); '# review-override' waives the whole scan.
     """
@@ -1277,6 +1278,7 @@ def _check_inline_review_findings(
     p1: list[str] = []
     p2: list[str] = []
     doc_skipped: list[str] = []  # P1s on doc paths — surfaced, never blocking
+    doc_skipped_p2: list[str] = []  # P2s on doc paths — surfaced, excluded from score
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
         body = c.get("body") or ""
@@ -1297,9 +1299,12 @@ def _check_inline_review_findings(
             if c.get("id") in replied_to:
                 continue  # thread engaged — maintainer consciously accepted the P2
             if _is_doc_path(c.get("path") or ""):
-                # A P2 on a doc path is not a code defect — excluded from the score.
-                # Dropped silently (unlike a doc-path P1, surfaced as a NOTE): a
-                # doc-file P2 nitpick is negligible; the asymmetry is deliberate.
+                # A P2 on a doc path is not a code defect — excluded from the SCORE, but
+                # still SURFACED as a NOTE (mirroring doc-path P1s). A documentation-
+                # correctness P2 can be substantive, so it must stay visible in the
+                # canonical pre-merge report to be consciously accepted, never silently
+                # dropped (Codex #1589 P2).
+                doc_skipped_p2.append(_inline_title(body))
                 continue
             p2.append(_inline_title(body))
 
@@ -1312,6 +1317,15 @@ def _check_inline_review_findings(
         )
         for title in doc_skipped[:5]:
             print(f"  [doc P1] {title}", file=sys.stderr)
+    if doc_skipped_p2:
+        print(
+            f"NOTE: PR #{pr_num} — {len(doc_skipped_p2)} inline [P2] finding(s) on "
+            f"documentation paths — surfaced for conscious acceptance, NOT counted "
+            f"toward the review score:",
+            file=sys.stderr,
+        )
+        for title in doc_skipped_p2[:5]:
+            print(f"  [doc P2] {title}", file=sys.stderr)
     # Weighted review score: P1 = 1.0 (full blocker), P2 = 0.5. Blocks at
     # score >= threshold — any unresolved P1, OR >= 2 unresolved P2s. Doc-path
     # and maintainer-replied findings were already excluded from p1/p2 above.

@@ -1262,9 +1262,10 @@ class TestCheckInlineReviewFindings:
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
 
-    def test_inline_doc_path_p2_excluded_from_score(self, guard_module):
+    def test_inline_doc_path_p2_excluded_from_score(self, guard_module, capsys):
         """A P2 on a documentation path is not a code defect — excluded from the
-        score, so two P2s where one is on CHANGELOG.md = 0.5 < 1.0 → no block."""
+        score, so two P2s where one is on CHANGELOG.md = 0.5 < 1.0 → no block. But it is
+        still SURFACED as a NOTE (never silently dropped — Codex #1589 P2)."""
         comments = [
             self._codex(1, _P2_BODY, path="src/genesis/foo.py"),
             self._codex(2, _P2_BODY, path="CHANGELOG.md"),
@@ -1272,6 +1273,8 @@ class TestCheckInlineReviewFindings:
         with self._mock(guard_module, comments):
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
+        # The doc-path P2 must remain VISIBLE in the pre-merge report, not dropped.
+        assert "[doc P2]" in capsys.readouterr().err
 
     def test_replied_p1_is_acknowledged_by_maintainer(self, guard_module):
         """A MAINTAINER reply (author_association OWNER/MEMBER/COLLABORATOR) acks a P1."""
