@@ -1241,8 +1241,13 @@ def _check_inline_review_findings(
     score — P1 = 1.0, P2 = 0.5 — and the gate blocks when the score >= 1.0 (any P1, OR
     >= 2 P2s). A finding is EXCLUDED from the score when its thread has a MAINTAINER
     reply (engagement = consciously accepted) or its path is documentation
-    (``_is_doc_path``). Exclusion is from the SCORE only, never from VISIBILITY: every P2
-    is surfaced on stderr — scored P2s as a WARNING, doc-path P2s as a NOTE. An UNREADABLE or
+    (``_is_doc_path``). The two exclusions differ in VISIBILITY by design: a doc-path
+    finding was auto-excluded by PATH (not engaged), so it is still SURFACED as a NOTE —
+    scored P2s print as a WARNING, doc-path P1s/P2s as a NOTE — nothing unaddressed is
+    dropped. A maintainer-replied finding was CONSCIOUSLY ENGAGED (the reply IS the
+    acknowledgement), so it is excluded from the report too: the pre-merge report shows
+    what still needs attention, not what a maintainer already handled (re-listing every
+    replied finding on each check would bury the live ones). An UNREADABLE or
     INCOMPLETE scan (gh error/timeout/malformed/clipped budget) ALWAYS blocks
     (fail-closed — see ``_scan_unreadable``); '# review-override' waives the whole scan.
     """
