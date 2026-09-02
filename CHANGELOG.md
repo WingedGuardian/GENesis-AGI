@@ -727,7 +727,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   counter written by the old reviewer-agnostic code (no `last_source`) is treated as legacy
   and discarded — its count was built entirely from internal self-reviews, so preserving it
   would keep false-blocking; the streak self-heals on the next cross-model mark (no per-install
-  data repair needed).
+  data repair needed). "External" is judged by the reviewing MODEL, not the gateway: Anthropic
+  Claude via any route (incl. an OpenRouter Claude route) is internal, and Genesis's own
+  cognitive/routing systems are never reviewers — approved external methods today are Codex and
+  Kimi (on .123). `mark` also accepts the `--source=external` equals form (previously silently
+  dropped to internal).
 - **Contributor-issue privacy scan no longer over-blocks legitimate Markdown.**
   The `scan_prose` secret-scan floor ran `detect-secrets scan --string <line>` per
   line; argparse then misread any line whose content starts with `-` (a Markdown

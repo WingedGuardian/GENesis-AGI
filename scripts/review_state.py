@@ -33,10 +33,13 @@ FINDINGS the mark represents, and it is what decides whether the round counts:
     any-subagent / self review. Same author-model reviewing its own work: it is free,
     shares the author's blind spots, and NEVER moves the streak (not an increment, not
     a reset), whatever its outcome. The outcome flag is optional and ignored here.
-  * ``--source external`` — a non-Anthropic cross-model reviewer (Codex, Kimi,
-    OpenRouter…) found (or cleared) the round. This is the only kind that counts, so it
-    REQUIRES a review-outcome flag: ``--defects`` (a new BLOCKER/SHOULD-FIX/P1/P2 →
-    +1) or ``--clean`` (none → reset the streak, circuit-breaker reset-on-success).
+  * ``--source external`` — a review by a non-ANTHROPIC MODEL found (or cleared) the round.
+    EXTERNAL is judged by the reviewing MODEL, not the gateway: Anthropic Claude via any
+    route (incl. an OpenRouter Claude route) is INTERNAL, and a Genesis internal model call
+    is never a reviewer. Approved external methods TODAY are Codex and Kimi (on .123) —
+    NOT OpenRouter. This is the only kind that counts, so it REQUIRES a review-outcome flag:
+    ``--defects`` (a new BLOCKER/SHOULD-FIX/P1/P2 → +1) or ``--clean`` (none → reset the
+    streak, circuit-breaker reset-on-success).
 The ``--source`` value describes the review that produced the findings, NOT who typed
 the evidence file: a mark recording "verified + fixed Codex's findings" is external; a
 mark of your own architect/security audit is internal. (supersedes feea3f71 / #1446 —
@@ -773,25 +776,39 @@ def main() -> None:
         saw_clean = False
         saw_defects = False
         source = "internal"
-        for i, arg in enumerate(sys.argv[2:], 2):
-            if arg == "--agent-output" and i + 1 < len(sys.argv):
-                agent_path = sys.argv[i + 1]
+        # Normalize `--key=value` into `--key value` first, so the conventional equals form is
+        # parsed too. A split-token-only parser silently dropped `--source=external`, recording
+        # a cross-model review as INTERNAL (an external round then wrote a marker without
+        # advancing the cap). dont_hand_roll_cli_parsing_in_hooks — bind atomically. (Codex P2.)
+        norm_args: list[str] = []
+        for a in sys.argv[2:]:
+            if a.startswith("--") and "=" in a:
+                k, v = a.split("=", 1)
+                norm_args.extend([k, v])
+            else:
+                norm_args.append(a)
+        i = 0
+        while i < len(norm_args):
+            arg = norm_args[i]
+            if arg == "--agent-output" and i + 1 < len(norm_args):
+                agent_path = norm_args[i + 1]
+                i += 1
             elif arg == "--clean":
                 saw_clean = True
             elif arg == "--defects":
                 saw_defects = True
             elif arg == "--source":
-                # Bind atomically + fail-closed: a valueless --source (e.g. it is the
-                # last token) must NOT silently fall through to the internal default —
-                # that would let an intended `--source external` mark be miscounted as a
-                # non-counting internal one. Refuse instead (dont_hand_roll_cli_parsing).
-                if i + 1 >= len(sys.argv):
+                # A valueless --source must NOT fall through to the internal default (that would
+                # miscount an intended external mark) — refuse instead. Fail-closed.
+                if i + 1 >= len(norm_args):
                     print(
                         "REFUSED: --source requires a value (internal or external).",
                         file=sys.stderr,
                     )
                     sys.exit(1)
-                source = sys.argv[i + 1]
+                source = norm_args[i + 1]
+                i += 1
+            i += 1
         if source not in ("internal", "external"):
             print(
                 f"REFUSED: --source must be 'internal' or 'external', got {source!r}. "

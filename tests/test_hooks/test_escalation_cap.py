@@ -629,6 +629,22 @@ def test_mark_rejects_valueless_source(repo, home):
     assert not (home / ".genesis" / "review_rounds" / f"{key}.json").exists()
 
 
+def test_source_equals_form_is_parsed(repo, home):
+    # `--source=external` (the conventional equals form) must parse like `--source external`,
+    # not be silently dropped to the internal default — else a cross-model review writes a
+    # marker WITHOUT advancing the cap (miscounted internal). Also the equals form of an
+    # invalid value is still rejected. (Codex P2 — dont_hand_roll_cli_parsing.)
+    key = review_state._worktree_key(cwd=str(repo))
+    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
+    _stage(repo, "a = 2\n")
+    res = _mark_raw(repo, home, "--source=external", "--defects")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert json.loads(rf.read_text())["round"] == 1  # counted as external, not dropped to internal
+    _stage(repo, "a = 3\n")
+    res2 = _mark_raw(repo, home, "--source=bogus", "--defects")
+    assert res2.returncode == 1 and "source" in res2.stderr.lower()
+
+
 def test_mark_rejects_contradictory_outcome(repo, home):
     # Passing BOTH --clean and --defects is a contradiction → refused, no marker
     # (independent of source).

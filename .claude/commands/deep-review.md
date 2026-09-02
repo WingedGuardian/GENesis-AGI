@@ -75,8 +75,9 @@ If you're on your 3rd EXTERNAL cross-model defect-bearing round, STOP at the esc
 - `python3 "$ROOT/scripts/review_state.py" mark --agent-output "$EVID"` — this is an INTERNAL
   (same-model) audit, so a plain `mark` is correct: it satisfies the commit review-depth gate and
   NEVER counts toward the cross-model escalation streak, whatever it found. No outcome flag is
-  needed. (Only a non-Anthropic cross-model review — Codex/Kimi/OpenRouter — is marked
-  `--source external --defects|--clean`; that is the only kind that moves the escalation counter.)
+  needed. (EXTERNAL is judged by the reviewing MODEL, not the gateway: only a non-Anthropic model —
+  Codex or Kimi on .123 (NOT OpenRouter, which is not an approved method today; and never a Genesis
+  internal model) — is marked `--source external --defects|--clean`; that alone moves the counter.)
 - Run `mark` AFTER the final `git add` and BEFORE `git commit`. The evidence must be recent when
   you `mark` (its age is checked at mark time), so write-then-mark promptly. Once marked, an
   unchanged staged diff stays cleared by its diff-hash — if you restage or amend, re-mark.

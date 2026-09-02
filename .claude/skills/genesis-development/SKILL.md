@@ -1168,11 +1168,20 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   (3) unless the command carries a deliberate trailing `# escalation-ack`.
 
   **THE COUNTER IS CROSS-MODEL ONLY.** The streak exists to catch *cross-model
-  non-convergence* — an EXTERNAL, non-Anthropic reviewer (Codex-CLI-local, Kimi,
-  OpenRouter…) finding NEW defects round after round. It does NOT exist to penalize
-  the free, encouraged act of reviewing your own work. So `mark` takes a
-  `--source {internal,external}` (default `internal`) that records WHO PRODUCED THE
-  FINDINGS, and that is what decides whether the round counts:
+  non-convergence* — an EXTERNAL reviewer finding NEW defects round after round. It does
+  NOT exist to penalize the free, encouraged act of reviewing your own work. So `mark`
+  takes a `--source {internal,external}` (default `internal`) that records WHO PRODUCED THE
+  FINDINGS, and that is what decides whether the round counts.
+
+  **EXTERNAL is judged by the reviewing MODEL, not the gateway/provider — this is the "big
+  one".** External = a review by a non-ANTHROPIC model. Anthropic Claude via ANY route
+  counts as INTERNAL — including a Claude model reached through OpenRouter (the repo's
+  `openrouter-haiku/sonnet/opus` routes are Claude), so "it went through OpenRouter" NEVER
+  makes a review external. And Genesis's OWN cognitive/routing systems are never reviewers:
+  they are cognitive infrastructure, not a review service, so no internal Genesis model call
+  is ever `--source external`. Approved external-review methods TODAY are **Codex** and
+  **Kimi (on .123)**; **OpenRouter is NOT an approved method today** (a future option, not a
+  current one). The rule below keys on this:
   - **`--source internal` (the default)** — a same-model self / genesis-architect /
     genesis-security / any-subagent review. It is free and shares the author-model's
     blind spots (rubber-stamp risk), so it **NEVER moves the streak** — not an
