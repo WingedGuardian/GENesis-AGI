@@ -21,7 +21,9 @@ and a minimal PATH, so nothing depends on the machine's actual CC install.
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 import pathlib
 import shutil
 import stat
@@ -49,6 +51,15 @@ def _minimal_bin(tmp_path: Path) -> Path:
             if src.exists():
                 dest.symlink_to(src)
                 break
+        # A missing tool must be LOUD. Silently omitting python3 here would send
+        # every test in TestSuppressionReconcile down the pure-bash fallback
+        # branch instead, and the assertions (both keys present) hold on that
+        # branch too -- so the suite would go green while covering a different
+        # code path than its docstrings claim.
+        assert dest.exists() or dest.is_symlink(), (
+            f"{tool} not found in /usr/bin, /bin or /usr/local/bin -- this harness "
+            f"would silently test a different branch than it claims"
+        )
     return d
 
 
@@ -192,10 +203,41 @@ class TestSuppressionReconcile:
         assert stat.S_IMODE(s.stat().st_mode) == 0o600
 
     def test_new_file_is_private(self, tmp_path: Path) -> None:
-        """A file we create from scratch starts 0600 — it is secrets-adjacent."""
+        """A file we create from scratch is 0600 — it is secrets-adjacent.
+
+        Honest about its own strength: this pins the OUTCOME, not the mechanism.
+        MEASURED, `tempfile.mkstemp` already returns 0600 even under `umask 0`,
+        so deleting the explicit `os.chmod(tmp, 0o600)` in cc_version.sh leaves
+        this green. The chmod stays as belt-and-braces against a future swap to
+        a different temp-file helper; no test here can distinguish the two, and
+        pretending otherwise would be worse than saying so.
+        """
         r = _run(tmp_path, "cc_ensure_updater_suppressed")
         assert r.returncode == 0, r.stderr
         assert stat.S_IMODE(_settings(tmp_path).stat().st_mode) == 0o600
+
+    def test_a_same_length_repair_still_bumps_mtime(self, tmp_path: Path) -> None:
+        """`os.utime(tmp, None)` after copystat, and why it is load-bearing.
+
+        copystat carries the SOURCE file's timestamps onto the replacement, so a
+        correction that changes no byte count ("0" -> "1") would land with the
+        pre-write mtime AND the same size — byte-identical to a file that was
+        never touched, to anything watching for a change. The mechanism carries
+        a nine-line justification comment and, until now, no test: exactly the
+        shape a later refactor deletes silently.
+        """
+        s = _settings(tmp_path)
+        s.parent.mkdir(parents=True, exist_ok=True)
+        s.write_text(json.dumps({"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "0"}}))
+        before = s.stat().st_mtime_ns
+        os.utime(s, ns=(before - 10**10, before - 10**10))  # 10s into the past
+        aged = s.stat().st_mtime_ns
+        r = _run(tmp_path, "cc_ensure_updater_suppressed || true")
+        assert json.loads(s.read_text())["env"]["DISABLE_UPDATES"] == "1", r.stderr
+        assert s.stat().st_mtime_ns > aged, (
+            "the repair restored the pre-write mtime — a same-length correction "
+            "is then indistinguishable from an untouched file"
+        )
 
     def test_follows_a_symlinked_settings_file(self, tmp_path: Path) -> None:
         """A dotfiles-managed settings.json must survive as a symlink.
@@ -302,6 +344,67 @@ class TestSuppressionState:
         s.write_text("{ not json")
         assert self._state(tmp_path, "cc_ensure_updater_suppressed || true") == "failed"
 
+    def _stub_python3(self, tmp_path: Path, code: int, reason: str) -> Path:
+        """A bin dir whose python3 consumes stdin and exits with *code*.
+
+        The reconciler's exit codes are its whole contract with three consumers
+        (the wrapper's message, update.sh's HOST_CC_DEGRADED, the timer unit's
+        state) and NONE of the contention codes had a test. Forcing a real
+        retry-exhaustion is nondeterministic; forcing the CODE is not, and the
+        code is what the wrapper dispatches on.
+        """
+        bindir = _minimal_bin(tmp_path)
+        stub = bindir / "python3"
+        if stub.is_symlink() or stub.exists():
+            stub.unlink()
+        stub.write_text(
+            "#!/bin/sh\n"
+            "cat >/dev/null\n"                      # swallow the piped script
+            f"echo '{reason}' >&2\n"
+            f"exit {code}\n"
+        )
+        stub.chmod(0o755)
+        return bindir
+
+    def _run_with_stub(self, tmp_path: Path, code: int, reason: str):
+        bindir = self._stub_python3(tmp_path, code, reason)
+        s = _settings(tmp_path)
+        s.parent.mkdir(parents=True, exist_ok=True)
+        s.write_text(json.dumps({"env": {"DISABLE_AUTOUPDATER": "1"}}))
+        return _run(
+            tmp_path,
+            'cc_ensure_updater_suppressed || true; '
+            'echo "STATE=${CC_SUPPRESSION_STATE:-unset}"',
+            path_dir=bindir,
+        )
+
+    def test_exit_3_is_contended_and_says_the_repair_did_not_stick(
+        self, tmp_path: Path
+    ) -> None:
+        """Exit 3: a write LANDED and was overwritten before we could confirm."""
+        r = self._run_with_stub(tmp_path, 3, "repair did not stick — reason")
+        assert "STATE=contended" in r.stdout, r.stdout
+        assert "did NOT" in r.stderr and "stick" in r.stderr, r.stderr
+
+    def test_exit_4_is_contended_but_says_nothing_was_written(
+        self, tmp_path: Path
+    ) -> None:
+        """Exit 4: retries exhausted, NOTHING written.
+
+        Same state as exit 3 — both are contention and both leave the file
+        unsuppressed — but not the same sentence. These shared one code and one
+        message until now, so a run that wrote nothing told the operator a
+        repair "did not stick" and sent them hunting a pathological writer over
+        a file that was merely busy. The two assertions below are the pin: same
+        state, different message.
+        """
+        r = self._run_with_stub(tmp_path, 4, "kept changing under us — left untouched")
+        assert "STATE=contended" in r.stdout, r.stdout
+        assert "NOT applied" in r.stderr, r.stderr
+        assert "did NOT" not in r.stderr, (
+            "exit 4 wrote nothing; claiming a repair that did not stick is false"
+        )
+
     def test_failure_names_its_actual_cause(self, tmp_path: Path) -> None:
         """One catch-all message made a full disk read as file corruption."""
         s = _settings(tmp_path)
@@ -394,8 +497,18 @@ class TestSetIfAbsentDefaults:
         env = json.loads(s.read_text())["env"]
         assert env["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] == "0", "set-if-absent, never overwrite"
 
-    def test_host_leg_passes_no_default_so_none_is_added(self, tmp_path: Path) -> None:
-        """The host's recovery `claude -p` is single-brain and never nests."""
+    def test_no_defaults_passed_means_only_the_two_keys_are_written(
+        self, tmp_path: Path
+    ) -> None:
+        """Called with no set-if-absent defaults, exactly two keys land.
+
+        RENAMED: this used to be called `test_host_leg_...`, but it calls with
+        no arguments — the CONTAINER default — while the host leg passes an
+        explicit path (host-setup.sh:1330). The invariant it checks is real; the
+        old name claimed coverage it did not have. The host's recovery
+        `claude -p` being single-brain is why no default is passed there, and
+        that remains the motivation.
+        """
         _run(tmp_path, "cc_ensure_updater_suppressed || true")
         env = json.loads(_settings(tmp_path).read_text())["env"]
         assert set(env) == {"DISABLE_AUTOUPDATER", "DISABLE_UPDATES"}, env
@@ -527,6 +640,37 @@ class TestCallerWiring:
         src = (_REPO_ROOT / "scripts" / "update.sh").read_text()
         assert "CC_SUPPRESSION_STATE" in src
         assert "cc_updater_suppression_" in src, "non-ok outcome must reach update_history"
+        # UNSET must not read as ok. `${VAR:-ok}` would let a partial deploy --
+        # cc_ensure_local sourced from a revision predating the variable -- record
+        # a clean deploy that verified nothing. scripts/cc_settings_align.sh
+        # refuses that read; this is the sibling consumer of the same channel and
+        # must refuse it too. A SOURCE pin: driving a real version skew from a test
+        # is not worth the machinery, and the failure mode is a silent default.
+        assert "${CC_SUPPRESSION_STATE:-ok}" not in src, (
+            "unset state must not default to ok -- that is the fail-open this "
+            "channel's other consumer explicitly rejects"
+        )
+        assert "CC_SUPPRESSION_STATE+set" in src, "unset must be distinguishable from ok"
+        assert "cc_updater_suppression_unverified" in src
+
+    def test_retry_exhaustion_has_its_own_exit_code(self) -> None:
+        """Exit 3 and exit 4 say opposite things about what is on disk.
+
+        3 = a write landed and was overwritten; 4 = nothing was written at all.
+        They report the same STATE (both are contention) but must not share a
+        sentence -- collapsing them is what made the wrapper tell an operator a
+        repair "did not stick" on a run that repaired nothing.
+
+        A SOURCE pin, deliberately. The behavioural tests above stub the exit
+        code to reach the wrapper deterministically, so they cannot see which
+        code the producer chooses; forcing genuine retry-exhaustion is a race.
+        This catches the revert, and says plainly that it is the weaker check.
+        """
+        src = _LIB.read_text()
+        assert "sys.exit(4)" in src, "_exhausted must not share exit 3's code"
+        assert '[ "$rc" -eq 3 ] || [ "$rc" -eq 4 ]' in src, (
+            "the wrapper must handle both contention codes"
+        )
 
     def test_the_recurring_reconcile_has_its_own_container_unit(self) -> None:
         script = _REPO_ROOT / "scripts" / "cc_settings_align.sh"
@@ -666,7 +810,16 @@ class TestSettingsAlignScriptRuns:
     def test_second_consecutive_repair_fails_the_unit(self, tmp_path: Path) -> None:
         """The doc calls a REPEAT repair the durable "something keeps rewriting
         this file" signal. During the gaps this timer exists for, update.sh is
-        not running, so unit state is the only receiver that signal has."""
+        not running, so unit state is where that signal lands.
+
+        Scoped honestly: `failed` unit state is COLLECTED (the infra profile
+        sweeps `systemctl --user list-units 'genesis-*'`) but nothing ALERTS on
+        it — this unit is not in observability's `_SYSTEMD_UNITS` map, which
+        holds three entries and omits the other genesis timers too. So on a
+        headless box the signal reaches a file, not a person. That is the house
+        pattern rather than a regression here, and widening the map is a
+        separate change.
+        """
         home = self._seed(tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1"}})
         first = self._run_script(home)
         assert first.returncode == 0, first.stdout + first.stderr
@@ -719,6 +872,7 @@ class TestSettingsAlignScriptRuns:
         assert "NOT verified" in r.stdout
 
 
+@functools.lru_cache(maxsize=1)
 def _user_manager_reachable() -> bool:
     """Whether `systemd-analyze --user verify` can actually run here.
 
@@ -763,18 +917,26 @@ class TestUnitsAreLoadable:
     _UNIT_DIR = _REPO_ROOT / "scripts" / "systemd"
 
     def _render(self, tmp_path: Path, name: str) -> Path:
+        """Substitute EVERY placeholder the installer does, not just the ones
+        these two templates happen to use today.
+
+        `test_only_supported_render_placeholders` sanctions four tokens; this
+        used to substitute two. Adding a sanctioned `__HOME__` to a template
+        would then leave it literal in the rendered unit, and
+        `systemd-analyze verify` would be checking a unit that does not match
+        what install.sh produces. Mirrors scripts/install.sh:900-903.
+        """
         src = (self._UNIT_DIR / name).read_text()
         rendered = (
-            src.replace("__REPO_DIR__", str(_REPO_ROOT))
+            src.replace("__HOME__", str(Path.home()))
             .replace("__VENV__", str(_REPO_ROOT / ".venv"))
+            .replace("__REPO_DIR__", str(_REPO_ROOT))
+            .replace("__CC_BIN_DIR__", str(Path.home() / ".local" / "bin"))
         )
         out = tmp_path / name.replace(".template", "")
         out.write_text(rendered)
         return out
 
-    @pytest.mark.skipif(
-        not _user_manager_reachable(), reason="no reachable systemd user manager"
-    )
     @pytest.mark.parametrize(
         "name",
         [
@@ -783,6 +945,13 @@ class TestUnitsAreLoadable:
         ],
     )
     def test_rendered_unit_is_valid(self, tmp_path: Path, name: str) -> None:
+        # Probed HERE, not as a `skipif` argument. A skipif predicate is
+        # evaluated at COLLECTION, so this 30s `systemd-analyze --user verify`
+        # ran on every collection of this module -- including --collect-only
+        # and -k runs that deselect it. Same class as the two most recent test
+        # fixes on main; cached, so parametrisation still costs one probe.
+        if not _user_manager_reachable():
+            pytest.skip("no reachable systemd user manager")
         unit = self._render(tmp_path, name)
         r = subprocess.run(
             ["systemd-analyze", "--user", "verify", str(unit)],

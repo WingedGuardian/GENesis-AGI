@@ -118,13 +118,22 @@ cc_ensure_updater_suppressed() {
             local _umask_prev
             _umask_prev="$(umask)"
             umask 077                     # secrets-adjacent: never world-readable
+            # Write-then-rename even here. This is the only path on this file
+            # that does not go through the python reconciler's atomic swap, and a
+            # plain truncating redirect can leave a zero-length settings.json if
+            # the process dies mid-write — indistinguishable from success to
+            # everything except the NEXT run, which then reports `failed`. The
+            # exposure is narrow (file absent AND python3 missing) but the fix is
+            # two lines of the same shell.
+            local _tmp_settings="${settings_file}.tmp.$$"
             if printf '%s\n' \
                 '{' \
                 '  "env": {' \
                 '    "DISABLE_AUTOUPDATER": "1",' \
                 '    "DISABLE_UPDATES": "1"' \
                 '  }' \
-                '}' > "$settings_file" 2>/dev/null; then
+                '}' > "$_tmp_settings" 2>/dev/null \
+                && mv -f "$_tmp_settings" "$settings_file" 2>/dev/null; then
                 umask "$_umask_prev"
                 CC_SUPPRESSION_STATE=repaired
                 echo "  ! CC auto-updater suppression was MISSING in $settings_file —" \
@@ -140,6 +149,7 @@ cc_ensure_updater_suppressed() {
                 fi
                 return 0
             fi
+            rm -f "$_tmp_settings" 2>/dev/null || true   # create failed: no litter
             umask "$_umask_prev"
         fi
         CC_SUPPRESSION_STATE=failed
@@ -192,12 +202,19 @@ def fail(reason):
 
 
 def _exhausted(reason):
-    # Exit 3, not 2. Retry exhaustion IS contention — a competing writer, just
-    # detected by running out of attempts rather than by losing one race. Both
-    # must report `contended`; labelling this one `failed` gives a single root
-    # cause two names and defeats the point of having the state.
+    # Exit 4, not 2. Retry exhaustion IS contention — a competing writer, just
+    # detected by running out of attempts rather than by losing one race, so it
+    # reports the same STATE (`contended`) as exit 3; labelling it `failed`
+    # would give one root cause two names and defeat the point of the state.
+    #
+    # But not the same CODE, because the two say opposite things about what is
+    # on disk: exit 3 means a write landed and was then overwritten, exit 4
+    # means nothing was written at all. A caller that collapses them has to
+    # describe one of the two wrongly, which is exactly what the wrapper below
+    # used to do ("was repaired but did NOT stick" for a run that repaired
+    # nothing). Same state, distinct codes, honest message for each.
     print(reason, file=sys.stderr)
-    sys.exit(3)
+    sys.exit(4)
 
 
 def identity():
@@ -371,15 +388,25 @@ _exhausted("settings.json kept changing under us (%d attempts) — left untouche
 PYEOF
     )" || rc=$?
 
-    if [ "$rc" -eq 3 ]; then
-        # Wrote successfully, then something overwrote it before we could confirm.
-        # NOT "repaired": the effective state is still unsuppressed. Rare by
-        # construction (the window is a few syscalls), so seeing it at all is a
-        # strong hint at an aggressive writer — but its ABSENCE proves nothing, and
-        # a repeat `repaired` across ticks remains the durable signal.
+    if [ "$rc" -eq 3 ] || [ "$rc" -eq 4 ]; then
+        # Both are contention, and both leave the effective state unsuppressed, so
+        # they share a STATE. They do not share a sentence: 3 means a write landed
+        # and was overwritten before we could confirm it; 4 means the file kept
+        # changing under us and we wrote NOTHING rather than revert a concurrent
+        # writer. Telling an operator a repair "did not stick" when no repair was
+        # attempted sends them hunting a pathological writer over a file that is
+        # simply busy. Rare by construction either way, so seeing one at all is a
+        # hint at an aggressive writer — but its ABSENCE proves nothing, and a
+        # repeat `repaired` across ticks remains the durable signal.
         CC_SUPPRESSION_STATE=contended
-        echo "  ! CC auto-updater suppression in $settings_file was repaired but did NOT" \
-             "stick (reason above) — CC may self-update past the pin; find the writer" >&2
+        if [ "$rc" -eq 3 ]; then
+            echo "  ! CC auto-updater suppression in $settings_file was repaired but did NOT" \
+                 "stick (reason above) — CC may self-update past the pin; find the writer" >&2
+        else
+            echo "  ! CC auto-updater suppression in $settings_file was NOT applied — a" \
+                 "concurrent writer kept winning (reason above); the next run should" \
+                 "succeed, but a repeat means something keeps rewriting it" >&2
+        fi
         return 1
     fi
     if [ "$rc" -ne 0 ]; then

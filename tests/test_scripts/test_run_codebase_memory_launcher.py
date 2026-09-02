@@ -13,6 +13,7 @@ One real-cgroup smoke test runs only where ``systemd-run --user`` works.
 
 from __future__ import annotations
 
+import functools
 import os
 import stat
 import subprocess
@@ -198,11 +199,68 @@ def test_unparseable_memmax_warns_and_runs_uncapped(tmp_path):
 # ── real-cgroup smoke (local only; skipped where no user manager) ─────────
 
 
+_SCOPE_PROBE = [
+    "systemd-run", "--user", "--scope", "--quiet",
+    "-p", "MemoryMax=2G", "-p", "MemorySwapMax=0", "--", "/bin/true",
+]
+
+
+def _launcher_env(**extra: str) -> dict[str, str]:
+    """The environment the launcher is given -- built in ONE place.
+
+    Forwarded CONDITIONALLY. `os.environ.get(k, "")` does not mean "pass it
+    through if set": it forwards an EMPTY STRING when the key is absent, and
+    for both of these an empty value is strictly WORSE than omitting the key,
+    because sd-bus treats set-but-empty as an address it must use and never
+    falls back. MEASURED on systemd 255 with the probe above:
+
+        DBUS absent,        XDG set            -> rc=0
+        DBUS set-but-EMPTY, XDG set            -> rc=1 connection refused
+        DBUS absent,        XDG set-but-EMPTY  -> rc=1 no such file
+
+    CONFIRMED IN CI: a GitHub runner has XDG_RUNTIME_DIR set and no
+    DBUS_SESSION_BUS_ADDRESS, so the old form handed the launcher an empty bus
+    address, its probe failed, it took its SILENT ulimit fallback, and
+    memory.max read `max` -- while the identical probe under pytest's own env
+    returned rc=0. That looked like a launcher regression for five days and was
+    a test-harness bug the whole time.
+
+    The gate below uses this too. A gate that probes under a DIFFERENT
+    environment than the subject asks a weaker question than the assertion
+    depends on, which is the same asymmetry in another axis.
+    """
+    return {
+        "PATH": os.environ["PATH"],
+        "HOME": os.environ["HOME"],
+        **{k: os.environ[k]
+           for k in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+           if k in os.environ},
+        **extra,
+    }
+
+
+@functools.lru_cache(maxsize=1)
 def _user_scope_works() -> bool:
+    """Can a --user scope be created with the launcher's properties AND env?
+
+    The properties are not decoration: a plain scope needs only a reachable
+    user manager, while `MemoryMax` additionally needs the memory controller
+    delegated to the branch --user scopes are created in
+    (`user@UID.service/app.slice`). A gate that asks only the first question
+    says "usable" on a machine that cannot answer the second, and the assertion
+    then fails for an environmental reason instead of skipping -- a red CI that
+    says nothing about the launcher.
+
+    Called from inside the test, never as a `skipif` argument. A `skipif`
+    predicate is evaluated at COLLECTION, so this would spawn a real transient
+    scope on every collection of this module -- including `--collect-only` and
+    `-k` runs that deselect it. That is the same class as the two most recent
+    test fixes on main ("read the clock where it is used", "...when the helper
+    is called, not at module import"); cached so the cost stays one probe.
+    """
     try:
         return subprocess.run(
-            ["systemd-run", "--user", "--scope", "--quiet", "--", "/bin/true"],
-            capture_output=True, timeout=15,
+            _SCOPE_PROBE, capture_output=True, timeout=15, env=_launcher_env(),
         ).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -296,9 +354,10 @@ def _scope_diagnostics(launcher_env: dict[str, str], res) -> str:
             "--- scope diagnostics (this assertion cannot explain itself alone) ---",
             f"launcher stderr : {(res.stderr or '').strip()!r}",
             f"launcher env    : {shown}",
-            f"probe+props, LAUNCHER env : {_run(with_props, env=launcher_env)}",
+            f"probe+props, LAUNCHER env : {_run(with_props, env=launcher_env)}"
+            f"   (what the gate asks, and what the launcher needs)",
             f"probe+props, pytest   env : {_run(with_props)}",
-            f"probe plain, pytest   env : {_run(plain)}   (what the skipif gate asks)",
+            f"probe plain, pytest   env : {_run(plain)}   (no properties: weaker still)",
             f"systemd         : {_run(['systemctl', '--version'])}",
             f"/proc/self/cgroup: {own}",
             "pytest's own branch:",
@@ -310,8 +369,39 @@ def _scope_diagnostics(launcher_env: dict[str, str], res) -> str:
     )
 
 
-@pytest.mark.skipif(not _user_scope_works(), reason="no usable systemd user manager")
+def test_launcher_env_omits_an_absent_key_rather_than_emptying_it(monkeypatch):
+    """The root cause, pinned where it cannot skip.
+
+    MEASURED on systemd 255: a set-but-EMPTY DBUS_SESSION_BUS_ADDRESS makes
+    `systemd-run --user` fail with "Failed to connect to bus: Connection
+    refused" where an ABSENT one succeeds -- sd-bus treats empty as an address
+    it must use and never falls back to XDG_RUNTIME_DIR. So `os.environ.get(k,
+    "")` hands the child something strictly worse than nothing.
+
+    This is a pure dict assertion ON PURPOSE. The real-scope test below cannot
+    carry this pin any more: its gate now probes under this same env, so
+    reintroducing the bug makes that test SKIP rather than fail -- measured,
+    when the mutation was run. A gate that protects a test from an environment
+    also hides a bug IN how that environment is built, and the only way out is
+    to assert the construction directly, where no systemd is involved and
+    nothing can skip.
+    """
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/12345")
+    env = _launcher_env()
+    assert "DBUS_SESSION_BUS_ADDRESS" not in env, (
+        "an absent key was forwarded as empty; empty is not absent, and for a "
+        "bus address it is strictly worse"
+    )
+    assert env["XDG_RUNTIME_DIR"] == "/run/user/12345", "a SET key must pass through"
+
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/12345/bus")
+    assert _launcher_env()["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/12345/bus"
+
+
 def test_real_scope_applies_memory_max(tmp_path):
+    if not _user_scope_works():
+        pytest.skip("no --user scope with MemoryMax available under the launcher's env")
     probe = _write_exec(
         tmp_path / "cgprobe",
         "#!/usr/bin/env bash\n"
@@ -323,10 +413,24 @@ def test_real_scope_applies_memory_max(tmp_path):
         'printf \'CG:%s ULIMIT_V:%s\\n\' "$cg" "$(ulimit -v)" >&2\n'
         'cat "/sys/fs/cgroup${cg}/memory.max"\n',
     )
-    env = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"],
-           "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", ""),
-           "DBUS_SESSION_BUS_ADDRESS": os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""),
-           "CODEBASE_MEMORY_MCP_BIN": str(probe)}
+    # Forward these two CONDITIONALLY. `os.environ.get(k, "")` does not mean
+    # "pass it through if set" -- it forwards an EMPTY STRING when the key is
+    # absent, and for both of these an empty value is strictly WORSE than
+    # omitting the key, because sd-bus treats set-but-empty as an address it
+    # must use and never falls back. MEASURED on systemd 255, running the
+    # launcher's own probe (`systemd-run --user --scope -p MemoryMax=2G
+    # -p MemorySwapMax=0 -- /bin/true`):
+    #     DBUS absent,        XDG set            -> rc=0
+    #     DBUS set-but-EMPTY, XDG set            -> rc=1 connection refused
+    #     DBUS absent,        XDG set-but-EMPTY  -> rc=1 no such file
+    # CONFIRMED IN CI, not just locally: a GitHub runner has XDG_RUNTIME_DIR
+    # set and no DBUS_SESSION_BUS_ADDRESS, so the old form handed the launcher
+    # `DBUS_SESSION_BUS_ADDRESS=''`, its probe failed with "Failed to connect
+    # to bus: Connection refused", it took its SILENT ulimit fallback, and
+    # memory.max read `max` -- while the identical probe under pytest's own
+    # env returned rc=0. The failure looked like a launcher regression and was
+    # a test-harness bug the whole time.
+    env = _launcher_env(CODEBASE_MEMORY_MCP_BIN=str(probe))
     res = subprocess.run(
         ["bash", str(_LAUNCHER)], env=env, capture_output=True, text=True, timeout=30,
     )

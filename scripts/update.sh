@@ -490,7 +490,15 @@ _sync_deploy_targets() {
         # sync failure: an unsuppressed auto-updater makes the pin advisory, and a
         # REPEATED repair means something on this box keeps rewriting settings.json
         # — neither should live only as a line in a long deploy log.
-        if [ "${CC_SUPPRESSION_STATE:-ok}" != "ok" ]; then
+        # UNSET is not ok. `cc_ensure_local` sourced from a revision that predates
+        # the state variable — version skew across a partial deploy — would sail
+        # through a `${VAR:-ok}` default as a clean deploy that verified nothing.
+        # scripts/cc_settings_align.sh already refuses that read for the same
+        # reason; this is the sibling consumer of the same channel, so it refuses
+        # it too. The `+set` test distinguishes unset from empty; `:-` cannot.
+        if [ -z "${CC_SUPPRESSION_STATE+set}" ]; then
+            HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_unverified"
+        elif [ "$CC_SUPPRESSION_STATE" != "ok" ]; then
             HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_${CC_SUPPRESSION_STATE}"
         fi
         cc_shadow_scan || true
