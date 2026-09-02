@@ -59,6 +59,33 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `contributor_issue_propose` rejects a proposal missing either (fail-closed, after
   the privacy scan). The public PR template now prompts for a `Closes #NNN` keyword,
   and CONTRIBUTING documents that a bare `#NNN` won't auto-close the linked issue.
+
+- **Concurrent-session awareness now says what a peer is working on, and which
+  model it runs.** When several Claude Code sessions share an install, each one
+  is shown a `[Concurrent | …]` line per peer. Those lines previously carried a
+  digest of the peer's last few tool calls — so a peer read as
+  `Bash grep -n "Version History"`, which says nothing about what it is doing.
+  They now carry the peer's model and its topic. The topic is whichever is the
+  more recent account of what that session is doing: the summary Genesis
+  already writes when it summarises a session's activity, refreshed on a cycle
+  of a couple of hours, or the session's own mission, set the moment its
+  purpose changes. A mission declared after the last summary wins; otherwise
+  the summary does. Sessions whose mission predates this release keep showing
+  the summary, because there is no honest way to know when an older mission was
+  set. Where neither exists it falls back to the session's newest in-progress
+  or open ledger item. All of those are written by Genesis rather
+  than by you: the raw first user message is deliberately never used, for the
+  same reason the peer's typed prompts are already withheld — another session's
+  user text is decontextualised in yours.
+- **A session that is working but not being typed into no longer disappears
+  from its peers.** Peer lines are hidden once a session's heartbeat is ten
+  minutes old, and the heartbeat previously only refreshed when its user typed
+  — so a session heads-down on a long task silently vanished from everyone
+  else's view exactly while it was busiest. A tool-use refresh now keeps it
+  visible. It is throttled to at most one write a minute per session; on every
+  other tool call it costs a file stat and the hook's own module load, which is
+  a few milliseconds and no database work at all.
+
 - **Outreach total-cessation monitoring, without the old false-alarm trap.**
   Outreach is now in the `subsystem_stale` alert set (WARNING) alongside
   ego/inbox/dashboard. Previously it was excluded because its heartbeat was
@@ -143,6 +170,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   threshold is loosened to 3 hours, matching the surplus dashboard tile's own
   liveness bound; a genuinely dead surplus is still caught within ~15 minutes by the
   scheduler watchdog, which reads a separate, per-dispatch signal.
+
+- **A partial write to the concurrent-session record no longer erases fields it
+  was not told about.** The row has several writers that each know a different
+  part of it, and all but one of its columns were overwritten unconditionally —
+  so a writer that simply did not know the model wiped the stored one. The
+  model cache holds a bounded number of sessions, so a long-lived session whose
+  entry had aged out would destroy its own model on the next write. Every
+  content column is now preserved when a writer omits it; only the source tag,
+  which has a real default, is still overwritten.
 
 - **The Queues card could report "healthy — queues are clear" for counters it
   never collected.** When the queues section of the health snapshot fails, it is
