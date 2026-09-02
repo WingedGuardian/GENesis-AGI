@@ -74,6 +74,7 @@ import aiosqlite
 
 from genesis.db.crud import observations
 from genesis.recon import career_outreach_config as cfg
+from genesis.security.sanitizer import strip_control_chars
 
 logger = logging.getLogger(__name__)
 
@@ -586,15 +587,41 @@ class CareerOutreachMonitor:
 
         # Flatten (stage, entry) across the engaged-stage buckets → a single pass, so the
         # per-tick nudge cap and the pause check need only one loop + one break.
+        # Distinguish an ABSENT bucket (stage legitimately has no entries → skip) from a
+        # PRESENT-but-wrong-type bucket (a partial schema change the top-level dict check
+        # can't catch): the latter is surfaced via `malformed` → errors, never silently
+        # dropped, so a jerbs schema drift can't masquerade as "no new advances" forever.
         candidates: list[tuple[str, dict]] = []
+        malformed = 0
         for stage in BITE_STAGES:
             bucket = pipeline_by_stage.get(stage)
-            if isinstance(bucket, list):  # defensive: absent/typed-wrong bucket → skip
-                candidates.extend((stage, e) for e in bucket)
+            if bucket is None:
+                continue  # stage legitimately absent (JSON null / missing key) — normal
+            if isinstance(bucket, list):
+                candidates.extend((stage, e) for e in bucket)  # empty [] is fine (no entries)
+            else:
+                # Present but NOT a list ({}, "", 0, False, a non-empty dict/str, …) = a
+                # partial schema change the top-level dict check can't catch → surface it,
+                # never silently absorb as "no advances".
+                malformed += 1
+                logger.warning(
+                    "career outreach bite-relay: stage %r bucket is %s, expected list "
+                    "(schema drift?) — surfacing as failure",
+                    stage,
+                    type(bucket).__name__,
+                )
         if len(candidates) > _MAX_BITE_CANDIDATES_PER_TICK:
             # Hard scan ceiling — bounds the per-tick DB work (a read/write per candidate)
             # against a buggy/oversized data_module response, independent of the
-            # message-only nudge cap. Loud-truncation (the excess re-appears next tick).
+            # message-only nudge cap. NOTE: this is a WORK-bound, not a fair scheduler —
+            # entries beyond the ceiling that PERSIST in the pipeline (e.g. a company that
+            # stays in an engaged stage) keep occupying the truncated prefix, so a
+            # pathological >ceiling-engaged response could starve the tail indefinitely.
+            # Accepted: a real personal pipeline never has hundreds of simultaneously
+            # engaged companies, and under the buggy/compromised response this defends
+            # against, tail liveness is not a requirement (bounding work is). Applying the
+            # ceiling AFTER the seen-filter would reintroduce the unbounded exists_by_hash
+            # reads it exists to bound, so the prefix-cap is deliberate.
             logger.warning(
                 "career outreach bite-relay: %d engaged-stage entries returned — truncating "
                 "scan to %d (buggy/oversized data_module response?)",
@@ -613,14 +640,23 @@ class CareerOutreachMonitor:
                 details.append("paused — halting bite-relay")
                 break
             if not isinstance(entry, dict):
+                malformed += 1  # present-but-wrong-type entry → surface, never silent-drop
                 continue
             company_id = entry.get("id")
             if company_id is None or company_id == "":
                 continue  # no stable key → cannot dedup safely; skip (fail-safe)
-            # Bound the external name (NOTE: a crafted long name must not bloat the obs
-            # row / nudge). [:200] before use — the marker dedups on id, not name, so this
-            # never affects dedup.
-            company_name = (str(entry.get("name") or "").strip() or f"company {company_id}")[:200]
+            # Bound + sanitize the external name. strip_control_chars collapses the
+            # line-forging / line-concealing class — C0/C1 controls (incl. \n\r\t), the
+            # Unicode line+paragraph separators, and zero-width / bidi overrides — to a
+            # single space and trims. company_name is rendered into a parse_mode="HTML"
+            # Telegram message where html.escape (in _bite_nudge) neutralizes <>&"' but
+            # NOT those characters, so a crafted job posting could otherwise forge extra
+            # notification lines or visually reorder/conceal the message. Then [:200] so a
+            # crafted long name can't bloat the obs row / nudge. The marker dedups on id
+            # (not name), so neither transform affects dedup.
+            company_name = (
+                strip_control_chars(str(entry.get("name") or "")) or f"company {company_id}"
+            )[:200]
             h = _bite_hash(company_id, stage)
             # unresolved_only=False: a stage advance is a POINT EVENT — the marker
             # permanently suppresses a re-nudge (never re-emits on resolution/TTL).
@@ -642,22 +678,37 @@ class CareerOutreachMonitor:
                     "further advances deferred to the next tick"
                 )
                 break
-            status = await self._bite_nudge(company_name, stage, company_id)
+            status = await self._bite_nudge(company_name, stage, h)
             attempts += 1
             if status == OutreachStatus.DELIVERED:
                 await self._record_bite(h, company_name, stage)
                 bites += 1
                 details.append(f"bite: {company_name} → {stage}")
             elif status == OutreachStatus.REJECTED:
-                # Pipeline dedup — the owner already got an identical nudge. Not a
-                # failure, not marked (a harmless re-derive next tick).
-                details.append(f"bite nudge deduped — {company_name} → {stage}")
+                # Pipeline dedup: submit_raw found an identical recent (company, stage)
+                # nudge (the topic is unique per (company, stage)), so the owner ALREADY
+                # received this exact advance. Treat it as relayed and WRITE THE MARKER —
+                # this closes the crash-window where a prior tick delivered the nudge but
+                # crashed before _record_bite committed (marker absent): without marking
+                # here, the next daily tick (after the pipeline's 24h dedup expires) would
+                # re-deliver the same point-event, violating the one-time contract. Not a
+                # failure; not counted as a fresh bite (no new delivery this tick).
+                await self._record_bite(h, company_name, stage)
+                details.append(f"bite nudge deduped (marked relayed) — {company_name} → {stage}")
             else:
                 # FAILED / None (no pipeline / exception) — a real delivery failure.
                 errors += 1
                 details.append(
                     f"bite nudge not delivered (status={status}) — {company_name} → {stage}"
                 )
+        if malformed:
+            # Present-but-wrong-type buckets/entries → job-health failure, so a partial
+            # jerbs schema change surfaces instead of silently reading nothing.
+            errors += malformed
+            details.append(
+                f"bite-relay: {malformed} malformed engaged-stage bucket(s)/entry(ies) "
+                "(schema drift?) — surfaced as failures"
+            )
         if not details:
             details.append(f"bite-relay: {bite_mode} — no new advances")
         return CareerOutreachResult(
@@ -922,8 +973,9 @@ class CareerOutreachMonitor:
             logger.warning("career outreach: nudge not delivered (status=%s) — will retry", status)
         return status
 
-    async def _bite_nudge(self, company_name: str, stage: str, company_id: object):
+    async def _bite_nudge(self, company_name: str, stage: str, dedup_key: str):
         """Push ONE owner Telegram nudge that a company advanced into an engaged stage.
+        ``dedup_key`` is the caller's per-(full company_id, stage) marker hash (``_bite_hash``).
         Returns the delivery ``OutreachStatus`` (``None`` if no pipeline / the send
         raised) so the caller marks only on DELIVERED. Plain ``submit_raw`` (mirrors
         ``_nudge``) — NOTE: the ``best_effort`` no-retry flag is not on origin/main yet
@@ -944,11 +996,19 @@ class CareerOutreachMonitor:
         request = OutreachRequest(
             category=OutreachCategory.NOTIFICATION,
             channel="telegram",
-            # Unique per (company, stage) so submit_raw's 24h (signal_type, topic,
-            # category) dedup never collapses two distinct advances. The company name
-            # is in the delivered `text`, so the content-hash dedup key is distinct too.
-            topic=f"Career bite: {str(company_id)[:100]} {stage}",
-            context=text,
+            # Dedup identity on BOTH of submit_raw's dedup queries is `dedup_key` — the
+            # caller's per-(FULL company_id, stage) marker hash (_bite_hash), the SAME key
+            # as the permanent 'already relayed' observation. The PRIMARY query keys on
+            # (signal_type, topic, category); the SECONDARY on content_hash(context[:200]).
+            # Using the full-id hash (NOT a raw str(company_id)[:100] prefix) for both means
+            # REJECTED ⟺ this exact (full id, stage) was delivered in the last 24h — so
+            # mark-on-REJECTED below can never suppress a DISTINCT advance (two ids sharing
+            # a >100-char prefix would collide after truncation; the hash cannot). The
+            # delivered message is the `text` arg (submit_raw ignores request.context for
+            # delivery — it feeds only the dedup hash), so this sets dedup identity only,
+            # not what the owner sees.
+            topic=f"Career bite: {dedup_key}",
+            context=f"{dedup_key}\n{text}",
             signal_type="career_bite",
             salience_score=0.85,
             verbatim=True,

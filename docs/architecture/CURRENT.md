@@ -661,7 +661,15 @@ verified: 6f3310e5 2026-09-01
   (not a job-health failure — the read service is legitimately down when the search is
   dormant), while a read the service answered with an error IS a failure. Being a pure
   read + owner-nudge (no CLI dispatch, no outreach send), it can run `live` while the
-  auto-run stays gated.
+  auto-run stays gated. Hardening: external company names are control-char-sanitized
+  (`strip_control_chars` — collapses newlines / Unicode line+paragraph separators /
+  zero-width+bidi) before the `parse_mode="HTML"` nudge, so a crafted name can't forge
+  or conceal notification lines; a present-but-wrong-type pipeline bucket/entry surfaces
+  as a job-health failure (distinct from a legitimately-absent stage) rather than a
+  silent "no advances"; a pipeline-dedup `REJECTED` marks the point-event relayed
+  (closing the deliver-before-`_record_bite` crash-window that would otherwise re-nudge
+  after the 24h dedup expires); and the auto-run no-progress warning excludes bite
+  activity, since the two sub-capabilities are independent.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
   (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,
   research, recon, pipeline), not runtime init.

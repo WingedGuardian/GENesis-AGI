@@ -163,10 +163,15 @@ async def run_career_outreach_monitor(sched: SchedulerContext) -> None:
         # occurred) the failure is recorded below — a "verifier refused every attempt"
         # warning would be a second, misleading diagnosis. Cross-tick threshold
         # alerting (durable counters) is a tracked follow-up.
+        # NOTE: `result.bites` is deliberately EXCLUDED from this suppression. The
+        # bite-relay is an INDEPENDENT sub-capability (a pipeline read), unrelated to the
+        # auto-run's verifier; a successful bite must not mask a persistently-broken
+        # auto-run verifier. This warning is about auto-run progress only (auto_runs /
+        # nudged). Bites still appear in the info-log above.
         if (
             result.verify_failed
             and not result.errors
-            and not (result.auto_runs or result.nudged or result.bites)
+            and not (result.auto_runs or result.nudged)
         ):
             logger.warning(
                 "Career outreach: NO-PROGRESS tick — %d verify_failed, 0 staged/nudged "

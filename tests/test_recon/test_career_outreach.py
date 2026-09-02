@@ -1023,6 +1023,101 @@ async def test_bite_relay_only_engaged_stages_fire(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_bite_relay_rejected_nudge_marks_relayed(db, monkeypatch):
+    # Codex #1590 F2 (crash-window close): a REJECTED nudge means the pipeline's dedup
+    # found an identical recent (company, stage) nudge — the owner ALREADY got this exact
+    # advance. Treat it as relayed and WRITE THE MARKER, so a later tick (after the 24h
+    # pipeline dedup expires) never re-delivers the same point-event. Not a fresh bite,
+    # not a failure.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": [_entry(9, "Hooli")]})
+    mon, pipe = _mon_bite(db, data, pipe_status=OutreachStatus.REJECTED)
+    result = await mon.gather()
+    assert result.bites == 0 and result.errors == 0  # not a fresh bite, not a failure
+    assert len(pipe.sent) == 1  # nudge was attempted
+    assert await observations.exists_by_hash(
+        db, source="recon", content_hash=_bite_hash(9, "offer"), unresolved_only=False
+    )  # marker written on REJECTED → next tick's seen-check skips it (crash-window closed)
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_nudge_dedup_key_is_full_id_hash(db, monkeypatch):
+    # Codex #1590 F2 (architect + security follow-up): BOTH of submit_raw's dedup queries
+    # (primary topic; secondary content-hash of context[:200]) must key on the FULL-id
+    # marker hash (_bite_hash), NOT the id-free text (name+stage collides across distinct
+    # companies) and NOT a raw str(company_id)[:100] prefix (two ids sharing a >100-char
+    # prefix collide after truncation). Combined with mark-on-REJECTED, either collision
+    # would permanently suppress a DISTINCT advance; the full-id hash cannot collide. The
+    # delivered message is the `text` arg (submit_raw delivers text, not context), so this
+    # sets dedup identity only, not what the owner sees.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": [_entry(9, "Hooli")]})
+    mon, pipe = _mon_bite(db, data)
+    await mon.gather()
+    text, request = pipe.sent[0]
+    key = _bite_hash(9, "offer")  # the permanent marker hash — the SAME key
+    assert request.topic == f"Career bite: {key}"  # primary dedup keyed on the full-id hash
+    assert request.context.startswith(f"{key}\n")  # secondary content-hash keyed on it too
+    assert "Hooli" in text  # owner still sees the human-readable name
+    assert request.context.split("\n", 1)[1] == text  # delivered text unchanged
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_malformed_stage_bucket_surfaces_failure(db, monkeypatch):
+    # Codex #1590 F4: a PRESENT-but-wrong-type engaged-stage bucket (a partial jerbs
+    # schema change) is surfaced as a job-health failure, NOT silently dropped as
+    # "no new advances" — distinguished from a legitimately-absent stage.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": {"items": [_entry(9, "Hooli")]}})  # dict, not list
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.errors >= 1 and result.bites == 0
+    assert pipe.sent == []
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_falsy_wrong_type_bucket_is_malformed(db, monkeypatch):
+    # Codex #1590 F4 / security #3 (strict): a present-but-wrong-type bucket that is ALSO
+    # falsy ({} / "" / 0 / False) must STILL surface as malformed (schema drift), not be
+    # silently absorbed as an empty stage. Only None (absent) and a list (possibly empty)
+    # are legitimate — an empty DICT is a wrong-type drift, not a legitimately-empty stage.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": {}})  # empty dict — wrong type AND falsy
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.errors >= 1 and result.bites == 0
+    assert pipe.sent == []
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_malformed_entry_surfaces_failure(db, monkeypatch):
+    # Codex #1590 F4: a non-dict entry inside a valid list bucket is surfaced (errors),
+    # not silently skipped — but the valid sibling entry still nudges.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": ["not-a-dict", _entry(9, "Hooli")]})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.errors >= 1
+    assert result.bites == 1 and len(pipe.sent) == 1  # the valid entry still relays
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_strips_control_chars_from_company_name(db, monkeypatch):
+    # Codex #1590 F5: a crafted company name with an embedded newline (line-forging) is
+    # collapsed to a single space BEFORE render — html.escape alone (in _bite_nudge)
+    # would NOT catch \n, so the parse_mode="HTML" Telegram sink could otherwise be
+    # tricked into a forged notification line.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": [_entry(9, "Acme\nFAKE LINE")]})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.bites == 1
+    body = pipe.sent[0][0]
+    assert "\n" not in body  # the injected newline was collapsed → single-line message
+    assert "Acme FAKE LINE" in body  # collapsed to a space, substance preserved
+
+
+@pytest.mark.asyncio
 async def test_bite_relay_runs_while_autorun_off(db, monkeypatch):
     # The load-bearing decoupling: auto-run mode="off", bite-relay live → the relay
     # runs and nudges even though the (policy-blocked) auto-run is gated off.
@@ -1301,9 +1396,11 @@ async def test_runner_records_failure_on_bite_relay_error(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_runner_no_progress_warning_suppressed_by_bites(monkeypatch):
-    # A tick with verify_failed but ALSO bites>0 made progress (the relay) → the
-    # "verifier refused every attempt" no-progress warning must NOT fire.
+async def test_runner_no_progress_warning_fires_despite_bites(monkeypatch):
+    # The auto-run verifier refused every attempt (verify_failed>0, no auto_runs/nudged),
+    # but the INDEPENDENT bite-relay delivered a bite. The auto-run no-progress warning
+    # must STILL fire — bite activity is a separate sub-capability and must not mask a
+    # persistently-broken auto-run verifier (Codex #1590 F3). (Was previously suppressed.)
     from genesis.surplus.jobs import runners
 
     calls = {"fail": [], "success": []}
@@ -1324,8 +1421,10 @@ async def test_runner_no_progress_warning_suppressed_by_bites(monkeypatch):
         _event_bus = _Bus()
 
     await runners.run_career_outreach_monitor(_Sched())
+    # verify_failed is NOT a job-health failure (the gate working) → still success…
     assert calls["success"] == ["career_outreach_monitor"]
-    assert "career_outreach.no_progress" not in events
+    # …but the no-progress warning FIRES: a bite is not auto-run progress.
+    assert "career_outreach.no_progress" in events
 
 
 # ── C3-G: gate-compat auto-run fix (root cause = ground-truth-gate collision) ──
