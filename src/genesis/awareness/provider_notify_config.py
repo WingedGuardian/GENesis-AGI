@@ -6,9 +6,14 @@ Telegram), so its authority is graded —
 
   * ``off``          — the sweep does not run; any open notify rows are resolved
                        so disabling never strands an alert (loop contract).
-  * ``propose_only`` — the sweep writes at ``priority="high"``: visible on the
-                       dashboard and to the ego, never sent to Telegram
-                       (``_critical_observations_job`` polls only critical).
+  * ``propose_only`` — the sweep writes at ``priority="high"``: no IMMEDIATE
+                       page (``_critical_observations_job`` polls only
+                       critical), but the record is visible on the dashboard,
+                       to the ego, AND in the next MORNING REPORT, which
+                       delivers unsurfaced high-priority observations. That is
+                       deliberate: a proposal the user never sees anywhere
+                       outbound is not a proposal. (Raised at review — the
+                       original text claimed dashboard-only, which was false.)
   * ``live``         — the sweep writes at ``priority="critical"``: the one
                        Telegram. The DEFAULT: the feature exists to tell the
                        user, and shipping it dark reproduces the

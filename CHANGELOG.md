@@ -2949,7 +2949,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   provider that goes quiet after failing still gets reported. One new lever:
   the `provider_outage_notify` setting (`off` / `propose_only` / `live`,
   default `live`; env `GENESIS_PROVIDER_NOTIFY_DISABLED=1` forces off) —
-  `propose_only` keeps the record on the dashboard without the Telegram, and
+  `propose_only` skips the immediate page (the record still shows on the dashboard, to the ego, and in the next morning report), and
   turning it off resolves any open notification so re-enabling tells you about
   a still-dead provider again.
 ### Fixed

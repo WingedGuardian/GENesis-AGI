@@ -220,6 +220,16 @@ class ProviderEscalation:
         # Leaving the notify row open would make the first outage in a
         # provider's life the only one the user ever hears about, because
         # `skip_if_duplicate` suppresses on an unresolved row of the same hash.
+        # KNOWN, ACCEPTED (raised twice at review): if the SECOND resolve
+        # fails, the stale failure row survives and will deduplicate the NEXT
+        # outage's record, so that outage reports a duration measured from the
+        # older row. Accepted because the earliest-row-wins clock semantics
+        # knowingly tolerate stale-row persistence, the liveness gate bounds
+        # the damage (no page unless the breaker really is non-closed), and
+        # the row self-heals on the next successful recovery resolve. The
+        # single-statement plural resolve that would close it was rejected on
+        # measured probability — a failure must land between two adjacent
+        # retried UPDATEs.
         # NOTIFY FIRST, deliberately. These are two separately committed
         # statements — there is no transaction facility on this connection
         # (`SerializedConnection.__aenter__` is a no-op) — so one can succeed
@@ -420,6 +430,65 @@ async def notify_provider_if_due(
                 exc_info=True,
             )
             return False
+
+    # ACK SUPPRESSION — "once per outage" must survive the user resolving the
+    # delivered notification. `skip_if_duplicate` keys on UNRESOLVED rows only,
+    # so a dashboard ack would otherwise re-arm the sweep and re-page five
+    # minutes later — alert fatigue, the disease this feature treats. A RESOLVED
+    # notify row younger than the outage start means this outage was already
+    # reported: suppress, UNLESS the resolution was the operator LEVER (its
+    # resolution notes are machine-written and prefixed detectably), because the
+    # off→on re-notify is a user-decided contract. A resolved notify row OLDER
+    # than the outage start belongs to a previous outage and blocks nothing.
+    try:
+        from genesis.db.crud import observations as _obs
+
+        prior = await _obs.query(
+            db,
+            source="routing",
+            type="provider_failure",
+            resolved=True,
+            limit=_SWEEP_ROW_LIMIT,
+        )
+        notify_hash = ProviderEscalation._notify_content_hash(provider)
+        for r in prior:
+            if r.get("content_hash") != notify_hash:
+                continue
+            r_at = ProviderEscalation._outage_started_at(r)
+            if r_at is None or r_at < started:
+                continue  # a previous outage's notification — irrelevant
+            notes = str(r.get("resolution_notes") or "")
+            # MACHINE resolutions permit a re-notify; only a USER ack
+            # suppresses. Three machine classes exist, each with a
+            # machine-written prefix: the lever (off→on re-notify is a
+            # user-decided contract), the lever upgrade, and RECOVERY's
+            # auto-resolve — a genuine recovery then re-death is a NEW
+            # outage and must be reported again (the original design
+            # decision, pinned by test_recovery_then_re_death_notifies_again).
+            if notes.startswith(
+                (
+                    "provider-outage notify lever",
+                    "superseded: lever",
+                    "auto-resolved:",
+                )
+            ):
+                continue
+            logger.debug(
+                "outage for '%s' already notified and acknowledged; not re-paging",
+                provider,
+            )
+            return False
+    except Exception:
+        # An unreadable ack-history must not BLOCK a due notification: the
+        # failure direction here is the opposite of the liveness gate's. A
+        # missed suppression re-sends a message the user has seen — annoying,
+        # recoverable. A false suppression silences a real outage — the
+        # unrecoverable direction for THIS check.
+        logger.warning(
+            "could not read ack history for '%s'; notifying anyway",
+            provider,
+            exc_info=True,
+        )
 
     hours = elapsed / 3600.0
     human = f"{hours / 24:.1f} days" if hours >= 24 else f"{hours:.1f} hours"

@@ -666,6 +666,63 @@ class TestDeadProviderNotification:
             "an unverifiable provider was paged — errors must fail toward silence"
         )
 
+    async def test_a_user_ack_silences_the_outage_until_recovery(
+        self, escalation, empty_db
+    ):
+        """Resolving the delivered notification must not re-page five minutes later.
+
+        REGRESSION (#1573 Codex P2 on the redesign). `skip_if_duplicate` keys on
+        UNRESOLVED rows, so a dashboard ack removed the only dedup and the next
+        sweep tick re-created the critical — re-paging the user for an outage
+        they had just acknowledged. A RESOLVED notify row younger than the
+        outage start now suppresses re-creation.
+        """
+        await self._seed_failure_obs(escalation, empty_db, "prov-ack", "pf-ack", age_s=7200)
+        await escalation._maybe_notify("prov-ack")
+        rows = await self._criticals(empty_db, "prov-ack", escalation)
+        assert len(rows) == 1
+
+        # The user acks it from the dashboard (plain resolve, user notes).
+        from genesis.db.crud import observations as obs_crud
+
+        await obs_crud.resolve(
+            empty_db, rows[0]["id"],
+            resolved_at="2099-01-01T00:00:00+00:00",
+            resolution_notes="seen it, working on the account",
+        )
+        await escalation._maybe_notify("prov-ack")
+        rows = await self._criticals(empty_db, "prov-ack", escalation)
+        assert len([r for r in rows if r["resolved"] == 0]) == 0, (
+            "the sweep re-paged an outage the user had acknowledged"
+        )
+
+    async def test_a_lever_resolve_does_not_suppress_the_re_notify(
+        self, escalation, empty_db
+    ):
+        """The discriminator's other direction — USER-DECIDED off→on re-notify.
+
+        Lever resolutions carry machine-written notes; only those permit a
+        re-page for the same outage. Without this arm, turning the lever off
+        and on would go silent, undoing the recorded decision.
+        """
+        await self._seed_failure_obs(escalation, empty_db, "prov-lvr", "pf-lvr", age_s=7200)
+        await escalation._maybe_notify("prov-lvr")
+        rows = await self._criticals(empty_db, "prov-lvr", escalation)
+        assert len(rows) == 1
+
+        from genesis.db.crud import observations as obs_crud
+
+        await obs_crud.resolve(
+            empty_db, rows[0]["id"],
+            resolved_at="2099-01-01T00:00:00+00:00",
+            resolution_notes="provider-outage notify lever turned off",
+        )
+        await escalation._maybe_notify("prov-lvr")
+        rows = await self._criticals(empty_db, "prov-lvr", escalation)
+        assert len([r for r in rows if r["resolved"] == 0]) == 1, (
+            "a lever resolve suppressed the off→on re-notify the user decided on"
+        )
+
     async def test_a_duplicate_failure_row_does_not_reset_the_outage_clock(
         self, escalation, empty_db
     ):
