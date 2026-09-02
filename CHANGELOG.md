@@ -43,7 +43,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   — along with several additional vendor prefixes, and tokens appearing on
   diff-style `-`/`+` lines are handled the same as anywhere else. Redaction
   around a key marker covers the adjacent key material and stops there, so an
-  ordinary diagnostic keeps its surrounding lines. The scrub subprocess in the
+  ordinary diagnostic keeps its surrounding lines. Key material is recognised
+  even when the capture decorates every line — a log timestamp, a service
+  prefix, a diff marker, an indent — rather than only when it starts at the
+  left margin. The scrub subprocess in the
   exit-capture path also gained a wall-clock bound and an input cap, both
   failing toward withholding the tail rather than storing it unscrubbed.
 - **Long terminal lines are redacted as one line, not as fragments.** A

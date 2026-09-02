@@ -472,6 +472,14 @@ class TestScrubIsLinearAcrossInputShapes:
         "pem_header_then_body": (
             "-----BEGIN RSA PRIVATE KEY-----\n" + ("QUFB" * 16 + "\n") * 4000
         ),
+        # Decoration recognition inspects the TAIL of every line, so the two
+        # shapes that exercise it belong here: a wall of decorated body lines,
+        # and prose whose lines end in a long token (the near-miss that must
+        # stay cheap as well as stay OUT of the key-material class).
+        "decorated_body_wall": ("2026-09-02 12:00:00 " + "QUFB" * 16 + "\n") * 4000,
+        "long_tail_prose": (
+            "crash at 0400c706186786ccc92e8a8d7904773e7ed5f8b1abc\n" * 6000
+        ),
     }
 
     @pytest.mark.parametrize("shape", sorted(SHAPES))
@@ -691,6 +699,69 @@ class TestPemPrivateKeysAreRedacted:
         out = s.scrub(text)
         assert "QUFB" not in out
         assert "before" in out and "after" in out
+
+    # ── captured output is frequently DECORATED ────────────────────────────
+    # A column-0 test for "is this line key material" is an assumption about
+    # the CAPTURE, not about the key. Enumerated as a class rather than as the
+    # one shape a reviewer happened to name: MEASURED across 7 decorations x 3
+    # clipping states, 4 decorations wrote the whole body out before this was
+    # handled, while plain / indented / diff-`+` did not — and those three pass
+    # only because `+` is a base64 character and `.strip()` covers indentation.
+    # Passing by accident of the alphabet is not coverage.
+    _DECORATIONS = {
+        "log_timestamp": lambda ln: f"2026-09-02 12:00:00 {ln}",
+        "journalctl": lambda ln: f"host genesis[123]: {ln}",
+        "diff_removed": lambda ln: f"-{ln}",
+        "diff_added": lambda ln: f"+{ln}",
+        "indented": lambda ln: f"    {ln}",
+        "pipe_gutter": lambda ln: f"  | {ln}",
+    }
+
+    def _armoured(self, kind="RSA"):
+        """Real RFC 1421 shape: metadata headers, a blank line, then body."""
+        body = [("QUFB" * 16) for _ in range(6)]
+        return (
+            [f"-----BEGIN {kind} PRIVATE KEY-----",
+             "Proc-Type: 4,ENCRYPTED",
+             "DEK-Info: AES-128-CBC,B6F35A9DA8465EEE6BD4B061D097D3C5",
+             ""]
+            + body
+            + [f"-----END {kind} PRIVATE KEY-----"]
+        )
+
+    @pytest.mark.parametrize("decoration", sorted(_DECORATIONS))
+    @pytest.mark.parametrize("clip", ["paired", "end_clipped", "begin_clipped"])
+    def test_decorated_key_material_is_redacted(self, decoration, clip):
+        lines = self._armoured()
+        if clip == "end_clipped":
+            lines = lines[:-1]
+        elif clip == "begin_clipped":
+            lines = lines[1:]
+        decorate = self._DECORATIONS[decoration]
+        out = s.scrub("\n".join(decorate(ln) for ln in lines))
+        assert "QUFB" not in out, f"{decoration}/{clip} body survived:\n{out}"
+
+    def test_decoration_handling_does_not_reopen_the_marker_swallow(self):
+        """Guard for the guard: recognising decorated bodies must not make
+        ordinary prose look like key material and re-open the two-marker
+        swallow. Prose ends in a word, not in a long base64 run."""
+        text = "\n".join(
+            ["2026-09-02 12:00:00 grep: -----BEGIN RSA PRIVATE KEY-----"]
+            + [f"2026-09-02 12:00:0{i} crash line {i} KEEPME" for i in range(1, 7)]
+            + ["2026-09-02 12:00:09 grep: -----END RSA PRIVATE KEY-----"]
+        )
+        out = s.scrub(text)
+        kept = sum(1 for ln in out.splitlines() if "KEEPME" in ln)
+        assert kept == 6, f"only {kept}/6 decorated diagnostic lines survived:\n{out}"
+
+    def test_armour_metadata_is_not_mistaken_for_body(self):
+        """`DEK-Info:` ends in a long hex run that reads as base64, so a
+        tail-only test would stop the body search on the metadata line and walk
+        straight past the key."""
+        assert not s._body_line(
+            "DEK-Info: AES-128-CBC,B6F35A9DA8465EEE6BD4B061D097D3C5"
+        )
+        assert s._body_line("2026-09-02 12:00:00 " + "QUFB" * 16)
 
     def test_a_certificate_is_not_a_private_key(self):
         """Only PRIVATE KEY armour redacts. A certificate is public material,
