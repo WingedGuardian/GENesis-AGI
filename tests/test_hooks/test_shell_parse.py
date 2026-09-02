@@ -7,12 +7,15 @@ these lock in the wrapper/substitution/nesting cases two review passes found.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "hooks"))
+_SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
+sys.path.insert(0, str(_SCRIPTS / "hooks"))
 import shell_parse as sp  # noqa: E402
 
 NV = "--no" + "-verify"  # keep the literal out of this file's own text
@@ -739,3 +742,102 @@ def test_has_top_level_pipe_substitution_is_not_a_bg_pipe(cmd):
 )
 def test_has_top_level_pipe_real_pipe_around_substitution(cmd):
     assert sp.has_top_level_pipe(cmd) is True
+
+
+class TestSigilRunRegression:
+    """A sigil passed to has_trailing_override but absent from _KNOWN_SIGILS is
+    read as PROSE, so writing it FIRST silently ends the leading run and disables
+    every sigil after it. The sigil queried for ITSELF still matches, which is why
+    two such tokens shipped undetected."""
+
+    def test_an_unlisted_leading_sigil_no_longer_ends_the_run(self):
+        h = sp.has_trailing_override
+
+        assert h("git merge f  # merge-to-main-override audit-ack", "audit-ack")
+        assert h("git merge f  # audit-ack merge-to-main-override", "audit-ack")
+        assert h("git merge f  # merge-to-main-override", "merge-to-main-override")
+
+    def test_prose_still_ends_the_run(self):
+        h = sp.has_trailing_override
+
+        assert not h("git merge f  # see merge-to-main-override docs", "merge-to-main-override")
+
+    def test_every_sigil_any_guard_queries_is_declared(self):
+        """``_KNOWN_SIGILS`` claims to be kept in sync with the sigils actually
+        passed to has_trailing_override across the guards. Twice it was not, and
+        both times the consequence was silent.
+
+        Derived with ``ast`` over every CONSUMER, not a regex over one file. Two
+        guards pass their sigil as a module constant (``_OVERRIDE_SIGIL``,
+        ``_OVERRIDE``), so a literal-only scan cannot see them — which is how
+        ``full-suite-ok`` stayed undeclared while a regex test passed green.
+
+        The population is ``scripts/**.py``, NOT ``scripts/hooks/*.py``: a
+        hooks-only glob misses ``review_enforcement_commit.py``, where
+        ``audit-ack`` and ``depth-ack`` are queried — 2 of the declared sigils,
+        invisible to a scan that claimed to cover "every hook".
+        """
+        _DEFAULT_SIGIL = inspect.signature(sp._has_trailing_override).parameters["sigil"].default
+
+        queried: dict[str, str] = {}
+        for path in sorted(_SCRIPTS.rglob("*.py")):
+            tree = ast.parse(path.read_text())
+            consts = {}
+            for n in ast.walk(tree):
+                # Assign (`X = "s"`) AND AnnAssign (`X: str = "s"`) — a scan that
+                # handled only the first missed an annotated constant silently.
+                if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant):
+                    targets = [t for t in n.targets if isinstance(t, ast.Name)]
+                elif (
+                    isinstance(n, ast.AnnAssign)
+                    and isinstance(n.value, ast.Constant)
+                    and isinstance(n.target, ast.Name)
+                ):
+                    targets = [n.target]
+                else:
+                    continue
+                if isinstance(n.value.value, str):
+                    for t in targets:
+                        consts[t.id] = n.value.value
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                fn = node.func
+                name = getattr(fn, "attr", None) or getattr(fn, "id", None)
+                if name not in ("has_trailing_override", "_has_trailing_override"):
+                    continue
+                arg = node.args[1] if len(node.args) > 1 else None
+                for kw in node.keywords:
+                    if kw.arg == "sigil":
+                        arg = kw.value
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    queried[arg.value] = path.name
+                elif isinstance(arg, ast.Name) and arg.id in consts:
+                    queried[consts[arg.id]] = path.name
+                elif arg is None:
+                    # A call with no sigil relies on the DEFAULT, which the walk
+                    # would otherwise never see — so a changed default could point
+                    # at an undeclared token from a call site invisible to this
+                    # test. Resolved from the live signature rather than restated
+                    # here, so the two cannot drift.
+                    queried[_DEFAULT_SIGIL] = path.name
+
+        # Guard the guard, against the CONSUMERS not a magic number: a floor of 5
+        # was satisfied by three files even when a fourth was silently dropped
+        # from the population, so it could not detect a lost consumer.
+        files = set(queried.values())
+        assert files >= {
+            "git_push_guard.py",
+            "git_discard_guard.py",
+            "full_suite_guard.py",
+            "review_enforcement_commit.py",
+        }, f"a known consumer produced no sigils — the walk went blind: {sorted(files)}"
+        undeclared = {s: f for s, f in queried.items() if s not in sp._KNOWN_SIGILS}
+        assert not undeclared, f"queried but not declared in _KNOWN_SIGILS: {undeclared}"
+        # The REVERSE direction, and it is the same defect class rather than an
+        # extra: an over-declared sigil no guard enforces widens acceptance for
+        # every OTHER sigil exactly as the two missing ones narrowed it, and a
+        # one-directional assertion ships it green. MEASURED: injecting an unqueried
+        # token into _KNOWN_SIGILS left all 146 tests in this file passing.
+        unqueried = sorted(set(sp._KNOWN_SIGILS) - set(queried))
+        assert not unqueried, f"declared in _KNOWN_SIGILS but no guard queries it: {unqueried}"

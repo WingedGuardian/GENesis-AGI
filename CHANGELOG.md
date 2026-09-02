@@ -11,6 +11,81 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Gated autonomous cold marketing outreach (inert by default).** Genesis can
+  now stage cold marketing emails to an owner-curated prospect list via the new
+  `marketing_send` tool. The recipient is resolved in code from a private
+  `marketing_prospects` store (by id — the tool never accepts a raw address),
+  respects permanent opt-outs, and every send still holds at the email
+  authorization gate for your approval. It ships OFF: nothing sends until you set
+  the `marketing_outreach` lever to `observe`/`live` (kill switch:
+  `GENESIS_MARKETING_OUTREACH_DISABLED=1`). Autonomous cold sending requires BOTH
+  affirmatively setting the lever to `live` AND the BULK capability cell earning a
+  grant through your approvals — in `observe` (or `off`) every cold send holds for
+  your explicit approval even after the cell is granted. Manage prospects and
+  opt-outs in the `marketing_prospects` table. Hardened: the `marketing_send`
+  actuator is reachable only from the `campaign` session profile (every other
+  profile — including the untrusted-inbound `mail`/`community-responder` perimeter
+  — denies it, so an injected inbound message can't reach it); arming `live` is
+  overlay-file-only and cannot be set through `settings_update` (a model can't
+  self-elevate past the observe gate); a held send to a permanently opted-out
+  prospect is refused before delivery regardless of how the pitch classified (a
+  money-pattern body that lands as FINANCIAL no longer bypasses the bulk-only
+  opt-out check); and the `pending_outreach.labeled_surplus` migration no longer
+  swallows ALTER errors (a transient lock is retried, a real failure fails loud); and an
+  already-approved cold send is halted at delivery if the lever is flipped to `off` / the
+  kill switch is set before it goes out (the outer off-switch is now honored deliver-side,
+  not only at enqueue — the held send is paused and resumes if you re-enable).
+- **Contributor-issue close loop.** When an external contributor's merged PR
+  closes a GitHub issue Genesis posted from the Contributor Work-Log (via a
+  `Closes #N` keyword), the repo-pulse worker now auto-resolves the originating
+  follow-up — so shipped contributor work no longer lingers as a false TODO.
+  Scoped to default-branch merges and same-repo references; idempotent, and
+  fails closed on any ambiguity (empty/unresolvable state no-ops; a genuine read
+  failure fails the run and preserves the cursor to re-cover). Gated by the same
+  `repo_pulse` lever. Hardened: the originating follow-up id is resolved to its
+  canonical form at proposal time (a prefix/tagged/uppercase handle resolves to
+  the full id; an ambiguous or unknown handle is rejected rather than stored as a
+  ref the join can never match); and only issues Genesis actually CREATED are
+  treated as authoritative close-links — any issue Genesis merely ADOPTED (a
+  pre-existing open issue with a coincidental same title, or one re-found after a
+  crash) is recorded as adopted and excluded from the join, so a PR closing it never
+  falsely resolves a follow-up. (Adopt provenance no longer relies on issue
+  authorship, which cannot be trusted on a single-account install.)
+- **Contributor issues are labeled by domain and difficulty, enforced at the source.**
+  Every issue the Contributor Work-Log proposes must now carry an `area:*` domain
+  label (memory/dashboard/runtime/guardian/autonomy/channels/knowledge/eval, or
+  `area:other`) and a difficulty/environment label (`good first issue`,
+  `first-timers-only`, `needs-genesis-instance`, or `help wanted`) —
+  `contributor_issue_propose` rejects a proposal missing either (fail-closed, after
+  the privacy scan). The public PR template now prompts for a `Closes #NNN` keyword,
+  and CONTRIBUTING documents that a bare `#NNN` won't auto-close the linked issue.
+
+- **Concurrent-session awareness now says what a peer is working on, and which
+  model it runs.** When several Claude Code sessions share an install, each one
+  is shown a `[Concurrent | …]` line per peer. Those lines previously carried a
+  digest of the peer's last few tool calls — so a peer read as
+  `Bash grep -n "Version History"`, which says nothing about what it is doing.
+  They now carry the peer's model and its topic. The topic is whichever is the
+  more recent account of what that session is doing: the summary Genesis
+  already writes when it summarises a session's activity, refreshed on a cycle
+  of a couple of hours, or the session's own mission, set the moment its
+  purpose changes. A mission declared after the last summary wins; otherwise
+  the summary does. Sessions whose mission predates this release keep showing
+  the summary, because there is no honest way to know when an older mission was
+  set. Where neither exists it falls back to the session's newest in-progress
+  or open ledger item. All of those are written by Genesis rather
+  than by you: the raw first user message is deliberately never used, for the
+  same reason the peer's typed prompts are already withheld — another session's
+  user text is decontextualised in yours.
+- **A session that is working but not being typed into no longer disappears
+  from its peers.** Peer lines are hidden once a session's heartbeat is ten
+  minutes old, and the heartbeat previously only refreshed when its user typed
+  — so a session heads-down on a long task silently vanished from everyone
+  else's view exactly while it was busiest. A tool-use refresh now keeps it
+  visible. It is throttled to at most one write a minute per session; on every
+  other tool call it costs a file stat and the hook's own module load, which is
+  a few milliseconds and no database work at all.
+
 - **Outreach total-cessation monitoring, without the old false-alarm trap.**
   Outreach is now in the `subsystem_stale` alert set (WARNING) alongside
   ego/inbox/dashboard. Previously it was excluded because its heartbeat was
@@ -31,7 +106,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   init *failure* still surfaces); a *wedged-but-alive* loop is job_health's domain. The
   new `subsystem_stale:outreach` id is handled generically by the existing consumers
   (morning-report dedup by prefix, the Sentinel `subsystem_stale:` disposition).
-
 - **Session-start surface for age-stale open PRs.** The repo-pulse worker now
   also caches the open-PR set each boundary, and a SessionStart hook lists the
   ones idle past a threshold (default 7 days) as one passive inline line —
@@ -78,6 +152,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The `deliberate` MCP tool ("Model Fusion") no longer fails on real prompts.** Two
+  distinct bugs: (1) analysis mode 404'd because the orchestrator slug
+  `openai/gpt-oss-120b:free` was retired from OpenRouter's catalog (`:free` variant gone)
+  — switched to the live base slug `openai/gpt-oss-120b`; (2) real multi-paragraph prompts
+  false-timed-out at 240s (a 6-model frontier panel + judge legitimately runs several
+  minutes, while a trivial ping finished in ~33s) — the budget is now a single env-driven
+  knob (`GENESIS_DELIBERATE_TIMEOUT_S`, default 1000s) read per-call and threaded through
+  `core.deliberate()` (which previously hard-pinned 240s, silently overriding the backend
+  default). Also hardened the panels' one remaining concrete `x-ai/grok-4.3` slug to the
+  drift-resistant `~x-ai/grok-latest`.
 - **The morning report no longer cries "surplus heartbeat overdue" during a long
   healthy dispatch.** Surplus emits its subsystem heartbeat only at the end of a
   dispatch cycle, and a single healthy dispatch can run 15-30 minutes — longer than
@@ -86,6 +170,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   threshold is loosened to 3 hours, matching the surplus dashboard tile's own
   liveness bound; a genuinely dead surplus is still caught within ~15 minutes by the
   scheduler watchdog, which reads a separate, per-dispatch signal.
+
+- **A partial write to the concurrent-session record no longer erases fields it
+  was not told about.** The row has several writers that each know a different
+  part of it, and all but one of its columns were overwritten unconditionally —
+  so a writer that simply did not know the model wiped the stored one. The
+  model cache holds a bounded number of sessions, so a long-lived session whose
+  entry had aged out would destroy its own model on the next write. Every
+  content column is now preserved when a writer omits it; only the source tag,
+  which has a real default, is still overwritten.
 
 - **The Queues card could report "healthy — queues are clear" for counters it
   never collected.** When the queues section of the health snapshot fails, it is
@@ -662,6 +755,38 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The review-enforcement commit escalation cap is now CROSS-MODEL only — internal
+  self-reviews never count toward it.** The cap exists to catch cross-model
+  non-convergence (an external, non-Anthropic reviewer finding new defects round after
+  round), not to penalize free same-model self-review. `review_state.py mark` gains a
+  `--source {internal,external}` (default `internal`): an `internal` mark (a
+  genesis-architect / genesis-security / any-subagent audit, the overwhelmingly common
+  case) NEVER advances or resets the streak, whatever it found, and needs no outcome
+  flag; only an `--source external` mark counts, and it still requires `--defects` (a new
+  BLOCKER/SHOULD-FIX/P1/P2 → +1) or `--clean` (none → reset). This ends the weeks of
+  false blocks — including the case where the round-2 mode-switch gate *mandated* a
+  fresh-context internal audit whose mark then tripped the hard cap, penalizing the very
+  remedy the gate demanded. Supersedes the earlier required-outcome fix (feea3f71 /
+  #1446), whose bare-mark refusal only ever bit internal re-audits; that fix's still-useful
+  parts (the outcome requirement for external marks, and the class-sweep reminder that now
+  fires on the second external round) are folded in here. On upgrade, a pre-existing round
+  counter written by the old reviewer-agnostic code (no `last_source`) is treated as legacy
+  and discarded — its count was built entirely from internal self-reviews, so preserving it
+  would keep false-blocking; the streak self-heals on the next cross-model mark (no per-install
+  data repair needed). "External" is judged by the reviewing MODEL, not the gateway: Anthropic
+  Claude via any route (incl. an OpenRouter Claude route) is internal, and Genesis's own
+  cognitive/routing systems are never reviewers — approved external methods today are Codex and
+  Kimi (on .123). `mark` also accepts the `--source=external` equals form (previously silently
+  dropped to internal).
+- **Contributor-issue privacy scan no longer over-blocks legitimate Markdown.**
+  The `scan_prose` secret-scan floor ran `detect-secrets scan --string <line>` per
+  line; argparse then misread any line whose content starts with `-` (a Markdown
+  `---` horizontal rule, a `--flag` example — both common in issue/PR prose) as an
+  unknown option (exit 2), which the fail-closed nonzero-exit branch turned into a
+  spurious BLOCK. Switched to the `--string=<value>` form so the value binds
+  literally even when it starts with a dash; secret detection is unchanged for all
+  other input. Locked with real-binary regression tests (a `---`/`--flag` body
+  scans clean; a planted key still BLOCKs).
 - **A transient `git ls-remote` failure no longer re-prompts an already-approved
   branch push.** The push-approval hook prompts only on a branch's FIRST push; a
   re-push of fixes to the same, already-published branch should be silent. But the
@@ -2827,6 +2952,107 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `propose_only` keeps the record on the dashboard without the Telegram, and
   turning it off resolves any open notification so re-enabling tells you about
   a still-dead provider again.
+### Fixed
+
+- **A dead provider kept reporting itself recovered, so a multi-day outage was
+  recorded as a series of short incidents that each "recovered".** The
+  `/v1/models` health probe healed a circuit breaker whenever the model was still
+  *listed* by the provider — but a model can be listed and not callable. When an
+  account loses entitlement to a model, the listing endpoint keeps answering 200
+  while every real call returns 403, which is exactly the shape the probe read as
+  "recovered". Closing the breaker fired the recovery hook, which resolved the
+  `provider_failure` record and cleared the only per-provider "failing since"
+  timestamp Genesis keeps; the next real call failed again and the cycle
+  restarted, so the outage clock never accumulated and no surface could report a
+  duration. Measured over one real multi-day outage: eight separate failure
+  records, every one of them closed automatically while the provider was in fact
+  answering nothing at all. The rule now is symmetry: a health probe may undo
+  a health probe's own suspicion, and nothing else. If real calls broke a
+  provider, a real call has to prove it fixed.
+
+  This does not take a provider out of rotation. A tripped provider is
+  automatically put back on probation once its backoff window passes, and a
+  provider on probation is still called — so the next real request to it *is*
+  the retry, and a success clears it. What changed is only that Genesis no
+  longer announces a recovery it has not actually seen.
+
+  **What this changes for you:** a provider that is genuinely dead is now retried
+  progressively less often instead of every couple of minutes, settling at once
+  every 30 minutes — or once every 4 hours when the failure looks like an
+  exhausted quota. That is the point for a dead provider, but it also means a
+  provider whose quota resets can wait up to 4 hours before Genesis tries it
+  again, using the next provider in the chain until then. Reading the retry delay
+  the provider itself reports is the exact fix and is tracked as follow-up work.
+
+- **Disabling a provider from the dashboard now holds against health checks,
+  and re-enabling one actually clears it.** The toggle used to reach into the
+  breaker and set its fields directly, which left the new "who broke this"
+  record out of step in both directions: a provider switched off by hand could
+  be quietly switched back on by a routine health check, and a provider
+  switched back on kept a stale "real calls failed here" mark that made it
+  refuse to go green again until real traffic arrived. Both transitions are now
+  operations the breaker performs on itself, so the state and the reason for it
+  are set together, with a test that scans for code setting breaker state from
+  outside. (A disabled provider still returns to rotation when its
+  backoff window elapses — that is separate, and tracked.)
+
+- **Removed a provider toggle that could never work.** The Tool Providers card
+  on the Overview tab carried disable/enable buttons that posted the tool
+  provider's name to an endpoint which only knows routing-provider names. The
+  two are different namespaces, so every click returned "not found" and popped
+  an error. The working toggle is on the Internals tab and is unaffected.
+
+- **Upgrading in the middle of an outage no longer forgets that the outage is
+  real.** The saved breaker file written by the previous version has no record
+  of what broke a provider, and reading that silence as "a health check did it"
+  would have let the first health check after the upgrade close a breaker that
+  real calls had opened — losing the outage exactly once, at the worst moment.
+  A saved-as-failing provider with no recorded cause is now treated as broken by
+  real calls, which is the only thing it can have been.
+
+- **Alerts now say how long they have been firing.** `alert_events` has recorded
+  `created_at` for every open alert with 90-day retention since it was
+  introduced, and nothing read it — so a condition three days old was rendered
+  identically to one three minutes old. Alert messages now carry
+  `(ongoing for 3d 4h)` once an alert has been continuously open for more than an
+  hour. Enriching the message rather than adding a widget means every surface
+  that renders an alert message gains the duration at once — the dashboard
+  banner, the morning report and the outreach path. Note the existing filters
+  still apply: the morning report omits call-site warnings and the Telegram path
+  carries only whitelisted critical alerts, so for a degraded call site the
+  duration appears on the dashboard. Self-isolating: a failure to compute the
+  duration costs the suffix, never the alert.
+
+- **The dashboard could not display a tripped circuit breaker at all.** The
+  routing API emits breaker state from a lowercase-valued enum, while four
+  frontend comparisons tested against an uppercase literal — a comparison that is
+  never true. The provider dot rendered green, the toggle button read "disable",
+  and the Provider Keys indicator stayed green regardless of the real state, with
+  the "circuit breaker open" tooltip unreachable. All four now route through a
+  single case-insensitive helper, and a guard test scans the frontend directories
+  so a new file cannot reintroduce the comparison.
+
+- **The dashboard now tells "broken" apart from "not proven working yet."** A
+  provider is shown three ways instead of two: red when real calls are failing
+  and it is not being used, hollow amber when it is still in rotation but has
+  not completed a call since its last trouble, and green when it is healthy.
+  Hovering says which, and why — real calls failed, or only a health check
+  could not reach it. Previously a provider awaiting its next call looked
+  identical to one actively failing, which overstated the problem; that state
+  is now common enough to be worth naming, since recovery waits for a real call.
+
+- **Alert severity dots were always amber, including for critical alerts.** The
+  colour map was keyed lowercase while severities are emitted uppercase, so every
+  lookup missed and fell through to the warning colour. The map now normalises
+  case, covers the full emitted vocabulary, and gives an unrecognised severity its
+  own colour instead of silently painting it as a warning.
+
+- **Grouped error severity was ranked alphabetically, which inverts it.** The
+  severity vocabulary is lowercase, so a plain `MAX()` orders
+  `warning > info > error > debug > critical` — critical sorts lowest. Any group
+  mixing a critical with a warning reported "warning" and rendered amber,
+  silently downgrading the most severe events in the group. Ranking is now
+  explicit.
 
 ## [v3.0b17] - 2026-07-06
 
