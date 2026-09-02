@@ -41,9 +41,11 @@
 #   failover_order     — lower = tried first when the active model exhausts
 #                        (0 = primary; `claude` is a valid failover peer)
 #   validated          — ADVISORY ONLY. A human note recording when someone last
-#                        confirmed this peer actually worked. No code reads it;
-#                        it gates nothing. Do not carry a stamp forward without
-#                        re-testing — an unverified date is worse than none.
+#                        confirmed this peer actually worked. It is PARSED into
+#                        `RosterEntry.validated` and then acted on by nothing:
+#                        it gates nothing, anywhere. Do not carry a stamp
+#                        forward without re-testing — an unverified date is
+#                        worse than none.
 #
 # Selection + failover live in genesis.cc.roster; the invoker only honors the
 # resolved fields. Interactive use: `gmodel <name>` launches a foreground
@@ -85,7 +87,10 @@ models:
 #       auth_env: ZAI_CODING_API_KEY
 #       # ...or China (BigModel) — swap BOTH of the two lines above for:
 #       #   anthropic_base_url: "https://open.bigmodel.cn/api/anthropic"
-#       #   auth_env: ZHIPU_API_KEY
+#       #   auth_env: BIGMODEL_CODING_API_KEY
+#       # NOT ZHIPU_API_KEY: that is the general/prepaid slot for /api/paas/v4,
+#       # and pointing it at /api/anthropic is exactly the 1113 failure below.
+#       # A Coding Plan is bought PER PLATFORM, so the key is not portable.
 #       model_id: glm-5.3
 #       failover_order: 1
 #

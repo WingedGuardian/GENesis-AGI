@@ -146,18 +146,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
       failover_order: 1
   ```
 
-  This matters because the failure is quiet: an overlay setting `default: glm-5.2`
-  with no matching entry does not error — it falls back to native Claude, so a
+  This matters because the failure is quiet FOR THE USER: an overlay setting
+  `default: glm-5.2` with no matching entry falls back to native Claude, so a
   subscription-cap fallback you believed was configured would simply not engage.
+  It is not silent in the logs (`apply_active` logs an error with a traceback),
+  and the `cc_roster` settings domain rejects such a write outright — the quiet
+  path is a hand-edited overlay.
 
-  `secrets.env.example` now documents both Z.AI keys and which endpoint each one
-  serves: a Coding Plan key (`ZAI_CODING_API_KEY`) is required for a roster peer
+  `secrets.env.example` now documents all three GLM key slots and which endpoint
+  each one serves: a Coding Plan key (`ZAI_CODING_API_KEY`) is required for a roster peer
   because Claude Code speaks the Anthropic protocol, while a general/prepaid key
   (`ZHIPU_API_KEY`) works only on `/api/paas/v4`. Using the general key on a coding
   endpoint returns `1113 Insufficient balance` even when the account is funded.
 
-  The `validated:` field is unchanged but now documented as advisory only — no code
-  reads it. Stale stamps were dropped rather than carried forward unverified.
+  The `validated:` field is unchanged but now documented as advisory only: it is
+  parsed into `RosterEntry.validated` and then acted on by nothing, so it gates
+  nothing. Stale stamps were dropped rather than carried forward unverified.
 
 ### Fixed
 

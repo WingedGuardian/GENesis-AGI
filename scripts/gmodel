@@ -37,7 +37,7 @@ if _VENV_PYTHON.is_file() and Path(sys.executable).resolve() != _VENV_PYTHON.res
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 # Load secrets.env into THIS process only so peer auth_env tokens (e.g.
-# ZHIPU_API_KEY) resolve for roster.overrides_for. The child's env is built
+# ZAI_CODING_API_KEY) resolve for roster.overrides_for. The child's env is built
 # explicitly below — we never blanket-forward every secret, and ANTHROPIC_API_KEY
 # is always dropped from the child.
 _SECRETS = _REPO_ROOT / "secrets.env"
@@ -61,9 +61,11 @@ def _list_models() -> int:
     models = r.get("models") or {}
     if not models:
         print(
-            "No roster models configured. Declare peers in "
-            "~/.genesis/config/cc_roster.local.yaml "
-            "(config/cc_roster.yaml ships none by design).",
+            "No roster models resolved — the base config ships `claude`, so "
+            "this means config/cc_roster.yaml failed to load, or a "
+            "non-mapping `models:` in ~/.genesis/config/cc_roster.local.yaml "
+            "REPLACED the shipped block instead of merging into it. "
+            "(Peers are declared in that overlay; the base ships no PEERS.)",
             file=sys.stderr,
         )
         return 1
