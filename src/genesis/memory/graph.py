@@ -145,8 +145,43 @@ def _bfs_with_strength(
         # the only one that must also PICK a type, so strongest-wins is a
         # deliberate choice, not an inherited convention. Revisit if polarity
         # types start appearing on multi-type pairs (0 of 139 today carry
-        # `contradicts` as their max-strength edge), since graph_expansion
-        # deliberately excludes those from LLM-visible context.
+        # `contradicts` as their max-strength edge). Note the consumers of THIS
+        # path (mcp/memory/core.py:431,:704) put link_type in front of the model
+        # and do NOT exclude `contradicts` — graph_expansion, which does exclude
+        # it, reaches the graph through memory_links_crud.neighbors_of and never
+        # calls this function. So demoting the type here is a small real
+        # improvement on the one path that surfaces it, not consistency with a
+        # subsystem that already filters it elsewhere.
+        #
+        # The comparison is on the (strength, link_type) TUPLE, not on strength
+        # alone, because strength alone leaves ties to row order: 106 of the 139
+        # live multi-type pairs carry EQUAL strengths (MEASURED 2026-09-02), and
+        # the loader's SELECT has no ORDER BY, so a strength-only max would keep
+        # reporting an arbitrary type for those — the same defect as the DiGraph
+        # collapse, just narrowed. The secondary key is a DETERMINISTIC tie-break,
+        # not a semantic ranking; it happens to demote `contradicts` (which sorts
+        # early), the safe direction. 0 of the 106 tied pairs carries one.
+        #
+        # This makes the choice WITHIN one (source, target) pair well-defined. It
+        # does NOT make the traversal's reported labels row-order independent, and
+        # nothing here claims that: the `visited` check below means a node
+        # reachable from several parents is claimed by whichever parent the queue
+        # reaches first, and queue order follows row order. MEASURED 2026-09-02 on
+        # the live graph: ~15.8% of reported labels flip under a reversed row
+        # order. Attribution at 500 roots traced every flip to multi-parent claim
+        # order and none to ties — but that zero is a SUBSAMPLE BOUND, not an
+        # absolute: at 3000 roots the tie-break itself removes 16 of 21,486 flips
+        # (~0.07%). Ties are a rounding error on this surface, not nil.
+        #
+        # Pre-existing (~15.8% before the multigraph change too) and tracked as
+        # follow-up ab0d0c28 rather than changed here, since best-parent-wins is a
+        # traversal-semantics change needing its own blast-radius measurement.
+        # "Reach-set-neutral (0 delta)" holds for THIS function's full output, but
+        # not for what the model sees: core.py:437,:709 slice nodes[:5] after a
+        # stable sort on (depth, -strength), so on 3.5% of roots a different SET
+        # of five memories reaches the context depending on row order. Same root
+        # cause, same follow-up — stated here so the bound is not read as wider
+        # than it is.
         best: dict[str, tuple[float, str]] = {}
         for _, neighbor, data in G.out_edges(node, data=True):
             if neighbor in visited:
@@ -160,7 +195,7 @@ def _bfs_with_strength(
                 continue
 
             current = best.get(neighbor)
-            if current is None or strength > current[0]:
+            if current is None or (strength, edge_type) > current:
                 best[neighbor] = (strength, edge_type)
 
         for neighbor, (strength, edge_type) in best.items():

@@ -65,7 +65,14 @@ class NxIncrementalEngine:
             for s, t, lt, st in conn.execute(
                 "SELECT source_id, target_id, link_type, strength FROM memory_links"
             ):
-                G.add_edge(s, t, link_type=lt, strength=st if st is not None else 0.0)
+                # Coalesce BOTH: production's `strength < min_strength` guard
+                # already rejects a None strength before selection, but the
+                # shared `_bfs_with_strength` now tie-breaks on the
+                # (strength, link_type) tuple, so a NULL link_type here would
+                # raise rather than sort. The production CHECK constraint makes
+                # that unreachable from a real snapshot; this keeps the engine
+                # honest against a hand-built one.
+                G.add_edge(s, t, link_type=lt or "", strength=st if st is not None else 0.0)
 
             mentions: dict[str, set[str]] = defaultdict(set)
             for mid, eid in conn.execute("SELECT memory_id, entity_id FROM entity_mentions"):
