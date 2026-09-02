@@ -371,6 +371,12 @@ def test_provider_toggle_invalidates_the_snapshot_cache():
         ):
             providers_route.provider_toggle("qdrant")
 
+    # A MagicMock absorbed the OLD `cb._state = ...` assignments and absorbs
+    # the NEW `cb.force_close()` with equal silence, so without this the route
+    # could be reverted to poking private fields and nothing here would fail.
+    cb.force_close.assert_called_once_with()
+    assert not cb.force_open.called, "re-enable branch must not force OPEN"
+
     assert inval.called, (
         "toggling a provider did not invalidate, so the Call Sites card and the "
         "attention strip keep the pre-toggle status"

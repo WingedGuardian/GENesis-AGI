@@ -237,7 +237,6 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._surplus_queue: object | None = None
         self._model_profile_registry: object | None = None
         self._contingency_dispatcher: object | None = None
-        self._prediction_logger: object | None = None
         self._identity_loader: object | None = None
         self._output_router: object | None = None
         self._task_executor: object | None = None
