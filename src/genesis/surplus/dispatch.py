@@ -431,34 +431,81 @@ async def dispatch_once(sched: DispatchContext) -> bool:
 
     executor = _select_executor(sched, task)
 
+    # Flag this dispatch as a heavy workload for the WHOLE dispatch body (execute
+    # + intake routing + completion) so the 900s zombie-scheduler watchdog FORGIVES
+    # a single long-running task (e.g. j9_eval_batch ~25 min) that would otherwise
+    # gap the dispatch-loop heartbeat and trigger a server restart. Closes the KNOWN
+    # GAP flagged at scheduler.py: the loop refreshes liveness only BETWEEN
+    # dispatches, never DURING one that itself blocks 15-30 min. Covers ALL long
+    # surplus executors (j9, model_eval, wing_audit, code_audit), not just the one
+    # that surfaced it. The runtime flag auto-expires after 2h (runtime/_core.py),
+    # so a genuinely HUNG task is still caught by the watchdog — forgives long, not
+    # dead. (Mirrors the dream jobs; direct-attr writes match dream.py.)
+    #
+    # CLAIM ONLY A FREE SLOT: the flag is a single process-wide slot the dream jobs
+    # also use. Overwriting it would clear a concurrent dream's protection when THIS
+    # (short) dispatch finishes, leaving the dream unprotected mid-cycle. So we set
+    # only when the slot is free, and clear only what WE set. Any truthy label
+    # already forgives the watchdog, so declining to claim still leaves us covered.
+    #
+    # NOTE: while set, this also defers the sentinel's restart remediation
+    # (sentinel/dispatcher.py Gate 2.5 reads heavy_workload). That now applies to
+    # every surplus dispatch, not just dream cycles — intended (a running dispatch
+    # is genuine work), low harm (the sentinel retries).
+    import contextlib
+    from datetime import UTC, datetime
+
+    from genesis.runtime import GenesisRuntime
+
+    _hw_label = f"surplus:{task.task_type}"
+    _hw_rt = None
+    _hw_did_set = False
+    with contextlib.suppress(Exception):
+        _rt = GenesisRuntime.instance()
+        if _rt._heavy_workload is None:  # free slot only — never stomp dream's flag
+            _rt._heavy_workload = _hw_label
+            _rt._heavy_workload_since = datetime.now(UTC)
+            _hw_rt, _hw_did_set = _rt, True
+
     try:
-        result = await executor.execute(task)
-    except Exception:
-        logger.exception("Surplus task %s failed with exception", task.id)
-        await _handle_failure(sched, task, "executor_exception", emit_event=True)
-        return False
+        try:
+            result = await executor.execute(task)
+        except Exception:
+            logger.exception("Surplus task %s failed with exception", task.id)
+            await _handle_failure(sched, task, "executor_exception", emit_event=True)
+            return False
 
-    if not result.success:
-        await _handle_failure(sched, task, result.error or "unknown", emit_event=False)
-        return False
+        if not result.success:
+            await _handle_failure(
+                sched, task, result.error or "unknown", emit_event=False
+            )
+            return False
 
-    # 6. Route through intake pipeline (atomize → score → route to knowledge)
-    staging_id, outcome_quality, judge_score, judge_detail = await _route_insights(
-        sched, task, result,
-    )
+        # 6. Route through intake pipeline (atomize → score → route to knowledge)
+        staging_id, outcome_quality, judge_score, judge_detail = await _route_insights(
+            sched, task, result,
+        )
 
-    await sched._queue.mark_completed(
-        task.id, staging_id=staging_id, outcome_quality=outcome_quality,
-        judge_score=judge_score, judge_detail=judge_detail,
-    )
+        await sched._queue.mark_completed(
+            task.id, staging_id=staging_id, outcome_quality=outcome_quality,
+            judge_score=judge_score, judge_detail=judge_detail,
+        )
 
-    await _chain_pipeline(sched, task, result)
-    await _bridge_code_audit_findings(task, result)
-    await _log_brainstorm(sched, task, result, staging_id)
-    await _signal_autonomy_success()
+        await _chain_pipeline(sched, task, result)
+        await _bridge_code_audit_findings(task, result)
+        await _log_brainstorm(sched, task, result, staging_id)
+        await _signal_autonomy_success()
 
-    logger.info("Surplus task %s completed (staging=%s)", task.id, staging_id)
-    return True
+        logger.info("Surplus task %s completed (staging=%s)", task.id, staging_id)
+        return True
+    finally:
+        # Clear only what WE claimed, and only if still ours (label-guarded) —
+        # brackets the WHOLE body so the heartbeat gap is covered end-to-end.
+        if _hw_did_set and _hw_rt is not None:
+            with contextlib.suppress(Exception):
+                if _hw_rt._heavy_workload == _hw_label:
+                    _hw_rt._heavy_workload = None
+                    _hw_rt._heavy_workload_since = None
 
 
 async def maybe_observe_failure(sched: DispatchContext, task, reason: str) -> None:

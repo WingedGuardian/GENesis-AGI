@@ -149,6 +149,124 @@ async def test_success_path_marks_completed_and_returns_true():
     ctx._event_bus.emit.assert_not_awaited()
 
 
+# ── dispatch_once: heavy_workload flag guards the zombie watchdog ────
+# A single long dispatch (e.g. j9_eval_batch ~25 min) must set the runtime
+# heavy_workload flag for the DURATION of executor.execute so the 900s
+# zombie-scheduler watchdog forgives it instead of restarting the server.
+
+async def test_heavy_workload_flag_set_during_execute_and_cleared_after(monkeypatch):
+    import genesis.runtime as runtime_mod
+
+    fake_rt = types.SimpleNamespace(_heavy_workload=None, _heavy_workload_since=None)
+    monkeypatch.setattr(
+        runtime_mod.GenesisRuntime, "instance", staticmethod(lambda: fake_rt)
+    )
+
+    task = _Task(TaskType.J9_EVAL_BATCH)
+    captured = {}
+
+    async def _capture_execute(t):
+        # Observe the flag AT execute time — this is the window the watchdog sees.
+        captured["hw"] = fake_rt._heavy_workload
+        captured["since"] = fake_rt._heavy_workload_since
+        return _Result(success=True)
+
+    ctx = _make_ctx(executor=types.SimpleNamespace(execute=_capture_execute))
+    ctx._queue.next_task = AsyncMock(return_value=task)
+
+    result = await dispatch.dispatch_once(ctx)
+
+    assert result is True
+    # DURING execute the flag was set to the task-type label (this is the fix).
+    assert captured["hw"] == f"surplus:{task.task_type}"
+    assert captured["since"] is not None
+    # AFTER the dispatch the flag is cleared (label-guarded) — no leak.
+    assert fake_rt._heavy_workload is None
+    assert fake_rt._heavy_workload_since is None
+
+
+async def test_heavy_workload_flag_cleared_even_when_executor_raises(monkeypatch):
+    import genesis.runtime as runtime_mod
+
+    fake_rt = types.SimpleNamespace(_heavy_workload=None, _heavy_workload_since=None)
+    monkeypatch.setattr(
+        runtime_mod.GenesisRuntime, "instance", staticmethod(lambda: fake_rt)
+    )
+
+    seen = {}
+
+    async def _boom(_t):
+        seen["hw"] = fake_rt._heavy_workload  # set before execute (the fix)
+        raise RuntimeError("hang→boom")
+
+    task = _Task(TaskType.J9_EVAL_BATCH)
+    ctx = _make_ctx(executor=types.SimpleNamespace(execute=_boom))
+    ctx._queue.next_task = AsyncMock(return_value=task)
+
+    result = await dispatch.dispatch_once(ctx)
+
+    assert result is False
+    # Flag was set BEFORE the executor ran (RED without the fix).
+    assert seen["hw"] == f"surplus:{task.task_type}"
+    # The finally clears it even on the exception path — no stuck heavy flag.
+    assert fake_rt._heavy_workload is None
+    assert fake_rt._heavy_workload_since is None
+
+
+async def test_heavy_workload_clear_does_not_stomp_another_jobs_flag(monkeypatch):
+    import genesis.runtime as runtime_mod
+
+    # A concurrent job (e.g. dream_cycle) owns the flag; our clear must not touch it
+    # if, mid-dispatch, the label no longer matches ours.
+    fake_rt = types.SimpleNamespace(_heavy_workload=None, _heavy_workload_since=None)
+    monkeypatch.setattr(
+        runtime_mod.GenesisRuntime, "instance", staticmethod(lambda: fake_rt)
+    )
+
+    async def _steal(_t):
+        # Simulate another job taking ownership during our execute.
+        fake_rt._heavy_workload = "dream_cycle"
+        return _Result(success=True)
+
+    ctx = _make_ctx(executor=types.SimpleNamespace(execute=_steal))
+    ctx._queue.next_task = AsyncMock(return_value=_Task(TaskType.J9_EVAL_BATCH))
+
+    await dispatch.dispatch_once(ctx)
+
+    # Label no longer ours → we must leave the other job's flag intact.
+    assert fake_rt._heavy_workload == "dream_cycle"
+
+
+async def test_heavy_workload_not_claimed_when_slot_already_held(monkeypatch):
+    # A concurrent dream job already owns the single-slot flag BEFORE this dispatch
+    # starts. We must NOT overwrite it (free-slot claim only) — otherwise our clear
+    # would leave the dream unprotected mid-cycle. (RED against an unconditional set.)
+    import genesis.runtime as runtime_mod
+
+    fake_rt = types.SimpleNamespace(
+        _heavy_workload="dream_cycle", _heavy_workload_since=datetime.now(UTC)
+    )
+    monkeypatch.setattr(
+        runtime_mod.GenesisRuntime, "instance", staticmethod(lambda: fake_rt)
+    )
+
+    captured = {}
+
+    async def _capture_execute(_t):
+        captured["hw"] = fake_rt._heavy_workload
+        return _Result(success=True)
+
+    ctx = _make_ctx(executor=types.SimpleNamespace(execute=_capture_execute))
+    ctx._queue.next_task = AsyncMock(return_value=_Task(TaskType.J9_EVAL_BATCH))
+
+    await dispatch.dispatch_once(ctx)
+
+    # Dream's flag untouched DURING our dispatch (we declined to claim)...
+    assert captured["hw"] == "dream_cycle"
+    # ...and NOT cleared afterward (we never owned it).
+    assert fake_rt._heavy_workload == "dream_cycle"
+
+
 # ── maybe_observe_failure: the 3-strike threshold ───────────────────
 
 async def test_maybe_observe_failure_upserts_at_threshold(monkeypatch):
