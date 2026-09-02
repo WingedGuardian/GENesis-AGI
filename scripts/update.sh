@@ -281,7 +281,10 @@ _sync_deploy_targets() {
         # into a function; test_update_host_sync.py guards the class.
         HOST_IP=$("$VENV_DIR/bin/python" -c "import yaml, pathlib; print(yaml.safe_load(pathlib.Path('$GUARDIAN_CONFIG').read_text()).get('host_ip', ''))" 2>/dev/null || true)
         HOST_USER=$("$VENV_DIR/bin/python" -c "import yaml, pathlib; print(yaml.safe_load(pathlib.Path('$GUARDIAN_CONFIG').read_text()).get('host_user', 'ubuntu'))" 2>/dev/null || echo "ubuntu")
-        SSH_KEY="$HOME/.ssh/genesis_guardian_ed25519"
+        # Honor the configured ssh_key (single-line parse per the note above; expand
+        # a leading ~), falling back to the historical default when absent/empty.
+        SSH_KEY=$("$VENV_DIR/bin/python" -c "import yaml, pathlib, os; print(os.path.expanduser(yaml.safe_load(pathlib.Path('$GUARDIAN_CONFIG').read_text()).get('ssh_key', '') or ''))" 2>/dev/null || true)
+        [ -n "$SSH_KEY" ] || SSH_KEY="$HOME/.ssh/genesis_guardian_ed25519"
 
         if [ -n "$HOST_IP" ] && [ -f "$SSH_KEY" ]; then
             # Check if Guardian-relevant paths changed in this update. Includes
@@ -727,7 +730,10 @@ _guardian_pause() {
     local hip hus key
     hip=$("$VENV_DIR/bin/python" -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_ip',''))" 2>/dev/null || true)
     hus=$("$VENV_DIR/bin/python" -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_user','ubuntu'))" 2>/dev/null || echo ubuntu)
-    key="$HOME/.ssh/genesis_guardian_ed25519"
+    # Honor the configured ssh_key (guardian_remote.yaml), expanding a leading ~,
+    # and fall back to the historical default when the field is absent/empty.
+    key=$("$VENV_DIR/bin/python" -c "import yaml,pathlib,os;k=yaml.safe_load(pathlib.Path('$cfg').read_text()).get('ssh_key','') or '';print(os.path.expanduser(k))" 2>/dev/null || true)
+    [ -n "$key" ] || key="$HOME/.ssh/genesis_guardian_ed25519"
     [ -n "$hip" ] && [ -f "$key" ] || return 0
     _GUARDIAN_HOST="${hus:-ubuntu}@${hip}"
     _GUARDIAN_KEY="$key"
@@ -750,9 +756,14 @@ _guardian_pause() {
 
 _guardian_resume() {
     [ "${_GUARDIAN_PAUSED:-}" = 1 ] || return 0
-    _GUARDIAN_PAUSED=""
-    timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
-        "$_GUARDIAN_HOST" resume >/dev/null 2>&1 || true
+    # Clear the flag ONLY after the gateway accepts `resume`. On a transient SSH
+    # failure the flag stays set so the EXIT-trap retries; if every retry fails the
+    # host-side TTL (expires_at) self-heals. Clearing first would no-op the retry.
+    if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+        "$_GUARDIAN_HOST" resume >/dev/null 2>&1; then
+        _GUARDIAN_PAUSED=""
+    fi
+    return 0
 }
 
 # ── Pre-update DB snapshot ────────────────────────────────
@@ -1347,6 +1358,11 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
         rm -f "$USER_MD_BAK"
         echo "  (restored live $USER_MD from pre-merge backup)"
     fi
+    # Resume the Guardian now the server is back up — BEFORE the multi-minute
+    # host-sync below — mirroring the success path (else this no-change path leaves
+    # it stood-down through the whole drift-heal, only resuming on EXIT). The
+    # EXIT-trap resume stays the backstop; idempotent (flag cleared on first resume).
+    _guardian_resume
     # Even with no repo delta, heal deploy-target drift (host/container CC + Node
     # pins): a pin bump pulled MANUALLY before this run, or an earlier failed
     # sync, must not leave drift in place just because the merge was a no-op.

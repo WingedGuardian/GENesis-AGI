@@ -89,13 +89,21 @@ def test_resume_is_flag_guarded(text: str) -> None:
 
 def test_ssh_calls_are_bounded_and_nonaborting(text: str) -> None:
     """BLOCKER-1: each SSH is bounded (timeout + ConnectTimeout) and cannot abort
-    the deploy — pause guards it with an `if`, resume with `|| true`. The actual
+    the deploy — both pause and resume guard the ssh with an `if`. The actual
     no-abort behaviour is proven functionally below."""
     for name in ("_guardian_pause", "_guardian_resume"):
         body = _extract_func(text, name)
         assert "ssh" in body, f"{name} must SSH the gateway"
         assert "timeout" in body and "ConnectTimeout" in body, f"{name} SSH must be bounded"
-    assert "|| true" in _extract_func(text, "_guardian_resume"), "resume SSH must swallow"
+    # resume swallows a failed SSH: the ssh sits in an `if` CONDITION (set -e-safe,
+    # so a non-zero exit can't abort) and the function returns 0 explicitly. The
+    # `if` is load-bearing beyond swallowing — it clears _GUARDIAN_PAUSED only on
+    # success, so a failed resume keeps the flag set for the EXIT-trap retry.
+    resume = _extract_func(text, "_guardian_resume")
+    assert re.search(r"if\s+timeout[^\n]*\bssh\b", resume), (
+        "resume SSH must be guarded by an `if` (set -e-safe, non-aborting)"
+    )
+    assert "return 0" in resume, "resume must `return 0` so a failed resume never aborts"
 
 
 def test_wire_contract_pause_int_in_gateway_range(text: str) -> None:
@@ -125,7 +133,11 @@ def _harness(text: str, tmp_path: Path, *, ssh_rc: int):
     (home / ".ssh" / "genesis_guardian_ed25519").write_text("")
     venv = tmp_path / "venv" / "bin"
     venv.mkdir(parents=True)
-    (venv / "python").write_text("#!/bin/bash\necho 1.2.3.4\n")  # any non-empty host
+    # Delegate to real python3 so it actually parses the yaml (host_ip=1.2.3.4,
+    # host_user=u, ssh_key ABSENT → '' → the helper falls back to the default key).
+    # A fixed `echo` stub would return that string for EVERY parse — including the
+    # ssh_key resolution — yielding a bogus key path that fails `[ -f "$key" ]`.
+    (venv / "python").write_text('#!/bin/bash\nexec python3 "$@"\n')
     (venv / "python").chmod(0o755)
     stub = tmp_path / "bin"
     stub.mkdir()
@@ -186,6 +198,21 @@ def test_resume_best_effort_on_ssh_failure(text: str, tmp_path: Path) -> None:
         '_GUARDIAN_PAUSED=1; _GUARDIAN_HOST="u@1.2.3.4"; _GUARDIAN_KEY="/x"\n_guardian_resume\n'
     )
     assert "REACHED_END" in out, "a failed resume SSH must NOT abort"
+
+
+def test_resume_keeps_flag_set_on_failure_clears_on_success(text: str, tmp_path: Path) -> None:
+    """P2 #3: the flag is cleared ONLY after the gateway accepts `resume`. A FAILED
+    resume keeps _GUARDIAN_PAUSED set so the EXIT-trap retries (else a transient SSH
+    failure leaves the host paused until its TTL); a SUCCESSFUL resume clears it."""
+    probe = (
+        '_GUARDIAN_PAUSED=1; _GUARDIAN_HOST="u@1.2.3.4"; _GUARDIAN_KEY="/x"\n'
+        "_guardian_resume\n"
+        '[ "${_GUARDIAN_PAUSED:-}" = 1 ] && echo FLAG_KEPT || echo FLAG_CLEARED\n'
+    )
+    run_fail, _ = _harness(text, tmp_path / "fail", ssh_rc=255)
+    assert "FLAG_KEPT" in run_fail(probe), "a FAILED resume must keep the flag for the EXIT retry"
+    run_ok, _ = _harness(text, tmp_path / "ok", ssh_rc=0)
+    assert "FLAG_CLEARED" in run_ok(probe), "a SUCCESSFUL resume must clear the flag (idempotent)"
 
 
 def test_resume_noops_when_not_paused(text: str, tmp_path: Path) -> None:
