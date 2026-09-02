@@ -597,6 +597,18 @@ def _load_round(cwd: str | None = None) -> dict:
         if p.exists():
             data = json.loads(p.read_text())
             if isinstance(data, dict):
+                # LEGACY discard: a counter written by the pre-source-axis (reviewer-
+                # agnostic) implementation has a `round` but no `last_source`. Its count
+                # is untrusted — under the old model the local streak only ever counted
+                # INTERNAL self-reviews, so a nonzero legacy count is exactly the
+                # internally-inflated streak this change exists to stop counting. On
+                # upgrade, preserving it would let the commit gate keep mode-switching /
+                # hard-blocking on rounds that were never cross-model. Treat it as no
+                # counter → the next EXTERNAL mark re-establishes a clean streak (and
+                # stamps last_source); an internal mark leaves it at 0. (Self-healing
+                # mechanism — obviates a one-time per-install data repair.)
+                if "round" in data and "last_source" not in data:
+                    return {}
                 if "round" in data:
                     data["round"] = _coerce_finite_int(data.get("round"))
                 return data

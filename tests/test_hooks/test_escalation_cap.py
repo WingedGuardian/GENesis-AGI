@@ -122,6 +122,24 @@ def test_reset_clears(repo, _isolate_rounds):
     assert review_state.get_review_round(cwd=str(repo)) == 0
 
 
+def test_legacy_counter_without_last_source_is_discarded(repo, _isolate_rounds):
+    # A round file written by the pre-source-axis (reviewer-agnostic) code has a `round`
+    # but NO `last_source`; under the old model that count was built entirely from INTERNAL
+    # self-reviews. On upgrade it must NOT be trusted (else the commit gate keeps blocking on
+    # a never-cross-model streak — the exact false block this change removes). It is discarded:
+    # get_review_round → 0, and the first EXTERNAL mark starts fresh at 1 (not legacy+1), now
+    # stamping last_source so it is trusted henceforth. Self-heals without a data repair.
+    branch = review_state.get_current_branch(cwd=str(repo))
+    rf = review_state._round_file(cwd=str(repo))
+    rf.parent.mkdir(parents=True, exist_ok=True)
+    rf.write_text(json.dumps({"branch": branch, "round": 2, "last_hash": "deadbeef"}))
+    assert review_state.get_review_round(cwd=str(repo)) == 0  # legacy discarded, not 2
+    _stage(repo, "legacy_fix = 1\n")
+    assert review_state.bump_review_round(cwd=str(repo), source="external") == 1  # fresh, not 3
+    st = json.loads(rf.read_text())
+    assert st["last_source"] == "external" and st["round"] == 1
+
+
 # ── Defect-bearing streak + reset-on-clean (option (e), round-4 fix) ───────
 
 
@@ -512,21 +530,30 @@ def test_coerce_finite_int_rejects_non_finite():
 
 
 def test_load_round_coerces_non_finite_round_to_zero(repo, _isolate_rounds):
-    # A well-formed dict whose 'round' is a non-finite JSON number (1e999 → inf)
-    # must be coerced to 0 at the load boundary — int(inf) OverflowError escapes the
-    # plain int() guards and would crash the gate. Both the load boundary and
-    # get_review_round must fail open to 0.
+    # A well-formed CURRENT-era dict (has last_source) whose 'round' is a non-finite JSON
+    # number (1e999 → inf) must be coerced to 0 at the load boundary — int(inf) OverflowError
+    # escapes the plain int() guards and would crash the gate. Both the load boundary and
+    # get_review_round must fail open to 0. (last_source present so this exercises coercion,
+    # not the separate legacy-discard path for pre-source-axis files.)
     branch = review_state.get_current_branch(cwd=str(repo))
-    _write_round_file(repo, '{"branch": "' + branch + '", "round": 1e999, "last_hash": "x"}')
+    _write_round_file(
+        repo,
+        '{"branch": "' + branch + '", "round": 1e999, "last_hash": "x", "last_source": "external"}',
+    )
     assert review_state._load_round(cwd=str(repo))["round"] == 0
     assert review_state.get_review_round(cwd=str(repo)) == 0
 
 
 def test_bump_no_crash_on_infinity_round(repo, _isolate_rounds):
-    # A defect-bearing bump over an infinity 'round' must not raise; it coerces the
-    # bad value to 0 and increments to 1.
+    # A defect-bearing bump over an infinity 'round' (in a current-era file with last_source)
+    # must not raise; it coerces the bad value to 0 and increments to 1.
     branch = review_state.get_current_branch(cwd=str(repo))
-    _write_round_file(repo, '{"branch": "' + branch + '", "round": 1e999, "last_hash": "old"}')
+    _write_round_file(
+        repo,
+        '{"branch": "'
+        + branch
+        + '", "round": 1e999, "last_hash": "old", "last_source": "external"}',
+    )
     _stage(repo, "a = 2\n")
     assert review_state.bump_review_round(cwd=str(repo), source="external") == 1
 

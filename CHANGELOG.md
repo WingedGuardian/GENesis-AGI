@@ -723,7 +723,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   remedy the gate demanded. Supersedes the earlier required-outcome fix (feea3f71 /
   #1446), whose bare-mark refusal only ever bit internal re-audits; that fix's still-useful
   parts (the outcome requirement for external marks, and the class-sweep reminder that now
-  fires on the second external round) are folded in here.
+  fires on the second external round) are folded in here. On upgrade, a pre-existing round
+  counter written by the old reviewer-agnostic code (no `last_source`) is treated as legacy
+  and discarded — its count was built entirely from internal self-reviews, so preserving it
+  would keep false-blocking; the streak self-heals on the next cross-model mark (no per-install
+  data repair needed).
 - **Contributor-issue privacy scan no longer over-blocks legitimate Markdown.**
   The `scan_prose` secret-scan floor ran `detect-secrets scan --string <line>` per
   line; argparse then misread any line whose content starts with `-` (a Markdown
