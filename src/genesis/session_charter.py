@@ -31,7 +31,16 @@ SESSIONS_DIR = Path.home() / ".genesis" / "sessions"
 # (subsystem_traps_hook.py) rather than a strict UUID: measured ids on live
 # installs are not all hex-UUIDs (a `wt-` prefixed form exists), and this still
 # rejects `/`, `\`, `..`, NUL and the empty string.
-_SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+#
+# `\A…\Z` and 255, character-for-character identical to
+# scripts/hooks/hook_input.py:_SESSION_ID_RE — this is the src/ chokepoint for
+# the same rule, and callers in src/ import it from here rather than keeping a
+# fourth copy. Both halves of that sentence were wrong before and were caught
+# by review: `^…$` accepts a TRAILING NEWLINE in Python (`'abc\n'` matched),
+# which would have created a session directory whose name ends in a newline,
+# and the 128 cap rejected ids the upstream guard admits. A regex copied "to
+# mirror" a sibling must be diffed against it, not eyeballed.
+_SAFE_SESSION_ID = re.compile(r"\A[A-Za-z0-9_-]{1,255}\Z")
 
 _STATUS_MARKS = {
     "open": " ",

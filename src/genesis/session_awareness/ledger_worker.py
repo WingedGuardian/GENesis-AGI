@@ -48,6 +48,7 @@ from genesis.session_awareness.ledger_extractor import (
 )
 from genesis.session_awareness.ledger_shadow_config import effective_mode
 from genesis.session_awareness.transcript import parse_delta
+from genesis.session_charter import _SAFE_SESSION_ID as _SESSION_ID_RE
 
 # The spawner captures this process's stderr to the worker error log, so a
 # warning here is durable rather than discarded.
@@ -55,6 +56,17 @@ logger = logging.getLogger(__name__)
 
 CURSOR_FILENAME = "ledger_shadow_cursor.json"
 LOCK_FILENAME = "ledger_shadow.lock"
+
+# The session id becomes ONE filesystem path component under
+# ``~/.genesis/sessions/`` (cursor + lock live there). A traversal or
+# absolute-path value would place worker state outside the sessions root, so
+# an unsafe id skips the run entirely (fail toward doing nothing, never toward
+# writing elsewhere).
+#
+# IMPORTED, not re-declared (see the import block): a local copy here
+# diverged from the sibling it claimed to mirror the first time it was
+# written. session_charter owns the src/ definition, next to the
+# session_dir() chokepoint that consumes it.
 
 # Defensive ceiling on a single delta read: parse_delta streams line-by-line
 # so memory stays flat, but an unbounded window on a monster transcript is
@@ -66,8 +78,10 @@ MAX_WINDOW_BYTES = 64 * 1024 * 1024
 def _sessions_root() -> Path:
     """Where per-session state lives.
 
-    Defers to the canonical constant rather than recomputing the path. Three
-    spellings of this directory existed across the subsystem; two of them being
+    Defers to the canonical constant rather than recomputing the path. FOUR
+    spellings of this directory existed across the subsystem — the fourth,
+    ``scripts/genesis_precompact.py:_SESSIONS_DIR``, is genuinely
+    un-shareable, since scripts/ must not import from src/. Two of them being
     equal today is not a guarantee, and the mirror write below depends on the
     two agreeing.
     """
@@ -139,7 +153,7 @@ async def _record_telemetry(db_path: Path | str, status: str, detail: str) -> bo
 # DISPATCHED CC session, and the shadow report's leak invariant keys on this
 # value to assert the extractor has written nothing live. One shared value would
 # make that check unable to tell the two apart on the day it starts mattering.
-# Mirrored by a schema CHECK (migration 0087).
+# Mirrored by a schema CHECK (migration 0090).
 PROMOTION_ADDED_BY = "ambient_ledger_extractor"
 
 # INTERIM cap on rows promoted per run. Explicitly temporary: it is a guard held
@@ -151,65 +165,110 @@ PROMOTION_ADDED_BY = "ambient_ledger_extractor"
 PROMOTION_CAP = 5
 
 
-def _qualifies_for_promotion(ev: dict) -> bool:
-    """Conservative first cut: only unambiguous, quote-backed, novel agreements.
+# The retryable-promotion sweep. Qualification lives in SQL, not in the
+# in-memory events of one run, so a proposal whose promotion FAILED (locked
+# db, bad row, crash) is simply still here next run — the cursor never has to
+# move backwards.
+#
+# WHERE CORRECTNESS ACTUALLY LIVES. Every clause below is an EFFICIENCY
+# filter — it skips work already known to be pointless. The guarantee that an
+# agreement is never promoted twice is the novelty recheck inside the write
+# transaction (see _promote_live), and only that. This split is deliberate and
+# measured: mutation-testing removed `promoted_item_id IS NULL` on its own and
+# the idempotency test stayed green, because the recheck caught it. Do not
+# re-read these filters as safety properties; adding one that is wrong
+# SUPPRESSES agreements silently, which is the failure mode below.
+#
+# The qualifying bar is a conservative first cut — only unambiguous,
+# quote-backed, novel agreements. A false ledger row costs attention in EVERY
+# later window, so this starts tight and loosens on evidence:
+#   - kind='agreement': a pivot is a change of direction, not a commitment,
+#     and reads badly as a checkbox.
+#   - quote_verified: the extractor found the words in the transcript, so the
+#     row is not a paraphrase of something never said.
+#   - match_kind='none': not already a live ledger row at observation time.
+#
+# `duplicate_of IS NULL` is deliberately ABSENT, and its absence is a fix.
+# match_proposals builds its dedup pool from ALL prior events of the session,
+# unfiltered by mode or prompt generation. So a re-proposal links to a root
+# that the mode/version clauses below then exclude — and the agreement is
+# suppressed FOREVER, with no log line and no counter. Letting the chain
+# through instead costs one extra recheck per duplicate, which permanently
+# marks it. MEASURED on the live corpus: 3/550 events (0.5%) carry a
+# duplicate_of, and chain nesting is 0 — so the cost is negligible and the
+# suppression it removes is total. The recheck uses the SAME matcher and
+# threshold (best_match, >=0.85) as the deduper, against the promoted ledger
+# row, so anything duplicate_of would have caught it catches too.
+#
+# Three deliberate scope guards:
+#   - e.mode = 'live': promote only what was proposed UNDER the live promise.
+#     Without it, flipping the two keys does not start promoting from now on —
+#     it drains the entire backlog gathered while the config promised the live
+#     ledger is never written (MEASURED: 550/550 stored events are
+#     mode='shadow'). The two-key gate proves CURRENT intent; applying it
+#     backwards is more write authority than the operator asked for. A failed
+#     promotion's own event was recorded mode='live', so retry is unaffected.
+#   - r.prompt_version = current: a prompt-generation bump must not promote a
+#     backlog the old prompt produced (the v1 corpus was adjudicated at 43%
+#     wanted and is exactly what this excludes).
+#   - r.trigger != 'backfill': backfill replays historical windows; those
+#     agreements belong to sessions that have already ended.
+#
+# ORDER BY carries an id tiebreaker because one run stamps a single
+# observed_at across its whole batch — without it, which candidates the cap
+# takes is implementation-defined and a bug report cannot be reproduced.
+_PROMOTION_SWEEP_SQL = """
+    SELECT e.* FROM session_ledger_shadow_events e
+    JOIN session_ledger_shadow_runs r ON r.run_id = e.run_id
+    WHERE e.session_id = ?
+      AND e.kind = 'agreement'
+      AND e.quote_verified = 1
+      AND e.match_kind = 'none'
+      AND e.promoted_item_id IS NULL
+      AND e.mode = 'live'
+      AND r.trigger != 'backfill'
+      AND r.prompt_version = ?
+    ORDER BY e.observed_at, e.id
+"""
 
-    A false ledger row costs attention in EVERY later window, so this starts
-    tight and loosens on evidence rather than the reverse.
 
-    - ``kind == "agreement"`` — a pivot is a change of direction, not a
-      commitment, and reads badly as a checkbox.
-    - ``quote_verified`` — the extractor found the words in the transcript, so
-      the row is not a paraphrase of something never said.
-    - ``match_kind == "none"`` — it does not already correspond to a live
-      ledger row; promoting a match would duplicate what a human already wrote.
-    - ``duplicate_of is None`` — not a re-proposal of an earlier window's row.
-      This is also why promotion must run AFTER duplicate marking: the shadow
-      store's re-cover guarantee is a SHADOW guarantee, and without this gate a
-      run that failed mid-write would duplicate rows when the window is
-      re-covered.
-    """
-    return (
-        ev.get("kind") == "agreement"
-        and bool(ev.get("quote_verified"))
-        and ev.get("match_kind", "none") == "none"
-        and ev.get("duplicate_of") is None
-    )
+async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -> dict:
+    """Promote qualifying shadow proposals into the REAL ledger. Live mode only.
 
+    Reads its candidates from the shadow store (``_PROMOTION_SWEEP_SQL``), not
+    from the calling run's in-memory events — the shadow row IS the retryable
+    promotion state, so a failure here costs nothing but time: the event stays
+    unpromoted and the next live run sweeps it again. The cursor is therefore
+    never coupled to promotion outcome.
 
-async def _promote_live(
-    db_path: Path | str, session_id: str, events: list[dict], *, trigger: str
-) -> dict:
-    """Write qualifying proposals into the REAL ledger. Live mode only.
+    Per candidate, novelty is re-checked INSIDE the write transaction
+    (``BEGIN IMMEDIATE`` holds the WAL write lock across recheck + insert), so
+    a foreground ``session_ledger_add`` landing between observation-time
+    matching and promotion cannot produce a duplicate: the recheck sees it,
+    writes the discovered match back onto the event (which permanently
+    disqualifies it — ``match_kind`` leaves ``'none'``), and skips.
 
-    Returns a summary for the run detail line. Best-effort per row: one bad row
-    must not cost the rest, and none of it may cost the shadow record that has
-    already been written.
+    Crash windows are self-healing by the same mechanism: a ledger row
+    committed whose event update was lost is re-found by the next sweep's
+    recheck as an exact match of its own text and marked, never re-inserted.
+
+    Best-effort per row: one bad row must not cost the rest, and none of it
+    may cost the shadow record that has already been written.
     """
     if trigger == "backfill":
-        # --backfill replays historical windows and never advances the cursor.
-        # Promoting there would inject hundreds of months-old agreements into
-        # sessions that have long since ended.
+        # Belt to the sweep's braces: never even open a connection.
         return {"promoted": 0, "skipped_backfill": True}
-
-    qualifying = [ev for ev in events if _qualifies_for_promotion(ev)]
-    promoted_rows, dropped = qualifying[:PROMOTION_CAP], qualifying[PROMOTION_CAP:]
-    if dropped:
-        logger.warning(
-            "ledger promotion cap: promoted %d of %d qualifying proposals for %s, "
-            "dropped %d (cap=%d)",
-            len(promoted_rows), len(qualifying), session_id, len(dropped), PROMOTION_CAP,
-        )
-
-    if not promoted_rows:
-        return {"promoted": 0, "qualifying": len(qualifying), "dropped_by_cap": len(dropped)}
 
     import aiosqlite
 
     from genesis.db.crud import session_charters as crud
+    from genesis.session_awareness.ledger_extractor import best_match
     from genesis.session_charter import refresh_mirror
 
     written = 0
+    disqualified = 0
+    failed = 0
+    n_qualifying = 0
     try:
         async with aiosqlite.connect(str(db_path), timeout=10) as db:
             # Row factory is REQUIRED, not tidiness: `crud.get` builds
@@ -220,9 +279,49 @@ async def _promote_live(
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA busy_timeout=5000")
             await crud.upsert_stub(db, session_id)
-            for ev in promoted_rows:
+
+            cursor = await db.execute(_PROMOTION_SWEEP_SQL, (session_id, PROMPT_VERSION))
+            qualifying = [dict(r) for r in await cursor.fetchall()]
+            n_qualifying = len(qualifying)
+            candidates, dropped = qualifying[:PROMOTION_CAP], qualifying[PROMOTION_CAP:]
+            if dropped:
+                # Not lost — still unpromoted, swept again next run. Logged so
+                # a cap that keeps biting is visible, never silent.
+                logger.warning(
+                    "ledger promotion cap: taking %d of %d qualifying proposals "
+                    "for %s this run, %d deferred to the next sweep (cap=%d)",
+                    len(candidates), n_qualifying, session_id, len(dropped), PROMOTION_CAP,
+                )
+
+            for ev in candidates:
                 try:
-                    await crud.ledger_add(
+                    # Hold the write lock across recheck + insert: in WAL mode
+                    # a DEFERRED read snapshot could miss a foreground row
+                    # committed after it, and that stale novelty answer is the
+                    # TOCTOU this transaction exists to close.
+                    await db.execute("BEGIN IMMEDIATE")
+                    cur = await db.execute(
+                        "SELECT id, text FROM session_ledger WHERE session_id = ?",
+                        (session_id,),
+                    )
+                    rows = await cur.fetchall()
+                    kind, matched_id, score = best_match(
+                        ev.get("text") or "", [(r["id"], r["text"]) for r in rows]
+                    )
+                    if kind != "none":
+                        # Late match — a human (or an earlier crashed attempt)
+                        # already wrote this. Record the truth on the event;
+                        # that disqualifies it from every future sweep.
+                        await db.execute(
+                            "UPDATE session_ledger_shadow_events "
+                            "SET match_kind = ?, matched_item_id = ?, match_score = ? "
+                            "WHERE id = ?",
+                            (kind, matched_id, score, ev["id"]),
+                        )
+                        await db.commit()
+                        disqualified += 1
+                        continue
+                    item_id = await crud.ledger_add(
                         db,
                         session_id=session_id,
                         text=ev.get("text") or "",
@@ -236,12 +335,27 @@ async def _promote_live(
                         # source text.
                         evidence=ev.get("quote_preview"),
                     )
+                    # ledger_add commits (closing the IMMEDIATE transaction).
+                    # If we die between that commit and this update, the next
+                    # sweep's recheck finds the row as an exact match of its
+                    # own text and disqualifies the event — no duplicate.
+                    await db.execute(
+                        "UPDATE session_ledger_shadow_events "
+                        "SET promoted_item_id = ? WHERE id = ?",
+                        (item_id, ev["id"]),
+                    )
+                    await db.commit()
                     written += 1
                 except Exception:
+                    failed += 1
                     logger.warning(
                         "ledger promotion failed for one proposal in %s",
                         session_id, exc_info=True,
                     )
+                    try:
+                        await db.rollback()
+                    except Exception:
+                        logger.warning("promotion rollback failed", exc_info=True)
             # The mirror is what the NEXT window reads. A promoted row that
             # never reaches charter.md is invisible where it was meant to help,
             # so this is part of the write, not a nicety.
@@ -249,14 +363,22 @@ async def _promote_live(
             # constant inside refresh_mirror makes the destination
             # unredirectable, and a test that cannot redirect it writes into
             # the operator's real ~/.genesis/sessions.
-            await refresh_mirror(db, session_id, _sessions_root())
+            # Only when something actually changed: refreshing on every
+            # compaction rewrites charter.md for nothing and widens the window
+            # in which this write can interleave with the PreCompact hook's own.
+            if written:
+                await refresh_mirror(db, session_id, _sessions_root())
     except Exception:
-        logger.warning("ledger promotion could not open the db", exc_info=True)
+        # Deliberately vague: this wraps the connect AND the whole sweep, so
+        # naming one cause would mislead on most of its surface. exc_info
+        # carries the specific failure.
+        logger.warning("ledger promotion sweep aborted", exc_info=True)
 
     return {
         "promoted": written,
-        "qualifying": len(qualifying),
-        "dropped_by_cap": len(dropped),
+        "qualifying": n_qualifying,
+        "disqualified_at_write": disqualified,
+        "failed_rows": failed,
     }
 
 
@@ -294,10 +416,22 @@ async def _load_match_context(
     direction this must never take, and the caller cannot distinguish "read
     fine, nothing matched" from "read failed" unless it is told.
 
-    Reachable: this read uses timeout=5 while the write path uses timeout=10
-    with busy_timeout=5000, so any 5-10s write lock (a migration's
-    BEGIN IMMEDIATE, a large consolidation write, a WAL checkpoint) fails the
-    gate and passes the write.
+    Reachable, but NOT for the reason an earlier version of this docstring
+    gave. It claimed a timeout asymmetry — read at 5s, write at 10s — so a
+    5-10s lock would fail the gate and pass the write. That is false, and was
+    caught in review: the write path issues ``PRAGMA busy_timeout=5000``
+    AFTER ``connect(timeout=10)``, and the PRAGMA wins. MEASURED: both paths
+    report an effective busy_timeout of 5000 ms.
+
+    The real reachability is plainer and does not depend on any number. This
+    read happens up to EXTRACTOR_TIMEOUT_S before the write, on the far side
+    of a Haiku call, so the two connections meet different database states;
+    and it can fail outright for reasons the write path does not share — the
+    shadow tables not existing yet in the pre-migration window, a ``mode=ro``
+    handle unable to recover a hot WAL, or any I/O error. Frequency is not the
+    argument. The argument is the fail DIRECTION: a best-effort read feeding a
+    write-authority decision must fail closed on its own terms, whatever makes
+    it fail.
     """
     import aiosqlite
 
@@ -357,6 +491,9 @@ async def _run(
         # the feature not existing (the hook-side kill switch is the
         # cheaper lever; this one catches settings flips).
         return {"status": "skipped_off"}
+    if not _SESSION_ID_RE.match(session_id):
+        logger.warning("unsafe session id %r — skipping run", session_id)
+        return {"status": "skipped_bad_session_id"}
 
     session_dir = _sessions_root() / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -519,6 +656,22 @@ async def _run_locked(
     for ev in events:
         ev["observed_at"] = observed_at
 
+    # Decide the promotion disposition BEFORE the run row is written.
+    # `_base_row` renders detail_notes at CALL time, so anything appended after
+    # this point never reaches session_ledger_shadow_runs.detail — the note is
+    # written to a string that was already joined. That bug shipped twice here
+    # (this branch's promotion note, and the pre-existing cursor-preserved
+    # note below), which is why the ordering is now explicit rather than
+    # incidental.
+    promote_now = mode == "live"
+    if promote_now and not match_read_ok:
+        # Both novelty signals came from a read that failed, so everything
+        # looks promotable. Skip rather than write on evidence that does not
+        # exist; the shadow rows stay unpromoted and the next live run's sweep
+        # retries them at no cost.
+        detail_notes.append("promotion_skipped_match_context_unreadable")
+        promote_now = False
+
     recorded = await _record_run(
         db_path,
         **_base_row(
@@ -532,37 +685,57 @@ async def _run_locked(
     if recorded:
         _advance_cursor(session_dir, end_byte, cursor)
     else:
+        # The run row is already written, so this note cannot reach it — carry
+        # the fact on the returned outcome and the telemetry line instead.
         detail_notes.append("shadow_write_failed_cursor_preserved")
 
     # Promotion runs only AFTER the shadow row is safely written: the shadow
     # store is the audit trail for what the extractor proposed, and it must
     # exist even if the live write then fails. It also has to run after the
     # duplicate marking that match_proposals stamped onto these events, which
-    # is what makes a re-covered window idempotent.
-    promotion = {"promoted": 0}
-    if recorded and mode == "live":
-        if not match_read_ok:
-            # Both novelty signals came from a read that failed, so everything
-            # looks promotable. Skip rather than write on evidence that does not
-            # exist; the shadow row is recorded either way.
-            detail_notes.append("promotion_skipped_match_context_unreadable")
-            promotion = {"promoted": 0, "skipped_unreadable_context": True}
+    # is what makes a re-covered window idempotent. The sweep reads candidates
+    # back from the shadow store (this run's rows included, plus any earlier
+    # unpromoted leftovers), so promotion failure never needs the cursor to
+    # move backwards — the shadow row IS the retry state.
+    promotion: dict = {"promoted": 0}
+    if recorded and promote_now:
+        # Re-read the gate immediately before the only write. The mode read at
+        # entry is up to EXTRACTOR_TIMEOUT_S (120s) old by now, and the
+        # documented emergency rollback is `mode: shadow` — an operator doing
+        # that mid-run should not still get this run's promotions. Free, and
+        # fails in the safe direction.
+        if effective_mode() != "live":
+            detail_notes.append("promotion_skipped_mode_changed_midrun")
         else:
-            promotion = await _promote_live(
-                db_path, session_id, events, trigger=trigger
-            )
+            promotion = await _promote_live(db_path, session_id, trigger=trigger)
+    elif recorded and mode == "live" and not match_read_ok:
+        promotion = {"promoted": 0, "skipped_unreadable_context": True}
 
+    # Every counter reaches a surface an operator reads. A sweep where all
+    # candidates raised, and one where nothing qualified, both used to record
+    # `promoted=0` — byte-identical, with the only signal in a stderr log
+    # nobody tails. A silent write failure reads downstream as "the extractor
+    # found nothing", which is the exact misreading this whole subsystem's
+    # cap-logging convention exists to prevent.
     await _record_telemetry(
         db_path,
         "ok" if recorded else "failed",
         f"turns={len(included)}|proposals={len(events)}|recorded={recorded}"
-        f"|promoted={promotion.get('promoted', 0)}",
+        f"|qualifying={promotion.get('qualifying', 0)}"
+        f"|promoted={promotion.get('promoted', 0)}"
+        f"|disqualified={promotion.get('disqualified_at_write', 0)}"
+        f"|promotion_failed={promotion.get('failed_rows', 0)}"
+        + (f"|{'; '.join(detail_notes)}" if detail_notes else ""),
     )
     return {
         "status": "ok" if recorded else "failed",
         "n_proposals": len(events),
         "recorded": recorded,
         "promoted": promotion.get("promoted", 0),
+        "qualifying": promotion.get("qualifying", 0),
+        "disqualified_at_write": promotion.get("disqualified_at_write", 0),
+        "promotion_failed_rows": promotion.get("failed_rows", 0),
+        "notes": list(detail_notes),
     }
 
 
@@ -618,6 +791,10 @@ async def _run_backfill(
         return {"status": "skipped_disabled"}
     if effective_mode() == "off":
         return {"status": "skipped_off"}
+
+    if not _SESSION_ID_RE.match(session_id):
+        logger.warning("unsafe session id %r — skipping backfill", session_id)
+        return {"status": "skipped_bad_session_id"}
 
     transcript = Path(transcript_path)
     try:

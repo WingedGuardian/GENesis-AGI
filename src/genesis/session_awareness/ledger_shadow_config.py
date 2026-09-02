@@ -9,7 +9,10 @@ PR-3, ws3_immunity lineage):
   No boot cache — a ``settings_update`` or hand edit takes effect on the
   next PreCompact-spawned worker instantly (each run is a fresh process
   anyway). ``live`` promotes qualifying proposals into the real ledger;
-  it was reserved until the write path existed, and now it does.
+  it was reserved until the write path existed, and now it does. Because
+  old releases accepted (and coerced) ``live``, honoring it additionally
+  requires the renewed opt-in ``live_opt_in: true`` — a key no legacy
+  overlay can carry.
 
 Failure posture: a missing/corrupt config degrades to DEFAULTS (enabled,
 shadow) — shadow writes nothing user-visible, so config damage costs at
@@ -45,6 +48,11 @@ _CONFIG_NAME = "session_ledger_shadow.yaml"
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "mode": "shadow",
+    # Renewed opt-in for live writes. `mode: live` was accepted (and coerced)
+    # by releases that predate the write path, so the value alone cannot prove
+    # current intent — this key did not exist back then, so no legacy overlay
+    # can carry it.
+    "live_opt_in": False,
 }
 
 
@@ -80,19 +88,41 @@ def effective_mode() -> str:
 
     Read live, per call. Master ``enabled: false`` → ``off``.
 
-    An invalid value degrades to ``shadow``, never to ``live``: the failure
-    direction must be toward LESS write authority, so a typo or a corrupt
+    Every branch here fails toward LESS write authority — a typo or a corrupt
     config can only ever cost one Haiku call per compaction, never a live
-    ledger write.
+    ledger write:
+
+    - ``enabled`` must be the boolean ``True``. Any other value — including
+      the YAML *string* ``"false"``, which is truthy in Python — disables.
+    - ``mode: live`` alone grants nothing. Releases before the write path
+      existed accepted and persisted ``live`` while documenting it as
+      reserved, so an overlay written back then must not begin autonomous
+      ledger writes on upgrade. Live additionally requires the renewed
+      opt-in ``live_opt_in: true`` (see DEFAULTS).
+    - An invalid mode degrades to ``shadow`` (observable, never a silent
+      off, never live).
     """
     cfg = load_config()
-    if not cfg.get("enabled", True):
+    enabled = cfg.get("enabled", True)
+    if enabled is not True:
+        if enabled is not False:
+            logger.warning(
+                "session_ledger_shadow has non-boolean enabled %r — treating as off",
+                enabled,
+            )
         return "off"
     mode = cfg.get("mode")
     if mode is False:
         # A hand-edited unquoted `mode: off` parses as YAML-1.1 boolean
         # False. That intent is unambiguous — honor it.
         return "off"
+    if mode == "live" and cfg.get("live_opt_in") is not True:
+        logger.warning(
+            "session_ledger_shadow mode 'live' without live_opt_in: true — "
+            "coercing to shadow. A legacy overlay predating the write path "
+            "must not go live on upgrade; set BOTH keys to enable live writes."
+        )
+        return "shadow"
     if mode not in MODES:
         logger.warning("session_ledger_shadow has invalid mode %r — degrading to shadow", mode)
         return "shadow"

@@ -31,7 +31,26 @@ import aiosqlite
 _NEW_VALUE = "ambient_ledger_extractor"
 
 
+async def _add_promoted_item_id(db: aiosqlite.Connection) -> None:
+    """Additive: promotion state on shadow events (retryable-promotion sweep).
+
+    ``promoted_item_id`` is the ``session_ledger`` row a proposal became in
+    live mode; NULL means unpromoted and therefore still retryable. Guarded on
+    the column's own presence — pragma, not a version flag — so a partial
+    prior attempt cannot make this silently skip.
+    """
+    cursor = await db.execute("PRAGMA table_info(session_ledger_shadow_events)")
+    cols = {row[1] for row in await cursor.fetchall()}
+    if not cols:
+        return  # table absent: fresh install creates it from _tables.py
+    if "promoted_item_id" in cols:
+        return
+    await db.execute("ALTER TABLE session_ledger_shadow_events ADD COLUMN promoted_item_id TEXT")
+
+
 async def up(db: aiosqlite.Connection) -> None:
+    await _add_promoted_item_id(db)
+
     cursor = await db.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='session_ledger'"
     )

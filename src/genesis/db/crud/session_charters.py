@@ -27,7 +27,7 @@ VALID_LEDGER_STATUSES = frozenset({"open", "in_progress", "done", "absorbed", "d
 # session from the outside. They must stay distinct: the shadow report's leak
 # invariant keys on the extractor value to assert it has written nothing live,
 # and a shared value would make that check unable to tell them apart on the
-# very day it starts mattering. Mirrored by a schema CHECK (migration 0087).
+# very day it starts mattering. Mirrored by a schema CHECK (migration 0090).
 VALID_ADDED_BY = frozenset(
     {"foreground", "ambient", "pulse", "ambient_ledger_extractor"}
 )

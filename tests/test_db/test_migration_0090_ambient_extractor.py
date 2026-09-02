@@ -1,4 +1,4 @@
-"""Migration 0087 — widen session_ledger.added_by for the ambient extractor.
+"""Migration 0090 — widen session_ledger.added_by for the ambient extractor.
 
 Covers the rebuild itself (rows, constraint, indexes, idempotency) and, more
 importantly, the DRIFT that made this migration necessary in the first place.
@@ -21,11 +21,11 @@ import pytest
 from genesis.db.crud.session_charters import VALID_ADDED_BY
 from genesis.db.schema._tables import TABLES
 
-M87 = importlib.import_module("genesis.db.migrations.0087_session_ledger_ambient_extractor")
+M90 = importlib.import_module("genesis.db.migrations.0090_session_ledger_ambient_extractor")
 
 EXTRACTOR = "ambient_ledger_extractor"
 
-# The pre-0087 table, verbatim, so the migration is exercised against the shape
+# The pre-0090 table, verbatim, so the migration is exercised against the shape
 # it will actually meet on a real install rather than against its own output.
 _OLD_DDL = """
     CREATE TABLE session_ledger (
@@ -85,7 +85,7 @@ class TestTheRebuild:
     async def test_widens_the_constraint(self, db):
         await _seed_old(db)
         assert EXTRACTOR not in await _ddl(db)
-        await M87.up(db)
+        await M90.up(db)
         assert EXTRACTOR in await _ddl(db)
 
     @pytest.mark.asyncio
@@ -95,7 +95,7 @@ class TestTheRebuild:
         cur = await db.execute("SELECT * FROM session_ledger ORDER BY id")
         before = [tuple(r) for r in await cur.fetchall()]
 
-        await M87.up(db)
+        await M90.up(db)
 
         cur = await db.execute("SELECT * FROM session_ledger ORDER BY id")
         after = [tuple(r) for r in await cur.fetchall()]
@@ -105,7 +105,7 @@ class TestTheRebuild:
     async def test_restores_the_index(self, db):
         """DROP TABLE takes the table's indexes with it."""
         await _seed_old(db)
-        await M87.up(db)
+        await M90.up(db)
         cur = await db.execute(
             "SELECT name FROM sqlite_master WHERE type='index' "
             "AND tbl_name='session_ledger' AND name NOT LIKE 'sqlite_%'"
@@ -121,7 +121,7 @@ class TestTheRebuild:
         alone would pass just as happily against no constraint at all.
         """
         await _seed_old(db)
-        await M87.up(db)
+        await M90.up(db)
 
         await db.execute(
             "INSERT INTO session_ledger (id, session_id, text, status, added_by, "
@@ -137,12 +137,12 @@ class TestTheRebuild:
     @pytest.mark.asyncio
     async def test_is_idempotent(self, db):
         await _seed_old(db)
-        await M87.up(db)
+        await M90.up(db)
         first = await _ddl(db)
         cur = await db.execute("SELECT * FROM session_ledger ORDER BY id")
         rows_first = [tuple(r) for r in await cur.fetchall()]
 
-        await M87.up(db)
+        await M90.up(db)
 
         assert await _ddl(db) == first
         cur = await db.execute("SELECT * FROM session_ledger ORDER BY id")
@@ -151,7 +151,7 @@ class TestTheRebuild:
     @pytest.mark.asyncio
     async def test_absent_table_is_a_no_op(self, db):
         """A fresh install creates the table from _tables.py; nothing to migrate."""
-        await M87.up(db)
+        await M90.up(db)
         cur = await db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='session_ledger'"
         )
@@ -164,7 +164,7 @@ class TestTheRebuild:
         await db.execute("CREATE TABLE session_ledger_new (junk TEXT)")
         await db.commit()
 
-        await M87.up(db)
+        await M90.up(db)
 
         assert EXTRACTOR in await _ddl(db)
         cur = await db.execute(
@@ -193,7 +193,7 @@ class TestTheThreeSitesCannotDrift:
     @pytest.mark.asyncio
     async def test_migrated_schema_matches_the_python_allow_list(self, db):
         await _seed_old(db)
-        await M87.up(db)
+        await M90.up(db)
         allowed = _allowed_from_ddl(await _ddl(db))
         assert allowed == set(VALID_ADDED_BY), (
             "a MIGRATED install and VALID_ADDED_BY disagree: "
@@ -205,7 +205,7 @@ class TestTheThreeSitesCannotDrift:
     async def test_migrated_and_fresh_installs_agree(self, db):
         """The two paths must converge on the same constraint."""
         await _seed_old(db)
-        await M87.up(db)
+        await M90.up(db)
         assert _allowed_from_ddl(await _ddl(db)) == _allowed_from_ddl(TABLES["session_ledger"])
 
     def test_the_extractor_value_is_distinct_from_ambient(self):
@@ -219,3 +219,75 @@ class TestTheThreeSitesCannotDrift:
         assert EXTRACTOR in VALID_ADDED_BY
         assert "ambient" in VALID_ADDED_BY
         assert EXTRACTOR != "ambient"
+
+
+class TestThePromotionStateColumn:
+    """`promoted_item_id` on shadow events — the retryable-promotion sweep's
+    state. NULL means unpromoted and therefore still retryable, so the column
+    existing is what lets promotion failure cost nothing but time."""
+
+    _EVENTS_DDL_PRE = """
+        CREATE TABLE session_ledger_shadow_events (
+            id              TEXT PRIMARY KEY,
+            run_id          TEXT NOT NULL,
+            observed_at     TEXT NOT NULL,
+            session_id      TEXT NOT NULL,
+            kind            TEXT NOT NULL CHECK(kind IN ('agreement','pivot')),
+            text            TEXT NOT NULL,
+            turn_ref        TEXT,
+            quote_preview   TEXT,
+            quote_hash      TEXT,
+            quote_verified  INTEGER NOT NULL DEFAULT 0,
+            match_kind      TEXT NOT NULL DEFAULT 'none'
+                            CHECK(match_kind IN ('exact','fuzzy','none')),
+            matched_item_id TEXT,
+            match_score     REAL,
+            duplicate_of    TEXT,
+            mode            TEXT NOT NULL DEFAULT 'shadow'
+        )
+    """
+
+    async def _cols(self, db) -> set[str]:
+        cur = await db.execute("PRAGMA table_info(session_ledger_shadow_events)")
+        return {r[1] for r in await cur.fetchall()}
+
+    @pytest.mark.asyncio
+    async def test_adds_the_column_and_preserves_existing_rows(self, db):
+        await db.execute(self._EVENTS_DDL_PRE)
+        await db.execute(
+            "INSERT INTO session_ledger_shadow_events "
+            "(id, run_id, observed_at, session_id, kind, text) "
+            "VALUES ('e1', 'r1', 'now', 's', 'agreement', 'keep me')"
+        )
+        await db.commit()
+        assert "promoted_item_id" not in await self._cols(db)
+
+        await M90.up(db)
+
+        assert "promoted_item_id" in await self._cols(db)
+        cur = await db.execute("SELECT text, promoted_item_id FROM session_ledger_shadow_events")
+        # tuple(): the shared `db` fixture sets a row_factory, so rows compare
+        # by identity rather than value without it.
+        rows = [tuple(r) for r in await cur.fetchall()]
+        assert rows == [("keep me", None)], (
+            "existing events must survive and read as unpromoted (retryable)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_is_idempotent(self, db):
+        await db.execute(self._EVENTS_DDL_PRE)
+        await db.commit()
+        await M90.up(db)
+        await M90.up(db)  # must not raise "duplicate column name"
+        assert "promoted_item_id" in await self._cols(db)
+
+    @pytest.mark.asyncio
+    async def test_absent_events_table_is_a_no_op(self, db):
+        """A fresh install creates it from _tables.py, already with the column."""
+        await M90.up(db)
+        assert await self._cols(db) == set()
+
+    def test_fresh_install_schema_carries_the_column(self):
+        """The drift this whole file exists to prevent, for the new column:
+        migrated and fresh-install schemas must not disagree."""
+        assert "promoted_item_id" in TABLES["session_ledger_shadow_events"]

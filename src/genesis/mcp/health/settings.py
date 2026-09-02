@@ -97,7 +97,9 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "master `enabled` + `mode` off/shadow/live. Shadow logs "
             "proposals only; `live` also promotes the qualifying ones "
             "into the real ledger as added_by='ambient_ledger_extractor'. "
-            "An invalid mode degrades to shadow, never to live. "
+            "Live requires BOTH mode=live and live_opt_in=true (renewed "
+            "opt-in — legacy overlays persisted `live` while it was "
+            "reserved). An invalid mode degrades to shadow, never to live. "
             "Read at worker startup — takes effect next compaction."
         ),
         config_filename="session_ledger_shadow.yaml",
@@ -1211,11 +1213,11 @@ def _validate_session_ledger_shadow(changes: dict) -> list[str]:
 
     errors: list[str] = []
     for key, value in changes.items():
-        if key not in ("enabled", "mode"):
-            errors.append(f"Unknown key '{key}'. Valid: enabled, mode")
-        elif key == "enabled":
+        if key not in ("enabled", "mode", "live_opt_in"):
+            errors.append(f"Unknown key '{key}'. Valid: enabled, mode, live_opt_in")
+        elif key in ("enabled", "live_opt_in"):
             if not isinstance(value, bool):
-                errors.append("'enabled' must be a boolean")
+                errors.append(f"'{key}' must be a boolean")
         elif value not in MODES:
             errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
     return errors

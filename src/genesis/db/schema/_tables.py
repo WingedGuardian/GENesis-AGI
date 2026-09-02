@@ -1960,7 +1960,8 @@ TABLES = {
             matched_item_id TEXT,
             match_score     REAL,
             duplicate_of    TEXT,
-            mode            TEXT NOT NULL DEFAULT 'shadow'
+            mode            TEXT NOT NULL DEFAULT 'shadow',
+            promoted_item_id TEXT  -- session_ledger row this proposal became (live mode); NULL = unpromoted, retryable
         )
     """,
     # ── Repo-pulse annotator (session-manager PR-4a) ─────────────────────

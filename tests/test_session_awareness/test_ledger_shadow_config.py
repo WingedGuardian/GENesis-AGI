@@ -59,11 +59,46 @@ def test_master_enabled_false_wins(config_dirs):
     assert lsc.effective_mode() == "off"
 
 
-def test_live_is_honoured(config_dirs):
-    """`live` was reserved until the write path existed. It exists now."""
+def test_live_with_renewed_opt_in_is_honoured(config_dirs):
+    """`live` was reserved until the write path existed. It exists now — and
+    honoring it takes BOTH keys (see the legacy-overlay test below for why)."""
     base, _ = config_dirs
-    base.write_text("mode: live\n")
+    base.write_text("mode: live\nlive_opt_in: true\n")
     assert lsc.effective_mode() == "live"
+
+
+def test_legacy_live_overlay_does_not_go_live_on_upgrade(config_dirs, caplog):
+    """The upgrade-path P1. Releases that predate the write path accepted and
+    persisted `mode: live` through the settings validator while documenting it
+    as reserved. An install carrying that formerly-harmless value must NOT
+    begin autonomous ledger writes the moment this code arrives via git pull —
+    `live_opt_in` did not exist back then, so requiring it is exactly the
+    renewed-approval check a legacy overlay cannot pass."""
+    base, overlay = config_dirs
+    overlay.write_text("mode: live\n")  # the legacy overlay, verbatim
+    with caplog.at_level("WARNING"):
+        assert lsc.effective_mode() == "shadow"
+    assert any("live_opt_in" in r.message for r in caplog.records)
+
+
+def test_string_enabled_false_disables_even_with_live_keys(config_dirs):
+    """The truthy-string trap. YAML `enabled: "false"` is a non-empty string —
+    truthy in Python — so a naive check reads the operator's explicit OFF as
+    ON, and with the live keys set that misread grants write authority. Only
+    the boolean True enables; everything else is off."""
+    base, _ = config_dirs
+    base.write_text('enabled: "false"\nmode: live\nlive_opt_in: true\n')
+    assert lsc.effective_mode() == "off"
+
+
+def test_non_boolean_enabled_degrades_to_off(config_dirs, caplog):
+    base, _ = config_dirs
+    # NOT `yes`/`on` bare: YAML 1.1 parses those as boolean True, which is a
+    # legitimate enable. The trap cases are strings and ints that LOOK boolean.
+    for bogus in ('"true"', "1", "0", '"on"'):
+        base.write_text(f"enabled: {bogus}\nmode: shadow\n")
+        with caplog.at_level("WARNING"):
+            assert lsc.effective_mode() == "off", f"enabled: {bogus} did not degrade to off"
 
 
 def test_nothing_degrades_INTO_live(config_dirs, caplog):
@@ -128,12 +163,17 @@ def test_domain_registered():
 def test_validator_accepts_valid_changes():
     assert _validate_session_ledger_shadow({"enabled": False}) == []
     assert _validate_session_ledger_shadow({"mode": "off"}) == []
-    assert _validate_session_ledger_shadow({"mode": "live"}) == []  # reserved but settable
+    assert (
+        _validate_session_ledger_shadow({"mode": "live"}) == []
+    )  # config-valid; inert without opt-in
+    assert _validate_session_ledger_shadow({"live_opt_in": True}) == []
+    assert _validate_session_ledger_shadow({"mode": "live", "live_opt_in": True}) == []
 
 
 def test_validator_rejects_bad_values():
     assert _validate_session_ledger_shadow({"mode": "block"})
     assert _validate_session_ledger_shadow({"enabled": "false"})
+    assert _validate_session_ledger_shadow({"live_opt_in": "true"})
     assert _validate_session_ledger_shadow({"bogus": 1})
 
 
@@ -149,5 +189,5 @@ def test_base_config_file_ships_shadow_not_live():
 
     base = Path(__file__).parents[2] / "config" / "session_ledger_shadow.yaml"
     cfg = yaml.safe_load(base.read_text())
-    assert cfg == {"enabled": True, "mode": "shadow"}
+    assert cfg == {"enabled": True, "mode": "shadow", "live_opt_in": False}
     assert cfg["mode"] in lsc.MODES
