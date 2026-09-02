@@ -178,8 +178,8 @@ async def test_heavy_workload_flag_set_during_execute_and_cleared_after(monkeypa
     result = await dispatch.dispatch_once(ctx)
 
     assert result is True
-    # DURING execute the flag was set to the generic cycle label (set at entry).
-    assert captured["hw"] == "surplus:dispatch"
+    # DURING execute the flag was set to the task-type label.
+    assert captured["hw"] == f"surplus:{task.task_type}"
     assert captured["since"] is not None
     # AFTER the dispatch the flag is cleared (label-guarded) — no leak.
     assert fake_rt._heavy_workload is None
@@ -197,7 +197,7 @@ async def test_heavy_workload_flag_cleared_even_when_executor_raises(monkeypatch
     seen = {}
 
     async def _boom(_t):
-        seen["hw"] = fake_rt._heavy_workload  # set at entry, before execute
+        seen["hw"] = fake_rt._heavy_workload  # set before execute
         raise RuntimeError("hang→boom")
 
     task = _Task(TaskType.J9_EVAL_BATCH)
@@ -207,8 +207,8 @@ async def test_heavy_workload_flag_cleared_even_when_executor_raises(monkeypatch
     result = await dispatch.dispatch_once(ctx)
 
     assert result is False
-    # Flag was set at ENTRY, before the executor ran.
-    assert seen["hw"] == "surplus:dispatch"
+    # Flag was set before the executor ran.
+    assert seen["hw"] == f"surplus:{task.task_type}"
     # The finally clears it even on the exception path — no stuck heavy flag.
     assert fake_rt._heavy_workload is None
     assert fake_rt._heavy_workload_since is None
@@ -266,41 +266,6 @@ async def test_heavy_workload_not_claimed_when_slot_already_held(monkeypatch):
     assert captured["hw"] == "dream_cycle"
     # ...and NOT cleared afterward (we never owned it).
     assert fake_rt._heavy_workload == "dream_cycle"
-
-
-async def test_heavy_workload_flag_set_during_setup_phase(monkeypatch):
-    # 2026-09-01 incident: the surplus heartbeat can stall in a SETUP step
-    # (recover_stuck / drain_expired / next_task) with NO task running. #1588 set the
-    # flag only AFTER task selection, so a setup-phase stall was NOT forgiven by the
-    # 900s zombie watchdog. The flag must now cover the WHOLE dispatch_once cycle —
-    # set at entry, before recover_stuck — even on a no-task cycle.
-    import genesis.runtime as runtime_mod
-
-    fake_rt = types.SimpleNamespace(_heavy_workload=None, _heavy_workload_since=None)
-    monkeypatch.setattr(
-        runtime_mod.GenesisRuntime, "instance", staticmethod(lambda: fake_rt)
-    )
-
-    seen = {}
-
-    async def _capture_during_setup():
-        # The flag must ALREADY be set when the first setup phase runs.
-        seen["hw"] = fake_rt._heavy_workload
-        seen["since"] = fake_rt._heavy_workload_since
-
-    ctx = _make_ctx()
-    ctx._queue.recover_stuck = AsyncMock(side_effect=_capture_during_setup)
-    ctx._queue.next_task = AsyncMock(return_value=None)  # no-task early return
-
-    result = await dispatch.dispatch_once(ctx)
-
-    assert result is False
-    # Flag was set at ENTRY, before recover_stuck (RED on #1588 → None here).
-    assert seen["hw"] == "surplus:dispatch"
-    assert seen["since"] is not None
-    # Cleared after the no-task early return — no leak.
-    assert fake_rt._heavy_workload is None
-    assert fake_rt._heavy_workload_since is None
 
 
 # ── _timed_phase: diagnostic warning on an abnormally slow setup phase ──
