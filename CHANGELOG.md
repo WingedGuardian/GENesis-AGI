@@ -719,6 +719,29 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The review-enforcement commit escalation cap is now CROSS-MODEL only — internal
+  self-reviews never count toward it.** The cap exists to catch cross-model
+  non-convergence (an external, non-Anthropic reviewer finding new defects round after
+  round), not to penalize free same-model self-review. `review_state.py mark` gains a
+  `--source {internal,external}` (default `internal`): an `internal` mark (a
+  genesis-architect / genesis-security / any-subagent audit, the overwhelmingly common
+  case) NEVER advances or resets the streak, whatever it found, and needs no outcome
+  flag; only an `--source external` mark counts, and it still requires `--defects` (a new
+  BLOCKER/SHOULD-FIX/P1/P2 → +1) or `--clean` (none → reset). This ends the weeks of
+  false blocks — including the case where the round-2 mode-switch gate *mandated* a
+  fresh-context internal audit whose mark then tripped the hard cap, penalizing the very
+  remedy the gate demanded. Supersedes the earlier required-outcome fix (feea3f71 /
+  #1446), whose bare-mark refusal only ever bit internal re-audits; that fix's still-useful
+  parts (the outcome requirement for external marks, and the class-sweep reminder that now
+  fires on the second external round) are folded in here. On upgrade, a pre-existing round
+  counter written by the old reviewer-agnostic code (no `last_source`) is treated as legacy
+  and discarded — its count was built entirely from internal self-reviews, so preserving it
+  would keep false-blocking; the streak self-heals on the next cross-model mark (no per-install
+  data repair needed). "External" is judged by the reviewing MODEL, not the gateway: Anthropic
+  Claude via any route (incl. an OpenRouter Claude route) is internal, and Genesis's own
+  cognitive/routing systems are never reviewers — approved external methods today are Codex and
+  Kimi (on .123). `mark` also accepts the `--source=external` equals form (previously silently
+  dropped to internal).
 - **Contributor-issue privacy scan no longer over-blocks legitimate Markdown.**
   The `scan_prose` secret-scan floor ran `detect-secrets scan --string <line>` per
   line; argparse then misread any line whose content starts with `-` (a Markdown
