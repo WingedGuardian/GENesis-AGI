@@ -535,6 +535,21 @@ _KNOWN_SIGILS = (
     "stale-review-override",
     "scheduled-review-override",
     "discard-override",
+    # Both were passed to has_trailing_override from the day they shipped but never
+    # listed here, so the "kept in sync" claim above was false. The consequence is
+    # silent and asymmetric: the sigil queried FOR ITSELF still matches, so nothing
+    # looked broken, while an unlisted token written FIRST reads as prose and ends
+    # the leading run — disabling every sigil after it. NOTE this widens ACCEPTANCE
+    # as well as detection, in the fail-open direction, and the reach is wider than
+    # the merge gate; the PR that added them enumerates the combinations that flip.
+    # A test derives this set from the consumers themselves (an ast walk over
+    # scripts/, not just scripts/hooks/ — review_enforcement_commit.py lives
+    # outside that directory and is the only place two of the declared sigils are
+    # queried, and two guards pass their sigil as a module constant a literal scan
+    # cannot see), and asserts the set matches in BOTH directions, so neither a
+    # missing declaration nor an unwarranted one can ship unnoticed.
+    "merge-to-main-override",  # git_push_guard: local `git merge` onto main/master
+    "full-suite-ok",  # full_suite_guard: run the whole pytest suite locally
 )
 
 

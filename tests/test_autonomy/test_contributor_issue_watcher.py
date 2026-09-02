@@ -232,6 +232,71 @@ async def test_live_adopts_existing_open_issue_no_repost(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_adopt_owner_authored_issue_is_not_authoritative(db, monkeypatch):
+    """Provenance simplification (Codex round-4 finding 1): author identity is NOT a
+    sound creation signal in a single-owner install, so EVERY adopt is non-authoritative
+    (adopted=1) — only an in-band Genesis CREATE is authoritative. Here an open issue
+    authored by OUR OWN gh account is adopted → adopted=1, so its later closure never
+    auto-resolves the follow_up. Trade (fail-safe): a crash-recovered Genesis issue no
+    longer auto-resolves — it stays pending, manually resolvable, never a false
+    completion."""
+    _mode(monkeypatch, "live")
+    existing = json.dumps(
+        [
+            {
+                "number": 7,
+                "title": "add a NEWCOMER task",
+                "url": f"https://github.com/{_REPO}/issues/7",
+                "author": {
+                    "login": "wingedguardian"
+                },  # our own account — no longer trusted as provenance
+            }
+        ]
+    )
+    gh = _FakeGh(list_out=existing)
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    pid, rid, mgr = await _seed_held(db, title="Add a newcomer task", mode="live")
+    await mgr.resolve(rid, status="approved")
+
+    n = await ciw.drain_pending_issue_posts(_RT(db))
+    assert n == 1
+    assert not gh.created()
+    row = await pip.get_by_id(db, pid)
+    assert row["status"] == "posted"
+    assert row["adopted"] == 1  # FIX finding-1: ALL adopts non-authoritative (author not trusted)
+
+
+@pytest.mark.asyncio
+async def test_adopt_external_authored_issue_is_not_authoritative(db, monkeypatch):
+    """Adopting a coincidental-title issue authored by SOMEONE ELSE marks it
+    adopted=1 so its closure never auto-resolves Genesis's follow_up. Post-finding-1
+    the author is irrelevant (every adopt is adopted=1); paired with
+    test_adopt_owner_authored_issue_is_not_authoritative this proves author identity no
+    longer changes the verdict."""
+    _mode(monkeypatch, "live")
+    existing = json.dumps(
+        [
+            {
+                "number": 7,
+                "title": "add a NEWCOMER task",
+                "url": f"https://github.com/{_REPO}/issues/7",
+                "author": {"login": "randomContributor"},
+            }
+        ]
+    )
+    gh = _FakeGh(list_out=existing)
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    pid, rid, mgr = await _seed_held(db, title="Add a newcomer task", mode="live")
+    await mgr.resolve(rid, status="approved")
+
+    n = await ciw.drain_pending_issue_posts(_RT(db))
+    assert n == 1
+    row = await pip.get_by_id(db, pid)
+    assert row["status"] == "posted"
+    assert row["adopted"] == 1  # not authoritative — external author
+
+
+@pytest.mark.asyncio
 async def test_live_dedup_list_failure_does_not_post(db, monkeypatch):
     """If the open-issue dedup LIST fails, we must NOT post (can't verify dup) —
     the row stays held and retries next cycle."""
@@ -543,7 +608,11 @@ async def test_e2e_autoapprove_then_drain_posts(db, tmp_path, monkeypatch):
     # the test exercises the post path, not the empty-config edge (covered elsewhere).
     monkeypatch.setattr(ci, "_default_repo", lambda: _REPO)
     res = await ci._impl_contributor_issue_propose(
-        db, title="Autonomous newcomer task", body="A clean, public-safe task.", repo=_REPO
+        db,
+        title="Autonomous newcomer task",
+        body="A clean, public-safe task.",
+        labels=["good first issue", "area:runtime"],
+        repo=_REPO,
     )
     assert res["status"] == "held"
     assert res["auto_approved"] is True

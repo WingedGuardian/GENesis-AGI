@@ -370,9 +370,14 @@ class TestFocusWeightTable:
         assert FOCUS_CONTEXT_WEIGHTS["dispatch_outcome"]["proposal_history"] == "light"
 
     def test_section_count(self):
-        """_ALL_SECTIONS should have exactly 20 entries."""
+        """_ALL_SECTIONS should have exactly 21 entries.
+
+        Bumped 20 -> 21 when the ego_qa answer-delivery section was added (B3
+        questions channel, Codex #1499 NOTE-A) — this guard forces a conscious
+        review whenever the section set changes.
+        """
         from genesis.ego.focus import _ALL_SECTIONS
-        assert len(_ALL_SECTIONS) == 20
+        assert len(_ALL_SECTIONS) == 21
 
     def test_goal_deep_dive_deep_for_goal_review(self):
         """goal_deep_dive is 'deep' only during goal_review cycles."""

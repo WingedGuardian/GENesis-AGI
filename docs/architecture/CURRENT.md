@@ -220,7 +220,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: d71d1d39 2026-08-18
+verified: 975d3944 2026-08-31
 ```
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
@@ -414,7 +414,14 @@ verified: d71d1d39 2026-08-18
   re-run self-validates (re-limit → its own catch re-parks with backoff); exhausted
   parks escalate to `needs_user` with a governed (`rate_limit_park` signal) alert.
   Lever `cc_rate_limit_resume` (off|propose_only|**live**, default live) +
-  `GENESIS_RATE_LIMIT_RESUME_DISABLED`.
+  `GENESIS_RATE_LIMIT_RESUME_DISABLED`. Because the resume rewrites `caller_context`
+  to `rate_limit_resume:<park_id>` (needed for that re-limit lineage), the ORIGINAL
+  dispatch context (`ego_proposal:<id>`) is preserved separately on
+  `DirectSessionRequest.origin_caller_context` — threaded park payload → queue →
+  request → session metadata — and the three ego-dispatch consumers (proposal-outcome
+  recording, the post-exec auditor gate, the on-end follow-through hook) resolve back
+  to it via `rate_limit_park.effective_caller_context`, so a resumed ego dispatch's
+  outcome, audit, and follow-through survive the park→resume (closed 837f8b63).
 
 ## 3. Autonomy & egress gating
 
@@ -425,7 +432,7 @@ gated — that contract is one-directional.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: d8204a0c 2026-08-25
+verified: 84c7259d 2026-08-31
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -445,7 +452,11 @@ verified: d8204a0c 2026-08-25
 - **The Contributor Work-Log posts public GitHub issues, gated like email.** A
   server-side MCP tool (`contributor_issue_propose`, genesis-health) sanitizes a
   curator-drafted issue via the fail-closed `contribution/sanitize.py scan_prose`
-  (title+body+labels — every string that egresses), then HOLDS it: the
+  (title+body+labels — every string that egresses) and enforces the label policy
+  ON THE CONFIGURED PUBLIC TRACKER (fail-closed, AFTER the scan: a proposal missing
+  an `area:*` domain label or a difficulty/environment label —
+  `_AREA_LABELS`/`_ENV_DIFFICULTY_LABELS` — is `rejected` with no row; a
+  human-approved cross-repo post is not subject to the policy), then HOLDS it: the
   `approval_requests` row FIRST, then `pending_issue_posts` (mirroring the email
   gate). By default each hold is per-item owner-approved on the dashboard (excluded
   from `approve_all_pending`, like email). **Autonomous posture (opt-in,
@@ -465,6 +476,27 @@ verified: d8204a0c 2026-08-25
   the drain, incl. approved held rows). Terminal rows pruned >30d via
   `scripts/prune_contributor_issue_posts.py`; held rows never pruned. The
   curator campaigns are LOCAL user data (uncommitted).
+- **Cold marketing-email substrate (PR1) — gated like email, recipient resolved
+  in CODE.** The `marketing_send` MCP tool (genesis-outreach) stages a cold
+  marketing email to a recipient resolved from the owner-curated
+  `marketing_prospects` store by `prospect_id` — the tool takes NO address
+  parameter, so the LLM never supplies a recipient. It refuses unless the
+  `marketing_outreach` lever (`outreach/marketing_config.py`, default `off`,
+  invalid→off, env kill `GENESIS_MARKETING_OUTREACH_DISABLED`) is enabled, the
+  prospect exists, is not opted-out (PERMANENT suppression, never pruned), and its
+  address is RFC-shaped; then enqueues to `pending_outreach` with
+  `labeled_surplus=True` (threaded through the queue so the drain rebuilds a BULK
+  request). Every staged send still converges on the same `_deliver` →
+  `EmailAutonomyGate` chokepoint: the BULK capability cell ships at ASK, so
+  everything HOLDS for owner approval (ships INERT). A GRANTED bulk cell adds a
+  deterministic scope guard (`_scope_guard_trip` g2): the autonomous recipient
+  MUST be a curated, non-opted-out `marketing_prospects` row (authorization is
+  DECOUPLED from send-lifecycle status, so a `contacted` follow-up still sends) —
+  an unknown / opted-out recipient trips (`recipient_not_curated` / `opted_out`)
+  → demote + hold (fail-closed). PR2 will wire graduation, send-time contact
+  stamping, AND a hard per-window cap on hold-creation (the ASK-state
+  approval-flood guard) alongside the batch-approval card — `marketing_send` has
+  no autonomous caller until then.
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
   PII scan for EXTERNAL channels and `content`-category drafts only. Never
   applied to owner channels — don't add them.
@@ -493,7 +525,7 @@ Note: the *learning* package hosts the other big scheduler (see entry 10).
 ```yaml subsystem-map
 entry: scheduling-background
 modules: [surplus, scheduler, follow_ups]
-verified: 0e65071c 2026-07-21
+verified: 50b79ffb 2026-09-01
 ```
 
 - **Surplus generators are deliberately BLIND to `infrastructure_alert`
@@ -635,7 +667,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 0017242d 2026-08-11
+verified: 50b79ffb 2026-09-01
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -699,7 +731,7 @@ them.
 ```yaml subsystem-map
 entry: ego-self-model
 modules: [ego, identity, deliberation]
-verified: 94be12b3 2026-08-06
+verified: 975d3944 2026-08-31
 ```
 
 - **Two egos, both LIVE**: user ego (CEO, Opus, MCP profile `user_reflection`)
@@ -707,6 +739,16 @@ verified: 94be12b3 2026-08-06
   (~108K). `EgoCadenceManager`: adaptive proactive cycles, morning-report cron,
   30-min mechanical sweep, goal-staleness scans. Review cadence + budget
   controls before adding call sites.
+- **Questions channel (`questions[]` in both output contracts)**: the ego can
+  ASK the user directly — no approval gate (asking is NOTIFY_USER-class).
+  `_process_questions` → ONE sequential background task → outreach
+  `submit_and_wait` (NOTIFICATION category, governance applies); reply →
+  `origin_class="owner"` observation + reactive signal to the ASKING ego
+  (`set_reply_signal_sink` → cadence `push_reactive_event`); timeout/
+  undelivered → first-party observation. Reply waiter is in-memory — restart
+  mid-wait orphans the question (accepted; late reply falls to triage).
+  Sequential delivery is load-bearing: two concurrent waiters in one chat
+  make standalone replies unresolvable (`resolve_scoped_pending`).
 - **`capability_aggregator.py` → `capability_map` table** = per-domain
   self-confidence from up to 6 sources (inverse-confidence weighted; the
   Outcome-Bus feed is flag-gated, default OFF). Reads split by intent: `get_all` and
@@ -821,7 +863,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 159698d4 2026-07-16
+verified: 84c7259d 2026-08-31
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -830,10 +872,34 @@ verified: 159698d4 2026-07-16
   monitors the host Guardian every awareness tick, incl. git-SHA code-drift
   detection). Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **autonomy zombie-scheduler watchdog** (`autonomy/watchdog.py`, run out-of-process
+  by `genesis-watchdog.timer` every 300s via `watchdog_runner.py`; distinct from the
+  container `watchdog.py` above): reads `~/.genesis/status.json` (written by the runtime's
+  `status_writer_loop`) and RESTARTS the bridge/runtime on status-file staleness, or a
+  specific scheduler on a stale `scheduler_heartbeats` entry (`awareness`/`surplus`,
+  `job_health.last_run` age > 900s) — the "zombie scheduler, alive but not dispatching"
+  case. Restart is deferred while `heavy_workload` is set (dream cycle), during a boot
+  stabilization window, or a network outage; repeated restarts (flap) or max-restarts
+  escalate to a durable owner/Telegram alert. This is why a wedged/dead surplus needs no
+  `subsystem_stale` alert (§9): it is detected and self-healed here at 900s.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
   skill). Known wart: the watchdog's stale-alert wording inverts when the
   deployed script is NEWER than the host checkout.
+- **Planned-maintenance stand-down** (`check.py::_gateway_pause_active`): reads a
+  self-expiring `<state_dir>/paused.json` — written by the gateway `pause [ttl]`
+  verb, bounded by `expires_at` and capped by `gateway_pause_max_ahead_s` — and
+  stands the whole check cycle down beside the indefinite `maintenance_file`. This
+  is the *capability* a deploy uses to pause the Guardian across the server restart
+  — instead of escalating to `confirmed_dead` and firing a false down/recovered
+  alert — so that a paused restart is silent; the `scripts/update.sh` caller that
+  actually writes the pause across its stop/restart lands as a separate change (a
+  deploy on the old caller simply runs unpaused, as today). The TTL means a deploy
+  killed before its `resume` self-heals rather than muting the watchdog. During
+  stand-down the heartbeat carries a `standdown` marker so `probe_guardian` reports
+  DEGRADED (alive, not watching) rather than HEALTHY. Distinct from the container
+  `~/.genesis/paused.json` runtime kill switch (that pauses all of Genesis; this is
+  host-side and Guardian-only).
 - Provisioning verbs are EXECUTE-ONLY — approval is the CALLER's
   responsibility (container obtains it via Telegram before invoking). Two
   families: Proxmox VM grows (`provision-grow-disk/-memory`, hypervisor API) and
@@ -883,7 +949,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: ca875c4b 2026-07-24
+verified: 50b79ffb 2026-09-01
 ```
 
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
@@ -958,6 +1024,24 @@ verified: ca875c4b 2026-07-24
   in-memory, per-process, one-generation `_alert_history` dict so incident
   history survives restart. It does NOT drive the ego cadence (ego has its own
   scheduler). Trap: PEP 562 lazy `__init__` — don't eager-import `loop.py`.
+- **Subsystem-cessation alerts (the honest-liveness family, `_compute_alerts`)**:
+  three durable `subsystem_stale`-family alerts so a dead scheduler cannot read
+  healthy. `subsystem_stale:<name>` (ego CRITICAL; inbox/dashboard/outreach WARNING)
+  fires when a subsystem's heartbeat — the freshest valid pulse across the durable
+  `events` table and the in-memory event-bus ring — goes overdue past its per-subsystem
+  `HEARTBEAT_EXPECTED` threshold (via `mcp/health/manifest.py::compute_heartbeat_staleness`);
+  `subsystem_never_started:<name>`
+  tells a FAILED / never-pulsed start (cross-referenced against the persisted bootstrap
+  manifest, past a boot grace) from a fresh install; `subsystem_heartbeat_unknown` covers
+  a corrupt/unreadable pulse. Pause-gated subsystems (`surplus`, `inbox`) downgrade
+  overdue→`paused` while globally paused; conditional-pulse ones (`outreach`, whose
+  channel-independent daemon pulses only while its scheduler runs) are exempt from the
+  never-started inference. **surplus is EXCLUDED** from `subsystem_stale`: its wedged/dead
+  state is owned by the PR-B dashboard tile (a `job_health.surplus_dispatch` signal) and
+  the zombie-scheduler watchdog (§8), and its loop-END event-HB is load-fragile — a healthy
+  15-30 min dispatch legitimately gaps it, so its `HEARTBEAT_EXPECTED` overdue is a generous
+  3h (matching the tile) to avoid crying wolf. reflection/awareness ride the awareness tick's
+  own `tick_overdue`.
 - **scheduled-job telemetry (WS-2 M9)**: `runtime/_job_health.py` keeps the
   cumulative `job_health` row AND now appends per-run `job_run_events` (era
   attribution the cumulative row can't give). Writes are debounced off the
@@ -1095,6 +1179,14 @@ verified: ca875c4b 2026-07-24
   evidence via `ledger_update`; bare hex → proposal; `annotation_exists`
   re-absorb guard protects reopened items), the **fuzzy tier** (headless
   Haiku, echo-numbers-only fail-closed parse) is proposal-only in EVERY mode.
+  Two sibling reconciliation lanes ride the SAME merged PRs to resolve standalone
+  `follow_ups` (target_kind='follow_up', migration 0084): the **follow-up marker
+  lane** (#1397) auto-absorbs a follow_up whose id is cited `Follow-up: <id>` in
+  OUR own PR body; the **issue-close lane** (WS-A) resolves the follow_up that
+  spawned a Genesis-posted contributor issue when a contributor's PR CLOSES that
+  issue (`Closes #N` → `closingIssuesReferences`, joined via
+  `pending_issue_posts.source_ref`; default-branch + same-repo scoped). Both reuse
+  `absorb_followup` + the annotation store + the `annotation_exists` re-absorb guard.
   Store: `repo_pulse_runs`/`_annotations` (migration 0062,
   `UNIQUE(tier,item_id,pr_number)` dedupe; CRUD `db/crud/repo_pulse.py`).
   Cursor (`cursor.json`, gh-format mergedAt watermark) advances monotonically
@@ -1119,7 +1211,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: fbcf8ee4 2026-07-21
+verified: 50b79ffb 2026-09-01
 ```
 
 - **learning/** is the de-facto cron host: `rt._learning_scheduler` registers
@@ -1204,8 +1296,12 @@ verified: fbcf8ee4 2026-07-21
   (calibration + bench both use it — don't add inline copies).
 - **feedback/**: the Outcome Bus (`outcome_events`) — **write-path LIVE
   (harvest 8:45/20:45 + the first real-time emits: task executor COMPLETED/
-  FAILED, WS-2 P1b), read-path DARK** until the P2 grader lands. Tier
-  taxonomy is load-bearing: Tier-1 ground truth outranks user approval.
+  FAILED, WS-2 P1b); read-path PARTIAL** — the ego-ECE calibration consumer is
+  LIVE (`feedback/calibration.py::compute_ego_calibration` reads T1 ground-truth
+  rows via `outcome_events.calibration_pairs(tier=1)`, scheduled from
+  `runtime/init/learning.py` → one `ego_calibration_snapshots` row per run); the
+  broader grading/reinforcement read path stays DARK until the P2 grader lands.
+  Tier taxonomy is load-bearing: Tier-1 ground truth outranks user approval.
   `record_outcome` must never raise. Deliberately "observation, not
   reinforcement" — don't rename toward RL.
 - **calibration/**: Bayesian prediction-calibration primitives, currently
@@ -1378,7 +1474,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: d2d501b1 2026-08-31
+verified: 50b79ffb 2026-09-01
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
@@ -1413,15 +1509,21 @@ verified: d2d501b1 2026-08-31
   framed, refreshed on return to Overview) is **PR-B2b** — shipped.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
-  schema paths coexist: base DDL (`schema/_tables.py`, ~113 CREATE TABLE; docs
-  still say "60+") plus versioned `migrations/` 0001..0060 run ONCE at startup
+  schema paths coexist: base DDL (`schema/_tables.py`, 118 CREATE TABLE; docs
+  still say "60+") plus versioned `migrations/` 0001..0089 run ONCE at startup
   before any other init step touches data; a failed migration ABORTS bootstrap.
   EVERY table must be in BOTH paths (fresh-install DDL + its numbered
-  migration) — the `test_db/test_schema.py` allow-list enforces it. Migration
-  atomicity is hand-rolled (BEGIN IMMEDIATE + a proxy that blocks stray
-  commits/DDL autocommit) with a post-commit reconcile and SQLITE_LOCKED
-  retry (2026-06-25 incident guard). No TABLES-vs-sqlite_master parity test
-  exists.
+  migration) — a design CONVENTION whose TABLE-set parity is NOT test-enforced:
+  `test_db/test_schema.py`'s `EXPECTED_TABLES` allow-list only pins the DDL
+  path's table SET (its `db` fixture builds via `create_all_tables` +
+  `seed_data`, never the numbered migrations), and no test asserts DDL-vs-
+  migration table-set parity (nor declared-TABLES-vs-sqlite_master). The one
+  base-path guard that DOES exist (`test_schema_base_path_parity.py`) is
+  narrower — every `INDEXES`-referenced column a numbered migration adds must
+  ALSO be mirrored into `_migrate_add_columns` (the #1123/#1127 legacy-index
+  crash class), not table presence. Migration atomicity is hand-rolled
+  (BEGIN IMMEDIATE + a proxy that blocks stray commits/DDL autocommit) with a
+  post-commit reconcile and SQLITE_LOCKED retry (2026-06-25 incident guard).
   **DATA migrations (WS-C, `db/data_migrations/`) are the OPPOSITE contract:**
   non-schema backfills (Qdrant payloads, entity graphs) that run POST-boot as a
   background `tracked_task` (kicked from `runtime/_core`), never abort boot, are
@@ -1503,28 +1605,36 @@ verified: d2d501b1 2026-08-31
   model; owner/first-party never recorded). The gate set is CI-locked in
   `test_recall_inject_coverage.py` (a new inject site or a removed emit fails).
   **Gate 1 (procedure) is LIVE in SHADOW** — `record_would_block(gate="procedure")`
-  fires at the two promotion paths that have a trustworthy SOURCE-origin signal:
+  fires at the three promotion paths that have a trustworthy SOURCE-origin signal:
   the judge convergence (`judge._store_judged_procedure`, covering BOTH the
   struggle and rebuild callers) classifies by a coarse tool-name ingest scan over
   the real transcript spine (`provenance.origin_from_tool_names` — external-ingest
   tool → `external_untrusted`; over-observes by design since fetched content lives
   in tool RESULTS the spine doesn't carry); the autonomy retrospective
   (`executor/trace.py`) classifies by `initiated_by` (Genesis's own execution =
-  first_party/owner; the trace has no source-tool spine). Two promotion paths are
-  DEFERRED (classified `deferred-with-reason`, no emit): the deprecated
-  auto-extractor (`extractor.py` — its only signals are replay tools or a
-  hyphen-truncating prose scrape, both undercount) and `procedure_store` (an MCP
-  tool needing the caller's session origin — the session-origin PR's env; it
-  wires that emit). CI-locked in `test_procedure_gate_coverage.py`.
+  first_party/owner; the trace has no source-tool spine); and `procedure_store`
+  (`mcp/memory/procedural.py`) classifies by the CALLER session's origin
+  (`session_origin_from_env()`, coalesced to first_party when the env is unset —
+  an unset env is not a dispatched session; skipped duplicate teaches emit
+  nothing). One promotion path remains DEFERRED (classified
+  `deferred-with-reason`, no emit): the deprecated auto-extractor (`extractor.py`
+  — its only signals are replay tools or a hyphen-truncating prose scrape, both
+  undercount). CI-locked in `test_procedure_gate_coverage.py`.
   **Gates 2-3 (identity/autonomy) are LIVE in SHADOW.** Gate 2: the steering
   write (`learning/pipeline.py`) emits with a CHANNEL allow-map origin
   (`_CHANNEL_ORIGIN`: terminal/telegram/whatsapp/web = owner; voice + unknown
   channels fail CLOSED to external_untrusted — the polarity fix for the
   fail-open `_AUTONOMOUS_CHANNELS` deny-list, so a deny-list escape is now
   OBSERVED), and the USER_KNOWLEDGE synthesis (`runtime/init/learning.py`)
-  emits first_party-by-authorship (FLIP BLOCKER: observations carry no
-  origin_class, so externally-planted user-facts remain first_party until
-  delta-level provenance lands). Gate 3: the emit lives INSIDE
+  emits with REAL propagated provenance — it aggregates the accepted deltas'
+  stored `origin_class` (`external_untrusted` iff ANY contributing delta is
+  external, else `first_party`), no longer hardcoding first_party-by-authorship.
+  The reflection writer (`perception/writer.py`) stamps each user-model-delta
+  observation with `origin_class=run_origin`, a RUN-LEVEL aggregate
+  (`reflection_window_origin` → `external_untrusted` iff any external session
+  overlapped the window). Residual: provenance is run-level, not per-delta (a
+  per-delta signal is still future work); NULL/legacy deltas read first_party.
+  Gate 3: the emit lives INSIDE
   `db/crud/capability_grants.py` (record_success/record_correction/apply_event
   — `origin_class` is a REQUIRED kwarg so every future caller must state
   provenance); all six live callers thread owner/first_party → zero rows today
@@ -1631,7 +1741,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 9037d45b 2026-07-07
+verified: 50b79ffb 2026-09-01
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -1643,8 +1753,11 @@ verified: 9037d45b 2026-07-07
 - **skills/**: skills are directories with SKILL.md — registration is catalog
   generation (`scripts/generate_skill_catalog.py` scans `.claude/skills/`,
   `src/genesis/skills/`, `~/.genesis/skill-library/` →
-  `~/.genesis/skill_catalog.json`, self-heals hourly), consumed by the
-  injection hook and by autonomous-session resources. Skill refinement is
+  `~/.genesis/skill_catalog.json`; refresh is prompt-hook-triggered, NOT a
+  scheduler — `skill_injection_hook._ensure_catalog_fresh` spawns a detached
+  regen when the catalog is missing or >1h stale, `_CATALOG_MAX_AGE_S=3600`,
+  serving the next prompt), consumed by the injection hook and by
+  autonomous-session resources. Skill refinement is
   propose-only: `learning/skills/applicator.py` STAGES a proposal for human/CC
   review and never writes a skill file. Recording it as a tracked
   cognitive-file modification is DEFERRED — no ledger pre-image is captured

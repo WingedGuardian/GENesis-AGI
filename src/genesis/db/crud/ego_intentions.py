@@ -35,7 +35,8 @@ async def create(
     ``origin='system'`` rows (mechanical dispatch follow-through) bypass the
     cap — it exists to stop the LLM hoarding slots, not to drop follow-through.
     ``proposal_id`` at creation is the system row's source dispatch proposal
-    (dedup key); ``fire()`` later overwrites it with the fired proposal.
+    (dedup key); ``fire()`` COALESCE-preserves it — a fire without a new
+    proposal_id keeps this creation-time value rather than nulling it.
     """
     if origin not in ("ego", "system"):
         origin = "ego"

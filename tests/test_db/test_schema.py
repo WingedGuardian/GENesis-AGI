@@ -83,6 +83,7 @@ EXPECTED_TABLES = [
     "reflex_diagnoses",  # reflex arc P0: Tier-0 diagnose session artifacts (PR2 writes)
     "reflex_verdicts",  # reflex arc P0: taste corpus — every human verdict, never pruned
     "ego_proposal_revisions",  # ego lifecycle PR-4: prior-value audit trail for versioned revision (dark)
+    "marketing_prospects",  # marketing cold-send substrate: owner-curated cold-outreach target inventory
 ]
 
 
