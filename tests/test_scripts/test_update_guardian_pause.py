@@ -123,7 +123,7 @@ def test_syntax_ok(text: str) -> None:
 
 
 # ── functional: drive the SHIPPED helpers with a stubbed, LOGGED ssh ──────────
-def _harness(text: str, tmp_path: Path, *, ssh_rc: int):
+def _harness(text: str, tmp_path: Path, *, ssh_rc: int, pre_paused: bool = False):
     """Fake host-config (yaml + venv-python + key) and a PATH ssh stub that LOGS its
     verb and exits ssh_rc. Returns (run(body) -> stdout+stderr, ssh_log Path)."""
     home = tmp_path / "home"
@@ -144,19 +144,30 @@ def _harness(text: str, tmp_path: Path, *, ssh_rc: int):
     ssh_log = tmp_path / "ssh.log"
     (stub / "timeout").write_text('#!/bin/bash\nshift; exec "$@"\n')  # drop the N arg
     # log the LAST arg (the verb: "pause 1800" or "resume"), then exit ssh_rc
-    (stub / "ssh").write_text(f'#!/bin/bash\necho "${{@: -1}}" >> "{ssh_log}"\nexit {ssh_rc}\n')
+    # log the LAST arg (the verb) always; the `paused` query additionally returns
+    # its JSON on stdout (the ownership check greps it), so pre_paused drives it.
+    _paused_json = '{"paused": true}' if pre_paused else '{"paused": false}'
+    (stub / "ssh").write_text(
+        "#!/bin/bash\n"
+        'verb="${@: -1}"\n'
+        f'echo "$verb" >> "{ssh_log}"\n'
+        f"if [ \"$verb\" = paused ]; then echo '{_paused_json}'; fi\n"
+        f"exit {ssh_rc}\n"
+    )
     for f in ("timeout", "ssh"):
         (stub / f).chmod(0o755)
     pause = _extract_func(text, "_guardian_pause")
     resume = _extract_func(text, "_guardian_resume")
+    renew = _extract_func(text, "_guardian_renew_loop")
 
     def run(body: str) -> str:
         script = tmp_path / "h.sh"
         script.write_text(
             "#!/bin/bash\nset -euo pipefail\n"
             f'HOME="{home}"; VENV_DIR="{tmp_path}/venv"; GUARDIAN_PAUSE_TTL=1800\n'
-            '_GUARDIAN_PAUSED=""; _GUARDIAN_HOST=""; _GUARDIAN_KEY=""\n'
-            f"{pause}\n{resume}\n{body}\necho REACHED_END\n"
+            "GUARDIAN_PAUSE_RENEW_MAX=4\n"
+            '_GUARDIAN_PAUSED=""; _GUARDIAN_HOST=""; _GUARDIAN_KEY=""; _GUARDIAN_RENEW_PID=""\n'
+            f"{pause}\n{resume}\n{renew}\n{body}\necho REACHED_END\n"
         )
         env = {**os.environ, "PATH": f"{stub}:{os.environ['PATH']}"}
         r = subprocess.run(
@@ -192,6 +203,34 @@ def test_pause_failure_proceeds_unpaused_no_abort(text: str, tmp_path: Path) -> 
     assert "resume" not in (ssh_log.read_text() if ssh_log.exists() else "")
 
 
+def test_pause_skips_when_already_paused(text: str, tmp_path: Path) -> None:
+    """P2 #1: if the gateway already has an UNEXPIRED pause (operator/another
+    workflow), _guardian_pause must NOT re-pause and must NOT arm resume — so our
+    EXIT never removes a pause we did not create."""
+    run, ssh_log = _harness(text, tmp_path, ssh_rc=0, pre_paused=True)
+    out = run(
+        '_guardian_pause\n[ "${_GUARDIAN_PAUSED:-}" = 1 ] && echo PAUSED_SET || echo UNPAUSED\n'
+    )
+    assert "REACHED_END" in out
+    assert "UNPAUSED" in out and "PAUSED_SET" not in out, "must not own a pre-existing pause"
+    assert "already paused" in out
+    sent = ssh_log.read_text() if ssh_log.exists() else ""
+    assert "paused" in sent, "must query the gateway pause state"
+    assert "pause 1800" not in sent, "must NOT send our own pause over a pre-existing one"
+
+
+def test_pause_proceeds_when_not_already_paused(text: str, tmp_path: Path) -> None:
+    """P2 #1 (other side): with no pre-existing pause, _guardian_pause queries then
+    pauses and arms resume as normal."""
+    run, ssh_log = _harness(text, tmp_path, ssh_rc=0, pre_paused=False)
+    out = run(
+        '_guardian_pause\n[ "${_GUARDIAN_PAUSED:-}" = 1 ] && echo PAUSED_SET || echo UNPAUSED\n'
+    )
+    assert "PAUSED_SET" in out
+    sent = ssh_log.read_text()
+    assert "paused" in sent and "pause 1800" in sent, "must query THEN pause"
+
+
 def test_resume_best_effort_on_ssh_failure(text: str, tmp_path: Path) -> None:
     run, _ = _harness(text, tmp_path, ssh_rc=255)
     out = run(
@@ -221,6 +260,37 @@ def test_resume_noops_when_not_paused(text: str, tmp_path: Path) -> None:
     out = run("_guardian_resume\n")  # harness leaves _GUARDIAN_PAUSED=""
     assert "REACHED_END" in out
     assert not ssh_log.exists() or "resume" not in ssh_log.read_text(), "no spurious resume"
+
+
+def test_lease_renewer_wired_and_bounded(text: str) -> None:
+    """P2 #4: the renewer is bounded (GUARDIAN_PAUSE_RENEW_MAX), started as a
+    REDIRECTED background job by _guardian_pause, and killed by _guardian_resume
+    BEFORE the resume SSH (so it can't re-pause after we resume)."""
+    renew = _extract_func(text, "_guardian_renew_loop")
+    assert "GUARDIAN_PAUSE_RENEW_MAX" in renew, "renewer must be bounded (no runaway)"
+    assert "pause $GUARDIAN_PAUSE_TTL" in renew, "renewer must re-issue the pause verb"
+    pause = _extract_func(text, "_guardian_pause")
+    assert "_guardian_renew_loop >/dev/null 2>&1 &" in pause, (
+        "pause starts the renewer (redirected bg)"
+    )
+    assert "_GUARDIAN_RENEW_PID=$!" in pause, "pause must capture the renewer PID"
+    resume = _extract_func(text, "_guardian_resume")
+    assert 'kill "$_GUARDIAN_RENEW_PID"' in resume, "resume must kill the renewer"
+    assert resume.index("_GUARDIAN_RENEW_PID") < resume.index("resume >/dev/null"), (
+        "the renewer must be killed BEFORE the resume SSH"
+    )
+
+
+def test_lease_renewer_reissues_pause_then_stops(text: str, tmp_path: Path) -> None:
+    """P2 #4 functional: with a short TTL the renewer re-issues `pause` at least once
+    (the lease is renewed), and _guardian_resume stops it (no runaway re-pausing)."""
+    run, ssh_log = _harness(text, tmp_path, ssh_rc=0)
+    # TTL=2 → renewer sleeps 1s; keep the script alive ~3s to observe >=1 renewal,
+    # then _guardian_resume kills it.
+    run("GUARDIAN_PAUSE_TTL=2\n_guardian_pause\nsleep 3\n_guardian_resume\n")
+    sent = ssh_log.read_text() if ssh_log.exists() else ""
+    n = sent.count("pause 2")
+    assert n >= 2, f"renewer must re-issue pause at least once (saw {n} 'pause 2')"
 
 
 if sys.platform.startswith("win"):  # pragma: no cover

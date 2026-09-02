@@ -73,11 +73,19 @@ STATE_FILE="$HOME/.genesis/update_state.json"
 _GUARDIAN_PAUSED=""
 _GUARDIAN_HOST=""
 _GUARDIAN_KEY=""
+_GUARDIAN_RENEW_PID=""   # PID of the background lease-renewer (P2 #4), if running
 # Generous TTL: the EXIT-trap resume ends the pause early on success, so this only
 # matters if the deploy is SIGKILLed (the host's expires_at then self-heals after
 # this long). The bound is the server-DOWN window (~3-15 min), not the total pause
 # (the long host-sync runs server-up); capped at the guardian's 3600.
 GUARDIAN_PAUSE_TTL=1800
+# Bounded lease-renew (P2 #4): the stop→restart window has NO upper bound (the
+# bootstrap does unbounded network work — installer downloads, npm), so a fixed
+# TTL can expire mid-deploy and re-fire the very alerts the pause suppresses. A
+# background renewer re-issues `pause` every TTL/2 while the server is down. CAPPED
+# so an orphaned renewer (parent died before cleanup) self-terminates in
+# ~ RENEW_MAX * TTL/2 (here ~1h) instead of pausing the guardian forever.
+GUARDIAN_PAUSE_RENEW_MAX=4
 
 # ── Update state file helper ────────────────────────────
 # Written at each phase boundary so crash recovery knows where we stopped.
@@ -737,6 +745,18 @@ _guardian_pause() {
     [ -n "$hip" ] && [ -f "$key" ] || return 0
     _GUARDIAN_HOST="${hus:-ubuntu}@${hip}"
     _GUARDIAN_KEY="$key"
+    # Don't clobber a pause we did not create (P2 #1): if the gateway already has an
+    # UNEXPIRED pause (an operator or another workflow set it), leave it intact —
+    # proceed WITHOUT pausing and WITHOUT arming resume, so our EXIT never removes
+    # their pause (a pre-existing pause already covers our restart window). Against
+    # an OLD gateway with no `paused` verb the query errors/returns non-JSON → no
+    # match → we fall through and pause as before (backward-compatible). The pipe is
+    # in an `if` condition, so a failing ssh can't abort the deploy.
+    if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+        "$_GUARDIAN_HOST" paused 2>/dev/null | grep -q '"paused": true'; then
+        echo "  Guardian already paused (operator/other) — leaving it intact; not arming our resume"
+        return 0
+    fi
     # Only mark paused (and arm the resume) if the gateway ACCEPTED the verb.
     # Against an OLD gateway (no `pause <ttl>` grammar — needs PR-1 deployed) or an
     # unreachable host this fails; we then proceed unpaused with a VISIBLE warning
@@ -749,6 +769,12 @@ _guardian_pause() {
         # Resume on ANY exit, COMPOSED with the temp-copy self-delete (never
         # replace it — a resume-only re-arm would leak the mktemp copy each deploy).
         trap '_guardian_resume; rm -f "${BASH_SOURCE[0]}" 2>/dev/null' EXIT
+        # Start the bounded lease renewer so an over-TTL downtime can't expire the
+        # pause mid-deploy (P2 #4). _guardian_resume (and the EXIT trap) kills it.
+        # Redirect its fds so it (and its `sleep` child) don't hold the deploy's
+        # stdout/stderr — otherwise a lingering sleep would keep the pipe open.
+        _guardian_renew_loop >/dev/null 2>&1 &
+        _GUARDIAN_RENEW_PID=$!
     else
         echo "  WARNING: guardian pause not accepted (old gateway or host unreachable) — proceeding unpaused" >&2
     fi
@@ -756,6 +782,22 @@ _guardian_pause() {
 
 _guardian_resume() {
     [ "${_GUARDIAN_PAUSED:-}" = 1 ] || return 0
+    # Stop the lease renewer FIRST so it cannot re-pause after we resume (P2 #4).
+    # We never `wait` the renewer before this point, so its PID stays held (running,
+    # or a zombie once the bounded loop self-exits) and CANNOT be reused — so kill -0
+    # reliably identifies our own process (no PID-reuse hazard, no fragile identity
+    # check). `wait` reaps the renewer bash, stopping further renewals. RESIDUAL: a
+    # `pause` ssh already in flight when the kill lands (~15s window, only if the
+    # kill hits mid-renew) is orphaned and may complete AFTER the resume below,
+    # re-asserting the pause — bounded + self-healing via the host-side TTL (≤ the
+    # pause TTL, ≤30min). All steps non-aborting under set -e.
+    if [ -n "${_GUARDIAN_RENEW_PID:-}" ]; then
+        if kill -0 "$_GUARDIAN_RENEW_PID" 2>/dev/null; then
+            kill "$_GUARDIAN_RENEW_PID" 2>/dev/null || true
+        fi
+        wait "$_GUARDIAN_RENEW_PID" 2>/dev/null || true
+        _GUARDIAN_RENEW_PID=""
+    fi
     # Clear the flag ONLY after the gateway accepts `resume`. On a transient SSH
     # failure the flag stays set so the EXIT-trap retries; if every retry fails the
     # host-side TTL (expires_at) self-heals. Clearing first would no-op the retry.
@@ -764,6 +806,20 @@ _guardian_resume() {
         _GUARDIAN_PAUSED=""
     fi
     return 0
+}
+
+_guardian_renew_loop() {
+    # Re-issue `pause $TTL` every TTL/2 while the server is down, BOUNDED to
+    # GUARDIAN_PAUSE_RENEW_MAX iterations. Runs in the background (started by
+    # _guardian_pause); _guardian_resume — and thus the EXIT trap — kills it. A
+    # failed renew is swallowed (best-effort, like the pause itself).
+    local i=0
+    while [ "$i" -lt "$GUARDIAN_PAUSE_RENEW_MAX" ]; do
+        sleep "$((GUARDIAN_PAUSE_TTL / 2))"
+        timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+            "$_GUARDIAN_HOST" "pause $GUARDIAN_PAUSE_TTL" >/dev/null 2>&1 || true
+        i=$((i + 1))
+    done
 }
 
 # ── Pre-update DB snapshot ────────────────────────────────
