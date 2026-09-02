@@ -494,6 +494,36 @@ async def test_foreign_sender_does_not_ping(db):
     assert calls == []
 
 
+async def test_unverified_empty_sender_does_not_ping(db):
+    """A reply matched to a prospect thread but with a malformed/unparsable ``From``
+    (a display name with no address → empty parsed sender) slips PAST the
+    sender!=recipient guard, which only rejects when BOTH addresses are truthy.
+    The owner-ping must still NOT fire — we surface only a reply whose sender we
+    positively verified equals the prospect recipient, never an unverified
+    "reply from someone". Engagement recording keeps its pre-existing
+    permissiveness (this test does not assert on it)."""
+    await _seed_outreach(db)
+    await _seed_prospect(db)
+    calls = []
+
+    async def _notify(thread, reply):
+        calls.append(1)
+
+    # From header present (so the reply matches + reaches the bridge) but with an
+    # empty angle-address → parseaddr("Anonymous <>")[1] == "" → the mismatch guard
+    # (needs BOTH addrs truthy) can't reject it, so only the ping's own sender_addr
+    # check stops it. (NB: a bare quoted string like '"X"' parses AS the address, so
+    # it would trip the mismatch guard instead — not the path under test.)
+    no_addr = _reply(from_addr="Anonymous <>")
+    await _run_poll_with_notify(
+        db,
+        thread_context={"outreach_id": OUTREACH_ID},
+        notify_owner=_notify,
+        raws=[no_addr],
+    )
+    assert calls == []  # unverified/empty sender → no owner ping
+
+
 async def test_ping_failure_does_not_break_engagement_or_count_error(db):
     """The owner-ping is best-effort: if notify_owner raises, engagement is still
     recorded and the bridge does NOT report an error — reply tracking must never

@@ -105,7 +105,18 @@ def make_reply_engagement_bridge(tracker: EngagementTracker, notify_owner=None):
         # who replies is still a real human reply worth surfacing. Best-effort:
         # any failure is logged and swallowed so reply tracking never depends on
         # it (and it never counts as a bridge error).
-        if notify_owner is not None and recipient:
+        #
+        # Require a NON-EMPTY parsed sender: the foreign-sender guard above
+        # (`recipient and sender_addr and sender_addr != recipient`) only rejects
+        # when BOTH addresses are truthy, so a reply with a missing/unparsable
+        # `From` (empty sender_addr) slips past it. Gating the ping on `sender_addr`
+        # means we only surface a reply whose sender we positively verified equals
+        # the prospect recipient (a truthy sender that reached here must == recipient,
+        # or the guard would have returned) — never an unverified "reply from someone".
+        # record_reply_if_pending above is intentionally NOT gated on this (internal
+        # engagement tracking keeps its pre-existing permissiveness); only the
+        # owner-facing ping requires the stronger sender proof.
+        if notify_owner is not None and recipient and sender_addr:
             try:
                 from genesis.db.crud import marketing_prospects as _marketing_prospects
 
