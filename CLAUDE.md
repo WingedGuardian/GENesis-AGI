@@ -393,11 +393,18 @@ When a user shares a file path or URL in conversation:
 - **Code review after code changes.** Codex will review your output.
   Protocol in genesis-development skill.
 - **Commit continuously**: uncommitted = invisible = lost.
-- **Bias toward closing open work before opening new — softly (≈51/49).** Not a
-  gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
-  everything before starting the next thing. Just lean, gently, toward landing or
-  closing open PRs over opening more — so work doesn't pile up and go stale on the
-  repo instead of getting done.
+- **Closing outpaces opening — as a FLEET property, not a per-session rule.**
+  Building a PR and driving it to merge are different session types: a build
+  session's work ends when the PR is open (it runs the local adversarial pass,
+  then stops — it does not wait for the cross-model review), and closing
+  sessions own the open-PR queue regardless of who built each one. So do NOT
+  throttle your own work to "close before you open" — that just moves the queue
+  upstream. What must hold is the RATE: closed-per-week > opened-per-week, or
+  the queue grows without bound no matter how disciplined any single session is.
+  Treat an open PR whose originating session is gone as ordinary pickup work,
+  not as someone else's. Check the rate with `scripts/pr_flow_rate.py` rather
+  than by feel (measured 2026-09-02: 78.3 opened/wk vs 76.3 closed/wk — a ~3%
+  leak, not a 10x problem).
 - **Procedure recall is automatic** — the proactive hook surfaces relevant
   procedures. Store new procedures immediately when you discover them.
 - **Never insert directly into `task_states`.** Use `task_submit` MCP
