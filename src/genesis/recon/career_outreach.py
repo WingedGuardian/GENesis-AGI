@@ -63,6 +63,7 @@ Design notes:
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import logging
 import uuid
@@ -147,6 +148,30 @@ def _now_z() -> str:
 def _nudge_hash(company: str) -> str:
     """Content-hash namespace for the per-company 'owner already nudged' marker."""
     return hashlib.sha256(f"career_nudged:{company.strip().lower()}".encode()).hexdigest()[:32]
+
+
+# Bite-relay: pipeline stages that count as a "bite" — an advance INTO an engaged
+# stage. Pre-engagement stages (researching / contacts_mapped / outreach_sent) and the
+# terminal `closed` are deliberately excluded (user decision 2026-09-01). These match
+# the external engine's own /api/pipeline stage vocabulary (verified against its source).
+BITE_STAGES = ("in_conversation", "interviewing", "offer")
+
+# Hard per-tick ceiling on engaged-stage entries the bite-relay will PROCESS (a DB op
+# each — a live exists_by_hash read or an observe _record_bite write). Bounds the tick's
+# work against a buggy or compromised data_module returning a huge pipeline; independent
+# of the per-tick nudge cap (which bounds owner MESSAGES only). Generous: a single
+# person's real engaged pipeline is tiny — this only bites on an anomalous response.
+_MAX_BITE_CANDIDATES_PER_TICK = 500
+
+
+def _bite_hash(company_key: object, stage: str) -> str:
+    """Content-hash namespace for the per-(company, stage) 'advance already relayed'
+    marker. Keyed on the STABLE company id (not the display name, which can change) +
+    stage. A stage advance is a POINT EVENT, so this marker permanently dedups it
+    (checked with unresolved_only=False)."""
+    return hashlib.sha256(
+        f"career_bite:{str(company_key).strip().lower()}:{stage}".encode()
+    ).hexdigest()[:32]
 
 
 def _reply_text(result: object) -> str:
@@ -333,14 +358,16 @@ def classify_autorun_reply(reply_text: str) -> AutorunOutcome:
 
 @dataclass(frozen=True)
 class CareerOutreachResult:
-    """Summary of one monitor tick."""
+    """Summary of one monitor tick (both sub-capabilities merged)."""
 
-    mode: str = "off"
+    mode: str = "off"  # the auto-run driver's lever
+    bite_mode: str = "off"  # the INDEPENDENT bite-relay lever
     health_ok: bool = True
     auto_runs: int = 0  # dispatches that staged a fresh draft
     drafts_working: int = 0  # == auto_runs: drafts staged THIS tick (no backlog census)
     nudged: int = 0  # newly-staged drafts included in a delivered nudge
     verify_failed: int = 0  # engine drafted but its own accuracy gate refused (NOT an error)
+    bites: int = 0  # pipeline advances relayed to the owner this tick
     errors: int = 0  # unsuccessful operations (→ job-health FAILURE)
     details: list[str] = field(default_factory=list)
 
@@ -385,16 +412,56 @@ class CareerOutreachMonitor:
 
     # ── main tick ─────────────────────────────────────────────────────────
     async def gather(self) -> CareerOutreachResult:
+        """Run the two INDEPENDENT sub-capabilities and merge their results:
+        the auto-run driver (SSH ``reasoning_module``, ``mode`` lever) and the
+        bite-relay (HTTP ``data_module`` read + owner nudge, ``bite_relay_mode``
+        lever). Each is health-gated on its OWN module, so one being off / absent /
+        unhealthy never disables the other. The tick is skipped only when BOTH
+        levers are off."""
         mode = cfg.effective_mode()
-        if mode == "off":
-            return CareerOutreachResult(mode="off")
+        bite_mode = cfg.effective_bite_relay_mode()
+        if mode == "off" and bite_mode == "off":
+            return CareerOutreachResult(mode="off", bite_mode="off")
 
         conf = cfg.load_config()
         reg = self._module_registry()
         if reg is None:
             logger.debug("career outreach: module registry unavailable — skip")
-            return CareerOutreachResult(mode=mode)
+            return CareerOutreachResult(mode=mode, bite_mode=bite_mode)
 
+        auto = await self._run_autorun(mode, conf, reg) if mode != "off" else None
+        bite = await self._run_bite_relay(bite_mode, conf, reg) if bite_mode != "off" else None
+        return self._merge_results(mode, bite_mode, auto, bite)
+
+    @staticmethod
+    def _merge_results(
+        mode: str,
+        bite_mode: str,
+        auto: CareerOutreachResult | None,
+        bite: CareerOutreachResult | None,
+    ) -> CareerOutreachResult:
+        """Combine the two sub-capability results into one tick summary. A branch that
+        did not run contributes neutrally (0 counters, health_ok, no errors), so
+        job-health reflects whatever DID run."""
+        a = auto or CareerOutreachResult(mode=mode)
+        b = bite or CareerOutreachResult(bite_mode=bite_mode)
+        return CareerOutreachResult(
+            mode=mode,
+            bite_mode=bite_mode,
+            health_ok=a.health_ok and b.health_ok,
+            auto_runs=a.auto_runs,
+            drafts_working=a.drafts_working,
+            nudged=a.nudged,
+            verify_failed=a.verify_failed,
+            bites=b.bites,
+            errors=a.errors + b.errors,
+            details=[*a.details, *b.details],
+        )
+
+    async def _run_autorun(self, mode: str, conf: dict, reg) -> CareerOutreachResult:
+        """The auto-run driver: dispatch the SSH reasoning module to stage drafts +
+        nudge (``live``), or probe bridge reachability (``observe``). Health-gated on
+        the reasoning module. (Body relocated verbatim from the former ``gather``.)"""
         reasoning_name = cfg.module_name(conf, "reasoning_module")
         mod = reg.get(reasoning_name) if reasoning_name else None
         if mod is None:
@@ -438,6 +505,178 @@ class CareerOutreachMonitor:
         if mode == "observe":
             return await self._observe_probe(mod)
         return await self._live(mod, conf, timeout)
+
+    async def _run_bite_relay(self, bite_mode: str, conf: dict, reg) -> CareerOutreachResult:
+        """Read the external pipeline and nudge the owner when a company has advanced
+        into an engaged stage (``BITE_STAGES``). ``observe`` = read + SEED the dedup
+        ledger without nudging; ``live`` = nudge on a NEW advance, then mark it.
+
+        Health-gated on the DATA module (distinct from the auto-run's reasoning
+        module). An unhealthy/absent data bridge is a CLEAN SKIP, NOT a job-health
+        failure — the external read service is legitimately down when the search is
+        dormant, and a daily false alarm on a dormant service is noise, not signal. A
+        read the service DID answer with an error (service up, op failed) IS a genuine
+        failure and is counted."""
+        data_name = cfg.module_name(conf, "data_module")
+        mod = reg.get(data_name) if data_name else None
+        if mod is None:
+            # The lever is ON here (this method runs only when bite_mode != "off"), so an
+            # unresolvable data_module is a MISCONFIG worth surfacing — NOT the silent
+            # generic-install case (that ships bite_mode=off and never reaches here).
+            logger.warning(
+                "career outreach bite-relay: enabled (bite_mode=%s) but data_module %r is "
+                "unset/unresolvable — no-op; set data_module in the overlay",
+                bite_mode,
+                data_name,
+            )
+            return CareerOutreachResult(
+                bite_mode=bite_mode,
+                details=[f"bite-relay: data_module {data_name!r} unresolvable — no-op"],
+            )
+
+        try:
+            healthy = await mod.check_health_cached()
+        except Exception:
+            logger.debug(
+                "career outreach bite-relay: data health raised — clean skip", exc_info=True
+            )
+            return CareerOutreachResult(
+                bite_mode=bite_mode, details=["bite-relay: data module health raised — skipped"]
+            )
+        if not healthy:
+            logger.debug("career outreach bite-relay: data module unreachable — clean skip")
+            return CareerOutreachResult(
+                bite_mode=bite_mode, details=["bite-relay: data module unreachable — skipped"]
+            )
+
+        try:
+            result = await mod.execute_operation("pipeline")
+        except Exception as exc:
+            # execute_operation normally returns an error DICT, but a malformed response
+            # (e.g. a non-JSON body → resp.json() raising inside HttpIPCAdapter) can RAISE.
+            # Guard it so a bite-relay read failure never escapes gather() and discards the
+            # independently-computed auto-run result (mirrors the health-check guard above).
+            logger.warning(
+                "career outreach bite-relay: pipeline read raised — recording failure",
+                exc_info=True,
+            )
+            return CareerOutreachResult(
+                bite_mode=bite_mode,
+                errors=1,
+                details=[f"bite-relay: pipeline read raised: {str(exc)[:120]}"],
+            )
+        if not isinstance(result, dict) or result.get("error"):
+            detail = result.get("error") if isinstance(result, dict) else "non-dict reply"
+            return CareerOutreachResult(
+                bite_mode=bite_mode,
+                errors=1,
+                details=[f"bite-relay: pipeline read failed: {str(detail)[:120]}"],
+            )
+        pipeline_by_stage = result.get("pipeline")
+        if not isinstance(pipeline_by_stage, dict):
+            # Service up but an unexpected shape (a schema change) — surface a failure
+            # rather than silently reading nothing.
+            return CareerOutreachResult(
+                bite_mode=bite_mode,
+                errors=1,
+                details=["bite-relay: pipeline reply missing a 'pipeline' dict"],
+            )
+
+        from genesis.outreach.types import OutreachStatus
+
+        # Flatten (stage, entry) across the engaged-stage buckets → a single pass, so the
+        # per-tick nudge cap and the pause check need only one loop + one break.
+        candidates: list[tuple[str, dict]] = []
+        for stage in BITE_STAGES:
+            bucket = pipeline_by_stage.get(stage)
+            if isinstance(bucket, list):  # defensive: absent/typed-wrong bucket → skip
+                candidates.extend((stage, e) for e in bucket)
+        if len(candidates) > _MAX_BITE_CANDIDATES_PER_TICK:
+            # Hard scan ceiling — bounds the per-tick DB work (a read/write per candidate)
+            # against a buggy/oversized data_module response, independent of the
+            # message-only nudge cap. Loud-truncation (the excess re-appears next tick).
+            logger.warning(
+                "career outreach bite-relay: %d engaged-stage entries returned — truncating "
+                "scan to %d (buggy/oversized data_module response?)",
+                len(candidates),
+                _MAX_BITE_CANDIDATES_PER_TICK,
+            )
+            candidates = candidates[:_MAX_BITE_CANDIDATES_PER_TICK]
+
+        nudge_cap = cfg.knob_int(conf, "max_bite_nudges_per_tick")
+        bites = 0
+        errors = 0
+        attempts = 0  # live nudge attempts this tick (the cap bounds owner messages)
+        details: list[str] = []
+        for stage, entry in candidates:
+            if self._is_paused():
+                details.append("paused — halting bite-relay")
+                break
+            if not isinstance(entry, dict):
+                continue
+            company_id = entry.get("id")
+            if company_id is None or company_id == "":
+                continue  # no stable key → cannot dedup safely; skip (fail-safe)
+            # Bound the external name (NOTE: a crafted long name must not bloat the obs
+            # row / nudge). [:200] before use — the marker dedups on id, not name, so this
+            # never affects dedup.
+            company_name = (str(entry.get("name") or "").strip() or f"company {company_id}")[:200]
+            h = _bite_hash(company_id, stage)
+            # unresolved_only=False: a stage advance is a POINT EVENT — the marker
+            # permanently suppresses a re-nudge (never re-emits on resolution/TTL).
+            if await observations.exists_by_hash(
+                self._db, source=_SOURCE, content_hash=h, unresolved_only=False
+            ):
+                continue
+            if bite_mode == "observe":
+                # SEED the ledger without nudging (no owner message → the cap does not
+                # apply), so the first live tick does not fire a backlog for cos already
+                # advanced when observe started.
+                await self._record_bite(h, company_name, stage)
+                continue
+            # live: bound the per-tick owner-message burst. Un-nudged advances are NOT
+            # marked, so they surface on a later tick (loud-truncation, never dropped).
+            if attempts >= nudge_cap:
+                details.append(
+                    f"bite-relay: per-tick nudge cap ({nudge_cap}) reached — "
+                    "further advances deferred to the next tick"
+                )
+                break
+            status = await self._bite_nudge(company_name, stage, company_id)
+            attempts += 1
+            if status == OutreachStatus.DELIVERED:
+                await self._record_bite(h, company_name, stage)
+                bites += 1
+                details.append(f"bite: {company_name} → {stage}")
+            elif status == OutreachStatus.REJECTED:
+                # Pipeline dedup — the owner already got an identical nudge. Not a
+                # failure, not marked (a harmless re-derive next tick).
+                details.append(f"bite nudge deduped — {company_name} → {stage}")
+            else:
+                # FAILED / None (no pipeline / exception) — a real delivery failure.
+                errors += 1
+                details.append(
+                    f"bite nudge not delivered (status={status}) — {company_name} → {stage}"
+                )
+        if not details:
+            details.append(f"bite-relay: {bite_mode} — no new advances")
+        return CareerOutreachResult(
+            bite_mode=bite_mode, bites=bites, errors=errors, details=details
+        )
+
+    async def _record_bite(self, content_hash: str, company_name: str, stage: str) -> None:
+        """Write the permanent per-(company, stage) 'advance already relayed' marker."""
+        await observations.create(
+            self._db,
+            id=uuid.uuid4().hex,
+            source=_SOURCE,
+            type="career_bite",
+            content=f"bite:{company_name}:{stage}",
+            priority="low",
+            created_at=_now_z(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
 
     async def _observe_probe(self, mod) -> CareerOutreachResult:
         """Observe mode: a bridge-REACHABILITY probe, NOT a seeder. A minimal dispatch
@@ -681,4 +920,47 @@ class CareerOutreachMonitor:
             logger.info("career outreach: nudged %d staged draft(s)", n)
         else:
             logger.warning("career outreach: nudge not delivered (status=%s) — will retry", status)
+        return status
+
+    async def _bite_nudge(self, company_name: str, stage: str, company_id: object):
+        """Push ONE owner Telegram nudge that a company advanced into an engaged stage.
+        Returns the delivery ``OutreachStatus`` (``None`` if no pipeline / the send
+        raised) so the caller marks only on DELIVERED. Plain ``submit_raw`` (mirrors
+        ``_nudge``) — NOTE: the ``best_effort`` no-retry flag is not on origin/main yet
+        (PR #1585); applying it to the career nudges is a follow-up once that lands."""
+        from genesis.outreach.types import OutreachCategory, OutreachRequest, OutreachStatus
+
+        pipeline = self._pipeline()
+        if pipeline is None:
+            logger.warning("career outreach bite-relay: pipeline unavailable — cannot nudge")
+            return None
+
+        # company_name is EXTERNAL pipeline input and the outreach telegram path sends
+        # parse_mode="HTML" WITHOUT escaping — HTML-escape it so a crafted name (e.g. from
+        # an ingested job posting) can't render as live markup in the owner's chat. (When
+        # PR #1585's shared _sanitize_ping_field lands on main, reuse it here — follow-up.)
+        safe_name = html.escape(company_name)
+        text = f"🎯 Career: {safe_name} advanced to {stage.replace('_', ' ')}"
+        request = OutreachRequest(
+            category=OutreachCategory.NOTIFICATION,
+            channel="telegram",
+            # Unique per (company, stage) so submit_raw's 24h (signal_type, topic,
+            # category) dedup never collapses two distinct advances. The company name
+            # is in the delivered `text`, so the content-hash dedup key is distinct too.
+            topic=f"Career bite: {str(company_id)[:100]} {stage}",
+            context=text,
+            signal_type="career_bite",
+            salience_score=0.85,
+            verbatim=True,
+        )
+        try:
+            result = await pipeline.submit_raw(text, request)
+        except Exception:
+            logger.error("career outreach bite-relay: nudge failed", exc_info=True)
+            return None
+        status = getattr(result, "status", None)
+        if status == OutreachStatus.DELIVERED:
+            logger.info("career outreach bite-relay: relayed %s → %s", company_name, stage)
+        else:
+            logger.warning("career outreach bite-relay: nudge not delivered (status=%s)", status)
         return status

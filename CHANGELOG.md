@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Career pipeline "bite" notifications (opt-in, off by default).** Genesis can now
+  ping you on Telegram when a company advances into an engaged stage (in conversation /
+  interviewing / offer) in your job-search pipeline — so you hear about momentum
+  without watching the board. It only READS your pipeline and notifies you (no
+  autonomous action, no sending), on an independent lever separate from the
+  draft-staging driver. Ships OFF: enable it by pointing `data_module` at your
+  career-agent module and setting `bite_relay_mode` to `observe` then `live`.
 - **Gated autonomous cold marketing outreach (inert by default).** Genesis can
   now stage cold marketing emails to an owner-curated prospect list via the new
   `marketing_send` tool. The recipient is resolved in code from a private

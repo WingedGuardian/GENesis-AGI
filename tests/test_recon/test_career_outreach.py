@@ -19,6 +19,7 @@ from genesis.recon import career_outreach_config as cfg
 from genesis.recon.career_outreach import (
     _AUTORUN_PROMPT,
     _PROBE_PROMPT,
+    BITE_STAGES,
     CareerOutreachMonitor,
     CareerOutreachResult,
     ModuleError,
@@ -27,6 +28,7 @@ from genesis.recon.career_outreach import (
     Staged,
     VerifyFailed,
     _autorun_prompt,
+    _bite_hash,
     _nudge_hash,
     _parse_json,
     classify_autorun_reply,
@@ -157,6 +159,71 @@ def test_nudge_obs_type_registered_in_both_governance_sets():
     assert "career_outreach_nudged" in _TTL_BY_TYPE
 
 
+# ── C: bite-relay config lever (independent of the auto-run mode) ────────────
+
+
+def test_bite_relay_ships_off_and_data_module_empty():
+    # The bite-relay ships OFF + empty data_module → a generic install skips it,
+    # and no install-specific module name lands in the public repo.
+    assert cfg.DEFAULTS["bite_relay_mode"] == "off"
+    assert cfg.DEFAULTS["data_module"] == ""
+
+
+def test_effective_bite_relay_mode_default_off(monkeypatch, tmp_path):
+    # No config file → DEFAULTS → off (opt-in actuator inert on a fresh install).
+    monkeypatch.delenv(cfg._ENV_KILL_SWITCH, raising=False)
+    monkeypatch.setattr(cfg, "_base_path", lambda: tmp_path / "absent.yaml")
+    assert cfg.effective_bite_relay_mode() == "off"
+
+
+def test_effective_bite_relay_mode_pass_through(monkeypatch, tmp_path):
+    monkeypatch.delenv(cfg._ENV_KILL_SWITCH, raising=False)
+    for m in ("observe", "live"):
+        p = _write(tmp_path, f"enabled: true\nbite_relay_mode: {m}\n")
+        monkeypatch.setattr(cfg, "_base_path", lambda p=p: p)
+        assert cfg.effective_bite_relay_mode() == m
+
+
+def test_effective_bite_relay_mode_invalid_degrades_to_observe(monkeypatch, tmp_path):
+    # Invalid value → observe (read/seed safely; never a silent off that hides it),
+    # matching effective_mode()'s established degrade.
+    p = _write(tmp_path, "enabled: true\nbite_relay_mode: bogus\n")
+    monkeypatch.setattr(cfg, "_base_path", lambda: p)
+    monkeypatch.delenv(cfg._ENV_KILL_SWITCH, raising=False)
+    assert cfg.effective_bite_relay_mode() == "observe"
+
+
+def test_effective_bite_relay_mode_kill_switch_and_enabled_false(monkeypatch, tmp_path):
+    # The whole-monitor kill switch + master enabled flag force the bite-relay off too.
+    p = _write(tmp_path, "enabled: true\nbite_relay_mode: live\n")
+    monkeypatch.setattr(cfg, "_base_path", lambda: p)
+    monkeypatch.setenv(cfg._ENV_KILL_SWITCH, "1")
+    assert cfg.effective_bite_relay_mode() == "off"
+    monkeypatch.delenv(cfg._ENV_KILL_SWITCH, raising=False)
+    p2 = _write(tmp_path, "enabled: false\nbite_relay_mode: live\n")
+    monkeypatch.setattr(cfg, "_base_path", lambda: p2)
+    assert cfg.effective_bite_relay_mode() == "off"
+
+
+def test_bite_relay_lever_independent_of_auto_run(monkeypatch, tmp_path):
+    # The two levers are INDEPENDENT: auto-run off, bite-relay live (the whole point —
+    # the relay can go live while the policy-blocked auto-run stays gated).
+    p = _write(tmp_path, "enabled: true\nmode: off\nbite_relay_mode: live\n")
+    monkeypatch.setattr(cfg, "_base_path", lambda: p)
+    monkeypatch.delenv(cfg._ENV_KILL_SWITCH, raising=False)
+    assert cfg.effective_mode() == "off"
+    assert cfg.effective_bite_relay_mode() == "live"
+
+
+def test_career_bite_obs_type_registered_in_both_governance_sets():
+    # A stage-advance bite obs must register in BOTH sets (same governance requirement
+    # as career_outreach_nudged) — INTERNAL_OBS_TYPES (no user-surfacer leak) + _TTL_BY_TYPE.
+    from genesis.db.crud.observations import _TTL_BY_TYPE, INTERNAL_OBS_TYPES
+
+    assert "career_bite" in INTERNAL_OBS_TYPES
+    assert "career_bite" in _TTL_BY_TYPE
+
+
 # ── monitor tick tests (against a real in-memory observations store) ────────
 
 
@@ -253,19 +320,108 @@ def _autorun_calls(mod: _FakeModule) -> int:
     return sum(1 for c in mod.calls if c != _PROBE_PROMPT)
 
 
-def _cfg(monkeypatch, *, mode, cap=3, autorun_note=""):
+def _cfg(
+    monkeypatch,
+    *,
+    mode,
+    bite_mode="off",
+    cap=3,
+    bite_cap=10,
+    autorun_note="",
+    data_module="data-module",
+):
     monkeypatch.setattr(cfg, "effective_mode", lambda: mode)
+    # Stub the INDEPENDENT bite-relay lever too (default off) so the existing auto-run
+    # tests never spring the relay to observe via the invalid→observe degrade.
+    monkeypatch.setattr(cfg, "effective_bite_relay_mode", lambda: bite_mode)
     monkeypatch.setattr(
         cfg,
         "load_config",
         lambda: {
             "reasoning_module": "test-module",
+            "data_module": data_module,
             "max_auto_runs_per_tick": cap,
+            "max_bite_nudges_per_tick": bite_cap,
             "dispatch_timeout_s": 240,
             "dispatch_max_turns": 80,
             "autorun_note": autorun_note,
         },
     )
+
+
+# Stage list the external /api/pipeline returns (verified from jerbs pipeline_api.py).
+_PIPE_STAGES = (
+    "researching",
+    "contacts_mapped",
+    "outreach_sent",
+    "in_conversation",
+    "interviewing",
+    "offer",
+    "closed",
+)
+
+
+class _FakeDataModule:
+    """The HTTP data module the bite-relay reads: check_health_cached +
+    execute_operation('pipeline') returning {stages, pipeline: {stage: [entries]}}."""
+
+    def __init__(
+        self,
+        *,
+        healthy=True,
+        pipeline=None,
+        error=None,
+        bad_shape=False,
+        raise_health=False,
+        raise_op=False,
+    ) -> None:
+        self._healthy = healthy
+        self._pipeline = pipeline or {}
+        self._error = error
+        self._bad_shape = bad_shape
+        self._raise_health = raise_health
+        self._raise_op = raise_op
+        self.ops: list[str] = []
+
+    async def check_health_cached(self) -> bool:
+        if self._raise_health:
+            raise RuntimeError("data health boom")
+        return self._healthy
+
+    async def execute_operation(self, op, params=None):
+        self.ops.append(op)
+        if self._raise_op:
+            raise ValueError("malformed JSON body")  # e.g. resp.json() raising in ipc
+        if self._error is not None:
+            return {"error": self._error}
+        if self._bad_shape:
+            return {"stages": list(_PIPE_STAGES), "pipeline": "not-a-dict"}
+        return {"stages": list(_PIPE_STAGES), "pipeline": self._pipeline}
+
+
+class _FakeMultiRegistry:
+    """Resolves DIFFERENT modules by name — the bite-relay reads 'data-module', the
+    auto-run drives 'test-module' (the reasoning module)."""
+
+    def __init__(self, modules: dict):
+        self._modules = modules
+
+    def get(self, name):
+        return self._modules.get(name)
+
+
+def _entry(cid, name, tier="A"):
+    return {"id": cid, "name": name, "priority_tier": tier, "industry": ""}
+
+
+def _mon_bite(db, data_module, *, reasoning_module=None, pipe_status=OutreachStatus.DELIVERED):
+    mon = CareerOutreachMonitor(db)
+    pipe = _FakePipeline(pipe_status)
+    mon._pipeline = lambda: pipe
+    mon._module_registry = lambda: _FakeMultiRegistry(
+        {"data-module": data_module, "test-module": reasoning_module}
+    )
+    return mon, pipe
 
 
 def _mon(db, module=None, *, pipe_status=OutreachStatus.DELIVERED, registry_none=False):
@@ -741,6 +897,435 @@ async def test_runner_records_success_on_clean_tick(monkeypatch):
 
     await runners.run_career_outreach_monitor(_Sched())
     assert calls["success"] == ["career_outreach_monitor"] and not calls["fail"]
+
+
+# ── C: career bite-relay (pipeline-advance owner nudge, independent lever) ──────
+
+
+async def _bite_count(db) -> int:
+    row = await (
+        await db.execute("SELECT COUNT(*) FROM observations WHERE type = 'career_bite'")
+    ).fetchone()
+    return row[0]
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_off_does_not_read_or_nudge(db, monkeypatch):
+    # bite_relay off (and auto-run off) → the data module is never read, nothing nudged.
+    _cfg(monkeypatch, mode="off", bite_mode="off")
+    data = _FakeDataModule(pipeline={"in_conversation": [_entry(1, "Acme")]})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.bite_mode == "off" and result.bites == 0
+    assert data.ops == [] and pipe.sent == []
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_observe_seeds_ledger_no_nudge(db, monkeypatch):
+    # observe → READ + SEED the dedup ledger (record career_bite obs) but NEVER nudge,
+    # so the first live tick won't fire a backlog for already-advanced companies.
+    _cfg(monkeypatch, mode="off", bite_mode="observe")
+    data = _FakeDataModule(pipeline={"in_conversation": [_entry(1, "Acme"), _entry(2, "Globex")]})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.bite_mode == "observe" and result.bites == 0
+    assert pipe.sent == []  # observe never nudges
+    assert await _bite_count(db) == 2  # both seeded
+    assert await observations.exists_by_hash(
+        db, source="recon", content_hash=_bite_hash(1, "in_conversation"), unresolved_only=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_live_nudges_new_advance_and_marks(db, monkeypatch):
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"interviewing": [_entry(7, "Initech")]})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.bites == 1 and result.errors == 0
+    assert len(pipe.sent) == 1
+    body = pipe.sent[0][0]
+    assert "Initech" in body and "interviewing" in body
+    assert await observations.exists_by_hash(
+        db, source="recon", content_hash=_bite_hash(7, "interviewing"), unresolved_only=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_dedup_does_not_renudge(db, monkeypatch):
+    # A (company, stage) already in the ledger (even RESOLVED — point-event dedup uses
+    # unresolved_only=False) must NOT re-nudge.
+    await observations.create(
+        db,
+        id="seed",
+        source="recon",
+        type="career_bite",
+        content="bite:Initech:interviewing",
+        priority="low",
+        created_at="2026-08-01T00:00:00Z",
+        content_hash=_bite_hash(7, "interviewing"),
+        skip_if_duplicate=True,
+    )
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"interviewing": [_entry(7, "Initech")]})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.bites == 0 and pipe.sent == []  # already relayed → suppressed
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_dedup_survives_marker_resolution(db, monkeypatch):
+    # THE point-event-dedup lock (architect's sharpest finding): a stage advance is a
+    # one-time event, so a RESOLVED marker must STILL suppress a re-nudge. The relay
+    # calls exists_by_hash(unresolved_only=False); under the re-emittable-marker pattern
+    # (unresolved_only=True, copied from _nudge) a resolved marker would no longer match
+    # and the owner would get a surprise resurrection nudge. Seed + RESOLVE, expect no re-nudge.
+    await observations.create(
+        db,
+        id="bite-seed",
+        source="recon",
+        type="career_bite",
+        content="bite:Hooli:offer",
+        priority="low",
+        created_at="2026-07-01T00:00:00Z",
+        content_hash=_bite_hash(9, "offer"),
+        skip_if_duplicate=True,
+    )
+    await observations.resolve(
+        db, "bite-seed", resolved_at="2026-07-02T00:00:00Z", resolution_notes="closed out"
+    )
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": [_entry(9, "Hooli")]})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.bites == 0 and pipe.sent == []  # resolved marker STILL dedups (point event)
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_only_engaged_stages_fire(db, monkeypatch):
+    # A company in a pre-engagement stage (researching/outreach_sent) or terminal
+    # (closed) must NOT nudge; only advances into BITE_STAGES do.
+    assert set(BITE_STAGES) == {"in_conversation", "interviewing", "offer"}
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(
+        pipeline={
+            "researching": [_entry(1, "Early")],
+            "outreach_sent": [_entry(2, "Pitched")],
+            "closed": [_entry(3, "Done")],
+            "in_conversation": [_entry(4, "Talking")],
+        }
+    )
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.bites == 1 and len(pipe.sent) == 1
+    assert "Talking" in pipe.sent[0][0]
+    assert "Early" not in pipe.sent[0][0] and "Done" not in pipe.sent[0][0]
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_runs_while_autorun_off(db, monkeypatch):
+    # The load-bearing decoupling: auto-run mode="off", bite-relay live → the relay
+    # runs and nudges even though the (policy-blocked) auto-run is gated off.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": [_entry(9, "Hooli")]})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.mode == "off" and result.bite_mode == "live"
+    assert result.bites == 1 and len(pipe.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_unhealthy_data_module_is_clean_skip(db, monkeypatch):
+    # An unhealthy DATA bridge (the HTTP read service down when the search is dormant)
+    # is a CLEAN SKIP, NOT a job-health failure — avoids a daily false alarm.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(healthy=False, pipeline={"offer": [_entry(9, "Hooli")]})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.errors == 0 and result.bites == 0 and pipe.sent == []
+    assert data.ops == []  # never even read the pipeline
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_pipeline_error_dict_is_failure(db, monkeypatch):
+    # The service is UP (health ok) but the read returns {"error"} → a genuine failure
+    # (errors=1 → job-health), distinct from the dormant unhealthy-skip above.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(error="pipeline query failed")
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.errors == 1 and result.bites == 0 and pipe.sent == []
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_bad_shape_is_failure(db, monkeypatch):
+    # Service up but the reply's 'pipeline' is not a dict (a schema change) → surface a
+    # failure rather than silently reading nothing.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(bad_shape=True)
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.errors == 1 and result.bites == 0
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_pipeline_read_raise_is_failure_not_crash(db, monkeypatch):
+    # WARNING #2: execute_operation normally returns an error DICT, but a malformed
+    # non-JSON body makes resp.json() RAISE. The bite-relay must catch it (like the
+    # health-check guard) → errors=1, never let it escape gather().
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(raise_op=True)
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()  # must NOT raise
+    assert result.errors == 1 and result.bites == 0 and pipe.sent == []
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_read_raise_preserves_autorun_result(db, monkeypatch):
+    # The "independent levers" contract: a RAISED bite-relay read must not discard the
+    # auto-run branch's result. Both live; the relay read raises; the auto-run still staged.
+    _cfg(monkeypatch, mode="live", bite_mode="live")
+    reasoning = _FakeModule(autoruns=[{"company": "A", "contact": "a", "draft_summary": "s"}])
+    data = _FakeDataModule(raise_op=True)
+    mon, _ = _mon_bite(db, data, reasoning_module=reasoning)
+    result = await mon.gather()
+    assert result.auto_runs == 1  # auto-run result survived the relay's exception
+    assert result.errors >= 1  # the relay read failure is still counted
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_caps_total_candidates_scanned(db, monkeypatch):
+    # WARNING #1: the per-tick work (a DB op per candidate) is bounded independently of
+    # the message cap, so a buggy/oversized data_module response can't drive unbounded DB
+    # work. observe (which ignores the MESSAGE cap) still respects this scan ceiling.
+    from genesis.recon import career_outreach as co
+
+    monkeypatch.setattr(co, "_MAX_BITE_CANDIDATES_PER_TICK", 2, raising=False)
+    _cfg(monkeypatch, mode="off", bite_mode="observe")
+    data = _FakeDataModule(
+        pipeline={"in_conversation": [_entry(i, f"C{i}") for i in range(1, 6)]}  # 5 entries
+    )
+    mon, _ = _mon_bite(db, data)
+    await mon.gather()
+    assert await _bite_count(db) == 2  # scan truncated to the ceiling, not all 5 seeded
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_truncates_long_company_name(db, monkeypatch):
+    # NOTE 1: an adversarial entry with a very long name must not bloat the observations
+    # row unboundedly — the stored name is length-capped.
+    _cfg(monkeypatch, mode="off", bite_mode="observe")
+    data = _FakeDataModule(pipeline={"offer": [{"id": 1, "name": "X" * 5000}]})
+    mon, _ = _mon_bite(db, data)
+    await mon.gather()
+    row = await (
+        await db.execute("SELECT content FROM observations WHERE type='career_bite'")
+    ).fetchone()
+    assert len(row[0]) < 500  # bounded, not ~5000
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_absent_data_module_is_clean_noop(db, monkeypatch):
+    # A generic install lacking the data-module overlay → clean no-op (errors=0),
+    # exactly like the auto-run's absent-reasoning-module path.
+    _cfg(monkeypatch, mode="off", bite_mode="live", data_module="")
+    mon, pipe = _mon_bite(db, _FakeDataModule())
+    result = await mon.gather()
+    assert result.errors == 0 and result.bites == 0 and pipe.sent == []
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_nudge_failed_not_marked(db, monkeypatch):
+    # A FAILED nudge → errors=1 AND the marker is NOT written (so the advance re-tries
+    # next tick), mirroring the auto-run nudge's mark-only-on-delivery contract.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": [_entry(9, "Hooli")]})
+    mon, pipe = _mon_bite(db, data, pipe_status=OutreachStatus.FAILED)
+    result = await mon.gather()
+    assert result.errors == 1 and result.bites == 0 and len(pipe.sent) == 1
+    assert not await observations.exists_by_hash(
+        db, source="recon", content_hash=_bite_hash(9, "offer"), unresolved_only=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_rejected_nudge_is_not_error(db, monkeypatch):
+    # A REJECTED nudge (pipeline dedup) is not a failure and is not marked.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": [_entry(9, "Hooli")]})
+    mon, pipe = _mon_bite(db, data, pipe_status=OutreachStatus.REJECTED)
+    result = await mon.gather()
+    assert result.errors == 0 and result.bites == 0 and len(pipe.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_caps_nudges_per_tick(db, monkeypatch):
+    # A per-tick nudge cap bounds a burst (e.g. a direct off→live with many advances):
+    # excess advances are NOT marked, so they surface on a later tick (loud-truncation,
+    # never silently dropped). Mirrors the auto-run's max_auto_runs_per_tick.
+    _cfg(monkeypatch, mode="off", bite_mode="live", bite_cap=2)
+    data = _FakeDataModule(
+        pipeline={"in_conversation": [_entry(1, "A"), _entry(2, "B"), _entry(3, "C")]}
+    )
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.bites == 2 and len(pipe.sent) == 2  # capped at 2
+    # the 3rd was NOT marked → re-surfaces next tick (deferred, not lost)
+    assert not await observations.exists_by_hash(
+        db, source="recon", content_hash=_bite_hash(3, "in_conversation"), unresolved_only=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_observe_ignores_nudge_cap(db, monkeypatch):
+    # The cap bounds owner MESSAGES (live nudges); observe seeds all advances (no spam),
+    # so a low cap must not stop observe from seeding the whole set.
+    _cfg(monkeypatch, mode="off", bite_mode="observe", bite_cap=1)
+    data = _FakeDataModule(
+        pipeline={"in_conversation": [_entry(1, "A"), _entry(2, "B"), _entry(3, "C")]}
+    )
+    mon, pipe = _mon_bite(db, data)
+    await mon.gather()
+    assert pipe.sent == [] and await _bite_count(db) == 3  # all seeded despite cap=1
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_skips_falsy_id_entry(db, monkeypatch):
+    # A malformed row with an empty-string id is skipped (no nudge, no degenerate
+    # `career_bite::stage` collision hash); a real-id sibling still fires.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": [{"id": "", "name": "Malformed"}, _entry(9, "Good")]})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.bites == 1 and len(pipe.sent) == 1
+    assert "Good" in pipe.sent[0][0] and "Malformed" not in pipe.sent[0][0]
+
+
+@pytest.mark.asyncio
+async def test_bite_nudge_escapes_company_name_html(db, monkeypatch):
+    # company_name flows from the EXTERNAL pipeline into a telegram nudge the outreach
+    # path sends parse_mode="HTML" WITHOUT escaping. A crafted name (e.g. from a
+    # malicious job posting jerbs ingested) must be HTML-escaped so it can't render as
+    # live markup in the owner's trusted chat (same sink/class as the marketing reply-ping).
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": [{"id": 1, "name": '<a href="http://x">Evil</a>'}]})
+    mon, pipe = _mon_bite(db, data)
+    await mon.gather()
+    body = pipe.sent[0][0]
+    assert "<a href" not in body  # no raw tag survives
+    assert "&lt;a href" in body  # escaped form present (content preserved)
+
+
+@pytest.mark.asyncio
+async def test_bite_and_autorun_both_run_and_merge(db, monkeypatch):
+    # BOTH sub-capabilities live → both run, results merge (auto_runs from the auto-run,
+    # bites from the relay), each health-gated on its OWN module.
+    _cfg(monkeypatch, mode="live", bite_mode="live")
+    reasoning = _FakeModule(autoruns=[{"company": "A", "contact": "a", "draft_summary": "s"}])
+    data = _FakeDataModule(pipeline={"in_conversation": [_entry(5, "Talky")]})
+    mon, pipe = _mon_bite(db, data, reasoning_module=reasoning)
+    result = await mon.gather()
+    assert result.auto_runs == 1 and result.bites == 1
+    assert result.mode == "live" and result.bite_mode == "live"
+    # one auto-run nudge + one bite nudge
+    assert len(pipe.sent) == 2
+
+
+# ── bite-relay ↔ runner job-health accounting (architect finding #2) ───────────
+
+
+@pytest.mark.asyncio
+async def test_runner_records_when_only_bite_relay_active(monkeypatch):
+    # Architect finding #2: the auto-run mode is OFF but the bite-relay ran → the runner
+    # must NOT skip recording (the old `mode=="off"` skip would hide the relay's health).
+    from genesis.surplus.jobs import runners
+
+    calls = {"fail": [], "success": []}
+    monkeypatch.setattr(runners, "record_failure", lambda k, m=None: calls["fail"].append(k))
+    monkeypatch.setattr(runners, "record_success", lambda k: calls["success"].append(k))
+
+    class _StubMon:
+        async def gather(self):
+            return CareerOutreachResult(mode="off", bite_mode="live", bites=1)
+
+    class _Sched:
+        _career_outreach_monitor = _StubMon()
+        _event_bus = None
+
+    await runners.run_career_outreach_monitor(_Sched())
+    assert calls["success"] == ["career_outreach_monitor"] and not calls["fail"]
+
+
+@pytest.mark.asyncio
+async def test_runner_skips_only_when_both_levers_off(monkeypatch):
+    # The skip is now BOTH-off: only a fully-disabled monitor stays invisible in job-health.
+    from genesis.surplus.jobs import runners
+
+    calls = {"fail": [], "success": []}
+    monkeypatch.setattr(runners, "record_failure", lambda k, m=None: calls["fail"].append(k))
+    monkeypatch.setattr(runners, "record_success", lambda k: calls["success"].append(k))
+
+    class _StubMon:
+        async def gather(self):
+            return CareerOutreachResult(mode="off", bite_mode="off")
+
+    class _Sched:
+        _career_outreach_monitor = _StubMon()
+        _event_bus = None
+
+    await runners.run_career_outreach_monitor(_Sched())
+    assert not calls["success"] and not calls["fail"]
+
+
+@pytest.mark.asyncio
+async def test_runner_records_failure_on_bite_relay_error(monkeypatch):
+    # A bite-relay read error (auto-run off) surfaces errors=1 → record FAILURE.
+    from genesis.surplus.jobs import runners
+
+    calls = {"fail": [], "success": []}
+    monkeypatch.setattr(runners, "record_failure", lambda k, m=None: calls["fail"].append(k))
+    monkeypatch.setattr(runners, "record_success", lambda k: calls["success"].append(k))
+
+    class _StubMon:
+        async def gather(self):
+            return CareerOutreachResult(
+                mode="off", bite_mode="live", errors=1, details=["bite-relay: pipeline read failed"]
+            )
+
+    class _Sched:
+        _career_outreach_monitor = _StubMon()
+        _event_bus = None
+
+    await runners.run_career_outreach_monitor(_Sched())
+    assert calls["fail"] and not calls["success"]
+
+
+@pytest.mark.asyncio
+async def test_runner_no_progress_warning_suppressed_by_bites(monkeypatch):
+    # A tick with verify_failed but ALSO bites>0 made progress (the relay) → the
+    # "verifier refused every attempt" no-progress warning must NOT fire.
+    from genesis.surplus.jobs import runners
+
+    calls = {"fail": [], "success": []}
+    monkeypatch.setattr(runners, "record_failure", lambda k, m=None: calls["fail"].append(k))
+    monkeypatch.setattr(runners, "record_success", lambda k: calls["success"].append(k))
+    events: list = []
+
+    class _Bus:
+        async def emit(self, subsystem, severity, code, msg, **kw):
+            events.append(code)
+
+    class _StubMon:
+        async def gather(self):
+            return CareerOutreachResult(mode="live", bite_mode="live", verify_failed=1, bites=1)
+
+    class _Sched:
+        _career_outreach_monitor = _StubMon()
+        _event_bus = _Bus()
+
+    await runners.run_career_outreach_monitor(_Sched())
+    assert calls["success"] == ["career_outreach_monitor"]
+    assert "career_outreach.no_progress" not in events
 
 
 # ── C3-G: gate-compat auto-run fix (root cause = ground-truth-gate collision) ──

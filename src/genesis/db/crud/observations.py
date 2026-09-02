@@ -100,6 +100,10 @@ INTERNAL_OBS_TYPES: frozenset[str] = frozenset(
         # marker. The owner nudge (Telegram) is the delivery path; these rows must
         # NOT surface via the generic observation surfacers (would double-notify).
         "career_outreach_nudged",
+        # Career bite-relay — per (company, stage) "already relayed this advance"
+        # dedup marker. A stage-advance is a POINT EVENT; the owner Telegram nudge is
+        # the delivery path, so these rows must NOT surface via the generic surfacers.
+        "career_bite",
         # Ego questions channel — the Telegram question itself + the reactive
         # signal are the delivery paths. Surfacing user_reply would echo the
         # user's own answer back at them (double-notify); no_reply/not_delivered
@@ -219,6 +223,12 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     # abandoned marker cannot linger. The external engine's own staged-draft state is
     # the source of truth for draft counts; this row only records "owner already nudged".
     "career_outreach_nudged": timedelta(days=30),
+    # Career bite-relay — per (company, stage) advance-relayed dedup marker. 365d
+    # (vs 30d for the re-emittable "N staged" nudge marker): a stage advance is a
+    # POINT EVENT, so the marker must permanently suppress a re-nudge across a full
+    # search cycle — long enough that a company sitting in one stage for months never
+    # re-fires. Checked with unresolved_only=False (a point event never re-emits).
+    "career_bite": timedelta(days=365),
     # cognitive self-mod rollback audit (operator-visible correction event)
     "self_mod_rollback": timedelta(days=30),
     # skill-edit Critic shadow verdicts (WS1) — kept 30d (vs 14d for the

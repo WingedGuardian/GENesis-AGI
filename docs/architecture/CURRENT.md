@@ -583,7 +583,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: e425b35c 2026-08-21
+verified: 6f3310e5 2026-09-01
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -649,7 +649,19 @@ verified: e425b35c 2026-08-21
   same-company re-selection breaks the loop. Turn/timeout budgets (`dispatch_max_turns` default 80 via the ipc
   per-call `max_turns` override; `dispatch_timeout_s` default 900, capped 1800 by
   config + a 3600 SSH-adapter ceiling) cover the gated flow (research → draft →
-  verify → stage), MEASURED ~5.5 min live.
+  verify → stage), MEASURED ~5.5 min live. **Bite-relay (independent capability on the
+  same daily tick):** its OWN `bite_relay_mode` lever (off/observe/live, ships off),
+  DECOUPLED from the auto-run above — it READS a structured HTTP `data_module`
+  (`pipeline` op, distinct from the SSH reasoning module) and pushes ONE owner Telegram
+  nudge when a company advances into an engaged stage ({in_conversation, interviewing,
+  offer}). Dedup is a PERMANENT per-(company, stage) `career_bite` observation (a
+  point event — `unresolved_only=False`, 365d TTL — unlike the re-emittable
+  `career_outreach_nudged` marker); observe SEEDS the ledger without nudging. Health-
+  gated on the DATA module SEPARATELY: an unhealthy/absent data bridge is a CLEAN SKIP
+  (not a job-health failure — the read service is legitimately down when the search is
+  dormant), while a read the service answered with an error IS a failure. Being a pure
+  read + owner-nudge (no CLI dispatch, no outreach send), it can run `live` while the
+  auto-run stays gated.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
   (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,
   research, recon, pipeline), not runtime init.

@@ -89,10 +89,35 @@ DEFAULTS: dict[str, Any] = {
     # install-specific gate guidance (e.g. how this engine's own verification gate
     # behaves headless). Keeps install vocabulary out of the public repo.
     "autorun_note": "",
+    # ── Bite-relay: an INDEPENDENT lever (its own off/observe/live) for a pure READ
+    # + owner-nudge when a company advances through the external pipeline. DECOUPLED
+    # from the auto-run above — it never dispatches a CLI session and never sends
+    # outreach, so it can run ``live`` while the auto-run ``mode`` stays gated.
+    #   off     — the bite-relay does not run. SHIPPED DEFAULT.
+    #   observe — READ the pipeline and SEED the dedup ledger (mark current advances
+    #             as already-seen), but NEVER nudge. The observe→live seed step that
+    #             stops a first-live tick from firing a backlog of nudges.
+    #   live    — read, diff against the ledger, and nudge the owner on a NEW advance.
+    "bite_relay_mode": "off",
+    # Name of the external DATA module (a structured HTTP read exposing a ``pipeline``
+    # op — distinct from ``reasoning_module``'s SSH dispatch). SHIPPED EMPTY so no
+    # install-specific module name lands in the public repo — set it in the gitignored
+    # overlay. Empty (or an absent module) → the bite-relay no-ops cleanly.
+    "data_module": "",
+    # Per-tick cap on bite-relay owner NUDGES (bounds a burst — e.g. a direct off→live
+    # with many companies already in engaged stages). Excess advances are NOT marked, so
+    # they surface on a later tick (loud-truncation, never dropped). Observe-mode SEEDING
+    # ignores this cap (seeding writes no owner message). Mirrors max_auto_runs_per_tick.
+    "max_bite_nudges_per_tick": 10,
 }
 
 # Public: the settings-domain validator imports these to check knobs.
-INT_KNOBS = ("max_auto_runs_per_tick", "dispatch_timeout_s", "dispatch_max_turns")
+INT_KNOBS = (
+    "max_auto_runs_per_tick",
+    "dispatch_timeout_s",
+    "dispatch_max_turns",
+    "max_bite_nudges_per_tick",
+)
 
 # Key-specific upper bounds — a typo (e.g. max_auto_runs_per_tick: 3000) must not
 # authorize thousands of sequential draft-staging sessions, an unbounded per-run
@@ -102,6 +127,7 @@ _MAX_BY_KNOB: dict[str, int] = {
     "max_auto_runs_per_tick": 10,
     "dispatch_timeout_s": 1800,
     "dispatch_max_turns": 200,
+    "max_bite_nudges_per_tick": 50,
 }
 
 
@@ -134,8 +160,27 @@ def load_config() -> dict[str, Any]:
     return merged
 
 
+def _resolve_mode(cfg: dict[str, Any], key: str) -> str:
+    """Resolve one mode knob (``key``) from an already-loaded config, sharing the
+    master-enabled gate + the degrade rules. The env kill switch is checked by the
+    public callers BEFORE ``load_config`` (so a killed monitor never reads files)."""
+    # Master switch: require a LITERAL boolean True to stay enabled. A non-bool
+    # (e.g. the string "false" from env-templated YAML, or any corruption) degrades
+    # to off — the master actuator switch fails toward LESS authority.
+    if cfg.get("enabled", True) is not True:
+        return "off"
+    mode = cfg.get(key)
+    if mode is False:
+        # Hand-edited unquoted `<key>: off` parses as YAML-1.1 boolean False.
+        return "off"
+    if mode not in MODES:
+        logger.warning("career_outreach has invalid %s %r — degrading to observe", key, mode)
+        return "observe"
+    return mode
+
+
 def effective_mode() -> str:
-    """The mode the monitor runs under — read live.
+    """The mode the auto-run driver runs under — read live.
 
     Env kill switch → ``off``. Master ``enabled: false`` → ``off``. An invalid
     value degrades to ``observe`` (record/seed safely, never act, never a silent
@@ -143,20 +188,20 @@ def effective_mode() -> str:
     """
     if os.environ.get(_ENV_KILL_SWITCH) == "1":
         return "off"
-    cfg = load_config()
-    # Master switch: require a LITERAL boolean True to stay enabled. A non-bool
-    # (e.g. the string "false" from env-templated YAML, or any corruption) degrades
-    # to off — the master actuator switch fails toward LESS authority.
-    if cfg.get("enabled", True) is not True:
+    return _resolve_mode(load_config(), "mode")
+
+
+def effective_bite_relay_mode() -> str:
+    """The bite-relay's INDEPENDENT lever — read live.
+
+    Same env-kill + master-enabled gate + degrade as ``effective_mode``, but keyed on
+    its OWN ``bite_relay_mode``, so the relay can run while the auto-run ``mode`` is
+    ``off`` (and vice-versa). A generic install (or an overlay written before this
+    feature) has ``bite_relay_mode: off`` from DEFAULTS → the relay stays inert.
+    """
+    if os.environ.get(_ENV_KILL_SWITCH) == "1":
         return "off"
-    mode = cfg.get("mode")
-    if mode is False:
-        # Hand-edited unquoted `mode: off` parses as YAML-1.1 boolean False.
-        return "off"
-    if mode not in MODES:
-        logger.warning("career_outreach has invalid mode %r — degrading to observe", mode)
-        return "observe"
-    return mode
+    return _resolve_mode(load_config(), "bite_relay_mode")
 
 
 def knob_int(cfg: dict[str, Any], key: str) -> int:
