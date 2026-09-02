@@ -147,10 +147,27 @@ async def on_outreach_delivered(
     *,
     outreach_id: str,
     category: str,
+    channel: str,
     stated_confidence: float | None = None,
 ) -> None:
     """Post-delivery hook (OutreachPipeline._deliver): reply_received +
-    positive_engagement predictions for the just-recorded send."""
+    positive_engagement predictions for the just-recorded send.
+
+    Owner-facing sends are skipped: a message delivered to the OWNER (over Telegram
+    or voice — approvals, digests, blockers, alerts, GitHub-monitor pings, career
+    nudges, marketing reply-pings, bite-relay alerts) solicits no external reply, so
+    its predictions would only ever grade as silence, injecting a systematic false
+    negative into the outreach calibration data. The discriminator is CHANNEL, not
+    category: `category` is overloaded (NOTIFICATION is an owner Telegram ping but ALSO
+    the cold-marketing PROSPECT email on channel="email", which IS reply-gradable), so
+    gating on category would wrongly suppress genuine external outreach. Excluding the
+    owner-facing channel set (rather than allow-listing external ones) means a new
+    external channel is calibrated automatically. See outreach/types.py OWNER_FACING_CHANNELS."""
+
+    from genesis.outreach.types import OWNER_FACING_CHANNELS
+
+    if channel in OWNER_FACING_CHANNELS:
+        return
     try:
         now = datetime.now(UTC)
         deadline = now + timedelta(hours=_CATEGORY_HORIZON_H.get(category, _DEFAULT_HORIZON_H))
