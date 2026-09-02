@@ -125,6 +125,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The `deliberate` MCP tool ("Model Fusion") no longer fails on real prompts.** Two
+  distinct bugs: (1) analysis mode 404'd because the orchestrator slug
+  `openai/gpt-oss-120b:free` was retired from OpenRouter's catalog (`:free` variant gone)
+  — switched to the live base slug `openai/gpt-oss-120b`; (2) real multi-paragraph prompts
+  false-timed-out at 240s (a 6-model frontier panel + judge legitimately runs several
+  minutes, while a trivial ping finished in ~33s) — the budget is now a single env-driven
+  knob (`GENESIS_DELIBERATE_TIMEOUT_S`, default 1000s) read per-call and threaded through
+  `core.deliberate()` (which previously hard-pinned 240s, silently overriding the backend
+  default). Also hardened the panels' one remaining concrete `x-ai/grok-4.3` slug to the
+  drift-resistant `~x-ai/grok-latest`.
 - **The morning report no longer cries "surplus heartbeat overdue" during a long
   healthy dispatch.** Surplus emits its subsystem heartbeat only at the end of a
   dispatch cycle, and a single healthy dispatch can run 15-30 minutes — longer than

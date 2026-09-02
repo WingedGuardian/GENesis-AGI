@@ -1,11 +1,16 @@
 """Fusion backend — OpenRouter Fusion (a server-side panel-of-models + judge).
 
-Two modes × two presets, all probe-confirmed live (2026-06-24):
+Latency scales with prompt size: a trivial ping finishes in tens of seconds, but a real
+(multi-paragraph) prompt on a 6-model frontier panel + judge runs several MINUTES. The budget is
+therefore generous (``_DEFAULT_TIMEOUT_S``, env-overridable via ``GENESIS_DELIBERATE_TIMEOUT_S``);
+the old 240s false-timed-out real prompts.
+
+Two modes × two presets, all probe-confirmed live (2026-06-24; orchestrator slug refreshed 2026-09-01):
 
 - **synthesis** (default, fast): the `openrouter/fusion` model-slug → a synthesized prose verdict in
   ``message.content`` (the meta-model IGNORES output-format prompts, so we take its markdown as the
   ``answer``; consensus/dissent stay empty). Default preset: **budget**.
-- **analysis** (deep): a free, tool-capable orchestrator + the Fusion *server-tool*
+- **analysis** (deep): a tool-capable orchestrator + the Fusion *server-tool*
   (`tools:[{"type":"openrouter:fusion"}]`, `tool_choice:"required"`, via extra_body) → the orchestrator
   (a normal instruct model that honors a JSON system prompt) returns machine-structured
   {answer, consensus, dissent[], blind_spots[], confidence}. Default preset: **strong**.
@@ -32,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -45,8 +51,11 @@ logger = logging.getLogger(__name__)
 _OR_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 # synthesis: the `openrouter/fusion` model-slug — the meta-model itself (raw OpenRouter id, probe-confirmed).
 _MODEL = "openrouter/fusion"
-# analysis: a free, tool-capable orchestrator that calls the fusion server-tool and returns structured JSON.
-_ANALYSIS_ORCHESTRATOR = "openai/gpt-oss-120b:free"
+# analysis: a tool-capable orchestrator that calls the fusion server-tool and returns structured JSON.
+# NB: the `:free` variant was retired from OpenRouter's catalog (base + `:batch` remain) → the old
+# `openai/gpt-oss-120b:free` 404'd the analysis-mode call. Base slug; the orchestrator is a thin caller
+# so its small paid cost is negligible next to the fusion panel.
+_ANALYSIS_ORCHESTRATOR = "openai/gpt-oss-120b"
 
 # Explicit chorus panels (`analysis_models`) + judge (`model`) per preset. EDIT THESE to change the
 # chorus. `~…-latest` ids float to the newest version. Panel/judge models need NOT support tools.
@@ -56,7 +65,7 @@ _PRESET_PANELS: dict[str, dict] = {
             "~anthropic/claude-opus-latest",
             "~openai/gpt-latest",
             "~google/gemini-pro-latest",
-            "x-ai/grok-4.3",
+            "~x-ai/grok-latest",
             "deepseek/deepseek-v4-pro",
             "~moonshotai/kimi-latest",
         ],
@@ -66,7 +75,7 @@ _PRESET_PANELS: dict[str, dict] = {
         "analysis_models": [
             "deepseek/deepseek-v4-pro",
             "~openai/gpt-mini-latest",
-            "x-ai/grok-4.3",
+            "~x-ai/grok-latest",
             "qwen/qwen3-235b-a22b-thinking-2507",
             "~moonshotai/kimi-latest",
             "~google/gemini-flash-latest",
@@ -78,7 +87,10 @@ _PRESET_PANELS: dict[str, dict] = {
 _DEFAULT_PRESET = {"synthesis": "budget", "analysis": "strong"}
 
 _MAX_TOKENS = 2000  # explicit — the 65536 default trips OpenRouter's "fewer max_tokens" 402.
-_DEFAULT_TIMEOUT_S = 240.0  # analysis (panel + judge + orchestrator) runs ~120-170s; synthesis ~47-110s.
+# Deliberation budget. A real 6-model frontier panel + judge on a real (multi-paragraph) prompt
+# legitimately runs several MINUTES — the old 240s false-timed-out real prompts while a trivial ping
+# finished in ~33s. Generous by default; env-overridable at runtime (GENESIS_DELIBERATE_TIMEOUT_S).
+_DEFAULT_TIMEOUT_S = 1000.0
 _ANSWER_CAP = 6000
 # deliberate() owns its own retry on TRANSIENT errors (frontier panels 429 under load — observed on the
 # strong preset). Retried: 429/5xx + transport errors. NOT retried: other 4xx and timeouts.
@@ -129,6 +141,24 @@ def _resolve_stakes(stakes: str | None, mode: str, preset_name: str) -> str:
     return "high" if (mode == "analysis" or preset_name == "strong") else "normal"
 
 
+def _default_timeout_s() -> float:
+    """The deliberation timeout budget (seconds), overridable via ``GENESIS_DELIBERATE_TIMEOUT_S``.
+
+    Read per-CALL (not at import) so a runtime env change / test takes effect without a reload.
+    A non-positive, non-FINITE (``inf``/``nan``), or unparseable value falls back to
+    ``_DEFAULT_TIMEOUT_S`` — an infinite budget would let a hung panel wait forever.
+    """
+    raw = os.environ.get("GENESIS_DELIBERATE_TIMEOUT_S")
+    if raw:
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return _DEFAULT_TIMEOUT_S
+        if math.isfinite(v) and v > 0:
+            return v
+    return _DEFAULT_TIMEOUT_S
+
+
 class FusionBackend:
     """OpenRouter Fusion backend — `synthesis` (model-slug) and `analysis` (server-tool) modes."""
 
@@ -142,15 +172,21 @@ class FusionBackend:
         stakes: str | None = None,
         mode: str = "synthesis",
         preset: str | None = None,
-        timeout_s: float = _DEFAULT_TIMEOUT_S,
+        timeout_s: float | None = None,
         models: list[str] | None = None,  # noqa: ARG002 — panel is set via preset, not a client list
     ) -> DeliberationResult:
-        """Deliberate via Fusion in the given mode/preset. Returns a DeliberationResult; never raises."""
+        """Deliberate via Fusion in the given mode/preset. Returns a DeliberationResult; never raises.
+
+        ``timeout_s`` ``None`` (the default, used by the MCP tool) resolves to
+        ``_default_timeout_s()`` (env ``GENESIS_DELIBERATE_TIMEOUT_S``, else ``_DEFAULT_TIMEOUT_S``).
+        An explicit value overrides.
+        """
         key = _openrouter_key()
         if not key:
             return DeliberationResult(
                 answer=None, error="OpenRouter API key not configured (API_KEY_OPENROUTER)"
             )
+        timeout_s = timeout_s if timeout_s is not None else _default_timeout_s()
         user = question if not context else f"{question}\n\nContext:\n{context}"
         preset_name, panel = _resolve_preset(preset, mode)
         high = _HIGH_SUFFIX if _resolve_stakes(stakes, mode, preset_name) == "high" else ""
@@ -168,6 +204,15 @@ class FusionBackend:
         return await _call(_MODEL, _SYNTHESIS_SYSTEM + high, user, key, timeout_s, extra, "synthesis", preset_name)
 
 
+async def _bounded_backoff(attempt: int, t0: float, timeout_s: float) -> None:
+    """Sleep the retry backoff, but never past the total deadline — so the backoff itself
+    can't blow the budget (e.g. a 3s backoff on a 1s budget). Sleeps nothing if exhausted."""
+    remaining = timeout_s - (time.perf_counter() - t0)
+    if remaining <= 0:
+        return
+    await asyncio.sleep(min(_BACKOFF_S * (attempt + 1), remaining))
+
+
 async def _call(model, system, user, key, timeout_s, extra_body, mode, preset) -> DeliberationResult:
     body = {
         "model": model,
@@ -181,9 +226,24 @@ async def _call(model, system, user, key, timeout_s, extra_body, mode, preset) -
     t0 = time.perf_counter()
     last_exc: Exception | None = None
     for attempt in range(_MAX_ATTEMPTS):
+        # The budget is a TOTAL wall-clock bound, not per-attempt: a retry gets only the
+        # REMAINING budget (prior attempts + backoff sleeps are already counted via t0), so
+        # N retries can't multiply the user's max wait by N. Once exhausted, stop rather than
+        # start another full-timeout attempt.
+        remaining = timeout_s - (time.perf_counter() - t0)
+        if remaining <= 0:
+            return DeliberationResult(
+                answer=None,
+                backend_used=f"fusion/{mode}",
+                preset_used=preset,
+                latency_s=time.perf_counter() - t0,
+                error=f"fusion ({mode}) timed out after ~{timeout_s:.0f}s",
+            )
         try:
+            # wait_for bounded by `remaining` (NOT remaining+10): it is the hard total-budget
+            # deadline, so a stalled/keep-alive-chatty stream can't run past the advertised budget.
             content, cost, stream_err = await asyncio.wait_for(
-                _consume_stream(body, key, timeout_s), timeout=timeout_s + 10
+                _consume_stream(body, key, remaining), timeout=remaining
             )
         except (TimeoutError, httpx.TimeoutException):
             return DeliberationResult(
@@ -196,14 +256,14 @@ async def _call(model, system, user, key, timeout_s, extra_body, mode, preset) -
         except httpx.HTTPStatusError as exc:
             last_exc = exc
             if exc.response.status_code in _RETRYABLE_STATUS and attempt + 1 < _MAX_ATTEMPTS:
-                await asyncio.sleep(_BACKOFF_S * (attempt + 1))
+                await _bounded_backoff(attempt, t0, timeout_s)
                 continue
             return _error_result(exc, time.perf_counter() - t0, mode, preset)
         except httpx.TransportError as exc:
             # connection reset / read error mid-panel — transient, retry
             last_exc = exc
             if attempt + 1 < _MAX_ATTEMPTS:
-                await asyncio.sleep(_BACKOFF_S * (attempt + 1))
+                await _bounded_backoff(attempt, t0, timeout_s)
                 continue
             return _error_result(exc, time.perf_counter() - t0, mode, preset)
         except Exception as exc:  # noqa: BLE001 — any other error → graceful result, never raise
@@ -212,7 +272,7 @@ async def _call(model, system, user, key, timeout_s, extra_body, mode, preset) -
             if not content and attempt + 1 < _MAX_ATTEMPTS:
                 # transient empty / in-stream panel error from a flaky panel — one more shot
                 last_exc = RuntimeError(stream_err or "empty stream")
-                await asyncio.sleep(_BACKOFF_S * (attempt + 1))
+                await _bounded_backoff(attempt, t0, timeout_s)
                 continue
             return _normalize(content, cost, stream_err, time.perf_counter() - t0, mode, preset)
     return _error_result(last_exc or RuntimeError("retries exhausted"), time.perf_counter() - t0, mode, preset)
