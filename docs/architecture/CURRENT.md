@@ -1396,7 +1396,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: daa2d79d 2026-09-01
+verified: b8232425 2026-09-02
 ```
 
 - **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
@@ -1418,8 +1418,9 @@ verified: daa2d79d 2026-09-01
   branch also zeroes `_trip_count`, so refusing it leaves the backoff climbing
   to the cap instead of resetting — a dead provider is retried less often, and a
   quota-dead one may wait the full 4h. `last_failure_category` is restored from
-  disk ONLY when the saved state was OPEN — a qualifier must not outlive the
-  state it qualifies, or it poisons the heal guard for a healthy provider. The
+  disk for any NON-CLOSED saved state (OPEN or HALF_OPEN — see below) and never
+  for CLOSED — a qualifier must not outlive the state it qualifies, or it
+  poisons the heal guard for a healthy provider. The
   same rule governs `_opened_by_call`, with one asymmetry that decides the
   first cycle after any upgrade: a file written before the field existed has NO
   key, and a saved-OPEN row with no recorded origin defaults to **call**-opened,

@@ -264,8 +264,12 @@ site had to remember:
 - **The persisted schema had no migration.** A state file written before the
   field existed carries no key, and `.get()` read that absence as "a probe
   opened it" — the one origin a saved-OPEN row cannot have, since
-  `probe_suspect()` only ever produced HALF_OPEN and a non-OPEN save restores as
-  CLOSED. Measured against a live install mid-outage: the affected provider was
+  `probe_suspect()` only ever produced HALF_OPEN, and at the time the migration
+  default was designed a non-OPEN save restored as CLOSED. (The restore has
+  since been widened: HALF_OPEN now also restores, carrying its origin — but a
+  KEYLESS half_open row still defaults to probe-origin, because that state is
+  reachable both ways and assuming "call" would strand a provider that never
+  failed a real call.) Measured against a live install mid-outage: the affected provider was
   persisted OPEN with no key, so the first post-deploy probe could have healed
   it once more and the fix would have failed on the very incident that motivated
   it. A saved-OPEN row with no recorded origin now defaults to call-opened. An
@@ -304,7 +308,10 @@ attribute names. The measured present population is zero external assigners.
 
 The premise of the migration was measured the same way: across all 18 historical
 versions of `probe_suspect` in this repository, ZERO reference `ProviderState.OPEN`,
-and no version of `load_state` has ever restored a saved non-OPEN state. So a
+and no version of `load_state` BEFORE this branch had ever restored a saved
+non-OPEN state (it now restores HALF_OPEN too — that widening postdates the
+measurement, and every file the widened code can read was written by a version
+that already had the key, so the keyless-OPEN reasoning is unaffected). A
 persisted OPEN with no recorded origin really does have only two possible causes,
 both of which must refuse a probe heal.
 

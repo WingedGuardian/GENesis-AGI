@@ -470,19 +470,23 @@ class CircuitBreakerRegistry:
                     # operation because `.state` mutates OPEN -> HALF_OPEN when
                     # merely READ, and `save_state` serialises every breaker.
                     # Restored under the SAME condition as the category, and
-                    # for the same reason: it qualifies an OPEN breaker. A
-                    # non-OPEN save restores CLOSED, where "a call opened this"
-                    # is not a fact about anything — carrying it would be the
-                    # poison pill in a new field.
+                    # for the same reason: it qualifies a breaker that is NOT
+                    # closed (OPEN or HALF_OPEN — `restored_live`). A saved-
+                    # CLOSED row restores with neither, where "a call opened
+                    # this" is not a fact about anything — carrying it would be
+                    # the poison pill in a new field.
                     # MIGRATION, and it decides the first post-deploy cycle:
                     # a file written before this field existed has no key at
                     # all, and `.get()` would read that absence as "a probe
                     # opened it" -- the one origin a legacy OPEN row CANNOT
                     # have. In every version that wrote a keyless file,
                     # `probe_suspect()` produced HALF_OPEN and nothing else,
-                    # and a non-OPEN save restores CLOSED, so a persisted OPEN
-                    # can only have come from a real call trip or an operator
-                    # disable. Both must read True. MEASURED against this
+                    # and load_state THEN restored non-OPEN as CLOSED, so a
+                    # persisted OPEN can only have come from a real call trip
+                    # or an operator disable. Both must read True. (The restore
+                    # has since widened to HALF_OPEN; a keyless half_open row
+                    # defaults to probe-origin below, because that state is
+                    # reachable both ways.) MEASURED against this
                     # deploy's own live state file: the provider in the
                     # motivating outage is persisted OPEN with no key, so
                     # defaulting to False would have left it probe-healable for
