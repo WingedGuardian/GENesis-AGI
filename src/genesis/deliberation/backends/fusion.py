@@ -1,6 +1,11 @@
 """Fusion backend — OpenRouter Fusion (a server-side panel-of-models + judge).
 
-Two modes × two presets, all probe-confirmed live (2026-06-24):
+Latency scales with prompt size: a trivial ping finishes in tens of seconds, but a real
+(multi-paragraph) prompt on a 6-model frontier panel + judge runs several MINUTES. The budget is
+therefore generous (``_DEFAULT_TIMEOUT_S``, env-overridable via ``GENESIS_DELIBERATE_TIMEOUT_S``);
+the old 240s false-timed-out real prompts.
+
+Two modes × two presets, all probe-confirmed live (2026-06-24; orchestrator slug refreshed 2026-09-01):
 
 - **synthesis** (default, fast): the `openrouter/fusion` model-slug → a synthesized prose verdict in
   ``message.content`` (the meta-model IGNORES output-format prompts, so we take its markdown as the
@@ -45,8 +50,11 @@ logger = logging.getLogger(__name__)
 _OR_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 # synthesis: the `openrouter/fusion` model-slug — the meta-model itself (raw OpenRouter id, probe-confirmed).
 _MODEL = "openrouter/fusion"
-# analysis: a free, tool-capable orchestrator that calls the fusion server-tool and returns structured JSON.
-_ANALYSIS_ORCHESTRATOR = "openai/gpt-oss-120b:free"
+# analysis: a tool-capable orchestrator that calls the fusion server-tool and returns structured JSON.
+# NB: the `:free` variant was retired from OpenRouter's catalog (base + `:batch` remain) → the old
+# `openai/gpt-oss-120b:free` 404'd the analysis-mode call. Base slug; the orchestrator is a thin caller
+# so its small paid cost is negligible next to the fusion panel.
+_ANALYSIS_ORCHESTRATOR = "openai/gpt-oss-120b"
 
 # Explicit chorus panels (`analysis_models`) + judge (`model`) per preset. EDIT THESE to change the
 # chorus. `~…-latest` ids float to the newest version. Panel/judge models need NOT support tools.
@@ -56,7 +64,7 @@ _PRESET_PANELS: dict[str, dict] = {
             "~anthropic/claude-opus-latest",
             "~openai/gpt-latest",
             "~google/gemini-pro-latest",
-            "x-ai/grok-4.3",
+            "~x-ai/grok-latest",
             "deepseek/deepseek-v4-pro",
             "~moonshotai/kimi-latest",
         ],
@@ -66,7 +74,7 @@ _PRESET_PANELS: dict[str, dict] = {
         "analysis_models": [
             "deepseek/deepseek-v4-pro",
             "~openai/gpt-mini-latest",
-            "x-ai/grok-4.3",
+            "~x-ai/grok-latest",
             "qwen/qwen3-235b-a22b-thinking-2507",
             "~moonshotai/kimi-latest",
             "~google/gemini-flash-latest",
@@ -78,7 +86,10 @@ _PRESET_PANELS: dict[str, dict] = {
 _DEFAULT_PRESET = {"synthesis": "budget", "analysis": "strong"}
 
 _MAX_TOKENS = 2000  # explicit — the 65536 default trips OpenRouter's "fewer max_tokens" 402.
-_DEFAULT_TIMEOUT_S = 240.0  # analysis (panel + judge + orchestrator) runs ~120-170s; synthesis ~47-110s.
+# Deliberation budget. A real 6-model frontier panel + judge on a real (multi-paragraph) prompt
+# legitimately runs several MINUTES — the old 240s false-timed-out real prompts while a trivial ping
+# finished in ~33s. Generous by default; env-overridable at runtime (GENESIS_DELIBERATE_TIMEOUT_S).
+_DEFAULT_TIMEOUT_S = 1000.0
 _ANSWER_CAP = 6000
 # deliberate() owns its own retry on TRANSIENT errors (frontier panels 429 under load — observed on the
 # strong preset). Retried: 429/5xx + transport errors. NOT retried: other 4xx and timeouts.
@@ -129,6 +140,23 @@ def _resolve_stakes(stakes: str | None, mode: str, preset_name: str) -> str:
     return "high" if (mode == "analysis" or preset_name == "strong") else "normal"
 
 
+def _default_timeout_s() -> float:
+    """The deliberation timeout budget (seconds), overridable via ``GENESIS_DELIBERATE_TIMEOUT_S``.
+
+    Read per-CALL (not at import) so a runtime env change / test takes effect without a reload.
+    A non-positive or unparseable value falls back to ``_DEFAULT_TIMEOUT_S``.
+    """
+    raw = os.environ.get("GENESIS_DELIBERATE_TIMEOUT_S")
+    if raw:
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return _DEFAULT_TIMEOUT_S
+        if v > 0:
+            return v
+    return _DEFAULT_TIMEOUT_S
+
+
 class FusionBackend:
     """OpenRouter Fusion backend — `synthesis` (model-slug) and `analysis` (server-tool) modes."""
 
@@ -142,15 +170,21 @@ class FusionBackend:
         stakes: str | None = None,
         mode: str = "synthesis",
         preset: str | None = None,
-        timeout_s: float = _DEFAULT_TIMEOUT_S,
+        timeout_s: float | None = None,
         models: list[str] | None = None,  # noqa: ARG002 — panel is set via preset, not a client list
     ) -> DeliberationResult:
-        """Deliberate via Fusion in the given mode/preset. Returns a DeliberationResult; never raises."""
+        """Deliberate via Fusion in the given mode/preset. Returns a DeliberationResult; never raises.
+
+        ``timeout_s`` ``None`` (the default, used by the MCP tool) resolves to
+        ``_default_timeout_s()`` (env ``GENESIS_DELIBERATE_TIMEOUT_S``, else ``_DEFAULT_TIMEOUT_S``).
+        An explicit value overrides.
+        """
         key = _openrouter_key()
         if not key:
             return DeliberationResult(
                 answer=None, error="OpenRouter API key not configured (API_KEY_OPENROUTER)"
             )
+        timeout_s = timeout_s if timeout_s is not None else _default_timeout_s()
         user = question if not context else f"{question}\n\nContext:\n{context}"
         preset_name, panel = _resolve_preset(preset, mode)
         high = _HIGH_SUFFIX if _resolve_stakes(stakes, mode, preset_name) == "high" else ""

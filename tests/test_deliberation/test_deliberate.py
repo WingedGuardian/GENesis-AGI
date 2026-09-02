@@ -8,8 +8,10 @@ import httpx
 
 from genesis.deliberation import DeliberationResult, deliberate
 from genesis.deliberation.backends.fusion import (
+    _DEFAULT_TIMEOUT_S,
     _PRESET_PANELS,
     FusionBackend,
+    _default_timeout_s,
     _normalize,
     _parse_content,
     _parse_sse,
@@ -238,7 +240,10 @@ async def test_fusion_analysis_mode_request(monkeypatch):
     assert r.ok and len(r.dissent) == 3 and r.backend_used == "fusion/analysis"
     assert r.preset_used == "strong"  # analysis default preset
     body = m.call_args.args[0]
-    assert body["model"] == "openai/gpt-oss-120b:free"
+    # Bug-1 lock: the analysis orchestrator must be a LIVE slug. The `:free` variant was retired
+    # from OpenRouter (404'd the whole analysis call); the base slug is current.
+    assert body["model"] == "openai/gpt-oss-120b"
+    assert not body["model"].endswith(":free")
     assert body["tools"][0]["type"] == "openrouter:fusion"
     params = body["tools"][0]["parameters"]  # analysis default preset → strong panel
     assert params["analysis_models"] == _PRESET_PANELS["strong"]["analysis_models"]
@@ -303,6 +308,45 @@ async def test_fusion_timeout_graceful(monkeypatch):
     with patch(_STREAM, new=AsyncMock(side_effect=httpx.ReadTimeout("slow"))):
         r = await FusionBackend().run("q", timeout_s=1.0)
     assert not r.ok and "timed out" in r.error
+
+
+# ── Bug 2: the timeout budget is env-configurable and threads through to the HTTP layer ──
+
+
+def test_default_timeout_env_overridable(monkeypatch):
+    monkeypatch.delenv("GENESIS_DELIBERATE_TIMEOUT_S", raising=False)
+    assert _default_timeout_s() == _DEFAULT_TIMEOUT_S  # default when unset
+    monkeypatch.setenv("GENESIS_DELIBERATE_TIMEOUT_S", "512")
+    assert _default_timeout_s() == 512.0
+    # a non-positive / unparseable value falls back to the default (fail-safe, not a 0s timeout)
+    monkeypatch.setenv("GENESIS_DELIBERATE_TIMEOUT_S", "-5")
+    assert _default_timeout_s() == _DEFAULT_TIMEOUT_S
+    monkeypatch.setenv("GENESIS_DELIBERATE_TIMEOUT_S", "not-a-number")
+    assert _default_timeout_s() == _DEFAULT_TIMEOUT_S
+
+
+async def test_timeout_threads_env_to_http_layer(monkeypatch):
+    # timeout_s=None (the MCP-tool default) resolves to the env budget and reaches _consume_stream
+    # (its 3rd positional arg). An explicit timeout_s overrides. This is what makes the raised
+    # budget actually apply to real calls — the old 240s was hard-pinned in core.deliberate().
+    monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
+    monkeypatch.setenv("GENESIS_DELIBERATE_TIMEOUT_S", "777")
+    with patch(_STREAM, new=AsyncMock(return_value=(JSON_OK, 0.05, None))) as m:
+        await FusionBackend().run("q")  # timeout_s omitted → None → env default
+    assert m.call_args.args[2] == 777.0  # _consume_stream(body, key, timeout_s)
+    with patch(_STREAM, new=AsyncMock(return_value=(JSON_OK, 0.05, None))) as m2:
+        await FusionBackend().run("q", timeout_s=99.0)  # explicit wins
+    assert m2.call_args.args[2] == 99.0
+
+
+async def test_deliberate_core_threads_env_timeout(monkeypatch):
+    # core.deliberate() no longer hard-pins 240s: with no explicit timeout_s it defers to the
+    # backend's env-driven default all the way to the HTTP layer.
+    monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
+    monkeypatch.setenv("GENESIS_DELIBERATE_TIMEOUT_S", "633")
+    with patch(_STREAM, new=AsyncMock(return_value=(JSON_OK, 0.05, None))) as m:
+        await deliberate("q", backend="fusion")
+    assert m.call_args.args[2] == 633.0
 
 
 async def test_fusion_http_400_no_retry(monkeypatch):
