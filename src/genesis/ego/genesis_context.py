@@ -686,8 +686,9 @@ class GenesisEgoContextBuilder:
 
         Informational context for the ``confidence`` field (rendered right before
         the output contract), NOT a limiter and NOT a mechanical rescale. Reads
-        ``ego_calibration_snapshots`` ONLY (never ``calibration_curves`` — that table
-        is auto-injected into the perception context). Genesis ego only for v1 — the
+        ``ego_calibration_snapshots`` ONLY — deliberately separate from the
+        perception-facing calibration surface (``calibration_cells``, WS-2 P3).
+        Genesis ego only for v1 — the
         aggregate calibration is genesis-ego dominated; per-ego split is future work.
 
         Live flag ``EgoConfig.calibration_injection_enabled`` (default ON) is read

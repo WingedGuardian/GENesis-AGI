@@ -1319,6 +1319,8 @@ needs it. This is pure instrumentation — zero LLM cost.
   - Computes `actual_success_rate / predicted_confidence` per bucket
   - Produces calibration correction function per domain
   - Stores curves in `calibration_curves` table for Phase 9 context injection
+  - **SUPERSEDED (WS-2):** retired in the P5 sunset (migration 0090) — the unified
+    `calibration_cells` table (P3) replaced this loop; `calibration_curves` is dropped.
 - **Justification:** Google research on "Bayesian Teaching" (2026) confirmed LLMs
   hit a "one-and-done plateau" — they fail to update beliefs from sequential
   evidence. This calibration system is the architectural compensation: a symbolic
@@ -1399,6 +1401,9 @@ Phase 8 accumulates prediction data. Phase 9 uses it to inform autonomy decision
   you're historically right ~60% of the time. Adjust accordingly." Per-domain
   curves from Phase 8's `calibration_curves` table. This is the "symbolic +
   neural" pairing validated by Google's Bayesian Teaching research.
+  **SUPERSEDED (WS-2):** perception now reads the unified `calibration_cells`
+  table (P3); the legacy `calibration_curves` table was retired in the P5 sunset
+  (migration 0090).
 - **Hard disagreement gates** — when cross-vendor review (call sites #17/#20)
   disagrees with primary model, the action BLOCKS until resolved:
   - Third model tiebreaker, OR
