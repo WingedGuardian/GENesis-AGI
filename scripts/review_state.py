@@ -790,7 +790,10 @@ def main() -> None:
         i = 0
         while i < len(norm_args):
             arg = norm_args[i]
-            if arg == "--agent-output" and i + 1 < len(norm_args):
+            if arg == "--agent-output":
+                if i + 1 >= len(norm_args):
+                    print("REFUSED: --agent-output requires a value (a path).", file=sys.stderr)
+                    sys.exit(1)
                 agent_path = norm_args[i + 1]
                 i += 1
             elif arg == "--clean":
@@ -808,6 +811,17 @@ def main() -> None:
                     sys.exit(1)
                 source = norm_args[i + 1]
                 i += 1
+            elif arg.startswith("--"):
+                # FAIL-CLOSED on any unknown option (e.g. a `--soruce` typo). Silently skipping
+                # it would leave the internal default in place → an intended external review is
+                # recorded internal and never advances the cap. Refuse so the caller re-runs
+                # correctly. (dont_hand_roll_cli_parsing_in_hooks; Codex P2.)
+                print(
+                    f"REFUSED: unknown option {arg!r}. Recognized: --agent-output, --source, "
+                    "--clean, --defects.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             i += 1
         if source not in ("internal", "external"):
             print(

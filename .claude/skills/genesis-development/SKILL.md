@@ -833,7 +833,7 @@ thinking any of these, STOP — you are rationalizing a shortcut.
 | "The error is transient, retry will fix it" | Diagnose first. Retrying a misdiagnosed error wastes tokens and masks root causes. |
 | "I'll add the follow-up later" | Follow-ups not created in-session are lost. Create it now while context is fresh. |
 | "I don't need a skill for this" | If a skill exists, use it. The using-superpowers Red Flags table exists for this exact rationalization. |
-| "This review round is the same class, it doesn't really count" | The visible round counter decides what counts, not you. Update it every cycle; at the cap, STOP. |
+| "This review round is the same class, it doesn't really count" | For an EXTERNAL cross-model round, the counter decides, not you — a repeat-class external round still counts; update it every external cycle and STOP at the cap. (Internal same-model reviews are never rounds.) |
 | "The user already said proceed, so I can keep looping" | The escalation/fix-attempt caps CONSUME standing approval. Round 4+ (or fix #4) on an old instruction is a violation, not obedience. |
 | "I can read the summary instead of the source" | Summaries lose context. If you're about to change code, read the code, not the description of it. |
 | "The missing data was the problem — I wrote it, so it's fixed" | The mechanism that failed to write it is the problem. Hand-written artifacts are data repair, not a fix (see Instance-Fix vs Class-Fix Gate). |
@@ -1082,14 +1082,18 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   **Verify it saw a diff at all**: a clean verdict that does not demonstrate WHAT it
   reviewed is void, and a false clean from the cross-model gate is worse than no review.
   Do not merge on a same-model-only review.
-- **Escalation cap — a HARD BLOCK at 3 rounds that each find NEW defects.**
-  A *round* = one review→fix→re-review iteration (local reviewer rounds and
-  cloud-bot re-review rounds count together, per change). The cap is enforced
-  by three mechanics, not by vibes:
-  1. **Visible round counter.** From round 1, the plan file (or task list)
-     carries `Review rounds: N (cap 3)`, updated every cycle. Rounds are a
-     tracked artifact — "it's the same class, it doesn't really count" is
-     exactly the rationalization the counter exists to kill.
+- **Escalation cap — a HARD BLOCK at 3 CROSS-MODEL rounds that each find NEW defects.**
+  A *round* = one EXTERNAL cross-model review→fix→re-review iteration. INTERNAL
+  same-model reviews (genesis-architect / genesis-security / any subagent) are NOT
+  rounds — they never move the machine counter (see "THE COUNTER IS CROSS-MODEL ONLY"
+  below) and must not be counted in the visible tally either, or a session re-creates the
+  very false-stop this is meant to remove. A cloud-bot (Codex) re-review round counts; a
+  local non-Anthropic reviewer (Kimi on .123) counts. The cap is enforced by three
+  mechanics, not by vibes:
+  1. **Visible round counter.** From the first EXTERNAL round, the plan file (or task
+     list) carries `Cross-model rounds: N (cap 3)`, updated every external cycle. Rounds
+     are a tracked artifact — "it's the same class, it doesn't really count" is exactly
+     the rationalization the counter exists to kill (for a repeat EXTERNAL round).
   2. **The block point is BEFORE dispatching the next review.** The check is
      "am I about to trigger round 4+?" — evaluated at the mechanical moment
      (the `@codex review` comment, the re-push, the reviewer dispatch), never

@@ -645,6 +645,19 @@ def test_source_equals_form_is_parsed(repo, home):
     assert res2.returncode == 1 and "source" in res2.stderr.lower()
 
 
+def test_mark_fails_closed_on_unknown_option_typo(repo, home):
+    # A typo'd flag (e.g. `--soruce`) must FAIL CLOSED, not be silently skipped — otherwise the
+    # internal default stands and an intended external review is recorded internal, silently
+    # skipping the escalation cap. No marker, no round file. (Codex P2 — fail-closed-on-unknown.)
+    _stage(repo, "a = 2\n")
+    res = _mark_raw(repo, home, "--soruce", "external", "--defects")
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "unknown option" in res.stderr.lower()
+    key = review_state._worktree_key(cwd=str(repo))
+    assert not (home / ".genesis" / "review_markers" / f"{key}.json").exists()
+    assert not (home / ".genesis" / "review_rounds" / f"{key}.json").exists()
+
+
 def test_mark_rejects_contradictory_outcome(repo, home):
     # Passing BOTH --clean and --defects is a contradiction → refused, no marker
     # (independent of source).
