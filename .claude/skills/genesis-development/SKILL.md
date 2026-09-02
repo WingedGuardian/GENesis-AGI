@@ -615,10 +615,50 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   `scripts/hooks/destructive_command_guard.py:101-120`: its replacements delete a
   line continuation — which is what the shell does with it — or insert
   whitespace and separators; none introduces a quote or an escape, so none can
-  corrupt the quote balance shlex decides on. (The deletion removes a backslash,
-  but a backslash-newline is a continuation, not an escape the shell keeps; the
-  one place the shell does keep it, inside single quotes, is an over-block the
-  guard states rather than hides.) That is a `cannot`; a
+  corrupt the quote balance shlex decides on. (The one place the shell keeps a
+  backslash-newline literally, inside single quotes, is an over-block the guard
+  states rather than hides.) That is a `cannot` — but read the next paragraph
+  before reusing it, because the version of this argument that stood here for
+  weeks was WRONG in a way that shipped a live bypass.
+
+  **What that earlier version got wrong, and why it is the sharpest example on
+  this page.** It added: *"a backslash-newline is a continuation, not an escape
+  the shell keeps."* That is true only when the backslash is itself unescaped —
+  an ODD-length run. In an EVEN-length run every backslash is escaped by its
+  neighbour, so the last one is a literal character and the newline after it is
+  a REAL command separator. The guard folded it anyway, deleting the separator
+  and gluing the next command's first word onto the previous token, so no `rm`
+  token existed and a destructive command was ALLOWED — measured end-to-end
+  through the live hook, exit 0 where the plain-newline control gave exit 2. The
+  legacy regex net did not save it either: that fires only when tokenizing
+  FAILED, and this tokenized fine, just wrongly. Fixed 2026-09-02 by folding
+  only odd-length runs.
+
+  Note precisely what was and was not at fault, because the first attempt at
+  this correction got it wrong in an instructive way: it said the quote-balance
+  reasoning "was CORRECT and is not what broke", and exonerated it. Quote
+  corruption is indeed not the *mechanism* of the token-glue bypass — but the
+  quote-balance `cannot` **was not sound either, and it failed in the very same
+  cell**. Deleting one backslash from an even-length run leaves an ODD run whose
+  survivor escapes the next character; when that character is a quote, the fold
+  DOES introduce an escape and shlex's balance shifts. Measured: it turned
+  parseable commands UNPARSEABLE (11 of 20,000 random parseable commands under
+  the old fold, 0 under the fix), which dropped them into the legacy-regex net —
+  a net that matches neither `-Rf` nor `-r -f` nor `--recursive --force` nor a
+  quoted `'rm'`, so they failed OPEN. One quiet universal quantifier (*every*
+  backslash-newline is a continuation) falsified BOTH claims at once, and the
+  old code therefore had two bypass families rather than one. The fold now
+  always leaves an even-length run, which is what finally makes the `cannot`
+  true.
+
+  A structural `cannot` is only as good as the case-split it rests on, so state
+  the split explicitly and enumerate it — the same trap as the direction-claim
+  two paragraphs down, which was true of the operand and false of the option
+  token. That both the wrong premise AND the first correction of it were written
+  in a document teaching this exact discipline is the point: the danger is not
+  knowing the rule, it is believing you already applied it.
+
+  A corpus run only ever yields `did not, here`, and by the rule above it is
   corpus run only ever yields `did not, here`, and by the rule above it is
   structurally blind to the shape nobody typed. Run the corpus as
   corroboration, never as the proof, and pair it with a control that DOES flip
