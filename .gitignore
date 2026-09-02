@@ -123,6 +123,17 @@ docs/*
 # Private files within allowed dirs
 docs/reference/2026-*.md
 docs/reference/backup-history-migration.md
+# Dated docs are WORKING ARTIFACTS — design notes, decision drafts, migration
+# plans — and belong in ~/.genesis/output/specs/, never in the public tree.
+# Generalises the docs/reference/2026-*.md rule above to every opt-in dir,
+# because the opt-in above is per-DIRECTORY: anything dropped into one of them
+# inherits public-by-default, so an allowed dir doubles as a scratch pad and
+# `git add -A` publishes it. MEASURED 2026-09-02: 8 such files had accumulated
+# under docs/decisions/ (none ever pushed — caught first), while 0 of 92
+# tracked docs files carry a date prefix. So this excludes nothing currently
+# public and no legitimate naming convention.
+# A genuinely-public dated doc is still possible with an explicit `git add -f`.
+docs/**/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*
 
 # Career-ops interop (private — lives at ~/.genesis/interop/)
 config/interop_system_prompt.md
