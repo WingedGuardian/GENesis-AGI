@@ -1,6 +1,7 @@
 """Knowledge graph traversal with NetworkX caching.
 
-Primary path: in-memory NetworkX DiGraph loaded lazily from memory_links.
+Primary path: in-memory NetworkX MultiDiGraph loaded lazily from memory_links
+(a multigraph because one memory pair may carry several typed edges).
 Fallback: recursive CTE queries (if NetworkX import fails or cache is cold
 during the first query of a session).
 
@@ -49,7 +50,7 @@ class TraversalResult:
 
 # ─── NetworkX cache ───────────────────────────────────────────────────────────
 
-_nx_graph: object | None = None  # nx.DiGraph when _NX_AVAILABLE
+_nx_graph: object | None = None  # nx.MultiDiGraph when _NX_AVAILABLE
 _nx_dirty: bool = True
 
 
@@ -76,10 +77,17 @@ async def _ensure_graph(db: aiosqlite.Connection) -> object:
     )
     rows = await cursor.fetchall()
 
-    G = nx.DiGraph()
+    # MultiDiGraph, not DiGraph: memory_links' primary key is
+    # (source_id, target_id, link_type), so one pair may legitimately carry
+    # several typed edges. A DiGraph cannot hold parallel edges — the second
+    # add_edge for a pair overwrites the first's attributes — so the graph kept
+    # an arbitrary survivor and the strength/link_type filters below were
+    # evaluated against it.
+    G = nx.MultiDiGraph()
     for source_id, target_id, link_type, strength in rows:
         G.add_edge(
             source_id, target_id,
+            key=link_type,
             link_type=link_type, strength=strength,
         )
 
@@ -101,7 +109,7 @@ async def _ensure_graph(db: aiosqlite.Connection) -> object:
 
 
 def _bfs_with_strength(
-    G: object,  # nx.DiGraph
+    G: object,  # nx.MultiDiGraph
     root_id: str,
     *,
     max_depth: int,
@@ -125,6 +133,21 @@ def _bfs_with_strength(
         if depth >= max_depth:
             continue
 
+        # A pair may carry several typed edges (MultiDiGraph), so out_edges
+        # yields one tuple per parallel edge. Consider them all and keep the
+        # STRONGEST that passes the filters — otherwise the arbitrary survivor
+        # merely moves from load time to traversal time (the first parallel
+        # edge would win via the `visited` check) and a weak edge could still
+        # mask a strong one.
+        #
+        # Strength-max mirrors memory_links.neighbors_of's MAX(strength)
+        # collapse, but note neighbors_of returns no link_type — this path is
+        # the only one that must also PICK a type, so strongest-wins is a
+        # deliberate choice, not an inherited convention. Revisit if polarity
+        # types start appearing on multi-type pairs (0 of 139 today carry
+        # `contradicts` as their max-strength edge), since graph_expansion
+        # deliberately excludes those from LLM-visible context.
+        best: dict[str, tuple[float, str]] = {}
         for _, neighbor, data in G.out_edges(node, data=True):
             if neighbor in visited:
                 continue
@@ -136,6 +159,11 @@ def _bfs_with_strength(
             if link_type_filter and edge_type != link_type_filter:
                 continue
 
+            current = best.get(neighbor)
+            if current is None or strength > current[0]:
+                best[neighbor] = (strength, edge_type)
+
+        for neighbor, (strength, edge_type) in best.items():
             visited.add(neighbor)
             results.append(GraphNode(
                 memory_id=neighbor,

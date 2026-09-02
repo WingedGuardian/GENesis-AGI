@@ -117,7 +117,8 @@ Easy-to-forget mechanisms:
   — first-party memory vs knowledge-base is a load-bearing distinction.
 - **Entity layer (WS-H Pillar 2)** — typed entity nodes with identity:
   `entities`/`entity_mentions`/`entity_links` tables (migration 0051),
-  `db/crud/entities.py` (recursive-CTE traversal, bi-temporal edge validity,
+  `db/crud/entities.py` (Python frontier BFS — one flat `IN`-list query per
+  depth level, NOT a recursive CTE — bi-temporal edge validity,
   EXTRACTED/INFERRED/AMBIGUOUS provenance, `merge_entity` tombstone-with-
   redirect), `memory/entity_registry.py` (string→ID resolution tiering; fuzzy
   matches queue `entity_adjudication`), `memory/entity_seed.py` (curated spine
