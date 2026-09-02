@@ -13,15 +13,12 @@ logger = logging.getLogger("genesis.runtime")
 
 
 async def init(rt: GenesisRuntime) -> None:
-    """Initialize outreach pipeline, scheduler, calibration, MCP wiring."""
+    """Initialize outreach pipeline, scheduler, MCP wiring."""
     if rt._db is None:
         logger.warning("Outreach skipped — no DB")
         return
 
     try:
-        from genesis.calibration.curves import CalibrationCurveComputer
-        from genesis.calibration.logger import PredictionLogger
-        from genesis.calibration.reconciler import PredictionReconciler
         from genesis.content.drafter import ContentDrafter
         from genesis.content.formatter import ContentFormatter
         from genesis.mcp.outreach_mcp import init_outreach_mcp
@@ -147,14 +144,8 @@ async def init(rt: GenesisRuntime) -> None:
             event_bus=rt._event_bus,
         )
 
-        rt._prediction_logger = PredictionLogger(rt._db)
-        reconciler = PredictionReconciler(rt._db)
-        curve_computer = CalibrationCurveComputer(rt._db)
-
         rt._outreach_scheduler = _Scheduler(
             rt._outreach_pipeline, morning, engagement, config, rt._db,
-            reconciler=reconciler,
-            curve_computer=curve_computer,
             event_bus=rt._event_bus,
         )
 
