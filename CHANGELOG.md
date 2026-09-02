@@ -23,7 +23,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   (not category) is deliberate: a cold-marketing prospect email carries the same
   `notification` category as an owner ping but goes to `email` — so it stays
   correctly calibrated, while the owner ping is skipped. A one-time migration
-  (`0090`) also **voids the historical** owner-facing predictions already in the
+  (`0092`) also **voids the historical** owner-facing predictions already in the
   ledger, so the existing contamination clears at the next grading recompute
   instead of lingering in the all-time reply-rate cell.
 
