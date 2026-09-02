@@ -463,6 +463,15 @@ class TestScrubIsLinearAcrossInputShapes:
         "sparse_underscores": ("A" * 199 + "_") * 200,
         "quoted_wall": '"' + "x" * 40000,
         "url_wall": "https://u:" + "p" * 40000,
+        # PEM armour is the one arm that must reason ACROSS lines, so it is the
+        # one that can go quadratic on repeated markers. Both directions of the
+        # half-visible case belong in the matrix too: each drives the adjacent
+        # key-material walk rather than the matched-pair path.
+        "repeated_pem_headers": "-----BEGIN RSA PRIVATE KEY-----\n" * 8192,
+        "repeated_pem_footers": "-----END RSA PRIVATE KEY-----\n" * 8192,
+        "pem_header_then_body": (
+            "-----BEGIN RSA PRIVATE KEY-----\n" + ("QUFB" * 16 + "\n") * 4000
+        ),
     }
 
     @pytest.mark.parametrize("shape", sorted(SHAPES))
@@ -546,15 +555,150 @@ class TestPemPrivateKeysAreRedacted:
         assert "QUFB" not in out, f"{kind or 'generic'} PEM body survived"
         assert "here is the file" in out and "after" in out
 
-    def test_unterminated_header_is_linear(self):
+    def test_unterminated_header_redacts_the_key_run(self):
+        """A HALF-VISIBLE key must still be redacted.
+
+        This assertion used to read `"QUFB" in out` — it pinned a live leak.
+        The capture window (`-S -200`) and the 256KB input cap both cut at
+        arbitrary positions, so a key whose END marker was clipped away reached
+        the log with its body intact. Requiring BOTH delimiters means the
+        clipped case is exactly the case that leaks.
+        """
         import time
 
-        blob = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "QUFB" * 10000
+        blob = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "\n".join(
+            "QUFB" * 16 for _ in range(400)
+        )
         start = time.perf_counter()
         out = s.scrub(blob)
         assert time.perf_counter() - start < 5.0
-        # Unterminated -> no match; body passes through (armour incomplete).
-        assert "QUFB" in out
+        assert "QUFB" not in out, "clipped-END key body survived"
+
+    def test_orphan_end_marker_redacts_the_preceding_key_run(self):
+        """The mirror case: the BEGIN scrolled off the top of the window."""
+        body = "\n".join("QUFB" * 16 for _ in range(6))
+        text = f"ordinary diagnostic line\n{body}\n-----END RSA PRIVATE KEY-----\nafter"
+        out = s.scrub(text)
+        assert "QUFB" not in out, "clipped-BEGIN key body survived"
+        assert "ordinary diagnostic line" in out and "after" in out
+
+    def test_a_lone_marker_in_prose_does_not_blank_the_diagnostic(self):
+        """Redaction walks the ADJACENT key-material run and stops at the first
+        ordinary line, so one stray marker (grep output, a docstring) cannot
+        take the surrounding diagnostic with it."""
+        text = (
+            "line one of the crash\n"
+            "grep: id_rsa: -----BEGIN RSA PRIVATE KEY-----\n"
+            "line three of the crash\n"
+            "line four of the crash\n"
+        )
+        out = s.scrub(text)
+        for keep in ("line one of the crash", "line three", "line four"):
+            assert keep in out, f"{keep!r} was blanked by a lone marker:\n{out}"
+
+    def test_repeated_unmatched_headers_stay_linear(self):
+        """The measured quadratic: the old both-delimiter regex retried its
+        cross-line body scan at EVERY header, 25.5s on a 256KB input of
+        repeated headers (ratio 4.0 at 2x input) — past the exit-capture
+        timeout, so the whole diagnostic was discarded."""
+        import time
+
+        hdr = "-----BEGIN RSA PRIVATE KEY-----\n"
+        blob = hdr * (262144 // len(hdr))
+        start = time.perf_counter()
+        s.scrub(blob)
+        assert time.perf_counter() - start < 5.0
+
+    def test_mismatched_armour_labels_still_redact(self):
+        body = "\n".join("QUFB" * 16 for _ in range(4))
+        text = f"-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----"
+        assert "QUFB" not in s.scrub(text)
+
+    def test_crlf_line_endings_are_handled(self):
+        body = "\r\n".join("QUFB" * 16 for _ in range(4))
+        text = f"-----BEGIN RSA PRIVATE KEY-----\r\n{body}\r\n-----END RSA PRIVATE KEY-----"
+        assert "QUFB" not in s.scrub(text)
+
+    def test_legacy_encrypted_armour_puts_headers_before_the_body(self):
+        """RFC 1421 / OpenSSL legacy-encrypted armour — what
+        `openssl genrsa -aes128 -traditional` and `ssh-keygen -m PEM -N` emit —
+        carries `Proc-Type:`/`DEK-Info:` and a BLANK LINE between the marker and
+        the base64. A walk that requires the body on the very next line stops at
+        the metadata and writes the whole key out.
+
+        VERIFIED against a real `openssl genrsa -aes128` artifact before this
+        was handled: 14 of 14 visible body lines reached the log. Synthetic
+        fixtures with no header lines cannot see this, which is why it survived
+        a green suite.
+        """
+        body = "\n".join("QUFB" * 16 for _ in range(6))
+        text = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "Proc-Type: 4,ENCRYPTED\n"
+            "DEK-Info: AES-128-CBC,B6F35A9DA8465EEE6BD4B061D097D3C5\n"
+            "\n"
+            f"{body}\n"
+            "trailing diagnostic line\n"
+        )  # END deliberately absent: the capture window cut it off
+        out = s.scrub(text)
+        assert "QUFB" not in out, f"encrypted-armour body survived:\n{out}"
+        assert "trailing diagnostic line" in out
+
+    def test_encrypted_pkcs8_armour_is_redacted(self):
+        body = "\n".join("QUFB" * 16 for _ in range(4))
+        text = f"-----BEGIN ENCRYPTED PRIVATE KEY-----\n{body}\n-----END ENCRYPTED PRIVATE KEY-----"
+        assert "QUFB" not in s.scrub(text)
+
+    def test_pgp_secret_key_block_is_redacted(self):
+        """`gpg --export-secret-keys -a` armour says PRIVATE KEY BLOCK."""
+        body = "\n".join("lQVYBGhA" * 8 for _ in range(4))
+        text = f"-----BEGIN PGP PRIVATE KEY BLOCK-----\n{body}\n-----END PGP PRIVATE KEY BLOCK-----"
+        assert "lQVYBGhA" not in s.scrub(text)
+
+    def test_the_short_final_body_line_is_redacted_too(self):
+        """A base64 body's LAST line is short by construction (a 2048-bit RSA
+        key ends in a 2-char line), so a minimum-length run bound would leave
+        the key's tail sitting in the log."""
+        body = "\n".join("QUFB" * 16 for _ in range(3))
+        text = f"-----BEGIN RSA PRIVATE KEY-----\n{body}\nQUFBQUFB\nordinary line\n"
+        out = s.scrub(text)
+        assert "QUFBQUFB" not in out, f"key tail survived:\n{out}"
+        assert "ordinary line" in out
+
+    def test_two_unrelated_markers_do_not_swallow_the_span(self):
+        """The classic shape: one `grep` hit names a BEGIN, another names an
+        END, and everything between them is ordinary diagnostic output. Pairing
+        them destroys the crash context the log exists for.
+
+        VERIFIED before the interior check existed: 7 diagnostic lines in, 1
+        out.
+        """
+        text = "\n".join(
+            ["tests/a.py:12:  key = '-----BEGIN RSA PRIVATE KEY-----'"]
+            + [f"crash line {i} KEEPME" for i in range(1, 7)]
+            + ["tests/b.py:99:  end = '-----END RSA PRIVATE KEY-----'"]
+            + ["crash line 7 KEEPME"]
+        )
+        out = s.scrub(text)
+        kept = sum(1 for ln in out.splitlines() if "KEEPME" in ln)
+        assert kept == 7, f"only {kept}/7 diagnostic lines survived:\n{out}"
+
+    def test_a_real_block_is_still_redacted_whole(self):
+        """Guard for the check above: the interior test must not stop a genuine
+        block — whose interior IS key material — from being redacted."""
+        body = "\n".join("QUFB" * 16 for _ in range(20))
+        text = f"before\n-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----\nafter"
+        out = s.scrub(text)
+        assert "QUFB" not in out
+        assert "before" in out and "after" in out
+
+    def test_a_certificate_is_not_a_private_key(self):
+        """Only PRIVATE KEY armour redacts. A certificate is public material,
+        and treating it as a key would blank ordinary TLS diagnostics."""
+        body = "\n".join("Q0VSVA" * 8 for _ in range(4))
+        text = f"-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----"
+        out = s.scrub(text)
+        assert "Q0VSVA" in out, "a public certificate was redacted as a key"
 
 
 class TestAdditionalVendorPrefixes:
@@ -577,3 +721,45 @@ class TestAdditionalVendorPrefixes:
 
     def test_stripe_lookalike_prose_survives(self):
         assert R not in s.scrub("the sk_live_migration plan doc")
+
+
+class TestPatternsStayPortable:
+    """The scrubber runs under whatever bare `python3` the install has —
+    `scripts/cc_exit_capture.sh` invokes it by name, deliberately NOT the venv
+    interpreter, so a broken venv cannot break the dying-pane capture.
+
+    Possessive quantifiers (`*+`, `{m,n}+`) are Python 3.11+ ONLY (bpo-433030).
+    An install whose system `python3` is older — Ubuntu 22.04 ships 3.10, and
+    `scripts/install.sh` installs `python3.12` as a SEPARATE binary rather than
+    replacing it — would raise `re.error` at import, and every captured tail
+    would be withheld forever. Plain bounded repeats give the same linearity
+    (MEASURED: whole-blob scrubbing stays linear, 39KB/78KB/156KB =
+    349/705/1441ms) and the same matches (MEASURED: 0 differing outputs over
+    20,270 strings).
+    """
+
+    def test_no_possessive_quantifiers_in_any_compiled_pattern(self):
+        """Checks the COMPILED patterns, not the file text — prose may name the
+        construct (this module's own comments do); only a pattern can break the
+        import."""
+        import re as _re
+
+        possessive = _re.compile(r"(?:\*\+|\?\+|\{\d+(?:,\d*)?\}\+)")
+        offenders = {
+            name: possessive.findall(obj.pattern)
+            for name, obj in vars(s).items()
+            if isinstance(obj, _re.Pattern) and possessive.search(obj.pattern)
+        }
+        assert not offenders, (
+            f"possessive quantifier(s) in {offenders} require Python 3.11+; "
+            "the hook must import under the install's bare python3"
+        )
+
+    def test_the_portability_guard_can_actually_fail(self):
+        """Guard-the-guard: the check above reads `.pattern` off module-level
+        compiled regexes, so it is worth proving it SEES one."""
+        import re as _re
+
+        possessive = _re.compile(r"(?:\*\+|\?\+|\{\d+(?:,\d*)?\}\+)")
+        assert possessive.search(r"(?P<key>_*+[A-Z]{2,512}+)")
+        assert not possessive.search(r"(?P<key>_{0,4}[A-Z]{2,512})")

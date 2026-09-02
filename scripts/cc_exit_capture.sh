@@ -93,15 +93,24 @@ mkdir -p "$log_dir" 2>/dev/null || exit 0
         # up, for the case where python itself is unavailable. The exit-status
         # lines above are always written either way, so the primary diagnostic
         # (why did the session die) survives even with no tail at all.
-        if _tail=$(tmux capture-pane -p -t "$TMUX_PANE" -S -200 2>/dev/null) \
+        # -J JOINS soft-wrapped rows back into the logical line the program
+        # actually printed. Without it the terminal's wrap is a REDACTION HOLE:
+        # a credential that starts near the right edge arrives as two separate
+        # rows, neither of which carries a matchable prefix, so the token is
+        # persisted in reconstructable form. MEASURED on tmux 3.4 at width 80:
+        # a 300-char token is three unmatched rows without -J and one intact
+        # line with it.
+        if _tail=$(tmux capture-pane -p -J -t "$TMUX_PANE" -S -200 2>/dev/null) \
            && [ -n "$_tail" ]; then
             # Deliberately if/else, not `A && B || C`: in the chain form a
             # failure in the PRINT step (disk full, SIGPIPE) also fires C and
             # appends a "withheld" marker after a half-written tail.
-            # 256KB cap on the filter input. MEASURED: capture-pane emits long
-            # lines WRAPPED at pane width (a 4000-char blob arrived as 20 x
-            # 200-char lines), so a real tail is height*width — ~40KB; the cap
-            # bites only a pathological geometry and bounds the input either way.
+            # 256KB cap on the filter input. -S -200 counts PHYSICAL rows either
+            # way, so joining changes where the newlines fall, not the byte
+            # total: a real tail stays height*width (~40KB) and the cap bites
+            # only a pathological geometry. The scrubber is line-local for
+            # everything except PEM armour, so joined long lines cost linear
+            # time, not quadratic (see secret_scrub's LINEAR BY CONSTRUCTION).
             if _scrubbed=$(printf '%s\n' "$_tail" | head -c 262144 | _cc_scrub_stdin 2>/dev/null); then
                 printf '%s\n' "$_scrubbed" | sed 's/^/  | /'
             else

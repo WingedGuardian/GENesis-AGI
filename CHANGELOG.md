@@ -38,11 +38,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   width, measured), so this is hardening for any future caller that feeds
   unbroken machine output.
 - **Private-key blocks and more vendor key formats are detected.** A pasted or
-  displayed PEM private key (the armour, whole block) is now redacted, along
-  with several additional vendor prefixes, and tokens appearing on diff-style
-  `-`/`+` lines are handled the same as anywhere else. The scrub subprocess in
-  the exit-capture path also gained a wall-clock bound and an input cap, both
+  displayed PEM private key is now redacted — including one that is only
+  partly on screen, since a captured tail starts and ends at arbitrary points
+  — along with several additional vendor prefixes, and tokens appearing on
+  diff-style `-`/`+` lines are handled the same as anywhere else. Redaction
+  around a key marker covers the adjacent key material and stops there, so an
+  ordinary diagnostic keeps its surrounding lines. The scrub subprocess in the
+  exit-capture path also gained a wall-clock bound and an input cap, both
   failing toward withholding the tail rather than storing it unscrubbed.
+- **Long terminal lines are redacted as one line, not as fragments.** A
+  terminal stores a line longer than the window is wide as several rows.
+  The capture now reassembles them before scanning, so a value that happens to
+  straddle the right edge is treated as the single value it is.
+- **The scrubber runs on any supported Python.** Its patterns use only
+  widely-available regex syntax, so the capture path works with whatever
+  `python3` an install provides rather than requiring a recent one — it is
+  deliberately not tied to the project virtualenv, which may be unavailable at
+  exactly the moment a session is crashing. Scanning cost stays linear in the
+  size of the captured text.
 
 ### Added
 

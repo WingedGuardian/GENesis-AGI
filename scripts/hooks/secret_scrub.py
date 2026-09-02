@@ -32,6 +32,7 @@ Two layers callers combine:
 
 from __future__ import annotations
 
+import bisect
 import re
 
 _REDACTED = "[REDACTED]"
@@ -70,6 +71,16 @@ _KNOWN_KEY_PREFIX_PATTERN = re.compile(
     r"gh[pousr]_[A-Za-z0-9]{30,}"  # GitHub PAT / OAuth / user / server / refresh
     r"|github_pat_[A-Za-z0-9_]{30,}"  # GitHub fine-grained PAT
     r"|glpat-[A-Za-z0-9_\-]{15,}"  # GitLab PAT
+    # Hyphens are admitted deliberately: the motivating real token is
+    # `sk-ant-oat01-<...>`, which a hyphen-free class cannot match at all.
+    # MEASURED residual of that width, stated rather than hidden: a 20+ char
+    # hyphenated slug beginning `sk-` is redacted even in prose
+    # ("sk-learn-pipeline-preprocessing"). Over 779,899 tracked lines the
+    # NATURAL rate of that collision is ZERO — every observed hit is a
+    # deliberately adversarial lookalike in a precision-test fixture — and this
+    # module favours RECALL by contract (see the header: reference_extraction
+    # is the precision-favouring twin). Over-redacting a slug costs one token
+    # of a 0600 diagnostic; under-redacting costs the credential.
     r"|sk-[A-Za-z0-9_\-]{20,}"  # OpenAI / Anthropic / OpenRouter / compatible
     r"|gsk_[A-Za-z0-9]{20,}"  # Groq
     r"|nvapi-[A-Za-z0-9_\-]{20,}"  # NVIDIA NIM
@@ -95,16 +106,163 @@ _KNOWN_KEY_PREFIX_PATTERN = re.compile(
 )
 
 # PEM armour. A private-key BODY is unlabelled base64 no shape rule can own;
-# the BEGIN/END armour can. Non-greedy and anchored on BOTH delimiters, so an
-# unterminated header simply never matches (linear — the engine looks for the
-# literal END; pinned by test_unterminated_header_is_linear). The pane tail is
-# the motivating caller: `cat ~/.ssh/id_ed25519` in the last 200 lines is an
-# ordinary accident and the highest-value secret on the box.
-_PEM_PRIVATE_KEY_PATTERN = re.compile(
-    r"-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----"
-    r"[\s\S]*?"
-    r"-----END(?: [A-Z0-9]+)* PRIVATE KEY-----"
+# the BEGIN/END armour can. The pane tail is the motivating caller:
+# `cat ~/.ssh/id_ed25519` in the last 200 lines is an ordinary accident and the
+# highest-value secret on the box.
+#
+# Scanned LINE BY LINE against literal markers, not with one cross-line regex.
+# The previous form anchored a non-greedy `[\s\S]*?` body on BOTH delimiters,
+# which failed in both directions at once:
+#
+#   PERFORMANCE — every BEGIN with no END re-scanned the rest of the input.
+#   MEASURED quadratic: 25.5s on a 256KB run of repeated headers, ratio 4.0 at
+#   2x input. That is past the capture timeout, so the entire diagnostic was
+#   discarded — the failure the timeout exists to bound, reached by ordinary
+#   input rather than an attack.
+#
+#   CORRECTNESS — requiring both delimiters meant a HALF-VISIBLE key never
+#   matched at all, and half-visible is the NORMAL case here: the capture
+#   window (`-S -200`) and the 256KB input cap both cut at arbitrary positions.
+#   A key whose BEGIN scrolled off, or whose END was cut, reached the log with
+#   its body intact. Both directions were reproduced on the previous code.
+#
+# So a marker with no partner redacts the run of key-material lines ADJACENT to
+# it and stops at the first ordinary line. Fail-closed on the key material,
+# bounded in blast radius: one stray marker in prose (grep output, a docstring)
+# cannot blank the surrounding diagnostic. Redaction is LINE-granular, so a
+# complete block written on ONE line (an env assignment with escaped newlines)
+# takes the whole line — the safe direction for that shape.
+_PEM_LABEL = r"(?: [A-Z0-9]{1,32}){0,4}"
+# `BLOCK` covers the PGP family (`-----BEGIN PGP PRIVATE KEY BLOCK-----`), the
+# armour `gpg --export-secret-keys -a` emits.
+_PEM_BEGIN_LINE = re.compile(rf"-----BEGIN{_PEM_LABEL} PRIVATE KEY(?: BLOCK)?-----")
+_PEM_END_LINE = re.compile(rf"-----END{_PEM_LABEL} PRIVATE KEY(?: BLOCK)?-----")
+_PEM_MARKER_LITERAL = "PRIVATE KEY"
+_PEM_BODY_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
 )
+_PEM_MIN_BODY_LINE = 16
+# A base64 body's LAST line is short by construction (a 2048-bit RSA key ends
+# in a 2-char line), so a run bound alone leaves the key's tail behind.
+_PEM_MIN_TAIL_LINE = 4
+# RFC 1421 / OpenSSL legacy-encrypted armour (`openssl genrsa -aes128`,
+# `ssh-keygen -m PEM -N`) puts `Proc-Type:` / `DEK-Info:` and a blank line
+# BETWEEN the marker and the base64, so the body does not start on the next
+# line. MEASURED before this bound existed: 14 of 14 body lines of a real
+# encrypted key were written out, because the walk stopped at `Proc-Type:`.
+_PEM_BODY_HEADER = re.compile(r"^[A-Za-z][A-Za-z0-9-]{1,31}:\s")
+_PEM_MAX_HEADER_LINES = 8
+# Two UNRELATED markers (the classic case: one `grep` hit naming a BEGIN and
+# another naming an END) must not pair up and swallow everything between them.
+# A distance cap alone does NOT separate them — grep hits land close together —
+# so the discriminator is what lies BETWEEN: a real block's interior is base64,
+# optionally preceded by RFC 1421 headers and blank lines. One ordinary prose
+# line in the span means these are two mentions, not one block, and each is
+# then treated on its own (marker redacted, adjacent key material redacted,
+# surrounding diagnostic kept). MEASURED before this check existed: a 9-line
+# grep result collapsed to a single [REDACTED], destroying 6 diagnostic lines.
+# The cap bounds the interior scan, keeping the pass linear; a real block is
+# far shorter anyway (RSA-4096 ~52 lines, OPENSSH ~48).
+_PEM_MAX_BLOCK_LINES = 200
+
+
+def _is_key_material(line: str) -> bool:
+    """True for a base64 body line — the shape a PEM key's payload takes.
+
+    Deliberately narrow: anything with a space, punctuation or a short length
+    is an ordinary log line and STOPS the redaction run.
+    """
+    stripped = line.strip()
+    if len(stripped) < _PEM_MIN_BODY_LINE:
+        return False
+    return all(ch in _PEM_BODY_CHARS for ch in stripped)
+
+
+def _is_key_tail(line: str) -> bool:
+    """A SHORT pure-base64 line — the final line of a key body."""
+    stripped = line.strip()
+    return (
+        _PEM_MIN_TAIL_LINE <= len(stripped) < _PEM_MIN_BODY_LINE
+        and all(ch in _PEM_BODY_CHARS for ch in stripped)
+    )
+
+
+def _pem_body_end(lines: list[str], start: int, n: int) -> int:
+    """Index just past the key body beginning at or after ``start``."""
+    probe, skipped = start, 0
+    while (
+        probe < n
+        and skipped < _PEM_MAX_HEADER_LINES
+        and (not lines[probe].strip() or _PEM_BODY_HEADER.match(lines[probe].strip()))
+    ):
+        probe += 1
+        skipped += 1
+    # Only honour the skipped prefix when a body actually follows it, so a lone
+    # marker in prose still costs exactly its own line.
+    k = probe if probe < n and _is_key_material(lines[probe]) else start
+    while k < n and _is_key_material(lines[k]):
+        k += 1
+    if k > start and k < n and _is_key_tail(lines[k]):
+        k += 1
+    return k
+
+
+def _is_block_interior(lines: list[str], start: int, stop: int) -> bool:
+    """True when every line in ``[start, stop)`` belongs inside PEM armour."""
+    for idx in range(start, stop):
+        stripped = lines[idx].strip()
+        if not stripped or _PEM_BODY_HEADER.match(stripped):
+            continue
+        if _is_key_material(lines[idx]) or _is_key_tail(lines[idx]):
+            continue
+        return False
+    return True
+
+
+def _redact_pem_blocks(text: str) -> str:
+    """Redact PEM private keys, including half-visible ones. Linear."""
+    if _PEM_MARKER_LITERAL not in text:
+        return text  # one substring scan covers every ordinary input
+    lines = text.split("\n")
+    # Every END position, found once, so a BEGIN never re-scans the tail.
+    end_at = [i for i, ln in enumerate(lines) if _PEM_END_LINE.search(ln)]
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        begin = _PEM_BEGIN_LINE.search(line)
+        if begin:
+            if _PEM_END_LINE.search(line, begin.end()):
+                out.append(_REDACTED)  # whole block on one line
+                i += 1
+                continue
+            after = bisect.bisect_right(end_at, i)
+            if (
+                after < len(end_at)
+                and end_at[after] - i <= _PEM_MAX_BLOCK_LINES
+                and _is_block_interior(lines, i + 1, end_at[after])
+            ):
+                out.append(_REDACTED)  # matched pair: redact through the END
+                i = end_at[after] + 1
+                continue
+            # No END, or one too far away to belong to this marker: redact the
+            # marker plus whatever key body actually follows it.
+            out.append(_REDACTED)
+            i = _pem_body_end(lines, i + 1, n)
+            continue
+        if _PEM_END_LINE.search(line):
+            # An END we never opened: the BEGIN was clipped above, so the body
+            # is whatever key material we have already emitted.
+            if out and _is_key_tail(out[-1]):
+                out.pop()
+            while out and _is_key_material(out[-1]):
+                out.pop()
+            out.append(_REDACTED)
+            i += 1
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
 
 # Structured credentials — identified by SHAPE, not by a vendor prefix. Both
 # carry their secret as a positional path/field component, so no label pattern
@@ -178,8 +336,19 @@ _URL_CREDENTIAL_PATTERN = re.compile(
 # classes). Three pieces:
 #   * `(?<![A-Za-z0-9])` — a run of admitted characters offers only the starts
 #     the lookbehind allows, not every offset;
-#   * POSSESSIVE `{2,512}+` — no give-back, so a failed `=` cannot re-scan the
-#     key one character shorter per attempt (the quadratic engine);
+#   * the BOUNDED repeats `_{0,4}` and `{2,512}` — plain syntax, deliberately
+#     NOT possessive. The ceiling alone is what removes the quadratic: it caps
+#     the work a failed `=` can spend re-scanning the key, so cost is O(N x 512)
+#     rather than O(N^2). MEASURED whole-blob, ceilings kept, no possessives:
+#     39KB/78KB/156KB = 349/705/1441ms — exactly linear; a realistic 200x200
+#     pane tail is 80ms and the observer hook's 2000-char cap is 15ms, against
+#     a 10s scrub timeout. Possessive quantifiers (`*+`, `{m,n}+`) would shave
+#     the constant but are Python 3.11+ ONLY (bpo-433030), and this module is
+#     imported by whatever bare `python3` the install has — so they made the
+#     scrubber fail to import on an older system interpreter, withholding every
+#     captured tail. They were removed for that reason and the removal is
+#     MEASURED semantically free: 0 differing outputs over 20,270 strings.
+#     Pinned by TestPatternsStayPortable;
 #   * the 512 ceiling — bounds the per-start scan. The ceiling CANNOT reproduce
 #     the old slide-forward fail-open for ordinary names (the lookbehind blocks
 #     an alnum-preceded restart, so an over-ceiling key is a CLEAN MISS, not a
@@ -199,7 +368,7 @@ _URL_CREDENTIAL_PATTERN = re.compile(
 # redacted at all. Bounding a repeat that feeds a downstream semantic check can
 # break the check rather than just the reach.
 _ENV_ASSIGNMENT_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])(?P<key>_*+[A-Z][A-Z0-9_]{2,512}+)"
+    r"(?<![A-Za-z0-9])(?P<key>_{0,4}[A-Z][A-Z0-9_]{2,512})"
     r"(?P<sep>\s*=\s*)"
     r"(?P<val>\"[^\"]{6,}\"|'[^']{6,}'|[^\s]{6,})",
 )
@@ -258,7 +427,7 @@ def scrub(text: str) -> str:
     if not text:
         return text
     try:
-        text = _PEM_PRIVATE_KEY_PATTERN.sub(_REDACTED, text)
+        text = _redact_pem_blocks(text)
         text = _KNOWN_KEY_PREFIX_PATTERN.sub(_REDACTED, text)
         text = _STRUCTURED_CREDENTIAL_PATTERN.sub(_REDACTED, text)
         text = _redact_value_group(_CREDENTIAL_TOKEN_PATTERN, text, "token")

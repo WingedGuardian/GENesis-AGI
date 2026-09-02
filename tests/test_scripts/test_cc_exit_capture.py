@@ -219,6 +219,57 @@ def test_scrollback_credentials_are_redacted(tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("tmux"), reason="tmux not available")
+def test_a_credential_split_by_the_terminal_wrap_is_still_redacted(tmp_path):
+    """The terminal's soft wrap was a redaction hole.
+
+    A token longer than the pane is wide is stored by tmux as several physical
+    rows. Captured without ``-J`` those rows come back as separate lines, so
+    only the FIRST fragment still carries the vendor prefix the pattern needs —
+    the remaining fragments are unmatchable and the token is persisted in
+    reconstructable form. This drives the pane deliberately narrow so the token
+    cannot fit on one row, which is the ordinary case at any real pane width
+    for a long-lived token.
+    """
+    home = tmp_path / "home"
+    (home / ".genesis" / "logs").mkdir(parents=True)
+    benign = f"BENIGN_MARKER_{uuid.uuid4().hex[:8]}"
+    tail_marker = "W" * 30  # lands in a LATER wrapped row, never the first
+    secret = "sk-ant-oat01-" + "T" * 60 + tail_marker
+    fake_claude = tmp_path / "fakeclaude.sh"
+    fake_claude.write_text(
+        f"#!/usr/bin/env bash\necho '{benign}'\necho '{secret}'\nexit 0\n"
+    )
+    fake_claude.chmod(0o755)
+
+    sock = f"ccexit-wrap-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+    inner = (
+        f"HOME={home} '{fake_claude}'; __ec=$?; "
+        f"HOME={home} '{_CAPTURE}' 9 $__ec >/dev/null 2>&1; exit $__ec"
+    )
+    try:
+        subprocess.run(
+            ["tmux", "-L", sock, "new-session", "-d", "-s", "t",
+             "-x", "40", "-y", "10", inner],
+            check=True, capture_output=True, text=True,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            r = subprocess.run(["tmux", "-L", sock, "has-session", "-t", "t"], capture_output=True)
+            if r.returncode != 0:
+                break
+            time.sleep(0.2)
+    finally:
+        subprocess.run(["tmux", "-L", sock, "kill-server"], capture_output=True)
+
+    body = _log_for(home, "9").read_text()
+    assert tail_marker not in body, (
+        "a wrapped credential's later rows were persisted unredacted:\n" + body
+    )
+    assert "T" * 30 not in body, "wrapped credential body persisted:\n" + body
+    assert benign in body, f"redaction ate benign scrollback:\n{body}"
+
+
+@pytest.mark.skipif(not shutil.which("tmux"), reason="tmux not available")
 def test_tail_is_withheld_when_scrubber_is_unavailable(tmp_path):
     """Fail CLOSED: with no usable scrubber the tail is WITHHELD, never raw.
 
