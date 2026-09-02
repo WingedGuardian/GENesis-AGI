@@ -1302,6 +1302,14 @@ a burn-in period. Rationale:
 Start prediction logging early so calibration data accumulates before Phase 9
 needs it. This is pure instrumentation — zero LLM cost.
 
+> **SUPERSEDED (WS-2 P5 sunset, migration 0090).** This entire legacy calibration
+> subsystem — the `predictions` logging table, the prediction→outcome reconciler,
+> and the per-domain `calibration_curves` computation — has been retired. The
+> unified `calibration_cells` table (WS-2 P3) is the live calibration surface
+> (perception reads it; the graded cognitive ledger computes it). `predictions` is
+> archived to `predictions_legacy_ws2`; `calibration_curves` is dropped. The
+> descriptions and the checklist below are the historical Phase-8 record.
+
 - **Prediction logging table** (`predictions`):
   - Schema: `{id, action_id, timestamp, prediction, confidence, confidence_bucket,
     domain, reasoning, outcome (nullable), correct (nullable), matched_at (nullable)}`
@@ -1319,8 +1327,6 @@ needs it. This is pure instrumentation — zero LLM cost.
   - Computes `actual_success_rate / predicted_confidence` per bucket
   - Produces calibration correction function per domain
   - Stores curves in `calibration_curves` table for Phase 9 context injection
-  - **SUPERSEDED (WS-2):** retired in the P5 sunset (migration 0090) — the unified
-    `calibration_cells` table (P3) replaced this loop; `calibration_curves` is dropped.
 - **Justification:** Google research on "Bayesian Teaching" (2026) confirmed LLMs
   hit a "one-and-done plateau" — they fail to update beliefs from sequential
   evidence. This calibration system is the architectural compensation: a symbolic
