@@ -1636,7 +1636,10 @@ The review-findings gate specifically:
    for automated review findings (ERROR, [P1], HARD BLOCK).
 2. If review present with **blocking findings** → merge is **BLOCKED**
    by the hook (exit code 2). Fix the findings first.
-3. If review present with only WARNINGs/NOTEs → merge allowed.
+3. Inline findings are SCORED — P1 = 1.0, P2 = 0.5 — and the gate blocks at
+   score >= 1.0 (any P1, OR >= 2 P2s). A lone P2 is advisory (0.5, allowed); a
+   P2 is excluded from the score if a MAINTAINER reply engages it or it is on a
+   documentation path. Pure WARNINGs/NOTEs (non-P1/P2) → merge allowed.
 4. If no review comments at all (quota exhausted) → merge allowed
    on CI alone. Note in PR that review was quota-limited.
 5. **Override**: Append `# review-override` to the merge command to
@@ -1656,9 +1659,11 @@ The review-findings gate specifically:
    `gh repo view --json nameWithOwner --jq .nameWithOwner` — NEVER hardcode
    it (configs name several repos; the working repo is not the org default).
    A **404 from that endpoint means WRONG SLUG or PR number, never "no
-   findings"** — a clean PR returns `[]`. The merge-gate hook only blocks
-   ERROR/[P1]/HARD BLOCK, so unread P2s pass silently (2026-07-10: 8 real
-   P2s on the entity-layer PRs were merged past this exact way). And the two
+   findings"** — a clean PR returns `[]`. The merge-gate hook blocks on the
+   weighted inline SCORE (P1=1.0, P2=0.5; block at >= 1.0), so a lone P2 is
+   advisory but TWO unresolved P2s block — unread P2s no longer slip through in
+   pairs (2026-07-10: 8 real P2s on the entity-layer PRs merged past the OLD
+   P1-only gate, the exact gap this score closes). And the two
    channels are INDEPENDENT: Codex can post a quota/usage-limit message as an
    ISSUE comment while a later `@codex review` trigger delivers real inline
    findings anyway — a quota message is evidence about that channel at that

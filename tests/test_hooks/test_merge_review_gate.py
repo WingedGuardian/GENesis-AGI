@@ -1223,6 +1223,56 @@ class TestCheckInlineReviewFindings:
         err = capsys.readouterr().err
         assert "[P2] Preserve multi-word ledger keys" in err
 
+    # ── weighted review score: P1 = 1.0, P2 = 0.5, block at >= 1.0 ──
+    def test_inline_two_p2_block(self, guard_module):
+        """Two unresolved P2s score 1.0 >= threshold → BLOCK (a single P2 stays
+        advisory; see test_inline_p2_warns_but_allows)."""
+        with self._mock(
+            guard_module, [self._codex(1, _P2_BODY), self._codex(2, _P2_BODY)]
+        ):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "score" in msg.lower()
+
+    def test_inline_p1_plus_p2_block_lists_both(self, guard_module):
+        """1 P1 (1.0) + 1 P2 (0.5) = 1.5 → BLOCK; the P1 title is listed."""
+        with self._mock(
+            guard_module, [self._codex(1, _P1_BODY), self._codex(2, _P2_BODY)]
+        ):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "Make queue claim atomic" in msg
+
+    def test_inline_replied_p2_excluded_from_score(self, guard_module):
+        """A MAINTAINER reply acks a P2 (consciously accepted) — it drops from the
+        score, so two P2s where one is replied = 0.5 < 1.0 → no block."""
+        comments = [
+            self._codex(1, _P2_BODY),
+            self._codex(2, _P2_BODY),
+            {
+                "id": 3,
+                "reply_to": 2,
+                "login": "WingedGuardian",
+                "type": "User",
+                "assoc": "OWNER",
+                "body": "Accepted; tracked in a follow-up.",
+            },
+        ]
+        with self._mock(guard_module, comments):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_inline_doc_path_p2_excluded_from_score(self, guard_module):
+        """A P2 on a documentation path is not a code defect — excluded from the
+        score, so two P2s where one is on CHANGELOG.md = 0.5 < 1.0 → no block."""
+        comments = [
+            self._codex(1, _P2_BODY, path="src/genesis/foo.py"),
+            self._codex(2, _P2_BODY, path="CHANGELOG.md"),
+        ]
+        with self._mock(guard_module, comments):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
     def test_replied_p1_is_acknowledged_by_maintainer(self, guard_module):
         """A MAINTAINER reply (author_association OWNER/MEMBER/COLLABORATOR) acks a P1."""
         comments = [
