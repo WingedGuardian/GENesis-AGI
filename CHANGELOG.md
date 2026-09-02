@@ -2867,6 +2867,108 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   noise with the new `scripts/backfill_source_subsystem.py`, then
   `scripts/cleanup_subsystem_qdrant.py` — both dry-run by default; add `--apply` to commit.
 
+### Fixed
+
+- **A dead provider kept reporting itself recovered, so a multi-day outage was
+  recorded as a series of short incidents that each "recovered".** The
+  `/v1/models` health probe healed a circuit breaker whenever the model was still
+  *listed* by the provider — but a model can be listed and not callable. When an
+  account loses entitlement to a model, the listing endpoint keeps answering 200
+  while every real call returns 403, which is exactly the shape the probe read as
+  "recovered". Closing the breaker fired the recovery hook, which resolved the
+  `provider_failure` record and cleared the only per-provider "failing since"
+  timestamp Genesis keeps; the next real call failed again and the cycle
+  restarted, so the outage clock never accumulated and no surface could report a
+  duration. Measured over one real multi-day outage: eight separate failure
+  records, every one of them closed automatically while the provider was in fact
+  answering nothing at all. The rule now is symmetry: a health probe may undo
+  a health probe's own suspicion, and nothing else. If real calls broke a
+  provider, a real call has to prove it fixed.
+
+  This does not take a provider out of rotation. A tripped provider is
+  automatically put back on probation once its backoff window passes, and a
+  provider on probation is still called — so the next real request to it *is*
+  the retry, and a success clears it. What changed is only that Genesis no
+  longer announces a recovery it has not actually seen.
+
+  **What this changes for you:** a provider that is genuinely dead is now retried
+  progressively less often instead of every couple of minutes, settling at once
+  every 30 minutes — or once every 4 hours when the failure looks like an
+  exhausted quota. That is the point for a dead provider, but it also means a
+  provider whose quota resets can wait up to 4 hours before Genesis tries it
+  again, using the next provider in the chain until then. Reading the retry delay
+  the provider itself reports is the exact fix and is tracked as follow-up work.
+
+- **Disabling a provider from the dashboard now holds against health checks,
+  and re-enabling one actually clears it.** The toggle used to reach into the
+  breaker and set its fields directly, which left the new "who broke this"
+  record out of step in both directions: a provider switched off by hand could
+  be quietly switched back on by a routine health check, and a provider
+  switched back on kept a stale "real calls failed here" mark that made it
+  refuse to go green again until real traffic arrived. Both transitions are now
+  operations the breaker performs on itself, so the state and the reason for it
+  are set together, with a test that scans for code setting breaker state from
+  outside. (A disabled provider still returns to rotation when its
+  backoff window elapses — that is separate, and tracked.)
+
+- **Removed a provider toggle that could never work.** The Tool Providers card
+  on the Overview tab carried disable/enable buttons that posted the tool
+  provider's name to an endpoint which only knows routing-provider names. The
+  two are different namespaces, so every click returned "not found" and popped
+  an error. The working toggle is on the Internals tab and is unaffected.
+
+- **Upgrading in the middle of an outage no longer forgets that the outage is
+  real.** The saved breaker file written by the previous version has no record
+  of what broke a provider, and reading that silence as "a health check did it"
+  would have let the first health check after the upgrade close a breaker that
+  real calls had opened — losing the outage exactly once, at the worst moment.
+  A saved-as-failing provider with no recorded cause is now treated as broken by
+  real calls, which is the only thing it can have been.
+
+- **Alerts now say how long they have been firing.** `alert_events` has recorded
+  `created_at` for every open alert with 90-day retention since it was
+  introduced, and nothing read it — so a condition three days old was rendered
+  identically to one three minutes old. Alert messages now carry
+  `(ongoing for 3d 4h)` once an alert has been continuously open for more than an
+  hour. Enriching the message rather than adding a widget means every surface
+  that renders an alert message gains the duration at once — the dashboard
+  banner, the morning report and the outreach path. Note the existing filters
+  still apply: the morning report omits call-site warnings and the Telegram path
+  carries only whitelisted critical alerts, so for a degraded call site the
+  duration appears on the dashboard. Self-isolating: a failure to compute the
+  duration costs the suffix, never the alert.
+
+- **The dashboard could not display a tripped circuit breaker at all.** The
+  routing API emits breaker state from a lowercase-valued enum, while four
+  frontend comparisons tested against an uppercase literal — a comparison that is
+  never true. The provider dot rendered green, the toggle button read "disable",
+  and the Provider Keys indicator stayed green regardless of the real state, with
+  the "circuit breaker open" tooltip unreachable. All four now route through a
+  single case-insensitive helper, and a guard test scans the frontend directories
+  so a new file cannot reintroduce the comparison.
+
+- **The dashboard now tells "broken" apart from "not proven working yet."** A
+  provider is shown three ways instead of two: red when real calls are failing
+  and it is not being used, hollow amber when it is still in rotation but has
+  not completed a call since its last trouble, and green when it is healthy.
+  Hovering says which, and why — real calls failed, or only a health check
+  could not reach it. Previously a provider awaiting its next call looked
+  identical to one actively failing, which overstated the problem; that state
+  is now common enough to be worth naming, since recovery waits for a real call.
+
+- **Alert severity dots were always amber, including for critical alerts.** The
+  colour map was keyed lowercase while severities are emitted uppercase, so every
+  lookup missed and fell through to the warning colour. The map now normalises
+  case, covers the full emitted vocabulary, and gives an unrecognised severity its
+  own colour instead of silently painting it as a warning.
+
+- **Grouped error severity was ranked alphabetically, which inverts it.** The
+  severity vocabulary is lowercase, so a plain `MAX()` orders
+  `warning > info > error > debug > critical` — critical sorts lowest. Any group
+  mixing a critical with a warning reported "warning" and rendered amber,
+  silently downgrading the most severe events in the group. Ranking is now
+  explicit.
+
 ## [v3.0b17] - 2026-07-06
 
 ### Added

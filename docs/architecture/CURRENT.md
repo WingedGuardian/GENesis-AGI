@@ -1401,7 +1401,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: 409338c9 2026-08-07
+verified: b8232425 2026-09-02
 ```
 
 - **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
@@ -1409,7 +1409,56 @@ verified: 409338c9 2026-08-07
   free-only. Per-provider circuit breaker (3 failures, exponential backoff
   capped 30 min — 4h for QUOTA_EXHAUSTED; 429 = backpressure, NOT a breaker
   failure; state persisted cross-process to
-  `~/.genesis/circuit_breaker_state.json`). Degradation levels are
+  `~/.genesis/circuit_breaker_state.json`). **Probe/call evidence symmetry** —
+  a probe may only undo what a probe did: `probe_suspect()` downgrades CLOSED to
+  HALF_OPEN on a failed probe and a clean probe may clear THAT, but a breaker
+  opened by a real call failure (`_opened_by_call`) is closed only by a real
+  `record_success`. A models-listing 200 evidences *reachable*, never *working* —
+  it is what a 403-on-use, an exhausted quota or a truncated completion looks
+  like from outside. The probe heal deliberately does NOT fire `on_recovery`
+  (which resolves the `provider_failure` observation and clears `first_trip_at`),
+  so a listing can no longer erase an outage clock. This does not hold a provider
+  out of rotation: OPEN auto-transitions to HALF_OPEN on backoff, HALF_OPEN is
+  `is_available()`, so the next real call IS the retry. Supersedes PR #705. Consequence to know before touching it: the heal
+  branch also zeroes `_trip_count`, so refusing it leaves the backoff climbing
+  to the cap instead of resetting — a dead provider is retried less often, and a
+  quota-dead one may wait the full 4h. `last_failure_category` is restored from
+  disk for any NON-CLOSED saved state (OPEN or HALF_OPEN — see below) and never
+  for CLOSED — a qualifier must not outlive the state it qualifies, or it
+  poisons the heal guard for a healthy provider. The
+  same rule governs `_opened_by_call`, with one asymmetry that decides the
+  first cycle after any upgrade: a file written before the field existed has NO
+  key, and a saved-OPEN row with no recorded origin defaults to **call**-opened,
+  because legacy `probe_suspect()` produced HALF_OPEN and never OPEN — so a
+  probe cannot have been the cause. Reading that absence as "probe" would hand
+  the first post-upgrade probe a breaker real calls had opened. A keyless
+  saved-HALF_OPEN row defaults the other way, to **probe**: that state is
+  reachable both by `probe_suspect()` and by a call trip whose window elapsed,
+  so its origin is genuinely ambiguous and assuming "call" would strand a
+  provider that never failed a real call.
+  **BOTH non-closed states restore, and that scope is what makes the guarantee
+  outlive a deploy.** Restoring only OPEN silently expired it at the next
+  restart: `.state` assigns HALF_OPEN when merely READ (it mutates and does not
+  notify), and `save_state` serialises EVERY breaker's raw `_state`, so any
+  other breaker's change persists a call-tripped one as `half_open` — which
+  then restored CLOSED, i.e. a dead provider reading healthy and probe-healable
+  again, the original defect returning on every merge-restart. The failure
+  category restores under the same widened condition, because it qualifies any
+  breaker that is not closed; blanking it for HALF_OPEN stripped the reason from
+  `observability/snapshots/api_keys.py` and `dashboard/routes/vitals.py`. The ONLY
+  external mutator of breaker state is the dashboard toggle
+  (`dashboard/routes/providers.py`), and it goes through `force_open()` /
+  `force_close()` rather than assigning private fields, so the origin flag
+  cannot drift out of step with the state. Both are COMPLETE transitions --
+  they notify (which is what the registry wires to `save_state`) and clear the
+  qualifiers they invalidate. They are complete with respect to
+  BREAKER FIELDS only — neither fires `on_recovery`, so an operator re-enable
+  deliberately leaves the `provider_failure` observation open. A guard test in
+  `tests/test_routing/test_circuit_breaker.py` parses the tree for assignment to
+  breaker private state on a non-`self` receiver; it cannot see `__dict__` or
+  `object.__setattr__` writes. KNOWN LIMIT:
+  `_opened_by_call` is two-valued while the question now has three answers
+  (call / probe / operator), so the dashboard mislabels an operator disable. Degradation levels are
   hand-curated: L2 sheds nice-to-haves; **L3 keeps ONLY micro-reflection,
   embeddings, tagging** — changing those sets changes what survives an outage.
   Some call sites alias another site's chain — don't assume 1:1.
@@ -1530,7 +1579,11 @@ verified: 50b79ffb 2026-09-01
   sentinel's own `last_probe_at` and fail toward their safe default.
 - **observability/**: event bus dispatches inline AND logs every event;
   persist-queue overflow drops events but emits a rate-limited "dropped"
-  meta-event (WS-17). Two health layers (async probes vs systemd shell-out);
+  meta-event (WS-17). Two health layers (async probes vs systemd shell-out) — a
+  probe may HEAL only a breaker that a PROBE downgraded (`probe_suspect`);
+  one opened by a real call failure needs a real success, whatever the failure
+  category (a models-listing 200 is exactly what a 403-on-use looks like, and a
+  false heal resets the outage clock — measured live twice);
   `/health` is a dashboard route, not an MCP tool; `job_health` state machine
   is runtime-owned. `snapshots/deploy_health.py` = merged-vs-deployed drift
   (never does network I/O; host guardian state comes from
