@@ -617,21 +617,6 @@ TABLES = {
             source_subsystem    TEXT
         )
     """,
-    "predictions": """
-        CREATE TABLE IF NOT EXISTS predictions (
-            id                TEXT PRIMARY KEY,
-            action_id         TEXT NOT NULL,
-            timestamp         TEXT NOT NULL DEFAULT (datetime('now')),
-            prediction        TEXT NOT NULL,
-            confidence        REAL NOT NULL,
-            confidence_bucket TEXT NOT NULL,
-            domain            TEXT NOT NULL CHECK (domain IN ('outreach', 'triage', 'procedure', 'routing')),
-            reasoning         TEXT NOT NULL,
-            outcome           TEXT,
-            correct           INTEGER,
-            matched_at        TEXT
-        )
-    """,
     "outcome_events": """
         CREATE TABLE IF NOT EXISTS outcome_events (
             id                TEXT PRIMARY KEY,
@@ -680,19 +665,6 @@ TABLES = {
             details          TEXT,
             session_id       TEXT,
             created_at       TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """,
-    "calibration_curves": """
-        CREATE TABLE IF NOT EXISTS calibration_curves (
-            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-            domain               TEXT NOT NULL,
-            confidence_bucket    TEXT NOT NULL,
-            predicted_confidence REAL NOT NULL,
-            actual_success_rate  REAL NOT NULL,
-            sample_count         INTEGER NOT NULL,
-            correction_factor    REAL NOT NULL,
-            computed_at          TEXT NOT NULL DEFAULT (datetime('now')),
-            UNIQUE(domain, confidence_bucket)
         )
     """,
     "approval_requests": """
@@ -2446,10 +2418,6 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity)",
     "CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)",
-    # calibration
-    "CREATE INDEX IF NOT EXISTS idx_predictions_domain ON predictions(domain)",
-    "CREATE INDEX IF NOT EXISTS idx_predictions_bucket ON predictions(confidence_bucket)",
-    "CREATE INDEX IF NOT EXISTS idx_predictions_unmatched ON predictions(outcome) WHERE outcome IS NULL",
     # outcome bus (self-improvement ledger)
     "CREATE INDEX IF NOT EXISTS idx_outcome_events_domain ON outcome_events(domain)",
     "CREATE INDEX IF NOT EXISTS idx_outcome_events_source ON outcome_events(source)",

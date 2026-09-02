@@ -52,12 +52,13 @@ PROCEDURE_GATE_SITES: dict[str, tuple[str, str]] = {
         "source-provenance follow-up, not a tool-name signal here",
     ),
     "mcp/memory/procedural.py::procedure_store": (
-        "deferred-with-reason",
+        "gated",
         "MCP explicit-teach exposed in research/campaign profiles alongside web "
-        "tools — the correct origin is the CALLER's session provenance, which an "
-        "MCP tool sees only via PR-B's GENESIS_SESSION_ORIGIN env. tools_used is "
-        "the taught REPLAY tools, not caller provenance; gating on it undercounts. "
-        "PR-B wires the emit with the real session origin",
+        "tools; emits classified by the CALLER's session origin "
+        "(session_origin_from_env(), coalesced to first_party when the env is "
+        "unset — an unset env is not a dispatched session). tools_used is the "
+        "taught REPLAY tools, not caller provenance, so it is deliberately NOT "
+        "the signal; skipped duplicate teaches emit nothing",
     ),
     "learning/procedural/extractor.py::extract_procedure": (
         "deferred-with-reason",
