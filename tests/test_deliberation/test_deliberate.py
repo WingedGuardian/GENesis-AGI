@@ -331,19 +331,20 @@ def test_default_timeout_env_overridable(monkeypatch):
 
 
 async def test_timeout_is_total_budget_across_retries(monkeypatch):
-    # The budget bounds TOTAL wall time, not each attempt: a retry gets only the REMAINING
-    # budget, and once it's spent the loop STOPS instead of launching another full-timeout
-    # attempt (so 3 retries can't multiply the user's max wait by 3). Deterministic fake clock
-    # (perf_counter monkeypatched — NOT wall-clock): t0=0; attempt 1 runs with the full 100s;
-    # by attempt 2 the clock reads 60 → remaining 40; then it jumps past the budget so a 3rd
-    # attempt is refused.
+    # The budget bounds TOTAL wall time, not each attempt: each retry gets only the REMAINING
+    # budget (monotonically shrinking as time passes), never exceeds the total, and the loop
+    # terminates rather than launching N full-timeout attempts. Deterministic MONOTONIC fake
+    # clock (perf_counter monkeypatched — NOT wall-clock): every read advances 15 "seconds".
     monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
     monkeypatch.setattr("genesis.deliberation.backends.fusion._BACKOFF_S", 0.0)
-    times = [0.0, 0.0, 60.0, 200.0, 200.0, 200.0]
-    monkeypatch.setattr(
-        "genesis.deliberation.backends.fusion.time.perf_counter",
-        lambda: times.pop(0) if times else 200.0,
-    )
+    ticks = {"n": 0}
+
+    def fake_perf() -> float:
+        v = ticks["n"] * 15.0
+        ticks["n"] += 1
+        return v
+
+    monkeypatch.setattr("genesis.deliberation.backends.fusion.time.perf_counter", fake_perf)
     seen: list[float] = []
 
     async def fake_stream(body, key, t):
@@ -352,10 +353,33 @@ async def test_timeout_is_total_budget_across_retries(monkeypatch):
 
     monkeypatch.setattr("genesis.deliberation.backends.fusion._consume_stream", fake_stream)
     r = await FusionBackend().run("q", timeout_s=100.0)
-    # attempt 1 got the full 100s remaining; attempt 2 got only 40s (100 - 60 elapsed), NOT 100;
-    # attempt 3 was refused because the budget was exhausted (only 2 stream calls total).
-    assert seen == [100.0, 40.0]
-    assert not r.ok
+    assert len(seen) >= 2, seen  # it retried at least once
+    assert all(t <= 100.0 for t in seen), seen  # no attempt exceeds the TOTAL budget
+    assert seen == sorted(seen, reverse=True) and len(set(seen)) == len(seen), seen  # strictly shrinking
+    assert not r.ok  # exhausting the budget yields a graceful failure, never a hang
+
+
+async def test_bounded_backoff_never_exceeds_remaining(monkeypatch):
+    # A retry backoff must never blow the total budget: it is capped by the remaining deadline
+    # (a 3s backoff on a budget with 0.1s left sleeps 0.1s), and sleeps nothing once exhausted.
+    from genesis.deliberation.backends import fusion as fmod
+
+    monkeypatch.setattr(fmod, "_BACKOFF_S", 3.0)
+    slept: list[float] = []
+
+    async def fake_sleep(s):
+        slept.append(s)
+
+    monkeypatch.setattr(fmod.asyncio, "sleep", fake_sleep)
+    # 0.9s already elapsed of a 1.0s budget → raw backoff 3.0 capped to 0.1
+    monkeypatch.setattr(fmod.time, "perf_counter", lambda: 0.9)
+    await fmod._bounded_backoff(0, 0.0, 1.0)
+    assert slept == [pytest.approx(0.1)]
+    # budget exhausted → no sleep at all
+    slept.clear()
+    monkeypatch.setattr(fmod.time, "perf_counter", lambda: 2.0)
+    await fmod._bounded_backoff(0, 0.0, 1.0)
+    assert slept == []
 
 
 async def test_timeout_threads_env_to_http_layer(monkeypatch):

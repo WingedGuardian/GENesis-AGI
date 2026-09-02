@@ -204,6 +204,15 @@ class FusionBackend:
         return await _call(_MODEL, _SYNTHESIS_SYSTEM + high, user, key, timeout_s, extra, "synthesis", preset_name)
 
 
+async def _bounded_backoff(attempt: int, t0: float, timeout_s: float) -> None:
+    """Sleep the retry backoff, but never past the total deadline — so the backoff itself
+    can't blow the budget (e.g. a 3s backoff on a 1s budget). Sleeps nothing if exhausted."""
+    remaining = timeout_s - (time.perf_counter() - t0)
+    if remaining <= 0:
+        return
+    await asyncio.sleep(min(_BACKOFF_S * (attempt + 1), remaining))
+
+
 async def _call(model, system, user, key, timeout_s, extra_body, mode, preset) -> DeliberationResult:
     body = {
         "model": model,
@@ -231,8 +240,10 @@ async def _call(model, system, user, key, timeout_s, extra_body, mode, preset) -
                 error=f"fusion ({mode}) timed out after ~{timeout_s:.0f}s",
             )
         try:
+            # wait_for bounded by `remaining` (NOT remaining+10): it is the hard total-budget
+            # deadline, so a stalled/keep-alive-chatty stream can't run past the advertised budget.
             content, cost, stream_err = await asyncio.wait_for(
-                _consume_stream(body, key, remaining), timeout=remaining + 10
+                _consume_stream(body, key, remaining), timeout=remaining
             )
         except (TimeoutError, httpx.TimeoutException):
             return DeliberationResult(
@@ -245,14 +256,14 @@ async def _call(model, system, user, key, timeout_s, extra_body, mode, preset) -
         except httpx.HTTPStatusError as exc:
             last_exc = exc
             if exc.response.status_code in _RETRYABLE_STATUS and attempt + 1 < _MAX_ATTEMPTS:
-                await asyncio.sleep(_BACKOFF_S * (attempt + 1))
+                await _bounded_backoff(attempt, t0, timeout_s)
                 continue
             return _error_result(exc, time.perf_counter() - t0, mode, preset)
         except httpx.TransportError as exc:
             # connection reset / read error mid-panel — transient, retry
             last_exc = exc
             if attempt + 1 < _MAX_ATTEMPTS:
-                await asyncio.sleep(_BACKOFF_S * (attempt + 1))
+                await _bounded_backoff(attempt, t0, timeout_s)
                 continue
             return _error_result(exc, time.perf_counter() - t0, mode, preset)
         except Exception as exc:  # noqa: BLE001 — any other error → graceful result, never raise
@@ -261,7 +272,7 @@ async def _call(model, system, user, key, timeout_s, extra_body, mode, preset) -
             if not content and attempt + 1 < _MAX_ATTEMPTS:
                 # transient empty / in-stream panel error from a flaky panel — one more shot
                 last_exc = RuntimeError(stream_err or "empty stream")
-                await asyncio.sleep(_BACKOFF_S * (attempt + 1))
+                await _bounded_backoff(attempt, t0, timeout_s)
                 continue
             return _normalize(content, cost, stream_err, time.perf_counter() - t0, mode, preset)
     return _error_result(last_exc or RuntimeError("retries exhausted"), time.perf_counter() - t0, mode, preset)
