@@ -71,7 +71,35 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 
-STATE_DIR="${HOME}/.local/state/genesis-guardian"
+# Honor the GUARDIAN_STATE_DIR override (the same env the guardian config reads,
+# config.py) so the pause file the gateway writes lands where _gateway_pause_active
+# looks. Default matches GuardianConfig.state_dir. (A guardian.yaml-only override
+# with no env is a pre-existing gateway limitation shared by the status verb.)
+STATE_DIR="${GUARDIAN_STATE_DIR:-${HOME}/.local/state/genesis-guardian}"
+
+# Write the gateway pause file with a bounded TTL (arg = seconds ahead). The
+# Guardian (check.py::_gateway_pause_active) stands down while this is present and
+# unexpired, and IGNORES it once expires_at passes — so a deploy killed before
+# `resume` runs self-heals rather than muting the watchdog. The cap mirrors the
+# guardian's gateway_pause_max_ahead_s (3600). Distinct from the container-side
+# ~/.genesis/paused.json (the shared runtime kill switch).
+_write_gateway_pause() {
+    local ttl="$1"
+    mkdir -p "$STATE_DIR"
+    local now_epoch expires_epoch now_iso expires_iso
+    now_epoch=$(date -u +%s)
+    expires_epoch=$((now_epoch + ttl))
+    now_iso=$(date -u -d "@${now_epoch}" +%Y-%m-%dT%H:%M:%SZ)
+    expires_iso=$(date -u -d "@${expires_epoch}" +%Y-%m-%dT%H:%M:%SZ)
+    # Atomic write (temp + mv): a guardian read racing the write must never see
+    # truncated JSON. The fail direction is already safe (ValueError -> not
+    # paused), but a torn read at deploy start could still cost one tick.
+    local tmp="$STATE_DIR/paused.json.tmp.$$"
+    printf '{"paused": true, "reason": "deploy", "since": "%s", "expires_at": "%s"}' \
+        "$now_iso" "$expires_iso" > "$tmp"
+    mv -f "$tmp" "$STATE_DIR/paused.json"
+    printf '{"ok": true, "action": "pause", "expires_at": "%s"}\n' "$expires_iso"
+}
 
 case "${SSH_ORIGINAL_COMMAND:-}" in
     restart-timer)
@@ -79,9 +107,38 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
         echo '{"ok": true, "action": "restart-timer"}'
         ;;
     pause)
-        mkdir -p "$STATE_DIR"
-        printf '{"paused": true, "since": "%s"}' "$(date -Is)" > "$STATE_DIR/paused.json"
-        echo '{"ok": true, "action": "pause"}'
+        _write_gateway_pause 1800
+        ;;
+    pause\ *)
+        # pause <ttl_seconds> — deploy sets a generous TTL; EXIT-trap resume ends
+        # it early on success. Validate strictly (mirrors the redeploy arg guard).
+        _PAUSE_TTL="${SSH_ORIGINAL_COMMAND#pause }"
+        case "$_PAUSE_TTL" in
+            ''|*[!0-9]*)
+                echo '{"ok": false, "action": "pause", "error": "invalid ttl (want positive integer seconds)"}' >&2
+                exit 1
+                ;;
+        esac
+        # Reject oversized magnitudes BEFORE base-10 conversion. Bash arithmetic
+        # uses fixed-width integers with NO overflow check, so a value beyond
+        # 64-bit (e.g. `pause 18446744073709551617`) silently WRAPS into the
+        # accepted range and reports success. Max valid is 3600 (4 digits): strip
+        # leading zeros, then reject anything longer than 4 digits — the numeric
+        # range check below catches 4-digit overshoot (e.g. 3601).
+        _TTL_MAG="${_PAUSE_TTL#"${_PAUSE_TTL%%[!0]*}"}"
+        [ -z "$_TTL_MAG" ] && _TTL_MAG=0
+        if [ "${#_TTL_MAG}" -gt 4 ]; then
+            echo '{"ok": false, "action": "pause", "error": "ttl out of range (1-3600)"}' >&2
+            exit 1
+        fi
+        # Force base-10: a leading-zero value (e.g. 0888) would be read as octal
+        # by bash arithmetic and abort under set -e.
+        _PAUSE_TTL=$((10#$_PAUSE_TTL))
+        if [ "$_PAUSE_TTL" -lt 1 ] || [ "$_PAUSE_TTL" -gt 3600 ]; then
+            echo '{"ok": false, "action": "pause", "error": "ttl out of range (1-3600)"}' >&2
+            exit 1
+        fi
+        _write_gateway_pause "$_PAUSE_TTL"
         ;;
     resume)
         rm -f "$STATE_DIR/paused.json"

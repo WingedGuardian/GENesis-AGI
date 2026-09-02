@@ -84,6 +84,7 @@ _ALL_SECTIONS = (
     "proposal_history",
     "proposal_board",
     "execution_outcomes",
+    "ego_qa",
     "goal_progress",
     "goal_deep_dive",
     "capability_performance",
@@ -92,9 +93,14 @@ _ALL_SECTIONS = (
 )
 
 # Sections that are always included at full depth regardless of weights.
+# ego_qa is ALWAYS: a question reply arrives AS a reactive signal → a reactive
+# cycle, and the reactive profile trims most sections; the asking ego must still
+# see the answer on that exact cycle, so the delivery guarantee is explicit here
+# (not resting on the section_map's .get(key,"deep") default). Cheap — the
+# section returns "" when there are no recent Q&A.
 _ALWAYS_SECTIONS = frozenset({
     "user_model", "intentions", "directives", "settled_decisions",
-    "output_contract",
+    "output_contract", "ego_qa",
 })
 
 
