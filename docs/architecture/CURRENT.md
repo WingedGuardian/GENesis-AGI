@@ -1321,18 +1321,25 @@ verified: 6f3310e5 2026-09-02
   `mark_surfaced`) turns into exactly ONE Telegram. The age is read off the
   unresolved observation, not in-memory state, so it survives a restart; the
   EARLIEST unresolved row wins, because a duplicate would otherwise reset the
-  outage clock. Recovery resolves BOTH hashes — **notify hash FIRST**: the two
+  outage clock. **The hour check is CLOCK-driven, not trip-driven**: the
+  awareness tick (5 min) calls `sweep_due_notifications`, which reads the
+  durable rows and holds no in-memory state — the trip-driven version starved
+  when traffic stopped and its per-process flags produced four review defects.
+  Lever: `provider_outage_notify` domain (off/propose_only/live) +
+  `GENESIS_PROVIDER_NOTIFY_DISABLED`; off resolves open notify rows (so off→on
+  re-notifies a still-dead provider, deliberately). Recovery resolves BOTH
+  hashes — **notify hash FIRST**: the two
   are separately committed (this connection has no transactions), so a failure
   between them must leave the VISIBLE row open (a provider shown as failing when
   it is not, which the next recovery clears) rather than the SILENT one (an open
   notify row makes `skip_if_duplicate` suppress this provider's notifications
   until some later recovery happens to succeed). Do not raise the 10-minute
   observation to critical instead — it would page on every transient blip.
-  Two KNOWN GAPS are documented in-code at the sites, not fixed: the row is
-  stamped at the 5th trip rather than the first (duration short by the ramp),
-  and the notification re-check is gated on in-memory `escalated` (a restart
-  mid-outage waits for 5 fresh trips). Both have attempted fixes that were
-  reverted for creating worse failures; see the code comments before retrying.
+  ONE KNOWN GAP remains documented in-code, not fixed: the row is stamped at
+  the 5th trip rather than the first (duration short by the ramp) — its fix
+  needs the `first_trip_at` anchor bounded first; see the follow-up. The
+  restart-gate gap that used to sit beside it is GONE by construction: the
+  sweep consults no in-memory flag, so a restart changes nothing.
 - **providers/**: the `ToolProvider` registry for NON-LLM tools (search,
   embeddings, STT/TTS, crawl, probes). Adapters register GATED ON ENV KEYS —
   silent non-registration is by design (absence ≠ bug). LLM breaker/health

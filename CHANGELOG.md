@@ -2817,9 +2817,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   genuinely recovers and later dies again, you are told again.
 
   Nothing new was added to receive it: this reuses the existing critical-record
-  path, so there is no new alert type, no new table, and no new setting to
-  configure. The duration is read from the stored outage record rather than from
-  memory, so it survives a restart mid-outage without re-notifying.
+  path, so there is no new alert type and no new table. The duration is read
+  from the stored outage record rather than from memory, so it survives a
+  restart mid-outage without re-notifying — and the hourly check is driven by
+  Genesis's own 5-minute awareness tick rather than by provider traffic, so a
+  provider that goes quiet after failing still gets reported. One new lever:
+  the `provider_outage_notify` setting (`off` / `propose_only` / `live`,
+  default `live`; env `GENESIS_PROVIDER_NOTIFY_DISABLED=1` forces off) —
+  `propose_only` keeps the record on the dashboard without the Telegram, and
+  turning it off resolves any open notification so re-enabling tells you about
+  a still-dead provider again.
 
 ## [v3.0b17] - 2026-07-06
 

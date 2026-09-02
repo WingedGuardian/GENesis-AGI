@@ -1,0 +1,15 @@
+# Dead-provider notification sweep — the operator lever.
+#
+# The awareness tick (5 min) sweeps unresolved provider_failure observations
+# and, once an outage is over an hour old, writes the ONE record that reaches
+# you: mode `live` writes it at priority=critical (one Telegram, then quiet);
+# `propose_only` writes at priority=high (dashboard/ego only, no Telegram);
+# `off` disables the sweep AND resolves any open notification rows, so turning
+# it off never strands an alert — which also means off→on re-notifies a
+# provider that is still dead, deliberately.
+#
+# Invalid values degrade to propose_only (less write authority, never more).
+# Env kill switch: GENESIS_PROVIDER_NOTIFY_DISABLED=1 forces off.
+# Local overrides: ~/.genesis/config/provider_outage_notify.local.yaml
+enabled: true
+mode: live
