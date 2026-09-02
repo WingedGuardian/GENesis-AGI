@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 import httpx
+import pytest
 
 from genesis.deliberation import DeliberationResult, deliberate
 from genesis.deliberation.backends.fusion import (
@@ -323,6 +324,38 @@ def test_default_timeout_env_overridable(monkeypatch):
     assert _default_timeout_s() == _DEFAULT_TIMEOUT_S
     monkeypatch.setenv("GENESIS_DELIBERATE_TIMEOUT_S", "not-a-number")
     assert _default_timeout_s() == _DEFAULT_TIMEOUT_S
+    # non-FINITE values are rejected too — an infinite budget would let a hung panel wait forever
+    for bad in ("inf", "Infinity", "-inf", "nan"):
+        monkeypatch.setenv("GENESIS_DELIBERATE_TIMEOUT_S", bad)
+        assert _default_timeout_s() == _DEFAULT_TIMEOUT_S, bad
+
+
+async def test_timeout_is_total_budget_across_retries(monkeypatch):
+    # The budget bounds TOTAL wall time, not each attempt: a retry gets only the REMAINING
+    # budget, and once it's spent the loop STOPS instead of launching another full-timeout
+    # attempt (so 3 retries can't multiply the user's max wait by 3). Deterministic fake clock
+    # (perf_counter monkeypatched — NOT wall-clock): t0=0; attempt 1 runs with the full 100s;
+    # by attempt 2 the clock reads 60 → remaining 40; then it jumps past the budget so a 3rd
+    # attempt is refused.
+    monkeypatch.setenv("API_KEY_OPENROUTER", "test-key")
+    monkeypatch.setattr("genesis.deliberation.backends.fusion._BACKOFF_S", 0.0)
+    times = [0.0, 0.0, 60.0, 200.0, 200.0, 200.0]
+    monkeypatch.setattr(
+        "genesis.deliberation.backends.fusion.time.perf_counter",
+        lambda: times.pop(0) if times else 200.0,
+    )
+    seen: list[float] = []
+
+    async def fake_stream(body, key, t):
+        seen.append(t)
+        raise httpx.ConnectError("reset")  # retryable → the loop continues
+
+    monkeypatch.setattr("genesis.deliberation.backends.fusion._consume_stream", fake_stream)
+    r = await FusionBackend().run("q", timeout_s=100.0)
+    # attempt 1 got the full 100s remaining; attempt 2 got only 40s (100 - 60 elapsed), NOT 100;
+    # attempt 3 was refused because the budget was exhausted (only 2 stream calls total).
+    assert seen == [100.0, 40.0]
+    assert not r.ok
 
 
 async def test_timeout_threads_env_to_http_layer(monkeypatch):
@@ -333,10 +366,12 @@ async def test_timeout_threads_env_to_http_layer(monkeypatch):
     monkeypatch.setenv("GENESIS_DELIBERATE_TIMEOUT_S", "777")
     with patch(_STREAM, new=AsyncMock(return_value=(JSON_OK, 0.05, None))) as m:
         await FusionBackend().run("q")  # timeout_s omitted → None → env default
-    assert m.call_args.args[2] == 777.0  # _consume_stream(body, key, timeout_s)
+    # _consume_stream(body, key, remaining) — remaining ≈ full budget on the first attempt
+    # (a tiny elapsed is subtracted now that the budget is a total-wall-clock bound).
+    assert m.call_args.args[2] == pytest.approx(777.0, abs=1.0)
     with patch(_STREAM, new=AsyncMock(return_value=(JSON_OK, 0.05, None))) as m2:
         await FusionBackend().run("q", timeout_s=99.0)  # explicit wins
-    assert m2.call_args.args[2] == 99.0
+    assert m2.call_args.args[2] == pytest.approx(99.0, abs=1.0)
 
 
 async def test_deliberate_core_threads_env_timeout(monkeypatch):
@@ -346,7 +381,7 @@ async def test_deliberate_core_threads_env_timeout(monkeypatch):
     monkeypatch.setenv("GENESIS_DELIBERATE_TIMEOUT_S", "633")
     with patch(_STREAM, new=AsyncMock(return_value=(JSON_OK, 0.05, None))) as m:
         await deliberate("q", backend="fusion")
-    assert m.call_args.args[2] == 633.0
+    assert m.call_args.args[2] == pytest.approx(633.0, abs=1.0)
 
 
 async def test_fusion_http_400_no_retry(monkeypatch):

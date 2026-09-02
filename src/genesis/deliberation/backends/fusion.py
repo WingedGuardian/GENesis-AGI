@@ -10,7 +10,7 @@ Two modes × two presets, all probe-confirmed live (2026-06-24; orchestrator slu
 - **synthesis** (default, fast): the `openrouter/fusion` model-slug → a synthesized prose verdict in
   ``message.content`` (the meta-model IGNORES output-format prompts, so we take its markdown as the
   ``answer``; consensus/dissent stay empty). Default preset: **budget**.
-- **analysis** (deep): a free, tool-capable orchestrator + the Fusion *server-tool*
+- **analysis** (deep): a tool-capable orchestrator + the Fusion *server-tool*
   (`tools:[{"type":"openrouter:fusion"}]`, `tool_choice:"required"`, via extra_body) → the orchestrator
   (a normal instruct model that honors a JSON system prompt) returns machine-structured
   {answer, consensus, dissent[], blind_spots[], confidence}. Default preset: **strong**.
@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -144,7 +145,8 @@ def _default_timeout_s() -> float:
     """The deliberation timeout budget (seconds), overridable via ``GENESIS_DELIBERATE_TIMEOUT_S``.
 
     Read per-CALL (not at import) so a runtime env change / test takes effect without a reload.
-    A non-positive or unparseable value falls back to ``_DEFAULT_TIMEOUT_S``.
+    A non-positive, non-FINITE (``inf``/``nan``), or unparseable value falls back to
+    ``_DEFAULT_TIMEOUT_S`` — an infinite budget would let a hung panel wait forever.
     """
     raw = os.environ.get("GENESIS_DELIBERATE_TIMEOUT_S")
     if raw:
@@ -152,7 +154,7 @@ def _default_timeout_s() -> float:
             v = float(raw)
         except (TypeError, ValueError):
             return _DEFAULT_TIMEOUT_S
-        if v > 0:
+        if math.isfinite(v) and v > 0:
             return v
     return _DEFAULT_TIMEOUT_S
 
@@ -215,9 +217,22 @@ async def _call(model, system, user, key, timeout_s, extra_body, mode, preset) -
     t0 = time.perf_counter()
     last_exc: Exception | None = None
     for attempt in range(_MAX_ATTEMPTS):
+        # The budget is a TOTAL wall-clock bound, not per-attempt: a retry gets only the
+        # REMAINING budget (prior attempts + backoff sleeps are already counted via t0), so
+        # N retries can't multiply the user's max wait by N. Once exhausted, stop rather than
+        # start another full-timeout attempt.
+        remaining = timeout_s - (time.perf_counter() - t0)
+        if remaining <= 0:
+            return DeliberationResult(
+                answer=None,
+                backend_used=f"fusion/{mode}",
+                preset_used=preset,
+                latency_s=time.perf_counter() - t0,
+                error=f"fusion ({mode}) timed out after ~{timeout_s:.0f}s",
+            )
         try:
             content, cost, stream_err = await asyncio.wait_for(
-                _consume_stream(body, key, timeout_s), timeout=timeout_s + 10
+                _consume_stream(body, key, remaining), timeout=remaining + 10
             )
         except (TimeoutError, httpx.TimeoutException):
             return DeliberationResult(
