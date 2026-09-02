@@ -113,7 +113,7 @@ import time
 # Self-locate so sibling hook modules resolve whether run as a script or imported.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload  # noqa: E402
-from shell_parse import analyze, has_trailing_override  # noqa: E402
+from shell_parse import analyze_checked, has_trailing_override  # noqa: E402
 
 # Substrings that gate the parse path; absent all of them the command cannot be
 # a worktree-overwriting git op, so we return instantly. `clean` is included
@@ -332,8 +332,25 @@ def _clean_violation(cmd: str) -> str | None:
     detection (``"clean" in argv``) NOT positional resolution: resolution
     depends on skipping git's OPEN set of value-taking global flags, so a
     pathological ``git checkout clean`` merely over-blocks (override escape) —
-    the direction this boundary wants."""
-    for seg in analyze(cmd):
+    the direction this boundary wants.
+
+    A parse cut short by one of shell_parse's BOUNDS lands on the same fail-closed
+    message as a parser crash, because it is the same situation: this guard cannot
+    prove a clean-mentioning command safe. It matters that the parser says so rather
+    than raising — a bound does not crash, it silently returns fewer segments, and
+    reading that as "no clean here" is a silent allow of the one unrecoverable
+    operation this guard blocks. MEASURED before this call was switched: a
+    `git clean -fd` nested 9 deep went from refused to allowed.
+
+    `untokenizable` is deliberately EXCLUDED. It predates the bounds and this guard
+    already allowed those commands, so failing closed on it would be a new
+    over-block rather than a restoration — MEASURED at 209 of 1,367 real
+    clean-mentioning commands, against 0 for the bounds. Widening to it is a
+    separate decision with its own evidence, not a rider on this one."""
+    segs, blind = analyze_checked(cmd)
+    if blind is not None and blind.kind != "untokenizable":
+        return _CLEAN_PARSE_FAILED_MSG
+    for seg in segs:
         if seg.exe != "git":
             continue
         if "clean" not in set(seg.argv[1:]):
@@ -401,8 +418,18 @@ def _submodule_recurse_violation(cmd: str) -> str | None:
     worktrees, so recursing into them is unrecoverable (like clean) and a
     superproject snapshot is a false recovery promise. Closed-set: literal
     snapshot-verb membership AND a recursing token; honors ``# discard-override``
-    per segment. Returns a block message or None. Pure argv (no subprocess)."""
-    for seg in analyze(cmd):
+    per segment. Returns a block message or None. Pure argv (no subprocess).
+
+    Fails CLOSED when a shell_parse BOUND cut the parse short, for the reason given
+    in _clean_violation: a bound returns fewer segments without raising, so treating
+    that as "no recursing verb" silently allows the unrecoverable case this blocks.
+    MEASURED: `git checkout --recurse-submodules .` nested 9 deep went from refused
+    to allowed. The guard's documented fail-OPEN is for a parser CRASH, which is a
+    different event; `untokenizable` stays on that fail-open path unchanged."""
+    segs, blind = analyze_checked(cmd)
+    if blind is not None and blind.kind != "untokenizable":
+        return _SUBMODULE_BLOCK_MSG
+    for seg in segs:
         if seg.exe != "git":
             continue
         if not (set(seg.argv[1:]) & _SUBMODULE_RECURSE_VERBS):
@@ -430,7 +457,21 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
     seen_cwds: set[str] = set()
     deadline = time.monotonic() + _TOTAL_SNAPSHOT_BUDGET_S
     budget_hit = False
-    for seg in analyze(cmd):
+    segs, blind = analyze_checked(cmd)
+    if blind is not None and blind.kind != "untokenizable":
+        # The same "never silent" rule the time budget already obeys, applied to the
+        # other reason this can come up short. A parse stopped by a bound yields no
+        # segment for a nested snapshot verb, so the recovery point is simply missing
+        # — and a missing recovery point that says nothing is indistinguishable from
+        # "nothing needed one" exactly when someone is about to discard work.
+        # (`untokenizable` excluded for the reason given in _clean_violation: it is
+        # pre-existing behaviour here, and noting it would fire on ordinary work.)
+        notes.append(
+            f"[git-discard-guard] no recovery snapshot was recorded: this command "
+            f"{blind.cause}, so the guard could not tell which repositories it "
+            f"touches. To get the snapshot back: {blind.hint}."
+        )
+    for seg in segs:
         if seg.exe != "git":
             continue
         # Literal VERB membership — never positional subcommand resolution

@@ -141,8 +141,12 @@ def test_clean_parse_crash_no_clean_substring_fails_open(monkeypatch):
         "read_payload",
         lambda: {"tool_input": {"command": "git checkout main"}, "cwd": "/tmp"},
     )
-    # analyze() would be called by the snapshot path; force it to raise there too.
-    monkeypatch.setattr(_gd, "analyze", lambda cmd: (_ for _ in ()).throw(RuntimeError("boom")))
+    # The snapshot path parses too; force that to raise as well. It asks
+    # `analyze_checked` now (one call for "what runs" AND "could I read it all"), so
+    # that is the name to poison — patching the old one silently patched nothing.
+    monkeypatch.setattr(
+        _gd, "analyze_checked", lambda cmd: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
     assert _gd.main() == 0
 
 

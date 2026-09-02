@@ -57,7 +57,7 @@ from review_state import clear_marker  # noqa: E402
 # NOTHING → every marker stays valid for its TTL = the bypass). Detection degrades
 # to a strict regex; resolution degrades to clearing the candidate set.
 try:
-    from shell_parse import analyze, git_subcommand  # noqa: E402
+    from shell_parse import analyze_checked, git_subcommand  # noqa: E402
 
     _PARSE_OK = True
 except Exception:  # pragma: no cover - defensive
@@ -198,11 +198,38 @@ def main() -> None:
     # loose token match also hits "commit" in a filename / message / a non-commit
     # git subcommand (`commit-tree`), none of which should invalidate a review.
     # This mirrors the checker's post-early-out `analyze()` confirmation.
-    segs = analyze(command) if _PARSE_OK else None
+    #
+    # A parse stopped by one of shell_parse's BOUNDS over-clears UNCONDITIONALLY.
+    #
+    # An earlier version of this set `segs = None` to reuse the missing-parser path,
+    # with a comment claiming that "keeps the failure on the side this module already
+    # chose, where the cost is one redundant re-review". That comment was WRONG, and
+    # measurably so: the missing-parser path is not an unconditional over-clear — it
+    # is gated on `_STRICT_COMMIT`, `\bgit\s+commit\b`, which requires adjacency and
+    # so does NOT match `git -C <dir> commit` or `git -c k=v commit`. MEASURED:
+    #     'git commit -m x'              -> _STRICT_COMMIT True   (cleared)
+    #     'git -C /repo commit -m x'     -> _STRICT_COMMIT False  (NOT cleared)
+    #     'git -c user.name=x commit -m x' -> _STRICT_COMMIT False (NOT cleared)
+    # So for exactly the forms the PreToolUse checker still gates, the marker
+    # survived — which is this module's documented bypass, named in its own header:
+    # "if the invalidator early-exits on a form the checker gates, the checked marker
+    # is never cleared -> a later commit reuses the stale review". The regression test
+    # written alongside that comment used `git commit -m done`, the one form the
+    # regex DOES match, so it passed while the `git -C` form stayed broken.
+    #
+    # Clearing more than necessary costs one redundant re-review. Clearing less costs
+    # an unreviewed commit riding an old approval, silently, for the marker's TTL.
+    segs, blind = analyze_checked(command) if _PARSE_OK else (None, None)
+    # Bounds-blind bypasses the strict-adjacency gate below and falls through to the
+    # unconditional over-clear. It does NOT clear here directly: the success check
+    # further down still applies, so a FAILED commit does not invalidate a review.
+    bounds_blind = blind is not None and getattr(blind, "kind", "") != "untokenizable"
+    if blind is not None:
+        segs = None
     if segs is not None:
         if not any(git_subcommand(s.argv) == "commit" for s in segs):
             sys.exit(0)
-    elif not _STRICT_COMMIT.search(command):
+    elif not bounds_blind and not _STRICT_COMMIT.search(command):
         sys.exit(0)  # no parser: fall back to strict adjacency, never over-clear
 
     # Only invalidate on successful commits (exit code 0)

@@ -26,12 +26,11 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks"))
 from hook_input import field, read_payload, run_guard  # noqa: E402
 from shell_parse import (  # noqa: E402
-    analyze,
+    analyze_checked,
     commit_skips_hooks,
     git_subcommand,
     has_trailing_override,
     split_segments,
-    untokenizable,
 )
 
 # Sentinel: the commit's effective cwd cannot be confidently resolved (a cd into
@@ -644,7 +643,11 @@ def main() -> None:
     # Parse the command into the segments it actually executes (through
     # wrappers, bash -c, command substitutions). Reused for Rule 0, the
     # add-chain detection, and the override binding.
-    segs = analyze(command)
+    #
+    # `blind` is the same parse telling us whether it could read ALL of the command
+    # — an empty result means "found no commit" only when it is not also "stopped
+    # looking". One call answers both, so the two can never disagree.
+    segs, blind = analyze_checked(command)
 
     # The cheap _COMMIT_PATTERN early-out can match "git commit" mentioned in a
     # string (a reply body, an echo). Confirm a REAL executed commit segment
@@ -674,7 +677,7 @@ def main() -> None:
         # for a different reason than this comment used to give: analyze()
         # resolves the segment, and the net only fires where it found none.
         try:
-            if untokenizable(command):
+            if blind is not None:
                 # EXACT "1", never truthiness. `cc/invoker.py` stamps the marker as
                 # "1" and every other consumer compares to it exactly
                 # (git_push_guard._is_dispatched, pretool_check, genesis_stop_hook,
@@ -687,28 +690,29 @@ def main() -> None:
                 if os.environ.get("GENESIS_CC_SESSION") == "1":
                     # No human present to answer a prompt in a dispatched session.
                     _deny(
-                        "BLOCKED: this command cannot be parsed safely (e.g. "
-                        "ANSI-C $'...' quoting) and mentions a commit. Autonomous "
-                        "sessions cannot proceed on an unverifiable command.\n"
-                        "To proceed: if you are WRITING TEXT (a commit message, "
-                        "a plan, review notes) whose content merely mentions a "
-                        "commit, use the Write tool instead of a here-doc — an "
-                        "apostrophe in ordinary prose is what makes this "
-                        "unparseable, and re-quoting the here-doc cannot fix "
-                        "that. If you are RUNNING a git command, rewrite it in "
-                        "a directly-parseable form (plain quotes, or "
+                        f"BLOCKED: this command {blind.cause} and mentions a "
+                        "commit. Autonomous sessions cannot proceed on an "
+                        "unverifiable command.\n"
+                        f"To proceed: {blind.hint}. If you are WRITING TEXT (a "
+                        "commit message, a plan, review notes) whose content "
+                        "merely mentions a commit, use the Write tool instead of "
+                        "a here-doc. If you are RUNNING a git command, rewrite it "
+                        "in a directly-parseable form (plain quotes, or "
                         "`git commit -F <file>`)."
                         # The way OUT belongs here more than on the ask below:
                         # an interactive session can ask a human what it did
                         # wrong, an unattended one cannot. A refusal it cannot
                         # act on is a wall; with the rewrite named it is a cost.
+                        # `blind.hint` is cause-specific for the same reason —
+                        # telling someone whose command is merely nested to go
+                        # re-quote an apostrophe is a wall wearing advice.
                     )
                 _ask(
-                    "This command could not be parsed safely (e.g. ANSI-C $'...' "
-                    "quoting) and mentions a commit, so review enforcement cannot "
-                    "verify what it would actually run. Approve only if you are "
-                    "sure. To avoid the prompt, rewrite it in a directly-parseable "
-                    "form (plain quotes, or `git commit -F <file>`)."
+                    f"This command {blind.cause} and mentions a commit, so review "
+                    "enforcement cannot verify what it would actually run. Approve "
+                    f"only if you are sure. To avoid the prompt: {blind.hint}, or "
+                    "rewrite it in a directly-parseable form (plain quotes, or "
+                    "`git commit -F <file>`)."
                 )
         except Exception:  # noqa: BLE001 — never crash into a silent allow
             _ask(

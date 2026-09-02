@@ -615,6 +615,65 @@ def test_invalidate_ignores_non_commit(repo: Path, home: Path) -> None:
     assert len(_markers(home)) == 1  # marker survives
 
 
+def test_invalidate_clears_when_the_parse_went_blind(repo: Path, home: Path) -> None:
+    """A commit the parser could not reach must still clear the marker.
+
+    `analyze` stops descending past a depth bound, so for a commit buried deeper
+    than that the segment list comes back WITHOUT it. Treating that as "no commit
+    happened" is this module's documented bypass in its worst form: the marker is
+    never cleared, and the next commit reuses a review that no longer applies —
+    silently, and for the marker's whole TTL.
+
+    Over-clearing costs one redundant re-review, which is the direction this module
+    already chose everywhere else it cannot be sure. The parse reports that it went
+    blind, so the choice is available rather than guessed at.
+    """
+    assert _mark(repo, home).returncode == 0
+    assert len(_markers(home)) == 1
+
+    buried = "$(" * 40 + "git commit -m done" + ")" * 40
+    _run_invalidate(buried, repo, home)
+    assert _markers(home) == [], (
+        "a commit buried past the parser's depth bound left the review marker in "
+        "place — the next commit would reuse a review that no longer applies"
+    )
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        "git commit -m done",
+        "git -C {repo} commit -m done",
+        "git -c user.name=x commit -m done",
+    ],
+    ids=["plain", "dash_C", "dash_c_config"],
+)
+def test_invalidate_clears_for_every_commit_form_the_checker_gates(
+    repo: Path, home: Path, form: str
+) -> None:
+    """The forms matter, and the first version of this test only covered one of them.
+
+    A blind parse used to fall back to `_STRICT_COMMIT` (`\\bgit\\s+commit\\b`), which
+    requires ADJACENCY. MEASURED: it matches `git commit` but NOT `git -C <dir> commit`
+    nor `git -c k=v commit` — precisely the forms the PreToolUse checker still gates.
+    So for those, the marker survived a real commit and the next one rode a stale
+    review, which is the bypass this module's own header warns about.
+
+    The original regression test used the plain form, the one shape the regex does
+    match, so it passed while the other two stayed broken. Parametrising over the
+    checker's whole accepted set is what makes it non-vacuous.
+    """
+    assert _mark(repo, home).returncode == 0
+    assert len(_markers(home)) == 1
+
+    buried = "$(" * 40 + form.format(repo=repo) + ")" * 40
+    _run_invalidate(buried, repo, home)
+    assert _markers(home) == [], (
+        f"a buried {form!r} left the review marker in place — the checker gates this "
+        "form, so the invalidator must clear for it too or the two disagree"
+    )
+
+
 # ── Invalidator/checker cwd symmetry (the #1254 follow-up, ab42b04f) ──────
 # #1254 made the PreToolUse checker resolve the commit's real worktree via
 # `git -C` / the last `cd` / the payload cwd. The PostToolUse invalidator was

@@ -326,3 +326,65 @@ class TestQuotedParenRedirectTargetRegression:
         assert r.returncode == 0, (
             f"benign command wrongly blocked: out={r.stdout!r} err={r.stderr!r}"
         )
+
+
+class TestBoundedParseNeverDowngradesToTheWeakerCheck:
+    """A parse stopped by a shell_parse BOUND must not fall back to substring matching.
+
+    The substring fallback is STRICTLY WEAKER than the parse it replaces, and weakest
+    exactly where the command is most destructive. The parse catches an ANCESTOR of a
+    protected directory (`prot.startswith(expanded + "/")`) and a GLOB over its
+    contents (`fnmatch`); a substring test catches NEITHER, because a protected path
+    is not a substring of a command naming its PARENT.
+
+    MEASURED at depth 9 before this was fixed — the default branch refused all three,
+    this guard refused only the last:
+
+        rm -rf $HOME/genesis        (ancestor)  -> ALLOWED
+        rm -rf $HOME/genesis/*      (glob)      -> ALLOWED
+        rm -rf $HOME/genesis/data   (exact)     -> refused
+
+    The acceptance test that missed this used the exact path, the one shape the weak
+    check does catch, so it passed over a hole that swallowed the whole install.
+    """
+
+    # `genesis/data` is on _PROTECTED_RELATIVE; `genesis` is its parent and is NOT.
+    @pytest.mark.parametrize(
+        "shape,target",
+        [
+            ("ancestor", f"{H}/genesis"),
+            ("glob", f"{H}/genesis/*"),
+            ("exact", f"{H}/genesis/data"),
+        ],
+    )
+    def test_a_buried_rm_is_refused_whatever_the_path_shape(self, fake_home, shape, target):
+        buried = "$(" * 9 + f"rm -rf {target}" + ")" * 9
+        r = _run(buried, fake_home)
+        assert r.returncode == 2, (
+            f"{shape}: an rm the parser could not read was ALLOWED. The parse is "
+            f"bounded, so 'no protected operand found' may mean 'stopped looking' — "
+            f"and for this shape the substring fallback cannot see it either.\n"
+            f"out={r.stdout!r} err={r.stderr!r}"
+        )
+
+    def test_an_over_length_rm_is_refused_too(self, fake_home):
+        """The other bound reaches the same weak fallback, so it gets the same test."""
+        over = f'rm -rf {H}/genesis "' + "x" * 40_000 + '"'
+        r = _run(over, fake_home)
+        assert r.returncode == 2, (
+            f"an over-length rm naming a protected ancestor was ALLOWED.\n"
+            f"out={r.stdout!r} err={r.stderr!r}"
+        )
+
+    def test_an_ordinary_unreadable_command_without_rm_is_untouched(self, fake_home):
+        """The control on the other side: this guard only ever refuses rm commands.
+
+        Without it, the tests above would pass equally well against a guard that
+        refused every unreadable command, which would be a different and much worse
+        change than the one being made.
+        """
+        buried = "$(" * 9 + "echo hello" + ")" * 9
+        r = _run(buried, fake_home)
+        assert r.returncode == 0, (
+            f"a buried non-rm command was blocked: out={r.stdout!r} err={r.stderr!r}"
+        )

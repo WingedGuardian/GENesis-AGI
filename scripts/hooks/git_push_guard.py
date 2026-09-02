@@ -134,12 +134,12 @@ except Exception:  # noqa: BLE001 — ANY failure (absent OR broken: SyntaxError
 
 from shell_parse import (  # noqa: E402
     analyze,
+    analyze_checked,
     commit_skips_hooks,
     gh_pr_subcommand,
     git_subcommand,
     has_trailing_override,
     split_segments,
-    untokenizable,
 )
 
 # Mentions of a GATED operation, consulted ONLY on the un-parseable path where
@@ -5184,7 +5184,10 @@ def main() -> int:
         # like sudo/env and /path/to/git stripped, nested `bash -c` recursed,
         # quoted mentions excluded). Each guarded subcommand is matched on real
         # argv, and the `# review-override` approval binds to its OWN segment.
-        segs = analyze(cmd)
+        # `blind` is this same parse reporting whether it could read the WHOLE
+        # command. An empty segment list means "no gated op here" only when it does
+        # not also mean "I stopped reading", and one call cannot disagree with itself.
+        segs, blind = analyze_checked(cmd)
 
         push_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "push"]
         merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
@@ -5230,7 +5233,7 @@ def main() -> int:
         blind_spot_reason: str | None = None
         if (
             not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
-            and untokenizable(cmd)
+            and blind is not None
             and _mentions_gated_op(cmd)
         ):
             if _is_dispatched():
@@ -5238,16 +5241,13 @@ def main() -> int:
                 # gated command must not proceed unattended. Mirrors the
                 # dispatched deny legs on the push / pr-create asks below.
                 print(
-                    "BLOCKED: this command cannot be parsed safely (e.g. "
-                    "ANSI-C $'...' quoting) and names a gated operation. "
-                    "Autonomous sessions cannot proceed on an unverifiable "
-                    "command.\n"
-                    "To proceed: if you are WRITING TEXT (a commit message, a "
-                    "plan, review notes) whose content merely mentions push or "
-                    "merge, use the Write tool instead of a here-doc — the "
-                    "apostrophe in ordinary prose is what makes this "
-                    "unparseable, and no amount of re-quoting a here-doc fixes "
-                    "it. If you are RUNNING a git command, rewrite it in a "
+                    f"BLOCKED: this command {blind.cause} and names a gated "
+                    "operation. Autonomous sessions cannot proceed on an "
+                    "unverifiable command.\n"
+                    f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
+                    "message, a plan, review notes) whose content merely mentions "
+                    "push or merge, use the Write tool instead of a here-doc. If "
+                    "you are RUNNING a git command, rewrite it in a "
                     "directly-parseable form (plain quotes, or -F <file>).",
                     file=sys.stderr,
                 )
@@ -5260,13 +5260,12 @@ def main() -> int:
                 # directly-parseable form") does not apply to it.
                 return 2
             blind_spot_reason = (
-                "This command could not be parsed safely (e.g. ANSI-C $'...' "
-                "quoting) and mentions a gated operation (push / merge / "
-                "gh pr create / --force / --no-verify / --admin), so the guard "
-                "cannot verify "
-                "what it would actually run. Approve only if you are sure. To "
-                "avoid the prompt, rewrite it in a directly-parseable form "
-                "(plain quotes, or -F <file>)."
+                f"This command {blind.cause} and mentions a gated operation "
+                "(push / merge / gh pr create / --force / --no-verify / --admin), "
+                "so the guard cannot verify what it would actually run. Approve "
+                f"only if you are sure. To avoid the prompt: {blind.hint}, or "
+                "rewrite it in a directly-parseable form (plain quotes, or "
+                "-F <file>)."
             )
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
