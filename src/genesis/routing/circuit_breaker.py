@@ -418,9 +418,28 @@ class CircuitBreakerRegistry:
                 if name in self._providers:
                     cb = self.get(name)
                     saved_state = info.get("state", "CLOSED")
+                    # BOTH non-closed states restore. Restoring only OPEN made
+                    # the guarantee below expire at the next restart, by an
+                    # entirely ordinary route: `.state` assigns HALF_OPEN when
+                    # merely READ (it mutates and does NOT notify), and
+                    # `save_state` serialises EVERY breaker's raw `_state`, so
+                    # any other breaker's change persists this one as
+                    # "half_open". A restart then read it as CLOSED — a dead
+                    # provider reporting healthy and probe-healable again, which
+                    # is the original defect returning on a timer.
+                    # `_opened_at` is reset for OPEN only: for HALF_OPEN it is
+                    # not consulted (the window has already elapsed), and the
+                    # breaker is routable, so the next real call decides it.
+                    restored_live = saved_state in (
+                        ProviderState.OPEN.value,
+                        ProviderState.HALF_OPEN.value,
+                    )
                     if saved_state == ProviderState.OPEN.value:
                         cb._state = ProviderState.OPEN
                         cb._opened_at = cb._clock()
+                    elif saved_state == ProviderState.HALF_OPEN.value:
+                        cb._state = ProviderState.HALF_OPEN
+                        cb._consecutive_successes = 0
                     cb._consecutive_failures = info.get("consecutive_failures", 0)
                     cb._trip_count = info.get("trip_count", 0)
                     # Cap backoff on restart — escalating backoff is for consecutive
@@ -474,18 +493,31 @@ class CircuitBreakerRegistry:
                     # from a hand-edit or a torn write, and reading it as False
                     # would hand back exactly the probe-healable value this
                     # migration exists to prevent.
+                    # The keyless MIGRATION default is True for OPEN only, and
+                    # that scope is load-bearing. A legacy OPEN row can only have
+                    # come from a call trip or an operator disable (see above),
+                    # so True is the sole possible origin. A legacy HALF_OPEN row
+                    # is genuinely AMBIGUOUS — `probe_suspect()` reaches it
+                    # directly, and so does a call trip whose window elapsed —
+                    # so it defaults to False, the conservative direction: a
+                    # probe may heal it, which merely restores pre-fix behaviour
+                    # and self-corrects on the next real failure. Defaulting it
+                    # True instead would strand a healthy probe-suspected
+                    # provider with no traffic to rescue it, which is the harm
+                    # the poison-pill work removed. Files written by THIS build
+                    # always carry the key, so the ambiguity is legacy-only.
                     saved_origin = info.get("opened_by_call")
-                    cb._opened_by_call = (
-                        (True if saved_origin is None else bool(saved_origin))
-                        if saved_state == ProviderState.OPEN.value
-                        else False
-                    )
+                    if not restored_live:
+                        cb._opened_by_call = False
+                    elif saved_origin is None:
+                        cb._opened_by_call = saved_state == ProviderState.OPEN.value
+                    else:
+                        cb._opened_by_call = bool(saved_origin)
                     saved_cat = info.get("last_failure_category")
                     try:
                         cb._last_failure_category = (
                             ErrorCategory(saved_cat)
-                            if saved_cat
-                            and saved_state == ProviderState.OPEN.value
+                            if saved_cat and restored_live
                             else None
                         )
                     except ValueError:

@@ -1329,7 +1329,21 @@ verified: daa2d79d 2026-09-01
   key, and a saved-OPEN row with no recorded origin defaults to **call**-opened,
   because legacy `probe_suspect()` produced HALF_OPEN and never OPEN — so a
   probe cannot have been the cause. Reading that absence as "probe" would hand
-  the first post-upgrade probe a breaker real calls had opened. The ONLY
+  the first post-upgrade probe a breaker real calls had opened. A keyless
+  saved-HALF_OPEN row defaults the other way, to **probe**: that state is
+  reachable both by `probe_suspect()` and by a call trip whose window elapsed,
+  so its origin is genuinely ambiguous and assuming "call" would strand a
+  provider that never failed a real call.
+  **BOTH non-closed states restore, and that scope is what makes the guarantee
+  outlive a deploy.** Restoring only OPEN silently expired it at the next
+  restart: `.state` assigns HALF_OPEN when merely READ (it mutates and does not
+  notify), and `save_state` serialises EVERY breaker's raw `_state`, so any
+  other breaker's change persists a call-tripped one as `half_open` — which
+  then restored CLOSED, i.e. a dead provider reading healthy and probe-healable
+  again, the original defect returning on every merge-restart. The failure
+  category restores under the same widened condition, because it qualifies any
+  breaker that is not closed; blanking it for HALF_OPEN stripped the reason from
+  `observability/snapshots/api_keys.py` and `dashboard/routes/vitals.py`. The ONLY
   external mutator of breaker state is the dashboard toggle
   (`dashboard/routes/providers.py`), and it goes through `force_open()` /
   `force_close()` rather than assigning private fields, so the origin flag

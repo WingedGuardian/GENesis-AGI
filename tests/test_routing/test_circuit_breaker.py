@@ -1090,3 +1090,68 @@ def test_no_module_outside_the_breaker_assigns_its_private_state():
         "persisted field cannot be silently forgotten:\n  "
         + "\n  ".join(offenders)
     )
+
+
+def test_a_half_open_row_keeps_its_state_and_origin_across_a_restart(tmp_path):
+    """The guarantee must survive the restart that routinely follows a trip.
+
+    REGRESSION (#1563, found by the GLM cross-model reviewer after Codex and two
+    internal audits missed it). The path is ordinary, not adversarial:
+
+      1. a dead provider call-trips -> persisted {"state":"open",
+         "opened_by_call":true};
+      2. its backoff window expires;
+      3. ANY read of `.state` — the health snapshot, the routing config route,
+         the vitals route — silently assigns HALF_OPEN, because the property
+         mutates on read and never calls `_notify_change`;
+      4. the next state change of ANY OTHER breaker calls `save_state`, which
+         serialises every breaker's raw `_state`, persisting this one as
+         "half_open";
+      5. a restart then restored it CLOSED with `opened_by_call=False`.
+
+    So after every merge-restart the dead provider read HEALTHY and was
+    probe-healable again — the original bug this PR exists to remove, returning
+    on a timer. Restoring HALF_OPEN with its origin was dropped from the plan on
+    the stated rationale that "a breaker restored CLOSED cannot be wrongly
+    probe-healed"; that is true and beside the point, because the harm is the
+    breaker reading CLOSED for a provider that is dead.
+    """
+    cb = _restore(
+        tmp_path,
+        {"x": {"state": "half_open", "trip_count": 2, "opened_by_call": True}},
+    )
+    assert cb._state == ProviderState.HALF_OPEN, (
+        "a half_open row restored as CLOSED — the provider reads healthy after "
+        "a restart though no real call ever succeeded"
+    )
+    assert cb._opened_by_call is True, (
+        "the origin flag was dropped on restore, so a listing probe can heal a "
+        "breaker that real calls opened"
+    )
+
+
+def test_a_restart_keeps_the_failure_reason_for_a_half_open_row(tmp_path):
+    """The failure category is a live fact about a breaker that is still not closed.
+
+    REGRESSION (#1563). Blanking it for every non-OPEN row stripped the reason
+    from two production readers — `observability/snapshots/api_keys.py` renders
+    it as `reason`, and `dashboard/routes/vitals.py` as `last_failure` — so a
+    provider persisted half_open came back with no explanation until it failed
+    again. On `origin/main` the restore was unconditional; narrowing it to OPEN
+    was a diagnostic regression introduced by this branch.
+    """
+    cb = _restore(
+        tmp_path,
+        {
+            "x": {
+                "state": "half_open",
+                "trip_count": 2,
+                "opened_by_call": True,
+                "last_failure_category": "quota_exhausted",
+            }
+        },
+    )
+    assert cb._last_failure_category == ErrorCategory.QUOTA_EXHAUSTED, (
+        "the failure reason was blanked on restart; the dashboard and the API-key "
+        "snapshot lose why this provider is not closed"
+    )

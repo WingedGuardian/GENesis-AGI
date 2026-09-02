@@ -286,24 +286,29 @@ def test_a_probe_heal_never_fires_the_recovery_hook():
     assert recovered == [], "a probe fired the recovery hook and could erase an outage record"
 
 
-def test_a_restart_does_not_carry_a_stale_category_onto_a_closed_breaker(tmp_path):
-    """A qualifier must not outlive the state it qualifies.
+def test_a_legacy_keyless_half_open_row_stays_probe_healable(tmp_path):
+    """A legacy half_open row is AMBIGUOUS, so it must not be assumed call-tripped.
 
-    `load_state` restores `_state` only when the saved value was OPEN, but
-    restored `_last_failure_category` UNCONDITIONALLY. So a breaker persisted
-    while HALF_OPEN came back CLOSED still carrying "permanent" — and the
-    probe-heal guard then read that dead fact from a previous process forever.
+    SUPERSEDED EXPECTATION, recorded rather than deleted. This previously
+    asserted that a half_open row restores CLOSED with no category. The restore
+    now keeps HALF_OPEN (a call-dead provider reading CLOSED after a restart was
+    the original defect returning — see the origin-flag test below), so the
+    invariant this test actually protects had to be re-expressed rather than
+    dropped.
 
-    That is reachable in normal operation: the `.state` property mutates
-    OPEN -> HALF_OPEN as a side effect of being READ (every routing decision
-    reads it), and `save_state` serialises every breaker whenever any one of
-    them changes.
+    What it protects is unchanged and still matters: a HEALTHY provider must not
+    be stranded in HALF_OPEN by a stale fact from a previous process. Under the
+    widened restore that danger moved from the CATEGORY to the ORIGIN FLAG's
+    migration default. A row written before `opened_by_call` existed has no key,
+    and while a legacy OPEN row can only have been call-tripped, a legacy
+    HALF_OPEN row could equally have come from `probe_suspect()`. Defaulting it
+    to call-origin would refuse probe healing forever for a provider that never
+    failed a call — exactly the stranding this test was written to prevent.
+    So keyless + half_open defaults to probe-origin, and a probe can still heal it.
 
-    Consequence, and the reason this test exists: the guard would strand a
-    HEALTHY provider in HALF_OPEN indefinitely once a probe blip suspected it,
-    with no real traffic to heal it — which is precisely the case
-    `record_probe_success` was written to rescue, and precisely what the guard's
-    own comment claims cannot happen.
+    The reachability described originally is unchanged: `.state` mutates
+    OPEN -> HALF_OPEN merely on being READ, and `save_state` serialises every
+    breaker, so this on-disk shape is ordinary rather than contrived.
     """
     import json
 
@@ -321,17 +326,18 @@ def test_a_restart_does_not_carry_a_stale_category_onto_a_closed_breaker(tmp_pat
         {"free-1": prov}, clock=lambda: 0.0, state_file=state_file, persist=False,
     )
     cb = reg.get("free-1")
-    assert cb.state == ProviderState.CLOSED, "precondition: a non-OPEN save restores CLOSED"
-    assert cb._last_failure_category is None, (
-        "a category was carried onto a CLOSED breaker — it qualifies a FAILING "
-        "breaker, and surviving the state it describes makes it a poison pill "
-        "that permanently disables probe healing"
+    assert cb.state == ProviderState.HALF_OPEN, (
+        "a half_open row must restore as HALF_OPEN; restoring CLOSED is how a "
+        "call-dead provider came back reading healthy"
+    )
+    assert cb._opened_by_call is False, (
+        "a KEYLESS half_open row was assumed call-tripped; its origin is "
+        "ambiguous, and assuming call-origin strands a provider that never "
+        "failed a real call"
     )
 
-    # And the behaviour that guard-poisoning would break: a probe blip must
-    # still be able to heal a provider that is not actually failing.
-    cb.probe_suspect()
-    assert cb.state == ProviderState.HALF_OPEN
+    # The behaviour that assuming call-origin would break: a probe must still be
+    # able to heal a provider that is not actually failing.
     for _ in range(3):
         cb.record_probe_success()
     assert cb.state == ProviderState.CLOSED, (
@@ -340,15 +346,31 @@ def test_a_restart_does_not_carry_a_stale_category_onto_a_closed_breaker(tmp_pat
     )
 
 
-def test_a_restart_does_not_carry_opened_by_call_onto_a_closed_breaker(tmp_path):
-    """The flag is a qualifier on an OPEN breaker — it must not outlive it.
+def test_a_restart_carries_opened_by_call_onto_a_restored_half_open_breaker(tmp_path):
+    """A half_open row is a CALL-TRIPPED breaker mid-backoff — its origin survives.
 
-    Same shape as the `last_failure_category` poison pill this branch already
-    fixed, in the new field. `save_state` serialises every breaker whenever any
-    one changes, and `.state` mutates OPEN -> HALF_OPEN merely on being READ, so
-    a breaker persisted as `half_open` is an ordinary on-disk shape. It restores
-    CLOSED — and if the flag came back True with it, a healthy provider could
-    never be probe-healed again.
+    SUPERSEDED EXPECTATION, recorded rather than deleted. This test previously
+    asserted the opposite: that a `half_open` row restores CLOSED with the flag
+    dropped, on the rationale that "a healthy provider could never be
+    probe-healed again". The GLM cross-model reviewer showed that rationale
+    inverts the risk, and the premise was wrong on its own terms:
+
+      * `opened_by_call=True` can ONLY be set by `record_failure`, so a
+        half_open row carrying it describes a provider whose REAL CALLS failed
+        and whose backoff window then elapsed. It is not "a healthy provider".
+      * Restoring it CLOSED made a dead provider read HEALTHY after any restart
+        and become probe-healable again — the exact defect this branch exists to
+        remove, returning at every deploy.
+      * The feared cost does not withhold traffic. HALF_OPEN is routable
+        (`is_available()` is `state != OPEN`), so the next real call still
+        reaches the provider and one success closes it. What lingers is the
+        dashboard dot, and this branch already accepts precisely that tradeoff
+        in memory; restoring CLOSED was the inconsistent case.
+
+    The reachability the old docstring described is real and unchanged: `.state`
+    mutates OPEN -> HALF_OPEN when merely READ, and `save_state` serialises every
+    breaker, so a half_open row is an ordinary on-disk shape rather than a
+    contrived one. That is what makes restoring it correctly matter.
     """
     import json
 
@@ -367,10 +389,58 @@ def test_a_restart_does_not_carry_opened_by_call_onto_a_closed_breaker(tmp_path)
         state_file=state_file, persist=False,
     )
     cb = reg.get("free-1")
-    assert cb.state == ProviderState.CLOSED, "precondition: a non-OPEN save restores CLOSED"
+    assert cb.state == ProviderState.HALF_OPEN, (
+        "a half_open row restored as CLOSED — a call-dead provider would read "
+        "healthy after a restart with no real call having succeeded"
+    )
+    assert cb._opened_by_call is True, (
+        "the origin was dropped on restore, so a listing probe could heal a "
+        "breaker that real calls opened"
+    )
+    # The guarantee itself: probes must NOT close it, real successes must.
+    for _ in range(5):
+        cb.record_probe_success()
+    assert cb.state == ProviderState.HALF_OPEN, (
+        "a probe healed a call-tripped breaker across a restart"
+    )
+    for _ in range(2):
+        cb.record_success()
+    assert cb.state == ProviderState.CLOSED, "a real success must still close it"
+
+
+def test_a_restart_still_drops_the_origin_flag_for_a_closed_row(tmp_path):
+    """The boundary in the other direction, preserved from the superseded test.
+
+    Widening the restore to HALF_OPEN must not widen it to CLOSED. A row saved
+    closed carries no live failure, so neither the origin nor the category may
+    outlive it — that would be the poison pill this branch fixed in
+    `last_failure_category`, reproduced in the new field, and it WOULD strand a
+    genuinely healthy provider (unlike the half_open case above).
+    """
+    import json
+
+    state_file = tmp_path / "cb.json"
+    state_file.write_text(json.dumps({
+        "free-1": {
+            "state": "closed",
+            "consecutive_failures": 0,
+            "trip_count": 2,
+            "last_failure_category": "permanent",
+            "opened_by_call": True,
+        }
+    }))
+    reg = CircuitBreakerRegistry(
+        {"free-1": _provider("free-1")}, clock=lambda: 0.0,
+        state_file=state_file, persist=False,
+    )
+    cb = reg.get("free-1")
+    assert cb.state == ProviderState.CLOSED
     assert cb._opened_by_call is False, (
         "a CLOSED breaker came back claiming a call opened it — probe healing "
         "would be permanently disabled for a provider that is not failing"
+    )
+    assert cb._last_failure_category is None, (
+        "a CLOSED breaker came back carrying a stale failure category"
     )
     # And the behaviour that would break: a probe blip must still heal.
     cb.probe_suspect()
