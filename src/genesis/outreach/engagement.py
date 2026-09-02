@@ -126,10 +126,11 @@ def make_marketing_reply_notifier(pipeline):
     owner that a real human reply landed on a cold marketing pitch.
 
     Owner-facing delivery is never gated: ``submit_raw`` skips governance,
-    quiet-hours, and the LLM drafter. A non-DELIVERED result is logged, not
-    retried — the reply itself is already durably recorded in
-    ``outreach_history`` / ``email_threads``, so a transient miss is an
-    un-pushed row, not lost data.
+    quiet-hours, and the LLM drafter. Sent ``best_effort=True`` so a
+    non-DELIVERED result is logged and dropped, never deferred into the recovery
+    queue (no retries, no delivery-exhausted observation) — the reply itself is
+    already durably recorded in ``outreach_history`` / ``email_threads``, so a
+    transient miss is an un-pushed row, not lost data.
     """
 
     async def _notify(thread: dict, reply) -> None:
@@ -157,23 +158,33 @@ def make_marketing_reply_notifier(pipeline):
         # Per-reply uniqueness so a genuine reply is never suppressed as a
         # duplicate of an earlier, differently-worded one. submit_raw dedups on
         # BOTH (signal_type, topic) AND a topic-independent content_hash(context)
-        # (outreach/governance.py::_is_duplicate) — so message_id keys BOTH the
-        # topic and the (non-delivered) context. Effect: each distinct reply
-        # pings once; only the exact same reply re-processed is deduped. The
+        # (outreach/governance.py::_is_duplicate). content_hash only hashes the
+        # FIRST 200 chars (governance.py::content_hash), so message_id must lead
+        # the context — a long rendered ping (sender+subject+preview can exceed
+        # 200 chars) would otherwise push the discriminator out of the hashed
+        # prefix and two distinct replies would collide. Effect: each distinct
+        # reply pings once; only the exact same reply re-processed is deduped. The
         # delivered message is the `text` arg (submit_raw ignores request.context,
         # which feeds only the dedup hash), so context can carry the discriminator
         # without changing what the owner sees.
-        message_id = getattr(reply, "message_id", "") or thread.get("id") or ""
+        # Cap the attacker-influenceable Message-ID for storage hygiene (metadata
+        # only — never rendered to the owner; feeds the dedup topic/hash), matching
+        # the 200-char cap on the other reply fields.
+        message_id = (getattr(reply, "message_id", "") or thread.get("id") or "")[:200]
         request = OutreachRequest(
             category=OutreachCategory.NOTIFICATION,
             channel="telegram",
             topic=f"Marketing reply {message_id}",
-            context=f"{text}\n{message_id}",
+            context=f"{message_id}\n{text}",
             signal_type="marketing_reply",
             salience_score=0.9,
             verbatim=True,
         )
-        result = await pipeline.submit_raw(text, request)
+        # best_effort: this ping is fire-and-forget. A missing Telegram adapter
+        # (email-only install) or a transient outage must NOT defer into the
+        # recovery queue (5 retries + a delivery-exhausted observation) — the
+        # reply is already durably recorded in outreach_history/email_threads.
+        result = await pipeline.submit_raw(text, request, best_effort=True)
         if result is not None and result.status == OutreachStatus.DELIVERED:
             logger.info("Pinged owner of marketing reply on thread %s", thread.get("id"))
         else:

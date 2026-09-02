@@ -533,9 +533,11 @@ class _FakePipeline:
     def __init__(self, status):
         self._status = status
         self.calls = []
+        self.best_effort_flags = []
 
-    async def submit_raw(self, text, request):
+    async def submit_raw(self, text, request, *, best_effort=False):
         self.calls.append((text, request))
+        self.best_effort_flags.append(best_effort)
         from genesis.outreach.types import OutreachResult
 
         return OutreachResult(
@@ -572,6 +574,7 @@ async def test_marketing_reply_notifier_builds_brief_telegram_ping():
     assert "Re: your pitch" in text
     assert "Interesting" in text
     assert "Second line should be dropped" not in text  # only the FIRST preview line
+    assert pipe.best_effort_flags == [True]  # fire-and-forget: never deferred/retried
 
 
 async def test_marketing_reply_notifier_escapes_attacker_html():
@@ -682,9 +685,15 @@ async def test_marketing_reply_notifier_dedup_is_per_reply():
     """Two DISTINCT replies with identical rendered text but different
     Message-IDs must produce different dedup keys, so submit_raw's
     content-hash secondary key (outreach/governance.py::_is_duplicate) cannot
-    collapse two genuine replies into a single owner ping. Locks the SHOULD-FIX:
-    reddens if `context` reverts to the delivered text."""
+    collapse two genuine replies into a single owner ping.
+
+    The rendered text here is LONG (>200 chars) on purpose: content_hash only
+    hashes context[:200] (governance.py::content_hash), so the per-reply
+    discriminator (message_id) must LEAD the context to stay inside the hashed
+    prefix. Reddens if `context` appends message_id after the text (the pre-fix
+    order), where both long replies share an identical first-200-char prefix."""
     from genesis.outreach.engagement import make_marketing_reply_notifier
+    from genesis.outreach.governance import content_hash
     from genesis.outreach.types import OutreachStatus
 
     pipe = _FakePipeline(OutreachStatus.DELIVERED)
@@ -693,7 +702,7 @@ async def test_marketing_reply_notifier_dedup_is_per_reply():
     class _R1:
         sender = "same@example.com"
         subject = "Re: pitch"
-        body_preview = "ok"
+        body_preview = "x" * 300  # long → any trailing discriminator falls past char 200
         message_id = "<r-A@example.com>"
 
     class _R2(_R1):
@@ -707,3 +716,6 @@ async def test_marketing_reply_notifier_dedup_is_per_reply():
     assert text1 == text2  # identical DELIVERED text...
     assert req1.context != req2.context  # ...but distinct dedup context (per-reply)
     assert req1.topic != req2.topic
+    # The load-bearing lock: the discriminator participates in the hashed prefix,
+    # so the secondary content-hash dedup key differs for the two replies.
+    assert content_hash(req1.context) != content_hash(req2.context)
