@@ -37,7 +37,13 @@ logger = logging.getLogger(__name__)
 # external-watchdog case the timeout policy carves out.
 _GH_TIMEOUT_S = 30
 
-PR_FIELDS = "number,title,body,mergedAt"
+# baseRefName + closingIssuesReferences added for the issue-close lane (WS-A):
+# a contributor PR's `Closes #N` populates closingIssuesReferences (each ref
+# carries {number, repository:{name, owner:{login}}, url}); baseRefName gates the
+# default-branch-only rule (GitHub auto-closes the issue only on default merge).
+# Additive — list_merged_prs only validates number/mergedAt; the fuzzy prompt
+# reads only title/body, so the extra fields never enter a model prompt.
+PR_FIELDS = "number,title,body,mergedAt,baseRefName,closingIssuesReferences"
 
 
 async def _default_runner(argv: list[str]) -> tuple[int, str, str]:
@@ -81,6 +87,25 @@ async def resolve_repo(runner: Runner | None = None) -> str | None:
         logger.warning("repo_pulse slug resolve failed (rc=%s): %s", rc, err.strip())
         return None
     return slug
+
+
+async def resolve_default_branch(runner: Runner | None = None) -> str | None:
+    """Live default-branch name of the repo the worker runs against.
+
+    The issue-close lane (WS-A) honors a contributor PR's ``Closes #N`` only when
+    the PR merged to the default branch (GitHub auto-closes the linked issue only
+    then). Resolved LIVE from the repo, like ``resolve_repo`` — never hardcoded
+    'main' (other installs may differ). None on failure → the worker skips the
+    lane rather than risk a false absorb against the wrong branch."""
+    run = runner or _default_runner
+    rc, out, err = await run(
+        ["gh", "repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"]
+    )
+    name = out.strip()
+    if rc != 0 or not name:
+        logger.warning("repo_pulse default-branch resolve failed (rc=%s): %s", rc, err.strip())
+        return None
+    return name
 
 
 async def list_merged_prs(
