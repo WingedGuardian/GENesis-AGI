@@ -1304,12 +1304,16 @@ verified: 50b79ffb 2026-09-01
   Tier taxonomy is load-bearing: Tier-1 ground truth outranks user approval.
   `record_outcome` must never raise. Deliberately "observation, not
   reinforcement" — don't rename toward RL.
-- **calibration/**: Bayesian prediction-calibration primitives, currently
-  wired via outreach (engagement reconciliation). **Four distinct
-  "calibration" surfaces exist** (this package, `learning/triage/calibration`,
-  `feedback/calibration` ego-ECE, `eval/calibration` golden-set loader) —
-  don't conflate. Slated for WS-2 sunset (P5) once the ledger's unified
-  calibration table bakes.
+- **calibration/**: the pure ECE/MCE + confidence-bucket primitives
+  (`metrics.py`, `types.py`), consumed by the WS-2 ledger (`ledger/cells.py`) and
+  the ego-ECE path (`feedback/calibration.py`). **Four distinct "calibration"
+  surfaces exist** (this package, `learning/triage/calibration`,
+  `feedback/calibration` ego-ECE, `eval/calibration` golden-set loader) — don't
+  conflate. **WS-2 P5 sunset DONE (migration 0090):** the legacy per-domain
+  curve/reconcile loop (`curves.py`/`logger.py`/`reconciler.py`, the
+  `calibration_curves` table, and the proto-ledger `predictions` table — archived
+  to `predictions_legacy_ws2`) is retired; `calibration_cells` (P3) is the live
+  calibration surface.
 - **ledger/** (WS-2 P1a+P1b+P2+P3): the cognitive ledger — falsifiable predictions
   in `ledger_predictions` (migration 0064), written only through the
   validating CRUD (`db/crud/ledger_predictions.py`) against the code registry
