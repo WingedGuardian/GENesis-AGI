@@ -481,6 +481,12 @@ _sync_deploy_targets() {
         # swallowing it — symmetric with the host-side pin failures accumulated
         # above, so a container left on a stale CC pin is surfaced in
         # update_history, not silently dropped.
+        # Clear any inherited value first: the `+set` probe below catches a
+        # LIBRARY that predates the state variable only if nothing else already
+        # put the name in scope — an exported CC_SUPPRESSION_STATE=ok from the
+        # parent environment, or an earlier in-process call, would defeat it.
+        # cc_settings_align.sh does the same, for the same reason.
+        unset CC_SUPPRESSION_STATE
         if ! cc_ensure_local; then
             echo "  WARNING: container Claude Code sync failed"
             HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}container_cc_sync"
@@ -503,7 +509,12 @@ _sync_deploy_targets() {
         fi
         cc_shadow_scan || true
     else
+        # Without the marker, a deploy that never ran the container CC sync OR
+        # the suppression check recorded "success" with an empty degraded list —
+        # the whole block above is behind this file check, so its absence must
+        # be a first-class degraded cause, same as any failure inside it.
         echo "  WARNING: $_cc_env missing — skipping container CC sync"
+        HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_env_missing"
     fi
     echo ""
 }

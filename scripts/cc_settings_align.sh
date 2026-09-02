@@ -79,8 +79,29 @@ if ! command -v flock >/dev/null 2>&1; then
     exit 3
 fi
 if ! flock -n "$LOCK_FD"; then
-    echo "cc_settings_align: another run is in progress — skipping"
-    exit 0
+    # Another run holds the WRITE lock. Do not write — but a held lock is not
+    # evidence the keys are present, and the old `exit 0` here recorded a
+    # successful check that checked nothing. Reads race nothing destructively,
+    # so VERIFY read-only and report the truth: green only if both keys are on
+    # disk right now.
+    if command -v python3 >/dev/null 2>&1 && python3 - "$HOME/.claude/settings.json" <<'RONLY'
+import json, sys
+try:
+    env = (json.load(open(sys.argv[1])).get("env") or {})
+except Exception:
+    sys.exit(1)
+sys.exit(0 if env.get("DISABLE_AUTOUPDATER") == "1"
+         and env.get("DISABLE_UPDATES") == "1" else 1)
+RONLY
+    then
+        echo "cc_settings_align: another run is in progress — verified read-only:" \
+             "both suppression keys present"
+        exit 0
+    fi
+    echo "cc_settings_align: another run is in progress and suppression could NOT" \
+         "be verified read-only — deferring to that run; failing this one so the" \
+         "unit does not report a check that checked nothing"
+    exit 3
 fi
 
 if [ ! -f "$CC_ENV" ]; then
@@ -138,9 +159,19 @@ if [ "$_prev" = "${CC_SUPPRESSION_STATE}" ] && [ -n "$_prev_since" ]; then
 else
     _since="$_now"
 fi
-printf '%s %s\n' "${CC_SUPPRESSION_STATE}" "$_since" > "$_STATE_FILE" 2>/dev/null || true
+if ! printf '%s %s\n' "${CC_SUPPRESSION_STATE}" "$_since" > "$_STATE_FILE" 2>/dev/null; then
+    # Swallowing this made every repair look like a FIRST repair forever: the
+    # repeat-repair escalation reads this file, so an unwritable state file
+    # (e.g. root-owned after a restore) silently disarmed the one durable
+    # "something keeps rewriting settings.json" signal. The escalation channel
+    # is load-bearing; a run that cannot persist it has not done its job.
+    echo "cc_settings_align: cannot persist repeat-repair state to $_STATE_FILE —" \
+         "the repeat-repair escalation is disarmed until this is fixed" \
+         "(this run's suppression state was: ${CC_SUPPRESSION_STATE})"
+    exit 3
+fi
 
-case "${CC_SUPPRESSION_STATE:-ok}" in
+case "${CC_SUPPRESSION_STATE:-unverified}" in
     ok)
         exit 0
         ;;

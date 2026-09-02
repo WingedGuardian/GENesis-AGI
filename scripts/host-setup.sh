@@ -1319,7 +1319,11 @@ mkdir -p "$_host_home/.claude"
 # CC can't write (it creates projects/todos/settings there). chown the DIR to the
 # operator, not just the files placed inside it.
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-    chown "$_host_user:" "$_host_home/.claude" 2>/dev/null || true
+    # Owner only, same class as the settings-file chown below: a trailing colon
+    # resets the group to the login group, wrong for a pre-existing directory
+    # with a deliberate group. A dir this run created stays group root — the
+    # operator-owner rwx is what CC needs to create files inside it.
+    chown "$_host_user" "$_host_home/.claude" 2>/dev/null || true
 fi
 # Same shared owner of these two keys as the container leg and the align path:
 # cc_ensure_updater_suppressed (scripts/lib/cc_version.sh, sourced above). One
@@ -1355,14 +1359,19 @@ fi
 # root-owned ~/.claude/settings.json that the operator's CC then cannot write,
 # which is worse than the drift this whole block exists to prevent, and silence
 # is how it would go unnoticed.
-if [ "${CC_SUPPRESSION_STATE:-ok}" = "repaired" ] &&
+if [ "${CC_SUPPRESSION_STATE:-unverified}" = "repaired" ] &&
    [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] &&
    [ ! -L "$_host_settings_file" ]; then
-    if ! chown "$_host_user:" "$_host_settings_file" 2>/dev/null; then
+    # Owner ONLY — no trailing colon. MEASURED: `chown user:` resets the group
+    # to the user's LOGIN group (a file at ubuntu:sudo became ubuntu:ubuntu),
+    # which undoes the group preservation the reconciler's write path just
+    # performed. Owner alone is what the failure mode needs: the operator's CC
+    # must be able to write the file it owns.
+    if ! chown "$_host_user" "$_host_settings_file" 2>/dev/null; then
         echo "  WARNING: could not chown $_host_settings_file to $_host_user —" \
              "it may be root-owned, which will stop the operator's Claude Code from"
         echo "           writing its own settings. Fix with:" \
-             "sudo chown $_host_user: $_host_settings_file"
+             "sudo chown $_host_user $_host_settings_file"
     fi
 fi
 
@@ -1420,7 +1429,10 @@ sed -i \
     -e "s|__CONTAINER_IP__|$_ctr_ip|g" \
     -e "s|__UBUNTU_UID__|$UBUNTU_UID|g" \
     "$_host_claude"
-chown "$_host_user:" "$_host_claude" 2>/dev/null || true
+# Owner only (no trailing colon — see the settings-file chown above): the
+# `>` truncate-write PRESERVES a pre-existing inode's group, and the colon
+# form would then reset it to the login group.
+chown "$_host_user" "$_host_claude" 2>/dev/null || true
 echo "  + Shared user-level CLAUDE.md written to $_host_claude"
 
 # ── Operator-project CLAUDE.md in the host SSH-landing dir (D16) ──
@@ -1432,7 +1444,7 @@ _operator_dst="$_host_home/CLAUDE.md"
 if [ -f "$_operator_src" ]; then
     if [ ! -f "$_operator_dst" ] || grep -q "Operator — You're on a Genesis Host VM" "$_operator_dst" 2>/dev/null; then
         sed -e "s|__CONTAINER_NAME__|$CONTAINER_NAME|g" -e "s|__UBUNTU_UID__|$UBUNTU_UID|g" "$_operator_src" > "$_operator_dst"
-        chown "$_host_user:" "$_operator_dst" 2>/dev/null || true
+        chown "$_host_user" "$_operator_dst" 2>/dev/null || true  # owner only, same class
         echo "  + Operator CLAUDE.md written to $_operator_dst"
     else
         echo "  . $_operator_dst exists and isn't ours — leaving it untouched"

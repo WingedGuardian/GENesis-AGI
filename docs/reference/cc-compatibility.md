@@ -873,12 +873,18 @@ by one shared function, **`cc_ensure_updater_suppressed`** (`scripts/lib/cc_vers
   live install, `update.sh` had not run for **14 days**, which is precisely the window in
   which a drifted settings file stays silently unprotected.
 - **A non-ok outcome reaches health, not just the log** — the function sets
-  `CC_SUPPRESSION_STATE` (`ok` / `repaired` / `failed` / `contended`), `update.sh` folds
-  anything other than `ok` into `HOST_CC_DEGRADED` → `update_history` → deploy health (the
-  same channel a *version* sync failure uses), and the **service**
+  `CC_SUPPRESSION_STATE` (`ok` / `repaired` / `failed` / `contended` / `unverified`),
+  `update.sh` folds anything other than `ok` into `HOST_CC_DEGRADED` → `update_history` →
+  deploy health (the same channel a *version* sync failure uses), and the **service**
   (`genesis-cc-settings-align.service`, driven by the timer of the same name) exits
   non-zero so the unit enters `failed` — visible in
-  `systemctl --user status genesis-cc-settings-align.service`. Every path that did not
+  `systemctl --user status genesis-cc-settings-align.service`. `ok` and `repaired` are EARNED, never defaulted: the state starts `unverified` at
+  function entry and is promoted only where a post-operation READ confirms both keys
+  (the reconciler's re-read; the python3-less create's grep-back of its own literals;
+  the read-only check the align timer runs even when another run holds the write
+  lock). A path added later that sets nothing therefore reports `unverified`, which
+  every consumer treats as not-ok — fail closed by construction, not by review.
+  Every path that did not
   positively verify suppression exits non-zero, including the structural ones (no lock,
   library missing, function renamed away): a run that checked nothing must never report
   success, or the unit becomes a green light for an unguarded updater.

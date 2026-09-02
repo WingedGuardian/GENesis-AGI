@@ -855,10 +855,22 @@ if [ -f "$_cc_env" ]; then
     # shellcheck source=/dev/null
     source "$_cc_env"
     echo "  Installing Claude Code (v${CC_VERSION}) before service generation..."
+    unset CC_SUPPRESSION_STATE
     if ! cc_ensure_local; then
         echo "    (will finalize at step 12; manual: npm install -g @anthropic-ai/claude-code@${CC_VERSION})"
         SETUP_WARNINGS=1
     fi
+    # cc_ensure_local's return code carries only the VERSION outcome; suppression
+    # travels on CC_SUPPRESSION_STATE and used to be dropped here entirely. A
+    # warning suffices at this step — step 12 makes the authoritative call and
+    # sets SETUP_WARNINGS if it still cannot verify.
+    case "${CC_SUPPRESSION_STATE:-unverified}" in
+        ok|repaired) : ;;
+        *)
+            echo "    WARNING: CC auto-updater suppression not verified yet" \
+                 "(${CC_SUPPRESSION_STATE:-unverified}) — step 12 will retry"
+            ;;
+    esac
 fi
 
 echo "  [7/$TOTAL_STEPS] Generating systemd service files from templates..."
@@ -1290,6 +1302,7 @@ echo "  [12/$TOTAL_STEPS] Setting up Claude Code (v${CC_VERSION})..."
 # Install OR align to the pin — cc_ensure_local (scripts/lib/cc_version.sh, sourced
 # above) installs when absent AND upgrades/downgrades a drifted-but-present CC to
 # the pin (the prior "already installed → skip" check never re-aligned drift).
+unset CC_SUPPRESSION_STATE
 if ! cc_ensure_local; then
     echo "    Install manually: npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
     SETUP_WARNINGS=1
@@ -1342,7 +1355,12 @@ _settings_file="$HOME/.claude/settings.json"
 # (The host VM's recovery `claude -p` is single-brain and never nests, so
 # host-setup.sh deliberately passes no nesting default.)
 if cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2"; then
-    echo "    + CC auto-updater suppression + subagent-nesting default verified in $_settings_file"
+    # rc 0 now means VERIFIED (a post-operation read confirmed the keys), so
+    # "verified" is finally true here. The nesting default is deliberately not
+    # claimed on this line: on the python3-less create path it is NOT applied
+    # (the function says so loudly on stderr), and a summary line that
+    # overclaims for a corner case teaches the reader to distrust the summary.
+    echo "    + CC auto-updater suppression verified in $_settings_file"
 else
     echo "    WARNING: Could not write CC settings in $_settings_file"
     echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\","

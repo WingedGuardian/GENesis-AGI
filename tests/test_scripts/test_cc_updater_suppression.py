@@ -1131,3 +1131,234 @@ class TestNonFatalUnderErrexit:
         assert r.returncode == 0, r.stderr
         assert "REACHED" in r.stdout
         assert json.loads(s.read_text())["env"]["DISABLE_UPDATES"] == "1"
+
+class TestVerifiedByConstruction:
+    """The state channel after the fail-open audit: ok/repaired are EARNED.
+
+    An enumeration of every exit path found NINE that reported success without
+    a post-operation read — including `CC_SUPPRESSION_STATE=ok` set
+    optimistically at function ENTRY (so `ok` was a default, not a conclusion)
+    and the python3-less create, which wrote the file and never read it back
+    yet returned the state that everywhere else means "verified after
+    writing". None of those paths had a test, which is WHY they were
+    fail-open. These are those tests.
+    """
+
+    def _bin_sans_python(self, tmp_path: Path) -> Path:
+        """A bin dir with everything the no-python branch needs EXCEPT python3.
+
+        mv and grep are the create path's own dependencies and are deliberately
+        included — they are not in _TOOLS because no test ever exercised this
+        branch before. Every tool asserted present: a missing one would
+        silently route down a different branch than the test names.
+        """
+        d = tmp_path / "nopybin"
+        d.mkdir(exist_ok=True)
+        for tool in ("bash", "sh", "env", "mkdir", "dirname", "cat", "rm", "mv", "grep"):
+            dest = d / tool
+            if dest.exists() or dest.is_symlink():
+                continue
+            for src_dir in ("/usr/bin", "/bin", "/usr/local/bin"):
+                src = Path(src_dir) / tool
+                if src.exists():
+                    dest.symlink_to(src)
+                    break
+            assert dest.exists() or dest.is_symlink(), (
+                f"{tool} not found in the probe dirs -- this harness would "
+                f"silently test a different branch than it claims"
+            )
+        return d
+
+    def test_a_defaults_only_write_reports_repaired_not_ok(self, tmp_path: Path) -> None:
+        """A run that MODIFIED the file must not report `ok` (= untouched).
+
+        Before this contract, a write that filled only set-if-absent defaults
+        produced rc 0 with EMPTY stdout -- byte-identical to "already correct,
+        nothing written" -- so the caller reported `ok` for a run that wrote.
+        host-setup gates its created-as-root chown handback on `repaired`, so
+        the collapse had a consumer-visible cost, not just a naming one.
+        """
+        s = _settings(tmp_path)
+        s.parent.mkdir(parents=True, exist_ok=True)
+        s.write_text(json.dumps({"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}}))
+        r = _run(
+            tmp_path,
+            'cc_ensure_updater_suppressed "" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=9" || true; '
+            'echo "STATE=${CC_SUPPRESSION_STATE:-unset}"',
+        )
+        assert "STATE=repaired" in r.stdout, (r.stdout, r.stderr)
+        assert "set-if-absent default(s) applied" in r.stderr
+        assert "MISSING" not in r.stderr, (
+            "a defaults-only write must not cry 'suppression was MISSING' -- "
+            "the suppression keys were present the whole time"
+        )
+        env = json.loads(s.read_text())["env"]
+        assert env["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] == "9"
+
+    def test_the_no_python_create_verifies_before_claiming_repaired(self, tmp_path: Path) -> None:
+        bindir = self._bin_sans_python(tmp_path)
+        r = _run(
+            tmp_path,
+            'cc_ensure_updater_suppressed || true; echo "STATE=${CC_SUPPRESSION_STATE:-unset}"',
+            path_dir=bindir,
+        )
+        assert "STATE=repaired" in r.stdout, (r.stdout, r.stderr)
+        assert "verified by re-read" in r.stderr
+        env = json.loads(_settings(tmp_path).read_text())["env"]
+        assert env["DISABLE_AUTOUPDATER"] == "1"
+        assert env["DISABLE_UPDATES"] == "1"
+
+    def test_a_create_whose_write_did_not_land_reports_failed(self, tmp_path: Path) -> None:
+        """Sabotaged mv: the rename 'succeeds' but the content never arrives.
+
+        The stub creates an EMPTY destination, which is exactly what a torn or
+        clobbered create looks like. Before the verify greps, this path
+        reported `repaired` rc 0 over an empty file.
+        """
+        bindir = self._bin_sans_python(tmp_path)
+        mv = bindir / "mv"
+        mv.unlink()
+        mv.write_text('#!/bin/sh\n: > "$3"\nrm -f "$2"\nexit 0\n')
+        mv.chmod(0o755)
+        r = _run(
+            tmp_path,
+            'cc_ensure_updater_suppressed || true; echo "STATE=${CC_SUPPRESSION_STATE:-unset}"',
+            path_dir=bindir,
+        )
+        assert "STATE=failed" in r.stdout, (r.stdout, r.stderr)
+        assert "could not create-and-verify" in r.stderr
+        assert "left untouched" not in r.stderr, (
+            "the create branch owns its failure message -- 'left untouched' is "
+            "false when a write landed"
+        )
+
+    def test_entry_state_is_pessimistic_and_defaults_are_verified(self) -> None:
+        """SOURCE pins for the two mechanisms a behavioural test cannot reach.
+
+        (a) the entry assignment: every in-tree branch now sets a final state,
+        so no behavioural test can observe the entry value -- but a future
+        branch that forgets is exactly the audience. Reverting the entry to
+        `ok` re-opens all nine holes at once.
+        (b) the reconciler verifying WRITTEN DEFAULTS in its post-write
+        re-read: forcing a clobber that eats only the default between
+        os.replace and the re-read is a race this harness cannot stage
+        deterministically. A pin is weaker than behaviour and is labelled so.
+        """
+        src = _LIB.read_text()
+        assert "CC_SUPPRESSION_STATE=unverified" in src, (
+            "the entry state must be pessimistic -- `ok` as a default is how "
+            "nine paths reported success without verifying"
+        )
+        assert "still += [k for k in missing_defaults if k not in final_env]" in src
+
+
+class TestAlignVerifiesNotAssumes:
+    """cc_settings_align.sh: green means VERIFIED, on every path."""
+
+    _SCRIPT = _REPO_ROOT / "scripts" / "cc_settings_align.sh"
+
+    def _run_script(self, home: Path):
+        return subprocess.run(
+            ["bash", str(self._SCRIPT)],
+            capture_output=True,
+            text=True,
+            env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+            timeout=60,
+        )
+
+    def _seed(self, tmp_path: Path, payload) -> Path:
+        home = tmp_path / "h"
+        (home / ".claude").mkdir(parents=True, exist_ok=True)
+        f = home / ".claude" / "settings.json"
+        f.write_text(payload if isinstance(payload, str) else json.dumps(payload))
+        return home
+
+    def _hold_lock(self, home: Path):
+        lockdir = home / ".genesis" / "locks"
+        lockdir.mkdir(parents=True, exist_ok=True)
+        return open(lockdir / "cc_settings_align.lock", "w")
+
+    def test_a_held_lock_with_the_keys_present_verifies_read_only(self, tmp_path: Path) -> None:
+        """Busy lock used to exit 0 having checked NOTHING -- a green unit for a
+        run that never looked at the file. Reads race nothing destructively,
+        so the busy path now verifies read-only and earns its green."""
+        import fcntl as _fcntl
+
+        home = self._seed(
+            tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}}
+        )
+        with self._hold_lock(home) as fh:
+            _fcntl.flock(fh, _fcntl.LOCK_EX)
+            r = self._run_script(home)
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert "verified read-only" in r.stdout
+        assert "both suppression keys present" in r.stdout
+
+    def test_a_held_lock_with_keys_absent_fails_the_unit(self, tmp_path: Path) -> None:
+        import fcntl as _fcntl
+
+        home = self._seed(tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1"}})
+        with self._hold_lock(home) as fh:
+            _fcntl.flock(fh, _fcntl.LOCK_EX)
+            r = self._run_script(home)
+        assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
+        assert "could NOT" in r.stdout and "read-only" in r.stdout
+
+    def test_an_unpersistable_state_file_fails_the_unit(self, tmp_path: Path) -> None:
+        """The repeat-repair escalation reads this file; a swallowed write made
+        every repair look like a FIRST repair forever, silently disarming the
+        one durable "something keeps rewriting settings.json" signal. The
+        state-file path is made a DIRECTORY so the redirect fails."""
+        home = self._seed(
+            tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}}
+        )
+        (home / ".genesis" / "cc_settings_align.last").mkdir(parents=True, exist_ok=True)
+        r = self._run_script(home)
+        assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
+        assert "cannot persist repeat-repair state" in r.stdout
+
+
+class TestConsumersReadTheChannel:
+    """SOURCE pins: every consumer of CC_SUPPRESSION_STATE reads it honestly.
+
+    Pins, not behaviour, deliberately: driving install.sh / bootstrap.sh /
+    host-setup.sh end-to-end needs a box these tests do not get, and the
+    failure mode being pinned is a silent DEFAULT -- precisely what a source
+    assertion catches and a green e2e cannot.
+    """
+
+    def test_update_sh_marks_a_missing_lib_as_degraded(self) -> None:
+        src = (_REPO_ROOT / "scripts" / "update.sh").read_text()
+        assert "cc_env_missing" in src, (
+            "a deploy that never ran the suppression check must not record a "
+            "clean update_history row"
+        )
+        assert "unset CC_SUPPRESSION_STATE" in src
+
+    def test_bootstrap_reads_the_state_it_used_to_drop(self) -> None:
+        src = (_REPO_ROOT / "scripts" / "bootstrap.sh").read_text()
+        assert "CC_SUPPRESSION_STATE:-unverified" in src, (
+            "bootstrap was the one caller with NO signal at all: rc discarded "
+            "by `|| true` and the state never read"
+        )
+
+    def test_install_reads_the_state_and_claims_only_what_holds(self) -> None:
+        src = (_REPO_ROOT / "scripts" / "install.sh").read_text()
+        assert "CC_SUPPRESSION_STATE:-unverified" in src
+        assert "suppression + subagent-nesting default verified" not in src, (
+            "the summary line must not claim the nesting default on the "
+            "python3-less path where it is provably not applied"
+        )
+
+    def test_host_setup_never_resets_the_group(self) -> None:
+        """MEASURED: `chown user:` (trailing colon) sets the group to the
+        user's LOGIN group -- a file at ubuntu:sudo became ubuntu:ubuntu --
+        undoing the group preservation the write path just performed."""
+        src = (_REPO_ROOT / "scripts" / "host-setup.sh").read_text()
+        assert 'chown "$_host_user:"' not in src
+        assert "sudo chown $_host_user: " not in src
+        assert "CC_SUPPRESSION_STATE:-ok" not in src, (
+            "the :-ok default is the fail-open idiom the other consumers of "
+            "this channel explicitly refuse"
+        )
+

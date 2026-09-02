@@ -11,6 +11,21 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Claude Code's auto-updater suppression now re-asserts itself, and "verified"
+  means verified.** The two kill switches (`DISABLE_AUTOUPDATER`/`DISABLE_UPDATES`
+  in the user-level `~/.claude/settings.json`) were written only at install time,
+  so a machine whose settings drifted stayed silently unprotected until someone
+  re-ran setup — twice CC self-updated past the pin that way. One shared owner now
+  re-asserts them on every install/bootstrap/update and on a daily container timer
+  (`genesis-cc-settings-align.timer`), whose unit goes red rather than staying
+  green when it cannot verify. The outcome channel is fail-closed by
+  construction: the state starts `unverified` and is promoted to `ok`/`repaired`
+  only where a post-operation read confirms both keys are on disk — an audit
+  found nine paths that previously reported success without checking (a
+  busy lock, a missing library, a write never read back, and callers that
+  discarded the outcome entirely), and each now either verifies or says plainly
+  that it could not.
+
 - **Gated autonomous cold marketing outreach (inert by default).** Genesis can
   now stage cold marketing emails to an owner-curated prospect list via the new
   `marketing_send` tool. The recipient is resolved in code from a private

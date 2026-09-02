@@ -78,9 +78,17 @@ cc_ensure_updater_suppressed() {
     local -a extra_defaults=("$@")
     # Outcome for callers that surface health (update.sh folds a non-ok value into
     # HOST_CC_DEGRADED -> update_history -> deploy health). `ok` | `repaired` |
-    # `failed` | `contended`. A stderr line alone is not a signal — it dies in a
-    # long deploy log.
-    CC_SUPPRESSION_STATE=ok
+    # `failed` | `contended` | `unverified`. A stderr line alone is not a signal —
+    # it dies in a long deploy log.
+    #
+    # The entry value is PESSIMISTIC on purpose. This used to start at `ok`,
+    # which made `ok` a default rather than a conclusion: any path that forgot
+    # to set the state reported success, and an audit found nine such paths
+    # across the chain. Now `ok`/`repaired` exist only where a branch EARNS
+    # them by reading the file after the operation — a path added later that
+    # sets nothing reports `unverified`, which every consumer treats as
+    # not-ok. Fail closed by construction, not by review.
+    CC_SUPPRESSION_STATE=unverified
 
     # Create the directory BEFORE the python3 gate: install.sh used to do this
     # unconditionally, and moving it behind the gate meant a python3-less box got
@@ -133,11 +141,21 @@ cc_ensure_updater_suppressed() {
                 '    "DISABLE_UPDATES": "1"' \
                 '  }' \
                 '}' > "$_tmp_settings" 2>/dev/null \
-                && mv -f "$_tmp_settings" "$settings_file" 2>/dev/null; then
+                && mv -f "$_tmp_settings" "$settings_file" 2>/dev/null \
+                && grep -qF '"DISABLE_AUTOUPDATER": "1"' "$settings_file" 2>/dev/null \
+                && grep -qF '"DISABLE_UPDATES": "1"' "$settings_file" 2>/dev/null; then
+                # The greps are the post-write verification. This branch used to
+                # set `repaired` on the strength of the mv alone — the ONE path
+                # in the chain that wrote and never read back, reporting the
+                # state that everywhere else means "verified correct after
+                # writing". grep -F on the exact literals is faithful HERE
+                # because this branch wrote those exact bytes itself; it is not
+                # a general JSON check and must not be copied to paths that
+                # merge foreign content.
                 umask "$_umask_prev"
                 CC_SUPPRESSION_STATE=repaired
                 echo "  ! CC auto-updater suppression was MISSING in $settings_file —" \
-                     "created it without python3 (both keys set)" >&2
+                     "created it without python3 (both keys set, verified by re-read)" >&2
                 # This branch writes ONLY the two suppression keys. Any
                 # set-if-absent defaults the caller passed are silently absent,
                 # and a caller that prints "suppression + <default> verified"
@@ -151,6 +169,15 @@ cc_ensure_updater_suppressed() {
             fi
             rm -f "$_tmp_settings" 2>/dev/null || true   # create failed: no litter
             umask "$_umask_prev"
+            # Own failure arm: falling through would print "already exists —
+            # left untouched", which is false both when the create itself failed
+            # (nothing exists) and when the mv landed but the verify greps did
+            # not (something rewrote the file in the gap).
+            CC_SUPPRESSION_STATE=failed
+            echo "  WARNING: cc_ensure_updater_suppressed: could not create-and-verify" \
+                 "$settings_file without python3 — CC auto-updater suppression NOT" \
+                 "in effect; add DISABLE_AUTOUPDATER=1 and DISABLE_UPDATES=1 by hand" >&2
+            return 1
         fi
         CC_SUPPRESSION_STATE=failed
         echo "  WARNING: cc_ensure_updater_suppressed: python3 not found and $settings_file" \
@@ -370,8 +397,13 @@ for _attempt in range(ATTEMPTS):
     try:
         with open(path, encoding="utf-8") as f:
             final = json.load(f)
-        still = [k for k, v in REQUIRED.items()
-                 if (final.get("env") or {}).get(k) != v]
+        final_env = final.get("env") or {}
+        still = [k for k, v in REQUIRED.items() if final_env.get(k) != v]
+        # Defaults this run WROTE are part of the write being verified — a
+        # clobber that ate the default but spared the suppression keys would
+        # otherwise pass, and the caller would print "applied" for a key that
+        # is not there.
+        still += [k for k in missing_defaults if k not in final_env]
     except (OSError, ValueError):
         still = list(REQUIRED)
     if still:
@@ -380,7 +412,11 @@ for _attempt in range(ATTEMPTS):
               file=sys.stderr)
         sys.exit(3)
 
-    print(" ".join(sorted(repaired)))   # empty when only defaults were filled in
+    # Report EVERY key this run wrote, defaults included. Printing only the
+    # suppression repairs made a defaults-only write produce rc 0 with EMPTY
+    # stdout — byte-identical to "file already correct, nothing written" — so
+    # the caller reported `ok` (untouched) for a run that modified the file.
+    print(" ".join(sorted(repaired + missing_defaults)))
     sys.exit(0)
 
 _exhausted("settings.json kept changing under us (%d attempts) — left untouched rather "
@@ -421,10 +457,26 @@ PYEOF
     fi
 
     if [ -n "$out" ]; then
-        # Drift repaired — say so loudly; this should be rare, and a repeat means
-        # something on this machine is rewriting the file.
+        # A write landed and was verified by the post-write re-read. `repaired`
+        # for both shapes — the timer's repeat-repair escalation is safe because
+        # only install.sh passes defaults, and a set-if-absent default can be
+        # written at most once — but the MESSAGE must not cry "suppression was
+        # MISSING" over a defaults-only write.
         CC_SUPPRESSION_STATE=repaired
-        echo "  ! CC auto-updater suppression was MISSING in $settings_file — restored: $out" >&2
+        case "$out" in
+            *DISABLE_*)
+                echo "  ! CC auto-updater suppression was MISSING in $settings_file — restored: $out" >&2
+                ;;
+            *)
+                echo "  . set-if-absent default(s) applied to $settings_file: $out" \
+                     "(suppression keys verified present)" >&2
+                ;;
+        esac
+    else
+        # rc 0 with empty stdout: the reconciler READ both keys correct in this
+        # process and wrote nothing. That read is the verification — the ONLY
+        # way `ok` is ever granted.
+        CC_SUPPRESSION_STATE=ok
     fi
     return 0
 }
