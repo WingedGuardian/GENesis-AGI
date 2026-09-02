@@ -20,11 +20,18 @@ self-contained snapshot (never coupled to a constant whose membership might late
 — cf. ``OWNER_FACING_CHANNELS``). Guarded ``WHERE status != 'void'`` → idempotent. No
 commit — the runner owns the transaction.
 
-Voiding a previously-*resolved* row also CLEARS its ``outcome_value``/``resolver``/``brier``
-so the result satisfies the ledger invariant "outcome_value is non-None iff status is
-resolved" (``grader.py``; ``ledger_predictions.resolve`` refuses a non-resolved status that
-carries an outcome). A void row carrying a stale grade is a latent trap for any future
-reader keyed on ``outcome_value IS NOT NULL`` alone.
+Voiding a previously-*resolved* row also CLEARS its ``outcome_value``/``resolver``/``brier``/
+``evidence_ref`` so the result matches what the canonical ``ledger_predictions.resolve(...,
+status="void")`` path writes and satisfies the ledger invariant "outcome_value is non-None
+iff status is resolved" (``grader.py``). A void row carrying a stale grade (or dangling
+evidence pointer) is a latent trap for any future reader keyed on ``outcome_value IS NOT
+NULL`` alone.
+
+It ALSO invalidates the DERIVED calibration data (``calibration_cells`` +
+``calibration_cell_history``) for ``action_class='outreach_send'`` so the correction is
+immediate rather than deferred to the next grader recompute (and effective even when the
+grader is disabled). See ``up()`` for the rationale (cells can't be un-mixed per-channel, so
+they're deleted and rebuilt cleanly by the recompute).
 
 Scope limit (accepted): a prediction whose originating ``outreach_history`` row was already
 deleted/pruned cannot be matched by the channel join (its channel is unknowable), so it
@@ -57,7 +64,7 @@ async def up(db: aiosqlite.Connection) -> None:
     await db.execute(
         "UPDATE ledger_predictions "
         "SET status = 'void', resolved_at = COALESCE(resolved_at, ?), "
-        "    outcome_value = NULL, resolver = NULL, brier = NULL "
+        "    outcome_value = NULL, resolver = NULL, brier = NULL, evidence_ref = NULL "
         "WHERE action_class = 'outreach_send' "
         "AND status != 'void' "
         "AND subject_ref_id IN ("
@@ -65,3 +72,19 @@ async def up(db: aiosqlite.Connection) -> None:
         ")",
         (now,),
     )
+    # Invalidate the DERIVED calibration data too, so the correction is IMMEDIATE — not
+    # deferred to the next grader recompute, and effective even if the grader is disabled
+    # (GENESIS_LEDGER_GRADER_DISABLED=1). The current outreach_send cells become cold-start
+    # ("no data") until the grader rebuilds them cleanly from the remaining (non-void)
+    # resolved rows — an honest absence beats a stale ~0% reply rate. The cells aggregate
+    # by domain (owner + external predictions mix in an outreach.<category> cell), so a cell
+    # cannot be surgically un-mixed; deleting the outreach_send cells and letting the full
+    # recompute rebuild them is the correct invalidation. The append-only trend snapshots
+    # (read only by the calibration-status trend surface, never for current values) are
+    # pruned for the same reason. Both guarded for the standalone runner.
+    if await _has_table(db, "calibration_cells"):
+        await db.execute("DELETE FROM calibration_cells WHERE action_class = 'outreach_send'")
+    if await _has_table(db, "calibration_cell_history"):
+        await db.execute(
+            "DELETE FROM calibration_cell_history WHERE action_class = 'outreach_send'"
+        )
