@@ -47,7 +47,15 @@ _cc_scrub_stdin() {
     # Read BYTES and decode leniently: the tail exists to capture a CRASHING
     # session, which is exactly the kind that emits a stray non-UTF-8 byte, and
     # a strict decode would discard the entire diagnostic over one of them.
-    python3 -c 'import sys
+    #
+    # Wall-clock belt (fail-closed: timeout's 124 is non-zero, so the caller
+    # withholds the tail exactly as for any other scrub failure). 10s is >100x
+    # the measured full-matrix worst case; the failure mode it bounds is a
+    # future pattern edit going super-linear on a shape the perf matrix does
+    # not span — the one hang this path cannot otherwise exclude.
+    _to=""
+    command -v timeout >/dev/null 2>&1 && _to="timeout 10"
+    $_to python3 -c 'import sys
 sys.path.insert(0, sys.argv[1])
 from secret_scrub import scrub
 sys.stdout.write(scrub(sys.stdin.buffer.read().decode("utf-8", "replace")))' "$_CC_HOOKS_DIR"
@@ -90,7 +98,11 @@ mkdir -p "$log_dir" 2>/dev/null || exit 0
             # Deliberately if/else, not `A && B || C`: in the chain form a
             # failure in the PRINT step (disk full, SIGPIPE) also fires C and
             # appends a "withheld" marker after a half-written tail.
-            if _scrubbed=$(printf '%s\n' "$_tail" | _cc_scrub_stdin 2>/dev/null); then
+            # 256KB cap on the filter input. MEASURED: capture-pane emits long
+            # lines WRAPPED at pane width (a 4000-char blob arrived as 20 x
+            # 200-char lines), so a real tail is height*width — ~40KB; the cap
+            # bites only a pathological geometry and bounds the input either way.
+            if _scrubbed=$(printf '%s\n' "$_tail" | head -c 262144 | _cc_scrub_stdin 2>/dev/null); then
                 printf '%s\n' "$_scrubbed" | sed 's/^/  | /'
             else
                 echo "  | [tail withheld: scrubber unavailable]"

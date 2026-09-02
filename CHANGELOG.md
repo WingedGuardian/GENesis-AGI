@@ -26,11 +26,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `KEY=VALUE` forms remain the broadest net. The reference-capture path keeps a
   deliberately narrower rule, so an ordinary hyphenated name is never stored as
   though it were a credential.
-- **Secret scrubbing no longer stalls on long machine output.** Two detection
-  patterns backtracked quadratically against a long unbroken alphanumeric run
-  (a base64 blob or a minified bundle), taking tens of seconds on input a session
-  produces routinely. The repeats with real-world ceilings are now bounded, which
-  removes the stall while leaving long values fully covered.
+- **Secret scrubbing completes in linear time on every input shape.** Two
+  detection patterns backtracked quadratically against long unbroken character
+  runs, taking tens of seconds on 40KB of the wrong shape. The rework is
+  measured across a matrix of input classes rather than a single benchmark —
+  the first attempt was validated on one shape and remained quadratic on
+  another — and every cell now completes in under 40ms where the slowest was
+  previously tens of seconds. A locked perf-matrix test spans those classes so
+  a future pattern edit cannot pass on a flattering input. In practice the
+  capture path was already insulated (terminal capture wraps long lines at pane
+  width, measured), so this is hardening for any future caller that feeds
+  unbroken machine output.
+- **Private-key blocks and more vendor key formats are detected.** A pasted or
+  displayed PEM private key (the armour, whole block) is now redacted, along
+  with several additional vendor prefixes, and tokens appearing on diff-style
+  `-`/`+` lines are handled the same as anywhere else. The scrub subprocess in
+  the exit-capture path also gained a wall-clock bound and an input cap, both
+  failing toward withholding the tail rather than storing it unscrubbed.
 
 ### Added
 

@@ -11,6 +11,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "hooks"))
 import secret_scrub as s  # noqa: E402
 
@@ -363,3 +365,215 @@ class TestScrubDoesNotBacktrackCatastrophically:
 
     def test_long_url_password_still_redacted_after_bounding(self):
         assert R in s.scrub("https://user:" + "p" * 900 + "@host.example/path")
+
+
+class TestBoundingNeverFailsOpen:
+    """Bounding a repeat to stop quadratic backtracking must not stop a real
+    secret being redacted — the failure mode is silent, so each bound needs a
+    control on the side it does NOT protect.
+
+    The first attempt bounded the env-assignment KEY at 64. That did not merely
+    miss long keys: it slid the match FORWARD past the name's secret-ish prefix,
+    so `_SECRET_KEY_HINT` no longer saw `SECRET_`/`TOKEN_` and redaction stopped
+    entirely. And it bounded a URL span labelled "hostname" that is in fact the
+    USERINFO, capping usernames for no perf benefit at all.
+    """
+
+    # A value with no vendor prefix and no label: only the arm under test can
+    # match it, so a pass cannot be borrowed from another pattern.
+    UNLABELLED = "9f8e7d6c5b4a39281706abcdef0123456789"
+
+    def test_the_isolation_control_holds(self):
+        assert R not in s.scrub(self.UNLABELLED), (
+            "the bare value is caught by some other arm — the tests below would "
+            "pass without proving anything about the arm under test"
+        )
+
+    def test_long_env_key_is_still_redacted(self):
+        for n in (10, 64, 65, 120, 400):
+            line = f"SECRET_{'A' * n}={self.UNLABELLED}"
+            assert R in s.scrub(line), f"env key of {n + 7} chars silently unredacted"
+
+    def test_long_url_userinfo_is_still_redacted(self):
+        for n in (5, 253, 254, 600):
+            url = f"https://{'u' * n}:{'p' * 40}@host.example/path"
+            assert R in s.scrub(url), f"userinfo of {n} chars silently unredacted"
+
+    def test_long_secret_value_is_still_redacted(self):
+        # The side the original bounding DID protect — kept as a guard so a
+        # future fix cannot trade one direction for the other.
+        assert R in s.scrub("API_SECRET=" + "y" * 9000)
+
+
+class TestStructuredCredentialsAreCaseInsensitive:
+    """Hosts and schemes are case-insensitive per RFC 3986, and real logs carry
+    both forms."""
+
+    def test_discord_webhook_uppercase_host(self):
+        assert R in s.scrub("https://DISCORD.COM/api/webhooks/123456789012345678/" + "A" * 60)
+
+    def test_discord_webhook_uppercase_scheme(self):
+        assert R in s.scrub("HTTPS://discord.com/api/webhooks/123456789012345678/" + "A" * 60)
+
+    def test_discord_webhook_mixed_case_app_host(self):
+        assert R in s.scrub("https://DiscordApp.com/api/webhooks/123456789012345678/" + "A" * 60)
+
+    def test_lowercase_still_works(self):
+        assert R in s.scrub("https://discord.com/api/webhooks/123456789012345678/" + "A" * 60)
+
+
+class TestEnvAssignmentAnchorKeepsBaselineRecall:
+    """The anchor that removes the quadratic behaviour must not cost recall the
+    shipping version already had."""
+
+    V = "9f8e7d6c5b4a39281706abcdef0123456789"
+
+    def test_underscore_prefixed_secret_name_still_redacted(self):
+        assert R in s.scrub(f"_MY_SECRET={self.V}")
+
+    def test_plain_secret_name_still_redacted(self):
+        assert R in s.scrub(f"SECRET_KEY={self.V}")
+
+    def test_empty_quoted_value_is_not_a_secret(self):
+        # The dominant historical false positive: an ordinary code constant
+        # whose NAME contains a secret word and whose value is empty.
+        assert R not in s.scrub('_OAUTH_SRC=""')
+
+    def test_trivial_quoted_value_is_not_a_secret(self):
+        assert R not in s.scrub('API_MODE="on"')
+
+
+class TestScrubIsLinearAcrossInputShapes:
+    """A perf claim measured on one input shape is not a perf claim.
+
+    The first regression here passed its benchmark because the benchmark was
+    drawn from the exact character class the anchor excluded — the test
+    validated the fix's own assumption. This matrix spans the classes that
+    drive the env-assignment arm differently, so a pattern edit cannot go
+    quadratic on one shape while the suite stays green on another.
+
+    The 5s ceiling is deliberately loose (machine-speed tolerant): the broken
+    shapes measured 13-16 SECONDS, healthy ones under 100ms.
+    """
+
+    SHAPES = {
+        "all_alnum": "eyJ" + "A" * 40000,
+        "underscore_pairs": "A_" * 20000,
+        "screaming_snake": "_".join("ABCDEFGH" for _ in range(5000)),
+        "sparse_underscores": ("A" * 199 + "_") * 200,
+        "quoted_wall": '"' + "x" * 40000,
+        "url_wall": "https://u:" + "p" * 40000,
+    }
+
+    @pytest.mark.parametrize("shape", sorted(SHAPES))
+    def test_shape_completes_promptly(self, shape):
+        import time
+
+        start = time.perf_counter()
+        s.scrub(self.SHAPES[shape])
+        elapsed = time.perf_counter() - start
+        assert elapsed < 5.0, f"{shape}: {elapsed:.1f}s — quadratic behaviour"
+
+
+class TestEnvKeyCeilingResidual:
+    """The {2,512}+ ceiling has ONE residual, accepted deliberately and pinned
+    here so it is a stated behaviour, not a surprise.
+
+    The lookbehind admits a match start after `_` (that is what keeps
+    `2FA_TOKEN=` catchable), so a key LONGER than 512 chars with interior
+    underscores can match a late suffix that no longer contains the secret-ish
+    hint — and the value is then not redacted by THIS arm. Exposure is zero
+    measured (the longest real key on this install is 31 chars); this test
+    firing in anger is the trigger to revisit the ceiling.
+    """
+
+    V = "9f8e7d6c5b4a39281706abcdef0123456789"
+
+    def test_keys_up_to_the_ceiling_redact(self):
+        for n in (31, 120, 400, 505):
+            assert R in s.scrub(f"SECRET_{'A' * n}={self.V}"), f"key len {n + 7}"
+
+    def test_the_documented_residual_at_600_chars(self):
+        # No interior underscore after SECRET_ -> lookbehind blocks every
+        # restart, so an over-ceiling key is a CLEAN MISS (better than the old
+        # fail-open, which broke redaction at 65 chars).
+        out = s.scrub(f"SECRET{'A' * 600}={self.V}")
+        assert R not in out  # documented: clean miss past the ceiling
+
+
+class TestDiffLineTokensAreRedacted:
+    """A token on a git-diff removed line arrives as `-<token>` with no
+    separator. The version on main redacts these; an anchor that excludes `-`
+    from the start position regressed them to raw. Pane tails routinely hold
+    `git diff` / `git log -p` output, so this is an ordinary shape."""
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "-ghp_" + "a" * 36,
+            "-AKIAIOSFODNN7EXAMPLE",
+            "-AIza" + "c" * 35,
+            "-sk-ant-oat01-" + "T" * 40,
+            "+ghp_" + "a" * 36,  # added lines too
+        ],
+    )
+    def test_diff_prefixed_token_redacts(self, line):
+        assert R in s.scrub(line), line[:30]
+
+    def test_hyphenated_prose_still_survives(self):
+        # The negatives that justified the old exclusion must keep passing.
+        assert R not in s.scrub(
+            "a well-documented self-healing check-and-repair reconciliation pass"
+        )
+
+
+class TestPemPrivateKeysAreRedacted:
+    """`cat ~/.ssh/id_ed25519` in the last 200 lines of a pane is an ordinary
+    accident and the highest-value secret on the box. No shape pattern can
+    catch a base64 body; the BEGIN/END armour can."""
+
+    def _pem(self, kind="OPENSSH"):
+        body = "\n".join("QUFB" * 16 for _ in range(6))
+        # kind="" is the real PKCS#8 form `BEGIN PRIVATE KEY` — single space,
+        # not the double space naive interpolation produces.
+        label = f"{kind} PRIVATE KEY" if kind else "PRIVATE KEY"
+        return f"-----BEGIN {label}-----\n{body}\n-----END {label}-----"
+
+    @pytest.mark.parametrize("kind", ["OPENSSH", "RSA", "EC", ""])
+    def test_pem_block_is_redacted(self, kind):
+        text = f"here is the file:\n{self._pem(kind)}\nafter"
+        out = s.scrub(text)
+        assert "QUFB" not in out, f"{kind or 'generic'} PEM body survived"
+        assert "here is the file" in out and "after" in out
+
+    def test_unterminated_header_is_linear(self):
+        import time
+
+        blob = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "QUFB" * 10000
+        start = time.perf_counter()
+        out = s.scrub(blob)
+        assert time.perf_counter() - start < 5.0
+        # Unterminated -> no match; body passes through (armour incomplete).
+        assert "QUFB" in out
+
+
+class TestAdditionalVendorPrefixes:
+    @pytest.mark.parametrize(
+        "tok",
+        [
+            "sk_live_" + "a" * 24,          # Stripe secret
+            "rk_live_" + "b" * 24,          # Stripe restricted
+            "ASIA" + "QRSTUVWXYZ12345A",    # AWS STS temporary
+            "npm_" + "c" * 36,
+            "pypi-" + "d" * 60,
+            "csk-" + "e" * 48,  # Cerebras — a miss the left-anchor exposed
+        ],
+    )
+    def test_prefix_redacts(self, tok):
+        assert R in s.scrub("value: " + tok), tok[:16]
+
+    def test_asia_the_word_is_not_a_credential(self):
+        assert R not in s.scrub("shipping to ASIA next week")
+
+    def test_stripe_lookalike_prose_survives(self):
+        assert R not in s.scrub("the sk_live_migration plan doc")

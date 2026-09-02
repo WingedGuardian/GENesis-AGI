@@ -59,10 +59,14 @@ _REDACTED = "[REDACTED]"
 # namespace themselves with interior separators (``sk-ant-…``, ``sk-or-v1-…``,
 # ``sk-proj-…``), so an [A-Za-z0-9]-only class stops at the first hyphen — only
 # a few characters in — and never reaches the length floor. The token then
-# passes through whole. Prefixes are anchored on the left (?<![A-Za-z0-9_-]) so
-# a longer surrounding word cannot part-match into one.
+# passes through whole. Prefixes are anchored on the left so a longer ALNUM run
+# cannot part-match into one — but `-` is deliberately NOT excluded: a token on
+# a git-diff line arrives as `-<token>`/`+<token>` with no separator, and pane
+# tails routinely hold diff output. Excluding `-` regressed those to raw
+# (measured against the shipping version). Over-matching after a hyphen costs a
+# redaction, which is this file's cheap direction.
 _KNOWN_KEY_PREFIX_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9_-])(?:"
+    r"(?<![A-Za-z0-9_])(?:"
     r"gh[pousr]_[A-Za-z0-9]{30,}"  # GitHub PAT / OAuth / user / server / refresh
     r"|github_pat_[A-Za-z0-9_]{30,}"  # GitHub fine-grained PAT
     r"|glpat-[A-Za-z0-9_\-]{15,}"  # GitLab PAT
@@ -79,7 +83,27 @@ _KNOWN_KEY_PREFIX_PATTERN = re.compile(
     r"|AIza[A-Za-z0-9_\-]{30,}"  # Google API key
     r"|di-[A-Za-z0-9]{20,}"  # DeepInfra
     r"|eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"  # JWT
+    r"|csk-[A-Za-z0-9_\-]{20,}"    # Cerebras (the shipping unanchored sk- caught
+                                   # these as a SUBSTRING accident; the anchor
+                                   # made that a miss, so name them explicitly)
+    r"|sk_live_[A-Za-z0-9]{16,}"   # Stripe secret key
+    r"|rk_live_[A-Za-z0-9]{16,}"   # Stripe restricted key
+    r"|ASIA[A-Z0-9]{12,}"          # AWS STS temporary access key
+    r"|npm_[A-Za-z0-9]{30,}"       # npm token
+    r"|pypi-[A-Za-z0-9_\-]{40,}"   # PyPI token
     r")",
+)
+
+# PEM armour. A private-key BODY is unlabelled base64 no shape rule can own;
+# the BEGIN/END armour can. Non-greedy and anchored on BOTH delimiters, so an
+# unterminated header simply never matches (linear — the engine looks for the
+# literal END; pinned by test_unterminated_header_is_linear). The pane tail is
+# the motivating caller: `cat ~/.ssh/id_ed25519` in the last 200 lines is an
+# ordinary accident and the highest-value secret on the box.
+_PEM_PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----"
+    r"[\s\S]*?"
+    r"-----END(?: [A-Z0-9]+)* PRIVATE KEY-----"
 )
 
 # Structured credentials — identified by SHAPE, not by a vendor prefix. Both
@@ -88,7 +112,10 @@ _KNOWN_KEY_PREFIX_PATTERN = re.compile(
 _STRUCTURED_CREDENTIAL_PATTERN = re.compile(
     r"(?:"
     # Discord webhook: the trailing path segment IS the credential.
-    r"https://(?:canary\.|ptb\.)?discord(?:app)?\.com/api/(?:v\d+/)?webhooks/"
+    # (?i:...) scoped to this alternative: schemes and hosts are
+    # case-insensitive (RFC 3986) and real logs carry both forms. Scoped rather
+    # than global so the alternatives below keep their exact casing semantics.
+    r"(?i:https://(?:canary\.|ptb\.)?discord(?:app)?\.com/api/(?:v\d+/)?webhooks/)"
     r"\d{15,}/[A-Za-z0-9_\-]{40,}"
     # Telegram bot token: <bot-id>:<secret>. The anchor rejects only a preceding
     # DIGIT — enough to stop a match starting mid-way through a longer digit
@@ -130,15 +157,13 @@ _SINGLE_CREDENTIAL_PATTERN = re.compile(
 # Credentials embedded in a URL's userinfo section (the user/password pair that
 # can precede an "@" host separator). Only fires when an "@" follows, so a plain
 # host-and-port URL never matches.
-# The SCHEME and HOST repeats are bounded; the PASSWORD repeat deliberately is
-# not. A greedy unbounded repeat followed by a required literal backtracks
-# quadratically over a long unbroken run — ordinary machine output (base64
-# blobs, minified bundles) hits this, and the scrubber runs on captured tool
-# output. Bounding only the parts with real-world ceilings (RFC 1035 caps a
-# hostname at 253 chars; a URL scheme is a handful) removes the blowup WITHOUT
-# introducing a fail-open: a long password still matches and is still redacted.
+# Only the SCHEME is bounded, and that bound carries the whole perf win:
+# MEASURED on a 40KB run, 2,788ms -> 6.6ms from the scheme bound alone. The span
+# after `://` was previously capped at 253 as if it were a hostname — it is the
+# USERINFO (the username before the `:`), so that cap bought nothing and simply
+# stopped long usernames being redacted. Unbounded here, same 6.6ms.
 _URL_CREDENTIAL_PATTERN = re.compile(
-    r"(?P<pre>[a-zA-Z][a-zA-Z0-9+.\-]{0,32}://[^:/@\s]{1,253}:)(?P<pw>[^@/\s]+)(?P<at>@)",
+    r"(?P<pre>[a-zA-Z][a-zA-Z0-9+.\-]{0,32}://[^:/@\s]+:)(?P<pw>[^@/\s]+)(?P<at>@)",
 )
 
 # .env-style UPPER_SNAKE=value. The bare pattern over-redacts (PYTHONPATH=…,
@@ -146,13 +171,37 @@ _URL_CREDENTIAL_PATTERN = re.compile(
 # is captured whole (so a multi-word secret like KEY='a b c' is not left with
 # its tail exposed after the first space); an unquoted value is a 6+ run of
 # non-space so short non-secret values aren't touched.
-# The KEY repeat is bounded for the same reason as the URL host above (see that
-# comment): an environment-variable NAME has a small real ceiling, while the
-# VALUE repeat stays unbounded so no long secret escapes redaction.
+# LINEAR BY CONSTRUCTION, on every character class — a perf property measured
+# on one input shape is not a perf property (the first fix here benchmarked an
+# all-alphanumeric run, the exact class its anchor excluded, and was quadratic
+# on underscore-bearing input; TestScrubIsLinearAcrossInputShapes now spans the
+# classes). Three pieces:
+#   * `(?<![A-Za-z0-9])` — a run of admitted characters offers only the starts
+#     the lookbehind allows, not every offset;
+#   * POSSESSIVE `{2,512}+` — no give-back, so a failed `=` cannot re-scan the
+#     key one character shorter per attempt (the quadratic engine);
+#   * the 512 ceiling — bounds the per-start scan. The ceiling CANNOT reproduce
+#     the old slide-forward fail-open for ordinary names (the lookbehind blocks
+#     an alnum-preceded restart, so an over-ceiling key is a CLEAN MISS, not a
+#     silently disabled hint). ONE residual, accepted and pinned by
+#     TestEnvKeyCeilingResidual: a >512-char key with INTERIOR underscores can
+#     match a late suffix without the hint — the lookbehind deliberately admits
+#     a start after `_`, which is what keeps `2FA_TOKEN=` catchable. Longest
+#     real key observed on an install: 31 chars.
+#
+# The lookbehind admits a LEADING underscore for recall (`_MY_SECRET=…`), and
+# the quoted-value floor is what removes the historical noise: an empty or
+# trivial quoted value (`_OAUTH_SRC=""`) is not a secret.
+#
+# The bound it replaces was a FAIL-OPEN, and a subtle one: capping the key did
+# not merely miss long names, it slid the match FORWARD past the name's prefix,
+# so `_SECRET_KEY_HINT` no longer saw SECRET_/TOKEN_ and the value stopped being
+# redacted at all. Bounding a repeat that feeds a downstream semantic check can
+# break the check rather than just the reach.
 _ENV_ASSIGNMENT_PATTERN = re.compile(
-    r"(?P<key>[A-Z][A-Z0-9_]{2,64})"
+    r"(?<![A-Za-z0-9])(?P<key>_*+[A-Z][A-Z0-9_]{2,512}+)"
     r"(?P<sep>\s*=\s*)"
-    r"(?P<val>\"[^\"]*\"|'[^']*'|[^\s]{6,})",
+    r"(?P<val>\"[^\"]{6,}\"|'[^']{6,}'|[^\s]{6,})",
 )
 _SECRET_KEY_HINT = re.compile(
     r"KEY|SECRET|TOKEN|PASSWORD|PASSWD|PASS|AUTH|API|CRED|PRIVATE", re.IGNORECASE
@@ -209,6 +258,7 @@ def scrub(text: str) -> str:
     if not text:
         return text
     try:
+        text = _PEM_PRIVATE_KEY_PATTERN.sub(_REDACTED, text)
         text = _KNOWN_KEY_PREFIX_PATTERN.sub(_REDACTED, text)
         text = _STRUCTURED_CREDENTIAL_PATTERN.sub(_REDACTED, text)
         text = _redact_value_group(_CREDENTIAL_TOKEN_PATTERN, text, "token")
