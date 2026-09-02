@@ -19,8 +19,10 @@ seam and the import-cycle breaker; do not hoist them to module top.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
+import time
 from datetime import timedelta
 from typing import TYPE_CHECKING, Protocol
 
@@ -47,6 +49,32 @@ if TYPE_CHECKING:
     from genesis.surplus.types import SurplusExecutor
 
 logger = logging.getLogger(__name__)
+
+# A single dispatch_once phase (queue maintenance or task selection) is normally
+# sub-second. One this slow is abnormal and is the diagnostic surface for the
+# 2026-09-01 heartbeat-stall class (a phase blocking with NO task running). Observe
+# only — never a timeout: a legitimately long task lives inside `execute`, not these
+# phases, so this only LOGS to localize a stall the heavy_workload flag already forgives.
+_SLOW_PHASE_WARN_S = 120.0
+
+
+@contextlib.contextmanager
+def _timed_phase(name: str):
+    """Time a dispatch_once phase; WARN (never kill) if it runs abnormally long."""
+    t0 = time.monotonic()
+    try:
+        yield
+    finally:
+        dt = time.monotonic() - t0
+        if dt > _SLOW_PHASE_WARN_S:
+            logger.warning(
+                "surplus dispatch phase '%s' took %.0fs (>%ds) — possible "
+                "heartbeat-stall source; heavy_workload forgives the watchdog, this "
+                "log localizes the stalling phase",
+                name,
+                dt,
+                int(_SLOW_PHASE_WARN_S),
+            )
 
 
 class DispatchContext(Protocol):
@@ -398,66 +426,40 @@ def _filter_tiers_for_network(tiers: list[ComputeTier]) -> list[ComputeTier]:
 
 async def dispatch_once(sched: DispatchContext) -> bool:
     """Single dispatch cycle. Returns True if a task was processed."""
-    # 0. Recover tasks stuck in 'running' state (crashed mid-execution)
-    await sched._queue.recover_stuck()
-
-    # 1. Drain expired pending tasks
-    await sched._queue.drain_expired(max_age_hours=sched._task_expiry_hours)
-
-    # 1b. Age-cap terminal rows (completed/failed/cancelled) so they don't
-    # accumulate forever — drain_expired only touches pending.
-    await sched._queue.reap_terminal(older_than_days=sched._terminal_retention_days)
-
-    # 2. Check idle
-    if not sched._idle_detector.is_idle():
-        return False
-
-    # 3. Check compute availability
-    available_tiers = await sched._compute.get_available_tiers()
-
-    # 3b. Outage awareness (PR-3): when the network is hard-OFFLINE, strip cloud
-    # tiers so internet-dependent tasks stay `pending` instead of churning into a
-    # dead network. LAN-local compute still runs; fail-safe leaves tiers intact.
-    available_tiers = _filter_tiers_for_network(available_tiers)
-
-    # 4. Get next task
-    task = await sched._queue.next_task(available_tiers)
-    if task is None:
-        return False
-
-    # 5. Execute
-    logger.info("Dispatching surplus task %s (%s)", task.id, task.task_type)
-    await sched._queue.mark_running(task.id)
-
-    executor = _select_executor(sched, task)
-
-    # Flag this dispatch as a heavy workload for the WHOLE dispatch body (execute
-    # + intake routing + completion) so the 900s zombie-scheduler watchdog FORGIVES
-    # a single long-running task (e.g. j9_eval_batch ~25 min) that would otherwise
-    # gap the dispatch-loop heartbeat and trigger a server restart. Closes the KNOWN
-    # GAP flagged at scheduler.py: the loop refreshes liveness only BETWEEN
-    # dispatches, never DURING one that itself blocks 15-30 min. Covers ALL long
-    # surplus executors (j9, model_eval, wing_audit, code_audit), not just the one
-    # that surfaced it. The runtime flag auto-expires after 2h (runtime/_core.py),
-    # so a genuinely HUNG task is still caught by the watchdog — forgives long, not
-    # dead. (Mirrors the dream jobs; direct-attr writes match dream.py.)
+    # Flag the WHOLE dispatch cycle — setup phases (recover/drain/reap/select) AND the
+    # executor — as a heavy workload so the 900s zombie-scheduler watchdog FORGIVES a
+    # stall ANYWHERE in dispatch_once, not just inside a long executor. The dispatch
+    # loop refreshes the surplus heartbeat only BETWEEN dispatches (scheduler.py), so a
+    # single dispatch_once that blocks — whether in a 25-min executor (j9) OR in a setup
+    # phase (the 2026-09-01 incident: 3 of 4 zombie restarts had NO task running) —
+    # gaps the heartbeat past 900s and triggers a restart. Setting the flag at ENTRY,
+    # before recover_stuck, closes the setup-phase half that #1588 left open (its flag
+    # was set only AFTER task selection). Covers ALL long surplus executors (j9,
+    # model_eval, wing_audit, code_audit) too. The runtime flag auto-expires after 2h
+    # (runtime/_core.py), so a genuinely HUNG cycle is still caught — forgives long, not
+    # dead. Propagates to the watchdog via status.json (status_writer runs on its own
+    # 60s loop, decoupled from this one — verified), so the flag is seen as long as the
+    # event loop stays responsive (a truly-blocked loop is a real hang, correctly NOT
+    # masked). (Mirrors the dream jobs; direct-attr writes match dream.py.)
     #
     # CLAIM ONLY A FREE SLOT: the flag is a single process-wide slot the dream jobs
     # also use. Overwriting it would clear a concurrent dream's protection when THIS
     # (short) dispatch finishes, leaving the dream unprotected mid-cycle. So we set
-    # only when the slot is free, and clear only what WE set. Any truthy label
-    # already forgives the watchdog, so declining to claim still leaves us covered.
+    # only when the slot is free, and clear only what WE set. Any truthy label already
+    # forgives the watchdog, so declining to claim still leaves us covered. A GENERIC
+    # label (not the task-type) is used because the flag is now claimed before a task
+    # is selected — and any truthy label forgives identically.
     #
     # NOTE: while set, this also defers the sentinel's restart remediation
-    # (sentinel/dispatcher.py Gate 2.5 reads heavy_workload). That now applies to
-    # every surplus dispatch, not just dream cycles — intended (a running dispatch
-    # is genuine work), low harm (the sentinel retries).
-    import contextlib
+    # (sentinel/dispatcher.py Gate 2.5 reads heavy_workload). That now applies to every
+    # dispatch cycle (incl. brief idle no-ops), not just long tasks — intended (a
+    # running dispatch is genuine work), low harm (the sentinel retries), and the window
+    # is milliseconds for an idle cycle.
     from datetime import UTC, datetime
 
     from genesis.runtime import GenesisRuntime
 
-    _hw_label = f"surplus:{task.task_type}"
+    _hw_label = "surplus:dispatch"
     _hw_rt = None
     _hw_did_set = False
     with contextlib.suppress(Exception):
@@ -468,6 +470,46 @@ async def dispatch_once(sched: DispatchContext) -> bool:
             _hw_rt, _hw_did_set = _rt, True
 
     try:
+        # 0. Recover tasks stuck in 'running' state (crashed mid-execution)
+        with _timed_phase("recover_stuck"):
+            await sched._queue.recover_stuck()
+
+        # 1. Drain expired pending tasks
+        with _timed_phase("drain_expired"):
+            await sched._queue.drain_expired(max_age_hours=sched._task_expiry_hours)
+
+        # 1b. Age-cap terminal rows (completed/failed/cancelled) so they don't
+        # accumulate forever — drain_expired only touches pending.
+        with _timed_phase("reap_terminal"):
+            await sched._queue.reap_terminal(
+                older_than_days=sched._terminal_retention_days
+            )
+
+        # 2. Check idle
+        if not sched._idle_detector.is_idle():
+            return False
+
+        # 3. Check compute availability
+        with _timed_phase("get_available_tiers"):
+            available_tiers = await sched._compute.get_available_tiers()
+
+        # 3b. Outage awareness (PR-3): when the network is hard-OFFLINE, strip cloud
+        # tiers so internet-dependent tasks stay `pending` instead of churning into a
+        # dead network. LAN-local compute still runs; fail-safe leaves tiers intact.
+        available_tiers = _filter_tiers_for_network(available_tiers)
+
+        # 4. Get next task
+        with _timed_phase("next_task"):
+            task = await sched._queue.next_task(available_tiers)
+        if task is None:
+            return False
+
+        # 5. Execute
+        logger.info("Dispatching surplus task %s (%s)", task.id, task.task_type)
+        await sched._queue.mark_running(task.id)
+
+        executor = _select_executor(sched, task)
+
         try:
             result = await executor.execute(task)
         except Exception:
@@ -500,7 +542,7 @@ async def dispatch_once(sched: DispatchContext) -> bool:
         return True
     finally:
         # Clear only what WE claimed, and only if still ours (label-guarded) —
-        # brackets the WHOLE body so the heartbeat gap is covered end-to-end.
+        # brackets the WHOLE cycle so the heartbeat gap is covered end-to-end.
         if _hw_did_set and _hw_rt is not None:
             with contextlib.suppress(Exception):
                 if _hw_rt._heavy_workload == _hw_label:

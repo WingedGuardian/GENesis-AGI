@@ -8,6 +8,7 @@ task.failed), executor-selection fallback semantics, the maintenance→idle→
 task ordering, and the consecutive-failure observation threshold.
 """
 
+import logging
 import types
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
@@ -177,8 +178,8 @@ async def test_heavy_workload_flag_set_during_execute_and_cleared_after(monkeypa
     result = await dispatch.dispatch_once(ctx)
 
     assert result is True
-    # DURING execute the flag was set to the task-type label (this is the fix).
-    assert captured["hw"] == f"surplus:{task.task_type}"
+    # DURING execute the flag was set to the generic cycle label (set at entry).
+    assert captured["hw"] == "surplus:dispatch"
     assert captured["since"] is not None
     # AFTER the dispatch the flag is cleared (label-guarded) — no leak.
     assert fake_rt._heavy_workload is None
@@ -196,7 +197,7 @@ async def test_heavy_workload_flag_cleared_even_when_executor_raises(monkeypatch
     seen = {}
 
     async def _boom(_t):
-        seen["hw"] = fake_rt._heavy_workload  # set before execute (the fix)
+        seen["hw"] = fake_rt._heavy_workload  # set at entry, before execute
         raise RuntimeError("hang→boom")
 
     task = _Task(TaskType.J9_EVAL_BATCH)
@@ -206,8 +207,8 @@ async def test_heavy_workload_flag_cleared_even_when_executor_raises(monkeypatch
     result = await dispatch.dispatch_once(ctx)
 
     assert result is False
-    # Flag was set BEFORE the executor ran (RED without the fix).
-    assert seen["hw"] == f"surplus:{task.task_type}"
+    # Flag was set at ENTRY, before the executor ran.
+    assert seen["hw"] == "surplus:dispatch"
     # The finally clears it even on the exception path — no stuck heavy flag.
     assert fake_rt._heavy_workload is None
     assert fake_rt._heavy_workload_since is None
@@ -265,6 +266,63 @@ async def test_heavy_workload_not_claimed_when_slot_already_held(monkeypatch):
     assert captured["hw"] == "dream_cycle"
     # ...and NOT cleared afterward (we never owned it).
     assert fake_rt._heavy_workload == "dream_cycle"
+
+
+async def test_heavy_workload_flag_set_during_setup_phase(monkeypatch):
+    # 2026-09-01 incident: the surplus heartbeat can stall in a SETUP step
+    # (recover_stuck / drain_expired / next_task) with NO task running. #1588 set the
+    # flag only AFTER task selection, so a setup-phase stall was NOT forgiven by the
+    # 900s zombie watchdog. The flag must now cover the WHOLE dispatch_once cycle —
+    # set at entry, before recover_stuck — even on a no-task cycle.
+    import genesis.runtime as runtime_mod
+
+    fake_rt = types.SimpleNamespace(_heavy_workload=None, _heavy_workload_since=None)
+    monkeypatch.setattr(
+        runtime_mod.GenesisRuntime, "instance", staticmethod(lambda: fake_rt)
+    )
+
+    seen = {}
+
+    async def _capture_during_setup():
+        # The flag must ALREADY be set when the first setup phase runs.
+        seen["hw"] = fake_rt._heavy_workload
+        seen["since"] = fake_rt._heavy_workload_since
+
+    ctx = _make_ctx()
+    ctx._queue.recover_stuck = AsyncMock(side_effect=_capture_during_setup)
+    ctx._queue.next_task = AsyncMock(return_value=None)  # no-task early return
+
+    result = await dispatch.dispatch_once(ctx)
+
+    assert result is False
+    # Flag was set at ENTRY, before recover_stuck (RED on #1588 → None here).
+    assert seen["hw"] == "surplus:dispatch"
+    assert seen["since"] is not None
+    # Cleared after the no-task early return — no leak.
+    assert fake_rt._heavy_workload is None
+    assert fake_rt._heavy_workload_since is None
+
+
+# ── _timed_phase: diagnostic warning on an abnormally slow setup phase ──
+
+
+def test_timed_phase_warns_when_slow(monkeypatch, caplog):
+    # A setup phase exceeding the threshold logs a diagnostic WARNING (the surface
+    # that would have localized the 2026-09-01 no-task-running stall).
+    monkeypatch.setattr(dispatch, "_SLOW_PHASE_WARN_S", -1.0)  # any duration exceeds
+    with caplog.at_level(logging.WARNING), dispatch._timed_phase("recover_stuck"):
+        pass
+    assert any(
+        "recover_stuck" in r.getMessage() and "heartbeat-stall" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_timed_phase_silent_when_fast(monkeypatch, caplog):
+    monkeypatch.setattr(dispatch, "_SLOW_PHASE_WARN_S", 1e9)  # nothing exceeds
+    with caplog.at_level(logging.WARNING), dispatch._timed_phase("recover_stuck"):
+        pass
+    assert not any("heartbeat-stall" in r.getMessage() for r in caplog.records)
 
 
 # ── maybe_observe_failure: the 3-strike threshold ───────────────────
