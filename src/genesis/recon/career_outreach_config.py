@@ -160,10 +160,17 @@ def load_config() -> dict[str, Any]:
     return merged
 
 
-def _resolve_mode(cfg: dict[str, Any], key: str) -> str:
+def _resolve_mode(cfg: dict[str, Any], key: str, *, invalid_fallback: str = "observe") -> str:
     """Resolve one mode knob (``key``) from an already-loaded config, sharing the
     master-enabled gate + the degrade rules. The env kill switch is checked by the
-    public callers BEFORE ``load_config`` (so a killed monitor never reads files)."""
+    public callers BEFORE ``load_config`` (so a killed monitor never reads files).
+
+    ``invalid_fallback`` is where an unrecognized value degrades. The auto-run uses
+    ``observe`` (a harmless bridge probe). The bite-relay MUST pass ``off``: its
+    ``observe`` SEEDS permanent ``career_bite`` markers, so degrading a typo'd mode to
+    ``observe`` would silently mark every current advance as relayed — then a later
+    correction to ``live`` suppresses them forever. Fail closed for the seeding lever.
+    """
     # Master switch: require a LITERAL boolean True to stay enabled. A non-bool
     # (e.g. the string "false" from env-templated YAML, or any corruption) degrades
     # to off — the master actuator switch fails toward LESS authority.
@@ -174,8 +181,10 @@ def _resolve_mode(cfg: dict[str, Any], key: str) -> str:
         # Hand-edited unquoted `<key>: off` parses as YAML-1.1 boolean False.
         return "off"
     if mode not in MODES:
-        logger.warning("career_outreach has invalid %s %r — degrading to observe", key, mode)
-        return "observe"
+        logger.warning(
+            "career_outreach has invalid %s %r — degrading to %s", key, mode, invalid_fallback
+        )
+        return invalid_fallback
     return mode
 
 
@@ -194,14 +203,17 @@ def effective_mode() -> str:
 def effective_bite_relay_mode() -> str:
     """The bite-relay's INDEPENDENT lever — read live.
 
-    Same env-kill + master-enabled gate + degrade as ``effective_mode``, but keyed on
-    its OWN ``bite_relay_mode``, so the relay can run while the auto-run ``mode`` is
-    ``off`` (and vice-versa). A generic install (or an overlay written before this
-    feature) has ``bite_relay_mode: off`` from DEFAULTS → the relay stays inert.
+    Same env-kill + master-enabled gate as ``effective_mode``, keyed on its OWN
+    ``bite_relay_mode`` so the relay can run while the auto-run ``mode`` is ``off`` (and
+    vice-versa). A generic install (or an overlay written before this feature) has
+    ``bite_relay_mode: off`` from DEFAULTS → the relay stays inert. An INVALID value
+    fails closed to ``off`` (NOT ``observe`` like the auto-run): the relay's ``observe``
+    SEEDS permanent markers, so a typo'd mode degrading to ``observe`` would silently
+    suppress the current backlog forever once corrected to ``live``.
     """
     if os.environ.get(_ENV_KILL_SWITCH) == "1":
         return "off"
-    return _resolve_mode(load_config(), "bite_relay_mode")
+    return _resolve_mode(load_config(), "bite_relay_mode", invalid_fallback="off")
 
 
 def knob_int(cfg: dict[str, Any], key: str) -> int:

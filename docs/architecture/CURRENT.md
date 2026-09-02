@@ -669,7 +669,12 @@ verified: 6f3310e5 2026-09-01
   silent "no advances"; a pipeline-dedup `REJECTED` marks the point-event relayed
   (closing the deliver-before-`_record_bite` crash-window that would otherwise re-nudge
   after the 24h dedup expires); and the auto-run no-progress warning excludes bite
-  activity, since the two sub-capabilities are independent.
+  activity, since the two sub-capabilities are independent. Misconfig fails LOUD, not
+  silent: an invalid `bite_relay_mode` fails **closed to `off`** (its `observe` seeds
+  permanent markers, so degrading to `observe` like the auto-run would silently suppress
+  the backlog); an ENABLED lever whose `data_module` is unset/unresolvable records a
+  job-health **failure** (not a green no-op); and pause is rechecked **before** the
+  pipeline read (an external action), not only between nudges.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
   (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,
   research, recon, pipeline), not runtime init.

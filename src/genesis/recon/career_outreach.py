@@ -518,6 +518,14 @@ class CareerOutreachMonitor:
         dormant, and a daily false alarm on a dormant service is noise, not signal. A
         read the service DID answer with an error (service up, op failed) IS a genuine
         failure and is counted."""
+        # Recheck pause BEFORE the health check + external pipeline read. The runner's
+        # initial pause check can go stale while the (long) preceding auto-run dispatch
+        # runs; the module contract is "pause is rechecked between external actions", and
+        # the pipeline read is itself an external action. A clean skip, not a failure.
+        if self._is_paused():
+            return CareerOutreachResult(
+                bite_mode=bite_mode, details=["bite-relay: paused before read — skipped"]
+            )
         data_name = cfg.module_name(conf, "data_module")
         mod = reg.get(data_name) if data_name else None
         if mod is None:
@@ -526,13 +534,18 @@ class CareerOutreachMonitor:
             # generic-install case (that ships bite_mode=off and never reaches here).
             logger.warning(
                 "career outreach bite-relay: enabled (bite_mode=%s) but data_module %r is "
-                "unset/unresolvable — no-op; set data_module in the overlay",
+                "unset/unresolvable — recording a job-health FAILURE; set data_module in the overlay",
                 bite_mode,
                 data_name,
             )
+            # errors=1: an ENABLED lever that can't resolve its module delivers NOTHING.
+            # Without surfacing a failure the job stays green while silently doing nothing
+            # (a log warning nobody watches). This path is unreachable when bite_mode="off"
+            # (the generic-install case), so it never false-alarms a dormant install.
             return CareerOutreachResult(
                 bite_mode=bite_mode,
-                details=[f"bite-relay: data_module {data_name!r} unresolvable — no-op"],
+                errors=1,
+                details=[f"bite-relay: data_module {data_name!r} unresolvable — misconfig"],
             )
 
         try:
@@ -644,18 +657,28 @@ class CareerOutreachMonitor:
                 continue
             company_id = entry.get("id")
             if company_id is None or company_id == "":
-                continue  # no stable key → cannot dedup safely; skip (fail-safe)
+                # No stable key → cannot dedup/deliver safely. Surface as MALFORMED (a
+                # schema drift that renamed/removed `id` would otherwise drop EVERY advance
+                # while job-health stays green), then skip this entry (fail-safe).
+                malformed += 1
+                continue
             # Bound + sanitize the external name. strip_control_chars collapses the
             # line-forging / line-concealing class — C0/C1 controls (incl. \n\r\t), the
             # Unicode line+paragraph separators, and zero-width / bidi overrides — to a
             # single space and trims. company_name is rendered into a parse_mode="HTML"
             # Telegram message where html.escape (in _bite_nudge) neutralizes <>&"' but
             # NOT those characters, so a crafted job posting could otherwise forge extra
-            # notification lines or visually reorder/conceal the message. Then [:200] so a
-            # crafted long name can't bloat the obs row / nudge. The marker dedups on id
-            # (not name), so neither transform affects dedup.
+            # notification lines or visually reorder/conceal the message. Sanitize the name
+            # AND the id-derived fallback SEPARATELY: strip_control_chars also .strip()s, so
+            # a name that is non-empty but sanitizes to EMPTY (whitespace-/control-/zero-
+            # width-only) must still fall through to the fallback — and the fallback itself
+            # interpolates a raw external company_id that can carry control chars html.escape
+            # won't remove, so it is sanitized too. Then [:200] so a crafted long name can't
+            # bloat the obs row / nudge. The marker dedups on the id hash (not name), so
+            # neither transform affects dedup.
             company_name = (
-                strip_control_chars(str(entry.get("name") or "")) or f"company {company_id}"
+                strip_control_chars(str(entry.get("name") or ""))
+                or strip_control_chars(f"company {company_id}")
             )[:200]
             h = _bite_hash(company_id, stage)
             # unresolved_only=False: a stage advance is a POINT EVENT — the marker

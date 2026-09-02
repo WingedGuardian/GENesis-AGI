@@ -184,13 +184,25 @@ def test_effective_bite_relay_mode_pass_through(monkeypatch, tmp_path):
         assert cfg.effective_bite_relay_mode() == m
 
 
-def test_effective_bite_relay_mode_invalid_degrades_to_observe(monkeypatch, tmp_path):
-    # Invalid value → observe (read/seed safely; never a silent off that hides it),
-    # matching effective_mode()'s established degrade.
+def test_effective_bite_relay_mode_invalid_fails_closed_to_off(monkeypatch, tmp_path):
+    # Invalid bite_relay_mode → OFF (NOT observe): the relay's observe SEEDS permanent
+    # markers, so degrading a typo to observe would silently mark the current backlog as
+    # relayed and suppress it forever once corrected to live. Fail closed for the seeding
+    # lever. (Contrast the auto-run's harmless observe degrade, locked just below.)
     p = _write(tmp_path, "enabled: true\nbite_relay_mode: bogus\n")
     monkeypatch.setattr(cfg, "_base_path", lambda: p)
     monkeypatch.delenv(cfg._ENV_KILL_SWITCH, raising=False)
-    assert cfg.effective_bite_relay_mode() == "observe"
+    assert cfg.effective_bite_relay_mode() == "off"
+
+
+def test_effective_mode_invalid_still_degrades_to_observe(monkeypatch, tmp_path):
+    # The AUTO-RUN's invalid-mode degrade is UNCHANGED — observe is a harmless bridge
+    # reachability probe (stages/seeds nothing), so only the SEEDING bite-relay diverges
+    # to off. Locks that the two levers degrade differently on purpose.
+    p = _write(tmp_path, "enabled: true\nmode: bogus\n")
+    monkeypatch.setattr(cfg, "_base_path", lambda: p)
+    monkeypatch.delenv(cfg._ENV_KILL_SWITCH, raising=False)
+    assert cfg.effective_mode() == "observe"
 
 
 def test_effective_bite_relay_mode_kill_switch_and_enabled_false(monkeypatch, tmp_path):
@@ -1220,13 +1232,15 @@ async def test_bite_relay_truncates_long_company_name(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_bite_relay_absent_data_module_is_clean_noop(db, monkeypatch):
-    # A generic install lacking the data-module overlay → clean no-op (errors=0),
-    # exactly like the auto-run's absent-reasoning-module path.
+async def test_bite_relay_enabled_but_no_data_module_is_failure(db, monkeypatch):
+    # An ENABLED lever (observe/live) whose data_module is empty/unresolvable delivers
+    # NOTHING — surface a job-health FAILURE (errors=1), not a silent green no-op that a
+    # log warning nobody watches would hide. (The genuine generic-install case ships
+    # bite_mode=off and never reaches _run_bite_relay at all.)
     _cfg(monkeypatch, mode="off", bite_mode="live", data_module="")
     mon, pipe = _mon_bite(db, _FakeDataModule())
     result = await mon.gather()
-    assert result.errors == 0 and result.bites == 0 and pipe.sent == []
+    assert result.errors == 1 and result.bites == 0 and pipe.sent == []
 
 
 @pytest.mark.asyncio
@@ -1287,13 +1301,62 @@ async def test_bite_relay_observe_ignores_nudge_cap(db, monkeypatch):
 @pytest.mark.asyncio
 async def test_bite_relay_skips_falsy_id_entry(db, monkeypatch):
     # A malformed row with an empty-string id is skipped (no nudge, no degenerate
-    # `career_bite::stage` collision hash); a real-id sibling still fires.
+    # `career_bite::stage` collision hash) AND surfaced as malformed (errors>=1, so a
+    # schema drift that strips `id` from every entry can't stay green while dropping all
+    # advances); a real-id sibling still fires.
     _cfg(monkeypatch, mode="off", bite_mode="live")
     data = _FakeDataModule(pipeline={"offer": [{"id": "", "name": "Malformed"}, _entry(9, "Good")]})
     mon, pipe = _mon_bite(db, data)
     result = await mon.gather()
     assert result.bites == 1 and len(pipe.sent) == 1
     assert "Good" in pipe.sent[0][0] and "Malformed" not in pipe.sent[0][0]
+    assert result.errors >= 1  # the id-less entry is surfaced, not silently dropped
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_rechecks_pause_before_read(db, monkeypatch):
+    # Codex #1590: the pipeline read is an external action. A /pause that lands after the
+    # runner's initial check (e.g. during the long preceding auto-run dispatch) must halt
+    # the relay BEFORE its health check + pipeline read, per the "pause between external
+    # actions" contract. Clean skip — no read, no error, no nudge.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": [_entry(9, "Hooli")]})
+    mon, pipe = _mon_bite(db, data)
+    mon._is_paused = lambda: True
+    result = await mon.gather()
+    assert data.ops == []  # paused → the external pipeline read never ran
+    assert result.bites == 0 and result.errors == 0 and pipe.sent == []
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_sanitizes_id_fallback_name(db, monkeypatch):
+    # Codex #1590: when `name` is absent, the fallback "company {id}" interpolates a RAW
+    # external company_id, which can itself carry control chars html.escape won't remove.
+    # strip_control_chars must run on the WHOLE value, fallback included.
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    # id carries an embedded newline; name absent → the fallback path renders the id.
+    data = _FakeDataModule(pipeline={"offer": [{"id": "77\ninjected"}]})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.bites == 1
+    body = pipe.sent[0][0]
+    assert "\n" not in body  # the id's newline was collapsed by strip_control_chars
+    assert "company 77 injected" in body  # fallback sanitized (newline → single space)
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_fallback_fires_when_name_sanitizes_empty(db, monkeypatch):
+    # A name that is non-empty but sanitizes to EMPTY (whitespace-/control-only) must STILL
+    # fall through to the id-derived fallback — strip_control_chars also .strip()s, so gating
+    # the fallback on the raw name would leave a blank "🎯 Career:  advanced to offer". The
+    # owner must see "company {id}".
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(pipeline={"offer": [{"id": 42, "name": "   \t "}]})
+    mon, pipe = _mon_bite(db, data)
+    result = await mon.gather()
+    assert result.bites == 1
+    body = pipe.sent[0][0]
+    assert "company 42" in body  # fallback fired despite a non-empty-but-blank name
 
 
 @pytest.mark.asyncio
