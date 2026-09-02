@@ -61,6 +61,9 @@ DEFAULT_FORBIDDEN_GLOBS: tuple[str, ...] = (
     # Sanitizer's own secret-scan rules — a contribution must not weaken the gate
     # that scans it (else a merged edit silently disables detection downstream).
     ".gitleaks.toml",
+    # GitHub-native secret scanning config — a contribution must not widen its
+    # paths-ignore (e.g. to "**") and silently disable GitHub's own detection.
+    ".github/secret_scanning.yml",
     "config/research-profiles/*",
     "config/research-profiles/**",
     "config/external-modules/*",
