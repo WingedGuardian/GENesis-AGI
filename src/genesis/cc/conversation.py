@@ -1096,6 +1096,21 @@ class ConversationLoop:
                 base_inv = replace(base_inv, system_prompt=system_prompt)
             peers = roster.failover_invocations(home, base_inv)
             if not peers:
+                # Say so. This is the one branch that degrades SILENTLY at the
+                # exact moment the fallback exists for — the subscription has
+                # capped and there is nothing to fail over to. The turn goes on
+                # to contingency and rate_limit_park, which do surface something
+                # to the user, but nothing anywhere names the actual cause: no
+                # usable peer is configured. `failover_chain` also drops any
+                # peer whose auth_env is unset, so "declared but keyless" lands
+                # here too and looks identical to "none declared".
+                logger.warning(
+                    "CC failover: no usable roster peer for home=%r — degrading "
+                    "to contingency. Declare one in "
+                    "~/.genesis/config/cc_roster.local.yaml (a peer whose "
+                    "auth_env key is unset is skipped).",
+                    home,
+                )
                 return None
             sticky = self._session_fallback_session(session)
             for peer_name, peer_inv in peers:

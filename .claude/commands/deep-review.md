@@ -57,7 +57,8 @@ Prime each reviewer with the RIGHT SHAPE (what a lint scan misses). Paste this i
 3-bucket disposition: FIX real+material now / evidence-tiered documented-accept / escalate.
 When you fix, fix the mechanism/class — a per-instance patch is what spawns the next review
 round. `git add` the fix, but do NOT commit yet — the commit is the last step, after the marker.
-If you're on your 3rd defect-bearing round, STOP at the escalation cap (see SKILL.md).
+If you're on your 3rd EXTERNAL cross-model defect-bearing round, STOP at the escalation cap
+(see SKILL.md) — internal self/subagent audits like this one never count toward it.
 
 ## 4. Record evidence, mark, THEN commit (satisfies the commit review-depth gate)
 
@@ -71,10 +72,12 @@ If you're on your 3rd defect-bearing round, STOP at the escalation cap (see SKIL
   (BLOCKER / SHOULD-FIX / CRITICAL / HIGH / MEDIUM / LOW / P1-P3 — a security-reviewer WARNING is
   NOT recognized by the validator, so render it as SHOULD-FIX in the text), at least one
   `file:line`, and ≥400 chars, or the gate rejects the evidence as non-adversarial.
-- `python3 "$ROOT/scripts/review_state.py" mark --agent-output "$EVID"` — add `--clean` IFF the
-  pass found nothing at **should-fix-or-worse**: genesis-architect → no BLOCKER/SHOULD-FIX;
-  genesis-security-reviewer → no CRITICAL/WARNING (WARNING is its "should address" tier); or no
-  P1/P2. A forgotten `--clean` is the safe direction (it counts the round).
+- `python3 "$ROOT/scripts/review_state.py" mark --agent-output "$EVID"` — this is an INTERNAL
+  (same-model) audit, so a plain `mark` is correct: it satisfies the commit review-depth gate and
+  NEVER counts toward the cross-model escalation streak, whatever it found. No outcome flag is
+  needed. (EXTERNAL is judged by the reviewing MODEL, not the gateway: only a non-Anthropic model —
+  Codex or Kimi on .123 (NOT OpenRouter, which is not an approved method today; and never a Genesis
+  internal model) — is marked `--source external --defects|--clean`; that alone moves the counter.)
 - Run `mark` AFTER the final `git add` and BEFORE `git commit`. The evidence must be recent when
   you `mark` (its age is checked at mark time), so write-then-mark promptly. Once marked, an
   unchanged staged diff stays cleared by its diff-hash — if you restage or amend, re-mark.

@@ -2055,6 +2055,25 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "memory_metadata.capture_clarity",
     )
 
+    # The two stamps the peer-line topic recency comparison needs. Neither
+    # table had a timestamp meaning what the comparison requires:
+    # session_charters.updated_at is a ROW timestamp (set_pointers and the
+    # upsert bump it too), and cc_sessions.last_extracted_at is a PASS
+    # watermark the extraction job advances even when it writes no topic
+    # (measured: 219/899 live rows carry a watermark with no topic). Mirrored
+    # in migration 0091 for the standalone runner; added here so an existing DB
+    # gets them on the base create_all_tables path (schema_both_build_paths).
+    await _try_alter(
+        db,
+        "ALTER TABLE session_charters ADD COLUMN mission_updated_at TEXT",
+        "session_charters.mission_updated_at",
+    )
+    await _try_alter(
+        db,
+        "ALTER TABLE cc_sessions ADD COLUMN topic_updated_at TEXT",
+        "cc_sessions.topic_updated_at",
+    )
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.
