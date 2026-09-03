@@ -51,10 +51,12 @@ Do not add locking without a measured reason; this is on a degraded-path loop.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import logging
 import os
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -68,6 +70,12 @@ _STATE_FILE = "cc_peer_availability.json"
 #: Bound on stored provider prose. Enough to identify the failure; short enough
 #: that a pathological error body cannot bloat the file. Applied AFTER scrubbing.
 _MAX_TEXT = 300
+
+#: Hard cap on a peer NAME. A roster name is short; anything longer is foreign
+#: data, and an unbounded key is as effective a bloat vector as an unbounded
+#: value — both end up in the health snapshot and, through the health MCP tool,
+#: in an LLM's context.
+_MAX_PEER_NAME = 128
 
 #: Hard cap on tracked peers. A roster holds a handful; this only bounds a
 #: pathological case (a renamed/rotating peer id) so the file cannot grow without
@@ -184,6 +192,28 @@ def _read_raw() -> dict:
     return peers if isinstance(peers, dict) else {}
 
 
+def _sanitise(peer: str, raw: dict) -> tuple[str, dict]:
+    """Bound a (peer, row) pair. THE single place width is enforced.
+
+    Previously only ``detail`` was bounded, and only on the way in — so every
+    other field of a row written by another build was re-persisted forever and
+    handed to the snapshot untouched. MEASURED before this existed: one foreign
+    row produced a 300KB state file and a 100,000-character ``reason`` in a
+    single snapshot row. Reader and writer both go through here so the two can
+    never disagree about what "bounded" means.
+    """
+    name = str(peer)[:_MAX_PEER_NAME]
+    row = {
+        "available": bool(raw.get("available", True)),
+        "reason": str(raw.get("reason", ""))[:_MAX_TEXT],
+        "observed_at": str(raw.get("observed_at", ""))[:_MAX_TEXT],
+        "detail": str(raw.get("detail", ""))[:_MAX_TEXT],
+        "reset_at": str(raw.get("reset_at", ""))[:_MAX_TEXT],
+        "limit_kind": str(raw.get("limit_kind", ""))[:_MAX_TEXT],
+    }
+    return name, row
+
+
 def read() -> dict[str, PeerStatus]:
     """Every recorded peer's last-observed status. Never raises.
 
@@ -195,15 +225,8 @@ def read() -> dict[str, PeerStatus]:
     for name, raw in _read_raw().items():
         if not isinstance(raw, dict):
             continue
-        out[str(name)] = PeerStatus(
-            peer=str(name),
-            available=bool(raw.get("available", True)),
-            reason=str(raw.get("reason", "")),
-            observed_at=str(raw.get("observed_at", "")),
-            detail=str(raw.get("detail", ""))[:_MAX_TEXT],
-            reset_at=str(raw.get("reset_at", "")),
-            limit_kind=str(raw.get("limit_kind", "")),
-        )
+        key, row = _sanitise(name, raw)
+        out[key] = PeerStatus(peer=key, **row)
     return out
 
 
@@ -260,7 +283,17 @@ def note_failure(peer: str, exc: BaseException) -> bool:
     exception — the classification lives here on purpose, so there is exactly one
     place that decides what counts as evidence about a peer. Never raises.
     """
-    if not peer or not _is_provider_refusal(exc):
+    try:
+        if not peer or not _is_provider_refusal(exc):
+            return False
+        detail = str(exc)
+    except Exception:
+        # This module promises it never raises, and it sits on the failover
+        # path: a raise here escapes into the peer loop and abandons every
+        # REMAINING peer, turning an observability helper into an outage
+        # amplifier. _is_provider_refusal imports and str()s a foreign
+        # exception, both of which can raise on a hostile __str__.
+        logger.debug("peer availability classification failed for %s", peer, exc_info=True)
         return False
     reset_at, limit_kind = "", ""
     try:
@@ -282,7 +315,7 @@ def note_failure(peer: str, exc: BaseException) -> bool:
         peer,
         available=False,
         reason=QUOTA,
-        detail=str(exc),
+        detail=detail,
         reset_at=reset_at,
         limit_kind=limit_kind,
     )
@@ -291,6 +324,67 @@ def note_failure(peer: str, exc: BaseException) -> bool:
 def note_success(peer: str) -> bool:
     """Record that the peer served a turn, clearing any stale block. Never raises."""
     return _record(peer, available=True)
+
+
+#: Sidecar lock for the read-modify-write in :func:`_record`. A SEPARATE file on
+#: purpose: the state file is published with ``os.replace``, so a lock held on
+#: its inode would be released the moment a writer swapped it — the lock has to
+#: outlive the file it protects.
+_LOCK_FILE = "cc_peer_availability.lock"
+
+#: Lock acquisition is NON-BLOCKING with a bounded retry, never a bare LOCK_EX.
+#: This runs synchronously inside an async failover turn, so a blocking flock
+#: stalls the whole event loop — advisory bookkeeping would then delay every
+#: concurrent conversation during the outage it exists to observe, which is a
+#: worse failure than the lost row it prevents. 10 x 20ms caps the stall at
+#: ~200ms under contention, after which it degrades open exactly as documented.
+_LOCK_ATTEMPTS = 10
+_LOCK_SLEEP_S = 0.02
+
+
+@contextlib.contextmanager
+def _record_lock():
+    """Serialize read-modify-write across processes. Never raises.
+
+    Without it the sequence is last-writer-wins: two processes recording
+    DIFFERENT peers in the same instant each read the map, each add their row,
+    and the second write drops the first. An earlier draft accepted that on the
+    grounds it was advisory and self-healing — but "self-healing" was itself a
+    claim that had to be retracted (records refresh only during a home outage),
+    so a lost record can persist for days, and losing an observation is exactly
+    the silence this module exists to remove.
+
+    Degrades OPEN: if the lock cannot be taken (a filesystem without flock, a
+    permissions problem), the write still proceeds unserialized rather than
+    being dropped. A racy record beats no record on an advisory path.
+    """
+    path = _state_path().parent / _LOCK_FILE
+    fh = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = path.open("a+")
+        for attempt in range(_LOCK_ATTEMPTS):
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if attempt == _LOCK_ATTEMPTS - 1:
+                    raise
+                time.sleep(_LOCK_SLEEP_S)
+    except Exception:
+        logger.debug("peer availability lock unavailable — proceeding unserialized", exc_info=True)
+        if fh is not None:
+            with contextlib.suppress(Exception):
+                fh.close()
+            fh = None
+    try:
+        yield
+    finally:
+        if fh is not None:
+            with contextlib.suppress(Exception):
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            with contextlib.suppress(Exception):
+                fh.close()
 
 
 def _record(
@@ -314,41 +408,53 @@ def _record(
             reset_at="" if available else reset_at,
             limit_kind="" if available else limit_kind,
         )
-        # Merge onto a SANITISED view of what is on disk. Writing _read_raw()
+        # Merge onto a SANITISED view of what is on disk, under the lock so a
+        # concurrent recorder cannot drop this row. Writing _read_raw()
         # straight back would (a) crash the eviction sort below on a non-dict row
         # — permanently killing recording, because the failure is swallowed by
         # the except clause and note_failure just returns False forever — and
         # (b) re-persist an oversized detail written by another build, since
         # _MAX_TEXT otherwise bounds only the value being written now.
-        peers = {
-            k: {**v, "detail": str(v.get("detail", ""))[:_MAX_TEXT]}
-            for k, v in _read_raw().items()
-            if isinstance(v, dict)
-        }
-        peers[peer] = {k: v for k, v in asdict(status).items() if k != "peer"}
-        if len(peers) > _MAX_PEERS:
-            # Evict least-recently-observed, ranking by a PARSED timestamp.
-            # Sorting the raw string ranked malformed values by ASCII, so a row
-            # carrying observed_at="zzzz" outranked every real ISO stamp: once
-            # enough such rows existed, each genuine new observation was evicted
-            # the moment it was written, and _record would report success while
-            # read_peer found nothing. Unparseable rows now sort OLDEST, and the
-            # row being written this call is never a candidate for eviction.
-            def _rank(kv: tuple[str, dict]) -> datetime:
-                try:
-                    return datetime.fromisoformat(str(kv[1].get("observed_at", "")))
-                except (ValueError, TypeError):
-                    return datetime.min.replace(tzinfo=UTC)
-
-            others = sorted(
-                ((k, v) for k, v in peers.items() if k != peer), key=_rank,
-            )
-            keep = others[-(_MAX_PEERS - 1):] if _MAX_PEERS > 1 else []
-            peers = dict([*keep, (peer, peers[peer])])
-        return _write({"peers": peers})
+        with _record_lock():
+            return _merge_and_write(peer, status)
     except Exception:
         logger.debug("peer availability record failed for %s", peer, exc_info=True)
         return False
+
+
+def _merge_and_write(peer: str, status: PeerStatus) -> bool:
+    """Read-modify-write the peer map. Caller holds :func:`_record_lock`.
+
+    Merges onto a SANITISED view of what is on disk. Writing ``_read_raw()``
+    straight back would re-persist a non-dict row (which older eviction logic
+    then choked on) and an oversized detail written by another build, since
+    ``_MAX_TEXT`` otherwise bounds only the value being written now.
+    """
+    peers = dict(
+        _sanitise(k, v) for k, v in _read_raw().items() if isinstance(v, dict)
+    )
+    peer, row = _sanitise(peer, {k: v for k, v in asdict(status).items() if k != "peer"})
+    # pop-then-set UNCONDITIONALLY: assigning an existing key does NOT move it in
+    # a dict, so without this the order is first-seen and eviction below drops the
+    # MOST RECENTLY observed peer while keeping stale ones. Measured: re-recording
+    # the freshest peer then adding one id evicted the fresh peer.
+    peers.pop(peer, None)
+    peers[peer] = row
+    if len(peers) > _MAX_PEERS:
+        # Evict by INSERTION ORDER, not by timestamp. Ranking on observed_at
+        # produced three review findings across two rounds — a raw-string sort
+        # that ranked "zzzz" above every ISO stamp, then a parsed sort that
+        # raised TypeError the moment a legacy naive stamp met an aware one —
+        # and each failed the same silent way: the sort blew up inside the
+        # guarded block, _record returned False, and recording stopped for good.
+        # A ranking that must parse legacy-shaped data, on a path whose whole
+        # purpose is honest bookkeeping, is the wrong mechanism; it is gone
+        # rather than fixed a third time. dicts preserve insertion order, the
+        # row written this call is re-inserted last, and nothing here can raise.
+        # The row written this call is already last (pop-then-set above), so
+        # keeping the tail keeps it plus the most recently observed others.
+        peers = dict(list(peers.items())[-_MAX_PEERS:])
+    return _write({"peers": peers})
 
 
 def _write(payload: dict) -> bool:
@@ -366,14 +472,22 @@ def _write(payload: dict) -> bool:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-        try:
-            os.write(fd, json.dumps(payload, indent=2).encode())
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        # os.fdopen, not a bare os.write: os.write may legally write FEWER bytes
+        # than asked without raising (disk pressure, file-size limits), and this
+        # code then fsynced and atomically replaced a valid state file with
+        # truncated JSON while reporting success. A file object loops until the
+        # payload is written or raises trying, so a short write can no longer be
+        # mistaken for a complete one.
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(json.dumps(payload, indent=2).encode())
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, str(path))
         return True
-    except OSError:
+    except Exception:
+        # Exception, not OSError: json.dumps can raise TypeError on an
+        # unserialisable value, which left the temp file behind while the
+        # docstring promised cleanup.
         logger.error("Failed to write %s", _STATE_FILE, exc_info=True)
         if tmp is not None:
             with contextlib.suppress(OSError):

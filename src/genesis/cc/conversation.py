@@ -1112,6 +1112,18 @@ class ConversationLoop:
                     home,
                 )
                 return None
+            def _streamed_text() -> bool:
+                """True once answer text has reached the user this turn.
+
+                Load-bearing in THREE places, so it is one predicate: once the
+                user can see text, we must neither advance to another peer nor
+                fall through to contingency, because either produces a SECOND
+                answer stacked on the first. Returning "" (not None) is what
+                stops the caller running contingency — the call sites test
+                `is not None`.
+                """
+                return bool(streamed and streamed.get("text"))
+
             sticky = self._session_fallback_session(session)
             for peer_name, peer_inv in peers:
                 if streamed and streamed.get("text"):
@@ -1128,6 +1140,8 @@ class ConversationLoop:
                     # tried; it exists so a blocked standby is VISIBLE, since the
                     # roster admits a peer on credential presence alone.
                     peer_availability.note_failure(peer_name, exc)
+                    if _streamed_text():
+                        return ""  # see _streamed_text
                     continue  # this peer is also down → try the next one
                 except CCError as exc:
                     logger.warning("failover peer %s failed", peer_name, exc_info=True)
@@ -1137,29 +1151,26 @@ class ConversationLoop:
                     # but is not evidence about the peer. note_failure declines it,
                     # so one local blip can't mark the whole standby fleet down.
                     peer_availability.note_failure(peer_name, exc)
+                    if _streamed_text():
+                        return ""
                     continue
-                if output.is_error or not (output.text or "").strip():
-                    # No usable answer. The invoker returns normally in two
-                    # degenerate cases (a silent cap yields an empty non-error
-                    # output), and taking the success path on those recorded the
-                    # peer as available, entered fallback state, and handed the
-                    # user an EMPTY reply without ever trying the next peer.
-                    #
-                    # Move on — but ONLY if nothing has been streamed yet. If
-                    # this peer already streamed text, continuing would hit the
-                    # loop-top guard, break to contingency, and answer a second
-                    # time on top of the text the user can already see. In that
-                    # case keep the existing behaviour and return what we have.
-                    if not (streamed and streamed.get("text")):
-                        logger.warning(
-                            "failover peer %s returned no usable answer — trying "
-                            "the next peer", peer_name,
-                        )
-                        continue
-                else:
-                    # A genuine answer clears any stale block, so a recovered
-                    # peer stops being reported as down.
-                    peer_availability.note_success(peer_name)
+                usable = not output.is_error and bool((output.text or "").strip())
+                if not usable and not _streamed_text():
+                    # No usable answer and nothing shown to the user: the invoker
+                    # returns normally in degenerate cases (a silent cap yields an
+                    # empty non-error output). Taking the success path on those
+                    # recorded the peer available, entered fallback state, and
+                    # handed back an EMPTY reply without trying anyone else.
+                    logger.warning(
+                        "failover peer %s returned no usable answer — trying the "
+                        "next peer", peer_name,
+                    )
+                    continue
+                # Either a usable output, or text already on the user's screen —
+                # both mean this peer SERVED the turn, so both clear a stale block.
+                # Recording only the first left the surface blind in exactly the
+                # degenerate case this feature exists to make visible.
+                peer_availability.note_success(peer_name)
                 # Success on this peer. Record the account-wide flag + this session's
                 # sticky peer session (only with a real session id, else continuity
                 # can't resume). Home identity in cc_sessions stays on Claude.

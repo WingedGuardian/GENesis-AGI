@@ -413,3 +413,136 @@ def test_an_mcp_error_mentioning_funds_is_not_a_peer_refusal():
     assert PA._is_provider_refusal(
         CCMCPError("MCP server 'payments' returned error: insufficient funds")
     ) is False
+
+
+# ── review round 4 (PR #1646) — eviction redesigned, write hardened ──────────
+
+
+def test_mixed_naive_and_aware_timestamps_do_not_break_recording(tmp_path):
+    """REGRESSION LOCK: a parsed-timestamp sort raised TypeError the moment a
+    legacy NAIVE stamp met an aware one, and the failure was swallowed — every
+    later observation returned False and went unrecorded. Eviction no longer
+    parses timestamps at all, so mixed shapes are simply data."""
+    rows = {}
+    for i in range(PA._MAX_PEERS + 3):
+        stamp = "2026-01-01T00:00:00" if i % 2 else "2026-01-01T00:00:00+00:00"
+        rows[f"legacy-{i}"] = {"available": False, "observed_at": stamp}
+    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": rows}))
+
+    assert PA.note_failure("fresh", CCRateLimitError("429")) is True
+    assert PA.read_peer("fresh") is not None
+    assert len(PA.read()) <= PA._MAX_PEERS
+
+
+def test_state_file_round_trips_as_valid_json(tmp_path):
+    """Sanity check on the published file, NOT a regression lock.
+
+    Stated honestly because it was previously claimed as one: this asserts the
+    written file parses, but it would pass identically against the old bare
+    `os.write`, since a ~2KB payload never short-writes in practice. The
+    short-write fix (writing through a file object, which loops or raises) is
+    real but is not what this test proves — no cheap probe forces a partial
+    write, and a test that cannot fail against the old code is not a lock.
+    """
+    for i in range(5):
+        PA.note_failure(f"peer-{i}", CCRateLimitError("429 " + "x" * 200))
+    raw = PA._state_path().read_text()
+    parsed = json.loads(raw)  # must not raise
+    assert isinstance(parsed.get("peers"), dict)
+    assert len(parsed["peers"]) == 5
+
+
+def test_concurrent_recorders_do_not_drop_each_others_rows(tmp_path):
+    """Read-modify-write is serialized across writers. Unserialized, two
+    recorders writing DIFFERENT peers in the same instant each read the map, each
+    add a row, and the second write drops the first — losing exactly the
+    observation this module exists to preserve."""
+    import threading
+
+    names = [f"peer-{i:02d}" for i in range(12)]
+    barrier = threading.Barrier(len(names))
+
+    def _writer(name: str) -> None:
+        barrier.wait()  # maximise overlap on the read-modify-write
+        PA.note_failure(name, CCRateLimitError("429"))
+
+    threads = [threading.Thread(target=_writer, args=(n,)) for n in names]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    recorded = set(PA.read())
+    assert recorded == set(names), f"lost {set(names) - recorded}"
+
+
+# ── round-5: the three BLOCKERs from the full-diff audit ────────────────────
+
+
+def test_every_field_and_the_key_are_bounded_not_just_detail(tmp_path):
+    """BLOCKER: _MAX_TEXT bounded 1 of 7 fields, and nothing bounded the KEY.
+
+    A foreign row was re-persisted whole and handed to the snapshot untouched —
+    measured at a 300KB state file and a 100,000-char `reason` reaching an LLM
+    through the health MCP tool. The previous test passed only because it seeded
+    the one field that WAS bounded, which is how this survived a round.
+    """
+    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": {
+        "K" * 50_000: {
+            "available": False,
+            "reason": "R" * 100_000,
+            "observed_at": "O" * 100_000,
+            "detail": "D" * 100_000,
+            "reset_at": "T" * 100_000,
+            "limit_kind": "L" * 100_000,
+        },
+    }}))
+    st = next(iter(PA.read().values()))
+    for field in ("reason", "observed_at", "detail", "reset_at", "limit_kind"):
+        assert len(getattr(st, field)) <= PA._MAX_TEXT, f"{field} unbounded on read"
+    assert len(st.peer) <= PA._MAX_PEER_NAME, "peer key unbounded on read"
+
+    # ...and the bound must survive a write, not just a read.
+    PA.note_failure("fresh", CCRateLimitError("429"))
+    assert len(PA._state_path().read_text()) < 10_000
+
+
+def test_re_recording_a_peer_makes_it_newest_not_oldest(tmp_path):
+    """BLOCKER: assigning an existing dict key does NOT reorder it, so insertion
+    order decayed to FIRST-seen and eviction dropped the most recently observed
+    peer while keeping stale ones."""
+    for i in range(PA._MAX_PEERS):
+        PA.note_failure(f"old-{i:03d}", CCRateLimitError("429"))
+    PA.note_success("old-000")          # the freshest observation
+    PA.note_failure("newcomer", CCRateLimitError("429"))  # forces one eviction
+
+    peers = PA.read()
+    assert "old-000" in peers, "evicted the most recently observed peer"
+    assert "newcomer" in peers
+    assert len(peers) <= PA._MAX_PEERS
+
+
+def test_lock_acquisition_is_bounded_not_blocking(tmp_path):
+    """BLOCKER: a bare LOCK_EX stalled the asyncio event loop — measured at 1.2s
+    while another holder ran. This path is reached synchronously from an async
+    failover turn, so advisory bookkeeping could delay every concurrent
+    conversation during the very outage it exists to observe."""
+    import fcntl
+    import time
+
+    lock_path = PA._state_path().parent / PA._LOCK_FILE
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    holder = lock_path.open("a+")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+    try:
+        start = time.monotonic()
+        assert PA.note_failure("peer-x", CCRateLimitError("429")) is True
+        elapsed = time.monotonic() - start
+    finally:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        holder.close()
+
+    # Bounded by _LOCK_ATTEMPTS * _LOCK_SLEEP_S, then degrades OPEN and records.
+    budget = PA._LOCK_ATTEMPTS * PA._LOCK_SLEEP_S
+    assert elapsed < budget * 3, f"blocked {elapsed:.2f}s against a {budget:.2f}s budget"
+    assert PA.read_peer("peer-x") is not None, "degrade-open must still record"

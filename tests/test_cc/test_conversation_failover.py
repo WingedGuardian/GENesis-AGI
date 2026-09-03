@@ -448,10 +448,73 @@ async def test_empty_answer_after_streaming_does_not_double_output(loop, invoker
 
     invoker.run = AsyncMock(side_effect=_stream_then_empty)
 
-    await loop._try_roster_failover(
+    result = await loop._try_roster_failover(
         session=session, base_inv=base_inv, channel=ChannelType.TERMINAL,
         model=CCModel.SONNET, effort=EffortLevel.LOW, prompt_text="x",
         streamed=streamed,
     )
-    # Only peer-a was attempted — we did NOT advance to peer-b.
+    # Only peer-a was attempted — we did NOT advance to peer-b...
     assert invoker.run.await_count == 1
+    # ...and the RETURN VALUE is what actually prevents the second answer: the
+    # call sites test `is not None`, so "" suppresses contingency while None
+    # would let it answer again over the streamed text. Counting calls alone
+    # certified a property this test never exercised.
+    assert result == ""
+
+
+@pytest.mark.asyncio
+async def test_streamed_then_raised_does_not_let_contingency_answer_again(loop, invoker, monkeypatch):
+    """The double-output reasoning applied only to the EMPTY-output branch; the
+    exception branches still `continue`. A peer that streams text and then
+    raises hit the loop-top break, returned None, and contingency answered a
+    second time on top of the partial text the user could already see."""
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV), ("peer-b", _PEER_INV)],
+    )
+    streamed: dict = {}
+
+    async def _stream_then_raise(*a, **k):
+        streamed["text"] = "partial answer already shown to the user"
+        raise CCRateLimitError("limit")
+
+    invoker.run = AsyncMock(side_effect=_stream_then_raise)
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    result = await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x", streamed=streamed,
+    )
+    assert result == "", "None here lets contingency answer over the streamed text"
+    assert invoker.run.await_count == 1  # peer-b never attempted
+
+
+@pytest.mark.asyncio
+async def test_streamed_then_empty_still_records_the_peer_as_available(loop, invoker, monkeypatch):
+    """The surface was blind in exactly the degenerate case it was built for:
+    streamed-then-empty skipped recording entirely while still entering fallback
+    state and telling the user replies were running on that peer."""
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+    streamed: dict = {}
+
+    async def _stream_then_empty(*a, **k):
+        streamed["text"] = "partial answer already shown"
+        return _output(text="", session_id="a-1")
+
+    invoker.run = AsyncMock(side_effect=_stream_then_empty)
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x", streamed=streamed,
+    )
+    st = peer_availability.read_peer("peer-a")
+    assert st is not None, "served the turn but recorded nothing"
+    assert st.available is True
