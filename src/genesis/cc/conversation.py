@@ -60,6 +60,25 @@ def _bg_notice(output) -> str:
     return _BG_TRUNCATION_NOTICE if getattr(output, "bg_truncated", False) else ""
 
 
+def _is_oom_death(exc: BaseException) -> bool:
+    """Whether this failure was attributed to an out-of-memory reap.
+
+    Reads ``CCProcessError.oom_suspected`` — the machine-readable half of the
+    attribution — never the message prose, which is a human-facing string that will
+    be reworded. ``getattr`` rather than an isinstance check so every CCError type
+    can answer the question and none has to.
+
+    An OOM death is a THIRD kind of failure alongside the rate/quota/timeout/offline
+    family already fast-re-raised: not a stale resume. The resumed session is
+    perfectly valid and the process was reaped, so ``_recover_stale_resume`` would
+    fail a live session for the wrong reason AND immediately re-run the identical
+    memory-heavy work under the same pressure — the retry amplification the
+    attribution exists to end. Worse, a retry that happens to succeed swallows the
+    cause entirely: the user learns nothing about why the first attempt died.
+    """
+    return bool(getattr(exc, "oom_suspected", False))
+
+
 # Nudge for dispatched, delivery-addressable (Telegram) channels: route long research/bg work
 # durable direct_session lane instead of an inline Workflow, which the CC bg-wait ceiling
 # kills after ~10min with nothing left to report back (the 2026-07-20 silent-death class).
@@ -842,8 +861,8 @@ class ConversationLoop:
             # retry fresh (which would also just re-raise offline). Let the
             # caller's terminal handler deal with it.
             raise
-        except CCError:
-            if not was_resume:
+        except CCError as exc:
+            if not was_resume or _is_oom_death(exc):
                 raise
             # Resume failed — recover and retry fresh
             session = await self._recover_stale_resume(
@@ -888,8 +907,8 @@ class ConversationLoop:
             # network-offline preflight (PR-3) likewise must NOT fail the live
             # session as a stale resume — the internet is down, not the session.
             raise
-        except CCError:
-            if not was_resume:
+        except CCError as exc:
+            if not was_resume or _is_oom_death(exc):
                 raise
             session = await self._recover_stale_resume(
                 session, user_id=user_id, channel=channel,
@@ -1052,10 +1071,17 @@ class ConversationLoop:
             # network is not a stale peer resume — retrying fresh won't help and
             # must not mark the sticky peer session stale.
             raise
-        except CCError:
+        except CCError as exc:
             # Don't re-stream: nothing to recover if already fresh, and never retry
-            # once answer text has reached the user (would double-output).
-            if inv.resume_session_id is None or (streamed and streamed.get("text")):
+            # once answer text has reached the user (would double-output). An
+            # attributed OOM joins those: the peer's sticky session is fine, the
+            # local subprocess was reaped, and re-running the identical workload
+            # under the same memory pressure re-arms the failure.
+            if (
+                inv.resume_session_id is None
+                or (streamed and streamed.get("text"))
+                or _is_oom_death(exc)
+            ):
                 raise
             logger.warning(
                 "failover peer %s sticky resume failed — retrying fresh", peer_name,

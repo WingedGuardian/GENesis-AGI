@@ -16,7 +16,26 @@ class CCTimeoutError(CCError):
 
 
 class CCProcessError(CCError):
-    """CC CLI exited with non-zero status."""
+    """CC CLI exited with non-zero status.
+
+    ``oom_suspected`` is the MACHINE-READABLE half of an OOM attribution; the
+    human half is the note appended to the message, which no caller should have
+    to pattern-match to make a control-flow decision. It exists because an OOM
+    death must NOT be handled as a stale resume: the resumed session is fine, the
+    process was reaped, and re-running the identical memory-heavy work re-arms
+    the failure under the same pressure while discarding the live session for the
+    wrong reason. The flag rather than a new exception TYPE keeps the retry
+    semantics of a generic process failure everywhere that does not opt in —
+    only the stale-resume recovery in conversation.py keys off it, exactly as it
+    keys off ``CCNetworkOfflineError``.
+
+    See ``genesis.observability.oom`` for how the attribution is derived and for
+    the (deliberately narrow) conditions under which it is claimed at all.
+    """
+
+    def __init__(self, message: str = "", *, oom_suspected: bool = False):
+        super().__init__(message)
+        self.oom_suspected = oom_suspected
 
 
 class CCParsingError(CCError):

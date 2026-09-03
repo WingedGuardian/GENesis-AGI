@@ -2292,3 +2292,185 @@ async def test_streaming_escalates_when_leader_exits_but_group_survives(
     import signal as _signal
 
     assert (99992, _signal.SIGKILL) in calls
+
+
+# ── The STREAMING path: the one a human is waiting on ──
+#
+# run_streaming is what foreground conversations and DirectSessionRunner take. Its
+# no-result branch builds a CCOutput with the default is_error=False regardless of
+# proc.returncode, so a subprocess reaped mid-stream was handed back as an ordinary
+# (empty) answer and DirectSessionRunner persisted `success=not output.is_error` as
+# True. Attribution has to reach this path too, or killed work is recorded as done.
+
+
+class _RecordingProbe:
+    """Stands in for OomProbe: the WIRING is what these tests are about.
+
+    Whether the counter itself attributes correctly is settled hermetically in
+    test_observability/test_oom_attribution.py against a constructed cgroup tree.
+    What cannot be settled there is whether the streaming path SAMPLES at all, and
+    what it tells the probe about the exit — in particular whether a SIGKILL we sent
+    ourselves is declared as such, since our own group-kill produces the identical
+    -9 an OOM reap does.
+    """
+
+    def __init__(self, note: str | None):
+        self._note = note
+        self.calls: list[dict] = []
+
+    def describe(self, returncode, *, self_killed=False, score_adjusted=False):
+        self.calls.append(
+            {
+                "returncode": returncode,
+                "self_killed": self_killed,
+                "score_adjusted": score_adjusted,
+            }
+        )
+        return self._note
+
+    @classmethod
+    def install(cls, monkeypatch, note):
+        probe = cls(note)
+        monkeypatch.setattr(
+            "genesis.cc.invoker.OomProbe.sample",
+            classmethod(lambda _cls, *a, **kw: probe),
+        )
+        return probe
+
+
+def _reaped_stream_proc(returncode=-9):
+    """A stream that ends WITHOUT a result event, on a process that died by SIGKILL."""
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "par"}]}},
+    )
+    proc = AsyncMock()
+    proc.stdout = _make_async_stdout(data)
+    proc.stdin = _make_mock_stdin()
+    proc.stderr = _make_mock_stderr()
+    proc.wait = AsyncMock()
+    proc.terminate = MagicMock()
+    proc.kill = MagicMock()
+    proc.returncode = returncode
+    # pid deliberately left a MagicMock: process_group_alive/kill_process_group both
+    # refuse a non-int pid, so no real signal is ever aimed at a live pid.
+    return proc
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_reaped_without_a_result_raises_instead_of_reporting_success(
+    invoker, monkeypatch
+):
+    """THE regression for the streaming half. Before this, an OOM-reaped streaming
+    session returned a CCOutput with is_error=False and DirectSession stored it as
+    success=True — killed work recorded as finished work, with no cause anywhere."""
+    probe = _RecordingProbe.install(monkeypatch, "probable cause: out-of-memory reap")
+    mock_proc = _reaped_stream_proc()
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(CCProcessError) as caught,
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="hello"))
+
+    assert "out-of-memory" in str(caught.value)
+    assert caught.value.oom_suspected is True, (
+        "callers branch on the flag, never on the message prose"
+    )
+    assert probe.calls == [
+        {"returncode": -9, "self_killed": False, "score_adjusted": False}
+    ], "the exit must be reported to the probe verbatim, with no kill of our own"
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_without_an_attribution_still_returns_collected_text(
+    invoker, monkeypatch
+):
+    """The control, and the deliberate limit of this change. A nonzero exit ALONE is
+    ambiguous — the process may have crashed after streaming a usable answer — so the
+    existing return-what-we-collected behaviour is untouched when the counter did not
+    attribute. Only a positive attribution turns the return into a raise."""
+    probe = _RecordingProbe.install(monkeypatch, None)
+    mock_proc = _reaped_stream_proc()
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="hello"))
+
+    assert output.text == "par"
+    assert output.is_error is False
+    assert probe.calls, "the probe must still be consulted"
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_declares_our_own_group_kill_as_self_killed(
+    invoker, monkeypatch
+):
+    """Our escalation SIGKILL sets returncode to -9 — indistinguishable from a reap by
+    exit code alone. If the streaming path did not declare it, a self-inflicted kill
+    that merely coincided with someone else's reap in the same cgroup would be
+    reported as a probable OOM: a plausible wrong cause replacing a known true one."""
+    probe = _RecordingProbe.install(monkeypatch, None)
+    mock_proc = _reaped_stream_proc(returncode=None)
+
+    # Leader still unreaped after the first bounded wait → the escalation branch runs
+    # its own group-kill; the second wait sees it dead.
+    waits = {"n": 0}
+
+    async def _wait():
+        waits["n"] += 1
+        if waits["n"] >= 2:
+            mock_proc.returncode = -9
+
+    mock_proc.wait = _wait
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        await invoker.run_streaming(CCInvocation(prompt="hello"))
+
+    assert waits["n"] >= 2, "the escalation path did not run — test proves nothing"
+    assert probe.calls[-1]["self_killed"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_reports_an_unwritable_oom_score_as_unadjusted(
+    invoker, monkeypatch
+):
+    """The +500 preference is cited as the reason THIS process was the likely victim.
+    On a host where the procfs write is denied it was never established, so the
+    caller must pass the observed result rather than the intent."""
+    probe = _RecordingProbe.install(monkeypatch, None)
+    monkeypatch.setattr("genesis.cc.invoker.set_oom_score_adj", lambda *a, **kw: True)
+    with patch("asyncio.create_subprocess_exec", return_value=_reaped_stream_proc()):
+        await invoker.run_streaming(CCInvocation(prompt="hello"))
+    assert probe.calls[-1]["score_adjusted"] is True
+
+    probe = _RecordingProbe.install(monkeypatch, None)
+    monkeypatch.setattr("genesis.cc.invoker.set_oom_score_adj", lambda *a, **kw: False)
+    with patch("asyncio.create_subprocess_exec", return_value=_reaped_stream_proc()):
+        await invoker.run_streaming(CCInvocation(prompt="hello"))
+    assert probe.calls[-1]["score_adjusted"] is False
+
+
+def test_set_oom_score_adj_reports_whether_the_write_landed(monkeypatch, tmp_path):
+    """It returns a fact, not a hope: the annotation's victim premise is built on it."""
+    from genesis.cc import invoker as invoker_mod
+
+    written = tmp_path / "oom_score_adj"
+    monkeypatch.setattr(invoker_mod, "Path", lambda _p: written)
+    assert invoker_mod.set_oom_score_adj(1234, 500) is True
+    assert written.read_text() == "500"
+
+    class _Denied:
+        def write_text(self, _s):
+            raise PermissionError("read-only procfs")
+
+    monkeypatch.setattr(invoker_mod, "Path", lambda _p: _Denied())
+    assert invoker_mod.set_oom_score_adj(1234, 500) is False
+
+
+def test_classify_error_marks_an_oom_death_machine_readably(invoker):
+    """The message is prose for a human; the flag is what control flow reads.
+    conversation.py keys its stale-resume opt-out off this — pattern-matching the
+    message would silently break the moment the wording changed."""
+    err = invoker._classify_error("", "", oom_note="probable cause: out-of-memory reap")
+    assert err.oom_suspected is True
+    assert invoker._classify_error("boom").oom_suspected is False

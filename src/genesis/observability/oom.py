@@ -26,7 +26,11 @@ specifically, and both are recorded rather than assumed:
 * ``cc.invoker.set_oom_score_adj`` deliberately sets ``oom_score_adj=+500`` on CC
   subprocesses so the kernel prefers them over genesis-server and qdrant. The
   dispatched work is the INTENDED victim, so when a reap occurs in its cgroup while
-  it dies by SIGKILL, it is very likely the one that was chosen.
+  it dies by SIGKILL, it is very likely the one that was chosen. That write can
+  FAIL (denied procfs, read-only, or the process exited first), so it is not assumed
+  either: ``set_oom_score_adj`` returns whether it landed and the caller passes that
+  through as :meth:`OomProbe.describe`'s ``score_adjusted``, which omits the
+  preference sentence when the preference was never established.
 * A SIGKILL that Genesis itself sent (a timeout, a reaper) is distinguishable by the
   caller, which knows it sent one — see :meth:`OomProbe.describe` and its ``self_killed``
   argument. Attribution is skipped in that case rather than guessed at.
@@ -173,7 +177,13 @@ class OomProbe:
             return None
         return None
 
-    def describe(self, returncode: int | None, *, self_killed: bool = False) -> str | None:
+    def describe(
+        self,
+        returncode: int | None,
+        *,
+        self_killed: bool = False,
+        score_adjusted: bool = False,
+    ) -> str | None:
         """A cause annotation for an abnormal exit, or None to stay silent.
 
         Returns None — deliberately, and in every ambiguous case — unless all of:
@@ -186,6 +196,16 @@ class OomProbe:
         * the counter is readable AND increased. An unreadable counter is "unknown",
           which this reports as nothing rather than as absence.
 
+        ``score_adjusted`` is the caller's OBSERVED result of writing
+        ``oom_score_adj`` for this process (``cc.invoker.set_oom_score_adj`` returns
+        it), not an assumption that the write landed. The "the kernel prefers this
+        process" sentence strengthens the inference, so it is printed only when that
+        preference was actually established: on a host where procfs denied the write,
+        is read-only, or the process exited first, the sentence would present an
+        unverified premise as evidence — overstating what the counter and the SIGKILL
+        together prove. The default is False so a caller that does not know stays
+        silent about it rather than claiming it.
+
         Silence is the right default because this annotation exists to be trusted:
         a cause line that is sometimes invented is worse than a bare kill, which at
         least does not mislead.
@@ -195,10 +215,15 @@ class OomProbe:
         delta = self.kills_since()
         if not delta:
             return None
+        victim = (
+            " Dispatched work carries oom_score_adj=+500 so the kernel prefers it "
+            "over the server, which makes it the likely victim."
+            if score_adjusted
+            else ""
+        )
         return (
             f"probable cause: out-of-memory reap — the kernel OOM-killed {delta} "
             f"process(es) in {self.cgroup} while this ran, and this process died by "
-            "SIGKILL. Dispatched work carries oom_score_adj=+500 so the kernel "
-            "prefers it over the server, which makes it the likely victim. Reduce "
-            "the working set, or run fewer sessions concurrently."
+            f"SIGKILL.{victim} Reduce the working set, or run fewer sessions "
+            "concurrently."
         )

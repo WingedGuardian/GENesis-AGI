@@ -14,7 +14,12 @@ import pytest
 
 from genesis.cc import fallback_state, roster
 from genesis.cc.conversation import ConversationLoop
-from genesis.cc.exceptions import CCError, CCNetworkOfflineError, CCRateLimitError
+from genesis.cc.exceptions import (
+    CCError,
+    CCNetworkOfflineError,
+    CCProcessError,
+    CCRateLimitError,
+)
 from genesis.cc.invoker import CCInvoker
 from genesis.cc.system_prompt import SystemPromptAssembler
 from genesis.cc.types import (
@@ -285,3 +290,82 @@ async def test_run_failover_peer_offline_propagates_without_fresh_retry(loop, in
             on_event=None,
         )
     assert invoker.run.call_count == 1  # no fresh retry
+
+
+# ── An attributed OOM death is NOT a stale resume ──
+#
+# The reap kills the local subprocess; the CC session it was resuming is untouched.
+# Treating it as a stale resume does two wrong things at once: it fails a live
+# session for a cause that had nothing to do with it, and it immediately re-runs the
+# identical memory-heavy workload under the same pressure. If that retry happens to
+# succeed, the OOM fact is swallowed entirely and the user never learns why the first
+# attempt died — the exact retry amplification the attribution exists to end.
+
+
+def _oom_error(msg: str = "killed with no output — probable cause: out-of-memory reap"):
+    return CCProcessError(msg, oom_suspected=True)
+
+
+@pytest.mark.asyncio
+async def test_oom_death_on_resume_does_not_enter_stale_resume_recovery(loop, invoker):
+    invoker.run = AsyncMock(side_effect=_oom_error())
+    loop._recover_stale_resume = AsyncMock()
+    inv = CCInvocation(prompt="x", resume_session_id="cc-live")
+    with pytest.raises(CCProcessError) as caught:
+        await loop._try_invoke(
+            inv, session={"id": "cc-live"}, was_resume=True, prompt_text="x",
+            model=CCModel.SONNET, effort=EffortLevel.MEDIUM,
+            user_id="u1", channel=ChannelType.TERMINAL, thread_id=None,
+        )
+    loop._recover_stale_resume.assert_not_awaited()
+    assert invoker.run.await_count == 1, "the identical workload must not be re-armed"
+    assert "out-of-memory" in str(caught.value), "the cause must survive to the caller"
+
+
+@pytest.mark.asyncio
+async def test_oom_death_on_streaming_resume_does_not_enter_stale_resume_recovery(
+    loop, invoker
+):
+    invoker.run_streaming = AsyncMock(side_effect=_oom_error())
+    loop._recover_stale_resume = AsyncMock()
+    inv = CCInvocation(prompt="x", resume_session_id="cc-live")
+    with pytest.raises(CCProcessError):
+        await loop._try_invoke_streaming(
+            inv, session={"id": "cc-live"}, was_resume=True, prompt_text="x",
+            model=CCModel.SONNET, effort=EffortLevel.MEDIUM,
+            user_id="u1", channel=ChannelType.TERMINAL, thread_id=None, on_event=None,
+        )
+    loop._recover_stale_resume.assert_not_awaited()
+    assert invoker.run_streaming.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_oom_death_on_failover_peer_propagates_without_fresh_retry(loop, invoker):
+    # The third member of the retry class: a sticky PEER resume. Same reasoning —
+    # the peer's session is fine, our subprocess was reaped.
+    invoker.run = AsyncMock(side_effect=_oom_error())
+    with pytest.raises(CCProcessError):
+        await loop._run_failover_peer(
+            "glm-5.2", _PEER_INV,
+            sticky={"roster_model": "glm-5.2", "cc_session_id": "glm-prev"},
+            on_event=None,
+        )
+    assert invoker.run.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unattributed_process_error_still_recovers_a_stale_resume(loop, invoker):
+    """The control. Only an ATTRIBUTED OOM opts out — an ordinary CCProcessError on a
+    resume must still go through stale-resume recovery, or this change would have
+    silently disabled the recovery path it was meant to leave alone."""
+    invoker.run = AsyncMock(side_effect=[CCProcessError("plain crash"), _output()])
+    loop._recover_stale_resume = AsyncMock(return_value={"id": "cc-fresh"})
+    inv = CCInvocation(prompt="x", resume_session_id="cc-live")
+    out, _sess = await loop._try_invoke(
+        inv, session={"id": "cc-live"}, was_resume=True, prompt_text="x",
+        model=CCModel.SONNET, effort=EffortLevel.MEDIUM,
+        user_id="u1", channel=ChannelType.TERMINAL, thread_id=None,
+    )
+    loop._recover_stale_resume.assert_awaited_once()
+    assert invoker.run.await_count == 2
+    assert out.text == "reply"

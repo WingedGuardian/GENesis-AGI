@@ -162,3 +162,40 @@ def test_the_note_names_the_cgroup_it_watched(fake_cgroup):
     assert note is not None
     assert "user-1000.slice" in note
     assert "probable cause" in note, "must not claim certainty it cannot have"
+
+
+def test_the_victim_premise_is_printed_only_when_it_was_established(fake_cgroup):
+    """The note cites oom_score_adj=+500 as the reason THIS process was the likely
+    victim. That write can fail — denied procfs, a read-only mount, a process that
+    exited first — and `set_oom_score_adj` swallows the OSError. Asserting the
+    preference anyway would present an unverified premise as evidence, overstating
+    what a counter delta and a SIGKILL actually prove between them.
+    """
+    root, _ = fake_cgroup
+    probe = oom.OomProbe.sample()
+    _tree(root, "user.slice/user-1000.slice", 8)
+
+    established = probe.describe(-signal.SIGKILL, score_adjusted=True)
+    assert established is not None
+    assert "oom_score_adj=+500" in established
+    assert "likely victim" in established
+
+    unestablished = probe.describe(-signal.SIGKILL, score_adjusted=False)
+    assert unestablished is not None, "the reap itself is still worth reporting"
+    assert "oom_score_adj" not in unestablished
+    assert "likely victim" not in unestablished
+    # What the counter and the signal DO prove stays, either way.
+    for note in (established, unestablished):
+        assert "probable cause" in note
+        assert "1 process(es)" in note
+        assert "Reduce the working set" in note
+
+
+def test_the_victim_premise_defaults_to_unclaimed(fake_cgroup):
+    """A caller that does not know whether the write landed must not have the claim
+    made on its behalf — the default is silence about it, not assertion of it."""
+    root, _ = fake_cgroup
+    probe = oom.OomProbe.sample()
+    _tree(root, "user.slice/user-1000.slice", 8)
+    note = probe.describe(-signal.SIGKILL)
+    assert note is not None and "oom_score_adj" not in note
