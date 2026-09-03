@@ -23,86 +23,132 @@ owner: Genesis-repo work → a **GitHub issue**; user-owned work → `follow_up_
 consciously not pursuing → `follow_up_create` with `work_state="deferred_cold"`.
 
 
+
 ## Where Deferred Work Goes — mechanics
 
 `CLAUDE.md` carries the routing principle (Genesis-repo work → a GitHub issue;
 user-owned + purely-local operational work → a follow-up; consciously-not-doing →
-`tabled`). This section is the operational detail behind it.
+`tabled`) and its two hard limits (explicit approval every time; never publish a
+security defect before it is fixed). This section is the operational detail.
+
+### Who may file at all
+
+Only a session on an install whose operator **owns the tracker** — i.e. `origin` IS
+the public repo and the operator has push access. Check before filing:
+
+```bash
+gh repo view --json nameWithOwner --jq .nameWithOwner
+```
+
+If that is not the shared tracker, DO NOT file. `gh` resolves the target from the git
+remote, and the documented install is a fork clone, so an issue would land in the
+operator's own fork where nobody can pick it up — silently, with no error. Note also
+that GitHub silently DROPS labels supplied by a user without push access, so a
+non-owner cannot satisfy the label rule below even if the target were right.
+
+On a non-owning install, Genesis-repo work stays a local `follow_up_create` row until
+a maintainer carries it across. That is a known gap, not a workaround.
+
+### Approval — every time
+
+A public post is irreversible; `contributor_issue.py` classifies it exactly that way
+(`action_class="irreversible"`, owner approval, never auto-approved). CLAUDE.md's
+standing rule already covers it: irreversible actions need explicit approval first.
+
+**Human presence is not approval.** Channel-driven sessions run with
+`skip_permissions=True` (`src/genesis/cc/conversation.py`), so no tool confirmation
+appears — the session must ASK, in words, and get a yes, for each issue. A prior
+"go ahead" does not carry to the next one.
 
 ### Filing the issue
 
 ```bash
-gh issue create --repo <owner>/<public-repo> \
+# 1. preflight — do not create a duplicate
+gh issue list --search "<distinctive phrase> in:title" --state all --limit 10
+
+# 2. file, non-interactively
+gh issue create \
+  --title "<title>" --body-file <path> \
   --label area:<domain> --label <difficulty-or-environment>
 ```
 
-**Always pass `--repo`.** `gh` resolves the target from the git remote, and the
-documented install is a fork clone (`.claude/docs/your-genesis.md`) — so on most
-installs a bare `gh issue create` files to the user's PRIVATE fork, where nobody can
-pick it up, silently and with no error. The target is `github.user` + `github.public_repo` in
-`~/.genesis/config/genesis.yaml` (resolvers: `genesis.env.github_user()` /
-`github_public_repo()` — the latter returns the bare name, without the owner).
+`--title` and `--body`/`--body-file` are REQUIRED, not optional: `gh` prompts for a
+missing body, and Genesis runs the CLI with piped stdin, so the prompt can never be
+answered — the command hangs or fails and neither an issue nor a local row results.
+
+The preflight matters because the hand path has no dedup. The gated path checks open
+titles and fails closed; nothing protects a direct `gh issue create`, and two sessions
+finding the same defect (or one retrying after losing the first command's output)
+otherwise produce duplicates — against the one-record-per-item rule.
 
 **Both label classes are mandatory**, matching the policy the propose path enforces
 fail-closed (`src/genesis/mcp/health/contributor_issue.py`): an `area:*` domain label
-AND a difficulty/environment label (`good first issue`, `first-timers-only`,
-`help wanted`, `needs-genesis-instance`). The hand path has no validator, so this is on you — an
-unlabelled issue silently breaks an invariant the codebase enforces elsewhere.
+AND one of `good first issue`, `first-timers-only`, `help wanted`,
+`needs-genesis-instance`.
 
-**Privacy-scan the body first.** Technical detail only: no IPs, hostnames, absolute
+**Privacy-scan the TITLE and the BODY, and the labels.** All three egress; the gated
+path scans all three for exactly that reason, and a title is the easiest place to leak
+a hostname, a path, or a metric. Technical detail only — no IPs, hostnames, absolute
 home paths, identifiers, or raw install metrics (row counts and spend leak usage
-scale — state proportions or shapes instead). Nothing gates this path — `gh issue
+scale; state proportions or shapes instead). Nothing gates this path — `gh issue
 create` appears nowhere in `scripts/hooks/git_push_guard.py`, which gates push /
-`gh pr merge` / `gh pr create` — so a public post here is irreversible and unguarded,
-and must be a conscious, human-present act.
+`gh pr merge` / `gh pr create` — so the scan is manual and there is no backstop.
+
+### Security defects never go public first
+
+An unpatched authentication bypass, credential exposure, injection path, or anything
+otherwise exploitable is NOT filed on the public tracker while it is unfixed —
+publishing it hands a working lead to anyone reading, against installs that are
+running the vulnerable code right now. Keep it local, fix it, then file (or file a
+post-fix note). The privacy scan does not catch this: it looks for install-specific
+data, not for dangerous technical disclosure.
 
 ### Why not `contributor_issue_propose`
 
-That MCP tool is the *gated* door: fail-closed prose sanitizer, owner approval hold,
-label validation, dedup and rate backpressure, and a `source_follow_up_id` close-loop
-link. It is the better path when it applies — but it ships `propose_only` by default,
-where an approved hold still dry-runs and never posts, and a `dry_run` mark is
-terminal (flipping the lever to `live` later does NOT retro-post). So it cannot serve
-"file this now". Use it for curated contributor-facing work; use the hand path above
-for engineering issues you need on the tracker today.
+That MCP tool is the *gated* door: fail-closed sanitizer over title/body/labels, owner
+approval hold, label validation, dedup and rate backpressure, and a
+`source_follow_up_id` close-loop link. It is the better path when it applies — but it
+ships `propose_only` by default, where an approved hold still dry-runs and never
+posts, and a `dry_run` mark is terminal (flipping the lever to `live` later does NOT
+retro-post). So it cannot serve "file this now".
 
 ### Dispatched / background sessions
 
-A dispatched session must NOT file issues — no gate covers the path and no human is
-present. (`steward` gets `gh`-restricted Bash, so for that profile this is a policy
-line, not a locked door.) It records locally instead, but check the profile first
-(`.claude/docs/background-sessions.md`): **naming a route a session cannot take is
-worse than naming none.**
-
-Check your OWN denylist rather than trusting a list here — profiles change. Three
-tiers exist today:
+A dispatched session must NOT file issues — nothing gates the path and there is no one
+to approve. (`steward` gets `gh`-restricted Bash, so for that profile this is a policy
+line, not a locked door.) It records locally instead — but check the profile first:
+**naming a route a session cannot take is worse than naming none.** Check your OWN
+denylist rather than trusting a list here; three tiers exist today:
 
 - HAS `follow_up_create` (`interact`, `research`, `campaign`, `steward`; and
-  `sentinel` when NOT degraded — `_DEGRADED_DISALLOWED_TOOLS` denies no MCP tools)
-  → file there, and say in `reason` that it is repo work awaiting a foreground
-  session. Note the row is FORCED onto the cold `tabled` lane by sacred-board
-  authorization whatever `work_state` you pass, and tabled rows are excluded from
-  every default listing — retrieve with `follow_up_list(include_tabled=True)`.
-- HAS `observation_write` but NOT `follow_up_create` (reflection sessions, whose
-  denylist derives as `live registry − read-allowlist − observation_write`) → use
+  `sentinel` when NOT degraded) → file there, and say in `reason` that it is repo work
+  awaiting a foreground session. The row is FORCED onto the cold `tabled` lane by
+  sacred-board authorization whatever `work_state` you pass, and tabled rows are
+  excluded from every default listing — retrieve with
+  `follow_up_list(include_tabled=True)`.
+- HAS `observation_write` but NOT `follow_up_create` (reflection sessions) → use
   `observation_write` or the parsed `observations` output field.
-- Has NEITHER (`observe`, `community-responder`, `mail` — all carry
-  `_NO_MEMORY_WRITES` + no follow-ups; and sentinel-DEGRADED, which mounts no MCP at
-  all) → there is no local record to write. Return it in the session's output text
-  and let the dispatching foreground session file it.
+- Has NEITHER (`observe`, `community-responder`, `mail`; and sentinel-DEGRADED, which
+  mounts no MCP at all) → there is no local record to write. Return it in the
+  session's output text and let the dispatching foreground session file it.
 
-There is no automated promoter from a `tabled` row to an issue today. A foreground
-session has to carry it across.
+There is no automated promoter from a `tabled` row to an issue today.
 
-### The time-gated exception
+### The time-gated case
 
-A GitHub issue has no revisit mechanism — the trigger machinery (`blocked_on_trigger`,
-`revisit_condition`, `scheduled_at`, the 5-minute dispatcher) is ledger-only. So repo
-work that is ALSO gated on a time or event keeps **both**: the issue, plus a local
-`blocked_on_trigger` row carrying the trigger. That row REQUIRES a `revisit_condition`
-(the tool hard-errors without one) and cannot use `strategy="surplus_task"`.
+A GitHub issue has no revisit mechanism. Repo work ALSO gated on a time or event keeps
+a local `blocked_on_trigger` row carrying the trigger, which REQUIRES a
+`revisit_condition` (the tool hard-errors without one) and cannot use
+`strategy="surplus_task"`.
 
-This is the one case where two records for one item is correct. Otherwise: one record.
+Be clear about what that row does: `revisit_condition` is **stored and displayed, not
+evaluated**. The dispatcher dispatches due `scheduled_task` rows and immediate
+`surplus_task` rows; nothing watches for your event and nothing transitions the row
+when it happens. It is a passive reminder that surfaces in listings — for a TIME
+trigger use `strategy="scheduled_task"` with `scheduled_at`, which the dispatcher does
+act on.
+
+This is the one case where two records for one item is correct.
 
 ### Closing the loop
 

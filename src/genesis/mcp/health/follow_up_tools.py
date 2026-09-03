@@ -495,11 +495,15 @@ async def follow_up_create(
 
     FIRST — is this the right home? Genesis-repo work (code, tests, docs, infra —
     anything that would live in the public repo, even when hit locally) belongs on
-    the PUBLIC TRACKER as a GitHub issue, not here. This ledger is for USER-OWNED
-    work (a deliverable, an errand, something asked for and unfinished) and for
-    operational state purely LOCAL to this box; something a fresh clone would hit
-    too is a repo gap, so an issue. Something you are consciously NOT pursuing is
-    `deferred_cold` (tabled) — never an issue, because we don't want it picked up.
+    the PUBLIC TRACKER as a GitHub issue, not here — but ONLY from an install that
+    owns the tracker, and only with the user's explicit approval each time (a public
+    post is irreversible). A security defect is never filed publicly before it is
+    fixed. Where those do not hold, it stays HERE until a maintainer carries it over.
+
+    This ledger is otherwise for USER-OWNED work (a deliverable, an errand, something
+    asked for and unfinished) and operational state purely LOCAL to this box.
+    Something you are consciously NOT pursuing is `deferred_cold` (tabled) — never an
+    issue, because we don't want it picked up.
 
     A DISPATCHED session records here rather than filing publicly — but the row is
     FORCED onto the COLD `tabled` lane by sacred-board authorization, whatever
@@ -507,9 +511,7 @@ async def follow_up_create(
     Say in `reason` that it is repo work awaiting a foreground session, and expect
     to need `follow_up_list(include_tabled=True)` to find it again.
 
-    Mechanics (the exact `gh` command and its mandatory labels, the fork-install
-    trap, the time-gated exception): `.claude/docs/mcp-tools-guide.md`,
-    section "Where Deferred Work Goes".
+    Mechanics: `.claude/docs/mcp-tools-guide.md`, "Where Deferred Work Goes".
 
     Declare the item's WORK_STATE — the tool DERIVES the lane from it, so priority
     never decides the lane. Two lists:

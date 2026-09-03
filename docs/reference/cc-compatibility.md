@@ -644,7 +644,7 @@ When a new CC version is released, run through this:
    **Detection → behavior:** for each new skill/command/flag Genesis would
    plausibly WANT (overlaps an existing workflow, replaces a hand-rolled
    mechanism, covers a known gap), do not stop at the informational KB note —
-   file a GitHub ISSUE (`gh issue create --repo <owner>/<public-repo>`) naming
+   file a GitHub ISSUE (mechanics: `.claude/docs/mcp-tools-guide.md`) naming
    the SPECIFIC instruction change that would make Genesis actually reach for
    it (which skill/CLAUDE.md line to edit, and any precedence decision vs
    existing skills) — that edit is repo work, so it belongs on the public

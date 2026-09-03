@@ -401,7 +401,7 @@ existing Genesis workflow, replaces a hand-rolled mechanism, or covers a known
 gap), do BOTH:
 
 1. File the informational KB entry as usual (no alert — calibration unchanged).
-2. File a GitHub ISSUE (`gh issue create --repo <owner>/<public-repo>`) naming
+2. File a GitHub ISSUE (see the mechanics in `.claude/docs/mcp-tools-guide.md`) naming
    the SPECIFIC instruction change — editing a skill or CLAUDE.md is repo work,
    so it belongs on the public tracker. Because it is ALSO time-gated on the
    pin, keep a local `blocked_on_trigger` row alongside it, with a

@@ -474,10 +474,14 @@ When a user shares a file path or URL in conversation:
   far-off direction) → **tabled** (`work_state="deferred_cold"`) — a private record,
   never dispatched, surfaced, or filed as an issue, because we don't want it picked
   up. `work_state` DERIVES the lane, so priority never picks it. ONE record per item.
-  Mechanics — the exact `gh` command and its mandatory labels, what a DISPATCHED
-  session does instead, and the time-gated exception — are in
-  `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work Goes"). Read it before
-  filing your first; a bare `gh issue create` files to the wrong repo on most installs.
+  Two hard limits on the issue route, both non-negotiable: a public post is
+  IRREVERSIBLE, so it needs the user's **explicit approval every time** (no standing
+  approval carries forward, and a channel-driven session has no confirmation step of
+  its own); and a **security** defect — an unpatched bypass, a credential exposure,
+  anything exploitable — is NEVER filed publicly before it is fixed, no matter who
+  owns it. Everything else — who may file, the command, labels, dispatched sessions,
+  the time-gated case — is in `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work
+  Goes"). Read it before filing your first.
 - **No laziness.** Find root causes. No temporary fixes. No shortcuts.
   Don't EVER mute the symptom — fix the problem.
 - **Read before writing.** Never modify code you haven't fully read.
