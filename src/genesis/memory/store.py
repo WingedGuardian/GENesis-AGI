@@ -16,6 +16,7 @@ from genesis.memory._locks import memory_id_lock
 from genesis.memory.classification import classify_memory
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.linker import MemoryLinker
+from genesis.memory.taxonomy import WINGS
 from genesis.memory.taxonomy import classify as classify_taxonomy
 from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.events import GenesisEventBus
@@ -232,6 +233,37 @@ class MemoryStore:
         # fans out to the FTS5 tag, the Qdrant payload, and memory_metadata.
         wing = _strip_kv_prefix(wing, "wing")
         room = _strip_kv_prefix(room, "room")
+
+        # An explicit wing outside the controlled vocabulary is DROPPED, not
+        # stored. Until now this branch only tested falsiness, so any string
+        # sailed through into the FTS5 `wing:` tag, the Qdrant payload and
+        # memory_metadata.wing — and classify_life_domain() silently returns
+        # "personal" for an unknown wing, so one bad value corrupted the life
+        # domain too. essential_knowledge.py filters junk wings on READ; that
+        # hid the problem instead of preventing it.
+        #
+        # COERCE rather than raise. NB the two sibling controlled-vocabulary
+        # fields in this same function RAISE — life_domain just above, and
+        # origin_class via derive_origin_class(). The divergence is deliberate:
+        # those two are effectively never passed by live callers (life_domain is
+        # DERIVED from wing; almost nothing sets it explicitly), whereas `wing`
+        # genuinely arrives from model output on live paths (dream_cycle), where
+        # raising would abort a whole synthesis run over one bad token. Falling
+        # back to auto-classification yields a VALID wing instead of a poisoned
+        # one. The agent-facing MCP tools raise instead — a caller that can be
+        # told the valid set should be. `room` is deliberately NOT enforced:
+        # measured, 18% of live rows have a room outside ROOMS[wing] and the
+        # shipped ego prompts instruct room="ego", so enforcing it symmetrically
+        # would coerce a fifth of writes and break the ego. It is descriptive,
+        # has no read-side filter, and gets no FTS tag — unlike wing, whose bad
+        # value also corrupts the derived life_domain.
+        if wing and wing not in WINGS:
+            logger.warning(
+                "Ignoring unknown wing %r (not in the controlled vocabulary); "
+                "falling back to auto-classification. Valid wings: %s",
+                wing, sorted(WINGS),
+            )
+            wing = None
 
         # Taxonomy classification — auto-classify if not explicitly provided
         if not wing or not room:
