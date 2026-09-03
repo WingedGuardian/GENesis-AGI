@@ -130,10 +130,21 @@ docs/reference/backup-history-migration.md
 # inherits public-by-default, so an allowed dir doubles as a scratch pad and
 # `git add -A` publishes it. MEASURED 2026-09-02: 8 such files had accumulated
 # under docs/decisions/ (none ever pushed — caught first), while 0 of 92
-# tracked docs files carry a date prefix. So this excludes nothing currently
+# tracked docs files carry a year prefix. So this excludes nothing currently
 # public and no legitimate naming convention.
+#
+# The prefix is a YEAR, not a full date, because that is what the rule above
+# actually is — an earlier draft required YYYY-MM-DD- and so did NOT generalise
+# it: docs/decisions/2026-private-strategy.md stayed publishable while the
+# identically-named file under reference/ was ignored (Codex P1, #1611).
+# Written 20[0-9][0-9] rather than [0-9][0-9][0-9][0-9] to avoid colliding with
+# sequentially-numbered ADRs — docs/decisions/ uses 001-…007- today, but a
+# 4-digit ADR scheme would otherwise be silently swallowed.
+# No extension suffix, deliberately: the fail-safe direction for a PRIVACY rule
+# is to ignore too much (visible, recoverable with `git add -f`) rather than too
+# little (a silent leak). A dated .svg or .txt is a working artifact too.
 # A genuinely-public dated doc is still possible with an explicit `git add -f`.
-docs/**/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*
+docs/**/20[0-9][0-9]-*
 
 # Career-ops interop (private — lives at ~/.genesis/interop/)
 config/interop_system_prompt.md
