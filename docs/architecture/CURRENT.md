@@ -232,7 +232,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 061bad39 2026-09-02
+verified: 4d8bf173 2026-09-02
 ```
 
 - **The interactive slot door SELF-HEALS a session that lost its claude.**
@@ -259,7 +259,15 @@ verified: 061bad39 2026-09-02
   still only ever earns an attempt: immediately before any keystroke the door
   re-reads the pane list FRESH (the OAuth gate allows up to 30s between
   decision and action) and requires BOTH a shell foreground name and a
-  childless pane process (`slot_liveness --idle`) — an idle prompt has no
+  childless pane process (`slot_liveness --idle`). **Gate ORDER is load-bearing
+  and deliberate**: the idleness probe runs LAST, immediately before the first
+  keystroke, because it answers the DESTRUCTIVE question (the first key is a
+  `C-c`, which kills a running foreground job) and so its verdict must be the
+  freshest taken; the liveness re-check runs before it, and a claude that
+  starts in between is caught by idleness as a child of the pane shell. Manual
+  mode's printed slot map annotates a session running no claude and says
+  plainly that `tmux attach` will not relaunch it — manual allocation never
+  takes over an existing session, so only that slot's own door heals it — an idle prompt has no
   children, while `bash script.sh`, an editor, or rsync all do, and
   `send-keys C-c` would kill them. The pane command is built ONCE (`_PANE_CMD`)
   and shared by the create and heal paths, so a healed slot cannot drift into a

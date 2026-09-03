@@ -21,7 +21,9 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   Claude Code is actually running in the slot and relaunches it in place when it
   is not, telling you it did so. If it cannot tell, it attaches exactly as before
   — it will never type into a session that is in use, nor over a job the slot's
-  shell is running.
+  shell is running. The slot list printed by a manual connection now also marks
+  a slot that is running no Claude Code, and says that reattaching to it will
+  not relaunch it: only that slot's own door does.
 - **Launching Claude Code by hand inside a slot no longer produces a degraded
   session.** The `claude` shell wrapper only did its work outside tmux, so running
   `claude` from a slot's prompt skipped the permission mode, the temp directories

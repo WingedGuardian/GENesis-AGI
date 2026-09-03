@@ -45,6 +45,50 @@ fi
 
 MODE_ARG="$1"
 shift
+# Verdict for a slot: ALIVE | POISONED | UNKNOWN (empty on any failure). ONE
+# definition, and every consumer shares it so they can never drift into
+# disagreeing: the manual-mode slot map, the heal decision, the RE-CHECK, and
+# the `--idle` safe-to-type question that is the LAST gate before typing —
+# the re-check is deliberately no longer the final one. Defined
+# here — above the manual-mode map that is its first caller — because bash
+# resolves a function only once its definition has RUN; GENESIS_ROOT is set
+# just above. An unavailable probe prints nothing, and every caller treats
+# that as "no verdict".
+_probe_liveness() {
+    local out=""
+    [ -x "${GENESIS_ROOT}/.venv/bin/python" ] || { printf '%s' ""; return 0; }
+    out=$(timeout 15 "${GENESIS_ROOT}/.venv/bin/python" \
+        -m genesis.cc.slot_liveness "$@" 2>/dev/null | sed -n '1p' || true)
+    printf '%s' "$out"
+}
+
+# The slot map's variant. Same verdict, MUCH shorter leash: the map is
+# cosmetic and runs once per listed slot in the interactive login path, so a
+# hung interpreter would stall the door by 15s PER SLOT (MEASURED: 45s across
+# three slots, and this install carries seven). The heal path keeps the long
+# budget because there the verdict decides whether to touch a live pane; here
+# it only decides whether to print a note.
+_MAP_PROBE_BUDGET=3
+_MAP_PROBE_GAVE_UP=0
+_map_verdict() {
+    local out="" rc=0
+    [ -x "${GENESIS_ROOT}/.venv/bin/python" ] || { printf '%s' ""; return 0; }
+    # ONE timeout for the whole map, not one per slot. A hung interpreter hangs
+    # identically for every slot, so paying the budget N times buys nothing and
+    # costs N x budget on an interactive login (MEASURED healthy: 146ms a slot,
+    # 8 slots on this install; MEASURED hung, before this: 5 slots x 3s).
+    # The timeout is REPORTED to the caller rather than recorded here: this
+    # function's output is read through `$(...)`, which is a SUBSHELL, so a
+    # variable set in here never reaches the loop — the first attempt did
+    # exactly that and measured no better than per-slot.
+    [ "$_MAP_PROBE_GAVE_UP" = "1" ] && { printf '%s' ""; return 0; }
+    out=$(timeout "$_MAP_PROBE_BUDGET" "${GENESIS_ROOT}/.venv/bin/python" \
+        -m genesis.cc.slot_liveness "$@" 2>/dev/null | sed -n '1p') || rc=$?
+    # 124 is timeout(1)'s "deadline expired".
+    [ "$rc" = "124" ] && { printf '%s' "TIMEOUT"; return 0; }
+    printf '%s' "$out"
+}
+
 # Extra claude args exist only in manual mode (SSH RemoteCommand passes %n only).
 CLAUDE_EXTRA_ARGS=("$@")
 
@@ -61,7 +105,34 @@ if [[ "$MODE_ARG" == "manual" ]]; then
         while IFS='|' read -r name attached activity; do
             state="detached"
             [[ "$attached" -ge 1 ]] && state="attached"
-            echo "  ${name}  ${state}  (last activity: ${activity})" >&2
+            # Say when a slot is alive but running NO claude. Manual allocation
+            # deliberately never takes over an existing session, and only the
+            # hostname door heals its own slot — so without this the map lists a
+            # stuck slot as though it were healthy, and the `tmux attach` hint
+            # above sends the operator straight back to the bare prompt without
+            # ever passing the door that would relaunch it. One probe per listed
+            # slot; anything other than an explicit POISONED prints nothing, so
+            # an unavailable probe never renders as a verdict.
+            note=""
+            # `|| true` is load-bearing, not defensive noise: the script runs
+            # under `set -euo pipefail`, so a `var=$(cmd | filter)` whose FIRST
+            # component fails takes the whole door down with no message —
+            # pipefail promotes the failure past `tr`, and `set -e` exits. A
+            # listed session going away before it is inspected is ordinary (the
+            # tmux server shuts down the moment the last slot's claude exits),
+            # and `tmux list-panes` on a missing session exits 1. On the manual
+            # door — the dashboard terminal and manual SSH — that would drop the
+            # operator at a bare prompt with no claude and no error. Every
+            # sibling line of this shape in this file carries the same guard.
+            _map_pids=$(tmux list-panes -s -t "=${name}" -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ' || true)
+            _map_v=""
+            [ -n "$_map_pids" ] && _map_v=$(_map_verdict $_map_pids)
+            # Set in the LOOP's shell, not inside the substitution above.
+            [ "$_map_v" = "TIMEOUT" ] && _MAP_PROBE_GAVE_UP=1
+            if [[ "$_map_v" == "POISONED" ]]; then
+                note="  (no claude running — 'tmux attach' will NOT relaunch it; re-enter through this slot's door)"
+            fi
+            echo "  ${name}  ${state}  (last activity: ${activity})${note}" >&2
         done <<<"$slot_map"
     fi
     SLOT=1
@@ -346,17 +417,6 @@ _cap_fail_open() {
 existing=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
            | grep -cE "^${SESSION_PREFIX}-[0-9]+$" || true)
 
-# Verdict for a slot: ALIVE | POISONED | UNKNOWN (empty on any failure). One
-# definition, two call sites — the decision below and the RE-CHECK immediately
-# before typing — so they can never drift into disagreeing.
-_probe_liveness() {
-    local out=""
-    [ -x "${GENESIS_ROOT}/.venv/bin/python" ] || { printf '%s' ""; return 0; }
-    out=$(timeout 15 "${GENESIS_ROOT}/.venv/bin/python" \
-        -m genesis.cc.slot_liveness "$@" 2>/dev/null | sed -n '1p' || true)
-    printf '%s' "$out"
-}
-
 # Reattaching to existing session — always allow ('=' = exact-name match)
 _SESSION_EXISTS=0
 _HEAL=0
@@ -566,6 +626,17 @@ _PANE_ENV=(
     "GENESIS_SLOT=${SLOT}"
     "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}"
     "CLAUDE_CODE_TMPDIR=${CLAUDE_CODE_TMPDIR}"
+    # TMPDIR must be passed EXPLICITLY, and on BOTH paths. The obvious story —
+    # "create inherits it from this process" — is FALSE, and measurement says
+    # so: `tmux new-session` runs the pane from the tmux SERVER's environment,
+    # not the invoking client's, so a server started with a different TMPDIR
+    # wins (MEASURED: pane got the server's value without `-e`, the door's with
+    # it). So the create path never reliably inherited it either, and any slot
+    # created after a server someone else started got the ambient value —
+    # plausibly /tmp, which this repo treats as a small tmpfs to stay off. A
+    # heal into an already-running shell cannot inherit it at all. Same reason
+    # CLAUDE_CODE_TMPDIR has always been in this list.
+    "TMPDIR=${TMPDIR}"
     "LANG=${LANG:-}"
 )
 _PANE_ENV_FLAGS=()
@@ -650,20 +721,7 @@ if [ "$_HEAL" = "1" ]; then
 fi
 
 if [ "$_HEAL" = "1" ]; then
-    _idle=$(_probe_liveness --idle "$_fresh_pid")
-    if [ "$_idle" != "IDLE" ]; then
-        if [ "$_idle" = "BUSY" ]; then
-            echo "cc-slot: ${SESSION_NAME} has no claude, but its shell is mid-job — attaching without touching it." >&2
-        else
-            echo "cc-slot: ${SESSION_NAME} has no claude, but its idleness could not be established — attaching without touching it." >&2
-        fi
-        _HEAL=0
-    fi
-fi
-
-if [ "$_HEAL" = "1" ]; then
-    # RE-CHECK liveness, immediately before the keystrokes, against the FRESH
-    # pane pids. Typing into a live Claude Code TUI is the one failure this
+    # RE-CHECK liveness against the FRESH pane pids. Typing into a live Claude Code TUI is the one failure this
     # whole change must never cause, so the verdict is confirmed HERE, and
     # anything other than a still-POISONED answer stands down. (This also
     # closes the released-lock race: a second door serialized behind the flock
@@ -675,6 +733,25 @@ if [ "$_HEAL" = "1" ]; then
     _recheck=$(_probe_liveness $_pane_pids_now)
     if [ "$_recheck" != "POISONED" ]; then
         echo "cc-slot: ${SESSION_NAME} came alive while preparing — attaching instead." >&2
+        _HEAL=0
+    fi
+fi
+
+if [ "$_HEAL" = "1" ]; then
+    # IDLENESS IS THE LAST GATE, and that position is the whole point: it is
+    # the DESTRUCTIVE question ("may I type here", and the first keystroke is a
+    # C-c that kills a running foreground job), so its answer must be the
+    # freshest one taken. Asked before the liveness re-probe it went stale by
+    # that probe's whole timeout (up to 15s) — long enough for the operator to
+    # start a build in the pane and have it interrupted. Same stale-verdict
+    # defect as reading the pane snapshot, one gate further in.
+    _idle=$(_probe_liveness --idle "$_fresh_pid")
+    if [ "$_idle" != "IDLE" ]; then
+        if [ "$_idle" = "BUSY" ]; then
+            echo "cc-slot: ${SESSION_NAME} has no claude, but its shell is mid-job — attaching without touching it." >&2
+        else
+            echo "cc-slot: ${SESSION_NAME} has no claude, but its idleness could not be established — attaching without touching it." >&2
+        fi
         _HEAL=0
     fi
 fi

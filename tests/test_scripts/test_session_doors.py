@@ -44,6 +44,12 @@ if [[ "$args" == *has-session* ]]; then
     [[ -f "$FAKE_TMUX_SESSIONS" ]] && grep -qxF "$name" "$FAKE_TMUX_SESSIONS" && exit 0
     exit 1
 fi
+if [[ "$args" == *list-panes* && -n "${FAKE_TMUX_LIST_PANES_FAIL:-}" ]]; then
+    # A real tmux exits 1 for a session that has gone away. The fake used to
+    # exit 0 unconditionally here, which made the door's failure path
+    # structurally untestable — a green suite that proved nothing about it.
+    exit 1
+fi
 if [[ "$args" == *list-panes* ]]; then
     # 'pane_id pane_pid pane_current_command' rows, one per pane. Absent file
     # -> no output, which exercises the probe's "cannot enumerate" path.
@@ -103,6 +109,10 @@ def door(tmp_path):
     fake_py = venv_bin / "python"
     fake_py.write_text(
         "#!/usr/bin/env bash\n"
+        # Ordered call log: which probe ran, in which order. The ORDER is the
+        # invariant under test — the verdict that gates a destructive action
+        # must be the freshest one taken.
+        'if [[ "$*" == *slot_liveness* ]]; then echo "$([[ "$*" == *--idle* ]] && echo idle || echo liveness)" >> "$FAKE_PROBE_LOG"; fi\n'
         'if [[ "$*" == *slot_liveness* && "$*" == *--idle* ]]; then\n'
         # The idleness probe is a separate question with its own fake answer.
         # Default IDLE so heal tests exercise the keystroke path; "EMPTY"
@@ -143,15 +153,18 @@ def door(tmp_path):
             "FAKE_LIVENESS": os.environ.get("_TEST_FAKE_LIVENESS", ""),
             "FAKE_LIVENESS_N": str(tmp_path / "liveness_calls.txt"),
             "FAKE_IDLE": os.environ.get("_TEST_FAKE_IDLE", ""),
+            "FAKE_PROBE_LOG": str(tmp_path / "probe_order.txt"),
             "FAKE_TMUX_PANES_N": str(tmp_path / "panes_calls.txt"),
             "FAKE_TMUX_PANES2": os.environ.get("_TEST_FAKE_PANES2", ""),
             "FAKE_TMUX_SENDKEYS_FAIL": os.environ.get("_TEST_FAKE_SENDKEYS_FAIL", ""),
+            "FAKE_TMUX_LIST_PANES_FAIL": os.environ.get("_TEST_FAKE_LIST_PANES_FAIL", ""),
             "FAKE_TMUX_FDS": str(tmp_path / "tmux_fds.txt"),
         }
         # Per-invocation call counters: two run() calls in one test must not
         # leak sequence positions (FAKE_LIVENESS / FAKE_TMUX_PANES2) into
         # each other.
         (tmp_path / "liveness_calls.txt").unlink(missing_ok=True)
+        (tmp_path / "probe_order.txt").unlink(missing_ok=True)
         (tmp_path / "panes_calls.txt").unlink(missing_ok=True)
         # Deliberately NOT inheriting os.environ: the test itself may run
         # inside a cc slot, whose GENESIS_CC_PERMISSION_MODE / TMUX would
@@ -164,6 +177,7 @@ def door(tmp_path):
             timeout=30,
         )
 
+    run.probe_log = tmp_path / "probe_order.txt"
     run.fds_file = tmp_path / "tmux_fds.txt"
     run.panes2 = tmp_path / "panes2.txt"
     return run, log, sessions, listing, panes
@@ -197,6 +211,90 @@ class TestManualMode:
         assert "cc-1  attached" in result.stderr
         assert "cc-2  detached" in result.stderr
         assert "tmux attach" in result.stderr
+
+    def test_slot_map_marks_a_session_with_no_claude(self, door):
+        """The printed map is the door's only honest surface for a slot the
+        door itself will not heal.
+
+        Manual allocation deliberately never grabs an existing session (it
+        might be someone's on purpose), so only the hostname door heals its own
+        slot. That makes the map the place to SAY a slot has no claude — and to
+        point at the door rather than at `tmux attach`, which reattaches to the
+        bare prompt and heals nothing.
+        """
+        run, _log, sessions, listing, panes = door
+        sessions.write_text("cc-1\n")
+        listing.write_text("cc-1|0|Thu Jul 16 20:00:00 2026\n")
+        panes.write_text("%0 4242 bash\n")
+        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED"
+        try:
+            proc = run("manual")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert proc.returncode == 0, proc.stderr
+        assert "no claude" in proc.stderr, (
+            f"a claude-less slot was listed as if it were healthy:\n{proc.stderr}"
+        )
+
+    def test_slot_map_leaves_a_live_slot_unannotated(self, door):
+        run, _log, sessions, listing, panes = door
+        sessions.write_text("cc-1\n")
+        listing.write_text("cc-1|1|Thu Jul 16 20:00:00 2026\n")
+        panes.write_text("%0 4242 bash\n")
+        os.environ["_TEST_FAKE_LIVENESS"] = "ALIVE"
+        try:
+            proc = run("manual")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert "cc-1  attached" in proc.stderr, proc.stderr
+        assert "no claude" not in proc.stderr, (
+            f"a live slot was wrongly annotated:\n{proc.stderr}"
+        )
+
+    def test_slot_map_is_silent_when_the_probe_cannot_run(self, door):
+        """No verdict must never render as a verdict — and the map must not
+        pay for a probe it cannot make."""
+        run, _log, sessions, listing, panes = door
+        sessions.write_text("cc-1\n")
+        listing.write_text("cc-1|0|Thu Jul 16 20:00:00 2026\n")
+        panes.write_text("%0 4242 bash\n")
+        os.environ["_TEST_FAKE_LIVENESS"] = ""
+        try:
+            proc = run("manual")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIVENESS", None)
+        assert proc.returncode == 0, proc.stderr
+        assert "cc-1" in proc.stderr
+        assert "no claude" not in proc.stderr, (
+            f"an absent verdict was rendered as one:\n{proc.stderr}"
+        )
+
+    def test_the_door_survives_a_session_dying_during_the_slot_map(self, door):
+        """A session can vanish between listing it and inspecting it — which is
+        exactly what happens when the last slot's claude exits and the tmux
+        server shuts down.
+
+        The script runs under `set -euo pipefail`, so `var=$(tmux ... | tr ...)`
+        aborts the WHOLE door when tmux exits non-zero: `pipefail` promotes the
+        failure past the succeeding filter and `set -e` kills the script with no
+        message. On the manual door — the dashboard web terminal and manual SSH
+        — that drops the operator at a bare prompt with no claude and no error.
+        """
+        run, log, sessions, listing, panes = door
+        sessions.write_text("cc-1\n")
+        listing.write_text("cc-1|0|Thu Jul 16 20:00:00 2026\n")
+        panes.write_text("%0 4242 bash\n")
+        os.environ["_TEST_FAKE_LIST_PANES_FAIL"] = "1"
+        try:
+            proc = run("manual")
+        finally:
+            os.environ.pop("_TEST_FAKE_LIST_PANES_FAIL", None)
+        assert proc.returncode == 0, (
+            f"the door died when a listed session went away:\n{proc.stderr}"
+        )
+        assert "new-session" in log.read_text(), (
+            f"the door never reached the launch:\n{proc.stderr}"
+        )
 
     def test_has_session_probes_use_exact_name_match(self, door):
         run, log, sessions, _listing, _panes = door
@@ -493,6 +591,42 @@ class TestSlotHeal:
         _proc, log = self._run_with(door, "POISONED", panes_text=f"%0 4242 {shell}\n")
         assert "send-keys" in log, f"refused to heal an idle {shell} pane:\n{log}"
 
+    def test_idleness_is_the_LAST_verdict_before_any_keystroke(self, door):
+        """Whichever probe runs last is the only one whose answer is still
+        fresh when the keys land.
+
+        `send-keys C-c` kills a running foreground job, so "is it safe to type
+        here" is the destructive question and must be asked last. The liveness
+        re-probe is allowed a 15s timeout, so asking idleness BEFORE it leaves
+        a 15s window in which the operator can start a job that then gets
+        interrupted — the same stale-verdict defect as the pane snapshot, one
+        gate further in.
+        """
+        run, _log, _sessions, _listing, _panes = door
+        _proc, log = self._run_with(door, "POISONED")
+        assert "send-keys" in log, "heal did not run; ordering unexercised"
+        order = run.probe_log.read_text().split()
+        assert order, "probe shim recorded nothing — harness regression"
+        assert order[-1] == "idle", (
+            f"a liveness probe runs after the idleness verdict: {order}"
+        )
+        assert "liveness" in order, f"liveness never re-probed: {order}"
+
+    def test_a_stood_down_heal_still_probed_in_the_right_order(self, door):
+        """Ordering must not depend on the happy path."""
+        run, _log, _sessions, _listing, _panes = door
+        _proc, log = self._run_with(door, "POISONED", idle="BUSY")
+        assert "send-keys" not in log
+        order = run.probe_log.read_text().split()
+        # The SHAPE, not just the last element: under the old order a BUSY
+        # verdict stands the heal down before the liveness re-check ever runs,
+        # so ["liveness", "idle"] also ends in "idle" and the assertion could
+        # not fail on the mechanism it names.
+        assert order == ["liveness", "liveness", "idle"], (
+            f"the stand-down path did not re-probe liveness before asking "
+            f"idleness: {order}"
+        )
+
     def test_fish_pane_is_spared_not_relaunched(self, door):
         # The typed payload (`export K=V;`, `__ec=$?`) is POSIX and a parse
         # error in fish — a broken relaunch is worse than a plain attach.
@@ -593,7 +727,7 @@ class TestSlotHeal:
         assert literal, f"no literal payload sent:\n{log}"
         payload = literal[0]
         for var in ("GENESIS_SLOT=4", "GENESIS_CC_PERMISSION_MODE=",
-                    "CLAUDE_CODE_TMPDIR=", "LANG="):
+                    "CLAUDE_CODE_TMPDIR=", "TMPDIR=", "LANG="):
             assert f"export {var}" in payload, (
                 f"healed pane not given {var!r}:\n{payload}"
             )
@@ -605,7 +739,7 @@ class TestSlotHeal:
         assert result.returncode == 0, result.stderr
         line = _new_session_line(log)
         for var in ("GENESIS_SLOT=1", "GENESIS_CC_PERMISSION_MODE=",
-                    "CLAUDE_CODE_TMPDIR=", "LANG="):
+                    "CLAUDE_CODE_TMPDIR=", "TMPDIR=", "LANG="):
             assert f"-e {var}" in line, line
 
     def test_heal_lock_fd_is_not_inherited_by_the_tmux_client(self, door):
