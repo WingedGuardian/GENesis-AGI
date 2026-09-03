@@ -221,6 +221,30 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Guards no longer refuse a command for *mentioning* a risky operation.** Four
+  checks matched raw command text, so the phrase inside a quoted grep pattern, a
+  heredoc body, a docstring or a commit message read as the operation itself. That
+  is not just friction: a blocked command is discarded *whole*, so a false match on
+  the last step silently threw away the file writes in the earlier ones while the
+  error mentioned only the rule that fired. The worktree-removal check now keys on
+  the parsed command — the executable, its subcommand and its real arguments; the
+  three shell checks are anchored so the operation must sit at command position
+  with its flags as real arguments, rather than appearing anywhere in the text.
+  Measured against real session commands: the runtime-wrapper check's block rate
+  fell 42% (12→7 blocks in 6,000 commands), and the editable-install check no
+  longer fires on `--extra-index-url`, whose `-e` matched *inside* the longer flag.
+- **A worktree removal hidden behind a global git flag is now caught.** The
+  removal check required `git` to be followed immediately by the subcommand, so
+  `git -C <path> worktree remove <target>` slipped past it entirely — six real
+  instances among 48,363 commands. Fixing the false positives closed this false
+  *negative* at the same time, which is why that guard now blocks slightly more
+  commands than before, not fewer.
+- **The global Bash safety hook is now syntax-checked by the test suite.** It is
+  loaded for every session on the machine, and a shell syntax error there exits 2
+  — which Claude Code reads as "block" — so a typo would have refused every
+  subsequent command, including the one needed to repair it. Nothing checked for
+  that before.
+
 - **YouTube transcripts are less likely to come back quietly incomplete.** When
   Genesis fetches a video transcript it now asks for both English caption tracks and
   prefers the original ASR (`en-orig`) over the `en` variant. Observed once: the two

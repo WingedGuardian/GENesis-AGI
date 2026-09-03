@@ -555,3 +555,146 @@ class TestGenesisDedup:
     def test_broad_rm_still_blocks_in_genesis(self):
         r = _run("rm -rf /", cwd=self._GENESIS_CWD)
         assert r.returncode == 2
+# --- pip editable arm + force-removal arm: anchored predicates (2026-09-03) ---
+#
+# Both arms matched raw command text, so the phrase inside a grep pattern, a
+# heredoc body, a docstring or a commit message read as the operation. A block
+# discards the WHOLE Bash call, so a false match on the last step silently threw
+# away the file writes in the earlier ones while the error named only the rule
+# that fired. Reproduced four times on 2026-09-03, twice while editing this file.
+#
+# EVERY allow-case below carries a worktree marker ON PURPOSE. Without one, the
+# old predicate's second condition ("is a worktree named, or is cwd a worktree?")
+# is false anyway, the decision is never reached, and the case passes against the
+# OLD hook too — i.e. it pins nothing. A first version of these tests had exactly
+# that defect: 12 of 14 passed unchanged against the pre-fix hook. Each allow-case
+# here was verified to return rc=2 from origin/main's hook and rc=0 from this one,
+# EXCEPT the one explicitly labelled forward-looking below, which returns rc=0 from
+# BOTH and says so in its own docstring.
+#
+# Built from a fragment so this file's own text cannot trip the live hook when a
+# future session greps or edits it — the same defect, one level up.
+_E = "-e"
+_WT = "/srv/genesis/.claude/worktrees/somebranch"
+
+
+class TestPipEditableArm:
+    """Both directions. A benign-block rate of zero reads identically for a
+    correct guard and an inert one, so every allow-case is paired with a block
+    case that must still fire."""
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            f"pip install {_E} {_WT}",
+            f"pip install --editable {_WT}",
+            f"pip install {_E}{_WT}",
+            f"python -m pip install {_E} {_WT}",
+            f"python3.12 -m pip install {_E} {_WT}",
+            f"cd /tmp && pip install {_E} {_WT}",
+            f"VIRTUAL_ENV=/x pip install {_E} {_WT}",
+            f"pip install --editable={_WT}",
+        ],
+    )
+    def test_real_editable_install_to_a_worktree_still_blocks(self, cmd):
+        """TRUE-POSITIVE CONTROL — the reason the arm exists."""
+        r = _run(cmd)
+        assert r.returncode == 2, r.stdout + r.stderr
+        assert "PYTHONPATH" in r.stderr
+
+    def test_flag_must_belong_to_the_pip_command(self):
+        """The decoupling defect: two independent whole-command greps let an
+        unrelated `-e` (here, grep's) satisfy the editable half while an
+        unrelated path satisfied the worktree half — a block with no editable
+        install anywhere in the command."""
+        r = _run(f"pip install ruff && ls {_WT} && grep {_E} foo /dev/null")
+        assert r.returncode == 0, r.stderr
+
+    def test_long_flag_containing_dash_e_is_not_an_editable_install(self):
+        """`--extra-index-url` contains `-e`; the old unanchored alternative
+        matched inside it."""
+        r = _run(f"pip install requests --extra-index-url https://example.invalid/s && ls {_WT}")
+        assert r.returncode == 0, r.stderr
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            f"grep -rn 'pip install {_E}' {_WT}",
+            f"echo 'never pip install {_E} from a worktree' >> {_WT}/notes.md",
+            f"git commit -m 'docs: explain pip install {_E} risk in {_WT}'",
+        ],
+    )
+    def test_mention_only_is_not_an_install(self, cmd):
+        r = _run(cmd)
+        assert r.returncode == 0, r.stderr
+
+    def test_heredoc_body_mentioning_it_is_not_an_install(self):
+        """The exact shape that cost a file write on 2026-09-03: a heredoc whose
+        BODY quotes the phrase. The block discarded the whole call, the write
+        included, and reported only the pip rule."""
+        r = _run(
+            f"cat > {_WT}/probe_doc.py <<'PYEOF'\n"
+            f'"""Use PYTHONPATH, never pip install {_E} from a worktree."""\n'
+            "PYEOF"
+        )
+        assert r.returncode == 0, r.stderr
+
+    def test_pip_subcommand_other_than_install_is_ignored(self):
+        """Forward-looking only: this does NOT discriminate old from new (the old
+        predicate required `pip install` too, so it allowed this as well). Kept as
+        a pin against a future widening to any pip subcommand, and labelled so it
+        is not mistaken for a regression test."""
+        r = _run(f"pip download {_E} {_WT}")
+        assert r.returncode == 0, r.stderr
+
+
+class TestWorktreeForceRemovalArm:
+    """The same class, six lines below the pip arm — fixed together, because
+    fixing only the arm that was reported is fixing the list, not the class."""
+
+    def test_force_removal_still_blocks(self):
+        r = _run("git worktree remove --force /tmp/wt")
+        assert r.returncode == 2, r.stdout + r.stderr
+
+    def test_short_force_flag_still_blocks(self):
+        r = _run("git worktree remove -f /tmp/wt")
+        assert r.returncode == 2, r.stdout + r.stderr
+
+    def test_global_flag_before_the_subcommand_still_blocks(self):
+        """TRUE-POSITIVE CONTROL, not a regression pin. MEASURED old=BLOCK /
+        new=BLOCK: this hook's old predicate never required `git` at all, so a
+        global flag was never a hole HERE. (It was one in worktree_cwd_guard,
+        whose own test at test_worktree_guard.py is the genuine pin — measured
+        old=ALLOW / new=BLOCK.) The `-C` operand is inert; the verdict is
+        identical with any path."""
+        r = _run("git -C /srv/genesis worktree remove --force /tmp/wt")
+        assert r.returncode == 2, r.stdout + r.stderr
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "grep -rn 'worktree remove --force' /dev/null",
+            'echo "worktree remove --force is blocked"',
+            "git worktree remove /tmp/wt && rm -f /tmp/x",
+        ],
+    )
+    def test_mention_or_unrelated_force_flag_is_allowed(self, cmd):
+        """The last case is the segment-scoping one: an `rm -f` in a LATER
+        segment is not a force flag on the removal."""
+        r = _run(cmd)
+        assert r.returncode == 0, r.stderr
+
+
+class TestHookIsSyntacticallyValid:
+    """A syntax error in THIS file blocks every Bash command on the machine.
+
+    bash exits 2 on a syntax error, and Claude Code reads a PreToolUse exit 2 as
+    BLOCK — so a typo here is a self-inflicted lockout that also blocks the
+    command needed to undo it. The hook is wired at USER level, so it is not
+    scoped to one project. CI had no shell syntax gate when this was added
+    (verified 2026-09-03); this is that gate.
+    """
+
+    def test_bash_n_parses_the_hook(self):
+        r = subprocess.run(["bash", "-n", str(HOOK)], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr

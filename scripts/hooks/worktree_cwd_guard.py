@@ -39,26 +39,70 @@ import sys
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import read_payload, run_guard, tool_input  # noqa: E402
+from shell_parse import analyze, git_subcommand, untokenizable  # noqa: E402
 
-# Matches 'git worktree remove' with optional flags
+# Kept ONLY for the untokenizable fallback below and as a cheap pre-gate — never
+# as the verdict. As the verdict it was quote-blind: it matched the phrase inside
+# a quoted grep pattern, a heredoc body or a commit message, and target
+# extraction then read the following word as a path, so a read-only search was
+# refused with "use the lifecycle manager". MEASURED over 48,363 real commands:
+# 150 blocked, of which 146 were genuine removals and 4 were mentions. (An
+# earlier draft said 147/3. The extra "genuine" one was a commit message whose
+# markdown backticks the parser reads as command substitution — a reminder that
+# the classifier used to produce these numbers has its own blind spot.)
 _WORKTREE_REMOVE = re.compile(r"\bgit\s+worktree\s+remove\b")
+_SUBCOMMAND = "worktree"
+_OPERATION = "remove"
+
+
+def _legacy_targets(cmd: str) -> list[str]:
+    """The pre-parser extractor, kept ONLY for the untokenizable fallback.
+
+    Quote-blind — it matches the phrase anywhere and reads the following word as
+    a path — which is exactly why it is not the primary route any more. But when
+    shlex cannot tokenize the command there is nothing better available, and this
+    guard's operation can strand a session, so the coarse reading is the correct
+    fail-closed behaviour there rather than a silent allow.
+    """
+    targets: list[str] = []
+    for match in _WORKTREE_REMOVE.finditer(cmd):
+        for token in cmd[match.end() :].split():
+            token = token.strip("'\"")
+            if not token or token.startswith("-"):
+                continue
+            targets.append(token)
+            break
+    return targets
 
 
 def _extract_worktree_targets(cmd: str) -> list[str]:
-    """Extract target paths from git worktree remove commands."""
+    """Target paths of every EXECUTED worktree-removal segment.
+
+    Keyed on parsed structure, not on the phrase appearing in the text: the
+    segment's resolved executable must be ``git``, its subcommand ``worktree``,
+    and the next positional ``remove``. Operands come from ``seg.argv``, which is
+    already shlex-dequoted — the old ``rest.split()`` + ``strip("'\\"")`` mangled
+    any quoted path containing a space.
+
+    ``analyze`` flattens nested ``bash -c`` bodies, so a wrapped removal is still
+    seen; depth is deliberately NOT filtered, because a removal inside
+    ``bash -c`` really does execute.
+    """
     targets: list[str] = []
-    for match in _WORKTREE_REMOVE.finditer(cmd):
-        rest = cmd[match.end() :]
-        # Skip flags, grab paths
-        for token in rest.split():
-            token = token.strip("'\"")
-            if not token:
-                continue
+    for seg in analyze(cmd):
+        if seg.exe != "git" or git_subcommand(seg.argv) != _SUBCOMMAND:
+            continue
+        try:
+            after_sub = seg.argv[seg.argv.index(_SUBCOMMAND) + 1 :]
+        except ValueError:  # pragma: no cover — git_subcommand already found it
+            continue
+        if not after_sub or after_sub[0] != _OPERATION:
+            continue
+        for token in after_sub[1:]:
             if token.startswith("-"):
-                continue  # skip flags like --force
-            # This looks like a path
+                continue  # a flag such as --force
             targets.append(token)
-            break  # git worktree remove takes one path
+            break  # the removal takes one path
     return targets
 
 
@@ -148,14 +192,36 @@ def _handle_bash(data: dict) -> int:
     if not cmd:
         return 0
 
-    if not _WORKTREE_REMOVE.search(cmd):
+    # Cheap pre-gate: cost only. Correctness rests on the parser below, never on
+    # this substring.
+    if _SUBCOMMAND not in cmd:
         return 0
+
+    # A command shlex cannot tokenize gets the PREVIOUS, coarser reading rather
+    # than a silent allow. analyze() degrades to a naive split without SAYING so,
+    # so "no removal segment found" and "no removal present" are indistinguishable
+    # in its output; untokenizable() is the only way to tell them apart, and this
+    # guard covers an operation that can strand a session, so the unreadable case
+    # keeps failing CLOSED.
+    #
+    # The fallback has to use the LEGACY extractor, not the parser: a first cut
+    # gated on the regex here and then called the parser anyway, which returned []
+    # on precisely the input the parser could not read, so the loop never ran and
+    # the command was allowed — a branch whose comment claimed fail-closed while
+    # the code fell open. `echo 'it's fine' ; git worktree remove /wt/X` is the
+    # shape (an unbalanced quote collapses everything into one echo segment).
+    if untokenizable(cmd):
+        targets = _legacy_targets(cmd)
+        if not targets:
+            return 0
+    else:
+        targets = _extract_worktree_targets(cmd)
+        if not targets:
+            return 0
 
     # Get the current working directory
     cwd = os.getcwd()
     cwd_real = os.path.realpath(cwd)
-
-    targets = _extract_worktree_targets(cmd)
     for target in targets:
         target_real = _resolve_path(target)
 

@@ -80,7 +80,25 @@ fi
 
 # pip install -e from/to worktree — catches both explicit worktree paths AND
 # "pip install -e ." run from inside a worktree directory.
-if echo "$CMD" | grep -qE "pip install.*(-e|--editable)"; then
+#
+# The installer must sit at COMMAND POSITION (start, or after a ;/&/| separator,
+# optionally behind env assignments or `python -m`) and the editable flag must be
+# a real argv token. The previous predicate was `pip install.*(-e|--editable)`
+# over the whole command, which had two defects: the phrase matched wherever it
+# appeared — a heredoc body, a docstring, a grep pattern, a commit message — and
+# the unanchored `-e` alternative matched INSIDE an unrelated long flag, so
+# `pip install requests --extra-index-url …` tripped it. Same anchoring idiom as
+# the git-push arm below ("^git push|[;&|] *git push").
+# ONE regex, not two: the flag has to belong to the SAME command. A first cut
+# used two independent whole-command greps, which meant
+# `pip install ruff && ls .../worktrees && grep -e foo` blocked — the `-e` came
+# from grep and the worktree marker from the ls path, with no editable install
+# anywhere. That is the exact false-positive class this arm was being fixed for,
+# reintroduced inside the fix. `[^;&|]*` keeps the flag inside the pip segment,
+# and the trailing class accepts `-e.`, `--editable=x` and `-e <path>` while
+# rejecting the `-e` embedded in a longer flag like --extra-index-url.
+_PIP_EDITABLE_INSTALL="(^|[;&|])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*([^[:space:];&|]*python[0-9.]*[[:space:]]+-m[[:space:]]+)?pip[0-9.]*[[:space:]]+install[^;&|]*[[:space:]](-e|--editable)([^A-Za-z0-9_-]|$)"
+if echo "$CMD" | grep -qE "$_PIP_EDITABLE_INSTALL"; then
     _block=0
     # Check 1: explicit worktree path in command
     echo "$CMD" | grep -qiE "worktree" && _block=1
@@ -120,7 +138,14 @@ if echo "$CMD" | grep -qE "genesis[[:space:]]+serve"; then
 fi
 
 # git worktree remove --force / -f
-if echo "$CMD" | grep -qE "worktree remove.*(--force|-f )"; then
+#
+# Anchored for the same reason as the pip arm above, and found the same way: the
+# previous `worktree remove.*(--force|-f )` matched the phrase anywhere, so a
+# read-only `grep -rn 'worktree remove --force' scripts/` was refused. It sits six
+# lines from an arm that was already fixed, which is what fixing the named
+# instance instead of the class looks like.
+_WT_FORCE_REMOVE="(^|[;&|])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git[[:space:]]+([^;&|]*[[:space:]])?worktree[[:space:]]+remove[^;&|]*[[:space:]](--force|-f)([^A-Za-z0-9_-]|$)"
+if echo "$CMD" | grep -qE "$_WT_FORCE_REMOVE"; then
     echo "BLOCKED: git worktree remove --force destroys uncommitted work in the worktree." >&2
     echo "Use git worktree remove without --force, or ask the user first." >&2
     exit 2
