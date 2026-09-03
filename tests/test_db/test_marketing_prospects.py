@@ -154,3 +154,26 @@ async def test_mark_contacted_by_email_matches_mixed_case_seeded_row(db):
     await db.commit()
     assert await mp.mark_contacted_by_email(db, "mixed@example.com", contacted_at=_TS) is True
     assert (await mp.get_by_id(db, "mc"))["status"] == "contacted"
+
+
+@pytest.mark.asyncio
+async def test_mark_contacted_by_email_is_atomic_no_read_then_write(db, monkeypatch):
+    """The stamp is a single conditional UPDATE (`WHERE ... AND status = 'active'`),
+    NOT a read-then-write — so a concurrent active→replied flip between a lookup and an
+    update can't clobber the newer state back to 'contacted' (the never-downgrade
+    guarantee holds under concurrency). Proven structurally: it performs NO get_by_email
+    read before its write. RED on the old read-then-write (get_by_email → unconditional
+    mark_contacted)."""
+    calls: list[str] = []
+    orig = mp.get_by_email
+
+    async def spy_get_by_email(conn, email):
+        calls.append(email)
+        return await orig(conn, email)
+
+    monkeypatch.setattr(mp, "get_by_email", spy_get_by_email)
+
+    await mp.create(db, id="p1", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    assert await mp.mark_contacted_by_email(db, "prospect@example.com", contacted_at=_TS) is True
+    assert (await mp.get_by_id(db, "p1"))["status"] == "contacted"
+    assert calls == []  # atomic: no read-before-write window a concurrent flip could exploit

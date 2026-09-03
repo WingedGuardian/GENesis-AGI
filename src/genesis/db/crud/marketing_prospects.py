@@ -124,11 +124,21 @@ async def mark_contacted_by_email(
     non-marketing recipient is never touched). Keyed on the RECIPIENT being a curated
     prospect — NOT on cell_risk_class — so a cold pitch that misclassified FINANCIAL
     (money-term body) is still stamped. Only ``opted_out`` — NOT this status — gates
-    authorization, so this write can never weaken a send gate."""
-    row = await get_by_email(db, email)
-    if row is None or row.get("status") != "active":
-        return False
-    return await mark_contacted(db, row["id"], contacted_at=contacted_at)
+    authorization, so this write can never weaken a send gate.
+
+    ATOMIC: a single conditional UPDATE (``WHERE email = ? COLLATE NOCASE AND
+    status = 'active'``), NOT a read-then-write. A concurrent writer flipping the row
+    (e.g. active → replied) between a lookup and an update can't be clobbered back to
+    'contacted' — the never-downgrade guarantee holds under concurrency. ``rowcount``
+    is the stamped/not-stamped signal."""
+    cursor = await db.execute(
+        "UPDATE marketing_prospects "
+        "SET last_contacted_at = ?, status = 'contacted', updated_at = ? "
+        "WHERE email = ? COLLATE NOCASE AND status = 'active'",
+        (contacted_at, contacted_at, _normalize_email(email)),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
 
 
 async def mark_opted_out(db: aiosqlite.Connection, id: str, *, opted_out_at: str) -> bool:

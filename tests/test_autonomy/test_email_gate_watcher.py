@@ -481,3 +481,51 @@ async def test_reconciled_hold_stamps_prospect_before_terminalizing(db, monkeypa
     assert pipe.calls == []  # reconcile never re-sends
     # The stamp must have committed before the failed terminal write.
     assert (await mp.get_by_id(db, "prospect"))["status"] == "contacted"
+
+
+@pytest.mark.asyncio
+async def test_reconciled_consumed_hold_records_owner_success(db):
+    """Crash-recovery must complete capability success accounting: a consumed-approval
+    reconcile (delivered by a prior crashed cycle that never terminalized) records the
+    owner-approved cg success exactly once — so a transient DELIVERED-branch failure
+    before mark_sent doesn't permanently drop the delivery from promotion evidence.
+    RED: the reconcile branch previously never called record_success."""
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    await cg.ensure_cell(db, domain="email", verb="send", risk_class="bulk", updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await ac.mark_consumed(db, rid, consumed_at=_TS)
+    await _bulk_hold_for(db, prospect_email="prospect@example.com", rid=rid)
+
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == []  # reconcile never re-sends
+    assert (await pes.get_by_id(db, "pb"))["status"] == "sent"
+    cell = await cg.get_cell(db, "email", "send", "bulk")
+    assert cell["successes"] == 1  # owner-approved success accounted once via recovery
+
+
+@pytest.mark.asyncio
+async def test_owner_success_gated_on_mark_sent_claim(db, monkeypatch):
+    """record_success is gated on the mark_sent single-flip claim: if the hold was
+    already flipped out of 'held' (a lost race / double-drain), record_success is NOT
+    called, so an owner-approved success is counted AT MOST once (no double-count).
+    RED: the old code called record_success unconditionally after mark_sent."""
+    monkeypatch.setattr(egw, "_marketing_mode", lambda: "live")
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    await cg.ensure_cell(db, domain="email", verb="send", risk_class="bulk", updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await _bulk_hold_for(db, prospect_email="prospect@example.com", rid=rid)
+
+    async def _not_claimed(*a, **k):  # hold already left 'held' → this cycle didn't win the flip
+        return False
+
+    monkeypatch.setattr(pes, "mark_sent", _not_claimed)
+
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    cell = await cg.get_cell(db, "email", "send", "bulk")
+    assert cell["successes"] == 0  # not claimed → success not recorded (no double-count)
