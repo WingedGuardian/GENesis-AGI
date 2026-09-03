@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import sys
+import types
 from pathlib import Path
-
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CLI_PATH = REPO_ROOT / "scripts" / "browser.py"
@@ -27,16 +27,56 @@ _STAMP = re.compile(r"^\d{8}T\d{12}Z$")
 
 
 def _load_cli():
-    spec = importlib.util.spec_from_file_location("_genesis_browser_cli", CLI_PATH)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    """Import the standalone CLI WITHOUT requiring playwright.
+
+    `scripts/browser.py` imports `playwright.sync_api` at module scope, and CI
+    does not install playwright. Guarding this class with a `skipif` therefore
+    meant the CLI half of the fix had ZERO coverage on the one machine that
+    gates merges — it was only ever verified on a developer box that happened
+    to have playwright, while CI reported a green run that had asserted
+    nothing. Nothing under test here touches playwright (`_default_screenshot_path`
+    is pure stdlib), so stub the import instead of skipping the test.
+
+    The stub raises if anything actually calls it, so a future test that DOES
+    need a real browser fails loudly rather than passing against a mock.
+    """
+
+    def _stub_sync_playwright(*_args, **_kwargs):
+        raise RuntimeError(
+            "playwright is stubbed in this test module — it exists only to "
+            "satisfy the CLI's module-level import"
+        )
+
+    pw = types.ModuleType("playwright")
+    sync_api = types.ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = _stub_sync_playwright
+    pw.sync_api = sync_api
+
+    # Stub UNCONDITIONALLY, even where playwright is installed. A
+    # `find_spec`-guarded stub would take one path on a developer box and the
+    # other in CI — so the path that matters would be the one never exercised
+    # here, which is the same shape of hole this fix exists to close.
+    _MISSING = object()
+    saved = {
+        name: sys.modules.get(name, _MISSING) for name in ("playwright", "playwright.sync_api")
+    }
+    sys.modules["playwright"] = pw
+    sys.modules["playwright.sync_api"] = sync_api
+    try:
+        spec = importlib.util.spec_from_file_location("_genesis_browser_cli", CLI_PATH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        # Restore exactly what was there, so a real playwright installed by
+        # another test module survives and the stub never leaks.
+        for name, prior in saved.items():
+            if prior is _MISSING:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = prior
 
 
-@pytest.mark.skipif(
-    not importlib.util.find_spec("playwright"),
-    reason="playwright not installed",
-)
 class TestCliDefaultScreenshotPath:
     def test_each_call_returns_a_distinct_path(self):
         cli = _load_cli()
