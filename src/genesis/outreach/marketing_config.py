@@ -133,12 +133,12 @@ def max_pending_holds() -> int:
     guard. Read live. A non-int / bool / non-positive value degrades to the safe
     default (the guard is never disabled by a typo)."""
     raw = load_config().get("max_pending_holds", _DEFAULT_MAX_PENDING_HOLDS)
-    # bool is an int subclass — reject it explicitly (YAML `true` → 1 would be a
-    # nonsensical cap of one).
-    if isinstance(raw, bool):
+    # Require a GENUINE positive int (YAML `20`). Do NOT coerce with int(): a float
+    # would silently truncate (1.9 -> 1, unexpectedly blocking nearly all staging),
+    # a YAML `.inf` would raise OverflowError, and a string is malformed. bool is an
+    # int subclass so it is rejected first (YAML `true` must not read as a cap of 1).
+    # Every non-int / non-positive value degrades to the safe default (the documented
+    # promise — the guard is never silently mis-set or disabled by a typo).
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
         return _DEFAULT_MAX_PENDING_HOLDS
-    try:
-        n = int(raw)
-    except (TypeError, ValueError):
-        return _DEFAULT_MAX_PENDING_HOLDS
-    return n if n > 0 else _DEFAULT_MAX_PENDING_HOLDS
+    return raw

@@ -237,3 +237,52 @@ async def test_refused_send_does_not_stamp_contacted(db):
     out = await _call("p1")
     assert out["status"] == "refused"
     assert (await mp.get_by_id(db, "p1"))["status"] == "active"  # never stamped
+
+
+@pytest.mark.asyncio
+async def test_in_flight_queued_prospect_refuses_second_send(db):
+    """Codex P1 (dup-send): a prospect stays 'active' until a CONFIRMED outcome, so
+    the campaign would re-stage it next tick. The per-prospect in-flight dedup
+    refuses a second send while the first (queued in pending_outreach) is unresolved
+    — no duplicate hold, no two pitches to one person."""
+    await mp.create(db, id="p1", email="a@example.com", created_at=_TS, updated_at=_TS)
+    assert (await _call("p1"))["status"] == "queued"  # first send queued, prospect still active
+    assert (await mp.get_by_id(db, "p1"))["status"] == "active"
+    out = await _call("p1")  # second send while the first is in flight
+    assert out["status"] == "refused"
+    assert out["reason"] == "already_in_flight"
+
+
+@pytest.mark.asyncio
+async def test_in_flight_held_prospect_refuses_second_send(db):
+    """Same dedup via the held queue: a recipient with a HELD send (any risk class,
+    incl. a FINANCIAL-misclassified pitch) is refused a second stage."""
+    await mp.create(db, id="p1", email="a@example.com", created_at=_TS, updated_at=_TS)
+    await pes.create(
+        db,
+        id="h",
+        request_id="r",
+        validated_recipient="a@example.com",
+        category="notification",
+        message="held pitch",
+        cell_domain="email",
+        cell_verb="send",
+        cell_risk_class="financial",  # misclassified marketing hold — still caught
+        held_at=_TS,
+    )
+    out = await _call("p1")
+    assert out["status"] == "refused"
+    assert out["reason"] == "already_in_flight"
+
+
+def test_max_pending_holds_rejects_non_integer(monkeypatch):
+    """Codex P2: the cap must NOT coerce — a fractional value (1.9→1 would block
+    nearly all staging), a YAML .inf (int(float('inf')) raises OverflowError), a
+    string, a bool, or a non-positive value all degrade to the safe default (20)."""
+    import genesis.outreach.marketing_config as mc
+
+    monkeypatch.setattr(mc, "load_config", lambda: {"max_pending_holds": 25})
+    assert mc.max_pending_holds() == 25  # a genuine int is honored
+    for bad in (1.9, 100.9, float("inf"), "20", True, 0, -5):
+        monkeypatch.setattr(mc, "load_config", lambda v=bad: {"max_pending_holds": v})
+        assert mc.max_pending_holds() == mc._DEFAULT_MAX_PENDING_HOLDS

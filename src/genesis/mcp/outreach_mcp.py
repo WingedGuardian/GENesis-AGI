@@ -249,6 +249,20 @@ async def marketing_send(prospect_id: str, subject: str, body: str) -> str:
     # before any prior enqueue, pending_outreach may not exist yet; without this the
     # count would raise "no such table" instead of reading 0 (empty-state safety).
     await pending_outreach.ensure_table(_db)
+
+    # (b2b) Per-prospect in-flight dedup: refuse if THIS recipient already has an
+    # undelivered marketing send in flight (queued in pending_outreach OR held in
+    # pending_email_sends). An active prospect stays 'active' until a CONFIRMED
+    # outcome, so without this the campaign stages a SECOND send to the same person
+    # on the next tick → duplicate approval holds → two pitches to one person (and
+    # after one outcome stamps the prospect, the other hold still delivers).
+    # Recipient-keyed (case-insensitive), risk-class-agnostic (catches a
+    # FINANCIAL-misclassified pitch too).
+    if await pes.has_held_for_recipient(_db, recipient) or (
+        await pending_outreach.has_undelivered_labeled_surplus_for_recipient(_db, recipient)
+    ):
+        return json.dumps({"status": "refused", "reason": "already_in_flight"})
+
     in_flight = await pes.count_held_by_risk_class(_db, "bulk") + (
         await pending_outreach.count_undelivered_labeled_surplus(_db, channel="email")
     )

@@ -213,10 +213,12 @@ async def drain_pending_email_sends(rt: object) -> int:
                     # WS-3 gate-3: the OWNER approved this send — owner evidence.
                     origin_class="owner",
                 )
-                if row["cell_risk_class"] == "bulk":
-                    # Confirmed delivery of a cold-marketing send → advance the
-                    # prospect active → contacted so list_active stops re-pitching it.
-                    await _stamp_prospect_contacted(db, row["validated_recipient"], now)
+                # Confirmed delivery → advance a matching curated prospect
+                # active → contacted (a no-op for a non-prospect recipient) so
+                # list_active stops re-pitching it. Keyed on the RECIPIENT being a
+                # curated prospect, NOT cell_risk_class, so a cold pitch that
+                # misclassified FINANCIAL (a money-term body) is still stamped.
+                await _stamp_prospect_contacted(db, row["validated_recipient"], now)
                 resolved += 1
                 logger.info(
                     "Resolved held email %s → sent to %s",
@@ -257,12 +259,12 @@ async def drain_pending_email_sends(rt: object) -> int:
                     # WS-3 gate-3: the OWNER rejected/cancelled — owner decision.
                     origin_class="owner",
                 )
-                if row["cell_risk_class"] == "bulk":
-                    # Owner explicitly declined this cold-marketing draft → advance
-                    # the prospect to contacted so it is not auto re-proposed next
-                    # tick. (A rejection is a decision; opt-out is the "never
-                    # contact" signal — a system-drop, e.g. expiry, leaves it active.)
-                    await _stamp_prospect_contacted(db, row["validated_recipient"], now)
+                # Owner explicitly declined this draft → advance a matching curated
+                # prospect to contacted so it is not auto re-proposed next tick (a
+                # rejection is a decision; opt-out is the "never contact" signal; a
+                # system-drop/expiry leaves it active). Recipient-keyed, risk-class-
+                # agnostic (a FINANCIAL-misclassified pitch is handled too).
+                await _stamp_prospect_contacted(db, row["validated_recipient"], now)
                 resolved += 1
         elif status == "expired":
             # No-decision (the owner never answered) — expire the hold but do

@@ -428,27 +428,31 @@ async def test_orphaned_bulk_hold_leaves_prospect_active(db):
 
 
 @pytest.mark.asyncio
-async def test_delivered_standard_hold_does_not_stamp_prospects(db):
-    """Only BULK (marketing) sends stamp a prospect. A delivered STANDARD email that
-    happens to reach a prospect's address must NOT flip its status."""
+async def test_delivered_financial_misclassified_pitch_still_stamps_prospect(db):
+    """Provenance is RECIPIENT-based, NOT cell_risk_class. A cold pitch whose body
+    tripped the money-pattern classifier holds as FINANCIAL (not BULK), but on
+    delivery to a curated prospect it must STILL stamp them contacted — else that
+    prospect is re-pitched forever (Codex P1: preserve marketing provenance across
+    the financial misclassification)."""
     from genesis.db.crud import marketing_prospects as mp
 
     await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
     rid = await _approval(db, status="approved")
     await pes.create(
         db,
-        id="ps",
+        id="pf",
         request_id=rid,
         validated_recipient="prospect@example.com",
-        category="outreach",
-        message="a normal reply",
+        category="notification",
+        message="invoice attached — remit payment",
         held_at=_TS,
         cell_domain="email",
         cell_verb="send",
-        cell_risk_class="standard",
+        cell_risk_class="financial",
     )
 
     assert (
         await drain_pending_email_sends(_FakeRt(db, _FakePipeline(OutreachStatus.DELIVERED))) == 1
     )
-    assert (await mp.get_by_id(db, "prospect"))["status"] == "active"  # untouched
+    # stamped despite the FINANCIAL class — provenance is recipient-based
+    assert (await mp.get_by_id(db, "prospect"))["status"] == "contacted"

@@ -85,6 +85,22 @@ async def drain(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def has_undelivered_labeled_surplus_for_recipient(
+    db: aiosqlite.Connection, recipient: str, *, channel: str = "email"
+) -> bool:
+    """True iff ``recipient`` already has an undelivered BULK/campaign
+    (``labeled_surplus``) row queued for the drain — the pre-drain half of the
+    per-prospect in-flight dedup (a send enqueued this run, not yet converted into a
+    HELD row). Case-insensitive recipient match."""
+    cursor = await db.execute(
+        "SELECT 1 FROM pending_outreach "
+        "WHERE delivered = 0 AND labeled_surplus = 1 AND channel = ? "
+        "AND validated_recipient = ? COLLATE NOCASE LIMIT 1",
+        (channel, recipient),
+    )
+    return await cursor.fetchone() is not None
+
+
 async def count_undelivered_labeled_surplus(
     db: aiosqlite.Connection, *, channel: str = "email"
 ) -> int:

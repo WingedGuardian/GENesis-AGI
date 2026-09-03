@@ -45,9 +45,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   not only at enqueue — the held send is paused and resumes if you re-enable). A
   delivered (or owner-rejected) cold send marks its prospect `contacted` so the
   campaign never re-pitches the same person, while a send that never reaches a
-  decision (dropped/expired) leaves the prospect eligible; and Genesis refuses to
-  stage a new send once a configurable number of cold sends (`max_pending_holds`,
-  default 20) already await your approval — so a run can't flood your approval queue.
+  decision (dropped/expired) leaves the prospect eligible; Genesis won't stage a
+  second cold send to someone who already has one in flight (no duplicate pitches);
+  and it refuses to stage a new send once a configurable number of cold sends
+  (`max_pending_holds`, default 20) already await your approval — so a run can't
+  flood your approval queue.
 - **Contributor-issue close loop.** When an external contributor's merged PR
   closes a GitHub issue Genesis posted from the Contributor Work-Log (via a
   `Closes #N` keyword), the repo-pulse worker now auto-resolves the originating

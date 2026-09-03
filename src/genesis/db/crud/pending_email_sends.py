@@ -64,6 +64,20 @@ async def list_held(db: aiosqlite.Connection) -> list[dict]:
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def has_held_for_recipient(db: aiosqlite.Connection, recipient: str) -> bool:
+    """True iff a send to ``recipient`` is still HELD (awaiting owner approval).
+    Recipient-keyed (case-insensitive) + risk-class-AGNOSTIC so a marketing send is
+    caught whatever it classified (BULK, or FINANCIAL if the body tripped the money
+    pattern) — the per-prospect in-flight dedup that stops a second cold pitch to
+    someone already in flight."""
+    cursor = await db.execute(
+        "SELECT 1 FROM pending_email_sends "
+        "WHERE status = 'held' AND validated_recipient = ? COLLATE NOCASE LIMIT 1",
+        (recipient,),
+    )
+    return await cursor.fetchone() is not None
+
+
 async def count_held_by_risk_class(db: aiosqlite.Connection, risk_class: str) -> int:
     """Count rows still HELD (awaiting owner approval) for a given capability
     risk class. Used by the marketing approval-flood guard to bound the owner's

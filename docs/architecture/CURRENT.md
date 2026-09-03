@@ -562,14 +562,18 @@ verified: a2f2be52 2026-09-03
   lifecycle is stamped on a CONFIRMED outcome, not at stage time, via ONE
   active-guarded CRUD (`marketing_prospects.mark_contacted_by_email`) called from
   BOTH delivery paths: the email-gate drain (`email_gate_watcher`) on delivery or
-  owner-rejection of a HELD BULK send, AND `pipeline._deliver` on a GRANTED-cell
-  autonomous BULK delivery (which delivers inline and never touches the drain — so
-  the loop-fix survives graduation). A send dropped/expired before any decision
-  leaves the prospect `active` (no silent burn). `marketing_send` refuses
-  a non-`active` prospect (dedup) and refuses when `>= max_pending_holds` BULK
-  sends are in flight — counting BOTH the pending_outreach queue and the held
-  `pending_email_sends` so the cap bounds a single run (the ASK-state approval-flood
-  guard, `marketing_config.max_pending_holds`). A batch approval card (approve N
+  owner-rejection, AND `pipeline._deliver` on a GRANTED-cell autonomous delivery
+  (which delivers inline and never touches the drain — so the loop-fix survives
+  graduation). The stamp is keyed on the RECIPIENT being a curated prospect, NOT on
+  `cell_risk_class`, so a cold pitch that misclassified FINANCIAL (money-term body)
+  is still stamped and never re-pitched. A send dropped/expired before any decision
+  leaves the prospect `active` (no silent burn). `marketing_send` refuses a
+  non-`active` prospect, refuses a recipient that already has an in-flight send
+  (per-prospect dedup across both queues — no duplicate pitch to one person), and
+  refuses when `>= max_pending_holds` BULK sends are in flight — counting BOTH the
+  `pending_outreach` queue and the held `pending_email_sends` so the cap bounds a
+  single run (`marketing_config.max_pending_holds`; a non-int / non-positive value
+  degrades to the default, never coerced). A batch approval card (approve N
   holds at once) remains deferred — per-item dashboard approval is the surface today.
 - **Marketing reply → owner Telegram ping (notify-only).** When a GENUINE human
   reply lands (auto-responders + foreign senders already gated out by the
