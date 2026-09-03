@@ -108,6 +108,7 @@ import shlex
 import subprocess
 import sys
 import time
+from datetime import datetime
 
 # Self-locate so `from hook_input import …` resolves both when CC runs this as a
 # script (sys.path[0] is this dir) AND when it is imported as a module for tests
@@ -4402,6 +4403,493 @@ def _check_base_is_default(
     return False, ""
 
 
+#: The migration namespaces, each with its prefix pattern DERIVED FROM ITS
+#: RUNNER's own discovery regex (db/migrations/runner.py `^(\d{4})_\w+\.py$`;
+#: db/data_migrations/runner.py `^(d\d{4})_\w+\.py$`) — both runners raise on a
+#: duplicate prefix, and BOTH were unguarded cross-PR (CI's migration-check
+#: covers only the numbered dir). Anchored to the directory itself: nested
+#: paths, `runner.py` and `__init__.py` are not migrations, and a name the
+#: runner would silently SKIP (a dash, a dot — `\w+` rejects them) must not be
+#: claimed here either, or the gate blocks on a file that can never collide at
+#: runtime. The `d` prefix keeps the two namespaces' keys disjoint by
+#: construction, so they can never cross-collide in one claims dict.
+_MIGRATION_DIRS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("src/genesis/db/migrations/", re.compile(r"^(\d{4})_\w+\.py$")),
+    ("src/genesis/db/data_migrations/", re.compile(r"^(d\d{4})_\w+\.py$")),
+)
+
+#: How many overflowing PR file-lists to re-fetch individually (one paginated
+#: call each) before giving up and REPORTING the rest as unseen. Bounds the
+#: gate's wall-clock on a queue where many PRs overflow at once; measured
+#: 2026-09-03, 1 of 48 open PRs overflowed, so the cap is slack today and
+#: exists so a pathological queue degrades loudly instead of stalling the merge.
+_MIGRATION_TRUNCATION_REFETCH_CAP = 2
+
+#: File statuses that CREATE a path (and so claim its prefix). "modified",
+#: "removed" and "changed" touch a file that already exists on some base — a PR
+#: that merely edits an existing migration claims nothing, and treating every
+#: touched path as an addition is how two PRs that both patch one old migration
+#: would have hard-blocked each other with no override (architect BLOCKER 2).
+_MIGRATION_CREATING_STATUSES = frozenset({"added", "renamed", "copied"})
+
+
+def _migration_prefix_claims(paths: list[str]) -> dict[str, list[str]]:
+    """``{prefix: [basenames]}`` for the migration files among ``paths``.
+
+    Basenames are LISTS, not a single value: a PR adding TWO files under one
+    prefix is the exact state the runners raise on, and a last-write-wins dict
+    was structurally blind to that self-collision. Values are named files
+    because every message this gate prints names the colliding FILES, not just
+    the number — "0090 collides" leaves the reader to go and find what it
+    collides with, which is the whole diagnosis.
+    """
+    claims: dict[str, list[str]] = {}
+    for path in paths:
+        for dir_prefix, pattern in _MIGRATION_DIRS:
+            if not path.startswith(dir_prefix):
+                continue
+            basename = path[len(dir_prefix):]
+            m = pattern.match(basename)
+            if m:
+                claims.setdefault(m.group(1), []).append(basename)
+    return claims
+
+
+def _pr_added_files(pr_num: str, repo: str | None = None) -> list[str] | None:
+    """Filenames this PR CREATES (status added/renamed/copied), or None.
+
+    Distinct from ``_pr_changed_files``, which deliberately includes every
+    touched path plus rename SOURCES — right for the hook-surface fence (a
+    guard renamed away is a hook change), wrong here (a modified migration is
+    not a new prefix claim). Shares the ``_TEST_GH_PR_FILES`` seam; a seam
+    entry's optional ``status`` defaults to "added" so existing fixtures keep
+    their meaning.
+    """
+    raw = os.environ.get("_TEST_GH_PR_FILES")
+    if raw == "__error__":
+        return None
+    if raw is not None:
+        out = []
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                return None
+            if row.get("status", "added") in _MIGRATION_CREATING_STATUSES:
+                out.append(row["filename"])
+        return out
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/files",
+                "--paginate",
+                "--jq",
+                '.[] | select(.status == "added" or .status == "renamed" or '
+                '.status == "copied") | .filename',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(8),
+        )
+        if result.returncode != 0:
+            return None
+        return [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+    except Exception:
+        return None
+
+
+def _default_branch_migrations(repo: str | None = None) -> list[str] | None:
+    """Migration PATHS on the repo's DEFAULT BRANCH (both namespaces), or None.
+
+    Read live rather than from the local checkout: this gate's whole point is
+    that the merge base a CI run used has moved, so a local `origin/main` that
+    was last fetched at some other time answers the wrong question. Tests inject
+    via ``_TEST_GH_MAIN_MIGRATIONS`` (one entry per line — a bare basename means
+    the numbered dir, an entry containing ``/`` is a full path; the literal
+    ``__error__`` simulates an API error).
+    """
+    raw = os.environ.get("_TEST_GH_MAIN_MIGRATIONS")
+    if raw == "__error__":
+        return None
+    if raw is not None:
+        out = []
+        for ln in raw.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            out.append(ln if "/" in ln else f"src/genesis/db/migrations/{ln}")
+        return out
+    branch = _repo_default_branch(repo=repo)
+    if not branch:
+        return None
+    paths: list[str] = []
+    for dir_prefix, _pattern in _MIGRATION_DIRS:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/contents/{dir_prefix.rstrip('/')}",
+                    "-X",
+                    "GET",
+                    "-f",
+                    f"ref={branch}",
+                    "--jq",
+                    '.[] | select(.type == "file") | .name',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),
+            )
+            if result.returncode != 0:
+                return None
+            names = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+            # The directory form of the contents API returns AT MOST 1,000
+            # entries with no truncation marker (the Trees API is the >1k
+            # route). 94 files today; at the cap a full read and a clipped one
+            # are indistinguishable, so treat it as unreadable rather than
+            # report collisions from a listing that may have ended early.
+            if len(names) >= 1000:
+                return None
+            paths.extend(dir_prefix + n for n in names)
+        except Exception:
+            return None
+    return paths
+
+
+def _open_pr_migrations(
+    repo: str | None = None,
+) -> tuple[dict[str, list[str]], list[str], bool] | None:
+    """``({pr_number: [migration paths]}, [unresolved pr numbers], pr_list_truncated)``,
+    or None on any read failure.
+
+    ONE GraphQL request for every open PR (measured 3.4s for 48 PRs — a
+    per-PR REST walk of the same set took ~40s, well past the merge gate's
+    wall-clock budget). Only files whose ``changeType`` CREATES a path are
+    claims — a PR that merely edits an existing migration claims nothing.
+
+    The second and third elements are the honest half. GraphQL caps BOTH the
+    file list per PR and the PR list itself at 100, and a capped read is
+    indistinguishable from a short one: #1541 hit the file cap live while
+    carrying colliding migrations, and the docstring that said "every open PR"
+    was false the day the queue crossed 100 (architect SHOULD-FIX 3). Truncated
+    reads are RESOLVED where cheap and REPORTED where not — never silently
+    treated as complete. Tests inject via ``_TEST_GH_OPEN_PR_MIGRATIONS``.
+    """
+    raw = os.environ.get("_TEST_GH_OPEN_PR_MIGRATIONS")
+    if raw == "__error__":
+        return None
+    if raw is not None:
+        try:
+            payload = json.loads(raw)
+            prs = {
+                str(k): [v if "/" in v else f"src/genesis/db/migrations/{v}" for v in vs]
+                for k, vs in payload.get("prs", {}).items()
+            }
+            return (
+                prs,
+                [str(n) for n in payload.get("truncated", [])],
+                bool(payload.get("pr_list_truncated", False)),
+            )
+        except Exception:
+            return None
+    owner_name = repo or _derive_repo_from_cwd(os.getcwd()) or ""
+    if "/" not in owner_name:
+        return None
+    owner, name = owner_name.split("/", 1)
+    query = (
+        "query($owner:String!,$name:String!){repository(owner:$owner,name:$name)"
+        "{pullRequests(states:OPEN,first:100){pageInfo{hasNextPage} nodes{number "
+        "files(first:100){pageInfo{hasNextPage} nodes{path changeType}}}}}}"
+    )
+    try:
+        result = subprocess.run(
+            [
+                "gh", "api", "graphql",
+                "-f", f"query={query}",
+                "-F", f"owner={owner}",
+                "-F", f"name={name}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(8),
+        )
+        if result.returncode != 0:
+            return None
+        prs_conn = json.loads(result.stdout)["data"]["repository"]["pullRequests"]
+        nodes = prs_conn["nodes"]
+        pr_list_truncated = bool((prs_conn.get("pageInfo") or {}).get("hasNextPage"))
+    except Exception:
+        return None
+    out: dict[str, list[str]] = {}
+    short_read: list[str] = []
+    for node in nodes:
+        num = str(node.get("number"))
+        files = node.get("files") or {}
+        paths = [
+            f["path"]
+            for f in (files.get("nodes") or [])
+            if str(f.get("changeType", "ADDED")).lower() in _MIGRATION_CREATING_STATUSES
+        ]
+        # FULL PATHS, never basenames: the consumer re-derives claims by running
+        # these through `_migration_prefix_claims`, which is anchored on the
+        # directory — a basename matches nothing there, and every cross-PR
+        # collision silently vanishes. That exact live regression shipped once
+        # while 41 seam-fed unit tests stayed green (the seams normalize to full
+        # paths; the live path did not), and only the live acceptance replay
+        # caught it. The contract test that pins this feeds THIS function's real
+        # output into the consumer.
+        mig_paths = sorted(p for p in paths if _migration_prefix_claims([p]))
+        if mig_paths:
+            out[num] = mig_paths
+        if (files.get("pageInfo") or {}).get("hasNextPage"):
+            short_read.append(num)
+    # RESOLVE the short reads rather than merely reporting them. A standing
+    # "could not see PR #X" caveat on every other PR is noise that trains a
+    # reader to skip the line, and it leaves a real blind spot open: the PR whose
+    # list overflows is exactly the long-lived branch most likely to carry an
+    # old prefix. One paginated call per overflow closes it (measured
+    # 2026-09-03: 1 of 48 open PRs overflowed).
+    unresolved: list[str] = []
+    for i, num in enumerate(short_read):
+        # Bounded in BOTH dimensions: the refetch cap, and the shared merge
+        # deadline — this loop was the one multi-call loop on the merge path
+        # with no inter-iteration deadline check (architect BLOCKER 1), and a
+        # drained budget here starves nothing downstream only because the gate
+        # runs LAST; the check keeps it from spinning uselessly regardless.
+        if i >= _MIGRATION_TRUNCATION_REFETCH_CAP or (
+            _merge_deadline is not None and time.monotonic() >= _merge_deadline
+        ):
+            # NEVER a silent cap: anything past the budget is reported as
+            # unseen, so a bounded scan can't read as a complete one.
+            unresolved.extend(short_read[i:])
+            break
+        full = _pr_added_files(num, repo=repo)
+        if full is None:
+            unresolved.append(num)
+            continue
+        # Same full-path contract as the sweep above.
+        mig_paths = sorted(p for p in full if _migration_prefix_claims([p]))
+        if mig_paths:
+            out[num] = mig_paths
+        else:
+            out.pop(num, None)
+    return out, unresolved, pr_list_truncated
+
+
+def _ci_freshness_note(pr_num: str, repo: str | None = None) -> str | None:
+    """ADVISORY note when the PR's newest completed check predates the current
+    default-branch head — i.e. its green tick describes a main that has moved.
+
+    Deliberately NOT a gate. Measured 2026-09-03, 30 of 48 open PRs were in this
+    state (oldest tick six weeks old), so blocking would refuse most of the queue
+    for a condition nearly all of it shares; and the remedy — re-run every PR's
+    CI against current main — is a throughput decision the owner makes globally,
+    not one a gate should force one PR at a time. It is a note precisely because
+    the *specific* consequence worth blocking on (a prefix collision) now has its
+    own gate above; what is left here is the residual "tests were green against
+    different code", which is real but not mechanically decidable.
+
+    Returns None when either side is unreadable: no note beats a wrong note, and
+    a hedge printed on every PR is indistinguishable from a finding on every PR.
+    """
+    raw_check = os.environ.get("_TEST_GH_CI_COMPLETED_AT")
+    raw_main = os.environ.get("_TEST_GH_DEFAULT_HEAD_DATE")
+    if raw_check is None or raw_main is None:
+        branch = _repo_default_branch(repo=repo)
+        head_sha = _pr_head_sha(pr_num, repo=repo)
+        if not branch or not head_sha:
+            return None
+        try:
+            if raw_check is None:
+                # --paginate + max() HERE, not `max` in jq: the endpoint pages at
+                # 30 and this repo's heads carry 16+ check runs today — a
+                # first-page max UNDERSTATES the newest completion and emits a
+                # false "stale" note the day the count crosses the page size
+                # (architect SHOULD-FIX 8). With --paginate each page is its own
+                # JSON document, so per-page jq output is concatenated lines and
+                # the aggregate must happen client-side.
+                stamps = subprocess.run(
+                    ["gh", "api", f"repos/{repo or ':owner/:repo'}/commits/{head_sha}/check-runs",
+                     "--paginate",
+                     "--jq", ".check_runs[]|select(.completed_at != null)|.completed_at"],
+                    capture_output=True, text=True, timeout=_gh_timeout(8),
+                ).stdout.split()
+                raw_check = max(stamps) if stamps else ""
+            if raw_main is None:
+                raw_main = subprocess.run(
+                    ["gh", "api", f"repos/{repo or ':owner/:repo'}/commits/{branch}",
+                     "--jq", ".commit.committer.date"],
+                    capture_output=True, text=True, timeout=_gh_timeout(8),
+                ).stdout.strip()
+        except Exception:
+            return None
+    if raw_check in (None, "", "null", "__error__") or raw_main in (None, "", "null", "__error__"):
+        return None
+    try:
+        # PARSED, never lexical: the checks API returns `Z` and the commit API a
+        # numeric offset, so a string compare puts 21:43:17Z before its own
+        # equivalent 17:43:17-04:00 — the same instant, opposite answer. The
+        # COMPARISON sits inside the try as well: comparing a naive stamp to an
+        # aware one raises TypeError, and out here that aborts the whole report
+        # mid-print — a partial report that looks structurally complete
+        # (architect SHOULD-FIX 9). An advisory that cannot decide says nothing.
+        checked = datetime.fromisoformat(raw_check.replace("Z", "+00:00"))
+        main_at = datetime.fromisoformat(raw_main.replace("Z", "+00:00"))
+        if checked >= main_at:
+            return None
+    except Exception:
+        return None
+    return (
+        f"NOTE: CI last completed {raw_check} but the default branch moved at "
+        f"{raw_main} — this PR's checks ran against a DIFFERENT main. "
+        "CI re-runs only on a push, so whatever they concluded does not describe "
+        "a merge today."
+    )
+
+
+def _check_migration_prefixes(
+    pr_num: str, repo: str | None = None
+) -> tuple[bool, str]:
+    """Block when this PR's migration prefixes collide with the default branch
+    or with another OPEN PR.
+
+    CI's `migration-check` already rejects duplicates, but against the merge
+    preview AT ONE MOMENT. Two modes survive that and were both live on
+    2026-09-03: a green tick that went stale when main grew a colliding
+    migration hours later (#1541), and two PRs adding differently-NAMED files
+    under one prefix, each individually clean and colliding only once both
+    merge (#1610 vs #1616). `migrations/runner.py` raises on a duplicate prefix
+    BEFORE running anything, so the cost is every migration on every install
+    halted at next restart.
+
+    Blocks only on a DEFINITE collision. Every plumbing failure — unreadable
+    listing, malformed payload, an unresolved truncation — passes with the
+    limitation stated, because walling off every merge over an auxiliary check
+    is worse than the failure it prevents.
+    """
+    # One repo resolution for every read below — the helpers' individual
+    # fallbacks (gh's `:owner/:repo` vs `_derive_repo_from_cwd`) can disagree
+    # when `repo` is None, and a gate comparing two repos' listings answers a
+    # question nobody asked (architect NOTE 12).
+    repo = repo or _derive_repo_from_cwd(os.getcwd())
+    # ADDED files only — a PR that merely edits or deletes an existing
+    # migration claims no prefix (architect BLOCKER 2: reading every touched
+    # path as an addition hard-blocked two PRs that both patched one old
+    # migration, with no override).
+    added = _pr_added_files(pr_num, repo=repo)
+    if added is None:
+        return False, "NOTE: could not read the PR's file list — prefixes unverified."
+    mine = _migration_prefix_claims(added)
+    if not mine:
+        return False, "ok (no migrations in this PR)"
+
+    problems: list[str] = []
+    caveats: list[str] = []
+
+    # A SELF-collision — one PR adding two files under one prefix — is the
+    # exact state the runners raise on, and a scan that only compares against
+    # OTHER sources is structurally blind to it (architect SHOULD-FIX 6).
+    for prefix, names in sorted(mine.items()):
+        if len(names) > 1:
+            problems.append(f"  {prefix}: this PR itself adds {' and '.join(sorted(names))}")
+
+    on_main = _default_branch_migrations(repo=repo)
+    if on_main is None:
+        caveats.append("could not read the default branch's migrations")
+    elif not on_main:
+        # 90+ migrations exist on main today, so an EMPTY successful listing is
+        # not a possible answer — it means the read did not describe the
+        # directory (moved path, odd ref, changed API shape). Saying "clean" on
+        # it would be the seen-nothing-reported-no-problem failure (architect
+        # SHOULD-FIX 4).
+        caveats.append(
+            "the default branch's migration listing came back EMPTY — not a "
+            "possible state, so the read did not describe the directory"
+        )
+    else:
+        main_claims = _migration_prefix_claims(on_main)
+        for prefix, names in sorted(mine.items()):
+            others_on_main = main_claims.get(prefix, [])
+            for basename in sorted(names):
+                for other in others_on_main:
+                    # An IDENTICAL basename is the same file, not a duplicate
+                    # prefix: a long-lived branch that merged main carries
+                    # main's own migrations in its diff, and blocking there
+                    # refuses a PR that adds nothing.
+                    if other != basename:
+                        problems.append(
+                            f"  {prefix}: this PR adds {basename}, but the default "
+                            f"branch already has {other}"
+                        )
+
+    others = _open_pr_migrations(repo=repo)
+    if others is None:
+        caveats.append("could not read other open PRs' migrations")
+    else:
+        by_pr, unresolved, pr_list_truncated = others
+        for other_pr, other_paths in sorted(by_pr.items()):
+            # Exclude by PR NUMBER, not by filename: excluding "the file I also
+            # have" would silence a real collision whenever two PRs add the
+            # same basename.
+            if str(other_pr) == str(pr_num):
+                continue
+            other_claims = _migration_prefix_claims(other_paths)
+            for prefix, names in sorted(mine.items()):
+                # No identical-basename exemption here, unlike the default-branch
+                # arm above. There it means "the same file" — a branch that merged
+                # main carries main's own migrations in its diff. Between two OPEN
+                # PRs it means the opposite: both are CREATING that path (both
+                # sides are filtered to added files), which is a collision on the
+                # prefix (and a conflict on the path).
+                for clash in other_claims.get(prefix, []):
+                    problems.append(
+                        f"  {prefix}: this PR adds {' and '.join(sorted(names))}, "
+                        f"and open PR #{other_pr} adds {clash}"
+                    )
+        live_truncation = [n for n in unresolved if str(n) != str(pr_num)]
+        if live_truncation:
+            caveats.append(
+                "file lists TRUNCATED (incomplete) for open PR(s) "
+                + ", ".join(f"#{n}" for n in sorted(live_truncation))
+                + " — they may claim a prefix this scan could not see"
+            )
+        if pr_list_truncated:
+            caveats.append(
+                "the open-PR list itself was TRUNCATED at 100 — PRs beyond the "
+                "first page were not scanned"
+            )
+
+    if problems:
+        head = (
+            f"{len(problems)} migration-prefix collision(s) — a duplicate prefix "
+            "halts EVERY migration on EVERY install at next restart "
+            "(db/migrations/runner.py raises before running any)."
+        )
+        body = "\n".join(problems)
+        tail = ("\n  caveat: " + "; ".join(caveats)) if caveats else ""
+        return True, f"{head}\n{body}{tail}"
+    n_files = sum(len(v) for v in mine.values())
+    if caveats:
+        # Say what WAS checked, not just what was not. A blanket "unverified"
+        # when only one of the two arms came up short is the same defect the
+        # report-is-an-inventory rule names: it hides a true fact (the default
+        # branch WAS cleanly checked) behind a single pessimistic label, and a
+        # line that always reads the same trains a reader to skip it.
+        checked = "the default branch" if on_main else None
+        prefix = (
+            f"NOTE: {n_files} migration(s) — no collision with {checked}, but "
+            if checked
+            else "NOTE: prefixes unverified — "
+        )
+        return False, prefix + "; ".join(caveats) + "."
+    return False, f"ok ({n_files} migration(s), no prefix collision)"
+
+
 def _suggested_merge_cmd(pr_num: str, verified_head: str, repo: str | None) -> str:
     """The exact atomic merge command to copy — PRESERVING an explicit --repo.
 
@@ -5633,10 +6121,13 @@ def main() -> int:
                 # their own block/allow decision at or inside the budget, and
                 # any ONE of them timing out fail-closes IMMEDIATELY (the
                 # additive worst case needs every call slow-but-successful);
-                # the TOCTOU binding runs argv-only right after freshness, so
-                # only the tail advisory scanners (fail-OPEN by design) could
-                # ever be clipped, which nets the same outcome as their error
-                # path.
+                # the TOCTOU binding runs argv-only right after freshness. The
+                # finding scanners at the tail ALSO fail CLOSED on a clipped
+                # budget (PR #1434 removed their fail-open), so a drained
+                # deadline BLOCKS rather than silently passing; the one gate
+                # that degrades OPEN under starvation is the migration-prefix
+                # check, which is why it runs dead last — it can only starve
+                # itself, and it says so in a NOTE when it does.
                 # A timing-out fail-closed gate returns BLOCK immediately, so
                 # the additive worst case needs every call slow-but-successful.
                 mergeable = _check_mergeable(pr_num, repo=merge_repo)
@@ -5938,6 +6429,39 @@ def main() -> int:
                     print(sched_msg, file=sys.stderr)
                     return 2
 
+                # Migration-prefix collisions. CI's `migration-check` already rejects
+                # duplicates, but only against the merge preview AT THE MOMENT IT RAN:
+                # measured 2026-09-03, #1541 held a green tick from 8.5h before the
+                # colliding migration landed on main, and #1610/#1616 each add a
+                # differently-named 0092 that no single PR's CI can see. Only a
+                # merge-TIME read answers the question that matters.
+                # Deliberately the LAST gate (architect BLOCKER 1): it can spend up
+                # to ~5 gh calls, and every gate above fails CLOSED when the shared
+                # deadline drains — so run the fail-closed gates while budget is
+                # guaranteed, and let this one starve only ITSELF (its own failure
+                # direction is open-with-a-NOTE, the survivable degradation).
+                # NO override sigil, for the pin gate's reason above: the honest fix
+                # is to renumber the file, which takes seconds, and there is no
+                # legitimate duplicate-prefix state — both runners raise on one
+                # before running any migration, on every install. (A false block
+                # from status misreads is designed out instead: only files a PR
+                # ADDS claim a prefix.)
+                should_block, migration_msg = _check_migration_prefixes(
+                    pr_num, repo=merge_repo
+                )
+                if should_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — migration-prefix collision.",
+                        file=sys.stderr,
+                    )
+                    print(migration_msg, file=sys.stderr)
+                    return 2
+                elif migration_msg.startswith("NOTE:"):
+                    # Fail-open direction must be VISIBLE at the moment of merging,
+                    # mirroring the pin gate — a silent NOTE is what makes
+                    # "verified" and "could not verify" indistinguishable.
+                    print(migration_msg, file=sys.stderr)
+
         # ── sqlite3 write operations ────────────────────────────────
         # Whole-command match (never misses a fragmented/wrapped invocation),
         # narrowed to DML in statement position so the `replace()` scalar
@@ -6092,6 +6616,14 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
             f"({', '.join(ci_bad[:6])}); the required suite never ran."
         )
         failures += 1
+    # ADVISORY, and report-only by design. It never changes the verdict, so it
+    # cannot make the report and the enforcement arm disagree — the invariant in
+    # this function's docstring is about GATES. A green tick from before main
+    # moved is real (30/48 open PRs, 2026-09-03) but not mechanically decidable
+    # into a block; the one consequence that IS decidable has its own gate below.
+    _stale_ci = _ci_freshness_note(pr_num, repo=repo)
+    if _stale_ci:
+        print(f"  ↳ {_stale_ci}")
     # Order mirrors the gate: base-invariant → freshness → finding scans, so a
     # review published mid-run can't pass freshness with its P1s unscanned.
     blocked, msg = _check_base_is_default(pr_num, repo=repo)
@@ -6107,6 +6639,13 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     if blocked:
         for line in msg.splitlines()[1:]:
             print(f"  {line}")
+    failures += 1 if blocked else 0
+    blocked, msg = _check_migration_prefixes(pr_num, repo=repo)
+    print(f"migrations     : {'BLOCK — ' + msg.splitlines()[0] if blocked else msg.splitlines()[0]}")
+    # Render the TAIL: line 0 is the summary and the per-collision bullets live on
+    # lines 1+, which are the whole diagnosis (which prefix, against what).
+    for line in msg.splitlines()[1:]:
+        print(f"  {line}")
     failures += 1 if blocked else 0
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     if blocked:
