@@ -221,6 +221,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **YouTube transcripts are less likely to come back quietly incomplete.** When
+  Genesis fetches a video transcript it now asks for both English caption tracks and
+  prefers the original ASR (`en-orig`) over the `en` variant. Observed once: the two
+  were served as different transcriptions — different cue segmentation, and different
+  wording in the closing lines — while the same video served identical tracks hours
+  later. The cause is unknown and it did not reproduce, so this is insurance rather
+  than a diagnosed fix, but preferring `en-orig` costs only one extra small download.
+  Two real bugs fixed alongside it: the cleaning step left a stray whitespace-only
+  line in every transcript (a caption file carries both empty and single-space lines,
+  and the old filter matched only the empty ones), and the documented recovery path
+  for a video with no English captions could not work — dropping `--sub-langs`
+  narrows the request to one English-first track instead of broadening it, so it
+  could never surface the other languages it promised.
+
 - **The `deliberate` MCP tool ("Model Fusion") no longer fails on real prompts.** Two
   distinct bugs: (1) analysis mode 404'd because the orchestrator slug
   `openai/gpt-oss-120b:free` was retired from OpenRouter's catalog (`:free` variant gone)
