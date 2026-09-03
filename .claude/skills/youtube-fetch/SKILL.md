@@ -30,26 +30,77 @@ content, SSL issues). yt-dlp is the reliable alternative.
    yt-dlp --skip-download --print '%(title)s|||%(uploader)s|||%(description)s' 'VIDEO_URL'
    ```
 
-3. Fetch the auto-generated transcript:
+3. Fetch the auto-generated transcript. Request **both** English tracks and prefer
+   `en-orig`:
+   ```bash
+   mkdir -p ~/tmp/yt-transcripts
+   yt-dlp --write-auto-sub --skip-download --sub-langs "en-orig,en" -o "$HOME/tmp/yt-transcripts/%(id)s" 'VIDEO_URL'
+   ls ~/tmp/yt-transcripts/ | grep VIDEO_ID
    ```
-   mkdir -p /tmp/yt-transcripts
-   yt-dlp --write-auto-sub --skip-download --sub-lang en -o '/tmp/yt-transcripts/%(id)s' 'VIDEO_URL'
-   ```
-   The transcript lands at `/tmp/yt-transcripts/VIDEO_ID.en.vtt`.
+   YouTube may serve two English auto-caption tracks — `en-orig` ("English
+   (Original)") and `en` ("English"). Usually they are the same resource. Observed
+   2026-09 on one video: the two were served with different cue segmentation, and the
+   closing lines differed in wording ("subscribe" vs "subscription") — that wording
+   difference is direct evidence of a different transcription. The same video served
+   byte-identical tracks hours later. Cause unknown; requesting both and preferring
+   `en-orig` costs one extra small download and is free insurance either way.
 
-4. Clean the VTT file into plain text (strip timestamps and tags):
+   `en-orig` exists only where the video's original audio is English. On a
+   foreign-language video there is no `en-orig`, and `en` is a machine TRANSLATION
+   with nothing in the file marking it as one. A requested track that does not exist
+   is skipped silently — check the `ls`, and see step 6 if nothing was written.
+
+4. Clean the VTT into plain text. Do the file-preference and the clean in **one**
+   Bash call — shell variables do not survive between calls:
+   ```bash
+   VID='VIDEO_ID'   # <- substitute the real 11-char video id
+   VTT="$HOME/tmp/yt-transcripts/$VID.en-orig.vtt"
+   [ -f "$VTT" ] || VTT="$HOME/tmp/yt-transcripts/$VID.en.vtt"
+   [ -f "$VTT" ] || { echo "no English VTT for $VID — see step 6" >&2; exit 1; }
+   sed 's/<[^>]*>//g;/^WEBVTT/d;/^Kind:/d;/^Language:/d;/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]* -->/d;/^[[:space:]]*$/d' "$VTT" | awk '!seen[$0]++'
    ```
-   sed '/^WEBVTT/d;/^Kind:/d;/^Language:/d;/^[0-9][0-9]:[0-9][0-9]/d;/^$/d;s/<[^>]*>//g' /tmp/yt-transcripts/VIDEO_ID.en.vtt | awk '!seen[$0]++'
-   ```
+   Three details in that `sed`, each of which bit a previous version:
+
+   - The cue-header filter is anchored to the full `HH:MM:SS.mmm -->` shape, NOT a
+     bare `^[0-9][0-9]:[0-9][0-9]`. Because tag-stripping runs first, a loose pattern
+     sees stripped text and deletes real captions — measured: `<c>10:30</c> is the
+     deadline` becomes an empty line under the loose pattern and survives under this
+     one.
+   - `/^[[:space:]]*$/d`, not `/^$/d` — a VTT contains BOTH truly-empty lines (the
+     cue separator) and single-space lines (the first line of a cue's payload). The
+     plain form removes only the former, leaving one space-only line in the output
+     after the de-dupe.
+   - The `[ -f ]` guard matters: without it a missing VTT makes `sed` write one
+     stderr line while the pipeline still exits 0 (the status is `awk`'s), so the
+     failure looks like an empty transcript rather than an error.
+
+   The `awk` de-dupes the rolling caption lines. It is whole-FILE, not adjacent, so a
+   line genuinely repeated later in the talk is dropped too — and it is line-based, so
+   a phrase split across a cue boundary will not survive a `grep` of the result.
+   Flatten with `tr '\n' ' ' | tr -s ' '` before searching for phrases, and treat a
+   word-count delta between two tracks as suggestive only: different cue segmentation
+   changes what de-dupes, independently of content.
 
 5. If the transcript is too large to read at once, pipe through
    `head -N` / `tail -n +N` to read in chunks.
 
-6. If no English auto-subs are available, try without `--sub-lang`:
+6. If no English track was written, DO NOT just drop `--sub-langs` — omitting it
+   narrows the request to a single English-first track rather than broadening it
+   (measured: it writes one `en` file even when a dozen languages exist). List what
+   the video has, then request one language:
+   ```bash
+   # the listing runs to thousands of lines on a translated video — the real tracks
+   # are at the top, so cap it rather than dumping it into the session
+   yt-dlp --list-subs --skip-download 'VIDEO_URL' 2>&1 | head -45
+   yt-dlp --write-auto-sub --skip-download --sub-langs "<lang>" -o "$HOME/tmp/yt-transcripts/%(id)s" 'VIDEO_URL'
    ```
-   yt-dlp --write-auto-sub --skip-download -o '/tmp/yt-transcripts/%(id)s' 'VIDEO_URL'
-   ```
-   Then check `ls /tmp/yt-transcripts/VIDEO_ID.*.vtt` for available languages.
+   Pick from the **"Available automatic captions"** section — `--write-auto-sub` only
+   fetches those. For a track listed under "Available subtitles" (human/community),
+   swap in `--write-sub`. Then clean it with step 4, substituting your `<lang>` for
+   `en-orig`/`en` in the two `VTT=` lines.
+
+   Avoid `--sub-langs all`: it requests every translation pair the video exposes,
+   which is hundreds to thousands of tracks.
 
 7. If SSL errors occur, add `--no-check-certificate`.
 
@@ -74,7 +125,10 @@ Present results per video as:
 When multiple YouTube URLs are provided, run all metadata fetches in
 parallel (separate Bash calls in one message), then all transcript
 downloads in parallel. Process sequentially only if outputs depend on
-each other.
+each other. Note `--sub-langs "en-orig,en"` writes up to TWO files per
+video, and the `en-orig` preference in step 4 must be resolved PER VIDEO,
+inside the same Bash call that cleans that video — one shared `VTT`
+variable across a batch will clean the wrong file.
 
 ## Examples
 
@@ -92,6 +146,6 @@ transcript downloads in parallel, then clean and return.
 ### No Captions Available
 **Input:** A video with no auto-generated subtitles.
 
-**Action:** Report "No English auto-subs available for [title]" and
-list any other language VTT files found. Return metadata and
-description only.
+**Action:** Follow step 6 — list the available tracks, fetch one in a
+language you can work with, and clean it with step 4. Only if no usable
+track exists, report that and return metadata and description only.
