@@ -36,7 +36,7 @@ _EXPECTED_COLUMNS = {
 
 # The canonical _tables.py schema is the CUMULATIVE column set: migration 0065's
 # original columns PLUS approved_at/approved_by, which a LATER migration
-# (0090_entity_adjudication_approval) adds for the human-approval gate. Migration
+# (0092_entity_adjudication_approval) adds for the human-approval gate. Migration
 # 0065 is frozen history and must never be edited retroactively
 # (numbered_migration_self_contained), so its up() still builds only
 # _EXPECTED_COLUMNS — the parity check below asserts the canonical set is exactly
