@@ -93,6 +93,7 @@ def _others(
     mapping: dict[int, list[str]],
     truncated: list[int] | None = None,
     pr_list_truncated: bool = False,
+    bases: dict[int, str] | None = None,
 ) -> str:
     """The `_TEST_GH_OPEN_PR_MIGRATIONS` seam: a JSON object."""
     return json.dumps(
@@ -100,6 +101,7 @@ def _others(
             "prs": {str(k): v for k, v in mapping.items()},
             "truncated": truncated or [],
             "pr_list_truncated": pr_list_truncated,
+            "bases": {str(k): v for k, v in (bases or {}).items()},
         }
     )
 
@@ -117,6 +119,10 @@ def _seams(monkeypatch):
     monkeypatch.setenv("_TEST_GH_PR_FILES", "")
     monkeypatch.setenv("_TEST_GH_MAIN_MIGRATIONS", "")
     monkeypatch.setenv("_TEST_GH_OPEN_PR_MIGRATIONS", _others({}))
+    # Base-ref + default-branch seams: empty base = unreadable -> the gate takes
+    # the default-branch path with NO live gh reads (the lazy-resolve contract).
+    monkeypatch.setenv("_TEST_GH_BASE_REF", "")
+    monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", "main")
 
 
 class TestPrefixExtraction:
@@ -341,6 +347,59 @@ class TestCollisionWithOtherOpenPRs:
         assert "1610" in msg
 
 
+class TestStackedBase:
+    """Codex P2 (#1666 round 2): a non-default-base (stacked) PR merges into
+    its PARENT branch — comparing against the default branch is wrong in both
+    directions (a parent's deletion still shows on main → false block on the
+    child; a parent's addition is invisible on main → missed collision)."""
+
+    def test_collision_message_names_the_actual_base_branch(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_BASE_REF", "feat-parent")
+        monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", "main")
+        monkeypatch.setenv("_TEST_GH_PR_FILES", _files(f"{_D}0092_child.py"))
+        monkeypatch.setenv("_TEST_GH_MAIN_MIGRATIONS", _main("0092_parent.py"))
+        blocked, msg = _mod._check_migration_prefixes("1700")
+        assert blocked is True
+        assert "feat-parent" in msg
+        assert "the default branch" not in msg
+
+    def test_cross_pr_arm_skips_prs_with_a_DIFFERENT_target(self, monkeypatch):
+        """Two PRs adding one prefix collide iff they merge into the same
+        branch; a stacked child and a main-bound PR share no target tree, and
+        comparing them manufactures a collision no merge order produces."""
+        monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+        monkeypatch.setenv("_TEST_GH_PR_FILES", _files(f"{_D}0092_mine.py"))
+        monkeypatch.setenv("_TEST_GH_MAIN_MIGRATIONS", _main("0091_last.py"))
+        monkeypatch.setenv(
+            "_TEST_GH_OPEN_PR_MIGRATIONS",
+            _others({1610: ["0092_other.py"]}, bases={1610: "feat-parent"}),
+        )
+        blocked, _ = _mod._check_migration_prefixes("1616")
+        assert blocked is False
+
+    def test_cross_pr_arm_still_blocks_same_target_prs(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+        monkeypatch.setenv("_TEST_GH_PR_FILES", _files(f"{_D}0092_mine.py"))
+        monkeypatch.setenv("_TEST_GH_MAIN_MIGRATIONS", _main("0091_last.py"))
+        monkeypatch.setenv(
+            "_TEST_GH_OPEN_PR_MIGRATIONS",
+            _others({1610: ["0092_other.py"]}, bases={1610: "main"}),
+        )
+        blocked, msg = _mod._check_migration_prefixes("1616")
+        assert blocked is True
+        assert "1610" in msg
+
+    def test_unknown_bases_still_compare(self, monkeypatch):
+        """An absent base on either side compares anyway — the conservative
+        direction for the default-base majority (and older fixtures)."""
+        monkeypatch.setenv("_TEST_GH_BASE_REF", "")
+        monkeypatch.setenv("_TEST_GH_PR_FILES", _files(f"{_D}0092_mine.py"))
+        monkeypatch.setenv("_TEST_GH_MAIN_MIGRATIONS", _main("0091_last.py"))
+        monkeypatch.setenv("_TEST_GH_OPEN_PR_MIGRATIONS", _others({1610: ["0092_other.py"]}))
+        blocked, _ = _mod._check_migration_prefixes("1616")
+        assert blocked is True
+
+
 class TestFailDirection:
     """Plumbing failures must NOT block; they must also not read as clean."""
 
@@ -480,7 +539,7 @@ class TestOpenPrSweepSubprocessLevel:
         monkeypatch.setattr(_mod.subprocess, "run", run)
         out = _mod._open_pr_migrations(repo="o/r")
         assert out is not None
-        prs, unresolved, pr_trunc = out
+        prs, unresolved, pr_trunc, _bases = out
         # The MODIFIED file must not claim; the ADDED one must — and as a FULL
         # path, because the consumer re-parses claims through the dir-anchored
         # matcher. A basename here made every live cross-PR collision vanish
@@ -516,7 +575,7 @@ class TestOpenPrSweepSubprocessLevel:
         monkeypatch.setattr(_mod.subprocess, "run", run)
         out = _mod._open_pr_migrations(repo="o/r")
         assert out is not None
-        prs, unresolved, _ = out
+        prs, unresolved, _trunc, _bases = out
         assert prs == {"1541": [f"{_D}0090_ledger.py"]}  # full path — see above
         assert unresolved == []
         assert len(calls) == 2
@@ -533,9 +592,12 @@ class TestOpenPrSweepSubprocessLevel:
         monkeypatch.setattr(_mod.subprocess, "run", run)
         out = _mod._open_pr_migrations(repo="o/r")
         assert out is not None
-        _, unresolved, _ = out
-        # Everything past the cap is REPORTED, never silently dropped.
-        assert len(unresolved) == 2
+        _, unresolved, _trunc, _bases = out
+        # Past-cap PRs are reported unseen — AND the refetched ones landed in
+        # unresolved too, because their canned refetch returned ZERO rows and a
+        # >100-file PR cannot have an empty file list (empty-when-impossible;
+        # audit SF3: the old code resolved that truncation caveat as clean).
+        assert len(unresolved) == 2 + _mod._MIGRATION_TRUNCATION_REFETCH_CAP
         assert len(calls) == 1 + _mod._MIGRATION_TRUNCATION_REFETCH_CAP
 
     def test_pr_list_truncation_is_surfaced(self, monkeypatch):
@@ -545,10 +607,124 @@ class TestOpenPrSweepSubprocessLevel:
         assert out is not None
         assert out[2] is True
 
+    def test_live_contents_listing_preserves_exact_filenames(self, monkeypatch):
+        """Codex P3 (#1666 round 2): `strip()` on a scalar --jq name ALTERS a
+        legal-but-odd git filename before the runner's regex sees it — turning
+        ' 0092_fake.py ' (which the runner ignores) into a migration-looking
+        record that could block a real 0092 on a phantom collision. Names now
+        travel as JSON records; a name the runner ignores is ignored here, in
+        its exact original bytes."""
+        responses = [
+            (json.dumps({"name": " 0092_fake.py ", "type": "file"}) + "\n", 0),
+            ("", 0),  # data_migrations dir
+        ]
+        run, _ = _fake_run(responses)
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        monkeypatch.delenv("_TEST_GH_MAIN_MIGRATIONS", raising=False)
+        monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", "main")
+        listing = _mod._target_branch_migrations(repo="o/r")
+        assert listing == ["src/genesis/db/migrations/ 0092_fake.py "]
+        # The odd name flows through UNCHANGED and claims nothing:
+        assert _mod._migration_prefix_claims(listing) == {}
+
+    def test_ci_note_reads_check_SUITES_not_runs(self, monkeypatch):
+        """Codex P2 (#1666 round 2), second instance of the same class: any
+        per-RUN timestamp is a proxy for snapshot identity, and started_at
+        fails under runner queueing (this repo documents 50-75 min queues).
+        The suite's created_at is stamped at trigger time, before queueing —
+        so the live path must read /check-suites, not /check-runs."""
+        responses = [
+            ("2026-09-02T13:00:00Z\n", 0),  # suites created_at stamps
+            ("2026-09-03T00:00:00Z\n", 0),  # default-branch head date
+        ]
+        run, calls = _fake_run(responses)
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        monkeypatch.delenv("_TEST_GH_CI_NEWEST_SNAPSHOT", raising=False)
+        monkeypatch.delenv("_TEST_GH_DEFAULT_HEAD_DATE", raising=False)
+        monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", "main")
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", "a" * 40)
+        note = _mod._ci_freshness_note("1700", repo="o/r")
+        assert note is not None  # snapshot predates main's move → stale
+        joined = " ".join(str(a) for c in calls for a in c)
+        assert "check-suites" in joined
+        assert "check-runs" not in joined
+
     def test_a_failed_graphql_call_returns_None(self, monkeypatch):
         run, _ = _fake_run([("", 1)])
         monkeypatch.setattr(_mod.subprocess, "run", run)
         assert _mod._open_pr_migrations(repo="o/r") is None
+
+    def test_a_null_pr_node_returns_None_not_a_raise(self, monkeypatch):
+        """Audit BLOCKER (2026-09-03): a malformed element used to RAISE past
+        the docstring's 'None on any read failure' — AttributeError reaches
+        run_guard's fail-closed exit 2, i.e. one bad node among 100 open PRs
+        blocks EVERY merge on this machine, on the one gate designed to
+        degrade open."""
+        payload = json.dumps(
+            {
+                "data": {
+                    "repository": {
+                        "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": [None]}
+                    }
+                }
+            }
+        )
+        run, _ = _fake_run([(payload, 0)])
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        assert _mod._open_pr_migrations(repo="o/r") is None
+
+    def test_a_null_files_element_returns_None_not_a_raise(self, monkeypatch):
+        node = {
+            "number": 1610,
+            "baseRefName": "main",
+            "files": {"pageInfo": {"hasNextPage": False}, "nodes": [None]},
+        }
+        run, _ = _fake_run([(_graphql_payload([node]), 0)])
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        assert _mod._open_pr_migrations(repo="o/r") is None
+
+    def test_a_null_file_row_returns_None_not_a_raise(self, monkeypatch):
+        """The KeyError twin routed to the OTHER wrong direction: main()'s
+        broad catch turned it into a silent allow that also skipped every gate
+        after this one."""
+        monkeypatch.setenv("_TEST_GH_PR_FILES", "null")
+        assert _mod._pr_file_effects("1") is None
+
+    def test_a_row_missing_filename_returns_None_not_a_raise(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_PR_FILES", json.dumps({"status": "added"}))
+        assert _mod._pr_file_effects("1") is None
+
+    def test_non_default_base_listing_reads_the_BASE_ref(self, monkeypatch):
+        """Audit SF2 (measured delete-survivable): mutating the ref THREADING
+        in the caller to always-None left 55/55 tests green, because the
+        listing seam returns before `ref` is read. The lock is the recorded
+        argv — and it must run THROUGH the caller: a first version of this
+        test called the helper directly and the same mutation still survived
+        (the mutation lives in the threading, not the helper)."""
+        responses = [
+            (json.dumps({"name": "0092_parent.py", "type": "file"}) + "\n", 0),
+            ("", 0),  # data_migrations dir
+        ]
+        run, calls = _fake_run(responses)
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        monkeypatch.delenv("_TEST_GH_MAIN_MIGRATIONS", raising=False)
+        monkeypatch.setenv("_TEST_GH_BASE_REF", "feat-parent")
+        monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", "main")
+        monkeypatch.setenv("_TEST_GH_PR_FILES", _files(f"{_D}0092_child.py"))
+        blocked, _ = _mod._check_migration_prefixes("1700", repo="o/r")
+        assert blocked is True  # 0092_child vs the BASE's 0092_parent
+        assert any("ref=feat-parent" in str(a) for c in calls for a in c)
+
+    def test_live_sweep_captures_baseRefName_from_the_wire(self, monkeypatch):
+        """Audit SF2, second half: the live same-target filter is only as real
+        as the wire capture feeding it."""
+        node = _pr_node(1610, [f"{_D}0092_x.py"])
+        node["baseRefName"] = "feat-parent"
+        run, _ = _fake_run([(_graphql_payload([node]), 0)])
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        out = _mod._open_pr_migrations(repo="o/r")
+        assert out is not None
+        assert out[3]["1610"] == "feat-parent"
 
     def test_added_files_reads_status_from_the_wire(self, monkeypatch):
         """`_pr_file_effects`' live path reads status per row; the seam path filters
@@ -597,11 +773,11 @@ class TestCiFreshnessNote:
     """
 
     def test_flags_a_check_older_than_the_default_branch_head(self, monkeypatch):
-        monkeypatch.setenv("_TEST_GH_CI_NEWEST_START", "2026-09-02T13:17:21Z")
+        monkeypatch.setenv("_TEST_GH_CI_NEWEST_SNAPSHOT", "2026-09-02T13:17:21Z")
         monkeypatch.setenv("_TEST_GH_DEFAULT_HEAD_DATE", "2026-09-02T21:43:17Z")
         note = _mod._ci_freshness_note("1541")
         assert note is not None
-        assert "DIFFERENT main" in note
+        assert "DIFFERENT base" in note
         # Both instants named — a note that says "stale" without saying stale
         # against WHAT sends the reader back to the API to find out.
         assert "2026-09-02T13:17:21Z" in note and "2026-09-02T21:43:17Z" in note
@@ -612,22 +788,22 @@ class TestCiFreshnessNote:
         demonstrated on, had gone RED under a concurrent push. Staleness and
         outcome are independent facts; claiming one from the other is exactly
         the unverified-assertion class the report is supposed to avoid."""
-        monkeypatch.setenv("_TEST_GH_CI_NEWEST_START", "2026-09-02T13:17:21Z")
+        monkeypatch.setenv("_TEST_GH_CI_NEWEST_SNAPSHOT", "2026-09-02T13:17:21Z")
         monkeypatch.setenv("_TEST_GH_DEFAULT_HEAD_DATE", "2026-09-02T21:43:17Z")
         note = _mod._ci_freshness_note("1541")
         assert "green" not in note.lower()
         assert "pass" not in note.lower()
 
     def test_silent_when_the_check_is_newer_than_main(self, monkeypatch):
-        monkeypatch.setenv("_TEST_GH_CI_NEWEST_START", "2026-09-03T18:00:00Z")
+        monkeypatch.setenv("_TEST_GH_CI_NEWEST_SNAPSHOT", "2026-09-03T18:00:00Z")
         monkeypatch.setenv("_TEST_GH_DEFAULT_HEAD_DATE", "2026-09-03T12:00:00Z")
         assert _mod._ci_freshness_note("1616") is None
 
     def test_silent_when_either_side_is_unreadable(self, monkeypatch):
-        monkeypatch.setenv("_TEST_GH_CI_NEWEST_START", "__error__")
+        monkeypatch.setenv("_TEST_GH_CI_NEWEST_SNAPSHOT", "__error__")
         monkeypatch.setenv("_TEST_GH_DEFAULT_HEAD_DATE", "2026-09-03T12:00:00Z")
         assert _mod._ci_freshness_note("1616") is None
-        monkeypatch.setenv("_TEST_GH_CI_NEWEST_START", "2026-09-03T12:00:00Z")
+        monkeypatch.setenv("_TEST_GH_CI_NEWEST_SNAPSHOT", "2026-09-03T12:00:00Z")
         monkeypatch.setenv("_TEST_GH_DEFAULT_HEAD_DATE", "__error__")
         assert _mod._ci_freshness_note("1616") is None
 
@@ -635,7 +811,7 @@ class TestCiFreshnessNote:
         """GitHub returns `Z` on the checks API and a numeric offset on the
         commit API. Comparing them as STRINGS would put `2026-09-02T21:43:17Z`
         before `2026-09-02T17:43:17-04:00` — the same instant, wrong answer."""
-        monkeypatch.setenv("_TEST_GH_CI_NEWEST_START", "2026-09-02T13:17:21Z")
+        monkeypatch.setenv("_TEST_GH_CI_NEWEST_SNAPSHOT", "2026-09-02T13:17:21Z")
         monkeypatch.setenv("_TEST_GH_DEFAULT_HEAD_DATE", "2026-09-02T17:43:17-04:00")
         assert _mod._ci_freshness_note("1541") is not None
 
@@ -643,6 +819,6 @@ class TestCiFreshnessNote:
         """Comparing naive to aware raises TypeError; outside the guard that
         aborts the whole report mid-print — a partial report that looks
         structurally complete (SHOULD-FIX 9)."""
-        monkeypatch.setenv("_TEST_GH_CI_NEWEST_START", "2026-09-02T13:17:21")
+        monkeypatch.setenv("_TEST_GH_CI_NEWEST_SNAPSHOT", "2026-09-02T13:17:21")
         monkeypatch.setenv("_TEST_GH_DEFAULT_HEAD_DATE", "2026-09-02T21:43:17Z")
         assert _mod._ci_freshness_note("1541") is None

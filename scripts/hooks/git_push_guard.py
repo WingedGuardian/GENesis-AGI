@@ -4515,30 +4515,47 @@ def _pr_file_effects(
     created: list[str] = []
     removed: set[str] = set()
     for line in rows:
+        # The WHOLE row access sits inside the try, not just the parse: a null
+        # row or a missing "filename" raises past a parse-only guard, and those
+        # exceptions route to the two WRONG fail directions (audit BLOCKER,
+        # 2026-09-03 — AttributeError → run_guard exit 2 = every-merge outage;
+        # KeyError → main()'s catch = silent allow, gates after this skipped).
+        # The docstring promises None on any read failure; make it true.
         try:
             row = json.loads(line)
+            status = row.get("status", "added")
+            if status in _MIGRATION_CREATING_STATUSES:
+                created.append(row["filename"])
+            if status == "removed":
+                removed.add(row["filename"])
+            prev = row.get("previous_filename")
+            if status == "renamed" and prev:
+                removed.add(prev)
         except Exception:
             return None
-        status = row.get("status", "added")
-        if status in _MIGRATION_CREATING_STATUSES:
-            created.append(row["filename"])
-        if status == "removed":
-            removed.add(row["filename"])
-        prev = row.get("previous_filename")
-        if status == "renamed" and prev:
-            removed.add(prev)
     return created, removed
 
 
-def _default_branch_migrations(repo: str | None = None) -> list[str] | None:
-    """Migration PATHS on the repo's DEFAULT BRANCH (both namespaces), or None.
+def _target_branch_migrations(
+    repo: str | None = None, ref: str | None = None
+) -> list[str] | None:
+    """Migration PATHS on the branch this PR merges into (both namespaces).
 
-    Read live rather than from the local checkout: this gate's whole point is
-    that the merge base a CI run used has moved, so a local `origin/main` that
-    was last fetched at some other time answers the wrong question. Tests inject
-    via ``_TEST_GH_MAIN_MIGRATIONS`` (one entry per line — a bare basename means
-    the numbered dir, an entry containing ``/`` is a full path; the literal
-    ``__error__`` simulates an API error).
+    ``ref`` is the PR's base branch; None falls back to the repo default. Read
+    live rather than from the local checkout: this gate's whole point is that
+    the merge base a CI run used has moved, so a local ``origin/main`` fetched
+    at some other time answers the wrong question.
+
+    Filenames travel as JSON RECORDS, never trimmed scalars: ``strip()`` on a
+    legal-but-odd git filename (leading space, embedded newline) ALTERS the
+    identity before the runner's regex sees it, and could manufacture a
+    migration-looking record that blocks a merge on a collision that does not
+    exist (Codex P3, #1666 round 2). A name the runner would ignore must be
+    ignored here for the same reason, in its exact original bytes.
+
+    Tests inject via ``_TEST_GH_MAIN_MIGRATIONS`` (one entry per line — a bare
+    basename means the numbered dir, an entry containing ``/`` is a full path;
+    the literal ``__error__`` simulates an API error).
     """
     raw = os.environ.get("_TEST_GH_MAIN_MIGRATIONS")
     if raw == "__error__":
@@ -4551,7 +4568,7 @@ def _default_branch_migrations(repo: str | None = None) -> list[str] | None:
                 continue
             out.append(ln if "/" in ln else f"src/genesis/db/migrations/{ln}")
         return out
-    branch = _repo_default_branch(repo=repo)
+    branch = ref or _repo_default_branch(repo=repo)
     if not branch:
         return None
     paths: list[str] = []
@@ -4567,7 +4584,7 @@ def _default_branch_migrations(repo: str | None = None) -> list[str] | None:
                     "-f",
                     f"ref={branch}",
                     "--jq",
-                    '.[] | select(.type == "file") | .name',
+                    ".[] | {name: .name, type: .type}",
                 ],
                 capture_output=True,
                 text=True,
@@ -4575,25 +4592,70 @@ def _default_branch_migrations(repo: str | None = None) -> list[str] | None:
             )
             if result.returncode != 0:
                 return None
-            names = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+            rows = []
+            for ln in result.stdout.splitlines():
+                if not ln.strip():
+                    continue
+                try:
+                    rows.append(json.loads(ln))
+                except Exception:
+                    return None
             # The directory form of the contents API returns AT MOST 1,000
             # entries with no truncation marker (the Trees API is the >1k
-            # route). 94 files today; at the cap a full read and a clipped one
-            # are indistinguishable, so treat it as unreadable rather than
-            # report collisions from a listing that may have ended early.
-            if len(names) >= 1000:
+            # route). The cap check counts RAW rows, filtered client-side —
+            # a query-side type filter would hide non-file entries from the
+            # count and let a clipped read pass as complete, the exact class
+            # round 2 fixed in _pr_file_effects (audit SF4, 2026-09-03).
+            if len(rows) >= 1000:
                 return None
-            paths.extend(dir_prefix + n for n in names)
+            try:
+                paths.extend(
+                    dir_prefix + r["name"] for r in rows if r.get("type") == "file"
+                )
+            except Exception:
+                return None
         except Exception:
             return None
     return paths
 
 
+def _parse_open_pr_nodes(
+    nodes: list,
+    out: dict[str, list[str]],
+    short_read: list[str],
+    bases: dict[str, str | None],
+) -> None:
+    """Parse GraphQL PR nodes into claims/overflow/base maps. Raises on any
+    malformed element — the caller converts that to its documented None."""
+    for node in nodes:
+        num = str(node.get("number"))
+        bases[num] = node.get("baseRefName")
+        files = node.get("files") or {}
+        paths = [
+            f["path"]
+            for f in (files.get("nodes") or [])
+            if str(f.get("changeType", "ADDED")).lower() in _MIGRATION_CREATING_STATUSES
+        ]
+        # FULL PATHS, never basenames: the consumer re-derives claims by running
+        # these through `_migration_prefix_claims`, which is anchored on the
+        # directory — a basename matches nothing there, and every cross-PR
+        # collision silently vanishes. That exact live regression shipped once
+        # while 41 seam-fed unit tests stayed green (the seams normalize to full
+        # paths; the live path did not), and only the live acceptance replay
+        # caught it. The contract test that pins this feeds THIS function's real
+        # output into the consumer.
+        mig_paths = sorted(p for p in paths if _migration_prefix_claims([p]))
+        if mig_paths:
+            out[num] = mig_paths
+        if (files.get("pageInfo") or {}).get("hasNextPage"):
+            short_read.append(num)
+
+
 def _open_pr_migrations(
     repo: str | None = None,
-) -> tuple[dict[str, list[str]], list[str], bool] | None:
-    """``({pr_number: [migration paths]}, [unresolved pr numbers], pr_list_truncated)``,
-    or None on any read failure.
+) -> tuple[dict[str, list[str]], list[str], bool, dict[str, str | None]] | None:
+    """``({pr_number: [migration paths]}, [unresolved pr numbers], pr_list_truncated,
+    {pr_number: baseRefName})``, or None on any read failure.
 
     ONE GraphQL request for every open PR (measured 3.4s for 48 PRs — a
     per-PR REST walk of the same set took ~40s, well past the merge gate's
@@ -4622,6 +4684,9 @@ def _open_pr_migrations(
                 prs,
                 [str(n) for n in payload.get("truncated", [])],
                 bool(payload.get("pr_list_truncated", False)),
+                # Absent per-PR bases (older fixtures) read as None = "assume
+                # the same target", preserving pre-baseRefName behavior.
+                {str(k): v for k, v in payload.get("bases", {}).items()},
             )
         except Exception:
             return None
@@ -4632,7 +4697,7 @@ def _open_pr_migrations(
     query = (
         "query($owner:String!,$name:String!){repository(owner:$owner,name:$name)"
         "{pullRequests(states:OPEN,first:100){pageInfo{hasNextPage} nodes{number "
-        "files(first:100){pageInfo{hasNextPage} nodes{path changeType}}}}}}"
+        "baseRefName files(first:100){pageInfo{hasNextPage} nodes{path changeType}}}}}}"
     )
     try:
         result = subprocess.run(
@@ -4655,27 +4720,16 @@ def _open_pr_migrations(
         return None
     out: dict[str, list[str]] = {}
     short_read: list[str] = []
-    for node in nodes:
-        num = str(node.get("number"))
-        files = node.get("files") or {}
-        paths = [
-            f["path"]
-            for f in (files.get("nodes") or [])
-            if str(f.get("changeType", "ADDED")).lower() in _MIGRATION_CREATING_STATUSES
-        ]
-        # FULL PATHS, never basenames: the consumer re-derives claims by running
-        # these through `_migration_prefix_claims`, which is anchored on the
-        # directory — a basename matches nothing there, and every cross-PR
-        # collision silently vanishes. That exact live regression shipped once
-        # while 41 seam-fed unit tests stayed green (the seams normalize to full
-        # paths; the live path did not), and only the live acceptance replay
-        # caught it. The contract test that pins this feeds THIS function's real
-        # output into the consumer.
-        mig_paths = sorted(p for p in paths if _migration_prefix_claims([p]))
-        if mig_paths:
-            out[num] = mig_paths
-        if (files.get("pageInfo") or {}).get("hasNextPage"):
-            short_read.append(num)
+    bases: dict[str, str | None] = {}
+    try:
+        _parse_open_pr_nodes(nodes, out, short_read, bases)
+    except Exception:
+        # Docstring contract: None on ANY read failure. A null node or a null
+        # files element raises AttributeError, which would otherwise reach
+        # run_guard's fail-closed exit 2 — a repo-wide every-merge outage from
+        # one malformed element among 100 open PRs, on the one gate designed
+        # to degrade OPEN (audit BLOCKER, 2026-09-03; raises measured).
+        return None
     # RESOLVE the short reads rather than merely reporting them. A standing
     # "could not see PR #X" caveat on every other PR is noise that trains a
     # reader to skip the line, and it leaves a real blind spot open: the PR whose
@@ -4697,7 +4751,12 @@ def _open_pr_migrations(
             unresolved.extend(short_read[i:])
             break
         effects = _pr_file_effects(num, repo=repo)
-        if effects is None:
+        if effects is None or (not effects[0] and not effects[1]):
+            # A >100-file PR (that is WHY we are refetching) cannot have an
+            # empty file list — a zero-row rc-0 read is not a possible answer,
+            # so it goes to UNRESOLVED, never to clean. The sibling listing arm
+            # applies the same empty-when-impossible contract (audit SF3,
+            # 2026-09-03: the old code resolved the truncation caveat as clean).
             unresolved.append(num)
             continue
         # Same full-path contract as the sweep above. Only the CREATED side
@@ -4708,20 +4767,23 @@ def _open_pr_migrations(
             out[num] = mig_paths
         else:
             out.pop(num, None)
-    return out, unresolved, pr_list_truncated
+    return out, unresolved, pr_list_truncated, bases
 
 
 def _ci_freshness_note(pr_num: str, repo: str | None = None) -> str | None:
     """ADVISORY note when NO check on the PR's head STARTED after the current
     default-branch head landed — i.e. every run tested a main that has moved.
 
-    STARTED, not completed (Codex P2, #1666): a check's merge-ref snapshot is
-    taken when the run is created, so ``completed_at`` proves nothing about
-    WHICH main was tested — a slow run finishing after main moved still tested
-    the old merge ref, and its late completion would suppress this note in
-    exactly the stale case it exists to expose. ``max(started_at)`` is the
-    faithful cheap proxy; the residual (a run created in the seconds between
-    snapshot and main's commit) is accepted for an advisory.
+    Keyed on check-suite ``created_at`` — the event that SELECTS the merge-ref
+    snapshot. Two per-run timestamps failed here first, same class both times
+    (a per-run field standing in for snapshot identity): ``completed_at``
+    (a slow run finishing after main moved still tested the old ref) and then
+    ``started_at`` (a queued run STARTS long after its snapshot was taken —
+    this repo documents 50-75 minute runner queues in codeql.yml). Suite
+    creation happens at trigger time, before any queueing, so
+    ``max(created_at)`` is the faithful time for "newest snapshot"; the
+    residual (a suite created in the seconds before main's commit) is accepted
+    for an advisory.
 
     Deliberately NOT a gate. Measured 2026-09-03, 30 of 48 open PRs were in this
     state (oldest tick six weeks old), so blocking would refuse most of the queue
@@ -4735,10 +4797,13 @@ def _ci_freshness_note(pr_num: str, repo: str | None = None) -> str | None:
     Returns None when either side is unreadable: no note beats a wrong note, and
     a hedge printed on every PR is indistinguishable from a finding on every PR.
     """
-    raw_check = os.environ.get("_TEST_GH_CI_NEWEST_START")
+    raw_check = os.environ.get("_TEST_GH_CI_NEWEST_SNAPSHOT")
     raw_main = os.environ.get("_TEST_GH_DEFAULT_HEAD_DATE")
     if raw_check is None or raw_main is None:
-        branch = _repo_default_branch(repo=repo)
+        # The PR's ACTUAL base where readable (audit NOTE 5): a stacked PR's
+        # CI ran against its parent, and keying the note to main's movement is
+        # wrong in both directions there. Default branch as fallback.
+        branch = _pr_base_ref(pr_num, repo=repo) or _repo_default_branch(repo=repo)
         head_sha = _pr_head_sha(pr_num, repo=repo)
         if not branch or not head_sha:
             return None
@@ -4750,12 +4815,12 @@ def _ci_freshness_note(pr_num: str, repo: str | None = None) -> str | None:
                 # "stale" note the day the count crosses the page size
                 # (architect SHOULD-FIX 8). With --paginate each page is its own
                 # JSON document, so per-page jq output is concatenated lines and
-                # the aggregate must happen client-side. started_at, not
-                # completed_at — see the docstring.
+                # the aggregate must happen client-side. Suite created_at,
+                # not any per-run timestamp — see the docstring.
                 stamps = subprocess.run(
-                    ["gh", "api", f"repos/{repo or ':owner/:repo'}/commits/{head_sha}/check-runs",
+                    ["gh", "api", f"repos/{repo or ':owner/:repo'}/commits/{head_sha}/check-suites",
                      "--paginate",
-                     "--jq", ".check_runs[]|select(.started_at != null)|.started_at"],
+                     "--jq", ".check_suites[]|select(.created_at != null)|.created_at"],
                     capture_output=True, text=True, timeout=_gh_timeout(8),
                 ).stdout.split()
                 raw_check = max(stamps) if stamps else ""
@@ -4784,9 +4849,10 @@ def _ci_freshness_note(pr_num: str, repo: str | None = None) -> str | None:
     except Exception:
         return None
     return (
-        f"NOTE: the newest check on this head STARTED {raw_check}, before the "
-        f"default branch moved at {raw_main} — this PR's checks ran against a "
-        "DIFFERENT main. CI re-runs only on a push, so whatever they concluded "
+        f"NOTE: the newest CI snapshot of this head was taken {raw_check} "
+        "(check-suite created), before the "
+        f"target branch moved at {raw_main} — this PR's checks ran against a "
+        "DIFFERENT base. CI re-runs only on a push, so whatever they concluded "
         "does not describe a merge today."
     )
 
@@ -4829,7 +4895,7 @@ def _check_migration_prefixes(
     if not mine:
         return False, "ok (no migrations in this PR)"
 
-    problems: list[str] = []
+    problems: list[tuple[str, str]] = []
     caveats: list[str] = []
 
     # A SELF-collision — one PR adding two files under one prefix — is the
@@ -4837,11 +4903,35 @@ def _check_migration_prefixes(
     # OTHER sources is structurally blind to it (architect SHOULD-FIX 6).
     for prefix, names in sorted(mine.items()):
         if len(names) > 1:
-            problems.append(f"  {prefix}: this PR itself adds {' and '.join(sorted(names))}")
+            problems.append(
+                (prefix, f"  {prefix}: this PR itself adds {' and '.join(sorted(names))}")
+            )
 
-    on_main = _default_branch_migrations(repo=repo)
+    # Compare against the branch this PR ACTUALLY merges into. For the
+    # default-base majority this is the default branch; for the deliberately
+    # supported stacked path it is the parent branch, where a parent's
+    # deletions and additions are both visible (Codex P2, #1666 round 2).
+    # Unreadable base ref → default branch (today's behavior), and the label
+    # keeps the message honest either way. Reuses the EXISTING _pr_base_ref
+    # (seam _TEST_GH_BASE_REF) — a first draft added a second one, which
+    # SHADOWED the original and silently swapped the seam under the
+    # base-is-default gate; one gh interaction, one helper, one seam.
+    base_ref = _pr_base_ref(pr_num, repo=repo)
+    non_default_base = False
+    if base_ref:
+        # Default-branch resolution only when there IS a base to compare it to —
+        # an unconditional call would put a live gh read on every invocation
+        # (and every unit test) for a fact only the stacked minority needs.
+        default_ref = _repo_default_branch(repo=repo)
+        non_default_base = bool(default_ref and base_ref != default_ref)
+    target_label = (
+        f"the base branch '{base_ref}'" if non_default_base else "the default branch"
+    )
+    on_main = _target_branch_migrations(
+        repo=repo, ref=base_ref if non_default_base else None
+    )
     if on_main is None:
-        caveats.append("could not read the default branch's migrations")
+        caveats.append(f"could not read {target_label}'s migrations")
     elif not on_main:
         # 90+ migrations exist on main today, so an EMPTY successful listing is
         # not a possible answer — it means the read did not describe the
@@ -4849,7 +4939,7 @@ def _check_migration_prefixes(
         # it would be the seen-nothing-reported-no-problem failure (architect
         # SHOULD-FIX 4).
         caveats.append(
-            "the default branch's migration listing came back EMPTY — not a "
+            f"{target_label}'s migration listing came back EMPTY — not a "
             "possible state, so the read did not describe the directory"
         )
     else:
@@ -4873,20 +4963,32 @@ def _check_migration_prefixes(
                     # refuses a PR that adds nothing.
                     if other != basename:
                         problems.append(
-                            f"  {prefix}: this PR adds {basename}, but the default "
-                            f"branch already has {other}"
+                            (
+                                prefix,
+                                f"  {prefix}: this PR adds {basename}, but "
+                                f"{target_label} already has {other}",
+                            )
                         )
 
     others = _open_pr_migrations(repo=repo)
     if others is None:
         caveats.append("could not read other open PRs' migrations")
     else:
-        by_pr, unresolved, pr_list_truncated = others
+        by_pr, unresolved, pr_list_truncated, other_bases = others
         for other_pr, other_paths in sorted(by_pr.items()):
             # Exclude by PR NUMBER, not by filename: excluding "the file I also
             # have" would silence a real collision whenever two PRs add the
             # same basename.
             if str(other_pr) == str(pr_num):
+                continue
+            # Same-TARGET PRs only (Codex P2, #1666 round 2): two PRs adding
+            # one prefix collide iff they merge into the same branch. A stacked
+            # child and an unrelated main-bound PR share no target tree, and
+            # comparing them manufactures a collision that no merge order
+            # produces. An unknown base on either side compares anyway — the
+            # conservative direction for the default-base majority.
+            other_base = other_bases.get(str(other_pr))
+            if base_ref and other_base and other_base != base_ref:
                 continue
             other_claims = _migration_prefix_claims(other_paths)
             for prefix, names in sorted(mine.items()):
@@ -4898,9 +5000,21 @@ def _check_migration_prefixes(
                 # prefix (and a conflict on the path).
                 for clash in other_claims.get(prefix, []):
                     problems.append(
-                        f"  {prefix}: this PR adds {' and '.join(sorted(names))}, "
-                        f"and open PR #{other_pr} adds {clash}"
+                        (
+                            prefix,
+                            f"  {prefix}: this PR adds {' and '.join(sorted(names))}, "
+                            f"and open PR #{other_pr} adds {clash}",
+                        )
                     )
+        if not base_ref and any(other_bases.values()):
+            # Comparing against ALL open PRs because THIS PR's base could not
+            # be read is the conservative direction — but a block built on it
+            # must say so, or a plumbing failure wears the grammar of a
+            # definite fact (audit NOTE 8).
+            caveats.append(
+                "this PR's base branch was unreadable — compared against every "
+                "open PR's target"
+            )
         live_truncation = [n for n in unresolved if str(n) != str(pr_num)]
         if live_truncation:
             caveats.append(
@@ -4920,8 +5034,12 @@ def _check_migration_prefixes(
         # the numbered runner raises pre-flight and ABORTS BOOTSTRAP on every
         # install; the data runner catches its duplicate post-boot and skips
         # ONLY the data-migration batch while the server runs on.
-        numbered_hit = any(not ln.strip().startswith("d") for ln in problems)
-        data_hit = any(ln.strip().startswith("d") for ln in problems)
+        # Classified on the PREFIX carried with each line, never re-derived
+        # from the rendered string — a text-shape proxy for identity silently
+        # misclassifies the headline the day a line's format changes (audit
+        # NOTE 6; same class as the timestamp proxies, in miniature).
+        numbered_hit = any(not pfx.startswith("d") for pfx, _ in problems)
+        data_hit = any(pfx.startswith("d") for pfx, _ in problems)
         consequences = []
         if numbered_hit:
             consequences.append(
@@ -4941,7 +5059,7 @@ def _check_migration_prefixes(
             + "; ".join(consequences)
             + "."
         )
-        body = "\n".join(problems)
+        body = "\n".join(line for _, line in problems)
         tail = ("\n  caveat: " + "; ".join(caveats)) if caveats else ""
         return True, f"{head}\n{body}{tail}"
     n_files = sum(len(v) for v in mine.values())
@@ -4951,7 +5069,7 @@ def _check_migration_prefixes(
         # report-is-an-inventory rule names: it hides a true fact (the default
         # branch WAS cleanly checked) behind a single pessimistic label, and a
         # line that always reads the same trains a reader to skip it.
-        checked = "the default branch" if on_main else None
+        checked = target_label if on_main else None
         prefix = (
             f"NOTE: {n_files} migration(s) — no collision with {checked}, but "
             if checked
