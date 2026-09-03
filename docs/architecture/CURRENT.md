@@ -494,7 +494,7 @@ gated — that contract is one-directional.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 84c7259d 2026-08-31
+verified: 85f91765 2026-09-01
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -559,6 +559,19 @@ verified: 84c7259d 2026-08-31
   stamping, AND a hard per-window cap on hold-creation (the ASK-state
   approval-flood guard) alongside the batch-approval card — `marketing_send` has
   no autonomous caller until then.
+- **Marketing reply → owner Telegram ping (notify-only).** When a GENUINE human
+  reply lands (auto-responders + foreign senders already gated out by the
+  reply→engagement bridge, `outreach/engagement.py`) AND the reply's recipient is
+  a curated `marketing_prospects` row (`get_by_email` — NOT the thread
+  `signal_type`, which the owner-approval resume path overwrites to
+  `email_gate_resume`, so it never survives a held→approved cold send), the owner
+  gets ONE brief `submit_raw` Telegram ping (`make_marketing_reply_notifier`,
+  wired in `runtime/init/outreach.py`). Owner-facing, so never gated; best-effort
+  (a non-DELIVERED ping is logged, not retried — the reply is already durably
+  recorded in `outreach_history`/`email_threads`). Attacker-controlled reply
+  fields are HTML-escaped + control-char-stripped (`_sanitize_ping_field`) because
+  the outreach telegram path delivers with `parse_mode="HTML"` unescaped. The
+  autonomous `ReplyHandler` auto-reply path is unchanged by this.
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
   PII scan for EXTERNAL channels and `content`-category drafts only. Never
   applied to owner channels — don't add them.

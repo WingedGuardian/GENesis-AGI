@@ -11,6 +11,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Telegram ping when someone replies to a marketing pitch.** When a real person
+  replies to one of Genesis's cold marketing emails, you now get one brief
+  Telegram notification — the sender and the first line of their reply.
+  Auto-responders (out-of-office / bounces) and spoofed senders are filtered out,
+  so you're pinged only for genuine human replies, and never for sends. The reply
+  is still recorded on the dashboard exactly as before; this just surfaces it to
+  you immediately instead of waiting for you to go look.
+
 - **Gated autonomous cold marketing outreach (inert by default).** Genesis can
   now stage cold marketing emails to an owner-curated prospect list via the new
   `marketing_send` tool. The recipient is resolved in code from a private
