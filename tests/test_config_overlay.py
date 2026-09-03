@@ -24,6 +24,20 @@ _SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "genesis"
 _HOME_CONFIG_RE = re.compile(r'Path\.home\(\)\s*/\s*["\']\.genesis["\']\s*/\s*["\']config["\']')
 
 
+@pytest.fixture(autouse=True)
+def _reset_overlay_warn_cache():
+    """Isolate the module-global warn-dedupe map.
+
+    ``_WARNED_OVERLAYS`` persists for the process, so without this one test's
+    warning suppresses another's and the suite passes for the wrong reason.
+    """
+    from genesis import _config_overlay as ov
+
+    ov._WARNED_OVERLAYS.clear()
+    yield
+    ov._WARNED_OVERLAYS.clear()
+
+
 def test_merge_reads_user_dir_overlay_first(tmp_path, monkeypatch):
     user_dir = tmp_path / "user_config"
     user_dir.mkdir()
@@ -334,3 +348,121 @@ def test_broken_overlay_warns_and_falls_back(tmp_path, monkeypatch, caplog):
     msg = caplog.records[0].getMessage()
     assert "cc_roster.local.yaml" in msg  # names the offending file
     assert "NOT in effect" in msg  # states the consequence
+
+
+# ── wrong ROOT SHAPE: valid YAML, not a mapping ──────────────────────────────
+# Codex/CodeRabbit review of the roster-portability PR: `_deep_merge` calls
+# `overlay.items()`, so a list or scalar root raised AttributeError from OUTSIDE
+# merge_local_overlay — propagating to every caller of the config loader instead
+# of degrading to base like every other malformed case.
+
+
+@pytest.mark.parametrize(
+    ("body", "shape"),
+    [("- one\n- two\n", "list"), ("just-a-string\n", "str"), ("42\n", "int")],
+)
+def test_non_mapping_overlay_root_falls_back_and_warns(tmp_path, monkeypatch, caplog, body, shape):
+    import logging
+
+    from genesis import _config_overlay as ov
+
+    base_path = tmp_path / "cc_roster.yaml"
+    base_path.write_text("default: claude\n")
+    user_dir = tmp_path / "user"
+    user_dir.mkdir()
+    (user_dir / "cc_roster.local.yaml").write_text(body)
+    monkeypatch.setattr(ov, "_user_config_dir", lambda: user_dir)
+
+    base = {"default": "claude", "models": {"claude": {"native_subscription": True}}}
+    with caplog.at_level(logging.WARNING, logger="genesis._config_overlay"):
+        out = ov.merge_local_overlay(base, base_path)  # must not raise
+
+    assert out == base  # fell back rather than exploding
+    assert caplog.records, "a wrong-shape overlay must not fail silently"
+    msg = caplog.records[0].getMessage()
+    assert "cc_roster.local.yaml" in msg
+    assert shape in msg  # names the offending shape
+    assert "NOT in effect" in msg
+
+
+def test_overlay_warning_is_deduped_per_file_version(tmp_path, monkeypatch, caplog):
+    """Some loaders re-read the overlay on EVERY call (the immunity gate reloads
+    per gate check), so an undeduped warning turns one YAML typo into a traceback
+    on every memory or approval operation. Warn once per file VERSION — and warn
+    again once the file changes, so a failed repair is still visible."""
+    import logging
+    import os
+
+    from genesis import _config_overlay as ov
+
+    base_path = tmp_path / "cc_roster.yaml"
+    base_path.write_text("default: claude\n")
+    user_dir = tmp_path / "user"
+    user_dir.mkdir()
+    local = user_dir / "cc_roster.local.yaml"
+    local.write_text("models:\n  bad: [unclosed\n")
+    monkeypatch.setattr(ov, "_user_config_dir", lambda: user_dir)
+
+    base = {"default": "claude"}
+    with caplog.at_level(logging.WARNING, logger="genesis._config_overlay"):
+        for _ in range(5):
+            assert ov.merge_local_overlay(base, base_path) == base
+    assert len(caplog.records) == 1, "flooded the journal on a hot-path loader"
+
+    # A NEW bad version must warn again — a silent second failure would hide a
+    # botched repair.
+    caplog.clear()
+    local.write_text("models:\n  worse: {also-unclosed\n")
+    os.utime(local, (0, 0))  # force a distinct mtime
+    with caplog.at_level(logging.WARNING, logger="genesis._config_overlay"):
+        assert ov.merge_local_overlay(base, base_path) == base
+    assert len(caplog.records) == 1, "a changed bad file must warn again"
+
+
+@pytest.mark.parametrize(
+    ("body", "shape"),
+    [("[]\n", "list"), ("false\n", "bool"), ("0\n", "int"), ('""\n', "str")],
+)
+def test_falsy_non_mapping_root_still_warns(tmp_path, monkeypatch, caplog, body, shape):
+    """A FALSY non-mapping root used to be swallowed by an `or {}` default — no
+    warning, every override silently dropped. An empty-list root is exactly the
+    shape this guard advertises catching, so the non-empty cases above were not
+    enough to prove it."""
+    import logging
+
+    from genesis import _config_overlay as ov
+
+    base_path = tmp_path / "cc_roster.yaml"
+    base_path.write_text("default: claude\n")
+    user_dir = tmp_path / "user"
+    user_dir.mkdir()
+    (user_dir / "cc_roster.local.yaml").write_text(body)
+    monkeypatch.setattr(ov, "_user_config_dir", lambda: user_dir)
+
+    base = {"default": "claude"}
+    with caplog.at_level(logging.WARNING, logger="genesis._config_overlay"):
+        assert ov.merge_local_overlay(base, base_path) == base
+    assert caplog.records, f"a {shape} root was dropped silently"
+    assert shape in caplog.records[0].getMessage()
+
+
+@pytest.mark.parametrize("body", ["", "\n", "null\n"])
+def test_empty_or_null_overlay_is_not_an_error(tmp_path, monkeypatch, caplog, body):
+    """An empty file or explicit `null` legitimately has nothing to merge, and
+    must NOT be reported as malformed — otherwise a freshly-created overlay
+    warns on every read."""
+    import logging
+
+    from genesis import _config_overlay as ov
+
+    base_path = tmp_path / "cc_roster.yaml"
+    base_path.write_text("default: claude\n")
+    user_dir = tmp_path / "user"
+    user_dir.mkdir()
+    (user_dir / "cc_roster.local.yaml").write_text(body)
+    monkeypatch.setattr(ov, "_user_config_dir", lambda: user_dir)
+
+    base = {"default": "claude"}
+    with caplog.at_level(logging.WARNING, logger="genesis._config_overlay"):
+        assert ov.merge_local_overlay(base, base_path) == base
+    assert not caplog.records, "an empty overlay is not a malformed one"

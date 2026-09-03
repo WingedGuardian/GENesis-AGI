@@ -53,7 +53,7 @@
 # `gmodel --print-env <name>` previews the env without launching.
 default: claude
 # Agentic gauntlet (genesis.eval.gauntlet) — validates that a roster member can
-# still drive Claude Code through a coding fix-loop. `genesis eval gauntlet run
+# still drive Claude Code through a coding fix-loop. `genesis eval gauntlet -m
 # <model>` runs on demand anytime. The WEEKLY auto-run is OFF by default because
 # it spends inference on paid peers; flip `scheduled: true` (here or via the
 # cc_roster settings domain) to enable it for all runnable roster models.
@@ -117,6 +117,6 @@ models:
 #     deepseek:      anthropic_base_url: "https://api.deepseek.com/anthropic"
 #
 # Prove a peer before you depend on it: `gmodel --print-env <name>` to check the
-# env resolves, then `genesis eval gauntlet run <name>` to confirm it can
+# env resolves, then `genesis eval gauntlet -m <name>` to confirm it can
 # actually drive a coding fix-loop. Record the date in `validated:` yourself.
 # ─────────────────────────────────────────────────────────────────────────────
