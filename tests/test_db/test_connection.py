@@ -234,3 +234,146 @@ async def test_get_db_foreign_keys_opt_out(tmp_path):
         assert (await cur.fetchone())[0] == 0
     finally:
         await db.close()
+
+
+# ── transaction(): multi-statement atomicity (F1) ─────────────────────────
+
+
+async def test_transaction_commits_on_clean_exit(sconn):
+    """Statements inside the block are committed as a unit on clean exit."""
+    async with sconn.transaction():
+        await sconn.execute("INSERT INTO t VALUES (1, 'a')")
+        await sconn.execute("INSERT INTO t VALUES (2, 'b')")
+    # visible AFTER the block (single commit at exit)
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 2
+
+
+async def test_transaction_rolls_back_on_error(sconn):
+    """ANY exception in the block rolls the WHOLE transaction back — the first
+    insert must not survive when the block later raises."""
+    with contextlib.suppress(RuntimeError):
+        async with sconn.transaction():
+            await sconn.execute("INSERT INTO t VALUES (1, 'a')")
+            raise RuntimeError("boom")
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 0  # rolled back
+    # connection is not wedged — a later normal write still works
+    await sconn.execute("INSERT INTO t VALUES (9, 'ok')")
+    await sconn.commit()
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 1
+
+
+async def test_execute_is_reentrant_inside_transaction(sconn):
+    """execute() from the OWNING task inside the block runs on the held lock
+    (does not deadlock re-acquiring the non-reentrant lock)."""
+    async with sconn.transaction():
+        # would hang forever if execute() tried to re-acquire self._lock
+        await asyncio.wait_for(
+            sconn.execute("INSERT INTO t VALUES (1, 'reentrant')"), timeout=2.0
+        )
+    cur = await sconn.execute("SELECT val FROM t WHERE id = 1")
+    assert (await cur.fetchone())["val"] == "reentrant"
+
+
+async def test_transaction_holds_lock_across_body(sconn):
+    """The core mechanism: while task A is INSIDE an open transaction (paused
+    between statements), task B's execute() on the same connection BLOCKS until
+    A's transaction commits — no peer can interleave.
+
+    Verify-RED: make _maybe_lock always yield (never take the lock) and B is no
+    longer blocked, so 'b-done' appears before A is released and the final order
+    assertion fails."""
+    order: list[str] = []
+    a_inside = asyncio.Event()
+    release_a = asyncio.Event()
+
+    async def task_a():
+        async with sconn.transaction():
+            await sconn.execute("INSERT INTO t VALUES (100, 'a1')")
+            order.append("a-mid")
+            a_inside.set()
+            await release_a.wait()  # hold the transaction open
+            await sconn.execute("INSERT INTO t VALUES (101, 'a2')")
+            order.append("a-commit")
+
+    async def task_b():
+        await a_inside.wait()
+        order.append("b-attempt")
+        await sconn.execute("INSERT INTO t VALUES (200, 'b')")  # must block on held lock
+        order.append("b-done")
+
+    ta = asyncio.create_task(task_a())
+    tb = asyncio.create_task(task_b())
+    await a_inside.wait()
+    await asyncio.sleep(0.05)  # give B every chance to run — it must be blocked
+    assert "b-attempt" in order and "b-done" not in order
+    release_a.set()
+    await asyncio.gather(ta, tb)
+    # A's ENTIRE transaction committed before B's write ran
+    assert order == ["a-mid", "b-attempt", "a-commit", "b-done"]
+
+
+async def test_transaction_isolates_peer_from_uncommitted_write(sconn):
+    """ACCEPTANCE BAR — a deterministic replay of the exact fork defect F1 fixes.
+
+    A peer coroutine's ROLLBACK must not discard an uncommitted write that
+    belongs to another coroutine's atomic unit. Task A opens a transaction and
+    writes r1, then pauses (mid read-modify-write). While A is paused a peer B
+    issues rollback() on the SAME shared connection. With transaction() holding
+    the lock, B's rollback BLOCKS until A commits, so BOTH of A's rows survive.
+
+    Verify-RED: this is the real known-positive. Break the mechanism (make
+    transaction() release the lock during the body, i.e. the pre-F1 per-call
+    behavior) and B's rollback lands between A's two writes and discards r1 — the
+    final count is 1, not 2. Confirmed RED during development against a
+    lock-releasing transaction()."""
+    a_wrote_r1 = asyncio.Event()
+    release_a = asyncio.Event()
+
+    async def task_a():
+        async with sconn.transaction():
+            await sconn.execute("INSERT INTO t VALUES (1, 'a1')")
+            a_wrote_r1.set()
+            await release_a.wait()  # pause mid-unit, transaction still open
+            await sconn.execute("INSERT INTO t VALUES (2, 'a2')")
+
+    ta = asyncio.create_task(task_a())
+    await a_wrote_r1.wait()
+
+    # Peer rollback while A is paused — must block on the held transaction lock.
+    tb = asyncio.create_task(sconn.rollback())
+    await asyncio.sleep(0.05)
+    assert not tb.done()  # B's rollback is blocked, cannot nuke A's uncommitted r1
+
+    release_a.set()
+    await asyncio.gather(ta, tb)  # A commits both rows, THEN B's rollback no-ops
+
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 2  # both survived — no peer contamination
+
+
+async def test_transaction_is_not_reentrant(sconn):
+    """A nested transaction() on the SAME task raises rather than deadlocking or
+    silently sharing the transaction."""
+    with pytest.raises(RuntimeError, match="not re-entrant"):
+        async with sconn.transaction():
+            async with sconn.transaction():
+                pass
+
+
+async def test_commit_rollback_close_refused_inside_transaction(sconn):
+    """commit/rollback/close/executescript are refused inside the block — the
+    context manager owns the single commit/rollback, so a body cannot silently
+    early-commit or discard the transaction. (F-B)"""
+    async with sconn.transaction():
+        await sconn.execute("INSERT INTO t VALUES (1, 'x')")
+        for bad in ("commit", "rollback", "close"):
+            with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+                await getattr(sconn, bad)()
+        with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+            await sconn.executescript("SELECT 1")
+    # the block still committed normally despite the refused calls
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 1

@@ -4,20 +4,29 @@ federation_messages hash-chained transcript). Exercises the real
 
 from __future__ import annotations
 
+import asyncio
+
 import aiosqlite
 import pytest
 
+from genesis.db.connection import SerializedConnection
 from genesis.db.crud import federation as fed
 from genesis.db.schema import create_all_tables
 
 
 @pytest.fixture
 async def db(tmp_path):
-    async with aiosqlite.connect(str(tmp_path / "t.db")) as conn:
-        conn.row_factory = aiosqlite.Row
-        await create_all_tables(conn)
-        await conn.commit()
-        yield conn
+    # Wrap in SerializedConnection — the runtime type, and the one append_message
+    # requires for its transaction()-scoped atomicity. Schema build runs on the
+    # raw handle (unchanged path); CRUD is exercised through the wrapper.
+    raw = await aiosqlite.connect(str(tmp_path / "t.db"))
+    raw.row_factory = aiosqlite.Row
+    await create_all_tables(raw)
+    await raw.commit()
+    try:
+        yield SerializedConnection(raw)
+    finally:
+        await raw.close()
 
 
 async def _contact(db, cid="c1", state="active"):
@@ -100,6 +109,69 @@ async def test_append_advances_chain_head_atomically(db):
     row = await fed.get_contact(db, "c1")
     assert row["last_seq_sent"] == 2 and row["send_chain_head"] == "h2"
     assert row["last_seq_recv"] == 0  # untouched
+
+
+@pytest.mark.asyncio
+async def test_concurrent_independent_chains_stay_consistent(db):
+    """Concurrency SMOKE/integration test: PR2 runs the inbound poll-loop and the
+    outbound approval-drain concurrently on Genesis's single shared connection,
+    appending to INDEPENDENT chains (separate seq + head columns). Exercises many
+    concurrent atomic appends end-to-end and asserts both chains come out intact
+    (no deadlock, no error, correct tips + row counts).
+
+    NOTE: an all-SUCCESS interleaving does NOT distinguish the fix from the old
+    per-call-commit form (a prematurely-committed but internally-consistent
+    intermediate state is still consistent), so this is not the atomicity
+    acceptance bar — that is
+    ``test_connection.py::test_transaction_isolates_peer_from_uncommitted_write``,
+    a deterministic known-positive replay of the actual fork defect (a peer
+    rollback discarding another coroutine's uncommitted write)."""
+    await _contact(db)
+
+    async def out_chain():
+        prev = None
+        for i in range(1, 26):
+            h = f"ho{i}"
+            await fed.append_message(
+                db,
+                msg_id=f"o{i:02d}",
+                contact_id="c1",
+                direction="out",
+                seq=i,
+                prev_hash=prev,
+                payload_hash=h,
+                created_at="2026-08-31T00:00:00Z",
+                hitl_state="held",
+            )
+            prev = h
+
+    async def in_chain():
+        prev = None
+        for i in range(1, 26):
+            h = f"hi{i}"
+            await fed.append_message(
+                db,
+                msg_id=f"i{i:02d}",
+                contact_id="c1",
+                direction="in",
+                seq=i,
+                prev_hash=prev,
+                payload_hash=h,
+                created_at="2026-08-31T00:00:00Z",
+                hitl_state="received",
+            )
+            prev = h
+
+    await asyncio.gather(out_chain(), in_chain())
+
+    # Both chains intact — tips at the last link, all rows present, no fork.
+    assert await fed.chain_tip(db, "c1", direction="out") == (25, "ho25")
+    assert await fed.chain_tip(db, "c1", direction="in") == (25, "hi25")
+    assert len(await fed.list_messages(db, "c1", direction="out")) == 25
+    assert len(await fed.list_messages(db, "c1", direction="in")) == 25
+    row = await fed.get_contact(db, "c1")
+    assert row["last_seq_sent"] == 25 and row["send_chain_head"] == "ho25"
+    assert row["last_seq_recv"] == 25 and row["recv_chain_head"] == "hi25"
 
 
 @pytest.mark.asyncio

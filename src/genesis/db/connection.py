@@ -139,6 +139,7 @@ class SerializedConnection:
             "_reconnect_fn",
             "_consecutive_errors",
             "_max_errors",
+            "_txn_owner",
         }
     )
 
@@ -155,6 +156,12 @@ class SerializedConnection:
         object.__setattr__(self, "_reconnect_fn", reconnect_fn)
         object.__setattr__(self, "_consecutive_errors", 0)
         object.__setattr__(self, "_max_errors", self._MAX_LOCK_ERRORS)
+        # The asyncio.Task holding an OPEN explicit transaction (via
+        # :meth:`transaction`), or None. Read on every DB op by _owns_txn(), so
+        # it MUST be initialized here and live in _OWN_ATTRS — otherwise the
+        # first op resolves it through __getattr__ against the wrapped
+        # connection and raises AttributeError before any transaction exists.
+        object.__setattr__(self, "_txn_owner", None)
 
     # -- Attribute passthrough (e.g. row_factory, in_transaction) ----------
 
@@ -176,7 +183,14 @@ class SerializedConnection:
         """Track lock errors and attempt reconnection after threshold."""
         count = self._consecutive_errors + 1
         object.__setattr__(self, "_consecutive_errors", count)
-        if count >= self._max_errors and self._reconnect_fn is not None:
+        # Never reconnect in the middle of an OPEN explicit transaction: swapping
+        # `_conn` here would silently discard the uncommitted transaction on the
+        # old connection and leave :meth:`transaction`'s COMMIT/ROLLBACK operating
+        # on a fresh, transaction-less connection. Integrity is preserved either
+        # way (the CAS + single commit means a discarded txn wrote nothing), so
+        # just count the episode and raise — transaction() then rolls back on the
+        # still-open connection and the caller retries the whole unit. (F-E)
+        if count >= self._max_errors and self._reconnect_fn is not None and not self._owns_txn():
             logger.warning(
                 "DB lock error %d/%d — attempting reconnection",
                 count,
@@ -262,6 +276,51 @@ class SerializedConnection:
         msg = "unreachable: retry loop exits via return or raise"
         raise AssertionError(msg)
 
+    # -- Transaction ownership (multi-statement atomicity) ------------------
+
+    def _owns_txn(self) -> bool:
+        """True iff the CURRENT task holds this connection's open explicit
+        transaction (opened via :meth:`transaction`).
+
+        Short-circuits on the common no-transaction case (``_txn_owner is None``)
+        WITHOUT calling ``asyncio.current_task()``, so the hot per-call locking
+        path pays only one attribute load + identity test when nothing is inside
+        a transaction — behavior-preserving vs the original ``async with
+        self._lock``.
+        """
+        return self._txn_owner is not None and self._txn_owner is asyncio.current_task()
+
+    @asynccontextmanager
+    async def _maybe_lock(self) -> AsyncIterator[None]:
+        """Acquire ``self._lock`` — UNLESS the current task already holds it via
+        an open :meth:`transaction` on this connection.
+
+        The lock is non-reentrant, and :meth:`transaction` holds it across the
+        whole ``BEGIN IMMEDIATE`` … COMMIT; a statement issued from inside that
+        block (same task) must therefore run on the ALREADY-held lock rather than
+        deadlocking on a re-acquire. When no transaction is active this is exactly
+        ``async with self._lock``.
+        """
+        if self._owns_txn():
+            yield
+        else:
+            async with self._lock:
+                yield
+
+    def _refuse_inside_txn(self, op: str) -> None:
+        """Refuse a transaction-level op (commit/rollback/close/executescript)
+        issued from INSIDE an owned :meth:`transaction` block. The context
+        manager owns the single COMMIT/ROLLBACK; a body that committed or closed
+        mid-block would fork the all-or-nothing invariant the transaction exists
+        to provide. Mirrors the migration runner's ``_MigrationConnectionProxy``.
+        """
+        if self._owns_txn():
+            raise RuntimeError(
+                f"{op}() is not allowed inside transaction() — the transaction "
+                "context manager owns the single commit/rollback; issue only "
+                "statement executes inside the block"
+            )
+
     # -- Operations that return Result (support both await and async with) --
 
     def execute(
@@ -270,7 +329,7 @@ class SerializedConnection:
         parameters: Iterable[Any] | None = None,
     ) -> Result:
         async def _locked() -> aiosqlite.Cursor:
-            async with self._lock:
+            async with self._maybe_lock():
                 return await self._retry_locked(lambda: self._conn.execute(sql, parameters))
 
         return Result(_locked())
@@ -285,7 +344,7 @@ class SerializedConnection:
             # consumed by a failed first attempt, so the retry would silently
             # execute zero/partial rows and "succeed".
             params = list(parameters)
-            async with self._lock:
+            async with self._maybe_lock():
                 return await self._retry_locked(lambda: self._conn.executemany(sql, params))
 
         return Result(_locked())
@@ -296,7 +355,7 @@ class SerializedConnection:
         parameters: Iterable[Any] | None = None,
     ) -> Result:
         async def _locked() -> list[aiosqlite.Row]:
-            async with self._lock:
+            async with self._maybe_lock():
                 return await self._retry_locked(
                     lambda: self._conn.execute_fetchall(sql, parameters)
                 )
@@ -309,7 +368,7 @@ class SerializedConnection:
         parameters: Iterable[Any] | None = None,
     ) -> Result:
         async def _locked() -> tuple | None:
-            async with self._lock:
+            async with self._maybe_lock():
                 return await self._retry_locked(lambda: self._conn.execute_insert(sql, parameters))
 
         return Result(_locked())
@@ -319,6 +378,7 @@ class SerializedConnection:
         # partially apply before the lock error, so re-running it is not
         # idempotent. Keeps the pre-retry behavior: count + re-raise.
         async def _locked() -> aiosqlite.Cursor:
+            self._refuse_inside_txn("executescript")  # (F-B) — see _refuse_inside_txn
             async with self._lock:
                 try:
                     result = await self._conn.executescript(sql)
@@ -334,10 +394,12 @@ class SerializedConnection:
     # -- Simple async operations -------------------------------------------
 
     async def commit(self) -> None:
+        self._refuse_inside_txn("commit")  # (F-B)
         async with self._lock:
             await self._retry_locked(lambda: self._conn.commit())
 
     async def rollback(self) -> None:
+        self._refuse_inside_txn("rollback")  # (F-B)
         # Retried like commit (idempotent in legacy isolation mode): a locked
         # ROLLBACK that never lands leaves in_transaction=True permanently —
         # the exact wedge this class exists to prevent. Previously this path
@@ -346,12 +408,78 @@ class SerializedConnection:
             await self._retry_locked(lambda: self._conn.rollback())
 
     async def close(self) -> None:
+        self._refuse_inside_txn("close")  # (F-B)
         async with self._lock:
             await self._conn.close()
 
     async def cursor(self) -> aiosqlite.Cursor:
-        async with self._lock:
+        async with self._maybe_lock():
             return await self._conn.cursor()
+
+    # -- Multi-statement atomic transaction --------------------------------
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[SerializedConnection]:
+        """Hold the connection lock across an atomic ``BEGIN IMMEDIATE`` … COMMIT.
+
+        The multi-statement counterpart to the per-call locking every other
+        method uses. Statements issued on this connection FROM THE SAME TASK
+        inside the ``async with`` block run on the already-held lock (``execute``
+        & friends detect ownership via :meth:`_maybe_lock` and skip re-acquiring),
+        so no other coroutine can interleave a statement, commit, or rollback into
+        this transaction. That is what makes a read-modify-write like federation
+        ``append_message`` (CAS-UPDATE then INSERT) atomic against the other
+        coroutines that share Genesis's single connection — the per-call lock
+        alone releases between the two statements and lets a peer commit the
+        half-open transaction, forking the chain.
+
+        Semantics: COMMIT on clean exit, ROLLBACK on ANY exception (the body's own
+        ``ValueError`` etc. included), then re-raise. ``commit``/``rollback``/
+        ``close``/``executescript`` are REFUSED inside the block (they would fork
+        the single-commit invariant); only statement execution is allowed.
+
+        NOT re-entrant (a nested ``transaction()`` on the same task raises). A
+        CHILD task that issues a statement on this connection from inside the
+        block is a *different* task, so it takes the normal lock path and BLOCKS
+        on the held lock — do not fan out concurrent writes inside a transaction.
+        """
+        if self._owns_txn():
+            raise RuntimeError("transaction() is not re-entrant on the same connection")
+        async with self._lock:
+            object.__setattr__(self, "_txn_owner", asyncio.current_task())
+            began = False
+            try:
+                # Explicit IMMEDIATE: takes the write lock up front (no lazy
+                # read→write upgrade deadlock across processes) and makes the
+                # boundary unambiguous rather than relying on legacy implicit-BEGIN
+                # timing. A locked BEGIN opened no transaction, so _retry_locked
+                # re-running it is safe. Matches the migration runner's idiom.
+                await self._retry_locked(lambda: self._conn.execute("BEGIN IMMEDIATE"))
+                began = True
+                yield self
+                # COMMIT via the driver method, NOT execute("COMMIT"): under a WAL
+                # post-commit-autocheckpoint SQLITE_BUSY the commit frame is already
+                # durable and in_transaction is False, so _retry_locked's retry of
+                # .commit() no-ops (idempotent). execute("COMMIT") would instead
+                # raise "no transaction is active" and surface a SPURIOUS failure
+                # for an append that actually landed. (F-A)
+                await self._retry_locked(lambda: self._conn.commit())
+            except BaseException:
+                if began:
+                    try:
+                        await self._retry_locked(lambda: self._conn.rollback())
+                    except Exception:
+                        # A failed ROLLBACK must not mask the original error. The
+                        # connection may wedge in_transaction=True until the
+                        # reconnect threshold recovers it; log and re-raise the
+                        # real cause.
+                        logger.error("ROLLBACK after transaction() error failed", exc_info=True)
+                raise
+            finally:
+                # Clear ownership BEFORE the lock is released (this finally runs
+                # inside `async with self._lock`), so there is never a window where
+                # the lock is free but a stale owner would route ops lock-free.
+                object.__setattr__(self, "_txn_owner", None)
 
     # -- Async iteration support (used by some callers) --------------------
 

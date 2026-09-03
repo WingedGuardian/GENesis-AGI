@@ -7,18 +7,17 @@ The persistence layer is deliberately thin: chain math (``payload_hash``,
 exception that must be atomic: :func:`append_message` advances the contact's
 per-direction chain head in the SAME transaction as the message insert.
 
-CONCURRENCY PRECONDITION (must hold before PR2 wires the loops):
-:func:`append_message` is CRASH-atomic within one coroutine, but it is NOT
-concurrency-atomic on Genesis's shared ``SerializedConnection`` — that wrapper
-acquires its lock PER CALL (execute/commit/rollback each lock-and-release), so a
-PEER coroutine that commits (or rolls back) the shared connection's open
-transaction BETWEEN this function's CAS-UPDATE and INSERT would fork the chain
-(head advanced with no row, or a row past an unmoved head) — the very thing this
-design exists to prevent. Before PR2 runs the poll-loop and approval-drain
-concurrently with other writers, the CAS+INSERT MUST be wrapped in a
-transaction-scoped lock (a ``SerializedConnection.transaction()`` context that
-holds the lock across the whole txn) OR the federation loops MUST use a dedicated
-connection. Tracked as a hard PR2 precondition; see the follow-up.
+CONCURRENCY (the PR2 precondition, now MET): :func:`append_message` wraps its
+CAS-UPDATE + INSERT in ``SerializedConnection.transaction()``, which holds the
+shared connection's lock across the whole ``BEGIN IMMEDIATE`` … COMMIT. That
+closes the fork window the per-call lock left open — without it a PEER coroutine
+could commit (or roll back) the shared connection's open transaction BETWEEN the
+CAS-UPDATE and the INSERT and split the chain (head advanced with no row, or a
+row past an unmoved head). The append is therefore CRASH-atomic AND
+concurrency-atomic against the other coroutines that share Genesis's single
+connection, so PR2's poll-loop and approval-drain can run concurrently with other
+writers. (``db`` must be a ``SerializedConnection`` for this — the runtime always
+supplies one; a raw ``aiosqlite.Connection`` has no ``transaction()``.)
 
 Row shape is a plain ``dict`` (``aiosqlite.Row`` → ``dict``); BLOB columns come
 back as ``bytes``.
@@ -26,7 +25,12 @@ back as ``bytes``.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import aiosqlite
+
+if TYPE_CHECKING:
+    from genesis.db.connection import SerializedConnection
 
 # ---------------------------------------------------------------------------
 # contacts
@@ -141,7 +145,7 @@ def _require_direction(direction: str) -> None:
 
 
 async def append_message(
-    db: aiosqlite.Connection,
+    db: SerializedConnection,
     *,
     msg_id: str,
     contact_id: str,
@@ -161,9 +165,10 @@ async def append_message(
 ) -> str:
     """Append a transcript message AND advance the contact's per-direction chain
     head via a **compare-and-swap**, in one transaction (single commit).
-    (CRASH-atomic within this coroutine; see the module docstring's CONCURRENCY
-    PRECONDITION — the CAS+INSERT is NOT yet concurrency-atomic on the shared
-    connection, which PR2 must ensure before wiring concurrent loops.)
+    CRASH-atomic AND concurrency-atomic: the CAS+INSERT run inside
+    ``db.transaction()``, which holds the shared connection's lock across the
+    whole ``BEGIN IMMEDIATE`` … COMMIT, so no peer coroutine can commit/roll back
+    between the two statements and fork the chain (see the module docstring).
 
     The head UPDATE is a CAS: it moves ``last_seq_{sent,recv}`` + ``{send,recv}_
     chain_head`` to ``(seq, payload_hash)`` ONLY when the stored tip currently
@@ -185,7 +190,12 @@ async def append_message(
         origin_class = _INBOUND_ORIGIN_CLASS
     col_seq = "last_seq_sent" if direction == "out" else "last_seq_recv"
     col_head = "send_chain_head" if direction == "out" else "recv_chain_head"
-    try:
+    # Atomic on the shared connection: transaction() holds the lock across the
+    # whole BEGIN IMMEDIATE … COMMIT, commits on clean exit and ROLLS BACK on any
+    # exception (the CAS ValueError and INSERT IntegrityError included) — so the
+    # CAS-UPDATE and the INSERT land together or not at all, and no peer coroutine
+    # interleaves between them.
+    async with db.transaction():
         # CAS: only advance if the stored tip is exactly (seq-1, prev_hash).
         # `IS ?` compares NULL correctly (genesis prev_hash=None ↔ head IS NULL).
         cur = await db.execute(
@@ -223,10 +233,6 @@ async def append_message(
                 delivered_at,
             ),
         )
-        await db.commit()
-    except BaseException:
-        await db.rollback()
-        raise
     return msg_id
 
 
