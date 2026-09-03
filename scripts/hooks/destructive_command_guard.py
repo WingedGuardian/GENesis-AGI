@@ -99,10 +99,20 @@ _COMMENT_OPENERS = frozenset(" \t\n|&;<>()")
 #   word-form   $( … )  $(( … ))   command/arithmetic substitution
 #               <( … )  >( … )     process substitution
 #               =( … )             array assignment (`a=(x)`, `a+=(x)`)
-#               ?( *( +( @( !(     extglob patterns
+#               ?( *( @(           extglob patterns
 #   command     ( … )              subshell
 #               (( … ))            arithmetic command
 #               x)                 case pattern, function definition `f()`
+#               !( … )             see below — NOT an extglob pattern here
+#
+# `!(` is the member that cannot be settled from a static set, so the runtime
+# decides it. It is an extglob pattern only when `shopt -s extglob` is set; this
+# hook sees non-interactive `bash -c`, where extglob is OFF, and there `!(true)`
+# is a `!` negation applied to a subshell — a COMMAND-form paren whose `)` really
+# does let a following `#` open a comment. MEASURED both ways with
+# `!(true)#note; touch MARKER`: extglob off, no marker (a comment opened);
+# extglob on, marker present (no comment). The two answers are incompatible, so
+# the default that this hook actually runs under wins, and `!` stays out.
 #
 # ENUMERATED against bash 5.2, one member at a time, with `<prefix>#note; touch
 # MARKER`: the marker appears iff `#` did NOT open a comment, so the `; touch`
@@ -112,13 +122,18 @@ _COMMENT_OPENERS = frozenset(" \t\n|&;<>()")
 # `touch` runs as the command word and the marker appears in BOTH directions.
 # That confound reported array assignment as command-form, which it is not.
 #
+# Deliberately no worked example here. Naming a construct beside a statement
+# that a gate stopped working is a recipe, and this repository is public; the
+# repo's own prose tripwire forbids the pairing but cannot see every construct
+# name, so its silence is not permission. The shapes live as fixture rows in the
+# guard's tests, where they are data rather than instruction.
+#
 # Getting a member wrong is a bypass in one direction or the other: calling a
 # word-form `)` a boundary lets a glued `#` fake a comment and hide the next
-# line (measured: `echo <(true)#x; rm -r\`⏎`f /usr` deleted while the guard
-# returned 0), and calling a command-form `)` mid-word folds a continuation the
-# shell does not fold, gluing the next command onto the comment text so no `rm`
-# token survives.
-_WORD_PAREN_PREFIXES = frozenset("$<>=?*+@!")
+# line, and calling a command-form `)` mid-word folds a continuation the shell
+# does not fold, gluing the next command onto the comment text so no `rm` token
+# survives. Both directions are covered by fixture rows in the guard's tests.
+_WORD_PAREN_PREFIXES = frozenset("$<>=?*+@")
 
 
 def _fold_continuations(cmd: str) -> str:
@@ -162,11 +177,21 @@ def _fold_continuations(cmd: str) -> str:
     # refused — which splits a word the shell joins and can hide the
     # recursive-force flags.
     at_word_start = True
-    # Open WORD-FORM parentheses (see _WORD_PAREN_PREFIXES): while this is
-    # non-zero a `)` closes an expansion/pattern and the word continues, so it is
-    # not a place a `#` can open a comment. Command-form parens never enter it,
-    # so their `)` falls through to the _COMMENT_OPENERS rule below.
-    word_paren_depth = 0
+    # One entry per OPEN parenthesis, each classified from its OWN preceding
+    # character: True = word-form (see _WORD_PAREN_PREFIXES), so its `)` closes an
+    # expansion and the word continues; False = command-form, so its `)` is a
+    # boundary and a `#` after it opens a comment.
+    #
+    # A stack rather than a depth counter, and each entry classified independently
+    # rather than inheriting from the one below it. A counter cannot express either
+    # property and was wrong twice over: nesting inherited, so a genuine subshell
+    # inside `$( … )` was read as word-form and a real comment was missed; and the
+    # count leaked whenever a partially-modelled context swallowed an opener or a
+    # closer — a `)` inside a comment never decremented it, so every later `)` in
+    # the command read as mid-word. Independent classification also keeps `$((`
+    # right without a special case: the inner entry may be command-form, but the
+    # outer word-form `)` is the one that decides where the word ends.
+    paren_forms: list[bool] = []
     # The previous UNQUOTED, UNESCAPED character — what decides a `(`'s form.
     # A quoted or backslash-escaped character resets it to None: `\$(` is a
     # literal `$` followed by a subshell, not a command substitution.
@@ -208,11 +233,9 @@ def _fold_continuations(cmd: str) -> str:
             i += 2
             continue
         if not in_comment:
-            if c == "(" and (word_paren_depth or prev in _WORD_PAREN_PREFIXES):
-                # Word-form opener, or any nesting inside one (`$((`, `<( (x) )`).
-                word_paren_depth += 1
-            elif c == ")" and word_paren_depth:
-                word_paren_depth -= 1
+            if c == "(":
+                paren_forms.append(prev in _WORD_PAREN_PREFIXES)
+            elif c == ")" and paren_forms and paren_forms.pop():
                 out.append(c)
                 at_word_start = False  # closes an expansion, so still inside a word
                 prev = c

@@ -293,9 +293,11 @@ class TestWordFormParentheses:
     word. Every other WORD-FORM parenthesis — process substitution, extglob,
     array assignment — closed into what the code called a word boundary, so a
     glued `#` faked a comment, the continuation after it was not folded, and the
-    command on the next line vanished from the token stream. Measured through
-    the live hook: ``echo <(true)#x; rm -r\\``⏎``f /usr`` deleted ``/usr`` while
-    both this guard and ``protected_paths_guard`` returned 0.
+    command on the next line vanished from the token stream. Both directions
+    were measured through the live hook, with ``main`` as the control column so
+    a pre-existing gap could not be reported as a regression; the shapes are the
+    parametrised rows below, where they are fixture data rather than prose.
+    Spelling one out here would publish a recipe, and this repository is public.
 
     The opposite error is a bypass too, so the members cannot be guessed in
     either direction. Each row below carries the answer BASH gives, measured
@@ -318,7 +320,24 @@ class TestWordFormParentheses:
         ("process-substitution-out", "echo >(true)#x"),
         ("process-substitution-nested", "echo <(echo <(true))#x"),
         ("process-substitution-inner-subshell", "echo <( (true) )#x"),
-        ("extglob-negate", "echo !(zzz)#x"),
+        # The extglob openers are a DIFFERENT evidentiary case from the rows
+        # around them, and saying so is the point. Under the non-interactive
+        # `bash -c` this hook actually sees, extglob is OFF and these are a
+        # SYNTAX ERROR — so the marker probe records "no marker" and a reader
+        # scores that as "a comment opened", which is a fabricated answer rather
+        # than a measurement. Their bash answer above was taken under
+        # `-O extglob`; they are kept because a caller may have it set, and the
+        # set must be right for that case too, but they are NOT evidence about
+        # the default configuration.
+        #
+        # `!(` used to sit in this list and has been REMOVED from the set: with
+        # extglob off it is `!` negation plus a subshell, whose `)` really does
+        # let a `#` open a comment. Measured both ways; the two answers are
+        # incompatible and the runtime default wins. It now lives in _COMMAND_FORM.
+        # `+(` must be probed in a NON-INITIAL position: at the start of a `-c`
+        # string bash reads it as an option (`+(: invalid option`) and the probe
+        # reports nothing, which is easy to mistake for a real answer. Measured
+        # here as word-form under `-O extglob`.
         ("extglob-at", "echo @(zzz)#x"),
         ("extglob-star", "echo *(zzz)#x"),
         ("extglob-plus", "echo +(zzz)#x"),
@@ -354,6 +373,12 @@ class TestWordFormParentheses:
         ("subshell-after-substitution", "echo $(true); (true)#note"),
         ("arith-command-after-substitution", "echo $(true); ((1+1))#note"),
         ("subshell-after-process-substitution", "echo <(true); (true)#note"),
+        # `!(` with extglob OFF — the default for the `bash -c` this hook sees —
+        # is `!` negation applied to a SUBSHELL, so its `)` ends a command and a
+        # glued `#` opens a real comment. It reads as an extglob pattern only
+        # with `shopt -s extglob`; the two answers are incompatible and the
+        # runtime default decides, which is why `!` is not in the prefix set.
+        ("bang-subshell-extglob-off", "!(true)#note"),
     ]
 
     @pytest.mark.parametrize(("label", "prefix"), _COMMAND_FORM, ids=[c[0] for c in _COMMAND_FORM])
@@ -361,6 +386,26 @@ class TestWordFormParentheses:
         assert _blocks(f"{prefix}\\\nrm -rf /usr"), (
             f"{label}: bash ends the comment at the newline and runs the rm"
         )
+
+    # A command-form paren NESTED INSIDE a word-form one. This needs its own
+    # payload — the construct has to be closed — which is exactly why it was
+    # missed: the sibling table's `*-inner-subshell` rows put the `#` after the
+    # OUTER `)`, a position the code already handled, so they passed while these
+    # were open. A classification that INHERITS word-form-ness down the nesting
+    # cannot see them at all; each paren has to be judged from its own opener.
+    @pytest.mark.parametrize(
+        ("label", "payload"),
+        [
+            ("inside-command-substitution", "echo $( (true)#c\\\nrm -rf /usr\n)"),
+            ("inside-process-substitution", "cat <( (true)#c\\\nrm -rf /usr\n)"),
+        ],
+        ids=["inside-command-substitution", "inside-process-substitution"],
+    )
+    def test_a_subshell_inside_a_word_form_paren_still_opens_a_comment(self, label, payload):
+        # MEASURED: bash runs the rm in both — the inner `)` ends a command, so
+        # `#c` opens a real comment and the backslash before the newline is
+        # comment text rather than a continuation.
+        assert _blocks(payload), f"{label}: bash runs the rm; the guard must see it"
 
     def test_a_command_substitution_depth_returns_to_zero(self):
         """The counter must unwind, not leak — the mechanism behind the above.
