@@ -417,12 +417,27 @@ class Router:
 
         # All exhausted
         if self._event_bus:
+            # `attempts` alone is not readable. A provider skipped for an open
+            # breaker, a missing key or an exceeded budget costs no attempt, so
+            # "attempts: 2" on a seven-provider chain looks exactly like a
+            # two-provider chain that was fully tried. Carrying the names AND
+            # the chain length lets a reader reconcile the two — and makes the
+            # aggregate-deadline `break` above legible, which is the one exit
+            # that abandons the walk while recording nothing at all.
             await self._event_bus.emit(
                 Subsystem.ROUTING, Severity.ERROR,
                 "all_exhausted",
                 f"All providers exhausted for {call_site_id}",
                 call_site=call_site_id,
                 attempts=attempts,
+                failed_providers=tuple(failed_providers),
+                # The WALKABLE chain: post-`_filter_chain`, so a `never_pays`
+                # site does not count paid entries it was never going to try.
+                # That is the only length `attempts` can be reconciled against
+                # — but it is NOT the length a reader counts in
+                # `model_routing.yaml`, and the two currently differ on three
+                # of this install's nine `never_pays` sites.
+                chain_size=len(chain),
             )
 
         # Record failure for neural monitor visibility
@@ -456,6 +471,11 @@ class Router:
             success=False,
             call_site_id=call_site_id,
             attempts=attempts,
+            # The success path has always returned this (see above); the
+            # exhaustion path accumulated the same list and then dropped it, so
+            # the one result whose reader most needs to know which providers
+            # were involved was the only one that said nothing.
+            failed_providers=tuple(failed_providers),
             error="All providers exhausted",
             dead_lettered=dead_lettered,
         )

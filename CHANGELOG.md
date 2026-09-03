@@ -9,6 +9,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **When every provider fails, the log now says which ones.** A routing failure
+  recorded only how many attempts were made — but a provider skipped because its
+  circuit breaker is open, its API key is missing, or the budget is spent costs
+  no attempt at all, so "2 attempts" on a seven-provider chain looked exactly
+  like a two-provider chain that was fully tried. The exhaustion event and result
+  now name the providers that were reached, alongside how many the chain had to
+  offer — so a short list against a longer chain reads as "stopped early" rather
+  than as the whole story.
+
 ### Changed
 
 - **Mistral Large is now tracked as a paid provider.** Mistral removed the Large
