@@ -15,6 +15,7 @@ async def test_all_tools_registered():
     tools = await _get_tools()
     expected = [
         "memory_recall", "memory_store", "memory_extract", "memory_proactive",
+        "memory_synthesize",
         "memory_core_facts", "memory_stats",
         "observation_write", "observation_query", "observation_resolve",
         "conversation_history",
@@ -2028,3 +2029,95 @@ async def test_conversation_history_search_honors_scoping_and_cursor():
             )
         finally:
             mod._store, mod._db, mod._retriever = old_store, old_db, old_retriever
+
+
+# --- memory_store: `wing` is a controlled vocabulary at the agent boundary ---
+# The tool takes a `wing` parameter (it has since 2026-04-14), but nothing
+# validated it: any string was accepted and written through to the FTS5 tag,
+# the Qdrant payload and memory_metadata.wing. A background session once
+# reported that no memory tool exposed `wing` at all and encoded its intent as
+# a free-text tag instead — a caller that can be told the valid set should be.
+
+
+@pytest.mark.asyncio
+async def test_memory_store_rejects_unknown_wing():
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(return_value="mem-id")
+        with pytest.raises(ValueError) as exc:
+            await tools["memory_store"].fn("content", "src", wing="portfolio")
+
+    msg = str(exc.value)
+    assert "portfolio" in msg
+    # The error must TEACH the vocabulary, not merely refuse.
+    assert "career" in msg and "infrastructure" in msg, msg
+    # And it must refuse BEFORE writing anything.
+    mod.return_value._store.store.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_memory_store_accepts_a_valid_wing():
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(return_value="mem-id")
+        result = await tools["memory_store"].fn("content", "src", wing="career")
+
+    assert result == "mem-id"
+    assert mod.return_value._store.store.await_args.kwargs["wing"] == "career"
+
+
+@pytest.mark.asyncio
+async def test_memory_store_without_wing_is_unaffected():
+    """Omitting `wing` must still reach the store for auto-classification."""
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(return_value="mem-id")
+        result = await tools["memory_store"].fn("content", "src")
+
+    assert result == "mem-id"
+    assert mod.return_value._store.store.await_args.kwargs["wing"] is None
+
+
+@pytest.mark.asyncio
+async def test_memory_synthesize_rejects_unknown_wing():
+    """The SECOND agent-facing door into the same boundary.
+
+    Provenance on the 18 out-of-vocabulary rows in the live store: 17 have
+    dream_cycle_run_id IS NULL, i.e. they came through the MCP boundary rather
+    than the LLM-internal synthesis path. Guarding memory_store while leaving
+    memory_synthesize open just moves the door.
+    """
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(return_value="mem-id")
+        with pytest.raises(ValueError) as exc:
+            await tools["memory_synthesize"].fn("content", wing="portfolio")
+
+    assert "portfolio" in str(exc.value)
+    assert "career" in str(exc.value), str(exc.value)
+    mod.return_value._store.store.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_memory_synthesize_accepts_a_valid_wing():
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        mod.return_value._store = MagicMock()
+        mod.return_value._store.store = AsyncMock(return_value="mem-id")
+        result = await tools["memory_synthesize"].fn("content", wing="memory")
+
+    assert result == "mem-id"

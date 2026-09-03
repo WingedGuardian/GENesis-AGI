@@ -732,6 +732,31 @@ async def memory_expand(
     return results
 
 
+def _validate_wing(wing: str | None) -> None:
+    """Reject an out-of-vocabulary wing at the AGENT-FACING boundary.
+
+    Every MCP tool that accepts a `wing` must call this. A caller that can be
+    told the valid set should be told it: a silent coercion here teaches
+    nothing, and this parameter has been reported as "not exposed" by an agent
+    that never tried it. `MemoryStore.store()` coerces instead — see the
+    comment there for why the two tiers differ.
+
+    Measured 2026-09-02 on the live store: 18 of ~81k rows carry an
+    out-of-vocabulary wing, and 17 of those 18 have `dream_cycle_run_id IS
+    NULL` — they came through THIS boundary, not the LLM-internal synthesis
+    path. Guarding one tool and not its sibling just moves the door.
+    """
+    if wing is None or not wing.strip():
+        return
+    from genesis.memory.taxonomy import WINGS
+
+    if wing.strip() not in WINGS:
+        raise ValueError(
+            f"invalid wing {wing!r}; expected one of {sorted(WINGS)}. "
+            "Omit `wing` to let it be classified automatically."
+        )
+
+
 @mcp.tool()
 async def memory_store(
     content: str,
@@ -761,6 +786,7 @@ async def memory_store(
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._store is not None
+    _validate_wing(wing)
     # WS-3: dispatched sessions carry a session-level origin via env
     # (GENESIS_SESSION_ORIGIN, stamped by CCInvoker). Forward it so an
     # external-influenced session's writes stop landing first_party via the
@@ -1379,6 +1405,7 @@ async def memory_synthesize(
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._store is not None
+    _validate_wing(wing)
 
     resolved_tags = list(tags or [])
     if "synthesis" not in resolved_tags:
