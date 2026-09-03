@@ -138,3 +138,19 @@ async def test_mark_contacted_by_email_only_advances_active(db):
     assert (await mp.get_by_id(db, "p2"))["status"] == "replied"
     # absent recipient → no-op, no crash
     assert await mp.mark_contacted_by_email(db, "nobody@example.com", contacted_at=_TS) is False
+
+
+@pytest.mark.asyncio
+async def test_mark_contacted_by_email_matches_mixed_case_seeded_row(db):
+    """A directly-seeded row with a mixed-case email (bypassing create()'s
+    normalization — e.g. a future bulk-import path) is still matched
+    case-insensitively (get_by_email COLLATE NOCASE), so the delivery stamp never
+    misses it and re-pitches a delivered prospect."""
+    await db.execute(
+        "INSERT INTO marketing_prospects (id, email, status, opted_out, created_at, updated_at) "
+        "VALUES ('mc', 'Mixed@Example.com', 'active', 0, ?, ?)",
+        (_TS, _TS),
+    )
+    await db.commit()
+    assert await mp.mark_contacted_by_email(db, "mixed@example.com", contacted_at=_TS) is True
+    assert (await mp.get_by_id(db, "mc"))["status"] == "contacted"

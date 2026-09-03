@@ -69,7 +69,8 @@ async def get_by_id(db: aiosqlite.Connection, id: str) -> dict | None:
 
 async def get_by_email(db: aiosqlite.Connection, email: str) -> dict | None:
     cursor = await db.execute(
-        "SELECT * FROM marketing_prospects WHERE email = ?", (_normalize_email(email),)
+        "SELECT * FROM marketing_prospects WHERE email = ? COLLATE NOCASE",
+        (_normalize_email(email),),
     )
     row = await cursor.fetchone()
     return dict(row) if row else None

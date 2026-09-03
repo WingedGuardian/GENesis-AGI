@@ -207,6 +207,16 @@ async def drain_pending_email_sends(rt: object) -> int:
             )
             if result.status == OutreachStatus.DELIVERED:
                 await approval_crud.mark_consumed(db, row["request_id"], consumed_at=now)
+                # LOOP-FIX: stamp the prospect BEFORE the hold goes terminal
+                # (`mark_sent`), so a crash in this window leaves the hold 'held' —
+                # re-drained via the consumed-approval reconcile branch above, which
+                # re-stamps — rather than 'sent' with the prospect never advanced.
+                # `mark_consumed` already ran, so a re-drain can never double-send.
+                # Advance a matching curated prospect active → contacted (a no-op for
+                # a non-prospect recipient) so list_active stops re-pitching it. Keyed
+                # on the RECIPIENT being a curated prospect, NOT cell_risk_class, so a
+                # cold pitch that misclassified FINANCIAL (money-term body) is stamped.
+                await _stamp_prospect_contacted(db, row["validated_recipient"], now)
                 await pes.mark_sent(db, row["id"], sent_at=now)
                 await cg.record_success(
                     db,
@@ -217,12 +227,6 @@ async def drain_pending_email_sends(rt: object) -> int:
                     # WS-3 gate-3: the OWNER approved this send — owner evidence.
                     origin_class="owner",
                 )
-                # LOOP-FIX: confirmed delivery → advance a matching curated prospect
-                # active → contacted (a no-op for a non-prospect recipient) so
-                # list_active stops re-pitching it. Keyed on the RECIPIENT being a
-                # curated prospect, NOT cell_risk_class, so a cold pitch that
-                # misclassified FINANCIAL (money-term body) is still stamped.
-                await _stamp_prospect_contacted(db, row["validated_recipient"], now)
                 resolved += 1
                 logger.info(
                     "Resolved held email %s → sent to %s",
