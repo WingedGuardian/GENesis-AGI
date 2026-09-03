@@ -1223,6 +1223,59 @@ class TestCheckInlineReviewFindings:
         err = capsys.readouterr().err
         assert "[P2] Preserve multi-word ledger keys" in err
 
+    # ── weighted review score: P1 = 1.0, P2 = 0.5, block at >= 1.0 ──
+    def test_inline_two_p2_block(self, guard_module):
+        """Two unresolved P2s score 1.0 >= threshold → BLOCK (a single P2 stays
+        advisory; see test_inline_p2_warns_but_allows)."""
+        with self._mock(
+            guard_module, [self._codex(1, _P2_BODY), self._codex(2, _P2_BODY)]
+        ):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "score" in msg.lower()
+
+    def test_inline_p1_plus_p2_block_lists_both(self, guard_module):
+        """1 P1 (1.0) + 1 P2 (0.5) = 1.5 → BLOCK; the P1 title is listed."""
+        with self._mock(
+            guard_module, [self._codex(1, _P1_BODY), self._codex(2, _P2_BODY)]
+        ):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "Make queue claim atomic" in msg
+
+    def test_inline_replied_p2_excluded_from_score(self, guard_module):
+        """A MAINTAINER reply acks a P2 (consciously accepted) — it drops from the
+        score, so two P2s where one is replied = 0.5 < 1.0 → no block."""
+        comments = [
+            self._codex(1, _P2_BODY),
+            self._codex(2, _P2_BODY),
+            {
+                "id": 3,
+                "reply_to": 2,
+                "login": "WingedGuardian",
+                "type": "User",
+                "assoc": "OWNER",
+                "body": "Accepted; tracked in a follow-up.",
+            },
+        ]
+        with self._mock(guard_module, comments):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_inline_doc_path_p2_excluded_from_score(self, guard_module, capsys):
+        """A P2 on a documentation path is not a code defect — excluded from the
+        score, so two P2s where one is on CHANGELOG.md = 0.5 < 1.0 → no block. But it is
+        still SURFACED as a NOTE (never silently dropped — Codex #1589 P2)."""
+        comments = [
+            self._codex(1, _P2_BODY, path="src/genesis/foo.py"),
+            self._codex(2, _P2_BODY, path="CHANGELOG.md"),
+        ]
+        with self._mock(guard_module, comments):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+        # The doc-path P2 must remain VISIBLE in the pre-merge report, not dropped.
+        assert "[doc P2]" in capsys.readouterr().err
+
     def test_replied_p1_is_acknowledged_by_maintainer(self, guard_module):
         """A MAINTAINER reply (author_association OWNER/MEMBER/COLLABORATOR) acks a P1."""
         comments = [
@@ -2129,6 +2182,11 @@ class TestCiGateEndToEnd:
             "_check_scheduled_claude_reviewed_head",
             lambda n, head=None, repo=None, force=False, strict=False: None,
         )
+        # The pin-receipt gate is downstream too. Without this it runs for real
+        # against the cwd repo's PR — whose tree predates scripts/lib/cc_version.sh,
+        # so the read is a genuine 404 and the gate correctly BLOCKS, which has
+        # nothing to do with the invariant under test here.
+        monkeypatch.setattr(guard_module, "_check_pin_receipts", lambda n, repo=None: (False, ""))
 
     def test_red_ci_blocks_exit_2(self, guard_module, monkeypatch, capsys):
         monkeypatch.setenv(
@@ -2335,6 +2393,11 @@ class TestMergeableAllowlist:
             "_check_scheduled_claude_reviewed_head",
             lambda n, head=None, repo=None, force=False, strict=False: None,
         )
+        # The pin-receipt gate is downstream too. Without this it runs for real
+        # against the cwd repo's PR — whose tree predates scripts/lib/cc_version.sh,
+        # so the read is a genuine 404 and the gate correctly BLOCKS, which has
+        # nothing to do with the invariant under test here.
+        monkeypatch.setattr(guard_module, "_check_pin_receipts", lambda n, repo=None: (False, ""))
 
     @pytest.mark.parametrize("bad", [None, "", "UNKNOWN", "SOMETHING_NEW"])
     def test_non_mergeable_blocks(self, guard_module, monkeypatch, bad):
@@ -2411,6 +2474,11 @@ class TestRepoDerivationGate:
             "_check_scheduled_claude_reviewed_head",
             lambda n, head=None, repo=None, force=False, strict=False: None,
         )
+        # The pin-receipt gate is downstream too. Without this it runs for real
+        # against the cwd repo's PR — whose tree predates scripts/lib/cc_version.sh,
+        # so the read is a genuine 404 and the gate correctly BLOCKS, which has
+        # nothing to do with the invariant under test here.
+        monkeypatch.setattr(guard_module, "_check_pin_receipts", lambda n, repo=None: (False, ""))
 
     def test_derived_repo_threads_into_gates(self, guard_module, monkeypatch):
         seen = {}
@@ -2622,6 +2690,9 @@ class TestGateOrdering:
                 None,
             )[1],
         )
+        # Downstream of the ordering under test, and it would otherwise run live
+        # against a PR whose tree predates scripts/lib/cc_version.sh (a real 404).
+        monkeypatch.setattr(guard_module, "_check_pin_receipts", lambda n, repo=None: (False, ""))
         monkeypatch.setattr(
             guard_module,
             "_check_pr_review_findings",

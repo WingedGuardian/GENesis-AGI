@@ -48,12 +48,14 @@ _REGISTRY_URL = "https://registry.npmjs.org/@anthropic-ai/claude-code/{version}"
 _HTTP_TIMEOUT = 15  # seconds — a single registry GET; generous for a slow runner.
 _RETRIES = 1  # one retry on a transient network error before failing open.
 
-# Matches `CC_VERSION="${CC_VERSION:-2.1.201}"` / `NODE_MAJOR="${NODE_MAJOR:-22}"`.
-# Captures the default value after `:-`. Tolerant of surrounding quoting/spacing.
-_PIN_RE = {
-    "CC_VERSION": re.compile(r'CC_VERSION="?\$\{CC_VERSION:-([0-9]+\.[0-9]+\.[0-9]+)\}"?'),
-    "NODE_MAJOR": re.compile(r'NODE_MAJOR="?\$\{NODE_MAJOR:-([0-9]+)\}"?'),
-}
+# Pin reading lives in scripts/ci/cc_pin_parse.py, shared with the pin-receipt
+# guard. It replaced a local first-match regex that disagreed with bash: a
+# COMMENTED-OUT decoy above the real assignment made this guard read a pin the
+# machine never installs (measured: 2.1.100/Node 18 from a file bash resolves as
+# 2.1.246/Node 22), so a CC bump could clear the Node floor against the wrong
+# version entirely.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "ci"))
+from cc_pin_parse import parse_cc_version, parse_node_major  # noqa: E402
 
 
 class LockstepViolation(Exception):
@@ -75,19 +77,22 @@ def parse_pins(pin_file: Path) -> tuple[str, int]:
     except OSError as exc:
         raise LockstepViolation(f"cannot read pin file {pin_file}: {exc}") from exc
 
-    cc_match = _PIN_RE["CC_VERSION"].search(text)
-    node_match = _PIN_RE["NODE_MAJOR"].search(text)
-    if not cc_match or not node_match:
+    cc_version = parse_cc_version(text)
+    node_major = parse_node_major(text)
+    if cc_version is None or node_major is None:
         missing = []
-        if not cc_match:
+        if cc_version is None:
             missing.append("CC_VERSION")
-        if not node_match:
+        if node_major is None:
             missing.append("NODE_MAJOR")
         raise LockstepViolation(
-            f"could not parse {', '.join(missing)} default(s) from {pin_file} "
-            "(expected `VAR=\"${VAR:-value}\"` form)"
+            f"could not unambiguously determine {', '.join(missing)} from {pin_file} "
+            "(expected exactly ONE `VAR=\"${VAR:-value}\"` assignment at the start "
+            "of a line, outside comments). A duplicate assignment reports as "
+            "unparseable ON PURPOSE: this gate must not guess which one the "
+            "runtime uses."
         )
-    return cc_match.group(1), int(node_match.group(1))
+    return cc_version, node_major
 
 
 def fetch_engines_node(cc_version: str, *, opener=urllib.request.urlopen) -> str:

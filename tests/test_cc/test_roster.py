@@ -272,3 +272,85 @@ def test_apply_routing_env_auth_token_only_still_drops_api_key():
     R.apply_routing_env(env, base_url=None, auth_token="zk-secret", model_id=None)
     assert "ANTHROPIC_API_KEY" not in env
     assert env["ANTHROPIC_AUTH_TOKEN"] == "zk-secret"
+
+
+def test_shipped_config_ships_no_peers():
+    """DELIVERABLE LOCK: config/cc_roster.yaml ships INFRASTRUCTURE, not peers.
+
+    A peer pins a `model_id`, and model ids go EOL — this file shipped
+    `glm-5.2` past its replacement by `glm-5.3`. A stale pinned peer fails at
+    the one moment it is needed (when the subscription caps) and fails while
+    LOOKING configured, which is worse than an empty roster failing honestly.
+    So peers are declared per-install in ~/.genesis/config/cc_roster.local.yaml.
+
+    Asserts on the SHIPPED FILE directly rather than the merged roster, so
+    neither a developer's real overlay nor the repo-relative fallback can mask
+    a regression. Without this, re-adding a peer to the shipped config would
+    break nothing — every other roster test writes its own synthetic yaml.
+    """
+    import yaml
+
+    from genesis.cc.roster import _CONFIG_DIR, _ROSTER_FILE
+
+    base = yaml.safe_load((_CONFIG_DIR / _ROSTER_FILE).read_text())
+    assert base["default"] == "claude"
+    assert set(base["models"]) == {"claude"}, (
+        "config/cc_roster.yaml must ship no peers — declare them in "
+        "~/.genesis/config/cc_roster.local.yaml. See the file header for why "
+        "(version churn: a stale pinned model_id fails exactly when needed)."
+    )
+    assert base["models"]["claude"].get("native_subscription") is True
+
+
+def test_every_documented_auth_env_has_a_secrets_slot():
+    """CROSS-FILE GUARD: a peer example may not name a key the template lacks.
+
+    Round-2 defect on PR #1606: the shipped China example told users to set
+    `auth_env: ZHIPU_API_KEY` against `/api/anthropic`, while
+    `secrets.env.example` — edited in the SAME change — declared that variable
+    to be the general/prepaid key for a different endpoint. Two files, each
+    internally consistent, contradicting each other. Nothing checked the pair,
+    so a human reviewer had to notice.
+
+    Scans COMMENTED examples too, on purpose: the shipped roster declares no
+    active peers (see test_shipped_config_ships_no_peers), so every auth_env in
+    it lives in a comment — which is exactly where the defect was.
+    """
+    import re
+
+    from genesis.cc.roster import _CONFIG_DIR, _ROSTER_FILE
+
+    roster_text = (_CONFIG_DIR / _ROSTER_FILE).read_text()
+    # Prose mentions a key to warn AGAINST it ("NOT ZHIPU_API_KEY"), so match
+    # only the field form `auth_env: NAME`, commented or not.
+    named = set(re.findall(r"auth_env:\s*([A-Z][A-Z0-9_]+)", roster_text))
+    assert named, "no auth_env examples found — has the example block moved?"
+
+    example = _CONFIG_DIR.parent / "secrets.env.example"
+    declared = set(re.findall(r"^([A-Z][A-Z0-9_]+)=", example.read_text(), re.MULTILINE))
+
+    missing = named - declared
+    assert not missing, (
+        f"config/cc_roster.yaml names auth_env {sorted(missing)}, which "
+        "secrets.env.example does not declare. A user following the example "
+        "would set a variable nothing reads. Add the slot (with its own "
+        "`# Used by:` and `# Signup:` lines) or fix the example."
+    )
+
+    # "Is it declared?" is NOT enough, and verifying-RED proved it: the round-2
+    # defect named ZHIPU_API_KEY, which IS a declared slot — it is simply the
+    # WRONG KIND of key. The real invariant is about the endpoint: every roster
+    # peer reaches its provider over the Anthropic protocol (that is what
+    # `anthropic_base_url` means), and those coding endpoints require a
+    # CODING-PLAN key, never the general/prepaid one. The naming convention
+    # `*_CODING_API_KEY` is what makes that mechanically checkable, and
+    # secrets.env.example documents it.
+    wrong_class = {n for n in named if not n.endswith("_CODING_API_KEY")}
+    assert not wrong_class, (
+        f"config/cc_roster.yaml names auth_env {sorted(wrong_class)} for a peer. "
+        "A roster peer talks to an Anthropic-protocol coding endpoint, which "
+        "needs a CODING-PLAN key (`*_CODING_API_KEY`) — a general/prepaid key "
+        "there returns `1113 Insufficient balance` on a funded account. If a "
+        "provider genuinely uses one key for both, rename the slot so the "
+        "convention still reads true."
+    )

@@ -1,6 +1,6 @@
 """Model roster — first-class model-diversification policy layer.
 
-Maps roster names (e.g. "glm-5.2") to the CCInvocation overrides that point a
+Maps roster names ("claude", or a peer from the local overlay) to the
 Claude Code subprocess at a non-Anthropic provider's native Anthropic-compatible
 endpoint. This is the POLICY layer.
 
@@ -202,6 +202,34 @@ def overrides_for(name: str, roster: dict | None = None) -> dict:
     }
 
 
+#: Defaults already reported as unresolvable. apply_active sits on the universal
+#: CC path, so without dedupe this logs on EVERY routed invocation; the point is
+#: one actionable line per process, not a flood.
+_WARNED_UNRESOLVABLE_DEFAULTS: set[str] = set()
+
+
+def _warn_unresolvable_default_once(name: str) -> None:
+    """Report a configured default that no longer resolves. Once per name."""
+    if name in _WARNED_UNRESOLVABLE_DEFAULTS:
+        return
+    _WARNED_UNRESOLVABLE_DEFAULTS.add(name)
+    logger.error(
+        "cc_roster default %r cannot be resolved — there is no model by that "
+        "name in config/cc_roster.yaml, nor in the cc_roster overlay under "
+        "~/.genesis/config/. "
+        "Falling back to native Claude, so every roster-eligible call now runs on "
+        "a DIFFERENT model than the one configured. The usual cause is an upgrade: "
+        "the default was chosen through the cc_roster settings domain, which "
+        "persists only `default: %s` because the model DEFINITION came from the "
+        "shipped base file — and that base entry has since been removed, leaving "
+        "the selection without an endpoint. Fix by re-selecting a model, or by "
+        "adding its definition (anthropic_base_url, auth_env, model_id) to the "
+        "local overlay.",
+        name,
+        name,
+    )
+
+
 def apply_active(
     inv: CCInvocation, roster: dict | None = None,
 ) -> tuple[CCInvocation, str]:
@@ -230,8 +258,32 @@ def apply_active(
             return inv, (inv.model_id_override or "routed")
         if inv.resume_session_id is not None:
             return inv, CLAUDE
-        active = active_model(roster)
-        overrides = overrides_for(active, roster)
+        # Load ONCE and thread it through. active_model/resolve/overrides_for each
+        # fall back to load_roster() when passed None, and production call sites
+        # pass None — so reading per-helper meant three independent YAML loads per
+        # invocation on the universal CC path, which can also disagree with each
+        # other while the server rewrites the overlay live.
+        r = roster if roster is not None else load_roster()
+        active = active_model(r)
+        if active != CLAUDE and resolve(active, r) is None:
+            # UNDEFINED default — deliberately narrow on two axes.
+            # (1) Not CLAUDE: `resolve` returns None for EVERY name when the
+            #     models mapping is missing or nulled (a bare `models:` in an
+            #     overlay merges as None), and claiming the native default "has
+            #     been removed" would be flatly false.
+            # (2) Absent definition only: a model that exists but has no auth
+            #     token, or is missing routing fields, is a DIFFERENT fault with
+            #     a different repair and must fall through to the generic handler.
+            _warn_unresolvable_default_once(active)
+            return inv, CLAUDE
+        overrides = overrides_for(active, r)
+        # Resolved cleanly — drop EVERY prior complaint, not just this name's. A
+        # successful resolve proves the roster is currently coherent, so any
+        # earlier grievance is stale by definition; discarding only `active`
+        # leaves an entry behind when the default is repaired by pointing
+        # SOMEWHERE ELSE, and the original name then re-breaks in silence. Only
+        # one default is active at a time, so the set stays tiny either way.
+        _WARNED_UNRESOLVABLE_DEFAULTS.clear()
         if not overrides:
             return inv, active
         return replace(inv, **overrides), active

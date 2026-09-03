@@ -215,6 +215,13 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             "ON repo_pulse_annotations(tier, target_kind, item_id, pr_number)"
         )
 
+    # B2b dispatch follow-through: who created an intention — 'ego' (LLM,
+    # counts against MAX_ACTIVE_PER_SOURCE) or 'system' (mechanical dispatch
+    # follow-through, bypasses the cap). Mirrored in migration 0086.
+    await _try_alter(db,
+        "ALTER TABLE ego_intentions ADD COLUMN origin TEXT NOT NULL DEFAULT 'ego'",
+        "ego_intentions.origin")
+
     # Phase 9: thread_id on cc_sessions (for forum topic multi-session)
     await _try_alter(db,
         "ALTER TABLE cc_sessions ADD COLUMN thread_id TEXT",
@@ -2046,6 +2053,25 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         db,
         "ALTER TABLE memory_metadata ADD COLUMN capture_clarity REAL",
         "memory_metadata.capture_clarity",
+    )
+
+    # The two stamps the peer-line topic recency comparison needs. Neither
+    # table had a timestamp meaning what the comparison requires:
+    # session_charters.updated_at is a ROW timestamp (set_pointers and the
+    # upsert bump it too), and cc_sessions.last_extracted_at is a PASS
+    # watermark the extraction job advances even when it writes no topic
+    # (measured: 219/899 live rows carry a watermark with no topic). Mirrored
+    # in migration 0091 for the standalone runner; added here so an existing DB
+    # gets them on the base create_all_tables path (schema_both_build_paths).
+    await _try_alter(
+        db,
+        "ALTER TABLE session_charters ADD COLUMN mission_updated_at TEXT",
+        "session_charters.mission_updated_at",
+    )
+    await _try_alter(
+        db,
+        "ALTER TABLE cc_sessions ADD COLUMN topic_updated_at TEXT",
+        "cc_sessions.topic_updated_at",
     )
 
 
