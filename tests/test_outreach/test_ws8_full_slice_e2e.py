@@ -219,3 +219,49 @@ async def test_granted_bulk_autonomous_send_stamps_prospect_contacted(config, db
         "status"
     ] == "contacted"  # loop-fix at the granted chokepoint
     assert await mp.list_active(db) == []
+
+
+@pytest.mark.asyncio
+async def test_granted_bulk_send_survives_stamp_failure(config, db, monkeypatch):
+    """The granted-path contact-stamp runs AFTER the irreversible adapter.send, so a
+    transient DB error in the stamp must NOT raise out of _deliver: the message is
+    already out, and a post-send raise would report FAILED (re-attempt → dup) and
+    strand thread registration. Assert the send still reports DELIVERED and the
+    adapter was called exactly once despite the stamp blowing up (best-effort wrap).
+    RED on the pre-wrap bare-await code."""
+    from genesis.db.crud import capability_grants as cg
+    from genesis.db.crud import marketing_prospects as mp
+
+    _ts = "2026-06-21T00:00:00"
+    monkeypatch.setattr("genesis.outreach.marketing_config.effective_mode", lambda: "live")
+    await cg.ensure_cell(db, domain="email", verb="send", risk_class="bulk", updated_at=_ts)
+    await db.execute(
+        "UPDATE capability_grants SET state = 'granted', granted_at = ? WHERE id = ?",
+        (_ts, cg.cell_id("email", "send", "bulk")),
+    )
+    await db.commit()
+    await mp.create(db, id="p1", email="prospect@example.com", created_at=_ts, updated_at=_ts)
+
+    async def _boom(*a, **k):
+        raise RuntimeError("simulated DB error stamping the prospect post-send")
+
+    monkeypatch.setattr(mp, "mark_contacted_by_email", _boom)
+
+    adapter = AsyncMock()
+    adapter.send_message.return_value = "<m@x>"
+    pipe = _pipeline(config, db, adapter)
+
+    req = OutreachRequest(
+        category=OutreachCategory.NOTIFICATION,
+        topic="cold pitch",
+        context="body",
+        salience_score=0.5,
+        signal_type="marketing_cold",
+        channel="email",
+        validated_recipient="prospect@example.com",
+        labeled_surplus=True,  # → classifies BULK at the gate
+        verbatim=True,
+    )
+    r = await pipe.submit_raw("cold pitch", req)
+    assert r.status == OutreachStatus.DELIVERED  # completed send NOT broken by the stamp failure
+    adapter.send_message.assert_called_once()  # sent exactly once — no re-attempt

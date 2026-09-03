@@ -121,12 +121,15 @@ async def drain_pending_email_sends(rt: object) -> int:
                 # but crashed before marking the hold 'sent'. Reconcile WITHOUT
                 # re-sending: this narrows the at-least-once window to the gap
                 # between adapter.send and mark_consumed.
-                await pes.mark_sent(db, row["id"], sent_at=now)
                 # LOOP-FIX: this row was genuinely DELIVERED by the prior (crashed)
-                # cycle, which never reached the stamp below — advance the prospect
-                # here too so a crash between delivery and the stamp can't leave it
-                # 'active' and re-pitched.
+                # cycle, which never reached the DELIVERED-branch stamp — advance the
+                # prospect here too. Stamp BEFORE terminalizing (mark_sent), mirroring
+                # the DELIVERED branch: if this recovery itself crashes/DB-errors in the
+                # window, the hold stays 'held' (re-drained → this branch re-runs, the
+                # stamp being idempotent) rather than going 'sent' with the prospect
+                # left 'active' and re-pitched.
                 await _stamp_prospect_contacted(db, row["validated_recipient"], now)
+                await pes.mark_sent(db, row["id"], sent_at=now)
                 resolved += 1
                 logger.info(
                     "Reconciled held email %s (approval already consumed) — not re-sent",

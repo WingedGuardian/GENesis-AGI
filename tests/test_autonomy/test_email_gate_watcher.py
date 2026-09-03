@@ -451,3 +451,33 @@ async def test_reconciled_consumed_hold_stamps_prospect(db):
     assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
     assert pipe.calls == []  # NOT re-sent
     assert (await mp.get_by_id(db, "prospect"))["status"] == "contacted"
+
+
+@pytest.mark.asyncio
+async def test_reconciled_hold_stamps_prospect_before_terminalizing(db, monkeypatch):
+    """Crash-safety of the reconcile branch: the prospect stamp must be durable
+    BEFORE the hold goes terminal (mark_sent). If the terminal write fails (DB
+    error) — or the process stops right after mark_sent commits — the hold leaves
+    list_held forever while the prospect is still 'active' → re-pitched. Simulate
+    the terminal write raising at exactly that point and assert the prospect was
+    ALREADY advanced to 'contacted' (i.e. stamp precedes mark_sent, matching the
+    DELIVERED branch). RED on the old mark_sent-first order."""
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await ac.mark_consumed(db, rid, consumed_at=_TS)
+    await _bulk_hold_for(db, prospect_email="prospect@example.com", rid=rid)
+
+    async def _boom(*a, **k):
+        raise aiosqlite.OperationalError("simulated crash terminalizing the hold")
+
+    monkeypatch.setattr(pes, "mark_sent", _boom)
+
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+    with pytest.raises(aiosqlite.OperationalError):
+        await drain_pending_email_sends(_FakeRt(db, pipe))
+
+    assert pipe.calls == []  # reconcile never re-sends
+    # The stamp must have committed before the failed terminal write.
+    assert (await mp.get_by_id(db, "prospect"))["status"] == "contacted"
