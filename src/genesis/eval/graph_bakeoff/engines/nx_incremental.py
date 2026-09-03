@@ -1,17 +1,26 @@
 """NetworkX-incremental control engine (the baseline candidate).
 
 Represents "NetworkX done correctly as an engine": it REUSES production's exact
-BFS (``genesis.memory.graph._bfs_with_strength``) so we measure the shipped
-traversal logic, but builds an ``nx.MultiDiGraph`` (not production's lossy
-``DiGraph``) so all 115 parallel-typed edge-pairs are preserved and it matches the
-all-rows SQL oracle. Its cold-start IS a full rebuild from the snapshot — the
-honest architecture, and the number that quantifies today's price of every one of
-the 11 ``invalidate_graph_cache()`` sites.
+BFS (``genesis.memory.graph._bfs_with_strength``) and builds an
+``nx.MultiDiGraph`` — the same shape production's ``_ensure_graph`` now builds —
+so all parallel-typed edge-pairs are preserved and it matches the all-rows SQL
+oracle. Its cold-start IS a full rebuild from the snapshot — the honest
+architecture, and the number that quantifies today's price of every one of the
+11 ``invalidate_graph_cache()`` sites.
 
-FINDING (for the doc): production ``graph.py`` uses a plain ``DiGraph`` that
-silently collapses those parallel-typed edges (last-write-wins). Any adopted
-engine — including a productionized incremental-NX — must fix that to represent
-the true multigraph.
+HISTORY: production ``graph.py`` used a plain ``DiGraph`` that silently collapsed
+those parallel-typed edges (last-write-wins) until the MultiDiGraph fix. This
+engine predates that fix and was the finding that motivated it; any adopted
+engine must keep representing the true multigraph. (The pair count quoted here
+was 115 at the 2026-08-06 snapshot and is 139 as of 2026-09-02 — it tracks the
+graph, so re-derive it rather than citing this line.)
+
+One residual difference from production: ``load()`` below calls ``add_edge``
+without an explicit ``key=``, so networkx assigns auto-incrementing integer
+keys, whereas production passes ``key=link_type``. On a snapshot containing a
+duplicate ``(source, target, link_type)`` row the two would diverge (this keeps
+both, production keeps one). The production PK forbids that row, so it cannot
+occur in a snapshot exported from a real database.
 """
 
 from __future__ import annotations
@@ -56,7 +65,14 @@ class NxIncrementalEngine:
             for s, t, lt, st in conn.execute(
                 "SELECT source_id, target_id, link_type, strength FROM memory_links"
             ):
-                G.add_edge(s, t, link_type=lt, strength=st if st is not None else 0.0)
+                # Coalesce BOTH: production's `strength < min_strength` guard
+                # already rejects a None strength before selection, but the
+                # shared `_bfs_with_strength` now tie-breaks on the
+                # (strength, link_type) tuple, so a NULL link_type here would
+                # raise rather than sort. The production CHECK constraint makes
+                # that unreachable from a real snapshot; this keeps the engine
+                # honest against a hand-built one.
+                G.add_edge(s, t, link_type=lt or "", strength=st if st is not None else 0.0)
 
             mentions: dict[str, set[str]] = defaultdict(set)
             for mid, eid in conn.execute("SELECT memory_id, entity_id FROM entity_mentions"):
