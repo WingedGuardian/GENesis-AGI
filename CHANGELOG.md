@@ -152,6 +152,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The rm-guard now reads a multi-line command the way the shell reads it,
+  comments included.** It already joined a line continuation before checking a
+  delete's flags and target, which is what the shell does — but it did so with a
+  pattern that had no notion of a comment, and a comment ends at the newline rather
+  than continuing past it. A trailing comment on a multi-line command could
+  therefore make the guard read the two lines as one, and stop recognising what the
+  second line was. It now tracks quotes and comments while joining, and where a
+  comment begins is checked against the shell itself rather than inferred — both
+  ways round, since a `#` that only looks like a comment start must not stop the
+  join either. Nothing else about the guard changes: verified identical to the
+  previous behaviour on every backslash form outside a comment, and across 15,835
+  real commands from this install's history not one verdict moves in either
+  direction.
 - **The `deliberate` MCP tool ("Model Fusion") no longer fails on real prompts.** Two
   distinct bugs: (1) analysis mode 404'd because the orchestrator slug
   `openai/gpt-oss-120b:free` was retired from OpenRouter's catalog (`:free` variant gone)

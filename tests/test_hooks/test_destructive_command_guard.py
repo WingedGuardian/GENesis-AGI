@@ -189,3 +189,98 @@ class TestEscapedBackslashIsNotAContinuation:
         assert _blocks("printf x\\\\\nrm -rf /"), (
             "even run is a literal backslash + a real separator: rm must be seen"
         )
+
+
+class TestContinuationInsideAComment:
+    """A comment ends at the newline — the shell does not continue it.
+
+    The fold was a whole-string regex with no comment model, so a backslash at
+    the end of a `#` comment was treated as a continuation and the following
+    command was glued into the comment text. No `rm` token then existed, and
+    because tokenizing SUCCEEDED the legacy-regex fallback (which only fires
+    when tokenizing FAILS) never ran either.
+
+    This guard is the only one that covers shallow non-protected targets, so
+    there is no compensating control for these shapes.
+
+    Both error directions are unsafe here, which is why the fix tracks real
+    state rather than approximating: failing to fold a genuine continuation
+    splits a word the shell joins and can hide the recursive-force flags (the
+    bypass recorded in ``_rm_violations``), while folding one the shell does not
+    join hides the command itself.
+    """
+
+    # Every context a `#` can follow, with the flag recording whether BASH opens a
+    # comment there — derived by running `<prefix>#note \`⏎`touch <marker>` under
+    # `bash --norc --noprofile` and checking for the marker FILE.
+    #
+    # An earlier revision of this list held four contexts that all happened to be
+    # ones the code already got right (three spaces and a subshell `)`), so the
+    # suite was green while two bypass classes were live. A table that only
+    # contains passing cases tests nothing; these are the cases that DISAGREED.
+    _COMMENT_CONTEXTS = [
+        ("space", "echo hi  # note a", True),
+        ("tight", "ls #x", True),
+        ("trailing-word", "true # trailing", True),
+        ("subshell-close", "(true)#n", True),
+        ("semicolon", "echo hi;# note a", True),
+        ("pipe", "echo hi|# note a", True),
+        ("and-and", "true&&# note a", True),
+        ("or-or", "false||# note a", True),
+        ("background-amp", "true&# note a", True),
+    ]
+
+    @pytest.mark.parametrize(
+        ("label", "prefix", "bash_opens_comment"),
+        _COMMENT_CONTEXTS,
+        ids=[c[0] for c in _COMMENT_CONTEXTS],
+    )
+    def test_a_comment_ending_in_a_backslash_does_not_hide_the_next_rm(
+        self, label, prefix, bash_opens_comment
+    ):
+        assert bash_opens_comment, "table lists only real comment contexts"
+        assert _blocks(f"{prefix}\\\nrm -rf /"), (
+            f"{label}: the shell ends the comment at the newline and runs the rm"
+        )
+
+    # The opposite direction, and it is a bypass too: these look like comment
+    # starts to a naive rule but are MID-WORD to the shell, so the continuation
+    # after them is real. Refusing to fold splits `-r` from `f` and the guard
+    # stops seeing a recursive-force removal at all.
+    @pytest.mark.parametrize(
+        ("label", "prefix"),
+        [
+            ("command-substitution", "echo $(date)#x"),
+            ("arithmetic-expansion", "echo $((1))#x"),
+            ("nested-substitution", "echo $(echo $(date))#x"),
+            ("escaped-space", "echo a\\ #x"),
+        ],
+        ids=[
+            "command-substitution",
+            "arithmetic-expansion",
+            "nested-substitution",
+            "escaped-space",
+        ],
+    )
+    def test_a_mid_word_hash_does_not_suppress_a_real_fold(self, label, prefix):
+        assert _blocks(f"{prefix}; rm -r\\\nf /"), (
+            f"{label}: the shell joins these, so the guard must still see -rf"
+        )
+
+    def test_the_shallow_target_class_this_guard_uniquely_covers(self):
+        """`/usr` is caught by nothing else in the chain — the control matters."""
+        assert _blocks("rm -rf /usr"), "control: one line must block"
+        assert _blocks("echo hi  # note a\\\nrm -rf /usr")
+
+    def test_a_hash_inside_quotes_is_not_a_comment_and_must_still_fold(self):
+        """The dangerous inverse: declining to fold hides the flags.
+
+        A `#` inside a quoted string opens no comment, so a continuation after
+        it is real. Treating it as a comment would split `-r`/`f` across the
+        newline and the guard would no longer see a recursive-force removal.
+        """
+        assert _blocks("echo '# not a comment' && rm -r\\\nf /")
+
+    def test_a_comment_on_an_earlier_line_does_not_disarm_a_later_fold(self):
+        """Comment state must clear at the newline, not persist down the command."""
+        assert _blocks("echo hi # done\nrm -r\\\nf /")
