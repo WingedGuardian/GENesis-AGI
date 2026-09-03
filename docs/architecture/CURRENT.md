@@ -494,7 +494,7 @@ gated — that contract is one-directional.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 85f91765 2026-09-01
+verified: 5808e7cd 2026-09-03
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -555,10 +555,22 @@ verified: 85f91765 2026-09-01
   MUST be a curated, non-opted-out `marketing_prospects` row (authorization is
   DECOUPLED from send-lifecycle status, so a `contacted` follow-up still sends) —
   an unknown / opted-out recipient trips (`recipient_not_curated` / `opted_out`)
-  → demote + hold (fail-closed). PR2 will wire graduation, send-time contact
-  stamping, AND a hard per-window cap on hold-creation (the ASK-state
-  approval-flood guard) alongside the batch-approval card — `marketing_send` has
-  no autonomous caller until then.
+  → demote + hold (fail-closed). Graduation for the BULK cell rides the generic
+  capability-promotion path (`capability_grants.detect_promotable_cells` — no
+  risk-class filter → `email:send:bulk` qualifies once it has ≥5 owner-approved
+  successes + posterior ≥0.70). **Contact-stamping (loop-fix):** on a CONFIRMED
+  delivery a matching prospect is advanced active → `contacted` via one
+  active-guarded CRUD (`marketing_prospects.mark_contacted_by_email`) called from
+  BOTH delivery paths — the email-gate drain (`email_gate_watcher`) for a HELD →
+  owner-approved send, AND `pipeline._deliver` for a GRANTED-cell autonomous send
+  (which delivers inline and never touches the drain, so the fix survives
+  graduation). Keyed on the RECIPIENT being a curated prospect, NOT `cell_risk_class`
+  (a FINANCIAL-misclassified pitch is still stamped); a send that never delivers
+  (dropped/expired/rejected) leaves the prospect `active`, re-eligible. Without this,
+  `mark_contacted` had no caller and `list_active` re-returned a delivered prospect
+  every tick. **DEFERRED (hot follow-up, before arming at volume):** an atomic
+  per-prospect in-flight dedup + a per-window approval-flood cap + the batch-approval
+  card — `marketing_send` has no autonomous caller until the campaign is armed.
 - **Marketing reply → owner Telegram ping (notify-only).** When a GENUINE human
   reply lands (auto-responders + foreign senders already gated out by the
   reply→engagement bridge, `outreach/engagement.py`) AND the reply's recipient is
@@ -1024,7 +1036,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 50b79ffb 2026-09-01
+verified: 29a382e7 2026-09-03
 ```
 
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
@@ -1151,6 +1163,21 @@ verified: 50b79ffb 2026-09-01
   `job.failed` is in the ego's `_REFLEX_OWNED_EVENT_TYPES` so it never spins a
   reactive ego cycle. Ingested by the reflex arc as of PR-2b (`ingest.py`
   consumes `job.failed`, guarded on `error_type` presence).
+- **A resumed reflection runs against a DIFFERENT tick than the one that asked.**
+  When a user approves a reflection's gated CC fallback, `_resume_approved_reflections`
+  dispatches it with `self._last_tick_result` — the CURRENT tick — because the
+  loop's own scoring may never reach that depth again. So what a person approved
+  and what runs are about different moments — and per that method's docstring
+  the reason is availability, not a preference for fresher state: the current
+  tick is the only one it has. The ORIGINATING tick is genuinely unrecoverable: the approval context is
+  built from a fixed key set with no tick field, and `_approval_key` excludes
+  per-invocation identity on purpose so recurring dispatches reuse one pending
+  row rather than minting a new approval every tick. The resume log therefore
+  names the approval, its age, and the tick being run against, and says outright
+  that this is not the requesting tick — rather than implying a lineage that
+  does not exist. Giving it one would mean a key-neutral carrier that does not
+  currently exist; do not smuggle a tick id into `action_label` or
+  `extra_context`, both of which feed the approval key.
 - **perception/**: the real-time reflection engine — MICRO (and LIGHT without
   a CC bridge) run in-process via the router; DEEP/STRATEGIC go to the CC
   reflection bridge. GROUNDWORK: user-model-synthesis, pre-execution-gate
