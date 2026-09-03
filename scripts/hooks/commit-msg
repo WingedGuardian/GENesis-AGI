@@ -9,7 +9,31 @@
 #   2. This install's EXACT non-classable identifiers (private repo/host names,
 #      hardware, tokens) read from the local release-fingerprint file when
 #      present — zero private bytes are tracked in this file.
+#   3. ADVISORY (never blocks): security-INCIDENT framing — a past-tense claim
+#      that this system leaked/exposed/stored credentials. Layers 1-2 are about
+#      PRIVACY (who/where); this one is a different axis that those miss.
+#      SCOPE: the SUBJECT LINE only, and that is a measured choice, not an
+#      accident of the regex — see the scope note at layer 3.
 # Covers the gap that gitleaks (file-content only) does not scan commit messages.
+#
+# Why layer 3 lives HERE, at commit time, and only warns:
+#   * The scheduled leak review already catches this class — but it is a MERGE
+#     gate. It stops the text reaching `main`; it cannot stop it reaching the
+#     internet, which happens at `git push`.
+#   * On this repo the BRANCH COMMIT message is what lands on `main` (squash
+#     merges use COMMIT_MESSAGES), and a pushed public branch cannot be
+#     force-pushed (git_push_guard, deliberately) — so the commit message is
+#     both the artifact that matters and the one that is expensive to fix later.
+#   * Before push, `--amend` is free. A warning is therefore actionable, and a
+#     block would be an escalation with no measured reason behind it — it would
+#     also stop background sessions from committing at all.
+#
+# Deliberately NOT implemented: a second axis flagging descriptions of what
+# still EVADES a guard. MEASURED against 1,600 real commit messages here: it
+# fired 10 times, mostly false, because "bypass the gate" / "defeated the guard"
+# is core vocabulary in a repo whose job is building gates. A checker that cries
+# wolf on normal language gets muted, and takes the useful axis down with it.
+# That judgement stays with the LLM leak review, which made it correctly.
 
 MSG_FILE="$1"
 
@@ -41,12 +65,81 @@ if [ -f "$FP_FILE" ]; then
     fi
 fi
 
+# Layer 3 — ADVISORY, subject line only.
+#
+# SCOPE, decided by measurement rather than by what the regex happened to do.
+# Against this repo's own history (1,756 commit messages, full bodies):
+#   * subject line only  ->  0 fires (0.00%)
+#   * every body line    -> 41 fires (2.33%), and reading them, ALL are ordinary
+#     engineering prose — "the key is ABSENT ... logged at ERROR", "no token
+#     ever persisted", "would be echoed verbatim into logs". A body is long
+#     enough that a credential noun and a leak verb land near each other by
+#     chance, and a checker that cries wolf at that rate gets muted by whoever
+#     hits it next — taking the useful axis down with it. Same reasoning that
+#     rejected the residual-gap axis below, and the same evidence shape.
+# The subject is also where this matters most: it is the PR title, the squash
+# commit subject, and the line that stays on the commits tab.
+#
+# RECALL is measured, not asserted — the first version of this check was tuned
+# for precision alone and caught 6 of 23 incident phrasings while reporting a
+# clean 0% false-positive rate, which is half a measurement wearing the
+# grammar of a whole one. Against a hand-built set of 23 incident-framing
+# subjects and 18 deliberately similar benign ones: 23/23 and 0/18.
+# The corpus, the labelled sets and both numbers are reproduced by
+# tests/test_scripts/test_commit_msg_framing.py, so a future pattern edit
+# re-measures instead of guessing.
+#
+# Two directions, because a claim can be phrased either way round:
+#   * a credential noun near an exposure STATE  ("tokens ... unredacted")
+#   * a past-tense or stopping LEAK VERB near a credential noun
+# Present tense alone must NOT fire: "store credentials in the reference store"
+# is a feature description, and requiring a past or stopping claim is what
+# separates the two. `(was|were) vulnerable` was dropped outright — it carried
+# no credential-noun requirement, had zero support in the corpus, and fires on
+# an ordinary CVE dependency bump.
+_FRAMING_NOUN='(credential|secret|token|api[ _-]?key|private[ _-]?key|signing[ _-]?key|password|passphrase|cred|cookie|key)s?'
+_FRAMING_STATE='(plaintext|cleartext|unencrypted|unredacted|verbatim|in the clear|recoverable)'
+_FRAMING_PAST='(leaked|exposed|persisted|stored|storing|wrote|written|writing|logged|logging|printed|recorded|contained|revealed|leaking|exposing|persisting)'
+_FRAMING_STOPV='(leaking|exposing|persisting|storing|writing|logging|persists|leaks|exposes|stores|writes|logs|write|store|log|leak|expose)'
+FRAMING_PATTERNS="${_FRAMING_NOUN}[^.]{0,45}${_FRAMING_STATE}|${_FRAMING_STATE}[^.]{0,45}${_FRAMING_NOUN}|${_FRAMING_PAST}[^.]{0,45}${_FRAMING_NOUN}|${_FRAMING_NOUN}[^.]{0,45}${_FRAMING_PAST}|(no longer|used to|stop|stops|stopped|prevent|prevents|prevented)[^.]{0,30}${_FRAMING_STOPV}[^.]{0,45}${_FRAMING_NOUN}"
+
+framing_hit=""
+_subject=$(head -n 1 "$MSG_FILE")
+if printf '%s\n' "$_subject" | grep -qiE "$FRAMING_PATTERNS"; then
+    framing_hit="$_subject"
+fi
+
+_emit_framing_advisory() {
+    [ -n "$framing_hit" ] || return 0
+    echo ""
+    echo "ADVISORY (not blocking): possible security-incident framing in the subject."
+    echo "  $framing_hit"
+    echo ""
+    echo "  Public artifacts describe what the code NOW DOES; they do not assert"
+    echo "  in past tense that this system leaked or exposed anything. A fix does"
+    echo "  not need a confessed incident to justify it."
+    echo ""
+    echo "  This matters most for a COMMIT message: squash merges take their text"
+    echo "  from the branch commits, so this wording is what lands on main"
+    echo "  permanently — and a pushed public branch cannot be force-pushed, so"
+    echo "  amending is free NOW and expensive after the push."
+    echo ""
+    echo "  Rewrite forward, or ignore this if the wording is already neutral."
+    echo ""
+}
+
 if [ "$blocked" -eq 1 ]; then
     echo ""
     echo "Remove private IPs, hostnames, or account IDs from the commit message."
     echo "If this is a false positive, commit with --no-verify (but think twice)."
     echo ""
+    # AFTER the block's own remedy, never before it. Printed above, the advisory
+    # sat directly on top of the "--no-verify" escape hatch, which disarms every
+    # hook including the privacy gates — an advisory should not read as
+    # instructions for getting past a block it has nothing to do with.
+    _emit_framing_advisory
     exit 1
 fi
 
+_emit_framing_advisory
 exit 0
