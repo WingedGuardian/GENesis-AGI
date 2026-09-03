@@ -33,10 +33,17 @@ content, SSL issues). yt-dlp is the reliable alternative.
 3. Fetch the auto-generated transcript. Request **both** English tracks and prefer
    `en-orig`:
    ```bash
+   VID='VIDEO_ID'   # <- substitute the real 11-char video id
    mkdir -p ~/tmp/yt-transcripts
+   rm -f ~/tmp/yt-transcripts/"$VID".*.vtt        # drop any earlier run's files
    yt-dlp --write-auto-sub --skip-download --sub-langs "en-orig,en" -o "$HOME/tmp/yt-transcripts/%(id)s" 'VIDEO_URL'
-   ls ~/tmp/yt-transcripts/ | grep VIDEO_ID
+   ls ~/tmp/yt-transcripts/ | grep -F -- "$VID"
    ```
+   The `rm -f` is load-bearing, not tidiness: that directory persists across runs and
+   across videos, so a stale `$VID.en-orig.vtt` from an earlier fetch would satisfy
+   step 4's preference check even when THIS fetch failed or returned only `en` — you
+   would clean an old transcript and never see an error. `grep -F --` because a video
+   id may begin with `-`, which `grep` would otherwise read as options.
    YouTube may serve two English auto-caption tracks — `en-orig` ("English
    (Original)") and `en` ("English"). Usually they are the same resource. Observed
    2026-09 on one video: the two were served with different cue segmentation, and the
@@ -57,19 +64,23 @@ content, SSL issues). yt-dlp is the reliable alternative.
    VTT="$HOME/tmp/yt-transcripts/$VID.en-orig.vtt"
    [ -f "$VTT" ] || VTT="$HOME/tmp/yt-transcripts/$VID.en.vtt"
    [ -f "$VTT" ] || { echo "no English VTT for $VID — see step 6" >&2; exit 1; }
-   sed 's/<[^>]*>//g;/^WEBVTT/d;/^Kind:/d;/^Language:/d;/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]* -->/d;/^[[:space:]]*$/d' "$VTT" | awk '!seen[$0]++'
+   sed '/^WEBVTT/d;/^Kind:/d;/^Language:/d;/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]* -->/d;s/<[^>]*>//g;/^[[:space:]]*$/d' "$VTT" | awk '!seen[$0]++'
    ```
-   Three details in that `sed`, each of which bit a previous version:
+   The ORDER is the whole point, and each stage bit a previous version:
 
-   - The cue-header filter is anchored to the full `HH:MM:SS.mmm -->` shape, NOT a
-     bare `^[0-9][0-9]:[0-9][0-9]`. Because tag-stripping runs first, a loose pattern
-     sees stripped text and deletes real captions — measured: `<c>10:30</c> is the
-     deadline` becomes an empty line under the loose pattern and survives under this
-     one.
-   - `/^[[:space:]]*$/d`, not `/^$/d` — a VTT contains BOTH truly-empty lines (the
-     cue separator) and single-space lines (the first line of a cue's payload). The
-     plain form removes only the former, leaving one space-only line in the output
-     after the de-dupe.
+   - **Control-line deletes run FIRST, on raw text.** A real `WEBVTT`/`Kind:`/
+     `Language:`/cue-header line carries no tags, so on raw text those predicates are
+     unambiguous. Strip tags first and a genuine caption can be mistaken for a control
+     line and deleted — measured: `<c>Language: Python is the topic</c>` and
+     `<00:00:01.500><c>10:30</c> is the deadline` were both destroyed by a
+     strip-first ordering and both survive this one.
+   - The cue-header pattern is anchored to the full `HH:MM:SS.mmm -->` shape rather
+     than a bare `^[0-9][0-9]:[0-9][0-9]`, so a caption that merely starts with a
+     clock time is not eaten.
+   - **Tag-strip next, blank-delete LAST.** `/^[[:space:]]*$/d`, not `/^$/d` — a VTT
+     carries BOTH truly-empty lines (the cue separator) and single-space lines (the
+     first line of a cue payload); the plain form leaves the latter. Running it last
+     also collapses any line that became empty once its markup was stripped.
    - The `[ -f ]` guard matters: without it a missing VTT makes `sed` write one
      stderr line while the pipeline still exits 0 (the status is `awk`'s), so the
      failure looks like an empty transcript rather than an error.
