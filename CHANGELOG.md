@@ -9,6 +9,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **Mistral Large is now tracked as a paid provider.** Mistral removed the Large
+  model family from free-tier entitlement (unannounced; surfaces as
+  `403 tier_not_allowed`). The `mistral-large-free` provider is now flagged
+  `free: false`, so its spend is recorded at real rates ($0.5/$1.5 per MTok)
+  instead of $0, and call sites marked `never_pays` no longer route to it. The
+  provider name keeps its historical `-free` suffix to avoid churning the 30
+  chains that reference it. If your account tier still gets Large at $0,
+  override `free: true` in your local routing overlay.
+
 ### Added
 
 - **Telegram ping when someone replies to a marketing pitch.** When a real person
