@@ -583,23 +583,54 @@ def _make_mock_stderr(data: bytes = b""):
     return _AsyncReader()
 
 
-def _make_async_stdout(data: bytes):
-    """Create a mock async iterator for proc.stdout."""
+def _make_async_stdout(data: bytes, *, raise_on: tuple[int, ...] = ()):
+    """A faithful-enough stand-in for asyncio.StreamReader over `data`.
+
+    Faithfulness matters here in one specific way. The reader consumes stdout
+    with readline(), where an empty return means EOF and ONLY EOF — a blank
+    line in the stream comes back as b"\n". A fake built on data.split(b"\n")
+    yields a bare b"" for a blank line, which the reader would take as EOF and
+    silently truncate the stream mid-run. So lines keep their terminator and
+    b"" is emitted exactly once, at the end.
+
+    `raise_on` names 0-based line indices where readline() raises ValueError,
+    reproducing StreamReader's over-limit behaviour: it discards the offending
+    span BEFORE raising, so the next call returns the FOLLOWING line — which is
+    what makes skip-and-continue safe rather than an infinite loop.
+    """
 
     class _AsyncStdout:
-        def __init__(self, lines):
-            self._lines = iter(lines)
+        def __init__(self, payload: bytes):
+            self._lines = payload.splitlines(keepends=True)
+            self._i = 0
+            # Which indices the reader actually asked for. A fault injected at
+            # an index that is never requested makes a test VACUOUS, and the
+            # loop breaks on the `result` event — so anything after it is never
+            # read. Tests assert against this rather than assuming.
+            self.reads: list[int] = []
+
+        async def readline(self) -> bytes:
+            if self._i >= len(self._lines):
+                return b""
+            idx = self._i
+            self._i += 1                      # consumed BEFORE raising
+            self.reads.append(idx)
+            if idx in raise_on:
+                raise ValueError(
+                    "Separator is not found, and chunk exceed the limit"
+                )
+            return self._lines[idx]
 
         def __aiter__(self):
             return self
 
         async def __anext__(self):
-            try:
-                return next(self._lines)
-            except StopIteration:
-                raise StopAsyncIteration from None
+            line = await self.readline()
+            if not line:
+                raise StopAsyncIteration
+            return line
 
-    return _AsyncStdout(data.split(b"\n"))
+    return _AsyncStdout(data)
 
 
 @pytest.mark.asyncio
@@ -674,16 +705,24 @@ async def test_run_streaming_timeout_returns_partial(invoker, monkeypatch):
     data = _make_stream_lines(*events)
 
     mock_proc = AsyncMock()
-    # Simulate: stdout yields lines then hangs → timeout fires
-    lines = data.split(b"\n")
+    # Simulate: stdout yields lines then hangs → timeout fires. Must expose
+    # readline() (the reader no longer uses the async-iterator protocol), and
+    # must hang at the AWAIT rather than end the stream — an EOF would exit
+    # the loop cleanly and never reach the timeout this test is about.
+    class _SlowStdout:
+        def __init__(self, payload: bytes):
+            self._lines = payload.splitlines(keepends=True)
+            self._i = 0
 
-    async def _slow_iter():
-        for line in lines:
-            yield line
-        # Simulate hang
-        await asyncio.sleep(999)
+        async def readline(self) -> bytes:
+            if self._i < len(self._lines):
+                line = self._lines[self._i]
+                self._i += 1
+                return line
+            await asyncio.sleep(3600)  # hang, do not EOF
+            return b""
 
-    mock_proc.stdout = _slow_iter()
+    mock_proc.stdout = _SlowStdout(data)
     mock_proc.stdin = _make_mock_stdin()
     mock_proc.stderr = _make_mock_stderr()
     mock_proc.pid = 99999  # Must set — see test_run_timeout comment
@@ -1761,6 +1800,11 @@ async def test_run_streaming_cancelled_kills_subprocess(invoker, monkeypatch):
         def __aiter__(self):
             return self
 
+        async def readline(self):
+            # Cancellation is delivered at the stdout await point, which is
+            # now readline() rather than __anext__.
+            raise asyncio.CancelledError()
+
         async def __anext__(self):
             # Simulate task.cancel() delivered at the stdout await point
             raise asyncio.CancelledError
@@ -2246,3 +2290,165 @@ async def test_streaming_escalates_when_leader_exits_but_group_survives(
     import signal as _signal
 
     assert (99992, _signal.SIGKILL) in calls
+
+
+# --- Over-limit stream-json lines must cost the LINE, not the SESSION -------
+# MEASURED 2026-09-02: a browser session emitted one stream-json line above the
+# 1 MiB reader limit. StreamReader.readline() raised ValueError, it propagated
+# out of `async for raw_line in proc.stdout`, and the whole session died after
+# 104.4s of completed work. One occurrence since 2026-08-01 — rare, and total
+# loss when it fires.
+
+
+def _result_event(text: str = "done") -> dict:
+    return {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": text,
+        "session_id": "s1",
+        "total_cost_usd": 0.01,
+        "duration_ms": 10,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+
+
+def _streaming_proc(data: bytes, *, raise_on: tuple[int, ...] = ()):
+    proc = AsyncMock()
+    proc.stdout = _make_async_stdout(data, raise_on=raise_on)
+    proc.stdin = _make_mock_stdin()
+    proc.stderr = _make_mock_stderr()
+    proc.wait = AsyncMock()
+    proc.terminate = MagicMock()
+    proc.returncode = 0
+    return proc
+
+
+@pytest.mark.asyncio
+async def test_over_limit_line_is_dropped_and_the_session_survives(invoker):
+    """The exact incident shape: an oversized line mid-stream, with the real
+    result arriving after it."""
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}},
+        _result_event("survived"),
+    )
+    # index 1 = the assistant line; it raises instead of being returned.
+    proc = _streaming_proc(data, raise_on=(1,))
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.text == "survived"
+    assert output.session_id == "s1"
+    assert not output.is_error
+    assert 1 in proc.stdout.reads, proc.stdout.reads   # the fault was reached
+
+
+@pytest.mark.asyncio
+async def test_multiple_over_limit_lines_all_dropped(invoker):
+    """Several oversized lines in one stream must not compound into a failure,
+    and must not spin: readline() consumes the span before raising."""
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "a"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "b"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "c"}]}},
+        _result_event("still here"),
+    )
+    proc = _streaming_proc(data, raise_on=(1, 2, 3))
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.text == "still here"
+    assert {1, 2, 3} <= set(proc.stdout.reads), proc.stdout.reads
+
+
+@pytest.mark.asyncio
+async def test_dropping_the_result_line_raises_instead_of_faking_success(invoker):
+    """THE dangerous case, and the reason dropping cannot be silent.
+
+    If the dropped line was the `result` event there is no result at all. The
+    no-result path builds CCOutput(is_error=False, session_id="", cost_usd=0.0),
+    and downstream `success = not output.is_error` would record a phantom
+    completion — which on the home model calls note_home_recovery() and clears
+    an account-wide rate-limit fallback, and whose empty-text shape forges the
+    silent subscription-cap signature that becomes a CRITICAL alert. Before the
+    drop-and-continue loop this raised; it must keep raising.
+
+    Also the drop-then-EOF shape: nothing parseable follows, so a loop that
+    failed to advance would spin instead of reaching EOF.
+    """
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        _result_event("never seen"),
+    )
+    proc = _streaming_proc(data, raise_on=(1,))   # the RESULT line is dropped
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCProcessError, match="NO result event"),
+    ):
+        await asyncio.wait_for(
+            invoker.run_streaming(CCInvocation(prompt="x")), timeout=10
+        )
+
+    # Guard the guard: prove the injected fault was actually REACHED. The reader
+    # breaks on a result event, so a fault placed after one is never read and
+    # the test would pass with the whole except-branch deleted.
+    assert 1 in proc.stdout.reads, proc.stdout.reads
+
+
+@pytest.mark.asyncio
+async def test_dropped_line_with_empty_result_does_not_feed_the_cap_detector(invoker):
+    """A drop is a KNOWN cause of thin output, so it must not be reported as the
+    unexplained-empty signature the silent-cap detector aggregates into a
+    CRITICAL alert.
+
+    The reachable shape is a result that DID arrive but is empty, alongside a
+    drop. (Drop + NO result raises before reaching any detector, so a guard on
+    that branch would be dead code — a mutation sweep caught exactly that.)
+    """
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}},
+        _result_event(""),
+    )
+    proc = _streaming_proc(data, raise_on=(1,))   # drop the assistant line
+    fired = []
+
+    async def _spy(*a, **k):
+        fired.append(a)
+
+    invoker._fire_empty_output_callback = _spy
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(
+            CCInvocation(prompt="x", expect_output=True)
+        )
+
+    assert output.text == ""
+    assert 1 in proc.stdout.reads, proc.stdout.reads   # the fault was reached
+    assert not fired, "a dropped-line run forged the silent-cap signature"
+
+
+@pytest.mark.asyncio
+async def test_blank_line_mid_stream_is_not_treated_as_eof(invoker):
+    """readline() returns b"" ONLY at EOF; a blank line comes back as b"\\n".
+
+    A reader that treats any falsy line as EOF truncates the stream at the
+    first blank line and silently loses the result — which is worse than the
+    crash being fixed, because it looks like a clean empty run.
+    """
+    data = (
+        _make_stream_lines({"type": "system", "subtype": "init", "session_id": "s1"})
+        + b"\n"
+        + _make_stream_lines(_result_event("after blank"))
+    )
+    proc = _streaming_proc(data)
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.text == "after blank"
