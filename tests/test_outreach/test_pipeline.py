@@ -969,13 +969,16 @@ async def test_deliver_writes_ledger_predictions(
     from genesis.db.crud import ledger_predictions
 
     gate = GovernanceGate(config, db)
+    # EXTERNAL channel (discord): reply predictions are created only for external
+    # outreach — owner-facing channels (telegram/voice) are skipped, since they solicit
+    # no external reply (see test_deliver_owner_channel_skips_ledger_predictions).
     pipeline = OutreachPipeline(
         governance=gate, drafter=mock_drafter, formatter=mock_formatter,
-        channels={"telegram": mock_channel}, db=db, config=config,
-        recipients={"telegram": "12345"},
+        channels={"discord": mock_channel}, db=db, config=config,
+        recipients={"discord": "12345"},
     )
     req = OutreachRequest(
-        category=OutreachCategory.SURPLUS, topic="Ledger test",
+        category=OutreachCategory.SURPLUS, topic="Ledger test", channel="discord",
         context="Predict me", salience_score=0.9, signal_type="surplus_insight",
     )
     result = await pipeline.submit(req)
@@ -991,9 +994,12 @@ async def test_deliver_writes_ledger_predictions(
 
 
 @pytest.mark.asyncio
-async def test_deliver_threads_stated_confidence(
+async def test_deliver_owner_channel_skips_ledger_predictions(
     config, db, mock_drafter, mock_formatter, mock_channel,
 ):
+    # Owner-facing delivery (telegram) creates NO reply/engagement predictions — the owner
+    # gets the message, there is no external reply to predict, so they'd only ever grade as
+    # silence and poison outreach calibration.
     from genesis.db.crud import ledger_predictions
 
     gate = GovernanceGate(config, db)
@@ -1003,7 +1009,31 @@ async def test_deliver_threads_stated_confidence(
         recipients={"telegram": "12345"},
     )
     req = OutreachRequest(
-        category=OutreachCategory.SURPLUS, topic="Stated",
+        category=OutreachCategory.SURPLUS, topic="Owner ping", channel="telegram",
+        context="hi", salience_score=0.9, signal_type="surplus_insight",
+    )
+    result = await pipeline.submit(req)
+    rows = await ledger_predictions.list_by_subject(
+        db, action_class="outreach_send", subject_ref_id=result.outreach_id,
+    )
+    assert rows == []  # owner-facing channel → no predictions
+
+
+@pytest.mark.asyncio
+async def test_deliver_threads_stated_confidence(
+    config, db, mock_drafter, mock_formatter, mock_channel,
+):
+    from genesis.db.crud import ledger_predictions
+
+    gate = GovernanceGate(config, db)
+    # EXTERNAL channel (discord) — predictions are created only for external outreach.
+    pipeline = OutreachPipeline(
+        governance=gate, drafter=mock_drafter, formatter=mock_formatter,
+        channels={"discord": mock_channel}, db=db, config=config,
+        recipients={"discord": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS, topic="Stated", channel="discord",
         context="c", salience_score=0.9, signal_type="surplus_insight",
         stated_confidence=0.3,
     )
