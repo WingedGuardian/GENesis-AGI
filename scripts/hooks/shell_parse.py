@@ -78,6 +78,28 @@ _WRAPPER_SPEC = {
     "time": ({"-o", "--output", "-f", "--format"}, 0),
     "command": (set(), 0),
     "exec": ({"-a"}, 0),
+    "builtin": (set(), 0),
+    # An entry here asserts that the trailing tokens ARE the command, which holds
+    # when the prefix passes its argv through unchanged. It does not hold when a
+    # prefix re-parses a single argument string, or takes a compound instead of a
+    # simple command: argv[0] is then not the executable and the command stays
+    # unresolved. Those shapes are held as fixture data in the protected-paths
+    # suite rather than described here.
+    #
+    # This table is a WHITELIST, so it says nothing about prefixes not in it —
+    # `setpriv`, `systemd-run`, `unshare`, `flock`, `runuser` and others pass a
+    # command through and are absent. A caller that must not certify an
+    # unresolved command therefore cannot rely on this table alone; see
+    # protected_paths_guard's own conservative check, which is what covers the
+    # complement.
+    #
+    # `chroot` is deliberately NOT here. It re-roots the filesystem, so every
+    # operand changes meaning — `chroot /nr rm -rf /x` deletes `/nr/x`, not `/x`.
+    # Resolving it would hand a path guard operands that mean something else,
+    # which is argv-to-effect modelling of exactly the kind this module's header
+    # disclaims.
+    "eval": (set(), 0),
+    "coproc": (set(), 0),
     "xargs": (
         {
             "-I",
