@@ -33,18 +33,25 @@ security defect before it is fixed). This section is the operational detail.
 
 ### Who may file at all
 
-Only a session on an install whose operator **owns the tracker** — i.e. `origin` IS
-the public repo and the operator has push access. Check before filing:
+Only a session whose operator has **write access to the shared tracker**. Identity is
+not enough — a direct clone of the shared repo reports the right slug while the
+authenticated user still lacks push access, and GitHub then silently DROPS the
+mandatory labels. Check the PERMISSION, fail closed, and CAPTURE the slug:
 
 ```bash
-gh repo view --json nameWithOwner --jq .nameWithOwner
+REPO="$(gh repo view --json nameWithOwner,viewerPermission \
+        --jq 'select(.viewerPermission|IN("WRITE","MAINTAIN","ADMIN")) | .nameWithOwner')"
+[ -n "$REPO" ] || { echo "no write access to this tracker — keep it local" >&2; exit 1; }
 ```
 
-If that is not the shared tracker, DO NOT file. `gh` resolves the target from the git
-remote, and the documented install is a fork clone, so an issue would land in the
-operator's own fork where nobody can pick it up — silently, with no error. Note also
-that GitHub silently DROPS labels supplied by a user without push access, so a
-non-owner cannot satisfy the label rule below even if the target were right.
+Keep `$REPO` and pass it explicitly to every later command (below). A bare `gh issue
+…` re-resolves its target from the CURRENT directory each time, so a `cd` between the
+check and the post sends an irreversible write to a repository nobody verified — and
+on a fork-cloned install the bare form targets the operator's own fork, where nobody
+can pick the issue up.
+
+If the check fails, Genesis-repo work stays a local `follow_up_create` row until a
+maintainer carries it across. That is a known gap, not a workaround.
 
 On a non-owning install, Genesis-repo work stays a local `follow_up_create` row until
 a maintainer carries it across. That is a known gap, not a workaround.
@@ -62,15 +69,27 @@ appears — the session must ASK, in words, and get a yes, for each issue. A pri
 
 ### Filing the issue
 
-```bash
-# 1. preflight — do not create a duplicate
-gh issue list --search "<distinctive phrase> in:title" --state all --limit 10
+Write the title and body to FILES first, then read them into quoted variables. Never
+paste issue text straight into the command line: a title containing backticks or
+`$(...)` — ordinary in a technical title — is executed by the shell AFTER your privacy
+scan, and its output lands in the public title.
 
-# 2. file, non-interactively
-gh issue create \
-  --title "<title>" --body-file <path> \
-  --label area:<domain> --label <difficulty-or-environment>
+```bash
+# title and body already written to files by an editor tool, not echoed through a shell
+TITLE="$(cat ~/tmp/issue-title.txt)"
+BODY=~/tmp/issue-body.md
+
+# 1. preflight against the VERIFIED repo — do not create a duplicate
+gh issue list --repo "$REPO" --search "$TITLE" --state all --limit 10
+
+# 2. file, non-interactively, every expansion quoted
+gh issue create --repo "$REPO" \
+  --title "$TITLE" --body-file "$BODY" \
+  --label "area:<domain>" --label "good first issue"
 ```
+
+Quote every label: `good first issue` and `help wanted` contain spaces and word-split
+into invalid arguments unquoted. Quote `"$BODY"` too.
 
 `--title` and `--body`/`--body-file` are REQUIRED, not optional: `gh` prompts for a
 missing body, and Genesis runs the CLI with piped stdin, so the prompt can never be
@@ -141,12 +160,22 @@ a local `blocked_on_trigger` row carrying the trigger, which REQUIRES a
 `revisit_condition` (the tool hard-errors without one) and cannot use
 `strategy="surplus_task"`.
 
-Be clear about what that row does: `revisit_condition` is **stored and displayed, not
-evaluated**. The dispatcher dispatches due `scheduled_task` rows and immediate
-`surplus_task` rows; nothing watches for your event and nothing transitions the row
-when it happens. It is a passive reminder that surfaces in listings — for a TIME
-trigger use `strategy="scheduled_task"` with `scheduled_at`, which the dispatcher does
-act on.
+Be clear about what that row does, because none of the strategies gives repo work a
+real trigger — read what the dispatcher does with each before choosing:
+
+- `revisit_condition` is **stored and displayed, never evaluated**. Nothing watches for
+  your event and nothing transitions the row. It is a passive reminder that surfaces in
+  listings for a foreground session to act on. That is the right choice here.
+- Do NOT reach for `strategy="scheduled_task"` to get a time trigger. The dispatcher
+  hands every due scheduled row to SURPLUS (`follow_ups/dispatcher.py` `run_cycle`),
+  where a keyword fallback turns arbitrary repo work into a free-model
+  `BRAINSTORM_SELF` task, and output from that task marks the follow-up COMPLETED. The
+  reminder deletes itself while the GitHub issue is still unimplemented — strictly
+  worse than no trigger.
+- `surplus_task` is rejected outright for `blocked_on_trigger` (it dispatches
+  immediately, ignoring the trigger).
+
+So: a passive row a human reads, not an automated revisit.
 
 This is the one case where two records for one item is correct.
 
