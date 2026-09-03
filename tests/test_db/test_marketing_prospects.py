@@ -116,3 +116,25 @@ async def test_mark_opted_out_is_permanent_suppression(db):
     assert row["opted_out"] == 1
     # An opted-out prospect never re-enters the active set.
     assert await mp.list_active(db) == []
+
+
+@pytest.mark.asyncio
+async def test_mark_contacted_by_email_only_advances_active(db):
+    """The shared by-email stamp used by BOTH delivery paths (drain + granted
+    pipeline). Advances an ACTIVE match → contacted; no-ops (returns False) on an
+    absent recipient or a non-'active' row (never downgrades 'replied'/'contacted',
+    never touches a non-marketing address). Case-insensitive on the email."""
+    await mp.create(db, id="p1", email="Prospect@Example.com", created_at=_TS, updated_at=_TS)
+    # active → contacted (and email match is normalized/case-insensitive)
+    assert await mp.mark_contacted_by_email(db, "prospect@example.com", contacted_at=_TS) is True
+    assert (await mp.get_by_id(db, "p1"))["status"] == "contacted"
+    # second call is a no-op — already non-active, never re-stamped/downgraded
+    assert await mp.mark_contacted_by_email(db, "prospect@example.com", contacted_at=_TS) is False
+    # a 'replied' prospect is NEVER downgraded to 'contacted'
+    await mp.create(
+        db, id="p2", email="replied@example.com", status="replied", created_at=_TS, updated_at=_TS
+    )
+    assert await mp.mark_contacted_by_email(db, "replied@example.com", contacted_at=_TS) is False
+    assert (await mp.get_by_id(db, "p2"))["status"] == "replied"
+    # absent recipient → no-op, no crash
+    assert await mp.mark_contacted_by_email(db, "nobody@example.com", contacted_at=_TS) is False

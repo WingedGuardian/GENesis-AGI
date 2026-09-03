@@ -226,6 +226,35 @@ async def marketing_send(prospect_id: str, subject: str, body: str) -> str:
     if not recipient or not _is_valid_email(recipient):
         return json.dumps({"status": "refused", "reason": "invalid_recipient"})
 
+    # (b2) Per-prospect dedup: only an ACTIVE prospect may be staged. A prospect is
+    # stamped 'contacted' at the end of a successful stage below, so together with
+    # list_active this stops the ongoing campaign from re-pitching the same targets
+    # every tick (the loop bug), prevents a duplicate hold across ticks, and never
+    # re-cold-pitches someone already in conversation ('replied').
+    if prospect.get("status") != "active":
+        return json.dumps({"status": "refused", "reason": "already_contacted"})
+
+    # (b3) Approval-flood guard: refuse when the owner already has
+    # >= max_pending_holds BULK marketing sends in flight awaiting approval. Count
+    # BOTH queues so the cap bounds a single campaign RUN, not just the post-drain
+    # queue: the campaign (subprocess) path enqueues to pending_outreach, which the
+    # */5min scheduler drain only later converts into HELD pending_email_sends rows.
+    # Counting only the latter reads stale mid-run (the cap would never fire).
+    # held (awaiting owner approval) + queued (awaiting the drain). Read live.
+    from genesis.db.crud import pending_email_sends as pes
+    from genesis.db.crud import pending_outreach
+    from genesis.outreach.marketing_config import max_pending_holds
+
+    # Ensure the queue table exists BEFORE counting it — on a standalone MCP boot
+    # before any prior enqueue, pending_outreach may not exist yet; without this the
+    # count would raise "no such table" instead of reading 0 (empty-state safety).
+    await pending_outreach.ensure_table(_db)
+    in_flight = await pes.count_held_by_risk_class(_db, "bulk") + (
+        await pending_outreach.count_undelivered_labeled_surplus(_db, channel="email")
+    )
+    if in_flight >= max_pending_holds():
+        return json.dumps({"status": "refused", "reason": "approval_queue_full"})
+
     # (c) Compose + stage. category=NOTIFICATION (external informational outreach,
     # no category-level approval gate — the email autonomy gate is the authority);
     # labeled_surplus=True → BULK classification at the gate.
@@ -239,9 +268,10 @@ async def marketing_send(prospect_id: str, subject: str, body: str) -> str:
         # Subprocess (standalone MCP) path — enqueue for the genesis-server drain,
         # which rebuilds the request with labeled_surplus preserved (mirrors
         # outreach_send's enqueue). The BULK flag survives via pending_outreach.
-        from genesis.db.crud import pending_outreach
-
-        await pending_outreach.ensure_table(_db)  # idempotent safety net
+        # The prospect is stamped 'contacted' downstream by the email-gate drain /
+        # pipeline on a CONFIRMED outcome (delivered / owner-rejected) — NOT here at
+        # enqueue, so a send later dropped before it reaches the gate never burns the
+        # prospect. (pending_outreach.ensure_table already ran in the flood-cap check.)
         pending_id = await pending_outreach.enqueue(
             _db,
             message=message,
@@ -268,6 +298,10 @@ async def marketing_send(prospect_id: str, subject: str, body: str) -> str:
         verbatim=True,
     )
     result = await _pipeline.submit(req)
+    # The prospect is stamped 'contacted' by the email-gate drain on a CONFIRMED
+    # outcome (delivered / owner-rejected), NOT here — a held send is not yet a
+    # confirmed contact, and stamping now would burn the prospect if it is later
+    # rejected as uncurated/opted-out or never approved.
     if result.status == OutreachStatus.HELD:
         return json.dumps({
             "status": "not_performed",

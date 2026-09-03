@@ -352,3 +352,103 @@ async def test_approved_but_pipeline_ignores_is_terminal(db):
     # The approval lifecycle is closed (consumed) so it doesn't linger as a
     # ghost approved/unconsumed row in operator views.
     assert (await ac.get_by_id(db, rid))["consumed_at"] is not None
+
+
+# --- PR2: prospect contact-stamping at CONFIRMED outcome (not stage time) -----
+
+
+async def _bulk_hold_for(db, *, prospect_email, rid, pid="pb"):
+    await pes.create(
+        db,
+        id=pid,
+        request_id=rid,
+        validated_recipient=prospect_email,
+        category="notification",
+        message="cold pitch",
+        held_at=_TS,
+        cell_domain="email",
+        cell_verb="send",
+        cell_risk_class="bulk",
+    )
+
+
+@pytest.mark.asyncio
+async def test_delivered_bulk_hold_stamps_prospect_contacted(db, monkeypatch):
+    """Confirmed delivery of a cold-marketing (BULK) send advances the prospect
+    active → contacted at the DRAIN (the confirmed-outcome home), so the campaign's
+    list_active stops re-pitching it — the loop fix, applied where delivery is real."""
+    monkeypatch.setattr(egw, "_marketing_mode", lambda: "live")  # armed
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await _bulk_hold_for(db, prospect_email="prospect@example.com", rid=rid)
+
+    assert (
+        await drain_pending_email_sends(_FakeRt(db, _FakePipeline(OutreachStatus.DELIVERED))) == 1
+    )
+    row = await mp.get_by_id(db, "prospect")
+    assert row["status"] == "contacted"
+    assert row["last_contacted_at"] is not None
+    assert await mp.list_active(db) == []  # no longer re-pitched
+
+
+@pytest.mark.asyncio
+async def test_owner_rejected_bulk_hold_stamps_prospect_contacted(db):
+    """An owner REJECTION of a cold-marketing draft advances the prospect to
+    contacted (not auto re-proposed next tick) — a rejection is a decision. No live
+    lever needed: this is the reject branch, not delivery."""
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="rejected")
+    await _bulk_hold_for(db, prospect_email="prospect@example.com", rid=rid)
+
+    assert (
+        await drain_pending_email_sends(_FakeRt(db, _FakePipeline(OutreachStatus.DELIVERED))) == 1
+    )
+    assert (await mp.get_by_id(db, "prospect"))["status"] == "contacted"
+
+
+@pytest.mark.asyncio
+async def test_orphaned_bulk_hold_leaves_prospect_active(db):
+    """Anti-burn: a system drop (orphaned hold — approval gone, no owner decision)
+    must NOT stamp the prospect. It stays 'active', re-eligible — only a confirmed
+    owner outcome (deliver / reject) closes a prospect, never a stage or a drop."""
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    await _bulk_hold_for(db, prospect_email="prospect@example.com", rid="gone")
+
+    assert (
+        await drain_pending_email_sends(_FakeRt(db, _FakePipeline(OutreachStatus.DELIVERED))) == 1
+    )
+    assert (await mp.get_by_id(db, "prospect"))["status"] == "active"  # not burned
+    assert len(await mp.list_active(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_delivered_standard_hold_does_not_stamp_prospects(db):
+    """Only BULK (marketing) sends stamp a prospect. A delivered STANDARD email that
+    happens to reach a prospect's address must NOT flip its status."""
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await pes.create(
+        db,
+        id="ps",
+        request_id=rid,
+        validated_recipient="prospect@example.com",
+        category="outreach",
+        message="a normal reply",
+        held_at=_TS,
+        cell_domain="email",
+        cell_verb="send",
+        cell_risk_class="standard",
+    )
+
+    assert (
+        await drain_pending_email_sends(_FakeRt(db, _FakePipeline(OutreachStatus.DELIVERED))) == 1
+    )
+    assert (await mp.get_by_id(db, "prospect"))["status"] == "active"  # untouched

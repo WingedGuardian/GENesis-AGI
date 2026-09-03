@@ -494,7 +494,7 @@ gated — that contract is one-directional.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 85f91765 2026-09-01
+verified: a2f2be52 2026-09-03
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -555,10 +555,22 @@ verified: 85f91765 2026-09-01
   MUST be a curated, non-opted-out `marketing_prospects` row (authorization is
   DECOUPLED from send-lifecycle status, so a `contacted` follow-up still sends) —
   an unknown / opted-out recipient trips (`recipient_not_curated` / `opted_out`)
-  → demote + hold (fail-closed). PR2 will wire graduation, send-time contact
-  stamping, AND a hard per-window cap on hold-creation (the ASK-state
-  approval-flood guard) alongside the batch-approval card — `marketing_send` has
-  no autonomous caller until then.
+  → demote + hold (fail-closed). Graduation for the BULK cell rides the generic
+  capability-promotion path (`capability_grants.detect_promotable_cells` — no
+  risk-class filter → `email:send:bulk` qualifies once it has ≥5 owner-approved
+  successes + posterior ≥0.70 → `ego/cadence` proposes → owner grants). The prospect
+  lifecycle is stamped on a CONFIRMED outcome, not at stage time, via ONE
+  active-guarded CRUD (`marketing_prospects.mark_contacted_by_email`) called from
+  BOTH delivery paths: the email-gate drain (`email_gate_watcher`) on delivery or
+  owner-rejection of a HELD BULK send, AND `pipeline._deliver` on a GRANTED-cell
+  autonomous BULK delivery (which delivers inline and never touches the drain — so
+  the loop-fix survives graduation). A send dropped/expired before any decision
+  leaves the prospect `active` (no silent burn). `marketing_send` refuses
+  a non-`active` prospect (dedup) and refuses when `>= max_pending_holds` BULK
+  sends are in flight — counting BOTH the pending_outreach queue and the held
+  `pending_email_sends` so the cap bounds a single run (the ASK-state approval-flood
+  guard, `marketing_config.max_pending_holds`). A batch approval card (approve N
+  holds at once) remains deferred — per-item dashboard approval is the surface today.
 - **Marketing reply → owner Telegram ping (notify-only).** When a GENUINE human
   reply lands (auto-responders + foreign senders already gated out by the
   reply→engagement bridge, `outreach/engagement.py`) AND the reply's recipient is

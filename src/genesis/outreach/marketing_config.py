@@ -56,12 +56,20 @@ _CONFIG_NAME = "marketing_outreach.yaml"
 
 _ENV_KILL_SWITCH = "GENESIS_MARKETING_OUTREACH_DISABLED"
 
+# Default cap on BULK marketing sends awaiting owner approval — the ASK-state
+# approval-flood guard. Bounds the owner's approval queue independent of prospect
+# count. A non-positive / non-int / corrupt override degrades to this value (the
+# guard can never be disabled by a typo — set a very high number for "unbounded").
+_DEFAULT_MAX_PENDING_HOLDS = 20
+
 DEFAULTS: dict[str, Any] = {
     # Master switch: require a LITERAL boolean True to stay enabled.
     "enabled": True,
     # Shipped default: OFF. This substrate stages cold outreach on the owner's
     # behalf — it stays inert until the owner deliberately opts in.
     "mode": "off",
+    # ASK-state approval-flood guard (see _DEFAULT_MAX_PENDING_HOLDS).
+    "max_pending_holds": _DEFAULT_MAX_PENDING_HOLDS,
 }
 
 
@@ -117,3 +125,20 @@ def effective_mode() -> str:
         logger.warning("marketing_outreach has invalid mode %r — degrading to off", mode)
         return "off"
     return mode
+
+
+def max_pending_holds() -> int:
+    """Max BULK (marketing) sends that may sit HELD awaiting owner approval before
+    ``marketing_send`` refuses to stage new ones — the ASK-state approval-flood
+    guard. Read live. A non-int / bool / non-positive value degrades to the safe
+    default (the guard is never disabled by a typo)."""
+    raw = load_config().get("max_pending_holds", _DEFAULT_MAX_PENDING_HOLDS)
+    # bool is an int subclass — reject it explicitly (YAML `true` → 1 would be a
+    # nonsensical cap of one).
+    if isinstance(raw, bool):
+        return _DEFAULT_MAX_PENDING_HOLDS
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_PENDING_HOLDS
+    return n if n > 0 else _DEFAULT_MAX_PENDING_HOLDS

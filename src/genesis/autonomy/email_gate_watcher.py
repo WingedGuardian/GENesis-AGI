@@ -70,6 +70,21 @@ async def _recipient_opted_out(db: object, recipient: str | None) -> bool:
     return bool(row.get("opted_out"))
 
 
+async def _stamp_prospect_contacted(db: object, recipient: str | None, now: str) -> None:
+    """After a CONFIRMED marketing outcome (delivered / owner-rejected), advance the
+    matching prospect active → contacted so the campaign's ``list_active`` never
+    re-pitches it. Stamped on a confirmed outcome, NOT at stage time, so a send
+    dropped before it reaches a decision never burns the prospect (it stays
+    'active', re-eligible). Delegates to the shared, active-guarded CRUD (the same
+    entry point ``pipeline._deliver`` uses for the GRANTED autonomous path), so the
+    stamp semantics live in one place."""
+    if not recipient:
+        return
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.mark_contacted_by_email(db, recipient, contacted_at=now)
+
+
 def _subject(context: str | None) -> str:
     if not context:
         return ""
@@ -198,6 +213,10 @@ async def drain_pending_email_sends(rt: object) -> int:
                     # WS-3 gate-3: the OWNER approved this send — owner evidence.
                     origin_class="owner",
                 )
+                if row["cell_risk_class"] == "bulk":
+                    # Confirmed delivery of a cold-marketing send → advance the
+                    # prospect active → contacted so list_active stops re-pitching it.
+                    await _stamp_prospect_contacted(db, row["validated_recipient"], now)
                 resolved += 1
                 logger.info(
                     "Resolved held email %s → sent to %s",
@@ -238,6 +257,12 @@ async def drain_pending_email_sends(rt: object) -> int:
                     # WS-3 gate-3: the OWNER rejected/cancelled — owner decision.
                     origin_class="owner",
                 )
+                if row["cell_risk_class"] == "bulk":
+                    # Owner explicitly declined this cold-marketing draft → advance
+                    # the prospect to contacted so it is not auto re-proposed next
+                    # tick. (A rejection is a decision; opt-out is the "never
+                    # contact" signal — a system-drop, e.g. expiry, leaves it active.)
+                    await _stamp_prospect_contacted(db, row["validated_recipient"], now)
                 resolved += 1
         elif status == "expired":
             # No-decision (the owner never answered) — expire the hold but do

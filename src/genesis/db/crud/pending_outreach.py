@@ -85,6 +85,22 @@ async def drain(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def count_undelivered_labeled_surplus(
+    db: aiosqlite.Connection, *, channel: str = "email"
+) -> int:
+    """Count undelivered BULK/campaign (``labeled_surplus``) rows still queued for
+    the drain. Used with ``pending_email_sends.count_held_by_risk_class`` so the
+    marketing approval-flood guard bounds a single campaign RUN — this is the
+    pre-drain half (rows enqueued this run, not yet converted into HELD sends)."""
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM pending_outreach "
+        "WHERE delivered = 0 AND labeled_surplus = 1 AND channel = ?",
+        (channel,),
+    )
+    row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
 async def mark_delivered(
     db: aiosqlite.Connection,
     pending_id: str,

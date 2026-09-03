@@ -109,6 +109,24 @@ async def mark_contacted(
     return cursor.rowcount > 0
 
 
+async def mark_contacted_by_email(
+    db: aiosqlite.Connection, email: str, *, contacted_at: str
+) -> bool:
+    """Advance the ACTIVE prospect matching ``email`` → contacted. The by-email
+    entry point for the delivery paths (which know the resolved recipient, not the
+    id) — used on a CONFIRMED marketing outcome (delivery / owner-rejection) so
+    ``list_active`` stops re-pitching the prospect.
+
+    No-op returning False when there is no matching prospect, or the row is not
+    'active' (an already-'contacted'/'replied' row is never downgraded, and a
+    non-marketing recipient is never touched). Only ``opted_out`` — NOT this
+    status — gates authorization, so this write can never weaken a send gate."""
+    row = await get_by_email(db, email)
+    if row is None or row.get("status") != "active":
+        return False
+    return await mark_contacted(db, row["id"], contacted_at=contacted_at)
+
+
 async def mark_opted_out(db: aiosqlite.Connection, id: str, *, opted_out_at: str) -> bool:
     """PERMANENT suppression — set opted_out=1. Returns False if id is unknown.
     The row is never pruned, so the address can never be silently re-enabled."""

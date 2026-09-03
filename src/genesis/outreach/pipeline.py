@@ -781,6 +781,17 @@ class OutreachPipeline:
                 await self._record_autonomous_send(
                     request, gate_cell, recipient, outreach_id, now,
                 )
+                # Marketing (BULK) autonomous delivery: advance the prospect
+                # active → contacted so the campaign's list_active stops re-pitching
+                # it. The HELD → owner-approved path stamps in the email-gate drain
+                # (email_gate_watcher, keyed on the hold's cell_risk_class); this is
+                # the GRANTED-cell path, which delivers INLINE here and never touches
+                # that drain — without this the loop-fix would silently regress once
+                # the BULK cell graduates to autonomous. Same active-guarded CRUD.
+                if gate_cell[2] == "bulk":
+                    from genesis.db.crud import marketing_prospects as _mp
+
+                    await _mp.mark_contacted_by_email(self._db, recipient, contacted_at=now)
 
         # Auto-register email threads for reply tracking
         if channel == "email" and self._thread_tracker is not None:

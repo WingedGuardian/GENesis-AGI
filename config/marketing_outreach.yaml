@@ -24,3 +24,9 @@
 # tool cleanly refuses.
 enabled: true
 mode: "off"
+
+# Max BULK (cold-marketing) sends that may sit HELD awaiting owner approval
+# before `marketing_send` refuses to stage new ones (the ASK-state approval-flood
+# guard). Bounds the owner's approval queue regardless of how many prospects are
+# curated. A non-positive / non-int / corrupt value degrades to the safe default.
+max_pending_holds: 20

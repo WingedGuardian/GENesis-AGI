@@ -64,6 +64,19 @@ async def list_held(db: aiosqlite.Connection) -> list[dict]:
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def count_held_by_risk_class(db: aiosqlite.Connection, risk_class: str) -> int:
+    """Count rows still HELD (awaiting owner approval) for a given capability
+    risk class. Used by the marketing approval-flood guard to bound the owner's
+    BULK approval queue (``risk_class='bulk'``)."""
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM pending_email_sends "
+        "WHERE status = 'held' AND cell_risk_class = ?",
+        (risk_class,),
+    )
+    row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
 async def mark_sent(db: aiosqlite.Connection, id: str, *, sent_at: str) -> bool:
     """Transition held → sent. Returns False if the row already left 'held'
     (double-send guard: only one caller can flip a given hold)."""
