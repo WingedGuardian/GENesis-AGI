@@ -62,9 +62,12 @@ def apply_routing_env(
     Shared by :class:`~genesis.cc.invoker.CCInvoker._build_env` and the foreground
     ``scripts/gmodel`` launcher so the routing-env contract lives in ONE place.
 
-    - Set ``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_AUTH_TOKEN`` / the four model slots
-      when the corresponding value is provided; **pop** them when it is ``None`` so
-      a reused environment can never leak stale routing.
+    - Set ``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_AUTH_TOKEN`` / every slot in
+      ``_ROSTER_MODEL_ENV_VARS`` when the corresponding value is provided;
+      **pop** them when it is ``None`` so a reused environment can never leak
+      stale routing. Named by the constant rather than counted — this docstring
+      said "the four model slots" while the tuple held six, and that stale count
+      is what made a hardcoded 4-entry copy in the tests look correct.
     - **Credential isolation:** pop ``ANTHROPIC_API_KEY`` whenever routing to a peer
       (either ``base_url`` or ``auth_token`` present) so the Anthropic key never
       travels to a third-party endpoint. Native Claude (neither set) keeps whatever

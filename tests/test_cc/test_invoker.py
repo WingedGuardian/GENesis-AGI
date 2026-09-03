@@ -282,6 +282,152 @@ def test_scope_args_built_when_probe_succeeds(monkeypatch):
     assert "MemoryMax=75%" in out
 
 
+# --- _get_scope_args caching: success is permanent, FAILURE is not ------------
+# genesis-server is long-lived. Caching one transient probe failure for the
+# process lifetime silently drops MemoryHigh/MemoryMax from every later CC
+# subprocess, for days, on a swapless box — the exact thing the scope exists to
+# prevent. These pin the asymmetry in both directions.
+
+
+def _stub_probe(monkeypatch, results):
+    """Patch the probe to yield `results` in order; return the call counter."""
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    calls = []
+    seq = list(results)
+
+    def _probe(*args, **kwargs):
+        calls.append(args[0])
+        # NOT `next(iter(...))`. An exhausted iterator raises StopIteration,
+        # which is pathological across an `await` — the over-probing case this
+        # stub exists to catch HUNG the test run instead of failing it, so the
+        # mutation read as "no result" rather than RED. Fail loudly instead.
+        if len(calls) > len(seq):
+            raise AssertionError(
+                f"probe called {len(calls)}x but only {len(seq)} result(s) were "
+                "stubbed — the caller is probing more often than expected"
+            )
+        return real_subprocess.CompletedProcess(
+            args[0], seq[len(calls) - 1], b"", b"bus error"
+        )
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe)
+    # Reset the module cache through monkeypatch so it is restored for siblings.
+    monkeypatch.setattr(inv_mod, "_SCOPE_ARGS", None)
+    monkeypatch.setattr(inv_mod, "_SCOPE_PROBE_FAILED_AT", None)
+    monkeypatch.setattr(inv_mod, "_SCOPE_PROBE_FAILURES", 0)
+    monkeypatch.setattr(inv_mod, "_SCOPE_PROBE_LOCK", None)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_scope_probe_failure_is_retried_after_the_cooldown(monkeypatch):
+    import genesis.cc.invoker as inv_mod
+
+    calls = _stub_probe(monkeypatch, [1, 0])  # fail, then succeed
+    now = [1000.0]
+    # Patch the module's own clock seam, NOT time.monotonic — `inv_mod.time` is
+    # the stdlib module object, so patching its attribute would replace the
+    # clock process-wide for the duration of this test.
+    monkeypatch.setattr(inv_mod, "_now", lambda: now[0])
+
+    assert await inv_mod._get_scope_args() == []
+    assert len(calls) == 1
+
+    # Inside the first cooldown step: no re-probe, still degraded.
+    now[0] += inv_mod._SCOPE_RETRY_SCHEDULE_S[0] - 1
+    assert await inv_mod._get_scope_args() == []
+    assert len(calls) == 1, "re-probed inside the cooldown — probes every dispatch"
+
+    # Past it: re-probe, and the recovered scope is used again.
+    now[0] += 2
+    out = await inv_mod._get_scope_args()
+    assert len(calls) == 2, "never re-probed — one transient failure is permanent"
+    assert "MemoryMax=75%" in out
+
+
+@pytest.mark.asyncio
+async def test_scope_probe_backoff_escalates_on_repeated_failure(monkeypatch):
+    """A permanently-unscoped box must decay to hourly, not probe every 5min.
+
+    The no-reachable-bus case is a property of the machine, so a fixed retry
+    would spawn a subprocess 288x/day forever and log a warning each time.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    calls = _stub_probe(monkeypatch, [1, 1, 1, 1])
+    now = [1000.0]
+    monkeypatch.setattr(inv_mod, "_now", lambda: now[0])
+
+    schedule = inv_mod._SCOPE_RETRY_SCHEDULE_S
+    assert await inv_mod._get_scope_args() == []
+    for step, wait in enumerate(schedule, start=1):
+        # Just before this step elapses, still cooling down.
+        now[0] += wait - 1
+        assert await inv_mod._get_scope_args() == []
+        assert len(calls) == step, f"re-probed early at step {step}"
+        now[0] += 2
+        assert await inv_mod._get_scope_args() == []
+        assert len(calls) == step + 1, f"failed to re-probe at step {step}"
+
+    # The last interval is the cap — it must not keep growing past the table.
+    assert schedule[-1] == max(schedule)
+
+
+@pytest.mark.asyncio
+async def test_only_the_first_probe_failure_warns(monkeypatch):
+    """Announce once, then demote — otherwise the retry turns a one-line
+    degradation notice into 288 warnings a day."""
+    import genesis.cc.invoker as inv_mod
+
+    _stub_probe(monkeypatch, [1, 1])
+    now = [1000.0]
+    monkeypatch.setattr(inv_mod, "_now", lambda: now[0])
+    announced: list[bool] = []
+    real_build = inv_mod._build_scope_args
+    monkeypatch.setattr(
+        inv_mod,
+        "_build_scope_args",
+        lambda announce=True: (announced.append(announce), real_build(announce))[1],
+    )
+
+    await inv_mod._get_scope_args()
+    now[0] += inv_mod._SCOPE_RETRY_SCHEDULE_S[0] + 1
+    await inv_mod._get_scope_args()
+    assert announced == [True, False], announced
+
+
+@pytest.mark.asyncio
+async def test_concurrent_dispatches_share_one_probe(monkeypatch):
+    """Single-flight: N dispatches during startup must not spawn N probes."""
+    import genesis.cc.invoker as inv_mod
+
+    calls = _stub_probe(monkeypatch, [0])
+    monkeypatch.setattr(inv_mod, "_now", lambda: 1000.0)
+
+    results = await asyncio.gather(*(inv_mod._get_scope_args() for _ in range(5)))
+    assert len(calls) == 1, f"{len(calls)} probes for 5 concurrent dispatches"
+    assert all("MemoryMax=75%" in r for r in results)
+
+
+@pytest.mark.asyncio
+async def test_scope_probe_success_is_cached_for_the_process_lifetime(monkeypatch):
+    """The other direction: a working user manager must not be re-probed."""
+    import genesis.cc.invoker as inv_mod
+
+    calls = _stub_probe(monkeypatch, [0])
+    monkeypatch.setattr(inv_mod, "_now", lambda: 1e9)
+
+    first = await inv_mod._get_scope_args()
+    assert "MemoryMax=75%" in first
+    for _ in range(3):
+        assert await inv_mod._get_scope_args() == first
+    assert len(calls) == 1, "re-probed despite a cached success"
+
+
 def test_build_env_applies_env_overrides_last(invoker):
     """env_overrides wins over keys the invoker itself computes.
 

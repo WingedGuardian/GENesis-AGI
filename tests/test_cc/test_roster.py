@@ -192,12 +192,45 @@ def test_non_dict_config_is_ignored(tmp_path):
 
 # --- apply_routing_env: the shared invoker/gmodel routing-env contract ----------
 
-_MODEL_SLOTS = (
-    "ANTHROPIC_MODEL",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-)
+# Bound to the production constant, NOT restated. A hardcoded copy here went
+# stale the moment two slots were added to `_ROSTER_MODEL_ENV_VARS`
+# (ANTHROPIC_DEFAULT_FABLE_MODEL, CLAUDE_CODE_SUBAGENT_MODEL): both tests below
+# iterated the old 4-tuple, so deleting either new slot from production left
+# the whole suite green — zero coverage on the exact mechanism this PR adds
+# them for. A duplicated literal in a test is a silent drift generator; every
+# future slot is now covered the moment it is added.
+_MODEL_SLOTS = R._ROSTER_MODEL_ENV_VARS
+
+
+def test_model_slots_is_the_production_tuple_and_its_contents_are_pinned():
+    """Binding fixes ADD-drift but makes DELETION self-cancelling — pin both.
+
+    `_MODEL_SLOTS = R._ROSTER_MODEL_ENV_VARS` means the loops below shorten
+    with the tuple, so removing a slot from production removes it from the
+    assertions too and every test stays green. Membership checks on two names
+    were not enough: mutation showed the other four are caught only by the
+    surviving hardcoded duplicate in `test_invoker_roster_env.py`, which this
+    file's own comment calls a drift generator — so the obvious tidy-up of
+    deleting that duplicate would silently strip deletion coverage from four
+    slots.
+
+    One explicit set contract, in one place, closes the delete direction. Any
+    change to the slot list is now a deliberate edit here, which is the point.
+    """
+    assert _MODEL_SLOTS is R._ROSTER_MODEL_ENV_VARS
+    assert set(_MODEL_SLOTS) == {
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        # CC 2.1.x routes sub-agents and background tasks through these two; an
+        # unset slot makes a peer endpoint reject with model-not-found.
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+    }
+    # No duplicates — the tuple is iterated to set env vars, and a repeat would
+    # hide a typo'd name behind a correct one.
+    assert len(_MODEL_SLOTS) == len(set(_MODEL_SLOTS))
 
 
 def test_apply_routing_env_peer_sets_all_and_drops_api_key():
