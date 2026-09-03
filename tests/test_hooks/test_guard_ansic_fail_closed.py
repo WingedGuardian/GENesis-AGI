@@ -674,12 +674,13 @@ class TestAcceptanceCorpus:
         unquoted `\\`-newline before segmentation, which is precisely the
         durable fix the prior docstring predicted would be required.
 
-        It was the one residue class where the mis-parse was ALSO a live gate
-        bypass: bash joins the continuation before reading the command, so the
-        push really ran and no gate ever saw the flag. The ANSI-C `$( )` shapes
-        mis-parse too — and, measured, the shell DOES go on to run the following
-        command — but the fail-closed net still routes them to a human (locked
-        above), which makes them parser defects rather than open bypasses.
+        It was the one residue class where the mis-parse also let a real command
+        reach the shell unexamined: bash joins the two halves before reading the
+        command, so the push ran and no gate ever saw the flag. The shapes locked
+        above mis-parse too — and, measured, the shell does go on to run what
+        follows them, which an earlier version of this docstring denied — but the
+        fail-closed net still routes those to a human, so they are parser defects
+        rather than open holes.
 
         Assert PARITY with the joined spelling AND the same reason. A matching
         verdict is not a matching reason: `_decision` collapses everything to
