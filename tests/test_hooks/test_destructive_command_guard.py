@@ -284,3 +284,90 @@ class TestContinuationInsideAComment:
     def test_a_comment_on_an_earlier_line_does_not_disarm_a_later_fold(self):
         """Comment state must clear at the newline, not persist down the command."""
         assert _blocks("echo hi # done\nrm -r\\\nf /")
+
+
+class TestWordFormParentheses:
+    """Not every `)` ends a word — and reading that wrong is a bypass both ways.
+
+    The first fix recognized only `$(` as a parenthesis whose `)` stays inside a
+    word. Every other WORD-FORM parenthesis — process substitution, extglob,
+    array assignment — closed into what the code called a word boundary, so a
+    glued `#` faked a comment, the continuation after it was not folded, and the
+    command on the next line vanished from the token stream. Measured through
+    the live hook: ``echo <(true)#x; rm -r\\``⏎``f /usr`` deleted ``/usr`` while
+    both this guard and ``protected_paths_guard`` returned 0.
+
+    The opposite error is a bypass too, so the members cannot be guessed in
+    either direction. Each row below carries the answer BASH gives, measured
+    with ``<prefix>#note; touch <marker>`` under bash 5.2 — the marker appears
+    iff the ``; touch`` escaped the comment, i.e. iff ``#`` opened none.
+
+    That spelling replaced an earlier ``<prefix>#note \\``⏎``touch <marker>``
+    probe, which is CONFOUNDED: folding leaves ``<prefix>#note touch <marker>``,
+    and when the prefix is an assignment (``a=(x)``) the first word is an
+    assignment prefix, so ``touch`` runs as the command word and the marker
+    appears whether or not a comment opened. That confound reported array
+    assignment as a word boundary, which bash says it is not.
+    """
+
+    # `)` closes a WORD-FORM parenthesis: the word continues, a glued `#` is
+    # ordinary text, and the continuation on the next line is REAL. Refusing to
+    # fold it splits `-r` from `f` and no recursive-force rm is seen.
+    _WORD_FORM = [
+        ("process-substitution-in", "echo <(true)#x"),
+        ("process-substitution-out", "echo >(true)#x"),
+        ("process-substitution-nested", "echo <(echo <(true))#x"),
+        ("process-substitution-inner-subshell", "echo <( (true) )#x"),
+        ("extglob-negate", "echo !(zzz)#x"),
+        ("extglob-at", "echo @(zzz)#x"),
+        ("extglob-star", "echo *(zzz)#x"),
+        ("extglob-plus", "echo +(zzz)#x"),
+        ("extglob-question", "echo ?(zzz)#x"),
+        ("array-assignment", "arr=(a b)#x"),
+        ("array-append", "arr+=(a b)#x"),
+        ("array-declare", "declare -a arr=(a b)#x"),
+        ("command-substitution", "echo $(true)#x"),
+        ("arithmetic-expansion", "echo $((1+1))#x"),
+        ("command-substitution-inner-subshell", "echo $( (true) )#x"),
+    ]
+
+    @pytest.mark.parametrize(("label", "prefix"), _WORD_FORM, ids=[c[0] for c in _WORD_FORM])
+    def test_a_word_form_close_paren_does_not_fake_a_comment(self, label, prefix):
+        assert _blocks(f"{prefix}; rm -r\\\nf /usr"), (
+            f"{label}: bash keeps the word open, so the continuation is real "
+            "and the guard must still see -rf"
+        )
+
+    # `)` closes a COMMAND-FORM parenthesis: it ends a command, so a glued `#`
+    # DOES open a comment and the trailing backslash is comment text, not a
+    # continuation. Folding it anyway glues the next command onto the comment
+    # and the `rm` token disappears.
+    _COMMAND_FORM = [
+        ("subshell", "(true)#note"),
+        ("subshell-nested", "( (true) )#note"),
+        ("arithmetic-command", "((1+1))#note"),
+        ("arithmetic-command-nested", "((1+(2)))#note"),
+        # Regression lock for a depth counter that never unwound: `$(` was
+        # counted twice (once by the `$` lookahead, once by the `(` itself), so
+        # after ANY command substitution every later `)` was read as mid-word
+        # and this shape was allowed while bash ran the rm.
+        ("subshell-after-substitution", "echo $(true); (true)#note"),
+        ("arith-command-after-substitution", "echo $(true); ((1+1))#note"),
+        ("subshell-after-process-substitution", "echo <(true); (true)#note"),
+    ]
+
+    @pytest.mark.parametrize(("label", "prefix"), _COMMAND_FORM, ids=[c[0] for c in _COMMAND_FORM])
+    def test_a_command_form_close_paren_still_opens_a_comment(self, label, prefix):
+        assert _blocks(f"{prefix}\\\nrm -rf /usr"), (
+            f"{label}: bash ends the comment at the newline and runs the rm"
+        )
+
+    def test_a_command_substitution_depth_returns_to_zero(self):
+        """The counter must unwind, not leak — the mechanism behind the above.
+
+        Asserted on the fold's own output rather than a verdict, so a future
+        change that re-breaks the arithmetic is caught at the source: with a
+        leaked depth the trailing `)` reads as mid-word and the fold happens.
+        """
+        folded = dg._fold_continuations("echo $(true); (true)#note \\\nZZZ")
+        assert "\nZZZ" in folded, "comment must survive as its own line"

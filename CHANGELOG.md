@@ -161,10 +161,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   second line was. It now tracks quotes and comments while joining, and where a
   comment begins is checked against the shell itself rather than inferred — both
   ways round, since a `#` that only looks like a comment start must not stop the
-  join either. Nothing else about the guard changes: verified identical to the
-  previous behaviour on every backslash form outside a comment, and across 15,835
-  real commands from this install's history not one verdict moves in either
-  direction.
+  join either. Which closing parentheses end a word is part of that question, and
+  the shell's answer is not uniform: a `)` closing a process substitution, an
+  extglob pattern or an array assignment leaves the word open, while one closing a
+  subshell or an arithmetic command ends it. Each form was checked against the
+  shell one at a time rather than reasoned about, because an error in either
+  direction lets a payload through. Nothing else about the guard changes: verified
+  identical to the previous behaviour on every backslash form outside a comment,
+  and across 47,938 distinct commands from this install's history not one verdict
+  moves in either direction.
 - **The `deliberate` MCP tool ("Model Fusion") no longer fails on real prompts.** Two
   distinct bugs: (1) analysis mode 404'd because the orchestrator slug
   `openai/gpt-oss-120b:free` was retired from OpenRouter's catalog (`:free` variant gone)

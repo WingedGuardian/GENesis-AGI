@@ -85,10 +85,40 @@ _CONTINUATION = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
 
 # Unquoted characters after which the shell starts a new word, and therefore
 # after which a `#` opens a comment. This is the shell's metacharacter set plus
-# whitespace — ENUMERATED against bash (each member checked by whether the line
-# after `<char>#note \` actually executes), not inferred from the parser's shape.
-# An earlier revision inferred it and was wrong in BOTH directions at once.
+# whitespace — ENUMERATED against bash (each member checked by whether the text
+# after `<char>#note` is executed or swallowed as comment), not inferred from the
+# parser's shape. An earlier revision inferred it and was wrong in BOTH
+# directions at once.
 _COMMENT_OPENERS = frozenset(" \t\n|&;<>()")
+
+# The character immediately before a `(` decides whether that parenthesis is
+# WORD-FORM — part of the surrounding word, so its matching `)` leaves the word
+# open and a `#` glued to it is NOT a comment — or COMMAND-FORM, where the `)`
+# ends a command and a glued `#` does open a comment.
+#
+#   word-form   $( … )  $(( … ))   command/arithmetic substitution
+#               <( … )  >( … )     process substitution
+#               =( … )             array assignment (`a=(x)`, `a+=(x)`)
+#               ?( *( +( @( !(     extglob patterns
+#   command     ( … )              subshell
+#               (( … ))            arithmetic command
+#               x)                 case pattern, function definition `f()`
+#
+# ENUMERATED against bash 5.2, one member at a time, with `<prefix>#note; touch
+# MARKER`: the marker appears iff `#` did NOT open a comment, so the `; touch`
+# ran. That spelling is used deliberately instead of a trailing continuation —
+# with `<prefix>#note \`⏎`touch MARKER`, folding leaves `<prefix>#note touch
+# MARKER`, whose first word is an assignment prefix for the `a=(x)` case, so
+# `touch` runs as the command word and the marker appears in BOTH directions.
+# That confound reported array assignment as command-form, which it is not.
+#
+# Getting a member wrong is a bypass in one direction or the other: calling a
+# word-form `)` a boundary lets a glued `#` fake a comment and hide the next
+# line (measured: `echo <(true)#x; rm -r\`⏎`f /usr` deleted while the guard
+# returned 0), and calling a command-form `)` mid-word folds a continuation the
+# shell does not fold, gluing the next command onto the comment text so no `rm`
+# token survives.
+_WORD_PAREN_PREFIXES = frozenset("$<>=?*+@!")
 
 
 def _fold_continuations(cmd: str) -> str:
@@ -127,11 +157,20 @@ def _fold_continuations(cmd: str) -> str:
     # wrong in both directions: the separators `;` `|` `&` reach the output as
     # themselves here (the spacing pass runs downstream, on this function's
     # result), so they were missed and the fold still ran inside a real comment;
-    # and a `)` closing `$( … )` or `$(( … ))` is mid-word, so it was treated as
-    # a boundary and a real continuation was refused — which splits a word the
-    # shell joins and can hide the recursive-force flags.
+    # and a `)` closing a word-form parenthesis (see _WORD_PAREN_PREFIXES) is
+    # mid-word, so it was treated as a boundary and a real continuation was
+    # refused — which splits a word the shell joins and can hide the
+    # recursive-force flags.
     at_word_start = True
-    subst_depth = 0  # inside $( … ): a closing `)` there ends an expansion, not a word
+    # Open WORD-FORM parentheses (see _WORD_PAREN_PREFIXES): while this is
+    # non-zero a `)` closes an expansion/pattern and the word continues, so it is
+    # not a place a `#` can open a comment. Command-form parens never enter it,
+    # so their `)` falls through to the _COMMENT_OPENERS rule below.
+    word_paren_depth = 0
+    # The previous UNQUOTED, UNESCAPED character — what decides a `(`'s form.
+    # A quoted or backslash-escaped character resets it to None: `\$(` is a
+    # literal `$` followed by a subshell, not a command substitution.
+    prev: str | None = None
     i, n = 0, len(cmd)
     while i < n:
         c = cmd[i]
@@ -146,12 +185,14 @@ def _fold_continuations(cmd: str) -> str:
                 continue
             if c == quote:
                 quote = None
+                prev = None
             i += 1
             continue
         if not in_comment and c in ("'", '"'):
             quote = c
             out.append(c)
             at_word_start = False
+            prev = None
             i += 1
             continue
         if c == "#" and not in_comment and at_word_start:
@@ -163,17 +204,18 @@ def _fold_continuations(cmd: str) -> str:
             out.append(c)
             out.append(cmd[i + 1])
             at_word_start = False  # `a\ #x` is one word — the escaped space does not end it
+            prev = None
             i += 2
             continue
         if not in_comment:
-            if c == "$" and i + 1 < n and cmd[i + 1] == "(":
-                subst_depth += 1
-            elif c == "(" and subst_depth:
-                subst_depth += 1  # `$((` and any nesting inside an expansion
-            elif c == ")" and subst_depth:
-                subst_depth -= 1
+            if c == "(" and (word_paren_depth or prev in _WORD_PAREN_PREFIXES):
+                # Word-form opener, or any nesting inside one (`$((`, `<( (x) )`).
+                word_paren_depth += 1
+            elif c == ")" and word_paren_depth:
+                word_paren_depth -= 1
                 out.append(c)
                 at_word_start = False  # closes an expansion, so still inside a word
+                prev = c
                 i += 1
                 continue
         if c == "\n":
@@ -181,6 +223,7 @@ def _fold_continuations(cmd: str) -> str:
         out.append(c)
         if not in_comment:
             at_word_start = c in _COMMENT_OPENERS
+        prev = c
         i += 1
     return "".join(out)
 
