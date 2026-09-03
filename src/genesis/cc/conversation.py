@@ -81,6 +81,71 @@ _BG_RESEARCH_ROUTING = (
 )
 
 
+def _session_control_block(
+    channel: ChannelType | str | None,
+    model,
+    effort,
+    session_id: str | None,
+) -> str:
+    """Tell a conversation session what it currently IS, and that it can change it.
+
+    Two failures this closes, both MEASURED on a Telegram DM session 2026-09-02.
+
+    1. The session was asked to "switch to Opus, medium effort" and replied that
+       it could not change its own model. It could: `session_config` has existed
+       on the health MCP since long before, its docstring literally says "Call
+       when the user asks to switch models ('use opus', 'switch to haiku')", and
+       `GENESIS_SESSION_ID` — the id that tool needs — was in its environment.
+       It had even run `env` and seen that variable 31 seconds earlier. No
+       capability was missing; the session simply held a false belief about
+       itself. A tool the model does not know it has is not a capability.
+
+    2. The model/effort a session believes it is running are stated ONLY in the
+       fresh-session system prompt. A resumed turn sends no system prompt, so
+       after any /model or /effort switch the session's self-description goes
+       stale and stays stale for the life of the conversation.
+
+    Both are fixed by re-stating the CURRENT values every turn, which is why this
+    rides `--append-system-prompt` alongside `--resume` (the same delivery the
+    topic-context block uses) rather than living in the assembler — an assembler
+    change would reach fresh sessions only, i.e. it would have missed the very
+    turn that failed.
+
+    Deliberately NOT a natural-language intent matcher. The failure was
+    self-knowledge, not parsing: no pattern over the USER's words would have
+    corrected a model that believed the capability did not exist.
+
+    Scoped to OWNER-ATTENDED channels via ``origin_delivery_supported`` — i.e.
+    Telegram today. That predicate was written for a different purpose (can a
+    background result be delivered back here) but it is the correct one here for
+    an independent reason: it is the same "the owner is on the other end" test.
+
+    Withheld everywhere else, deliberately:
+    - TERMINAL: the human already has Claude Code's own /model and /effort, and
+      a terminal resume carries NO system prompt at all (an invariant
+      test_second_message_resumes pins).
+    - WEB (OpenClaw): `/v1/chat/completions` is registered with NO auth gate and
+      the invocation is stamped supervised=False, origin=external_untrusted.
+      Telling THAT session it can switch its own model — and never to refuse —
+      hands an anonymous caller a lever the user is supposed to own. Quality
+      over cost is the USER's tradeoff to make.
+    - VOICE / WHATSAPP: no ConversationLoop call sites exist for them today.
+    """
+    if not origin_delivery_supported(channel):
+        return ""
+    return (
+        "\n\n## Changing your own model / effort\n"
+        f"You are currently running model={model}, effort={effort}. "
+        "These are NOT fixed for the conversation. When the user asks you to "
+        "switch (\"use opus\", \"switch to haiku\", \"think harder\", \"low effort\"), "
+        f'call `mcp__genesis-health__session_config` with session_id="{session_id}" '
+        "(not the shorter id in the [Clock | Session: x] tag). The change takes "
+        "effect on your next response, so say what you switched to and continue. "
+        "You DO have this capability — never claim otherwise; if the tool returns "
+        "an error, report that error verbatim rather than hiding it."
+    )
+
+
 def _apply_research_routing(system_prompt: str | None, channel) -> str | None:
     """Append the long-research routing nudge for channels the delivery model can
     actually report back to.
@@ -284,6 +349,13 @@ class ConversationLoop:
                 )
                 resume_id = None
 
+            # Self-knowledge on BOTH new and resumed turns — see
+            # _session_control_block. Same slot as the routing nudge below and
+            # for the same reason: a resumed turn carries no system prompt.
+            _ctl = _session_control_block(channel, model, effort, session["id"])
+            if _ctl:
+                system_prompt = (system_prompt + _ctl) if system_prompt else _ctl
+
             # Non-terminal (dispatched) channels end the turn after replying, so long
             # inline work is killed at the CC bg-wait ceiling with nothing left to report
             # back — nudge routing to the durable background lane (delivers back via
@@ -357,6 +429,7 @@ class ConversationLoop:
                 fallback = await self._try_contingency(
                     prompt_text, system_prompt, channel,
                     session_id=session["id"],
+                    was_resume=resume_id is not None,
                 )
                 if fallback is not None:
                     return fallback
@@ -629,6 +702,14 @@ class ConversationLoop:
                     else:
                         system_prompt = topic_ctx
 
+            # Self-knowledge, injected for BOTH new and resumed sessions for the
+            # same reason as the topic context above: a resumed turn carries no
+            # system prompt, so anything stated only at session start is both
+            # absent from every later turn AND stale after a /model switch.
+            _ctl = _session_control_block(channel, model, effort, session["id"])
+            if _ctl:
+                system_prompt = (system_prompt + _ctl) if system_prompt else _ctl
+
             # Route long research off this turn to the durable background lane
             # (dispatched channels end the turn). See _apply_research_routing.
             system_prompt = _apply_research_routing(system_prompt, channel)
@@ -715,6 +796,7 @@ class ConversationLoop:
                 fallback = await self._try_contingency(
                     prompt_text, system_prompt, channel,
                     session_id=session["id"],
+                    was_resume=resume_id is not None,
                 )
                 if fallback is not None:
                     return fallback
@@ -919,8 +1001,14 @@ class ConversationLoop:
             session_id=session_id,
         )
         system_prompt = await self._enrich_with_context(system_prompt, prompt_text)
-        # A stale-resume retry rebuilds the prompt from scratch — re-apply the
-        # dispatched-channel research routing so the nudge isn't lost on recovery.
+        # A stale-resume retry rebuilds the prompt from scratch — re-apply both
+        # the dispatched-channel research routing and the session-control block,
+        # so neither is lost on recovery.
+        # This path always has a freshly assembled prompt, so a plain append is
+        # enough; the block is "" on TERMINAL and appends nothing.
+        system_prompt += _session_control_block(
+            channel, model, effort, session_id,
+        )
         system_prompt = _apply_research_routing(system_prompt, channel)
         return CCInvocation(
             prompt=prompt_text,
@@ -1085,7 +1173,12 @@ class ConversationLoop:
             # session being resumed). The peer runs a FRESH session, so re-assemble
             # the identity/context — otherwise the peer answers with no Genesis
             # persona/instructions.
-            if base_inv.system_prompt is None:
+            # Keyed on the RESUME FACT, not on `system_prompt is None`. The
+            # latter is a proxy that silently breaks the moment anything is
+            # appended to a resumed turn's prompt (the research-routing nudge
+            # already does this on Telegram), leaving the peer with only that
+            # fragment as its whole identity.
+            if base_inv.resume_session_id is not None:
                 system_prompt = await self._assembler.assemble(
                     db=self._db, model=str(model), effort=str(effort),
                     session_id=session["id"],
@@ -1540,6 +1633,7 @@ class ConversationLoop:
         system_prompt: str | None,
         channel: ChannelType,
         session_id: str | None = None,
+        was_resume: bool = False,
     ) -> str | None:
         """Attempt to route through API contingency dispatcher.
 
@@ -1548,8 +1642,11 @@ class ConversationLoop:
         if self._contingency is None:
             return None
 
-        # Rebuild system prompt if it was None (resume case)
-        if system_prompt is None:
+        # Rebuild the system prompt for the resume case. Keyed on the resume
+        # FACT: a resumed turn's prompt may be a non-empty fragment (an appended
+        # nudge) rather than None, and shipping that fragment alone to a raw
+        # router LLM would answer as Genesis with no Genesis identity at all.
+        if was_resume or system_prompt is None:
             try:
                 system_prompt = await self._assembler.assemble(
                     db=self._db, model="sonnet", effort="medium",
