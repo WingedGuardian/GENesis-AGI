@@ -243,9 +243,15 @@ def main() -> int:
         # does catch.
         #
         # We are past the _RM_PATTERN fast path, so this can only ever refuse a
-        # command that mentions rm, and bounds-induced blindness fires on 0 of 20,514
+        # command that mentions rm, and bounds-induced blindness fires on 0 of 45,358
         # real commands — so refusing outright costs nothing measurable.
-        if blind.kind != "untokenizable":
+        #
+        # Both bounds refuse, uniformly with every other fail-closed guard here.
+        # The known cost is real and accepted — a here-doc above the cap whose PROSE
+        # quotes an `rm -rf` (a review note like this one) is refused rather than
+        # scanned. `blind.hint` says to write the payload to a file, which is the
+        # action that shape wants anyway.
+        if blind.bounds_induced:
             return _block(
                 f"an rm command that {blind.cause}, so its real targets cannot be "
                 f"resolved. To proceed: {blind.hint}"

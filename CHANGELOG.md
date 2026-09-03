@@ -144,21 +144,46 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   The limits are sized against the tightest path rather than the loosest, which is not
   the one the individual guards are registered on: the shell safety hook is registered
   at **5 seconds** and runs two of these guards sequentially over the same command, so
-  two full parses share that budget. Measured through that path at three candidate
-  sizes, all refusing correctly: 0.57s, 0.95s, 2.33s. The middle one is chosen, for a
-  5.3x margin. The two directions are deliberately not treated as symmetric — over the
-  size limit a command is refused or prompted, while over the timeout it runs
+  those parses share that budget — and there are FIVE of them, not two: the hook
+  delegates to three guards, one of which analysed the same command three times over.
+  Those duplicates are now parsed once. The two limits are chosen TOGETHER, because
+  the parser re-scans the remaining text at every level and the worst case is a
+  command at the size limit nested to the depth limit — cost is length times levels,
+  so neither number means anything alone. Measured end to end through the real hook,
+  the chosen pair costs about half the budget. The two directions are deliberately not treated as symmetric —
+  over the size limit a command is refused or prompted, while over the timeout it runs
   unchecked, so margin is bought on the side that fails open.
 
   Both axes are now bounded, because neither subsumes the other: a length cap alone
   leaves nesting free to multiply the work, and a depth bound alone leaves the first
   pass — which happens before any recursion — completely unbounded. Every one of the
   same fifteen cells now refuses, in under 2.6s. Both limits are set from data rather
-  than taste: across 20,461 distinct real commands the deepest nesting seen is 3 and
-  the longest command is 14,682 characters, so the bounds sit at roughly five levels
-  and four-and-a-half times beyond anything ever actually run, and fire on none of
-  them. Commands whose top-level segments change: 0 of 20,461, which is what keeps
-  the guards that match working directories by exact string unaffected.
+  than taste: across 45,358 distinct real commands the deepest nesting seen is 3 and
+  the longest command is 43,480 characters, so the bounds sit twice the observed
+  nesting and a little beyond the longest command, and fire on none of them. Commands whose
+  top-level segments change: 0, which is what keeps the guards that match working
+  directories by exact string unaffected.
+
+  The size limit was first set against a corpus half that size, whose longest command
+  was 14,682 characters — and the resulting limit turned out to sit *below* three real
+  commands, all of them here-documents writing review prose, a shape this workflow
+  produces and that corpus had simply not accumulated yet. A limit is only as good as
+  the corpus it was measured against, and a corpus keeps growing after the
+  measurement. Raising it then pushed the pair over the hook's budget — measured at
+  6.12 seconds against a five-second registration, which is the very fail-open this
+  change exists to close — until the duplicate parses were removed and the nesting
+  limit came down to compensate. The same lesson from the other side: these are one
+  decision, not two, and the budget they are measured against has to be the real one.
+
+  Both limits carry the SAME verdict, and briefly they did not. A per-axis severity
+  flag let the size limit prompt where the nesting limit refused; it was wired into
+  guards whose only verdicts are block and allow, where not refusing is not a lighter
+  verdict but a silent permit, and a real unrecoverable discard padded past the size
+  limit went from refused to allowed through every layer. The flag's entire benefit
+  was hypothetical — the case it distinguished occurs in none of the forty-five
+  thousand real commands — so it is deleted. A distinction that no real input
+  exercises, that six call sites must each get right, and whose wrong answer is
+  silent, is a defect generator rather than a feature.
 
   Bounding the work alone would have traded one fail-open for a worse one — a guard
   that quietly stops seeing a buried command and allows it — so the bounds and the

@@ -25,10 +25,10 @@ directory) padded with a quoted string to 65,400 chars, under the guard's regist
 The payload must name a genuinely protected path or the test is vacuous: an
 unprotected path returns exit 0 at every depth, and timing an allow proves nothing.
 
-The crossing needs a command longer than anything real (at 14,682 chars, the longest
-of 20,212 real commands, the unbounded parse peaks at 3.86s), so it is reachable by a
-CRAFTED command rather than by ordinary work — which for a security guard is the
-threat model, not a mitigation.
+The crossing needs a command longer than anything real (at 43,480 chars, the longest
+of 45,956 real commands, the unbounded parse stays well inside the budget), so it is
+reachable by a CRAFTED command rather than by ordinary work — which for a security
+guard is the threat model, not a mitigation.
 
 The fix bounds the WORK rather than a proxy for it, and — critically — SIGNALS when
 it truncated. Silently capping the recursion would trade this fail-open for a worse
@@ -68,9 +68,11 @@ def _nested(depth: int, length: int = _UNDER_CAP) -> str:
     return "$(" * depth + "x" * max(length - depth * 3, 1) + ")" * depth
 
 
-#: The longest Bash command in this install's history, over 20,461 real commands.
-#: The realistic worst case is this length, NOT the synthetic bomb.
-_REAL_MAX_LEN = 14_682
+#: The longest Bash command in this install's history, over 45,956 real commands.
+#: The realistic worst case is this length, NOT the synthetic bomb. (Was 14,682 from
+#: a corpus half this size — see test_the_cap_admits_every_real_command for why that
+#: number is a trap worth remembering rather than just a stale figure.)
+_REAL_MAX_LEN = 43_480
 
 
 def test_cost_does_not_grow_with_nesting_depth():
@@ -104,18 +106,25 @@ def test_a_realistic_worst_case_command_is_cheap():
 
 
 def test_an_adversarial_command_stays_inside_the_guard_budget():
-    """A 65KB bomb is 4.5x longer than anything real, and now past the length cap —
-    so this asserts the REFUSAL is instant rather than that the parse is quick.
+    """A 65KB bomb nested 128 deep is refused INSTANTLY — this times the refusal, not
+    the parse.
+
+    Deliberately asserts only that a BOUND fired, not WHICH one. The payload is over
+    both, and which one reports first is a function of the cap: at 32,768 this was the
+    length bound, and raising the cap moved it to depth, failing this test on an
+    assertion that was never the point. An adversarial command does not have to
+    be refused for the reason a test author happened to have in mind — the two
+    dedicated tests below pin each bound separately, on payloads over exactly one.
 
     The budget it must leave room inside is 5s, not 10s: `bash_safety_hook.sh` is
-    registered at 5s and runs two guards sequentially over the same command. A hook
+    registered at 5s and delegates to THREE guards over the same command. A hook
     killed before its `exit 2` does not refuse — it permits."""
     started = time.monotonic()
     segments, blind = sp.analyze_checked(_nested(128, length=65_400))
     elapsed = time.monotonic() - started
-    assert blind is not None and blind.kind == "over_long"
+    assert blind is not None and blind.bounds_induced
     assert segments == []
-    assert elapsed < 1.0, f"took {elapsed:.2f}s against a 5s budget shared by two guards"
+    assert elapsed < 1.0, f"took {elapsed:.2f}s against a 5s budget shared by three guards"
 
 
 @pytest.mark.parametrize("depth", [16, 48, 128])
@@ -156,10 +165,13 @@ def test_ordinary_commands_are_not_reported_as_over_nested(cmd):
     """The control. A bound that fires on real commands would make every guard
     fail closed on ordinary work, which is a worse outcome than the bug.
 
-    MEASURED over 20,212 distinct real Bash commands from this install's history,
-    counting the depth ``analyze`` actually recurses to: 83.9% reach depth 0, 15.4%
-    depth 1, 0.70% depth 2, and exactly one command reaches depth 3. Nothing reaches
-    the bound of 8.
+    MEASURED over 45,956 distinct real Bash commands from this install's history,
+    counting the depth ``analyze`` actually recurses to: 87.5% reach depth 0, 11.7%
+    depth 1, 0.79% depth 2, and 7 commands reach depth 3. Nothing reaches the bound of 5.
+
+    Those are ``Segment.depth`` units, which is what the bound counts — NOT how deep
+    a command looks, since ``bash -c "$(…)"`` descends twice per level. Comparing the
+    bound against an eyeballed nesting level is how it would get set too tight.
     """
     assert sp.over_nested(cmd) is False
 
@@ -246,7 +258,7 @@ def test_length_alone_can_exhaust_a_guard_so_length_alone_is_bounded():
     started = time.monotonic()
     segments, blind = sp.analyze_checked(over)
     elapsed = time.monotonic() - started
-    assert blind is not None and blind.kind == "over_long"
+    assert blind is sp._BLIND_OVER_LONG
     assert segments == [], (
         "an over-length command must yield NO segments. A prefix of a shell command "
         "is not a partial parse: truncating mid-string flips the quoting state for "
@@ -259,13 +271,17 @@ def test_the_worst_shape_at_the_cap_still_leaves_the_guard_its_clock():
     """The number the cap was chosen from: worst token shape, at the depth bound.
 
     Calibrated against the TIGHTEST path, not the loosest. `bash_safety_hook.sh` is
-    registered at 5s and runs TWO guards sequentially over the same command, so the
-    real budget is 5s for two parses — not the 10s a single guard is registered at.
-    MEASURED end to end through that path at three candidate caps: 16 KiB 0.57s,
-    32 KiB 0.95s, 64 KiB 2.33s. The cap is 32 KiB for a 5.3x margin.
+    registered at 5s and delegates to THREE guards sequentially over the same command
+    — destructive_command_guard, protected_paths_guard, and git_discard_guard, the
+    last of which calls `analyze_checked` three times — so one 5s clock can carry
+    FIVE full parses plus `git stash create` subprocesses, not the 10s a single guard
+    is registered at and not the "two parses" an earlier version of this docstring
+    claimed. MEASURED end to end through the real hook, payload inside both bounds so
+    nothing short-circuits and allowed by every guard so nothing exits early:
+    1.06s at depth 0, 2.16s at depth 3, 3.19s at depth 5.
 
     This asserts the in-process parse only, so its threshold is deliberately looser
-    than the 0.95s end-to-end figure; it exists to catch a cap raised far enough to
+    than the end-to-end figures; it exists to catch a bound raised far enough to
     matter, not to re-measure the shell path.
     """
     worst = (
@@ -284,23 +300,43 @@ def test_the_worst_shape_at_the_cap_still_leaves_the_guard_its_clock():
     )
 
 
-def test_the_cap_admits_every_real_command_by_a_wide_margin():
+def test_the_cap_admits_every_real_command():
     """A cap that fires on real work would be worse than the bug it fixes.
 
-    MEASURED: the longest of 20,461 distinct real Bash commands from this install's
-    history is 14,682 chars, so the cap is 2.2x anything ever actually run here and
+    (This was named "…by_a_wide_margin" while asserting only `longest_real < cap`,
+    i.e. any margin down to one character. The name promised what the assertion did
+    not check — so the name came down to what is actually enforced rather than the
+    assertion being tightened, because a wide margin is NOT wanted here: the cost
+    ceiling is the binding constraint and the headroom is deliberately 1.13x.)
+
+    MEASURED over 45,956 distinct real Bash commands from this install's history: the
+    longest is 43,480 chars, so the cap is 1.13x anything ever actually run here and
     fires on 0 of them.
 
-    The headroom is 2x rather than 4x on purpose. The cap trades against the hook's
-    5s budget, and the two directions are NOT symmetric: over the cap fails CLOSED (a
-    refusal or a prompt), over the timeout fails OPEN (the command runs unchecked).
-    Margin is therefore bought on the failing-open side and paid for on the
-    failing-closed side — and at this size it is not actually paid at all.
+    THE FIGURE IN THIS TEST WAS ONCE 14,682, AND THAT IS THE POINT OF THE COMMENT.
+    It came from an earlier corpus of 20,514 commands and justified a 32,768 cap as
+    "2.2x headroom, 0 fires". The full corpus is 2.2x larger and holds three commands
+    ABOVE that cap — all `cat > … <<EOF` here-docs writing review prose, a shape this
+    workflow itself generates and the earlier corpus had not yet accumulated. A cap is
+    only as good as the corpus it was sized against, and a corpus keeps growing after
+    the measurement. Re-derive this number before trusting it; do not raise the cap to
+    chase a single outlier without re-running the cost curve.
+
+    The headroom is deliberately modest, because the cost ceiling binds before the
+    corpus does. The cap trades against the hook's 5s budget, and the two directions
+    are NOT symmetric: over the cap fails CLOSED (a refusal or a prompt), over the
+    timeout fails OPEN (the command runs unchecked). Margin is bought on the
+    failing-open side and paid for on the failing-closed side.
+
+    Do NOT quote a depth-0 cost figure here to argue the cap is cheap. An earlier
+    version of this docstring cited "0.86s at 64 KiB", which is the DEPTH-0 number —
+    the same figure `shell_parse` explicitly labels as the mistake that produced an
+    over-budget cap. Cost is length x levels; see the grid in `MAX_COMMAND_CHARS`.
     """
-    longest_real = 14_682
-    assert longest_real * 2 < sp.MAX_COMMAND_CHARS, (
-        f"cap {sp.MAX_COMMAND_CHARS} leaves less than 4x headroom over the longest "
-        f"real command ({longest_real})"
+    longest_real = 43_480
+    assert longest_real < sp.MAX_COMMAND_CHARS, (
+        f"cap {sp.MAX_COMMAND_CHARS} is BELOW the longest real command "
+        f"({longest_real}) — real work would be refused"
     )
     assert sp.analyze_checked("echo " + "x" * (longest_real - 5))[1] is None
 
@@ -369,3 +405,102 @@ def test_deeply_nested_work_is_not_silently_dropped():
     truncated = sp.over_nested(cmd)
     saw_rm = "rm" in {s.exe for s in sp.analyze(cmd)}
     assert truncated or saw_rm, "the rm was dropped AND the truncation went unreported"
+
+
+# ── The shapes a whole green suite missed ────────────────────────────────────────
+#
+# Every fixture above tests a command with ONE operation. That is why 1,224 tests and
+# 15 verified mutations shipped over three fail-opens: the consumers decide by
+# SEARCHING the segment list and treating "not found" as "not present", and a
+# single-operation fixture can never reach the not-found branch where the blind-spot
+# net lives. Two shapes are needed, and neither existed here before.
+
+_DECOYS = [
+    ("push", "git push origin feature", "git push origin +main"),
+    ("commit", "git " + "commit" + " -m ok", "git " + "commit" + " --no-verify -m x"),
+    ("clean", "git status", "git clean -fd"),
+    ("rm", "echo hello", "rm -rf $HOME/genesis"),
+]
+
+
+@pytest.mark.parametrize("label,decoy,hidden", _DECOYS)
+def test_a_decoy_cannot_hide_a_second_operation_past_the_bound(label, decoy, hidden):
+    """A visible benign operation must NOT make the hidden one disappear.
+
+    THE regression shape. MEASURED against a version that returned the segments a
+    bounded parse managed to reach: a visible commit followed by a nested
+    ``--no-verify`` one went BLOCK -> ALLOW, and the push equivalent BLOCK -> ask,
+    because the decoy filled the segment list so the not-found branch — where the
+    blind-spot net lives — was never reached.
+
+    The fix is that a bounded parse returns NOTHING, so this asserts the property
+    that makes every consumer correct without per-consumer logic: past the bound the
+    parse yields no segments at all, and a decoy cannot be mistaken for the whole
+    command. The guard-level suites assert the verdicts; this pins the contract they
+    all rest on.
+    """
+    cmd = f"{decoy} && " + 'bash -c "$(' * 9 + hidden + ')"' * 9
+    segs, blind = sp.analyze_checked(cmd)
+    assert blind is not None and blind.bounds_induced, (
+        f"a {label} command nested past the bound must report a bounds blind spot"
+    )
+    assert segs == [], (
+        f"the {label} decoy leaked {len(segs)} segment(s) from a truncated parse. A "
+        "consumer that searches this list would find only the decoy and conclude the "
+        "hidden operation is absent — which is the fail-open this bound created"
+    )
+
+
+def test_a_blind_spot_carries_exactly_one_decision():
+    """The chokepoint must answer ONE question, and this pins that it still does.
+
+    A per-axis severity field once existed alongside `bounds_induced`, letting the
+    length bound "ask" where the depth bound refused. It was wired into guards with
+    no ask verdict — where not refusing is permitting — and MEASURED a real
+    unrecoverable discard going BLOCK -> ALLOW. Its entire benefit was hypothetical:
+    the axis it distinguished fires on 0 of 45,956 real commands.
+
+    A distinction no real input exercises, which six call sites must each choose
+    correctly, and whose wrong choice is silent, is a defect generator. So the domain
+    is checked for exactly the fields a consumer may branch on: adding another
+    decision to a BlindSpot re-opens that generator, and should fail here first.
+
+    Iterates `_ALL_BLIND_SPOTS` so a blind spot added later is covered without anyone
+    remembering to extend this — the drift the deleted `kind` string used to cause.
+    """
+    assert sp._ALL_BLIND_SPOTS, "the domain must not be empty, or this asserts nothing"
+    decision_fields = {f for f in sp.BlindSpot._fields if f not in ("cause", "hint")}
+    assert decision_fields == {"bounds_induced"}, (
+        f"BlindSpot grew a second decision field {decision_fields - {'bounds_induced'}}. "
+        "Every consumer must then choose which one to branch on, and a wrong choice "
+        "fails OPEN silently — the exact shape that shipped a fail-open before"
+    )
+    for spot in sp._ALL_BLIND_SPOTS:
+        assert isinstance(spot.bounds_induced, bool)
+        assert spot.cause and spot.hint, "a blind spot must be actionable, not just true"
+
+
+@pytest.mark.parametrize("bounds_expected,depth", [(True, 9), (False, 0)])
+def test_two_causes_at_once_report_the_bound_not_the_tokenizer(bounds_expected, depth):
+    """Precedence, tested where it can actually be wrong: BOTH causes firing at once.
+
+    A trailing apostrophe-comment is valid shell that shlex cannot tokenize, so a
+    nested command with one appended is over-nested AND untokenizable simultaneously.
+    The first version of this chokepoint reported ``untokenizable`` — the one cause
+    every consumer deliberately ignores, since widening to it is a measured
+    over-block — so three guards went BLOCK -> ALLOW on a one-word suffix.
+
+    One-cause-at-a-time cells cannot see this: each cause alone was already correct.
+    A precedence bug exists ONLY in the intersection, which is exactly the region a
+    matrix of single causes leaves untested. The depth-0 case is the control — same
+    suffix, no bound — proving the fixture is not simply always-bounds.
+    """
+    cmd = 'bash -c "$(' * depth + "git clean -fd" + ')"' * depth + " # don" + chr(39) + "t"
+    _, blind = sp.analyze_checked(cmd)
+    assert blind is not None
+    assert sp.untokenizable(cmd), "fixture must genuinely defeat the tokenizer"
+    assert blind.bounds_induced is bounds_expected, (
+        "a command over a BOUND must report the bound even when it is also "
+        "untokenizable — consumers act on bounds_induced, so reporting the "
+        "pre-existing cause hands them the one answer they are documented to ignore"
+    )

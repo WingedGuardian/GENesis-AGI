@@ -5236,6 +5236,26 @@ def main() -> int:
             and blind is not None
             and _mentions_gated_op(cmd)
         ):
+            if blind.bounds_induced:
+                # The DEPTH bound refuses outright, interactive or not, and the
+                # asymmetry between the two bounds is measured rather than felt.
+                # Over 45,358 real commands the deepest nesting is 3 against a
+                # bound of 5, so nothing legitimate comes near this and a command
+                # that does is not a shape ordinary work produces. It is also the
+                # axis the decoy attacks use: a visible benign `git push` with a
+                # force push buried past the bound, which reaches an approval
+                # prompt describing the decoy. A human approving what looks like an
+                # ordinary push is not a gate on the operation actually hidden
+                # there. Length still asks — a long here-doc IS ordinary work.
+                print(
+                    f"BLOCKED: this command {blind.cause} and names a gated "
+                    "operation, so the guard cannot see every publish it would "
+                    "run. A command can carry a second, hidden one past the point "
+                    "the parser stops — approving the visible one would approve "
+                    f"that too.\nTo proceed: {blind.hint}.",
+                    file=sys.stderr,
+                )
+                return 2
             if _is_dispatched():
                 # No human is present to answer a prompt, and an unverifiable
                 # gated command must not proceed unattended. Mirrors the

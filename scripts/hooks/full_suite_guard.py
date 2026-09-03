@@ -143,7 +143,14 @@ def main() -> None:
     # already allowed those, and failing closed on it would newly refuse 161 of 3,222
     # real pytest-mentioning commands (against 0 for the bounds). Restore what the
     # bound took; do not widen under cover of the same edit.
-    if blind is not None and blind.kind != "untokenizable" and "pytest" in cmd:
+    #
+    # BOTH bounds refuse. There is no per-axis severity to consult, for the reason
+    # documented at length in git_discard_guard._clean_violation. This guard's only
+    # verdicts are BLOCK and ALLOW; it cannot ask. For a guard with no third option,
+    # softening an axis is not "a lighter verdict", it is a silent permit, and the
+    # sibling layer that was supposed to cover the softened case did not.
+    # Cost of refusing both: 0 of 45,956 real commands reach either bound.
+    if blind is not None and blind.bounds_induced and "pytest" in cmd:
         print(
             f"BLOCKED: this command {blind.cause}, so this guard cannot check whether "
             f"the pytest run inside it is targeted — and an untargeted full-suite run "

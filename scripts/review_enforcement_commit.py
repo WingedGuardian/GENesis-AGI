@@ -677,6 +677,23 @@ def main() -> None:
         # for a different reason than this comment used to give: analyze()
         # resolves the segment, and the net only fires where it found none.
         try:
+            if blind is not None and blind.bounds_induced:
+                # The DEPTH bound refuses outright rather than asking. The comment
+                # above explains why this net ASKS in general — a hard block cannot
+                # be surgically precise about which unparseable commands are real
+                # commits — but that reasoning was sized against `untokenizable`,
+                # which fires on 928 of 45,956 real commands. Depth fires on NONE of
+                # them (deepest real nesting is 3, bound is 5), so the precision
+                # objection does not apply to it: there is nothing legitimate here
+                # to be imprecise about. MEASURED base-vs-branch, this is also the
+                # shape that hid a `git commit --no-verify` behind a visible benign
+                # commit, where an approval prompt would describe only the decoy.
+                _deny(
+                    f"BLOCKED: this command {blind.cause} and mentions a commit, so "
+                    "the guard cannot see every commit it would make — a second one "
+                    "can sit past the point the parser stops, and approving the "
+                    f"visible commit would approve that one too.\nTo proceed: {blind.hint}."
+                )
             if blind is not None:
                 # EXACT "1", never truthiness. `cc/invoker.py` stamps the marker as
                 # "1" and every other consumer compares to it exactly

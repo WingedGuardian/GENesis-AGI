@@ -32,6 +32,11 @@ _spec = importlib.util.spec_from_file_location("git_discard_guard", _HOOKS / "gi
 _gd = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_gd)
 
+# The guard's own parser, so a fixture can PROVE it trips the bound it claims to.
+_sp_spec = importlib.util.spec_from_file_location("shell_parse", _HOOKS / "shell_parse.py")
+shell_parse = importlib.util.module_from_spec(_sp_spec)
+_sp_spec.loader.exec_module(shell_parse)
+
 _GIT_ENV = {
     **os.environ,
     "GIT_AUTHOR_NAME": "t",
@@ -108,6 +113,102 @@ def test_main_fails_open_on_garbage(monkeypatch):
 #    `"clean" in cmd`, so a crash on a clean-MENTIONING command fails CLOSED
 #    unconditionally and asks the user to simplify. The direct settings.json wiring
 #    has no shell floor behind it, so the guard must self-block here.
+@pytest.mark.parametrize(
+    "label,verb",
+    [
+        ("clean", "git clean -fd"),
+        ("submodule-recursive checkout", "git checkout --recurse-submodules ."),
+    ],
+)
+@pytest.mark.parametrize("axis", ["length", "depth"])
+def test_an_unreadable_command_never_reaches_a_silent_allow(label, verb, axis, monkeypatch):
+    """A guard whose only verdicts are BLOCK and ALLOW must refuse on EITHER bound.
+
+    This is the coverage that did not exist, and its absence is why a real fail-open
+    shipped green. No test drove any guard with an OVER-LENGTH command, so when the
+    length axis was softened to "ask" — for a guard that cannot ask, where not
+    refusing means permitting — MEASURED `echo "<49,200 chars>" && git clean -fd`
+    returned rc=0 from this guard AND rc=0 from bash_safety_hook.sh, with nothing
+    anywhere blocking a real, executing `git clean -fd`. The whole suite stayed green.
+
+    The justification at the time was that bash_safety_hook.sh's raw-text `git clean`
+    grep still covered it. It does not: that fallback runs only when this guard is
+    ABSENT or CRASHES (bash_safety_hook.sh:220 gates it on `_handled == 0`), and
+    exiting 0 sets `_handled=1`. For the submodule verb there is no fallback at all.
+
+    Parametrised over BOTH axes deliberately — a bound softened on one axis is
+    invisible to a test that only exercises the other.
+    """
+    if axis == "length":
+        cmd = 'echo "' + "x" * (shell_parse.MAX_COMMAND_CHARS + 64) + '" && ' + verb
+    else:
+        cmd = 'bash -c "$(' * 9 + verb + ')"' * 9
+    _segs, blind = shell_parse.analyze_checked(cmd)
+    assert blind is not None and blind.bounds_induced, (
+        f"fixture must actually trip the {axis} bound, or it proves nothing"
+    )
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": "/tmp"}
+    )
+    assert _gd.main() == 2, (
+        f"an over-{axis} `{label}` was not refused. This guard cannot ask, so any "
+        "verdict other than 2 is a silent permit of an unrecoverable operation"
+    )
+
+
+def test_the_command_is_parsed_exactly_once_per_process(monkeypatch):
+    """Parsing once is a SECURITY property here, not a tidiness one.
+
+    `bash_safety_hook.sh` is registered at 5s and delegates to THREE guards over the
+    same command, this one included — and this guard reaches three consumers that each
+    analyse it. That put FIVE full parses on one 5s clock. MEASURED end to end with
+    the worst payload inside both bounds: 6.12s BEFORE memoisation, i.e. the hook is
+    KILLED, and a killed hook does not refuse — it PERMITS. 2.67s after.
+
+    So bounding the input was not sufficient on its own; the same work had to stop
+    being done three times. This test exists because a mutation removing the memo
+    SURVIVED the whole suite: every verdict stayed correct and only the clock moved,
+    which is invisible to an assertion about verdicts and fatal in production.
+    Counting the calls pins the property directly rather than timing it, since a
+    wall-clock assertion would be flaky on a shared box.
+    """
+    cmd = "git clean -nd && git checkout -- x.py && git submodule update --recurse-submodules"
+    calls = []
+    real = _gd.analyze_checked
+
+    def counting(c):
+        calls.append(c)
+        return real(c)
+
+    _gd._PARSE_MEMO.clear()
+    monkeypatch.setattr(_gd, "analyze_checked", counting)
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": "/tmp"}
+    )
+    _gd.main()
+    assert len(calls) == 1, (
+        f"the command was parsed {len(calls)} times in one process. Three of the five "
+        "parses on the shell hook's 5s clock are this guard's; duplicating them "
+        "measured 6.12s against that 5s registration, which permits the command"
+    )
+
+
+def test_an_ordinary_command_near_the_cap_is_still_allowed(monkeypatch):
+    """The control for the test above: refusing everything would also make it pass.
+
+    A long-but-readable command mentioning the trigger words must still be ALLOWED,
+    so the refusals above are attributable to the bound rather than to a guard that
+    blocks anything large or anything containing "clean".
+    """
+    cmd = 'echo "' + "x" * (shell_parse.MAX_COMMAND_CHARS - 256) + '" && git status'
+    _segs, blind = shell_parse.analyze_checked(cmd)
+    assert blind is None, "control must be INSIDE the bounds"
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": "/tmp"}
+    )
+    assert _gd.main() == 0
+
+
 def test_clean_parse_crash_blocks(monkeypatch):
     monkeypatch.setattr(
         _gd, "read_payload", lambda: {"tool_input": {"command": "git clean -f"}, "cwd": "/tmp"}

@@ -479,9 +479,21 @@ class TestEveryGuardConsultsTheChokepoint:
     #: from an honest one — both end in "allow" — so the raise proves nothing and the
     #: test would pass against a guard that never asked. What distinguishes them is
     #: the guard ACTING on a reported blind spot.
-    _POISON_RETURNS_BLIND = (
-        "return ([], _real.BlindSpot(kind='over_nested', cause='POISONED', hint='POISONED'))"
-    )
+    #:
+    #: Returns the module's REAL over-length blind spot rather than a hand-built one.
+    #: A hand-built BlindSpot coupled this test to the poison rather than to the
+    #: shipped policy, so a change to a real blind spot's fields left it green.
+    #: Returning a shipped singleton means the poison carries whatever the module
+    #: actually declares.
+    #:
+    #: `_BLIND_OVER_LONG` specifically: while a per-axis severity flag briefly
+    #: existed, the length bound was the SOFT one, and the guards wired to it
+    #: fail-opened on a real unrecoverable discard. That flag is deleted and every
+    #: bounds-induced blind spot now refuses identically, so the choice no longer
+    #: discriminates — it is kept deliberately, because any future attempt to
+    #: re-introduce a soft axis would have to soften THIS one first, and this test
+    #: would go red the moment it did.
+    _POISON_RETURNS_BLIND = "return ([], _real._BLIND_OVER_LONG)"
 
     #: The other poison: raise. For guards whose wrapper fails CLOSED on an exception,
     #: where the raise turning an allow into a refusal IS the observation.

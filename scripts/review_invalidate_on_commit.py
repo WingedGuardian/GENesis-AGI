@@ -43,7 +43,7 @@ from hook_input import field, read_payload, tool_response  # noqa: E402
 
 # review_state lives in scripts/ (this file's own dir).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from review_state import clear_marker  # noqa: E402
+from review_state import clear_all_markers, clear_marker  # noqa: E402
 
 # Commit DETECTION uses shell_parse (the same precise `analyze()` the checker
 # uses) so a loose "commit" token match doesn't clear on a non-commit that merely
@@ -223,14 +223,30 @@ def main() -> None:
     # Bounds-blind bypasses the strict-adjacency gate below and falls through to the
     # unconditional over-clear. It does NOT clear here directly: the success check
     # further down still applies, so a FAILED commit does not invalidate a review.
-    bounds_blind = blind is not None and getattr(blind, "kind", "") != "untokenizable"
-    if blind is not None:
-        segs = None
-    if segs is not None:
-        if not any(git_subcommand(s.argv) == "commit" for s in segs):
-            sys.exit(0)
-    elif not bounds_blind and not _STRICT_COMMIT.search(command):
-        sys.exit(0)  # no parser: fall back to strict adjacency, never over-clear
+    bounds_blind = blind is not None and blind.bounds_induced
+
+    # UNTOKENIZABLE KEEPS ITS SEGMENTS. An earlier version discarded them along with
+    # the bounded ones, and that was a third way to reach this module's documented
+    # bypass. `untokenizable` does not truncate — shlex fails while the parse still
+    # resolves a complete argv — so throwing the segments away dropped an EXACT
+    # answer and fell back to `_STRICT_COMMIT`, which requires adjacency. MEASURED:
+    # `git -C /other/worktree commit -m x # don't` is valid shell (the apostrophe is
+    # inside a comment), the parser returns the full `git -C` argv, and the regex
+    # misses it — so invalidation exited and the target marker survived.
+    #
+    # Its segments are USED but not TRUSTED-TO-BE-COMPLETE: a commit they find is
+    # real, while finding none is not evidence of absence, so that case still falls
+    # through to the regex. A bounded parse returns nothing at all, by design.
+    has_commit_seg = bool(segs) and any(git_subcommand(s.argv) == "commit" for s in segs)
+    if bounds_blind:
+        segs = None  # nothing was parsed; force the unconditional over-clear below
+    elif blind is None and segs is not None:
+        if not has_commit_seg:
+            sys.exit(0)  # complete parse, no commit segment: nothing to invalidate
+    elif not has_commit_seg and not _STRICT_COMMIT.search(command):
+        # No parser, or an unreliable one that found nothing: neither source of
+        # evidence names a commit.
+        sys.exit(0)
 
     # Only invalidate on successful commits (exit code 0)
     try:
@@ -244,6 +260,30 @@ def main() -> None:
             sys.exit(0)  # Commit failed, don't invalidate
     except (json.JSONDecodeError, AttributeError):
         pass  # Can't parse result — be conservative, invalidate anyway
+
+    # A BOUNDED parse cannot IDENTIFY the marker to clear, so it clears all of them.
+    # The candidate-set over-clear below covers the payload cwd, a leading `cd`, and
+    # the hook process cwd — every shell-side candidate. It cannot cover a repository
+    # named only by an explicit selector: for `git -C /other/worktree commit -m
+    # '<payload over the cap>'` the target is discoverable solely from the parse, and
+    # a bounded parse returns nothing by design. Recovering the selector from the raw
+    # string would mean a second, hand-rolled shell parser — the exact trap these
+    # guards exist to avoid — so the fail-safe is breadth instead. MEASURED at 0 of
+    # 45,358 real commands, against a bypass that authorizes an unreviewed commit for
+    # the marker's TTL.
+    if bounds_blind:
+        cleared, failures = clear_all_markers()
+        if failures:
+            # Never silent: a marker that survived is the bypass itself, and the one
+            # thing a later session must not have to guess at.
+            print(
+                f"[review-invalidate] cleared {cleared} review marker(s) after a "
+                f"commit whose command could not be fully parsed, but could NOT "
+                f"clear: {'; '.join(failures)}. A surviving marker can authorize an "
+                f"unreviewed commit — remove it by hand.",
+                file=sys.stderr,
+            )
+        sys.exit(0)
 
     # Clear the per-worktree review marker (matching the dir that authorized this
     # commit) so the next commit requires a fresh review. Resolution mirrors the
