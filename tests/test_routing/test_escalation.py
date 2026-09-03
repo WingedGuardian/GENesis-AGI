@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -810,15 +811,18 @@ class TestDeadProviderNotification:
 
         await self._seed_failure_obs(escalation, empty_db, "prov-race", "pf-race", age_s=7200)
 
-        real_query = obs_crud.query
+        # Patch the outage-clock read seam the notify path actually uses
+        # (the hash-scoped unresolved_by_hash — NOT the generic query(),
+        # which this path deliberately no longer calls).
+        real_read = obs_crud.unresolved_by_hash
 
-        async def racing_query(*args, **kwargs):
-            rows = await real_query(*args, **kwargs)
+        async def racing_read(*args, **kwargs):
+            rows = await real_read(*args, **kwargs)
             # Recovery lands HERE: after the read, before the write.
             await escalation._resolve_observation("prov-race")
             return rows
 
-        monkeypatch.setattr(obs_crud, "query", racing_query)
+        monkeypatch.setattr(obs_crud, "unresolved_by_hash", racing_read)
         await escalation._maybe_notify("prov-race")
 
         rows = await self._criticals(empty_db, "prov-race", escalation)
@@ -826,4 +830,93 @@ class TestDeadProviderNotification:
         assert unresolved == [], (
             "a provider that recovered mid-check was still reported dead — "
             f"{len(unresolved)} unresolved critical row(s) written after recovery"
+        )
+
+
+class TestTripWindowReanchor:
+    """A stale in-memory incident must not lend its anchor to a new one.
+
+    The state entry dies only on FULL recovery (trip_count reaching 0, which
+    a flapping provider never does with success_threshold=2), so without the
+    24h trip window `first_trip_at` could be weeks old when a fresh incident
+    escalates — writing an observation that claims a weeks-long outage.
+    """
+
+    async def test_a_daylong_gap_starts_a_fresh_incident(self, empty_db, event_bus):
+        from datetime import timedelta
+
+        t = {"now": datetime(2026, 9, 1, 12, 0, tzinfo=UTC)}
+        esc = ProviderEscalation(
+            db=empty_db, event_bus=event_bus, clock=lambda: t["now"],
+        )
+        await esc._on_event(_make_event("prov-gap"))
+        first_anchor = esc._state["prov-gap"]["first_trip_at"]
+        t["now"] += timedelta(hours=25)
+        await esc._on_event(_make_event("prov-gap"))
+        state = esc._state["prov-gap"]
+        assert state["trip_count"] == 1, "the stale count must not carry over"
+        assert state["first_trip_at"] == t["now"].isoformat()
+        assert state["first_trip_at"] != first_anchor
+
+    async def test_backoff_scale_gaps_never_reanchor(self, empty_db, event_bus):
+        """Gaps a real continuing outage produces (backoff cap 30min/4h plus
+        idle-traffic stretches, widest measured ~12h) must accumulate — the
+        window exists for STALE incidents, not slow ones."""
+        from datetime import timedelta
+
+        t = {"now": datetime(2026, 9, 1, 12, 0, tzinfo=UTC)}
+        esc = ProviderEscalation(
+            db=empty_db, event_bus=event_bus, clock=lambda: t["now"],
+        )
+        for _ in range(5):
+            await esc._on_event(_make_event("prov-slow"))
+            t["now"] += timedelta(hours=4)
+        state = esc._state["prov-slow"]
+        assert state["trip_count"] == 5
+        assert state["first_trip_at"] == "2026-09-01T12:00:00+00:00"
+
+
+class TestHashScopedOutageClock:
+    async def test_a_crowded_unresolved_table_cannot_starve_the_clock(self, empty_db):
+        """ACCEPTANCE REPLAY of the truncated-read defect: with >100 unrelated
+        unresolved routing rows, the old query(limit=100)+Python-filter shape
+        dropped the target provider's row out of the fetch window and read the
+        outage clock as ABSENT — no notification, indistinguishable from
+        healthy. The hash-scoped read must find it regardless of crowd size."""
+        from genesis.db.crud import observations as obs_crud
+        from genesis.routing.escalation import notify_provider_if_due
+
+        started = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        target_hash = ProviderEscalation._provider_content_hash("prov-crowded")
+        await obs_crud.create(
+            empty_db,
+            id="target-row",
+            person_id=None,
+            type="provider_failure",
+            content=json.dumps({"provider": "prov-crowded", "first_trip_at": started}),
+            source="routing",
+            priority="high",
+            content_hash=target_hash,
+            created_at=started,
+        )
+        # 120 NEWER unrelated unresolved rows — under a newest-first
+        # limit-100 global read, the target falls outside the window.
+        for i in range(120):
+            await obs_crud.create(
+                empty_db,
+                id=f"crowd-{i}",
+                person_id=None,
+                type="provider_failure",
+                content=json.dumps({"provider": f"crowd-{i}"}),
+                source="routing",
+                priority="high",
+                content_hash=f"crowdhash-{i}",
+                created_at=datetime.now(UTC).isoformat(),
+            )
+        notified = await notify_provider_if_due(
+            empty_db, "prov-crowded",
+            provider_still_failing=lambda p: True,
+        )
+        assert notified is True, (
+            "the outage clock was starved by unrelated unresolved rows"
         )

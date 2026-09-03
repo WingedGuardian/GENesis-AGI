@@ -473,6 +473,37 @@ async def exists_by_hash(
     return len(rows) > 0
 
 
+async def unresolved_by_hash(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    content_hash: str,
+    limit: int = 10,
+) -> list[dict]:
+    """Unresolved observations for ONE ``(source, content_hash)``, OLDEST first.
+
+    A hash-scoped read (covered by ``idx_observations_content_hash``) for
+    callers that need a specific hash's rows. ``query()`` cannot express this
+    — no ``content_hash`` parameter, no offset, a hard ``LIMIT`` bound — so
+    its callers had to over-fetch the whole unresolved set and filter in
+    Python, which silently starves any hash that falls outside the fetch
+    window once the TOTAL unresolved population exceeds the limit (the
+    starved caller reads "no rows", indistinguishable from "no outage").
+
+    ``limit`` bounds a pathological same-hash pile-up only
+    (``skip_if_duplicate`` holds same-hash rows to origin-class variants in
+    practice — a handful); oldest-first means even a truncated read keeps the
+    EARLIEST rows, which is the direction outage-clock callers need — a
+    truncated NEWEST-first read would silently reset the clock.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT * FROM observations WHERE source = ? AND content_hash = ? "
+        "AND resolved = 0 ORDER BY created_at ASC LIMIT ?",
+        (source, content_hash, limit),
+    )
+    return [dict(r) for r in rows]
+
+
 async def get_by_id(db: aiosqlite.Connection, id: str) -> dict | None:
     rows = await db.execute_fetchall("SELECT * FROM observations WHERE id = ?", (id,))
     row = rows[0] if rows else None

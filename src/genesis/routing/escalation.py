@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 # 5 trips ≈ 10 minutes of cycling (120s open duration × 5 cycles).
 _TRIP_THRESHOLD = 5
 
+# Consecutive trips further apart than this belong to SEPARATE incidents.
+# Genuine same-outage trip gaps are bounded by the breaker backoff (30 min
+# cap, 4h for quota) plus idle-traffic stretches — the widest gap measured on
+# a real multi-day outage was ~12h (sparse overnight traffic on a HALF_OPEN
+# breaker). 24h clears that with margin, while bounding a stale in-memory
+# anchor to a day instead of weeks.
+_TRIP_WINDOW_S = 24 * 3600
+
 # How long a provider must have been continuously failing before the user is
 # told. The escalation observation above fires at ~10 minutes, which is the
 # right threshold for a DASHBOARD row and far too eager for a notification —
@@ -66,8 +74,40 @@ class ProviderEscalation:
                 "trip_count": 0,
                 "first_trip_at": None,
                 "escalated": False,
+                "last_trip_at": None,
             },
         )
+
+        # Re-anchor a STALE incident before counting this trip. The entry is
+        # deleted only on full recovery (`record_recovery` needs trip_count
+        # to reach 0, which a flapping provider — one success, then a
+        # failure — never does with success_threshold=2), so without a
+        # window `first_trip_at` can be WEEKS old and `trip_count` never
+        # decays: the next escalation then writes an observation claiming a
+        # weeks-long outage that never happened. A gap larger than
+        # `_TRIP_WINDOW_S` between consecutive trips means this trip starts
+        # a NEW incident. Over-eager resets are cheap by design: an
+        # unresolved row from the prior incident still exists, so
+        # `skip_if_duplicate` yields no second row and the durable clock
+        # (that row's created_at) is untouched.
+        now = self._clock()
+        last_trip = state.get("last_trip_at")
+        if last_trip is not None:
+            try:
+                gap_s = (now - datetime.fromisoformat(last_trip)).total_seconds()
+            except ValueError:
+                gap_s = None
+            if gap_s is not None and gap_s > _TRIP_WINDOW_S:
+                logger.info(
+                    "Provider '%s': %.0fh since its last trip — starting a "
+                    "fresh escalation window (old anchor %s discarded)",
+                    provider, gap_s / 3600, state.get("first_trip_at"),
+                )
+                state["trip_count"] = 0
+                state["first_trip_at"] = None
+                state["escalated"] = False
+        state["last_trip_at"] = now.isoformat()
+
         state["trip_count"] += 1
         if state["first_trip_at"] is None:
             state["first_trip_at"] = self._clock().isoformat()
@@ -336,12 +376,17 @@ async def notify_provider_if_due(
     clock = clock or (lambda: datetime.now(UTC))
     failure_hash = ProviderEscalation._provider_content_hash(provider)
     try:
-        rows = await observations.query(
+        # Hash-scoped read, NOT `query(resolved=False, limit=N)` + a Python
+        # filter: that shape silently starves this provider once the TOTAL
+        # unresolved routing population exceeds the fetch window — its clock
+        # then reads as absent, indistinguishable from "provider is fine".
+        # `unresolved_by_hash` is index-covered (idx_observations_content_hash)
+        # and returns oldest-first, so even its own (per-hash) bound keeps
+        # the earliest rows — the direction the outage clock needs.
+        rows = await observations.unresolved_by_hash(
             db,
             source="routing",
-            type="provider_failure",
-            resolved=False,
-            limit=100,
+            content_hash=failure_hash,
         )
     except Exception:
         logger.error(
@@ -355,12 +400,14 @@ async def notify_provider_if_due(
     # written through a different origin_class — or present before this
     # provider was first seen by THIS process — does not suppress a second.
     # Taking the newest would reset the outage clock on every duplicate,
-    # which is the exact failure this whole change exists to remove.
+    # which is the exact failure this whole change exists to remove. The
+    # min() stays in Python (not LIMIT 1 in SQL) deliberately: the oldest
+    # row's content can be unparseable, and the clock should then fall to
+    # the next parseable row rather than to silence.
     starts = [
         s
         for r in rows
-        if r.get("content_hash") == failure_hash
-        and (s := ProviderEscalation._outage_started_at(r)) is not None
+        if (s := ProviderEscalation._outage_started_at(r)) is not None
     ]
     if not starts:
         # No unresolved failure record → nothing to measure an outage from.
