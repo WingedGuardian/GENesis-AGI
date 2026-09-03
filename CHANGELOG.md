@@ -125,6 +125,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The shared command parser now understands an unquoted backslash, so the safety
+  hooks read a multi-line command the way the shell runs it.** It previously handled a
+  backslash only inside a double-quoted string; everywhere else the escaped character
+  was treated as if it stood alone. The practical effect for you is that commands
+  written across several lines — the ordinary way a long command gets typed — are now
+  matched against the guards as one command rather than as disconnected pieces, in both
+  directions: a long delete is checked against the path it will actually operate on, and
+  a long test or push command is recognised for what it is. An escaped separator or
+  quote is likewise read as the literal character it is, and a comment ending in a
+  backslash no longer absorbs the line after it. The line-continuation rule follows the
+  shell's own parity rule. Measured across 15,845
+  real commands from this install's history: 2.1% are segmented differently and no guard
+  verdict changes in either direction.
 - **The `deliberate` MCP tool ("Model Fusion") no longer fails on real prompts.** Two
   distinct bugs: (1) analysis mode 404'd because the orchestrator slug
   `openai/gpt-oss-120b:free` was retired from OpenRouter's catalog (`:free` variant gone)

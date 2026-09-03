@@ -281,12 +281,20 @@ def _redirect_target_end(command: str, j0: int, n: int) -> int:
 
 
 def parse_segments(command: str) -> list[_ParsedSegment]:
-    """Split a command line into executed segments, returning per segment BOTH the raw
+    r"""Split a command line into executed segments, returning per segment BOTH the raw
     text and a redirect-STRIPPED argv source (see ``_ParsedSegment``).
 
     Quote-aware: an operator inside a quoted string does not split. Splits on ``&&``,
     ``||``, ``;``, ``|``, ``&`` and newlines. A ``#`` comment (opened outside quotes)
     runs to end-of-line and is retained in ``raw`` so override detection can see it.
+
+    Escape-aware: an UNQUOTED backslash escapes the next character, so the escapee is
+    never dispatched as an operator or a quote opener. A backslash-newline is a line
+    continuation and is REMOVED, joining the two halves into one word exactly as bash
+    joins them. Parity is handled by consuming each escaped pair rather than by
+    counting: only an ODD-length backslash run is a continuation, because in an EVEN
+    run the last backslash is itself escaped and the newline after it really does
+    separate two commands.
 
     Redirect-aware: a redirection (``2>/dev/null``, ``> out.log``, ``2>&1``, ``&>log``,
     ``>| f``, ``< in``, ``<<<here``) is consumed — operator AND target. A PLAIN-filename
@@ -298,8 +306,40 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
     split closes). Process substitution ``<(…)``/``>(…)`` stays in BOTH (documented gap).
     ``raw`` stays byte-identical to the historical ``split_segments`` output for every
     ordinary command (the cwd/occurrence consumers match ``Segment.raw`` against a fresh
-    re-split; locked by a golden test over a broad corpus). ONE intentional difference
-    from the pre-#1455 scanner: a ``$(…)``/backtick target that contains an UNQUOTED
+    re-split; locked by a golden test over a broad corpus). TWO intentional differences.
+
+    The first is the unquoted backslash above. Before it, a genuine line continuation
+    split a word bash joins, so ``rm -rf <protected>/da\``⏎``ta`` reached the
+    protected-paths guard as two segments, neither naming the real target, and was
+    ALLOWED while the shell removed the continuation and ran it on the whole path
+    (measured through the live hook entry: exit 0 against exit 2 for the joined
+    control). Escaped separators and escaped quotes were mis-read the same way, one
+    missing branch generating all three.
+
+    **The direction of that first difference is stated carefully, because an earlier
+    revision of this paragraph claimed it was SAFER everywhere and that was false.**
+    Folding a continuation joins segments, and joining can HIDE a command as easily as
+    it can reveal a path — which is exactly what it did inside a ``#`` comment, where
+    bash ends the comment at the newline and does not continue it: the fold deleted a
+    real separator, the following command vanished from every consumer, and both a
+    protected-path delete and a forged approval sigil went from blocked to allowed.
+    That is why the branch is scoped to ``not in_comment``, and why the comment-start
+    set was then ENUMERATED against bash rather than extended one context at a time —
+    the first scoping covered whitespace only, and a second pass found ``)``.
+
+    What can be claimed is narrower than "safer", and is measured rather than reasoned:
+    across 15,845 real commands 2.13% segment differently and NO guard verdict moves in
+    either direction; every context a ``#`` can follow is checked against bash for
+    whether it executes the following line, and where it does, the parser still sees it.
+    Two residuals stay open and are NOT closure claims. The comment-start predicate is
+    approximate on both edges — it can open a comment bash would not (after an escaped
+    space) and decline one bash would — but only ever by DECLINING to fold, which falls
+    back to the pre-existing split. And the heredoc body is unmodelled by this scanner
+    and its predecessor alike, so a body line ending in a backslash joins where it used
+    to split. Treat any new joining context as a fail-open candidate until it is
+    measured: joining hides a command as readily as it reveals a path.
+
+    The second, from the pre-#1455 scanner: a ``$(…)``/backtick target that contains an UNQUOTED
     control operator (``;`` ``&&`` ``||`` ``|``) is now paren-balanced into ONE segment
     instead of mis-split on that operator — which CLOSES an additional fail-open (HEAD
     mis-split ``git 2>$(a; b) push`` into ``git  $(a`` + ``b) push`` so ``git_subcommand``
@@ -314,6 +354,13 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
     redirs: list[str] = []
     i, n = 0, len(command)
     quote: str | None = None
+    # Whether an unquoted `#` comment is open. Tracked ONLY to scope the
+    # backslash branch below — a comment ends at the newline and bash does NOT
+    # honour a continuation inside one, so folding there would delete a real
+    # command separator and swallow the next line. Nothing else reads this, so
+    # comment handling is otherwise byte-identical to before (a separator inside
+    # a comment still splits, an over-read that costs a guard nothing).
+    in_comment = False
     while i < n:
         c = command[i]
         if quote:
@@ -383,7 +430,57 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
                 argv_buf.append(" ")
             i = j
             continue
+        # An unquoted `#` that starts a word opens a comment running to the newline.
+        # Read off the last emitted character rather than a parallel flag, so the two
+        # cannot drift.
+        #
+        # `(` and `)` are in the set because bash opens a comment after ANY unquoted
+        # metacharacter, and those two are the only metacharacters that survive into
+        # `raw_buf` as themselves — ENUMERATED against bash rather than guessed:
+        # `;` `|` `&` and newline hit the separator branch, which empties the buffer;
+        # `<` `>` are eaten by the redirect branch, which leaves a space; whitespace
+        # is covered directly. So this set is the whole class, not two more instances.
+        #
+        # Approximate in the harmless direction on both edges, deliberately: an
+        # escaped space (`echo a\ #b`) leaves a literal space here and opens a comment
+        # bash does not, and a `#` inside a word does not open one here either. Both
+        # only ever DECLINE to fold — falling back to the pre-existing split — so a
+        # wrong answer costs an over-read a guard already tolerated, never a join.
+        if (
+            c == "#"
+            and not in_comment
+            and (not raw_buf or raw_buf[-1].isspace() or raw_buf[-1] in "()")
+        ):
+            in_comment = True
+        if c == "\\" and i + 1 < n and not in_comment:
+            # An unquoted backslash escapes exactly one character. Handled AFTER the
+            # redirect branch on purpose: an escaped space inside a redirect TARGET
+            # (`git 2>err\ log push`) is consumed by `_redirect_target_end`, and the
+            # golden corpus locks that output — reaching it from here would change it.
+            # `not in_comment` is load-bearing: bash ends a comment at the newline and
+            # does NOT continue it, so folding there would delete a real separator and
+            # make the following command vanish from every consumer's segment list.
+            if command[i + 1] == "\n":
+                # A line continuation. bash REMOVES the pair and joins the halves into
+                # ONE word, so emitting nothing IS the join. Splitting here instead
+                # handed the protected-paths guard half a path and it allowed the
+                # command the shell then ran on the whole one.
+                i += 2
+                continue
+            # Any other escapee is a literal: consume the PAIR so it can never be
+            # dispatched as an operator or a quote opener. Consuming the pair is also
+            # what makes the odd/even parity fall out with no counting — `\\` is eaten
+            # here, so a newline after an EVEN run is seen fresh by the branch below
+            # and still separates, which is what bash does.
+            raw_buf.append(c)
+            raw_buf.append(command[i + 1])
+            argv_buf.append(c)
+            argv_buf.append(command[i + 1])
+            i += 2
+            continue
         if c in (";", "|", "&", "\n"):
+            if c == "\n":
+                in_comment = False  # a comment ends at the newline, never past it
             pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
             raw_buf, argv_buf, redirs = [], [], []
             i += 1
@@ -417,14 +514,19 @@ def has_top_level_pipe(command: str, *, count_substitutions: bool = False) -> bo
     so its ``|`` still counts. Used by the run_in_background guard: a piped background
     command's stdout is swallowed, so ONLY a genuine streamed pipe should block it.
 
-    Residual (accepted for a CONVENIENCE guard — friction, not a sandbox): the quote
-    model still mirrors ``split_segments``, so a quote that is backslash-escaped OUTSIDE
+    Residual (accepted for a CONVENIENCE guard — friction, not a sandbox): this scanner
+    has NO unquoted-backslash branch, so a quote that is backslash-escaped OUTSIDE
     quotes (``printf %s \\"foo | cat``), a stray quote char in a ``#`` comment or a
     ``<<EOF`` heredoc body, or a ``|`` in a ``case`` pattern can MISread — OVER-reading
     (``case`` ``|`` looks like a pipe) or UNDER-reading (a swallowed quote hides a later
     pipe). Never a security bypass either way (an over-read is a reworked command, an
     under-read re-exposes the empty-output footgun this guard usually prevents); closing
-    these fully is the unbounded quote-parsing tail shared with ``split_segments``.
+    these fully is the unbounded quote-parsing tail. It no longer MIRRORS
+    ``split_segments`` — that scanner learned the escape and this one deliberately did
+    not, since both consumers here are convenience guards where the accepted-residual
+    argument above already holds. Deliberately left divergent rather than changed for
+    symmetry: a second scanner edit would need its own measurement to earn the same
+    argument, and this one has nothing to gain from it.
 
     ``count_substitutions`` inverts the ``$( … )`` rule, and exists because the two
     consumers need OPPOSITE answers about the same syntax. The background-output guard
