@@ -24,6 +24,45 @@ Genesis itself, or using Genesis for something else?"
 Internalize these immediately when this skill fires — they shape how to
 work from the start, not just what to check before commit.
 
+### Where your session ENDS — build sessions and closing sessions
+
+**A session that writes code and a session that drives a PR to merge are
+different SESSION TYPES, not two phases of one session's life** (user decision,
+2026-09-02). Loading this skill makes you a **build session**.
+
+- **A build session owns an item from Ready through opening its PR.** It runs
+  the local adversarial pass (`/deep-review`) because that clears the commit
+  gate — and then it is DONE with that item. It does not wait for Codex, and it
+  carries no review loop.
+- **A closing session owns the open-PR queue**, whichever session built each
+  PR. Its unit of work is the queue, not the card. That is the
+  **`closing-session`** skill; load it instead when the job is "get the open PRs
+  merged".
+
+The handoff between them is **the PR itself** — a durable artifact that survives
+compaction and session death, so nothing has to be remembered across the
+boundary. It also satisfies the `reviewer ≠ implementer, fresh context` contract
+structurally rather than by discipline.
+
+Why it matters here: fused, the first item's review loop consumes the whole
+session — several compactions deep — while everything else the owner arrived
+with goes untouched. **Finishing the PR is finishing the work.** Handing it to
+the queue is not abandoning it.
+
+Two consequences worth internalizing:
+
+- **Throughput is a RATE, not a per-session virtue.** Closed/wk must exceed
+  opened/wk or the queue grows without bound (Little's Law). Build sessions do
+  NOT throttle themselves to protect it — that just relocates the queue upstream
+  onto the human deciding what not to start. Closing capacity is the control
+  variable. (`scripts/pr_flow_rate.py` measures the two rates; it lands with
+  PR #1613, so check that it exists before reaching for it.)
+- **Compaction policy follows the same seam.** Reset context at
+  plan→implement. Implement→review is a session-TYPE boundary, not a compaction
+  decision — you hand off, you do not compact and continue. And never reset
+  mid-"fix the findings": that work needs the implementation context you would
+  be throwing away.
+
 ### Wiring Discipline
 
 Every new component needs at least one call site in the actual runtime
@@ -36,6 +75,21 @@ path. Apply this 4-level verification taxonomy:
    critical paths.
 
 Mark nothing "done" below Level 3.
+
+**A new SKILL has its own version of this, and it is easy to miss.** Dropping a
+`SKILL.md` into `.claude/skills/` gets it INDEXED automatically (the catalog
+generator scans the directory — no registry to update), which looks like done.
+It is Level 1. The nudge that actually surfaces it scores **only** whole-word
+skill-NAME tokens and explicit frontmatter `keywords:` — description prose is
+deliberately not scored — so a skill whose name is a concept nobody types is
+indexed and silent. MEASURED 2026-09-02: `closing-session` scored **0.0** on
+every one of its own trigger phrases ("work the open PR queue", "review and fix
+the open PRs") until `keywords:` was declared; with them, 4/4 trigger phrases
+fire and 3/3 unrelated prompts stay silent. Note the extractor drops tokens
+shorter than 3 characters and does no stemming, so `pr` can never match and
+`merge` will not match "merging" — declare the surface forms. Verify a new
+skill by scoring it against the phrasings a user would really type, in BOTH
+directions.
 
 ### GROUNDWORK Code Is NOT Dead Code
 
@@ -267,6 +321,24 @@ these are the GATES that make it enforceable:
   revealing a new problem in a different place is not bad luck — it is the
   signature of a wrong architecture or a wrong problem statement. Do not
   attempt fix #4; bring the pattern to the user.
+- **Date the code before classifying a red — a stale tree fabricates live
+  blockers.** MEASURED 2026-09-02: the main worktree sat at ONE commit from
+  09-01 13:40 to 09-02 19:06. A test run against it at ~18:05 failed
+  reproducibly and was reported as a live repo-wide blocker; it had been fixed
+  at 15:47 that day by a merged PR. The failure was real, reproducible, and
+  describing state that no longer existed. Nothing warns you — `git log --all`
+  and `git status` both work perfectly on a stale tree, and `git log --all`
+  even SHOWS the fix, because the fetch is fine and only the checkout is old.
+  Before calling any red live: `git log -1 --format=%ad -- <file>`, or check
+  the reflog for when the tree last moved.
+  **The same trap applies to your TOOLS, which is easier to miss**: a worktree
+  carries its own copy of `scripts/`, so a script run from an old branch is the
+  OLD script. MEASURED the same day — `git_push_guard.py --check-pr 1611` from
+  a days-old worktree reported `ci: pending` where the current copy reported
+  `ci: green`, same PR, same minute. Run repo tooling from a tree at
+  `origin/main`, not from whatever branch you happen to be on.
+  *"Verify against actual code" needs the companion "verify against actual
+  CURRENT code."*
 - **Boundary instrumentation for multi-component failures.** When the path
   crosses components (hook → server → engine; CI → build → deploy), don't
   reason about where it breaks — LOG entry/exit at each boundary, run ONCE,
@@ -1580,6 +1652,12 @@ same-day PR that lands the same change at source — a host divergence that
 outlives its incident is a bug.
 
 ## Pre-Merge Gate
+
+> **This is closing-session territory.** A build session's work ends when the PR
+> is open (see "Where your session ENDS" above); driving it through this gate is
+> the **`closing-session`** skill's job. The mechanics below stay here because
+> they are the authority — that skill composes them rather than restating them.
+> Read on when you are the one at the gate.
 
 **Canonical pre-merge check:** run
 `python3 scripts/hooks/git_push_guard.py --check-pr <N> [--repo OWNER/REPO]`
