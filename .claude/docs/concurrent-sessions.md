@@ -36,6 +36,16 @@ Worktrees stop sessions from corrupting each other's commits. They do nothing
 about the other half of the problem: two sessions editing the same region, or
 each acting on a claim the other got wrong. That is what this section is for.
 
+**You are told when a peer's deploy lands under you.** When the main tree moves
+while your session is running, the next prompt carries a one-line
+`[⚠ Deploy: main moved N commits …]` naming the merged PRs — once per deploy, not
+on a timer (`_emit_deploy_nudge`, `scripts/genesis_urgent_alerts.py`). Read it as
+a coordination signal as much as a restart prompt: a peer just landed something,
+and if a named PR touches the region you are editing, rebase or re-read before
+you keep going. Your CC hooks and policy are ALREADY running the new code (they
+re-exec per invocation from the main tree); your MCP subprocesses and
+genesis-server are not, and stay on the old build until the session restarts.
+
 > **Scope: sessions that HAVE `SendMessage`.** Reflection, inbox, mail-judge and
 > sentinel-degraded sessions deny it by design — read the denylists themselves
 > (`cc/session_config.py`, `sentinel/dispatcher.py`, `mail/monitor.py`) rather than a

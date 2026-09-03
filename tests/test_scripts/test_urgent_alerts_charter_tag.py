@@ -132,3 +132,45 @@ def test_tag_omitted_locked_db(monkeypatch, capsys, tmp_path):
     finally:
         blocker.execute("ROLLBACK")
         blocker.close()
+# ── _ro_uri (shared read-only-URI builder) ─────────────────────────────────
+#
+# Restored here because the deploy-nudge rewrite deleted the module that used to
+# own these. `_ro_uri` is STILL live and `_emit_charter_tag` — this module's
+# subject — is now its ONLY caller. The sibling suite records that reverting
+# `_ro_uri` to the naive form previously left the whole suite green, i.e. nothing
+# else covers it, so deleting these with the old module would have silently
+# dropped the only coverage of a live helper.
+
+
+def test_ro_uri_encodes_special_chars_and_is_idempotent(tmp_path):
+    weird = tmp_path / "a b&c?d#e" / "genesis.db"
+    weird.parent.mkdir(parents=True)
+    weird.touch()
+    uri = _ua._ro_uri(weird)
+    assert uri.startswith("file:") and uri.endswith("?mode=ro")
+    # mode=ro, never immutable=1: immutable ignores the -wal, so a just-committed
+    # write reads back as absent.
+    assert "immutable" not in uri
+    body = uri[len("file:") : -len("?mode=ro")]
+    for ch in (" ", "&", "?", "#"):
+        assert ch not in body, f"{ch!r} left unencoded in {body!r}"
+    # idempotent: building it twice yields the same string
+    assert _ua._ro_uri(weird) == uri
+
+
+def test_ro_uri_reads_a_db_under_a_special_char_path(tmp_path):
+    """The encoding has to actually WORK, not merely look encoded."""
+    db_path = tmp_path / "x y&z" / "genesis.db"
+    db_path.parent.mkdir(parents=True)
+    seed = sqlite3.connect(db_path)
+    try:
+        seed.execute("CREATE TABLE t (v TEXT)")
+        seed.execute("INSERT INTO t VALUES ('ok')")
+        seed.commit()
+    finally:
+        seed.close()
+    ro = sqlite3.connect(_ua._ro_uri(db_path), uri=True)
+    try:
+        assert ro.execute("SELECT v FROM t").fetchone()[0] == "ok"
+    finally:
+        ro.close()
