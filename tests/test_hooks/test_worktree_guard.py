@@ -349,3 +349,56 @@ class TestFailOpen:
             timeout=10,
         )
         assert result.returncode == 0
+
+
+# --- mention vs execution (2026-09-03) -------------------------------------
+#
+# The predicate was `\bgit\s+worktree\s+remove\b` over the raw command, and the
+# target was then read by splitting the text that FOLLOWED the match. That is
+# quote-blind: the phrase inside a grep pattern, a heredoc body or a commit
+# message matched, and the next word became the "target", so a read-only search
+# was refused with "use the lifecycle manager". It also MISSED real removals,
+# because the regex required `git` immediately followed by `worktree` —
+# `git -C <path> worktree remove <target>` slipped straight through.
+#
+# MEASURED over 48,363 real commands from this install's transcripts: the swap
+# frees 4 mention-only blocks AND closes 6 genuine removals that were previously
+# allowed. The blocked count ROSE, 150 -> 152, which is the correct outcome — it
+# is a different and strictly better set, not a smaller one.
+#
+# Built from fragments so this file's own text cannot trip the guard it tests.
+_SUB = "worktree"
+_OP = "remove"
+_PHRASE = f"git {_SUB} {_OP}"
+
+
+class TestMentionIsNotExecution:
+    """Both directions. An allow-only suite passes just as well against a guard
+    that has stopped working, so every mention case is paired with a removal that
+    must still block."""
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            f"grep -rn '{_PHRASE}' scripts/",
+            f'echo "{_PHRASE} is blocked here"',
+            f"git commit -m 'docs: explain why {_PHRASE} is gated'",
+            f"cat > /tmp/wt_note.md <<'EOF'\nNever run {_PHRASE} by hand.\nEOF",
+        ],
+    )
+    def test_mention_only_is_allowed(self, guard_cmd: str, inner: str) -> None:
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 0, result.stderr
+
+    def test_real_removal_still_blocks(self, guard_cmd: str) -> None:
+        """TRUE-POSITIVE CONTROL."""
+        result = _run_guard(guard_cmd, {"command": f"{_PHRASE} /tmp/some-worktree"})
+        assert result.returncode == 2, result.stdout + result.stderr
+
+    def test_removal_behind_a_global_flag_now_blocks(self, guard_cmd: str) -> None:
+        """REGRESSION PIN for a fail-OPEN hole the old regex had: it required
+        `git` immediately followed by the subcommand, so a global flag in between
+        hid a real removal. Six such commands were found in the corpus."""
+        inner = f"git -C /home/ubuntu/genesis {_SUB} {_OP} /tmp/some-worktree"
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
