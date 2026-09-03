@@ -1523,6 +1523,34 @@ verified: b8232425 2026-09-02
   hand-curated: L2 sheds nice-to-haves; **L3 keeps ONLY micro-reflection,
   embeddings, tagging** — changing those sets changes what survives an outage.
   Some call sites alias another site's chain — don't assume 1:1.
+- **routing/escalation.py**: breaker trips → a high-priority `provider_failure`
+  observation at 5 trips (~10 min), carrying `first_trip_at` — the only
+  per-provider "failing since" timestamp. Once the outage passes
+  `_NOTIFY_AFTER_S` (1h) it ALSO writes a `priority="critical"` observation on a
+  separate `provider_dead_notify:<name>` content hash, which the existing
+  fire-once path (`outreach/scheduler.py::_critical_observations_job` +
+  `mark_surfaced`) turns into exactly ONE Telegram. The age is read off the
+  unresolved observation, not in-memory state, so it survives a restart; the
+  EARLIEST unresolved row wins, because a duplicate would otherwise reset the
+  outage clock. **The hour check is CLOCK-driven, not trip-driven**: the
+  awareness tick (5 min) calls `sweep_due_notifications`, which reads the
+  durable rows and holds no in-memory state — the trip-driven version starved
+  when traffic stopped and its per-process flags produced four review defects.
+  Lever: `provider_outage_notify` domain (off/propose_only/live) +
+  `GENESIS_PROVIDER_NOTIFY_DISABLED`; off resolves open notify rows (so off→on
+  re-notifies a still-dead provider, deliberately). Recovery resolves BOTH
+  hashes — **notify hash FIRST**: the two
+  are separately committed (this connection has no transactions), so a failure
+  between them must leave the VISIBLE row open (a provider shown as failing when
+  it is not, which the next recovery clears) rather than the SILENT one (an open
+  notify row makes `skip_if_duplicate` suppress this provider's notifications
+  until some later recovery happens to succeed). Do not raise the 10-minute
+  observation to critical instead — it would page on every transient blip.
+  ONE KNOWN GAP remains documented in-code, not fixed: the row is stamped at
+  the 5th trip rather than the first (duration short by the ramp) — its fix
+  needs the `first_trip_at` anchor bounded first; see the follow-up. The
+  restart-gate gap that used to sit beside it is GONE by construction: the
+  sweep consults no in-memory flag, so a restart changes nothing.
 - **providers/**: the `ToolProvider` registry for NON-LLM tools (search,
   embeddings, STT/TTS, crawl, probes). Adapters register GATED ON ENV KEYS —
   silent non-registration is by design (absence ≠ bug). LLM breaker/health

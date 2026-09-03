@@ -2926,6 +2926,32 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   noise with the new `scripts/backfill_source_subsystem.py`, then
   `scripts/cleanup_subsystem_qdrant.py` — both dry-run by default; add `--apply` to commit.
 
+### Added
+
+- **You now get one Telegram when a model provider has been dead for an hour.**
+  Genesis already detected a provider failing every call and already showed it on
+  the dashboard — but nothing ever told you. The record it wrote was
+  high-priority, and only *critical* ones reach Telegram; the matching call-site
+  alert is a warning, which the outreach path filters out. So a provider could be
+  down for days while the only trace was a dashboard panel nobody was looking at.
+
+  One message, then quiet: it names the provider and how long it has been failing,
+  and does not repeat. The hour is deliberate — the underlying record is written
+  after about ten minutes, which is right for a dashboard row and far too eager
+  for a notification, since most breaker trips resolve themselves. If the provider
+  genuinely recovers and later dies again, you are told again.
+
+  Nothing new was added to receive it: this reuses the existing critical-record
+  path, so there is no new alert type and no new table. The duration is read
+  from the stored outage record rather than from memory, so it survives a
+  restart mid-outage without re-notifying — and the hourly check is driven by
+  Genesis's own 5-minute awareness tick rather than by provider traffic, so a
+  provider that goes quiet after failing still gets reported. One new lever:
+  the `provider_outage_notify` setting (`off` / `propose_only` / `live`,
+  default `live`; env `GENESIS_PROVIDER_NOTIFY_DISABLED=1` forces off) —
+  `propose_only` skips the immediate page (the record still shows on the dashboard, to the ego, and in the next morning report), and
+  turning it off resolves any open notification so re-enabling tells you about
+  a still-dead provider again.
 ### Fixed
 
 - **A dead provider kept reporting itself recovered, so a multi-day outage was
