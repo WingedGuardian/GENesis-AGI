@@ -59,6 +59,74 @@ def _default_added_by() -> str:
     return "ambient" if os.environ.get("GENESIS_CC_SESSION") == "1" else "foreground"
 
 
+def _self_write_unreadable_error(sid: str) -> dict | None:
+    """Refuse a charter/ledger write a DISPATCHED session makes to ITS OWN charter.
+
+    The charter system is foreground-only: the reader
+    (``scripts/genesis_session_context.py`` — the emission block sits in the
+    ``not is_genesis_session`` branch) and the maintainer
+    (``scripts/genesis_precompact.py``, which returns early on the same
+    discriminator so ``origin_prompt`` is never filled) both skip dispatched
+    sessions. A dispatched session writing to its OWN charter therefore
+    produces a row that is inert BY CONSTRUCTION — stored, never re-injected.
+
+    Measured 2026-09-02: a Telegram DM session (``claude -p`` via CCInvoker)
+    wrote a ledger row and told the user it would "survive to Friday". It could
+    not — the emission block returned 0 chars for that session on startup,
+    resume AND compact.
+
+    Deliberately NARROW. A dispatched session writing to a FOREGROUND session's
+    charter is legitimate and readable — that is what ``added_by='ambient'``
+    exists for — so only the self-write is refused.
+
+    Residual known gap: a dispatched session writing to a DIFFERENT dispatched
+    session's charter is equally inert and is NOT caught here. The obvious
+    alternative — classify the TARGET via ``cc_sessions`` — would be WRONG, not
+    merely expensive: the incident session's own row records
+    ``session_type='foreground', source_tag='foreground', channel='telegram'``,
+    so a DB-based gate would have waved the actual defect through, and another
+    ambient charter has no ``cc_sessions`` row at all. There is no DB signal for
+    "will this session's charter ever be read"; the writer's own env is the only
+    sound one.
+
+    Fails OPEN when the session id is unavailable OR STALE. The MCP child's env
+    is a SNAPSHOT taken when CC spawned it: CC sets ``CLAUDE_CODE_SESSION_ID``
+    at stdio-MCP spawn and, on a conversation reset, updates only its OWN
+    ``process.env`` — the child keeps the pre-reset id (MEASURED 2026-09-02: the
+    health MCP held ``837dfb4b…`` while the live session was ``d3d02163…``).
+    Unreachable for this gate, because staleness needs a reset and a
+    ``GENESIS_CC_SESSION=1`` session is a single-shot ``claude -p`` that never
+    resets — but a future dispatched shape that DID reset would silently disarm
+    this. A truthfulness gate, not a security boundary.
+
+    Two things this deliberately does NOT do. ``_impl_session_ledger_update`` is
+    ungated: it can only edit an existing row, never mint a new promise. And a
+    refused session could route around this by passing a fabricated 32-char id
+    (``upsert_stub`` is a bare INSERT OR IGNORE), producing an orphan charter —
+    pre-existing and equally reachable from a foreground session, but newly
+    incentivised by this refusal, so it is named here rather than discovered.
+    """
+    if os.environ.get("GENESIS_CC_SESSION") != "1":
+        return None
+    own = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    if not own or own != sid:
+        return None
+    return {
+        "error": "Refusing the write: this is a dispatched/channel session "
+        "writing to its OWN charter, and the charter/ledger is foreground-only. "
+        "The row would be stored but NEVER re-injected into any future window, "
+        "so recording it here would promise a persistence that does not exist. "
+        "Durable alternatives, IF this session's profile allows them: "
+        "`memory_store` for a fact/decision/plan — denied on every "
+        "direct-session profile (cc/direct_session.py _UNIVERSAL_DISALLOW), "
+        "reachable from a conversation channel; or `follow_up_create` for "
+        "actionable work — a dispatched session's item is routed to the COLD "
+        "`tabled` lane, tracked but never auto-dispatched. If both are denied, "
+        "put it in your final output: that transcript IS this session's "
+        "deliverable."
+    }
+
+
 def _unresolved_short_id_error(sid: str) -> dict | None:
     """Refuse WRITES under a truncated id that did not resolve.
 
@@ -99,6 +167,13 @@ async def _impl_session_charter(session_id: str) -> dict:
                 "error": f"No charter for session '{session_id}'. A charter row "
                 "appears at the session's first compaction, or on the first "
                 "session_charter_update / session_ledger_add call."
+                + (
+                    " NOTE: for a dispatched/channel session neither route"
+                    " fires — compaction skips it and both writes are refused"
+                    " — so no charter will ever appear. task_states is the"
+                    " continuity spine for that session class."
+                    if os.environ.get("GENESIS_CC_SESSION") == "1" else ""
+                )
             }
         ledger = await crud.ledger_list(db, sid)
         counts = await crud.ledger_counts(db, sid)
@@ -147,6 +222,8 @@ async def _impl_session_charter_update(
 
         sid = await crud.resolve_session_id(db, session_id)
         if err := _unresolved_short_id_error(sid):
+            return err
+        if err := _self_write_unreadable_error(sid):
             return err
         # A stub row lets mission/pointers precede the first compaction; the
         # PreCompact hook fills origin later (WHERE origin_prompt IS NULL).
@@ -197,6 +274,8 @@ async def _impl_session_ledger_add(
         sid = await crud.resolve_session_id(db, session_id)
         if err := _unresolved_short_id_error(sid):
             return err
+        if err := _self_write_unreadable_error(sid):
+            return err
         await crud.upsert_stub(db, sid)
         item_id = await crud.ledger_add(
             db,
@@ -208,13 +287,43 @@ async def _impl_session_ledger_add(
         await _refresh_mirror(db, sid)
         counts = await crud.ledger_counts(db, sid)
         open_n = counts.get("open", 0) + counts.get("in_progress", 0)
+        # The message must mirror the GATE's predicate exactly. The gate needs
+        # BOTH dispatched AND own-id-known-and-equal; a message keyed on only
+        # the first is FALSE on the fail-open path, where a dispatched
+        # SELF-write gets through and would be told the row lands on "THAT
+        # session" — which is this one. Three states, not two.
+        _own = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+        _dispatched = os.environ.get("GENESIS_CC_SESSION") == "1"
+        if _dispatched and _own:
+            # Own id known and != sid (equal was refused by the gate above), so
+            # this is the supported cross-session write. Name the beneficiary:
+            # the row re-injects into the TARGET's windows, never this session's.
+            message = (
+                f"Ledger item recorded on session {sid[:8]}'s charter — it will "
+                "re-inject into THAT session's post-compaction windows, NOT "
+                "this one (dispatched sessions get no charter injection). "
+                "Close via session_ledger_update."
+            )
+        elif _dispatched:
+            # Fail-open: own id unknown, so sid may be THIS session. Claim
+            # nothing about persistence rather than claim it confidently wrong.
+            message = (
+                f"Ledger item recorded on session {sid[:8]}'s charter. This "
+                "session's own id is unknown, so whether that charter is ever "
+                "re-injected could NOT be verified — do not tell the user it "
+                "persists. Close via session_ledger_update."
+            )
+        else:
+            message = (
+                "Ledger item recorded — it will re-inject into every "
+                "post-compaction window until closed via session_ledger_update."
+            )
         return {
             "id": item_id,
             "session_id": sid,
             "status": "open",
             "open_items": open_n,
-            "message": "Ledger item recorded — it will re-inject into every "
-            "post-compaction window until closed via session_ledger_update.",
+            "message": message,
         }
     except ValueError as exc:
         return {"error": str(exc)}
@@ -274,6 +383,8 @@ async def session_charter(session_id: str) -> dict:
     what the session is FOR. Use it to reconnect with the origin after heavy
     compaction, or to fetch ledger item ids before session_ledger_update.
 
+    FOREGROUND SESSIONS ONLY: a dispatched/channel session's own charter is never re-injected (the SessionStart reader, the PreCompact maintainer and the per-turn drift tag all skip GENESIS_CC_SESSION=1), so a self-write is refused; writing to a FOREGROUND session's charter is supported.
+
     Args:
         session_id: CC session id (shown in the per-turn [Clock | Session: x]
             tag). A truncated prefix resolves when unambiguous.
@@ -294,6 +405,8 @@ async def session_charter_update(
     an approved plan) so post-compaction windows inherit it. Pointers are
     paths/refs to the session's governing artifacts (spec docs, plan files).
     The immutable origin cannot be changed by this tool.
+
+    FOREGROUND SESSIONS ONLY: a dispatched/channel session's own charter is never re-injected (the SessionStart reader, the PreCompact maintainer and the per-turn drift tag all skip GENESIS_CC_SESSION=1), so a self-write is refused; writing to a FOREGROUND session's charter is supported.
 
     Args:
         session_id: CC session id (per-turn [Clock | Session: x] tag; unique
@@ -323,6 +436,8 @@ async def session_ledger_add(
     plan item, or work is promised — the row re-injects into every
     post-compaction window until closed, so no summary can erase it. This is
     the first line of defense; ambient extraction is only the safety net.
+
+    FOREGROUND SESSIONS ONLY: a dispatched/channel session's own charter is never re-injected (the SessionStart reader, the PreCompact maintainer and the per-turn drift tag all skip GENESIS_CC_SESSION=1), so a self-write is refused; writing to a FOREGROUND session's charter is supported.
 
     Args:
         session_id: CC session id (per-turn [Clock | Session: x] tag; unique
