@@ -232,7 +232,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 975d3944 2026-08-31
+verified: 29a382e7 2026-09-03
 ```
 
 - **Roster peer availability is OBSERVATION, never a gate** (`cc/peer_availability.py`,
@@ -246,7 +246,15 @@ verified: 975d3944 2026-08-31
   (offline, our timeout, an MCP crash, a stale session) is a `CCError` on the same
   branch but never reaches the provider, and `note_failure` declines it; and records
   refresh ONLY while the home model is down, so they are last-observed facts carrying
-  `observed_at`/`age_seconds`, never current state.
+  `observed_at`/`age_seconds`, never current state. A third, learned the hard way: a
+  self-report is an EXPOSURE surface, so provider prose is scrubbed at the single
+  read/write chokepoint and never merely on the way in — the state file is read into
+  every health snapshot, reaches an LLM context via the health MCP tool, and is
+  JSON-dumped whole into `sentinel/monitor.py`'s monitoring prompt with no
+  sanitisation on that path. A write-only scrub therefore republished (and
+  re-persisted) any credential already on disk. Bounding is per-FIELD and never
+  truncates: a cut identifier merged two peers onto one key, so one peer's success
+  cleared another's recorded failure.
 - **Cross-session awareness — how concurrent CC sessions perceive each other.**
   LIVE. Two DISTINCT stores answer two different questions, and conflating them
   is the trap: `cc_sessions` (+ a `/proc` walk, `observability/cc_slots.
