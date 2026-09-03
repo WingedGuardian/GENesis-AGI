@@ -237,6 +237,17 @@ def test_load_full_yaml(monkeypatch):
     assert ml.is_free is True
     assert ml.model_id == "mistral-large-latest"
 
+    # Daily budgets (2026-09): groq ships both caps, each in Groq's OWN unit
+    # (tpd measured from Groq's 429 text, rpd from its documented free tier);
+    # gemini deliberately ships NEITHER (its per-day cap is inferred, not
+    # proven). Pinning both directions keeps a wrong shipped cap loud.
+    gq = cfg.providers["groq-free"]
+    assert gq.rpd_limit == 1000
+    assert gq.tpd_limit == 200000
+    gm = cfg.providers["gemini-free"]
+    assert gm.rpd_limit is None
+    assert gm.tpd_limit is None
+
     # groq-free provider — MIGRATED 2026-08-06: Groq deprecated
     # llama-3.3-70b-versatile (shutdown 2026-08-16) → openai/gpt-oss-120b, its
     # recommended free-tier replacement. The alias name is kept deliberately so

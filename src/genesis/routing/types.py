@@ -77,6 +77,15 @@ class ProviderConfig:
     # mirroring the behaviour for a tripped breaker. Snapshot surfaces
     # this so partially-configured installs see the state on the dashboard.
     has_api_key: bool = True
+    # Provider-side DAILY caps, each in the provider's OWN unit — requests
+    # per UTC day and tokens per UTC day. Never converted between units
+    # (Groq caps tokens, Gemini caps requests). None = no daily budget.
+    # Enforced by DailyBudgetLedger via chain-walk DESELECTION, never a
+    # breaker trip. NOTE: a daily budget is per API key/account — keep one
+    # provider entry per account for daily-limited providers, or one real
+    # budget splits across counters and neither trips.
+    rpd_limit: int | None = None
+    tpd_limit: int | None = None
 
 
 @dataclass(frozen=True)
