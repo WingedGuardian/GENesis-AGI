@@ -1,7 +1,10 @@
 name: Contributor review trigger
 
 # Ask the automated reviewer to look at an OUTSIDE contributor's PR — but only
-# when that PR is answering an issue we actually put on the board.
+# when that PR answers an issue we put on the board, and only once per such
+# issue. Labelling an issue is a maintainer action that authorises exactly ONE
+# automatic review; the closing link is author-controlled, so on its own it
+# would let a single invited issue authorise unlimited reviews.
 #
 # WHY THIS EXISTS. The reviewer runs automatically for the maintainer's own PRs
 # and does not for forks, which is the right default: an outside PR should not be
@@ -20,8 +23,11 @@ name: Contributor review trigger
 # obtains the head code. There is no `actions/checkout`, no build, no install, no
 # test, and no `run:` step that consumes PR-authored content. It reads metadata
 # through the API and posts one comment. Nothing an author writes is executed,
-# and the only PR-authored value it reads (labels on a LINKED ISSUE) is compared
-# against a fixed allow-list rather than interpolated anywhere.
+# and the one author-influenced input — WHICH issue is linked — decides nothing
+# on its own: the issue must be in this repository, must carry a label only a
+# maintainer can set, and must not already have spent its single automatic
+# review. No author-supplied string is interpolated into a shell, a template,
+# or a query.
 #
 # Keep it that way. If this workflow ever needs to inspect the diff, that work
 # belongs in a separate `pull_request` job with the default read-only token.
@@ -60,56 +66,222 @@ jobs:
             // Labels that mark an issue as one we invited work on. An issue
             // carrying none of these is not part of the contributor pipeline,
             // and its PR waits for a human like any other outside change.
-            const INVITED = ['good first issue', 'first-timers-only', 'help wanted'];
+            const INVITED = ['good first issue', 'first-timers-only'];
+
+            // How many linked PRs we will examine before giving up. Hitting this
+            // means we cannot prove the issue's budget is unspent, so we decline.
+            const MAX_LINKED_PRS = 30;
+
+            // Same idea in the other direction: an author controls how many
+            // "Closes #N" links their body carries, and each one costs an API
+            // call (plus a whole budget walk if it turns out to be invited).
+            // Past this we decline rather than fan out on request.
+            const MAX_LINKED_ISSUES = 20;
 
             const pr = context.payload.pull_request;
 
-            // A FORMAL closing link, not a mention. `closingIssuesReferences` is
-            // populated only by "Closes #N"-style keywords, so this cannot be
-            // satisfied by a PR body that merely names an issue number — which
-            // matters, because the PR body is attacker-controlled text and the
-            // whole point is that the ISSUE (ours) decides, not the PR (theirs).
+            // ── WHY A CLOSING LINK IS NOT ENOUGH ─────────────────────────────
+            // The labels are ours, but the LINK is theirs: any fork author can
+            // write "Closes #1480" against an already-invited issue, and nothing
+            // stops arbitrarily many PRs pointing at that same issue. Labels
+            // alone therefore authorise an UNBOUNDED number of reviews from one
+            // maintainer action, and reviews are the finite resource this
+            // workflow spends — it was exhausted twice while this was written.
+            //
+            // The per-PR duplicate guard is not the answer: it dedupes within
+            // one PR, not across many.
+            //
+            // So an invited issue carries a budget of ONE automatic review. We
+            // fire only if no PR closing that issue has been sent to the
+            // reviewer yet. N invited issues can cost at most N reviews, which
+            // is the maintainer-controlled bound; the maintainer sets N by
+            // labelling.
+            //
+            // What this deliberately does NOT do: stop someone spending a
+            // genuine contributor's slot first. If that happens the contributor
+            // waits for a human to type "@codex review", which is exactly the
+            // behaviour before this workflow existed — so the failure mode is
+            // the old status quo, not a new harm. Requiring issue ASSIGNMENT
+            // instead would close that too, but it was measured against the
+            // real case (#1529 closing #1480) and would have blocked it: that
+            // issue carried both invited labels and no assignee.
             const q = `
-              query($owner:String!, $repo:String!, $number:Int!) {
+              query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
                 repository(owner:$owner, name:$repo) {
                   pullRequest(number:$number) {
-                    closingIssuesReferences(first: 10) {
-                      nodes { number labels(first: 20) { nodes { name } } }
+                    closingIssuesReferences(first: 50, after: $cursor) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { number repository { nameWithOwner } }
                     }
                   }
                 }
               }`;
-            const data = await github.graphql(q, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              number: pr.number,
-            });
 
-            const issues = data.repository.pullRequest.closingIssuesReferences.nodes || [];
-            const matched = issues.find(i =>
-              (i.labels.nodes || []).some(l => INVITED.includes(l.name.toLowerCase()))
-            );
-
-            if (!matched) {
+            // Paginate: treating the first page as exhaustive silently drops
+            // eligible contributors once a PR links past the page size.
+            const linked = [];
+            let cursor = null;
+            let overLinked = false;
+            for (;;) {
+              const data = await github.graphql(q, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                number: pr.number,
+                cursor,
+              });
+              const conn = data.repository.pullRequest.closingIssuesReferences;
+              linked.push(...(conn.nodes || []));
+              if (linked.length > MAX_LINKED_ISSUES) { overLinked = true; break; }
+              if (!conn.pageInfo.hasNextPage) break;
+              cursor = conn.pageInfo.endCursor;
+            }
+            if (overLinked) {
               core.info(
-                `PR #${pr.number} closes no issue carrying ${JSON.stringify(INVITED)} — ` +
-                `no review requested. Linked issues: ` +
-                (issues.map(i => `#${i.number}`).join(', ') || 'none')
+                `PR #${pr.number} closes more than ${MAX_LINKED_ISSUES} issues — ` +
+                `declining rather than fanning out on request.`
               );
               return;
             }
 
-            // Do not stack requests. The concurrency group serialises runs but
-            // does not dedupe across event types, and a human may have already
-            // asked — in which case a second request only burns quota.
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: pr.number,
-              per_page: 100,
-            });
-            if (comments.some(c => c.body && c.body.includes('@codex review'))) {
-              core.info(`PR #${pr.number} already has a review request — not repeating it.`);
+            // Only issues in THIS repository decide. A reference into a repo the
+            // author controls would let them supply their own labels.
+            const ours = linked.filter(i =>
+              i.repository && i.repository.nameWithOwner === `${context.repo.owner}/${context.repo.repo}`
+            );
+
+            // REST returns every label inline, so there is no nested label
+            // connection left to truncate.
+            const invitedIssues = [];
+            for (const ref of ours) {
+              const { data: issue } = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: ref.number,
+              });
+              const invited = (issue.labels || []).some(l =>
+                INVITED.includes(((typeof l === 'string' ? l : l.name) || '').toLowerCase())
+              );
+              if (invited) invitedIssues.push(ref.number);
+            }
+
+            if (!invitedIssues.length) {
+              core.info(
+                `PR #${pr.number} closes no issue carrying ${JSON.stringify(INVITED)} — ` +
+                `no review requested. Linked issues in this repo: ` +
+                (ours.map(i => `#${i.number}`).join(', ') || 'none')
+              );
+              return;
+            }
+
+            // ── HAS THIS ISSUE'S ONE REVIEW ALREADY BEEN SPENT? ──────────────
+            // Walk every PR that closes the invited issue — this one included,
+            // which also subsumes the draft-then-ready double fire — and look
+            // for a review request. Absence must be PROVEN: a truncated page or
+            // an over-large fan-out means we do not know, and not knowing
+            // resolves to declining. Failing closed costs a human one comment;
+            // failing open costs the quota this whole guard exists to protect.
+            //
+            // ── AND WHO GETS IT, WHEN TWO PRs ARRIVE AT ONCE ─────────────────
+            // "No request exists yet" is a read, and the comment is a later
+            // write, so on its own it is check-then-act: two PRs closing the
+            // same issue, opened seconds apart, could both read "unspent" and
+            // both post. `concurrency` cannot fix this — its group is keyed by
+            // PR number, so it serialises one PR's own events and nothing
+            // across PRs.
+            //
+            // Rather than take a lock, make the winner DETERMINISTIC: the
+            // budget belongs to the LOWEST-NUMBERED PR closing the issue.
+            // Every racer computes the same answer from the same data, so at
+            // most one of them can conclude it is the winner — no ordering
+            // between the runs is required. This holds because PR numbers are
+            // monotonic: a PR created later is guaranteed to see the earlier
+            // ones in this connection, so it can never mistake itself for the
+            // lowest. The earlier PR may or may not see the later one, and it
+            // does not matter — it is the winner either way.
+            const spentQ = `
+              query($owner:String!, $repo:String!, $issue:Int!, $cursor:String) {
+                repository(owner:$owner, name:$repo) {
+                  issue(number:$issue) {
+                    closedByPullRequestsReferences(first: 30, after: $cursor, includeClosedPrs: true) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        number
+                        comments(first: 100) {
+                          pageInfo { hasNextPage }
+                          nodes { body }
+                        }
+                      }
+                    }
+                  }
+                }
+              }`;
+
+            async function budgetIsOurs(issueNumber) {
+              let cursor = null;
+              let seen = 0;
+              // Seed with our own number: the connection may not list this PR
+              // yet, and it must still take part in the comparison.
+              let lowest = pr.number;
+              for (;;) {
+                const d = await github.graphql(spentQ, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue: issueNumber,
+                  cursor,
+                });
+                const conn = d.repository.issue.closedByPullRequestsReferences;
+                for (const node of conn.nodes || []) {
+                  seen += 1;
+                  if (seen > MAX_LINKED_PRS) {
+                    core.info(
+                      `Issue #${issueNumber} has more than ${MAX_LINKED_PRS} linked PRs — ` +
+                      `cannot prove its review budget is unspent; declining.`
+                    );
+                    return false;
+                  }
+                  if (node.comments.pageInfo.hasNextPage) {
+                    core.info(
+                      `PR #${node.number} (closing #${issueNumber}) has more comments than ` +
+                      `one page — cannot prove no review was requested; declining.`
+                    );
+                    return false;
+                  }
+                  const asked = (node.comments.nodes || []).some(
+                    c => c.body && c.body.includes('@codex review')
+                  );
+                  if (asked) {
+                    core.info(
+                      `Issue #${issueNumber} already spent its automatic review on ` +
+                      `PR #${node.number} — not requesting another.`
+                    );
+                    return false;
+                  }
+                  if (node.number < lowest) lowest = node.number;
+                }
+                if (!conn.pageInfo.hasNextPage) break;
+                cursor = conn.pageInfo.endCursor;
+              }
+              if (lowest !== pr.number) {
+                core.info(
+                  `Issue #${issueNumber}'s review belongs to PR #${lowest}, which was ` +
+                  `opened before PR #${pr.number} — declining.`
+                );
+                return false;
+              }
+              return true;
+            }
+
+            let matched = null;
+            for (const issueNumber of invitedIssues) {
+              if (await budgetIsOurs(issueNumber)) { matched = issueNumber; break; }
+            }
+
+            if (matched === null) {
+              core.info(
+                `PR #${pr.number}: every invited issue it closes ` +
+                `(${invitedIssues.map(n => `#${n}`).join(', ')}) has already spent its ` +
+                `automatic review, or could not be proven unspent — no review requested.`
+              );
               return;
             }
 
@@ -119,4 +291,7 @@ jobs:
               issue_number: pr.number,
               body: '@codex review',
             });
-            core.info(`Requested a review on PR #${pr.number} (closes #${matched.number}).`);
+            core.info(
+              `Requested a review on PR #${pr.number} — it closes invited issue ` +
+              `#${matched}, whose automatic review had not been spent.`
+            );
