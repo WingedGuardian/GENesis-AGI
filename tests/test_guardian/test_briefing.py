@@ -400,3 +400,84 @@ class TestRenderDynamicSections:
         assert "Awareness Loop Status" not in md
         assert "Active CC Sessions" not in md
         assert "Recent Errors" not in md
+
+
+_OBS_COUNT = "genesis.db.crud.observations.count_unresolved"
+
+
+class TestObservationDigestMarker:
+    """The 15-row observation digest must announce truncation — a silent
+    15-of-N reads as complete while the OLDEST (longest-standing) rows are
+    the ones dropped."""
+
+    @staticmethod
+    def _rows(n):
+        return [
+            {"content": f"obs {i}", "source": "s", "priority": "low"}
+            for i in range(n)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_full_read_with_more_beyond_gets_a_marker(self) -> None:
+        db = _make_db()
+        with (
+            patch(_OBS, new=AsyncMock(return_value=self._rows(15))),
+            patch(_OBS_COUNT, new=AsyncMock(return_value=42)),
+            patch(_EVENTS, new=AsyncMock(return_value=[])),
+            patch(_TICKS_LAST, new=AsyncMock(return_value=None)),
+            patch(_TICKS_COUNT, new=AsyncMock(return_value=0)),
+            patch(_CC_ACTIVE, new=AsyncMock(return_value=[])),
+        ):
+            content = await build_dynamic_briefing(db)
+        assert len(content.active_observations) == 16
+        marker = content.active_observations[-1]
+        assert "15 NEWEST of 42" in marker
+        assert "27 older" in marker
+
+    @pytest.mark.asyncio
+    async def test_a_short_read_proves_completeness_no_marker_no_count(self) -> None:
+        """< cap rows = the set is complete; the count must not even run."""
+        db = _make_db()
+        count = AsyncMock(return_value=999)
+        with (
+            patch(_OBS, new=AsyncMock(return_value=self._rows(3))),
+            patch(_OBS_COUNT, new=count),
+            patch(_EVENTS, new=AsyncMock(return_value=[])),
+            patch(_TICKS_LAST, new=AsyncMock(return_value=None)),
+            patch(_TICKS_COUNT, new=AsyncMock(return_value=0)),
+            patch(_CC_ACTIVE, new=AsyncMock(return_value=[])),
+        ):
+            content = await build_dynamic_briefing(db)
+        assert len(content.active_observations) == 3
+        count.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exactly_cap_rows_total_equal_no_marker(self) -> None:
+        db = _make_db()
+        with (
+            patch(_OBS, new=AsyncMock(return_value=self._rows(15))),
+            patch(_OBS_COUNT, new=AsyncMock(return_value=15)),
+            patch(_EVENTS, new=AsyncMock(return_value=[])),
+            patch(_TICKS_LAST, new=AsyncMock(return_value=None)),
+            patch(_TICKS_COUNT, new=AsyncMock(return_value=0)),
+            patch(_CC_ACTIVE, new=AsyncMock(return_value=[])),
+        ):
+            content = await build_dynamic_briefing(db)
+        assert len(content.active_observations) == 15
+
+    @pytest.mark.asyncio
+    async def test_a_failed_count_degrades_to_an_unknown_total_marker(self) -> None:
+        """A broken denominator must not silently re-create the truncation."""
+        db = _make_db()
+        with (
+            patch(_OBS, new=AsyncMock(return_value=self._rows(15))),
+            patch(_OBS_COUNT, new=AsyncMock(side_effect=RuntimeError("boom"))),
+            patch(_EVENTS, new=AsyncMock(return_value=[])),
+            patch(_TICKS_LAST, new=AsyncMock(return_value=None)),
+            patch(_TICKS_COUNT, new=AsyncMock(return_value=0)),
+            patch(_CC_ACTIVE, new=AsyncMock(return_value=[])),
+        ):
+            content = await build_dynamic_briefing(db)
+        assert content.active_observations[-1] == (
+            "(digest capped at 15 — total unresolved count unavailable)"
+        )
