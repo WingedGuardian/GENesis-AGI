@@ -403,16 +403,17 @@ class KnowledgeOrchestrator:
         vectors written so far are deleted to prevent orphaned state.
         """
         # Import the memory module to access the store + CRUD
-        import genesis.mcp.memory_mcp as memory_mod
-
-        memory_mod._require_init()
-        assert memory_mod._store is not None  # noqa: S101 - type-narrowing invariant
-        assert memory_mod._db is not None  # noqa: S101 - type-narrowing invariant
-
+        import contextlib
         import uuid
         from datetime import UTC, datetime
 
+        import genesis.mcp.memory_mcp as memory_mod
+        from genesis.db.connection import get_raw_db
+        from genesis.env import genesis_db_path
         from genesis.qdrant.collections import delete_point
+
+        memory_mod._require_init()
+        assert memory_mod._store is not None  # noqa: S101 - type-narrowing invariant
 
         unit_ids: list[str] = []
         qdrant_ids: list[str] = []  # Track for compensation on failure
@@ -420,111 +421,127 @@ class KnowledgeOrchestrator:
         now_iso = datetime.now(UTC).isoformat()
         embedding_model = getattr(memory_mod._store._embeddings, "model_name", "unknown")
 
-        try:
-            for unit in units:
-                # Check for existing unit (idempotent re-ingestion)
-                existing = await memory_mod.knowledge.find_by_unique_key(
-                    memory_mod._db,
-                    project_type=project_type,
-                    domain=unit.domain,
-                    concept=unit.concept,
-                )
-                unit_id = existing["id"] if existing else str(uuid.uuid4())
-                old_qdrant_id = existing.get("qdrant_id") if existing else None
+        # Own the SQLite batch on a DEDICATED get_raw_db() connection (NOT the shared
+        # memory_mod._db). On the shared SerializedConnection the lock releases between
+        # ops, so a CONCURRENT MCP tool call's commit()/rollback() could durably commit
+        # or discard this batch's partial units mid-run; an owned BEGIN IMMEDIATE …
+        # COMMIT envelope isolates it and never touches another coroutine's transaction.
+        # genesis_db_path() is resolved at call time (function-scope import) so the test
+        # conftest redirect applies. NO app-level BUSY retry: get_raw_db already waits
+        # out busy_timeout, and retrying the whole batch would re-issue (and orphan) the
+        # per-unit Qdrant writes — a rare post-timeout BUSY instead fails cleanly through
+        # the compensation path below.
+        async with get_raw_db(genesis_db_path()) as own:
+            try:
+                await own.execute("BEGIN IMMEDIATE")
+                for unit in units:
+                    # Existing unit? (idempotent re-ingestion). Reads on the owned conn
+                    # see prior COMMITTED units (WAL) and this batch's own uncommitted
+                    # upserts (same connection) — identical to the shared-conn behavior.
+                    existing = await memory_mod.knowledge.find_by_unique_key(
+                        own,
+                        project_type=project_type,
+                        domain=unit.domain,
+                        concept=unit.concept,
+                    )
+                    unit_id = existing["id"] if existing else str(uuid.uuid4())
+                    old_qdrant_id = existing.get("qdrant_id") if existing else None
 
-                # Store to Qdrant via MemoryStore (non-transactional, immediate)
-                # WS-3: curated ingest is external_untrusted (authority tier,
-                # not authorship); derived once, mirrored to both stores.
-                from genesis.memory.provenance import derive_origin_class
+                    # Store to Qdrant via MemoryStore (non-transactional, immediate)
+                    # WS-3: curated ingest is external_untrusted (authority tier,
+                    # not authorship); derived once, mirrored to both stores.
+                    from genesis.memory.provenance import derive_origin_class
 
-                resolved_origin = derive_origin_class(
-                    source_pipeline="curated",
-                    collection="knowledge_base",
-                )
-                qdrant_id = await memory_mod._store.store(
-                    unit.body,
-                    f"knowledge:{project_type}/{unit.domain}",
-                    memory_type="knowledge",
-                    collection="knowledge_base",
-                    tags=unit.tags + [unit.domain, project_type],
-                    confidence=unit.confidence,
-                    auto_link=False,
-                    source_pipeline="curated",
-                    origin_class=resolved_origin,
-                )
-                qdrant_ids.append(qdrant_id)
+                    resolved_origin = derive_origin_class(
+                        source_pipeline="curated",
+                        collection="knowledge_base",
+                    )
+                    qdrant_id = await memory_mod._store.store(
+                        unit.body,
+                        f"knowledge:{project_type}/{unit.domain}",
+                        memory_type="knowledge",
+                        collection="knowledge_base",
+                        tags=unit.tags + [unit.domain, project_type],
+                        confidence=unit.confidence,
+                        auto_link=False,
+                        source_pipeline="curated",
+                        origin_class=resolved_origin,
+                    )
+                    qdrant_ids.append(qdrant_id)
 
-                # Clean up stale Qdrant point if re-ingesting
-                if old_qdrant_id and old_qdrant_id != qdrant_id:
+                    # Clean up stale Qdrant point if re-ingesting
+                    if old_qdrant_id and old_qdrant_id != qdrant_id:
+                        try:
+                            delete_point(
+                                memory_mod._store.qdrant_client,
+                                collection="knowledge_base",
+                                point_id=old_qdrant_id,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to clean up stale Qdrant point %s",
+                                old_qdrant_id,
+                            )
+
+                    # Upsert to SQLite on the OWNED conn (_commit=False — batch txn)
+                    actual_id, _inserted = await memory_mod.knowledge.upsert(
+                        own,
+                        id=unit_id,
+                        project_type=project_type,
+                        domain=unit.domain,
+                        source_doc=source,
+                        concept=unit.concept,
+                        body=unit.body,
+                        relationships=json.dumps(unit.relationships)
+                        if unit.relationships
+                        else None,
+                        caveats=json.dumps(unit.caveats) if unit.caveats else None,
+                        tags=json.dumps(unit.tags) if unit.tags else None,
+                        confidence=unit.confidence,
+                        ingested_at=now_iso,
+                        qdrant_id=qdrant_id,
+                        section_title=unit.section_title,
+                        source_date=unit.source_date,
+                        embedding_model=embedding_model,
+                        source_pipeline="curated",
+                        purpose=purpose_json,
+                        ingestion_source=source,
+                        origin_class=resolved_origin,
+                        _commit=False,
+                    )
+
+                    unit_ids.append(actual_id)
+
+                # Single commit for all units in the batch (owned conn)
+                await own.commit()
+
+            except Exception:
+                logger.error(
+                    "Batch storage failed after %d/%d units (%d qdrant vectors) from %s — rolling back",
+                    len(unit_ids),
+                    len(units),
+                    len(qdrant_ids),
+                    source,
+                    exc_info=True,
+                )
+                # Roll back the OWNED SQLite txn to release the write lock eagerly (the
+                # connection close would also discard it). Owned conn → this can never
+                # discard another coroutine's uncommitted writes.
+                with contextlib.suppress(Exception):
+                    await own.rollback()
+
+                # Compensate: delete orphaned Qdrant vectors
+                for qid in qdrant_ids:
                     try:
                         delete_point(
                             memory_mod._store.qdrant_client,
                             collection="knowledge_base",
-                            point_id=old_qdrant_id,
+                            point_id=qid,
                         )
                     except Exception:
-                        logger.warning(
-                            "Failed to clean up stale Qdrant point %s",
-                            old_qdrant_id,
-                        )
+                        logger.warning("Qdrant compensation delete failed for %s", qid)
 
-                # Upsert to SQLite (_commit=False for batch transaction)
-                actual_id, _inserted = await memory_mod.knowledge.upsert(
-                    memory_mod._db,
-                    id=unit_id,
-                    project_type=project_type,
-                    domain=unit.domain,
-                    source_doc=source,
-                    concept=unit.concept,
-                    body=unit.body,
-                    relationships=json.dumps(unit.relationships) if unit.relationships else None,
-                    caveats=json.dumps(unit.caveats) if unit.caveats else None,
-                    tags=json.dumps(unit.tags) if unit.tags else None,
-                    confidence=unit.confidence,
-                    ingested_at=now_iso,
-                    qdrant_id=qdrant_id,
-                    section_title=unit.section_title,
-                    source_date=unit.source_date,
-                    embedding_model=embedding_model,
-                    source_pipeline="curated",
-                    purpose=purpose_json,
-                    ingestion_source=source,
-                    origin_class=resolved_origin,
-                    _commit=False,
-                )
-
-                unit_ids.append(actual_id)
-
-            # Single commit for all units in the batch
-            await memory_mod._db.commit()
-
-        except Exception:
-            logger.error(
-                "Batch storage failed after %d/%d units (%d qdrant vectors) from %s — rolling back",
-                len(unit_ids),
-                len(units),
-                len(qdrant_ids),
-                source,
-                exc_info=True,
-            )
-            # Roll back SQLite to release the write lock immediately
-            try:
-                await memory_mod._db.rollback()
-            except Exception:
-                logger.warning("SQLite rollback failed", exc_info=True)
-
-            # Compensate: delete orphaned Qdrant vectors
-            for qid in qdrant_ids:
-                try:
-                    delete_point(
-                        memory_mod._store.qdrant_client,
-                        collection="knowledge_base",
-                        point_id=qid,
-                    )
-                except Exception:
-                    logger.warning("Qdrant compensation delete failed for %s", qid)
-
-            raise
+                raise
 
         logger.info("Stored %d knowledge units from %s", len(unit_ids), source)
         return unit_ids

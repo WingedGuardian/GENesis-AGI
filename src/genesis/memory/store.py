@@ -396,11 +396,14 @@ class MemoryStore:
 
         # Mechanical code anchors (entity layer) — regex-only, every write
         # path. Failure-isolated: a broken anchor write must never break
-        # the store itself.
+        # the store itself. record_anchors owns its own connection + txn (it no
+        # longer writes on self._db), so the metadata write above must already be
+        # committed here — it is (create_metadata commits) — or the owned conn's
+        # BEGIN IMMEDIATE would deadlock against this coroutine's own open txn.
         try:
             from genesis.memory.entity_anchors import record_anchors
 
-            await record_anchors(self._db, memory_id, content)
+            await record_anchors(memory_id, content)
         except Exception:
             logger.debug(
                 "entity anchor extraction failed for %s",

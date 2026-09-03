@@ -1,5 +1,6 @@
 """Tests for knowledge ingestion orchestrator."""
 
+import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -153,8 +154,16 @@ async def test_store_units_rollback_on_failure(tmp_path: Path):
     ]
     orch = _make_orchestrator(tmp_path, mock_distill_result=units)
 
-    # Mock the memory module internals that _store_units uses
-    mock_db = AsyncMock()
+    # Mock the memory module internals that _store_units uses. The SQLite batch now
+    # runs on a DEDICATED get_raw_db() connection (owned-conn isolation), NOT the shared
+    # memory_mod._db — so patch get_raw_db to yield a mock connection and assert the
+    # rollback/commit there.
+    mock_own = AsyncMock()
+
+    @contextlib.asynccontextmanager
+    async def _fake_get_raw_db(_path):
+        yield mock_own
+
     mock_store = MagicMock()
     # store() succeeds for first 2 calls, then the 3rd SQLite insert fails
     mock_store.store = AsyncMock(side_effect=["qid-0", "qid-1", "qid-2"])
@@ -171,8 +180,8 @@ async def test_store_units_rollback_on_failure(tmp_path: Path):
 
     with patch("genesis.mcp.memory_mcp._require_init"), \
          patch("genesis.mcp.memory_mcp._store", mock_store), \
-         patch("genesis.mcp.memory_mcp._db", mock_db), \
          patch("genesis.mcp.memory_mcp.knowledge", mock_knowledge), \
+         patch("genesis.db.connection.get_raw_db", _fake_get_raw_db), \
          patch("genesis.qdrant.collections.delete_point") as mock_delete_point:
 
         file = tmp_path / "test.txt"
@@ -185,10 +194,11 @@ async def test_store_units_rollback_on_failure(tmp_path: Path):
         assert "Storage failed" in result.error
         assert result.units_created == 0
 
-        # SQLite should have been rolled back
-        mock_db.rollback.assert_awaited_once()
-        # commit should NOT have been called (failed before reaching it)
-        mock_db.commit.assert_not_awaited()
+        # The OWNED connection opened a BEGIN IMMEDIATE txn and rolled it back; it never
+        # reached the batch commit (failed on the 3rd unit).
+        mock_own.execute.assert_any_await("BEGIN IMMEDIATE")
+        mock_own.rollback.assert_awaited_once()
+        mock_own.commit.assert_not_awaited()
 
         # All 3 Qdrant vectors should be compensation-deleted
         assert mock_delete_point.call_count == 3
