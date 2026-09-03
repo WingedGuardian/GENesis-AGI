@@ -31,96 +31,77 @@ user-owned + purely-local operational work → a follow-up; consciously-not-doin
 `tabled`) and its two hard limits (explicit approval every time; never publish a
 security defect before it is fixed). This section is the operational detail.
 
-### Who may file at all
-
-Only a session whose operator has **write access to the shared tracker**. Identity is
-not enough — a direct clone of the shared repo reports the right slug while the
-authenticated user still lacks push access, and GitHub then silently DROPS the
-mandatory labels. Check the PERMISSION, fail closed, and CAPTURE the slug:
+### Filing it — use the script, not a hand-typed command
 
 ```bash
-REPO="$(gh repo view --json nameWithOwner,viewerPermission \
-        --jq 'select(.viewerPermission|IN("WRITE","MAINTAIN","ADMIN")) | .nameWithOwner')"
-[ -n "$REPO" ] || { echo "no write access to this tracker — keep it local" >&2; exit 1; }
+DRAFT="$(mktemp -d)"                       # per-invocation, never a shared path
+# write the title and body with an EDITOR TOOL, not by echoing through a shell
+#   $DRAFT/title.txt   $DRAFT/body.md
+
+python3 scripts/file_tracker_issue.py \
+  --title-file "$DRAFT/title.txt" --body-file "$DRAFT/body.md" \
+  --area area:memory --difficulty "help wanted" --dry-run   # drop --dry-run to post
+rm -f "$DRAFT"/*.txt "$DRAFT"/*.md && rmdir "$DRAFT"
 ```
 
-Keep `$REPO` and pass it explicitly to every later command (below). A bare `gh issue
-…` re-resolves its target from the CURRENT directory each time, so a `cd` between the
-check and the post sends an irreversible write to a repository nobody verified — and
-on a fork-cloned install the bare form targets the operator's own fork, where nobody
-can pick the issue up.
+The script exists because three cross-model review rounds each found a different
+way for a hand-typed version of this to target the wrong repository or execute its
+own input. Those are not things prose can enforce and nothing tests, so they now
+live in code with `tests/test_scripts/test_file_tracker_issue.py` pinning each one:
 
-If the check fails, Genesis-repo work stays a local `follow_up_create` row until a
-maintainer carries it across. That is a known gap, not a workaround.
+- **Resolves the UPSTREAM tracker.** `gh repo view` with no argument reports the
+  CURRENT directory's repo, so on a fork-cloned install it returns the operator's
+  own fork — where they are ADMIN, so a permission check on it passes and the issue
+  lands where nobody reads it. The script follows `parent` when `isFork`, and
+  refuses outright if a fork's parent cannot be resolved.
+- **Checks `viewerPermission` on that explicit slug.** Identity is not permission:
+  a direct clone reports the right slug while the user still lacks push access, and
+  GitHub then silently DROPS the mandatory labels.
+- **Never lets issue text reach a shell.** Title and body travel as argv. A title
+  containing backticks or `$(...)` — ordinary in a technical title — would execute
+  if interpolated into a command line, after your privacy scan, with its output in
+  the public title.
+- **Exact-title dedup, failing closed.** `gh issue list --search` parses `repo:` /
+  `is:` / `label:` inside a title as query syntax. The script compares normalized
+  titles over structured output, and REFUSES if the lookup fails — a failed lookup
+  is not evidence of no duplicate.
+- **Validates both labels against the real sets.** `area:docs` and `area:infra` do
+  not exist; a nonexistent mandatory label makes `gh issue create` fail. Use
+  `area:other` when nothing fits.
 
-On a non-owning install, Genesis-repo work stays a local `follow_up_create` row until
+Exit codes: `0` filed (or dry-run clean) · `2` refused, nothing posted · `3` an
+identical title already exists · `1` unexpected error. **Run `--dry-run` first** —
+it performs every check and posts nothing.
+
+Use a fresh `mktemp -d` per invocation, and clean it WITHOUT `rm -rf` — this
+repo's own destructive-command guard refuses a recursive-force delete on a path it
+cannot prove is deep enough, so `rm -rf "$DRAFT"` is blocked for every session. Foreground and background sessions run
+concurrently here, and a shared draft path lets one session overwrite the body
+another has already scanned and approved, between the scan and the post.
+
+### What the script does NOT decide
+
+Two things stay with you, because they are judgment, not mechanism:
+
+**Approval, every time.** A public post is irreversible;
+`contributor_issue.py` classifies it exactly that way. Channel-driven sessions run
+with `skip_permissions=True`, so no tool confirmation appears — ASK, in words, and
+get a yes, for each issue. A prior "go ahead" does not carry.
+
+**Privacy-scan the title AND the body.** Both egress. Technical detail only: no
+IPs, hostnames, absolute home paths, identifiers, or raw install metrics (row
+counts and spend leak usage scale — state proportions instead). Nothing gates this
+path; `gh issue create` appears nowhere in `scripts/hooks/git_push_guard.py`.
+
+**Security defects never go public first.** An unpatched authentication bypass,
+credential exposure, injection path, or anything otherwise exploitable is not filed
+publicly while unfixed — publishing hands a working lead to anyone reading, against
+installs running the vulnerable code right now. Keep it local, fix it, then file.
+The privacy scan does not catch this: it looks for install-specific data, not for
+dangerous technical disclosure.
+
+If the script refuses (exit 2), the work stays a local `follow_up_create` row until
 a maintainer carries it across. That is a known gap, not a workaround.
-
-### Approval — every time
-
-A public post is irreversible; `contributor_issue.py` classifies it exactly that way
-(`action_class="irreversible"`, owner approval, never auto-approved). CLAUDE.md's
-standing rule already covers it: irreversible actions need explicit approval first.
-
-**Human presence is not approval.** Channel-driven sessions run with
-`skip_permissions=True` (`src/genesis/cc/conversation.py`), so no tool confirmation
-appears — the session must ASK, in words, and get a yes, for each issue. A prior
-"go ahead" does not carry to the next one.
-
-### Filing the issue
-
-Write the title and body to FILES first, then read them into quoted variables. Never
-paste issue text straight into the command line: a title containing backticks or
-`$(...)` — ordinary in a technical title — is executed by the shell AFTER your privacy
-scan, and its output lands in the public title.
-
-```bash
-# title and body already written to files by an editor tool, not echoed through a shell
-TITLE="$(cat ~/tmp/issue-title.txt)"
-BODY=~/tmp/issue-body.md
-
-# 1. preflight against the VERIFIED repo — do not create a duplicate
-gh issue list --repo "$REPO" --search "$TITLE" --state all --limit 10
-
-# 2. file, non-interactively, every expansion quoted
-gh issue create --repo "$REPO" \
-  --title "$TITLE" --body-file "$BODY" \
-  --label "area:<domain>" --label "good first issue"
-```
-
-Quote every label: `good first issue` and `help wanted` contain spaces and word-split
-into invalid arguments unquoted. Quote `"$BODY"` too.
-
-`--title` and `--body`/`--body-file` are REQUIRED, not optional: `gh` prompts for a
-missing body, and Genesis runs the CLI with piped stdin, so the prompt can never be
-answered — the command hangs or fails and neither an issue nor a local row results.
-
-The preflight matters because the hand path has no dedup. The gated path checks open
-titles and fails closed; nothing protects a direct `gh issue create`, and two sessions
-finding the same defect (or one retrying after losing the first command's output)
-otherwise produce duplicates — against the one-record-per-item rule.
-
-**Both label classes are mandatory**, matching the policy the propose path enforces
-fail-closed (`src/genesis/mcp/health/contributor_issue.py`): an `area:*` domain label
-AND one of `good first issue`, `first-timers-only`, `help wanted`,
-`needs-genesis-instance`.
-
-**Privacy-scan the TITLE and the BODY, and the labels.** All three egress; the gated
-path scans all three for exactly that reason, and a title is the easiest place to leak
-a hostname, a path, or a metric. Technical detail only — no IPs, hostnames, absolute
-home paths, identifiers, or raw install metrics (row counts and spend leak usage
-scale; state proportions or shapes instead). Nothing gates this path — `gh issue
-create` appears nowhere in `scripts/hooks/git_push_guard.py`, which gates push /
-`gh pr merge` / `gh pr create` — so the scan is manual and there is no backstop.
-
-### Security defects never go public first
-
-An unpatched authentication bypass, credential exposure, injection path, or anything
-otherwise exploitable is NOT filed on the public tracker while it is unfixed —
-publishing it hands a working lead to anyone reading, against installs that are
-running the vulnerable code right now. Keep it local, fix it, then file (or file a
-post-fix note). The privacy scan does not catch this: it looks for install-specific
-data, not for dangerous technical disclosure.
 
 ### Why not `contributor_issue_propose`
 
@@ -140,11 +121,13 @@ line, not a locked door.) It records locally instead — but check the profile f
 denylist rather than trusting a list here; three tiers exist today:
 
 - HAS `follow_up_create` (`interact`, `research`, `campaign`, `steward`; and
-  `sentinel` when NOT degraded) → file there, and say in `reason` that it is repo work
-  awaiting a foreground session. The row is FORCED onto the cold `tabled` lane by
-  sacred-board authorization whatever `work_state` you pass, and tabled rows are
-  excluded from every default listing — retrieve with
-  `follow_up_list(include_tabled=True)`.
+  `sentinel` when NOT degraded) → file there AND state the finding in the session's
+  returned output. Both, not either: the row is FORCED onto the cold `tabled` lane by
+  sacred-board authorization whatever `work_state` you pass, tabled rows are excluded
+  from every default listing, and there is no promoter — so a row alone is a handoff
+  nobody receives unless someone independently guesses to run
+  `follow_up_list(include_tabled=True)`. The returned output is what the dispatching
+  foreground session actually reads.
 - HAS `observation_write` but NOT `follow_up_create` (reflection sessions) → use
   `observation_write` or the parsed `observations` output field.
 - Has NEITHER (`observe`, `community-responder`, `mail`; and sentinel-DEGRADED, which

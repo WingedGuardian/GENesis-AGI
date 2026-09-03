@@ -1573,9 +1573,12 @@ session assumed deploy "happens somehow").
    `deployed_commit` / CC version; guardian tick healthy in its journal.
 3. State the deploy + verification result explicitly in the wrap-up. If the
    deploy cannot happen this session, record it — never leave deploy as an
-   implicit assumption. Route it: a purely LOCAL blocker (host unreachable
-   tonight) is a `follow_up_create` row; a blocker that exposes a REPO-level gap
-   (a missing reconcile mechanism, no self-heal path) is a GitHub issue.
+   implicit assumption. A purely LOCAL blocker (host unreachable tonight) is a
+   `follow_up_create` row. A blocker exposing a REPO-level gap (a missing reconcile
+   mechanism, no self-heal path) needs BOTH: an issue for the mechanism fix, AND a
+   local row for the fact that THIS install is still undeployed — another
+   contributor can close the issue without ever touching this host, which is
+   exactly the stale-host failure above.
 
 **The reverse direction is equally binding**: host VMs are deploy targets,
 never edit-in-place dev environments. An emergency hand-edit on a host gets a
