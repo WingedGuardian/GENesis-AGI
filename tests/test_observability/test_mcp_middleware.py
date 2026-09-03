@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -145,3 +146,54 @@ class TestMiddlewareUnitOfWork:
 
         with pytest.raises(ValueError, match="original tool error"):
             await mw.on_call_tool(context, call_next)
+
+    async def test_rolls_back_on_cancelled_tool_call(self):
+        """A CANCELLED tool call rolls back its partial, exactly like an errored one.
+
+        ``asyncio.CancelledError`` is a ``BaseException``, not an ``Exception``, so
+        a bare ``except Exception`` never catches it: ``success`` stays ``True`` and
+        the ``finally`` COMMITS a possibly-partial write (follow-up 3183405d). The
+        boundary must roll it back instead (the flip pattern defaults ``success=False``,
+        so only a clean return commits).
+        """
+        tracker = ProviderActivityTracker()
+        db = AsyncMock()
+        mw = InstrumentationMiddleware(tracker, "memory", db=db)
+        context = MagicMock()
+        context.message.name = "memory_store"
+        call_next = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await mw.on_call_tool(context, call_next)
+
+        db.rollback.assert_awaited_once()
+        db.commit.assert_not_awaited()
+
+    async def test_real_cancellation_mid_call_rolls_back(self):
+        """A GENUINE task cancellation mid-tool-call rolls back, never commits.
+
+        Unlike the synthetic ``side_effect=CancelledError`` above, this cancels a
+        real task while it is suspended INSIDE ``call_next`` — exercising the
+        finally's cleanup on the actual cancellation path, not just the routing.
+        """
+        tracker = ProviderActivityTracker()
+        db = AsyncMock()
+        mw = InstrumentationMiddleware(tracker, "memory", db=db)
+        context = MagicMock()
+        context.message.name = "memory_store"
+
+        inside_call = asyncio.Event()
+
+        async def _blocks_until_cancelled(_ctx):
+            inside_call.set()
+            await asyncio.Event().wait()  # never set — only cancellation ends this
+            return {"unreachable": True}
+
+        task = asyncio.create_task(mw.on_call_tool(context, _blocks_until_cancelled))
+        await inside_call.wait()  # ensure we are suspended inside call_next
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        db.rollback.assert_awaited_once()
+        db.commit.assert_not_awaited()

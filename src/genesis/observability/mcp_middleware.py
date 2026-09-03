@@ -40,14 +40,17 @@ class InstrumentationMiddleware(Middleware):
     the MCP tool handler.
 
     Per-call transaction boundary (WS-15 follow-up): when constructed with the
-    server's long-lived ``db`` connection, each tool call ends with a
-    commit-on-success / rollback-on-error. This releases the read snapshot that
-    a read-only tool would otherwise leave open in deferred-isolation mode —
-    which pins the SQLite WAL checkpoint and makes later writes fail
-    "database is locked". Writes already commit at the CRUD layer before the
-    tool returns, so the commit here only closes a *trailing* read txn (it can
-    never discard a tool's own write); rollback-on-error discards a partial.
-    DB errors in this boundary never propagate to the tool handler.
+    server's long-lived ``db`` connection, each tool call commits only after a
+    clean return and rolls back otherwise. This releases the read snapshot that a
+    read-only tool would otherwise leave open in deferred-isolation mode — which
+    pins the SQLite WAL checkpoint and makes later writes fail "database is locked".
+    Writes already commit at the CRUD layer before the tool returns, so the commit
+    here only closes a *trailing* read txn (it can never discard a tool's own
+    write); any non-clean exit — a raised ``Exception``, or a ``BaseException`` no
+    clause catches (``asyncio.CancelledError``, ``SystemExit``, …) — rolls back the
+    possibly-partial write instead of committing it. The boundary catches nothing;
+    every exception propagates unchanged. DB errors in this boundary never
+    propagate to the tool handler.
     """
 
     def __init__(
@@ -70,7 +73,15 @@ class InstrumentationMiddleware(Middleware):
         tool_name = context.message.name
         provider = f"mcp.{self._server}.{tool_name}"
         t0 = time.monotonic()
-        success = True
+        # Default False so the finally COMMITS only after a clean return. Any exit
+        # that is NOT a normal return leaves this False and rolls back the
+        # possibly-partial write instead of committing it: a raised ``Exception``,
+        # or a ``BaseException`` no clause catches — ``asyncio.CancelledError``,
+        # ``SystemExit``, ``KeyboardInterrupt``, ``GeneratorExit`` (follow-up
+        # 3183405d — the old ``except Exception`` let all of those keep success=True
+        # and commit a partial). Nothing is caught here, so every exception,
+        # cancellation included, propagates unchanged.
+        success = False
         try:
             if tool_name in GUARDED_MCP_TOOLS:
                 # Raises ToolError (block mode) if this subprocess is running
@@ -78,10 +89,8 @@ class InstrumentationMiddleware(Middleware):
                 # the read snapshot the staleness check opened on self._db.
                 await self._enforce_freshness(tool_name)
             result = await call_next(context)
+            success = True
             return result
-        except Exception:
-            success = False
-            raise
         finally:
             if self._db is not None:
                 try:
