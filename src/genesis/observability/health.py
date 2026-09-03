@@ -520,6 +520,21 @@ async def probe_guardian(
         staleness_s = (now - heartbeat_time).total_seconds()
 
         if staleness_s < degraded_threshold_s:
+            # A fresh heartbeat that carries a stand-down marker is an intentional,
+            # alive-but-not-watching Guardian (deploy pause / maintenance). The
+            # heartbeat is written each tick so the watchdog stays quiet, but the
+            # check cycle is skipped — so report DEGRADED, not HEALTHY, or health
+            # surfaces would claim full monitoring for the whole stand-down window.
+            standdown = data.get("standdown")
+            if standdown:
+                return ProbeResult(
+                    name="guardian",
+                    status=ProbeStatus.DEGRADED,
+                    latency_ms=round(latency, 2),
+                    message=f"Guardian standing down ({standdown}) — not monitoring",
+                    checked_at=now.isoformat(),
+                    details={"staleness_s": round(staleness_s, 1), "standdown": standdown},
+                )
             return ProbeResult(
                 name="guardian",
                 status=ProbeStatus.HEALTHY,

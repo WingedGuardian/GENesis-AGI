@@ -61,6 +61,9 @@ DEFAULT_FORBIDDEN_GLOBS: tuple[str, ...] = (
     # Sanitizer's own secret-scan rules — a contribution must not weaken the gate
     # that scans it (else a merged edit silently disables detection downstream).
     ".gitleaks.toml",
+    # GitHub-native secret scanning config — a contribution must not widen its
+    # paths-ignore (e.g. to "**") and silently disable GitHub's own detection.
+    ".github/secret_scanning.yml",
     "config/research-profiles/*",
     "config/research-profiles/**",
     "config/external-modules/*",
@@ -523,10 +526,22 @@ def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
     hits: list[Finding] = []
     for file, line_no, text in parsed.added_lines:
         if not text.strip():
+            # Load-bearing (not just an optimization): `detect-secrets scan
+            # --string=` with an EMPTY value scans the whole CWD tree instead of
+            # the string, which would misfire + mis-parse. Skipping blank lines
+            # keeps `text` non-empty when `--string={text}` is built below.
             continue
         try:
+            # Use the `--string=<value>` form (NOT `--string <value>`): a line
+            # whose content starts with `-` — a Markdown `---` rule, a `--flag`
+            # example, both common in issue/PR prose — would otherwise be read by
+            # argparse as an unknown OPTION ("unrecognized arguments", exit 2),
+            # which the nonzero-exit branch below turns into a spurious
+            # fail-closed BLOCK. Binding the value with `=` makes argparse take
+            # it literally even when it starts with a dash; scan semantics are
+            # identical for every other input.
             proc = subprocess.run(
-                [ds_bin, "scan", "--string", text],
+                [ds_bin, "scan", f"--string={text}"],
                 capture_output=True,
                 text=True,
                 timeout=5,

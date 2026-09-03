@@ -13,6 +13,13 @@ import pytest
 from genesis.contribution import sanitize
 from genesis.contribution.findings import FindingKind, Severity
 
+# Captured at import time — BEFORE the autouse stub below patches them — so a
+# test can restore the genuine binary lookup + subprocess runner and exercise
+# the REAL detect-secrets CLI. The `--string` argv bug lives in argparse and is
+# invisible to a mocked subprocess.
+_REAL_WHICH = sanitize.shutil.which
+_REAL_RUN = sanitize.subprocess.run
+
 
 @pytest.fixture(autouse=True)
 def no_external_scanners(monkeypatch):
@@ -720,6 +727,67 @@ def test_scan_prose_clean_ok(tmp_path):
     )
     assert r.ok is True
     assert r.blocking() == []
+
+
+def _use_real_detect_secrets(monkeypatch):
+    """Override the autouse stub so the REAL detect-secrets binary runs.
+
+    The `--string` argv bug lives in argparse's handling of the invocation, so
+    a mocked subprocess cannot exercise it — these tests must hit the real CLI.
+    detect-secrets is a core dependency (pyproject), so it is present in CI;
+    skip defensively if it is genuinely absent."""
+    real = _REAL_WHICH("detect-secrets")
+    if not real:
+        pytest.skip("detect-secrets binary not installed")
+    monkeypatch.setattr(
+        sanitize.shutil,
+        "which",
+        lambda name: real
+        if name == "detect-secrets"
+        else (None if name in ("gitleaks", "betterleaks") else _REAL_WHICH(name)),
+    )
+    monkeypatch.setattr(sanitize.subprocess, "run", _REAL_RUN)
+
+
+def test_scan_prose_markdown_dash_lines_not_falsely_blocked(tmp_path, monkeypatch):
+    """Regression: a Markdown horizontal rule (`---`) or a `--flag` line in a
+    contributor issue body must NOT trip a spurious detect-secrets fail-closed
+    BLOCK. Before the fix, `detect-secrets scan --string ---` made argparse read
+    `---` as an unknown option (exit 2), which the nonzero-exit path turned into
+    a BLOCK. Uses the real binary — the mocked subprocess hides this bug."""
+    _use_real_detect_secrets(monkeypatch)
+    fp = tmp_path / "fp.txt"
+    fp.write_text("")  # present-but-empty (a MISSING file fails closed)
+    body = (
+        "Add a SQLite fallback to the loader.\n\n"
+        "---\n\n"
+        "Run the tool with `--verbose` to see the trace.\n"
+    )
+    r = sanitize.scan_prose(body, fingerprint_file=fp)
+    assert r.ok is True, [f"{f.scanner}:{f.message}" for f in r.blocking()]
+    assert r.blocking() == []
+
+
+def test_scan_prose_secret_on_dash_leading_token_still_detected(tmp_path, monkeypatch):
+    """Fail-open guard for the `--string=VALUE` fix. The secret sits on a SINGLE,
+    dash-LEADING token (`-AKIA…`) — exactly the shape argparse misread as an
+    option under the old `--string VALUE` form (exit 2 → crash). We assert the
+    genuine-detection finding ('Potential secret …'), NOT merely `ok is False`:
+    the crash path ALSO yields `ok is False` (fail-closed BLOCK, message
+    'exited N …'), so only the message distinguishes a real scan from the old
+    misparse. Under the old form this assertion fails (message is the crash
+    text); under the fix it passes (AWSKeyDetector genuinely fires)."""
+    _use_real_detect_secrets(monkeypatch)
+    fp = tmp_path / "fp.txt"
+    fp.write_text("")
+    # Leading '-' → one argv token the pre-fix form rejected as an unknown option.
+    body = "Example (never paste real keys):\n\n-AKIAIOSFODNN7EXAMPLE\n"
+    r = sanitize.scan_prose(body, fingerprint_file=fp)
+    assert r.ok is False
+    assert any(
+        f.scanner == "detect-secrets" and "Potential secret" in f.message
+        for f in r.blocking()
+    ), [f"{f.scanner}:{f.message}" for f in r.blocking()]
 
 
 def test_scan_prose_blocks_personal_email(tmp_path):
