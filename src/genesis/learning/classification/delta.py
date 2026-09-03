@@ -7,7 +7,11 @@ import json
 import re
 from typing import Any, Protocol
 
-from genesis.learning.response_context import response_lines
+from genesis.learning.response_context import (
+    request_lines,
+    response_lines,
+    tool_lines,
+)
 from genesis.learning.types import (
     DeltaClassification,
     DiscoveryAttribution,
@@ -66,9 +70,9 @@ class DeltaAssessor:
             "",
             "## Interaction",
             f"Session: {summary.session_id}",
-            f"User: {summary.user_text}",
+            *request_lines(summary),
             *response_lines(summary),
-            f"Tools used: {', '.join(summary.tool_calls) or 'none'}",
+            *tool_lines(summary),
             "",
             "Respond with JSON:",
             '{',

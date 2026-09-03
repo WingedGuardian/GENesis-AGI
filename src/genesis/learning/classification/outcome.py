@@ -8,7 +8,11 @@ import logging
 import re
 from typing import Any, Protocol
 
-from genesis.learning.response_context import response_lines
+from genesis.learning.response_context import (
+    request_lines,
+    response_lines,
+    tool_lines,
+)
 from genesis.learning.types import InteractionSummary, OutcomeClass
 
 logger = logging.getLogger(__name__)
@@ -124,8 +128,8 @@ class OutcomeClassifier:
             "## Interaction",
             f"Session: {summary.session_id}",
             f"Channel: {summary.channel}",
-            f"Tools used: {', '.join(summary.tool_calls) or 'none'}",
-            f"User: {summary.user_text}",
+            *tool_lines(summary),
+            *request_lines(summary),
             *response_lines(summary),
             "",
             "Respond with JSON:",

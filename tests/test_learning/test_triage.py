@@ -83,10 +83,39 @@ class TestBuildSummary:
         assert s.channel == "terminal"
         assert s.token_count == 300  # 100 + 200
 
-    def test_user_text_truncation(self):
+    def test_an_ordinary_request_reaches_the_grader_whole(self):
+        """The cap was 500 and it was a WORKING limit: MEASURED on this
+        install, 222 of 1481 inbound messages (15.0%) exceed it, the longest
+        5,924 chars. Every one arrived at the delta assessor — the grader whose
+        job is comparing what was asked against what was delivered — as a bare
+        prefix with nothing saying so."""
         long = "x" * 1000
         s = build_summary(_make_output(), "s", long, "terminal")
-        assert len(s.user_text) == 500
+        assert s.user_text == long
+        assert s.user_text_elided_chars == 0
+
+    def test_a_pathological_request_is_elided_from_the_middle_and_says_so(self):
+        from genesis.learning.triage.summarizer import _MAX_USER_TEXT
+
+        head, tail = "H" * (_MAX_USER_TEXT + 50), "TAIL"
+        s = build_summary(_make_output(), "s", head + tail, "terminal")
+        assert s.user_text_elided_chars > 0
+        assert s.user_text.startswith("H")
+        assert s.user_text.endswith(tail), "the ENDING of the request was dropped"
+        assert "elided" in s.user_text
+
+    def test_the_reported_request_count_is_the_real_one(self):
+        """Same rule as the response: the count is a fact the pipeline holds,
+        so it is computed from the inputs rather than pinned to a literal."""
+        from genesis.learning.triage.summarizer import (
+            _ELIDE_HEAD,
+            _ELIDE_TAIL,
+            _MAX_USER_TEXT,
+        )
+
+        body = "Q" * (_MAX_USER_TEXT + 5_000)
+        s = build_summary(_make_output(), "s", body, "terminal")
+        assert s.user_text_elided_chars == len(body) - _ELIDE_HEAD - _ELIDE_TAIL
 
     def test_ordinary_response_reaches_the_grader_whole(self):
         """An ordinary reply must not be cut.

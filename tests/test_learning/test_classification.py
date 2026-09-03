@@ -481,13 +481,14 @@ class TestResponseIsPresentedHonestly:
             assert "killed dispatched background work" not in outside
 
     def test_every_prompt_places_the_notes_after_the_response(self):
-        """The elision note says the marker is 'inside the response'. That is
-        only true if the notes follow the fence — and the three prompts had
-        already drifted into different orderings before this was locked."""
-        long_text = "Q" * 25_000
+        """A note about the response must not be readable as part of it. The
+        three prompts had already drifted into different orderings before this
+        was locked, and the delta prompt still appends a `Tools used:` line
+        after the block, so ordering is not self-evident."""
         from genesis.learning.triage.summarizer import _fit_response
 
-        s = _make_summary(response_text=_fit_response(long_text))
+        fitted, elided = _fit_response("Q" * 25_000)
+        s = _make_summary(response_text=fitted, response_elided_chars=elided)
         for prompt in self._prompts(s):
             assert prompt.index("RESPONSE>>>") < prompt.index(
                 "shortening a long response"
@@ -498,17 +499,236 @@ class TestResponseIsPresentedHonestly:
             assert "shortening a long response" not in prompt
 
 
-class TestPromptWordingStaysCoupledToTheCode:
-    """The wording the prompt quotes and the wording the summarizer emits are
-    one definition. They were four copies, and had already diverged."""
+class TestTheReportedCountAndTheRenderedCountAreOneNumber:
+    """The count the summarizer REPORTS and the count the marker RENDERS come
+    from one computation, and a test has to say so.
 
-    def test_the_quoted_sentinel_appears_in_the_real_marker(self):
-        from genesis.learning.response_context import ELISION_SENTINEL, elision_marker
+    This replaces a coupling test for the old shared sentinel. The sentinel is
+    gone — nothing reads the response body to learn what the pipeline did — so
+    the invariant worth locking moved: the out-of-band number the graders are
+    told must be the same number the in-band marker shows, or a grader reading
+    both sees the pipeline contradict itself.
+    """
 
-        assert ELISION_SENTINEL in elision_marker(123)
+    def test_the_out_of_band_count_matches_the_marker_in_the_text(self):
+        import re
 
-    def test_the_summarizer_emits_the_shared_marker(self):
-        from genesis.learning.response_context import ELISION_SENTINEL
         from genesis.learning.triage.summarizer import _fit_response
 
-        assert ELISION_SENTINEL in _fit_response("Z" * 25_000)
+        fitted, elided = _fit_response("Z" * 25_000)
+        assert elided > 0
+        m = re.search(r"\[(\d+) characters elided", fitted)
+        assert m, fitted[:200]
+        assert int(m.group(1)) == elided
+
+    def test_an_unelided_response_reports_zero_and_carries_no_marker(self):
+        from genesis.learning.triage.summarizer import _fit_response
+
+        fitted, elided = _fit_response("short enough")
+        assert elided == 0
+        assert "elided" not in fitted
+
+
+class TestPipelineStateIsNeverReadOutOfTheResponse:
+    """What the pipeline DID to a response is a fact the pipeline holds.
+
+    Recovering it by searching the response body makes any text that quotes
+    this mechanism — a debrief about the summarizer, an inbox item echoing a
+    prompt back — manufacture a pipeline-status claim that is simply false.
+    The graders' verdicts reach observations, memory and drive weights, so a
+    manufactured claim there is not cosmetic.
+    """
+
+    def _prompts(self, summary):
+        from unittest.mock import AsyncMock as _AM
+
+        from genesis.learning.triage.classifier import TriageClassifier
+
+        return [
+            TriageClassifier(_AM())._build_prompt(summary, ""),
+            OutcomeClassifier(_AM())._build_prompt(summary, ""),
+            DeltaAssessor(_AM())._build_prompt(summary),
+        ]
+
+    @staticmethod
+    def _summary(text: str, **kw):
+        """Build through the real summarizer so these tests never encode the
+        shape of the elision bookkeeping, only its observable effect."""
+        from genesis.cc.types import CCOutput
+        from genesis.learning.triage.summarizer import build_summary
+
+        output = CCOutput(
+            session_id="s1",
+            text=text,
+            model_used="sonnet",
+            cost_usd=0.01,
+            input_tokens=10,
+            output_tokens=20,
+            duration_ms=5,
+            exit_code=0,
+            **kw,
+        )
+        return build_summary(output, session_id="s1", user_text="hi", channel="terminal")
+
+    def test_a_response_that_merely_describes_elision_gets_no_elision_note(self):
+        """The finding, stated as a test: an UNELIDED response containing the
+        marker's own wording must not produce the pipeline's elision note."""
+        summary = self._summary(
+            "I checked the log and nothing was elided here by the retrospective "
+            "summarizer, so the reply is whole."
+        )
+        for prompt in self._prompts(summary):
+            assert "shortening a long response" not in prompt, prompt[-400:]
+
+    def test_a_genuinely_elided_response_still_gets_the_note(self):
+        """Guard the guard: the test above must not pass by killing the note."""
+        summary = self._summary("H" + "Q" * 25_000 + "T")
+        for prompt in self._prompts(summary):
+            assert "shortening a long response" in prompt
+
+    def test_the_note_reports_the_count_the_pipeline_actually_holds(self):
+        """The whole thesis is that the graders are TOLD this number, and the
+        number was never asserted from a RENDERED prompt — only from the
+        summarizer's own return value against its own marker. Replacing the
+        interpolation with a constant survived the entire suite."""
+        summary = self._summary("H" + "Q" * 25_000 + "T")
+        assert summary.response_elided_chars > 0
+        for prompt in self._prompts(summary):
+            assert (
+                f"{summary.response_elided_chars} characters were removed" in prompt
+            ), prompt[-400:]
+
+    def test_an_elided_request_is_reported_too(self):
+        """The request side of the same rule — 15% of real inbound messages
+        exceeded the old bare-prefix cap."""
+        from genesis.cc.types import CCOutput
+        from genesis.learning.triage.summarizer import build_summary
+
+        output = CCOutput(
+            session_id="s1", text="ok", model_used="sonnet", cost_usd=0.0,
+            input_tokens=1, output_tokens=1, duration_ms=1, exit_code=0,
+        )
+        summary = build_summary(
+            output, session_id="s1", user_text="R" * 25_000, channel="inbox"
+        )
+        assert summary.user_text_elided_chars > 0
+        for prompt in self._prompts(summary):
+            assert "shortening a long REQUEST" in prompt
+            assert (
+                f"{summary.user_text_elided_chars} characters were removed" in prompt
+            )
+
+    def test_elision_never_denies_that_the_runtime_truncated(self):
+        """Two independent facts. The summarizer knows it removed characters;
+        it knows nothing about whether the model stopped early, and asserting
+        the negative is how the original defect looked with its sign flipped.
+        Worst case is both at once: bg_truncated true AND over the valve."""
+        summary = self._summary("H" + "Q" * 25_000 + "T", bg_truncated=True)
+        for prompt in self._prompts(summary):
+            lowered = prompt.lower()
+            assert "was not truncated" not in lowered, prompt[-400:]
+            assert "not the model stopping early" not in lowered, prompt[-400:]
+            # ...while the real runtime signal is still reported.
+            assert "killed dispatched background work" in prompt
+            # ...and the elision note is NOT suppressed by the other signal.
+            # The two facts are independent. Without this line the suite stays
+            # green under `if elided > 0 and not response_truncated:` — which
+            # hands the grader a middle-gutted body with nothing saying so, on
+            # precisely the path this test calls the worst case. MEASURED:
+            # that mutant survived 104 passing tests.
+            assert "shortening a long response" in prompt, prompt[-400:]
+
+
+class TestToolNamesSayWhereTheyCameFrom:
+    """`tool_calls` was the last field derived from the response body.
+
+    It is the sharper case of the same defect the rest of this change fixes:
+    the names land as an authoritative line OUTSIDE the fence, and a non-empty
+    list also tells `prefilter.should_skip` the interaction was substantive. A
+    reply that merely DISCUSSES tools produced both effects.
+    """
+
+    def _prompts(self, summary):
+        from unittest.mock import AsyncMock as _AM
+
+        from genesis.learning.triage.classifier import TriageClassifier
+
+        return [
+            TriageClassifier(_AM())._build_prompt(summary, ""),
+            OutcomeClassifier(_AM())._build_prompt(summary, ""),
+            DeltaAssessor(_AM())._build_prompt(summary),
+        ]
+
+    @staticmethod
+    def _summary(text: str, **kw):
+        from genesis.cc.types import CCOutput
+        from genesis.learning.triage.summarizer import build_summary
+
+        output = CCOutput(
+            session_id="s1",
+            text=text,
+            model_used="sonnet",
+            cost_usd=0.01,
+            input_tokens=10,
+            output_tokens=20,
+            duration_ms=5,
+            exit_code=0,
+            **kw,
+        )
+        return build_summary(output, session_id="s1", user_text="hi", channel="terminal")
+
+    _DISCUSSES = "I would run Tool: Bash and Using tool: WebFetch, but I did neither."
+
+    def test_the_runtime_is_believed_over_the_text(self):
+        """Both sources present and disagreeing: the runtime wins outright —
+        the scraped names must not be merged in as though they were equal."""
+        s = self._summary(self._DISCUSSES, tools_used=("Read",))
+        assert s.tool_calls == ["Read"]
+        assert s.tool_calls_from_runtime is True
+        for prompt in self._prompts(s):
+            assert "Tools used: Read" in prompt
+            # Whole-prompt, deliberately: delta.py orders the tools line AFTER
+            # the fence, so a head-only assertion here passes vacuously on one
+            # of the three builders.
+            assert "Bash" not in prompt.replace(s.response_text, "")
+            assert "WebFetch" not in prompt.replace(s.response_text, "")
+
+    def test_scraped_names_are_never_presented_as_tools_that_ran(self):
+        s = self._summary(self._DISCUSSES)
+        assert s.tool_calls == ["Bash", "WebFetch"]
+        assert s.tool_calls_from_runtime is False
+        for prompt in self._prompts(s):
+            assert "Tools used: Bash" not in prompt, prompt[:600]
+            assert "found in the response text" in prompt
+            assert "only mentioned rather than ran" in prompt
+
+    def test_no_report_and_no_names_is_stated_as_not_reported(self):
+        """The trap this replaces: an earlier version of this helper rendered
+        "Tools used: none" here, which is the deleted elision marker's mistake
+        with its sign flipped — absence of evidence written in the grammar of
+        evidence of absence — and it lands on the non-streaming inbox/mail path
+        where tools demonstrably do run."""
+        s = self._summary("Nothing to report.")
+        assert s.tool_calls == []
+        assert s.tool_calls_from_runtime is False
+        for prompt in self._prompts(s):
+            assert "not reported" in prompt
+            assert "absence of evidence" in prompt
+            assert "Tools used: none" not in prompt
+
+    def test_a_runtime_report_of_zero_is_reported_as_none(self):
+        """The other side of the tri-state, and the reason CCOutput.tools_used
+        is `tuple | None`: when the runtime DID watch and saw nothing, "none"
+        is a fact and should be said plainly."""
+        s = self._summary("Nothing to report.", tools_used=())
+        assert s.tool_calls == []
+        assert s.tool_calls_from_runtime is True
+        for prompt in self._prompts(s):
+            assert "Tools used: none" in prompt
+            assert "absence of evidence" not in prompt
+
+    def test_the_runtime_flag_tracks_the_runtime_field_not_the_names(self):
+        """Guard the guard: a summary can carry names AND the flag only when
+        the runtime actually supplied them."""
+        assert self._summary("plain", tools_used=("Edit",)).tool_calls_from_runtime is True
+        assert self._summary("plain").tool_calls_from_runtime is False

@@ -22,7 +22,30 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   response does have to be shortened, the middle is removed rather than the end and
   the gap is labelled. The graders are also given the response inside explicit
   markers, and told about a shortened or interrupted run only when there is an
-  actual signal to report.
+  actual signal to report — and the "shortened" signal now comes from the
+  pipeline's own record of what it did, rather than from searching the reply for
+  a phrase. A reply that
+  happens to discuss this mechanism (or an incoming message that quotes it back)
+  can no longer make the grader believe the reply was shortened when it was not,
+  and the label on a genuinely shortened reply no longer claims anything about
+  whether the model stopped early.
+- **The tools a session used are now read from the session, not from its own
+  reply.** The same self-review pipeline told its graders which tools an
+  interaction used by pattern-matching the reply's text — so a reply that merely
+  *discussed* running a tool was reported as having run it. Genesis now records
+  tool use as it happens and reports that instead. Where it cannot — some
+  invocations do not stream — the graders are told plainly that any names were
+  extracted from the reply and may be tools it only mentioned, and where there
+  is no evidence either way they are told that too, rather than being handed a
+  bare "none" that reads like a finding. One visible consequence: short
+  interactions that genuinely used a tool are now reviewed where some were
+  previously filtered out, so review volume rises slightly.
+- **A long request is no longer cut off before Genesis reviews it.** The same
+  pipeline shortened the user's own message to its first 500 characters with
+  nothing marking the cut, and then asked a grader to judge whether the reply
+  matched the request. On this install 15% of incoming messages were over that
+  limit. Requests now reach the reviewer whole; a genuinely enormous one is
+  shortened from the middle, keeps its ending, and says how much was removed.
 
 ### Added
 

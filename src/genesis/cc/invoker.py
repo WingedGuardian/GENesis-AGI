@@ -1051,6 +1051,7 @@ class CCInvoker:
         result_data: dict | None = None
         collected_text: list[str] = []
         event_types: list[str] = []
+        tools_seen: list[str] = []
         rate_limit_raw: dict | None = None
         timed_out = False
         terminated_after_result = False
@@ -1086,6 +1087,27 @@ class CCInvoker:
 
                     if event.event_type == "text" and event.text:
                         collected_text.append(event.text)
+                    if etype == "assistant":
+                        # Read off the RAW content array, not the parsed
+                        # StreamEvent: `from_raw` returns ONE event per message
+                        # and stops at the first recognised block, so a message
+                        # shaped `thinking + text + tool_use` parses as "text"
+                        # and drops the tool name entirely. MEASURED on this
+                        # install's own transcripts: 13 of 8655 assistant
+                        # messages carrying a tool_use (0.15%) have it in a
+                        # non-first position. Rare, but the failure is
+                        # asymmetric — if OTHER tools were captured the list is
+                        # marked runtime-sourced and rendered as authoritative
+                        # while silently incomplete, which is the exact grammar
+                        # this change exists to remove.
+                        for block in event_raw.get("message", {}).get("content", []) or []:
+                            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                                continue
+                            name = block.get("name")
+                            # First-seen order, deduplicated — the same shape
+                            # the text-scraping fallback produces.
+                            if name and name not in tools_seen:
+                                tools_seen.append(name)
                     if event.event_type == "result":
                         result_data = event_raw
                         result_text = event_raw.get("result", "")
@@ -1204,6 +1226,11 @@ class CCInvoker:
 
         if result_data is not None:
             output = self._parse_result_dict(result_data, invocation, elapsed)
+            # Unconditional: () is now a real report ("the runtime watched and
+            # saw no tool_use"), distinct from None ("nothing watched"). A
+            # `if tools_seen:` guard here would silently downgrade the former
+            # to the latter on every tool-free streaming turn.
+            output = replace(output, tools_used=tuple(tools_seen))
             # When CC uses extended thinking, the result field can be empty
             # but the actual response was emitted as text events during streaming
             if not output.text and collected_text:
@@ -1270,6 +1297,7 @@ class CCInvoker:
             model_requested=str(invocation.model),
             via_proxy=bool(invocation.anthropic_base_url),
             bg_truncated=bg_truncated,
+            tools_used=tuple(tools_seen),
         )
         if bg_truncated:
             await _emit_bg_truncation_event(output.session_id)
