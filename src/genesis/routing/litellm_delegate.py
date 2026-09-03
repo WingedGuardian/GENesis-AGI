@@ -55,7 +55,7 @@ _TYPE_TO_PREFIX: dict[str, str] = {
     "ollama": "ollama",
     "lmstudio": "openai",  # OpenAI-compatible with base_url
     "qwen": "openai",  # Alibaba — use OpenAI-compatible endpoint
-    "glm": "openai",  # Zhipu — use OpenAI-compatible endpoint
+    "zhipu": "openai",  # Zhipu GLM — OpenAI-compatible endpoint (api/paas/v4)
     "zenmux": "openai",  # ZenMux — OpenAI-compatible aggregator
     "minimax": "openai",  # MiniMax — OpenAI-compatible with base_url
     "deepseek": "deepseek",  # DeepSeek — native LiteLLM support

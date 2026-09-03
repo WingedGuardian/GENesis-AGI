@@ -220,6 +220,43 @@ providers:
     base_url: https://zenmux.ai/api/v1
     free: false
     open_duration_s: 120
+  zhipu-glm-flash:
+    # Zhipu/Z.AI direct, GENERAL endpoint (api/paas/v4) with the standard
+    # ZHIPU_API_KEY — the type's env resolution finds it by convention.
+    # NEVER point this at a coding-plan endpoint or key: Z.AI's coding-plan
+    # surface is restricted to approved tools and misuse risks the account.
+    # glm-4-flash is Zhipu's published free model (live probe at this
+    # endpoint: 200, clean bare JSON, ~3s; glm-4.5-flash was rejected for
+    # this lane — reasoning-by-default, 10-18s, fence-wrapped JSON even with
+    # thinking disabled). Billing-vs-free unverified against an account
+    # statement — measure alongside the success-rate acceptance below.
+    # NOTE: ZHIPU_API_KEY is SHARED with the CC roster's glm failover
+    # (cc_roster.yaml auth_env) — it must be a key valid on the GENERAL
+    # endpoint. A coding-plan-only key would 401 this lane on every fallback
+    # pass (graceful — the chain continues — but it is a dead hop and log
+    # noise; and never point such a key at coding endpoints from here).
+    # Placement: inserted immediately BEFORE the first paid DeepSeek member,
+    # only where that member is not the chain lead. Pre-existing free
+    # last-resort tails that already sat below the paid members keep their
+    # positions (so in a few chains this provider ranks above those tails).
+    # Not promoted above the free providers that precede the paid fallback,
+    # and never ahead of a deliberately-paid lead, until a real success rate
+    # is measured on live fallback traffic.
+    # rpd_limit is the published free-tier daily cap (~1K req/day, not yet
+    # verified against this account). No consumer exists in THIS tree — it
+    # is a forward declaration for the daily-budget ledger (built on a
+    # sibling branch, PR #1624) and is silently ignored until that lands.
+    # rpm_limit 20 is a conservative self-throttle, PROVISIONAL — Zhipu's
+    # real free-tier RPM is unmeasured; revisit with the success-rate
+    # measurement.
+    type: zhipu
+    model: glm-4-flash
+    profile: glm-4-flash
+    base_url: https://api.z.ai/api/paas/v4
+    free: true
+    rpm_limit: 20
+    rpd_limit: 1000
+    open_duration_s: 120
   minimax-m25:
     type: minimax
     model: MiniMax-M2.7
@@ -309,6 +346,7 @@ call_sites:
     - gemini-free
     - nvidia-nim-deepseek
     - mistral-large-free
+    - zhipu-glm-flash
     - openrouter-deepseek-v4-flash
   # V4 placeholder: cognitive state IS actively maintained today, but via direct
   # DB writes (awareness/loop.py, cc/reflection_bridge*.py), NOT this call site.
@@ -373,6 +411,7 @@ call_sites:
     chain:
     - openrouter-gpt55
     - nvidia-nim-deepseek
+    - zhipu-glm-flash
     - openrouter-deepseek-v4
     - openrouter-qwen36plus
     default_paid: true
@@ -396,6 +435,7 @@ call_sites:
   dream_cycle_synthesis:
     chain:
     - nvidia-nim-deepseek
+    - zhipu-glm-flash
     - openrouter-deepseek-v4-flash
     - groq-free
     retry_profile: background
@@ -444,6 +484,7 @@ call_sites:
   dream_cycle_entity_challenge:
     chain:
     - nvidia-nim-deepseek
+    - zhipu-glm-flash
     - openrouter-deepseek-v4-flash
     retry_profile: background
   # Entity-NODE merge-vs-distinct adjudication (entity_adjudication drainer).
@@ -463,6 +504,7 @@ call_sites:
   entity_adjudication_challenge:
     chain:
     - nvidia-nim-deepseek
+    - zhipu-glm-flash
     - openrouter-deepseek-v4-flash
     retry_profile: background
   # One-shot supervised wing backfill (scripts/wing_backfill.py) — batch
@@ -472,11 +514,13 @@ call_sites:
     chain:
     - nvidia-nim-deepseek
     - groq-free
+    - zhipu-glm-flash
     - openrouter-deepseek-v4-flash
     retry_profile: background
   27_pre_execution_assessment:
     chain:
     - glm51
+    - zhipu-glm-flash
     - openrouter-deepseek-v4-flash
     default_paid: true
     retry_profile: user_facing
@@ -531,6 +575,7 @@ call_sites:
   38_procedure_extraction:
     chain:
     - nvidia-nim-deepseek
+    - zhipu-glm-flash
     - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
     - groq-free
@@ -550,6 +595,7 @@ call_sites:
     chain:
     - mistral-large-free
     - gemini-free
+    - zhipu-glm-flash
     - openrouter-deepseek-v4
     default_paid: true
     description: Salvage a deep-reflection CC session that ended in prose (no
@@ -565,6 +611,7 @@ call_sites:
   43_task_retrospective:
     chain:
     - nvidia-nim-deepseek
+    - zhipu-glm-flash
     - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
     - mistral-large-free
@@ -574,6 +621,7 @@ call_sites:
   44_task_premortem:
     chain:
     - nvidia-nim-deepseek
+    - zhipu-glm-flash
     - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
     - mistral-large-free
@@ -644,6 +692,7 @@ call_sites:
     - gemini-free
     - mistral-large-free
     - openrouter-free
+    - zhipu-glm-flash
     - openrouter-deepseek-v4-flash
     default_paid: true
     retry_profile: background

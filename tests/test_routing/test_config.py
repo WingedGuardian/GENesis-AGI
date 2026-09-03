@@ -133,7 +133,8 @@ def test_load_full_yaml(monkeypatch):
     # unwired openrouter-qwen3coder (delisted qwen/qwen3-coder:free slug).
     # 2026-08-19: 26 → 25 after removing dead nvidia-nim-kimi (moonshotai/kimi-k2.6
     # 404-for-account on NIM); nvidia-nim-deepseek repointed v4-pro → v4-flash-0731.
-    assert len(cfg.providers) == 25
+    # 2026-09-03: 25 → 26 adding zhipu-glm-flash (Zhipu direct, general endpoint).
+    assert len(cfg.providers) == 26
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
     assert "openrouter-deepseek-r1" not in cfg.providers  # removed from config
@@ -236,6 +237,23 @@ def test_load_full_yaml(monkeypatch):
     ml = cfg.providers["mistral-large-free"]
     assert ml.is_free is True
     assert ml.model_id == "mistral-large-latest"
+
+    # zhipu-glm-flash (2026-09): Zhipu direct on the GENERAL endpoint with the
+    # published free flash model. Inserted immediately before the first paid
+    # DeepSeek member, only where that member is not the chain lead; free
+    # last-resort tails already below the paid members keep their positions
+    # (success rate unmeasured beyond a live smoke probe — no promotion).
+    zp = cfg.providers["zhipu-glm-flash"]
+    assert zp.provider_type == "zhipu"
+    assert zp.model_id == "glm-4-flash"
+    assert zp.is_free is True
+    assert zp.base_url == "https://api.z.ai/api/paas/v4"
+    chain_38 = cfg.call_sites["38_procedure_extraction"].chain
+    pos = chain_38.index("zhipu-glm-flash")
+    assert chain_38[pos + 1] in (
+        "openrouter-deepseek-v4-flash", "openrouter-deepseek-v4",
+    ), "zhipu-glm-flash must sit immediately ahead of the paid fallback"
+    assert pos > 0, "zhipu-glm-flash must not lead a chain yet (unmeasured)"
 
     # groq-free provider — MIGRATED 2026-08-06: Groq deprecated
     # llama-3.3-70b-versatile (shutdown 2026-08-16) → openai/gpt-oss-120b, its
