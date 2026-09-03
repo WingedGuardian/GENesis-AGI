@@ -781,6 +781,16 @@ class OutreachPipeline:
                 await self._record_autonomous_send(
                     request, gate_cell, recipient, outreach_id, now,
                 )
+                # LOOP-FIX: autonomous (GRANTED-cell) delivery advances a matching
+                # curated prospect active → contacted (a no-op for a non-prospect
+                # recipient) so the campaign's list_active stops re-pitching it. The
+                # HELD → owner-approved path stamps in the email-gate drain; this is
+                # the GRANTED-cell path, which delivers INLINE here and never touches
+                # that drain — without this the loop-fix would silently regress once
+                # the cell graduates to autonomous. Same active-guarded CRUD.
+                from genesis.db.crud import marketing_prospects as _mp
+
+                await _mp.mark_contacted_by_email(self._db, recipient, contacted_at=now)
 
         # Auto-register email threads for reply tracking
         if channel == "email" and self._thread_tracker is not None:

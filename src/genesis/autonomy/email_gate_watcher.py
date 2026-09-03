@@ -70,6 +70,20 @@ async def _recipient_opted_out(db: object, recipient: str | None) -> bool:
     return bool(row.get("opted_out"))
 
 
+async def _stamp_prospect_contacted(db: object, recipient: str | None, now: str) -> None:
+    """LOOP-FIX helper: on a CONFIRMED delivery, advance the matching prospect
+    active → contacted so the campaign's ``list_active`` never re-pitches it.
+    Delegates to the shared, active-guarded CRUD (the same entry point
+    ``pipeline._deliver`` uses for the GRANTED autonomous path), so the stamp
+    semantics live in one place. A non-marketing / non-active / absent recipient is
+    a no-op."""
+    if not recipient:
+        return
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.mark_contacted_by_email(db, recipient, contacted_at=now)
+
+
 def _subject(context: str | None) -> str:
     if not context:
         return ""
@@ -108,6 +122,11 @@ async def drain_pending_email_sends(rt: object) -> int:
                 # re-sending: this narrows the at-least-once window to the gap
                 # between adapter.send and mark_consumed.
                 await pes.mark_sent(db, row["id"], sent_at=now)
+                # LOOP-FIX: this row was genuinely DELIVERED by the prior (crashed)
+                # cycle, which never reached the stamp below — advance the prospect
+                # here too so a crash between delivery and the stamp can't leave it
+                # 'active' and re-pitched.
+                await _stamp_prospect_contacted(db, row["validated_recipient"], now)
                 resolved += 1
                 logger.info(
                     "Reconciled held email %s (approval already consumed) — not re-sent",
@@ -198,6 +217,12 @@ async def drain_pending_email_sends(rt: object) -> int:
                     # WS-3 gate-3: the OWNER approved this send — owner evidence.
                     origin_class="owner",
                 )
+                # LOOP-FIX: confirmed delivery → advance a matching curated prospect
+                # active → contacted (a no-op for a non-prospect recipient) so
+                # list_active stops re-pitching it. Keyed on the RECIPIENT being a
+                # curated prospect, NOT cell_risk_class, so a cold pitch that
+                # misclassified FINANCIAL (money-term body) is still stamped.
+                await _stamp_prospect_contacted(db, row["validated_recipient"], now)
                 resolved += 1
                 logger.info(
                     "Resolved held email %s → sent to %s",

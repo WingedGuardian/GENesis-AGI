@@ -175,3 +175,47 @@ async def test_full_earn_grant_send_flag_demote_loop(config, db):
 
     # 7. Re-flag is idempotent: no second demotion path is taken.
     assert await aes.mark_flagged(db, log[0]["id"], flagged_at=now) is False
+
+
+@pytest.mark.asyncio
+async def test_granted_bulk_autonomous_send_stamps_prospect_contacted(config, db, monkeypatch):
+    """The GRANTED-cell autonomous path delivers INLINE in pipeline._deliver, NEVER
+    through the email-gate drain — so the loop-fix (advance the prospect
+    active → contacted) must fire there too. Without it, a delivered cold send leaves
+    the prospect 'active' forever once BULK graduates, and the campaign re-pitches it
+    every tick, unsupervised — the highest-stakes moment for the loop-fix to hold."""
+    from genesis.db.crud import capability_grants as cg
+    from genesis.db.crud import marketing_prospects as mp
+
+    _ts = "2026-06-21T00:00:00"
+    monkeypatch.setattr("genesis.outreach.marketing_config.effective_mode", lambda: "live")
+    await cg.ensure_cell(db, domain="email", verb="send", risk_class="bulk", updated_at=_ts)
+    await db.execute(
+        "UPDATE capability_grants SET state = 'granted', granted_at = ? WHERE id = ?",
+        (_ts, cg.cell_id("email", "send", "bulk")),
+    )
+    await db.commit()
+    await mp.create(db, id="p1", email="prospect@example.com", created_at=_ts, updated_at=_ts)
+
+    adapter = AsyncMock()
+    adapter.send_message.return_value = "<m@x>"
+    pipe = _pipeline(config, db, adapter)
+
+    req = OutreachRequest(
+        category=OutreachCategory.NOTIFICATION,
+        topic="cold pitch",
+        context="body",
+        salience_score=0.5,
+        signal_type="marketing_cold",
+        channel="email",
+        validated_recipient="prospect@example.com",
+        labeled_surplus=True,  # → classifies BULK at the gate
+        verbatim=True,
+    )
+    r = await pipe.submit_raw("cold pitch", req)
+    assert r.status == OutreachStatus.DELIVERED  # autonomous — no hold
+    adapter.send_message.assert_called_once()
+    assert (await mp.get_by_id(db, "p1"))[
+        "status"
+    ] == "contacted"  # loop-fix at the granted chokepoint
+    assert await mp.list_active(db) == []

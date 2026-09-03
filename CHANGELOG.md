@@ -9,6 +9,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **The cold-marketing campaign no longer re-pitches the same person.** Once a
+  marketing pitch is delivered to a prospect, that prospect is marked contacted and
+  drops out of the campaign's target list — previously nothing recorded the contact,
+  so the campaign would have re-pitched every delivered target on each run. Works on
+  both the owner-approved and (future) autonomous send paths; a pitch that never
+  delivers (dropped, expired, or rejected) leaves the prospect eligible for a later,
+  re-worked pitch. (The substrate still ships off by default.)
+
 ### Changed
 
 - **Mistral Large is now tracked as a paid provider.** Mistral removed the Large
