@@ -7,9 +7,12 @@ against independent measurements where they exist. Kept here because these
 lessons generalize past any one pipeline: they apply to how Genesis sessions
 work, tiered process or not.
 
-Status: reference document. Mechanisms Genesis has adopted are cited in the
-work-tracking and dev-process design docs; this file is the durable index of
-the *lessons*, with the numbers that back them.
+Status: reference document — the durable index of the *lessons*, with the
+numbers that back them. It records what the external evidence says, not what
+Genesis has adopted. Where a mechanism here is live, it is visible in the
+enforcement hooks (`scripts/hooks/`) and the `genesis-development` skill;
+there is no design doc to cite, because design docs are install-local and
+never reach this repo.
 
 ## The through-line
 
@@ -109,7 +112,15 @@ gate declares which side of the line it sits on — no gate is ambiently
 ## Sources
 
 Primary: the repos and video named in the header, fetched and read as source.
-Independent corroboration of tips 3/5/11: a 47-run empirical test of the same
-claims (sharp stop conditions 31% faster / 7% cheaper than vague prompts;
+Independent corroboration of tips 5 and 11: a 47-run empirical test of the
+same claims (sharp stop conditions 31% faster / 7% cheaper than vague prompts;
 reusable rules cut cost ~21.6%) — the mechanisms replicate even where the
 surrounding terminology is marketing.
+
+**Not corroborated — tip 3.** The "~10% of specific detail survives
+auto-compaction" figure is SINGLE-SOURCE, from the primary above; neither
+cited result speaks to it. It is the number here most likely to be quoted
+onward as settled, because it drives a concrete behavioural recommendation
+(smaller units of work, manual handoff over `/compact`). The recommendation
+stands on its stated mechanism; the figure is one practitioner's measurement
+until someone replicates it.
