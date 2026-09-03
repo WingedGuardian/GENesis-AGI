@@ -502,7 +502,11 @@ TABLES = {
             rate_limited_at  TEXT,
             rate_limit_resumes_at TEXT,
             origin_class     TEXT,
-            chat_id          TEXT
+            chat_id          TEXT,
+            -- when the TOPIC was written, as distinct from
+            -- last_extracted_at, which is a pass watermark the extraction
+            -- job advances even when it writes no topic.
+            topic_updated_at TEXT
         )
     """,
     "inbox_items": """
@@ -1880,7 +1884,10 @@ TABLES = {
             pointers         TEXT NOT NULL DEFAULT '[]',
             compaction_count INTEGER NOT NULL DEFAULT 0,
             created_at       TEXT NOT NULL,
-            updated_at       TEXT
+            updated_at       TEXT,
+            -- when the MISSION was last set, as distinct from updated_at, which
+            -- is a ROW timestamp bumped by pointer edits and the upsert too.
+            mission_updated_at TEXT
         )
     """,
     # Data-migration framework ledger (WS-C). Kept in LOCKSTEP with migration
