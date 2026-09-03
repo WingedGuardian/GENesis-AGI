@@ -34,6 +34,7 @@ from genesis.cc.types import (
     clamp_effort,
     model_supports_effort,
 )
+from genesis.observability.oom import OomProbe
 from genesis.observability.spans import SpanKind, start_span
 from genesis.util.proc_kill import (
     kill_process_group,
@@ -539,8 +540,19 @@ class CCInvoker:
             proc.send_signal(signal.SIGINT)
 
     @staticmethod
-    def _classify_error(stderr_text: str, stdout_text: str = "") -> CCError:
+    def _classify_error(
+        stderr_text: str, stdout_text: str = "", *, oom_note: str | None = None
+    ) -> CCError:
         """Classify CC output into a typed CC exception.
+
+        ``oom_note`` carries a cause this function cannot derive from text, because
+        the failure it describes produces none: a process reaped by the OOM killer
+        dies by SIGKILL with empty output, so every pattern below misses and it lands
+        on the generic error at the end. The note is appended to the message rather
+        than routed to a new exception type — the retry semantics of an OOM death are
+        the generic ones, and inventing a type would change control flow to deliver a
+        string. Callers that need to branch on it should key off the counter, not on
+        message text.
 
         Checks both stderr and stdout — when CC runs in streaming-JSON
         mode the rate-limit / quota signal often appears in stdout
@@ -611,7 +623,13 @@ class CCInvoker:
         # CCError on resumes, so this only improves classification fidelity.
         if "thinking" in lower and "cannot be modified" in lower:
             return CCSessionError(source)
-        # Generic process error
+        # Generic process error — and the one place an OOM note can land, because a
+        # reaped process matches none of the patterns above. `source` is typically
+        # EMPTY here (SIGKILL writes nothing), which is exactly the bare "[killed]"
+        # this note exists to replace; the fallback text keeps the message from being
+        # only the annotation with no statement of what happened.
+        if oom_note:
+            return CCProcessError(f"{source or 'killed with no output'} — {oom_note}")
         return CCProcessError(source)
 
     async def _notify_status_change(self, error: CCError | None) -> None:
@@ -797,6 +815,11 @@ class CCInvoker:
 
         proc = None
         reg_key: str | None = None
+        # Sample the OOM counter BEFORE the spawn, because attribution is a delta and
+        # there is no way to take a "before" reading after the fact. Cheap (one small
+        # read), never raises, and degrades to a probe that declines to attribute
+        # anything on a host where the counter is unreadable.
+        oom_probe = OomProbe.sample()
         try:
             scope_args = _get_scope_args()
             proc = await asyncio.create_subprocess_exec(
@@ -894,13 +917,23 @@ class CCInvoker:
         if proc.returncode != 0:
             stderr_text = stderr.decode(errors="replace").strip()
             stdout_text = stdout.decode(errors="replace").strip()
+            # An OOM reap is the one failure that arrives with NOTHING to classify:
+            # SIGKILL leaves no message, so stderr and stdout are typically empty and
+            # every text-matching branch below falls through to a generic error. The
+            # cause has to come from outside the process's own output, and the cgroup
+            # counter is the only source that does not depend on a log line the
+            # journal usually does not have. `self_killed` is False here by
+            # construction: this is the normal-completion path, and the timeout and
+            # reaper paths that DO send SIGKILL return before reaching it.
+            oom_note = oom_probe.describe(proc.returncode)
             logger.error(
-                "CC subprocess failed (exit=%s): stderr=%s stdout=%s",
+                "CC subprocess failed (exit=%s): stderr=%s stdout=%s%s",
                 proc.returncode,
                 stderr_text[:500] or "(no stderr)",
                 stdout_text[:500] or "(no stdout)",
+                f" [{oom_note}]" if oom_note else "",
             )
-            err = self._classify_error(stderr_text, stdout_text)
+            err = self._classify_error(stderr_text, stdout_text, oom_note=oom_note)
             await self._notify_status_change(err)
             raise err
 

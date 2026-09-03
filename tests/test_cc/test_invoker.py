@@ -906,6 +906,52 @@ def test_classify_error_generic(invoker):
     assert isinstance(err, CCProcessError)
 
 
+def test_classify_error_carries_an_oom_cause_when_there_is_no_output(invoker):
+    """The reap arrives with NOTHING to classify, which is the whole problem.
+
+    SIGKILL writes no message, so stderr and stdout are empty and every pattern in
+    the classifier misses — the death lands on the generic error carrying an empty
+    string. That is the bare "[killed]" a session cannot distinguish from a crash or
+    a timeout, and re-arms the identical work after. The cause has to be attached
+    from outside the process's own output.
+    """
+    err = invoker._classify_error("", "", oom_note="probable cause: out-of-memory reap")
+    assert isinstance(err, CCProcessError)
+    assert "out-of-memory" in str(err)
+    assert "killed with no output" in str(err), (
+        "an empty source must still state WHAT happened, not carry only the annotation"
+    )
+
+
+def test_classify_error_without_an_oom_note_is_unchanged(invoker):
+    """The control: the note is additive. Every existing classification path must
+    behave exactly as before when no cause was derivable, or this observability
+    change would be quietly altering failure handling."""
+    err = invoker._classify_error("Something unknown went wrong")
+    assert isinstance(err, CCProcessError)
+    assert "probable cause" not in str(err)
+
+
+def test_classify_error_oom_note_does_not_override_a_typed_failure(invoker):
+    """A rate-limit death that happens to coincide with a reap elsewhere in the
+    cgroup must still classify as a rate limit — the typed exceptions drive retry and
+    park/resume behaviour, and demoting one to a generic error to deliver a string
+    would change control flow for an annotation."""
+    from genesis.cc.exceptions import CCQuotaExhaustedError, CCRateLimitError
+
+    note = "probable cause: out-of-memory reap"
+    assert isinstance(
+        invoker._classify_error("Rate limit exceeded, status 429", "", oom_note=note),
+        CCRateLimitError,
+    )
+    # The quota family too — it drives the park/resume layer, so a demotion here
+    # would strand a background session instead of parking it.
+    assert isinstance(
+        invoker._classify_error("usage limit reached", "", oom_note=note),
+        CCQuotaExhaustedError,
+    )
+
+
 def test_classify_error_thinking_block(invoker):
     """Thinking-block corruption on resume classified as session error."""
     from genesis.cc.exceptions import CCSessionError
