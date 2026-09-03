@@ -470,6 +470,46 @@ def test_marketing_send_cannot_be_re_enabled_via_tool_exceptions(profile):
     assert _MARKETING_SEND in inv.disallowed_tools
 
 
+_MARKETING_LIST = "mcp__genesis-outreach__marketing_prospects_list"
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [p for p in PROFILES if p != "campaign"],
+)
+def test_marketing_prospects_list_denied_outside_campaign(profile):
+    """The prospect ENUMERATION tool exposes private names+addresses from the
+    marketing_prospects store. Like the actuator, it must be reachable ONLY from
+    `campaign`; every other profile — crucially the untrusted-inbound perimeter
+    (mail + community-responder) — must deny it, so an injected inbound message can
+    never enumerate the list and echo it back through the reply tool."""
+    assert _MARKETING_LIST in PROFILES[profile], f"{profile} must deny {_MARKETING_LIST}"
+
+
+def test_marketing_prospects_list_allowed_in_campaign():
+    """campaign is the intended marketing caller — it must NOT deny the enumeration."""
+    assert _MARKETING_LIST not in PROFILES["campaign"]
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [p for p in PROFILES if p != "campaign"],
+)
+def test_marketing_prospects_list_cannot_be_re_enabled_via_tool_exceptions(profile):
+    """A per-request tool_exception must NOT unblock the enumeration on a non-campaign
+    profile — otherwise the exception mechanism is a prospect-PII exfil hole from the
+    untrusted-inbound perimeter."""
+    runner = _make_runner()
+    req = DirectSessionRequest(
+        prompt="t",
+        profile=profile,
+        model=CCModel.SONNET,
+        tool_exceptions=(_MARKETING_LIST,),
+    )
+    inv = runner._build_invocation(req, "test-session")
+    assert _MARKETING_LIST in inv.disallowed_tools
+
+
 def test_mail_blocks_outreach_extras():
     assert "mcp__genesis-outreach__outreach_send_and_wait" in PROFILES["mail"]
     assert "mcp__genesis-outreach__outreach_poll" in PROFILES["mail"]

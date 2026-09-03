@@ -223,15 +223,20 @@ _NO_OUTREACH_EXTRAS = [
     "mcp__genesis-outreach__outreach_digest",
 ]
 
-# Cold-marketing actuator. marketing_send resolves its recipient in-code from the
-# owner-curated marketing_prospects store and enqueues a BULK cold send — it must be
-# reachable ONLY from the `campaign` profile (the intended autonomous marketing
-# caller). Deny it in every other profile: mandatorily for the untrusted-inbound
-# perimeter profiles (mail, community-responder), where an injected inbound message
-# could otherwise reach the actuator, and belt-and-suspenders on profiles that don't
-# mount genesis-outreach today (guards an MCP-config fallback-to-full).
+# Cold-marketing tools. marketing_send resolves its recipient in-code from the
+# owner-curated marketing_prospects store and enqueues a BULK cold send;
+# marketing_prospects_list ENUMERATES that same private store (names + addresses).
+# Both must be reachable ONLY from the `campaign` profile (the intended autonomous
+# marketing caller). Deny them in every other profile: mandatorily for the
+# untrusted-inbound perimeter profiles (mail, community-responder), where an injected
+# inbound message could otherwise reach the actuator OR exfiltrate the prospect list
+# by echoing it back through the profile's reply tool, and belt-and-suspenders on
+# profiles that don't mount genesis-outreach today (guards an MCP-config
+# fallback-to-full). NOTE: the tool code-gates on effective_mode()==off (returns
+# empty), so this denial is what protects the store once marketing mode is ARMED.
 _NO_MARKETING_SEND = [
     "mcp__genesis-outreach__marketing_send",
+    "mcp__genesis-outreach__marketing_prospects_list",
 ]
 
 # The venv Python interpreter running genesis-server. Exposed to profile
