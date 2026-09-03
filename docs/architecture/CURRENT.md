@@ -1024,7 +1024,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 50b79ffb 2026-09-01
+verified: 29a382e7 2026-09-03
 ```
 
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
@@ -1151,6 +1151,21 @@ verified: 50b79ffb 2026-09-01
   `job.failed` is in the ego's `_REFLEX_OWNED_EVENT_TYPES` so it never spins a
   reactive ego cycle. Ingested by the reflex arc as of PR-2b (`ingest.py`
   consumes `job.failed`, guarded on `error_type` presence).
+- **A resumed reflection runs against a DIFFERENT tick than the one that asked.**
+  When a user approves a reflection's gated CC fallback, `_resume_approved_reflections`
+  dispatches it with `self._last_tick_result` — the CURRENT tick — because the
+  loop's own scoring may never reach that depth again. So what a person approved
+  and what runs are about different moments — and per that method's docstring
+  the reason is availability, not a preference for fresher state: the current
+  tick is the only one it has. The ORIGINATING tick is genuinely unrecoverable: the approval context is
+  built from a fixed key set with no tick field, and `_approval_key` excludes
+  per-invocation identity on purpose so recurring dispatches reuse one pending
+  row rather than minting a new approval every tick. The resume log therefore
+  names the approval, its age, and the tick being run against, and says outright
+  that this is not the requesting tick — rather than implying a lineage that
+  does not exist. Giving it one would mean a key-neutral carrier that does not
+  currently exist; do not smuggle a tick id into `action_label` or
+  `extra_context`, both of which feed the approval key.
 - **perception/**: the real-time reflection engine — MICRO (and LIGHT without
   a CC bridge) run in-process via the router; DEEP/STRATEGIC go to the CC
   reflection bridge. GROUNDWORK: user-model-synthesis, pre-execution-gate
