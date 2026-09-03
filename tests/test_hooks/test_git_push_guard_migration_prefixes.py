@@ -78,6 +78,11 @@ def _files(*paths: str, status: str = "added") -> str:
     )
 
 
+def _file_row(filename: str, status: str = "added", previous: str | None = None) -> str:
+    """One wire row with full control (rename sources, removals)."""
+    return json.dumps({"filename": filename, "previous_filename": previous, "status": status})
+
+
 def _main(*names: str) -> str:
     """The `_TEST_GH_MAIN_MIGRATIONS` seam: one entry per line (bare basename
     = the numbered dir; an entry with a slash is a full path)."""
@@ -180,6 +185,42 @@ class TestOnlyAddedFilesClaim:
         blocked, _ = _mod._check_migration_prefixes("1616")
         assert blocked is False
 
+    def test_a_rename_of_a_MAIN_migration_is_not_a_collision(self, monkeypatch):
+        """Codex P2 (#1666): renaming main's `0090_old.py` to `0090_new.py`
+        claims 0090 while main still lists 0090_old — but the MERGED tree holds
+        only one 0090, so blocking (with no override, by design) makes a
+        legitimate migration replacement permanently unmergeable. The rename
+        SOURCE must be subtracted from main's claims before comparing."""
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            _file_row(f"{_D}0090_new.py", status="renamed", previous=f"{_D}0090_old.py"),
+        )
+        monkeypatch.setenv("_TEST_GH_MAIN_MIGRATIONS", _main("0090_old.py"))
+        blocked, _ = _mod._check_migration_prefixes("1700")
+        assert blocked is False
+
+    def test_a_delete_plus_add_replacement_is_not_a_collision(self, monkeypatch):
+        """Same replacement expressed as remove-old + add-new."""
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            _file_row(f"{_D}0090_new.py") + "\n" + _file_row(f"{_D}0090_old.py", status="removed"),
+        )
+        monkeypatch.setenv("_TEST_GH_MAIN_MIGRATIONS", _main("0090_old.py"))
+        blocked, _ = _mod._check_migration_prefixes("1700")
+        assert blocked is False
+
+    def test_removing_an_UNRELATED_file_exempts_nothing(self, monkeypatch):
+        """The subtraction is by exact path, never by 'the PR removed
+        something': removing 0089_x must not license a 0090 collision."""
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            _file_row(f"{_D}0090_new.py") + "\n" + _file_row(f"{_D}0089_x.py", status="removed"),
+        )
+        monkeypatch.setenv("_TEST_GH_MAIN_MIGRATIONS", _main("0090_old.py", "0089_x.py"))
+        blocked, msg = _mod._check_migration_prefixes("1700")
+        assert blocked is True
+        assert "0090" in msg
+
     def test_a_renamed_target_still_claims(self, monkeypatch):
         """A rename CREATES the destination path — that prefix is claimed."""
         monkeypatch.setenv("_TEST_GH_PR_FILES", _files(f"{_D}0092_renamed.py", status="renamed"))
@@ -187,6 +228,29 @@ class TestOnlyAddedFilesClaim:
         blocked, msg = _mod._check_migration_prefixes("1616")
         assert blocked is True
         assert "0092" in msg
+
+
+class TestConsequenceAccuracy:
+    """Codex P3 (#1666): the two runners fail DIFFERENTLY, and the block must
+    say which. The numbered runner raises pre-flight and aborts bootstrap; the
+    data runner catches its duplicate, skips ONLY the data-migration batch, and
+    the server boots on (data_migrations/runner.py catches; _core.py runs it
+    post-boot). Attributing the startup-halt to a d-collision overstates it."""
+
+    def test_numbered_collision_names_the_startup_halt(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_PR_FILES", _files(f"{_D}0090_x.py"))
+        monkeypatch.setenv("_TEST_GH_MAIN_MIGRATIONS", _main("0090_y.py"))
+        blocked, msg = _mod._check_migration_prefixes("1700")
+        assert blocked is True
+        assert "halts" in msg and "restart" in msg
+
+    def test_data_collision_names_the_batch_skip_not_the_halt(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_PR_FILES", _files(f"{_DD}d0004_mine.py"))
+        monkeypatch.setenv("_TEST_GH_MAIN_MIGRATIONS", _main(f"{_DD}d0004_theirs.py"))
+        blocked, msg = _mod._check_migration_prefixes("1700")
+        assert blocked is True
+        assert "data-migration" in msg
+        assert "EVERY migration" not in msg
 
 
 class TestSelfCollision:
@@ -445,8 +509,8 @@ class TestOpenPrSweepSubprocessLevel:
         run, calls = _fake_run(
             [
                 (_graphql_payload([_pr_node(1541, [], has_next=True)]), 0),
-                # the refetch: _pr_added_files' REST read for #1541
-                (f"{_D}0090_ledger.py\n", 0),
+                # the refetch: _pr_file_effects' REST read for #1541 — JSON rows
+                (_file_row(f"{_D}0090_ledger.py") + "\n", 0),
             ]
         )
         monkeypatch.setattr(_mod.subprocess, "run", run)
@@ -487,7 +551,7 @@ class TestOpenPrSweepSubprocessLevel:
         assert _mod._open_pr_migrations(repo="o/r") is None
 
     def test_added_files_reads_status_from_the_wire(self, monkeypatch):
-        """`_pr_added_files`' live jq filters by status; the seam path filters
+        """`_pr_file_effects`' live path reads status per row; the seam path filters
         in Python. This exercises the SEAM path's filter with explicit
         statuses — the live filter is asserted by the jq text itself."""
         monkeypatch.setenv(
@@ -496,7 +560,29 @@ class TestOpenPrSweepSubprocessLevel:
             + "\n"
             + _files(f"{_D}0090_b.py", status="modified"),
         )
-        assert _mod._pr_added_files("1") == [f"{_D}0092_a.py"]
+        created, removed = _mod._pr_file_effects("1")
+        assert created == [f"{_D}0092_a.py"]
+        assert removed == set()
+
+    def test_file_effects_reports_removals_and_rename_sources(self, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            _file_row(f"{_D}0090_new.py", status="renamed", previous=f"{_D}0090_old.py")
+            + "\n"
+            + _file_row(f"{_D}0089_gone.py", status="removed"),
+        )
+        created, removed = _mod._pr_file_effects("1")
+        assert created == [f"{_D}0090_new.py"]
+        assert removed == {f"{_D}0090_old.py", f"{_D}0089_gone.py"}
+
+    def test_file_effects_fails_to_None_at_the_api_cap(self, monkeypatch):
+        """Codex P2 (#1666): pulls/N/files caps at 3,000 rows; at the cap a
+        migration beyond the listing is silently absent, so 'no migrations'
+        would describe the LISTING, not the PR. Same contract as the sibling
+        _pr_changed_files."""
+        rows = "\n".join(_file_row(f"src/f{i}.py") for i in range(_mod._PR_FILES_API_CAP))
+        monkeypatch.setenv("_TEST_GH_PR_FILES", rows)
+        assert _mod._pr_file_effects("1") is None
 
 
 class TestCiFreshnessNote:
@@ -511,7 +597,7 @@ class TestCiFreshnessNote:
     """
 
     def test_flags_a_check_older_than_the_default_branch_head(self, monkeypatch):
-        monkeypatch.setenv("_TEST_GH_CI_COMPLETED_AT", "2026-09-02T13:17:21Z")
+        monkeypatch.setenv("_TEST_GH_CI_NEWEST_START", "2026-09-02T13:17:21Z")
         monkeypatch.setenv("_TEST_GH_DEFAULT_HEAD_DATE", "2026-09-02T21:43:17Z")
         note = _mod._ci_freshness_note("1541")
         assert note is not None
@@ -526,22 +612,22 @@ class TestCiFreshnessNote:
         demonstrated on, had gone RED under a concurrent push. Staleness and
         outcome are independent facts; claiming one from the other is exactly
         the unverified-assertion class the report is supposed to avoid."""
-        monkeypatch.setenv("_TEST_GH_CI_COMPLETED_AT", "2026-09-02T13:17:21Z")
+        monkeypatch.setenv("_TEST_GH_CI_NEWEST_START", "2026-09-02T13:17:21Z")
         monkeypatch.setenv("_TEST_GH_DEFAULT_HEAD_DATE", "2026-09-02T21:43:17Z")
         note = _mod._ci_freshness_note("1541")
         assert "green" not in note.lower()
         assert "pass" not in note.lower()
 
     def test_silent_when_the_check_is_newer_than_main(self, monkeypatch):
-        monkeypatch.setenv("_TEST_GH_CI_COMPLETED_AT", "2026-09-03T18:00:00Z")
+        monkeypatch.setenv("_TEST_GH_CI_NEWEST_START", "2026-09-03T18:00:00Z")
         monkeypatch.setenv("_TEST_GH_DEFAULT_HEAD_DATE", "2026-09-03T12:00:00Z")
         assert _mod._ci_freshness_note("1616") is None
 
     def test_silent_when_either_side_is_unreadable(self, monkeypatch):
-        monkeypatch.setenv("_TEST_GH_CI_COMPLETED_AT", "__error__")
+        monkeypatch.setenv("_TEST_GH_CI_NEWEST_START", "__error__")
         monkeypatch.setenv("_TEST_GH_DEFAULT_HEAD_DATE", "2026-09-03T12:00:00Z")
         assert _mod._ci_freshness_note("1616") is None
-        monkeypatch.setenv("_TEST_GH_CI_COMPLETED_AT", "2026-09-03T12:00:00Z")
+        monkeypatch.setenv("_TEST_GH_CI_NEWEST_START", "2026-09-03T12:00:00Z")
         monkeypatch.setenv("_TEST_GH_DEFAULT_HEAD_DATE", "__error__")
         assert _mod._ci_freshness_note("1616") is None
 
@@ -549,7 +635,7 @@ class TestCiFreshnessNote:
         """GitHub returns `Z` on the checks API and a numeric offset on the
         commit API. Comparing them as STRINGS would put `2026-09-02T21:43:17Z`
         before `2026-09-02T17:43:17-04:00` — the same instant, wrong answer."""
-        monkeypatch.setenv("_TEST_GH_CI_COMPLETED_AT", "2026-09-02T13:17:21Z")
+        monkeypatch.setenv("_TEST_GH_CI_NEWEST_START", "2026-09-02T13:17:21Z")
         monkeypatch.setenv("_TEST_GH_DEFAULT_HEAD_DATE", "2026-09-02T17:43:17-04:00")
         assert _mod._ci_freshness_note("1541") is not None
 
@@ -557,6 +643,6 @@ class TestCiFreshnessNote:
         """Comparing naive to aware raises TypeError; outside the guard that
         aborts the whole report mid-print — a partial report that looks
         structurally complete (SHOULD-FIX 9)."""
-        monkeypatch.setenv("_TEST_GH_CI_COMPLETED_AT", "2026-09-02T13:17:21")
+        monkeypatch.setenv("_TEST_GH_CI_NEWEST_START", "2026-09-02T13:17:21")
         monkeypatch.setenv("_TEST_GH_DEFAULT_HEAD_DATE", "2026-09-02T21:43:17Z")
         assert _mod._ci_freshness_note("1541") is None

@@ -4455,51 +4455,79 @@ def _migration_prefix_claims(paths: list[str]) -> dict[str, list[str]]:
     return claims
 
 
-def _pr_added_files(pr_num: str, repo: str | None = None) -> list[str] | None:
-    """Filenames this PR CREATES (status added/renamed/copied), or None.
+#: GitHub caps ``pulls/N/files`` at 3,000 entries; at the cap a file may sit
+#: beyond the listing, indistinguishable from absence (the sibling
+#: ``_pr_changed_files`` documents and fails closed on the same cap).
+_PR_FILES_API_CAP = 3000
 
-    Distinct from ``_pr_changed_files``, which deliberately includes every
-    touched path plus rename SOURCES — right for the hook-surface fence (a
-    guard renamed away is a hook change), wrong here (a modified migration is
-    not a new prefix claim). Shares the ``_TEST_GH_PR_FILES`` seam; a seam
-    entry's optional ``status`` defaults to "added" so existing fixtures keep
-    their meaning.
+
+def _pr_file_effects(
+    pr_num: str, repo: str | None = None
+) -> tuple[list[str], set[str]] | None:
+    """``(created_paths, removed_paths)`` for this PR, or None if unreadable.
+
+    ``created``: files the PR ADDS (status added/renamed/copied) — the only
+    ones that claim a migration prefix. ``removed``: paths the PR deletes plus
+    rename SOURCES — the ones to SUBTRACT from the default branch's claims,
+    because a rename/replacement of main's ``0090_old.py`` into ``0090_new.py``
+    leaves the MERGED tree with one 0090, and comparing the addition against a
+    listing that still shows the old file reports a collision that will not
+    exist (Codex P2, #1666 — and this gate has no override, so that false
+    block would make a legitimate migration replacement unmergeable).
+
+    Distinct from ``_pr_changed_files``, which flattens every touched path into
+    one undifferentiated list — right for the hook-surface fence, wrong here.
+    Shares the ``_TEST_GH_PR_FILES`` seam (optional ``status`` defaults to
+    "added"; ``previous_filename`` carries a rename source).
+
+    Fails to None at ``_PR_FILES_API_CAP`` rows: at the cap, a migration beyond
+    the listing is silently absent and "no migrations" would be a claim about
+    the LISTING, not the PR (Codex P2, #1666; same contract as the sibling).
     """
     raw = os.environ.get("_TEST_GH_PR_FILES")
     if raw == "__error__":
         return None
     if raw is not None:
-        out = []
-        for line in raw.splitlines():
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except Exception:
+        rows = [ln for ln in raw.splitlines() if ln.strip()]
+    else:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/files",
+                    "--paginate",
+                    "--jq",
+                    '.[] | {filename: .filename, previous_filename: '
+                    ".previous_filename, status: .status}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),
+            )
+            if result.returncode != 0:
                 return None
-            if row.get("status", "added") in _MIGRATION_CREATING_STATUSES:
-                out.append(row["filename"])
-        return out
-    try:
-        result = subprocess.run(
-            [
-                "gh",
-                "api",
-                f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/files",
-                "--paginate",
-                "--jq",
-                '.[] | select(.status == "added" or .status == "renamed" or '
-                '.status == "copied") | .filename',
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_gh_timeout(8),
-        )
-        if result.returncode != 0:
+            rows = [ln for ln in result.stdout.splitlines() if ln.strip()]
+        except Exception:
             return None
-        return [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
-    except Exception:
+    if len(rows) >= _PR_FILES_API_CAP:
         return None
+    created: list[str] = []
+    removed: set[str] = set()
+    for line in rows:
+        try:
+            row = json.loads(line)
+        except Exception:
+            return None
+        status = row.get("status", "added")
+        if status in _MIGRATION_CREATING_STATUSES:
+            created.append(row["filename"])
+        if status == "removed":
+            removed.add(row["filename"])
+        prev = row.get("previous_filename")
+        if status == "renamed" and prev:
+            removed.add(prev)
+    return created, removed
 
 
 def _default_branch_migrations(repo: str | None = None) -> list[str] | None:
@@ -4668,12 +4696,14 @@ def _open_pr_migrations(
             # unseen, so a bounded scan can't read as a complete one.
             unresolved.extend(short_read[i:])
             break
-        full = _pr_added_files(num, repo=repo)
-        if full is None:
+        effects = _pr_file_effects(num, repo=repo)
+        if effects is None:
             unresolved.append(num)
             continue
-        # Same full-path contract as the sweep above.
-        mig_paths = sorted(p for p in full if _migration_prefix_claims([p]))
+        # Same full-path contract as the sweep above. Only the CREATED side
+        # matters cross-PR: another PR's removals affect its own main
+        # comparison, never this one's claim set.
+        mig_paths = sorted(p for p in effects[0] if _migration_prefix_claims([p]))
         if mig_paths:
             out[num] = mig_paths
         else:
@@ -4682,8 +4712,16 @@ def _open_pr_migrations(
 
 
 def _ci_freshness_note(pr_num: str, repo: str | None = None) -> str | None:
-    """ADVISORY note when the PR's newest completed check predates the current
-    default-branch head — i.e. its green tick describes a main that has moved.
+    """ADVISORY note when NO check on the PR's head STARTED after the current
+    default-branch head landed — i.e. every run tested a main that has moved.
+
+    STARTED, not completed (Codex P2, #1666): a check's merge-ref snapshot is
+    taken when the run is created, so ``completed_at`` proves nothing about
+    WHICH main was tested — a slow run finishing after main moved still tested
+    the old merge ref, and its late completion would suppress this note in
+    exactly the stale case it exists to expose. ``max(started_at)`` is the
+    faithful cheap proxy; the residual (a run created in the seconds between
+    snapshot and main's commit) is accepted for an advisory.
 
     Deliberately NOT a gate. Measured 2026-09-03, 30 of 48 open PRs were in this
     state (oldest tick six weeks old), so blocking would refuse most of the queue
@@ -4697,7 +4735,7 @@ def _ci_freshness_note(pr_num: str, repo: str | None = None) -> str | None:
     Returns None when either side is unreadable: no note beats a wrong note, and
     a hedge printed on every PR is indistinguishable from a finding on every PR.
     """
-    raw_check = os.environ.get("_TEST_GH_CI_COMPLETED_AT")
+    raw_check = os.environ.get("_TEST_GH_CI_NEWEST_START")
     raw_main = os.environ.get("_TEST_GH_DEFAULT_HEAD_DATE")
     if raw_check is None or raw_main is None:
         branch = _repo_default_branch(repo=repo)
@@ -4708,15 +4746,16 @@ def _ci_freshness_note(pr_num: str, repo: str | None = None) -> str | None:
             if raw_check is None:
                 # --paginate + max() HERE, not `max` in jq: the endpoint pages at
                 # 30 and this repo's heads carry 16+ check runs today — a
-                # first-page max UNDERSTATES the newest completion and emits a
-                # false "stale" note the day the count crosses the page size
+                # first-page max UNDERSTATES the newest run and emits a false
+                # "stale" note the day the count crosses the page size
                 # (architect SHOULD-FIX 8). With --paginate each page is its own
                 # JSON document, so per-page jq output is concatenated lines and
-                # the aggregate must happen client-side.
+                # the aggregate must happen client-side. started_at, not
+                # completed_at — see the docstring.
                 stamps = subprocess.run(
                     ["gh", "api", f"repos/{repo or ':owner/:repo'}/commits/{head_sha}/check-runs",
                      "--paginate",
-                     "--jq", ".check_runs[]|select(.completed_at != null)|.completed_at"],
+                     "--jq", ".check_runs[]|select(.started_at != null)|.started_at"],
                     capture_output=True, text=True, timeout=_gh_timeout(8),
                 ).stdout.split()
                 raw_check = max(stamps) if stamps else ""
@@ -4745,10 +4784,10 @@ def _ci_freshness_note(pr_num: str, repo: str | None = None) -> str | None:
     except Exception:
         return None
     return (
-        f"NOTE: CI last completed {raw_check} but the default branch moved at "
-        f"{raw_main} — this PR's checks ran against a DIFFERENT main. "
-        "CI re-runs only on a push, so whatever they concluded does not describe "
-        "a merge today."
+        f"NOTE: the newest check on this head STARTED {raw_check}, before the "
+        f"default branch moved at {raw_main} — this PR's checks ran against a "
+        "DIFFERENT main. CI re-runs only on a push, so whatever they concluded "
+        "does not describe a merge today."
     )
 
 
@@ -4780,10 +4819,12 @@ def _check_migration_prefixes(
     # ADDED files only — a PR that merely edits or deletes an existing
     # migration claims no prefix (architect BLOCKER 2: reading every touched
     # path as an addition hard-blocked two PRs that both patched one old
-    # migration, with no override).
-    added = _pr_added_files(pr_num, repo=repo)
-    if added is None:
+    # migration, with no override). Removals and rename SOURCES ride along so
+    # the default-branch arm can subtract a replaced file (Codex P2, #1666).
+    effects = _pr_file_effects(pr_num, repo=repo)
+    if effects is None:
         return False, "NOTE: could not read the PR's file list — prefixes unverified."
+    added, removed_paths = effects
     mine = _migration_prefix_claims(added)
     if not mine:
         return False, "ok (no migrations in this PR)"
@@ -4812,7 +4853,16 @@ def _check_migration_prefixes(
             "possible state, so the read did not describe the directory"
         )
     else:
-        main_claims = _migration_prefix_claims(on_main)
+        # SUBTRACT this PR's removals and rename sources first (Codex P2,
+        # #1666): a rename/replacement of main's 0090_old.py into 0090_new.py
+        # leaves the MERGED tree with one 0090 — comparing the addition against
+        # a listing that still shows the old file reports a collision that will
+        # not exist, and with no override that false block makes a legitimate
+        # migration replacement permanently unmergeable. The subtraction is by
+        # EXACT PATH: removing an unrelated file licenses nothing.
+        main_claims = _migration_prefix_claims(
+            [p for p in on_main if p not in removed_paths]
+        )
         for prefix, names in sorted(mine.items()):
             others_on_main = main_claims.get(prefix, [])
             for basename in sorted(names):
@@ -4865,10 +4915,31 @@ def _check_migration_prefixes(
             )
 
     if problems:
+        # The two runners fail DIFFERENTLY, and the headline must not attribute
+        # the harsher consequence to the milder namespace (Codex P3, #1666):
+        # the numbered runner raises pre-flight and ABORTS BOOTSTRAP on every
+        # install; the data runner catches its duplicate post-boot and skips
+        # ONLY the data-migration batch while the server runs on.
+        numbered_hit = any(not ln.strip().startswith("d") for ln in problems)
+        data_hit = any(ln.strip().startswith("d") for ln in problems)
+        consequences = []
+        if numbered_hit:
+            consequences.append(
+                "a duplicate numbered prefix halts EVERY migration on EVERY "
+                "install at next restart (db/migrations/runner.py raises before "
+                "running any)"
+            )
+        if data_hit:
+            consequences.append(
+                "a duplicate data-migration prefix makes every install skip its "
+                "whole data-migration batch post-boot "
+                "(db/data_migrations/runner.py refuses the batch; the server "
+                "boots on)"
+            )
         head = (
-            f"{len(problems)} migration-prefix collision(s) — a duplicate prefix "
-            "halts EVERY migration on EVERY install at next restart "
-            "(db/migrations/runner.py raises before running any)."
+            f"{len(problems)} migration-prefix collision(s) — "
+            + "; ".join(consequences)
+            + "."
         )
         body = "\n".join(problems)
         tail = ("\n  caveat: " + "; ".join(caveats)) if caveats else ""
