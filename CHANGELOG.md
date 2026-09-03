@@ -11,6 +11,21 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Follow-ups now record which session they came from.** The `source_session`
+  column existed and repo-pulse read it to attribute completions — but nothing
+  ever wrote it: 513 of 513 live rows were NULL across all four sources. It now
+  fills without guessing: the inbox evaluator and the task executor pass
+  through the session id they already held and were dropping; the
+  `follow_up_create` MCP tool takes a `source_session` the
+  calling session reads off its own per-turn tag — an 8-char prefix resolves to
+  the full id, and one that does not resolve uniquely is stored as NULL (and
+  says so) rather than as a truncated id. Callers with no session, like surplus
+  ideation, keep an honest NULL — and an empty-string id from a degraded CC
+  result normalizes to NULL at the one chokepoint rather than by per-caller
+  convention. (A ContextVar default exists as forward-provision for future
+  scoped callers; no current caller runs under a session scope, so nothing
+  claims it works today.)
+
 - **Gated autonomous cold marketing outreach (inert by default).** Genesis can
   now stage cold marketing emails to an owner-curated prospect list via the new
   `marketing_send` tool. The recipient is resolved in code from a private

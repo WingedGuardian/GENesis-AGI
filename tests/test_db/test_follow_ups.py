@@ -752,3 +752,97 @@ async def test_update_status_batch_reopen_clears_completed_at(db):
         row = await follow_ups.get_by_id(db, fid)
         assert row["status"] == "pending"
         assert row["completed_at"] is None
+
+
+# ── source_session provenance (the 513/513-NULL fix) ─────────────────────────
+# The column existed, a consumer read it (repo_pulse_worker's item_session_id),
+# and NOTHING populated it: 513/513 live rows NULL across all four sources.
+# The contract: explicit param > runtime ContextVar > honest NULL. Never guessed.
+
+
+async def test_source_session_defaults_from_the_runtime_contextvar(db):
+    from genesis.observability.session_context import set_session_id
+
+    set_session_id("11111111-2222-3333-4444-555555555555")
+    try:
+        fid = await follow_ups.create(
+            db, content="scoped work", source="foreground_session", strategy="ego_judgment"
+        )
+    finally:
+        set_session_id(None)
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["source_session"] == "11111111-2222-3333-4444-555555555555"
+
+
+async def test_source_session_is_null_when_no_scope_and_no_param(db):
+    """Honest NULL: a caller with no session scope stores nothing, never a guess."""
+    from genesis.observability.session_context import set_session_id
+
+    set_session_id(None)  # explicit: the ContextVar must read empty here
+    fid = await follow_ups.create(
+        db, content="scopeless work", source="surplus_ideation", strategy="surplus_task"
+    )
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["source_session"] is None
+
+
+async def test_an_explicit_source_session_beats_the_contextvar(db):
+    """The param is the deterministic hand-off (inbox passes the EVALUATED
+    session's id, not its own scope); the ContextVar is only the fallback."""
+    from genesis.observability.session_context import set_session_id
+
+    set_session_id("99999999-8888-7777-6666-555555555555")
+    try:
+        fid = await follow_ups.create(
+            db,
+            content="hand-off",
+            source="inbox_evaluation",
+            strategy="ego_judgment",
+            source_session="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        )
+    finally:
+        set_session_id(None)
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["source_session"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+async def test_an_intended_null_is_not_overridden_by_an_active_scope(db):
+    """None means NULL, even with the ContextVar set.
+
+    Without the _UNSET sentinel this FAILED: `None` fell through to the
+    ContextVar and stored the ambient id — so the MCP tool's "unresolvable
+    prefix -> stored NULL" promise held only while the MCP process happened to
+    never set a scope. A refusal to substitute must be expressible.
+    """
+    from genesis.observability.session_context import set_session_id
+
+    set_session_id("77777777-6666-5555-4444-333333333333")
+    try:
+        fid = await follow_ups.create(
+            db,
+            content="provenance refused",
+            source="foreground_session",
+            strategy="ego_judgment",
+            source_session=None,
+        )
+    finally:
+        set_session_id(None)
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["source_session"] is None
+
+
+async def test_an_empty_string_session_id_normalizes_to_null(db):
+    """"" is not provenance: degraded CC results construct CCOutput with
+    session_id="" on three invoker paths, and "" is invisible to IS NULL
+    consumers. Normalized at the crud chokepoint so no call site has to
+    remember an `or None` (one already forgot)."""
+    fid = await follow_ups.create(
+        db,
+        content="degraded result",
+        source="task_executor",
+        strategy="ego_judgment",
+        source_session="",
+    )
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["source_session"] is None
+
