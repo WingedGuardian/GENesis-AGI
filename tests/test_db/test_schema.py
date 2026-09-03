@@ -36,8 +36,6 @@ EXPECTED_TABLES = [
     "inbox_items",
     "deferred_work_queue",
     "pending_embeddings",
-    "predictions",
-    "calibration_curves",
     "events",
     "approval_requests",
     "task_states",

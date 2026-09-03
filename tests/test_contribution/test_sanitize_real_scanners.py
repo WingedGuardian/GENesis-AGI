@@ -332,3 +332,25 @@ def test_gitleaks_toml_is_contribution_forbidden():
         f.kind == FindingKind.FORBIDDEN_PATH and ".gitleaks.toml" in (f.file or "")
         for f in result.blocking()
     ), "a .gitleaks.toml edit must raise a FORBIDDEN_PATH block"
+
+
+def test_secret_scanning_yml_is_contribution_forbidden():
+    """A contribution that edits .github/secret_scanning.yml must be BLOCKED — otherwise a
+    merged edit could widen paths-ignore to ["**"] and silently disable GitHub-native secret
+    detection for every future contribution. Mirrors the .gitleaks.toml self-protection; no
+    scanner binary needed — a path-policy check."""
+    diff = (
+        "diff --git a/.github/secret_scanning.yml b/.github/secret_scanning.yml\n"
+        "--- a/.github/secret_scanning.yml\n"
+        "+++ b/.github/secret_scanning.yml\n"
+        "@@ -1,2 +1,2 @@\n"
+        " paths-ignore:\n"
+        '-  - "tests/test_hooks/test_secret_scrub.py"\n'
+        '+  - "**"\n'
+    )
+    result = sanitize.scan_diff(diff)
+    assert result.ok is False, ".github/secret_scanning.yml edits must be blocked"
+    assert any(
+        f.kind == FindingKind.FORBIDDEN_PATH and ".github/secret_scanning.yml" in (f.file or "")
+        for f in result.blocking()
+    ), "a .github/secret_scanning.yml edit must raise a FORBIDDEN_PATH block"
