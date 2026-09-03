@@ -270,6 +270,67 @@ def test_a_credential_split_by_the_terminal_wrap_is_still_redacted(tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("tmux"), reason="tmux not available")
+def test_a_credential_split_by_the_input_cap_is_not_written_out(tmp_path):
+    """The byte cap must not hand a pattern half a value.
+
+    Several patterns are recognised by a TERMINATOR: a URL credential needs its
+    `@host`. A byte cut lands anywhere, so a capture truncated mid-URL presents
+    `postgres://user:password` with the `@` just past the cut — matching
+    nothing, and writing the password out. Cutting on a line boundary instead
+    drops the over-long line whole, so no pattern is ever shown part of one.
+
+    The cap is both lowered AND COMPUTED so the cut is guaranteed to land
+    between the password and its `@`. An earlier version of this test picked a
+    round number, the cut landed in the padding before the URL even started,
+    and it passed against the unfixed code — it proved nothing.
+    """
+    home = tmp_path / "home"
+    (home / ".genesis" / "logs").mkdir(parents=True)
+    first_line = "BENIGNLINE"
+    pad = "x" * 50
+    secret = "s3cr3tpassword"
+    url_head = f"postgres://user:{secret}"
+    # feed is "<first_line>\n<pad> <url_head>@host/db"; cut immediately after
+    # the password and before the '@' that the pattern needs to match.
+    cap = len(first_line) + 1 + len(pad) + 1 + len(url_head)
+    fake_claude = tmp_path / "fakeclaude.sh"
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        f"echo '{first_line}'\n"
+        f"echo '{pad} {url_head}@host/db'\n"
+        "exit 0\n"
+    )
+    fake_claude.chmod(0o755)
+
+    sock = f"ccexit-cap-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+    inner = (
+        f"HOME={home} '{fake_claude}'; __ec=$?; "
+        f"HOME={home} GENESIS_CC_TAIL_CAP={cap} '{_CAPTURE}' 4 $__ec >/dev/null 2>&1; "
+        "exit $__ec"
+    )
+    try:
+        subprocess.run(
+            ["tmux", "-L", sock, "new-session", "-d", "-s", "t",
+             "-x", "300", "-y", "12", inner],
+            check=True, capture_output=True, text=True,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            r = subprocess.run(["tmux", "-L", sock, "has-session", "-t", "t"], capture_output=True)
+            if r.returncode != 0:
+                break
+            time.sleep(0.2)
+    finally:
+        subprocess.run(["tmux", "-L", sock, "kill-server"], capture_output=True)
+
+    body = _log_for(home, "4").read_text()
+    assert secret not in body, (
+        f"a credential split by the input cap was written out:\n{body}"
+    )
+    assert "cc-4 claude exited status=0" in body, body
+
+
+@pytest.mark.skipif(not shutil.which("tmux"), reason="tmux not available")
 def test_tail_is_withheld_when_scrubber_is_unavailable(tmp_path):
     """Fail CLOSED: with no usable scrubber the tail is WITHHELD, never raw.
 

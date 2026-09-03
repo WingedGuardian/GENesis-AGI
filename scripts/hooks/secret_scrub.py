@@ -32,7 +32,6 @@ Two layers callers combine:
 
 from __future__ import annotations
 
-import bisect
 import re
 
 _REDACTED = "[REDACTED]"
@@ -93,7 +92,15 @@ _KNOWN_KEY_PREFIX_PATTERN = re.compile(
     r"|AKIA[A-Z0-9]{12,}"  # AWS access key id
     r"|AIza[A-Za-z0-9_\-]{30,}"  # Google API key
     r"|di-[A-Za-z0-9]{20,}"  # DeepInfra
-    r"|eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"  # JWT
+    # JWT. The segment repeats are BOUNDED, and the ceiling is the whole point
+    # rather than a guess at real token sizes: an unbounded repeat rescans the
+    # remaining suffix from every `eyJ` that never completes, which is
+    # quadratic on the input that FAILS to match — the common case in ordinary
+    # output. MEASURED unbounded: 48/96/192KB of failed candidates took
+    # 350/1587/5319ms, so a full 256KB capture crossed the scrub timeout and
+    # the entire diagnostic was withheld. 4096 is far above any real JWT
+    # segment (a signature is 43 chars, a fat payload a few hundred).
+    r"|eyJ[A-Za-z0-9_\-]{8,4096}\.eyJ[A-Za-z0-9_\-]{8,4096}\.[A-Za-z0-9_\-]{8,4096}"  # JWT
     r"|csk-[A-Za-z0-9_\-]{20,}"    # Cerebras (the shipping unanchored sk- caught
                                    # these as a SUBSTRING accident; the anchor
                                    # made that a miss, so name them explicitly)
@@ -138,200 +145,73 @@ _PEM_LABEL = r"(?: [A-Z0-9]{1,32}){0,4}"
 _PEM_BEGIN_LINE = re.compile(rf"-----BEGIN{_PEM_LABEL} PRIVATE KEY(?: BLOCK)?-----")
 _PEM_END_LINE = re.compile(rf"-----END{_PEM_LABEL} PRIVATE KEY(?: BLOCK)?-----")
 _PEM_MARKER_LITERAL = "PRIVATE KEY"
-_PEM_BODY_CHARS = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
-)
-_PEM_MIN_BODY_LINE = 16
-# A base64 body's LAST line is short by construction (a 2048-bit RSA key ends
-# in a 2-char line), so a run bound alone leaves the key's tail behind.
-_PEM_MIN_TAIL_LINE = 4
-# Captured output is frequently DECORATED: a log timestamp, a `journalctl`
-# prefix, a diff's leading `-`, a pipe gutter. The armour markers still match
-# (they are searched, not anchored), but a decorated body line is not pure
-# base64, so a column-0 test rejects it and the body survives. MEASURED across
-# the decoration class on a real key: timestamp / journalctl / diff-`-` / pipe
-# all wrote all 25 body lines out, while plain, indented and diff-`+` did not
-# (`+` happens to be a base64 character, and `.strip()` covers indentation) —
-# the shapes that pass are an accident of the alphabet, which is not coverage.
-# A decorated body is recognised by its TAIL instead: a long unbroken base64
-# run ending the line. The 32-char floor is what keeps ordinary prose out —
-# a diagnostic line ends in a word, not in 32 unbroken base64 characters.
-_PEM_MIN_DECORATED_BODY = 32
-# RFC 1421 / OpenSSL legacy-encrypted armour (`openssl genrsa -aes128`,
-# `ssh-keygen -m PEM -N`) puts `Proc-Type:` / `DEK-Info:` and a blank line
-# BETWEEN the marker and the base64, so the body does not start on the next
-# line. MEASURED before this bound existed: 14 of 14 body lines of a real
-# encrypted key were written out, because the walk stopped at `Proc-Type:`.
-# Armour METADATA lines, as a CLOSED set of the header names RFC 1421 and the
-# OpenPGP armour actually define. A closed set on purpose: an open-set shape
-# rule ("word followed by a colon") also matches a journalctl prefix, which
-# would classify a decorated BODY line as metadata and skip straight past the
-# key. Base64 cannot contain any of these literals, so matching them anywhere
-# in the line is decoration-tolerant without being over-broad.
-_PEM_ARMOUR_HEADERS = (
-    "Proc-Type:",
-    "DEK-Info:",
-    "Version:",
-    "Comment:",
-    "Charset:",
-    "MessageID:",
-    "Hash:",
-)
-# How far past a marker to look for the body. Covers the RFC 1421 header block
-# (two headers plus a blank line) with room to spare, and bounds how much a
-# marker with no body after it can ever consume.
-_PEM_BODY_LOOKAHEAD = 8
-# Two UNRELATED markers (the classic case: one `grep` hit naming a BEGIN and
-# another naming an END) must not pair up and swallow everything between them.
-# A distance cap alone does NOT separate them — grep hits land close together —
-# so the discriminator is what lies BETWEEN: a real block's interior is base64,
-# optionally preceded by RFC 1421 headers and blank lines. One ordinary prose
-# line in the span means these are two mentions, not one block, and each is
-# then treated on its own (marker redacted, adjacent key material redacted,
-# surrounding diagnostic kept). MEASURED before this check existed: a 9-line
-# grep result collapsed to a single [REDACTED], destroying 6 diagnostic lines.
-# The cap bounds the interior scan, keeping the pass linear; a real block is
-# far shorter anyway (RSA-4096 ~52 lines, OPENSSH ~48).
-_PEM_MAX_BLOCK_LINES = 200
 
 
-def _is_key_material(line: str) -> bool:
-    """True for a base64 body line — the shape a PEM key's payload takes.
+def _armour_line(pattern, line: str) -> bool:
+    """True when this line IS an armour delimiter, rather than mentioning one.
 
-    Deliberately narrow: anything with a space, punctuation or a short length
-    is an ordinary log line and STOPS the redaction run.
+    ONE distinction, and it replaces every "does this line look like key
+    material" predicate this scanner used to carry. Those predicates were a
+    defect GENERATOR rather than a set of bugs: each review round produced
+    another shape they answered wrongly — armour with `Proc-Type:` metadata
+    between the marker and the body, bodies carrying a log prefix, and a final
+    base64 line short enough that no floor could admit it without admitting
+    prose too. Answering better was the losing move; the question is gone. The
+    body is never inspected at all now, so none of those shapes can matter.
+
+    An armour delimiter ENDS its line (trailing whitespace aside). Whatever the
+    capture puts BEFORE it — a log timestamp, a `journalctl` tag, a diff
+    marker, a pipe gutter, an indent — is irrelevant, and that is precisely the
+    class that kept breaking. A MENTION does not end the line: a grep hit
+    closes a quote, source code closes a string, prose runs on into a sentence.
+    Checked against both families rather than assumed.
     """
-    stripped = line.strip()
-    if len(stripped) < _PEM_MIN_BODY_LINE:
-        return False
-    return all(ch in _PEM_BODY_CHARS for ch in stripped)
-
-
-def _is_decorated_key_material(line: str) -> bool:
-    """True when the line ENDS in a long base64 run (a prefixed body line)."""
     stripped = line.rstrip()
-    run = 0
-    for ch in reversed(stripped):
-        if ch not in _PEM_BODY_CHARS:
-            break
-        run += 1
-    return run >= _PEM_MIN_DECORATED_BODY
-
-
-def _is_key_tail(line: str) -> bool:
-    """A SHORT pure-base64 line — the final line of a key body."""
-    stripped = line.strip()
-    return (
-        _PEM_MIN_TAIL_LINE <= len(stripped) < _PEM_MIN_BODY_LINE
-        and all(ch in _PEM_BODY_CHARS for ch in stripped)
-    )
-
-
-def _is_armour_metadata(line: str) -> bool:
-    """An armour header line (`Proc-Type:`, `DEK-Info:`, …) — not body."""
-    stripped = line.strip()
-    return any(header in stripped for header in _PEM_ARMOUR_HEADERS)
-
-
-def _body_line(line: str) -> bool:
-    """A key-body line, decorated or not — and never armour metadata."""
-    if _is_armour_metadata(line):
+    if not stripped.endswith("-----"):
         return False
-    return _is_key_material(line) or _is_decorated_key_material(line)
-
-
-def _pem_body_end(lines: list[str], start: int, n: int) -> int:
-    """Index just past the key body beginning at or after ``start``.
-
-    The body does not always start on the very next line: RFC 1421 armour puts
-    `Proc-Type:` / `DEK-Info:` and a blank line first, and any of those lines
-    may carry the same decoration as the rest of the capture. Rather than model
-    each of those shapes — the column-0 assumption is exactly what let decorated
-    bodies through — look AHEAD a bounded number of lines for the first line
-    that is recognisably key material, and redact from the marker through the
-    run it starts. If no body turns up within the bound the marker stands alone
-    and costs exactly its own line, which is what keeps a lone marker in prose
-    from taking the surrounding diagnostic with it.
-    """
-    limit = min(n, start + _PEM_BODY_LOOKAHEAD)
-    probe = start
-    while probe < limit and not _body_line(lines[probe]):
-        # Deliberately NOT "bail on the first unrecognised line": under
-        # decoration a blank line is not blank (it carries the prefix), and a
-        # rule that models which separators are allowed is the same column-0
-        # assumption one level up. The BOUND is the protection instead — a
-        # marker with no body within it consumes only itself.
-        probe += 1
-    if probe >= limit:
-        return start
-    k = probe
-    while k < n and _body_line(lines[k]):
-        k += 1
-    if k < n and _is_key_tail(lines[k]):
-        k += 1
-    return k
-
-
-def _is_block_interior(lines: list[str], start: int, stop: int) -> bool:
-    """True when every line in ``[start, stop)`` belongs inside PEM armour."""
-    for idx in range(start, stop):
-        stripped = lines[idx].strip()
-        if not stripped or _is_armour_metadata(lines[idx]):
-            continue
-        if (
-            _is_key_material(lines[idx])
-            or _is_key_tail(lines[idx])
-            or _is_decorated_key_material(lines[idx])
-        ):
-            continue
-        return False
-    return True
+    return bool(pattern.search(stripped))
 
 
 def _redact_pem_blocks(text: str) -> str:
-    """Redact PEM private keys, including half-visible ones. Linear."""
+    """Redact private-key armour, including a key the capture window cut.
+
+    A key missing one delimiter is the NORMAL case here, not an edge: the
+    window (`-S -200`) and the byte cap both cut at arbitrary points. In that
+    situation the surviving delimiter sits at one END of the capture — a key
+    with no END ran off the bottom, a key with no BEGIN started above the top —
+    so an unpaired delimiter redacts to that end of the input. Fail-closed, and
+    it discards no diagnostic that was not already the key's own.
+    """
     if _PEM_MARKER_LITERAL not in text:
         return text  # one substring scan covers every ordinary input
     lines = text.split("\n")
-    # Every END position, found once, so a BEGIN never re-scans the tail.
-    end_at = [i for i, ln in enumerate(lines) if _PEM_END_LINE.search(ln)]
     out: list[str] = []
     i, n = 0, len(lines)
     while i < n:
         line = lines[i]
-        begin = _PEM_BEGIN_LINE.search(line)
-        if begin:
-            if _PEM_END_LINE.search(line, begin.end()):
-                out.append(_REDACTED)  # whole block on one line
+        if _armour_line(_PEM_BEGIN_LINE, line):
+            if _armour_line(_PEM_END_LINE, line):
+                out.append(_REDACTED)  # a whole block written on one line
                 i += 1
                 continue
-            after = bisect.bisect_right(end_at, i)
-            if (
-                after < len(end_at)
-                and end_at[after] - i <= _PEM_MAX_BLOCK_LINES
-                and _is_block_interior(lines, i + 1, end_at[after])
-            ):
-                out.append(_REDACTED)  # matched pair: redact through the END
-                i = end_at[after] + 1
-                continue
-            # No END, or one too far away to belong to this marker: redact the
-            # marker plus whatever key body actually follows it.
+            end = next(
+                (j for j in range(i + 1, n) if _armour_line(_PEM_END_LINE, lines[j])),
+                None,
+            )
             out.append(_REDACTED)
-            i = _pem_body_end(lines, i + 1, n)
+            i = n if end is None else end + 1
             continue
-        if _PEM_END_LINE.search(line):
-            # An END we never opened: the BEGIN was clipped above, so the body
-            # is whatever key material we have already emitted.
-            if out and _is_key_tail(out[-1]):
-                out.pop()
-            while out and _body_line(out[-1]):
-                out.pop()
-            out.append(_REDACTED)
+        if _armour_line(_PEM_END_LINE, line):
+            # An END nothing opened: its BEGIN was above the top of the
+            # capture, so everything up to here belongs to the key.
+            out = [_REDACTED]
             i += 1
             continue
         out.append(line)
         i += 1
     return "\n".join(out)
+
+
 
 # Structured credentials — identified by SHAPE, not by a vendor prefix. Both
 # carry their secret as a positional path/field component, so no label pattern

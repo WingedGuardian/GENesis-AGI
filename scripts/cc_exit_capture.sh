@@ -108,11 +108,27 @@ mkdir -p "$log_dir" 2>/dev/null || exit 0
             # 256KB cap on the filter input. -S -200 counts PHYSICAL rows either
             # way, so joining changes where the newlines fall, not the byte
             # total: a real tail stays height*width (~40KB) and the cap bites
-            # only a pathological geometry. The scrubber is line-local for
-            # everything except PEM armour, so joined long lines cost linear
-            # time, not quadratic (see secret_scrub's LINEAR BY CONSTRUCTION).
-            if _scrubbed=$(printf '%s\n' "$_tail" | head -c 262144 | _cc_scrub_stdin 2>/dev/null); then
+            # only a pathological geometry.
+            #
+            # When the cap DOES bite, the trailing PARTIAL line is dropped
+            # rather than handed on. A byte cut lands anywhere, and several
+            # patterns need a terminator that may sit just past it — a URL
+            # credential is recognised by its `@host`, so `postgres://u:pw`
+            # with the cut before the `@` matches nothing and the password
+            # would be written out. Cutting on a line boundary means no pattern
+            # is ever shown half a value: the over-long line is dropped whole.
+            _cap="${GENESIS_CC_TAIL_CAP:-262144}"
+            _feed=$(printf '%s\n' "$_tail")
+            if [ "$(printf '%s' "$_feed" | wc -c)" -gt "$_cap" ]; then
+                _feed=$(printf '%s' "$_feed" | head -c "$_cap" | sed '$d')
+                _truncated=1
+            else
+                _truncated=0
+            fi
+            if _scrubbed=$(printf '%s\n' "$_feed" | _cc_scrub_stdin 2>/dev/null); then
                 printf '%s\n' "$_scrubbed" | sed 's/^/  | /'
+                [ "$_truncated" = "1" ] && \
+                    echo "  | [earlier output dropped: tail exceeded ${_cap} bytes]"
             else
                 echo "  | [tail withheld: scrubber unavailable]"
             fi

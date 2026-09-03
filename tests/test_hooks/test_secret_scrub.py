@@ -477,6 +477,13 @@ class TestScrubIsLinearAcrossInputShapes:
         # and prose whose lines end in a long token (the near-miss that must
         # stay cheap as well as stay OUT of the key-material class).
         "decorated_body_wall": ("2026-09-02 12:00:00 " + "QUFB" * 16 + "\n") * 4000,
+        # Many FAILED candidates, not one successful token: an unbounded
+        # segment repeat rescans the remaining suffix from every start, which
+        # is quadratic on exactly the input that never matches. MEASURED
+        # before bounding: 48/96/192KB = 350/1587/5319ms, so a full 256KB
+        # capture crossed the scrub timeout and the whole diagnostic was
+        # discarded.
+        "failed_jwt_candidates": ("-eyJ" + "A" * 8) * 21845,
         "long_tail_prose": (
             "crash at 0400c706186786ccc92e8a8d7904773e7ed5f8b1abc\n" * 6000
         ),
@@ -582,27 +589,56 @@ class TestPemPrivateKeysAreRedacted:
         assert time.perf_counter() - start < 5.0
         assert "QUFB" not in out, "clipped-END key body survived"
 
-    def test_orphan_end_marker_redacts_the_preceding_key_run(self):
-        """The mirror case: the BEGIN scrolled off the top of the window."""
+    def test_orphan_end_marker_redacts_everything_above_it(self):
+        """The mirror case: the BEGIN scrolled off the top of the window.
+
+        Everything above a delimiter nothing opened is the key's, so it all
+        goes. That DOES discard any diagnostic printed before the key — the
+        deliberate price of never inspecting the body to guess where the key
+        starts, which is the question that produced a fresh defect every review
+        round.
+        """
         body = "\n".join("QUFB" * 16 for _ in range(6))
-        text = f"ordinary diagnostic line\n{body}\n-----END RSA PRIVATE KEY-----\nafter"
+        text = f"earlier diagnostic\n{body}\n-----END RSA PRIVATE KEY-----\nafter"
         out = s.scrub(text)
         assert "QUFB" not in out, "clipped-BEGIN key body survived"
-        assert "ordinary diagnostic line" in out and "after" in out
+        assert "after" in out, "output below the key was discarded too"
 
-    def test_a_lone_marker_in_prose_does_not_blank_the_diagnostic(self):
-        """Redaction walks the ADJACENT key-material run and stops at the first
-        ordinary line, so one stray marker (grep output, a docstring) cannot
-        take the surrounding diagnostic with it."""
+    def test_a_marker_that_does_not_end_its_line_is_a_mention(self):
+        """A delimiter that ENDS its line is armour; one that does not is a
+        mention, and a mention costs nothing.
+
+        This is the whole distinction the scanner rests on, so both directions
+        are pinned. A grep hit closes a quote, source closes a string, prose
+        runs on — none of them end with the delimiter, so the surrounding
+        diagnostic survives intact.
+        """
         text = (
             "line one of the crash\n"
-            "grep: id_rsa: -----BEGIN RSA PRIVATE KEY-----\n"
-            "line three of the crash\n"
+            "tests/a.py:12:  key = '-----BEGIN RSA PRIVATE KEY-----'\n"
+            "see -----BEGIN RSA PRIVATE KEY----- for the format\n"
             "line four of the crash\n"
         )
         out = s.scrub(text)
-        for keep in ("line one of the crash", "line three", "line four"):
-            assert keep in out, f"{keep!r} was blanked by a lone marker:\n{out}"
+        for keep in ("line one of the crash", "see -----BEGIN", "line four"):
+            assert keep in out, f"{keep!r} was blanked by a mention:\n{out}"
+
+    def test_an_unpaired_armour_line_redacts_to_that_end_of_the_capture(self):
+        """The stated cost of the design, pinned so it stays a decision.
+
+        A delimiter ENDING its line with no partner is treated as a key whose
+        other delimiter the window cut off, and redaction runs to that end of
+        the input. A bare delimiter echoed into a log therefore takes the rest
+        of the capture with it. Accepted: in a crash tail a line that ends in
+        exactly this text is overwhelmingly a real key, and the alternative —
+        inspecting the body to decide — is the generator this design removes.
+        """
+        text = "before the key\n-----BEGIN RSA PRIVATE KEY-----\nafter the key\n"
+        out = s.scrub(text)
+        assert "before the key" in out, "output ABOVE an unpaired BEGIN is not the key's"
+        assert "after the key" not in out, (
+            "an unpaired BEGIN must be treated as a key running to the bottom"
+        )
 
     def test_repeated_unmatched_headers_stay_linear(self):
         """The measured quadratic: the old both-delimiter regex retried its
@@ -631,13 +667,12 @@ class TestPemPrivateKeysAreRedacted:
         """RFC 1421 / OpenSSL legacy-encrypted armour — what
         `openssl genrsa -aes128 -traditional` and `ssh-keygen -m PEM -N` emit —
         carries `Proc-Type:`/`DEK-Info:` and a BLANK LINE between the marker and
-        the base64. A walk that requires the body on the very next line stops at
-        the metadata and writes the whole key out.
+        the base64.
 
-        VERIFIED against a real `openssl genrsa -aes128` artifact before this
-        was handled: 14 of 14 visible body lines reached the log. Synthetic
-        fixtures with no header lines cannot see this, which is why it survived
-        a green suite.
+        VERIFIED against a real openssl artifact when the scanner still looked
+        at the body: 14 of 14 visible body lines reached the log, because the
+        walk expected material on the very next line. Nothing inspects the body
+        now, so the shape cannot matter — this stays as the regression pin.
         """
         body = "\n".join("QUFB" * 16 for _ in range(6))
         text = (
@@ -646,11 +681,8 @@ class TestPemPrivateKeysAreRedacted:
             "DEK-Info: AES-128-CBC,B6F35A9DA8465EEE6BD4B061D097D3C5\n"
             "\n"
             f"{body}\n"
-            "trailing diagnostic line\n"
         )  # END deliberately absent: the capture window cut it off
-        out = s.scrub(text)
-        assert "QUFB" not in out, f"encrypted-armour body survived:\n{out}"
-        assert "trailing diagnostic line" in out
+        assert "QUFB" not in s.scrub(text), "encrypted-armour body survived"
 
     def test_encrypted_pkcs8_armour_is_redacted(self):
         body = "\n".join("QUFB" * 16 for _ in range(4))
@@ -665,13 +697,14 @@ class TestPemPrivateKeysAreRedacted:
 
     def test_the_short_final_body_line_is_redacted_too(self):
         """A base64 body's LAST line is short by construction (a 2048-bit RSA
-        key ends in a 2-char line), so a minimum-length run bound would leave
-        the key's tail sitting in the log."""
+        key ends in a 24-character line), and under decoration it satisfied
+        neither a long-run floor nor a whole-line base64 test — so it survived
+        while the rest of the key was covered. Nothing measures the body now.
+        """
         body = "\n".join("QUFB" * 16 for _ in range(3))
-        text = f"-----BEGIN RSA PRIVATE KEY-----\n{body}\nQUFBQUFB\nordinary line\n"
+        text = f"-----BEGIN RSA PRIVATE KEY-----\n{body}\nQUFBQUFB\n"
         out = s.scrub(text)
         assert "QUFBQUFB" not in out, f"key tail survived:\n{out}"
-        assert "ordinary line" in out
 
     def test_two_unrelated_markers_do_not_swallow_the_span(self):
         """The classic shape: one `grep` hit names a BEGIN, another names an
@@ -741,27 +774,17 @@ class TestPemPrivateKeysAreRedacted:
         out = s.scrub("\n".join(decorate(ln) for ln in lines))
         assert "QUFB" not in out, f"{decoration}/{clip} body survived:\n{out}"
 
-    def test_decoration_handling_does_not_reopen_the_marker_swallow(self):
-        """Guard for the guard: recognising decorated bodies must not make
-        ordinary prose look like key material and re-open the two-marker
-        swallow. Prose ends in a word, not in a long base64 run."""
+    def test_a_decorated_mention_is_still_only_a_mention(self):
+        """Decoration must not turn a mention into armour: the test is what
+        ENDS the line, and a decorated grep hit still closes its quote."""
         text = "\n".join(
-            ["2026-09-02 12:00:00 grep: -----BEGIN RSA PRIVATE KEY-----"]
-            + [f"2026-09-02 12:00:0{i} crash line {i} KEEPME" for i in range(1, 7)]
-            + ["2026-09-02 12:00:09 grep: -----END RSA PRIVATE KEY-----"]
+            [f"2026-09-02 12:00:0{i} crash line {i} KEEPME" for i in range(1, 4)]
+            + ["2026-09-02 12:00:04 a.py:1: k = '-----BEGIN RSA PRIVATE KEY-----'"]
+            + [f"2026-09-02 12:00:0{i} crash line {i} KEEPME" for i in range(5, 8)]
         )
         out = s.scrub(text)
         kept = sum(1 for ln in out.splitlines() if "KEEPME" in ln)
         assert kept == 6, f"only {kept}/6 decorated diagnostic lines survived:\n{out}"
-
-    def test_armour_metadata_is_not_mistaken_for_body(self):
-        """`DEK-Info:` ends in a long hex run that reads as base64, so a
-        tail-only test would stop the body search on the metadata line and walk
-        straight past the key."""
-        assert not s._body_line(
-            "DEK-Info: AES-128-CBC,B6F35A9DA8465EEE6BD4B061D097D3C5"
-        )
-        assert s._body_line("2026-09-02 12:00:00 " + "QUFB" * 16)
 
     def test_a_certificate_is_not_a_private_key(self):
         """Only PRIVATE KEY armour redacts. A certificate is public material,
