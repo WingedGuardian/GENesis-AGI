@@ -565,15 +565,6 @@ class CCInvoker:
         # generic CCProcessError, so the rate-limit park/resume layer never
         # engaged and background sessions died instead of parking (reflex signal
         # CCProcessError×cc, 2026-07/08).
-        # The balance/credit family covers ROSTER PEERS, not the Max plan: a
-        # third-party Anthropic-compatible endpoint refuses a drained prepaid
-        # account with "insufficient balance" (observed from a peer provider),
-        # which is operationally identical to a quota ceiling — the peer will not
-        # serve until someone tops it up. Without these, the most common way a
-        # peer becomes unusable fell through to a generic CCProcessError, so the
-        # failover layer could not tell "backup is out of credit" from "backup
-        # threw an error" and a drained standby stayed invisible.
-        # Phrases only, deliberately: a bare "402" would match a request id.
         _QUOTA_PATTERNS = (
             "usage limit",
             "quota exceeded",
@@ -583,10 +574,6 @@ class CCInvoker:
             "token limit exceeded",
             "session limit",
             "weekly limit",
-            "insufficient balance",
-            "insufficient credit",
-            "insufficient funds",
-            "insufficient_quota",
         )
         if any(p in lower for p in _QUOTA_PATTERNS):
             return CCQuotaExhaustedError(stderr_text or stdout_text, raw_text=combined)

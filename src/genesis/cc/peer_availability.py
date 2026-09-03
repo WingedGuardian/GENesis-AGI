@@ -50,6 +50,7 @@ Do not add locking without a measured reason; this is on a degraded-path loop.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -211,8 +212,27 @@ def read_peer(peer: str) -> PeerStatus | None:
     return read().get(peer)
 
 
+#: How a third-party Anthropic-compatible endpoint refuses a DRAINED prepaid
+#: account. Matched here, on the exception text, rather than added to the
+#: invoker's global ``_QUOTA_PATTERNS`` — and that placement is the whole point.
+#: The global classifier decides CC STATUS and PARKING: a CCQuotaExhaustedError
+#: relays to an account-wide ``CCStatus.UNAVAILABLE`` with no notion of whether
+#: the invocation was the home model or a failover peer, so teaching it these
+#: phrases would let a drained BACKUP report the primary as down, and would also
+#: outrank the invoker's later MCP classification (an MCP tool whose own error
+#: text says "insufficient funds" would be parked as a provider quota failure).
+#: This module is advisory-only, so the same knowledge is safe here and affects
+#: nothing but the record.
+_BALANCE_REFUSALS = (
+    "insufficient balance",
+    "insufficient credit",
+    "insufficient funds",
+    "insufficient_quota",
+)
+
+
 def _is_provider_refusal(exc: BaseException) -> bool:
-    """True only for an error the PROVIDER returned about capacity/quota.
+    """True only for an error the PROVIDER returned about capacity or credit.
 
     Deliberately narrow. Every other ``CCError`` on the failover path is
     ambiguous about the peer (see the module docstring), and a wrong "down" is
@@ -220,7 +240,17 @@ def _is_provider_refusal(exc: BaseException) -> bool:
     """
     from genesis.cc.exceptions import CCQuotaExhaustedError, CCRateLimitError
 
-    return isinstance(exc, (CCRateLimitError, CCQuotaExhaustedError))
+    if isinstance(exc, (CCRateLimitError, CCQuotaExhaustedError)):
+        return True
+    # A drained account is a refusal in substance but reaches us as a generic
+    # process error, because the global classifier deliberately does not know
+    # these phrases (see above). Text-matching is confined to this advisory path.
+    from genesis.cc.exceptions import CCProcessError
+
+    if isinstance(exc, CCProcessError):
+        blob = str(exc).lower()
+        return any(p in blob for p in _BALANCE_REFUSALS)
+    return False
 
 
 def note_failure(peer: str, exc: BaseException) -> bool:
@@ -297,20 +327,42 @@ def _record(
         }
         peers[peer] = {k: v for k, v in asdict(status).items() if k != "peer"}
         if len(peers) > _MAX_PEERS:
-            # Evict least-recently-observed. "" sorts first, so a malformed row
-            # missing observed_at is dropped before a well-formed one.
-            ordered = sorted(peers.items(), key=lambda kv: str(kv[1].get("observed_at", "")))
-            peers = dict(ordered[-_MAX_PEERS:])
-        _write({"peers": peers})
-        return True
+            # Evict least-recently-observed, ranking by a PARSED timestamp.
+            # Sorting the raw string ranked malformed values by ASCII, so a row
+            # carrying observed_at="zzzz" outranked every real ISO stamp: once
+            # enough such rows existed, each genuine new observation was evicted
+            # the moment it was written, and _record would report success while
+            # read_peer found nothing. Unparseable rows now sort OLDEST, and the
+            # row being written this call is never a candidate for eviction.
+            def _rank(kv: tuple[str, dict]) -> datetime:
+                try:
+                    return datetime.fromisoformat(str(kv[1].get("observed_at", "")))
+                except (ValueError, TypeError):
+                    return datetime.min.replace(tzinfo=UTC)
+
+            others = sorted(
+                ((k, v) for k, v in peers.items() if k != peer), key=_rank,
+            )
+            keep = others[-(_MAX_PEERS - 1):] if _MAX_PEERS > 1 else []
+            peers = dict([*keep, (peer, peers[peer])])
+        return _write({"peers": peers})
     except Exception:
         logger.debug("peer availability record failed for %s", peer, exc_info=True)
         return False
 
 
-def _write(payload: dict) -> None:
-    """Atomic write (temp file + os.replace) so a reader never sees partial JSON."""
+def _write(payload: dict) -> bool:
+    """Atomic write (temp file + os.replace). Returns True iff the file landed.
+
+    The return value is load-bearing, not decoration: a caller that reports a
+    recorded observation while the write failed is exactly the confident-but-
+    wrong signal this module exists to remove. A failure between mkstemp and
+    os.replace also leaves the temp file behind, so it is unlinked here —
+    otherwise a disk-full condition accumulates orphaned .tmp files next to the
+    state it could not write.
+    """
     path = _state_path()
+    tmp: str | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
@@ -320,5 +372,10 @@ def _write(payload: dict) -> None:
         finally:
             os.close(fd)
         os.replace(tmp, str(path))
+        return True
     except OSError:
         logger.error("Failed to write %s", _STATE_FILE, exc_info=True)
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+        return False

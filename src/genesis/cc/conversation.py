@@ -1138,12 +1138,27 @@ class ConversationLoop:
                     # so one local blip can't mark the whole standby fleet down.
                     peer_availability.note_failure(peer_name, exc)
                     continue
-                # Clear any stale block ONLY on a genuine answer. The invoker
-                # returns normally in two degenerate cases — a silent cap yields
-                # an empty non-error output — and treating those as "available"
-                # would erase a real prior block, deleting the one signal an
-                # operator would act on.
-                if not output.is_error and (output.text or "").strip():
+                if output.is_error or not (output.text or "").strip():
+                    # No usable answer. The invoker returns normally in two
+                    # degenerate cases (a silent cap yields an empty non-error
+                    # output), and taking the success path on those recorded the
+                    # peer as available, entered fallback state, and handed the
+                    # user an EMPTY reply without ever trying the next peer.
+                    #
+                    # Move on — but ONLY if nothing has been streamed yet. If
+                    # this peer already streamed text, continuing would hit the
+                    # loop-top guard, break to contingency, and answer a second
+                    # time on top of the text the user can already see. In that
+                    # case keep the existing behaviour and return what we have.
+                    if not (streamed and streamed.get("text")):
+                        logger.warning(
+                            "failover peer %s returned no usable answer — trying "
+                            "the next peer", peer_name,
+                        )
+                        continue
+                else:
+                    # A genuine answer clears any stale block, so a recovered
+                    # peer stops being reported as down.
                     peer_availability.note_success(peer_name)
                 # Success on this peer. Record the account-wide flag + this session's
                 # sticky peer session (only with a real session id, else continuity

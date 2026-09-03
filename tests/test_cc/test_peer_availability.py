@@ -341,3 +341,75 @@ def test_snapshot_is_empty_and_silent_with_no_records():
     from genesis.observability.snapshots.cc_sessions import _peer_availability_snapshot
 
     assert _peer_availability_snapshot() == []
+
+
+# ── review round 3 (PR #1646) ────────────────────────────────────────────────
+
+
+def test_malformed_timestamps_do_not_evict_the_record_being_written(tmp_path):
+    """REGRESSION LOCK: eviction ranked by the RAW string, so a row carrying
+    observed_at="zzzz" outranked every real ISO stamp by ASCII. Once _MAX_PEERS
+    such rows existed, each genuine new observation was evicted the instant it
+    was written — note_failure returned True while read_peer found nothing, and
+    recording stayed broken until someone deleted the file by hand."""
+    poison = {
+        f"junk-{i}": {"available": False, "observed_at": "zzzz"}
+        for i in range(PA._MAX_PEERS + 5)
+    }
+    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": poison}))
+
+    assert PA.note_failure("real-peer", CCRateLimitError("429")) is True
+    st = PA.read_peer("real-peer")
+    assert st is not None, "the row just written was evicted by malformed rows"
+    assert st.available is False
+    assert len(PA.read()) <= PA._MAX_PEERS
+
+
+def test_record_reports_false_when_the_write_fails(monkeypatch):
+    """A caller told an observation was recorded when it was not is exactly the
+    confident-but-wrong signal this module exists to remove."""
+    monkeypatch.setattr(PA, "_write", lambda payload: False)
+    assert PA.note_failure("peer-x", CCRateLimitError("429")) is False
+
+
+def test_failed_write_leaves_no_orphaned_temp_file(tmp_path, monkeypatch):
+    """A failure between mkstemp and os.replace must not accumulate .tmp files
+    next to the state it could not write (disk-full is the realistic trigger)."""
+    def _boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(PA.os, "replace", _boom)
+    assert PA.note_failure("peer-x", CCRateLimitError("429")) is False
+    assert not list(tmp_path.glob("*.tmp")), "orphaned temp file left behind"
+
+
+def test_balance_refusal_is_recorded_without_widening_global_classification():
+    """The drained-account phrases live HERE, not in the invoker's quota table.
+
+    Teaching the global classifier these phrases would let a drained BACKUP
+    relay an account-wide CCStatus.UNAVAILABLE about the primary, and would
+    outrank the invoker's MCP classification (an MCP tool whose own error text
+    says "insufficient funds" would be parked as a provider quota failure).
+    """
+    from genesis.cc.exceptions import CCProcessError
+    from genesis.cc.invoker import CCInvoker
+
+    exc = CCInvoker._classify_error("API Error (HTTP 402): insufficient balance")
+    # Global classification is deliberately UNCHANGED by this PR...
+    assert isinstance(exc, CCProcessError)
+    assert not isinstance(exc, (CCRateLimitError, CCQuotaExhaustedError))
+    # ...while the advisory record still recognises it as a refusal.
+    assert PA._is_provider_refusal(exc) is True
+    assert PA.note_failure("peer-x", exc) is True
+    assert PA.read_peer("peer-x").reason == PA.QUOTA
+
+
+def test_an_mcp_error_mentioning_funds_is_not_a_peer_refusal():
+    """The exact false positive that keeping these phrases out of the global
+    classifier prevents — asserted so a future 'simplification' cannot quietly
+    move them back."""
+    from genesis.cc.exceptions import CCMCPError
+
+    assert PA._is_provider_refusal(
+        CCMCPError("MCP server 'payments' returned error: insufficient funds")
+    ) is False

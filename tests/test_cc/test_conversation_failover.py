@@ -400,3 +400,58 @@ async def test_degenerate_empty_success_does_not_clear_a_block(loop, invoker):
     ])
     await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
     assert peer_availability.read_peer("glm-5.2").available is False
+
+
+@pytest.mark.asyncio
+async def test_empty_peer_answer_falls_over_to_the_next_peer(loop, invoker, monkeypatch):
+    """An empty answer is not a success. Before this, the loop recorded fallback
+    state and handed the user an EMPTY reply without trying anyone else."""
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV), ("peer-b", _PEER_INV)],
+    )
+    invoker.run = AsyncMock(side_effect=[
+        CCRateLimitError("limit"),                       # home
+        _output(text="", session_id="a-1"),              # peer-a: no usable answer
+        _output(text="second peer reply", session_id="b-1"),
+    ])
+    result = await loop.handle_message("hi", user_id="u1", channel=ChannelType.TERMINAL)
+    assert "second peer reply" in result
+    assert invoker.run.await_count == 3
+    # The empty peer must not be recorded available.
+    assert peer_availability.read_peer("peer-a") is None
+
+
+@pytest.mark.asyncio
+async def test_empty_answer_after_streaming_does_not_double_output(loop, invoker, monkeypatch):
+    """The limit on the fix above. If a peer ALREADY streamed text, continuing
+    would hit the loop-top guard, break to contingency, and answer a second time
+    on top of text the user can already see — the exact double-output the guard
+    at the top of the loop exists to prevent. So a streamed-then-empty peer keeps
+    the old behaviour and does NOT advance."""
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV), ("peer-b", _PEER_INV)],
+    )
+    # streamed starts EMPTY — the loop-top guard would otherwise break before
+    # any peer is attempted, which tests nothing. peer-a streams text DURING its
+    # attempt and then returns an empty output: the case the guard is for.
+    streamed: dict = {}
+    base_inv = CCInvocation(prompt="x", roster_eligible=True)
+    session = {"id": "s1"}
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    async def _stream_then_empty(*a, **k):
+        streamed["text"] = "partial answer already shown to the user"
+        return _output(text="", session_id="a-1")
+
+    invoker.run = AsyncMock(side_effect=_stream_then_empty)
+
+    await loop._try_roster_failover(
+        session=session, base_inv=base_inv, channel=ChannelType.TERMINAL,
+        model=CCModel.SONNET, effort=EffortLevel.LOW, prompt_text="x",
+        streamed=streamed,
+    )
+    # Only peer-a was attempted — we did NOT advance to peer-b.
+    assert invoker.run.await_count == 1
