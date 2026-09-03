@@ -1,5 +1,6 @@
 """Tests for memory-mcp server — verify all tools are registered with correct signatures."""
 
+import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2121,3 +2122,118 @@ async def test_memory_synthesize_accepts_a_valid_wing():
         result = await tools["memory_synthesize"].fn("content", wing="memory")
 
     assert result == "mem-id"
+
+
+# --- memory_recall: the THIRD door, and the only one that READS ---
+# Enumerated rather than spot-checked: exactly three MCP tools take a `wing`
+# (memory_recall, memory_store, memory_synthesize). The two writers above
+# validate; the reader did not. Qdrant applies wing as a hard `must` condition
+# and the FTS5 path post-filters on it, so a typo returns [] — which an agent
+# reads as "no such memories exist" rather than "no such wing".
+
+
+@pytest.mark.asyncio
+async def test_memory_recall_reports_an_unknown_wing_instead_of_returning_empty():
+    """A bad wing must be DISTINGUISHABLE from an honest empty result."""
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    with patch.object(core, "_memory_mod") as mod:
+        result = await tools["memory_recall"].fn(query="anything", wing="architecture")
+
+    assert len(result) == 1 and "error" in result[0], result
+    msg = result[0]["error"]
+    assert "architecture" in msg
+    # Must TEACH the vocabulary, exactly as the write path does.
+    assert "career" in msg and "infrastructure" in msg, msg
+    # And it must refuse BEFORE the expensive search, not filter afterwards.
+    mod.assert_not_called()
+
+
+def test_memory_recall_docstring_lists_exactly_the_wing_vocabulary():
+    """The docstring IS the agent-facing schema, so it must not rot.
+
+    This PR's thesis is "stop hand-copying a closed vocabulary" — and its own
+    fix to `memory_recall`'s docstring introduced a fresh hand-copied copy, in
+    the one place with the highest blast radius: the MCP tool schema every
+    agent reads to decide what to pass. The prompt copy 200 lines away is
+    derived AND locked; this one was neither.
+
+    Deriving it is not available here (the docstring is the schema, extracted
+    statically), so it gets the lock instead. `WINGS` has changed membership
+    twice in this repo's history, so "correct today" is not a guarantee.
+    """
+    import re
+
+    from genesis.mcp.memory import core
+    from genesis.memory.taxonomy import WINGS
+
+    doc = core.memory_recall.fn.__doc__
+    m = re.search(r"one of: (.*?)\. Enumerated", doc, re.S)
+    assert m, "the `wing` docstring entry no longer enumerates the vocabulary"
+    listed = {w.strip() for w in m.group(1).replace("\n", " ").split(",")}
+    assert listed == WINGS, f"docstring drifted from WINGS: {listed ^ WINGS}"
+
+
+@pytest.mark.asyncio
+async def test_memory_recall_forwards_the_wing_it_validated_not_the_raw_one():
+    """A padded wing must not pass validation and then match zero rows.
+
+    `_validate_wing` tests `wing.strip()`, but Qdrant applies `wing` as a hard
+    `must` FieldCondition and the FTS5 path compares it verbatim. Forwarding the
+    RAW value would let `" memory "` clear the guard and still return [] — the
+    exact silent-empty-result this guard exists to eliminate, surviving on a
+    whitespace edge. Blank means "no filter", not "filter on empty".
+    """
+    from genesis.mcp.memory import core
+
+    tools = await _get_tools()
+    seen = {}
+
+    with patch.object(core, "_memory_mod") as mod:
+
+        async def _capture(*args, **kwargs):
+            seen["wing"] = kwargs.get("wing")
+            raise RuntimeError("stop after the filter is decided")
+
+        mod.return_value._retriever.recall = _capture
+        with contextlib.suppress(RuntimeError):
+            await tools["memory_recall"].fn(query="q", wing="  memory  ")
+    assert seen.get("wing") == "memory", seen
+
+    seen.clear()
+    with patch.object(core, "_memory_mod") as mod:
+
+        async def _capture2(*args, **kwargs):
+            seen["wing"] = kwargs.get("wing")
+            raise RuntimeError("stop after the filter is decided")
+
+        mod.return_value._retriever.recall = _capture2
+        with contextlib.suppress(RuntimeError):
+            await tools["memory_recall"].fn(query="q", wing="   ")
+    assert seen.get("wing") is None, seen
+
+
+@pytest.mark.asyncio
+async def test_memory_recall_wing_validation_shares_one_definition_with_the_writers():
+    """No second vocabulary. Every WINGS member is accepted by the reader.
+
+    A per-tool copy of the list is the defect this whole PR is about — the
+    WING_AUDIT prompt carried one and put `architecture` into 11 live rows.
+
+    Scope, stated because this test's green is narrower than its name: it
+    catches a NARROWED vocabulary (verified RED by validating against
+    ``WINGS - {"employment"}``), which is the copy-the-list defect. It does NOT
+    catch validation being deleted outright — with no check at all every wing
+    is trivially "accepted" and this still passes. The sibling test above is
+    the deletion guard; verify both when either changes.
+    """
+    from genesis.mcp.memory import core
+    from genesis.memory.taxonomy import WINGS
+
+    tools = await _get_tools()
+    for wing in sorted(WINGS):
+        with patch.object(core, "_memory_mod") as mod:
+            mod.side_effect = RuntimeError("reached the search path")
+            with pytest.raises(RuntimeError):
+                await tools["memory_recall"].fn(query="q", wing=wing)
