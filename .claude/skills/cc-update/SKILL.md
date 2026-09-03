@@ -388,7 +388,7 @@ the delta touches:
   backstop).
 - **`--flags` Genesis passes** (`--model`, `--mcp-config`, `--bare`, `-p`, `--append-system-prompt`).
 
-Capture any such change as a follow-up + a doc entry — that is how the next update stays
+Capture any such change as a GitHub issue + a doc entry — that is how the next update stays
 execute-not-rediscover.
 
 ## Detection → behavior (new-capability adoption path)
@@ -401,8 +401,12 @@ existing Genesis workflow, replaces a hand-rolled mechanism, or covers a known
 gap), do BOTH:
 
 1. File the informational KB entry as usual (no alert — calibration unchanged).
-2. Create a `follow_up_create` row (`work_state="ready"`, low priority) naming
-   the SPECIFIC instruction change, e.g. "once CC >= vX.Y.Z is pinned: prefer
+2. File a GitHub ISSUE (`gh issue create --repo <owner>/<public-repo>`) naming
+   the SPECIFIC instruction change — editing a skill or CLAUDE.md is repo work,
+   so it belongs on the public tracker. Because it is ALSO time-gated on the
+   pin, keep a local `blocked_on_trigger` row alongside it, with a
+   `revisit_condition` (the tool hard-errors without one; the tracker has no
+   revisit mechanism). E.g. "once CC >= vX.Y.Z is pinned: prefer
    native `/design` over the gstack `design-*` skills for UI drafting; decide
    precedence and update the relevant skill/CLAUDE.md instruction". A
    capability nobody wires into an instruction is a capability Genesis never

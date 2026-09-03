@@ -240,8 +240,9 @@ classify it:
 
 - **Data repair** — you wrote the artifact the mechanism should have
   written. Label it "data repair" explicitly, and in the same session
-  either fix the mechanism or get the user's explicit deferral
-  (recorded as a follow-up). Never report a data repair as "fixed".
+  either fix the mechanism or get the user's explicit deferral (the mechanism
+  fix recorded as an ISSUE; a local row only if the deferral itself needs
+  tracking). Never report a data repair as "fixed".
 - **Class fix** — you changed the mechanism so the artifact is written
   correctly on every install, going forward, with a test proving it.
 
@@ -865,13 +866,13 @@ thinking any of these, STOP — you are rationalizing a shortcut.
 | "This is just a simple fix, no tests needed" | Simple fixes break complex systems. The Qdrant regression was a "simple fix." Write the test. |
 | "I already know what this function does" | You haven't read the implementation. Docstrings lie. Read the actual code. |
 | "Tests pass, so we're done" | Tests verify what they cover, not the outcome. Verify actual end-to-end behavior. |
-| "I'll clean this up in the next commit" | Next commit never comes in autonomous sessions. Do it now or create a follow-up. |
+| "I'll clean this up in the next commit" | Next commit never comes in autonomous sessions. Do it now, or file it — Genesis-repo work is a GitHub issue, not a local row. |
 | "This file is too large to read fully" | Read the relevant section. Partial reads lead to partial understanding and wrong fixes. |
 | "The linter is happy, ship it" | Linters catch syntax, not logic. Clean lint with broken behavior is worse than a warning with correct behavior. |
 | "This change is low-risk, no impact analysis needed" | Your confidence is based on what you know; checking callers reveals what you don't. Serena `find_referencing_symbols` is live — run it. For multi-hop blast radius, `gitnexus analyze` then `impact`. |
 | "I can skip the worktree, I'll be quick" | Concurrent session safety exists because "quick" commits have destroyed work before. Always worktree. |
 | "The error is transient, retry will fix it" | Diagnose first. Retrying a misdiagnosed error wastes tokens and masks root causes. |
-| "I'll add the follow-up later" | Follow-ups not created in-session are lost. Create it now while context is fresh. |
+| "I'll add the follow-up later" | Records not created in-session are lost. File it now while context is fresh — Genesis-repo work as a GitHub issue, user-owned work as a follow-up. |
 | "I don't need a skill for this" | If a skill exists, use it. The using-superpowers Red Flags table exists for this exact rationalization. |
 | "This review round is the same class, it doesn't really count" | For an EXTERNAL cross-model round, the counter decides, not you — a repeat-class external round still counts; update it every external cycle and STOP at the cap. (Internal same-model reviews are never rounds.) |
 | "The user already said proceed, so I can keep looping" | The escalation/fix-attempt caps CONSUME standing approval. Round 4+ (or fix #4) on an old instruction is a violation, not obedience. |
@@ -1571,8 +1572,10 @@ session assumed deploy "happens somehow").
 2. Verify the deploy landed: gateway `version` op reports the expected
    `deployed_commit` / CC version; guardian tick healthy in its journal.
 3. State the deploy + verification result explicitly in the wrap-up. If the
-   deploy cannot happen this session (host unreachable), create a follow-up
-   via `follow_up_create` — never leave deploy as an implicit assumption.
+   deploy cannot happen this session, record it — never leave deploy as an
+   implicit assumption. Route it: a purely LOCAL blocker (host unreachable
+   tonight) is a `follow_up_create` row; a blocker that exposes a REPO-level gap
+   (a missing reconcile mechanism, no self-heal path) is a GitHub issue.
 
 **The reverse direction is equally binding**: host VMs are deploy targets,
 never edit-in-place dev environments. An emergency hand-edit on a host gets a
