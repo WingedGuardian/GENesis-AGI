@@ -105,18 +105,40 @@ def test_empty_peer_name_is_ignored():
 # ── secret handling ──────────────────────────────────────────────────────────
 
 
-def test_secret_straddling_the_truncation_bound_is_still_scrubbed(monkeypatch):
-    """REGRESSION LOCK (review blocker B3).
+def test_bounding_can_never_emit_a_partial_value(monkeypatch):
+    """The scrub-order defect class is CLOSED BY CONSTRUCTION — this locks the
+    construction, not the ordering.
 
-    The first draft truncated to _MAX_TEXT and THEN scanned the environment, so a
-    secret crossing the bound lost its tail, no longer matched, and its head was
-    written to disk verbatim (reproduced: a 64-char token at offset 290 leaked a
-    10-char prefix). This file is persisted and lands in backups, so a partial
-    prefix is a real leak. Scrub must happen BEFORE truncation.
+    Original defect (review blocker B3): the value was cut to a length bound and
+    THEN scanned for secrets, so a secret straddling the bound lost its tail, no
+    longer matched the environment value, and its head was written to disk
+    verbatim (reproduced: a 64-char token at offset 290 leaked a 10-char prefix).
+    The fix at the time was to reorder scrub-before-bound.
+
+    That ordering lock is now UNTESTABLE, and honesty is better than a fixture
+    contorted to look like it still works: `_bound_text` returns the value WHOLE
+    or replaces it with a fixed-size marker, so bounding cannot produce a proper
+    prefix for a scrub to miss. VERIFIED by mutation — with the scrub/bound order
+    deliberately reversed, no prefix leaks, because an oversized value is
+    replaced entirely rather than cut.
+
+    So the property worth locking is the structural one that closed the class.
+    If anyone reintroduces truncation, this fails and the prefix leak returns.
     """
-    secret = "TOKENVALUE-" + ("z" * 53)  # 64 chars, straddles the 300-char bound
+    for text in ("short", "x" * (PA._MAX_DETAIL - 1), "y" * PA._MAX_DETAIL,
+                 "z" * (PA._MAX_DETAIL + 1), "w" * (PA._MAX_DETAIL * 10)):
+        out = PA._bound_text(text)
+        assert out == text or not text.startswith(out), (
+            f"bounding emitted a PROPER PREFIX of a {len(text)}-char value — "
+            "the exact shape that let a straddling secret leak its head"
+        )
+
+    # And end to end: a secret crossing the bound leaves nothing behind.
+    secret = "TOKENVALUE-" + ("z" * 53)
     monkeypatch.setenv("SOME_API_KEY", secret)
-    PA.note_failure("peer-x", CCRateLimitError(("a" * 290) + secret))
+    msg = ("a" * (PA._MAX_DETAIL - (len(secret) // 2))) + secret
+    assert len(msg) > PA._MAX_DETAIL, "fixture must cross the bound"
+    PA.note_failure("peer-x", CCRateLimitError(msg))
     raw = PA._state_path().read_text()
     assert secret not in raw
     for n in (10, 16, 24):
@@ -148,8 +170,11 @@ def test_short_env_values_are_not_scrubbed(monkeypatch):
 
 
 def test_detail_is_bounded_after_scrubbing():
+    """Bounded by OMISSION, not by a cut — see the invariant tests below."""
     PA.note_failure("peer-x", CCRateLimitError("x" * 5000))
-    assert len(PA.read_peer("peer-x").detail) <= PA._MAX_TEXT
+    detail = PA.read_peer("peer-x").detail
+    assert "omitted" in detail and "5000" in detail
+    assert "xxxx" not in detail, "kept a fragment of the omitted value"
 
 
 # ── reset parsing (reuses genesis.cc.rate_limit_reset) ───────────────────────
@@ -206,7 +231,9 @@ def test_oversized_detail_from_disk_is_rebounded_on_read(tmp_path):
     (tmp_path / "cc_peer_availability.json").write_text(
         json.dumps({"peers": {"p": {"available": False, "detail": "y" * 50_000}}})
     )
-    assert len(PA.read_peer("p").detail) <= PA._MAX_TEXT
+    detail = PA.read_peer("p").detail
+    assert "omitted" in detail and "50000" in detail
+    assert "yyyy" not in detail, "kept a fragment of the omitted value"
 
 
 def test_peer_count_is_capped():
@@ -271,7 +298,7 @@ def test_a_corrupt_row_does_not_permanently_kill_recording(tmp_path):
 
 
 def test_oversized_row_from_disk_is_rebounded_when_writing(tmp_path):
-    """_MAX_TEXT bounds the value being written; a blob left by another build
+    """Bounding applies to the value being written; a blob left by another build
     must not be re-persisted verbatim on the next record."""
     (tmp_path / "cc_peer_availability.json").write_text(
         json.dumps({"peers": {"old": {"available": False, "detail": "y" * 50_000}}})
@@ -285,9 +312,12 @@ def test_roster_declared_auth_env_is_scrubbed_even_without_a_hint_word(monkeypat
     error text, and auth_env names are user-chosen — `GLM_PAT` matches no hint."""
     token = "PEERTOKEN-abcdefghijklmnop"
     monkeypatch.setenv("GLM_PAT", token)
+    # Patch the ROSTER, not _secret_names. Stubbing _secret_names skips the
+    # auth_env loop entirely, so the test passed even with that loop deleted —
+    # it asserted nothing about the mechanism its own name claims to cover.
     monkeypatch.setattr(
-        PA, "_secret_names",
-        lambda: {"GLM_PAT"},  # stand in for the roster declaring auth_env: GLM_PAT
+        "genesis.cc.roster.load_roster",
+        lambda *a, **k: {"models": {"glm": {"auth_env": "GLM_PAT"}}},
     )
     PA.note_failure("peer-x", CCRateLimitError(f"429 rejected token {token}"))
     assert token not in PA._state_path().read_text()
@@ -480,7 +510,7 @@ def test_concurrent_recorders_do_not_drop_each_others_rows(tmp_path):
 
 
 def test_every_field_and_the_key_are_bounded_not_just_detail(tmp_path):
-    """BLOCKER: _MAX_TEXT bounded 1 of 7 fields, and nothing bounded the KEY.
+    """BLOCKER: one blanket cap bounded 1 of 7 fields, and nothing bounded the KEY.
 
     A foreign row was re-persisted whole and handed to the snapshot untouched —
     measured at a 300KB state file and a 100,000-char `reason` reaching an LLM
@@ -497,10 +527,25 @@ def test_every_field_and_the_key_are_bounded_not_just_detail(tmp_path):
             "limit_kind": "L" * 100_000,
         },
     }}))
-    st = next(iter(PA.read().values()))
-    for field in ("reason", "observed_at", "detail", "reset_at", "limit_kind"):
-        assert len(getattr(st, field)) <= PA._MAX_TEXT, f"{field} unbounded on read"
-    assert len(st.peer) <= PA._MAX_PEER_NAME, "peer key unbounded on read"
+    # The row is DROPPED outright: its key is unstorable, and truncating the key
+    # to make it fit is the collision bug (see the peer-identity invariant).
+    assert PA.read() == {}, "a row with an unstorable key must be dropped, not cut"
+
+    # A row whose KEY is fine but whose FIELDS are foreign keeps the row and
+    # rejects the values — each field by what it means, not by a blanket cut.
+    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": {
+        "p": {
+            "available": False,
+            "reason": "R" * 100_000,
+            "observed_at": "O" * 100_000,
+            "detail": "D" * 100_000,
+            "reset_at": "T" * 100_000,
+            "limit_kind": "L" * 100_000,
+        },
+    }}))
+    st = PA.read_peer("p")
+    assert (st.reason, st.observed_at, st.reset_at, st.limit_kind) == ("", "", "", "")
+    assert "omitted" in st.detail and "D" * 20 not in st.detail
 
     # ...and the bound must survive a write, not just a read.
     PA.note_failure("fresh", CCRateLimitError("429"))
@@ -546,3 +591,261 @@ def test_lock_acquisition_is_bounded_not_blocking(tmp_path):
     budget = PA._LOCK_ATTEMPTS * PA._LOCK_SLEEP_S
     assert elapsed < budget * 3, f"blocked {elapsed:.2f}s against a {budget:.2f}s budget"
     assert PA.read_peer("peer-x") is not None, "degrade-open must still record"
+
+
+# ── THE MODULE'S INVARIANTS, AS EXECUTABLE TESTS ─────────────────────────────
+#
+# The adversarial audit's root cause was "each round added a mechanism without
+# re-deriving the module's invariants". Prose did not prevent that — the module
+# docstring said "never block the event loop" and a blocking flock was added
+# under it anyway. So each invariant below is a test, not a sentence.
+
+
+def test_invariant_a_storable_name_is_kept_whole_and_distinct():
+    """I5. Names that FIT are stored verbatim, and two of them never merge.
+
+    Lengths are derived from the cap, never written as literals: an earlier
+    version of this test used a 213-char name, which stopped exercising anything
+    the moment the cap moved above it — it passed identically against a build
+    that truncated names. A test whose relevance depends on a constant it does
+    not read is a test with an expiry date.
+    """
+    stem = "peer-" + ("p" * (PA._MAX_PEER_NAME - 20))
+    blocked, healthy = stem + "-BLOCKED", stem + "-HEALTHY"
+    assert max(len(blocked), len(healthy)) <= PA._MAX_PEER_NAME, "fixture must be storable"
+
+    PA.note_failure(blocked, CCRateLimitError("429 quota"))
+    PA.note_success(healthy)
+
+    assert PA.read_peer(blocked) is not None, "a storable name was not kept whole"
+    assert PA.read_peer(blocked).available is False, "another peer's success cleared this block"
+    assert PA.read_peer(healthy).available is True
+    assert len({blocked, healthy} & set(PA.read())) == 2, "two peers collapsed onto one key"
+
+
+def test_invariant_an_unstorable_name_is_dropped_not_truncated():
+    """I5. Over the cap, a row is OMITTED — never cut down to a shared prefix.
+
+    `roster.py` applies no length bound to model names (zero `len()` calls), so
+    two long names sharing a prefix are possible. Truncating them to fit maps
+    both to ONE state key, and a success on one then clears the other's recorded
+    quota failure — a correctness bug manufactured by the protective cap. Not
+    storing the row is honest; storing it under another peer's identity is not.
+    """
+    stem = "peer-" + ("p" * (PA._MAX_PEER_NAME + 50))
+    blocked, healthy = stem + "-BLOCKED", stem + "-HEALTHY"
+    assert min(len(blocked), len(healthy)) > PA._MAX_PEER_NAME, "fixture must be unstorable"
+
+    assert PA.note_failure(blocked, CCRateLimitError("429 quota")) is False, (
+        "an unstorable row must report False — True means the row landed"
+    )
+    PA.note_success(healthy)
+
+    # Nothing was stored, so nothing can be attributed to the wrong peer. Under
+    # truncation both would share one key and this map would hold a single row
+    # claiming availability for the peer that is actually blocked.
+    assert PA.read() == {}, f"an unstorable name reached the store: {list(PA.read())}"
+
+
+def test_invariant_oversized_text_is_omitted_wholesale_not_cut_in_half():
+    """I5. A pathological value is REPLACED by a marker, never amputated.
+
+    A truncated value still LOOKS complete, so nobody checks it; an honest gap
+    does not. The marker must name the real size so a reader can tell what was
+    dropped, and must not carry a fragment of the original.
+    """
+    body = "PROVIDER-BODY-" + ("x" * 100_000)
+    PA.note_failure("peer-x", CCRateLimitError(body))
+    detail = PA.read_peer("peer-x").detail
+
+    assert "omitted" in detail, f"expected an omission marker, got: {detail[:80]!r}"
+    assert str(len(body)) in detail, "marker must state the real size that was dropped"
+    assert "PROVIDER-BODY-" not in detail, "kept a fragment of the amputated value"
+    assert len(detail) < 200, "the marker itself must be fixed-size"
+
+
+def test_invariant_a_real_provider_message_survives_whole():
+    """I5. The acceptance bar for the bound: real refusal prose is NOT cut.
+
+    MEASURED against 60 days of this install's server log: 183/670 (27.3%) of
+    real refusal messages exceed the 300-char cap the first draft invented, and
+    0/670 exceed the bound used now (observed max 1057). A bound that amputates
+    a quarter of the real population makes the field pointless — which is the
+    whole reason the field exists.
+    """
+    # Shape taken from a real provider refusal: a JSON error body, not a sentence.
+    real = json.dumps({
+        "error": {
+            "message": (
+                "Rate limit reached for model `peer-model` in organization "
+                "`org_0123456789abcdefghijklmn` service tier `on_demand` on tokens "
+                "per minute (TPM): Limit 30000, Used 29847, Requested 1200. "
+                "Please try again in 2.5s. Need more? Visit the billing console."
+            ),
+            "type": "rate_limit_exceeded",
+            "code": "rate_limit_exceeded",
+        },
+    }, indent=2)
+    assert 300 < len(real) < 2000, "fixture must sit in the band that used to be cut"
+
+    PA.note_failure("peer-x", CCRateLimitError(real))
+    detail = PA.read_peer("peer-x").detail
+
+    assert "omitted" not in detail, "a real provider message was treated as pathological"
+    assert "rate_limit_exceeded" in detail, "lost the machine-readable cause"
+    assert "billing console" in detail, "amputated the tail of a real message"
+
+
+def test_invariant_fail_closed_when_credential_discovery_fails(monkeypatch):
+    """I6. Uncertain secret discovery ⇒ drop `detail` entirely.
+
+    `auth_env` names are user-chosen and need not contain a hint word
+    (`auth_env: GLM_PAT`), so when the roster cannot be read the scrub CANNOT
+    know which env values are credentials. Falling back to hints alone writes
+    that peer's own token to disk verbatim — and the token most likely to appear
+    in a peer's error text is precisely that peer's own. Losing diagnostic prose
+    is strictly safer than leaking a credential.
+    """
+    monkeypatch.setenv("GLM_PAT", "PATVALUE-abcdefghijklmnopqrstuvwxyz")
+
+    def _boom(*a, **k):
+        raise RuntimeError("roster unreadable")
+
+    monkeypatch.setattr("genesis.cc.roster.load_roster", _boom)
+    PA.note_failure("peer-x", CCRateLimitError("401 using PATVALUE-abcdefghijklmnopqrstuvwxyz"))
+
+    raw = PA._state_path().read_text()
+    assert "PATVALUE-abcdefghijklmnopqrstuvwxyz" not in raw, "leaked a roster-declared credential"
+    assert PA.read_peer("peer-x") is not None, "the observation itself must still be recorded"
+    assert PA.read_peer("peer-x").available is False
+
+
+def test_invariant_read_path_enforces_the_peer_cap(tmp_path):
+    """I5. The cap must hold on READ, not only on write.
+
+    The file is copied whole into every health snapshot and from there into an
+    LLM context via the health MCP tool. Write-side eviction does not help until
+    the next observation is recorded — which only happens during a home-model
+    outage, so a foreign or older file can inflate every snapshot for days.
+    """
+    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": {
+        f"peer-{i:04d}": {"available": False, "reason": "quota"}
+        for i in range(PA._MAX_PEERS * 20)
+    }}))
+    assert len(PA.read()) <= PA._MAX_PEERS, "read path ignored the peer cap"
+
+
+def test_invariant_a_pathological_file_is_not_read_into_memory(tmp_path):
+    """I5. Bound the INPUT, not just the parsed result.
+
+    `read()` runs synchronously on the health path. Parsing a multi-hundred-MB
+    file to then discard most of it is the memory spike, not the row count —
+    and this box is shared with other sessions.
+    """
+    # Sized FROM the cap, and only just over it: an earlier version wrote ~81MB
+    # to test a 1MB bound and asserted against a hard-coded 50MB, which is the
+    # same expiry-date anti-pattern this file warns about elsewhere.
+    f = tmp_path / "cc_peer_availability.json"
+    f.write_text(json.dumps({"peers": {"p": {"available": True,
+                                             "detail": "z" * PA._MAX_STATE_BYTES}}}))
+    assert f.stat().st_size > PA._MAX_STATE_BYTES
+    assert PA.read() == {}, "an implausibly large state file must be refused, not parsed"
+
+
+def test_invariant_field_values_are_typed_not_merely_short(tmp_path):
+    """I5. Each field is bounded by what it MEANS, not by one blanket number.
+
+    `reason` and `limit_kind` are closed enums and `observed_at`/`reset_at` are
+    timestamps; a foreign value in any of them is INVALID, not "too long". A
+    blanket character cap answers the wrong question — it turns 100k chars of
+    garbage into 300 chars of garbage and calls it bounded.
+    """
+    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": {
+        "p": {
+            "available": False,
+            "reason": "R" * 100_000,
+            "observed_at": "O" * 100_000,
+            "reset_at": "T" * 100_000,
+            "limit_kind": "L" * 100_000,
+        },
+    }}))
+    st = PA.read_peer("p")
+    assert st.reason == "", "an unknown reason is invalid, not truncatable"
+    assert st.limit_kind == "", "an unknown limit_kind is invalid, not truncatable"
+    assert st.observed_at == "", "a non-timestamp observed_at is invalid, not truncatable"
+    assert st.reset_at == "", "a non-timestamp reset_at is invalid, not truncatable"
+
+
+def test_invariant_recording_never_raises_on_a_hostile_exception():
+    """I2. This module sits ON the failover path. A raise here escapes into the
+    peer loop and abandons every REMAINING peer — turning an observability
+    helper into an outage amplifier."""
+
+    class Hostile(CCRateLimitError):
+        def __str__(self):
+            raise RuntimeError("hostile __str__")
+
+    assert PA.note_failure("peer-x", Hostile()) is False
+    assert PA.note_success("peer-x") is True
+
+
+def test_invariant_a_credential_on_disk_is_scrubbed_on_the_way_OUT(monkeypatch, tmp_path):
+    """I6. The scrub was WRITE-ONLY, so the read path republished a secret.
+
+    A row left by an older build — or by this build in an environment where the
+    credential was not discoverable — was handed verbatim to every health
+    snapshot, from there into an LLM context via the health MCP tool and into
+    `sentinel/monitor.py`'s unsanitised monitoring prompt, and was re-persisted
+    forever by the next merge. `_sanitise` is documented as THE chokepoint where
+    reader and writer agree; it bounded `detail` and did not scrub it.
+    """
+    secret = "SECRETVALUE-abcdefghijklmnop"
+    monkeypatch.setenv("FOO_API_KEY", secret)
+    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": {
+        "legacy": {"available": False, "reason": "quota",
+                   "detail": f"429 rejected token {secret}"},
+    }}))
+
+    assert secret not in PA.read_peer("legacy").detail, "read republished a credential"
+    assert "<redacted>" in PA.read_peer("legacy").detail
+
+    # ...and it must not survive the next merge either.
+    PA.note_failure("fresh", CCRateLimitError("429"))
+    assert secret not in PA._state_path().read_text(), "re-persisted a credential"
+
+
+def test_invariant_an_unreadable_roster_fails_closed(monkeypatch, tmp_path):
+    """I6. Break the FILE, not the function.
+
+    The previous version of this test monkeypatched `roster.load_roster` to
+    RAISE — a condition the real loader cannot produce, because
+    `roster._load_yaml` swallows every read failure and returns {}. It proved the
+    `except` branch worked while the guard was dead for the cause its own
+    docstring named. The completeness signal is now keyed on the RESULT.
+    """
+    monkeypatch.setenv("GLM_PAT", "PATVALUE-abcdefghijklmnopqrstuvwxyz")
+    # What an unreadable/absent roster actually yields from the real loader.
+    monkeypatch.setattr("genesis.cc.roster.load_roster", lambda *a, **k: {})
+
+    names, ok = PA._secret_names()
+    assert ok is False, "an empty roster must read as INCOMPLETE discovery"
+
+    PA.note_failure("peer-x", CCRateLimitError("401 using PATVALUE-abcdefghijklmnopqrstuvwxyz"))
+    raw = PA._state_path().read_text()
+    assert "PATVALUE-abcdefghijklmnopqrstuvwxyz" not in raw, "leaked a roster credential"
+    assert PA.read_peer("peer-x").available is False, "lost the observation itself"
+
+
+def test_read_resolves_the_roster_once_not_once_per_row(tmp_path, monkeypatch):
+    """Scrubbing at the chokepoint must not reload the roster for every peer —
+    read() is on the health snapshot path."""
+    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": {
+        f"p{i}": {"available": False, "reason": "quota", "detail": "429"}
+        for i in range(20)
+    }}))
+    calls = []
+    real = __import__("genesis.cc.roster", fromlist=["x"]).load_roster
+    monkeypatch.setattr("genesis.cc.roster.load_roster",
+                        lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    assert len(PA.read()) == 20
+    assert len(calls) <= 1, f"resolved the roster {len(calls)} times for 20 rows"

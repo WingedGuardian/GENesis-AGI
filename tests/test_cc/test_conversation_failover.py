@@ -14,7 +14,12 @@ import pytest
 
 from genesis.cc import fallback_state, peer_availability, roster
 from genesis.cc.conversation import ConversationLoop
-from genesis.cc.exceptions import CCError, CCNetworkOfflineError, CCRateLimitError
+from genesis.cc.exceptions import (
+    CCError,
+    CCMCPError,
+    CCNetworkOfflineError,
+    CCRateLimitError,
+)
 from genesis.cc.invoker import CCInvoker
 from genesis.cc.system_prompt import SystemPromptAssembler
 from genesis.cc.types import (
@@ -518,3 +523,101 @@ async def test_streamed_then_empty_still_records_the_peer_as_available(loop, inv
     st = peer_availability.read_peer("peer-a")
     assert st is not None, "served the turn but recorded nothing"
     assert st.available is True
+
+
+@pytest.mark.asyncio
+async def test_streamed_then_local_error_clears_a_stale_block(loop, invoker, monkeypatch):
+    """A peer that ANSWERS must not keep a stale "blocked" record.
+
+    The peer streams text — the user can see it — and then a LOCAL fault ends the
+    turn (an MCP crash, our own timeout). `note_failure` correctly declines that
+    as evidence about the peer, but the earlier quota block then survives an
+    attempt that demonstrably reached and served from this peer. Because records
+    refresh only during a home-model outage, that false "blocked" can stand for
+    days on the one surface built to show whether the standby is usable.
+    """
+    peer_availability.note_failure("peer-a", CCRateLimitError("429 quota"))
+    assert peer_availability.read_peer("peer-a").available is False, "fixture precondition"
+
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+    streamed: dict = {}
+
+    async def _stream_then_local_error(*a, **k):
+        streamed["text"] = "answer already shown to the user"
+        raise CCMCPError("genesis-health MCP server crashed")
+
+    invoker.run = AsyncMock(side_effect=_stream_then_local_error)
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    result = await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x", streamed=streamed,
+    )
+
+    assert result == "", "streamed text must still suppress contingency"
+    st = peer_availability.read_peer("peer-a")
+    assert st.available is True, "a peer that answered is still recorded blocked"
+    assert st.reason == "", "stale quota reason survived a served turn"
+
+
+@pytest.mark.asyncio
+async def test_local_error_without_streaming_leaves_the_block_untouched(loop, invoker, monkeypatch):
+    """The CONVERSE, so the fix above cannot over-reach.
+
+    With no text streamed the peer did NOT demonstrably serve, so a local fault
+    is no evidence of recovery — clearing the block there would invent an
+    observation, which is the failure mode this whole module exists to avoid.
+    """
+    peer_availability.note_failure("peer-a", CCRateLimitError("429 quota"))
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+    invoker.run = AsyncMock(side_effect=CCMCPError("MCP crashed before any output"))
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x", streamed={},
+    )
+    st = peer_availability.read_peer("peer-a")
+    assert st.available is False, "invented a recovery from a local fault"
+
+
+@pytest.mark.asyncio
+async def test_recorder_failure_never_abandons_the_failover(loop, invoker, monkeypatch):
+    """Advisory bookkeeping must never decide whether the user gets an answer.
+
+    Moving the recorder off the event loop put the module's never-raises
+    guarantee at risk at the WRAPPER: `asyncio.to_thread` raises RuntimeError
+    once the default executor is shut down, and the outer handler catches that
+    by returning None — abandoning the entire failover, which is strictly worse
+    than the lost row the move was protecting.
+    """
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+
+    async def _explode(*a, **k):
+        raise RuntimeError("cannot schedule new futures after shutdown")
+
+    monkeypatch.setattr("asyncio.to_thread", _explode)
+    invoker.run = AsyncMock(return_value=_output(text="the peer's answer"))
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    result = await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x", streamed={},
+    )
+    assert result is not None, "a recorder fault threw away the peer's reply"
+    assert "the peer's answer" in result

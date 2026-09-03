@@ -1112,6 +1112,29 @@ class ConversationLoop:
                     home,
                 )
                 return None
+            async def _record_peer(fn, *args) -> bool:
+                """Run a peer_availability recorder OFF the event loop, safely.
+
+                The recorder itself is exhaustively guarded against raising,
+                because a raise here escapes into the peer loop and abandons
+                every REMAINING peer. Moving it to a worker thread put that
+                guarantee back at risk: `asyncio.to_thread` raises RuntimeError
+                once the default executor is shut down, which the outer handler
+                catches by returning None — abandoning the whole failover, which
+                is strictly worse than the lost row it was protecting. Advisory
+                bookkeeping must never decide whether the user gets an answer.
+
+                CancelledError is deliberately re-raised: it is a BaseException
+                and means the turn itself is going away.
+                """
+                try:
+                    return await asyncio.to_thread(fn, *args)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug("peer availability record failed", exc_info=True)
+                    return False
+
             def _streamed_text() -> bool:
                 """True once answer text has reached the user this turn.
 
@@ -1139,7 +1162,11 @@ class ConversationLoop:
                     # peer. Recording is advisory and never changes which peers are
                     # tried; it exists so a blocked standby is VISIBLE, since the
                     # roster admits a peer on credential presence alone.
-                    peer_availability.note_failure(peer_name, exc)
+                    # to_thread: the recorder does a roster read, a lock with
+                    # bounded retry sleeps, a tempfile write, fsync and replace.
+                    # Run inline it blocks the event loop — stalling every other
+                    # conversation during the very outage it exists to observe.
+                    await _record_peer(peer_availability.note_failure, peer_name, exc)
                     if _streamed_text():
                         return ""  # see _streamed_text
                     continue  # this peer is also down → try the next one
@@ -1150,8 +1177,21 @@ class ConversationLoop:
                     # server crash, a stale sticky session) is a CCError here too,
                     # but is not evidence about the peer. note_failure declines it,
                     # so one local blip can't mark the whole standby fleet down.
-                    peer_availability.note_failure(peer_name, exc)
+                    recorded = await _record_peer(
+                        peer_availability.note_failure, peer_name, exc,
+                    )
                     if _streamed_text():
+                        if not recorded:
+                            # The peer ANSWERED — text is on the user's screen —
+                            # and then a local fault (an MCP crash, our own
+                            # timeout) ended the turn. note_failure declined it,
+                            # correctly, as not evidence about the peer. But a
+                            # PRIOR block would then survive an attempt that
+                            # demonstrably reached and served from this peer, and
+                            # records only refresh during a home outage, so that
+                            # false "blocked" can stand for days. Serving the turn
+                            # is the clearest evidence of availability there is.
+                            await _record_peer(peer_availability.note_success, peer_name)
                         return ""
                     continue
                 usable = not output.is_error and bool((output.text or "").strip())
@@ -1170,7 +1210,7 @@ class ConversationLoop:
                 # both mean this peer SERVED the turn, so both clear a stale block.
                 # Recording only the first left the surface blind in exactly the
                 # degenerate case this feature exists to make visible.
-                peer_availability.note_success(peer_name)
+                await _record_peer(peer_availability.note_success, peer_name)
                 # Success on this peer. Record the account-wide flag + this session's
                 # sticky peer session (only with a real session id, else continuity
                 # can't resume). Home identity in cc_sessions stays on Claude.
