@@ -494,7 +494,7 @@ gated — that contract is one-directional.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 85f91765 2026-09-01
+verified: 5808e7cd 2026-09-03
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -555,10 +555,22 @@ verified: 85f91765 2026-09-01
   MUST be a curated, non-opted-out `marketing_prospects` row (authorization is
   DECOUPLED from send-lifecycle status, so a `contacted` follow-up still sends) —
   an unknown / opted-out recipient trips (`recipient_not_curated` / `opted_out`)
-  → demote + hold (fail-closed). PR2 will wire graduation, send-time contact
-  stamping, AND a hard per-window cap on hold-creation (the ASK-state
-  approval-flood guard) alongside the batch-approval card — `marketing_send` has
-  no autonomous caller until then.
+  → demote + hold (fail-closed). Graduation for the BULK cell rides the generic
+  capability-promotion path (`capability_grants.detect_promotable_cells` — no
+  risk-class filter → `email:send:bulk` qualifies once it has ≥5 owner-approved
+  successes + posterior ≥0.70). **Contact-stamping (loop-fix):** on a CONFIRMED
+  delivery a matching prospect is advanced active → `contacted` via one
+  active-guarded CRUD (`marketing_prospects.mark_contacted_by_email`) called from
+  BOTH delivery paths — the email-gate drain (`email_gate_watcher`) for a HELD →
+  owner-approved send, AND `pipeline._deliver` for a GRANTED-cell autonomous send
+  (which delivers inline and never touches the drain, so the fix survives
+  graduation). Keyed on the RECIPIENT being a curated prospect, NOT `cell_risk_class`
+  (a FINANCIAL-misclassified pitch is still stamped); a send that never delivers
+  (dropped/expired/rejected) leaves the prospect `active`, re-eligible. Without this,
+  `mark_contacted` had no caller and `list_active` re-returned a delivered prospect
+  every tick. **DEFERRED (hot follow-up, before arming at volume):** an atomic
+  per-prospect in-flight dedup + a per-window approval-flood cap + the batch-approval
+  card — `marketing_send` has no autonomous caller until the campaign is armed.
 - **Marketing reply → owner Telegram ping (notify-only).** When a GENUINE human
   reply lands (auto-responders + foreign senders already gated out by the
   reply→engagement bridge, `outreach/engagement.py`) AND the reply's recipient is
