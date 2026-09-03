@@ -110,7 +110,7 @@ async def test_mark_stale_noop_on_already_merged(db):
     await adj.record_verdict(
         db, entity_a="a", entity_b="b", verdict="proposed_merge", loser_id="b", survivor_id="a"
     )
-    await adj.approve(db, pair_key="a|b", approved_by="jay")
+    await adj.approve(db, pair_key="a|b", approved_by="owner")
     # A concurrent winner already applied: proposed_merge → merge.
     assert (
         await adj.claim_approved_for_apply(db, pair_key="a|b", loser_id="b", survivor_id="a")
@@ -138,7 +138,7 @@ async def test_readjudication_direction_flip_clears_approval(db):
         norm_a="n1",
         norm_b="n2",
     )
-    await adj.approve(db, pair_key=adj.pair_key("e1", "e2"), approved_by="jay")
+    await adj.approve(db, pair_key=adj.pair_key("e1", "e2"), approved_by="owner")
     assert (await adj.get_by_pair(db, "e1", "e2"))["approved_at"] is not None
     # Re-judge flips the direction (survivor/loser swapped).
     await adj.record_verdict(
@@ -171,7 +171,7 @@ async def test_readjudication_norm_change_clears_approval(db):
         norm_a="n1",
         norm_b="n2",
     )
-    await adj.approve(db, pair_key=adj.pair_key("e1", "e2"), approved_by="jay")
+    await adj.approve(db, pair_key=adj.pair_key("e1", "e2"), approved_by="owner")
     await adj.record_verdict(
         db,
         entity_a="e1",
@@ -200,7 +200,7 @@ async def test_readjudication_same_decision_preserves_approval(db):
         norm_a="n1",
         norm_b="n2",
     )
-    await adj.approve(db, pair_key=adj.pair_key("e1", "e2"), approved_by="jay")
+    await adj.approve(db, pair_key=adj.pair_key("e1", "e2"), approved_by="owner")
     await adj.record_verdict(
         db,
         entity_a="e1",
@@ -214,7 +214,7 @@ async def test_readjudication_same_decision_preserves_approval(db):
         reasoning="re-confirmed",
     )
     row = await adj.get_by_pair(db, "e1", "e2")
-    assert row["approved_at"] is not None and row["approved_by"] == "jay"
+    assert row["approved_at"] is not None and row["approved_by"] == "owner"
 
 
 @pytest.mark.asyncio
@@ -238,4 +238,4 @@ async def test_approve_reject_refuse_dispatched_at_crud_layer(db, monkeypatch):
     assert row["verdict"] == "proposed_merge" and row["approved_at"] is None
     # Supervised foreground session passes.
     monkeypatch.setenv("GENESIS_SESSION_SUPERVISED", "1")
-    assert await adj.approve(db, pair_key=pk, approved_by="jay") is True
+    assert await adj.approve(db, pair_key=pk, approved_by="owner") is True

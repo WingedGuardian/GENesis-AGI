@@ -484,7 +484,7 @@ async def test_apply_approved_merges_applies_and_stamps(file_db):
         norm_a="nu",
         norm_b="nuu",
     )
-    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="jay")
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="owner")
 
     counts = await adj.apply_approved_merges(db, budget=10)  # no mode='live' needed
 
@@ -537,7 +537,7 @@ async def test_reapprove_not_clobbered_by_readjudication(db):
         norm_a="omicron",
         norm_b="omicronn",
     )
-    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="jay")
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="owner")
     # Re-judge records a fresh proposed_merge on the same pair (upsert on pair_key).
     await adj_crud.record_verdict(
         db,
@@ -551,7 +551,7 @@ async def test_reapprove_not_clobbered_by_readjudication(db):
         provider="strong-model",
     )
     row = await adj_crud.get_by_pair(db, a, b)
-    assert row["approved_at"] is not None and row["approved_by"] == "jay"
+    assert row["approved_at"] is not None and row["approved_by"] == "owner"
     assert row["provider"] == "strong-model"  # the re-judge DID update other fields
 
 
@@ -574,7 +574,7 @@ async def test_stale_voids_approval_no_silent_reapply(file_db):
         norm_b="jon smith",
     )
     pk = adj_crud.pair_key(a, b)
-    await adj_crud.approve(db, pair_key=pk, approved_by="jay")
+    await adj_crud.approve(db, pair_key=pk, approved_by="owner")
     # `a` drifts (rename) before apply — still active, so it will re-pair later.
     await db.execute("UPDATE entities SET norm_name='john q smith' WHERE entity_id=?", (a,))
     await db.commit()
@@ -627,7 +627,7 @@ async def test_concurrent_apply_does_not_clobber_applied_merge(file_db):
         norm_b="acme inc",
     )
     pk = adj_crud.pair_key(a, b)
-    await adj_crud.approve(db, pair_key=pk, approved_by="jay")
+    await adj_crud.approve(db, pair_key=pk, approved_by="owner")
     # The loser captured this proposal dict BEFORE the winner committed.
     proposal = (await adj_crud.list_proposed_merges(db, approved_only=True))[0]
     # WINNER applies first: merge b into a and atomically flip the row to `merge`.
@@ -666,7 +666,7 @@ async def test_apply_approved_merges_refuses_dispatched_session(file_db, monkeyp
         norm_a="delta co",
         norm_b="delta inc",
     )
-    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="jay")
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="owner")
     monkeypatch.setenv("GENESIS_CC_SESSION", "1")
     monkeypatch.delenv("GENESIS_SESSION_SUPERVISED", raising=False)
     with pytest.raises(DispatchGateRefused):
@@ -716,7 +716,7 @@ async def test_apply_batch_isolates_failing_row(file_db, monkeypatch):
         norm_a="good a",
         norm_b="good b",
     )
-    await adj_crud.approve(db, pair_key=adj_crud.pair_key(g1, g2), approved_by="jay")
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(g1, g2), approved_by="owner")
     b1 = await _mk_entity(db, "bad a", "bad a")
     b2 = await _mk_entity(db, "bad b", "bad b")
     await adj_crud.record_verdict(
@@ -729,7 +729,7 @@ async def test_apply_batch_isolates_failing_row(file_db, monkeypatch):
         norm_a="bad a",
         norm_b="bad b",
     )
-    await adj_crud.approve(db, pair_key=adj_crud.pair_key(b1, b2), approved_by="jay")
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(b1, b2), approved_by="owner")
 
     real_merge = entities_crud.merge_entity
 
@@ -911,7 +911,7 @@ async def test_apply_honors_stored_direction_not_recomputed_survivor(file_db):
         norm_a="keep",
         norm_b="keepp",
     )
-    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="jay")
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="owner")
     # Counts now DISAGREE with the stored direction: b is better-attested.
     await _add_mentions(db, b, 3)
     assert await entities_crud.count_entity_mentions(
@@ -940,7 +940,7 @@ async def test_claim_approved_for_apply_is_atomic_single_winner(db):
     await adj_crud.record_verdict(
         db, entity_a=a, entity_b=b, verdict="proposed_merge", loser_id=b, survivor_id=a
     )
-    await adj_crud.approve(db, pair_key=pk, approved_by="jay")
+    await adj_crud.approve(db, pair_key=pk, approved_by="owner")
 
     first = await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=b, survivor_id=a)
     second = await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=b, survivor_id=a)
@@ -971,7 +971,7 @@ async def test_claim_fails_when_the_approved_direction_changed_under_it(db):
     await adj_crud.record_verdict(
         db, entity_a=a, entity_b=b, verdict="proposed_merge", loser_id=b, survivor_id=a
     )
-    await adj_crud.approve(db, pair_key=pk, approved_by="jay")
+    await adj_crud.approve(db, pair_key=pk, approved_by="owner")
 
     # ...then it is re-adjudicated the OTHER way round and re-approved, while the
     # applier still holds the old snapshot. Same pair, same norms — only the
@@ -980,7 +980,7 @@ async def test_claim_fails_when_the_approved_direction_changed_under_it(db):
     await adj_crud.record_verdict(
         db, entity_a=a, entity_b=b, verdict="proposed_merge", loser_id=a, survivor_id=b
     )
-    await adj_crud.approve(db, pair_key=pk, approved_by="jay")
+    await adj_crud.approve(db, pair_key=pk, approved_by="owner")
 
     # The applier claims with its STALE direction. It must lose.
     claimed = await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=b, survivor_id=a)
@@ -1005,7 +1005,7 @@ async def test_claim_fails_after_reject(db):
     await adj_crud.record_verdict(
         db, entity_a=a, entity_b=b, verdict="proposed_merge", loser_id=b, survivor_id=a
     )
-    await adj_crud.approve(db, pair_key=pk, approved_by="jay")
+    await adj_crud.approve(db, pair_key=pk, approved_by="owner")
     await adj_crud.reject(db, pair_key=pk, reason="not the same")
     claimed = await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=b, survivor_id=a)
     assert claimed is False
@@ -1027,7 +1027,7 @@ async def test_apply_negative_budget_applies_nothing(db):
         norm_a="nb",
         norm_b="nbb",
     )
-    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="jay")
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="owner")
 
     counts = await adj.apply_approved_merges(db, budget=-1)
 
@@ -1053,7 +1053,7 @@ async def test_apply_stale_when_stored_direction_absent(file_db):
         norm_a="sd",
         norm_b="sdd",
     )
-    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="jay")
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="owner")
 
     counts = await adj.apply_approved_merges(db, budget=10)
 

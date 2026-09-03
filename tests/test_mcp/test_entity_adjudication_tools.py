@@ -88,7 +88,7 @@ async def test_approve_then_apply_merges():
         pre = await tools["entity_adjudication_apply"].fn(budget=5)
         assert pre["merged"] == 0
         # approve, then apply
-        appr = await tools["entity_adjudication_approve"].fn(pair_key=pk, approved_by="jay")
+        appr = await tools["entity_adjudication_approve"].fn(pair_key=pk, approved_by="owner")
         assert appr["approved"] is True
         post = await tools["entity_adjudication_apply"].fn(budget=5)
         assert post["merged"] == 1
@@ -117,7 +117,7 @@ async def test_list_status_branches():
         assert await tools["entity_adjudication_list"].fn(status="approved") == []
         assert len(await tools["entity_adjudication_list"].fn(status="all")) == 1
         # approve → moves to 'approved', leaves 'proposed'
-        await tools["entity_adjudication_approve"].fn(pair_key=pk, approved_by="jay")
+        await tools["entity_adjudication_approve"].fn(pair_key=pk, approved_by="owner")
         assert await tools["entity_adjudication_list"].fn(status="proposed") == []
         assert len(await tools["entity_adjudication_list"].fn(status="approved")) == 1
         assert len(await tools["entity_adjudication_list"].fn(status="all")) == 1
