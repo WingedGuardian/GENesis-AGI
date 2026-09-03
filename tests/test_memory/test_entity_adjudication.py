@@ -949,6 +949,54 @@ async def test_claim_approved_for_apply_is_atomic_single_winner(db):
 
 
 @pytest.mark.asyncio
+async def test_claim_fails_when_the_approved_direction_changed_under_it(db):
+    """A stale snapshot must not overwrite a freshly-approved direction.
+
+    The applier works from a batch snapshot taken before its transaction, and
+    the in-transaction staleness re-check compares `{survivor_id, loser_id}` as
+    a SET — order-independent on purpose, so it answers "same pair?" and not
+    "same direction?". A row that is marked stale, re-adjudicated with the
+    direction FLIPPED, and re-approved therefore passes staleness while the
+    snapshot still holds the OLD direction.
+
+    The claim is the last line of defence, and it OVERWRITES both id columns —
+    so it has to check them. Without that, this merges the wrong entity, and
+    `merge_entity` deletes the loser's mentions and links with no unmerge path.
+    """
+    a = await _mk_entity(db, "dir", "dir")
+    b = await _mk_entity(db, "dirr", "dirr")
+    pk = adj_crud.pair_key(a, b)
+
+    # A human approves a -> survivor, b -> loser. This is the batch snapshot.
+    await adj_crud.record_verdict(
+        db, entity_a=a, entity_b=b, verdict="proposed_merge", loser_id=b, survivor_id=a
+    )
+    await adj_crud.approve(db, pair_key=pk, approved_by="jay")
+
+    # ...then it is re-adjudicated the OTHER way round and re-approved, while the
+    # applier still holds the old snapshot. Same pair, same norms — only the
+    # direction moved, which is exactly what the set comparison cannot see.
+    await adj_crud.mark_stale(db, pair_key=pk)
+    await adj_crud.record_verdict(
+        db, entity_a=a, entity_b=b, verdict="proposed_merge", loser_id=a, survivor_id=b
+    )
+    await adj_crud.approve(db, pair_key=pk, approved_by="jay")
+
+    # The applier claims with its STALE direction. It must lose.
+    claimed = await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=b, survivor_id=a)
+    assert claimed is False, "stale direction won the claim — the wrong entity would be merged"
+
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "proposed_merge", "a lost claim must not consume the row"
+    assert (row["loser_id"], row["survivor_id"]) == (a, b), "the approved direction was overwritten"
+    assert await _status(db, a) == "active" and await _status(db, b) == "active"
+
+    # And the CURRENT direction still claims cleanly — the guard rejects staleness,
+    # not the row itself.
+    assert await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=a, survivor_id=b)
+
+
+@pytest.mark.asyncio
 async def test_claim_fails_after_reject(db):
     """A reject landing before the claim (read-then-apply TOCTOU) blocks the apply."""
     a = await _mk_entity(db, "rj", "rj")

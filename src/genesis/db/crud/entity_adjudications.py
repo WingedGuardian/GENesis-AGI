@@ -337,7 +337,29 @@ async def claim_approved_for_apply(
     ``merge_entity`` under the SAME savepoint so a failure rolls the claim back.
 
     ``loser_id``/``survivor_id`` are the STORED, human-approved direction — the
-    caller passes the row's own values, never a freshly recomputed pick.
+    caller passes the row's own values, never a freshly recomputed pick. They are
+    ALSO part of the predicate, and that is load-bearing rather than defensive:
+    this statement OVERWRITES both columns, so any field it writes without
+    checking is a field a concurrent writer can lose.
+
+    The window it closes (Codex round 5). The caller applies a batch snapshot
+    taken before the transaction, and re-checks identity inside it — but that
+    re-check compares ``{survivor_id, loser_id}`` as a SET, deliberately
+    order-independent so it answers "same pair?" and NOT "same direction?".
+    So a row that was marked stale, re-adjudicated with the direction FLIPPED,
+    and re-approved by a human between the listing and its turn in the sequential
+    batch passes staleness (same two entities, same norms) while the snapshot
+    still holds the old direction. Without these two conjuncts the UPDATE would
+    match, overwrite the freshly-approved direction with the stale one, and merge
+    the WRONG entity — irreversibly, since ``merge_entity`` deletes the loser's
+    mentions and links and there is no unmerge path.
+
+    With them, a flipped row simply loses the claim (rowcount 0). The caller
+    already treats that as ``skipped`` and the reconcile sweep re-picks it with
+    the current direction, which is the correct outcome: a human approved THAT
+    direction, not this one. Mirrors the field-by-field comparison
+    ``record_verdict`` already uses to decide whether an approval survives.
+
     Returns True iff this caller won the claim.
     """
     now = datetime.now(UTC).isoformat()
@@ -345,8 +367,9 @@ async def claim_approved_for_apply(
         "UPDATE entity_adjudications SET verdict = 'merge', loser_id = ?, "
         "survivor_id = ?, applied_at = ? "
         "WHERE pair_key = ? AND verdict = 'proposed_merge' "
-        "AND approved_at IS NOT NULL",
-        (loser_id, survivor_id, now, pair_key),
+        "AND approved_at IS NOT NULL "
+        "AND loser_id IS ? AND survivor_id IS ?",
+        (loser_id, survivor_id, now, pair_key, loser_id, survivor_id),
     )
     if _commit:
         await db.commit()
