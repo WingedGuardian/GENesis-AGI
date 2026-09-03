@@ -606,9 +606,18 @@ async def _apply_one_proposal(
                         or {survivor_id, loser_id} != {ent_a["entity_id"], ent_b["entity_id"]}
                     )
                     if is_stale:
-                        await adj_crud.mark_stale(own, pair_key=pair_key, _commit=False)
+                        # Conditional stale write (WHERE verdict='proposed_merge'):
+                        # if a concurrent applier already flipped this row to `merge`,
+                        # or a human rejected it to `distinct`, between our batch read
+                        # and this write-locked re-read, mark_stale is a no-op and we
+                        # must NOT clobber that terminal state back to stale. It
+                        # returns False then — count the row as skipped, not stale.
+                        marked = await adj_crud.mark_stale(own, pair_key=pair_key, _commit=False)
                         await own.commit()
-                        counts["stale"] += 1
+                        if marked:
+                            counts["stale"] += 1
+                        else:
+                            counts["skipped"] = counts.get("skipped", 0) + 1
                         return
 
                     # Atomic claim: flip proposed_merge→merge ONLY while it is still
@@ -685,14 +694,21 @@ async def _apply_proposed_backlog(
 async def apply_approved_merges(db: aiosqlite.Connection, *, budget: int = 50) -> dict[str, int]:
     """Apply human-APPROVED proposed_merge rows — mode-independent.
 
-    Intended entry point for the review surface (MCP tool, wired in PR-2): once a
-    human approves rows, this applies them WITHOUT requiring the drainer be flipped
-    to ``live`` (which would also grant new-pair auto-merge authority). NOTE: as of
-    PR-1 the only caller is the test suite — PR-2 wires the MCP tool. Reuses the SAME
-    gated, staleness-guarded apply loop as the live-mode Phase 0
+    Entry point for the review surface (the ``entity_adjudication_apply`` MCP tool):
+    once a human approves rows, this applies them WITHOUT requiring the drainer be
+    flipped to ``live`` (which would also grant new-pair auto-merge authority). Reuses
+    the SAME gated, staleness-guarded apply loop as the live-mode Phase 0
     (``_apply_proposed_backlog``, which lists only approved rows). Returns a counts
     summary: {'merged': N, 'stale': M}.
+
+    Human-only: refuses a dispatched/unsupervised session at this service entry (below
+    the MCP wrapper) so a direct import can't apply an irreversible merge without a
+    human. The live-mode drainer bypasses this (it calls ``_apply_proposed_backlog``
+    directly and runs in-server, not dispatched); its gate is the ``live`` mode setting.
     """
+    from genesis.security.immunity_shadow import guard_human_gate
+
+    guard_human_gate("entity_adjudication_apply")
     # Clamp a negative budget to 0 (a negative SQLite LIMIT is UNLIMITED — the
     # apply(budget=-1) unbounded-apply bug). Defense-in-depth with the crud clamp.
     budget = max(int(budget), 0)

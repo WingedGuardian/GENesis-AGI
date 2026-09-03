@@ -22,6 +22,43 @@ def _memory_mod():
     return memory_mod
 
 
+# The HUMAN half of the entity-merge approval gate. approve/apply/reject each carry
+# irreversible human-review authority (apply tombstones one entity into another; reject
+# buries a proposal), so an autonomous/dispatched CC session must never call them — it
+# would self-approve the gate. TWO layers, by design:
+#   1. This wrapper pre-check returns a clean refusal dict on the normal MCP-tool path
+#      (a friendly message to the calling LLM, no exception on the common path).
+#   2. The REAL chokepoint is the guard_human_gate() call inside the CRUD/service
+#      functions (adj_crud.approve/reject, apply_approved_merges) — it fires for ANY
+#      caller, including a Bash-capable dispatched session that imports the function
+#      directly (its subprocess inherits GENESIS_CC_SESSION=1). See
+#      security/immunity_shadow.guard_human_gate.
+# Mirrors the guard protecting the user-only ego tools (mcp/health/ego_tools.py:144).
+# SCOPE (do not overstate): this closes the tool-call and naive-import self-approval
+# paths. It is NOT a sandbox — a session that forges GENESIS_SESSION_SUPERVISED in a
+# subprocess it spawns, or opens the SQLite file with raw SQL, bypasses any env-based
+# gate. Containment of Bash-capable autonomous builders (Sentinel/Ego run unrestricted
+# Bash with same-host DB access) is a separate architecture concern, tracked as a
+# follow-up. The per-builder disallowed_tools denylists stay as CC-layer belt. Fail
+# direction is safe: a foreground human terminal has no dispatch marker (or is
+# supervised) → allowed; see is_dispatched_session_env.
+def _refuse_if_dispatched(tool: str) -> dict | None:
+    from genesis.security.immunity_shadow import is_dispatched_session_env
+
+    if is_dispatched_session_env():
+        return {
+            "status": "refused",
+            "reason": (
+                f"{tool} is the human half of the entity-merge approval gate. An "
+                "autonomous/dispatched session must not approve, apply, or reject a "
+                "proposed entity merge (applying is an irreversible tombstone) — that "
+                "is a human decision. Surface the proposal through your session's "
+                "normal output instead; a person reviews it in a foreground session."
+            ),
+        }
+    return None
+
+
 async def _entity_brief(db: aiosqlite.Connection, entity_id: str) -> dict:
     """Lightweight display fields for one side of a proposed merge."""
     cur = await db.execute(
@@ -77,6 +114,8 @@ async def entity_adjudication_list(status: str = "proposed", limit: int = 50) ->
 async def entity_adjudication_approve(pair_key: str, approved_by: str = "user") -> dict:
     """Approve a proposed entity merge for application. Does NOT apply it — run
     ``entity_adjudication_apply`` afterwards. Idempotent."""
+    if (refused := _refuse_if_dispatched("entity_adjudication_approve")) is not None:
+        return refused
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None
@@ -88,6 +127,8 @@ async def entity_adjudication_approve(pair_key: str, approved_by: str = "user") 
 async def entity_adjudication_reject(pair_key: str, reason: str) -> dict:
     """Reject a proposed entity merge: records it as 'distinct' so it is never
     applied and never re-nominated by the sweep."""
+    if (refused := _refuse_if_dispatched("entity_adjudication_reject")) is not None:
+        return refused
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None
@@ -102,6 +143,8 @@ async def entity_adjudication_apply(budget: int = 50) -> dict:
     Only rows with ``approved_at`` set are applied; the staleness guard still runs.
     Returns a counts summary: {'merged': N, 'stale': M}.
     """
+    if (refused := _refuse_if_dispatched("entity_adjudication_apply")) is not None:
+        return refused
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None

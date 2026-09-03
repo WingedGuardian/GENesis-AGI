@@ -95,11 +95,47 @@ async def record_verdict(
              norm_b = excluded.norm_b,
              updated_a = excluded.updated_a,
              updated_b = excluded.updated_b,
-             applied_at = excluded.applied_at""",
-        # DELIBERATELY absent from the INSERT column list and the ON CONFLICT SET:
-        # approved_at / approved_by. A re-adjudication of an already-approved pair
-        # (e.g. the strong-model re-judge) must NEVER wipe a human approval — the
-        # gate depends on it. Locked by test_reapprove_not_clobbered_by_readjudication.
+             applied_at = excluded.applied_at,
+             -- Approval INVALIDATION on a semantically-changed re-adjudication.
+             -- Preserve the human approval ONLY when every field the apply path
+             -- reads to execute the destructive merge is unchanged. If a re-judge
+             -- flips loser_id/survivor_id (a DIRECTION swap the order-independent
+             -- staleness set at entity_adjudication.py:606 does NOT catch — it
+             -- compares {survivor_id, loser_id} as a set), or changes the entities /
+             -- norm snapshots / verdict, the human approved a DIFFERENT merge than
+             -- would now execute, so the old approval must not carry over — clear it
+             -- and force re-review. A harmless re-judge that reaches the SAME
+             -- decision (only provider/reasoning/updated_* changed) keeps approval.
+             -- The field set here MUST equal _apply_one_proposal's staleness reads
+             -- (entity_a/entity_b/norm_a/norm_b/survivor_id/loser_id) + verdict;
+             -- excludes updated_a/updated_b (the apply path never reads them, so a
+             -- routine re-judge that only refreshes them must not clear approval).
+             -- Unqualified columns = the EXISTING row; excluded.* = the new values.
+             -- `IS` is NULL-safe equality. Locked by
+             -- test_reapprove_not_clobbered_by_readjudication (preserve) and
+             -- test_readjudication_direction_flip_clears_approval (clear).
+             approved_at = CASE
+               WHEN entity_a IS excluded.entity_a
+                AND entity_b IS excluded.entity_b
+                AND loser_id IS excluded.loser_id
+                AND survivor_id IS excluded.survivor_id
+                AND norm_a IS excluded.norm_a
+                AND norm_b IS excluded.norm_b
+                AND verdict IS excluded.verdict
+               THEN approved_at ELSE NULL END,
+             approved_by = CASE
+               WHEN entity_a IS excluded.entity_a
+                AND entity_b IS excluded.entity_b
+                AND loser_id IS excluded.loser_id
+                AND survivor_id IS excluded.survivor_id
+                AND norm_a IS excluded.norm_a
+                AND norm_b IS excluded.norm_b
+                AND verdict IS excluded.verdict
+               THEN approved_by ELSE NULL END""",
+        # approved_at / approved_by are absent from the INSERT column list (a fresh
+        # proposal is never pre-approved) and CONDITIONALLY preserved on conflict by
+        # the CASE above: a re-adjudication keeps approval iff the approved merge is
+        # unchanged, else clears it (approval invalidation on semantic change).
         (
             row_id,
             key,
@@ -191,7 +227,13 @@ async def approve(
     Only a ``proposed_merge`` row can be approved (an already-applied 'merge' or a
     'distinct'/'stale' verdict is left untouched). Idempotent: re-approving an
     already-approved row is a no-op that still returns True.
+
+    Human-only: refuses a dispatched/unsupervised session at the CRUD layer (below the
+    MCP wrapper) so a direct import can't self-approve. See ``guard_human_gate``.
     """
+    from genesis.security.immunity_shadow import guard_human_gate
+
+    guard_human_gate("entity_adjudication_approve")
     now = datetime.now(UTC).isoformat()
     cursor = await db.execute(
         "UPDATE entity_adjudications SET approved_at = COALESCE(approved_at, ?), "
@@ -212,7 +254,13 @@ async def reject(
     A 'distinct' verdict lands in ``settled_pair_keys`` (excluded from the sweep's
     re-nomination), so the pair does not bounce back. Returns True if a row moved.
     Clears any prior approval on the row (the human's final call is 'do not merge').
+
+    Human-only: refuses a dispatched/unsupervised session at the CRUD layer (reject
+    carries the same human-review authority as approve). See ``guard_human_gate``.
     """
+    from genesis.security.immunity_shadow import guard_human_gate
+
+    guard_human_gate("entity_adjudication_reject")
     cursor = await db.execute(
         "UPDATE entity_adjudications SET verdict = 'distinct', approved_at = NULL, "
         "approved_by = NULL, reasoning = ? WHERE pair_key = ? AND verdict = 'proposed_merge'",
@@ -305,20 +353,34 @@ async def claim_approved_for_apply(
     return cursor.rowcount == 1
 
 
-async def mark_stale(db: aiosqlite.Connection, *, pair_key: str, _commit: bool = True) -> None:
-    """Mark a proposal that no longer holds (one side merged/renamed/gone).
+async def mark_stale(db: aiosqlite.Connection, *, pair_key: str, _commit: bool = True) -> bool:
+    """Mark a still-``proposed_merge`` proposal that no longer holds (one side
+    merged/renamed/gone). Returns True iff a row actually transitioned to stale.
 
-    VOIDS any human approval. ``stale`` is the ONLY transition that re-opens an
-    approved row for re-proposal (the sweep excludes stale from settled_pair_keys,
-    and record_verdict deliberately preserves approved_at on re-adjudication). So if
-    stale kept the approval, a merge approved under identity-state v1 would silently
-    re-apply under drifted identity-state v2 that the human never saw — defeating the
-    gate. Staleness means "the thing you approved changed": the approval must not survive.
+    VOIDS any human approval. ``stale`` re-opens an approved row for re-proposal
+    (the sweep excludes stale from settled_pair_keys, and record_verdict preserves
+    approved_at across a re-adjudication that reaches the SAME decision). So if stale
+    kept the approval, a merge approved under identity-state v1 could silently re-apply
+    under drifted state v2 the human never saw — defeating the gate. Staleness means
+    "the thing you approved changed": the approval must not survive.
+
+    CONDITIONAL on ``verdict = 'proposed_merge'`` — the state the apply path operates
+    on. Two concurrent appliers can list the same approved row; the winner flips
+    proposed_merge→merge and commits, then the loser re-reads identities (now both
+    resolving to the survivor), enters the staleness branch, and would otherwise
+    unconditionally rewrite the applied ``merge`` back to ``stale`` — corrupting the
+    ledger. The same race could overwrite a human ``distinct`` rejection. This stale
+    write happens BEFORE ``claim_approved_for_apply``, so the atomic claim never
+    arbitrates it; gating on ``proposed_merge`` makes it a no-op once the row has left
+    that state (a concurrent winner merged, or a human rejected). Returns False then,
+    and the caller counts the row as skipped rather than stale (Codex P2, #1477).
     """
-    await db.execute(
+    cursor = await db.execute(
         "UPDATE entity_adjudications SET verdict = 'stale', "
-        "approved_at = NULL, approved_by = NULL WHERE pair_key = ?",
+        "approved_at = NULL, approved_by = NULL "
+        "WHERE pair_key = ? AND verdict = 'proposed_merge'",
         (pair_key,),
     )
     if _commit:
         await db.commit()
+    return cursor.rowcount > 0

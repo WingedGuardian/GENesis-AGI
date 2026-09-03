@@ -605,6 +605,101 @@ async def test_stale_voids_approval_no_silent_reapply(file_db):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_apply_does_not_clobber_applied_merge(file_db):
+    """P2#4: two appliers list the same approved row; the winner flips
+    proposed_merge→merge and commits. The loser then runs _apply_one_proposal on its
+    already-fetched proposal dict, re-reads identities (now both resolving to the
+    survivor), and enters the staleness branch. It must NOT rewrite the applied `merge`
+    back to `stale` (that stale write happens BEFORE the atomic claim, so the claim
+    never arbitrates it). mark_stale is conditional on verdict='proposed_merge', so it
+    is a no-op; the row stays `merge` and the loser counts it skipped (Codex P2, #1477)."""
+    db = file_db
+    a = await _mk_entity(db, "acme corp", "acme corp")
+    b = await _mk_entity(db, "acme inc", "acme inc")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="acme corp",
+        norm_b="acme inc",
+    )
+    pk = adj_crud.pair_key(a, b)
+    await adj_crud.approve(db, pair_key=pk, approved_by="jay")
+    # The loser captured this proposal dict BEFORE the winner committed.
+    proposal = (await adj_crud.list_proposed_merges(db, approved_only=True))[0]
+    # WINNER applies first: merge b into a and atomically flip the row to `merge`.
+    await entities_crud.merge_entity(db, loser_id=b, survivor_id=a)
+    assert (
+        await adj_crud.claim_approved_for_apply(db, pair_key=pk, loser_id=b, survivor_id=a) is True
+    )
+    assert (await adj_crud.get_by_pair(db, a, b))["verdict"] == "merge"
+    # LOSER now applies its stale proposal dict on its own owned connection.
+    counts: dict[str, int] = {"merged": 0, "stale": 0}
+    await adj._apply_one_proposal(proposal, counts, [])
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "merge"  # NOT clobbered back to stale
+    assert counts.get("stale", 0) == 0
+    assert counts.get("skipped", 0) == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_approved_merges_refuses_dispatched_session(file_db, monkeypatch):
+    """P1#2 CRITICAL: the irreversible apply entry refuses a dispatched/unsupervised
+    session at the SERVICE layer, so a Bash-capable dispatched session that imports
+    apply_approved_merges directly (inherited GENESIS_CC_SESSION=1) cannot self-apply an
+    entity tombstone. The approved row is left untouched (#1477)."""
+    from genesis.security.immunity_shadow import DispatchGateRefused
+
+    db = file_db
+    a = await _mk_entity(db, "delta co", "delta co")
+    b = await _mk_entity(db, "delta inc", "delta inc")
+    await adj_crud.record_verdict(
+        db,
+        entity_a=a,
+        entity_b=b,
+        verdict="proposed_merge",
+        loser_id=b,
+        survivor_id=a,
+        norm_a="delta co",
+        norm_b="delta inc",
+    )
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="jay")
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.delenv("GENESIS_SESSION_SUPERVISED", raising=False)
+    with pytest.raises(DispatchGateRefused):
+        await adj.apply_approved_merges(db, budget=10)
+    # Nothing applied: row still an approved proposed_merge, loser still active.
+    row = await adj_crud.get_by_pair(db, a, b)
+    assert row["verdict"] == "proposed_merge" and row["approved_at"] is not None
+    assert await _status(db, b) == "active"
+
+
+@pytest.mark.asyncio
+async def test_merge_entity_refuses_dispatched_session(db, monkeypatch):
+    """P1#2 CRITICAL (round-2): merge_entity is the app-level FLOOR of the approval gate
+    — the actual irreversible tombstone. It refuses a dispatched/unsupervised session,
+    so a Bash-capable dispatched session can't bypass the approve/apply guards by
+    importing merge_entity one layer deeper. The two in-server callers (live-mode
+    drainer, gated apply path) are non-dispatched, so this is a no-op for them (#1477)."""
+    from genesis.security.immunity_shadow import DispatchGateRefused
+
+    a = await _mk_entity(db, "epsilon co", "epsilon co")
+    b = await _mk_entity(db, "epsilon inc", "epsilon inc")
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.delenv("GENESIS_SESSION_SUPERVISED", raising=False)
+    with pytest.raises(DispatchGateRefused):
+        await entities_crud.merge_entity(db, loser_id=b, survivor_id=a)
+    assert await _status(db, b) == "active"  # loser NOT tombstoned
+    # Supervised/foreground passes and performs the merge.
+    monkeypatch.setenv("GENESIS_SESSION_SUPERVISED", "1")
+    await entities_crud.merge_entity(db, loser_id=b, survivor_id=a)
+    assert await _status(db, b) == "merged"
+
+
+@pytest.mark.asyncio
 async def test_apply_batch_isolates_failing_row(file_db, monkeypatch):
     """A row that raises in merge_entity is rolled back + skipped; other approved rows
     in the same batch still apply, and the failed row's partial write is discarded."""

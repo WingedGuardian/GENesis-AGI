@@ -146,3 +146,36 @@ async def test_reject_records_distinct_not_applied():
         assert counts["merged"] == 0
 
     await _with_db(body)
+
+
+@pytest.mark.asyncio
+async def test_write_tools_refuse_in_dispatched_session(monkeypatch):
+    """P1#2: approve/apply/reject refuse when called from an autonomous/dispatched CC
+    session (GENESIS_CC_SESSION=1, unsupervised). This SERVER-SIDE guard is the single
+    chokepoint covering every autonomous invocation path (Sentinel/Research/Ego/
+    DirectSession + any future one), so none can self-approve a destructive merge. A
+    foreground human (supervised, or no dispatch marker) is allowed through (Codex P1,
+    #1477)."""
+
+    async def body(db):
+        a, b, pk = await _seed_proposal(db, "gamma", "gamma", "gammaa", "gammaa")
+        tools = await _tools()
+        # Dispatched, unsupervised → every write tool refuses.
+        monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+        monkeypatch.delenv("GENESIS_SESSION_SUPERVISED", raising=False)
+        for name, kwargs in (
+            ("entity_adjudication_approve", {"pair_key": pk}),
+            ("entity_adjudication_reject", {"pair_key": pk, "reason": "x"}),
+            ("entity_adjudication_apply", {}),
+        ):
+            res = await tools[name].fn(**kwargs)
+            assert res.get("status") == "refused", f"{name} not refused when dispatched"
+        # None of them mutated the proposal.
+        row = await adj_crud.get_by_pair(db, a, b)
+        assert row["verdict"] == "proposed_merge" and row["approved_at"] is None
+        # A supervised foreground session is allowed through.
+        monkeypatch.setenv("GENESIS_SESSION_SUPERVISED", "1")
+        ok = await tools["entity_adjudication_approve"].fn(pair_key=pk)
+        assert ok.get("approved") is True
+
+    await _with_db(body)

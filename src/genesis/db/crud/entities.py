@@ -446,7 +446,19 @@ async def merge_entity(
     when the survivor already holds the same mention/relation, the
     higher-confidence row wins — a merge must never discard the
     strongest evidence (the loser is often the better-attested record).
+
+    Human-gated primitive: this is the irreversible entity tombstone the whole
+    adjudication approval gate exists to protect, and the app-level FLOOR of that gate
+    (below this is raw SQL on the DB — out of scope, tracked separately). Refuse a
+    dispatched/unsupervised session here too, so importing merge_entity directly can't
+    bypass the approve/apply guards one layer up. Both legitimate callers run in-server
+    (the live-mode drainer and the gated apply path, neither dispatched), so this is a
+    no-op for them; it only blocks a dispatched-session direct import. See
+    ``guard_human_gate``.
     """
+    from genesis.security.immunity_shadow import guard_human_gate
+
+    guard_human_gate("merge_entity")
     # Self-merge guard: writing ``merged_into = self`` makes the entity
     # unresolvable (the _resolve_active seen-set walk dead-ends), so a caller
     # that resolved both sides to the same row (easy via merge-following
