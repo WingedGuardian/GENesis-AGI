@@ -60,6 +60,37 @@ def set_oom_score_adj(pid: int, score: int = 500) -> None:
         logger.warning("Could not set oom_score_adj for PID %d: %s", pid, exc)
 
 
+# The unit properties the scope actually carries. ONE tuple, consumed by BOTH
+# the probe and the real invocation, because a probe that omits them answers a
+# weaker question than the one that matters. systemd-run exits non-zero on a
+# property it cannot accept — MEASURED on systemd 255: an unknown assignment
+# ("Unknown assignment: BogusProperty=1") and an unparseable value ("Failed to
+# parse MemoryMax=...") both exit 1 — and older systemd predates the ``N%``
+# syntax these use. A property-free probe therefore SUCCEEDS on such a box, its
+# verdict is cached for the process lifetime, and every real dispatch then dies
+# inside systemd-run before Claude starts: the exact fail-closed-to-dead outcome
+# the probe was added to prevent, converted from "no isolation" to "no CC".
+# The sibling probe-then-commit sites (.claude/mcp/run-codebase-memory,
+# scripts/lib/code_intel_index.sh) already set their own properties at probe
+# time for this reason; this was the one that did not.
+_SCOPE_PROPERTIES = ("IOWeight=100", "MemoryHigh=62%", "MemoryMax=75%")
+
+
+def _scope_argv(*trailing: str) -> list[str]:
+    """`systemd-run` argv carrying `_SCOPE_PROPERTIES`, then `trailing` after `--`.
+
+    With no `trailing` this is the prefix a caller prepends to its own command;
+    with `/bin/true` it is the probe. Sharing the builder is what keeps the two
+    from drifting apart again.
+    """
+    argv = ["systemd-run", "--user", "--scope", "--quiet"]
+    for prop in _SCOPE_PROPERTIES:
+        argv += ["-p", prop]
+    argv.append("--")
+    argv.extend(trailing)
+    return argv
+
+
 def _build_scope_args(announce: bool = True) -> list[str]:
     """Build systemd-run prefix for CC subprocess I/O isolation.
 
@@ -80,7 +111,10 @@ def _build_scope_args(announce: bool = True) -> list[str]:
     DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR, and ``systemd-run --user`` then
     dies instantly with "Failed to connect to bus", taking the CC subprocess
     down with it at 0.0s. Measured on a live install.
-    Same probe-then-commit pattern as .claude/mcp/run-codebase-memory.
+    Same probe-then-commit pattern as .claude/mcp/run-codebase-memory, and the
+    probe sets the SAME properties as the real invocation (`_SCOPE_PROPERTIES`)
+    so a property the manager rejects fails at probe time rather than on every
+    dispatch afterwards.
 
     Caching is asymmetric and lives in `_get_scope_args`: a SUCCESS is cached
     for the process lifetime, a FAILURE only until a backoff elapses. Set
@@ -91,11 +125,22 @@ def _build_scope_args(announce: bool = True) -> list[str]:
         return []
     try:
         probe = subprocess.run(
-            ["systemd-run", "--user", "--scope", "--quiet", "--", "/bin/true"],
+            _scope_argv("/bin/true"),
             capture_output=True,
             timeout=15,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        # Same announced degradation as the non-zero-exit branch below. Without
+        # it a timeout or a systemd-run that vanished between `shutil.which` and
+        # exec drops MemoryHigh/MemoryMax silently, and the operator has no way
+        # to tell an unscoped box from a scoped one.
+        _log = logger.warning if announce else logger.debug
+        _log(
+            "systemd-run --user probe raised (%s: %s) — CC subprocesses will run "
+            "WITHOUT the cgroup scope (no MemoryHigh/MemoryMax isolation)",
+            type(exc).__name__,
+            exc,
+        )
         return []
     if probe.returncode != 0:
         _log = logger.warning if announce else logger.debug
@@ -105,19 +150,7 @@ def _build_scope_args(announce: bool = True) -> list[str]:
             probe.stderr.decode(errors="replace").strip()[:200],
         )
         return []
-    return [
-        "systemd-run",
-        "--user",
-        "--scope",
-        "--quiet",
-        "-p",
-        "IOWeight=100",
-        "-p",
-        "MemoryHigh=62%",
-        "-p",
-        "MemoryMax=75%",
-        "--",
-    ]
+    return _scope_argv()
 
 
 # Cache the scope args. SUCCESS is cached for the process lifetime — a working

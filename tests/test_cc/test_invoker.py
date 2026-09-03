@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -266,6 +267,77 @@ def test_scope_args_empty_when_probe_raises(monkeypatch):
     assert inv_mod._build_scope_args() == []
 
 
+def test_probe_raising_announces_the_lost_isolation(monkeypatch, caplog):
+    """A raising probe must degrade LOUDLY, like the non-zero-exit branch.
+
+    Silence here is indistinguishable from a scoped box: MemoryHigh/MemoryMax
+    are gone and nothing in the log says so. `announce=False` (a backoff
+    re-probe) still demotes to debug so a permanently-unscoped box does not
+    warn on every retry forever.
+    """
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+
+    def _probe_times_out(*args, **kwargs):
+        raise real_subprocess.TimeoutExpired(cmd="systemd-run", timeout=15)
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_times_out)
+
+    with caplog.at_level(logging.WARNING, logger=inv_mod.logger.name):
+        assert inv_mod._build_scope_args(announce=True) == []
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "probe raised and nothing warned — the degradation is silent"
+    assert "TimeoutExpired" in warnings[0].getMessage()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=inv_mod.logger.name):
+        assert inv_mod._build_scope_args(announce=False) == []
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+        "re-probe warned again — announce=False must demote to debug"
+    )
+
+
+def test_probe_sets_the_same_properties_as_the_real_invocation(monkeypatch):
+    """The probe must carry the scope's properties, not just ask for a scope.
+
+    `systemd-run` exits non-zero on a property it cannot accept (measured on
+    systemd 255: "Unknown assignment: ..." and "Failed to parse MemoryMax=..."
+    both exit 1), and older systemd predates the ``N%`` syntax. A property-free
+    probe would SUCCEED on such a box, cache that verdict for the process
+    lifetime, and leave every real dispatch dying inside systemd-run before
+    Claude starts.
+    """
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+    seen = []
+
+    def _probe_ok(*args, **kwargs):
+        seen.append(list(args[0]))
+        return real_subprocess.CompletedProcess(args[0], 0, b"", b"")
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_ok)
+    out = inv_mod._build_scope_args()
+
+    assert len(seen) == 1
+    probe_argv = seen[0]
+    assert probe_argv[-1] == "/bin/true"
+    # Everything the real prefix passes, the probe passed too — compared as the
+    # whole argv so a future property added to one side and not the other fails
+    # here instead of at dispatch time.
+    assert probe_argv[:-1] == out
+    for prop in inv_mod._SCOPE_PROPERTIES:
+        assert ["-p", prop] == probe_argv[
+            probe_argv.index(prop) - 1 : probe_argv.index(prop) + 1
+        ]
+        assert prop in out
+
+
 def test_scope_args_built_when_probe_succeeds(monkeypatch):
     import subprocess as real_subprocess
 
@@ -358,7 +430,7 @@ async def test_scope_probe_backoff_escalates_on_repeated_failure(monkeypatch):
     """
     import genesis.cc.invoker as inv_mod
 
-    calls = _stub_probe(monkeypatch, [1, 1, 1, 1])
+    calls = _stub_probe(monkeypatch, [1, 1, 1, 1, 1])
     now = [1000.0]
     monkeypatch.setattr(inv_mod, "_now", lambda: now[0])
 
@@ -375,6 +447,22 @@ async def test_scope_probe_backoff_escalates_on_repeated_failure(monkeypatch):
 
     # The last interval is the cap — it must not keep growing past the table.
     assert schedule[-1] == max(schedule)
+
+    # BEYOND the table: failures now outnumber the schedule, so the index has
+    # to CLAMP rather than walk off the end. Asserting the constant above only
+    # says the table is sorted; this exercises the clamp itself — an unclamped
+    # index raises IndexError inside the cooldown check, and a clamp to the
+    # WRONG end (first entry) would re-probe after 300s instead of the 3600s
+    # cap, restoring the 288-warnings-a-day behaviour the schedule prevents.
+    now[0] += schedule[0] + 1
+    assert await inv_mod._get_scope_args() == []
+    assert len(calls) == len(schedule) + 1, (
+        "re-probed one short-interval after the cap — the backoff index clamped "
+        "to the wrong end of the schedule"
+    )
+    now[0] += schedule[-1] - schedule[0] + 1
+    assert await inv_mod._get_scope_args() == []
+    assert len(calls) == len(schedule) + 2, "never re-probed past the capped interval"
 
 
 @pytest.mark.asyncio
