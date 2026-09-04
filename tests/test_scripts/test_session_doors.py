@@ -594,7 +594,7 @@ class TestSlotHeal:
         panes_text="%0 4242 bash\n",
         session="cc-4",
         panes2_text=None,
-        heal_cap=None,
+        heal_cap="ALLOW|ok",
         stdin_text=None,
         wait_for=None,
         panes3_text=None,
@@ -615,7 +615,7 @@ class TestSlotHeal:
         if panes2_text is not None:
             run.panes2.write_text(panes2_text)
             os.environ["_TEST_FAKE_PANES2"] = str(run.panes2)
-        if heal_cap is not None:
+        if heal_cap:
             os.environ["_TEST_FAKE_HEAL_CAP"] = heal_cap
         if panes3_text is not None:
             p3 = run.panes2.parent / "panes3.txt"
@@ -771,7 +771,7 @@ class TestSlotHeal:
         run, _log, _sessions, _listing, _panes = door
         _proc, log = self._run_with(door, "POISONED", confirm="n")
         assert "respawn-pane" not in log
-        order = run.probe_log.read_text().split()
+        order = [x for x in run.probe_log.read_text().split() if x == "liveness"]
         # TWO liveness probes, and the second one matters: it is taken under
         # the lock, after the OAuth gate, so a slot that came alive while the
         # door was preparing is never respawned. There is no third probe any
@@ -1116,6 +1116,23 @@ class TestSlotHeal:
             f"a failed read aborted the door instead of declining:\n{proc.stdout}"
         )
 
+    def test_no_capacity_verdict_stands_the_rebuild_down(self, door):
+        """Fail CLOSED when the gate cannot answer.
+
+        "Fail open like the create path" was the earlier reasoning and it was
+        wrong: create does not fail open, it falls through to `_cap_fail_open`,
+        which still enforces a MemTotal-derived cap and the hard OOM floor. A
+        rebuild that simply proceeded was therefore WEAKER than a create on a
+        degraded Python environment — it could start the measured ~3GB process
+        on a swapless box where a create would refuse. Standing down costs one
+        manual repair; the other direction costs an OOM that takes every
+        session with it.
+        """
+        proc, log = self._run_with(door, "POISONED", heal_cap="")
+        assert "respawn-pane" not in log, f"rebuilt with no capacity verdict:\n{log}"
+        assert "Rebuild this slot?" not in proc.stdout, "asked before it could answer"
+        assert "no usable verdict" in proc.stdout
+
     def test_confirming_rebuilds_the_slot(self, door):
         _proc, log = self._run_with(door, "POISONED", confirm="y")
         assert "respawn-pane" in log
@@ -1133,7 +1150,7 @@ class TestWrapperInsideTmux:
     """
 
     @staticmethod
-    def _harness(tmp_path, env_extra, bootstrap_text, args=''):
+    def _harness(tmp_path, env_extra, bootstrap_text, args='', oauth=False):
         block = bootstrap_text
         start = block.index("# >>> genesis tmux-wrap >>>")
         end = block.index("# <<< genesis tmux-wrap <<<")
@@ -1146,7 +1163,8 @@ class TestWrapperInsideTmux:
         fake.write_text(
             "#!/usr/bin/env bash\n"
             f'{{ echo "ARGV=$*"; echo "TMPDIR=$TMPDIR"; '
-            f'echo "CCTMP=$CLAUDE_CODE_TMPDIR"; }} >> {str(rec)!r}\n'
+            f'echo "CCTMP=$CLAUDE_CODE_TMPDIR"; '
+            f'echo "OAUTH=${{CLAUDE_CODE_OAUTH_TOKEN:-none}}"; }} >> {str(rec)!r}\n'
             "exit 7\n"
         )
         fake.chmod(0o755)
@@ -1155,6 +1173,21 @@ class TestWrapperInsideTmux:
         cap = home / "genesis" / "scripts" / "cc_exit_capture.sh"
         cap.write_text(f'#!/usr/bin/env bash\necho "CAPTURE=$1 $2" >> {str(rec)!r}\n')
         cap.chmod(0o755)
+        if oauth:
+            vbin = home / "genesis" / ".venv" / "bin"
+            vbin.mkdir(parents=True, exist_ok=True)
+            py = vbin / "python"
+            # Stands in for BOTH halves the door uses: the gate that DECIDES
+            # (`-m genesis.cc.login_gate`, whose stdout is the operator notice)
+            # and the parser that READS the token (`-c ...`).
+            py.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                '  *login_gate*) echo "using the stored fallback login"; exit 0 ;;\n'
+                '  *read_fallback_token*) printf %s "sk-fake-fallback"; exit 0 ;;\n'
+                "esac\nexit 1\n"
+            )
+            py.chmod(0o755)
 
         script = f"""
 set -u
@@ -1195,6 +1228,36 @@ echo "RC=$?" >> {str(rec)!r}
             with contextlib.suppress(ChildProcessError):
                 os.waitpid(pid, 0)
         return None, (rec.read_text() if rec.exists() else "")
+
+    def test_a_hand_relaunch_gets_the_slot_fallback_login(self, tmp_path):
+        """The path this feature makes likely must not be auth-degraded.
+
+        An operator declines the rebuild to keep their shell, then types
+        `claude` themselves. Before this, that was the ONE launch that could not
+        use a configured fallback token — unlike both the create and the
+        confirmed-rebuild paths — so a valid token on disk could still strand
+        them at authentication. It now runs the same `login_gate` and the same
+        token parser the door uses, not a second implementation of either.
+        """
+        text = Path(_BOOTSTRAP).read_text()
+        _unused, rec = self._harness(
+            tmp_path, 'export TMUX=/tmp/fake,1,0\nexport GENESIS_SLOT=7',
+            bootstrap_text=text, oauth=True,
+        )
+        assert "OAUTH=sk-fake-fallback" in rec, (
+            f"the hand relaunch did not receive the slot's fallback token:\n{rec}"
+        )
+
+    def test_the_oauth_lever_still_turns_the_fallback_off(self, tmp_path):
+        """`GENESIS_CC_SLOT_OAUTH=off` is an operator lever, not a suggestion."""
+        text = Path(_BOOTSTRAP).read_text()
+        _unused, rec = self._harness(
+            tmp_path,
+            'export TMUX=/tmp/fake,1,0\nexport GENESIS_SLOT=7\n'
+            'export GENESIS_CC_SLOT_OAUTH=off',
+            bootstrap_text=text, oauth=True,
+        )
+        assert "OAUTH=none" in rec, f"honoured a token despite the off lever:\n{rec}"
 
     def test_temp_dir_falls_back_when_the_slot_dir_cannot_be_made(self, tmp_path):
         """The fallback has to NAME a different directory, not "the ambient one".

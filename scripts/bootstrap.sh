@@ -939,15 +939,42 @@ claude() {
             echo "genesis: the system default temp dir (check disk space/permissions)." >&2
             _ctmp=""
         fi
-        if [ -n "$_ctmp" ]; then
-            TMPDIR="$_ctmp" CLAUDE_CODE_TMPDIR="$_ctmp" \
-                command claude ${_perm:+$_perm} "$@"
-        else
-            # `env` execs the binary from PATH and never sees a shell function,
-            # so this cannot recurse back into this wrapper the way a bare
-            # `claude` would; `command` is a builtin and cannot be used here.
-            env -u TMPDIR -u CLAUDE_CODE_TMPDIR claude ${_perm:+$_perm} "$@"
-        fi
+        # A SUBSHELL, so the fallback token below is scoped to this launch and
+        # never lingers in the operator's interactive shell.
+        (
+            # Fallback OAuth, through the SAME gate and the SAME token parser
+            # the slot door uses — not a second implementation of either.
+            # Without this the hand-relaunch path is the one launch that cannot
+            # use a configured fallback token, and it is exactly the path this
+            # feature makes likely: the operator declines the rebuild to keep
+            # their shell, then types `claude` themselves. `login_gate` owns the
+            # mode semantics (conditional/always/off, stale-token and
+            # peer-route exclusions); this only honours its verdict.
+            _lg="$HOME/genesis/.venv/bin/python"
+            _mode="${GENESIS_CC_SLOT_OAUTH:-conditional}"
+            if [ "$_mode" != "off" ] && [ -x "$_lg" ]; then
+                if _notice=$(timeout 30 env GENESIS_CC_SLOT_OAUTH="$_mode" \
+                        "$_lg" -m genesis.cc.login_gate 2>/dev/null); then
+                    _tok=$("$_lg" -c 'import sys; from genesis.cc.login_health import read_fallback_token as r; sys.stdout.write(r() or str())' 2>/dev/null)
+                    # Export ONLY when non-empty: a failed read must never
+                    # export a blank credential over a working login.
+                    if [ -n "$_tok" ]; then
+                        export CLAUDE_CODE_OAUTH_TOKEN="$_tok"
+                        printf '%s\n' "$_notice" >&2
+                    fi
+                fi
+            fi
+            if [ -n "$_ctmp" ]; then
+                TMPDIR="$_ctmp" CLAUDE_CODE_TMPDIR="$_ctmp" \
+                    command claude ${_perm:+$_perm} "$@"
+            else
+                # `env` execs the binary from PATH and never sees a shell
+                # function, so this cannot recurse back into this wrapper the
+                # way a bare `claude` would; `command` is a builtin and cannot
+                # be used here.
+                env -u TMPDIR -u CLAUDE_CODE_TMPDIR claude ${_perm:+$_perm} "$@"
+            fi
+        )
         _ec=$?
         unset _ctmp
         [ -x "$HOME/genesis/scripts/cc_exit_capture.sh" ] \

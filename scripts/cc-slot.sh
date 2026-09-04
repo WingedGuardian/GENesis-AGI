@@ -754,8 +754,19 @@ if [ "$_HEAL" = "1" ]; then
     # of this gate a no-op, and a future non-operator entrance onto an existing
     # slot must not rebuild past a denial. It is enumeration, not dead weight.
     #
-    # ALLOW, an unavailable gate or an unparseable answer all proceed — the
-    # same fail-open direction the create path takes.
+    # ALLOW proceeds. Anything WITHOUT a complete verdict — no venv, a timeout,
+    # an empty or unparseable action — stands the rebuild DOWN.
+    #
+    # "Fail open like the create path" was the earlier reasoning and it was
+    # WRONG: create does not fail open, it falls through to `_cap_fail_open`,
+    # which still enforces a MemTotal-derived cap and the hard OOM floor. So
+    # falling through here made a rebuild WEAKER than a create on a degraded
+    # Python environment — it could start the measured ~3GB process on a
+    # swapless box where a create would refuse. Standing down costs an operator
+    # one manual repair; the other direction costs an OOM that takes every
+    # session with it. (Note the venv-absent case cannot actually reach here:
+    # `_probe_liveness` uses the same interpreter, so without it there is no
+    # POISONED verdict and no rebuild. It is enumerated anyway.)
     #
     # `--existing $((existing - 1))`: for a CREATE the count excludes the
     # session about to be made, so the raw count would judge a rebuild one
@@ -763,7 +774,11 @@ if [ "$_HEAL" = "1" ]; then
     # makes a poisoned slot permanently unrebuildable, stranding the operator
     # on the one slot that is broken.
     _heal_cap_py="${GENESIS_ROOT}/.venv/bin/python"
-    if [ -x "$_heal_cap_py" ]; then
+    if [ ! -x "$_heal_cap_py" ]; then
+        _HEAL=0
+        echo "cc-slot: ${SESSION_NAME} has no claude running, but the capacity gate is unavailable — not starting one without it." >&2
+        echo "cc-slot: attaching to the slot's shell instead." >&2
+    else
         _heal_existing=$(( existing > 0 ? existing - 1 : 0 ))
         _heal_cap_out=$(timeout 15 "$_heal_cap_py" \
             -m genesis.cc.session_cap --existing "$_heal_existing" 2>/dev/null || true)
@@ -792,6 +807,13 @@ if [ "$_HEAL" = "1" ]; then
                 else
                     _cap_warn="   NOTE: $(printf '%s\n' "$_heal_cap_out" | sed -n '2p')"
                 fi
+                ;;
+            ALLOW) ;;
+            *)
+                # No complete verdict. Fail CLOSED — see the note above.
+                _HEAL=0
+                echo "cc-slot: ${SESSION_NAME} has no claude running, but the capacity gate returned no usable verdict — not starting one without it." >&2
+                echo "cc-slot: attaching to the slot's shell instead." >&2
                 ;;
         esac
     fi
