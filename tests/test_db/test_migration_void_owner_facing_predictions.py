@@ -1,4 +1,4 @@
-"""Migration 0092 — void historical owner-facing outreach predictions.
+"""Migration 20260904213255 — void historical owner-facing outreach predictions.
 
 The outreach ledger hook wrote reply_received/positive_engagement predictions for every
 delivered send, including owner-facing pings (Telegram/voice), which never get an external
@@ -16,7 +16,9 @@ import importlib
 import aiosqlite
 import pytest
 
-M90 = importlib.import_module("genesis.db.migrations.0092_void_owner_facing_outreach_predictions")
+M90 = importlib.import_module(
+    "genesis.db.migrations.20260904213255_void_owner_facing_outreach_predictions"
+)
 
 
 async def _build(conn: aiosqlite.Connection) -> None:
