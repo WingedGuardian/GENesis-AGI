@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import os
 import pty
+import select
 import stat
 import subprocess
 import time
@@ -59,7 +60,7 @@ if [[ "$args" == *"list-sessions -F #{session_name} #{session_attached}"* ]]; th
     # var — the fixture builds the environment before a test writes that file.
     if [[ -f "$FAKE_TMUX_SESSIONS" ]]; then
         while read -r _n; do
-            [[ -n "$_n" ]] && echo "$_n ${FAKE_TMUX_ATTACHED:-0}"
+            [[ -n "$_n" ]] && echo "$_n 0"
         done < "$FAKE_TMUX_SESSIONS"
     fi
     exit 0
@@ -78,7 +79,12 @@ if [[ "$args" == *list-panes* ]]; then
     # reproduced.
     n=0; [[ -f "$FAKE_TMUX_PANES_N" ]] && n=$(cat "$FAKE_TMUX_PANES_N")
     echo $(( n + 1 )) > "$FAKE_TMUX_PANES_N"
-    if [[ $n -ge 1 && -n "${FAKE_TMUX_PANES2:-}" && -f "$FAKE_TMUX_PANES2" ]]; then
+    if [[ $n -ge 2 && -n "${FAKE_TMUX_PANES3:-}" && -f "$FAKE_TMUX_PANES3" ]]; then
+        # Served from the THIRD call on: the pane list is read to decide, again
+        # to build the prompt's disclosure, and again after the answer. Only
+        # this can express "it changed AFTER the operator agreed".
+        cat "$FAKE_TMUX_PANES3"
+    elif [[ $n -ge 1 && -n "${FAKE_TMUX_PANES2:-}" && -f "$FAKE_TMUX_PANES2" ]]; then
         cat "$FAKE_TMUX_PANES2"
     elif [[ -f "$FAKE_TMUX_PANES" ]]; then
         cat "$FAKE_TMUX_PANES"
@@ -95,11 +101,6 @@ if [[ "$args" == *set-environment* && -n "${FAKE_TMUX_SETENV_FAIL:-}" ]]; then
     # Session env could not be set. Respawning anyway would relaunch with
     # STALE values — the exact defect the respawn design removes — so the door
     # must stand the heal down.
-    exit 1
-fi
-if [[ "$args" == *send-keys* && -n "${FAKE_TMUX_SENDKEYS_FAIL:-}" ]]; then
-    # Undeliverable keystrokes (pane died, server gone). Logged above, so the
-    # tests can still see the attempt.
     exit 1
 fi
 if [[ "$args" == *new-session* && -n "${FAKE_TMUX_FDS:-}" ]]; then
@@ -144,14 +145,7 @@ def door(tmp_path):
         # Ordered call log: which probe ran, in which order. The ORDER is the
         # invariant under test — the verdict that gates a destructive action
         # must be the freshest one taken.
-        'if [[ "$*" == *slot_liveness* ]]; then echo "$([[ "$*" == *--idle* ]] && echo idle || echo liveness)" >> "$FAKE_PROBE_LOG"; fi\n'
-        'if [[ "$*" == *slot_liveness* && "$*" == *--idle* ]]; then\n'
-        # The idleness probe is a separate question with its own fake answer.
-        # Default IDLE so heal tests exercise the keystroke path; "EMPTY"
-        # models a probe that produced no verdict at all.
-        '  case "${FAKE_IDLE:-IDLE}" in EMPTY) ;; *) echo "${FAKE_IDLE:-IDLE}"; echo "note";; esac\n'
-        "  exit 0\n"
-        "fi\n"
+        'if [[ "$*" == *slot_liveness* ]]; then echo liveness >> "$FAKE_PROBE_LOG"; fi\n'
         'if [[ "$*" == *slot_liveness* ]]; then\n'
         # FAKE_LIVENESS may be a comma-separated SEQUENCE; each call consumes
         # the next entry (last one repeats). This is how the probe/re-probe
@@ -164,13 +158,11 @@ def door(tmp_path):
         '  echo $(( n + 1 )) > "$FAKE_LIVENESS_N"\n'
         "  exit 0\n"
         "fi\n"
-        # The capacity gate, when a test wants it to answer. A heal STARTS a
-        # claude, so it consults this the way a create does; without an answer
-        # the path fails open, which is why every heal test passed before this
-        # branch existed.
+        # The capacity gate, when a test wants it to answer. A rebuild STARTS a
+        # claude, so it consults this the way a create does.
         'if [[ "$*" == *session_cap* && -n "${FAKE_HEAL_CAP:-}" ]]; then\n'
         '  echo "session_cap $*" >> "$FAKE_PROBE_LOG"\n'
-        '  printf \'%s\\n\' "$FAKE_HEAL_CAP" "cap message"; exit 0\n'
+        '  printf \'%s\\n\' "${FAKE_HEAL_CAP%%|*}" "cap message" "${FAKE_HEAL_CAP#*|}"; exit 0\n'
         "fi\n"
         # Any other module (the capacity gate with no fake, the login gate) ->
         # no verdict, which those paths already treat as unavailable.
@@ -182,8 +174,8 @@ def door(tmp_path):
     listing = tmp_path / "list.txt"
     panes = tmp_path / "panes.txt"
 
-    def run(*args: str) -> subprocess.CompletedProcess:
-        env = {
+    def _env() -> dict:
+        return {
             "PATH": f"{bin_dir}:/usr/bin:/bin",
             "HOME": str(home),
             "FAKE_TMUX_LOG": str(log),
@@ -192,24 +184,29 @@ def door(tmp_path):
             "FAKE_TMUX_PANES": str(panes),
             "FAKE_LIVENESS": os.environ.get("_TEST_FAKE_LIVENESS", ""),
             "FAKE_LIVENESS_N": str(tmp_path / "liveness_calls.txt"),
-            "FAKE_IDLE": os.environ.get("_TEST_FAKE_IDLE", ""),
             "FAKE_PROBE_LOG": str(tmp_path / "probe_order.txt"),
             "FAKE_TMUX_PANES_N": str(tmp_path / "panes_calls.txt"),
             "FAKE_TMUX_PANES2": os.environ.get("_TEST_FAKE_PANES2", ""),
-            "FAKE_TMUX_SENDKEYS_FAIL": os.environ.get("_TEST_FAKE_SENDKEYS_FAIL", ""),
+            "FAKE_TMUX_PANES3": os.environ.get("_TEST_FAKE_PANES3", ""),
             "FAKE_TMUX_LIST_PANES_FAIL": os.environ.get("_TEST_FAKE_LIST_PANES_FAIL", ""),
-            "FAKE_HEAL_CAP": os.environ.get("_TEST_FAKE_HEAL_CAP", ""),
-            "FAKE_TMUX_ATTACHED": os.environ.get("_TEST_FAKE_ATTACHED", ""),
             "FAKE_TMUX_RESPAWN_FAIL": os.environ.get("_TEST_FAKE_RESPAWN_FAIL", ""),
             "FAKE_TMUX_SETENV_FAIL": os.environ.get("_TEST_FAKE_SETENV_FAIL", ""),
             "FAKE_TMUX_FDS": str(tmp_path / "tmux_fds.txt"),
+            "FAKE_HEAL_CAP": os.environ.get("_TEST_FAKE_HEAL_CAP", ""),
         }
-        # Per-invocation call counters: two run() calls in one test must not
-        # leak sequence positions (FAKE_LIVENESS / FAKE_TMUX_PANES2) into
-        # each other.
+
+    def _reset_counters() -> None:
+        # Per-invocation call counters: two runs in one test must not leak
+        # sequence positions (FAKE_LIVENESS / FAKE_TMUX_PANES2) into each
+        # other. BOTH runners must do this — the pty runner skipping it made
+        # probe-order assertions depend on whether a piped run preceded them.
         (tmp_path / "liveness_calls.txt").unlink(missing_ok=True)
         (tmp_path / "probe_order.txt").unlink(missing_ok=True)
         (tmp_path / "panes_calls.txt").unlink(missing_ok=True)
+
+    def run(*args: str) -> subprocess.CompletedProcess:
+        env = _env()
+        _reset_counters()
         # Deliberately NOT inheriting os.environ: the test itself may run
         # inside a cc slot, whose GENESIS_CC_PERMISSION_MODE / TMUX would
         # contaminate the branch under test.
@@ -219,8 +216,89 @@ def door(tmp_path):
             capture_output=True,
             text=True,
             timeout=30,
+            # DELIBERATE: without this, stdin is inherited from pytest, so the
+            # rebuild confirm's `-t 0` test would answer "there is a human"
+            # when the suite is run from a terminal and "there is not" in CI.
+            # The branch under test would then depend on how the suite was
+            # launched. DEVNULL pins it to the no-terminal path; the pty runner
+            # below is how the WITH-a-human path is exercised.
+            stdin=subprocess.DEVNULL,
+            # start_new_session detaches the CONTROLLING TERMINAL, which is what
+            # the confirm actually tests (`: >/dev/tty`). Without it the branch
+            # depends on whether pytest itself was launched from a terminal —
+            # green in CI, and on a dev box the door would sit at a prompt.
+            start_new_session=True,
         )
 
+    def run_tty(answer: str, *args: str, stdin_text: str | None = None,
+                wait_for: str | None = None):
+        """Run the door under a REAL pty and answer the rebuild confirm.
+
+        The confirm needs a controlling terminal and reads from /dev/tty, so a
+        piped runner measures the no-terminal branch instead of the code under
+        test. A pty merges the two streams, so `stdout` and `stderr` carry the
+        same combined text here.
+
+        `stdin_text` gives the child a stdin that is NOT the terminal — used to
+        prove the answer is taken from /dev/tty and never from stdin.
+
+        `wait_for` holds the answer back until that text has appeared. Writing
+        immediately is fine for ordinary answers (the tty buffers them), but it
+        is WRONG for a control character: the line discipline raises SIGINT
+        when the byte is RECEIVED, so a \x03 written before the prompt exists
+        is just buffered and later read as data. A Ctrl-C test that sends early
+        passes whether or not the door traps SIGINT — MEASURED: it did.
+        """
+        env = _env()
+        _reset_counters()
+        pid, fd = pty.fork()
+        if pid == 0:  # pragma: no cover - child exec's away
+            if stdin_text is not None:
+                r_fd, w_fd = os.pipe()
+                os.write(w_fd, stdin_text.encode())
+                os.close(w_fd)
+                os.dup2(r_fd, 0)
+            os.execve("/bin/bash", ["bash", str(_CC_SLOT), *args], env)  # noqa: S606
+        chunks: list[bytes] = []
+        sent = False
+        try:
+            if wait_for is None:
+                os.write(fd, (answer + "\n").encode())
+                sent = True
+            # Read to EOF (every slave fd closed => the child is gone), with a
+            # deadline enforced by select. Checking waitpid BEFORE a blocking
+            # read raced: the child could exit with output still buffered, so
+            # assertions on that output were a latent flake, and the deadline
+            # was never evaluated while the read blocked.
+            deadline = time.monotonic() + 30
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:  # pragma: no cover - only on a hang
+                    os.kill(pid, 9)
+                    break
+                ready, _, _ = select.select([fd], [], [], min(remaining, 1.0))
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if not sent and wait_for is not None \
+                        and wait_for in b"".join(chunks).decode(errors="replace"):
+                    os.write(fd, answer.encode() if answer == "\x03"
+                             else (answer + "\n").encode())
+                    sent = True
+        finally:
+            os.close(fd)
+            _done, status = os.waitpid(pid, 0)
+            rc = os.waitstatus_to_exitcode(status)
+        text = b"".join(chunks).decode(errors="replace")
+        return subprocess.CompletedProcess(args, rc, stdout=text, stderr=text)
+
+    run.tty = run_tty
     run.probe_log = tmp_path / "probe_order.txt"
     run.fds_file = tmp_path / "tmux_fds.txt"
     run.panes2 = tmp_path / "panes2.txt"
@@ -440,6 +518,24 @@ class TestHostnameMode:
 
 
 class TestScriptHygiene:
+    def test_the_rebuild_prompt_is_bounded(self):
+        """A SOURCE contract, and deliberately so.
+
+        `read -t 120` bounds an abandoned prompt. Its behaviour cannot honestly
+        be tested — a real assertion would have to wait two minutes — and
+        MEASURED, dropping the flag left the entire suite green. Pinning the
+        text is weaker than pinning behaviour and is stated as such, but it is
+        strictly better than the nothing that was here before.
+        """
+        text = Path(_CC_SLOT).read_text()
+        read_lines = [ln for ln in text.splitlines()
+                      if "Rebuild this slot?" in ln and "read " in ln]
+        assert len(read_lines) == 1, f"expected one confirm read, got {read_lines}"
+        assert "-t 120" in read_lines[0], (
+            f"the rebuild prompt is unbounded — an abandoned prompt would hold "
+            f"the door open forever:\n{read_lines[0]}"
+        )
+
     def test_cc_slot_syntax_clean(self):
         subprocess.run(["bash", "-n", str(_CC_SLOT)], check=True, timeout=10)
 
@@ -497,116 +593,52 @@ class TestSlotHeal:
         verdict,
         panes_text="%0 4242 bash\n",
         session="cc-4",
-        idle=None,
         panes2_text=None,
-        sendkeys_fail=False,
+        heal_cap=None,
+        stdin_text=None,
+        wait_for=None,
+        panes3_text=None,
         respawn_fail=False,
         setenv_fail=False,
-        heal_cap=None,
-        attached=None,
+        confirm="y",
     ):
+        """`confirm` is the operator's answer at the rebuild prompt.
+
+        Default "y" so the heal tests below exercise the relaunch. Pass None to
+        run WITHOUT a terminal at all — the branch a dashboard or background
+        entrance takes, which must never destroy a pane.
+        """
         run, log, sessions, _listing, panes = door
         sessions.write_text(f"{session}\n")
         panes.write_text(panes_text)
         os.environ["_TEST_FAKE_LIVENESS"] = verdict
-        if idle is not None:
-            os.environ["_TEST_FAKE_IDLE"] = idle
         if panes2_text is not None:
             run.panes2.write_text(panes2_text)
             os.environ["_TEST_FAKE_PANES2"] = str(run.panes2)
-        if sendkeys_fail:
-            os.environ["_TEST_FAKE_SENDKEYS_FAIL"] = "1"
+        if heal_cap is not None:
+            os.environ["_TEST_FAKE_HEAL_CAP"] = heal_cap
+        if panes3_text is not None:
+            p3 = run.panes2.parent / "panes3.txt"
+            p3.write_text(panes3_text)
+            os.environ["_TEST_FAKE_PANES3"] = str(p3)
         if respawn_fail:
             os.environ["_TEST_FAKE_RESPAWN_FAIL"] = "1"
         if setenv_fail:
             os.environ["_TEST_FAKE_SETENV_FAIL"] = "1"
-        if heal_cap is not None:
-            os.environ["_TEST_FAKE_HEAL_CAP"] = heal_cap
-        if attached is not None:
-            os.environ["_TEST_FAKE_ATTACHED"] = attached
+        door_arg = f"genesis-3-{session.split('-')[1]}"
         try:
-            proc = run(f"genesis-3-{session.split('-')[1]}")
+            proc = (
+                run(door_arg) if confirm is None
+                else run.tty(confirm, door_arg, stdin_text=stdin_text, wait_for=wait_for)
+            )
         finally:
             os.environ.pop("_TEST_FAKE_LIVENESS", None)
-            os.environ.pop("_TEST_FAKE_IDLE", None)
             os.environ.pop("_TEST_FAKE_PANES2", None)
-            os.environ.pop("_TEST_FAKE_SENDKEYS_FAIL", None)
             os.environ.pop("_TEST_FAKE_HEAL_CAP", None)
-            os.environ.pop("_TEST_FAKE_ATTACHED", None)
+            os.environ.pop("_TEST_FAKE_PANES3", None)
             os.environ.pop("_TEST_FAKE_RESPAWN_FAIL", None)
             os.environ.pop("_TEST_FAKE_SETENV_FAIL", None)
         return proc, log.read_text()
-
-    def test_a_denied_capacity_gate_stands_the_heal_down(self, door):
-        """A heal STARTS a claude, so it is create-like for memory.
-
-        The attach bypass above is justified for an ATTACH — it adds no
-        session, so the footprint is already counted. That does not carry to a
-        heal: the slot is poisoned precisely because no claude is running, so
-        healing is a real allocation on a swapless box.
-        """
-        proc, log = self._run_with(door, "POISONED", heal_cap="DENY")
-        assert "respawn-pane" not in log, "typed a launch line the gate declined"
-        assert "capacity gate declined" in proc.stderr, proc.stderr
-
-    def test_a_denied_heal_still_attaches_instead_of_exiting(self, door):
-        """Standing the heal down must not lock the operator out of the slot.
-
-        Denying is about not starting a second claude, not about refusing the
-        session — before this feature existed they got the shell, and they
-        still do."""
-        proc, log = self._run_with(door, "POISONED", heal_cap="DENY")
-        assert proc.returncode == 0, proc.stderr
-        assert "new-session" in log, "the door failed to attach at all"
-
-    def test_the_heal_asks_the_gate_about_one_FEWER_session(self, door):
-        """`--existing` excludes this slot, and that is load-bearing.
-
-        For a CREATE the count excludes the session about to be made. Passing
-        the raw count would judge a heal one session busier than the create it
-        is modelled on — and at the cap that means a poisoned slot could never
-        be healed, stranding the operator on the one slot that is broken.
-        """
-        _proc, _log = self._run_with(door, "POISONED", heal_cap="ALLOW")
-        recorded = door[0].probe_log.read_text()
-        cap_lines = [ln for ln in recorded.splitlines() if ln.startswith("session_cap")]
-        assert cap_lines, f"the heal never consulted the gate:\n{recorded}"
-        # One session live (this slot), excluded -> the gate is asked about 0.
-        # Raw would be 1, and THAT is the bug: at the cap, the raw count makes
-        # a poisoned slot permanently unhealable.
-        assert "--existing 0" in cap_lines[0], cap_lines
-
-    def test_an_unavailable_capacity_gate_still_heals(self, door):
-        """Fail OPEN, matching the create path. An unreachable gate must not
-        become an outage — and the pre-existing behaviour for this slot was a
-        dead prompt, which is worse than an unchecked relaunch."""
-        _proc, log = self._run_with(door, "POISONED")  # no fake -> gate exits 1
-        assert "respawn-pane" in log
-
-    def test_an_attached_session_is_never_typed_into(self, door):
-        """Child-presence cannot see shell-NATIVE work.
-
-        `source deploy.sh`, a `read` waiting on input, a loop of builtins — all
-        run inside the pane's own shell, spawn no child, and report `bash`. The
-        idleness probe calls that IDLE, and the door would then C-c a human's
-        task. Attachment is a closed-set fact instead of another heuristic, and
-        it asks the right question: is anyone there.
-        """
-        proc, log = self._run_with(door, "POISONED", attached="1")
-        assert "respawn-pane" not in log, "typed into a session with a client attached"
-        assert "another client is attached" in proc.stderr, proc.stderr
-
-    def test_an_unattached_poisoned_slot_still_heals(self, door):
-        """Guard the guard: the test above must not pass by killing the heal."""
-        _proc, log = self._run_with(door, "POISONED", attached="0")
-        assert "respawn-pane" in log
-
-    def test_an_unreadable_attachment_count_spares_the_session(self, door):
-        """Same fail direction as every other gate here: only a positive
-        answer permits keystrokes. A tmux that prints nothing usable must not
-        be read as 'nobody is there'."""
-        proc, log = self._run_with(door, "POISONED", attached="not-a-number")
-        assert "respawn-pane" not in log or "another client is attached" in proc.stderr
 
     def test_poisoned_slot_is_healed_with_the_full_launch_line(self, door):
         _proc, log = self._run_with(door, "POISONED")
@@ -652,6 +684,28 @@ class TestSlotHeal:
         proc, log = self._run_with(door, "ALIVE")
         assert "respawn-pane" not in log, f"typed into a LIVE session:\n{log}"
         assert "running no claude" not in proc.stderr
+
+    def test_an_alive_verdict_stops_before_the_lock(self, door):
+        """Locks the FIRST liveness gate specifically, by COUNTING probes.
+
+        MEASURED by mutation: deleting the `= POISONED` condition from the
+        decision gate left `test_alive_slot_is_attached_untouched` green,
+        because the re-probe taken under the lock also demands POISONED and
+        caught it there. That test therefore could not fail on the mechanism it
+        names — the same defect as asserting only the last element of a probe
+        ORDER. Behaviour was never wrong; the coverage was.
+
+        An ALIVE first verdict must short-circuit: exactly ONE probe, no lock,
+        no second probe. Two probes means the door entered the heal path for a
+        slot that already had a claude in it.
+        """
+        run, _log, _sessions, _listing, _panes = door
+        _proc, log = self._run_with(door, "ALIVE")
+        assert "respawn-pane" not in log
+        order = run.probe_log.read_text().split()
+        assert order == ["liveness"], (
+            f"an ALIVE slot entered the heal path instead of short-circuiting: {order}"
+        )
 
     def test_unknown_verdict_spares_the_session(self, door):
         _proc, log = self._run_with(door, "UNKNOWN")
@@ -712,79 +766,20 @@ class TestSlotHeal:
         _proc, log = self._run_with(door, "POISONED")
         assert len([ln for ln in log.splitlines() if "new-session" in ln]) == 1
 
-    def test_pane_running_a_foreground_job_is_never_touched(self, door):
-        """Liveness answers "is claude running", NOT "is it safe to type here".
-
-        MEASURED: send-keys C-c KILLS a running foreground job. A slot with no
-        claude but an active build, ssh session or editor must be left strictly
-        alone — including the C-c, which is itself destructive.
-        """
-        _proc, log = self._run_with(door, "POISONED", panes_text="%0 4242 vim\n")
-        assert "respawn-pane" not in log, f"typed into a pane running vim:\n{log}"
-
-    @pytest.mark.parametrize("busy", ["vim", "ssh", "python", "pytest", "less", "node"])
-    def test_non_shell_panes_are_all_spared(self, door, busy):
-        _proc, log = self._run_with(door, "POISONED", panes_text=f"%0 4242 {busy}\n")
-        assert "respawn-pane" not in log, f"typed into a pane running {busy}:\n{log}"
-
-    def test_busy_pane_stand_down_is_announced(self, door):
-        proc, _log = self._run_with(door, "POISONED", panes_text="%0 4242 rsync\n")
-        assert "running 'rsync'" in proc.stderr, proc.stderr
-
-    @pytest.mark.parametrize("shell", ["bash", "-bash", "sh", "zsh", "dash", "ksh"])
-    def test_shell_panes_still_heal(self, door, shell):
-        # Login shells arrive with a leading dash; missing them would make the
-        # gate refuse to heal the exact shape that motivated this change.
-        _proc, log = self._run_with(door, "POISONED", panes_text=f"%0 4242 {shell}\n")
-        assert "respawn-pane" in log, f"refused to heal an idle {shell} pane:\n{log}"
-
-    def test_idleness_is_the_LAST_verdict_before_any_keystroke(self, door):
-        """Whichever probe runs last is the only one whose answer is still
-        fresh when the keys land.
-
-        `send-keys C-c` kills a running foreground job, so "is it safe to type
-        here" is the destructive question and must be asked last. The liveness
-        re-probe is allowed a 15s timeout, so asking idleness BEFORE it leaves
-        a 15s window in which the operator can start a job that then gets
-        interrupted — the same stale-verdict defect as the pane snapshot, one
-        gate further in.
-        """
-        run, _log, _sessions, _listing, _panes = door
-        _proc, log = self._run_with(door, "POISONED")
-        assert "respawn-pane" in log, "heal did not run; ordering unexercised"
-        order = run.probe_log.read_text().split()
-        assert order, "probe shim recorded nothing — harness regression"
-        assert order[-1] == "idle", (
-            f"a liveness probe runs after the idleness verdict: {order}"
-        )
-        assert "liveness" in order, f"liveness never re-probed: {order}"
-
     def test_a_stood_down_heal_still_probed_in_the_right_order(self, door):
         """Ordering must not depend on the happy path."""
         run, _log, _sessions, _listing, _panes = door
-        _proc, log = self._run_with(door, "POISONED", idle="BUSY")
+        _proc, log = self._run_with(door, "POISONED", confirm="n")
         assert "respawn-pane" not in log
         order = run.probe_log.read_text().split()
-        # The SHAPE, not just the last element: under the old order a BUSY
-        # verdict stands the heal down before the liveness re-check ever runs,
-        # so ["liveness", "idle"] also ends in "idle" and the assertion could
-        # not fail on the mechanism it names.
-        assert order == ["liveness", "liveness", "idle"], (
-            f"the stand-down path did not re-probe liveness before asking "
-            f"idleness: {order}"
+        # TWO liveness probes, and the second one matters: it is taken under
+        # the lock, after the OAuth gate, so a slot that came alive while the
+        # door was preparing is never respawned. There is no third probe any
+        # more — the question the deleted `--idle` probe asked is now put to
+        # the operator, and a declined prompt must not skip the re-check.
+        assert order == ["liveness", "liveness"], (
+            f"the declined path did not re-probe liveness under the lock: {order}"
         )
-
-    def test_fish_pane_is_spared_not_relaunched(self, door):
-        # The typed payload (`export K=V;`, `__ec=$?`) is POSIX and a parse
-        # error in fish — a broken relaunch is worse than a plain attach.
-        _proc, log = self._run_with(door, "POISONED", panes_text="%0 4242 fish\n")
-        assert "respawn-pane" not in log, f"typed a POSIX payload into fish:\n{log}"
-
-    def test_process_name_containing_a_space_is_spared(self, door):
-        # pane_current_command is the row REMAINDER, not its first token —
-        # a renamed process reporting "bash x" must not pass as "bash".
-        _proc, log = self._run_with(door, "POISONED", panes_text="%0 4242 bash x\n")
-        assert "respawn-pane" not in log, f"first-token match let a masquerade through:\n{log}"
 
     def test_malformed_pane_id_is_never_a_send_keys_target(self, door):
         _proc, log = self._run_with(door, "POISONED", panes_text="garbage 4242 bash\n")
@@ -812,45 +807,26 @@ class TestSlotHeal:
 
     # ── G1: idleness is CURRENT state, established immediately before keys ──
 
-    def test_shell_running_a_script_is_spared_despite_its_name(self, door):
-        """`bash script.sh` reports pane_current_command == "bash", so the name
-        whitelist alone would C-c a running job. Child-presence is the signal
-        that tells an idle prompt from a busy shell — only IDLE may be typed at.
+    def test_the_prompt_discloses_the_FRESH_pane_command(self, door):
+        """The operator can only decide from what they are TOLD.
+
+        The pane list is captured when the heal is DECIDED, but the OAuth gate
+        is allowed up to 30s and the lock up to 45s before the prompt appears —
+        ample for the operator to have started vim in that pane. Disclosing the
+        stale snapshot would put "bash" in front of a person whose pane is now
+        running an editor, and their "y" would be uninformed. This is the same
+        freshness property the deleted safety gate carried; it moved from a
+        machine verdict to the sentence the human reads.
         """
-        _proc, log = self._run_with(door, "POISONED", idle="BUSY")
-        assert "respawn-pane" not in log, f"typed over a running shell job:\n{log}"
-
-    def test_busy_shell_stand_down_is_announced(self, door):
-        proc, _log = self._run_with(door, "POISONED", idle="BUSY")
-        assert "mid-job" in proc.stderr, proc.stderr
-
-    def test_idle_probe_without_a_verdict_spares(self, door):
-        # Broken venv / timeout / crashed probe -> no IDLE affirmation -> no keys.
-        proc, log = self._run_with(door, "POISONED", idle="EMPTY")
-        assert "respawn-pane" not in log, f"typed on an absent idle verdict:\n{log}"
-        # And the message must not claim knowledge the probe never produced —
-        # "mid-job" here sends an operator debugging a never-healing slot to
-        # inspect a job that does not exist.
-        assert "could not be established" in proc.stderr, proc.stderr
-        assert "mid-job" not in proc.stderr, proc.stderr
-
-    def test_unknown_idleness_spares(self, door):
-        _proc, log = self._run_with(door, "POISONED", idle="UNKNOWN")
-        assert "respawn-pane" not in log
-
-    def test_safety_gate_reads_fresh_pane_state_not_the_decision_snapshot(self, door):
-        """The pane list is captured when the heal is DECIDED, but the OAuth
-        gate is allowed up to 30s before any keystroke — ample for the operator
-        to have started vim in the pane. The safety gate must re-read the pane
-        immediately before typing; acting on the stale snapshot C-c's whatever
-        is running now.
-        """
-        _proc, log = self._run_with(
+        proc, _log = self._run_with(
             door, "POISONED",
             panes_text="%0 4242 bash\n",
             panes2_text="%0 4242 vim\n",
+            confirm="n",
         )
-        assert "respawn-pane" not in log, f"acted on the stale pane snapshot:\n{log}"
+        assert "'vim'" in proc.stdout, (
+            f"prompt disclosed the stale pane snapshot:\n{proc.stdout}"
+        )
 
     def test_pane_replaced_mid_flight_is_not_typed_into(self, door):
         # The first window's pane id changed between decision and action —
@@ -927,6 +903,224 @@ class TestSlotHeal:
         assert "could not relaunch" in proc.stderr, proc.stderr
 
 
+    # ---- the operator confirm -------------------------------------------
+    # These replace the machine gates (idleness, attachment, shell-name
+    # whitelist, capacity) deleted in this commit. Four review rounds produced
+    # eight findings against those gates because the question they asked — "is
+    # anyone using this pane" — is undecidable from outside it. The confirm
+    # asks the one party who can answer.
+
+    def test_without_a_terminal_the_door_never_destroys_a_pane(self, door):
+        """The branch a dashboard or background entrance takes.
+
+        There is no human to answer, so the destructive action is simply not
+        available. A background session was never able to heal a slot; this
+        keeps it exactly as capable as before while making it unable to do
+        damage, rather than letting it destroy a pane nobody is watching.
+        """
+        proc, log = self._run_with(door, "POISONED", confirm=None)
+        assert "respawn-pane" not in log, f"destroyed a pane with no human:\n{log}"
+        assert "no terminal here" in proc.stderr
+        assert "tmux kill-session" in proc.stderr, "did not name the manual repair"
+        # Pins the GUARD, not just the outcome. Without `: >/dev/tty` the door
+        # would print the prompt and then decline on a failed read — same final
+        # state, so asserting only "no respawn" left the guard
+        # mutation-transparent (MEASURED: the mutation survived 58/58).
+        assert "Rebuild this slot?" not in proc.stderr, (
+            f"prompted with no controlling terminal:\n{proc.stderr}"
+        )
+        # The probe must be SILENT when it fails. A bare `: >/dev/tty` leaks a
+        # shell-level redirection error above the door's own explanation.
+        assert "No such device" not in proc.stderr, (
+            f"leaked a shell redirection error:\n{proc.stderr}"
+        )
+
+    def test_declining_the_rebuild_leaves_the_pane_alone(self, door):
+        proc, log = self._run_with(door, "POISONED", confirm="n")
+        assert "respawn-pane" not in log, f"rebuilt after a refusal:\n{log}"
+        assert "left as-is" in proc.stdout
+
+    def test_bare_enter_declines(self, door):
+        """Default-deny, like `_cap_reclaim`'s ATTACHED confirm.
+
+        Someone reconnecting on autopilot presses Enter. That must not be the
+        answer that kills their process group.
+        """
+        _proc, log = self._run_with(door, "POISONED", confirm="")
+        assert "respawn-pane" not in log, f"a bare Enter rebuilt the slot:\n{log}"
+
+    def test_an_unrelated_answer_declines(self, door):
+        _proc, log = self._run_with(door, "POISONED", confirm="maybe")
+        assert "respawn-pane" not in log
+
+    def test_the_prompt_says_what_will_be_lost(self, door):
+        """An informed yes needs the consequence stated, not just the question.
+
+        `respawn-pane -k` kills the pane's process GROUP.
+        """
+        proc, _log = self._run_with(door, "POISONED", confirm="n")
+        assert "ends whatever is in it" in proc.stdout, (
+            f"the prompt did not state the consequence:\n{proc.stdout}"
+        )
+
+    def test_the_answer_comes_from_the_terminal_not_stdin(self, door):
+        """A redirected stdin must never be read as the operator's answer.
+
+        The door is reached through ssh, but a caller can still redirect stdin;
+        consuming that as consent would rebuild a slot nobody agreed to. Here
+        stdin says "y" and the terminal says nothing — the correct read gets
+        the terminal's empty line and declines. MEASURED: dropping `</dev/tty`
+        survived the whole suite before this test existed.
+        """
+        _proc, log = self._run_with(door, "POISONED", confirm="", stdin_text="y\n")
+        assert "respawn-pane" not in log, f"took stdin as the answer:\n{log}"
+
+    def test_capacity_denial_stands_the_rebuild_down_without_asking(self, door):
+        """DENY is not a question for the operator.
+
+        They can see whether the pane is in use; they cannot see whether a
+        swapless box can afford another ~3GB.
+
+        DENY is not reachable from either entrance today (`session_cap.decide()`
+        returns it only for a non-operator origin, and the only door that
+        reaches a rebuild is the SSH one). This still locks the arm on purpose:
+        handling a subset of the gate's outcome space is exactly what made the
+        previous version of this gate a silent no-op.
+        """
+        proc, log = self._run_with(door, "POISONED", heal_cap="DENY")
+        assert "respawn-pane" not in log, f"rebuilt past a capacity denial:\n{log}"
+        assert "Rebuild this slot?" not in proc.stdout, "asked a question it had already answered"
+        assert "capacity gate declined" in proc.stdout
+
+    def test_a_slot_that_came_alive_while_deciding_is_not_rebuilt(self, door):
+        """THE gate that the operator confirm does not replace.
+
+        A human takes unbounded time at the prompt, and in that time they can
+        attach from another terminal and start claude by hand. The verdict is
+        therefore retaken AFTER the answer, under the lock: third probe says
+        ALIVE, so the yes is discarded. Without that re-check this is a SIGKILL
+        of a live Claude Code session — the one failure this door must never
+        cause.
+        """
+        _proc, log = self._run_with(door, "POISONED,POISONED,ALIVE", confirm="y")
+        assert "respawn-pane" not in log, f"rebuilt a slot that came alive:\n{log}"
+
+    def test_the_verdict_is_retaken_after_the_answer(self, door):
+        """Counts probes, so it cannot pass on the outcome alone."""
+        run, _log, _sessions, _listing, _panes = door
+        _proc, log = self._run_with(door, "POISONED", confirm="y")
+        assert "respawn-pane" in log
+        order = [x for x in run.probe_log.read_text().split() if x == "liveness"]
+        assert len(order) == 3, (
+            f"expected decision + pre-prompt + post-answer probes, got {order}"
+        )
+
+    def test_ctrl_c_at_the_prompt_never_rebuilds(self, door):
+        """Ctrl-C aborts the door and rebuilds NOTHING.
+
+        The safety property is the one that matters and is the one asserted:
+        an interrupted prompt must never be read as consent. The abort itself
+        matches `_cap_reclaim`, whose cancel path also ends the door. Trapping
+        SIGINT to keep the door alive was tried and measured worse — bash
+        restarts the interrupted `read`, so the door hung with the prompt still
+        up instead of ending.
+
+        The signal is sent only AFTER the prompt appears: written earlier it is
+        buffered as ordinary input and never becomes SIGINT at all, which made
+        an earlier version of this test pass with no signal handling present.
+        """
+        proc, log = self._run_with(
+            door, "POISONED", confirm="\x03", wait_for="Rebuild this slot?",
+        )
+        assert "respawn-pane" not in log, f"Ctrl-C rebuilt the slot:\n{log}"
+        assert "Rebuild this slot?" in proc.stdout, "the prompt never appeared"
+
+    def test_an_answer_given_for_one_pane_does_not_destroy_another(self, door):
+        """Consent is for a STATE, not for a slot.
+
+        The prompt says the pane is running X and the operator agrees. If by
+        the time the lock is taken it is running Y, that yes was never given
+        for Y. Re-checking only pane IDENTITY and absence-of-claude would let a
+        yes given for an idle `bash` destroy an editor started during exactly
+        the window the prompt's own 120s timeout allows for.
+        """
+        proc, log = self._run_with(
+            door, "POISONED", confirm="y",
+            panes_text="%0 4242 bash\n",
+            panes3_text="%0 4242 vim\n",
+        )
+        assert "respawn-pane" not in log, f"destroyed a pane it never disclosed:\n{log}"
+        assert "not 'bash' as shown" in proc.stdout
+
+    def test_an_oom_floor_reclaim_is_refused_rather_than_offered(self, door):
+        """RECLAIM has two causes and only one of them is a choice.
+
+        `cap_full` can be traded away by ending a session. `oom_floor` means
+        RAM is below the safety floor, where starting a process risks an OOM
+        that takes down every session — the create path refuses there too.
+        """
+        proc, log = self._run_with(door, "POISONED", heal_cap="RECLAIM|oom_floor")
+        assert "respawn-pane" not in log, f"rebuilt below the OOM floor:\n{log}"
+        assert "Rebuild this slot?" not in proc.stdout, "offered a choice it should not have"
+
+    def test_reclaim_surfaces_the_gates_own_wording(self, door):
+        """Not an invented sentence: the gate's own message is the honest one,
+        because RECLAIM covers both a full box and an OOM floor."""
+        proc, log = self._run_with(door, "POISONED", heal_cap="RECLAIM|cap_full", confirm="y")
+        assert "cap message" in proc.stdout, f"invented its own wording:\n{proc.stdout}"
+        assert "respawn-pane" in log
+
+    def test_the_rebuild_takes_the_per_slot_lock(self, door):
+        """Pins that the lock is TAKEN, not merely released correctly.
+
+        MEASURED: deleting `_acquire_heal_lock` outright left the whole suite
+        green, because the only lock test asserted a NEGATIVE — that fd 9 is
+        not inherited — which is trivially true when no lock is ever opened.
+        """
+        run, _log, _sessions, _listing, _panes = door
+        _proc, log = self._run_with(door, "POISONED", confirm="y")
+        assert "respawn-pane" in log
+        locks = list((run.fds_file.parent / "home" / ".genesis").glob("cc-slot-heal-*.lock"))
+        assert locks, "no per-slot lock was created — the flock is not being taken"
+
+    def test_the_capacity_question_excludes_this_slot_and_never_goes_negative(self, door):
+        """`--existing` is the population the gate judges, and it must not go
+        negative.
+
+        A rebuild is create-like for memory, and a create's count EXCLUDES the
+        session about to exist, so the rebuild asks about one fewer. With no
+        sessions listed the subtraction must clamp: a prior round caught
+        `--existing -1` reaching the gate as a nonsense population, and nothing
+        pinned it afterwards.
+        """
+        run, _log, _sessions, listing, _panes = door
+        listing.write_text("")
+        self._run_with(door, "POISONED", heal_cap="ALLOW|ok", confirm="y")
+        probe = run.probe_log.read_text()
+        assert "--existing -" not in probe, f"passed a negative population:\n{probe}"
+        assert "--existing 0" in probe, f"did not ask about one fewer session:\n{probe}"
+
+    def test_eof_at_the_prompt_declines_instead_of_aborting(self, door):
+        """Ctrl-D makes `read` fail; the door must DECLINE, not die.
+
+        MEASURED: dropping `|| _heal_confirm=""` left the suite green, yet
+        under `set -euo pipefail` a failed read aborts the script — the
+        operator would get no rebuild, no message, and no shell. The declined
+        message below can only appear if the door survived the failed read.
+        """
+        proc, log = self._run_with(
+            door, "POISONED", confirm="\x04", wait_for="Rebuild this slot?",
+        )
+        assert "respawn-pane" not in log, f"EOF was read as consent:\n{log}"
+        assert "left as-is" in proc.stdout, (
+            f"a failed read aborted the door instead of declining:\n{proc.stdout}"
+        )
+
+    def test_confirming_rebuilds_the_slot(self, door):
+        _proc, log = self._run_with(door, "POISONED", confirm="y")
+        assert "respawn-pane" in log
+
+
 class TestWrapperInsideTmux:
     """A hand-typed `claude` inside a slot pane must not be a second-class
     session. Before this branch the wrapper fell through to a bare
@@ -1001,6 +1195,35 @@ echo "RC=$?" >> {str(rec)!r}
             with contextlib.suppress(ChildProcessError):
                 os.waitpid(pid, 0)
         return None, (rec.read_text() if rec.exists() else "")
+
+    def test_temp_dir_falls_back_when_the_slot_dir_cannot_be_made(self, tmp_path):
+        """The fallback has to NAME a different directory, not "the ambient one".
+
+        This branch runs only inside a slot pane, where the launcher has
+        ALREADY exported TMPDIR to the directory whose creation is now failing.
+        So "start Claude with the ambient TMPDIR" would hand it exactly the
+        missing path — the failure it was trying to avoid, moved somewhere less
+        visible. The env_extra below reproduces that precondition deliberately;
+        the harness's usual `unset` would hide it.
+        """
+        text = Path(_BOOTSTRAP).read_text()
+        home = tmp_path / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        # A FILE where the directory needs to be: `mkdir -p` cannot succeed.
+        (home / ".genesis").write_text("not a directory\n")
+        bad = home / ".genesis" / "cc-tmp"
+        _unused, rec = self._harness(
+            tmp_path,
+            "export TMUX=/tmp/fake,1,0\nexport GENESIS_SLOT=7\n"
+            f"export TMPDIR={str(bad)!r}\nexport CLAUDE_CODE_TMPDIR={str(bad)!r}",
+            bootstrap_text=text,
+        )
+        assert f"TMPDIR={home}/tmp" in rec, (
+            f"did not fall back to a usable temp dir:\n{rec}"
+        )
+        assert str(bad) not in rec, (
+            f"started Claude pointed at the directory that could not be created:\n{rec}"
+        )
 
     def test_injects_permission_flag_tmpdirs_and_capture(self, tmp_path):
         text = Path(_BOOTSTRAP).read_text()

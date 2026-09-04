@@ -254,79 +254,75 @@ verified: 1aedb682 2026-09-03
   argument**, so the launch command never runs. A slot alive but sitting at a
   bare shell was therefore permanently stuck — every later connection landed at
   that prompt while the door reported success. It now probes for a live claude
-  and types the canonical launch line into the pane when there is none.
+  and REBUILDS the pane when there is none — with the operator's explicit
+  consent, never on its own judgement.
   The probe is `cc/slot_liveness.py`, and it does NOT read
   `#{pane_current_command}`: that reports `bash` for the canonical
   `bash -c "… claude …; trailer"` pane WHILE claude runs (the launcher dropped
   `exec` so the exit-capture trailer can fire, so without job control tmux
   resolves the tty's foreground group to the shell). Keying on it would classify
-  healthy slots as broken and type into a live session. It walks `/proc`
-  ancestry from each pane pid instead — `comm` or `argv[0]`, excluding headless
-  `claude -p` — and is deliberately biased toward reporting ALIVE, since a false
-  ALIVE costs a plain attach while a false POISONED types into a running TUI.
-  Only an explicit POISONED heals; UNKNOWN, a broken venv, a timeout or an empty
-  read all attach — and a walk that ends INCONCLUSIVELY (hop bound hit, stat
-  unreadable mid-chain) answers UNKNOWN, never POISONED. A POISONED verdict
-  still only ever earns an attempt: immediately before any keystroke the door
-  re-reads the pane list FRESH (the OAuth gate allows up to 30s between
-  decision and action) and requires BOTH a shell foreground name and a
-  childless pane process (`slot_liveness --idle`). **Gate ORDER is load-bearing
-  and deliberate**: the idleness probe runs LAST, immediately before the first
-  keystroke, because it answers the DESTRUCTIVE question (the first key is a
-  `C-c`, which kills a running foreground job) and so its verdict must be the
-  freshest taken; the liveness re-check runs before it, and a claude that
-  starts in between is caught by idleness as a child of the pane shell. Manual
-  mode's printed slot map annotates a session running no claude and says
-  plainly that `tmux attach` will not relaunch it — manual allocation never
-  takes over an existing session, so only that slot's own door heals it — an idle prompt has no
-  children, while `bash script.sh`, an editor, or rsync all do, and
-  `send-keys C-c` would kill them. The pane command is built ONCE (`_PANE_CMD`)
-  and shared by the create and heal paths, so a healed slot cannot drift into a
-  claude without the OAuth prefix, permission flag or exit-capture trailer.
-  **The heal ACTION is `tmux respawn-pane -k`, not typed keystrokes, and the
-  reason is structural rather than cosmetic.** A typed ladder (C-c, C-u, type,
-  Enter) has to re-create by hand everything `new-session` provides, which is
-  an open-ended obligation: review found four separate members of it across
-  three rounds — the OAuth token, the environment, TMPDIR, the capacity gate —
-  each fixed one at a time while the next waited. `respawn-pane` runs the
-  command from the tmux SERVER's environment exactly as `new-session` does, so
-  the two paths share one execution context instead of one hand-maintained
-  imitation of it, and the class is closed rather than sampled. What remains
-  inheritable is pinned: `PATH` joined `_PANE_ENV` for precisely this reason,
-  since the server's value is right only by luck of who started it. Session env
-  is set with `tmux set-environment` BEFORE the respawn (the command reads it
-  at exec) and a failed set stands the heal down rather than relaunching with
-  stale values. The respawn's exit status IS the delivery check — no inferring
-  whether a keystroke landed — and a failure is reported instead of claimed.
-  `-k` kills the pane's process GROUP, which is strictly more destructive than
-  the C-c it replaced, so every gate above is load-bearing and the shell-name
-  whitelist most of all: its job is now "never `-k` a non-shell". Accepted and
-  stated: the respawn destroys the pane's VISIBLE screen (scrollback survives),
-  which for a slot sitting at a bare prompt is close to nothing, and the exit
-  capture already holds the dying session's tail. The door still closes its
-  per-slot lock fd before the client `exec` (an inherited fd would hold the
-  flock for the whole session).
-  Two further gates, both added because child-presence and session-count each
-  answer a NARROWER question than they appear to. (1) A session with another
-  client ATTACHED is never typed into: child-presence cannot see shell-NATIVE
-  work — `source deploy.sh`, a `read` awaiting input, a loop of builtins all
-  run inside the pane's own shell, spawn nothing, and report `bash`, so the
-  idleness probe calls them IDLE. Attachment is a closed-set fact rather than
-  another heuristic, and the door heals BEFORE it attaches, so a non-zero count
-  means somebody else is already there. An unreadable count spares the session,
-  like every other gate here. Accepted cost, stated rather than hidden: a
-  poisoned slot held open in a second window will not self-heal until that
-  window closes — a stall, where interrupting a deploy would be damage. (2) The
-  heal consults the CAPACITY gate, because it is create-like for MEMORY and not
-  only for the OAuth gate. The attach bypass is justified for an attach — it
-  adds no session, so the footprint is already counted — and that reasoning does
-  NOT carry to a heal, which STARTS a claude on a swapless box. It asks about
-  `existing - 1` (clamped at zero): for a create the count excludes the session
-  about to be made, so the raw count would judge a heal one session busier than
-  the create it models, and AT the cap a poisoned slot could then never be
-  healed — stranding the operator on the one slot that is broken. Only an
-  explicit DENY stands the heal down, and it never exits: the operator still
-  gets their shell, exactly as before the feature existed.
+  healthy slots as broken and destroy a live session. It walks `/proc` for a
+  claude descending from any pane pid instead.
+  Only an explicit POISONED reaches the prompt; UNKNOWN, a broken venv, a
+  timeout or an empty read all attach untouched — the pre-existing behaviour,
+  which costs nothing.
+
+  **The destructive decision belongs to the OPERATOR, and that is the design,
+  not a fallback.** `tmux respawn-pane -k` kills the pane's process GROUP, so
+  the door must know whether anyone is using that pane. Four review rounds
+  produced eight findings trying to INFER that — an idleness probe, an
+  attachment gate, a capacity gate, freshness re-reads — and each round found
+  the previous round's gate incomplete. The question is undecidable from
+  outside the pane: `source deploy.sh`, a loop of builtins and a bare idle
+  prompt all spawn no child, burn no distinguishing CPU, and share the shell's
+  own foreground process group. The sharpest evidence that stacking gates was
+  the wrong answer is MEASURED: the capacity gate added in round 3 tested only
+  for `DENY`, but `session_cap.decide()` returns ALLOW or RECLAIM for an
+  operator and never DENY, so on the SSH path it was unreachable code that had
+  reviewed clean twice.
+  So the door asks. It prints the slot, what the pane is currently running and
+  that rebuilding ends whatever is in it, then reads `[y/N]` from `/dev/tty` —
+  the same shape, tty handling and default-deny as the ATTACHED confirm in
+  `_cap_reclaim`, which is the settled pattern for "destructive, ask first" in
+  this script. Anything but an explicit yes attaches untouched.
+  With no CONTROLLING TERMINAL — a genuinely detached background session —
+  the door never destroys a pane: it reports what it saw and names the manual
+  repair.
+  Capacity is consulted BEFORE the prompt, because it is the one question the
+  person at the keyboard cannot answer: they can see whether the pane is in
+  use, not whether a swapless box can afford another process. MEASURED, and
+  stated precisely because an earlier draft of this entry got it wrong: the
+  ONLY entrance that reaches the rebuild is the SSH slot door, where
+  `session_cap.decide()` can return ALLOW or RECLAIM but never DENY. The
+  dashboard terminal does not reach it — it enters via `cc-slot.sh manual`,
+  which allocates the first slot whose session does NOT exist, while the
+  rebuild branch requires an existing one. The DENY arm is therefore kept as
+  enumeration rather than as a live path: handling a subset of this gate's
+  outcomes is what made its previous version a no-op. RECLAIM is reachable and
+  live — it surfaces the gate's own wording in the prompt, and its OOM-floor
+  case is refused outright rather than offered as a choice.
+
+  **The heal ACTION is `tmux respawn-pane -k`, not typed keystrokes.** A typed
+  ladder had to RE-CREATE by hand everything `new-session` provides — the OAuth
+  token, the environment, TMPDIR, PATH — an open-ended obligation review found
+  four separate members of. `respawn-pane` runs the command from the tmux
+  SERVER's environment exactly as `new-session` does, so create and heal share
+  one execution context instead of one hand-maintained imitation of it. The
+  pane command is built ONCE (`_PANE_ENV` + the single builder) and shared by
+  both paths, so a healed slot cannot drift from a created one. Session
+  environment is set with `tmux set-environment` BEFORE the respawn (the
+  command reads it at exec) and a failed set stands the heal down rather than
+  relaunching with stale values. The respawn's exit status IS the delivery
+  check, and a failure is reported rather than claimed.
+
+  What still guards the action is non-inferential and stays: the pane is
+  re-read under a per-slot flock and must be the one that was probed, and a
+  second liveness probe must still say POISONED — so a slot that came alive
+  while the door was preparing is never rebuilt. Every one of these gates is
+  mutation-verified: breaking it turns a named test RED, with a no-op control
+  proving the harness itself can pass. Accepted and stated: the respawn
+  destroys the pane's VISIBLE screen (scrollback survives), and a heal is
+  create-like for the OAuth gate, which therefore runs.
 
 - **Cross-session awareness — how concurrent CC sessions perceive each other.**
   LIVE. Two DISTINCT stores answer two different questions, and conflating them

@@ -16,12 +16,10 @@ import pytest
 
 from genesis.cc.slot_liveness import (
     ALIVE,
-    BUSY,
-    IDLE,
     POISONED,
     UNKNOWN,
-    idleness,
     liveness,
+    main,
 )
 
 
@@ -243,49 +241,43 @@ class TestInconclusiveWalksSpare:
         assert liveness([2200], proc) == POISONED
 
 
-class TestIdleness:
-    """`idleness()`'s question is "is it SAFE TO TYPE here": the pane process
-    must be sitting at a prompt with no running job. Only IDLE permits
-    keystrokes; every ambiguity answers BUSY/UNKNOWN and costs a plain attach."""
+class TestCliEntryPoint:
+    """`main()` is what the door actually calls, and it had no tests at all.
 
-    def test_shell_with_no_children_is_idle(self, proc):
-        _mkproc(proc, 3000, "bash", 1)
-        assert idleness(3000, proc) == IDLE
+    The door parses line 1 as the verdict and treats anything unexpected as
+    "no verdict"; a crash here must therefore never propagate, because the
+    caller would be left without an answer at the exact moment it is deciding
+    whether to destroy a pane.
+    """
 
-    def test_shell_with_a_foreground_child_is_busy(self, proc):
-        # `bash script.sh`, rsync, vim — anything running is a child of the
-        # pane shell, and C-c would kill it.
-        _mkproc(proc, 3100, "bash", 1)
-        _mkproc(proc, 3101, "rsync", 3100, ["rsync", "-a", "x", "y"])
-        assert idleness(3100, proc) == BUSY
+    def test_no_pids_is_unknown_never_poisoned(self, capsys):
+        """The sparing direction, and the one that matters most.
 
-    def test_child_named_like_a_shell_is_still_busy(self, proc):
-        # The pane_current_command whitelist reads `bash script.sh` as "bash";
-        # child-presence is the signal that catches it.
-        _mkproc(proc, 3200, "bash", 1)
-        _mkproc(proc, 3201, "bash", 3200, ["bash", "script.sh"])
-        assert idleness(3200, proc) == BUSY
+        POISONED with no pids would authorise a rebuild on an empty read.
+        """
+        assert main([]) == 0
+        assert capsys.readouterr().out.splitlines()[0] == UNKNOWN
 
-    def test_missing_pane_process_is_unknown(self, proc):
-        proc.mkdir(parents=True, exist_ok=True)
-        assert idleness(4242, proc) == UNKNOWN
+    def test_non_numeric_arguments_are_ignored(self, capsys):
+        """Argument handling changed when `--idle` was removed: a leading flag
+        is no longer a mode, it is simply not a pid. It must be dropped, not
+        parsed as one — `int("--idle")` would raise, and the except-clause
+        would mask a real verdict as UNKNOWN.
+        """
+        assert main(["--idle", "not-a-pid", ""]) == 0
+        assert capsys.readouterr().out.splitlines()[0] == UNKNOWN
 
-    def test_unenumerable_proc_is_unknown(self, tmp_path):
-        assert idleness(1, tmp_path / "no-such-proc") == UNKNOWN
+    def test_a_verdict_is_printed_with_its_note(self, capsys):
+        assert main(["1"]) == 0
+        out = capsys.readouterr().out.splitlines()
+        assert out[0] in (ALIVE, POISONED, UNKNOWN)
+        assert out[1], "every verdict must carry a human note on line 2"
 
-    def test_vanished_sibling_does_not_block_idle(self, proc):
-        # Processes exit between the directory listing and the stat read all
-        # the time. A vanished entry (dir present, stat gone — the shape a
-        # mid-read exit leaves) cannot be a LIVE child of the pane, so it must
-        # not withhold IDLE or busy boxes would never heal.
-        _mkproc(proc, 3300, "bash", 1)
-        (proc / "3301").mkdir()  # digit-named, but its stat never materialises
-        assert idleness(3300, proc) == IDLE
-
-    def test_unparseable_sibling_stat_is_unknown(self, proc):
-        # A stat we can read but not parse might BE the pane's child; typing
-        # over it is the expensive error, so withhold the IDLE verdict.
-        _mkproc(proc, 3400, "bash", 1)
-        d = _mkproc(proc, 3401, "mystery", 999)
-        (d / "stat").write_text("garbage without parens\n")
-        assert idleness(3400, proc) == UNKNOWN
+    def test_an_internal_error_still_answers(self, capsys, monkeypatch):
+        """The caller must never be left without a verdict."""
+        monkeypatch.setattr(
+            "genesis.cc.slot_liveness.liveness",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        assert main(["1"]) == 0
+        assert capsys.readouterr().out.splitlines()[0] == UNKNOWN

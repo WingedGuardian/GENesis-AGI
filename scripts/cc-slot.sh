@@ -47,9 +47,9 @@ MODE_ARG="$1"
 shift
 # Verdict for a slot: ALIVE | POISONED | UNKNOWN (empty on any failure). ONE
 # definition, and every consumer shares it so they can never drift into
-# disagreeing: the manual-mode slot map, the heal decision, the RE-CHECK, and
-# the `--idle` safe-to-type question that is the LAST gate before typing —
-# the re-check is deliberately no longer the final one. Defined
+# disagreeing: the manual-mode slot map, the heal decision, and the RE-CHECK
+# taken under the lock. There is no longer a `--idle` companion question: the
+# safe-to-destroy decision is the operator's, taken at the confirm. Defined
 # here — above the manual-mode map that is its first caller — because bash
 # resolves a function only once its definition has RUN; GENESIS_ROOT is set
 # just above. An unavailable probe prints nothing, and every caller treats
@@ -421,6 +421,7 @@ existing=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
 _SESSION_EXISTS=0
 _HEAL=0
 _HEAL_PANE=""
+_cap_warn=""
 if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
     _SESSION_EXISTS=1  # bypass the CAP gate: attaching adds no session, so the
                        # slot's RAM footprint is already counted. It no longer
@@ -461,83 +462,30 @@ if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
             %[0-9]*) ;;
             *) _first_pane="" ;;
         esac
-        # Nobody may be sitting at this shell. Child-presence answers "is a
-        # PROCESS running here" and cannot see shell-NATIVE work: `source
-        # deploy.sh`, a `read` waiting on input, a loop of builtins — all run
-        # inside the pane's own shell, spawn no child, and report `bash`. The
-        # probe calls that IDLE and the door would then C-c a human's task.
+        # DETECTION ONLY. Whether anyone is USING this pane is asked of the
+        # operator at the point of action (see the confirm before the respawn),
+        # never inferred here.
         #
-        # Attachment is a CLOSED-SET fact rather than another heuristic, and it
-        # is the right question: is anyone there. The door heals BEFORE it
-        # attaches, so at this moment a non-zero count means some OTHER client
-        # is already in the session — a person who may be mid-keystroke.
-        # Accepted cost, stated rather than hidden: a poisoned slot held open
-        # in a second window will not self-heal until that window closes. That
-        # is a stall; interrupting someone's deploy is damage.
-        # MEASURED on tmux 3.4, and getting it wrong disables the feature
-        # rather than weakening it: `display-message -p -t <session>
-        # '#{session_attached}'` renders EMPTY (the variable is not populated in
-        # that context, and even `#{?session_attached,1,0}` answers 0 for an
-        # attached session). An empty answer is treated as ATTACHED below, so
-        # the wrong query refuses EVERY heal. It IS populated per row in a
-        # session-LIST context, so ask there.
-        _attached=$(tmux list-sessions -F '#{session_name} #{session_attached}' 2>/dev/null \
-            | awk -v n="$SESSION_NAME" '$1==n{print $2}')
-        # Fail toward SPARING, like every other gate here: only an affirmative
-        # "nobody is attached" permits keystrokes. Coercing an empty or
-        # non-numeric answer to 0 would read a BROKEN query as "nobody there"
-        # and type anyway — caught by test, which asked an unreadable count to
-        # spare the session and watched it heal instead.
-        case "$_attached" in
-            ''|*[!0-9]*) _attached=1 ;;
-        esac
-        if [ "$_live_out" = "POISONED" ] && [ -n "$_first_pane" ] && [ "$_attached" -gt 0 ]; then
-            echo "cc-slot: slot ${SLOT} is running no claude, but another client is attached — not typing into a session someone may be using." >&2
-            echo "cc-slot: close the other window and reconnect to relaunch it." >&2
-        fi
-        if [ "$_live_out" = "POISONED" ] && [ -n "$_first_pane" ] && [ "$_attached" -eq 0 ]; then
+        # It was inferred here, across four review rounds and eight findings —
+        # idleness, attachment, capacity, freshness — and each round found the
+        # previous round's gate incomplete. That is not carelessness; the
+        # question is UNDECIDABLE from outside the pane. `source deploy.sh`, a
+        # loop of builtins and a bare idle prompt all spawn no child, burn no
+        # distinguishing CPU, and share the shell's own foreground process
+        # group. There is no signal left to read.
+        #
+        # MEASURED, and the sharpest evidence that stacking gates was the wrong
+        # answer: the capacity gate added in round 3 tested only for `DENY`,
+        # but `session_cap.decide()` returns ALLOW or RECLAIM for an operator
+        # and never DENY (src/genesis/cc/session_cap.py). On the SSH path the
+        # gate could not fire at all — a guard that reviewed clean twice and
+        # was dead code the whole time.
+        #
+        # A person at an SSH prompt can see their own pane. Asking them is not
+        # a weaker answer than the heuristics; it is the only correct one.
+        if [ "$_live_out" = "POISONED" ] && [ -n "$_first_pane" ]; then
             _HEAL=1
             _HEAL_PANE="$_first_pane"
-            # A heal is create-like for MEMORY, not just for the OAuth gate.
-            # The bypass above is justified for an ATTACH — it adds no session,
-            # so the slot's footprint is already counted. That reasoning does
-            # NOT carry to a heal: this slot is poisoned precisely because no
-            # claude is running in it, so healing STARTS one. On a swapless box
-            # that is a real allocation, and the capacity gate exists to decide
-            # whether the box can take it.
-            #
-            # `--existing $((existing - 1))` and not `$existing`: for a CREATE
-            # the count excludes the session about to be made, so passing the
-            # raw count would judge a heal one session busier than the create
-            # it is modelled on — and at the cap that means a poisoned slot can
-            # NEVER be healed, stranding the operator on the one slot that is
-            # broken. Excluding this slot asks the question the gate is for:
-            # "may one more claude start right now", given this one is not
-            # currently running.
-            #
-            # ONLY an explicit DENY stands the heal down, and it never exits:
-            # the operator still gets their shell, exactly as before this
-            # feature existed. A gate that is unavailable, slow or unparseable
-            # heals — same fail-open direction the create path takes, for the
-            # same reason (an unreachable gate must not become an outage).
-            _heal_cap_py="${GENESIS_ROOT}/.venv/bin/python"
-            if [ -x "$_heal_cap_py" ]; then
-                # Clamped: `existing` is a counted value and nothing
-                # guarantees it is >= 1 here (a listing that raced the session
-                # into being, or a count that excludes it). A negative would
-                # reach the gate as a nonsense population — caught by test,
-                # which asked for `--existing 0` and got `-1`.
-                _heal_existing=$(( existing > 0 ? existing - 1 : 0 ))
-                _heal_cap_out=$(timeout 15 "$_heal_cap_py" \
-                    -m genesis.cc.session_cap --existing "$_heal_existing" \
-                    2>/dev/null || true)
-                if [ "$(printf '%s\n' "$_heal_cap_out" | sed -n '1p')" = "DENY" ]; then
-                    _HEAL=0
-                    _HEAL_PANE=""
-                    echo "cc-slot: slot ${SLOT} has no claude running, but the capacity gate declined to start one: $(printf '%s\n' "$_heal_cap_out" | sed -n '2p')" >&2
-                    echo "cc-slot: attaching to the slot's shell instead — free a slot and reconnect to relaunch." >&2
-                fi
-            fi
         fi
     fi
 else
@@ -726,19 +674,19 @@ for _kv in "${_PANE_ENV[@]}"; do
     _PANE_ENV_FLAGS+=(-e "$_kv")
 done
 
-if [ "$_HEAL" = "1" ]; then
-    # SERIALIZE per slot. Every door converges here, so two of them (the
-    # dashboard web terminal and an SSH login, or an SSH retry) can hold the
-    # same POISONED verdict concurrently, both heal, and the second one type
-    # into the claude the first just started. A read cannot claim; this can.
-    # Best-effort: a missing flock or an unwritable lock path must not stop a
-    # legitimate heal.
-    # NOTE the shape: `exec` applies its redirections to the SHELL, so a
-    # `2>/dev/null` on the exec line would silence this script's stderr for the
-    # REST OF THE RUN — every later notice, including the heal message, would
-    # vanish while the heal itself still happened. Probe writability with an
-    # ordinary command first (safe to silence), and exec only once it is known
-    # to succeed.
+# SERIALIZE per slot, around the DESTRUCTIVE ACTION ONLY — never around the
+# prompt. Two doors can hold the same POISONED verdict concurrently (an SSH
+# login and the dashboard terminal, or an SSH retry) and both try to rebuild.
+# MEASURED cost of getting the scope wrong: with the confirm inside the lock a
+# second door sat silent for the full `flock -w 45` while the first waited on a
+# human, and past that timeout the `|| true` drops serialization entirely so
+# BOTH could respawn. The lock now spans only re-validate-and-respawn, which is
+# bounded by probe timeouts.
+# NOTE the shape: `exec` applies its redirections to the SHELL, so a
+# `2>/dev/null` on the exec line would silence this script's stderr for the
+# REST OF THE RUN. Probe writability with an ordinary command first (safe to
+# silence), and exec only once it is known to succeed.
+_acquire_heal_lock() {
     _lock="${HOME}/.genesis/cc-slot-heal-${SLOT}.lock"
     _LOCK_HELD=0
     if command -v flock >/dev/null 2>&1 \
@@ -748,92 +696,206 @@ if [ "$_HEAL" = "1" ]; then
         _LOCK_HELD=1
         flock -w 45 9 2>/dev/null || true
     fi
+}
 
-    # FRESH pane state — everything below reads CURRENT reality, not the
-    # snapshot the heal was DECIDED on. The OAuth gate is allowed up to 30s
-    # between decision and keystrokes, ample for the operator to have started
-    # vim in the pane (or killed the window); a gate that consults the old
-    # snapshot approves typing into a pane it never looked at.
+# Re-read the pane and re-confirm POISONED from CURRENT reality. Called TWICE
+# BY DESIGN: once to build an honest disclosure for the prompt, and again under
+# the lock immediately before the respawn.
+#
+# The SECOND call is the load-bearing one. An operator takes unbounded time at
+# a prompt, and in that time they can attach from another terminal and start
+# claude by hand — precisely what the bootstrap in-tmux branch exists for. A
+# verdict taken BEFORE the prompt and acted on AFTER it is the same
+# decision-time/action-time defect this door has already shipped twice; moving
+# the decision to a human does not retire that defect, it lengthens its window.
+_revalidate_heal() {
     _panes_now=$(tmux list-panes -s -t "=$SESSION_NAME" \
         -F '#{pane_id} #{pane_pid} #{pane_current_command}' 2>/dev/null || true)
     _fresh_row=$(printf '%s\n' "$_panes_now" | head -1)
     _fresh_pane=${_fresh_row%% *}
-    _fresh_pid=$(printf '%s\n' "$_fresh_row" | cut -d' ' -f2)
     # Full remainder after id+pid, NOT field 3: a process name containing a
-    # space ("bash x") must not pass the whitelist on its first token. A row
-    # with no third field leaves the whole row here, which no shell name
-    # matches — the sparing direction.
+    # space must not be truncated in the sentence the operator reads.
     _fresh_cmd=${_fresh_row#* * }
     _pane_pids_now=$(printf '%s\n' "$_panes_now" | cut -d' ' -f2 | tr '\n' ' ')
     if [ -z "$_panes_now" ] || [ "$_fresh_pane" != "$_HEAL_PANE" ]; then
-        # Gone, or the first window's pane is no longer the one we probed —
-        # whatever sits there now was never blessed by any verdict.
         echo "cc-slot: ${SESSION_NAME}'s pane changed while preparing — attaching instead." >&2
         _HEAL=0
+        return 0
     fi
-fi
-
-if [ "$_HEAL" = "1" ]; then
-    # SAFETY GATE — asked BEFORE any keystroke, including the C-c.
-    # The liveness probe answers "is claude running here"; it does NOT answer
-    # "is it safe to type here". MEASURED: send-keys C-c KILLS a running
-    # foreground job, so a pane with no claude but an active build, ssh session
-    # or editor must be left strictly alone.
-    #
-    # Two complementary signals, each covering the other's blind spot; BOTH
-    # must approve. `#{pane_current_command}` catches a pane whose process is
-    # not a shell at all (an exec'd vim has no children and would pass the
-    # child check). Child-presence catches a busy SHELL: `bash script.sh`,
-    # rsync, an editor — all children of the pane process, all reported merely
-    # as their leader's name here. Error directions stay harmless: a false
-    # "bash"/IDLE only ever permits a heal the liveness probe already blessed
-    # twice, and a false BUSY only ever suppresses one.
-    # No fish: the typed payload (`export K=V;`, `__ec=$?`) is POSIX and a
-    # parse error there — a fish pane gets a plain attach instead of a broken
-    # relaunch. dash/ksh/zsh parse it fine.
-    case "$_fresh_cmd" in
-        bash | -bash | sh | -sh | zsh | -zsh | dash | ksh) ;;
-        *)
-            echo "cc-slot: ${SESSION_NAME} has no claude, but its pane is running '${_fresh_cmd}' — attaching without touching it." >&2
-            _HEAL=0
-            ;;
-    esac
-fi
-
-if [ "$_HEAL" = "1" ]; then
-    # RE-CHECK liveness against the FRESH pane pids. Typing into a live Claude Code TUI is the one failure this
-    # whole change must never cause, so the verdict is confirmed HERE, and
-    # anything other than a still-POISONED answer stands down. (This also
-    # closes the released-lock race: a second door serialized behind the flock
-    # re-runs these gates and finds the first door's claude as a fresh child.
-    # ACCEPTED RESIDUAL: a few ms between door 1's Enter and its bash forking
-    # claude, versus door 2's ~100ms of python probe spawns — both probes
-    # landing inside that window needs scheduler starvation of the pane shell;
-    # not closable without tmux-side atomicity.)
-    _recheck=$(_probe_liveness $_pane_pids_now)
-    if [ "$_recheck" != "POISONED" ]; then
+    if [ "$(_probe_liveness $_pane_pids_now)" != "POISONED" ]; then
         echo "cc-slot: ${SESSION_NAME} came alive while preparing — attaching instead." >&2
         _HEAL=0
     fi
+}
+
+if [ "$_HEAL" = "1" ]; then
+    _revalidate_heal
 fi
 
 if [ "$_HEAL" = "1" ]; then
-    # IDLENESS IS THE LAST GATE, and that position is the whole point: it is
-    # the DESTRUCTIVE question ("may I type here", and the first keystroke is a
-    # C-c that kills a running foreground job), so its answer must be the
-    # freshest one taken. Asked before the liveness re-probe it went stale by
-    # that probe's whole timeout (up to 15s) — long enough for the operator to
-    # start a build in the pane and have it interrupted. Same stale-verdict
-    # defect as reading the pane snapshot, one gate further in.
-    _idle=$(_probe_liveness --idle "$_fresh_pid")
-    if [ "$_idle" != "IDLE" ]; then
-        if [ "$_idle" = "BUSY" ]; then
-            echo "cc-slot: ${SESSION_NAME} has no claude, but its shell is mid-job — attaching without touching it." >&2
-        else
-            echo "cc-slot: ${SESSION_NAME} has no claude, but its idleness could not be established — attaching without touching it." >&2
-        fi
-        _HEAL=0
+    # CAPACITY — restored, and this time over the WHOLE outcome space.
+    #
+    # A human cannot answer this. They are asked "is this pane in use?", which
+    # they can see; they are NOT asked "can a swapless box afford another
+    # ~3GB?", which they cannot. So capacity is consulted before the prompt.
+    #
+    # WHICH ARMS ARE REACHABLE — stated honestly, because an earlier version of
+    # this comment got it wrong in a way that then propagated into the
+    # subsystem map. MEASURED: `session_cap.decide()` returns DENY only for a
+    # NON-OPERATOR origin (it keys on SSH_CONNECTION). The only entrance that
+    # reaches this code is the SSH slot door, where the origin is always
+    # lan/tailscale, so ALLOW and RECLAIM are the reachable answers and
+    # **DENY is not reachable today**. The dashboard terminal does NOT reach
+    # here despite having a pty: it enters through `cc-slot.sh manual`, which
+    # allocates the first slot whose `has-session` FAILS, while this whole
+    # branch requires that session to EXIST.
+    # The DENY arm is kept anyway, and deliberately: handling a SUBSET of a
+    # gate's outcome space is the exact defect that made the previous version
+    # of this gate a no-op, and a future non-operator entrance onto an existing
+    # slot must not rebuild past a denial. It is enumeration, not dead weight.
+    #
+    # ALLOW, an unavailable gate or an unparseable answer all proceed — the
+    # same fail-open direction the create path takes.
+    #
+    # `--existing $((existing - 1))`: for a CREATE the count excludes the
+    # session about to be made, so the raw count would judge a rebuild one
+    # session busier than the create it is modelled on — and at the cap that
+    # makes a poisoned slot permanently unrebuildable, stranding the operator
+    # on the one slot that is broken.
+    _heal_cap_py="${GENESIS_ROOT}/.venv/bin/python"
+    if [ -x "$_heal_cap_py" ]; then
+        _heal_existing=$(( existing > 0 ? existing - 1 : 0 ))
+        _heal_cap_out=$(timeout 15 "$_heal_cap_py" \
+            -m genesis.cc.session_cap --existing "$_heal_existing" 2>/dev/null || true)
+        case "$(printf '%s\n' "$_heal_cap_out" | sed -n '1p')" in
+            DENY)
+                _HEAL=0
+                echo "cc-slot: ${SESSION_NAME} has no claude running, but the capacity gate declined to start one: $(printf '%s\n' "$_heal_cap_out" | sed -n '2p')" >&2
+                echo "cc-slot: attaching to the slot's shell instead — free a slot and reconnect to rebuild." >&2
+                ;;
+            RECLAIM)
+                # RECLAIM covers TWO different situations (session_cap.py):
+                # `cap_full` — full, but sessions could be traded — and
+                # `oom_floor` — RAM genuinely below the safety floor. Inventing
+                # one sentence for both told the OOM case the wrong thing, and
+                # that is precisely the case where an uninformed yes hurts. So
+                # the gate's OWN message is surfaced verbatim, and the OOM
+                # floor is not offered as a choice at all: the create path
+                # refuses there when there is nothing to trade, and starting a
+                # process on a swapless box below its floor risks an OOM that
+                # takes down every session, not just this one.
+                _cap_reason=$(printf '%s\n' "$_heal_cap_out" | sed -n '3p')
+                if [ "$_cap_reason" = "oom_floor" ]; then
+                    _HEAL=0
+                    echo "cc-slot: ${SESSION_NAME} has no claude running, but $(printf '%s\n' "$_heal_cap_out" | sed -n '2p')" >&2
+                    echo "cc-slot: attaching to the slot's shell instead — free memory and reconnect to rebuild." >&2
+                else
+                    _cap_warn="   NOTE: $(printf '%s\n' "$_heal_cap_out" | sed -n '2p')"
+                fi
+                ;;
+        esac
     fi
+fi
+
+if [ "$_HEAL" = "1" ]; then
+    # THE DESTRUCTIVE DECISION BELONGS TO THE OPERATOR, and this is the only
+    # gate on it. `respawn-pane -k` kills the pane's process GROUP, so whatever
+    # lives in that pane is gone — precisely the question no probe can answer
+    # from outside it (see the note at the detection site above). The person at
+    # this prompt can look at the pane. They are asked, and the default is no.
+    #
+    # Shape, tty handling and default-deny mirror `_cap_reclaim`'s ATTACHED
+    # confirm earlier in this script: the same "destructive, ask first" case,
+    # already the settled pattern here rather than a new one invented for this.
+    #
+    # ONE guard, and it is the question that matters: can this process reach a
+    # controlling terminal. A `-t 0` test was here too and was WRONG in both
+    # directions — it refused a caller whose stdin was merely redirected while
+    # a human sat at the tty (the very case the /dev/tty read exists for), and
+    # it made that read unreachable in exactly that case. Opening /dev/tty
+    # fails without a controlling terminal, which is what a daemon or a
+    # detached background process actually is.
+    #
+    # Read from /dev/tty, never stdin: a caller may redirect stdin, and the
+    # prompt must not silently consume something else's input as an answer.
+    # The redirection is probed inside a SUBSHELL whose stderr is discarded.
+    # `: >/dev/tty 2>/dev/null` does NOT work: the redirection is performed by
+    # the shell BEFORE the command runs, so its failure message goes to the
+    # shell's stderr, not the command's — MEASURED end-to-end, every
+    # terminal-less entrance printed
+    # "cc-slot.sh: line N: /dev/tty: No such device or address"
+    # above the door's own explanation. Only a real run surfaced it; the test
+    # fakes never had a missing /dev/tty to fail on.
+    if ! ( : >/dev/tty ) 2>/dev/null; then
+        # No controlling terminal, so nobody can be asked: report what was
+        # seen and the command that fixes it, then attach.
+        # WHICH entrances land here, precisely — an earlier version of this
+        # comment said "background or dashboard" and the dashboard half was
+        # WRONG. MEASURED: the dashboard terminal spawns its shell under a pty
+        # (dashboard/terminal_session.py), so it HAS a controlling terminal and
+        # takes the prompt branch, not this one. What lands here is a genuinely
+        # detached process — a background CC session, whose subprocesses have
+        # no ctty at all. That distinction is load-bearing: the dashboard is a
+        # NON-operator origin, so it is the one entrance where the capacity
+        # gate above can return DENY, and it still reaches the respawn.
+        echo "cc-slot: ${SESSION_NAME} has no claude running (pane is running '${_fresh_cmd}')." >&2
+        echo "cc-slot: no terminal here to confirm a rebuild — attaching as-is." >&2
+        echo "cc-slot: to rebuild it: tmux kill-session -t ${SESSION_NAME}, then reconnect." >&2
+        _HEAL=0
+    else
+        echo "" >&2
+        echo "!  ${SESSION_NAME} has no Claude Code running." >&2
+        echo "   Its pane is currently running '${_fresh_cmd}'." >&2
+        echo "   Rebuilding restarts that pane and ends whatever is in it." >&2
+        if [ -n "$_cap_warn" ]; then
+            echo "$_cap_warn" >&2
+        fi
+        # BOUNDED: an abandoned prompt must not hold the door open forever, so
+        # the read times out and the timeout lands on "" — the default-deny
+        # below then handles it, giving one refusal path rather than several.
+        #
+        # SIGINT is deliberately NOT trapped. Ctrl-C aborts the door, exactly
+        # as cancelling `_cap_reclaim`'s prompt does (`exit 1`), so the two
+        # confirms in this script behave the same way. Trapping it was tried
+        # and is WORSE: bash restarts an interrupted `read`, so the trap fired,
+        # the prompt stayed up, and the door hung for the rest of the timeout —
+        # MEASURED, the operator lost the terminal with no message at all. An
+        # abort at least ends promptly and never rebuilds anything.
+        # What the operator is consenting to, captured so the action can be
+        # checked against it below.
+        _disclosed_cmd="$_fresh_cmd"
+        _heal_confirm=""
+        IFS= read -r -t 120 -p "   Rebuild this slot? [y/N] > " _heal_confirm </dev/tty \
+            || _heal_confirm=""
+        case "$_heal_confirm" in
+            y | Y | yes | YES) ;;
+            *)
+                echo "cc-slot: left as-is — attaching to the slot without rebuilding." >&2
+                _HEAL=0
+                ;;
+        esac
+    fi
+fi
+
+if [ "$_HEAL" = "1" ]; then
+    # The answer is in. NOW take the lock and re-establish from scratch the two
+    # facts the respawn depends on — the pane is still the one that was probed,
+    # and still has no claude in it. Everything above was read before a human
+    # was asked, and a human takes unbounded time.
+    _acquire_heal_lock
+    _revalidate_heal
+fi
+
+if [ "$_HEAL" = "1" ] && [ "${_disclosed_cmd+set}" = "set" ] \
+   && [ "$_fresh_cmd" != "$_disclosed_cmd" ]; then
+    # CONSENT IS FOR A STATE, NOT A SLOT. The operator said yes to destroying
+    # a pane running `$_disclosed_cmd`; the re-validation above just re-read
+    # that pane and it is running something else now. Re-checking only pane
+    # IDENTITY and absence-of-claude would let a yes given for an idle `bash`
+    # destroy the editor started during the same window the prompt's own
+    # timeout allows for.
+    echo "cc-slot: ${SESSION_NAME}'s pane is now running '${_fresh_cmd}', not '${_disclosed_cmd}' as shown — not rebuilding on an answer given for something else." >&2
+    _HEAL=0
 fi
 
 if [ "$_HEAL" = "1" ]; then
@@ -860,10 +922,11 @@ if [ "$_HEAL" = "1" ]; then
     # hand-maintained imitation of it. What remains inheritable (PATH) is
     # pinned in `_PANE_ENV` above.
     #
-    # `-k` kills the pane's existing process, which is STRICTLY more
-    # destructive than the C-c it replaces (a process GROUP, not just the
-    # foreground job). Every gate above is therefore load-bearing, and the
-    # shell-name whitelist most of all: its job is now "never -k a non-shell".
+    # `-k` kills the pane's existing process GROUP. Nothing above infers
+    # whether that is safe any more — the operator was shown what the pane
+    # is running and said yes. What DOES still guard this point is
+    # non-inferential: the pane is the one that was probed, and no claude
+    # has appeared in it since.
     #
     # Session env must be set BEFORE the respawn — the respawned command reads
     # it at exec. A failed set stands the heal down rather than respawning with

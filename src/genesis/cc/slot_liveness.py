@@ -56,10 +56,6 @@ ALIVE = "ALIVE"
 POISONED = "POISONED"
 UNKNOWN = "UNKNOWN"
 
-# Idleness verdicts (`--idle`): "is it SAFE TO TYPE here", the second question
-# the door asks after liveness says POISONED. Only IDLE permits keystrokes.
-IDLE = "IDLE"
-BUSY = "BUSY"
 
 # A pane shell -> claude is one hop; a hand-typed `bash` in between makes two.
 # The bound only stops a cycle in a malformed /proc from spinning.
@@ -197,55 +193,6 @@ def _walk_verdict(proc_root: Path, pid: int, targets: set[int]) -> str:
         cur, hops = parent, hops + 1
 
 
-def idleness(pane_pid: int, proc_root: Path = Path("/proc")) -> str:
-    """Is the pane process sitting at a prompt, with no running job?
-
-    Liveness answers "is claude here"; this answers the door's SECOND question
-    before it may type: `send-keys C-c` kills whatever foreground job the pane
-    shell is running, and the shell's NAME cannot tell an idle prompt from
-    `bash script.sh` (both report "bash"). Child-presence can: an idle
-    interactive shell has no children, while every running job — vim, rsync,
-    a nested shell, a build — is a child of the pane process.
-
-    Same fail direction as liveness: only an affirmative IDLE permits
-    keystrokes. A shell that merely holds a BACKGROUND job also reads BUSY —
-    over-sparing, but the cost is a plain attach.
-
-    A sibling entry that vanishes between the listing and the read (dir or
-    stat already gone) cannot be a LIVE child and is skipped; one whose stat
-    is present but unreadable/unparseable might BE the pane's child, so it
-    withholds the IDLE verdict instead.
-    """
-    if pane_pid <= 0:
-        return UNKNOWN
-    if _read(proc_root / str(pane_pid) / "stat") is None:
-        return UNKNOWN  # the pane process itself is not observable
-    try:
-        entries = [p for p in proc_root.iterdir() if p.name.isdigit()]
-    except OSError:
-        return UNKNOWN
-    inconclusive = False
-    for entry in entries:
-        if entry.name == str(pane_pid):
-            continue
-        try:
-            raw = (entry / "stat").read_bytes()
-        except FileNotFoundError:
-            continue  # exited between listing and read — not a live child
-        except OSError:
-            inconclusive = True
-            continue
-        try:
-            after = raw[raw.rindex(b")") + 1 :].split()
-            ppid = int(after[1])
-        except (ValueError, IndexError):
-            inconclusive = True
-            continue
-        if ppid == pane_pid:
-            return BUSY
-    return UNKNOWN if inconclusive else IDLE
-
-
 def main(argv: list[str] | None = None) -> int:
     """Print the verdict on line 1 and a human note on line 2.
 
@@ -256,20 +203,14 @@ def main(argv: list[str] | None = None) -> int:
     """
     args = list(sys.argv[1:] if argv is None else argv)
     try:
-        if args and args[0] == "--idle":
-            rest = [a for a in args[1:] if a.strip().isdigit()]
-            verdict = idleness(int(rest[0])) if rest else UNKNOWN
-        else:
-            pids = [int(p) for p in args if p.strip().isdigit()]
-            verdict = liveness(pids)
+        pids = [int(p) for p in args if p.strip().isdigit()]
+        verdict = liveness(pids)
     except Exception:  # noqa: BLE001 - a crash here must not break the door
         verdict = UNKNOWN
     notes = {
         ALIVE: "an interactive claude is running in this slot",
         POISONED: "no interactive claude is running in this slot",
         UNKNOWN: "could not determine the slot's state; leaving it untouched",
-        IDLE: "the pane shell is at a prompt with no running job",
-        BUSY: "the pane shell is running a job; typing would interrupt it",
     }
     print(verdict)
     print(notes[verdict])

@@ -11,24 +11,30 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
-- **A session slot that lost its Claude Code now recovers itself.** Every
-  interactive entrance — the SSH slot hostnames, manual SSH, the dashboard web
-  terminal — lands on the same persistent tmux slot. If a slot ended up alive but
-  sitting at a plain shell prompt, it stayed that way forever: connecting again
-  simply reattached to that prompt, the launcher never relaunched Claude Code, and
-  the door reported success anyway. That is because attaching to an existing tmux
-  session silently discards the command it was given. The door now checks whether
-  Claude Code is actually running in the slot and relaunches it in place when it
-  is not, telling you it did so. If it cannot tell, it attaches exactly as before
-  — it will never disturb a session that is in use, nor a job the slot's
-  shell is running. The slot list printed by a manual connection now also marks
-  a slot that is running no Claude Code, and says that reattaching to it will
-  not relaunch it: only that slot's own door does. Two things it will not do:
-  relaunch when someone else already has that slot open in another window (it
-  cannot tell a quiet shell from one running a script that spawns nothing, so
-  it declines rather than risk interrupting you), and relaunch when the machine
-  is already at its session limit — recovering a slot starts a real Claude Code
-  process, so it asks the same capacity question opening a new one would.
+- **A session slot that lost its Claude Code can now be rebuilt, and it asks
+  you first.** Every interactive entrance — the SSH slot hostnames, manual SSH,
+  the dashboard web terminal — lands on the same persistent tmux slot. If a slot
+  ended up alive but sitting at a plain shell prompt, it stayed that way
+  forever: connecting again simply reattached to that prompt, the launcher never
+  relaunched Claude Code, and the door reported success anyway. That is because
+  attaching to an existing tmux session silently discards the command it was
+  given. The door now checks whether Claude Code is actually running in the
+  slot; when it is not, it tells you what the slot's pane is currently running,
+  warns that rebuilding ends whatever is in it, and asks. Pressing Enter — or
+  anything other than an explicit yes — attaches the slot untouched. If it
+  cannot tell whether Claude Code is running, it attaches exactly as before. The
+  slot list printed by a manual connection also marks a slot that is running no
+  Claude Code, and says that reattaching to it will not rebuild it: only that
+  slot's own door does. Where there is no terminal to ask — a detached
+  background session — the door never rebuilds anything; it reports what it
+  found and names the one command that fixes it. It also checks first whether
+  the machine can afford another Claude Code process, and says so in the
+  question when the answer is "only by ending something else": that is not a
+  judgement you can make by looking at the slot, so it is not one you are
+  asked to make. Rebuilding is deliberately a
+  decision you make rather than one the launcher makes for you: only the person
+  looking at the slot can know whether the shell sitting in it is idle or is
+  halfway through something that matters.
 - **Launching Claude Code by hand inside a slot no longer produces a degraded
   session.** The `claude` shell wrapper only did its work outside tmux, so running
   `claude` from a slot's prompt skipped the permission mode, the temp directories
