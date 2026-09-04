@@ -192,12 +192,45 @@ def test_non_dict_config_is_ignored(tmp_path):
 
 # --- apply_routing_env: the shared invoker/gmodel routing-env contract ----------
 
-_MODEL_SLOTS = (
-    "ANTHROPIC_MODEL",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-)
+# Bound to the production constant, NOT restated. A hardcoded copy here went
+# stale the moment two slots were added to `_ROSTER_MODEL_ENV_VARS`
+# (ANTHROPIC_DEFAULT_FABLE_MODEL, CLAUDE_CODE_SUBAGENT_MODEL): both tests below
+# iterated the old 4-tuple, so deleting either new slot from production left
+# the whole suite green — zero coverage on the exact mechanism this PR adds
+# them for. A duplicated literal in a test is a silent drift generator; every
+# future slot is now covered the moment it is added.
+_MODEL_SLOTS = R._ROSTER_MODEL_ENV_VARS
+
+
+def test_model_slots_is_the_production_tuple_and_its_contents_are_pinned():
+    """Binding fixes ADD-drift but makes DELETION self-cancelling — pin both.
+
+    `_MODEL_SLOTS = R._ROSTER_MODEL_ENV_VARS` means the loops below shorten
+    with the tuple, so removing a slot from production removes it from the
+    assertions too and every test stays green. Membership checks on two names
+    were not enough: mutation showed the other four are caught only by the
+    surviving hardcoded duplicate in `test_invoker_roster_env.py`, which this
+    file's own comment calls a drift generator — so the obvious tidy-up of
+    deleting that duplicate would silently strip deletion coverage from four
+    slots.
+
+    One explicit set contract, in one place, closes the delete direction. Any
+    change to the slot list is now a deliberate edit here, which is the point.
+    """
+    assert _MODEL_SLOTS is R._ROSTER_MODEL_ENV_VARS
+    assert set(_MODEL_SLOTS) == {
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        # CC 2.1.x routes sub-agents and background tasks through these two; an
+        # unset slot makes a peer endpoint reject with model-not-found.
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+    }
+    # No duplicates — the tuple is iterated to set env vars, and a repeat would
+    # hide a typo'd name behind a correct one.
+    assert len(_MODEL_SLOTS) == len(set(_MODEL_SLOTS))
 
 
 def test_apply_routing_env_peer_sets_all_and_drops_api_key():
@@ -239,3 +272,141 @@ def test_apply_routing_env_auth_token_only_still_drops_api_key():
     R.apply_routing_env(env, base_url=None, auth_token="zk-secret", model_id=None)
     assert "ANTHROPIC_API_KEY" not in env
     assert env["ANTHROPIC_AUTH_TOKEN"] == "zk-secret"
+
+
+def test_shipped_config_ships_no_peers():
+    """DELIVERABLE LOCK: config/cc_roster.yaml ships INFRASTRUCTURE, not peers.
+
+    A peer pins a `model_id`, and model ids go EOL — this file shipped
+    `glm-5.2` past its replacement by `glm-5.3`. A stale pinned peer fails at
+    the one moment it is needed (when the subscription caps) and fails while
+    LOOKING configured, which is worse than an empty roster failing honestly.
+    So peers are declared per-install in ~/.genesis/config/cc_roster.local.yaml.
+
+    Asserts on the SHIPPED FILE directly rather than the merged roster, so
+    neither a developer's real overlay nor the repo-relative fallback can mask
+    a regression. Without this, re-adding a peer to the shipped config would
+    break nothing — every other roster test writes its own synthetic yaml.
+    """
+    import yaml
+
+    from genesis.cc.roster import _CONFIG_DIR, _ROSTER_FILE
+
+    base = yaml.safe_load((_CONFIG_DIR / _ROSTER_FILE).read_text())
+    assert base["default"] == "claude"
+    assert set(base["models"]) == {"claude"}, (
+        "config/cc_roster.yaml must ship no peers — declare them in "
+        "~/.genesis/config/cc_roster.local.yaml. See the file header for why "
+        "(version churn: a stale pinned model_id fails exactly when needed)."
+    )
+    assert base["models"]["claude"].get("native_subscription") is True
+
+
+def test_every_documented_auth_env_has_a_secrets_slot():
+    """CROSS-FILE GUARD: a peer example may not name a key the template lacks.
+
+    Round-2 defect on PR #1606: the shipped China example told users to set
+    `auth_env: ZHIPU_API_KEY` against `/api/anthropic`, while
+    `secrets.env.example` — edited in the SAME change — declared that variable
+    to be the general/prepaid key for a different endpoint. Two files, each
+    internally consistent, contradicting each other. Nothing checked the pair,
+    so a human reviewer had to notice.
+
+    Scans COMMENTED examples too, on purpose: the shipped roster declares no
+    active peers (see test_shipped_config_ships_no_peers), so every auth_env in
+    it lives in a comment — which is exactly where the defect was.
+    """
+    import re
+
+    from genesis.cc.roster import _CONFIG_DIR, _ROSTER_FILE
+
+    roster_text = (_CONFIG_DIR / _ROSTER_FILE).read_text()
+    # Prose mentions a key to warn AGAINST it ("NOT ZHIPU_API_KEY"), so match
+    # only the field form `auth_env: NAME`, commented or not.
+    named = set(re.findall(r"auth_env:\s*([A-Z][A-Z0-9_]+)", roster_text))
+    assert named, "no auth_env examples found — has the example block moved?"
+
+    example = _CONFIG_DIR.parent / "secrets.env.example"
+    declared = set(re.findall(r"^([A-Z][A-Z0-9_]+)=", example.read_text(), re.MULTILINE))
+
+    missing = named - declared
+    assert not missing, (
+        f"config/cc_roster.yaml names auth_env {sorted(missing)}, which "
+        "secrets.env.example does not declare. A user following the example "
+        "would set a variable nothing reads. Add the slot (with its own "
+        "`# Used by:` and `# Signup:` lines) or fix the example."
+    )
+
+    # "Is it declared?" is NOT enough, and verifying-RED proved it: the round-2
+    # defect named ZHIPU_API_KEY, which IS a declared slot — it is simply the
+    # WRONG KIND of key. The real invariant is about the endpoint: every roster
+    # peer reaches its provider over the Anthropic protocol (that is what
+    # `anthropic_base_url` means), and those coding endpoints require a
+    # CODING-PLAN key, never the general/prepaid one. The naming convention
+    # `*_CODING_API_KEY` is what makes that mechanically checkable, and
+    # secrets.env.example documents it.
+    wrong_class = {n for n in named if not n.endswith("_CODING_API_KEY")}
+    assert not wrong_class, (
+        f"config/cc_roster.yaml names auth_env {sorted(wrong_class)} for a peer. "
+        "A roster peer talks to an Anthropic-protocol coding endpoint, which "
+        "needs a CODING-PLAN key (`*_CODING_API_KEY`) — a general/prepaid key "
+        "there returns `1113 Insufficient balance` on a funded account. If a "
+        "provider genuinely uses one key for both, rename the slot so the "
+        "convention still reads true."
+    )
+
+
+def test_shipped_examples_obey_the_key_equals_model_id_rule() -> None:
+    """The shipped file states this rule in prose; nothing enforced it.
+
+    ``config/cc_roster.yaml`` says, at the top of its EXAMPLE PEERS section,
+    "NAME YOUR PEER EXACTLY WHAT ITS ``model_id`` IS", and gives the reason: a
+    peer whose key differs from its model_id never persists its resume endpoint
+    (``endpoint_payload`` looks the NAME up and misses), so session continuity
+    can later target the wrong provider.
+
+    The examples are COMMENTED, so no YAML parse and no schema check ever looks
+    at them — and the Kimi example shipped violating the rule stated four lines
+    above it. A rule that only exists as prose is a rule the next example
+    breaks; this makes it a check instead.
+    """
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[2] / "config" / "cc_roster.yaml"
+    lines = src.read_text(encoding="utf-8").splitlines()
+
+    key_re = re.compile(r"^#\s{4,}([A-Za-z0-9][A-Za-z0-9._-]*):\s*$")
+    mid_re = re.compile(r"^#\s+model_id:\s*(\S+)\s*$")
+
+    pairs: list[tuple[int, str, str | None]] = []
+    for i, line in enumerate(lines):
+        m = key_re.match(line)
+        if not m:
+            continue
+        model_id = None
+        # The block is a handful of commented lines; stop at the first
+        # non-comment or the next example key.
+        for nxt in lines[i + 1 : i + 12]:
+            if not nxt.lstrip().startswith("#") or key_re.match(nxt):
+                break
+            mm = mid_re.match(nxt)
+            if mm:
+                model_id = mm.group(1)
+                break
+        pairs.append((i + 1, m.group(1), model_id))
+
+    assert pairs, (
+        "no commented example peers found — the parser drifted from the file's "
+        "format, so this test is silently checking nothing"
+    )
+    for lineno, key, model_id in pairs:
+        assert model_id is not None, (
+            f"example peer {key!r} at cc_roster.yaml:{lineno} declares no model_id"
+        )
+        assert key == model_id, (
+            f"example peer at cc_roster.yaml:{lineno} has key {key!r} but "
+            f"model_id {model_id!r}. The file's own EXAMPLE PEERS note requires "
+            "them to match: a copied peer whose key differs never persists its "
+            "resume endpoint, so continuity can target the wrong provider."
+        )

@@ -971,6 +971,13 @@ _REVIEW_BOTS = {"chatgpt-codex-connector[bot]", "github-actions[bot]"}
 # 118 merged PRs passed unseen, 64 of them P1).
 _INLINE_P1_RE = re.compile(r"!\[P1 Badge\]")
 _INLINE_P2_RE = re.compile(r"!\[P2 Badge\]")
+# Weighted review score for inline findings: a P1 is a full blocker (1.0), a P2
+# is half (0.5), so the gate blocks at any unresolved P1 OR >= 2 unresolved P2s.
+# Doc-path and maintainer-replied (consciously-accepted) findings are excluded
+# from the score, exactly as for P1s. Fixed policy value that works on any clone —
+# deliberately not per-install configurable.
+_INLINE_P2_SCORE_WEIGHT = 0.5
+_INLINE_SCORE_BLOCK_THRESHOLD = 1.0
 _INLINE_REVIEW_BOTS = {
     "chatgpt-codex-connector[bot]",
     "github-advanced-security[bot]",
@@ -1228,14 +1235,21 @@ def _check_inline_review_findings(
     force: bool = False,
     repo: str | None = None,
 ) -> tuple[bool, str]:
-    """Scan INLINE review comments for P1/P2 badge findings.
+    """Scan INLINE review comments for P1/P2 badge findings and apply a weighted score.
 
-    Returns (should_block, message). P1 findings block unless their thread has a
-    MAINTAINER reply (engagement = a reviewer read it) or the merge carries
-    '# review-override'. P2 findings never block but are printed to stderr one per
-    line — the session must consciously accept them. An UNREADABLE or INCOMPLETE scan
-    (gh error/timeout/malformed/clipped budget) ALWAYS blocks (fail-closed — see
-    ``_scan_unreadable``); '# review-override' is the conscious escape hatch.
+    Returns (should_block, message). Each unresolved finding contributes to a review
+    score — P1 = 1.0, P2 = 0.5 — and the gate blocks when the score >= 1.0 (any P1, OR
+    >= 2 P2s). A finding is EXCLUDED from the score when its thread has a MAINTAINER
+    reply (engagement = consciously accepted) or its path is documentation
+    (``_is_doc_path``). The two exclusions differ in VISIBILITY by design: a doc-path
+    finding was auto-excluded by PATH (not engaged), so it is still SURFACED as a NOTE —
+    scored P2s print as a WARNING, doc-path P1s/P2s as a NOTE — nothing unaddressed is
+    dropped. A maintainer-replied finding was CONSCIOUSLY ENGAGED (the reply IS the
+    acknowledgement), so it is excluded from the report too: the pre-merge report shows
+    what still needs attention, not what a maintainer already handled (re-listing every
+    replied finding on each check would bury the live ones). An UNREADABLE or
+    INCOMPLETE scan (gh error/timeout/malformed/clipped budget) ALWAYS blocks
+    (fail-closed — see ``_scan_unreadable``); '# review-override' waives the whole scan.
     """
     if force:
         return False, ""  # override NOTE already printed by the body gate
@@ -1269,6 +1283,7 @@ def _check_inline_review_findings(
     p1: list[str] = []
     p2: list[str] = []
     doc_skipped: list[str] = []  # P1s on doc paths — surfaced, never blocking
+    doc_skipped_p2: list[str] = []  # P2s on doc paths — surfaced, excluded from score
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
         body = c.get("body") or ""
@@ -1286,6 +1301,16 @@ def _check_inline_review_findings(
                 continue
             p1.append(_inline_title(body))
         elif _INLINE_P2_RE.search(body):
+            if c.get("id") in replied_to:
+                continue  # thread engaged — maintainer consciously accepted the P2
+            if _is_doc_path(c.get("path") or ""):
+                # A P2 on a doc path is not a code defect — excluded from the SCORE, but
+                # still SURFACED as a NOTE (mirroring doc-path P1s). A documentation-
+                # correctness P2 can be substantive, so it must stay visible in the
+                # canonical pre-merge report to be consciously accepted, never silently
+                # dropped (Codex #1589 P2).
+                doc_skipped_p2.append(_inline_title(body))
+                continue
             p2.append(_inline_title(body))
 
     if doc_skipped:
@@ -1297,18 +1322,37 @@ def _check_inline_review_findings(
         )
         for title in doc_skipped[:5]:
             print(f"  [doc P1] {title}", file=sys.stderr)
+    if doc_skipped_p2:
+        print(
+            f"NOTE: PR #{pr_num} — {len(doc_skipped_p2)} inline [P2] finding(s) on "
+            f"documentation paths — surfaced for conscious acceptance, NOT counted "
+            f"toward the review score:",
+            file=sys.stderr,
+        )
+        for title in doc_skipped_p2[:5]:
+            print(f"  [doc P2] {title}", file=sys.stderr)
+    # Weighted review score: P1 = 1.0 (full blocker), P2 = 0.5. Blocks at
+    # score >= threshold — any unresolved P1, OR >= 2 unresolved P2s. Doc-path
+    # and maintainer-replied findings were already excluded from p1/p2 above.
+    score = len(p1) + _INLINE_P2_SCORE_WEIGHT * len(p2)
     if p2:
         print(
-            f"WARNING: PR #{pr_num} has {len(p2)} inline [P2] review "
-            f"finding(s) (not blocking — address or consciously accept):",
+            f"WARNING: PR #{pr_num} has {len(p2)} inline [P2] review finding(s) "
+            f"(each adds {_INLINE_P2_SCORE_WEIGHT} to the review score; the gate "
+            f"blocks at score >= {_INLINE_SCORE_BLOCK_THRESHOLD:.0f}, i.e. any P1 "
+            f"or {int(_INLINE_SCORE_BLOCK_THRESHOLD / _INLINE_P2_SCORE_WEIGHT)}+ P2s):",
             file=sys.stderr,
         )
         for title in p2[:8]:
             print(f"  [P2] {title}", file=sys.stderr)
-    if p1:
-        listing = "\n".join(f"  [P1] {t}" for t in p1[:5])
+    if score >= _INLINE_SCORE_BLOCK_THRESHOLD:
+        listing = "\n".join(
+            [f"  [P1] {t}" for t in p1[:5]] + [f"  [P2] {t}" for t in p2[:5]]
+        )
         return True, (
-            f"{len(p1)} inline [P1] finding(s) with no reply:\n{listing}\n"
+            f"review score {score:.1f} >= {_INLINE_SCORE_BLOCK_THRESHOLD:.1f} blocks "
+            f"(P1=1.0, P2={_INLINE_P2_SCORE_WEIGHT} each): {len(p1)} unresolved [P1] + "
+            f"{len(p2)} unresolved [P2] finding(s), none maintainer-replied:\n{listing}\n"
             f"Fix and reply in-thread, or append '# review-override' "
             f"to the merge command to acknowledge and proceed."
         )
@@ -5861,7 +5905,8 @@ def main() -> int:
                     return 2
 
                 # Inline review comments (Codex P1/P2 badges) — separate
-                # endpoint, separate check. P1 blocks; P2 warns.
+                # endpoint, separate check. Weighted score: P1=1.0, P2=0.5;
+                # blocks at >= 1.0 (any P1, or 2+ unresolved P2s).
                 should_block, inline_msg = _check_inline_review_findings(
                     pr_num,
                     force=force_override,

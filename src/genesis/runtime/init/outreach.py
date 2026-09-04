@@ -13,21 +13,19 @@ logger = logging.getLogger("genesis.runtime")
 
 
 async def init(rt: GenesisRuntime) -> None:
-    """Initialize outreach pipeline, scheduler, calibration, MCP wiring."""
+    """Initialize outreach pipeline, scheduler, MCP wiring."""
     if rt._db is None:
         logger.warning("Outreach skipped — no DB")
         return
 
     try:
-        from genesis.calibration.curves import CalibrationCurveComputer
-        from genesis.calibration.logger import PredictionLogger
-        from genesis.calibration.reconciler import PredictionReconciler
         from genesis.content.drafter import ContentDrafter
         from genesis.content.formatter import ContentFormatter
         from genesis.mcp.outreach_mcp import init_outreach_mcp
         from genesis.outreach.config import load_outreach_config
         from genesis.outreach.engagement import (
             EngagementTracker,
+            make_marketing_reply_notifier,
             make_reply_engagement_bridge,
         )
         from genesis.outreach.fresh_eyes import FreshEyesReview
@@ -139,7 +137,12 @@ async def init(rt: GenesisRuntime) -> None:
         # exists; the mail layer stays outreach-agnostic via injection).
         reply_poller = getattr(rt, "_reply_poller", None)
         if reply_poller is not None:
-            reply_poller.set_engagement_bridge(make_reply_engagement_bridge(engagement))
+            reply_poller.set_engagement_bridge(
+                make_reply_engagement_bridge(
+                    engagement,
+                    notify_owner=make_marketing_reply_notifier(rt._outreach_pipeline),
+                )
+            )
             logger.info("Reply→engagement bridge wired into reply poller")
 
         morning = MorningReportGenerator(
@@ -147,14 +150,8 @@ async def init(rt: GenesisRuntime) -> None:
             event_bus=rt._event_bus,
         )
 
-        rt._prediction_logger = PredictionLogger(rt._db)
-        reconciler = PredictionReconciler(rt._db)
-        curve_computer = CalibrationCurveComputer(rt._db)
-
         rt._outreach_scheduler = _Scheduler(
             rt._outreach_pipeline, morning, engagement, config, rt._db,
-            reconciler=reconciler,
-            curve_computer=curve_computer,
             event_bus=rt._event_bus,
         )
 

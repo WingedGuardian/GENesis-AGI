@@ -240,8 +240,9 @@ classify it:
 
 - **Data repair** — you wrote the artifact the mechanism should have
   written. Label it "data repair" explicitly, and in the same session
-  either fix the mechanism or get the user's explicit deferral
-  (recorded as a follow-up). Never report a data repair as "fixed".
+  either fix the mechanism or get the user's explicit deferral (the mechanism
+  fix recorded as an ISSUE; a local row only if the deferral itself needs
+  tracking). Never report a data repair as "fixed".
 - **Class fix** — you changed the mechanism so the artifact is written
   correctly on every install, going forward, with a test proving it.
 
@@ -615,10 +616,50 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   `scripts/hooks/destructive_command_guard.py:101-120`: its replacements delete a
   line continuation — which is what the shell does with it — or insert
   whitespace and separators; none introduces a quote or an escape, so none can
-  corrupt the quote balance shlex decides on. (The deletion removes a backslash,
-  but a backslash-newline is a continuation, not an escape the shell keeps; the
-  one place the shell does keep it, inside single quotes, is an over-block the
-  guard states rather than hides.) That is a `cannot`; a
+  corrupt the quote balance shlex decides on. (The one place the shell keeps a
+  backslash-newline literally, inside single quotes, is an over-block the guard
+  states rather than hides.) That is a `cannot` — but read the next paragraph
+  before reusing it, because the version of this argument that stood here for
+  weeks was WRONG in a way that shipped a live bypass.
+
+  **What that earlier version got wrong, and why it is the sharpest example on
+  this page.** It added: *"a backslash-newline is a continuation, not an escape
+  the shell keeps."* That is true only when the backslash is itself unescaped —
+  an ODD-length run. In an EVEN-length run every backslash is escaped by its
+  neighbour, so the last one is a literal character and the newline after it is
+  a REAL command separator. The guard folded it anyway, deleting the separator
+  and gluing the next command's first word onto the previous token, so no `rm`
+  token existed and a destructive command was ALLOWED — measured end-to-end
+  through the live hook, exit 0 where the plain-newline control gave exit 2. The
+  legacy regex net did not save it either: that fires only when tokenizing
+  FAILED, and this tokenized fine, just wrongly. Fixed 2026-09-02 by folding
+  only odd-length runs.
+
+  Note precisely what was and was not at fault, because the first attempt at
+  this correction got it wrong in an instructive way: it said the quote-balance
+  reasoning "was CORRECT and is not what broke", and exonerated it. Quote
+  corruption is indeed not the *mechanism* of the token-glue bypass — but the
+  quote-balance `cannot` **was not sound either, and it failed in the very same
+  cell**. Deleting one backslash from an even-length run leaves an ODD run whose
+  survivor escapes the next character; when that character is a quote, the fold
+  DOES introduce an escape and shlex's balance shifts. Measured: it turned
+  parseable commands UNPARSEABLE (11 of 20,000 random parseable commands under
+  the old fold, 0 under the fix), which dropped them into the legacy-regex net —
+  a net that matches neither `-Rf` nor `-r -f` nor `--recursive --force` nor a
+  quoted `'rm'`, so they failed OPEN. One quiet universal quantifier (*every*
+  backslash-newline is a continuation) falsified BOTH claims at once, and the
+  old code therefore had two bypass families rather than one. The fold now
+  always leaves an even-length run, which is what finally makes the `cannot`
+  true.
+
+  A structural `cannot` is only as good as the case-split it rests on, so state
+  the split explicitly and enumerate it — the same trap as the direction-claim
+  two paragraphs down, which was true of the operand and false of the option
+  token. That both the wrong premise AND the first correction of it were written
+  in a document teaching this exact discipline is the point: the danger is not
+  knowing the rule, it is believing you already applied it.
+
+  A corpus run only ever yields `did not, here`, and by the rule above it is
   corpus run only ever yields `did not, here`, and by the rule above it is
   structurally blind to the shape nobody typed. Run the corpus as
   corroboration, never as the proof, and pair it with a control that DOES flip
@@ -825,15 +866,15 @@ thinking any of these, STOP — you are rationalizing a shortcut.
 | "This is just a simple fix, no tests needed" | Simple fixes break complex systems. The Qdrant regression was a "simple fix." Write the test. |
 | "I already know what this function does" | You haven't read the implementation. Docstrings lie. Read the actual code. |
 | "Tests pass, so we're done" | Tests verify what they cover, not the outcome. Verify actual end-to-end behavior. |
-| "I'll clean this up in the next commit" | Next commit never comes in autonomous sessions. Do it now or create a follow-up. |
+| "I'll clean this up in the next commit" | Next commit never comes in autonomous sessions. Do it now, or file it — Genesis-repo work is a GitHub issue, not a local row. |
 | "This file is too large to read fully" | Read the relevant section. Partial reads lead to partial understanding and wrong fixes. |
 | "The linter is happy, ship it" | Linters catch syntax, not logic. Clean lint with broken behavior is worse than a warning with correct behavior. |
 | "This change is low-risk, no impact analysis needed" | Your confidence is based on what you know; checking callers reveals what you don't. Serena `find_referencing_symbols` is live — run it. For multi-hop blast radius, `gitnexus analyze` then `impact`. |
 | "I can skip the worktree, I'll be quick" | Concurrent session safety exists because "quick" commits have destroyed work before. Always worktree. |
 | "The error is transient, retry will fix it" | Diagnose first. Retrying a misdiagnosed error wastes tokens and masks root causes. |
-| "I'll add the follow-up later" | Follow-ups not created in-session are lost. Create it now while context is fresh. |
+| "I'll add the follow-up later" | Records not created in-session are lost. File it now while context is fresh — Genesis-repo work as a GitHub issue, user-owned work as a follow-up. |
 | "I don't need a skill for this" | If a skill exists, use it. The using-superpowers Red Flags table exists for this exact rationalization. |
-| "This review round is the same class, it doesn't really count" | The visible round counter decides what counts, not you. Update it every cycle; at the cap, STOP. |
+| "This review round is the same class, it doesn't really count" | For an EXTERNAL cross-model round, the counter decides, not you — a repeat-class external round still counts; update it every external cycle and STOP at the cap. (Internal same-model reviews are never rounds.) |
 | "The user already said proceed, so I can keep looping" | The escalation/fix-attempt caps CONSUME standing approval. Round 4+ (or fix #4) on an old instruction is a violation, not obedience. |
 | "I can read the summary instead of the source" | Summaries lose context. If you're about to change code, read the code, not the description of it. |
 | "The missing data was the problem — I wrote it, so it's fixed" | The mechanism that failed to write it is the problem. Hand-written artifacts are data repair, not a fix (see Instance-Fix vs Class-Fix Gate). |
@@ -1082,14 +1123,18 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   **Verify it saw a diff at all**: a clean verdict that does not demonstrate WHAT it
   reviewed is void, and a false clean from the cross-model gate is worse than no review.
   Do not merge on a same-model-only review.
-- **Escalation cap — a HARD BLOCK at 3 rounds that each find NEW defects.**
-  A *round* = one review→fix→re-review iteration (local reviewer rounds and
-  cloud-bot re-review rounds count together, per change). The cap is enforced
-  by three mechanics, not by vibes:
-  1. **Visible round counter.** From round 1, the plan file (or task list)
-     carries `Review rounds: N (cap 3)`, updated every cycle. Rounds are a
-     tracked artifact — "it's the same class, it doesn't really count" is
-     exactly the rationalization the counter exists to kill.
+- **Escalation cap — a HARD BLOCK at 3 CROSS-MODEL rounds that each find NEW defects.**
+  A *round* = one EXTERNAL cross-model review→fix→re-review iteration. INTERNAL
+  same-model reviews (genesis-architect / genesis-security / any subagent) are NOT
+  rounds — they never move the machine counter (see "THE COUNTER IS CROSS-MODEL ONLY"
+  below) and must not be counted in the visible tally either, or a session re-creates the
+  very false-stop this is meant to remove. A cloud-bot (Codex) re-review round counts; a
+  local non-Anthropic reviewer (Kimi on .123) counts. The cap is enforced by three
+  mechanics, not by vibes:
+  1. **Visible round counter.** From the first EXTERNAL round, the plan file (or task
+     list) carries `Cross-model rounds: N (cap 3)`, updated every external cycle. Rounds
+     are a tracked artifact — "it's the same class, it doesn't really count" is exactly
+     the rationalization the counter exists to kill (for a repeat EXTERNAL round).
   2. **The block point is BEFORE dispatching the next review.** The check is
      "am I about to trigger round 4+?" — evaluated at the mechanical moment
      (the `@codex review` comment, the re-push, the reviewer dispatch), never
@@ -1115,14 +1160,17 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   five at once. If one class has ≥2 entries, look for the shared GENERATOR and fix
   that; two findings can land in one superficial class without sharing a cause, so
   the count is the prompt to look, not the verdict.
-  **Class grouping decides HOW you fix — never whether the round counts.** The
-  counter is deliberately class-blind: `bump_review_round` increments on a
-  distinct staged diff and records no class (or reviewer) identity, and the
-  marking rule below is finding-based — ANY new BLOCKER/SHOULD-FIX/P1/P2 makes
-  the round defect-bearing, including the second instance of a class you have
-  already named. Passing `--clean` to keep a repeat-class round off the counter
-  is a falsification, and worse than miscounting: `--clean` RESETS the streak to
-  zero, so it disarms the cap outright rather than merely under-counting it.
+  **Class grouping decides HOW you fix — never whether an external round counts.**
+  The counter is deliberately class-blind: `bump_review_round` increments on a
+  distinct staged diff and records no CLASS identity (it records only `source`, to
+  gate internal-vs-external), and the marking rule below is finding-based — ANY new
+  BLOCKER/SHOULD-FIX/P1/P2 from an EXTERNAL reviewer makes the round defect-bearing,
+  including the second instance of a class you have already named. On an external
+  round, passing `--clean` to keep a repeat-class round off the counter is a
+  falsification, and worse than miscounting: an external `--clean` RESETS the streak
+  to zero, so it disarms the cap outright rather than merely under-counting it.
+  (Internal reviews never count either way, so there is nothing to falsify there —
+  the temptation and the rule both live only on external marks.)
 
   A corollary that costs a round if missed: when you delete a duplicated layer,
   verify the class is closed by enumerating the registry for the BEHAVIOUR, not
@@ -1145,7 +1193,12 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   class), where the cap says *stop and re-decide*. Acking round 2 without actually
   doing the fresh-context audit is how a session arrives at round 3 having learned
   nothing. `# audit-ack` attests that the audit HAPPENED; it is not a "continue"
-  button.
+  button. Note the fresh-context subagent this tier mandates is INTERNAL — mark it
+  plainly (`--source internal`, the default); it satisfies the depth gate and does
+  NOT advance the counter, so it can never be the round that hard-blocks you. Only a
+  repeat EXTERNAL (Codex/Kimi/…) non-convergence moves the streak toward the cap.
+  (Origin, 2026-09-01: under the old model the audit this very tier demanded counted
+  as round 3 and tripped the HARD cap — the gate penalized the remedy it mandated.)
 
   There is a separate depth tier that can fire at ANY round: a **substantial**
   change (≥50 reviewable lines OR >1 code file OR auth/api/migrations OR any
@@ -1157,27 +1210,51 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   Backing all of it: `review_state.py` keeps a per-branch counter of
   CONSECUTIVE defect-bearing review rounds, and the commit gate
   (`review_enforcement_commit.py`) HARD-BLOCKS the commit at `ESCALATION_ROUND_CAP`
-  (3) unless the command carries a deliberate trailing `# escalation-ack`. The
-  counter implements the "each find NEW defects" clause literally — so when you
-  `mark` a review, record its OUTCOME:
-  - Review surfaced a NEW **BLOCKER / SHOULD-FIX / P1 / P2** finding → mark as usual
-    (`python3 scripts/review_state.py mark --agent-output <path>`) — the round counts.
-  - Review surfaced **no** new BLOCKER/SHOULD-FIX/P1/P2 finding → add `--clean`
-    (`… mark --agent-output <path> --clean`) — this RESETS the streak
-    (circuit-breaker reset-on-success), so honestly-clean multi-commit development
-    (independent clean reviews of distinct diffs) never trips the cap.
+  (3) unless the command carries a deliberate trailing `# escalation-ack`.
 
-  A round is CLEAN iff the review found no BLOCKER/SHOULD-FIX/P1/P2. NOTEs, nitpicks,
-  and dispositioned optional-hardening do NOT make a round defect-bearing — without
-  this line a nitpick-prone reviewer would make every round "defect-bearing" and the
-  cap collapses back into raw commit-counting. An unflagged mark counts as
-  defect-bearing by default: a forgotten `--clean` gives a slightly early conscious
-  checkpoint (the safe direction), never a silently-disabled cap. The ack is a
-  conscious, logged act (like `# review-override`); adding it — or falsely passing
+  **THE COUNTER IS CROSS-MODEL ONLY.** The streak exists to catch *cross-model
+  non-convergence* — an EXTERNAL reviewer finding NEW defects round after round. It does
+  NOT exist to penalize the free, encouraged act of reviewing your own work. So `mark`
+  takes a `--source {internal,external}` (default `internal`) that records WHO PRODUCED THE
+  FINDINGS, and that is what decides whether the round counts.
+
+  **EXTERNAL is judged by the reviewing MODEL, not the gateway/provider — this is the "big
+  one".** External = a review by a non-ANTHROPIC model. Anthropic Claude via ANY route
+  counts as INTERNAL — including a Claude model reached through OpenRouter (the repo's
+  `openrouter-haiku/sonnet/opus` routes are Claude), so "it went through OpenRouter" NEVER
+  makes a review external. And Genesis's OWN cognitive/routing systems are never reviewers:
+  they are cognitive infrastructure, not a review service, so no internal Genesis model call
+  is ever `--source external`. Approved external-review methods TODAY are **Codex** and
+  **Kimi (on .123)**; **OpenRouter is NOT an approved method today** (a future option, not a
+  current one). The rule below keys on this:
+  - **`--source internal` (the default)** — a same-model self / genesis-architect /
+    genesis-security / any-subagent review. It is free and shares the author-model's
+    blind spots (rubber-stamp risk), so it **NEVER moves the streak** — not an
+    increment, not a reset — whatever it found. No outcome flag is needed (a bare
+    `python3 scripts/review_state.py mark --agent-output <path>` is a valid internal
+    review). This is the fix for the weeks of false blocks: your own audits, including
+    the one the round-2 mode-switch gate itself *mandates*, can never trip the cap.
+  - **`--source external`** — a non-Anthropic cross-model reviewer drove this round.
+    This is the ONLY kind that counts, so it REQUIRES exactly one outcome flag:
+    - a NEW **BLOCKER / SHOULD-FIX / P1 / P2** → `--defects`
+      (`… mark --agent-output <path> --source external --defects`) — the round counts.
+    - **no** new BLOCKER/SHOULD-FIX/P1/P2 → `--clean`
+      (`… --source external --clean`) — RESETS the streak (circuit-breaker
+      reset-on-success). Only an EXTERNAL clean round resets; an internal "looks
+      fine" can never reset a standing cross-model streak (that would be a
+      self-rubber-stamp reset).
+
+  `--source` describes the REVIEW THAT PRODUCED THE FINDINGS, not who typed the
+  evidence file: a mark recording "verified + fixed Codex's (or Kimi's) findings" is
+  `external`; a mark of your own architect/security audit is `internal`. A round is
+  CLEAN iff the external review found no BLOCKER/SHOULD-FIX/P1/P2 (and no security
+  CRITICAL/WARNING). NOTEs, nitpicks, and dispositioned optional-hardening do NOT make
+  a round defect-bearing. The ack (`# audit-ack` / `# escalation-ack`) is a conscious,
+  logged act (like `# review-override`); adding it — or falsely passing an external
   `--clean` — WITHOUT the honest review result is the same violation as ignoring the
-  prose above (the `--clean` flag mirrors the review record you write to
-  the per-worktree evidence path (`review_state.py evidence-path`) at the same moment: falsifying one falsifies the
-  other).
+  prose above. (Supersedes feea3f71/#1446: its unconditional required-outcome only
+  ever bit internal re-audits, which now can't inflate the streak at all; the outcome
+  requirement is kept where it is still load-bearing — on external marks.)
   Caveats: **multiple findings in a single pass = one round** (not an
   escalation); the same defect reappearing (an incomplete prior fix) is a
   fix-it-properly issue, not an escalation trigger. This complements the
@@ -1234,8 +1311,9 @@ them costs a session real time, every time. The canonical sequence:
 python3 scripts/review_state.py evidence-path     # -> ~/.genesis/review_evidence/<key>.txt
 # ... write the adversarial audit to exactly that path ...
 git add <files>                                   # STAGE FIRST — mark hashes --cached
-python3 scripts/review_state.py mark [--clean]    # --clean only if NO new BLOCKER/P1/P2
+python3 scripts/review_state.py mark              # INTERNAL genesis-architect audit — plain mark, never counts
 git commit -F <msg-file>                          # bare, not piped (see below)
+# (a non-Anthropic cross-model round would instead be: mark --source external --defects|--clean)
 git push                                          # approve the dialog on a branch's first push
 gh pr create ...
 gh pr comment <N> --body "@codex review"          # after EVERY subsequent push
@@ -1417,6 +1495,8 @@ Merged-but-undeployable-elsewhere is a bug. The standard paths:
 | Runtime code | `git pull` + server restart (update.sh does both) |
 | DB schema | additive idempotent migration — applies at restart |
 | One-off data fix / backfill | data-migration framework (post-boot, idempotent) — NEVER a hand-run script only this install executed |
+| **Naming either migration** | **UTC timestamp id: `` `date -u +%Y%m%d%H%M%S` ``_description.py** (data migrations prefix a `d`). NEVER hand-pick the next number — the legacy 4-digit namespace is FROZEN and CI refuses a new one. An id you have to CHOOSE is an id two branches choose identically: measured 2026-09-03, one PR was renumbered twice in a day and four open PRs held live collisions, while a duplicate prefix aborts bootstrap on every install. Nobody allocates a timestamp. |
+| **Changing an EXISTING migration** | **Don't — add a new one.** The legacy 4-digit set is frozen by ENUMERATED FILENAME, so renaming or deleting one fails CI. Installs that already applied `0050` will never run a renamed `0050_*`, while fresh installs will — two schemas diverging with nothing to notice. Discovery also REFUSES to run anything from a directory holding a file it cannot classify (a mistyped 13-digit id used to be skipped in silence, so the migration never ran at all). |
 | Config default | repo config file (+ optional local overlay); works with no overlay |
 | systemd unit / timer | registered in bootstrap.sh AND the update path — never hand-`systemctl enable`d only here |
 | Hooks / MCP servers | land at next CC session start (note the mid-window in the PR) |
@@ -1494,8 +1574,13 @@ session assumed deploy "happens somehow").
 2. Verify the deploy landed: gateway `version` op reports the expected
    `deployed_commit` / CC version; guardian tick healthy in its journal.
 3. State the deploy + verification result explicitly in the wrap-up. If the
-   deploy cannot happen this session (host unreachable), create a follow-up
-   via `follow_up_create` — never leave deploy as an implicit assumption.
+   deploy cannot happen this session, record it — never leave deploy as an
+   implicit assumption. A purely LOCAL blocker (host unreachable tonight) is a
+   `follow_up_create` row. A blocker exposing a REPO-level gap (a missing reconcile
+   mechanism, no self-heal path) needs BOTH: an issue for the mechanism fix, AND a
+   local row for the fact that THIS install is still undeployed — another
+   contributor can close the issue without ever touching this host, which is
+   exactly the stale-host failure above.
 
 **The reverse direction is equally binding**: host VMs are deploy targets,
 never edit-in-place dev environments. An emergency hand-edit on a host gets a
@@ -1636,7 +1721,10 @@ The review-findings gate specifically:
    for automated review findings (ERROR, [P1], HARD BLOCK).
 2. If review present with **blocking findings** → merge is **BLOCKED**
    by the hook (exit code 2). Fix the findings first.
-3. If review present with only WARNINGs/NOTEs → merge allowed.
+3. Inline findings are SCORED — P1 = 1.0, P2 = 0.5 — and the gate blocks at
+   score >= 1.0 (any P1, OR >= 2 P2s). A lone P2 is advisory (0.5, allowed); a
+   P2 is excluded from the score if a MAINTAINER reply engages it or it is on a
+   documentation path. Pure WARNINGs/NOTEs (non-P1/P2) → merge allowed.
 4. If no review comments at all (quota exhausted) → merge allowed
    on CI alone. Note in PR that review was quota-limited.
 5. **Override**: Append `# review-override` to the merge command to
@@ -1656,9 +1744,11 @@ The review-findings gate specifically:
    `gh repo view --json nameWithOwner --jq .nameWithOwner` — NEVER hardcode
    it (configs name several repos; the working repo is not the org default).
    A **404 from that endpoint means WRONG SLUG or PR number, never "no
-   findings"** — a clean PR returns `[]`. The merge-gate hook only blocks
-   ERROR/[P1]/HARD BLOCK, so unread P2s pass silently (2026-07-10: 8 real
-   P2s on the entity-layer PRs were merged past this exact way). And the two
+   findings"** — a clean PR returns `[]`. The merge-gate hook blocks on the
+   weighted inline SCORE (P1=1.0, P2=0.5; block at >= 1.0), so a lone P2 is
+   advisory but TWO unresolved P2s block — unread P2s no longer slip through in
+   pairs (2026-07-10: 8 real P2s on the entity-layer PRs merged past the OLD
+   P1-only gate, the exact gap this score closes). And the two
    channels are INDEPENDENT: Codex can post a quota/usage-limit message as an
    ISSUE comment while a later `@codex review` trigger delivers real inline
    findings anyway — a quota message is evidence about that channel at that

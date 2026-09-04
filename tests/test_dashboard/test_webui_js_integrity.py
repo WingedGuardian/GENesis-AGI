@@ -145,6 +145,10 @@ _RAW_KEYS = ("discarded_count", "discarded_items")
 
 _NORMALISER_MARKS = ("Array.isArray", "Number.isFinite")
 
+# Deliberate escape hatch for the uppercase-'OPEN' ban below. Spelled as a
+# constant so `grep -r` finds every exemption in one shot.
+_ALLOW_UPPERCASE_OPEN = "guard-allow-uppercase-open"
+
 
 def _frontend_files() -> list[Path]:
     out: list[Path] = []
@@ -490,4 +494,207 @@ def test_a_recovered_exact_depth_is_not_reported_as_an_unknown_counter():
     assert r.returncode == 0, f"node failed: {r.stderr[:800]}"
     assert r.stdout.strip().endswith("OK"), (
         "queuesSemantic() disagreed with the expected verdicts:\n" + r.stdout
+    )
+
+
+def test_no_frontend_file_compares_breaker_state_to_an_uppercase_literal():
+    """Breaker state is emitted LOWERCASE; comparing to 'OPEN' can never match.
+
+    `dashboard/routes/routing.py` emits `cb.state.value`, and `ProviderState` is
+    a StrEnum whose values are "closed"/"open"/"half_open". Four consumers
+    compared against the literal 'OPEN', so the provider dot rendered green, the
+    toggle read "disable", and the Provider Keys dot stayed green regardless of
+    the real breaker state — the dashboard was structurally incapable of showing
+    a tripped provider.
+
+    Scans DIRECTORIES so a newly added file cannot escape the guard.
+
+    The ban is UNSCOPED on purpose. An earlier revision required the offending
+    line to also match /cb_state|cbState|breaker/, reasoning that an unscoped
+    ban would trip on an unrelated uppercase literal. MEASURED across the exact
+    directories this scans: zero occurrences of 'OPEN' or "OPEN" of any kind.
+    The false positive was hypothetical and the blindness it bought was real —
+    the natural two-line reintroduction
+
+        const s = (this.routingConfig?.cb_states || {})[p];
+        if (s === 'OPEN') { ... }
+
+    puts the comparison on a line with no breaker context, and the scoped guard
+    passed it. A genuine future false positive gets an explicit, greppable
+    exemption via the allowlist token below, so an exemption is a deliberate act
+    rather than a silent hole.
+    """
+    offenders = []
+    for path in _frontend_files():
+        for i, line in enumerate(path.read_text().splitlines(), 1):
+            if _ALLOW_UPPERCASE_OPEN in line:
+                continue  # deliberate, greppable exemption
+            if "'OPEN'" in line or '"OPEN"' in line:
+                offenders.append(f"{path.name}:{i}: {line.strip()[:100]}")
+    assert not offenders, (
+        "frontend contains an uppercase 'OPEN' literal. Breaker state is emitted "
+        "LOWERCASE ('open'/'half_open'/'closed'), so a comparison against it can "
+        "never match. If this literal is genuinely unrelated to breaker state, "
+        f"add the token {_ALLOW_UPPERCASE_OPEN!r} in a comment on that line:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_breaker_open_helper_is_case_insensitive_and_total():
+    """Behavioural: execute the real helper, don't pattern-match its source."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; the static guard above still applies")
+
+    js = DASHBOARD_JS.read_text()
+    # breakerIsOpen delegates to breakerState, so BOTH real bodies are wired —
+    # extracting one and stubbing the other would test a fake.
+    j = js.index("breakerState(providerName) {")
+    state_body = js[j + len("breakerState(providerName) {"): js.index("\n        },", j)]
+    i = js.index("breakerIsOpen(providerName) {")
+    body = js[i + len("breakerIsOpen(providerName) {"): js.index("\n        },", i)]
+
+    cases = [
+        ("lowercase open (what the API actually emits)", "open", True),
+        ("uppercase OPEN (defensive)", "OPEN", True),
+        ("mixed case", "Open", True),
+        ("closed", "closed", False),
+        ("half_open is NOT open", "half_open", False),
+        ("missing provider", None, False),
+    ]
+    script = (
+        "function mk(v){ const self={ routingConfig:{ cb_states: v===null?{}:{p:v} },\n"
+        "    breakerState(n){ return (function(providerName){" + state_body + "\n}).call(this,n); } };\n"
+        "  return (function(providerName){" + body + "\n}).call(self,'p'); }\n"
+        "const cases=" + json.dumps(cases) + ";\n"
+        "let bad=0;\n"
+        "for (const [label,val,want] of cases){ const got=mk(val);\n"
+        "  if (got!==want){ bad++; console.log('MISMATCH: '+label+' -> '+got+' want '+want); } }\n"
+        "console.log(bad===0?'OK':'FAIL');\n"
+    )
+    r = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, f"node failed: {r.stderr[:400]}"
+    assert r.stdout.strip().endswith("OK"), r.stdout
+
+
+def test_secret_health_counts_half_open_as_degraded():
+    """Codex P2, confirmed: HALF_OPEN was rendering the provider key GREEN.
+
+    `observability/snapshots/call_sites.py` treats a first-chain provider in
+    OPEN *or* HALF_OPEN as a degraded call site. `secretHealthStatus` counted
+    only 'open', so a provider parked in HALF_OPEN painted the Provider Keys
+    indicator healthy.
+
+    That was latent before this change and is live after it: refusing to
+    probe-heal a permanent/quota failure means such a breaker can sit HALF_OPEN
+    indefinitely on a low-traffic provider. It is the same "degraded renders as
+    healthy" defect this PR fixes one layer down, so shipping the fix without
+    this would have re-created the bug in the surface meant to reveal it.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available")
+
+    js = DASHBOARD_JS.read_text()
+
+    def _body(sig):
+        i = js.index(sig)
+        return js[i + len(sig): js.index("\n        },", i)]
+
+    # Every helper in the chain is the REAL extracted body — a hand-copied stub
+    # would let this pass against a broken production helper.
+    script = (
+        "const ctx = {\n"
+        "  _KEY_TO_PROVIDER_TYPES: { K: ['t'] },\n"
+        "  routingConfig: { providers: { p1: {type:'t'}, p2: {type:'t'} }, cb_states: {} },\n"
+        "  breakerState(providerName) {" + _body("breakerState(providerName) {") + "\n  },\n"
+        "  breakerVerdict(providerName) {" + _body("breakerVerdict(providerName) {") + "\n  },\n"
+        "  secretHealthStatus(keyEntry) {" + _body("secretHealthStatus(keyEntry) {") + "\n  },\n"
+        "};\n"
+        "const cases = [\n"
+        "  [{p1:'closed',   p2:'closed'},    'healthy'],\n"
+        "  [{p1:'half_open',p2:'closed'},    'degraded'],\n"
+        "  [{p1:'HALF_OPEN',p2:'closed'},    'degraded'],\n"
+        "  [{p1:'open',     p2:'closed'},    'degraded'],\n"
+        "  [{p1:'open',     p2:'open'},      'error'],\n"
+        "  [{p1:'half_open',p2:'half_open'}, 'degraded'],\n"
+        "];\n"
+        "let bad = 0;\n"
+        "for (const [states, want] of cases) {\n"
+        "  ctx.routingConfig.cb_states = states;\n"
+        "  const got = ctx.secretHealthStatus({key:'K', status:'validated'});\n"
+        "  if (got !== want) { bad++; console.log('FAIL', JSON.stringify(states), 'want', want, 'got', got); }\n"
+        "}\n"
+        "console.log(bad === 0 ? 'OK' : 'FAIL ' + bad);\n"
+    )
+    r = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, f"node failed: {r.stderr[:800]}"
+    assert r.stdout.strip().endswith("OK"), (
+        "secretHealthStatus disagreed with the backend's own OPEN-or-HALF_OPEN "
+        "= degraded rule:\n" + r.stdout
+    )
+
+
+def test_breaker_verdict_is_three_state_and_degrades_safely():
+    """HALF_OPEN is probation, not failure — and the helper must survive an
+    absent `cb_detail` (older server or cached payload) by falling back to the
+    two-state reading rather than throwing or rendering healthy.
+
+    Executes the REAL extracted bodies, chained the way the store chains them.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available")
+
+    js = DASHBOARD_JS.read_text()
+
+    def body(sig):
+        i = js.index(sig)
+        return js[i + len(sig): js.index("\n        },", i)]
+
+    state_b = body("breakerState(providerName) {")
+    verdict_b = body("breakerVerdict(providerName) {")
+    openedby_b = body("breakerOpenedBy(providerName) {")
+    tooltip_b = body("breakerTooltip(providerName) {")
+
+    script = (
+        "const ctx = {\n"
+        "  routingConfig: {},\n"
+        "  breakerState(providerName) {" + state_b + "\n  },\n"
+        "  breakerVerdict(providerName) {" + verdict_b + "\n  },\n"
+        "  breakerOpenedBy(providerName) {" + openedby_b + "\n  },\n"
+        "  breakerTooltip(providerName) {" + tooltip_b + "\n  },\n"
+        "};\n"
+        "const cases = [\n"
+        "  [{cb_states:{p:'closed'}}, 'healthy'],\n"
+        "  [{cb_states:{p:'open'}}, 'failing'],\n"
+        "  [{cb_states:{p:'half_open'}}, 'unverified'],\n"
+        # case-insensitive input, and unknown/absent config
+        "  [{cb_states:{p:'HALF_OPEN'}}, 'unverified'],\n"
+        "  [{cb_states:{}}, 'healthy'],\n"
+        "  [{}, 'healthy'],\n"
+        "];\n"
+        "let bad = 0;\n"
+        "for (const [cfg, want] of cases) {\n"
+        "  ctx.routingConfig = cfg;\n"
+        "  const got = ctx.breakerVerdict('p');\n"
+        "  if (got !== want) { bad++; console.log('VERDICT FAIL', JSON.stringify(cfg), 'want', want, 'got', got); }\n"
+        "}\n"
+        # opened_by plumbing, then the absent-cb_detail fallback
+        "ctx.routingConfig = {cb_states:{p:'half_open'}, cb_detail:{p:{state:'half_open', opened_by:'call'}}};\n"
+        "if (ctx.breakerOpenedBy('p') !== 'call') { bad++; console.log('OPENEDBY FAIL call'); }\n"
+        "if (!ctx.breakerTooltip('p').includes('real calls failed')) { bad++; console.log('TOOLTIP FAIL call'); }\n"
+        "ctx.routingConfig = {cb_states:{p:'half_open'}, cb_detail:{p:{state:'half_open', opened_by:'probe'}}};\n"
+        "if (!ctx.breakerTooltip('p').includes('health probe')) { bad++; console.log('TOOLTIP FAIL probe'); }\n"
+        # No cb_detail at all: still 'unverified', and must not throw.
+        "ctx.routingConfig = {cb_states:{p:'half_open'}};\n"
+        "if (ctx.breakerVerdict('p') !== 'unverified') { bad++; console.log('FALLBACK FAIL verdict'); }\n"
+        "if (ctx.breakerOpenedBy('p') !== null) { bad++; console.log('FALLBACK FAIL openedBy'); }\n"
+        "try { ctx.breakerTooltip('p'); } catch (e) { bad++; console.log('FALLBACK THREW', e.message); }\n"
+        "console.log(bad === 0 ? 'OK' : 'FAIL ' + bad);\n"
+    )
+    r = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, f"node failed: {r.stderr[:800]}"
+    assert r.stdout.strip().endswith("OK"), (
+        "breakerVerdict/breakerOpenedBy/breakerTooltip disagreed:\n" + r.stdout
     )
