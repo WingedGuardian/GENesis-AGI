@@ -125,11 +125,18 @@ models:
 # per-token, which makes it a fallback for a rate-limited primary rather than a
 # cheaper primary:
 #
-#     kimi:
+#     kimi-for-coding:
 #       anthropic_base_url: "https://api.kimi.com/coding/"
 #       auth_env: KIMI_CODING_API_KEY
 #       model_id: kimi-for-coding
 #       failover_order: 2
+#
+# The key is `kimi-for-coding`, not `kimi`, and that is the rule at the top of
+# this file rather than a naming preference — a key that differs from its
+# model_id never persists its resume endpoint, so session continuity can later
+# target the wrong provider. This example is the one most likely to be copied
+# with an edit, because the tier decides the id: if your account exposes a
+# different one, change the KEY AND the `model_id` together, never just one.
 #
 # Prove a peer before you depend on it: `gmodel --print-env <name>` to check the
 # env resolves, then `genesis eval gauntlet -m <name>` to confirm it can

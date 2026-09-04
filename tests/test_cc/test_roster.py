@@ -354,3 +354,59 @@ def test_every_documented_auth_env_has_a_secrets_slot():
         "provider genuinely uses one key for both, rename the slot so the "
         "convention still reads true."
     )
+
+
+def test_shipped_examples_obey_the_key_equals_model_id_rule() -> None:
+    """The shipped file states this rule in prose; nothing enforced it.
+
+    ``config/cc_roster.yaml`` says, at the top of its EXAMPLE PEERS section,
+    "NAME YOUR PEER EXACTLY WHAT ITS ``model_id`` IS", and gives the reason: a
+    peer whose key differs from its model_id never persists its resume endpoint
+    (``endpoint_payload`` looks the NAME up and misses), so session continuity
+    can later target the wrong provider.
+
+    The examples are COMMENTED, so no YAML parse and no schema check ever looks
+    at them — and the Kimi example shipped violating the rule stated four lines
+    above it. A rule that only exists as prose is a rule the next example
+    breaks; this makes it a check instead.
+    """
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[2] / "config" / "cc_roster.yaml"
+    lines = src.read_text(encoding="utf-8").splitlines()
+
+    key_re = re.compile(r"^#\s{4,}([A-Za-z0-9][A-Za-z0-9._-]*):\s*$")
+    mid_re = re.compile(r"^#\s+model_id:\s*(\S+)\s*$")
+
+    pairs: list[tuple[int, str, str | None]] = []
+    for i, line in enumerate(lines):
+        m = key_re.match(line)
+        if not m:
+            continue
+        model_id = None
+        # The block is a handful of commented lines; stop at the first
+        # non-comment or the next example key.
+        for nxt in lines[i + 1 : i + 12]:
+            if not nxt.lstrip().startswith("#") or key_re.match(nxt):
+                break
+            mm = mid_re.match(nxt)
+            if mm:
+                model_id = mm.group(1)
+                break
+        pairs.append((i + 1, m.group(1), model_id))
+
+    assert pairs, (
+        "no commented example peers found — the parser drifted from the file's "
+        "format, so this test is silently checking nothing"
+    )
+    for lineno, key, model_id in pairs:
+        assert model_id is not None, (
+            f"example peer {key!r} at cc_roster.yaml:{lineno} declares no model_id"
+        )
+        assert key == model_id, (
+            f"example peer at cc_roster.yaml:{lineno} has key {key!r} but "
+            f"model_id {model_id!r}. The file's own EXAMPLE PEERS note requires "
+            "them to match: a copied peer whose key differs never persists its "
+            "resume endpoint, so continuity can target the wrong provider."
+        )
