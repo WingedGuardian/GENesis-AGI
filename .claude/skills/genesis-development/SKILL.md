@@ -193,33 +193,12 @@ only replaying a known-positive tells them apart.
 ### Select, don't amputate — truncation is the absence of a decision
 
 **Scope first, because bounding is often correct.** A bounded PREVIEW is a
-selection with a pointer, not an amputation — but ONLY if the pointer actually
-resolves. The proactive memory hook is the worked example: it renders a snippet
-plus `id:xxxxxxxx` (for most rows — code-sourced ones render no handle at all,
-which is the same defect as the procedure case below), and `memory_expand` takes
-exactly that handle (it resolves
-short prefixes and reports `ambiguous` rather than guessing) and returns the full
-record. Bounding is likewise correct against a hard external budget — a hook
-stdout cap, a DB column, a context window — and a log line or diagnostic
-rendering of something stored intact elsewhere is a preview like any other. This
-section is about the other case: a value that is the ONLY copy, where cutting it
-destroys the information.
-
-**Test the pointer before you call something a preview.** The same hook renders
-`principle[:200]` for procedures with an id beside it, and that HANDLE does not
-resolve: procedures live in SQLite `procedural_memory`, `memory_expand` retrieves
-only the Qdrant collections, and `procedure_recall` takes a task description and
-tags with no id lookup at all. It is still not an amputation — the principle
-survives whole in SQLite and `procedure_recall` returns it unsliced, and the cap
-is a cache-width decision the code states outright. So this is a preview whose
-handle is DECORATIVE: a defect of its own, because it teaches a retrieval path
-that does not exist, but not the defect this section is about. Getting that
-distinction wrong is not academic — a reader who reads "amputation" here goes and
-removes the cap, and the proactive hook's output is bounded against CC's
-10,000-char hook-stdout limit, above which it is silently filed. Successive
-drafts of this very section cited this case as the carve-out, each naming a
-different wrong tool, and one called it an amputation. A pointer you have not
-followed is not a pointer.
+selection with a pointer, not an amputation — but only if the pointer actually
+resolves, and that is a claim to CHECK for the case in hand, never one to inherit
+from the mechanism. Bounding against a hard external budget is likewise correct:
+a hook's stdout cap, a database column, a context window. So is refusing an
+oversized value outright. This section is about the other case: a value that is
+the ONLY copy, where cutting it destroys the information.
 
 **There, do not truncate.** Not strings, not lists, not context, not output.
 Reaching for a character cap is a signal that a question was skipped, not
@@ -244,145 +223,63 @@ Three rules when a bound really is needed:
   **This governs HOW you bound, never WHETHER you may.** Rejecting a structured
   value or a collection by size is correct and stays correct: an over-long id, an
   over-large batch or an implausibly large file is simply not a value we accept,
-  and refusing it is a resource guard, not an amputation
-  (`channels/voice/transcript_writer.py` rejects a `session_id` over 128 chars;
-  `dashboard/routes/follow_ups.py` rejects a batch over 200 ids). What is
-  forbidden is silently CUTTING them to fit. Only free text gets a bound it is
-  expected to sit under; everything else gets one it must not cross.
+  and refusing it is a resource guard, not an amputation. What is forbidden is
+  silently CUTTING them to fit. Only free text gets a bound it is expected to sit
+  under; everything else gets one it must not cross.
 - **Derive the number, and record how — against a corpus that OUTLIVES the
   claim.** Measure the real population and report `k/N` per the Acceptance Bar,
   then name the corpus, the query and the date. Naming them is necessary and not
-  sufficient: a query is only re-derivable if the rows are still there when the
-  next reader runs it.
-  Worked example, and it fails that second test — deliberately, because the
-  failure is the lesson. Provider error prose lands in
-  `activity_log.error_message` (written by `routing/router.py`, already capped
-  there at 1024), so `SELECT SUM(LENGTH(error_message) > 300), COUNT(*) FROM
-  activity_log WHERE error_message IS NOT NULL AND error_message != '';` On one
-  install on 2026-09-03 that gave **270/318 (84.9%)** cut by a 300-char cap.
-  What the cap COSTS is a second claim needing its own denominator, and an
-  earlier draft asserted it without one — "JSON error bodies put the
-  machine-readable cause last, so the cap discards exactly the part worth
-  keeping." Measured against the same table: 251 of 600 cut rows (41.8%) carry
-  `code` inside the first 300 characters, and every row leads with the litellm
-  exception class. Some providers do put a `"code":"rate_limit_exceeded"` in the
-  tail a 300-char cut discards; others put it in the first sixty characters. So
-  the cap destroys a provider-specific remainder, unevenly — not "exactly the
-  part worth keeping". Note also that this corpus is ITSELF already cut at 1024
-  upstream, so the population being measured is one the rule would forbid
-  creating. Both of those are worth saying out loud, because a measurement
-  followed by an unmeasured generalisation is how a number launders an opinion.
-  That is an EPHEMERAL OBSERVATION, not a re-derivable one. `activity_log` is
-  reaped at 24 hours (`observability/provider_activity.py` `reap_old_records`,
-  scheduled four times daily by `runtime/init/learning.py`), and the query carries
-  no `created_at` predicate or snapshot id — so re-running it later measures a
-  different rolling window on the same install, and nobody can reproduce the
-  original. To make a number like this re-derivable you must pin the window in
-  the query AND export the rows, or measure something durable (git history, a
-  committed fixture) instead. Label it honestly when you cannot.
-  This rule has now failed on itself twice, which is why both corrections stay.
-  An earlier draft hedged that rate as "a floor" because the corpus is capped at
-  1024 upstream. Wrong — a 1024-cap cannot change whether a length exceeds 300,
-  and `COUNT(*)` counts rows, so the rate is EXACT and only the CONTENT LOST is a
-  lower bound. Hedging a number you have not thought through is the same failure
-  as asserting one; and calling a number re-derivable without checking that its
-  corpus survives is the same failure wearing the opposite face.
+  sufficient: the query is only re-derivable if the rows are still there when the
+  next reader runs it, so a table with a retention window yields an EPHEMERAL
+  observation. Say which one you have. And what the bound COSTS is a SECOND claim
+  needing its own denominator — "the cap discards the part worth keeping" is
+  exactly the sentence that sounds measured because it followed a measurement.
 - **Omit explicitly, with a constant-bounded marker** (`<omitted: 104,823
   chars>`), never a mid-value cut. An honest gap beats a plausible-looking
-  fragment. The FLAG half is already the house pattern — the character-count
-  marker is new, and no call site in the tree emits one today (grep for it and
-  you get nothing; do not go looking for a precedent that is not there):
-  repo-pulse's loud `limit_hit`
-  (`session_awareness/repo_pulse_gh.py` returns `limit_hit` alongside the rows),
-  and the bound-plus-flag-plus-stated-consequence model in
-  `memory/integrity_repair.py` ("Truncation asymmetry": ghost repair proceeds on
-  a partial scroll because every scanned point is genuinely present AND it holds
-  the complete id set from a full SQLite read; mirror repair is SKIPPED because
-  it proves absence, which a partial set cannot). Cited by SYMBOL, not by line — a line number in an
-  always-loaded file rots silently, and every claim here is one a reader should
-  be able to re-check with a grep.
+  fragment. The bound-plus-loud-flag half of this is already the house pattern;
+  the character-count marker is a proposal, so do not go looking for a precedent
+  that is not there.
 
-One trap worth naming: a cap can manufacture a correctness bug in the data it was
-added to protect. Truncating an identifier used as a KEY merges two distinct
-identities into one, and downstream code then attributes one subject's state to
-another. A short DISPLAY handle is a different thing and is the house pattern —
-`memory_expand` resolves an 8-char prefix and reports `ambiguous` rather than
-guessing. The rule is about the stored key, not the rendered one.
+One trap deserves naming, because it is what produced this rule: **a cap can
+manufacture a correctness bug in the very data it was added to protect.**
+Truncating an identifier used as a KEY merges two distinct identities into one,
+and downstream code then attributes one subject's state to another. That is not
+hypothetical — it shipped here. Two roster peers whose names shared a prefix
+collapsed onto a single key, so one peer's success cleared the other peer's
+recorded failure. A short DISPLAY handle is a different thing and is fine; the
+rule is about the stored key, not the rendered one.
 
 **A real need to truncate is a CONVERSATION to have, not a magic number to pick
-alone.** If you catch yourself choosing 300 or 200 or 1000, stop and raise it —
-and if there is nobody to raise it with (an unattended background session), the
-default is: emit the value WHOLE and record the decision owed — the value, the
-population you could not measure, and what you could not decide. Never pick the
-number just because no one was there to stop you.
+alone.** If you catch yourself choosing 300 or 200 or 1000, stop and raise it.
 
-Record it somewhere that session can actually REACH and that PRESERVES it whole.
-Both halves, checked against the surface you are on. This instruction names no
-channel on purpose: every earlier draft prescribed one, and each was wrong for
-some surface. Three worked examples of getting it wrong, because the failures
-teach the check better than a rule does:
-
-- **Reachable everywhere, preserving on only SOME paths.** An executor step's
-  `result` field exists everywhere and its contract calls it a "brief
-  description". The carry-forward paths cut it — `[:200]` into the next step's
-  prompt and into the trace, `[:2000]` on the write path — so a value left there
-  for a LATER step to read is not preserved. But a step that COMPLETES has its
-  result carried whole into the synthesized deliverable
-  (`autonomy/executor/dispatch.py` `synthesize_deliverable`, which interpolates
-  `r.result` unsliced) and persisted from there. An earlier draft of this bullet
-  said "every consumer cuts it" and was wrong: that ruled out a channel that
-  works, which would push a step toward halting on `blocker_description` when it
-  did not need to. Preservation is a property of the PATH, not of the field —
-  which is the whole point of checking rather than assuming.
-- **Preserves whole, not reachable.** `TASK_NOTEPAD.md` is promoted to memory
-  uncut — but it is seeded in a CODE task's worktree, and a VERIFICATION step runs
-  in the background-session directory, so for that step it is a file in the wrong
-  place. Preservation said yes; reachability said no.
-- **A ranking assumed instead of read.** A draft called CODE/VERIFICATION the
-  strictest executor scope because `follow_up_create` is denied there. Backwards:
-  the MCP setup is gated on `is_code_or_verify`, so RESEARCH/ANALYSIS/SYNTHESIS
-  get *zero* MCP tools — the denied-list surface is the most permissive one.
-  Membership facts were right; the ordering derived from them was never checked.
-
-The rule is the property, not the mechanism: **availability is not preservation,
-neither is portable between surfaces, and a ranking is a separate claim from the
-facts it sorts.** Verify each for the surface you are on.
-
-**And one pattern above all, because this section kept committing it while
-describing it.** Across four review rounds every single defect found here had the
-same shape: the membership facts were RIGHT and the CONCLUSION drawn from them
-was wrong. `procedure_recall` really has no id lookup — and "therefore it is an
-amputation" was false, because the principle is stored whole elsewhere. Some
-providers really do put the error code in the tail — and "therefore JSON bodies
-put the cause last" was false for 42% of the corpus. `follow_up_create` really is
-denied for CODE steps — and "therefore that scope is the strictest" was backwards.
-`blocker_description` really is stored unsliced — and "therefore it costs a
-status" understated a price that is the whole run. Checking that each cited fact
-is true is the easy half and it is not the half that fails. **Say the inference
-out loud as its own claim, and check THAT.** If nothing obvious
-qualifies, look harder before declaring a dead end — grep the sibling fields of
-whatever you were about to give up on. (The same `result` write that slices to
-`[:2000]` stores `blocker_description` and `artifacts` UNSLICED, and the step
-contract defines the first as "What specific information, credential, or
-decision is needed from the user" — scoped to blockers, so the fit is close but
-not exact. And price it honestly: it costs the whole RUN, not a status field.
-`engine.py` returns False on a blocked step, so no deliverable is synthesized,
-the notepad is never promoted, and the user is paged. That is far too high for a
-note; it is the answer only when the step was going to block anyway. An earlier
-draft said "it costs a `blocked` status", which named a price several times too
-small — worse than naming none, because it was written to encourage taking the
-route.) Where no channel qualifies at all, that is a conflict with "never leave a
-follow-up as just text" to RAISE, not to resolve unilaterally: that rule lives in
-CLAUDE.md and states no exception, and a skill file granting itself one is
-exactly the precedence problem CLAUDE.md tells you to name out loud.
+**When there is nobody to raise it with** — an unattended background session —
+the rule is NOT "never pick a number". It is **never pick one silently.** Bound
+if you must, and put the reasoning beside the number, where a reader of the value
+will see it. That includes the question that comes BEFORE the number — whether
+this value needed bounding at all — because "is this big enough to matter?" is
+the same judgement drawing on the same missing information, and skipping it is
+precisely how the number gets invented. State both. A number with its reasoning
+next to it can be argued with and corrected, which is all anyone needed from you.
+What made the original defect dangerous was never that 300 existed — it was that
+300 arrived silent, looking deliberate, and was then defended.
 
 That default is about SIZE, never about secrecy, and the two must not be
 confused. If a value may carry a credential, token, or personal data, the
 unbounded default does NOT apply: fail closed and omit it wholesale with a
 marker, exactly as the "omit explicitly" rule says, and record only
-non-sensitive metadata. Losing diagnostic prose is recoverable; leaking a
-token is not. Emitting whole and omitting wholesale are the same discipline —
-both refuse to hand on a fragment that looks complete.
+non-sensitive metadata. Losing diagnostic prose is recoverable; leaking a token
+is not. Emitting whole and omitting wholesale are the same discipline — both
+refuse to hand on a fragment that looks complete.
+
+**One last thing, learned the hard way from this section itself.** Four review
+rounds found defects in it, and every single one had the same shape: the cited
+FACT was true, and the CONCLUSION drawn from it was false. A retrieval tool
+really did lack an id lookup — and "therefore this is an amputation" was wrong,
+because the value was stored whole elsewhere. A field really was written
+unsliced — and "therefore it is a cheap place to record something" was wrong,
+because reaching it aborted the whole run. Verifying that each cited fact is true
+is the easy half, and it is not the half that fails. **State the inference as its
+own claim, and check THAT.**
 
 ### A blocked compound command loses EVERYTHING in it
 
