@@ -232,10 +232,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   shell hook's registration timeout, and a hook killed before its `exit 2` lets the
   refused command run. The reader has their own command on screen, which is what
   they must re-read before re-running it anyway. Strictly cosmetic and unable to
-  change a verdict: every import is guarded, exit codes are asserted unchanged in
-  both directions including with the helper made deliberately unreachable, and a
-  test derives each consumer's fallback from its own imports so the two cannot
-  drift.
+  change a verdict: every import is guarded, its own work is bounded by a wall
+  clock rather than by proxies for cost, and the shell hook asserts its exit code
+  unchanged in both directions with the helper made deliberately unreachable. Three
+  tests derive the consumer set from the code rather than a hand-written list —
+  every guarded import matches its fallback exactly, every consumer that imports
+  the helper also emits it, and every guard with an approval prompt appends the
+  warning — because a rule enforced at six call sites is a rule the seventh will
+  not have.
 - **A malformed Claude Code pin on `main` no longer wedges every merge in the
   repository, and a pin blob that cannot be decoded at the head now blocks.** Two
   fixes to the CC pin-receipt merge gate, one narrow and one broad.

@@ -59,16 +59,34 @@ CONTRACT — this module is COSMETIC and must never change a verdict
 from __future__ import annotations
 
 import os
+import signal
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from shell_parse import split_segments  # noqa: E402
+from shell_parse import analyze, split_segments  # noqa: E402
 
-#: Bound the input BEFORE parsing. Both checks are O(n) scans, so an adversarial
-#: command costs a scan rather than a superlinear parse. Past the bound the answer
-#: is "no note" — the same fail-open this takes for anything it cannot read.
+#: A cheap FIRST PASS, not the bound. Both checks are O(n) scans, so an obviously
+#: enormous command is refused without paying a parse at all.
 _MAX_COMMAND_CHARS = 65_536
 _MAX_SUBSTITUTIONS = 256
+
+#: The ACTUAL bound: wall clock. The two constants above are PROXIES for cost, and
+#: were MEASURED not to bound it. ``analyze`` recurses once per substitution NESTING
+#: level and re-scans the remainder each time, so cost is length x nesting-depth —
+#: the PRODUCT of two axes bounded independently above. Forty nested ``$(`` inside a
+#: 65KB command sits inside BOTH proxies and cost 8s; 255 cost 82s. On
+#: ``destructive_command_guard`` — which parsed nothing before this helper existed —
+#: that exceeded the hook's 10s registration, and a hook SIGKILLed before its
+#: ``exit 2`` is read by Claude Code as non-blocking: the refused ``rm -rf`` RAN.
+#: origin/main refused the same command in 0.21s at every depth.
+#:
+#: Bounding the thing that actually matters, rather than a third proxy, is the whole
+#: lesson: a budget cannot be defeated by an input shape nobody enumerated.
+_BUDGET_SECONDS = 0.5
+
+
+def _timed_out(_sig, _frame):
+    raise TimeoutError("discarded-write predicate exceeded its budget")
 
 _NOTE = (
     "\nNOTE: the ENTIRE command was discarded, not just the step refused above.\n"
@@ -82,11 +100,26 @@ _NOTE = (
 def carried_more_than_the_refused_step(command: str) -> bool:
     """Whether the command holds more than one step, so a refusal lost collateral.
 
-    Structural only: ``split_segments`` cuts on the shell's own separators and this
-    counts the pieces. It never inspects argv, so no tool's option grammar can make
-    it wrong, and a construct invented tomorrow cannot change its answer.
+    Structural only: this counts the steps the shell would run and never inspects
+    what any of them MEAN. No tool's option grammar can make it wrong, and a flag
+    invented tomorrow cannot change its answer.
 
-    ONE piece means the refused step IS the whole call and there is nothing to
+    Counted at BOTH levels, because the guards block at both. ``split_segments``
+    cuts only at the top, so steps living inside a nested script —
+    ``bash -c 'cp a b && git commit …'``, or the same in a command substitution —
+    read as one step and the note goes silent, while the guard recursively finds
+    the inner command and blocks the whole call. MEASURED on that command:
+    ``split_segments`` sees 1, ``analyze`` sees 3.
+
+    But a bare ``len(analyze(...)) > 1`` is WRONG in the other direction, which a
+    control caught before this shipped: ``analyze`` also yields the ``bash -c``
+    WRAPPER, so ``bash -c 'git reset --hard'`` counts 2 and gets a note for
+    collateral that does not exist. The wrapper is not a step the refusal
+    discarded; it is the thing that was refused. So nested steps are counted at
+    ``depth > 0``, where the wrapper does not appear, and the top-level count still
+    covers the ordinary compound. MEASURED across both shapes and their controls.
+
+    ONE step means the refused step IS the whole call and there is nothing to
     report. Never raises — an unreadable command yields False, which is silence.
     """
     try:
@@ -96,7 +129,21 @@ def carried_more_than_the_refused_step(command: str) -> bool:
             return False
         if command.count("$(") + command.count("`") > _MAX_SUBSTITUTIONS:
             return False
-        return len(split_segments(command)) > 1
+        # setitimer, not a proxy: see _BUDGET_SECONDS. The blanket handler below
+        # catches the TimeoutError -> silence, this module's documented fail-open.
+        # Off the main thread signal.signal raises ValueError, caught by the same
+        # handler -> also silence. Both land on the safe side.
+        prev = signal.signal(signal.SIGALRM, _timed_out)
+        signal.setitimer(signal.ITIMER_REAL, _BUDGET_SECONDS)
+        try:
+            segments = analyze(command)
+            return (
+                len([s for s in segments if s.depth > 0]) > 1
+                or len(split_segments(command)) > 1
+            )
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, prev)
     except Exception:  # noqa: BLE001 — cosmetic: never break the guard that called us
         return False
 

@@ -52,6 +52,50 @@ def test_a_multi_step_command_gets_the_note(cmd):
     assert dw.note(cmd) is not None, cmd
 
 
+_NESTED = [
+    "bash -c 'cp a b && git " + "commit -m x'",
+    "$(cp a b; git " + "commit -m x)",
+    "bash -lc 'cat > f <<EOF\nx\nEOF\ngit " + "commit -m x'",
+]
+
+
+_NESTED_SINGLE = [
+    "bash -c 'git " + "reset --hard'",
+    "bash -lc 'git push'",
+    "$(git push)",
+]
+
+
+@pytest.mark.parametrize("cmd", _NESTED_SINGLE)
+def test_a_NESTED_single_step_command_stays_silent(cmd):
+    """The control that caught the first fix being wrong in the other direction.
+
+    ``analyze`` also yields the ``bash -c`` WRAPPER, so a bare ``len(analyze) > 1``
+    reports collateral for a nested command that has exactly one step. The wrapper
+    is not something the refusal discarded — it IS the thing refused. Found by an
+    end-to-end run against the real hook, not by the unit tests, which is why it is
+    pinned here.
+    """
+    assert dw.note(cmd) is None, cmd
+
+
+@pytest.mark.parametrize("cmd", _NESTED)
+def test_a_NESTED_multi_step_command_gets_the_note(cmd):
+    """The note must count at the level the GUARD blocks at, not one above it.
+
+    ``split_segments`` cuts only at the top level, so a compound inside ``bash -c``
+    or a command substitution reads as ONE step — while the guard recursively finds
+    the inner step and blocks the whole call. MEASURED on the first case:
+    ``split_segments`` sees 1, ``analyze`` sees 3. Counting shallower than the guard
+    blocks at is how the note goes silent exactly where the discarded work is
+    hardest for the reader to spot.
+
+    The literals are split so this file's own text cannot trip the commit guard
+    that reads it — the same reason ``NV`` is spelled that way in test_shell_parse.
+    """
+    assert dw.note(cmd) is not None, cmd
+
+
 @pytest.mark.parametrize(
     "cmd",
     [
@@ -139,7 +183,7 @@ def test_the_prompt_note_is_fail_open_on_a_broken_parser(monkeypatch):
     def boom(_):
         raise RuntimeError("parser exploded")
 
-    monkeypatch.setattr(dw, "split_segments", boom)
+    monkeypatch.setattr(dw, "analyze", boom)
     assert dw.prompt_note("a && b") is None
 
 
@@ -149,7 +193,7 @@ def test_the_prompt_note_is_fail_open_on_a_broken_parser(monkeypatch):
 def test_every_entry_point_is_fail_open_on_a_broken_parser(monkeypatch):
     """A cosmetic helper must never raise into the guard that called it.
 
-    Mutating split_segments to raise stands in for any parser failure. The module's
+    Mutating the parser to raise stands in for any parser failure. The module's
     whole safety argument is that its worst case is silence, so this is the test that
     licenses calling it from inside a security gate.
     """
@@ -157,7 +201,7 @@ def test_every_entry_point_is_fail_open_on_a_broken_parser(monkeypatch):
     def boom(_):
         raise RuntimeError("parser exploded")
 
-    monkeypatch.setattr(dw, "split_segments", boom)
+    monkeypatch.setattr(dw, "analyze", boom)
     assert dw.carried_more_than_the_refused_step("a && b") is False
     assert dw.note("a && b") is None
     dw.warn("a && b")  # must not raise
@@ -203,6 +247,33 @@ def test_the_shape_that_once_sigkilled_the_hook_is_now_instant():
     assert elapsed < 1.0, f"took {elapsed:.2f}s — the quadratic assembly is back"
 
 
+@pytest.mark.parametrize("depth", [8, 40, 255])
+def test_a_NESTED_substitution_bomb_inside_every_bound_stays_cheap(depth):
+    """The axis the breadth test above does NOT cover, and the one that bit.
+
+    The test above sweeps BREADTH — 4000 top-level steps — which the rewrite already
+    made cheap. Cost actually scales with substitution NESTING DEPTH, because
+    ``analyze`` recurses once per level and re-scans the remainder each time. So the
+    real cost is length x depth: the PRODUCT of the two axes the char/substitution
+    bounds cap INDEPENDENTLY, which is why both proxies pass while the work explodes.
+
+    MEASURED before the wall-clock budget, every input inside both declared bounds:
+    depth 32 -> 8.07s, depth 128 -> 39.31s, depth 255 -> 82.74s. On the real
+    ``destructive_command_guard`` (which parsed nothing at all before this helper),
+    depth 40 was SIGKILLed past its 10s registration and the refused ``rm -rf`` RAN,
+    while origin/main refused the same command in 0.21s at every depth.
+
+    Guarding the axis that was never the problem is how that shipped.
+    """
+    cmd = "$(" * depth + "x" * (65_400 - depth * 3) + ")" * depth
+    assert len(cmd) <= dw._MAX_COMMAND_CHARS, "the fixture must sit inside the char bound"
+    assert cmd.count("$(") <= dw._MAX_SUBSTITUTIONS, "and inside the substitution bound"
+    started = time.monotonic()
+    dw.note(cmd)
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0, f"took {elapsed:.2f}s — the budget is not bounding the parse"
+
+
 def test_an_oversized_command_is_refused_before_parsing():
     """Past the input bound the answer is silence, not a slow parse."""
     assert dw.note("a && " + "x" * (dw._MAX_COMMAND_CHARS + 1)) is None
@@ -213,6 +284,62 @@ def test_a_substitution_bomb_is_refused_before_parsing():
 
 
 # ── every consumer's guarded import must match its own fallback ──────────────
+
+
+def test_every_guard_with_an_ask_path_wires_the_prompt_note():
+    """The class, not the two instances: an approval prompt must carry the warning.
+
+    Declining a prompt discards the whole command exactly as a refusal does, so a
+    guard that can ASK and does not append the prompt note leaves the operator
+    deciding without the fact that matters. Two guards have an ``_ask``; the note
+    was wired into one, which is how this gap shipped — the same per-call-site
+    pattern that keeps producing findings in this area.
+
+    Derived by ast so a THIRD guard growing an ``_ask`` is covered automatically.
+    """
+    scripts = _HOOKS.parent
+    asking, wired = set(), set()
+    for path in sorted(scripts.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_ask":
+                asking.add(path.name)
+            if isinstance(node, ast.ImportFrom) and node.module == "discarded_write":
+                for alias in node.names:
+                    if alias.name == "prompt_note":
+                        wired.add(path.name)
+    assert asking, "the walk found no guard with an _ask path — it went blind"
+    missing = asking - wired
+    assert not missing, f"guards with an _ask that never append the prompt note: {missing}"
+
+
+def test_every_consumer_actually_emits_the_note_it_imports():
+    """The WIRING, not the module — the gap a mutation sweep measured.
+
+    The module is well tested; the feature was not. MEASURED: 9 of 15 mutations
+    survived the entire suite, and every one was a deleted CALL SITE — remove
+    `_warn_discarded()` from any guard, or unwire the `_main_with_note` wrapper,
+    and CI stays green while that guard silently stops telling the operator what
+    its refusal threw away.
+
+    This is the repo's convention -> chokepoint -> LOCK pattern: six call sites
+    that must each REMEMBER to emit, and no lock. Deriving the consumer set from
+    the imports means a seventh guard is covered the day it is added.
+    """
+    scripts = _HOOKS.parent
+    checked = 0
+    for path in sorted(scripts.rglob("*.py")):
+        if path.name == "discarded_write.py":
+            continue  # the module itself is not one of its own consumers
+        src = path.read_text()
+        if "from discarded_write import" not in src:
+            continue
+        checked += 1
+        assert "_warn_discarded(" in src, (
+            f"{path.name}: imports the note helper but never emits it — "
+            "the import is wiring that does nothing"
+        )
+    assert checked >= 6, f"the walk found only {checked} consumers — it went blind"
 
 
 def test_each_guarded_import_has_a_stand_in_for_every_name_it_imports():
@@ -256,8 +383,18 @@ def test_each_guarded_import_has_a_stand_in_for_every_name_it_imports():
                 for stmt in handler.body
                 if isinstance(stmt, ast.FunctionDef)
             }
-            missing = imported - defined
-            assert not missing, f"{path.name}: imported but no fallback stand-in: {missing}"
+            # SET EQUALITY, both directions. This test previously asserted only
+            # `imported - defined`, which is the OPPOSITE of the incident its own
+            # docstring cites: the formatter deleted an IMPORT and left the
+            # hand-written stand-in behind, so the failing path was fine and the
+            # SUCCESSFUL one raised NameError. MEASURED: deleting one import while
+            # keeping its stand-in left this whole suite green while every push
+            # failed closed on a NameError.
+            assert imported == defined, (
+                f"{path.name}: guarded import and fallback disagree — "
+                f"imported with no stand-in: {imported - defined}; "
+                f"stand-in with no import (the formatter failure): {defined - imported}"
+            )
     assert checked >= 4, f"the walk found only {checked} guarded imports — it went blind"
 
 
