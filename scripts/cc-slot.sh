@@ -474,7 +474,15 @@ if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
         # Accepted cost, stated rather than hidden: a poisoned slot held open
         # in a second window will not self-heal until that window closes. That
         # is a stall; interrupting someone's deploy is damage.
-        _attached=$(tmux display-message -p -t "=$SESSION_NAME" '#{session_attached}' 2>/dev/null || echo "")
+        # MEASURED on tmux 3.4, and getting it wrong disables the feature
+        # rather than weakening it: `display-message -p -t <session>
+        # '#{session_attached}'` renders EMPTY (the variable is not populated in
+        # that context, and even `#{?session_attached,1,0}` answers 0 for an
+        # attached session). An empty answer is treated as ATTACHED below, so
+        # the wrong query refuses EVERY heal. It IS populated per row in a
+        # session-LIST context, so ask there.
+        _attached=$(tmux list-sessions -F '#{session_name} #{session_attached}' 2>/dev/null \
+            | awk -v n="$SESSION_NAME" '$1==n{print $2}')
         # Fail toward SPARING, like every other gate here: only an affirmative
         # "nobody is attached" permits keystrokes. Coercing an empty or
         # non-numeric answer to 0 would read a BROKEN query as "nobody there"

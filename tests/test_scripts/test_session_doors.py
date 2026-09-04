@@ -45,10 +45,23 @@ if [[ "$args" == *has-session* ]]; then
     exit 1
 fi
 if [[ "$args" == *display-message* && "$args" == *session_attached* ]]; then
-    # Whether another client is already in the session. Real tmux prints a
-    # count; absent fake -> 0, i.e. nobody there, which is the case every
-    # pre-existing heal test assumes.
-    echo "${FAKE_TMUX_ATTACHED:-0}"
+    # MODELS REAL TMUX, which is the point. MEASURED on 3.4: this context
+    # renders session_attached EMPTY. The fake used to print a number here,
+    # which made a door querying the WRONG way pass the suite while refusing
+    # every heal on a real machine — a fake more permissive than reality is
+    # worse than no fake.
+    echo ""
+    exit 0
+fi
+if [[ "$args" == *"list-sessions -F #{session_name} #{session_attached}"* ]]; then
+    # The context where tmux DOES populate it: one row per session. Read the
+    # session list from the same FILE has-session uses, not a pre-computed env
+    # var — the fixture builds the environment before a test writes that file.
+    if [[ -f "$FAKE_TMUX_SESSIONS" ]]; then
+        while read -r _n; do
+            [[ -n "$_n" ]] && echo "$_n ${FAKE_TMUX_ATTACHED:-0}"
+        done < "$FAKE_TMUX_SESSIONS"
+    fi
     exit 0
 fi
 if [[ "$args" == *list-panes* && -n "${FAKE_TMUX_LIST_PANES_FAIL:-}" ]]; then
