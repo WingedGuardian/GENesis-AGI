@@ -195,7 +195,9 @@ only replaying a known-positive tells them apart.
 **Scope first, because bounding is often correct.** A bounded PREVIEW is a
 selection with a pointer, not an amputation — but ONLY if the pointer actually
 resolves. The proactive memory hook is the worked example: it renders a snippet
-plus `id:xxxxxxxx`, and `memory_expand` takes exactly that handle (it resolves
+plus `id:xxxxxxxx` (for most rows — code-sourced ones render no handle at all,
+which is the same defect as the procedure case below), and `memory_expand` takes
+exactly that handle (it resolves
 short prefixes and reports `ambiguous` rather than guessing) and returns the full
 record. Bounding is likewise correct against a hard external budget — a hook
 stdout cap, a DB column, a context window — and a log line or diagnostic
@@ -204,13 +206,20 @@ section is about the other case: a value that is the ONLY copy, where cutting it
 destroys the information.
 
 **Test the pointer before you call something a preview.** The same hook renders
-`principle[:200]` for procedures with an id beside it, and that one does NOT
+`principle[:200]` for procedures with an id beside it, and that HANDLE does not
 resolve: procedures live in SQLite `procedural_memory`, `memory_expand` retrieves
 only the Qdrant collections, and `procedure_recall` takes a task description and
-tags with no id lookup at all. So it looks exactly like the memory case and is an
-amputation — and successive drafts of this very section cited it as the carve-out,
-each naming a different wrong tool. A pointer you have not followed is not a
-pointer.
+tags with no id lookup at all. It is still not an amputation — the principle
+survives whole in SQLite and `procedure_recall` returns it unsliced, and the cap
+is a cache-width decision the code states outright. So this is a preview whose
+handle is DECORATIVE: a defect of its own, because it teaches a retrieval path
+that does not exist, but not the defect this section is about. Getting that
+distinction wrong is not academic — a reader who reads "amputation" here goes and
+removes the cap, and the proactive hook's output is bounded against CC's
+10,000-char hook-stdout limit, above which it is silently filed. Successive
+drafts of this very section cited this case as the carve-out, each naming a
+different wrong tool, and one called it an amputation. A pointer you have not
+followed is not a pointer.
 
 **There, do not truncate.** Not strings, not lists, not context, not output.
 Reaching for a character cap is a signal that a question was skipped, not
@@ -250,9 +259,19 @@ Three rules when a bound really is needed:
   `activity_log.error_message` (written by `routing/router.py`, already capped
   there at 1024), so `SELECT SUM(LENGTH(error_message) > 300), COUNT(*) FROM
   activity_log WHERE error_message IS NOT NULL AND error_message != '';` On one
-  install on 2026-09-03 that gave **270/318 (84.9%)** cut by a 300-char cap —
-  and since JSON error bodies put the machine-readable cause last, the cap
-  discards exactly the part worth keeping.
+  install on 2026-09-03 that gave **270/318 (84.9%)** cut by a 300-char cap.
+  What the cap COSTS is a second claim needing its own denominator, and an
+  earlier draft asserted it without one — "JSON error bodies put the
+  machine-readable cause last, so the cap discards exactly the part worth
+  keeping." Measured against the same table: 251 of 600 cut rows (41.8%) carry
+  `code` inside the first 300 characters, and every row leads with the litellm
+  exception class. Some providers do put a `"code":"rate_limit_exceeded"` in the
+  tail a 300-char cut discards; others put it in the first sixty characters. So
+  the cap destroys a provider-specific remainder, unevenly — not "exactly the
+  part worth keeping". Note also that this corpus is ITSELF already cut at 1024
+  upstream, so the population being measured is one the rule would forbid
+  creating. Both of those are worth saying out loud, because a measurement
+  followed by an unmeasured generalisation is how a number launders an opinion.
   That is an EPHEMERAL OBSERVATION, not a re-derivable one. `activity_log` is
   reaped at 24 hours (`observability/provider_activity.py` `reap_old_records`,
   scheduled four times daily by `runtime/init/learning.py`), and the query carries
@@ -270,9 +289,18 @@ Three rules when a bound really is needed:
   corpus survives is the same failure wearing the opposite face.
 - **Omit explicitly, with a constant-bounded marker** (`<omitted: 104,823
   chars>`), never a mid-value cut. An honest gap beats a plausible-looking
-  fragment. Already the house pattern: repo-pulse's loud `limit_hit`
-  (`session_awareness/repo_pulse_gh.py:170`), and the bound-plus-flag-plus-stated
-  -consequence model in `memory/integrity_repair.py:27` ("Truncation asymmetry").
+  fragment. The FLAG half is already the house pattern — the character-count
+  marker is new, and no call site in the tree emits one today (grep for it and
+  you get nothing; do not go looking for a precedent that is not there):
+  repo-pulse's loud `limit_hit`
+  (`session_awareness/repo_pulse_gh.py` returns `limit_hit` alongside the rows),
+  and the bound-plus-flag-plus-stated-consequence model in
+  `memory/integrity_repair.py` ("Truncation asymmetry": ghost repair proceeds on
+  a partial scroll because every scanned point is genuinely present AND it holds
+  the complete id set from a full SQLite read; mirror repair is SKIPPED because
+  it proves absence, which a partial set cannot). Cited by SYMBOL, not by line — a line number in an
+  always-loaded file rots silently, and every claim here is one a reader should
+  be able to re-check with a grep.
 
 One trap worth naming: a cap can manufacture a correctness bug in the data it was
 added to protect. Truncating an identifier used as a KEY merges two distinct
@@ -318,17 +346,35 @@ teach the check better than a rule does:
 
 The rule is the property, not the mechanism: **availability is not preservation,
 neither is portable between surfaces, and a ranking is a separate claim from the
-facts it sorts.** Verify each for the surface you are on. If nothing obvious
+facts it sorts.** Verify each for the surface you are on.
+
+**And one pattern above all, because this section kept committing it while
+describing it.** Across four review rounds every single defect found here had the
+same shape: the membership facts were RIGHT and the CONCLUSION drawn from them
+was wrong. `procedure_recall` really has no id lookup — and "therefore it is an
+amputation" was false, because the principle is stored whole elsewhere. Some
+providers really do put the error code in the tail — and "therefore JSON bodies
+put the cause last" was false for 42% of the corpus. `follow_up_create` really is
+denied for CODE steps — and "therefore that scope is the strictest" was backwards.
+`blocker_description` really is stored unsliced — and "therefore it costs a
+status" understated a price that is the whole run. Checking that each cited fact
+is true is the easy half and it is not the half that fails. **Say the inference
+out loud as its own claim, and check THAT.** If nothing obvious
 qualifies, look harder before declaring a dead end — grep the sibling fields of
 whatever you were about to give up on. (The same `result` write that slices to
 `[:2000]` stores `blocker_description` and `artifacts` UNSLICED, and the step
-contract defines the first as "what decision is needed from the user", which is
-close to exactly this. It costs a `blocked` status, which is a real price worth
-naming — but it is an answer, and the earlier draft asserted there was none.)
-This is the one carve-out from "never leave a follow-up as just text": that rule
-assumes a surface where `follow_up_create` exists. Where it does not, an
-unrecorded debt is worse than a differently-recorded one — but say which surface
-forced it, so the exception cannot quietly become the habit.
+contract defines the first as "What specific information, credential, or
+decision is needed from the user" — scoped to blockers, so the fit is close but
+not exact. And price it honestly: it costs the whole RUN, not a status field.
+`engine.py` returns False on a blocked step, so no deliverable is synthesized,
+the notepad is never promoted, and the user is paged. That is far too high for a
+note; it is the answer only when the step was going to block anyway. An earlier
+draft said "it costs a `blocked` status", which named a price several times too
+small — worse than naming none, because it was written to encourage taking the
+route.) Where no channel qualifies at all, that is a conflict with "never leave a
+follow-up as just text" to RAISE, not to resolve unilaterally: that rule lives in
+CLAUDE.md and states no exception, and a skill file granting itself one is
+exactly the precedence problem CLAUDE.md tells you to name out loud.
 
 That default is about SIZE, never about secrecy, and the two must not be
 confused. If a value may carry a credential, token, or personal data, the
