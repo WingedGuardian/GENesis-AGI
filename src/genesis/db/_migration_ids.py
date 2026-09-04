@@ -430,4 +430,16 @@ def scan_directory(
             )
         runnable.append((match.group(1), path.stem, path))
 
+    # ORDER: every legacy-width id before every timestamp id, then by id within
+    # each band. A raw filename sort ALMOST does this — every frozen legacy id
+    # begins with '0' and every timestamp with '2' — but "begins with 0" holds
+    # only for the frozen 0001..0093 set, NOT for a downstream FORK's own
+    # legacy-width id. A fork's ``3000_custom.py`` (or ``d3000_…``) sorts AFTER a
+    # ``2026…`` timestamp by leading character, so a fresh clone would run it
+    # after the timestamp while the fork that authored it ran it before the
+    # timestamp existed — divergent order across installs, exactly what the
+    # ordering invariant exists to prevent. The band key makes the invariant
+    # true by construction instead of by a leading-digit coincidence, and it
+    # is a no-op for this repo (its legacy ids all begin with 0 already).
+    runnable.sort(key=lambda r: (is_valid_timestamp_id(r[0]), r[0]))
     return runnable, unrunnable, disallowed

@@ -83,6 +83,28 @@ def test_frozen_legacy_ids_always_precede_timestamp_ids(tmp_path):
         conn.close()
 
 
+def test_a_fork_legacy_id_above_2xxx_still_precedes_timestamps(tmp_path):
+    """The ordering invariant must hold by CONSTRUCTION, not by leading digit.
+
+    A raw filename sort keeps legacy ahead of timestamps only because the frozen
+    set all begins with '0' and timestamps with '2'. A downstream FORK's own
+    legacy-width id is runnable (DISALLOWED_LEGACY) and need not begin with '0':
+    ``3000_fork_custom.py`` sorts AFTER a ``2026…`` timestamp by leading char, so
+    a fresh clone would run it after the timestamp while the fork that authored
+    it ran it before — divergent order across installs. discovery bands
+    legacy-before-timestamp explicitly so a fork id in the 2xxx–9xxx range is
+    ordered with the other legacy history, not scattered into new work.
+    """
+    _make(tmp_path, FIRST_LEGACY, "3000_fork_custom.py", "20260904120000_upstream.py")
+    ids = [mid for mid, _, _ in discover_numbered_modules(tmp_path, SCHEMA)]
+    assert ids == ["0001", "3000", "20260904120000"], ids
+    # No legacy-width id may appear after any timestamp id.
+    from genesis.db._migration_ids import is_valid_timestamp_id
+
+    first_ts = next((i for i, x in enumerate(ids) if is_valid_timestamp_id(x)), len(ids))
+    assert not [x for x in ids[first_ts:] if not is_valid_timestamp_id(x)], ids
+
+
 def test_timestamp_ids_are_discovered_in_both_namespaces(tmp_path):
     """The runners' real patterns must accept the new width — a pattern that
     silently skipped it would mean the migration never runs, with no error."""
