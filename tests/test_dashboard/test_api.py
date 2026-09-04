@@ -36,11 +36,18 @@ def test_dashboard_page_without_template(client):
 
 
 def test_dashboard_page_contains_operator_controls(client):
-    """Dashboard HTML includes the queue, routing, and budget controls."""
+    """Dashboard HTML includes the queue, routing, and budget controls.
+
+    These assert that each control is PRESENT, so they anchor on the handler or
+    the stable heading rather than on display text. The clear-all check used to
+    match the literal "Clear all reviewed" and broke when that button began
+    reporting how many rows it deletes — a label change, not a missing control,
+    but indistinguishable from one at the assertion.
+    """
     resp = client.get("/genesis")
     assert resp.status_code == 200
     page = resp.get_data(as_text=True)
-    assert "Clear all reviewed" in page
+    assert "clearAllDiscardedItems()" in page
     assert "Reload routing config" in page
     assert "Approval Queue" in page
     assert "Save budget" in page
@@ -488,6 +495,72 @@ def test_routing_config_read_includes_call_sites(client):
     assert "autonomous_executor_reasoning" in data["call_sites"]
     assert data["call_sites"]["autonomous_executor_reasoning"]["chain"] == ["openrouter-sonnet"]
     assert data["call_sites"]["autonomous_executor_reasoning"]["default_paid"] is True
+
+
+def test_routing_config_read_reports_why_a_breaker_is_not_closed(client):
+    """WIRING: the route must actually emit `cb_detail.opened_by`.
+
+    The frontend tests drive `breakerVerdict`/`breakerTooltip` from synthetic
+    payloads, which proves the rendering and not that anything produces the
+    data. This drives REAL CircuitBreaker objects through the real route, so a
+    rename or a dropped key fails here rather than silently rendering every
+    provider as probe-suspected.
+
+    Uses real breakers rather than mocks deliberately: `opened_by` is derived
+    from `_opened_by_call`, and a MagicMock would answer truthy for it whatever
+    the production code did.
+    """
+    from genesis.routing.circuit_breaker import CircuitBreakerRegistry
+    from genesis.routing.types import ErrorCategory, ProviderConfig
+
+    def _p(name):
+        return ProviderConfig(
+            name=name, provider_type="openrouter", model_id="m",
+            is_free=True, rpm_limit=None, open_duration_s=120,
+        )
+
+    names = ["healthy-1", "call-dead", "probe-suspect"]
+    t = [0.0]
+    reg = CircuitBreakerRegistry(
+        {n: _p(n) for n in names}, clock=lambda: t[0], persist=False,
+    )
+    # call-dead: real calls failed → OPEN, opened_by == "call"
+    for _ in range(3):
+        reg.get("call-dead").record_failure(ErrorCategory.PERMANENT)
+    # probe-suspect: a probe blip only → HALF_OPEN, opened_by == "probe"
+    reg.get("probe-suspect").probe_suspect()
+
+    mock_cfg = SimpleNamespace()
+    mock_cfg.disabled_providers = {}
+    mock_cfg.providers = {
+        n: SimpleNamespace(name=n, provider_type="openrouter", model_id="m", is_free=True)
+        for n in names
+    }
+    mock_cfg.call_sites = {}
+    mock_router = MagicMock()
+    mock_router.config = mock_cfg
+    mock_router.breakers = reg
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = True
+    mock_rt.router = mock_router
+
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = client.get("/api/genesis/routing/config")
+
+    assert resp.status_code == 200
+    detail = resp.get_json()["cb_detail"]
+
+    assert detail["healthy-1"] == {"state": "closed", "opened_by": None}
+    assert detail["call-dead"] == {"state": "open", "opened_by": "call"}, (
+        "a call-tripped breaker must report opened_by='call' — the dashboard "
+        "uses it to say WHY, and defaulting to 'probe' understates a real outage"
+    )
+    assert detail["probe-suspect"] == {"state": "half_open", "opened_by": "probe"}
+
+    # cb_states must keep its plain-string shape — several consumers lowercase
+    # it directly, so widening it into an object would break them silently.
+    assert resp.get_json()["cb_states"]["call-dead"] == "open"
 
 
 def test_routing_config_update_endpoint(client):

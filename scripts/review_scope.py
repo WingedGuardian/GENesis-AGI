@@ -767,8 +767,8 @@ def render_reminder_block(manifest: dict | None) -> str:
         )
     else:
         lines.append(
-            f"Changeset is {manifest.get('diff_lines', 0)} lines (<50) — /review "
-            "skips specialists; still cover every file above."
+            f"Changeset is {manifest.get('diff_lines', 0)} lines (<50) — "
+            "specialists are skipped; still cover every file above."
         )
     return "\n".join(lines)
 

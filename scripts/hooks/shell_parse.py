@@ -22,6 +22,16 @@ This module centralizes that parsing so ``git_push_guard``,
 ``review_enforcement_commit``, and the destructive/path guards agree. Stdlib
 only; fail-open (a segment that won't tokenize degrades to a naive split rather
 than raising) — a guard must never crash the tool.
+
+That fail-open degradation is SILENT by design, which means ``analyze()`` can
+never report its own blind spot: "no gated segment found" and "no gated command
+present" are indistinguishable in its return value. A caller that treats the
+former as the latter fails OPEN. ``untokenizable()`` exists so a
+security-critical caller can tell them apart and choose its own fail direction
+at its own boundary — the parser degrades gracefully, each gate decides for
+itself what an unverifiable command means. Callers must probe the RAW command:
+normalizing text before a blind-spot probe can only ever delete the evidence
+the probe looks for.
 """
 
 from __future__ import annotations
@@ -396,7 +406,7 @@ def split_segments(command: str) -> list[str]:
     return [p.raw for p in parse_segments(command)]
 
 
-def has_top_level_pipe(command: str) -> bool:
+def has_top_level_pipe(command: str, *, count_substitutions: bool = False) -> bool:
     """Whether *command* contains a real top-level shell PIPE (``a | b``).
 
     Quote-, redirect-, and substitution-aware: a ``|`` inside a quoted string (a jq
@@ -415,6 +425,16 @@ def has_top_level_pipe(command: str) -> bool:
     pipe). Never a security bypass either way (an over-read is a reworked command, an
     under-read re-exposes the empty-output footgun this guard usually prevents); closing
     these fully is the unbounded quote-parsing tail shared with ``split_segments``.
+
+    ``count_substitutions`` inverts the ``$( … )`` rule, and exists because the two
+    consumers need OPPOSITE answers about the same syntax. The background-output guard
+    (default, ``False``) is right to skip them: ``RESULT=$(cmd | filter)`` captures its
+    output, so nothing is swallowed. The pipe-STATUS guard needs ``True``: bash defines
+    an assignment-only command's status as the status of the command substitution, so
+    ``rc=$(prog | tail); echo $?`` reads the FILTER's status — exactly the footgun that
+    guard exists to flag, and invisible while substitutions are skipped. Kept as one
+    scanner with a flag rather than a second copy: two hand-rolled shell scanners drift,
+    and this file's whole purpose is that there is one.
     """
     i, n = 0, len(command)
     quote: str | None = None
@@ -430,7 +450,7 @@ def has_top_level_pipe(command: str) -> bool:
                 quote = None
             i += 1
             continue
-        if in_backtick:  # `…` substitution — output captured, so any `|` inside is not a bg pipe
+        if in_backtick and not count_substitutions:  # `…` output captured: not a bg pipe
             if c == "`":
                 in_backtick = False
             i += 1
@@ -440,13 +460,14 @@ def has_top_level_pipe(command: str) -> bool:
             i += 1
             continue
         if c == "`":
-            in_backtick = True
+            in_backtick = not in_backtick
             i += 1
             continue
         if (
             c == "$" and i + 1 < n and command[i + 1] == "("
         ):  # $( … ) opens a capturing substitution
-            subst_depth += 1
+            if not count_substitutions:
+                subst_depth += 1
             i += 2
             continue
         if c == ")" and subst_depth > 0:
@@ -514,6 +535,21 @@ _KNOWN_SIGILS = (
     "stale-review-override",
     "scheduled-review-override",
     "discard-override",
+    # Both were passed to has_trailing_override from the day they shipped but never
+    # listed here, so the "kept in sync" claim above was false. The consequence is
+    # silent and asymmetric: the sigil queried FOR ITSELF still matches, so nothing
+    # looked broken, while an unlisted token written FIRST reads as prose and ends
+    # the leading run — disabling every sigil after it. NOTE this widens ACCEPTANCE
+    # as well as detection, in the fail-open direction, and the reach is wider than
+    # the merge gate; the PR that added them enumerates the combinations that flip.
+    # A test derives this set from the consumers themselves (an ast walk over
+    # scripts/, not just scripts/hooks/ — review_enforcement_commit.py lives
+    # outside that directory and is the only place two of the declared sigils are
+    # queried, and two guards pass their sigil as a module constant a literal scan
+    # cannot see), and asserts the set matches in BOTH directions, so neither a
+    # missing declaration nor an unwarranted one can ship unnoticed.
+    "merge-to-main-override",  # git_push_guard: local `git merge` onto main/master
+    "full-suite-ok",  # full_suite_guard: run the whole pytest suite locally
 )
 
 
@@ -584,6 +620,50 @@ def _argv(seg: str) -> list[str]:
         return shlex.split(core)
     except ValueError:
         return core.split()
+
+
+def untokenizable(command: str) -> bool:
+    """True when ``shlex`` cannot cleanly tokenize the command.
+
+    This is the blind-spot signal a guard consults when it is about to conclude
+    "no gated segment found". ``_argv`` degrades to a naive split on the SAME
+    ``ValueError`` silently, so ``analyze()`` can never self-report that its
+    result is untrustworthy: an ordinary quoting construct is enough to shift
+    segmentation off and drop a real, executing command from the parse, and the
+    return value looks identical to "there was nothing to find".
+
+    Deliberately reads the WHOLE raw command, with no normalization of any kind.
+    An earlier version pre-processed it to suppress prompts on a class of
+    multi-line command, and that MEASURABLY disarmed the signal: on a shape a
+    developer writes without thinking, the command really ran (verified against
+    a shimmed binary, so the proof was execution rather than parse) while the
+    pre-processed text tokenized cleanly and the guard fell silent. The
+    triggering shape is deliberately not written down — this file is public and
+    the guard it protects is load-bearing.
+
+    KNOWN COST, stated rather than hidden: ``_argv`` DOES normalize before its
+    own tokenize (it strips trailing comments), so this probe over-reports
+    relative to the very parser whose blind spot it reports — an unquoted
+    comment alone can make a benign command look unparseable. Stripping here is
+    NOT the fix: measured over 19,246 real commands, doing so erases a mention
+    of a gated operation in 3 of them, because a stripper's model of where a
+    comment begins is not the shell's and the two disagree in both directions.
+    A cure that can only raise severity, never clear it, is tracked separately.
+
+    That rule is now literal. An earlier revision folded ``\\<newline>`` to a
+    SPACE before probing, which contradicted the paragraph above and was also
+    simply wrong about bash — bash REMOVES a line continuation, joining the two
+    halves into one word (``ec\\<newline>ho`` runs ``echo``), so replacing it
+    with a space produced the reading furthest from what actually executes.
+    MEASURED over 12,099 real commands: folding and not folding classify
+    IDENTICALLY (339 un-tokenizable either way, zero commands differ), so the
+    normalization bought nothing and is removed rather than documented.
+    """
+    try:
+        shlex.split(command)
+        return False
+    except ValueError:
+        return True
 
 
 def _basename(token: str) -> str:

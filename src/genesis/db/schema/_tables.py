@@ -285,7 +285,8 @@ TABLES = {
             delivered           INTEGER NOT NULL DEFAULT 0,
             delivered_at        TEXT,
             thread_id           TEXT,
-            validated_recipient TEXT
+            validated_recipient TEXT,
+            labeled_surplus     INTEGER NOT NULL DEFAULT 0
         )
     """,
     "brainstorm_log": """
@@ -501,7 +502,11 @@ TABLES = {
             rate_limited_at  TEXT,
             rate_limit_resumes_at TEXT,
             origin_class     TEXT,
-            chat_id          TEXT
+            chat_id          TEXT,
+            -- when the TOPIC was written, as distinct from
+            -- last_extracted_at, which is a pass watermark the extraction
+            -- job advances even when it writes no topic.
+            topic_updated_at TEXT
         )
     """,
     "inbox_items": """
@@ -616,21 +621,6 @@ TABLES = {
             source_subsystem    TEXT
         )
     """,
-    "predictions": """
-        CREATE TABLE IF NOT EXISTS predictions (
-            id                TEXT PRIMARY KEY,
-            action_id         TEXT NOT NULL,
-            timestamp         TEXT NOT NULL DEFAULT (datetime('now')),
-            prediction        TEXT NOT NULL,
-            confidence        REAL NOT NULL,
-            confidence_bucket TEXT NOT NULL,
-            domain            TEXT NOT NULL CHECK (domain IN ('outreach', 'triage', 'procedure', 'routing')),
-            reasoning         TEXT NOT NULL,
-            outcome           TEXT,
-            correct           INTEGER,
-            matched_at        TEXT
-        )
-    """,
     "outcome_events": """
         CREATE TABLE IF NOT EXISTS outcome_events (
             id                TEXT PRIMARY KEY,
@@ -679,19 +669,6 @@ TABLES = {
             details          TEXT,
             session_id       TEXT,
             created_at       TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """,
-    "calibration_curves": """
-        CREATE TABLE IF NOT EXISTS calibration_curves (
-            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-            domain               TEXT NOT NULL,
-            confidence_bucket    TEXT NOT NULL,
-            predicted_confidence REAL NOT NULL,
-            actual_success_rate  REAL NOT NULL,
-            sample_count         INTEGER NOT NULL,
-            correction_factor    REAL NOT NULL,
-            computed_at          TEXT NOT NULL DEFAULT (datetime('now')),
-            UNIQUE(domain, confidence_bucket)
         )
     """,
     "approval_requests": """
@@ -790,8 +767,28 @@ TABLES = {
             issue_url           TEXT,
             posted_at           TEXT,
             rejected_at         TEXT,
-            dry_run_at          TEXT
+            dry_run_at          TEXT,
+            adopted             INTEGER NOT NULL DEFAULT 0
         )
+    """,
+    # Marketing cold-send substrate — owner-curated cold-outreach target inventory.
+    # Code-resolvable recipient (never the LLM), PERMANENT opt-out suppression, and
+    # status-queryable. See db/crud/marketing_prospects.py for the New-Store
+    # justification + retention (opted_out rows never pruned; owner-curated + bounded).
+    # DDL byte-identical to migration 0089.
+    "marketing_prospects": """
+    CREATE TABLE IF NOT EXISTS marketing_prospects (
+        id                TEXT PRIMARY KEY,
+        email             TEXT NOT NULL,
+        name              TEXT,
+        company           TEXT,
+        status            TEXT NOT NULL DEFAULT 'active',   -- active | contacted | replied
+        opted_out         INTEGER NOT NULL DEFAULT 0,       -- 1 = PERMANENT suppression (never pruned)
+        source            TEXT,
+        created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
+        last_contacted_at TEXT
+    )
     """,
     # WS-8 PR-D autonomous-send ledger — one row per email sent autonomously
     # under a GRANTED capability cell (i.e. the gate allowed it without holding
@@ -1138,12 +1135,15 @@ TABLES = {
                 CHECK (status IN ('active', 'fired', 'expired', 'withdrawn')),
             created_at        TEXT NOT NULL,
             fired_at          TEXT,
-            proposal_id       TEXT,                   -- FK to ego_proposals.id (set on fire)
+            proposal_id       TEXT,                   -- FK to ego_proposals.id (set on fire;
+                                                      -- system rows: source dispatch proposal, set at creation)
             cycle_count       INTEGER NOT NULL DEFAULT 0,
             max_cycles        INTEGER NOT NULL DEFAULT 20,
             reasoning         TEXT,
             priority          TEXT NOT NULL DEFAULT 'normal'
-                CHECK (priority IN ('low', 'normal', 'high'))
+                CHECK (priority IN ('low', 'normal', 'high')),
+            origin            TEXT NOT NULL DEFAULT 'ego'  -- 'ego' (LLM-created, capped) |
+                                                          -- 'system' (dispatch follow-through, uncapped)
         )
     """,
     # ── Intervention Journal ────────────────────────────────────────────────
@@ -1861,7 +1861,10 @@ TABLES = {
             pointers         TEXT NOT NULL DEFAULT '[]',
             compaction_count INTEGER NOT NULL DEFAULT 0,
             created_at       TEXT NOT NULL,
-            updated_at       TEXT
+            updated_at       TEXT,
+            -- when the MISSION was last set, as distinct from updated_at, which
+            -- is a ROW timestamp bumped by pointer edits and the upsert too.
+            mission_updated_at TEXT
         )
     """,
     # Data-migration framework ledger (WS-C). Kept in LOCKSTEP with migration
@@ -2394,10 +2397,6 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity)",
     "CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)",
-    # calibration
-    "CREATE INDEX IF NOT EXISTS idx_predictions_domain ON predictions(domain)",
-    "CREATE INDEX IF NOT EXISTS idx_predictions_bucket ON predictions(confidence_bucket)",
-    "CREATE INDEX IF NOT EXISTS idx_predictions_unmatched ON predictions(outcome) WHERE outcome IS NULL",
     # outcome bus (self-improvement ledger)
     "CREATE INDEX IF NOT EXISTS idx_outcome_events_domain ON outcome_events(domain)",
     "CREATE INDEX IF NOT EXISTS idx_outcome_events_source ON outcome_events(source)",
@@ -2424,6 +2423,10 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_autonomous_email_sends_cell "
     "ON autonomous_email_sends(cell_domain, cell_verb, cell_risk_class, sent_at)",
     "CREATE INDEX IF NOT EXISTS idx_autonomous_email_sends_sent ON autonomous_email_sends(sent_at)",
+    # Marketing cold-send prospect inventory — email lookup + active-set scan
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_marketing_prospects_email ON marketing_prospects(email COLLATE NOCASE)",
+    "CREATE INDEX IF NOT EXISTS idx_marketing_prospects_active "
+    "ON marketing_prospects(status, opted_out)",
     # task states (Phase 9)
     "CREATE INDEX IF NOT EXISTS idx_task_states_session ON task_states(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_task_states_phase ON task_states(current_phase)",

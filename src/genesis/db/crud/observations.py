@@ -100,6 +100,13 @@ INTERNAL_OBS_TYPES: frozenset[str] = frozenset(
         # marker. The owner nudge (Telegram) is the delivery path; these rows must
         # NOT surface via the generic observation surfacers (would double-notify).
         "career_outreach_nudged",
+        # Ego questions channel — the Telegram question itself + the reactive
+        # signal are the delivery paths. Surfacing user_reply would echo the
+        # user's own answer back at them (double-notify); no_reply/not_delivered
+        # are internal ego state.
+        "user_reply",
+        "no_reply",
+        "not_delivered",
     }
 )
 
@@ -123,6 +130,9 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "light_reflection_candidate": timedelta(days=3),
     "process_reaper_kill": timedelta(days=3),
     "operational_alert": timedelta(days=3),
+    # Ego questions channel — unanswered/undelivered are transient ego state.
+    "no_reply": timedelta(days=3),
+    "not_delivered": timedelta(days=3),
     "infrastructure_alert": timedelta(days=3),
     # ego cycle liveness: self-resolving + re-fireable, so a long TTL only delays
     # the next re-fire; matches infrastructure_alert. Surfaces in the dashboard
@@ -136,6 +146,8 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "task_detected": timedelta(days=1),
     "model_downgrade": timedelta(days=1),
     # ── 7-day (version tracking, operational) ──────────────────────────
+    # A captured user answer stays readable across a week of ego cycles.
+    "user_reply": timedelta(days=7),
     "conversation_pivot": timedelta(days=7),
     "genesis_version_change": timedelta(days=7),
     "memory_index": timedelta(days=7),
@@ -156,6 +168,9 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "sentinel_escalated": timedelta(days=7),
     "guardian_diagnosis": timedelta(days=7),
     "infrastructure_drift": timedelta(days=7),
+    # entity-resolution adjudication run summaries — a per-run diagnostic
+    # observation (memory/entity_adjudication.py), same class as guardian_diagnosis.
+    "entity_adjudication": timedelta(days=7),
     # ── 14-day (learning artifacts & assessments — also the DEFAULT) ───
     "build_state": timedelta(days=14),
     "project_context": timedelta(days=14),

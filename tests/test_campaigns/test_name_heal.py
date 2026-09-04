@@ -162,8 +162,22 @@ async def test_job_health_row_follows_the_rename(db):
     assert await cur.fetchone() is None, "stale row left under the old name"
 
 
-async def test_job_health_collision_leaves_both_rows(db):
-    """If a row already exists under the healed name, do not clobber live history."""
+async def test_job_health_collision_keeps_the_live_history(db):
+    """On a collision the row under the NEW name is the fossil, not the live one.
+
+    This inverts what an earlier version of this test asserted, so the reasoning
+    matters. At heal time nothing can legitimately hold ``campaign_{new_name}``:
+    the campaign answered to the OLD name until a moment ago, ``campaigns.name``
+    is UNIQUE so no other campaign holds the new one, and the heal runs BEFORE
+    ``runner.start()`` so nothing has written health under the new key in this
+    process. A row there can only be left over from a campaign that held the name
+    and was deleted.
+
+    Keeping it therefore preserved the row that can never be written again and
+    orphaned the one that will be — and an orphan is not inert: ``get_stale_jobs``
+    filters on neither the live scheduler registry nor recency, so it emits
+    ``job_stale`` forever.
+    """
     from genesis.campaigns.name_heal import heal_campaign_names
 
     await _insert_raw(db, "c-jh2", "alpha\tbeta")
@@ -176,10 +190,73 @@ async def test_job_health_collision_leaves_both_rows(db):
     await db.commit()
 
     assert await heal_campaign_names(db) == 1
+
     cur = await db.execute(
         "SELECT total_runs FROM job_health WHERE job_name = ?", ("campaign_alpha beta",)
     )
-    assert (await cur.fetchone())[0] == 99, "existing history was clobbered"
+    row = await cur.fetchone()
+    assert row is not None, "the campaign lost its health row entirely"
+    assert row[0] == 3, "the fossil won — the campaign's live history was discarded"
+
+    cur = await db.execute(
+        "SELECT 1 FROM job_health WHERE job_name = ?", ("campaign_alpha\tbeta",)
+    )
+    assert await cur.fetchone() is None, (
+        "orphan left under the dirty name — get_stale_jobs will warn on it forever"
+    )
+
+
+async def test_job_run_events_follow_the_rename(db):
+    """The per-run series must move with the name, or the ledger grades a hole.
+
+    ``list_runs_for_day`` and the scheduled-job ledger grader look runs up by
+    EXACT ``job_name``, so events stranded under the dirty name make a prediction
+    spanning this startup grade from a truncated series — or void as ``no_runs``.
+    """
+    from genesis.campaigns.name_heal import heal_campaign_names
+
+    await _insert_raw(db, "c-jre", "nightly​sweep")
+    for i, status in enumerate(("success", "failed", "success")):
+        await db.execute(
+            "INSERT INTO job_run_events (id, job_name, status, recorded_at) "
+            "VALUES (?,?,?,?)",
+            (f"e{i}", "campaign_nightly​sweep", status, f"2026-08-27T00:00:0{i}Z"),
+        )
+    await db.commit()
+
+    assert await heal_campaign_names(db) == 1
+
+    cur = await db.execute(
+        "SELECT COUNT(*) FROM job_run_events WHERE job_name = ?",
+        ("campaign_nightly sweep",),
+    )
+    assert (await cur.fetchone())[0] == 3, "run history did not follow the rename"
+
+    cur = await db.execute(
+        "SELECT COUNT(*) FROM job_run_events WHERE job_name = ?",
+        ("campaign_nightly​sweep",),
+    )
+    assert (await cur.fetchone())[0] == 0, "events stranded under the dirty name"
+
+
+async def test_reserved_scheduler_name_is_not_healed_into(db):
+    """Healing into a name the runner reserves would silently kill the campaign.
+
+    ``start()`` schedules campaigns and THEN registers its own reaper under
+    ``campaign_pending_reaper`` with ``replace_existing=True``, so a campaign that
+    normalized into that name would be evicted with no error and never tick
+    again. A dirty name still runs, so leaving it dirty is strictly better.
+    """
+    from genesis.campaigns.name_heal import heal_campaign_names
+
+    await _insert_raw(db, "c-res", "pending_reaper​")
+
+    assert await heal_campaign_names(db) == 0, "healed into a reserved scheduler name"
+
+    cur = await db.execute("SELECT name FROM campaigns WHERE id = ?", ("c-res",))
+    assert (await cur.fetchone())[0] == "pending_reaper​", (
+        "the row was renamed despite the reservation"
+    )
 
 
 async def test_empty_after_strip_is_rejected_at_the_crud_boundary(db):

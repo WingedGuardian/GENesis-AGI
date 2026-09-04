@@ -34,6 +34,7 @@ async def heal_campaign_names(db: Any) -> int:
     rather than renamed or deleted — silently merging two campaigns' identities
     would be worse than leaving one un-normalized.
     """
+    from genesis.campaigns.runner import RESERVED_CAMPAIGN_NAMES
     from genesis.db.crud import campaigns as crud
     from genesis.security.sanitizer import strip_control_chars
 
@@ -64,6 +65,22 @@ async def heal_campaign_names(db: Any) -> int:
                 row.get("id"),
             )
             continue
+        if clean in RESERVED_CAMPAIGN_NAMES:
+            # e.g. "pending_reaper​" normalizes to "pending_reaper", which
+            # need not collide with any CAMPAIGN and so would pass the check
+            # above — but the runner registers its own reaper under that derived
+            # scheduler id with replace_existing=True, and it registers AFTER the
+            # campaigns. Healing into this name would evict the campaign's job at
+            # the next start() with no error and no log: it would simply stop
+            # ticking. Leaving the name dirty is strictly better — a dirty name
+            # still runs.
+            logger.warning(
+                "Campaign %s: normalized name %r is reserved by the scheduler "
+                "— left as-is (rename it manually to resolve)",
+                row.get("id"),
+                clean,
+            )
+            continue
         try:
             await crud.update_campaign(db, row["id"], name=clean)
         except Exception:
@@ -79,34 +96,68 @@ async def heal_campaign_names(db: Any) -> int:
 
 
 async def _migrate_job_health(db: Any, old_name: str, new_name: str) -> None:
-    """Carry a campaign's durable job-health row across a rename.
+    """Carry a campaign's durable job state across a rename.
 
-    ``job_health.job_name`` is the PRIMARY KEY and the runner derives it as
-    ``campaign_{name}`` (``campaigns/runner.py``), so a rename would otherwise
-    orphan the row: the campaign's success/failure history and its
-    ``job_never_succeeded`` state would silently reset, and a dead row would
-    linger under the old name.
+    Two tables are keyed by the derived scheduler name ``campaign_{name}``
+    (``campaigns/runner.py``), and BOTH must move or the rename splits the
+    campaign's history in half:
+
+    * ``job_health`` — PRIMARY KEY on ``job_name``. Holds last_run/last_success
+      and ``job_never_succeeded`` state.
+    * ``job_run_events`` — the per-run series. The scheduled-job ledger grader
+      looks runs up by EXACT name (``db/crud/job_run_events.py``,
+      ``ledger/metrics.py``), so a prediction spanning this startup would be
+      graded from a truncated series, or voided as ``no_runs``, if the events
+      stayed behind under the dirty name.
+
+    A LEFT-BEHIND ROW IS NOT INERT, which is what makes this worth doing rather
+    than tolerating: ``get_stale_jobs`` filters neither against the live
+    scheduler registry nor on recency (``db/crud/job_health.py``), so an orphan
+    whose ``last_run``/``last_success`` gap exceeds the threshold emits a
+    ``job_stale`` warning on every health sweep, forever, and enters the ego
+    reconciliation snapshot. Nothing ever purges it.
 
     Best-effort and non-fatal — a heal that cannot carry the history must still
-    leave the (correctly renamed) campaign running. If a row already exists under
-    the new name, the old one is left alone rather than clobbering live history.
+    leave the (correctly renamed) campaign running.
     """
     old_job, new_job = f"campaign_{old_name}", f"campaign_{new_name}"
     try:
-        cur = await db.execute(
-            "SELECT 1 FROM job_health WHERE job_name = ?", (new_job,)
-        )
+        cur = await db.execute("SELECT 1 FROM job_health WHERE job_name = ?", (new_job,))
         if await cur.fetchone():
+            # A row already sits under the name we are moving INTO. It cannot be
+            # this campaign's — the campaign answered to `old_name` until a
+            # moment ago, `campaigns.name` is UNIQUE so no other campaign holds
+            # `new_name`, and this heal runs BEFORE runner.start(), so nothing
+            # has yet written health under `new_job` in this process. Only a
+            # campaign that previously held the name and was deleted leaves a row
+            # there: it is a fossil, and the LIVE history is the one under
+            # `old_job`.
+            #
+            # The earlier behaviour kept the fossil and orphaned the real
+            # history, which is the inversion worth naming: it preserved the row
+            # that can never be written again and abandoned the one that will be.
+            # Replace it, and say plainly what was discarded.
             logger.warning(
-                "job_health row already exists for %s — leaving %s in place",
+                "job_health: discarding an unreachable row under %s (no campaign "
+                "has held that name since it was written) so the live history "
+                "from %s can move into it",
                 new_job,
                 old_job,
             )
-            return
+            await db.execute("DELETE FROM job_health WHERE job_name = ?", (new_job,))
         await db.execute(
             "UPDATE job_health SET job_name = ? WHERE job_name = ?",
             (new_job, old_job),
         )
+        # Unconstrained TEXT column with no uniqueness, so this cannot collide —
+        # any events already under `new_job` belong to the same fossil campaign
+        # and are re-pointed alongside the live series rather than deleted. That
+        # direction is deliberate: an over-complete run series grades; a
+        # truncated one voids.
+        await db.execute(
+            "UPDATE job_run_events SET job_name = ? WHERE job_name = ?",
+            (new_job, old_job),
+        )
         await db.commit()
     except Exception:
-        logger.exception("job_health migration failed for campaign rename")
+        logger.exception("job state migration failed for campaign rename")

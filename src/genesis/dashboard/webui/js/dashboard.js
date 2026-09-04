@@ -2640,7 +2640,6 @@
           if (keyEntry.status === 'not_set') return 'not_set';
           const provTypes = this._KEY_TO_PROVIDER_TYPES[keyEntry.key];
           if (!provTypes || !this.routingConfig) return keyEntry.status;
-          const cbStates = this.routingConfig.cb_states || {};
           const providers = this.routingConfig.providers || {};
           // Find all routing providers that match this key's provider types
           const matchedProviders = Object.keys(providers).filter(pname => {
@@ -2648,9 +2647,22 @@
             return provTypes.includes(prov.type);
           });
           if (matchedProviders.length === 0) return keyEntry.status;
-          const openCount = matchedProviders.filter(p => cbStates[p] === 'OPEN').length;
-          if (openCount === matchedProviders.length) return 'error';
-          if (openCount > 0) return 'degraded';
+          // HALF_OPEN counts as degraded, matching the backend's own rule
+          // (observability/snapshots/call_sites.py treats OPEN *or* HALF_OPEN as
+          // a degraded call site). This matters now that a probe no longer heals
+          // a permanent/quota failure: such a breaker can sit HALF_OPEN
+          // indefinitely on a low-traffic provider, and counting only 'open'
+          // would paint the key green for a provider that never completes a
+          // call — the same "degraded renders as healthy" bug this change fixes
+          // one layer down.
+          const verdicts = matchedProviders.map(p => this.breakerVerdict(p));
+          const failing = verdicts.filter(v => v === 'failing').length;
+          const unverified = verdicts.filter(v => v === 'unverified').length;
+          if (failing === matchedProviders.length) return 'error';
+          // Unverified still counts as degraded here: this indicator's
+          // vocabulary is healthy/degraded/error only, and 'not proven healthy'
+          // belongs on the cautious side of a two-way split.
+          if (failing + unverified > 0) return 'degraded';
           return 'healthy';
         },
         secretStatusColor(status) {
@@ -3723,7 +3735,17 @@
         queuesSemantic() {
           const queues = this.health.queues;
           if (!queues) return { state: "unknown", reason: "queue data unavailable" };
-          if ((queues.dead_letters || 0) > 0 || (queues.discarded_items?.length || 0) > 0
+          // A failed section is replaced by `_or_error` with {status:"error"},
+          // which is TRUTHY and carries NO `errors` key — so without this check
+          // every depth field below reads 0 and the card falls through to
+          // "healthy - queues are clear", directly beside the panel's own
+          // "Queue data unavailable" banner, and feeds that false healthy into
+          // overallHealthSemantic(). Zeros we never measured are not a clean
+          // bill of health.
+          if (queues.status === "error") {
+            return { state: "unknown", reason: "queue data could not be collected" };
+          }
+          if ((queues.dead_letters || 0) > 0 || this.discarded.total > 0
               || (queues.deferred_stuck || 0) > 0 || (queues.failed_embeddings || 0) > 0) {
             return { state: "error", reason: "stuck/failed items or dead letters require attention" };
           }
@@ -3753,7 +3775,26 @@
           if (pe > 100) {
             return { state: "degraded", reason: `embedding queue backed up (${pe} pending)` };
           }
-          if (Array.isArray(queues.errors) && queues.errors.length > 0) {
+          // `errors` is a DIAGNOSTIC channel, not a second answer to "is this
+          // counter known". A counter that publishes its own exactness has
+          // already answered, and letting a stale error string overrule it
+          // renders a precise number beside "some queue counters could not be
+          // collected" — the panel contradicting itself. That is the same
+          // two-independent-descriptions fork removed one level down (the two
+          // flat depth/list keys no surface reads any more), and it reappeared the
+          // moment `known` started recovering from whichever read completed:
+          // a failed COUNT beside a complete sample is now an EXACT depth.
+          //
+          // The diagnostics are not suppressed — they stay in the payload and
+          // the panel still shows them. They just stop deciding a verdict they
+          // no longer describe. Only `discarded` publishes a `known` flag
+          // today, so every other counter's error remains its only unknown
+          // signal and still decides this; one such error beside a recovered
+          // one is enough to keep the section unknown.
+          const unresolved = (Array.isArray(queues.errors) ? queues.errors : []).filter(
+            (e) => !(this.discarded.known && String(e).startsWith("discarded:")),
+          );
+          if (unresolved.length > 0) {
             return { state: "unknown", reason: "some queue counters could not be collected" };
           }
           // Queue honesty is DEPTH-based by design; a drain-liveness verdict is
@@ -4386,12 +4427,124 @@
           return this.groupQueueItems(this.health.queues?.deferred_items || []);
         },
 
+        // The ONE reader of the discarded-queue payload in this file.
+        //
+        // The backend reconciles the uncapped depth and the LIMIT-20 review
+        // sample into a single object, so nothing here chooses between two
+        // numbers that can disagree — that fork, spread across four render
+        // surfaces, generated three rounds of bugs (2026-08-30): a 148-deep
+        // queue displayed as 20, a populated backlog with its clear-all button
+        // hidden, an empty-state message above rows it was listing.
+        //
+        // This normalises only for TRANSPORT damage — an old server with no
+        // `discarded` object, a section replaced wholesale by an error marker,
+        // a non-numeric total — never to re-derive a value the backend already
+        // decided. `known` distinguishes a measured zero from an unmeasured one,
+        // which is what lets the panel avoid claiming "nothing awaiting review"
+        // for a state it never observed.
+        get discarded() {
+          const d = this.health?.queues?.discarded;
+          if (!d || typeof d !== "object") {
+            // Absent: an older server, or `_or_error` replaced the whole queues
+            // section. Either way this is "we do not know", never a clean zero.
+            return { known: false, total: 0, totalLabel: "0+", sample: [], truncated: false };
+          }
+          const sample = Array.isArray(d.sample) ? d.sample : [];
+          const known = d.known === true && Number.isFinite(d.total);
+          // A non-finite total would make `> 0` and `=== 0` BOTH false, so the
+          // panel would render neither the list nor the empty state while the
+          // button read "Clear all NaN". The max() floor keeps the printed
+          // number from falling below the rows actually on screen, which would
+          // put "no items awaiting review" directly above a populated list.
+          const reported = Number.isFinite(d.total) ? d.total : sample.length;
+          const total = Math.max(reported, sample.length);
+          // Prefer the producer's own truncation verdict: it knows the sample
+          // hit its cap, which is invisible here when a failed count leaves
+          // total === sample.length. Fall back to comparing only if the field
+          // is missing (an older server).
+          const truncated = d.sample_truncated === true || total > sample.length;
+          // `total` is a FLOOR when the depth could not be read: the count
+          // contributes nothing, so it collapses to the rows in hand. Render
+          // sites take `totalLabel`, never the raw number — the "of 20" half of
+          // "showing 20 of 20" for a 148-row queue came from printing a floor
+          // as though it were a measurement, and every new expression that
+          // printed it could make that mistake again.
+          const totalLabel = known ? String(total) : total + "+";
+          return { known, total, totalLabel, sample, truncated };
+        },
+
         get discardedQueueGroups() {
-          return this.groupQueueItems(this.health.queues?.discarded_items || []);
+          return this.groupQueueItems(this.discarded.sample);
         },
 
         get routingProviderList() {
           return Object.keys(this.routingConfig?.providers || {});
+        },
+
+        // The one place IN THIS STORE that reads breaker state. (The two
+        // neural-monitor pages parse `cb_states` in their own plain <script>
+        // blocks and are already lowercase-correct; they are not reachable from
+        // here, so this is not a global chokepoint.)
+        //
+        // `routes/routing.py` emits `cb.state.value`, and ProviderState is a
+        // StrEnum with LOWERCASE values ("closed"/"open"/"half_open"). Four
+        // consumers compared against an UPPERCASE literal, never equal —
+        // so the provider dot rendered green, the toggle button read "disable",
+        // and the Provider Keys dot stayed green no matter what the breaker was
+        // actually doing. The dashboard was structurally incapable of showing a
+        // tripped breaker, which is a likelier reason a 3-day provider outage
+        // went unnoticed than any missing alarm.
+        //
+        // Comparing case-insensitively in ONE helper makes that class of bug
+        // unrepresentable at the call sites, rather than fixing it four times
+        // and waiting for a fifth to be written.
+        breakerState(providerName) {
+          const raw = (this.routingConfig?.cb_states || {})[providerName];
+          return String(raw ?? "").toLowerCase();
+        },
+
+        breakerIsOpen(providerName) {
+          return this.breakerState(providerName) === "open";
+        },
+
+        // Three-state verdict for rendering. HALF_OPEN is PROBATION, not
+        // failure: any failure while half-open trips it straight back to open,
+        // so a half-open breaker has had no failure since it entered that
+        // state. Painting it the same amber as "failing right now" overstated
+        // the problem — and after the probe-heal change a provider can sit
+        // half-open indefinitely, so this stopped being a rare case.
+        //   failing    — open: real calls failing, not routed to at all
+        //   unverified — half-open: routable, awaiting its next trial
+        //   healthy    — closed
+        // Falls back to the 2-state reading when `cb_detail` is absent (an
+        // older server, or a cached payload), so it can never render worse
+        // than before.
+        breakerVerdict(providerName) {
+          const state = this.breakerState(providerName);
+          if (state === "open") return "failing";
+          if (state === "half_open") return "unverified";
+          return "healthy";
+        },
+
+        // WHY it is unverified — "call" (real calls failed) or "probe" (a health
+        // probe could not reach it). Null when not applicable or unknown.
+        breakerOpenedBy(providerName) {
+          const d = (this.routingConfig?.cb_detail || {})[providerName];
+          return d && typeof d === "object" ? (d.opened_by ?? null) : null;
+        },
+
+        breakerTooltip(providerName) {
+          const verdict = this.breakerVerdict(providerName);
+          if (verdict === "healthy") return "Circuit breaker closed — provider healthy";
+          const by = this.breakerOpenedBy(providerName);
+          if (verdict === "failing") {
+            return by === "probe"
+              ? "Circuit breaker OPEN — health probe could not reach this provider"
+              : "Circuit breaker OPEN — real calls are failing; not being routed to";
+          }
+          return by === "call"
+            ? "Unverified — real calls failed; still in rotation and will be retried on the next call"
+            : "Unverified — a health probe could not reach it; awaiting the next probe";
         },
 
         providerCbState(providerName) {
@@ -4501,8 +4654,10 @@
           if ((this.health.queues?.dead_letters || 0) > 0) {
             items.push({ level: "critical", title: `${this.health.queues.dead_letters} dead letters`, detail: "requests exhausted all fallback providers; open the errors view to inspect", href: "/genesis/errors" });
           }
-          if ((this.health.queues?.discarded_items?.length || 0) > 0) {
-            items.push({ level: "warning", title: `${this.health.queues.discarded_items.length} discarded item${this.health.queues.discarded_items.length === 1 ? "" : "s"}`, detail: "work was dropped and can be reviewed or cleared below", href: "#queue-review", tab: "overview", anchor: "queue-review" });
+          if (this.discarded.total > 0) {
+            // Singular only for a MEASURED one: "1+ discarded item" would be
+            // wrong, since a floor of 1 means one or more.
+            items.push({ level: "warning", title: `${this.discarded.totalLabel} discarded item${this.discarded.total === 1 && this.discarded.known ? "" : "s"}`, detail: "work was dropped and can be reviewed or cleared below", href: "#queue-review", tab: "overview", anchor: "queue-review" });
           }
           // Fallback call sites are already captured in the warningAlerts
           // bucket above (severity=WARNING from health_alerts). The dedicated

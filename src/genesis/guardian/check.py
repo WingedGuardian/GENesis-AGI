@@ -23,7 +23,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from html import escape as html_escape
 from pathlib import Path
 
@@ -278,17 +278,37 @@ async def _maybe_propose_provisioning(
         logger.warning("autonomous pool-grow proposal failed", exc_info=True)
 
 
-async def _write_guardian_heartbeat(config: GuardianConfig) -> None:
-    """Write heartbeat file into the container so Genesis knows Guardian is alive.
+def _heartbeat_payload(standdown: str | None = None) -> dict:
+    """Build the Guardian heartbeat payload.
 
-    Uses stdin pipe instead of heredoc to avoid shell injection.
+    ``standdown`` names the active stand-down (``"gateway_pause"`` /
+    ``"maintenance"``) so health surfaces can tell an intentional, alive-but-not-
+    watching Guardian (DEGRADED) from a fully-monitoring one (HEALTHY). The
+    process is alive either way — the container watchdog stays quiet — but
+    ``probe_guardian`` must not report HEALTHY while a check cycle is skipped.
+    Absent/None on the normal end-of-cycle heartbeat.
     """
     uptime_s = (datetime.now(UTC) - _STARTED_AT).total_seconds()
-    heartbeat = json.dumps({
+    payload: dict = {
         "guardian_alive": True,
         "timestamp": datetime.now(UTC).isoformat(),
         "uptime_s": round(uptime_s),
-    })
+    }
+    if standdown:
+        payload["standdown"] = standdown
+    return payload
+
+
+async def _write_guardian_heartbeat(
+    config: GuardianConfig, standdown: str | None = None
+) -> None:
+    """Write heartbeat file into the container so Genesis knows Guardian is alive.
+
+    ``standdown`` (when set) marks the heartbeat as an intentional stand-down so
+    ``probe_guardian`` reports DEGRADED rather than HEALTHY for the skipped cycle.
+    Uses stdin pipe instead of heredoc to avoid shell injection.
+    """
+    heartbeat = json.dumps(_heartbeat_payload(standdown))
 
     try:
         # Use stdin pipe — avoids heredoc injection risk
@@ -311,8 +331,74 @@ async def _write_guardian_heartbeat(config: GuardianConfig) -> None:
             )
     except TimeoutError:
         logger.error("Guardian heartbeat write timed out", exc_info=True)
+        # wait_for cancelled communicate() but left the child running — kill and
+        # reap it, or a wedged incus/container orphans a process every tick (the
+        # stand-down paths call this each cycle during a long pause).
+        try:
+            proc.kill()
+            # Bound the reap: a D-state (uninterruptible) incus child could defer
+            # SIGKILL, so don't let the wait stall the tick indefinitely.
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except (TimeoutError, ProcessLookupError, OSError):
+            pass
     except OSError as exc:
         logger.error("Guardian heartbeat write failed: %s", exc)
+
+
+def _gateway_pause_active(
+    config: GuardianConfig, now: datetime | None = None
+) -> bool:
+    """True if a live, unexpired gateway pause file is present — stand down.
+
+    The gateway ``pause`` verb writes ``<state_dir>/paused.json`` with an
+    ``expires_at`` (its built-in TTL) across a deploy's server restart. We honor
+    it only while unexpired AND only if ``expires_at`` is within
+    ``gateway_pause_max_ahead_s`` of now — a bad writer or clock skew must never
+    mute the watchdog for hours. A missing ``expires_at``, a malformed file, or
+    ``paused: false`` all read as NOT active: fail safe toward monitoring, since
+    indefinite stand-down is the ``maintenance_file``'s job, not this file's.
+    This is distinct from the container ``~/.genesis/paused.json`` (the shared
+    runtime kill switch) — this file is host-side and self-expiring.
+    """
+    now = now or datetime.now(UTC)
+    pause_file = config.state_path / "paused.json"
+    try:
+        if not pause_file.exists():
+            return False
+        data = json.loads(pause_file.read_text())
+        # Valid JSON can still be a non-object (e.g. `123`, `[..]`); `.get` on
+        # those raises AttributeError, which must NOT escape into run_check
+        # (it would abort the cycle, withhold the heartbeat, and read as DOWN).
+        # `paused` must be the literal boolean True — a truthy-but-non-bool value
+        # ("false", 1, "yes", {}) is malformed and must NEVER mute the watchdog
+        # (e.g. an operator hand-editing "paused":"false" to cancel a pause).
+        if not isinstance(data, dict) or data.get("paused") is not True:
+            return False
+        expires_raw = data.get("expires_at")
+        if not expires_raw:
+            logger.warning(
+                "Gateway pause file has no expires_at — ignoring (use the "
+                "maintenance_file for indefinite stand-down): %s",
+                pause_file,
+            )
+            return False
+        expires_at = datetime.fromisoformat(expires_raw)
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if expires_at <= now:
+            return False  # expired — the deploy pause self-healed
+        if expires_at > now + timedelta(seconds=config.gateway_pause_max_ahead_s):
+            logger.warning(
+                "Gateway pause expires_at too far ahead (>%ds) — ignoring as "
+                "suspect: %s",
+                config.gateway_pause_max_ahead_s,
+                expires_raw,
+            )
+            return False
+        return True
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("Gateway pause file unreadable/malformed — ignoring: %s", exc)
+        return False
 
 
 async def run_check(config: GuardianConfig | None = None) -> None:
@@ -325,12 +411,25 @@ async def run_check(config: GuardianConfig | None = None) -> None:
     if config is None:
         config = load_config()
 
+    # A stand-down still writes the heartbeat: the Guardian PROCESS is alive and
+    # deliberately not watching, so it must not read as DOWN to the container
+    # watchdog (watchdog.py, 300s stale threshold), which would otherwise SSH-
+    # restart it and page the mirror of the alert we suppress here.
     maintenance_path = Path(config.maintenance_file)
     if maintenance_path.exists():
         logger.info(
             "Maintenance mode active — standing down (remove %s to resume)",
             maintenance_path,
         )
+        await _write_guardian_heartbeat(config, standdown="maintenance")
+        return
+
+    # Gateway-driven, self-expiring stand-down (a deploy pauses us across the
+    # server restart via the gateway `pause` verb) — beside the maintenance
+    # stand-down, but bounded by expires_at so a killed deploy can't mute us.
+    if _gateway_pause_active(config):
+        logger.info("Gateway pause active — standing down (deploy in progress)")
+        await _write_guardian_heartbeat(config, standdown="gateway_pause")
         return
 
     state_path = config.state_path / "state.json"

@@ -90,6 +90,21 @@ async def _impl_campaign_create(
             "Provide a name with at least one visible character."
         }
 
+    # The runner registers jobs of its own under the same derived
+    # ``campaign_{name}`` id, AFTER it schedules the campaigns, with
+    # replace_existing=True — so a campaign holding one of these names is evicted
+    # at startup with no error and never ticks again. Refusing at the write
+    # boundary is the only place a human sees why; the startup heal enforces the
+    # same set for rows that predate this check.
+    from genesis.campaigns.runner import RESERVED_CAMPAIGN_NAMES
+
+    if name in RESERVED_CAMPAIGN_NAMES:
+        return {
+            "error": f"Campaign name {name!r} is reserved by the scheduler — a "
+            "campaign with this name would be silently replaced at startup and "
+            "never run. Choose another name."
+        }
+
     # Validate the session profile against the live registry BEFORE persisting.
     # An unknown profile would pass here but raise ValueError at DirectSession
     # init on every tick — a silent campaign outage. Mirrors user_job_tools.py /

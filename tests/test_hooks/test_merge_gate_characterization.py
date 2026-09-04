@@ -254,6 +254,17 @@ def _merge_cmd(
     return cmd
 
 
+# Pin-receipt fixtures. `_PIN_FORWARD` moves the pin ahead of `_PIN_BASE`, which is
+# the only condition under which the gate demands receipts.
+_PIN_BASE = 'CC_VERSION="${CC_VERSION:-2.1.218}"\nNODE_MAJOR="${NODE_MAJOR:-22}"\n'
+_PIN_FORWARD = 'CC_VERSION="${CC_VERSION:-2.1.246}"\nNODE_MAJOR="${NODE_MAJOR:-22}"\n'
+_PIN_RECEIPTS_BODY = (
+    "CC-Gate-Changelog: read (2.1.218, 2.1.246] in full from CHANGELOG.md, 2026-08-28\n"
+    "CC-Gate-Soak: 2.1.246 on container 2026-08-25..2026-08-27, "
+    "check_cc_running_versions.sh clean, sign-off recorded\n"
+)
+
+
 def _run(
     monkeypatch,
     command: str,
@@ -265,6 +276,9 @@ def _run(
     default: str = "main",
     compare: str | None = None,
     scheduled: str | None = None,
+    head_pin: str | None = None,
+    base_pin: str | None = None,
+    pr_body: str | None = None,
     router=None,
 ) -> int:
     """Drive ``main()`` in-process: granular seams via env, un-seamed gh via the
@@ -286,6 +300,30 @@ def _run(
     )
     if compare is not None:
         monkeypatch.setenv("_TEST_GH_COMPARE", compare)  # smart-delta seam (opt-in)
+    # Pin-receipt seams, all opt-in. Left UNSET by default so every pre-existing
+    # case keeps its exact behaviour: with no seam the read falls to the router,
+    # which does not model it, and the gate takes its documented PLUMBING path
+    # (NOTE, no block). Pin cases pass these explicitly.
+    for seam, value in (
+        ("_TEST_GH_HEAD_PIN_FILE", head_pin),
+        ("_TEST_GH_BASE_PIN_FILE", base_pin),
+        ("_TEST_GH_PR_BODY", pr_body),
+    ):
+        if value is not None:
+            monkeypatch.setenv(seam, value)
+    # A case that injects a HEAD pin is describing a PR that EDITS the pin, so its
+    # changed-file list has to say so. The pin gate now asks that list first — a PR
+    # whose diff does not include the pin file cannot have moved it, which is what
+    # stops a stale PR being judged against a base tip that moved underneath it. The
+    # module-wide hermetic default (`src/benign.py` alone) is the opposite claim, and
+    # leaving it in place made these cases assert a pin bump while declaring the pin
+    # untouched — so the gate correctly skipped, and the cases silently stopped
+    # testing the thing they are named for.
+    if head_pin is not None:
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            json.dumps({"filename": _mod._PIN_FILE_PATH, "previous_filename": None}),
+        )
     monkeypatch.setattr(_mod.subprocess, "run", router or _router())
     payload = json.dumps(
         {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command}}
@@ -975,6 +1013,59 @@ _CASES: list[tuple[str, object, int, str]] = [
         lambda mp: _run(mp, _merge_cmd(trailer="# scheduled-review-override"), reviews=""),
         2,
         "has not reviewed the current head",
+    ),
+    # ── pin-receipt gate — BEHAVIOURAL, driven through main() ─────────────
+    # The wiring tests beside the checker assert only that the call site appears
+    # in the SOURCE TEXT. That cannot detect a DEAD gate: change `if should_block:`
+    # to `if False:` and each of them still passes, because the substring is still
+    # present. These drive the real merge arm, so the gate has to actually decide.
+    (
+        "pin_forward_without_receipts_blocks_through_main",
+        lambda mp: _run(
+            mp, _merge_cmd(), head_pin=_PIN_FORWARD, base_pin=_PIN_BASE, pr_body="no receipts"
+        ),
+        2,
+        "missing 2 required gate receipt(s)",
+    ),
+    (
+        "pin_forward_with_both_receipts_allows_through_main",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            head_pin=_PIN_FORWARD,
+            base_pin=_PIN_BASE,
+            pr_body=_PIN_RECEIPTS_BODY,
+        ),
+        0,
+        "",
+    ),
+    (
+        "pin_unchanged_allows_through_main",
+        lambda mp: _run(
+            mp, _merge_cmd(), head_pin=_PIN_BASE, base_pin=_PIN_BASE, pr_body="no receipts"
+        ),
+        0,
+        "",
+    ),
+    (
+        "pin_file_deleted_at_head_blocks_through_main",
+        lambda mp: _run(
+            mp, _merge_cmd(), head_pin="__absent__", base_pin=_PIN_BASE, pr_body="deletes the pin"
+        ),
+        2,
+        "ABSENT at the PR head",
+    ),
+    (
+        "pin_gate_is_waived_by_no_override_sigil",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(trailer="# ci-override review-override scheduled-review-override"),
+            head_pin=_PIN_FORWARD,
+            base_pin=_PIN_BASE,
+            pr_body="no receipts",
+        ),
+        2,
+        "missing 2 required gate receipt(s)",
     ),
 ]
 
