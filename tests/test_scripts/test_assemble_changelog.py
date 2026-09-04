@@ -11,6 +11,7 @@ is either a fragment, the README, or an error.
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 
 import pytest
@@ -413,3 +414,145 @@ def test_the_changelog_is_replaced_atomically_never_written_in_place(
     )
     assert len(list(d.iterdir())) == 1, "fragments deleted despite a failed write"
     assert not (tmp_path / "CHANGELOG.md.tmp").exists(), "left a half-finished twin"
+
+
+# ── --check validates the TARGET, not just the inputs ────────────────────────
+
+
+def test_check_rejects_a_changelog_with_no_unreleased_heading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Validating only the fragments certifies half the contract.
+
+    A PR that renames or deletes the heading would leave the job green and the
+    mismatch would surface at the first release — to whoever is cutting it
+    rather than to whoever caused it.
+    """
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-thing.md")
+    cl = tmp_path / "CHANGELOG.md"
+    cl.write_text("# Changelog\n\n## [v1.0]\n\n### Fixed\n\n- released\n")
+    monkeypatch.setattr(ac, "FRAGMENT_DIR", d)
+    monkeypatch.setattr(ac, "CHANGELOG", cl)
+    assert ac.main(["--check"]) == 2
+    assert "no '## [Unreleased]' heading" in capsys.readouterr().err
+
+
+def test_check_rejects_a_missing_changelog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-thing.md")
+    monkeypatch.setattr(ac, "FRAGMENT_DIR", d)
+    monkeypatch.setattr(ac, "CHANGELOG", tmp_path / "CHANGELOG.md")
+    assert ac.main(["--check"]) == 2
+    assert "cannot read CHANGELOG.md" in capsys.readouterr().err
+
+
+def test_a_directory_named_readme_md_cannot_hide_fragments(tmp_path: Path) -> None:
+    """The name exemption must not out-rank the flat-directory rule.
+
+    Exempting by name first let a DIRECTORY called README.md be skipped whole,
+    hiding every fragment inside it while --check reported success — a hole
+    straight through the total-classification guarantee.
+    """
+    d = tmp_path / "changelog.d"
+    d.mkdir(parents=True)
+    nested = d / "README.md"
+    nested.mkdir()
+    (nested / "20260904210000-fixed-lost.md").write_text("- lost entry\n")
+    with pytest.raises(ac.FragmentError, match="flat"):
+        ac.collect_fragments(d)
+# ── --base: a fragment must not vanish outside the release fold ──────────────
+
+
+def _repo_with_a_committed_fragment(tmp_path: Path) -> tuple[Path, str]:
+    """A real git repo holding one fragment and a CHANGELOG, plus its base SHA.
+
+    Built with plumbing rather than a porcelain commit so it depends on neither
+    an ambient git identity nor this repository's own hooks.
+    """
+    import subprocess as sp
+
+    repo = tmp_path / "repo"
+    (repo / "changelog.d").mkdir(parents=True)
+    env = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_AUTHOR_NAME": "T",
+        "GIT_AUTHOR_EMAIL": "t@e.invalid",
+        "GIT_COMMITTER_NAME": "T",
+        "GIT_COMMITTER_EMAIL": "t@e.invalid",
+    }
+
+    def git(*args: str) -> str:
+        proc = sp.run(["git", *args], cwd=repo, env=env, capture_output=True, text=True, check=True)
+        return proc.stdout.strip()
+
+    git("init", "--quiet", "-b", "trunk")
+    (repo / "CHANGELOG.md").write_text(CHANGELOG_SKELETON)
+    (repo / "changelog.d" / "20260904210000-fixed-kept.md").write_text("- **Kept.** x\n")
+    git("add", "-A")
+    base = git("commit-tree", git("write-tree"), "-m", "base")
+    git("update-ref", "refs/heads/trunk", base)
+    return repo, base
+
+
+def _patch_module_to(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ac, "REPO_ROOT", repo)
+    monkeypatch.setattr(ac, "FRAGMENT_DIR", repo / "changelog.d")
+    monkeypatch.setattr(ac, "CHANGELOG", repo / "CHANGELOG.md")
+
+
+def test_deleting_a_fragment_without_touching_the_changelog_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Before assembly a fragment is the only copy of its entry.
+
+    Every remaining file still validates, so without a base comparison the job
+    passes while the entry silently disappears from the next release.
+    """
+    repo, base = _repo_with_a_committed_fragment(tmp_path)
+    _patch_module_to(repo, monkeypatch)
+    (repo / "changelog.d" / "20260904210000-fixed-kept.md").unlink()
+    assert ac.main(["--check", "--base", base]) == 2
+    assert "gone and CHANGELOG.md is unchanged" in capsys.readouterr().err
+
+
+def test_the_release_fold_may_delete_every_fragment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one legitimate deletion, recognised by its pairing, not by a token.
+
+    A release fold removes the fragments AND rewrites CHANGELOG.md in the same
+    change; that combination is the signal, so no override is needed.
+    """
+    repo, base = _repo_with_a_committed_fragment(tmp_path)
+    _patch_module_to(repo, monkeypatch)
+    (repo / "changelog.d" / "20260904210000-fixed-kept.md").unlink()
+    (repo / "CHANGELOG.md").write_text(
+        CHANGELOG_SKELETON.replace("### Fixed\n", "### Fixed\n\n- **Kept.** x\n")
+    )
+    assert ac.main(["--check", "--base", base]) == 0
+
+
+def test_adding_a_fragment_is_always_fine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, base = _repo_with_a_committed_fragment(tmp_path)
+    _patch_module_to(repo, monkeypatch)
+    (repo / "changelog.d" / "20260904220000-added-new.md").write_text("- **New.** y\n")
+    assert ac.main(["--check", "--base", base]) == 0
+
+
+def test_an_unreadable_base_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A base that cannot be read means the rule checked NOTHING.
+
+    A silent pass there is indistinguishable from a clean result — which is the
+    failure mode this whole convention exists to avoid.
+    """
+    repo, _base = _repo_with_a_committed_fragment(tmp_path)
+    _patch_module_to(repo, monkeypatch)
+    assert ac.main(["--check", "--base", "0" * 40]) == 2
+    assert "cannot read fragments at base" in capsys.readouterr().err

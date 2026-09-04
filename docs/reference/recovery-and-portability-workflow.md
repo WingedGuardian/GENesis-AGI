@@ -29,16 +29,27 @@ The public repo (`GENesis-AGI`) is the primary repo, so there is no separate
 with the repo's `.gitleaks.toml` PII/infrastructure rules + portability
 + email scans).
 
-Releases are cut in three steps, and the first one is not optional:
+Releases are cut on a **release branch**, never on `main` — the pre-commit hook
+rejects direct commits there and branch discipline requires a PR, so the fold
+gets its own branch like any other change:
 
-1. **Assemble the changelog.** Run `scripts/assemble_changelog.py` on `main`. It
-   folds every `changelog.d/` fragment into the `[Unreleased]` section and
-   deletes the fragments; review the result and commit the fold together with
-   the deletions. Skipping this ships a release whose notes are missing every
+1. **Branch.** `git checkout -b chore/release-vX.Y`.
+2. **Assemble the changelog.** Run `scripts/assemble_changelog.py`. It folds
+   every `changelog.d/` fragment into the `[Unreleased]` section and deletes
+   the fragments. Skipping this ships a release whose notes are missing every
    entry merged since the last tag — silently, because the section still reads
    as complete. `--dry-run` prints the result without touching anything.
-2. **Tag** `vX.Y` on `main`.
-3. **Publish** the GitHub Release from the matching `CHANGELOG.md` section.
+3. **Close the section.** Rename `## [Unreleased]` to `## [vX.Y] - YYYY-MM-DD`
+   and add a fresh empty `## [Unreleased]` above it. A tag does not rewrite
+   `CHANGELOG.md`, so without this there is no section named after the version
+   for step 6 to publish from. Read the section while you are in it — see the
+   `union` caveats below.
+4. **PR and merge.** This is the one PR that may edit `CHANGELOG.md`: its diff
+   there is produced by the assembler and the rename, not hand-written. The
+   fragment-validation CI job recognises the pairing — fragments may only
+   disappear in a change that also rewrites `CHANGELOG.md`.
+5. **Tag** `vX.Y` on `main` once that PR has merged.
+6. **Publish** the GitHub Release from the matching `CHANGELOG.md` section.
 
 ## Current Recovery Anchors
 

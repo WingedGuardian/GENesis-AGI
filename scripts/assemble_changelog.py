@@ -28,6 +28,7 @@ import argparse
 import datetime as dt
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -147,6 +148,16 @@ def collect_fragments(directory: Path | None = None) -> list[tuple[str, str, Pat
         return []
     out: list[tuple[str, str, Path]] = []
     for path in sorted(directory.iterdir()):
+        # The flat-directory rule is checked FIRST, before any name-based
+        # exemption. Exempting by name first would let a DIRECTORY named
+        # `README.md` be skipped wholesale, hiding every fragment inside it
+        # while --check reported success — the name exemption would have
+        # punched a hole straight through the total-classification guarantee.
+        if path.is_dir():
+            raise FragmentError(
+                f"{path.name}/: changelog.d is flat; a nested directory would be "
+                "skipped by the assembler and its entries would never ship"
+            )
         if path.name in NON_FRAGMENTS:
             continue
         # Editor and VCS debris (.DS_Store, .gitkeep, vim swapfiles). A fragment
@@ -157,11 +168,6 @@ def collect_fragments(directory: Path | None = None) -> list[tuple[str, str, Pat
         # failed. The "never silently skipped" property lives on *.md files.
         if path.name.startswith("."):
             continue
-        if path.is_dir():
-            raise FragmentError(
-                f"{path.name}/: changelog.d is flat; a nested directory would be "
-                "skipped by the assembler and its entries would never ship"
-            )
         ts, category, _slug = parse_fragment_name(path.name)
         try:
             body = path.read_text(encoding="utf-8").strip()
@@ -240,6 +246,75 @@ def splice(changelog_text: str, sections: dict[str, list[str]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _check_target() -> None:
+    """The destination has to be usable, or --check certifies half the contract.
+
+    Validating only the fragments leaves the job green while a PR deletes
+    CHANGELOG.md or renames its ``[Unreleased]`` heading; the mismatch then
+    surfaces at the first release, to whoever is cutting it rather than to
+    whoever caused it.
+    """
+    try:
+        text = CHANGELOG.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise FragmentError(f"cannot read {CHANGELOG.name}: {exc}") from exc
+    if not any(ln.strip() == UNRELEASED_HEADING for ln in text.splitlines()):
+        raise FragmentError(
+            f"{CHANGELOG.name} has no '{UNRELEASED_HEADING}' heading — fragments "
+            "would have nowhere to be folded into at release"
+        )
+
+
+def _check_no_fragment_lost(base: str) -> None:
+    """Refuse a change that drops a fragment the base branch already had.
+
+    Before assembly a fragment is the ONLY copy of its entry, so deleting one
+    removes it from the next release with nothing to recover it from, and every
+    remaining file still validates — the job would pass. The one legitimate
+    deletion is the release fold, which removes every fragment and rewrites
+    CHANGELOG.md in the same change; that pairing is the signal, so no override
+    token is needed for it.
+    """
+    listed = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", "-z", base, "--", FRAGMENT_DIR.name],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=REPO_ROOT,
+    )
+    if listed.returncode != 0:
+        # Fail CLOSED: an unreadable base means the rule checked nothing, and a
+        # silent pass here is indistinguishable from a clean result.
+        raise FragmentError(
+            f"cannot read fragments at base {base!r}: {listed.stderr.strip()} "
+            "(a shallow clone has no base to compare against)"
+        )
+    was = {
+        name.rsplit("/", 1)[-1]
+        for name in listed.stdout.split("\0")
+        if name.endswith(".md") and name.rsplit("/", 1)[-1] not in NON_FRAGMENTS
+    }
+    now = {p.name for p in FRAGMENT_DIR.iterdir()} if FRAGMENT_DIR.is_dir() else set()
+    lost = sorted(was - now)
+    if not lost:
+        return
+    changed = subprocess.run(
+        ["git", "diff", "--name-only", base, "--", CHANGELOG.name],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=REPO_ROOT,
+    )
+    if changed.returncode == 0 and changed.stdout.strip():
+        return  # the release fold: fragments consumed INTO the changelog
+    raise FragmentError(
+        f"{len(lost)} fragment(s) present at {base} are gone and CHANGELOG.md is "
+        f"unchanged: {', '.join(lost[:5])}. Before assembly a fragment is the only "
+        "copy of its entry, so this drops it from the next release silently. If "
+        "this IS the release fold, it must also rewrite CHANGELOG.md."
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -252,6 +327,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="print the resulting CHANGELOG.md instead of writing it",
     )
+    parser.add_argument(
+        "--base",
+        default="",
+        metavar="REF",
+        help=(
+            "with --check: also refuse a fragment that this ref has and the "
+            "working tree does not, unless CHANGELOG.md changed too (the "
+            "release fold). Fragments are the only copy of an entry."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -261,6 +346,17 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.check:
+        # Validate the TARGET too, not only the inputs. Without this the job is
+        # green while a PR deletes CHANGELOG.md or renames the [Unreleased]
+        # heading, and the incompatibility surfaces at the first release —
+        # from whoever is cutting it, not from whoever caused it.
+        try:
+            _check_target()
+            if args.base:
+                _check_no_fragment_lost(args.base)
+        except FragmentError as exc:
+            print(f"changelog.d: {exc}", file=sys.stderr)
+            return 2
         print(f"changelog.d: {len(fragments)} fragment(s), all valid")
         return 0
 

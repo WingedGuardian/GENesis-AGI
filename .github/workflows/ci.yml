@@ -392,11 +392,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # --base asks git what the base branch ALREADY has, which is the one
+          # question the checked-out tree cannot answer. A shallow clone has no
+          # base commit, and the check treats an unreadable base as a violation
+          # rather than a pass.
+          fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Validate changelog.d fragments
-        run: python scripts/assemble_changelog.py --check
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # The deletion rule needs a base to compare against. On a PR that is
+          # the PR's base; on a push build there is nothing meaningful to
+          # compare with (the checkout IS the new main), so the fragment
+          # validation still runs and only the deletion rule is skipped.
+          if [ -n "${PR_BASE_SHA:-}" ] && git cat-file -e "$PR_BASE_SHA^{commit}" 2>/dev/null; then
+            python scripts/assemble_changelog.py --check --base "$PR_BASE_SHA"
+          else
+            python scripts/assemble_changelog.py --check
+          fi
 
   external-io-check:
     # WS5 regression guard: no NEW ungated autonomous external-world egress

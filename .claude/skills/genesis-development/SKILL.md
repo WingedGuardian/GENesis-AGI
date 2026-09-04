@@ -1807,7 +1807,11 @@ Standard open-source workflow: PRs go directly to the public repo.
   committing locally, or push will be rejected (non-fast-forward).
 - **README is public-authoritative** — the public repo's `README.md` is
   hand-crafted and must NEVER be overwritten.
-- **Never edit `CHANGELOG.md` in a PR — add a `changelog.d/` fragment.**
+- **Never edit `CHANGELOG.md` in an ordinary PR — add a `changelog.d/`
+  fragment.** (The one exception is the release-fold PR, where the
+  `CHANGELOG.md` diff is produced by `scripts/assemble_changelog.py` and the
+  section rename rather than written by hand — see the release procedure in
+  `docs/reference/recovery-and-portability-workflow.md`.)
   One file per change, named `<YYYYMMDDHHMMSS>-<category>-<slug>.md`
   (timestamp from `date -u +%Y%m%d%H%M%S`; category is one of `added`,
   `changed`, `deprecated`, `removed`, `fixed`, `security`). The file holds
