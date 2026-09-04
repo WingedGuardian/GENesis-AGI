@@ -1,10 +1,11 @@
 name: Contributor review trigger
 
 # Ask the automated reviewer to look at an OUTSIDE contributor's PR — but only
-# when that PR answers an issue we put on the board, and only once per such
-# issue. Labelling an issue is a maintainer action that authorises exactly ONE
-# automatic review; the closing link is author-controlled, so on its own it
-# would let a single invited issue authorise unlimited reviews.
+# when that PR answers an issue we both LABELLED as invited and ASSIGNED to that
+# contributor. Two maintainer actions, and the assignment is the one that
+# authorises: it needs triage permission, so no fork author can grant it to
+# themselves. The closing link is author-controlled and authorises nothing on
+# its own.
 #
 # WHY THIS EXISTS. The reviewer runs automatically for the maintainer's own PRs
 # and does not for forks, which is the right default: an outside PR should not be
@@ -25,9 +26,12 @@ name: Contributor review trigger
 # through the API and posts one comment. Nothing an author writes is executed,
 # and the one author-influenced input — WHICH issue is linked — decides nothing
 # on its own: the issue must be in this repository, must carry a label only a
-# maintainer can set, and must not already have spent its single automatic
-# review. No author-supplied string is interpolated into a shell, a template,
-# or a query.
+# maintainer can set, and must be ASSIGNED BY A MAINTAINER to this PR's author.
+# No author-supplied string is interpolated into a shell, a template, or a query.
+#
+# The one-review-per-issue budget further down is a courtesy bound, not part of
+# this boundary: it reads author-mutable state and must never be relied on as a
+# control. Assignment is what holds.
 #
 # Keep it that way. If this workflow ever needs to inspect the diff, that work
 # belongs in a separate `pull_request` job with the default read-only token.
@@ -79,32 +83,46 @@ jobs:
             const MAX_LINKED_ISSUES = 20;
 
             const pr = context.payload.pull_request;
+            const author = ((pr.user && pr.user.login) || '').toLowerCase();
 
-            // ── WHY A CLOSING LINK IS NOT ENOUGH ─────────────────────────────
-            // The labels are ours, but the LINK is theirs: any fork author can
-            // write "Closes #1480" against an already-invited issue, and nothing
-            // stops arbitrarily many PRs pointing at that same issue. Labels
-            // alone therefore authorise an UNBOUNDED number of reviews from one
-            // maintainer action, and reviews are the finite resource this
-            // workflow spends — it was exhausted twice while this was written.
+            // ── WHAT AUTHORISES A REVIEW, AND WHAT MERELY BOUNDS IT ──────────
             //
-            // The per-PR duplicate guard is not the answer: it dedupes within
-            // one PR, not across many.
+            // TWO CHECKS BELOW, AND THEY ARE NOT EQUALS. Read this before
+            // editing either, because the weaker one looks like the stronger.
             //
-            // So an invited issue carries a budget of ONE automatic review. We
-            // fire only if no PR closing that issue has been sent to the
-            // reviewer yet. N invited issues can cost at most N reviews, which
-            // is the maintainer-controlled bound; the maintainer sets N by
-            // labelling.
+            // 1. ASSIGNMENT — the load-bearing one, and the ONLY security
+            //    control here. The invited issue must be ASSIGNED to the PR's
+            //    author. Assignment requires triage permission, so an outside
+            //    contributor cannot grant it to themselves; it is maintainer
+            //    state, tied to a specific person, and nothing the author writes
+            //    can forge it.
             //
-            // What this deliberately does NOT do: stop someone spending a
-            // genuine contributor's slot first. If that happens the contributor
-            // waits for a human to type "@codex review", which is exactly the
-            // behaviour before this workflow existed — so the failure mode is
-            // the old status quo, not a new harm. Requiring issue ASSIGNMENT
-            // instead would close that too, but it was measured against the
-            // real case (#1529 closing #1480) and would have blocked it: that
-            // issue carried both invited labels and no assignee.
+            // 2. A ONE-REVIEW BUDGET PER INVITED ISSUE — a courtesy bound, NOT
+            //    a security control, and it must never be described as one.
+            //    It is derived from `closedByPullRequestsReferences`, which is
+            //    author-MUTABLE: remove "Closes #N" from a PR body and that PR
+            //    leaves the graph, so the budget reads as unspent again.
+            //    Unlink-and-reopen defeats it by construction. It is kept only
+            //    because it stops an ASSIGNED contributor from spending several
+            //    reviews by opening several PRs — a politeness problem, not an
+            //    attack — and it costs nothing now that it is written.
+            //
+            // WHY NOT THE OTHER WAY ROUND. An earlier revision relied on the
+            // budget alone, on the reasoning that N invited labels cost at most
+            // N reviews. That reasoning is wrong wherever the spent-state is
+            // author-mutable, which it is: the bound held against a racing
+            // attacker and not against an editing one. The tie-break below is
+            // still here and still correct about ordering, but ordering was
+            // never the thing standing between a fork author and the quota.
+            //
+            // THE PRICE, STATED SO IT IS NOT REDISCOVERED. Assignment was
+            // measured against the real case before being adopted: issue #1480
+            // carried both invited labels and NO assignee, so PR #1529 — the
+            // genuine first-time contributor this workflow exists for — does
+            // not qualify under it. Inviting work is now two maintainer actions,
+            // label AND assign. An unassigned contributor is not turned away,
+            // only un-automated: a human types "@codex review", which is the
+            // behaviour before this workflow existed.
             const q = `
               query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
                 repository(owner:$owner, name:$repo) {
@@ -149,8 +167,8 @@ jobs:
               i.repository && i.repository.nameWithOwner === `${context.repo.owner}/${context.repo.repo}`
             );
 
-            // REST returns every label inline, so there is no nested label
-            // connection left to truncate.
+            // REST returns every label AND every assignee inline, so there is no
+            // nested connection left to truncate on either check.
             const invitedIssues = [];
             for (const ref of ours) {
               const { data: issue } = await github.rest.issues.get({
@@ -161,12 +179,26 @@ jobs:
               const invited = (issue.labels || []).some(l =>
                 INVITED.includes(((typeof l === 'string' ? l : l.name) || '').toLowerCase())
               );
-              if (invited) invitedIssues.push(ref.number);
+              // The security control. Assignment needs triage permission, so a
+              // fork author cannot put their own name here.
+              const assigned = (issue.assignees || []).some(
+                a => ((a && a.login) || '').toLowerCase() === author
+              );
+              if (invited && assigned) {
+                invitedIssues.push(ref.number);
+              } else if (invited) {
+                core.info(
+                  `PR #${pr.number}: issue #${ref.number} is invited but is not ` +
+                  `assigned to @${pr.user.login} — label and assign it to automate ` +
+                  `the review request.`
+                );
+              }
             }
 
             if (!invitedIssues.length) {
               core.info(
-                `PR #${pr.number} closes no issue carrying ${JSON.stringify(INVITED)} — ` +
+                `PR #${pr.number} closes no issue that is both labelled ` +
+                `${JSON.stringify(INVITED)} and assigned to its author — ` +
                 `no review requested. Linked issues in this repo: ` +
                 (ours.map(i => `#${i.number}`).join(', ') || 'none')
               );
