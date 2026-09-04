@@ -6,20 +6,37 @@ calls that a conflict. Measured 2026-09-04 against ``origin/main`` 2d5ea3dd: of
 49 open PRs, 21 could not merge, and 18 of those 21 conflicted on CHANGELOG.md
 and nothing else.
 
-``.gitattributes`` fixes that with ``/CHANGELOG.md merge=union``. The guarantee
-is carried by :func:`test_two_branches_appending_at_the_same_position_merge_without_conflict`,
-which copies the real artifact into a fresh repo and runs a real merge, paired
-with its negative control — the ``check-attr`` tests below are cheap
-corroboration and could pass on a repo-local override alone.
+``.gitattributes`` fixes that with ``/CHANGELOG.md merge=union``. Note the
+leading slash: an unanchored pattern matches the basename at every depth, and
+that near-miss is the reason the scope tests exist at all.
 
-Scope is graded over the complete tracked-file population rather than a list of
-paths someone thought to name. ``union`` resolves *silently*, and an unanchored
-pattern captures precisely the paths nobody enumerated, so a negative allowlist
-is structurally unable to catch the failure it exists for.
+Four tests, and NONE of them is redundant — read this before deleting one:
+
+* :func:`test_two_branches_appending_at_the_same_position_merge_without_conflict`
+  carries the BEHAVIOURAL guarantee. It copies the real artifact into a fresh
+  repo and runs a real merge.
+* :func:`test_without_the_attribute_the_same_merge_conflicts` is its negative
+  control. Without it the test above could pass for reasons having nothing to do
+  with the attribute, and would keep passing after the rule was deleted.
+* :func:`test_union_applies_to_exactly_one_tracked_path` grades SCOPE as an
+  equality over every tracked file, because a widened pattern captures precisely
+  the paths nobody would have thought to enumerate.
+* :func:`test_union_does_not_reach_paths_that_do_not_exist_yet` covers what that
+  population check structurally CANNOT: paths absent from the tree. It is not a
+  weaker duplicate of the population check — it is the only test that fails on
+  an unanchored pattern today, since the one tracked ``CHANGELOG.md`` sits at
+  the root and satisfies both spellings. That is exactly the bug this rule
+  shipped with in review, and this is the test that would have caught it.
+
+The tests grade this repository's own attribute surface. A developer's local
+``merge.default`` routes unspecified paths to a driver regardless; no committed
+file can pin that, which is why every git subprocess here disables ambient
+config rather than trying to enumerate it.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -42,8 +59,30 @@ MUST_NOT_BE_UNION = (
 )
 
 
+# Ambient git configuration can decide the outcome of these tests, and
+# neutralising settings one at a time is whack-a-mole: `merge.default` routes
+# unspecified paths to a driver, `core.attributesFile` injects attributes from
+# outside the repo, `init.templateDir` can plant a `.git/info/attributes` (the
+# HIGHEST-precedence attribute source), `core.autocrlf` rewrites content before
+# a merge ever sees it. Rather than keep a list of them current, every git
+# subprocess here runs with global and system configuration switched off
+# outright, plus the system attributes file. One control instead of a checklist.
+_HERMETIC_ENV = {
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_SYSTEM": os.devnull,
+    "GIT_ATTR_NOSYSTEM": "1",
+}
+
+
 def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, **_HERMETIC_ENV},
+    )
 
 
 def _git_ok(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -74,18 +113,18 @@ def _merge_attr(path: str, cwd: Path) -> str:
 def _make_repo(tmp_path: Path, *, with_attributes: bool) -> Path:
     """A repo whose trunk holds a CHANGELOG with an [Unreleased] heading.
 
-    Deliberately hermetic: the ambient environment supplies an identity, a hooks
-    path and a signing setting, and a contributor whose global config turns on
-    ``commit.gpgsign`` without a key would otherwise get a silent no-commit that
-    surfaces later as a baffling merge failure in a test about merge drivers.
+    ``_git`` already disables global and system config, so nothing ambient
+    reaches this repo — including the setting that actually decides the negative
+    control's outcome (a global ``merge.default=union`` would resolve the merge
+    in the WITHOUT-attributes repo and turn that control green, voiding the only
+    proof that the attribute resolves anything). An identity is set here because
+    with global config off there is no longer one to inherit.
     """
     repo = tmp_path / ("with_attrs" if with_attributes else "without_attrs")
     repo.mkdir()
     _git_ok("init", "--quiet", "-b", "trunk", cwd=repo)
     _git_ok("config", "user.email", "test@example.invalid", cwd=repo)
     _git_ok("config", "user.name", "Test", cwd=repo)
-    _git_ok("config", "commit.gpgsign", "false", cwd=repo)
-    _git_ok("config", "core.hooksPath", str(repo / "no-such-hooks"), cwd=repo)
 
     (repo / "CHANGELOG.md").write_text(
         "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- a pre-existing entry\n"

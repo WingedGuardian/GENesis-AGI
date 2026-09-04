@@ -32,17 +32,24 @@ GitHub Release from the matching `CHANGELOG.md` section.
 
 **Read the section before you publish it.** `CHANGELOG.md` merges with git's
 `union` driver (see `.gitattributes`), which resolves same-position insertions
-without a conflict — that is what keeps ordinary PRs from colliding over it.
-The tradeoff lands here and nowhere else: union cannot express a *move* or a
-*removal*, so a release cut, which moves entries beneath a new version heading,
-can absorb another branch's later bullet into the section you are about to
-publish, and can restore an entry someone pruned. It does this with a zero exit
-code and no conflict to stop you. Union also makes no promise about ordering
-("tends to leave the added lines in the resulting file in random order" —
-`gitattributes(5)`), so entries may need re-sorting. Diff the version section
-against the tag's commit range and confirm every bullet belongs to it. Ordinary
-"add a bullet" merges cannot hit any of this; the release cut is the one
-operation that can.
+without a conflict when merging **locally**. GitHub ignores repository
+`.gitattributes` server-side, so a PR colliding on this file still shows as
+conflicting there and still has to have the base branch merged in locally.
+The tradeoff lands hardest here: union cannot express a *move* or a *removal*,
+so a release cut, which moves entries beneath a new version heading, can absorb
+another branch's later bullet into the section you are about to publish, and can
+restore an entry someone pruned. It does this with a zero exit code and no
+conflict to stop you. Union also makes no promise about ordering ("tends to
+leave the added lines in the resulting file in random order" —
+`gitattributes(5)`), so entries may need re-sorting.
+
+The release cut is the most exposed operation but not the only one: union merges
+lines, not records, so two entries sharing an identical aligned line can collapse
+into one even when both branches only added. Measured at 0 of the 18 real
+colliding PRs — it needs identical lines, and entries here are long distinctive
+prose — but it is why the check is **confirm every bullet is intact**, not merely
+"confirm nothing is missing". Diff the version section against the tag's commit
+range and read it.
 
 ## Current Recovery Anchors
 

@@ -1,51 +1,48 @@
-# CHANGELOG.md is an append-only list of independent bullets. Two branches that
-# each add an entry under the same heading are not disagreeing about anything —
-# they are inserting at the same position, which git's default driver reports as
-# a conflict. `union` keeps both sides' lines instead of leaving markers.
+# CHANGELOG.md is an append-only list of independent bullets, so two branches
+# adding an entry under the same heading are inserting at the same position
+# rather than disagreeing — which git's default driver calls a conflict. `union`
+# takes lines from both sides instead of leaving markers.
 #
-# It does NOT promise an ordering. gitattributes(5) on the union driver: "This
-# tends to leave the added lines in the resulting file in random order and the
-# user should verify the result." For a list of independent bullets that is a
-# proofreading matter, not a correctness one — but it is why nothing here claims
-# the entries come out in the order they were written.
+# WHAT THIS DOES NOT DO, because the measurement that motivated it is easy to
+# over-read: it does NOT make a conflicting PR mergeable on github.com. GitHub
+# ignores repository .gitattributes in its server-side merge. MEASURED against
+# GitHub's own merge engine (POST /repos/:owner/:repo/merges) on two branch
+# pairs built to collide on this file: 409 Conflict WITH the union attribute
+# present in both commits, and 409 for the no-attribute control. So a PR that
+# collides here still shows CONFLICTING, and scripts/hooks/git_push_guard.py
+# still blocks `gh pr merge` on GitHub's `mergeable` field — which this rule
+# provably cannot move. Clearing that block means merging the base branch into
+# the PR branch LOCALLY, which is what the gate itself instructs. THAT is what
+# this rule changes: the local merge resolves the changelog with no hand-editing.
+# Measured on the 18 open PRs that collided only on this file: 18/18 merge clean
+# locally, every bullet from both sides intact.
 #
-# Measured 2026-09-04 against origin/main 2d5ea3dd: of 49 open PRs, 21 could not
-# merge, and 18 of those 21 conflicted on CHANGELOG.md and nothing else — every
-# other file in them merged cleanly. That is 37% of the open queue blocked by
-# one file's merge semantics.
+# The pattern is ANCHORED. A gitattributes pattern with no slash matches the
+# basename at every depth, like .gitignore (gitattributes(5)) — unanchored, this
+# would silently arm every future vendored or subproject CHANGELOG.md with a
+# driver nobody reviewed for it.
 #
-# The pattern is ANCHORED with a leading slash on purpose. A gitattributes
-# pattern containing no slash matches the basename at EVERY depth, exactly like
-# .gitignore (gitattributes(5), "the same as in .gitignore files"). Unanchored,
-# this rule would silently pre-arm every future vendored, subproject or plugin
-# CHANGELOG.md with a driver nobody reviewed for it. Measured: `CHANGELOG.md`
-# resolves to union either way, but `vendor/dep/CHANGELOG.md` resolves to union
-# ONLY without the slash. Scope is one path, and the tests grade that over the
-# whole tracked file list rather than a hand-picked sample.
+# TWO WAYS UNION GETS IT WRONG, both at exit 0, both documented in the release
+# runbook (docs/reference/recovery-and-portability-workflow.md), which is where
+# the person who can act on them actually reads:
+#   1. It cannot express a REMOVAL. If one side deletes lines while the other
+#      edits the same hunk, the deleted lines come back. Pruning an entry and
+#      cutting a release (which MOVES entries under a version heading) both hit
+#      this. `git revert` of an older commit is absorbed the same way — git then
+#      reports "nothing to commit", so an exit-code check still catches it, and
+#      guardian/recovery.py's `git revert HEAD` on a clean tree is unaffected
+#      (MEASURED: reverts correctly, because ours == base so union never runs).
+#   2. It merges LINES, not records, so two entries sharing an aligned identical
+#      line collapse into one and the other loses its continuation. This reaches
+#      insertion-only merges, so "just adding a bullet" is not automatically
+#      safe. MEASURED rate on real work: 0 of those same 18 PRs — it needs
+#      identical aligned lines, and these entries are long distinctive prose.
+# Union also promises no ordering ("tends to leave the added lines in the
+# resulting file in random order and the user should verify the result" —
+# gitattributes(5)).
 #
-# `union` resolves SILENTLY, so it must only ever apply where a silent
-# resolution cannot be wrong: an unordered list of independent entries that no
-# code reads. It must NOT be extended to source, config, or prose that two
-# branches might legitimately rewrite in the same place — there, a conflict is
-# the correct and desirable outcome.
-#
-# WHAT UNION CANNOT DO IS EXPRESS A REMOVAL, and this is the sharp edge. If one
-# side deletes lines and the other edits the same hunk, union keeps the deleted
-# lines and exits 0 — the deletion is discarded, silently, with a success code
-# and no duplicated prose to catch the eye. MEASURED with a no-attribute
-# control: pruning an entry on one branch while another branch adds a bullet
-# merges rc=0 with the pruned entry restored; without this rule the same merge
-# conflicts and a human decides. So anyone PRUNING, REVERTING, or CUTTING A
-# RELEASE on this file must read the merged result rather than trust the exit
-# code. Cutting a release is the routine case, because it MOVES entries under a
-# version heading rather than adding them, and another branch's new bullet can
-# land under the wrong heading. Ordinary "add a bullet" merges — which is what
-# nearly every PR does — cannot hit any of this.
-#
-# The attribute also governs cherry-pick, revert, rebase and merge-tree, not
-# just merge (gitattributes(5)). In this repo that reaches
-# contribution/divergence.py (merge-tree conflict probe),
-# contribution/pr_opener.py (cherry-pick into an auto-opened PR) and
-# guardian/recovery.py (autonomous `git revert`): every path where a CHANGELOG
-# conflict used to stop for a human now resolves on its own.
+# Scope is deliberately this one path, and tests/test_changelog_merge_attribute.py
+# enforces that two ways, both of which are load-bearing: an equality over every
+# TRACKED file, and a list of paths that do NOT exist yet (a vendored changelog,
+# a shell script) which the population check structurally cannot reach.
 /CHANGELOG.md merge=union

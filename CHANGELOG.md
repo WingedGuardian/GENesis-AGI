@@ -29,6 +29,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   without conflict, while the three genuine conflicts (in source, a shell
   script and an architecture document) still conflict exactly as before.
 
+  **What this does not do, since that measurement is easy to over-read: it does
+  not make a conflicting pull request mergeable on GitHub.** GitHub ignores a
+  repository's `.gitattributes` in its server-side merge — measured directly
+  against GitHub's own merge engine on two branch pairs built to collide on this
+  file, which returned a conflict both with the union attribute present and
+  without it. Such a pull request still shows as conflicting, and the merge gate
+  still refuses it. Clearing that requires merging the base branch into the
+  branch locally, which is what the gate already instructs. What changes is the
+  cost of that step: the changelog now resolves itself instead of being
+  hand-edited every time.
+
   The rule is scoped to the one file at the repository root, and the tests
   enforce that scope over the complete tracked-file list rather than a sample.
   The leading slash matters: a pattern without one matches the basename at
@@ -41,9 +52,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   a release (which moves entries under a version heading rather than adding
   them) can quietly come out wrong, with a zero exit code and nothing visibly
   duplicated to catch the eye. Read the merged file in those three cases.
-  Ordinary "add a bullet" merges, which is what nearly every change does,
-  cannot hit it. The attribute also governs cherry-pick, revert and rebase, so
-  the same caveat reaches the automated contribution and recovery paths.
+
+  Union merges lines, not records, and that reaches insertion-only merges too:
+  two entries sharing an identical aligned line — the same closing sentence, the
+  same title — can collapse into one, again at exit 0. Measured across the 18
+  real colliding pull requests, every bullet from both sides survived intact in
+  all 18; the failure needs identical lines and these entries are long
+  distinctive prose. So it is a real edge with a measured rate of zero, worth
+  knowing when writing a terse or templated entry.
+
+  The attribute also governs `git revert` and `git cherry-pick`
+  (`gitattributes(5)`) and, measured here, `git merge-tree` — but only when the
+  checkout running them already carries this rule, since attributes resolve from
+  the current checkout rather than from the commits being compared. Two
+  consequences were measured rather than assumed: reverting an *older* commit
+  that added an entry is absorbed, and git then reports "nothing to commit" with
+  a non-zero exit, so a caller checking exit status still notices; and the
+  guardian's automated `git revert HEAD` on a clean tree is unaffected, because
+  there both sides equal the base and the driver never runs.
 
 - **Two branches can no longer pick the same database-migration number.** Each
   new migration is now named by the UTC time it was written rather than by the
