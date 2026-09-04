@@ -1495,6 +1495,7 @@ Merged-but-undeployable-elsewhere is a bug. The standard paths:
 | DB schema | additive idempotent migration — applies at restart |
 | One-off data fix / backfill | data-migration framework (post-boot, idempotent) — NEVER a hand-run script only this install executed |
 | **Naming either migration** | **UTC timestamp id: `` `date -u +%Y%m%d%H%M%S` ``_description.py** (data migrations prefix a `d`). NEVER hand-pick the next number — the legacy 4-digit namespace is FROZEN and CI refuses a new one. An id you have to CHOOSE is an id two branches choose identically: measured 2026-09-03, one PR was renumbered twice in a day and four open PRs held live collisions, while a duplicate prefix aborts bootstrap on every install. Nobody allocates a timestamp. |
+| **Changing an EXISTING migration** | **Don't — add a new one.** The legacy 4-digit set is frozen by ENUMERATED FILENAME, so renaming or deleting one fails CI. Installs that already applied `0050` will never run a renamed `0050_*`, while fresh installs will — two schemas diverging with nothing to notice. Discovery also REFUSES to run anything from a directory holding a file it cannot classify (a mistyped 13-digit id used to be skipped in silence, so the migration never ran at all). |
 | Config default | repo config file (+ optional local overlay); works with no overlay |
 | systemd unit / timer | registered in bootstrap.sh AND the update path — never hand-`systemctl enable`d only here |
 | Hooks / MCP servers | land at next CC session start (note the mid-window in the PR) |

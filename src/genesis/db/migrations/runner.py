@@ -3,10 +3,20 @@
 Each migration is a Python file in this directory. **New migrations use a UTC
 timestamp id** — ``YYYYMMDDHHMMSS_description.py``, e.g.
 ``20260903200000_add_widget_table.py``; generate it with
-``date -u +%Y%m%d%H%M%S``. The legacy hand-allocated 4-digit ids
-(``0001``-``0091``) are FROZEN: they still run, and nothing renames them, but
-no new one may be added (enforced by ``scripts/check_migration_prefixes.py``
-in CI).
+``date -u +%Y%m%d%H%M%S``. The legacy hand-allocated 4-digit ids are FROZEN as
+an ENUMERATED set (``_migration_ids.FROZEN_LEGACY_FILES``): they still run, and
+nothing adds to, deletes from, or renames within that set. A range could not
+express it — ``0092`` lies between the endpoints and does not exist, so an
+endpoint check admitted a brand-new hand-allocated ``0092_*.py``.
+
+Discovery is a TOTAL function over filenames: a name is a frozen legacy
+migration, a well-formed timestamp migration, or not a migration at all — and
+anything left over raises rather than being skipped. The skip is what made this
+dangerous: a mistyped ``2026090320000_x.py`` (13 digits) matched nothing, so it
+was discovered by nothing and NEVER RAN, and the code needing it deployed
+against a schema that never got the change. CI enforces the same contract via
+``scripts/check_migration_prefixes.py``, plus one rule that is only true of the
+default branch: every frozen file is still present under its own name.
 
 Why: a hand-allocated id has to be CHOSEN, so two branches routinely choose
 the same one — measured 2026-09-03, one PR was renumbered twice in a single
@@ -64,17 +74,23 @@ from pathlib import Path
 
 import aiosqlite
 
-from genesis.db._migration_ids import SCHEMA_MIGRATION_PATTERN
+from genesis.db._migration_ids import SCHEMA, SCHEMA_MIGRATION_PATTERN
 
 logger = logging.getLogger(__name__)
 
 _MIGRATIONS_DIR = Path(__file__).parent
-#: Frozen legacy ids (``0001``-``0091``) OR a UTC timestamp id
-#: (``YYYYMMDDHHMMSS``). Both widths are all-digits, so they sort together and
-#: '0' < '2' keeps every legacy id ahead of every timestamp one. Defined in
-#: ``db/_migration_ids`` (stdlib-only) so CI's guard can bind to the REAL
-#: pattern without importing this module's aiosqlite dependency; aliased here
-#: because the name is part of this module's established surface.
+#: A 4-digit legacy id OR a 14-digit UTC timestamp id. Both widths are ASCII
+#: digits, so they sort together, and '0' < '2' keeps every legacy id ahead of
+#: every timestamp one — which is why a timestamp must validate as a real
+#: calendar date at/after ``TIMESTAMP_EPOCH_YEAR`` and not merely be 14 digits.
+#: Defined in ``db/_migration_ids`` (stdlib-only) so CI's guard can bind to the
+#: REAL contract without importing this module's aiosqlite dependency; aliased
+#: here because the name is part of this module's established surface.
+#:
+#: MATCHING IS NOT SUFFICIENT: the pattern says a name is well-FORMED, never
+#: that it is ALLOWED. A legacy-width id must also be in the frozen set. Use
+#: ``_migration_ids.classify`` for the verdict; conflating the two is what let
+#: a fresh ``0092_new.py`` past an endpoint check.
 _MIGRATION_PATTERN = SCHEMA_MIGRATION_PATTERN
 
 # SQL statements that would escape the runner's outer BEGIN IMMEDIATE /
@@ -265,10 +281,12 @@ class MigrationRunner:
     async def get_available(self) -> list[tuple[str, str, Path]]:
         """Return ordered list of (id, name, path) for all migration files."""
         # Shared file-discovery with the data-migration runner (only the
-        # filename pattern differs; execution semantics are deliberately not).
+        # namespace differs; execution semantics are deliberately not). Raises
+        # if any file presents as a migration but cannot run — see the note on
+        # _MIGRATION_PATTERN for why silence there was the dangerous case.
         from genesis.db._migration_discovery import discover_numbered_modules
 
-        return discover_numbered_modules(_MIGRATIONS_DIR, _MIGRATION_PATTERN)
+        return discover_numbered_modules(_MIGRATIONS_DIR, SCHEMA)
 
     async def get_pending(self) -> list[tuple[str, str, Path]]:
         """Return ordered list of migrations not yet applied."""

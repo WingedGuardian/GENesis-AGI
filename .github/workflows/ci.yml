@@ -305,10 +305,17 @@ jobs:
           printf '%s\n%s\n' "$added" "$body" | python3 scripts/ci/private_pattern_scan.py --patterns "$pf"
 
   migration-check:
-    # Migration ids: no duplicate prefix in either namespace, and no NEW
-    # hand-allocated 4-digit id (that namespace is frozen — new migrations use
-    # a UTC timestamp, which nobody has to allocate and two branches therefore
-    # cannot both claim).
+    # Migration ids, three rules: every file in a migrations directory is a
+    # legal migration (the residue is a violation, because a name that matches
+    # nothing is discovered by nothing and NEVER RUNS), no duplicate id in
+    # either namespace, and every frozen legacy file is still present under its
+    # own name (deleting or renaming one leaves the id set identical while
+    # existing installs skip the replacement forever).
+    #
+    # The legacy namespace is frozen as an ENUMERATED set, not a range: 0092
+    # lies between the endpoints and does not exist, so a range check admitted
+    # a brand-new hand-allocated 0092_*.py. New migrations use a UTC timestamp,
+    # which nobody has to allocate and two branches therefore cannot both claim.
     #
     # The check moved out of shell deliberately. The old glob+grep restated the
     # runners' filename semantics in a second language and could not survive

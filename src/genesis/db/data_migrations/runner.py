@@ -21,16 +21,21 @@ from pathlib import Path
 import aiosqlite
 
 from genesis.db._migration_discovery import discover_numbered_modules
-from genesis.db._migration_ids import DATA_MIGRATION_PATTERN
+from genesis.db._migration_ids import DATA, DATA_MIGRATION_PATTERN
 from genesis.db.crud import data_migrations as crud
 from genesis.db.data_migrations._util import MigrationDependencyUnavailable
 
 logger = logging.getLogger(__name__)
 
 _DATA_MIGRATIONS_DIR = Path(__file__).parent
-#: Frozen legacy ids (``d0001``-``d0011``) OR ``d`` + a UTC timestamp. Defined
-#: in ``db/_migration_ids`` (stdlib-only, shared with CI's guard); see the
-#: schema runner's module docstring for why new ids are timestamps.
+#: A ``d`` + 4-digit legacy id OR ``d`` + a 14-digit UTC timestamp. Defined in
+#: ``db/_migration_ids`` (stdlib-only, shared with CI's guard); see the schema
+#: runner's module docstring for why new ids are timestamps.
+#:
+#: MATCHING IS NOT SUFFICIENT — the pattern says well-FORMED, not ALLOWED; the
+#: legacy set is enumerated, and ``classify`` is the verdict. Discovery raises
+#: on anything that presents as a data migration and cannot run, because a
+#: silently-skipped backfill is indistinguishable from one that ran.
 _DATA_MIGRATION_PATTERN = DATA_MIGRATION_PATTERN
 
 # The ledger bookkeeping (mark_completed / mark_failed) writes through the shared
@@ -113,7 +118,9 @@ class DataMigrationRunner:
         self._db = db
 
     def _discover(self) -> list[tuple[str, str, Path]]:
-        return discover_numbered_modules(_DATA_MIGRATIONS_DIR, _DATA_MIGRATION_PATTERN)
+        # Raises if any file presents as a data migration but cannot run — a
+        # silently-skipped backfill is indistinguishable from one that ran.
+        return discover_numbered_modules(_DATA_MIGRATIONS_DIR, DATA)
 
     async def run_pending(self) -> list[dict]:
         """Run every claimable data migration once. Returns per-migration outcomes.

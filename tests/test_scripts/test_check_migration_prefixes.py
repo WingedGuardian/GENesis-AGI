@@ -1,23 +1,24 @@
 """The migration-id CI guard (scripts/check_migration_prefixes.py).
 
-Two rules: no duplicate prefix in either namespace, and no NEW hand-allocated
-4-digit id — that namespace is frozen to the exact set that existed on
-2026-09-04 (0001..0093 with a gap at 0092, d0001..d0011), enforced at BOTH ends.
+Three rules: every file in a migrations directory classifies as a legal
+migration (the residue is a violation), no duplicate id in either namespace,
+and every frozen legacy file is still present under its own name.
 
-The both-ends part is load-bearing and was learned the hard way: a one-sided
-"above the freeze mark" rule let ``0000`` through, and ``0000`` is the worst
-possible id to miss — legacy-width, duplicating nothing, and ordering-divergent
-in the maximal way (on a fresh install it sorts first and runs before ``0001``;
-on an existing install every legacy id is already applied, so it runs last).
-Deliberately no size/contiguity check: it would only catch a deleted legacy id
-being re-allocated, which the freeze already makes unreachable — and the range
-is not contiguous anyway.
+The guard used to check properties of the id SET — no duplicates, min/max inside
+a window — and four independent review findings came out of that one choice,
+because a set-property is blind in two directions. It could not see a file the
+pattern failed to match (a 13-digit id was skipped in silence, in the guard AND
+in discovery, so the migration NEVER RAN), and it was invariant under mutations
+that preserve the endpoints (``0092`` sits inside ``0001..0093`` yet does not
+exist, so a hand-allocated ``0092_new.py`` passed; renaming a frozen file left
+the id set identical; deleting every legacy file left the legacy loop empty,
+which read as clean). Stating the contract as a total function over filenames is
+what closes all four, and closes the ones nobody has thought of yet.
 
-The guard replaced a shell glob+grep that could not survive mixed-width ids in
-either direction — MEASURED 2026-09-03: the 4-digit glob made timestamp
-migrations invisible to the guard, and widening the glob while keeping
-``grep -oP '^\\d{4}'`` truncated every ``20260903…`` id to ``2026``, so two
-distinct migrations reported as duplicates of each other.
+Fixtures bind to the REAL frozen set via the contract module rather than
+generating plausible names, because a generated ``0001_legacy.py`` is not a
+frozen filename and the guard is right to reject it — a fixture that hand-wrote
+the set would be testing the fixture.
 
 TWO LEVELS OF TEST HERE, and the second exists because the first cannot see
 CI's environment. Most cases call ``check()`` directly against a fake tree.
@@ -41,6 +42,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPO = Path(__file__).resolve().parent.parent.parent
 _SCRIPT = _REPO / "scripts" / "check_migration_prefixes.py"
 _spec = importlib.util.spec_from_file_location("check_migration_prefixes", _SCRIPT)
@@ -48,12 +51,14 @@ _mod = importlib.util.module_from_spec(_spec)
 sys.modules["check_migration_prefixes"] = _mod
 _spec.loader.exec_module(_mod)
 
+_IDS = _mod._load_id_contract(_REPO)
+
 
 def _fake_repo(schema: list[str], data: list[str], *, tmp_path: Path) -> Path:
     """A minimal tree with both migration dirs and the REAL id-contract module.
 
     The contract is copied verbatim from the repo so the guard binds to the
-    genuine patterns AND the genuine freeze window — a fixture that hand-wrote
+    genuine patterns AND the genuine frozen set — a fixture that hand-wrote
     either would be testing the fixture, which is the exact defect this script
     exists to remove.
     """
@@ -72,14 +77,15 @@ def _fake_repo(schema: list[str], data: list[str], *, tmp_path: Path) -> Path:
 def _full_legacy(
     schema_extra: list[str] | None = None, data_extra: list[str] | None = None
 ) -> tuple[list[str], list[str]]:
-    """The legacy ids as they actually exist, plus extras.
+    """The frozen legacy files as they ACTUALLY exist, plus extras.
 
-    Mirrors the real shape rather than an idealised one: the schema range runs
-    0001..0091 and then 0093, with a GAP at 0092 left by a rename — which is
-    why the freeze window pins endpoints and NOT a count.
+    Read from the contract, not generated: the real schema set runs 0001..0091
+    and then 0093 — a GAP at 0092, left by a rename — and it was exactly that
+    gap that a range check could not express, admitting a brand-new
+    hand-allocated ``0092_new.py``.
     """
-    schema = [f"{i:04d}_legacy.py" for i in list(range(1, 92)) + [93]]
-    data = [f"d{i:04d}_legacy.py" for i in range(1, 12)]
+    schema = sorted(_IDS.FROZEN_LEGACY_FILES[_IDS.SCHEMA])
+    data = sorted(_IDS.FROZEN_LEGACY_FILES[_IDS.DATA])
     return schema + (schema_extra or []), data + (data_extra or [])
 
 
@@ -97,57 +103,198 @@ def test_clean_mixed_tree_passes(tmp_path):
     assert _mod.check(repo) == []
 
 
-def test_duplicate_timestamp_prefix_is_caught(tmp_path):
+def test_duplicate_timestamp_id_is_caught(tmp_path):
     """The residual the freeze cannot remove: two authors CAN hit the same
     second. Rare, but both runners still raise on it, so the guard still checks."""
     repo = _fake_repo(
-        *_full_legacy(["20260903200000_a.py", "20260903200000_b.py"]), tmp_path=tmp_path
+        *_full_legacy(["20260903200000_a.py", "20260903200000_b.py"]),
+        tmp_path=tmp_path,
     )
     out = _mod.check(repo)
-    assert any("duplicate prefix '20260903200000'" in v for v in out)
+    assert any("duplicate id '20260903200000'" in v for v in out)
 
 
-def test_duplicate_legacy_prefix_still_caught(tmp_path):
+def test_a_second_file_claiming_a_frozen_id_is_caught(tmp_path):
+    """The legacy half of "duplicate id", which the freeze now subsumes.
+
+    Two files can no longer share a LEGACY id without one of them being outside
+    the frozen set — the set holds one filename per id — so this is reported as
+    an illegal legacy id rather than reaching the duplicate arm. The duplicate
+    arm still matters for TIMESTAMP ids, where two authors really can collide
+    (covered above); this test pins that the file is refused either way, which
+    is the property that actually protects the tree.
+    """
     schema, data = _full_legacy()
     repo = _fake_repo(schema + ["0001_duplicate.py"], data, tmp_path=tmp_path)
     out = _mod.check(repo)
-    assert any("duplicate prefix '0001'" in v for v in out)
+    assert any("0001_duplicate.py" in v for v in out), out
 
 
-def test_a_NEW_legacy_prefix_ABOVE_the_window_is_refused(tmp_path):
-    """The freeze rule — the whole point. 0094 is the id a human would
-    hand-allocate next, and allocating is what made two branches collide."""
-    repo = _fake_repo(*_full_legacy(["0094_hand_allocated.py"]), tmp_path=tmp_path)
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "0094_hand_allocated.py",  # the id a human would allocate next
+        "0000_hand_allocated.py",  # below the old window; maximally order-divergent
+        "0092_gap.py",  # INSIDE the old lo..hi range, absent from the set
+    ],
+)
+def test_a_new_hand_allocated_legacy_id_is_refused(tmp_path, bad):
+    """The freeze rule — the whole point. Allocating is what made two branches
+    collide, so no new legacy-width id is admissible in any position.
+
+    ``0092`` is the case a range check structurally could not catch: it lies
+    between the endpoints, so only the enumerated set can tell it is not real.
+    """
+    repo = _fake_repo(*_full_legacy([bad]), tmp_path=tmp_path)
     out = _mod.check(repo)
-    freeze = [v for v in out if "allocates a NEW legacy-width id" in v]
-    assert any("0094" in v for v in freeze)
+    freeze = [v for v in out if "allocates the legacy-width id" in v]
+    assert any(bad in v for v in freeze), out
     assert any("date -u +%Y%m%d%H%M%S" in v for v in freeze)  # names the remedy
 
 
-def test_a_NEW_legacy_prefix_BELOW_the_window_is_refused(tmp_path):
-    """0000 is legacy-width, duplicates nothing, and slipped a one-sided
-    `prefix > mark` rule. It is also the maximally order-divergent id: first on
-    a fresh install, last on an existing one."""
-    repo = _fake_repo(*_full_legacy(["0000_hand_allocated.py"]), tmp_path=tmp_path)
+@pytest.mark.parametrize("bad", ["d0012_new.py", "d0000_hand.py"])
+def test_a_new_hand_allocated_legacy_data_id_is_refused(tmp_path, bad):
+    repo = _fake_repo(*_full_legacy(data_extra=[bad]), tmp_path=tmp_path)
     out = _mod.check(repo)
-    # The FREEZE-WINDOW arm specifically. Asserting on "0000" + "frozen" alone
-    # passed under a one-sided mutation, because the contiguity message names
-    # both too — a test that fires for the wrong reason is not a lock.
-    assert any(
-        "0000" in v and "allocates a NEW legacy-width id" in v for v in out
-    )
+    assert any(bad in v and "allocates the legacy-width id" in v for v in out)
 
 
-def test_a_NEW_legacy_data_prefix_is_refused(tmp_path):
-    repo = _fake_repo(*_full_legacy(data_extra=["d0012_new.py"]), tmp_path=tmp_path)
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "2026090320000_short.py",  # 13 digits
+        "202609032000000_long.py",  # 15 digits
+        "00000000000000_zero.py",  # 14 digits, not a calendar timestamp
+        "20261301000000_month13.py",
+        "20260932000000_day32.py",
+        "19990101000000_preepoch.py",  # would sort before the frozen namespace
+        "２０２６０９０４００００００_fullwidth.py",
+        "d0001_misfiled_data_in_schema_dir.py",
+    ],
+)
+def test_a_file_that_cannot_run_is_a_violation_not_a_skip(tmp_path, bad):
+    """The finding the set-shaped guard could not see at all.
+
+    Each of these was previously skipped by ``if m:`` — in the guard AND in
+    discovery — so the migration was found by nothing, never ran, and the code
+    needing it deployed against a schema that never got the change. Silent, and
+    indistinguishable from a clean tree.
+    """
+    repo = _fake_repo(*_full_legacy([bad]), tmp_path=tmp_path)
     out = _mod.check(repo)
-    assert any("d0012" in v and "allocates a NEW legacy-width id" in v for v in out)
+    assert any(bad in v for v in out), out
 
 
-def test_a_NEW_legacy_data_prefix_below_the_window_is_refused(tmp_path):
-    repo = _fake_repo(*_full_legacy(data_extra=["d0000_hand.py"]), tmp_path=tmp_path)
+def test_deleting_a_frozen_migration_is_caught(tmp_path):
+    """An id-set check cannot see this: min, max and count are all unchanged.
+
+    The COUNT is asserted, not just the victim's presence in the message.
+    Mutating the guard so it never records what it saw makes it report all 92
+    frozen files as missing — which still contains the victim's name, so an
+    ``assert victim in message`` passes while the guard has gone completely
+    blind. A test that cannot tell one missing file from ninety-two is not
+    locking the behaviour it claims to.
+    """
+    schema, data = _full_legacy()
+    victim = "0051_entity_layer.py"
+    repo = _fake_repo([s for s in schema if s != victim], data, tmp_path=tmp_path)
     out = _mod.check(repo)
-    assert any("d0000" in v and "allocates a NEW legacy-width id" in v for v in out)
+    missing = [v for v in out if "frozen legacy file(s) missing" in v]
+    assert len(missing) == 1, out
+    assert "1 frozen legacy file(s) missing" in missing[0], missing
+    assert victim in missing[0], missing
+    # A file that is still present must not be named.
+    assert "0050_canonicalize_bitemporal_ts.py" not in missing[0], missing
+
+
+def test_renaming_a_frozen_migration_is_caught(tmp_path):
+    """``0050_old.py`` -> ``0050_new.py`` leaves the id set IDENTICAL, while
+    installs that already applied ``0050`` skip the replacement forever and
+    fresh installs run it — two schemas, diverging, with nothing to notice."""
+    schema, data = _full_legacy()
+    victim = "0050_canonicalize_bitemporal_ts.py"
+    renamed = [s for s in schema if s != victim] + ["0050_renamed.py"]
+    repo = _fake_repo(renamed, data, tmp_path=tmp_path)
+    out = _mod.check(repo)
+    assert any(victim in v and "missing" in v for v in out), out
+    assert any("0050_renamed.py" in v for v in out), out
+
+
+def test_deleting_every_legacy_migration_is_caught(tmp_path):
+    """The empty-legacy hole: with one timestamp migration present the id map is
+    non-empty, so the legacy loop simply had nothing to iterate and reported
+    clean."""
+    _, data = _full_legacy()
+    repo = _fake_repo(["20260904120000_only.py"], data, tmp_path=tmp_path)
+    out = _mod.check(repo)
+    assert any("frozen legacy file(s) missing" in v for v in out), out
+
+
+def test_the_frozen_legacy_set_is_closed(tmp_path):
+    """The set's SIZE is pinned, so growing it cannot be a quiet side effect.
+
+    This is a speed bump, not enforcement, and the distinction is worth stating.
+    The guard reads FROZEN_LEGACY_FILES from the commit under test — it takes no
+    base ref and shells out to no git — so a single PR can add ``0094_x.py`` AND
+    add ``"0094_x.py"`` to the set, and every rule passes. Only an out-of-repo
+    reference (a merge-base diff, or a required human review) could actually
+    close it.
+
+    A merge-base diff was considered and declined: it needs the base ref in CI
+    (``fetch-depth: 0``) and would mean exec'ing a source file from another ref.
+    An unmet CI dependency is the exact bug that already bit this guard once —
+    it path-imported aiosqlite-bearing modules and exited 2 on every PR while
+    every test passed inside the venv — so buying enforcement with a new CI
+    dependency is a poor trade here.
+
+    What this DOES buy: the addition can no longer be silent. Anyone growing the
+    set must also change a number in a test whose name says the set is closed,
+    which is a deliberate act with a message attached at the moment it matters.
+    The error text deliberately does not advertise the set as a remedy either.
+
+    If you are here because this test failed: you are hand-allocating a
+    migration id, which is the thing this whole scheme removed. Use
+    ``date -u +%Y%m%d%H%M%S`` instead. The only legitimate reason to proceed is
+    a legacy-id migration that was authored before this scheme and has already
+    merged to the default branch.
+    """
+    assert len(_IDS.FROZEN_LEGACY_FILES[_IDS.SCHEMA]) == 92
+    assert len(_IDS.FROZEN_LEGACY_FILES[_IDS.DATA]) == 11
+
+
+def test_a_future_timestamp_id_is_refused(tmp_path):
+    """The ordering invariant's ceiling — the side nobody looked at.
+
+    The floor is guarded in the contract because a year >= the epoch forces a
+    leading '2'. Nothing bounded the top, and the typo that reaches it is more
+    likely than the widths that WERE caught: one wrong digit turns 2026 into
+    2926, a perfectly valid id that sorts after every migration anyone writes
+    for the next nine centuries — silent in discovery, in the guard, and in the
+    runner.
+    """
+    repo = _fake_repo(*_full_legacy(["29260903200000_typo_year.py"]), tmp_path=tmp_path)
+    out = _mod.check(repo)
+    assert any("FUTURE timestamp id" in v and "29260903200000" in v for v in out), out
+
+
+def test_a_recent_past_timestamp_is_not_flagged_as_future(tmp_path):
+    """The control: the ceiling must not redden ordinary work. A guard that
+    fires on a normal migration gets disabled by whoever hits it next."""
+    repo = _fake_repo(*_full_legacy(["20200101000000_old_but_fine.py"]), tmp_path=tmp_path)
+    assert _mod.check(repo) == []
+
+
+def test_a_migration_in_a_subdirectory_is_caught(tmp_path):
+    """Discovery is flat (importlib resolves a flat package), so a nested file
+    is discovered by nothing — the same never-runs silence as a mistyped width,
+    in the one shape a flat scan structurally cannot see."""
+    schema, data = _full_legacy()
+    repo = _fake_repo(schema, data, tmp_path=tmp_path)
+    nested = repo / "src/genesis/db/migrations/helpers"
+    nested.mkdir()
+    (nested / "20260904120000_buried.py").write_text("")
+    out = _mod.check(repo)
+    assert any("subdirectory" in v and "20260904120000_buried.py" in v for v in out), out
 
 
 def test_existing_legacy_ids_are_not_flagged(tmp_path):
@@ -157,13 +304,25 @@ def test_existing_legacy_ids_are_not_flagged(tmp_path):
     assert _mod.check(repo) == []
 
 
+def test_the_runners_own_modules_are_not_migrations(tmp_path):
+    """The residue rule must not swallow files that never presented as
+    migrations — they share the directory with every migration."""
+    schema, data = _full_legacy()
+    repo = _fake_repo(
+        schema + ["__init__.py", "runner.py", "__main__.py"],
+        data + ["__init__.py", "runner.py", "_util.py", "stale_embedding_repair.py"],
+        tmp_path=tmp_path,
+    )
+    assert _mod.check(repo) == []
+
+
 def test_an_empty_directory_is_an_anomaly_not_a_pass(tmp_path):
-    """91 migrations exist; a scan finding none did not describe the directory.
+    """92 migrations exist; a scan finding none did not describe the directory.
     Reporting CLEAN there is the seen-nothing-so-no-problem failure."""
     _, data = _full_legacy()
     repo = _fake_repo([], data, tmp_path=tmp_path)
     out = _mod.check(repo)
-    assert any("no files matched" in v for v in out)
+    assert any("no runnable migration found" in v for v in out), out
 
 
 def test_a_missing_directory_fails_closed_not_clean(tmp_path):
@@ -209,7 +368,8 @@ def test_ci_command_line_runs_at_all_on_the_real_tree():
     """BLOCKER regression: the first version of this guard bound to the runner
     modules, which import aiosqlite at module scope, so it exited 2 on every PR
     in a job that installs nothing — while every check()-level test passed
-    inside the venv. The id contract is stdlib-only so this stays true."""
+    inside the venv. The id contract is stdlib-only so this stays true, and
+    ``datetime`` (added for timestamp validation) keeps it true."""
     proc = _run_as_ci(_REPO)
     assert proc.returncode == 0, f"exit {proc.returncode}\n{proc.stdout}\n{proc.stderr}"
     assert "CLEAN" in proc.stdout

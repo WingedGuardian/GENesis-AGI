@@ -15,7 +15,6 @@ import pytest
 from genesis.db.crud import data_migrations as crud
 from genesis.db.data_migrations import runner as runner_mod
 from genesis.db.data_migrations.runner import DataMigrationRunner
-from genesis.db.migrations import runner as _schema_runner
 from genesis.db.schema import create_all_tables
 
 
@@ -249,25 +248,18 @@ def test_no_duplicate_migration_prefixes_in_tree():
     from collections import Counter
 
     from genesis.db._migration_discovery import discover_numbered_modules
+    from genesis.db._migration_ids import DATA, SCHEMA
 
+    # The NAMESPACE, not a pattern: discovery resolves the pattern from the
+    # contract itself, so this test cannot bind to a regex that disagrees with
+    # the directory it is scanning. (A copied regex here silently stopped
+    # covering timestamp-id migrations the moment the runner's pattern widened.)
     surfaces = [
-        (
-            runner_mod._DATA_MIGRATIONS_DIR,
-            runner_mod._DATA_MIGRATION_PATTERN,
-            "data migration",
-        ),
-        (
-            runner_mod._DATA_MIGRATIONS_DIR.parent / "migrations",
-            # IMPORTED, not restated: a copied regex here silently stopped
-            # covering timestamp-id migrations the moment the runner's pattern
-            # widened, while the data half (which imports its constant, just
-            # above) self-healed. Same asymmetry, same fix.
-            _schema_runner._MIGRATION_PATTERN,
-            "schema migration",
-        ),
+        (runner_mod._DATA_MIGRATIONS_DIR, DATA, "data migration"),
+        (runner_mod._DATA_MIGRATIONS_DIR.parent / "migrations", SCHEMA, "schema migration"),
     ]
-    for directory, pattern, label in surfaces:
-        ids = [mid for mid, _, _ in discover_numbered_modules(directory, pattern)]
+    for directory, namespace, label in surfaces:
+        ids = [mid for mid, _, _ in discover_numbered_modules(directory, namespace)]
         dupes = {mid: n for mid, n in Counter(ids).items() if n > 1}
         assert not dupes, (
             f"duplicate {label} prefix(es) {dupes} in {directory} — "

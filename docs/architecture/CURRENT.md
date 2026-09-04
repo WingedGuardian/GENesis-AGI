@@ -1656,8 +1656,17 @@ verified: 50b79ffb 2026-09-01
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
   schema paths coexist: base DDL (`schema/_tables.py`, 118 CREATE TABLE; docs
-  still say "60+") plus versioned `migrations/` 0001..0089 run ONCE at startup
-  before any other init step touches data; a failed migration ABORTS bootstrap.
+  still say "60+") plus versioned `migrations/` run ONCE at startup before any
+  other init step touches data; a failed migration ABORTS bootstrap. Ids are
+  92 FROZEN legacy 4-digit ones (`0001`..`0093`, with a GAP at `0092` from a
+  rename) plus new `YYYYMMDDHHMMSS_*.py` UTC timestamps — nobody allocates an
+  id any more, which is what removed the cross-branch collisions. The legacy
+  set is ENUMERATED in `db/_migration_ids.FROZEN_LEGACY_FILES` (a range cannot
+  express the `0092` gap), and discovery REFUSES a directory holding any file
+  it cannot classify, because a name matching nothing is discovered by nothing
+  and would never run. Discovery enforces RUNNABLE; CI
+  (`scripts/check_migration_prefixes.py`) additionally enforces this repo's
+  freeze, so a fork's own 4-digit migration runs rather than bricking its boot.
   EVERY table must be in BOTH paths (fresh-install DDL + its numbered
   migration) — a design CONVENTION whose TABLE-set parity is NOT test-enforced:
   `test_db/test_schema.py`'s `EXPECTED_TABLES` allow-list only pins the DDL
