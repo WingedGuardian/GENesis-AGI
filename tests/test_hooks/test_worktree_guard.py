@@ -361,10 +361,16 @@ class TestFailOpen:
 # because the regex required `git` immediately followed by `worktree` —
 # `git -C <path> worktree remove <target>` slipped straight through.
 #
-# MEASURED over 48,363 real commands from this install's transcripts: the swap
-# frees 4 mention-only blocks AND closes 6 genuine removals that were previously
-# allowed. The blocked count ROSE, 150 -> 152, which is the correct outcome — it
-# is a different and strictly better set, not a smaller one.
+# MEASURED over 51,052 (command, directory) pairs from this install's
+# transcripts, each replayed from the directory it was typed in: 154 blocked
+# before and 154 after — a DIFFERENT set, freeing 6 mention-only refusals and
+# catching 6 real removals the old predicate allowed.
+#
+# An earlier draft of this comment said "48,363 … frees 4 … 150 -> 152". That
+# was a superseded corpus (before the harness replayed each command from its own
+# directory) and a superseded predicate (before the carrier fallback below). Two
+# other files quoted two other versions of the same claim. One measurement, one
+# set of numbers, or none.
 #
 # Built from fragments so this file's own text cannot trip the guard it tests.
 _SUB = "worktree"
@@ -435,3 +441,76 @@ class TestMentionIsNotExecution:
         inner = f"git {_SUB} {_OP} {_SUB}"
         result = _run_guard(guard_cmd, {"command": inner})
         assert result.returncode == 2, result.stdout + result.stderr
+
+
+class TestCommandCarriersAreNotAHole:
+    """A parser is NARROWER than the regex it replaced along an axis the
+    migration never named: executables that carry a command STRING.
+
+    `eval '<removal>'`, `ssh box "<removal>"`, `find -exec`, `parallel`,
+    `watch`, `script -c` and a shell function body all EXECUTE the removal, and
+    all tokenize perfectly — so the `untokenizable()` fallback cannot see them.
+    The parser reads the carrier as the executable, skips the segment, finds no
+    target, and allows it. MEASURED: 9 shapes the pre-parser version blocked and
+    the first parser version let through.
+
+    That is the same open-set trap this branch reverted three shell arms over,
+    reached from the other side: the justification for keeping the parser here
+    was that it has the real tokenizer, and the tokenizer does not model this.
+    """
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            f"eval '{_PHRASE} /tmp/wt-x'",
+            f'eval "{_PHRASE} /tmp/wt-x"',
+            f"eval {_PHRASE} /tmp/wt-x",
+            f'ssh box "{_PHRASE} /tmp/wt-x"',
+            f"find /tmp -name 'wt-*' -exec {_PHRASE} {{}} \\;",
+            f"watch {_PHRASE} /tmp/wt-x",
+            f"parallel {_PHRASE} ::: /tmp/wt-x",
+            f"script -q -c '{_PHRASE} /tmp/wt-x' /dev/null",
+            f"f() {{ {_PHRASE} $1; }}; f /tmp/wt-x",
+        ],
+    )
+    def test_a_carried_removal_still_blocks(self, guard_cmd: str, inner: str) -> None:
+        """REGRESSION PIN — each of these was rc=2 before the parser migration,
+        rc=0 after it, and is rc=2 again now."""
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            f"grep -rn '{_PHRASE}' scripts/",
+            f'echo "{_PHRASE} is blocked here"',
+            f"git commit -m 'docs: explain why {_PHRASE} is gated'",
+        ],
+    )
+    def test_the_mention_wins_survive_the_carrier_fallback(
+        self, guard_cmd: str, inner: str
+    ) -> None:
+        """TRUE-NEGATIVE CONTROL, and the reason the fallback is ordered as it is.
+
+        The carrier test runs only when the parser found NO target, so a mention
+        is unaffected — there is no carrier in it. Without this, closing the
+        carrier hole by falling back whenever the phrase appears would pass every
+        test above while silently reverting the whole branch.
+        """
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 0, result.stderr
+
+    def test_a_target_arriving_on_stdin_is_a_known_gap_in_every_version(
+        self, guard_cmd: str
+    ) -> None:
+        """NOT a regression — MEASURED allow on the pre-parser version too.
+
+        Piping a path into `xargs` puts the target BEFORE the phrase, so the
+        coarse extractor (which reads forward from its match) finds nothing
+        either. Neither predicate has ever caught this shape. Asserted as
+        current behaviour so the gap is visible rather than implicit; if this
+        starts failing the gap was closed and this test should go.
+        """
+        inner = f"echo /tmp/wt-x | xargs {_PHRASE}"
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 0, result.stdout + result.stderr

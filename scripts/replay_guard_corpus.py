@@ -33,6 +33,7 @@ show up as a false positive, so a clean sweep says nothing about it.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import json
 import os
@@ -108,9 +109,19 @@ def load_corpus(*, rebuild: bool = False) -> list[tuple[str, str]]:
     """
     if _CACHE.exists() and not rebuild:
         _harden(_CACHE)
-        with _CACHE.open() as f:
-            rows = [json.loads(line) for line in f if line.strip()]
-        if any(isinstance(r, str) for r in rows):
+        try:
+            with _CACHE.open() as f:
+                rows = [json.loads(line) for line in f if line.strip()]
+        except ValueError as exc:
+            # A cache truncated by an interrupted rebuild. Say what and where,
+            # and rebuild — the previous behaviour was a bare JSONDecodeError
+            # from inside a comprehension, naming neither.
+            print(
+                f"corpus cache is corrupt ({exc}) — rebuilding {_CACHE}",
+                file=sys.stderr,
+            )
+            rows = [None]
+        if any(r is None or isinstance(r, str) for r in rows):
             print(
                 "cache predates the cwd field (v1) — rebuilding, because "
                 "replaying it would measure the wrong directory",
@@ -125,15 +136,21 @@ def load_corpus(*, rebuild: bool = False) -> list[tuple[str, str]]:
     # lines from real sessions and demonstrably contains secrets passed in argv
     # (an inline `SSHPASS=…` was found in it), so it must never exist even
     # briefly at the default 0644.
-    fd = os.open(_CACHE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # Written to a sibling and renamed, so the cache is only ever replaced
+    # ATOMICALLY. The build walks ~1.4 GB and takes minutes; interrupting it
+    # used to leave a truncated final line, and the next load then died inside a
+    # list comprehension with a JSONDecodeError that named neither the cache nor
+    # the remedy. The tool stayed dead until someone deleted the file by hand.
+    tmp = _CACHE.with_name(_CACHE.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     # os.open's mode argument applies ONLY on the call that actually CREATES the
-    # file. Rebuilding over a cache that already exists at 0644 leaves it 0644,
-    # so tighten the inode explicitly — before a single byte is written, while
-    # O_TRUNC has just emptied it.
+    # file, so a leftover temp from an earlier run would keep its old mode.
+    # Tighten the inode explicitly, before a single byte is written.
     os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w") as f:
         for pair in cmds:
             f.write(json.dumps(pair) + "\n")
+    os.replace(tmp, _CACHE)
     # Report the mode the file ACTUALLY carries. A hard-coded "(mode 0600)" is
     # how the bug above stayed invisible: the line claimed a mode nothing had
     # verified, on a file that demonstrably holds secrets.
@@ -151,8 +168,10 @@ def _harden(path: Path) -> None:
         if path.stat().st_mode & 0o077:
             path.chmod(0o600)
             print(f"tightened {path} to 0600 (it held real commands)", file=sys.stderr)
-    except OSError:
-        pass
+    except OSError as exc:
+        # NOT silent. Swallowing this means reading and replaying from a
+        # world-readable file full of real commands while saying nothing.
+        print(f"WARNING: could not tighten {path} ({exc})", file=sys.stderr)
 
 
 # ── guard invocation ─────────────────────────────────────────────────────────
@@ -220,8 +239,15 @@ def _run_python_guard(module_name: str, cmd: str, cwd: str) -> bool:
         return True
     finally:
         os.chdir(prior)
+        # Unconditional. If a guard ever lacks the attribute, restoring only on
+        # the not-None branch leaves the patched lambda installed on the module
+        # for the rest of the process — every later command would then be
+        # classified against this command's payload.
         if original is not None:
             mod.read_payload = original
+        else:
+            with contextlib.suppress(AttributeError):
+                delattr(mod, "read_payload")
 
 
 _run_python_guard._loaded = {}  # type: ignore[attr-defined]
@@ -264,62 +290,96 @@ def _inline_blob() -> str:
 # objects is not a side effect worth any number. It is also the one guard not
 # wrapped by run_guard, so this harness's crash-counts-as-block rule would
 # misreport it: in production it fails OPEN.
+# git_push is deliberately ABSENT for a different reason, and it is worth
+# stating separately rather than folding into the note above. It performs no
+# writes — it is read-only in the filesystem sense — but it shells out to `gh
+# repo view` / `gh pr view` and to git at classify time, and the corpus holds
+# 1,195 push-shaped rows plus 924 `gh pr create|merge`-shaped ones. Replaying it
+# would make on the order of thousands of live GitHub API calls against the
+# user's account and burn their rate limit, from a tool whose docstring says it
+# replays local history. "Read-only" and "safe to run 2,119 times against a
+# remote API" are different claims. It also has no timeout on the in-process
+# path (_GUARD_TIMEOUT_S reaches only the shell runner), so one hung call stalls
+# the run indefinitely.
 GUARDS: dict[str, object] = {
     "protected_paths": lambda c, w: _run_python_guard("protected_paths_guard", c, w),
     "worktree_cwd": lambda c, w: _run_python_guard("worktree_cwd_guard", c, w),
-    "git_push": lambda c, w: _run_python_guard("git_push_guard", c, w),
     "bash_safety": lambda c, w: _run_shell_guard(
         ["bash", str(_REPO / "scripts" / "bash_safety_hook.sh")], c, w
     ),
-    "inline_blob": lambda c, w: _run_shell_guard(["bash", "-c", _inline_blob()], c, w),
+    "inline_blob": lambda c, w: _run_shell_guard(["bash", "-c", _INLINE_BLOB], c, w),
 }
 
+
+# Read ONCE. Inside the lambda this re-read and re-parsed settings.json for
+# every corpus row, times every worker.
+_INLINE_BLOB = _inline_blob()
 
 _SHELL_GUARDS = frozenset({"bash_safety", "inline_blob"})
 
 
-def _probe(args: tuple[str, str, str]) -> bool:
+def _probe(args: tuple[str, str, str]) -> tuple[bool, bool, bool]:
+    """(blocked, cwd_was_substituted, crashed) for one command.
+
+    Returns the substitution flag rather than relying on the module counter:
+    for shell guards this runs in a FORKED CHILD, so an increment to a module
+    global lands in the child's copy and the parent never sees it. The
+    disclosure the report calls the alternative to "quietly folding them into
+    the rate" was doing precisely that, on the only two guards that fan out.
+
+    Crashes are reported, not folded into the block count. Counting a crash as a
+    block let a guard that never ran once print a clean, quotable 100%.
+    """
     guard, cmd, cwd = args
+    _SUBSTITUTED_CWD["n"] = 0
     try:
-        return bool(GUARDS[guard](cmd, cwd))  # type: ignore[operator]
+        hit = bool(GUARDS[guard](cmd, cwd))  # type: ignore[operator]
+        return hit, bool(_SUBSTITUTED_CWD["n"]), False
     except subprocess.TimeoutExpired:
-        return True  # a hung guard is not a pass
+        return True, bool(_SUBSTITUTED_CWD["n"]), False  # a hung guard is not a pass
     except Exception:
-        return True
+        return True, bool(_SUBSTITUTED_CWD["n"]), True
 
 
-def replay(guard: str, corpus: list[str], show: int, jobs: int) -> int:
+def replay(guard: str, corpus: list[tuple[str, str]], show: int, jobs: int) -> int:
     """Replay the corpus through one guard.
 
     The two guard shapes have wildly different costs: an in-process Python guard
-    runs the whole corpus in ~17s, while a shell guard spawns a process per command
+    runs the whole corpus in ~17s (measured on `protected_paths`, which shells
+    out to nothing — a guard that spawns git per command is far slower), while a
+    shell guard spawns a process per command
     (~260 ms each — it shells out to git internally), which is ~3.5 h serially. So
     shell guards fan out across processes. Python guards stay serial: they are
     already fast, and they hold module state that a pool would have to re-import
     per worker.
     """
     blocked: list[str] = []
-    _SUBSTITUTED_CWD["n"] = 0
+    substituted = 0
+    crashed = 0
+    # BOTH paths go through _probe, so they cannot drift in what they count. They
+    # did: the pool swallowed every exception as a block while the serial loop
+    # let it propagate, so the same broken guard reported 100% blocked or a
+    # traceback depending only on the job count.
     if guard in _SHELL_GUARDS and jobs > 1:
         import multiprocessing as mp
 
         with mp.Pool(jobs) as pool:
-            for i, hit in enumerate(
-                pool.imap(_probe, ((guard, c, w) for c, w in corpus), chunksize=32), 1
-            ):
+            results = pool.imap(_probe, ((guard, c, w) for c, w in corpus), chunksize=32)
+            for i, (hit, sub, crash) in enumerate(results, 1):
                 if i % 2000 == 0:
                     print(f"  … {i}/{len(corpus)}", file=sys.stderr)
+                substituted += sub
+                crashed += crash
                 if hit:
                     blocked.append(corpus[i - 1][0])
     else:
-        fn = GUARDS[guard]
         for i, (cmd, cwd) in enumerate(corpus, 1):
             if i % 5000 == 0:
                 print(f"  … {i}/{len(corpus)}", file=sys.stderr)
-            try:
-                if fn(cmd, cwd):  # type: ignore[operator]
-                    blocked.append(cmd)
-            except subprocess.TimeoutExpired:
+            hit, sub, crash = _probe((guard, cmd, cwd))
+            substituted += sub
+            crashed += crash
+            if hit:
                 blocked.append(cmd)
     n = len(corpus)
     pct = (100.0 * len(blocked) / n) if n else 0.0
@@ -335,11 +395,18 @@ def replay(guard: str, corpus: list[str], show: int, jobs: int) -> int:
         print(f"    {flat[:150]}")
     if show and len(blocked) > show:
         print(f"    … and {len(blocked) - show} more")
-    if _SUBSTITUTED_CWD["n"]:
-        sub = _SUBSTITUTED_CWD["n"]
+    if substituted:
         print(
-            f"    note: {sub}/{n} replayed from the repo root because the "
+            f"    note: {substituted}/{n} replayed from the repo root because the "
             "recorded directory no longer exists",
+        )
+    if crashed:
+        # Loud, and phrased so the number above cannot be quoted as a rate. A
+        # crash counted as a block is how a guard that never ran once prints a
+        # clean 100%.
+        print(
+            f"    WARNING: {crashed}/{n} invocations RAISED and were counted as "
+            "blocks — the figure above is not a measurement until this is 0"
         )
     return len(blocked)
 

@@ -570,14 +570,23 @@ class TestGenesisDedup:
 # away the file writes in the earlier ones while the error named only the rule
 # that fired. Reproduced four times on 2026-09-03, twice while editing this file.
 #
-# EVERY allow-case below carries a worktree marker ON PURPOSE. Without one, the
-# old predicate's second condition ("is a worktree named, or is cwd a worktree?")
-# is false anyway, the decision is never reached, and the case passes against the
-# OLD hook too — i.e. it pins nothing. A first version of these tests had exactly
-# that defect: 12 of 14 passed unchanged against the pre-fix hook. Each allow-case
-# here was verified to return rc=2 from origin/main's hook and rc=0 from this one,
-# EXCEPT the one explicitly labelled forward-looking below, which returns rc=0 from
-# BOTH and says so in its own docstring.
+# EVERY case below carries a worktree marker ON PURPOSE. Without one, the
+# predicate's second condition ("is a worktree named, or is cwd a worktree?") is
+# false anyway, the decision is never reached, and the case would pass against
+# any version — i.e. it would pin nothing.
+#
+# THESE DO NOT DISCRIMINATE THIS BRANCH FROM origin/main, and an earlier version
+# of this comment claimed they did. That claim was written for a draft that
+# ANCHORED these predicates; the anchoring was reverted after review found it
+# fell open, so the shipped hook is behaviourally identical to main and its diff
+# is comments only. VERIFIED: all of the cases below pass against origin/main's
+# hook too.
+#
+# What they pin is a FUTURE re-anchoring: the mention cases assert the deliberate
+# over-matching, and the bypass shapes are positive controls that fail loudly if
+# someone anchors these arms again. That is their whole job, and it is worth
+# saying plainly, because "regression pin against main" is the first thing a
+# reader would otherwise assume.
 #
 # Built from a fragment so this file's own text cannot trip the live hook when a
 # future session greps or edits it — the same defect, one level up.

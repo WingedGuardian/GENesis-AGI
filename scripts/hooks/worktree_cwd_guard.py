@@ -49,14 +49,40 @@ from shell_parse import (  # noqa: E402
 # as the verdict. As the verdict it was quote-blind: it matched the phrase inside
 # a quoted grep pattern, a heredoc body or a commit message, and target
 # extraction then read the following word as a path, so a read-only search was
-# refused with "use the lifecycle manager". MEASURED over 48,363 real commands:
-# 150 blocked, of which 146 were genuine removals and 4 were mentions. (An
-# earlier draft said 147/3. The extra "genuine" one was a commit message whose
-# markdown backticks the parser reads as command substitution — a reminder that
-# the classifier used to produce these numbers has its own blind spot.)
+# refused with "use the lifecycle manager". MEASURED over 51,052 (command,
+# directory) pairs, replayed from the directory each was typed in: this coarse
+# predicate blocks 154, the parser below also blocks 154, and 148 are common —
+# so the swap releases 6 mentions and catches 6 real removals.
+#
+# The numbers here churned twice, which is the reason for the precision: an
+# earlier draft said 147/3, a later one 150/146/4 over a 48,363-command corpus
+# that replayed everything from the repo root. The classifier producing them has
+# its own blind spot (a commit message whose markdown backticks parse as command
+# substitution), so treat the composition as the claim and the total as context.
 _WORKTREE_REMOVE = re.compile(r"\bgit\s+worktree\s+remove\b")
 _SUBCOMMAND = "worktree"
 _OPERATION = "remove"
+
+# Executables that CARRY a command string ``analyze`` does not descend into, and
+# the shell function-definition syntax, which hides one the same way.
+#
+# This is a SECOND blind spot, distinct from the one ``untokenizable`` covers:
+# `eval '<removal>'`, `ssh box "<removal>"`, `find -exec`, `parallel`, `watch`,
+# `script -c` all tokenize PERFECTLY. The parser reads the carrier as the
+# executable, skips the segment, finds no target, and the removal is allowed.
+# MEASURED against the pre-parser version: 9 real removals it blocked and the
+# parser let through.
+#
+# This list IS an open set, and unlike the shell-side arms that fact is
+# tolerable here, because of the direction it fails in: a carrier absent from
+# the list costs a missed block (bad, but no worse than not having the list),
+# while every ADDITION only ever routes more commands to the coarse extractor.
+# The list grows toward safety and each entry was measured free or nearly so.
+# Adding one is a one-line change with no design question attached.
+_COMMAND_CARRIER = re.compile(
+    r"(?:^|[\s;&|(])(?:eval|ssh|find|parallel|watch|script|su|docker|flock|xargs)(?:\s|$)"
+    r"|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{"
+)
 
 
 def _legacy_targets(cmd: str) -> list[str]:
@@ -90,7 +116,10 @@ def _extract_worktree_targets(cmd: str) -> list[str]:
 
     ``analyze`` flattens nested ``bash -c`` bodies, so a wrapped removal is still
     seen; depth is deliberately NOT filtered, because a removal inside
-    ``bash -c`` really does execute.
+    ``bash -c`` really does execute. It does NOT descend into a command string
+    handed to an ordinary executable (``eval``, ``ssh host "…"``, ``find -exec``)
+    — see ``_COMMAND_CARRIER`` and the fallback in ``_handle_bash``, which is
+    what covers that class.
     """
     targets: list[str] = []
     for seg in analyze(cmd):
@@ -221,12 +250,23 @@ def _handle_bash(data: dict) -> int:
     # shape (an unbalanced quote collapses everything into one echo segment).
     if untokenizable(cmd):
         targets = _legacy_targets(cmd)
-        if not targets:
-            return 0
     else:
         targets = _extract_worktree_targets(cmd)
-        if not targets:
-            return 0
+        # The text says a removal and the parser found none, in a command that
+        # hands a command STRING to something. That is the carrier class: it
+        # tokenizes cleanly, so the probe above cannot see it, and the parser
+        # reads the carrier as the executable and skips the segment. Fall back
+        # to the coarse extractor rather than allow — this operation strands a
+        # session and cannot be undone.
+        #
+        # Ordered deliberately: the carrier test runs ONLY when the parser found
+        # nothing, so a normally-parsed command never touches it, and a mention
+        # inside `grep`/`echo`/`git commit -m` is unaffected because no carrier
+        # is present. MEASURED over 51,052 real commands: +2 blocks (0.004%).
+        if not targets and _WORKTREE_REMOVE.search(cmd) and _COMMAND_CARRIER.search(cmd):
+            targets = _legacy_targets(cmd)
+    if not targets:
+        return 0
 
     # Get the current working directory
     cwd = os.getcwd()

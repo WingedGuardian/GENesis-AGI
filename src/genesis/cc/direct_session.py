@@ -129,6 +129,16 @@ def _bg_session_sandbox(session_id: str) -> str:
 # cannot see or call them. Validated empirically: the init event's tools
 # list shrinks by the disallowed count.
 
+# The HUMAN half of the entity-merge approval gate. Denied universally AND
+# protected from re-enablement via `tool_exceptions` (see _NO_TOOL_EXCEPTIONS):
+# an autonomous session that could call approve+apply would self-approve the
+# gate, and reject carries the same human-review authority.
+_NO_ENTITY_ADJUDICATION_WRITE = [
+    "mcp__genesis-memory__entity_adjudication_approve",
+    "mcp__genesis-memory__entity_adjudication_apply",
+    "mcp__genesis-memory__entity_adjudication_reject",
+]
+
 _UNIVERSAL_DISALLOW = [
     "Bash",
     "Edit",
@@ -152,6 +162,17 @@ _UNIVERSAL_DISALLOW = [
     "mcp__genesis-memory__knowledge_ingest",
     "mcp__genesis-memory__knowledge_ingest_batch",
     "mcp__genesis-memory__knowledge_ingest_source",
+    # ── Entity-merge human-approval gate ──────────────────────────
+    # entity_adjudication_approve/_apply/_reject are the HUMAN half of the
+    # entity-merge gate: a proposed_merge is applied ONLY after a person
+    # approves it, and applying tombstones one entity into another
+    # irreversibly. An autonomous session that could call approve+apply would
+    # self-approve the gate — defeating its entire purpose — and reject is the
+    # same human-review authority (it could bury legitimate proposals). Denied
+    # UNIVERSALLY (every profile, present and future), not just the read-leaning
+    # ones, so no background profile can usurp the human decision. The read-only
+    # `entity_adjudication_list` stays reachable (surfacing proposals is safe).
+    *_NO_ENTITY_ADJUDICATION_WRITE,
     # ── User-scoped MCP servers (defense-in-depth) ────────────────
     # strict_mcp_config (CCInvocation default True) already drops these by making
     # --mcp-config authoritative; deny them by name too so a site that opts out of
@@ -1434,6 +1455,11 @@ class DirectSessionRunner:
             # profile disallow lists are the belt; this keeps the exception
             # mechanism from becoming a hole in them, regardless of caller.
             exceptions -= set(_NO_MARKETING_SEND)
+            # Same protection for the entity-merge human-approval gate: a
+            # tool_exception must never re-grant approve/apply/reject to a
+            # background session (that would let it self-approve the gate,
+            # defeating the whole point of the universal deny above).
+            exceptions -= set(_NO_ENTITY_ADJUDICATION_WRITE)
             disallowed = [t for t in disallowed if t not in exceptions]
 
         # Give background sessions access to Genesis MCP servers. Profile

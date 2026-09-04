@@ -37,11 +37,16 @@ CLAUDE = "claude"
 
 #: Env slots that select the model for a routed Claude Code subprocess. ALL are set
 #: (not just ANTHROPIC_MODEL) so CC's background/sub-agent calls also use the peer.
+#: FABLE + SUBAGENT included: CC 2.1.x routes sub-agents/background tasks through
+#: those slots, and an unset slot makes the peer endpoint reject the request with
+#: a model-not-found (it only knows its own model ids).
 _ROSTER_MODEL_ENV_VARS = (
     "ANTHROPIC_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
 )
 
 
@@ -57,9 +62,12 @@ def apply_routing_env(
     Shared by :class:`~genesis.cc.invoker.CCInvoker._build_env` and the foreground
     ``scripts/gmodel`` launcher so the routing-env contract lives in ONE place.
 
-    - Set ``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_AUTH_TOKEN`` / the four model slots
-      when the corresponding value is provided; **pop** them when it is ``None`` so
-      a reused environment can never leak stale routing.
+    - Set ``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_AUTH_TOKEN`` / every slot in
+      ``_ROSTER_MODEL_ENV_VARS`` when the corresponding value is provided;
+      **pop** them when it is ``None`` so a reused environment can never leak
+      stale routing. Named by the constant rather than counted — this docstring
+      said "the four model slots" while the tuple held six, and that stale count
+      is what made a hardcoded 4-entry copy in the tests look correct.
     - **Credential isolation:** pop ``ANTHROPIC_API_KEY`` whenever routing to a peer
       (either ``base_url`` or ``auth_token`` present) so the Anthropic key never
       travels to a third-party endpoint. Native Claude (neither set) keeps whatever
