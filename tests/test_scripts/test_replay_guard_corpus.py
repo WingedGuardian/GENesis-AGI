@@ -256,3 +256,38 @@ def test_a_cache_truncated_mid_rebuild_names_itself_and_recovers(cache, rgc, cap
     assert result == _ROWS, "a corrupt cache was not rebuilt"
     err = capsys.readouterr().err
     assert "corrupt" in err and str(cache) in err
+
+
+def test_replaying_a_shell_guard_never_touches_the_live_recovery_log(rgc, monkeypatch):
+    """The harness excludes git_discard_guard from GUARDS because replaying it is
+    not read-only — but the shell hooks DELEGATE to it, so excluding the guard
+    does not exclude it from a `bash_safety` replay.
+
+    MEASURED before the fix, in a scratch repo with uncommitted work: 4
+    discard-shaped commands wrote 4 rows to the recovery log. That log self-trims
+    at 1 MB keeping the most recent half, so a 51,052-command replay would evict
+    the genuine recovery history it exists to hold.
+
+    Redirected through the guard's own documented env seam rather than disabled,
+    so the guard still runs and still returns its real verdict. This asserts the
+    redirect actually reaches the subprocess — the whole fix is one env entry, and
+    an env dict built but not passed would look identical in review.
+    """
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["env"] = kwargs.get("env") or {}
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(rgc.subprocess, "run", fake_run)
+    rgc._run_shell_guard(["bash", "/nonexistent-hook"], "git checkout -- x", "/tmp")
+
+    log = seen["env"].get("GENESIS_DISCARD_SNAPSHOT_LOG")
+    assert log, "the recovery-log redirect never reached the subprocess env"
+    assert ".genesis/git_discard_snapshots.jsonl" not in log, (
+        f"replay would write to the LIVE recovery log: {log}"
+    )

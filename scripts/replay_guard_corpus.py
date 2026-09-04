@@ -253,8 +253,36 @@ def _run_python_guard(module_name: str, cmd: str, cwd: str) -> bool:
 _run_python_guard._loaded = {}  # type: ignore[attr-defined]
 
 
+# The shell hooks DELEGATE to git_discard_guard, which is deliberately absent
+# from GUARDS below because replaying it is not read-only: it runs
+# `git stash create` and appends to the live recovery log at
+# ~/.genesis/git_discard_snapshots.jsonl. Excluding the guard from the table does
+# NOT exclude it from a `bash_safety` replay — the delegation reaches it anyway,
+# which is how an exclusion that reasons about the guard and not about its
+# CALLERS gets defeated.
+#
+# MEASURED (scratch repo, uncommitted work present): 4 discard-shaped commands ->
+# 4 recovery rows + loose stash objects. The precondition is a DIRTY tree; with a
+# clean one `git stash create` captures nothing and the delegation writes nothing,
+# which is why a first probe on a clean worktree found no problem. Over a
+# 51,052-command corpus that log SELF-TRIMS at 1 MB keeping the most recent half,
+# so a single replay would evict the genuine recovery history it exists to hold.
+#
+# Redirected through the guard's OWN documented seam rather than disabled: the
+# guard still runs and still returns its real verdict, so the measurement stays
+# faithful. A "skip your side effects" flag on a recovery guard would be a bypass,
+# and bypasses on safety guards do not stay confined to the tool that added them.
+#
+# RESIDUAL, stated rather than hidden: the dangling `git stash create` objects are
+# still created in whatever repo each command is replayed from. They are
+# unreferenced and collected by `git gc`; unlike the log they destroy nothing.
+_REPLAY_SNAPSHOT_LOG = str(Path.home() / "tmp" / "replay-discard-snapshots.jsonl")
+
+
 def _run_shell_guard(argv: list[str], cmd: str, cwd: str) -> bool:
     here = _effective_cwd(cwd)
+    env = dict(os.environ)
+    env["GENESIS_DISCARD_SNAPSHOT_LOG"] = _REPLAY_SNAPSHOT_LOG
     proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
         argv,
         input=json.dumps(_payload(cmd, here)),
@@ -262,6 +290,7 @@ def _run_shell_guard(argv: list[str], cmd: str, cwd: str) -> bool:
         text=True,
         timeout=_GUARD_TIMEOUT_S,
         cwd=here,
+        env=env,
     )
     return proc.returncode == 2
 
