@@ -19,8 +19,10 @@ import aiosqlite
 import pytest
 
 from genesis.db.crud import pending_issue_posts as pip
+from genesis.db.schema._tables import TABLES
 
 MIGRATION = importlib.import_module("genesis.db.migrations.0079_pending_issue_posts")
+MIGRATION_0087 = importlib.import_module("genesis.db.migrations.0087_pending_issue_posts_adopted")
 
 _ROW = {
     "id": "p1",
@@ -46,8 +48,26 @@ async def db(tmp_path):
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
         await MIGRATION.up(conn)
+        # 0087 adds the create-vs-adopt provenance column onto the 0079 table (mirrors
+        # the real migration chain, which posted_index_for_repo's adopted filter needs).
+        await MIGRATION_0087.up(conn)
+        # follow_ups: the close-loop-aware prune reads it (NOT-EXISTS open-follow_up
+        # guard). In production it always exists (migration 0004, early); create the
+        # canonical table here so the prune subquery resolves.
+        await conn.execute(TABLES["follow_ups"])
         await conn.commit()
         yield conn
+
+
+async def _seed_followup(db, *, id, status="pending", kind="follow_up"):
+    """Minimal open/closed follow_up row for the close-loop prune guard."""
+    await db.execute(
+        "INSERT INTO follow_ups "
+        "(id, source, content, strategy, status, priority, kind, created_at) "
+        "VALUES (?, 'test', 'c', 'ego_judgment', ?, 'medium', ?, '2026-08-01T00:00:00')",
+        (id, status, kind),
+    )
+    await db.commit()
 
 
 # --------------------------------------------------------------------------- #
@@ -184,6 +204,18 @@ class TestCrud:
         assert {r["id"] for r in held} == {"p1", "p2"}
 
     @pytest.mark.asyncio
+    async def test_dedup_repo_match_is_case_insensitive(self, db):
+        # FIX 4 completion: the proposer stores the repo lowercased
+        # (contributor_issue.py: repo=repo.lower()) but calls list_dedup_active
+        # with the RAW config slug (e.g. "WingedGuardian/GENesis-AGI"). A
+        # case-sensitive match here silently misses every existing held/posted
+        # row → max_held backpressure bypassed + duplicate proposals. The query
+        # must be COLLATE NOCASE, matching posted_index_for_repo.
+        await pip.create(db, **{**_ROW, "repo": "wingedguardian/genesis-agi"})
+        active = await pip.list_dedup_active(db, "WingedGuardian/GENesis-AGI")
+        assert [r["id"] for r in active] == ["p1"]
+
+    @pytest.mark.asyncio
     async def test_mark_posted_once(self, db):
         await pip.create(db, **_ROW)
         assert (
@@ -249,6 +281,66 @@ class TestCrud:
         deleted = await pip.prune_terminal(db, older_than_days=1, now="2026-08-07T00:00:00")
         assert deleted == 0
         assert (await pip.get_by_id(db, "p1"))["status"] == "held"
+
+    @pytest.mark.asyncio
+    async def test_prune_keeps_posted_row_of_still_open_followup(self, db):
+        # FIX 3: a 'posted' row whose source_ref is a STILL-OPEN follow_up must
+        # SURVIVE prune — the close-loop still needs it to map issue_number ->
+        # follow_up when a contributor later closes the issue. Pruning it would
+        # orphan the follow_up (never resolves).
+        await _seed_followup(db, id="fu-open", status="pending")
+        await pip.create(db, **{**_ROW, "id": "p", "request_id": "r-p", "source_ref": "fu-open"})
+        await pip.mark_posted(
+            db, "p", issue_number=5, issue_url="u", posted_at="2026-01-01T00:00:00"
+        )
+
+        deleted = await pip.prune_terminal(db, older_than_days=30, now="2026-08-07T00:00:00")
+        assert deleted == 0  # protected — open follow_up
+        assert (await pip.get_by_id(db, "p"))["status"] == "posted"
+
+    @pytest.mark.asyncio
+    async def test_prune_reaps_adopted_posted_row_even_with_open_followup(self, db):
+        # An ADOPTED posted row is excluded from posted_index_for_repo, so it can never
+        # resolve a follow_up — the open-follow_up retention protection does NOT apply.
+        # It prunes on the normal age schedule instead of lingering uselessly.
+        await _seed_followup(db, id="fu-open2", status="pending")
+        await pip.create(db, **{**_ROW, "id": "ad", "request_id": "r-ad", "source_ref": "fu-open2"})
+        await pip.mark_posted(
+            db, "ad", issue_number=8, issue_url="u", posted_at="2026-01-01T00:00:00", adopted=True
+        )
+        deleted = await pip.prune_terminal(db, older_than_days=30, now="2026-08-07T00:00:00")
+        assert deleted == 1  # adopted → not protected → pruned
+        assert await pip.get_by_id(db, "ad") is None
+
+    @pytest.mark.asyncio
+    async def test_prune_reaps_posted_row_of_resolved_followup(self, db):
+        # A 'posted' row whose follow_up is RESOLVED (not open) is prunable — the
+        # close-loop will never act on it again.
+        await _seed_followup(db, id="fu-done", status="completed")
+        await pip.create(db, **{**_ROW, "id": "p", "request_id": "r-p", "source_ref": "fu-done"})
+        await pip.mark_posted(
+            db, "p", issue_number=6, issue_url="u", posted_at="2026-01-01T00:00:00"
+        )
+
+        deleted = await pip.prune_terminal(db, older_than_days=30, now="2026-08-07T00:00:00")
+        assert deleted == 1
+        assert await pip.get_by_id(db, "p") is None
+
+    @pytest.mark.asyncio
+    async def test_prune_reaps_posted_row_with_null_source_ref(self, db):
+        # A codebase 'posted' row (source_ref IS NULL) has no follow_up to protect
+        # and is prunable when aged out.
+        await pip.create(
+            db,
+            **{**_ROW, "id": "p", "request_id": "r-p", "source": "codebase", "source_ref": None},
+        )
+        await pip.mark_posted(
+            db, "p", issue_number=7, issue_url="u", posted_at="2026-01-01T00:00:00"
+        )
+
+        deleted = await pip.prune_terminal(db, older_than_days=30, now="2026-08-07T00:00:00")
+        assert deleted == 1
+        assert await pip.get_by_id(db, "p") is None
 
     @pytest.mark.asyncio
     async def test_posted_then_reject_is_noop(self, db):
@@ -320,3 +412,87 @@ class TestCrud:
         )
         assert await pip.mark_rejected(db, "p1", rejected_at=_TS) is False
         assert (await pip.get_by_id(db, "p1"))["status"] == "dry_run"
+
+
+# --------------------------------------------------------------------------- #
+# WS-A close-loop join: posted_index_for_repo
+# --------------------------------------------------------------------------- #
+class TestPostedIndexForRepo:
+    """issue_number → source_ref map for POSTED, follow_up-sourced rows only."""
+
+    _REPO = "acme/widgets"  # synthetic — install-agnostic
+
+    async def _make(self, db, *, id, source_ref, status, issue_number=None, repo=None):
+        row = {**_ROW, "id": id, "request_id": f"req-{id}", "repo": repo or self._REPO}
+        row["source_ref"] = source_ref
+        await pip.create(db, **row)
+        if status == "posted":
+            await pip.mark_posted(db, id, issue_number=issue_number, issue_url="u", posted_at=_TS)
+        elif status == "dry_run":
+            await pip.mark_dry_run(db, id, dry_run_at=_TS)
+
+    @pytest.mark.asyncio
+    async def test_only_posted_followup_rows_indexed(self, db):
+        await self._make(db, id="a", source_ref="fu-1", status="posted", issue_number=101)
+        await self._make(db, id="b", source_ref="fu-2", status="held")  # not posted
+        await self._make(db, id="c", source_ref=None, status="posted", issue_number=102)  # Cat-1
+        await self._make(db, id="d", source_ref="fu-3", status="dry_run")  # terminal, no post
+        await self._make(
+            db, id="e", source_ref="fu-4", status="posted", issue_number=103, repo="other/repo"
+        )
+        idx = await pip.posted_index_for_repo(db, self._REPO)
+        assert idx == {101: "fu-1"}  # b/c/d/e all correctly excluded
+
+    @pytest.mark.asyncio
+    async def test_empty_when_nothing_posted(self, db):
+        await self._make(db, id="a", source_ref="fu-1", status="held")
+        assert await pip.posted_index_for_repo(db, self._REPO) == {}
+
+    @pytest.mark.asyncio
+    async def test_non_followup_source_excluded_even_with_stray_source_ref(self, db):
+        # FIX 2: source='follow_up' is the authoritative filter. A codebase-sourced
+        # row that somehow carries a stray source_ref must NOT enter the close-loop
+        # index (write-time doesn't enforce source_ref-only-on-follow_up).
+        row = {
+            **_ROW,
+            "id": "cb",
+            "request_id": "req-cb",
+            "repo": self._REPO,
+            "source": "codebase",
+            "source_ref": "stray-ref",
+        }
+        await pip.create(db, **row)
+        await pip.mark_posted(db, "cb", issue_number=201, issue_url="u", posted_at=_TS)
+        assert await pip.posted_index_for_repo(db, self._REPO) == {}
+
+    @pytest.mark.asyncio
+    async def test_adopted_rows_excluded_from_close_loop(self, db):
+        # An issue Genesis ADOPTED (author-independent — every adopt is marked
+        # adopted=True) must NOT feed the close-loop join: a PR closing it should never
+        # auto-resolve the follow_up. A Genesis-CREATED issue (adopted default False)
+        # still indexes normally.
+        adopted_row = {
+            **_ROW,
+            "id": "ad",
+            "request_id": "req-ad",
+            "repo": self._REPO,
+            "source": "follow_up",
+            "source_ref": "fu-9",
+        }
+        await pip.create(db, **adopted_row)
+        await pip.mark_posted(
+            db, "ad", issue_number=301, issue_url="u", posted_at=_TS, adopted=True
+        )
+        await self._make(db, id="cr", source_ref="fu-10", status="posted", issue_number=302)
+        idx = await pip.posted_index_for_repo(db, self._REPO)
+        assert idx == {302: "fu-10"}  # adopted #301 excluded; created #302 kept
+
+    @pytest.mark.asyncio
+    async def test_repo_match_is_case_insensitive(self, db):
+        # FIX 4: stored repo is config-derived, queried repo is gh-canonical — a
+        # casing divergence must NOT silently no-op the whole close-loop.
+        await self._make(
+            db, id="cs", source_ref="fu-9", status="posted", issue_number=301, repo="Owner/Repo"
+        )
+        idx = await pip.posted_index_for_repo(db, "owner/repo")
+        assert idx == {301: "fu-9"}

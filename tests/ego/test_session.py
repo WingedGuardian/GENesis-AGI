@@ -1533,3 +1533,20 @@ class TestReconcilePrompt:
         p = _build_reconcile_prompt([_draft()], board, {}, ego_source="user_ego_cycle")
         board_line = next(ln for ln in p.splitlines() if "NO_REVAL" in ln)
         assert "⚠due" not in board_line
+
+
+@pytest.mark.asyncio
+async def test_parse_failure_still_ages_intentions(ego_session, monkeypatch):
+    """On a parse-failure cycle the intention aging sweep must STILL run, so
+    max_cycles stays a mechanical TTL rather than one dependent on the LLM
+    emitting parseable output (#1496 CodeRabbit). Pins the else-branch wiring."""
+    from unittest.mock import AsyncMock as _AM
+
+    from genesis.cc.types import CCModel
+
+    spy = _AM()
+    monkeypatch.setattr(ego_session, "_process_intentions", spy)
+    # unparseable text -> _parse_output returns None -> the else branch
+    output = _cc_output(text="this is definitely not json")
+    await ego_session._process_cycle_output(output, CCModel.SONNET, None)
+    spy.assert_awaited_once_with({})

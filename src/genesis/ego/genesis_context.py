@@ -686,8 +686,9 @@ class GenesisEgoContextBuilder:
 
         Informational context for the ``confidence`` field (rendered right before
         the output contract), NOT a limiter and NOT a mechanical rescale. Reads
-        ``ego_calibration_snapshots`` ONLY (never ``calibration_curves`` — that table
-        is auto-injected into the perception context). Genesis ego only for v1 — the
+        ``ego_calibration_snapshots`` ONLY — deliberately separate from the
+        perception-facing calibration surface (``calibration_cells``, WS-2 P3).
+        Genesis ego only for v1 — the
         aggregate calibration is genesis-ego dominated; per-ego split is future work.
 
         Live flag ``EgoConfig.calibration_injection_enabled`` (default ON) is read
@@ -950,6 +951,12 @@ class GenesisEgoContextBuilder:
             '  "notifications": [\n'
             "    {\n"
             '      "content": "what to tell the user (informational, no approval needed)",\n'
+            '      "urgency": "low|normal|high"\n'
+            "    }\n"
+            "  ],\n"
+            '  "questions": [\n'
+            "    {\n"
+            '      "content": "a direct question when you need the user\'s input or a decision — sent without approval; the reply comes back to you as a signal, and you\'ll see an observation if delivery or reply fails",\n'
             '      "urgency": "low|normal|high"\n'
             "    }\n"
             "  ],\n"

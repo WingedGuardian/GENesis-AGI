@@ -235,8 +235,24 @@ async def _resolve_approved(
         # string `posted_at >= since` comparison in count_posted_since is format-uniform
         # (no Z-vs-+00:00 footgun); a malformed value falls back to ``now`` (fail-safe).
         adopt_ts = _normalize_ts(existing.get("createdAt")) or now
+        # Create-vs-adopt provenance for the close-loop. EVERY adopt is
+        # non-authoritative (adopted=True); ONLY an issue Genesis CREATES in-band (the
+        # create branch below, adopted=0 by default) is an authoritative close-link.
+        # Author identity CANNOT distinguish a Genesis crash-recovery creation from a
+        # human coincidental-title issue in this single-owner install — both carry the
+        # owner's gh account — and a genuine crash-recovery adopt leaves no DB record to
+        # check (the crash happened before mark_posted), so there is no sound signal to
+        # infer authorship. Trade (fail-safe): a crash-recovered Genesis issue no longer
+        # auto-resolves its follow_up (it stays pending, manually resolvable) — never a
+        # false completion. Retires the round-3 author-identity proxy (Codex round-4
+        # finding 1: author ≠ creation provenance).
         if await pip.mark_posted(
-            rt_db, row["id"], issue_number=num, issue_url=existing.get("url"), posted_at=adopt_ts
+            rt_db,
+            row["id"],
+            issue_number=num,
+            issue_url=existing.get("url"),
+            posted_at=adopt_ts,
+            adopted=True,
         ):
             await approval_crud.mark_consumed(rt_db, row["request_id"], consumed_at=now)
             logger.info(

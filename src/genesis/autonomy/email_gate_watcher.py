@@ -29,9 +29,85 @@ from datetime import UTC, datetime
 from genesis.db.crud import approval_requests as approval_crud
 from genesis.db.crud import capability_grants as cg
 from genesis.db.crud import pending_email_sends as pes
+from genesis.outreach.marketing_config import effective_mode as _marketing_mode
 from genesis.outreach.types import OutreachStatus
 
 logger = logging.getLogger(__name__)
+
+
+async def _bulk_recipient_authorized(db: object, recipient: str | None) -> bool:
+    """True iff ``recipient`` is a CURATED, non-opted-out ``marketing_prospects``
+    row — the EXACT predicate the email gate's g2 BULK scope guard applies
+    (``email_gate.py`` ``_scope_guard_trip``). Fail-closed: a blank / not-curated
+    / opted-out recipient is NOT authorized. Status (active/contacted/replied) is
+    deliberately DECOUPLED — only opt-out revokes authorization, matching g2."""
+    if not recipient:
+        return False
+    from genesis.db.crud import marketing_prospects as mp
+
+    row = await mp.get_by_email(db, recipient)
+    if row is None:
+        return False
+    return not row.get("opted_out")
+
+
+async def _recipient_opted_out(db: object, recipient: str | None) -> bool:
+    """True iff ``recipient`` matches a ``marketing_prospects`` row that has OPTED
+    OUT — a NARROW predicate that applies to a held send of ANY capability class.
+
+    Distinct from ``_bulk_recipient_authorized`` (which fail-CLOSES on an
+    *uncurated* recipient): this returns True ONLY for a KNOWN, opted-out prospect,
+    so it never blocks a legitimate non-marketing send to someone who simply isn't
+    in the prospect store. Blank recipient / no row / not-opted-out → False (nothing
+    to refuse)."""
+    if not recipient:
+        return False
+    from genesis.db.crud import marketing_prospects as mp
+
+    row = await mp.get_by_email(db, recipient)
+    if row is None:
+        return False
+    return bool(row.get("opted_out"))
+
+
+async def _stamp_prospect_contacted(db: object, recipient: str | None, now: str) -> None:
+    """LOOP-FIX helper: on a CONFIRMED delivery, advance the matching prospect
+    active → contacted so the campaign's ``list_active`` never re-pitches it.
+    Delegates to the shared, active-guarded CRUD (the same entry point
+    ``pipeline._deliver`` uses for the GRANTED autonomous path), so the stamp
+    semantics live in one place. A non-marketing / non-active / absent recipient is
+    a no-op."""
+    if not recipient:
+        return
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.mark_contacted_by_email(db, recipient, contacted_at=now)
+
+
+async def _terminalize_delivered_hold(db: object, row: dict, now: str) -> None:
+    """Terminalize an owner-approved DELIVERED hold (held → sent) AND record its
+    capability success EXACTLY ONCE, shared by the DELIVERED branch and the
+    consumed-approval reconcile branch so both do the identical terminal accounting.
+
+    ``pes.mark_sent`` is the single-flip claim (``WHERE status='held'``): only the
+    ONE drain cycle that wins the flip records the success, so record_success is
+    called AT MOST once per hold (no double-count), and a reconcile replay of a hold
+    the prior cycle delivered-but-never-terminalized records it — closing the window
+    where a stamp/DB failure in the DELIVERED branch (before mark_sent) permanently
+    dropped an owner-approved delivery from promotion evidence. Residual (fail-safe,
+    tracked in follow-up 6a518adc): a crash in the microsecond between mark_sent
+    committing and record_success leaves the hold 'sent' (unrecoverable) → the success
+    is under-counted, delaying cell promotion but NEVER over-granting."""
+    if await pes.mark_sent(db, row["id"], sent_at=now):
+        await cg.record_success(
+            db,
+            domain=row["cell_domain"],
+            verb=row["cell_verb"],
+            risk_class=row["cell_risk_class"],
+            updated_at=now,
+            # WS-3 gate-3: the OWNER approved this send — owner evidence.
+            origin_class="owner",
+        )
 
 
 def _subject(context: str | None) -> str:
@@ -71,10 +147,85 @@ async def drain_pending_email_sends(rt: object) -> int:
                 # but crashed before marking the hold 'sent'. Reconcile WITHOUT
                 # re-sending: this narrows the at-least-once window to the gap
                 # between adapter.send and mark_consumed.
-                await pes.mark_sent(db, row["id"], sent_at=now)
+                # LOOP-FIX: this row was genuinely DELIVERED by the prior (crashed)
+                # cycle, which never reached the DELIVERED-branch terminal accounting —
+                # complete it here too, identically. Stamp BEFORE terminalizing, then
+                # _terminalize_delivered_hold (mark_sent single-flip claim → gated
+                # record_success): if this recovery itself crashes/DB-errors before the
+                # claim, the hold stays 'held' (re-drained → this branch re-runs, the
+                # stamp being idempotent and record_success gated on the flip) rather
+                # than going 'sent' with the prospect left 'active' or the owner-approved
+                # success dropped from promotion evidence.
+                await _stamp_prospect_contacted(db, row["validated_recipient"], now)
+                await _terminalize_delivered_hold(db, row, now)
                 resolved += 1
                 logger.info(
                     "Reconciled held email %s (approval already consumed) — not re-sent",
+                    row["id"],
+                )
+                continue
+            # Absolute opt-out re-check (ALL classes). A marketing pitch whose body
+            # trips the FINANCIAL money-pattern classifier lands as a FINANCIAL (not
+            # BULK) hold, so the bulk-gated re-check just below would skip it — yet an
+            # opted-out prospect must NEVER receive an autonomous send regardless of
+            # how the pitch classified. Refuse any held send to a KNOWN opted-out
+            # prospect, deliver-side, fail-safe. Narrow by construction: only a
+            # curated-and-opted-out row trips this, so a genuine non-marketing send to
+            # a non-prospect is untouched. Accepted residue (STOPGAP, tracked in the
+            # deferred dedup/provenance PR2, follow-up 17261bc9): a held STANDARD reply
+            # to someone who is ALSO an opted-out marketing prospect is refused too —
+            # rare (granted-cell replies auto-allow and never reach this branch) and
+            # fail-safe. The durable fix is a send-provenance flag separating a
+            # marketing send from an ordinary reply.
+            if await _recipient_opted_out(db, row["validated_recipient"]):
+                if await pes.mark_rejected(db, row["id"], rejected_at=now):
+                    await approval_crud.mark_consumed(db, row["request_id"], consumed_at=now)
+                    resolved += 1
+                logger.warning(
+                    "Held email %s recipient is an opted-out marketing prospect — "
+                    "not delivered, marked rejected (class=%s)",
+                    row["id"],
+                    row["cell_risk_class"],
+                )
+                continue
+            # Opt-out re-check at approved-send time (BULK / cold-marketing only).
+            # deliver_approved runs below the gate (gate_cleared=True), which
+            # bypasses the g2 BULK scope guard — so a prospect who opted out AFTER
+            # the hold was enqueued but BEFORE the owner approved would otherwise
+            # still be delivered. Re-apply g2's EXACT predicate (curated,
+            # non-opted-out marketing_prospects row) immediately before delivery;
+            # fail-closed. Non-BULK rows are untouched (behavior preserved).
+            if row["cell_risk_class"] == "bulk" and not await _bulk_recipient_authorized(
+                db, row["validated_recipient"]
+            ):
+                # Not owner rejection — a deterministic guard (like the IGNORED
+                # terminal path): mark the hold rejected + consume the approval so
+                # it can't busy-loop or linger as a ghost approved/unconsumed row.
+                # No correction (a guard trip is not owner competence signal).
+                if await pes.mark_rejected(db, row["id"], rejected_at=now):
+                    await approval_crud.mark_consumed(db, row["request_id"], consumed_at=now)
+                    resolved += 1
+                logger.warning(
+                    "Held BULK email %s recipient no longer authorized "
+                    "(opted-out/uncurated) — not delivered, marked rejected",
+                    row["id"],
+                )
+                continue
+            # Marketing kill-switch re-check — the LAST gate before the pipeline
+            # hand-off (Codex finding F9). The `off` lever / env kill-switch is the
+            # owner's emergency stop; it gates enqueue, but an already-HELD+APPROVED
+            # BULK cold-marketing send must ALSO be halted if the owner flips off
+            # before it goes out. Placed HERE (no `await` between this read and the
+            # deliver below) so a mid-run toggle during the opt-out/curation awaits
+            # above cannot slip a send past the stop (TOCTOU-closed). Fail-SAFE: pause
+            # on anything but an affirmatively-armed mode. PAUSE = leave held, approval
+            # unconsumed, nothing sent → a re-enable resumes it. Scoped to BULK (the
+            # marketing path); non-marketing sends untouched. A FINANCIAL-classified
+            # marketing pitch is the send-provenance edge tracked in follow-up df805eba.
+            if row["cell_risk_class"] == "bulk" and _marketing_mode() not in ("observe", "live"):
+                logger.info(
+                    "Held BULK email %s paused — marketing lever not armed (kill-switch); "
+                    "left held, resumes when re-enabled",
                     row["id"],
                 )
                 continue
@@ -87,16 +238,20 @@ async def drain_pending_email_sends(rt: object) -> int:
             )
             if result.status == OutreachStatus.DELIVERED:
                 await approval_crud.mark_consumed(db, row["request_id"], consumed_at=now)
-                await pes.mark_sent(db, row["id"], sent_at=now)
-                await cg.record_success(
-                    db,
-                    domain=row["cell_domain"],
-                    verb=row["cell_verb"],
-                    risk_class=row["cell_risk_class"],
-                    updated_at=now,
-                    # WS-3 gate-3: the OWNER approved this send — owner evidence.
-                    origin_class="owner",
-                )
+                # LOOP-FIX: stamp the prospect BEFORE the hold goes terminal
+                # (`mark_sent`), so a crash in this window leaves the hold 'held' —
+                # re-drained via the consumed-approval reconcile branch above, which
+                # re-stamps — rather than 'sent' with the prospect never advanced.
+                # `mark_consumed` already ran, so a re-drain can never double-send.
+                # Advance a matching curated prospect active → contacted (a no-op for
+                # a non-prospect recipient) so list_active stops re-pitching it. Keyed
+                # on the RECIPIENT being a curated prospect, NOT cell_risk_class, so a
+                # cold pitch that misclassified FINANCIAL (money-term body) is stamped.
+                await _stamp_prospect_contacted(db, row["validated_recipient"], now)
+                # Terminalize + record the owner-approved success exactly once (the
+                # mark_sent single-flip gates record_success; identical to the reconcile
+                # branch, so a crash-recovery replay accounts for it the same way).
+                await _terminalize_delivered_hold(db, row, now)
                 resolved += 1
                 logger.info(
                     "Resolved held email %s → sent to %s",

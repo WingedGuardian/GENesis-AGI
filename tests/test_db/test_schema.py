@@ -36,8 +36,6 @@ EXPECTED_TABLES = [
     "inbox_items",
     "deferred_work_queue",
     "pending_embeddings",
-    "predictions",
-    "calibration_curves",
     "events",
     "approval_requests",
     "task_states",
@@ -83,6 +81,7 @@ EXPECTED_TABLES = [
     "reflex_diagnoses",  # reflex arc P0: Tier-0 diagnose session artifacts (PR2 writes)
     "reflex_verdicts",  # reflex arc P0: taste corpus — every human verdict, never pruned
     "ego_proposal_revisions",  # ego lifecycle PR-4: prior-value audit trail for versioned revision (dark)
+    "marketing_prospects",  # marketing cold-send substrate: owner-curated cold-outreach target inventory
 ]
 
 
@@ -164,6 +163,7 @@ async def test_no_unexpected_tables(db):
         "entities",
         "entity_mentions",
         "entity_links",  # entity layer (WS-H P2)
+        "entity_merge_journal",  # reversibility snapshot for applied merges (approval gate)
         "job_run_events",
         "alert_events",  # WS-2 sensor fabric (M9/M10)
         "memory_consistency_reports",

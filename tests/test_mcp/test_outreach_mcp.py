@@ -500,3 +500,40 @@ async def test_engagement_rejects_lifecycle_and_normalizes_replied(monkeypatch):
         )
     finally:
         mcp_mod._db = old_db
+
+
+async def test_generic_outreach_send_forwards_labeled_surplus(tmp_path):
+    """Generic outreach_send (pipeline=None subprocess path) must forward
+    labeled_surplus into the pending_outreach enqueue, so a
+    outreach_send(channel="email", labeled_surplus=True) keeps its BULK flag
+    (stored 1) instead of silently downgrading to IDENTITY (0)."""
+    import aiosqlite
+
+    from genesis.db.crud import pending_outreach as po
+    from genesis.db.schema import create_all_tables
+
+    conn = await aiosqlite.connect(str(tmp_path / "t.db"))
+    conn.row_factory = aiosqlite.Row
+    await create_all_tables(conn)
+    await conn.commit()
+
+    old_pipeline, old_db = mcp_mod._pipeline, mcp_mod._db
+    try:
+        mcp_mod._pipeline = None
+        mcp_mod._db = conn
+        out = json.loads(
+            await mcp_mod.outreach_send.fn(
+                message="bulk note",
+                category="content",
+                channel="email",
+                labeled_surplus=True,
+            )
+        )
+        assert out["status"] == "queued"
+
+        rows = await po.drain(conn, now="2099-01-01T00:00:00")
+        assert len(rows) == 1
+        assert rows[0]["labeled_surplus"] == 1  # BULK flag survived the enqueue
+    finally:
+        mcp_mod._pipeline, mcp_mod._db = old_pipeline, old_db
+        await conn.close()

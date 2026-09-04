@@ -59,22 +59,99 @@ class TestTripTracking:
         assert state["escalated"] is False
 
     async def test_escalation_at_threshold(self, escalation):
-        """Exactly _TRIP_THRESHOLD trips should set escalated flag."""
+        """_TRIP_THRESHOLD trips escalate — once the observation WRITE lands.
+
+        SUPERSEDED EXPECTATION, recorded: this used to assert `escalated` was
+        True synchronously after the 5th trip. The flag was set BEFORE the
+        deferred DB write, whose errors are swallowed — so a transient failure
+        permanently convinced the process the row existed and no later trip ever
+        retried (#1573 Codex P2). The flag now means "the row exists" and is set
+        by `_create_observation` on success, so the test awaits the write like
+        the runtime does.
+        """
+        import asyncio
+
         for _ in range(_TRIP_THRESHOLD):
             await escalation._on_event(_make_event())
 
         state = escalation._state["test-provider"]
         assert state["trip_count"] == _TRIP_THRESHOLD
-        assert state["escalated"] is True
         assert state["first_trip_at"] is not None
+        pending = [t for t in asyncio.all_tasks()
+                   if t.get_name().startswith("escalation-obs-")]
+        assert pending, "the 5th trip did not schedule the observation write"
+        await asyncio.gather(*pending)
+        assert state["escalated"] is True, (
+            "a successful observation write did not mark the provider escalated"
+        )
+
+    async def test_a_failed_observation_write_is_retried_on_the_next_trip(
+        self, escalation, empty_db, monkeypatch
+    ):
+        """A transient DB error at the 5th trip must not silence the outage forever.
+
+        REGRESSION (#1573 Codex P2, `:326`). `escalated` was set BEFORE the
+        deferred write, whose exceptions `_create_observation` swallows — so one
+        transient failure permanently convinced the process the row existed, no
+        later trip retried, and the outage never became visible to any surface.
+        The flag now means "the row exists"; only the create's success path sets
+        it, so the next trip finds it False and retries.
+        """
+        import asyncio
+
+        import genesis.db.crud.observations as obs_crud
+
+        calls = {"n": 0}
+        real_create = obs_crud.create
+
+        async def flaky_create(db, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated transient DB failure")
+            return await real_create(db, **kwargs)
+
+        monkeypatch.setattr(obs_crud, "create", flaky_create)
+
+        for _ in range(_TRIP_THRESHOLD):
+            await escalation._on_event(_make_event("prov-retry"))
+        await asyncio.gather(
+            *(t for t in asyncio.all_tasks()
+              if t.get_name() == "escalation-obs-prov-retry"),
+            return_exceptions=True,
+        )
+        assert escalation._state["prov-retry"]["escalated"] is False, (
+            "a swallowed create failure still marked the provider escalated — "
+            "no later trip will ever retry and the outage stays invisible"
+        )
+
+        # The 6th trip retries, and this time the write lands.
+        await escalation._on_event(_make_event("prov-retry"))
+        await asyncio.gather(
+            *(t for t in asyncio.all_tasks()
+              if t.get_name() == "escalation-obs-prov-retry"),
+            return_exceptions=True,
+        )
+        assert escalation._state["prov-retry"]["escalated"] is True
+        cur = await empty_db.execute(
+            "SELECT COUNT(*) FROM observations WHERE content_hash = ?",
+            (escalation._provider_content_hash("prov-retry"),),
+        )
+        assert (await cur.fetchone())[0] == 1, "the retried write did not land"
 
     async def test_separate_providers_tracked_independently(self, escalation):
         """Different providers each have their own trip counter."""
+        import asyncio
+
         for _ in range(_TRIP_THRESHOLD):
             await escalation._on_event(_make_event("provider-a"))
         for _ in range(_TRIP_THRESHOLD - 1):
             await escalation._on_event(_make_event("provider-b"))
 
+        # `escalated` is set by the deferred write on success (see the
+        # threshold test above) — settle provider-a's before asserting.
+        pending = [t for t in asyncio.all_tasks()
+                   if t.get_name() == "escalation-obs-provider-a"]
+        await asyncio.gather(*pending)
         assert escalation._state["provider-a"]["escalated"] is True
         assert escalation._state["provider-b"]["escalated"] is False
 
@@ -274,3 +351,479 @@ class TestCircuitBreakerRecoveryCallback:
         )
         cb.record_success()
         assert recoveries == []
+
+
+class TestDeadProviderNotification:
+    """One Telegram when a provider has been down long enough to matter, then quiet.
+
+    The gap this closes: a provider dead for days produced NO user-facing ping.
+    `_create_observation` writes `priority="high"`, but the Telegram job
+    (`outreach/scheduler.py::_critical_observations_job`) polls only for
+    `priority="critical"`; the sibling `call_site:` alert is a WARNING, and
+    `outreach/health_outreach.py` sends only whitelisted CRITICALs. So the
+    dashboard knew and nothing reached the user.
+
+    Deliberately NOT solved by raising the existing observation to critical: it
+    fires at ~10 minutes (5 trips), which would page on every transient blip —
+    the alert fatigue that made the original incident inaudible.
+    """
+
+    async def _seed_failure_obs(self, escalation, empty_db, provider, oid, *, age_s: int):
+        """An unresolved provider_failure row aged `age_s` seconds.
+
+        Its created_at is the outage clock — the same row `_resolve_observation`
+        clears on recovery, so the age is real elapsed downtime rather than
+        anything this class tracks in memory.
+        """
+        await empty_db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, content, priority, resolved, content_hash, created_at) "
+            "VALUES (?, 'routing', 'provider_failure', ?, 'high', 0, ?, "
+            "datetime('now', ?))",
+            (
+                oid,
+                f"{provider} failing",
+                escalation._provider_content_hash(provider),
+                f"-{age_s} seconds",
+            ),
+        )
+        await empty_db.commit()
+
+    async def _criticals(self, empty_db, provider, escalation):
+        cur = await empty_db.execute(
+            "SELECT id, priority, content, resolved FROM observations "
+            "WHERE content_hash = ? ORDER BY created_at",
+            (escalation._notify_content_hash(provider),),
+        )
+        return await cur.fetchall()
+
+    async def test_no_notification_before_the_floor(self, escalation, empty_db):
+        """Under an hour is a blip. Most breaker trips resolve themselves."""
+        await self._seed_failure_obs(escalation, empty_db, "prov-y", "pf-y", age_s=600)
+        await escalation._maybe_notify("prov-y")
+        assert await self._criticals(empty_db, "prov-y", escalation) == []
+
+    async def test_one_notification_past_the_floor(self, escalation, empty_db):
+        await self._seed_failure_obs(escalation, empty_db, "prov-y", "pf-y", age_s=7200)
+        await escalation._maybe_notify("prov-y")
+        rows = await self._criticals(empty_db, "prov-y", escalation)
+        assert len(rows) == 1
+        assert rows[0]["priority"] == "critical"
+        assert "prov-y" in rows[0]["content"]
+
+    async def test_repeated_trips_do_not_re_notify(self, escalation, empty_db):
+        """The whole point of 'then quiet'."""
+        await self._seed_failure_obs(escalation, empty_db, "prov-y", "pf-y", age_s=7200)
+        for _ in range(5):
+            await escalation._maybe_notify("prov-y")
+        assert len(await self._criticals(empty_db, "prov-y", escalation)) == 1
+
+    async def test_a_restart_does_not_re_notify(self, escalation, event_bus, empty_db):
+        """In-memory state is lost on restart; the DEDUP must not be.
+
+        `skip_if_duplicate` keys on an UNRESOLVED row, so the still-open
+        notification suppresses a second one even from a process that has never
+        seen this provider before.
+        """
+        await self._seed_failure_obs(escalation, empty_db, "prov-y", "pf-y", age_s=7200)
+        await escalation._maybe_notify("prov-y")
+        fresh = ProviderEscalation(db=empty_db, event_bus=event_bus)
+        await fresh._maybe_notify("prov-y")
+        assert len(await self._criticals(empty_db, "prov-y", escalation)) == 1
+
+    async def test_recovery_then_re_death_notifies_again(self, escalation, empty_db):
+        """A genuine recovery must re-arm the notification.
+
+        Otherwise the FIRST outage in a provider's life is the only one the user
+        ever hears about.
+        """
+        await self._seed_failure_obs(escalation, empty_db, "prov-y", "pf-y", age_s=7200)
+        await escalation._maybe_notify("prov-y")
+        await escalation._resolve_observation("prov-y")
+        rows = await self._criticals(empty_db, "prov-y", escalation)
+        assert all(r["resolved"] == 1 for r in rows), "recovery left the notify row open"
+
+        await self._seed_failure_obs(escalation, empty_db, "prov-y", "pf-y2", age_s=7200)
+        await escalation._maybe_notify("prov-y")
+        assert len(await self._criticals(empty_db, "prov-y", escalation)) == 2
+
+    async def test_no_failure_record_means_no_notification(self, escalation, empty_db):
+        """No outage clock to read → say nothing. Absence of evidence is not an outage."""
+        await escalation._maybe_notify("prov-nothing")
+        assert await self._criticals(empty_db, "prov-nothing", escalation) == []
+
+    async def test_another_providers_outage_does_not_notify_for_this_one(
+        self, escalation, empty_db
+    ):
+        """The age must come from THIS provider's row, not the oldest row present."""
+        await self._seed_failure_obs(escalation, empty_db, "prov-old", "pf-old", age_s=99999)
+        await self._seed_failure_obs(escalation, empty_db, "prov-new", "pf-new", age_s=60)
+        await escalation._maybe_notify("prov-new")
+        assert await self._criticals(empty_db, "prov-new", escalation) == []
+
+    async def test_a_too_young_outage_does_not_suppress_the_later_notification(
+        self, escalation, empty_db
+    ):
+        """A below-floor check must not prevent the later notification.
+
+        SUPERSEDED EXPECTATION, recorded: this test used to pin that the
+        in-memory `notified` flag was only set on a real WRITE — because setting
+        it on a mere RUN silenced the provider forever. That flag no longer
+        exists; the redesign deleted it, and with it the whole class of "the
+        suppressor outlived what it described" defects (a replacement outage
+        marked notified by an in-flight task was the fourth of them). The
+        invariant this test protects is unchanged and now holds by construction:
+        checking early writes nothing, and nothing an early check does can
+        suppress the later one — the only dedup is `skip_if_duplicate` on an
+        UNRESOLVED row, and an early check creates no row.
+        """
+        await self._seed_failure_obs(escalation, empty_db, "prov-z", "pf-z1", age_s=600)
+        await escalation._maybe_notify("prov-z")
+        assert await self._criticals(empty_db, "prov-z", escalation) == []
+
+        # Same provider, now genuinely old.
+        await empty_db.execute("DELETE FROM observations WHERE id = 'pf-z1'")
+        await empty_db.commit()
+        await self._seed_failure_obs(escalation, empty_db, "prov-z", "pf-z2", age_s=7200)
+        await escalation._maybe_notify("prov-z")
+        assert len(await self._criticals(empty_db, "prov-z", escalation)) == 1, (
+            "an earlier below-floor check suppressed the real notification"
+        )
+
+    async def test_trip_events_never_drive_the_notification(
+        self, escalation, empty_db
+    ):
+        """WIRING, inverted: a `breaker.tripped` event must NOT schedule a notify.
+
+        SUPERSEDED EXPECTATION, recorded: this test used to assert the opposite
+        — that a trip event reached `_maybe_notify`. That wiring was the root
+        generator of four review defects: "has an hour passed" is a CLOCK
+        question, and answering it from trip events made delivery depend on
+        traffic (the 5th-trip check is below the floor BY CONSTRUCTION, so a
+        provider whose traffic stopped was never reported at all — found
+        independently by two reviewers). The notification is now driven by the
+        awareness tick via `sweep_due_notifications`. This test pins the
+        DELETION: if a trip ever schedules a notify task again, the starvation
+        class is back.
+        """
+        import asyncio
+
+        await self._seed_failure_obs(escalation, empty_db, "prov-w", "pf-w", age_s=7200)
+        for _ in range(_TRIP_THRESHOLD + 1):
+            await escalation._on_event(_make_event("prov-w"))
+
+        names = {t.get_name() for t in asyncio.all_tasks()}
+        assert not any(n.startswith("escalation-notify-") for n in names), (
+            "a breaker-trip event scheduled a notification check — the "
+            "trip-driven wiring the redesign deleted has been reintroduced"
+        )
+        # Settle the observation write so it cannot leak into a later test.
+        await asyncio.gather(
+            *(t for t in asyncio.all_tasks()
+              if t.get_name().startswith("escalation-obs-"))
+        )
+
+    async def test_the_sweep_drives_the_notification_end_to_end(
+        self, escalation, empty_db
+    ):
+        """WIRING: the sweep, given only the DB, finds the outage and notifies.
+
+        The provider name comes from the row's own content JSON — the sweep has
+        no in-memory state to consult. This is the replacement for the
+        trip-driven end-to-end above, and JSON content mirrors what
+        `_create_observation` actually writes (the plain-string seeds elsewhere
+        in this class exercise `_maybe_notify`, which takes the name as an
+        argument; the sweep cannot).
+        """
+        import json as _json
+
+        from genesis.routing.escalation import sweep_due_notifications
+
+        await empty_db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, content, priority, resolved, content_hash, created_at) "
+            "VALUES (?, 'routing', 'provider_failure', ?, 'high', 0, ?, "
+            "datetime('now', '-7200 seconds'))",
+            (
+                "pf-sweep",
+                _json.dumps({"provider": "prov-sw", "message": "prov-sw failing"}),
+                escalation._provider_content_hash("prov-sw"),
+            ),
+        )
+        await empty_db.commit()
+
+        written = await sweep_due_notifications(empty_db)
+        assert written == 1, "the sweep did not notify for a due outage"
+        rows = await self._criticals(empty_db, "prov-sw", escalation)
+        assert len(rows) == 1
+        assert rows[0]["priority"] == "critical"
+
+        # Idempotent: a second sweep writes nothing while the first row is open.
+        assert await sweep_due_notifications(empty_db) == 0
+        assert len(await self._criticals(empty_db, "prov-sw", escalation)) == 1
+
+    async def test_the_sweep_skips_rows_it_cannot_attribute(
+        self, escalation, empty_db
+    ):
+        """Non-JSON or provider-less content is SKIPPED, never guessed at.
+
+        The notify hash derives from the provider name, so a row the sweep
+        cannot attribute is one it cannot notify about without risking naming
+        the wrong provider to the user. No production writer of plain-string
+        content is known (every historical `_create_observation` wrote JSON
+        with a `provider` key — checked at review), so this pins the CORRUPT-row
+        posture rather than a legacy migration path; the test seeds in this
+        class happen to use the same shape.
+        """
+        from genesis.routing.escalation import sweep_due_notifications
+
+        await self._seed_failure_obs(escalation, empty_db, "prov-x", "pf-x", age_s=7200)
+        assert await sweep_due_notifications(empty_db) == 0, (
+            "the sweep notified from a row whose provider it could not know"
+        )
+
+    async def test_the_sweep_survives_one_provider_failing(
+        self, escalation, empty_db, monkeypatch
+    ):
+        """One provider's DB failure must not strand the rest of the sweep."""
+        import json as _json
+
+        import genesis.db.crud.observations as obs_crud
+        from genesis.routing.escalation import sweep_due_notifications
+
+        for name, oid in (("prov-a1", "pf-a1"), ("prov-b2", "pf-b2")):
+            await empty_db.execute(
+                "INSERT INTO observations "
+                "(id, source, type, content, priority, resolved, content_hash, created_at) "
+                "VALUES (?, 'routing', 'provider_failure', ?, 'high', 0, ?, "
+                "datetime('now', '-7200 seconds'))",
+                (oid, _json.dumps({"provider": name}),
+                 escalation._provider_content_hash(name)),
+            )
+        await empty_db.commit()
+
+        real_create = obs_crud.create
+
+        async def flaky_create(db, **kwargs):
+            # Fail ONLY the first provider's notify write (sorted order: prov-a1).
+            if kwargs.get("content_hash") == escalation._notify_content_hash("prov-a1"):
+                raise RuntimeError("simulated transient failure")
+            return await real_create(db, **kwargs)
+
+        monkeypatch.setattr(obs_crud, "create", flaky_create)
+        written = await sweep_due_notifications(empty_db)
+        assert written == 1, "the surviving provider was not notified"
+        assert len(await self._criticals(empty_db, "prov-b2", escalation)) == 1
+
+    async def test_a_stale_row_for_a_recovered_provider_never_pages(
+        self, escalation, empty_db
+    ):
+        """The liveness gate — the fence the deleted `escalated` conjunct was.
+
+        REGRESSION GUARD (redesign review BLOCKER). The durable row proves an
+        outage HAPPENED, not that it is still happening: a half-completed
+        recovery resolve deliberately leaves the FAILURE row open ("visible
+        beats silent"), and without a liveness source the clock sweep would turn
+        that stranded row into a false critical page claiming a multi-day outage
+        — the exact reverted failure the old in-memory gate prevented. When the
+        caller supplies live breaker evidence, a provider that reads recovered
+        is never paged; one that reads failing still is (an unmeasured recovery
+        is not a recovery, per the evidence model); one the callback cannot
+        answer for is skipped — every error fails toward silence, because the
+        false page is the unrecoverable direction.
+        """
+        import json as _json
+
+        from genesis.routing.escalation import sweep_due_notifications
+
+        for name, oid in (("prov-dead", "pf-dead"), ("prov-fine", "pf-fine"),
+                          ("prov-gone", "pf-gone")):
+            await empty_db.execute(
+                "INSERT INTO observations "
+                "(id, source, type, content, priority, resolved, content_hash, created_at) "
+                "VALUES (?, 'routing', 'provider_failure', ?, 'high', 0, ?, "
+                "datetime('now', '-7200 seconds'))",
+                (oid, _json.dumps({"provider": name}),
+                 escalation._provider_content_hash(name)),
+            )
+        await empty_db.commit()
+
+        def still_failing(name):
+            if name == "prov-gone":
+                raise KeyError(name)  # dropped from config — cannot verify
+            return name == "prov-dead"
+
+        written = await sweep_due_notifications(
+            empty_db, provider_still_failing=still_failing
+        )
+        assert written == 1, "expected exactly the still-failing provider to page"
+        assert len(await self._criticals(empty_db, "prov-dead", escalation)) == 1
+        assert await self._criticals(empty_db, "prov-fine", escalation) == [], (
+            "a stale row for a RECOVERED provider produced a critical page — "
+            "the reverted false-page failure is back"
+        )
+        assert await self._criticals(empty_db, "prov-gone", escalation) == [], (
+            "an unverifiable provider was paged — errors must fail toward silence"
+        )
+
+    async def test_a_user_ack_silences_the_outage_until_recovery(
+        self, escalation, empty_db
+    ):
+        """Resolving the delivered notification must not re-page five minutes later.
+
+        REGRESSION (#1573 Codex P2 on the redesign). `skip_if_duplicate` keys on
+        UNRESOLVED rows, so a dashboard ack removed the only dedup and the next
+        sweep tick re-created the critical — re-paging the user for an outage
+        they had just acknowledged. A RESOLVED notify row younger than the
+        outage start now suppresses re-creation.
+        """
+        await self._seed_failure_obs(escalation, empty_db, "prov-ack", "pf-ack", age_s=7200)
+        await escalation._maybe_notify("prov-ack")
+        rows = await self._criticals(empty_db, "prov-ack", escalation)
+        assert len(rows) == 1
+
+        # The user acks it from the dashboard (plain resolve, user notes).
+        from genesis.db.crud import observations as obs_crud
+
+        await obs_crud.resolve(
+            empty_db, rows[0]["id"],
+            resolved_at="2099-01-01T00:00:00+00:00",
+            resolution_notes="seen it, working on the account",
+        )
+        await escalation._maybe_notify("prov-ack")
+        rows = await self._criticals(empty_db, "prov-ack", escalation)
+        assert len([r for r in rows if r["resolved"] == 0]) == 0, (
+            "the sweep re-paged an outage the user had acknowledged"
+        )
+
+    async def test_a_lever_resolve_does_not_suppress_the_re_notify(
+        self, escalation, empty_db
+    ):
+        """The discriminator's other direction — USER-DECIDED off→on re-notify.
+
+        Lever resolutions carry machine-written notes; only those permit a
+        re-page for the same outage. Without this arm, turning the lever off
+        and on would go silent, undoing the recorded decision.
+        """
+        await self._seed_failure_obs(escalation, empty_db, "prov-lvr", "pf-lvr", age_s=7200)
+        await escalation._maybe_notify("prov-lvr")
+        rows = await self._criticals(empty_db, "prov-lvr", escalation)
+        assert len(rows) == 1
+
+        from genesis.db.crud import observations as obs_crud
+
+        await obs_crud.resolve(
+            empty_db, rows[0]["id"],
+            resolved_at="2099-01-01T00:00:00+00:00",
+            resolution_notes="provider-outage notify lever turned off",
+        )
+        await escalation._maybe_notify("prov-lvr")
+        rows = await self._criticals(empty_db, "prov-lvr", escalation)
+        assert len([r for r in rows if r["resolved"] == 0]) == 1, (
+            "a lever resolve suppressed the off→on re-notify the user decided on"
+        )
+
+    async def test_a_duplicate_failure_row_does_not_reset_the_outage_clock(
+        self, escalation, empty_db
+    ):
+        """Two unresolved records for one provider → the OLDEST is the clock.
+
+        `skip_if_duplicate` matches on (source, content_hash, resolved,
+        origin_class), so a row written under a different origin_class — or one
+        that predates this process — does not suppress a second. Reading an
+        arbitrary row then picks whichever the query happens to return first; if
+        that is the newest, the outage reads as seconds old and the user is
+        never told. That is the same clock-destruction this change exists to
+        remove, one layer up.
+
+        Found by the end-to-end wiring test rather than by design: driving the
+        real event path produced exactly this two-row state, because
+        `_create_observation` fires on the same trip.
+        """
+        await self._seed_failure_obs(escalation, empty_db, "prov-d", "pf-d-old", age_s=7200)
+        await self._seed_failure_obs(escalation, empty_db, "prov-d", "pf-d-new", age_s=5)
+        await escalation._maybe_notify("prov-d")
+        rows = await self._criticals(empty_db, "prov-d", escalation)
+        assert len(rows) == 1, (
+            "a fresh duplicate failure row reset the outage clock and suppressed "
+            "the notification"
+        )
+
+    async def test_a_failed_resolve_leaves_the_notification_re_armable(
+        self, escalation, empty_db, monkeypatch
+    ):
+        """A partial resolve must fail VISIBLY, never silently.
+
+        REGRESSION (#1573 Codex P2). Recovery resolves two hashes in two
+        separately committed statements. Failure-first meant a failure on the
+        second statement left the NOTIFY row unresolved — and `skip_if_duplicate`
+        keys on an unresolved row of the same hash, so that provider could never
+        notify again until some later recovery happened to succeed. Silent.
+
+        Notify-first inverts which row survives: the FAILURE row stays open,
+        which the dashboard shows as a provider still failing and the next
+        recovery clears. Visible beats silent at identical cost.
+        """
+        import genesis.db.crud.observations as obs_crud
+
+        await self._seed_failure_obs(escalation, empty_db, "prov-f", "pf-f", age_s=7200)
+        await escalation._maybe_notify("prov-f")
+        assert len(await self._criticals(empty_db, "prov-f", escalation)) == 1
+
+        calls = {"n": 0}
+        real = obs_crud.resolve_by_content_hash
+
+        async def flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("simulated transient failure on the second resolve")
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(obs_crud, "resolve_by_content_hash", flaky)
+        await escalation._resolve_observation("prov-f")
+        assert calls["n"] == 2, "precondition: both resolve statements were attempted"
+
+        # The provider is still dead. It must still be able to tell the user.
+        await escalation._maybe_notify("prov-f")
+        assert len(await self._criticals(empty_db, "prov-f", escalation)) == 2, (
+            "a half-completed resolve permanently silenced this provider"
+        )
+
+    async def test_recovery_between_the_read_and_the_write_writes_no_alert(
+        self, escalation, empty_db, monkeypatch
+    ):
+        """A provider that recovers mid-check must not be reported as dead.
+
+        REGRESSION (#1573, raised independently by two reviewers). `_maybe_notify`
+        reads the unresolved failure row, computes elapsed, and only then calls
+        `observations.create`. Those are separated by awaits, so a recovery can
+        land in between: `_resolve_observation` clears both hashes, then the
+        create fires anyway — `skip_if_duplicate` sees no UNRESOLVED notify row
+        and happily writes one. The result is a critical observation, and a
+        Telegram, claiming a multi-day outage for a provider that just recovered.
+
+        The race is driven deterministically by resolving inside the query call,
+        which is exactly the window under test — rather than by sleeping and
+        hoping the interleaving occurs.
+        """
+        import genesis.db.crud.observations as obs_crud
+
+        await self._seed_failure_obs(escalation, empty_db, "prov-race", "pf-race", age_s=7200)
+
+        real_query = obs_crud.query
+
+        async def racing_query(*args, **kwargs):
+            rows = await real_query(*args, **kwargs)
+            # Recovery lands HERE: after the read, before the write.
+            await escalation._resolve_observation("prov-race")
+            return rows
+
+        monkeypatch.setattr(obs_crud, "query", racing_query)
+        await escalation._maybe_notify("prov-race")
+
+        rows = await self._criticals(empty_db, "prov-race", escalation)
+        unresolved = [r for r in rows if r["resolved"] == 0]
+        assert unresolved == [], (
+            "a provider that recovered mid-check was still reported dead — "
+            f"{len(unresolved)} unresolved critical row(s) written after recovery"
+        )

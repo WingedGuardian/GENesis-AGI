@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import glob
 import json
 import logging
@@ -37,8 +38,13 @@ class ConversationCollector:
         last_ref = await awareness_ticks.last_reflected_tick(self._db)
         cutoff = last_ref["created_at"] if last_ref else "2000-01-01T00:00:00"
 
-        # Source 1: CC CLI turns from JSONL files
-        jsonl_turns = self._count_jsonl_turns(cutoff)
+        # Source 1: CC CLI turns from JSONL files. Offloaded to a worker thread:
+        # the glob + per-file getmtime stat() fan-out over the multi-GB transcript
+        # dir was measured blocking the event loop 2.6-3.6s under btrfs write
+        # contention (concurrent CC sessions appending 100MB+ transcripts), which
+        # timed out the health probes and tripped false critical_failure=1.0 alarms.
+        # Pure over the filesystem (no DB / shared state), so safe off-loop.
+        jsonl_turns = await asyncio.to_thread(self._count_jsonl_turns, cutoff)
 
         # Source 2: Telegram/terminal sessions since cutoff
         tg_sessions = await self._count_channel_sessions(cutoff)

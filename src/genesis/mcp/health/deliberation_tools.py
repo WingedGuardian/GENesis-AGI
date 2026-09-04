@@ -80,8 +80,10 @@ async def deliberate(
       context:  optional background to ground the panel.
       stakes:   "" (default) auto-couples — high for analysis or the strong preset, else normal.
                 Pass "normal"/"high" to override (high weights dissent more heavily).
-      mode:     "synthesis" (default) = fast prose verdict; "analysis" = deeper (~2-3min)
-                machine-structured consensus + dissent[] + blind_spots[] (always the strong panel).
+      mode:     "synthesis" (default) = fast prose verdict; "analysis" = deeper, machine-structured
+                consensus + dissent[] + blind_spots[] (always the strong panel). Latency scales with
+                prompt size — a real multi-paragraph prompt on the frontier panel runs several minutes
+                (budget: env GENESIS_DELIBERATE_TIMEOUT_S, default 1000s).
       preset:   "" = mode default (synthesis→budget, analysis→strong); "strong" = frontier panel
                 (opus/gpt/gemini/grok/deepseek/kimi, gpt judge); "budget" = mid-tier panel
                 (deepseek/gpt-mini/grok/qwen/kimi/gemini-flash, sonnet judge — cheaper/faster).
