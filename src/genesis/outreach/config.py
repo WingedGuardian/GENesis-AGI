@@ -90,7 +90,17 @@ class OutreachConfig:
 _DEFAULTS = OutreachConfig(
     quiet_hours=QuietHours(start="22:00", end="07:00"),
     channel_preferences={"default": "telegram"},
-    thresholds={"blocker": 0.0, "alert": 0.3, "surplus": 0.7, "digest": 0.0},
+    thresholds={
+        "blocker": 0.0,
+        "alert": 0.3,
+        "surplus": 0.7,
+        "digest": 0.0,
+        # Marketing digests are owner-facing and (by strategy) only sent when
+        # material, so 0.0 exempts them from the SALIENCE gate. Like
+        # notification/content they are still subject to quiet-hours and the
+        # shared daily cap (max_daily) — not in _BYPASS_CATEGORIES.
+        "marketing": 0.0,
+    },
     max_daily=5,
     surplus_daily=1,
     content_daily=3,

@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Marketing campaign updates now post to their own Telegram topic.** The marketing
+  campaign's tick updates previously routed to the shared Morning Reports topic; they
+  now go to a dedicated "Marketing" forum topic via a new `marketing` outreach
+  category, keeping them separate from the morning report and other digests. Existing
+  installs pick up the category automatically on restart (an additive schema
+  migration); the morning report and all other topics are unaffected.
+
 - **The cold-marketing campaign no longer re-pitches the same person.** Once a
   marketing pitch is delivered to a prospect, that prospect is marked contacted and
   drops out of the campaign's target list — previously nothing recorded the contact,
