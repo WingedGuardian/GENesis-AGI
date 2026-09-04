@@ -493,6 +493,26 @@ async def follow_up_create(
 ) -> dict:
     """Create a follow-up in the accountability ledger.
 
+    FIRST — is this the right home? Genesis-repo work (code, tests, docs, infra —
+    anything that would live in the public repo, even when hit locally) belongs on
+    the PUBLIC TRACKER as a GitHub issue, not here — but ONLY from an install that
+    owns the tracker, and only with the user's explicit approval each time (a public
+    post is irreversible). A security defect is never filed publicly before it is
+    fixed. Where those do not hold, it stays HERE until a maintainer carries it over.
+
+    This ledger is otherwise for USER-OWNED work (a deliverable, an errand, something
+    asked for and unfinished) and operational state purely LOCAL to this box.
+    Something you are consciously NOT pursuing is `deferred_cold` (tabled) — never an
+    issue, because we don't want it picked up.
+
+    A DISPATCHED session records here rather than filing publicly — but the row is
+    FORCED onto the COLD `tabled` lane by sacred-board authorization, whatever
+    work_state you pass, and tabled rows are excluded from every default listing.
+    Say in `reason` that it is repo work awaiting a foreground session, and expect
+    to need `follow_up_list(include_tabled=True)` to find it again.
+
+    Mechanics: `.claude/docs/mcp-tools-guide.md`, "Where Deferred Work Goes".
+
     Declare the item's WORK_STATE — the tool DERIVES the lane from it, so priority
     never decides the lane. Two lists:
     - HOT (follow_up): work you INTEND to do near-term. May be blocked on time, an
@@ -528,8 +548,11 @@ async def follow_up_create(
         scheduled_at: ISO datetime (required when strategy is scheduled_task).
         priority: low | medium | high | critical. Does NOT affect the lane.
         pinned: If true, ego can see but cannot auto-resolve; only the user closes it.
-        domain: "internal" (Genesis's own system work) or "user_world" (the user's
-            life/career/content). Leave empty to let Genesis classify (internal-only).
+        domain: "internal" (operational Genesis work that stays LOCAL — repo work
+            belongs on the public tracker, not here) or "user_world" (the user's
+            life/career/content). Leave empty to let Genesis classify (internal-only);
+            note the classifier keyword-matches repo-ish terms, so an empty domain on
+            a misrouted repo item will still look correctly filed.
     """
     return await _impl_follow_up_create(
         content,
