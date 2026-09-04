@@ -125,12 +125,13 @@ from hook_input import field, read_payload, run_guard  # noqa: E402
 # convert it to a block, and CC treats non-2 as non-blocking → EVERY fail-closed
 # gate in this file (force-push, merge, sqlite) would silently vanish.
 try:
-    from review_state import ESCALATION_ROUND_CAP  # noqa: E402
+    from review_state import ESCALATION_ROUND_CAP, FINAL_ROUND_CAP  # noqa: E402
 except Exception:  # noqa: BLE001 — ANY failure (absent OR broken: SyntaxError,
     # read error, top-level runtime error in review_state) must degrade to the
     # default cap, NEVER propagate: a module-load exception exits 1 (non-blocking)
     # and silently disables every fail-closed gate in this file (round-6 P1).
     ESCALATION_ROUND_CAP = 3  # the genesis-development SKILL.md prose cap
+    FINAL_ROUND_CAP = 7  # keep in step with review_state.FINAL_ROUND_CAP
 
 from shell_parse import (  # noqa: E402
     analyze,
@@ -1026,11 +1027,25 @@ _DOC_STEMS = {
 
 
 def _is_doc_path(path: str) -> bool:
-    """Whether a review finding's file *path* is documentation whose findings do
-    NOT block a merge. FAIL-CLOSED allowlist (see the section comment): anything
-    not provably prose — a source/config/manifest file under ``docs/`` (incl. a
-    ``.txt`` build manifest), a random top-level ``*.md``, a missing path, or a
-    control-char-bearing path — blocks."""
+    """Whether a review finding's file *path* is documentation.
+
+    OWNER DECISION 2026-09-04: a documentation extension is prose AT ANY DEPTH,
+    not only under ``docs/``. Previously a markdown file outside ``docs/`` was
+    treated as code, so a finding on ``AGENTS.md``, ``CLAUDE.md`` or any
+    ``.claude/skills/**/SKILL.md`` could block a merge. The old narrowness was
+    deliberate — a ``.md`` here is often an executable prompt surface rather than
+    prose — and it is being widened knowingly, on one specific ground: the
+    COMMIT-time gate classifies those files independently via
+    ``review_enforcement_commit._is_prompt_surface`` ("behavior surface —
+    reviewable, never docs-skipped"), so editing them still requires an
+    adversarial review. What changes is only whether a REVIEWER'S FINDING on a
+    prose file can block the MERGE. See ``_doc_findings_mode`` for the lever that
+    turns this back on.
+
+    Still FAIL-CLOSED on everything that is not provably prose: a source, config
+    or manifest file (including one under ``docs/``, and including a ``.txt``
+    build manifest), a missing path, or a control-char-bearing path all block.
+    """
     # Reject the COMPLETE control-character range (Unicode Cc): C0 (<0x20), DEL
     # (0x7F), and C1 (0x80-0x9F, incl. NEL 0x85 which ``gh --jq`` emits literally).
     if not path or any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in path):
@@ -1042,11 +1057,64 @@ def _is_doc_path(path: str) -> bool:
     # (1) A known doc-named file with a doc/text/empty extension, at any depth.
     if stem_l in _DOC_STEMS and ext in _DOC_STEM_EXTS:
         return True
-    # (2) A pure documentation format (reStructuredText) anywhere.
-    if ext == "rst":
-        return True
-    # (3) An unambiguous documentation extension under a top-level docs/ directory.
-    return ext in _DOC_EXTS and path.startswith("docs/")
+    # (2) An unambiguous documentation extension, AT ANY DEPTH. ``.txt`` is still
+    # excluded here and remains prose only on a known doc stem (rule 1), because
+    # a build/dep manifest carries it too.
+    return ext in _DOC_EXTS
+
+
+# How a finding on a documentation path is treated. The lever exists so the
+# widening above is reversible without a code change:
+#   skip     — a doc-path finding NEVER scores, at any severity (the default,
+#              and the owner's current policy: prose must not block a merge).
+#   p1_only  — a doc-path P1 scores and can block; lower severities only surface.
+#   score    — doc paths get no special treatment; findings score as code does.
+# Findings are SURFACED in every mode — the lever decides whether they count
+# toward the blocking score, never whether a human sees them.
+_DOC_FINDINGS_MODES = ("skip", "p1_only", "score")
+_DEFAULT_DOC_FINDINGS_MODE = "skip"
+
+
+def _doc_findings_mode() -> str:
+    """Resolve the doc-findings policy: env seam, then local config, then default.
+
+        # ~/.genesis/config/genesis.yaml
+        merge_gate:
+          doc_findings: p1_only
+
+    Unlike its siblings this does NOT fail toward more review, and the asymmetry
+    is deliberate rather than an oversight: the SHIPPED default is the permissive
+    end by owner decision, so there is no stricter default to fall back to. Any
+    unreadable file, parse error, duplicate key, wrong type or unknown value
+    therefore falls back to ``skip`` — the documented default — which is the
+    predictable behaviour, not a silent tightening an operator never asked for.
+    An install that wants findings to block on prose sets the key explicitly.
+    """
+    raw = os.environ.get("_TEST_DOC_FINDINGS_MODE") or os.environ.get(
+        "GENESIS_MERGE_GATE_DOC_FINDINGS"
+    )
+    if raw is None:
+        try:
+            import yaml  # lazy: keep the hook import-light; the genesis venv has pyyaml
+
+            path = os.path.expanduser("~/.genesis/config/genesis.yaml")
+            with open(path) as fh:
+                text = fh.read()
+            # Same duplicate-key line scan as the sibling readers: yaml.safe_load
+            # silently keeps the LAST value for a repeated key, so a badly-merged
+            # file could quietly change policy without anyone editing it.
+            if (
+                len(re.findall(r"(?m)^merge_gate\s*:", text)) > 1
+                or len(re.findall(r"(?m)^\s*doc_findings\s*:", text)) > 1
+            ):
+                raise ValueError("duplicate merge_gate/doc_findings key")
+            cfg = yaml.safe_load(text) or {}
+            raw = (cfg.get("merge_gate") or {}).get("doc_findings")
+        except Exception:
+            raw = None
+    if isinstance(raw, str) and raw.strip().lower() in _DOC_FINDINGS_MODES:
+        return raw.strip().lower()
+    return _DEFAULT_DOC_FINDINGS_MODE
 
 
 # ── Direct-sqlite-write detection ────────────────────────────────────────────
@@ -1294,16 +1362,18 @@ def _check_inline_review_findings(
         if _INLINE_P1_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — treated as acknowledged
-            if _is_doc_path(c.get("path") or ""):
+            if _is_doc_path(c.get("path") or "") and _doc_findings_mode() == "skip":
                 # A P1 on a documentation file (ledger 54eb3752) is surfaced but
                 # does NOT block; a code file (incl. code under docs/) still does.
+                # Under `p1_only` or `score` this falls through and DOES block —
+                # a doc-path P1 is the one a reader most often wants enforced.
                 doc_skipped.append(_inline_title(body))
                 continue
             p1.append(_inline_title(body))
         elif _INLINE_P2_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — maintainer consciously accepted the P2
-            if _is_doc_path(c.get("path") or ""):
+            if _is_doc_path(c.get("path") or "") and _doc_findings_mode() in ("skip", "p1_only"):
                 # A P2 on a doc path is not a code defect — excluded from the SCORE, but
                 # still SURFACED as a NOTE (mirroring doc-path P1s). A documentation-
                 # correctness P2 can be substantive, so it must stay visible in the
@@ -1316,7 +1386,7 @@ def _check_inline_review_findings(
     if doc_skipped:
         print(
             f"NOTE: PR #{pr_num} — {len(doc_skipped)} inline [P1] finding(s) on "
-            f"documentation paths (CHANGELOG/README/LICENSE/NOTICE/docs/**/*.rst) "
+            f"documentation paths (any *.md/*.rst/*.adoc, plus CHANGELOG/README/LICENSE) "
             f"NOT blocking:",
             file=sys.stderr,
         )
@@ -1346,9 +1416,7 @@ def _check_inline_review_findings(
         for title in p2[:8]:
             print(f"  [P2] {title}", file=sys.stderr)
     if score >= _INLINE_SCORE_BLOCK_THRESHOLD:
-        listing = "\n".join(
-            [f"  [P1] {t}" for t in p1[:5]] + [f"  [P2] {t}" for t in p2[:5]]
-        )
+        listing = "\n".join([f"  [P1] {t}" for t in p1[:5]] + [f"  [P2] {t}" for t in p2[:5]])
         return True, (
             f"review score {score:.1f} >= {_INLINE_SCORE_BLOCK_THRESHOLD:.1f} blocks "
             f"(P1=1.0, P2={_INLINE_P2_SCORE_WEIGHT} each): {len(p1)} unresolved [P1] + "
@@ -1735,6 +1803,64 @@ def _comment_repo(argv: list[str]) -> str | None:
     return val
 
 
+def _final_round_chained_advisory(pr_num: str) -> str:
+    """A second terminal-stage dispatch behind the SAME acceptance.
+
+    The sigil is matched command-wide so the documented nested form
+    (`bash -c '…' # final-round-accept`) keeps working, which also meant
+    `request && request # final-round-accept` could chain arbitrarily many rounds
+    behind one decision while the advisory promised "ONE more round".
+    """
+    return (
+        f"BLOCKED: a second terminal-stage review request for PR #{pr_num} in the "
+        "same command. '# final-round-accept' authorises ONE dispatch — the user "
+        "directed one more round, not a chain of them.\n\n"
+        "Run the requests separately, each with its own decision behind it."
+    )
+
+
+def _final_round_advisory(pr_num: str, rounds: int, repo: str | None = None) -> str:
+    """The terminal, stated for the DISPATCH side of the loop.
+
+    Counted from the PR's own review history rather than the local counter, so it
+    fires even when every round ran in the cloud and none was marked locally —
+    which is the case this gate exists for, and therefore the case the commit-side
+    terminal cannot see.
+
+    DELIBERATELY STATELESS, unlike the commit-side terminal. That one spends its
+    acceptance because it licenses a state change (a commit that lands work); this
+    one licenses a review REQUEST, which changes nothing on its own — a session
+    that can re-request reviews but cannot commit fixes achieves nothing, so the
+    commit gate remains the terminal that bites. Making an advisory, fail-open
+    gate carry per-branch consumption state would also contradict the
+    "stateless, authoritative" property the rest of this scan is built on. The
+    consequence is stated rather than hidden: the ack is required on EVERY
+    dispatch past the terminal, and it is not one-shot here.
+    """
+    repo_arg = f" --repo {repo}" if repo else ""
+    return (
+        f"BLOCKED: this would be Codex round {rounds + 1} on PR #{pr_num} — "
+        f"{rounds} rounds already ran on this PR, at or past the terminal "
+        f"({FINAL_ROUND_CAP}). Two full escalation cycles have run and each already "
+        "asked for a fresh decision. '# escalation-ack' does NOT clear this one; if "
+        "it did, the cycle would simply continue, which is what the terminal exists "
+        "to end.\n\n"
+        "There are exactly two ways out, and neither is this session's to choose "
+        "alone:\n"
+        "  (a) ACCEPT the outstanding findings and merge — document each one and why "
+        "it is acceptable in the PR body. The COMMIT gate is where that decision is "
+        "recorded, and there the acceptance is one-shot.\n"
+        "  (b) ABANDON the branch and restart from a design that does not need this "
+        "many rounds.\n\n"
+        "If the user directs ONE more round, that decision rides on this command:\n"
+        f"    gh pr comment {pr_num}{repo_arg} --body '@codex review'  # final-round-accept\n"
+        "Required on EVERY dispatch past the terminal — this gate keeps no state, so "
+        "the sigil is not spent here.\n\n"
+        "Take it to the user. A dispatched session with nobody reading cannot pick "
+        "any of these — surface it and stop."
+    )
+
+
 def _escalation_advisory(pr_num: str, rounds: int, repo: str | None = None) -> str:
     repo_arg = f" --repo {repo}" if repo else ""
     return (
@@ -1787,11 +1913,17 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
       '# escalation-ack' trailing ANY segment     → allow the whole command (a
         nested `bash -c '…' # escalation-ack` carries the ack on the OUTER
         segment; the ack is a conscious human-directed act, so one ack licenses
-        the command it trails)
+        the command it trails) — BUT ONLY BELOW THE TERMINAL. At or past
+        FINAL_ROUND_CAP it does not clear the block; '# final-round-accept' does.
+        This is why the ack is no longer a top-of-function short-circuit: a
+        short-circuit could never see the count it needed to be bounded by.
+      rounds >= FINAL_ROUND_CAP, no final-accept → BLOCK with the terminal (an
+        escalation-ack here is deliberately not enough)
       numberless/branch target (no PR number)     → that segment allows;
         SCANNING CONTINUES (an allowed segment must not shield a later one)
       gh/API/parse error (ids is None)            → that segment allows, scan on
       rounds < ESCALATION_ROUND_CAP               → that segment allows, scan on
+      cap <= rounds < FINAL_ROUND_CAP, no ack    → BLOCK with the step-back order
       any segment at rounds >= cap, no ack        → BLOCK with the step-back
         order (URL targets carry their OWN repo into the count — counting the
         hook cwd's repo for a cross-repo URL could produce a FALSE block)
@@ -1799,8 +1931,16 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
     fail-closed exit-2, which would turn an advisory bug into a hard block).
     """
     try:
-        if any(has_trailing_override(s.raw, "escalation-ack") for s in segs):
-            return False, ""
+        # Both sigils resolved up front, and the escalation-ack short-circuit is
+        # now CONDITIONAL on not having reached the terminal. It used to return
+        # before any counting, which meant this gate — the one that counts the
+        # PR's ACTUAL Codex rounds, and exists precisely because the local counter
+        # sleeps through them — could be re-acked forever. The commit-side terminal
+        # reads only that sleeping local counter, so it inherited the same blind
+        # spot: a review/fix loop driven entirely through cloud rounds never
+        # reached it.
+        acked = any(has_trailing_override(s.raw, "escalation-ack") for s in segs)
+        final_acked = any(has_trailing_override(s.raw, "final-round-accept") for s in segs)
         # Bound this scan's gh (_codex_reviews) calls by the SHARED hook deadline,
         # so a slow API + a compound command can't push the aggregate past the
         # ~60s hook wall-clock and get the WHOLE hook SIGKILLed — which fails open
@@ -1814,7 +1954,18 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
         # at cap-1 would otherwise dispatch round N+1 unacknowledged (round-2
         # finding). Keyed per (repo, pr) so distinct PRs don't cross-count.
         in_cmd: dict[str, int] = {}
+        # One '# final-round-accept' authorises ONE dispatch across the whole
+        # command; see where it is spent below.
+        terminal_license_spent = False
         for seg in segs:
+            # Stop scanning once the shared budget is drained. Past that point every
+            # remaining gh call still gets the 1.0s floor, so a long compound command
+            # against a hung API could walk the aggregate toward the hook wall-clock
+            # and get the WHOLE hook SIGKILLed — which fails open on every gate. The
+            # merge path already breaks here; this scan did not, and it now makes gh
+            # calls on acked commands that previously short-circuited before arming.
+            if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+                break
             if gh_pr_subcommand(seg.argv) != "comment":
                 continue
             if not any("@codex review" in tok.lower() for tok in seg.argv):
@@ -1830,7 +1981,26 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
                 continue
             key = f"{repo or ''}|{pr_num}"
             effective = len(reviews) + in_cmd.get(key, 0)
-            if effective >= ESCALATION_ROUND_CAP:
+            # TERMINAL tier, checked first and NOT clearable by the repeatable
+            # sigil — the whole point of a terminal is that the cycle cannot reach
+            # past it. Counted from the PR's real review history, so it holds even
+            # when every one of those rounds went unmarked locally.
+            if effective >= FINAL_ROUND_CAP:
+                if not final_acked:
+                    return True, _final_round_advisory(pr_num, effective, repo)
+                # ONE decision licenses ONE dispatch. `final_acked` is computed with
+                # any() over the whole command — deliberately, because a nested
+                # `bash -c '…' # final-round-accept` carries the sigil on the OUTER
+                # segment, so per-segment binding would break the documented nested
+                # form. But command-wide truth also let `request && request # sigil`
+                # chain arbitrarily many rounds behind a single decision, while the
+                # advisory promises the user is directing "ONE more round". Spending
+                # the license on first use keeps the nested form working and closes
+                # the chain.
+                if terminal_license_spent:
+                    return True, _final_round_chained_advisory(pr_num)
+                terminal_license_spent = True
+            elif effective >= ESCALATION_ROUND_CAP and not acked:
                 return True, _escalation_advisory(pr_num, effective, repo)
             in_cmd[key] = in_cmd.get(key, 0) + 1
     except Exception:
@@ -2901,10 +3071,7 @@ def _marker_kind_or_none(block: str) -> str | None:
 
 def _scheduled_review_marker_scan(
     pr_num: str, repo: str | None = None, head_sha: str | None = None
-) -> (
-    tuple[dict[str, set[str]], dict[str, set[str]], list[tuple[str | None, str, bool]]]
-    | None
-):
+) -> tuple[dict[str, set[str]], dict[str, set[str]], list[tuple[str | None, str, bool]]] | None:
     """``(accepted, rejected_not_clean, unusable, blocking_residue)`` for the PR's scheduled-review
     markers, or ``None`` on an UNREADABLE fetch.
 
@@ -2967,7 +3134,7 @@ def _scheduled_review_marker_scan(
     # order -- the sort is stable. Residue, stated: an edited REVIEW body has no edit
     # timestamp in the API, so a finding added by editing a review keeps the review's
     # original position.
-    rows = sorted(rows, key=lambda r: (r.get("stamp") or r.get("created_at") or ""))
+    rows = sorted(rows, key=lambda r: r.get("stamp") or r.get("created_at") or "")
     for row in rows:
         body = row.get("body") or ""
         # Blocks are parsed BEFORE the trust checks, so a row about to be dropped can
@@ -3018,8 +3185,7 @@ def _scheduled_review_marker_scan(
                         )
                 else:
                     why = (
-                        "it is carried by a DISMISSED review, which no longer vouches "
-                        "for anything"
+                        "it is carried by a DISMISSED review, which no longer vouches for anything"
                     )
                 unusable.append((_marker_kind_or_none(block), why, True))
             continue
@@ -3114,9 +3280,7 @@ def _scheduled_review_marker_scan(
                     # is not evidence about one review, it is evidence about all of them.
                     _residue_kind = _marker_kind_or_none(block)
                     blocking_residue.setdefault("", set()).add(
-                        _residue_kind
-                        if _residue_kind in _KNOWN_SCHEDULED_REVIEW_KINDS
-                        else "*"
+                        _residue_kind if _residue_kind in _KNOWN_SCHEDULED_REVIEW_KINDS else "*"
                     )
                 unusable.append((_marker_kind_or_none(block), why, True))
                 continue
@@ -6162,10 +6326,14 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
             # NEVER render a carried-forward review as one made at head: this line is
             # what a human (and a structured consumer) reads to judge freshness, and
             # "ok (at head)" here would be a false assertion about what was reviewed.
-            sched_state = "ok (" + "; ".join(
-                f"{kind} carried from {anc}, {check} green at head"
-                for kind, anc, check in sched_relief
-            ) + ")"
+            sched_state = (
+                "ok ("
+                + "; ".join(
+                    f"{kind} carried from {anc}, {check} green at head"
+                    for kind, anc, check in sched_relief
+                )
+                + ")"
+            )
         else:
             sched_state = "ok (at head)"
         print(f"scheduled-claude: {sched_state}")
