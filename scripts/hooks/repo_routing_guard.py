@@ -133,6 +133,28 @@ def _resolve_dir(base: str | None, token: str) -> str | None:
     a relative path.
     """
     d = os.path.expanduser(token)
+
+    # Where the token, read LITERALLY, names a real directory, that is the
+    # answer — and it outranks the character class below. shlex has already
+    # removed the quoting, so `cd '$repo'` and `cd $repo` arrive identical; if a
+    # directory named `$repo` exists, the first is what happened and refusing on
+    # the `$` skips the check on a real wrong-repo add. Same class as the
+    # `[{()<>` over-coverage found a round earlier, for the four characters that
+    # survived that narrowing.
+    #
+    # Positive validation, once more: asking whether the answer EXISTS settles
+    # what enumerating shell syntax cannot. The class below is now only the
+    # fallback for a token that names nothing, which is exactly what an
+    # unexpanded `$W` does.
+    literal: str | None = None
+    if not d.startswith("~"):
+        if os.path.isabs(d):
+            literal = os.path.normpath(d)
+        elif base is not None:
+            literal = os.path.normpath(os.path.join(base, d))
+    if literal is not None and os.path.isdir(literal):
+        return literal
+
     if d.startswith("~"):
         return None  # a ~user the passwd db cannot resolve
     if any(c in d for c in _UNRESOLVABLE_DIR_CHARS):

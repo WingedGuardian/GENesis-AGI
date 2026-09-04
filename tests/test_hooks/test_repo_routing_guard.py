@@ -524,3 +524,37 @@ def test_the_notice_composes_with_a_weak_hit(agi_repo, topology):
     note = _advisory(r)
     assert "satellite/config.py" in note
     assert "did NOT run" in note
+
+
+def test_a_directory_literally_containing_expansion_syntax_is_checked(tmp_path, topology):
+    """REGRESSION PIN for a BLOCK -> ALLOW the character class caused.
+
+    A directory can literally be named `$repo`. shlex removes the quoting
+    before the token arrives, so `cd '$repo'` and `cd $repo` are
+    indistinguishable — and refusing on the `$` skipped the check entirely on
+    a real wrong-repo add inside a directory that exists.
+
+    Same class as the `[{()<>` over-coverage a round earlier, for the four
+    characters that survived that narrowing. Fixed the same way: ask whether
+    the answer EXISTS before consulting any character class.
+    """
+    odd = _make_repo(tmp_path / "$repo", AGI)
+    _write(odd, "firmware/boot.py")
+
+    r = _run(f"cd '{odd}' && git add firmware/boot.py", tmp_path, topology)
+
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "GENesis-Voice" in r.stderr
+
+
+def test_an_unexpanded_variable_naming_nothing_is_still_unresolvable(agi_repo, topology):
+    """TRUE-NEGATIVE CONTROL — the character class must still do its job.
+
+    Without this, "accept anything that exists" would degrade into "accept
+    everything": an unexpanded `$W` names no directory, so it must still be
+    reported as unscopeable rather than silently joined onto the cwd.
+    """
+    r = _run("cd $NOSUCHVAR_XYZ && git add .", agi_repo, topology)
+
+    assert r.returncode == 0
+    assert "did NOT run" in _advisory(r)
