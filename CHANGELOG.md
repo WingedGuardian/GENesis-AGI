@@ -221,6 +221,33 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Campaign names stored before the control-character fix are now cleaned at
+  startup.** Names have been sanitized at the write boundary since the previous
+  release, so nothing new lands malformed, but rows written earlier were never
+  repaired. The cleanup now runs during campaign initialization, before the
+  scheduler registers its jobs — the ordering matters, because each campaign's
+  scheduled job is keyed by its name, and renaming afterwards would leave the
+  running job pointing at a name that no longer exists. A campaign whose cleaned
+  name would collide with another campaign's is left untouched and logged rather
+  than merged.
+
+  A campaign's history now travels with the rename — both its durable health
+  record and its individual run history. Leaving either behind was not merely
+  untidy: an abandoned health record keeps reporting the job as stale on every
+  health sweep, indefinitely, because nothing checks whether the job still
+  exists; and the run history is looked up by exact name, so a scheduled-job
+  prediction spanning the cleanup would have been scored against a series with a
+  hole in it, or discarded as having no runs at all. Where the name being moved
+  into already carried an abandoned record from a deleted campaign, the campaign's
+  own live history now wins and the leftover is removed — previously the reverse
+  happened, keeping the record that could never be written to again.
+
+  One name is now refused outright: a campaign called `pending_reaper` collides
+  with an internal job the scheduler registers for itself, and would have been
+  evicted at startup with no error and no log — it would simply never run again.
+  It is rejected when a campaign is created, and a stored name that would clean up
+  into it is left alone, since a name with a stray invisible character still runs.
+
 - **YouTube transcripts are less likely to come back quietly incomplete.** When
   Genesis fetches a video transcript it now asks for both English caption tracks and
   prefers the original ASR (`en-orig`) over the `en` variant. Observed once: the two
@@ -765,6 +792,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Security
 
+- **Invisible-character stripping now covers every invisible Unicode format
+  character, not a hand-picked 13 of them.** Campaign names and awareness-signal
+  text are normalized before they reach a line-parsed prompt, to stop injected text
+  forging or concealing a line. That normalizer enumerated 13 of Unicode's 170 `Cf`
+  format characters, silently omitting concealment characters from the very families
+  it did cover — most pointedly U+061C ARABIC LETTER MARK, sibling of the
+  already-stripped LRM/RLM, plus SOFT HYPHEN, WORD JOINER and the invisible U+E0000
+  tag block. The set is now derived from Python's Unicode database by an explicit
+  rule (strip a format character only when it is genuinely invisible — zero-width,
+  a bidi override, an invisible direction mark, or an annotation control), with a
+  test that regenerates it and fails if the two ever diverge.
+
+  Format characters that are *visible* content are deliberately preserved, so the
+  wider net does not corrupt real text: the Arabic number and end-of-ayah signs,
+  Syriac abbreviation mark, Kaithi number signs and Egyptian hieroglyph joiners all
+  pass through, as do zero-width joiner and non-joiner — stripping those would break
+  every emoji sequence (👨‍👩‍👧 → three separate people) and change Persian and Indic
+  words, where the non-joiner is orthographically required.
+
+- **A campaign name made only of invisible characters is now rejected instead of
+  being created with an empty name.**
 - **A malformed Claude Code session id can no longer create directories outside
   the session tree.** Hooks store per-session state under
   `~/.genesis/sessions/<session-id>/`, interpolating the id straight into the
