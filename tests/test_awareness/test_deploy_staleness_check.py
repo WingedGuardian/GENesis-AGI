@@ -50,6 +50,7 @@ def _snap(
     age_days=None,
     behind=None,
     missing_units=None,
+    stale_units=None,
     tier2=None,
     host_status="ok",
 ):
@@ -59,6 +60,7 @@ def _snap(
         "last_update": {"age_days": age_days, "new_commit": "abc", "completed_at": "x"},
         "git": {"head": "abc", "commits_behind_upstream": behind, "fetch_age_hours": 1.0},
         "missing_units": missing_units or [],
+        "stale_units": stale_units or [],
         "tier2_pending": tier2 or [],
         "host_gateway": {"status": host_status},
     }
@@ -77,6 +79,23 @@ async def _rows(db, resolved=0):
         f"FROM observations WHERE source='{SOURCE}' AND resolved={resolved}"
     )
     return list(await cur.fetchall())
+
+
+async def test_stale_units_finding_names_the_daemon(db, monkeypatch):
+    """A resident daemon running pre-update code raises an alert whose prose
+    names the unit — the inert-detector shape, surfaced instead of silent."""
+    _patch_snapshot(
+        monkeypatch,
+        _snap(
+            ["stale_units:genesis-tmp-watchgod.service"],
+            stale_units=["genesis-tmp-watchgod.service"],
+        ),
+    )
+    await loop._check_deploy_staleness(db)
+    rows = await _rows(db)
+    assert len(rows) == 1
+    assert "genesis-tmp-watchgod.service" in rows[0]["content"]
+    assert "pre-update code" in rows[0]["content"]
 
 
 async def test_no_findings_is_quiet(db, monkeypatch):

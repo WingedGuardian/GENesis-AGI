@@ -1197,11 +1197,12 @@ if [ -f "$SYSTEMD_USER_DIR/genesis-cc-tmp-align.service" ]; then
         echo "    + genesis-cc-tmp-align.service enabled (cold-start cc-tmp apply)" || true
 fi
 
-# Enable AND start tmp watchgod (OS-level temp protection)
-WATCHGOD_SRC="$REPO_DIR/config/genesis-tmp-watchgod.service"
-if [ -f "$WATCHGOD_SRC" ]; then
-    cp "$WATCHGOD_SRC" "$SYSTEMD_USER_DIR/"
-    systemctl --user daemon-reload 2>/dev/null || true
+# Enable AND start tmp watchgod (OS-level temp protection). The unit file
+# itself was already RENDERED from scripts/systemd/*.template in step 7 —
+# the legacy copy from config/ hardcoded %h/genesis as the repo path and
+# silently overwrote the correct render on any non-default clone location,
+# leaving two unsynchronized sources of the same unit. Enable-only here.
+if [ -f "$SYSTEMD_USER_DIR/genesis-tmp-watchgod.service" ]; then
     systemctl --user enable --now genesis-tmp-watchgod.service 2>/dev/null && \
         echo "    + genesis-tmp-watchgod.service enabled + started" || true
 fi

@@ -29,6 +29,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -73,6 +75,15 @@ GUARDIAN_HOST_PATHS = (
     "scripts/lib/host_swap.sh",
     "scripts/lib/cc_tmp_volume.sh",
 )
+
+# Resident daemons whose ExecStart is a repo script — keep in LOCKSTEP with
+# update.sh RESIDENT_UNIT_SCRIPTS (the restart heal). Timer-fired oneshots
+# re-exec their script every tick and are immune; genesis-server/bridge have
+# their own restart handling in update.sh. Values are repo-relative script
+# paths resolved against repo_root() at collection time.
+RESIDENT_UNIT_SCRIPTS = {
+    "genesis-tmp-watchgod.service": "scripts/tmp_watchgod.sh",
+}
 
 _HOST_STATE_FILE = "host_gateway_state.json"
 
@@ -132,6 +143,80 @@ def collect_missing_units(template_dir: Path, unit_dir: Path) -> list[str] | Non
         return [name for name in expected if not (unit_dir / name).exists()]
     except Exception:
         logger.debug("deploy_health: unit comparison failed", exc_info=True)
+        return None
+
+
+def _probe_unit(unit: str) -> tuple[bool, float | None]:
+    """(active, ExecMainStart epoch) for a user unit. Local systemd IPC only
+    (no network — the module contract), budgeted like the git probes. Any
+    unreadable fact degrades to (False, None) / (True, None) rather than
+    raising; the caller treats None as "cannot judge"."""
+    # TZ=UTC pins systemctl's CLIENT-SIDE timestamp render to one zone, so
+    # the strptime below can attach UTC explicitly — the same trick (and the
+    # same reason) as update.sh's _unit_restart_reason loop: ambiguous zone
+    # abbreviations and DST fold hours parse differently per install, and
+    # the two halves must reach the same verdict on the same facts.
+    utc_env = {**os.environ, "TZ": "UTC"}
+    rc = subprocess.run(
+        ["systemctl", "--user", "is-active", "--quiet", unit],
+        capture_output=True,
+        timeout=_CHEAP_TIMEOUT_S,
+        env=utc_env,
+    ).returncode
+    if rc != 0:
+        return False, None
+    out = subprocess.run(
+        ["systemctl", "--user", "show", unit, "-p", "ExecMainStartTimestamp", "--value"],
+        capture_output=True,
+        text=True,
+        timeout=_CHEAP_TIMEOUT_S,
+        env=utc_env,
+    )
+    ts = out.stdout.strip()
+    if out.returncode != 0 or not ts or ts == "n/a":
+        return True, None
+    try:
+        # Rendered under TZ=UTC above as "Thu 2026-09-04 21:53:58 UTC" —
+        # parse the date/time fields and attach UTC explicitly. stat()'s
+        # mtime is an absolute epoch, so the comparison is zone-free.
+        parts = ts.split()
+        dt = datetime.strptime(" ".join(parts[1:3]), "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+        return True, dt.timestamp()
+    except Exception:
+        return True, None
+
+
+def collect_stale_units(
+    unit_scripts: dict[str, Path],
+    *,
+    probe: object = None,
+) -> list[str] | None:
+    """Resident daemons running code older than their backing script.
+
+    Verdict mirrors update.sh's ``_unit_restart_reason``: a unit is stale iff
+    it is ACTIVE and its ExecMainStart epoch predates the script's file mtime
+    (mtime = when the code arrived on THIS install; a commit timestamp is
+    authored upstream and misses the started-between-commit-and-pull window).
+    Every unreadable fact fails open per unit (skip, never flag); a broken
+    probe returns ``None`` — "could not determine", never a clean empty
+    (fail-closed data-access doctrine: an outage must not masquerade as
+    health)."""
+    probe_fn = probe or _probe_unit
+    try:
+        stale: list[str] = []
+        for unit, script in unit_scripts.items():
+            active, start_epoch = probe_fn(unit)
+            if not active or start_epoch is None:
+                continue
+            try:
+                script_epoch = Path(script).stat().st_mtime
+            except OSError:
+                continue
+            if start_epoch < script_epoch:
+                stale.append(unit)
+        return sorted(stale)
+    except Exception:
+        logger.debug("deploy_health: stale-unit probe failed", exc_info=True)
         return None
 
 
@@ -269,6 +354,7 @@ STALE_UPDATE_COMMITS = 20
 def derive_findings(
     *,
     missing_units: list[str] | None,
+    stale_units: list[str] | None = None,
     tier2_pending: list[str] | None,
     host_gateway: dict,
     commits_behind: int | None,
@@ -286,6 +372,8 @@ def derive_findings(
     findings: list[str] = []
     if missing_units:
         findings.append("missing_units:" + ",".join(sorted(missing_units)))
+    if stale_units:
+        findings.append("stale_units:" + ",".join(sorted(stale_units)))
     if tier2_pending:
         findings.append(f"tier2_pending:{len(tier2_pending)}")
     if host_gateway.get("status") == "drift":
@@ -315,9 +403,13 @@ def _collect_sync(repo: Path, genesis_home_dir: Path) -> dict:
         Path.home() / ".config" / "systemd" / "user",
     )
     host_gateway = collect_host_gateway(repo, genesis_home_dir / _HOST_STATE_FILE)
+    stale_units = collect_stale_units(
+        {unit: repo / script for unit, script in RESIDENT_UNIT_SCRIPTS.items()}
+    )
     return {
         "git": git_facts,
         "missing_units": missing_units,
+        "stale_units": stale_units,
         "host_gateway": host_gateway,
     }
 
@@ -333,6 +425,7 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
         tier2 = await asyncio.to_thread(collect_tier2_pending, repo, update.get("new_commit"))
         findings = derive_findings(
             missing_units=collected["missing_units"],
+            stale_units=collected["stale_units"],
             tier2_pending=tier2,
             host_gateway=collected["host_gateway"],
             commits_behind=collected["git"].get("commits_behind_upstream"),
@@ -344,6 +437,7 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             "last_update": update,
             "git": collected["git"],
             "missing_units": collected["missing_units"],
+            "stale_units": collected["stale_units"],
             "tier2_pending": tier2,
             "host_gateway": collected["host_gateway"],
         }

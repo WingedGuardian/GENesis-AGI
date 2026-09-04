@@ -58,6 +58,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Merged changes to resident daemons now actually deploy.** A systemd user
+  unit that stays resident (like the temp-protection watchgod) only re-executes
+  its backing script when something restarts it — and nothing did: not
+  `update.sh`, not bootstrap, so a merged fix could run weeks late while the
+  unit dutifully kept its pre-merge copy alive. `update.sh` now compares each
+  resident repo-script daemon's start time against its script's on-disk change
+  time and restarts the stale ones, on no-op runs too (a daemon left stale by
+  an earlier pull must not stay stale just because today's merge brought
+  nothing). The deploy-health snapshot gains the matching `stale_units`
+  finding, so a daemon running pre-update code raises the standing
+  deploy-drift alert between updates instead of staying silent. The installer
+  also stops overwriting the rendered watchgod unit with a legacy copy that
+  hardcoded the repo path.
+
 - **Two branches that each add a changelog entry no longer collide over it.**
   This file is an append-only list of independent bullets, so two branches
   adding an entry under the same heading are not disagreeing about anything —

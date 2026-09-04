@@ -264,6 +264,37 @@ _guardian_redeploy_reason() {
     return 0
 }
 
+# Resident daemons whose ExecStart is a repo script, as unit:script pairs.
+# Timer-fired oneshots re-exec their script every tick and are immune;
+# genesis-server and genesis-bridge have their own restart handling. A unit
+# listed here is restarted by _sync_deploy_targets when it is RUNNING code
+# older than its on-disk script (verified instance: tmp_watchgod ran a
+# 7-week-old copy for two weeks after its OOM-capture feature merged,
+# leaving the one instrument built to explain silent session deaths inert).
+RESIDENT_UNIT_SCRIPTS="genesis-tmp-watchgod.service:scripts/tmp_watchgod.sh"
+
+_unit_restart_reason() {
+    # Pure verdict: facts in → reason out (mirrors _guardian_redeploy_reason,
+    # so tests exercise the decision with no systemd). $1 = unit active (1/0),
+    # $2 = unit ExecMainStart epoch ('' unreadable), $3 = script mtime epoch
+    # ('' unreadable), $4 = unit name. Fail direction: anything unreadable or
+    # non-numeric → NO restart. mtime, not commit time, on purpose: mtime is
+    # stamped at checkout — when the code arrived on THIS install — where a
+    # commit timestamp is authored upstream and misses a daemon started
+    # between the commit and the pull. A spurious touch costs one harmless
+    # bounce; the opposite miss is the two-week inert-detector case above.
+    local active="$1" start_epoch="$2" script_epoch="$3" unit="$4"
+    # Not running → nothing stale to heal (starting a stopped unit is
+    # bootstrap's enablement decision, not the drift heal's).
+    [ "$active" = "1" ] || return 0
+    case "$start_epoch" in '' | *[!0-9]*) return 0 ;; esac
+    case "$script_epoch" in '' | *[!0-9]*) return 0 ;; esac
+    if [ "$start_epoch" -lt "$script_epoch" ]; then
+        echo "$unit started before its script last changed — restarting onto current code"
+    fi
+    return 0
+}
+
 # ── Deploy-target sync: guardian redeploy + host Node/CC + container CC ──
 # Extracted into a function so it runs on BOTH paths: the normal post-update
 # path AND the "Already up to date" path. Drift healing (pin alignment on the
@@ -514,6 +545,43 @@ _sync_deploy_targets() {
     else
         echo "  WARNING: $_cc_env missing — skipping container CC sync"
     fi
+
+    # ── Restart resident repo-script daemons running pre-pull code ──────
+    # Runs on BOTH paths that reach this function (post-merge AND the
+    # "Already up to date" no-op), because the stale-daemon case survives
+    # no-op runs by definition. set -e is live at both call sites (the ERR
+    # trap is already disarmed at both) — every step is guarded so a probe
+    # failure cannot abort the tail of a run.
+    # BEGIN unit-restart-check (extracted by tests/test_scripts/test_update_unit_restart.py)
+    for _pair in $RESIDENT_UNIT_SCRIPTS; do
+        _ru_unit="${_pair%%:*}"
+        _ru_script="${_pair#*:}"
+        _ru_active=0
+        if systemctl --user is-active --quiet "$_ru_unit" 2>/dev/null; then
+            _ru_active=1
+        fi
+        # TZ=UTC on BOTH the render and the parse: systemctl formats
+        # timestamp properties client-side in the caller's zone, and GNU
+        # date resolves ambiguous zone ABBREVIATIONS (CST, IST …) to its
+        # own guess — measured 50400s off for a UTC+8 install, reading a
+        # stale daemon as fresh for up to 14h. An unambiguous UTC render
+        # parses identically everywhere (and sidesteps DST fold hours).
+        _ru_start_ts=""
+        _ru_start_ts=$(TZ=UTC systemctl --user show "$_ru_unit" -p ExecMainStartTimestamp --value 2>/dev/null) || _ru_start_ts=""
+        _ru_start_epoch=""
+        if [ -n "$_ru_start_ts" ] && [ "$_ru_start_ts" != "n/a" ]; then
+            _ru_start_epoch=$(TZ=UTC date -d "$_ru_start_ts" +%s 2>/dev/null) || _ru_start_epoch=""
+        fi
+        _ru_script_epoch=""
+        _ru_script_epoch=$(stat -c %Y "$GENESIS_ROOT/$_ru_script" 2>/dev/null) || _ru_script_epoch=""
+        _ru_reason=""
+        _ru_reason=$(_unit_restart_reason "$_ru_active" "$_ru_start_epoch" "$_ru_script_epoch" "$_ru_unit") || _ru_reason=""
+        if [ -n "$_ru_reason" ]; then
+            echo "  $_ru_reason"
+            systemctl --user restart "$_ru_unit" 2>/dev/null || echo "  WARNING: restart of $_ru_unit failed"
+        fi
+    done
+    # END unit-restart-check
     echo ""
 }
 
