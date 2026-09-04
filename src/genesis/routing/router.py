@@ -36,6 +36,31 @@ logger = logging.getLogger(__name__)
 # dead_letter.redispatch() and the matching test.
 UNKNOWN_CALL_SITE_ERROR_PREFIX = "Unknown call site:"
 
+# How many provider names an exhaustion line names before it summarises. A
+# chain is single digits today, so this never trims in practice — it is here so
+# that a future long chain cannot turn one ERROR line into a paragraph in
+# `journalctl`, which is where this message is read.
+_FAILED_NAMES_IN_MESSAGE = 8
+
+
+def _failed_clause(failed_providers: list[str]) -> str:
+    """The `; failed: a, b, c` tail of an exhaustion message, or '' when empty.
+
+    EMPTY IS A REAL STATE AND IT SAYS SOMETHING: every chain member was skipped
+    before it was tried (an open breaker, a missing key, an exceeded budget) or
+    the aggregate deadline abandoned the walk. Emitting `failed: ` with nothing
+    after it would read as a formatting bug, so the clause is dropped and the
+    `N attempted of M walkable` counts carry that case on their own — 0 of 7 is
+    the whole story there.
+    """
+    if not failed_providers:
+        return ""
+    shown = failed_providers[:_FAILED_NAMES_IN_MESSAGE]
+    listed = ", ".join(shown)
+    if len(failed_providers) > len(shown):
+        listed += f", +{len(failed_providers) - len(shown)} more"
+    return f"; failed: {listed}"
+
 
 class Router:
     """Routes LLM calls through provider fallback chains with resilience."""
@@ -424,10 +449,21 @@ class Router:
             # the chain length lets a reader reconcile the two — and makes the
             # aggregate-deadline `break` above legible, which is the one exit
             # that abandons the walk while recording nothing at all.
+            #
+            # THE NAMES GO IN THE MESSAGE, not only in the details. `emit()`
+            # logs `subsystem=… event=… msg=…` and nothing else
+            # (observability/events.py), so details reach the persisted event
+            # and the dashboard but never `journalctl` — and the runbook for
+            # this failure sends the reader to the systemd log. Details-only
+            # would have left that surface byte-identical to the behaviour this
+            # change exists to fix. The sibling `provider.fallback` event above
+            # already names its providers in the message; this one now matches.
             await self._event_bus.emit(
                 Subsystem.ROUTING, Severity.ERROR,
                 "all_exhausted",
-                f"All providers exhausted for {call_site_id}",
+                f"All providers exhausted for {call_site_id} "
+                f"({attempts} attempted of {len(chain)} walkable"
+                f"{_failed_clause(failed_providers)})",
                 call_site=call_site_id,
                 attempts=attempts,
                 failed_providers=tuple(failed_providers),

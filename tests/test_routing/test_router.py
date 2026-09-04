@@ -773,3 +773,99 @@ async def test_chain_size_counts_the_walkable_chain_not_the_configured_one(
     ][0].kwargs
     assert details["chain_size"] == 2, "counted the configured chain, not the walkable one"
     assert details["attempts"] == 2
+
+
+@pytest.mark.asyncio
+async def test_the_exhaustion_LOG_LINE_names_the_providers(
+    sample_config, breakers, cost_tracker, degradation, caplog
+):
+    """THE surface the runbook sends a reader to, and the one details never reach.
+
+    `GenesisEventBus.emit` logs `subsystem=… event=… msg=…` and nothing more, so
+    everything passed as a detail lands in the persisted event and the dashboard
+    while `journalctl` shows the same line it always showed. Attaching the names
+    as details ALONE would have left this PR's own stated surface byte-identical
+    to the behaviour it exists to fix.
+
+    So this asserts through a REAL event bus and the stdlib logger rather than a
+    mock: what is being checked is that the text arrives at the log, and a mock
+    cannot fail that way.
+    """
+    import logging
+
+    from genesis.observability.events import GenesisEventBus
+
+    delegate = MockDelegate(responses={
+        "free-1": CallResult(success=False, error="down", status_code=503),
+        "free-2": CallResult(success=False, error="down", status_code=503),
+        "paid-1": CallResult(success=False, error="down", status_code=503),
+    })
+    router = Router(
+        config=sample_config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate, event_bus=GenesisEventBus(),
+    )
+    with caplog.at_level(logging.ERROR, logger="genesis.observability.events"):
+        result = await router.route_call("test_mixed", [{"role": "user", "content": "hi"}])
+    assert result.success is False
+
+    lines = [r.getMessage() for r in caplog.records if "all_exhausted" in r.getMessage()]
+    assert len(lines) == 1, f"expected one exhaustion log line, got {lines}"
+    line = lines[0]
+    for name in ("free-1", "free-2", "paid-1"):
+        assert name in line, f"{name} never reached the log: {line}"
+    assert "test_mixed" in line, "the call site is what a reader greps for first"
+
+
+@pytest.mark.asyncio
+async def test_the_exhaustion_message_carries_both_counts(
+    sample_config, breakers, cost_tracker, degradation
+):
+    """Names alone still cannot distinguish "tried two of two" from "tried two of
+    seven" — the skipped members have no names to print. Both numbers travel with
+    them, in the message, for the same reason the names do."""
+    from unittest.mock import AsyncMock
+
+    cb = breakers.get("free-1")
+    for _ in range(3):
+        cb.record_failure(ErrorCategory.TRANSIENT)
+
+    event_bus = AsyncMock()
+    delegate = MockDelegate(responses={
+        "free-2": CallResult(success=False, error="down", status_code=503),
+        "paid-1": CallResult(success=False, error="down", status_code=503),
+    })
+    router = Router(
+        config=sample_config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate, event_bus=event_bus,
+    )
+    await router.route_call("test_mixed", [{"role": "user", "content": "hi"}])
+    message = [
+        c for c in event_bus.emit.call_args_list if c.args[2] == "all_exhausted"
+    ][0].args[3]
+    assert "2 attempted of 3 walkable" in message, message
+    assert "free-1" in message, "the breaker-skipped provider is the point of the event"
+
+
+def test_no_provider_failed_prints_no_dangling_failed_clause():
+    """EMPTY IS A REAL STATE. Every chain member skipped before it was tried — an
+    open breaker, a missing key, an exceeded budget — or the aggregate deadline
+    abandoned the walk. `failed: ` with nothing after it reads as a formatting
+    bug, and the `0 attempted of N` counts already tell that story on their own.
+    """
+    from genesis.routing.router import _failed_clause
+
+    assert _failed_clause([]) == ""
+
+
+def test_a_long_chain_summarises_instead_of_flooding_one_log_line():
+    """A bound on an ERROR line that goes to journalctl. Chains are single digits
+    today, so this never trims in practice — it is here so a future long chain
+    cannot turn one line into a paragraph."""
+    from genesis.routing.router import _FAILED_NAMES_IN_MESSAGE, _failed_clause
+
+    names = [f"p-{i}" for i in range(_FAILED_NAMES_IN_MESSAGE + 3)]
+    clause = _failed_clause(names)
+    assert clause.count("p-") == _FAILED_NAMES_IN_MESSAGE, clause
+    assert "+3 more" in clause, "the trimmed count is what stops it reading as complete"
+    assert names[-1] not in clause
+    assert names[0] in clause, "the FIRST provider tried is the one to keep"
