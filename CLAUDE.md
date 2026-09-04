@@ -455,19 +455,30 @@ When a user shares a file path or URL in conversation:
   mistakes, not just document them. A rule that only names the error is not
   preventive — state the CORRECT action, or it will be re-read while the same
   mistake repeats.
-- **Tool-call parameters** are `<parameter name="X">…</parameter>`. A bare
-  `<X>…</X>` is not a shorthand for it: the wrapper is the only form recognised,
-  so the opening tag never starts a parameter and its `</X>` closes nothing —
-  the value runs on past where it should have ended, typically swallowing every
-  later parameter, which then reports as *missing*. **Read the echoed
-  `input_value` first.** It shows how far the value actually ran, which is what
-  distinguishes a malformed CALL from a wrong value or a genuine tool defect —
-  repeated identical errors on their own do not establish which. If the echoed
-  value ran past its parameter, fix the STRUCTURE, not the text; if it ended
-  where it should have, the structure is fine and the value or the tool is the
-  problem — and whether that same tool already succeeded earlier in the session
-  separates those two. Most likely on long, multi-sentence values. Never file a
-  bug report from a payload you have not read.
+- **A tool call that reports parameters *missing* is usually malformed, not
+  buggy — and the echoed payload is what tells you which.** The diagnosis below
+  is encoding-independent; the concrete form is not, so take the form from your
+  own client.
+
+  **Read the echoed `input_value` first.** It shows how far each value actually
+  ran, which is what separates a malformed CALL from a wrong value or a genuine
+  tool defect — repeated identical errors on their own establish none of the
+  three, since resubmitting an invalid enum, or hitting a deterministic callee
+  defect, also fails identically every time. If a value ran PAST where it should
+  have ended and swallowed the parameters after it, fix the STRUCTURE, not the
+  text. If it ended where it should have, the structure is fine and the value or
+  the tool is the problem — and whether that same tool already succeeded earlier
+  in the session separates those two. Most likely on long, multi-sentence
+  values. Never file a bug report from a payload you have not read.
+
+  **In Claude Code specifically**, parameters are
+  `<parameter name="X">…</parameter>`. A bare `<X>…</X>` is not a shorthand: the
+  wrapper is the only recognised form, so the opening tag never starts a
+  parameter and its `</X>` closes nothing — which is what produces the run-on
+  above. This file is also the canonical instruction set for Codex, Cursor,
+  OpenCode and others (see `AGENTS.md`), whose call encodings are client-defined
+  and may be JSON or another protocol entirely. **Do not apply this
+  serialization outside Claude Code** — there it would corrupt a valid call.
 - **NEVER hide broken things — FIX THEM.** Fix the root cause, not the
   symptom. This is a thinking rule, not just a code rule.
 - **Bugs you see get fixed or tracked — never ignored.** Fix now by default; a
