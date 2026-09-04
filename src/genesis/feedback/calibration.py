@@ -7,8 +7,8 @@ accrues — the self-improvement signal.
 
 Wiring (updated 2026-07):
 - Writes one snapshot per run to ``ego_calibration_snapshots``.
-- Does NOT write ``calibration_curves`` (the table auto-read by
-  ``perception/context.py``) — that path stays separate.
+- Does NOT feed the perception-facing calibration surface (``calibration_cells``,
+  WS-2 P3) — this ego-ECE snapshot path stays deliberately separate.
 - The snapshot IS read back into the genesis ego's context by
   ``ego/genesis_context.py::_confidence_calibration_section`` and injected each
   cycle, gated on ``EgoConfig.calibration_injection_enabled`` (default on).
@@ -41,8 +41,8 @@ _LOW_CONF_MIN_BUCKETS = 3
 def _bucket_midpoint(bucket: str) -> float:
     """Parse a '0.8-0.9' bucket label to its midpoint 0.85.
 
-    Mirrors the parse in ``calibration/curves.py`` so ego calibration and the
-    existing outreach/triage calibration stay consistent.
+    Mirrors ``calibration/types.py`` bucket parsing so ego calibration and the
+    outreach/triage calibration surface stay consistent.
     """
     try:
         low, high = bucket.split("-")

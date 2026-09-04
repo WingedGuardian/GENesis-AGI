@@ -341,6 +341,24 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # re-read every hourly tick
     ),
+    "provider_outage_notify": SettingsDomain(
+        name="provider_outage_notify",
+        description=(
+            "Dead-provider notification sweep (awareness 5-min band) — master "
+            "`enabled` + `mode` off/propose_only/live. Once an unresolved "
+            "provider outage passes 1h: live (default) writes the ONE critical "
+            "observation that becomes a Telegram; propose_only writes it at "
+            "high (no immediate page; dashboard, ego and the next morning "
+            "report); off disables the sweep "
+            "AND resolves open notification rows — so off→on re-notifies a "
+            "still-dead provider, deliberately. Invalid mode degrades to "
+            "propose_only. Env kill switch GENESIS_PROVIDER_NOTIFY_DISABLED=1. "
+            "Read live each tick — no restart."
+        ),
+        config_filename="provider_outage_notify.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every 5-min tick
+    ),
     "voice_act": SettingsDomain(
         name="voice_act",
         description=(
@@ -1738,10 +1756,29 @@ def _validate_context_injection_watch(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_provider_outage_notify(changes: dict) -> list[str]:
+    """Validate dead-provider notify lever changes (see
+    genesis.awareness.provider_notify_config)."""
+    from genesis.awareness.provider_notify_config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "ego_reconcile": _validate_ego_reconcile,
     "follow_up_watchdog": _validate_follow_up_watchdog,
     "context_injection_watch": _validate_context_injection_watch,
+    "provider_outage_notify": _validate_provider_outage_notify,
     "surplus_ideation_promotion": _validate_surplus_ideation_promotion,
     "memory_integrity": _validate_memory_integrity,
     "entity_adjudication": _validate_entity_adjudication,

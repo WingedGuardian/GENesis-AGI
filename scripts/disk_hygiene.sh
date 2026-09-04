@@ -32,6 +32,9 @@
 #  11. Retention prune of pending_issue_posts terminal rows (>30d)
 #      → scripts/prune_contributor_issue_posts.py (Contributor Work-Log hold
 #      store; held rows never pruned)
+#  12. Retention prune of entity_merge_journal (>180d) → scripts/prune_entity_merge_journal.py
+#      (reversibility snapshot store; generous window so unmerge_entity outlives
+#      the mis-merge discovery horizon)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -194,6 +197,9 @@ main() {
                 rm -rf "$_sess_dir" || echo "sessions prune failed for $_sess_dir"
             done
     fi
+    echo "--- entity merge-journal reversibility retention prune (>180d) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/prune_entity_merge_journal.py" --days 180 \
+        || echo "prune_entity_merge_journal exited $?"
 
     echo "--- retrieval-efficacy report retention prune (>45d) ---"
     # WS2-0: retrieval_efficacy_report.py writes a dated md per run; bound the

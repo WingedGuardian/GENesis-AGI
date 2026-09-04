@@ -44,8 +44,6 @@ class OutreachScheduler:
         config: OutreachConfig,
         db: aiosqlite.Connection,
         *,
-        reconciler: object | None = None,
-        curve_computer: object | None = None,
         event_bus: object | None = None,
     ) -> None:
         self._pipeline = pipeline
@@ -53,8 +51,6 @@ class OutreachScheduler:
         self._engagement = engagement
         self._config = config
         self._db = db
-        self._reconciler = reconciler
-        self._curve_computer = curve_computer
         self._event_bus = event_bus
         self._scheduler: AsyncIOScheduler | None = None
         # In-memory alert dedup — DB-independent fallback.
@@ -106,20 +102,6 @@ class OutreachScheduler:
             "interval",
             minutes=self._config.engagement_poll_minutes,
             id="outreach_engagement_poll",
-            replace_existing=True,
-        )
-        # Daily calibration — reconcile predictions + recompute curves
-        # Wrap minute to avoid APScheduler crash if morning_report_time >= XX:55
-        cal_raw = int(minute) + 5
-        cal_hour = int(hour) + (cal_raw // 60)
-        cal_minute = cal_raw % 60
-        self._scheduler.add_job(
-            self._calibration_job,
-            "cron",
-            hour=cal_hour,
-            minute=cal_minute,
-            timezone=tz,
-            id="outreach_calibration",
             replace_existing=True,
         )
         # Health check — surfaces critical infrastructure problems to user
@@ -642,23 +624,6 @@ class OutreachScheduler:
                 "restart reclaims memory, but investigate before the VM feels it)"
             )
         return "(check the bridge: journalctl --user -u ambient-bridge)"
-
-    async def _calibration_job(self) -> None:
-        """Reconcile predictions and recompute calibration curves."""
-        if self._is_paused():
-            return
-        try:
-            if self._reconciler:
-                results = await self._reconciler.reconcile_all()
-                logger.info("Calibration reconciliation: %s", results)
-            if self._curve_computer:
-                for domain in ("outreach", "triage", "procedure", "routing"):
-                    await self._curve_computer.compute_and_save(domain)
-                logger.info("Calibration curves recomputed")
-            await self._record_job_result("calibration")
-        except Exception as exc:
-            logger.exception("Calibration job failed")
-            await self._record_job_result("calibration", error=str(exc), exc=exc)
 
     async def _mark_row_delivered(self, row: dict, delivered_at: str) -> None:
         """Mark a drained row delivered, keying on ``id`` or falling back to

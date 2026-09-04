@@ -426,7 +426,30 @@ async def query_grouped_errors(
     rows = await db.execute_fetchall(
         f"""SELECT subsystem, event_type,
                    SUBSTR(message, 1, 80) AS msg_prefix,
-                   MAX(severity) AS worst_severity,
+                   -- Rank by SEVERITY, not alphabetically. The vocabulary is
+                   -- lowercase (Severity StrEnum), so a plain MAX() orders
+                   -- warning > info > error > debug > critical -- i.e. critical
+                   -- sorts LOWEST, and any group mixing a critical with a
+                   -- warning reported "warning" and rendered amber. That
+                   -- silently downgraded the most severe events in the group.
+                   CASE MAX(CASE severity
+                              WHEN 'critical' THEN 5
+                              WHEN 'error'    THEN 4
+                              WHEN 'warning'  THEN 3
+                              WHEN 'info'     THEN 2
+                              WHEN 'debug'    THEN 1
+                              ELSE 0 END)
+                        WHEN 5 THEN 'critical'
+                        WHEN 4 THEN 'error'
+                        WHEN 3 THEN 'warning'
+                        WHEN 2 THEN 'info'
+                        WHEN 1 THEN 'debug'
+                        -- Defensive only: the WHERE clause above filters to
+                        -- warning/error/critical, so this branch is unreachable
+                        -- today. It exists so widening that filter cannot
+                        -- silently yield NULL here.
+                        ELSE MIN(severity)
+                   END AS worst_severity,
                    COUNT(*) AS count,
                    MIN(timestamp) AS first_seen,
                    MAX(timestamp) AS last_seen

@@ -117,3 +117,75 @@ class TestLineContinuationFoldsAsTheShellFolds:
         """Without this, an implementation that returned None for everything
         would satisfy the equality above."""
         assert _blocks("rm -rf ~/genesis")
+
+
+class TestEscapedBackslashIsNotAContinuation:
+    """An ESCAPED backslash before a newline does NOT continue the line.
+
+    The class above folds `\\<newline>` because the shell deletes it. That is
+    true only when the backslash is ITSELF unescaped — i.e. an ODD-length run.
+    In an EVEN-length run every backslash is already escaped by its neighbour,
+    so the final one is a literal character and the newline that follows is a
+    real command separator: the shell runs TWO commands.
+
+    Folding it anyway deletes that separator, glues the next command's first
+    word onto the previous token (`printf x` + `rm` -> `xrm`), and the guard
+    then never sees an `rm` token at all. It returns "no violations" — not
+    "unparseable" — so `main()`'s legacy-regex fallback, which only runs when
+    tokenizing FAILED, never fires either. The command is allowed and the shell
+    runs it.
+
+    Same property as the class above, asserted on the other side of the parity:
+    the verdict for the escaped form must equal the verdict for the form the
+    shell actually executes.
+    """
+
+    @pytest.mark.parametrize("run_len", [2, 4])
+    def test_even_run_preserves_the_separator(self, run_len):
+        backslashes = "\\" * run_len
+        escaped = f"printf x{backslashes}\nrm -rf /"
+        # What the shell really runs: two commands. `;` is the separator form.
+        as_shell_runs = f"printf x{backslashes} ; rm -rf /"
+
+        # Guard-the-guard: this fixture must actually carry an EVEN-length
+        # backslash run immediately before the newline, or it tests nothing.
+        head = escaped.split("\n", 1)[0]
+        trailing = len(head) - len(head.rstrip("\\"))
+        assert trailing == run_len and run_len % 2 == 0, (
+            f"fixture lost its property: trailing run {trailing}, expected even {run_len}"
+        )
+
+        assert dg._rm_violations(escaped) == dg._rm_violations(as_shell_runs), (
+            f"{escaped!r} -> {dg._rm_violations(escaped)!r}; "
+            f"shell runs {as_shell_runs!r} -> {dg._rm_violations(as_shell_runs)!r}"
+        )
+        assert _blocks(escaped), "an escaped backslash hid a destructive command"
+
+    def test_odd_run_still_folds(self):
+        """Cheap equivalence lock on the odd run — NOT an over-correction constraint.
+
+        Measured against a never-fold implementation, BOTH sides return ``[]``,
+        so this passes and constrains nothing in that direction. The
+        over-correction guarantee is carried entirely by
+        ``TestLineContinuationFoldsAsTheShellFolds`` above, which does fail
+        (4 cases) under never-fold. Do not read this as proof the fix cannot
+        over-correct; the docstring said exactly that once and was wrong.
+        """
+        assert dg._rm_violations("rm -rf /a/b/c/d\\\n/e") == dg._rm_violations("rm -rf /a/b/c/d/e")
+
+    def test_boundary_one_backslash_folds_two_does_not(self):
+        """The odd/even boundary is the whole fix, asserted directly.
+
+        The odd-run target is ``/`` — depth 1 — deliberately. An earlier
+        revision used a depth-5 target, which is ALLOWED whether or not the
+        fold happens, so the assertion passed under a never-fold implementation
+        too: vacuous in precisely the direction it claims to test. At ``/`` the
+        two implementations disagree — folding joins ``x``+``rm`` so no rm token
+        exists (allow), never-folding leaves a real ``rm -rf /`` (block).
+        """
+        assert not _blocks("printf x\\\nrm -rf /"), (
+            "odd run is a continuation: the words join, no second command exists"
+        )
+        assert _blocks("printf x\\\\\nrm -rf /"), (
+            "even run is a literal backslash + a real separator: rm must be seen"
+        )

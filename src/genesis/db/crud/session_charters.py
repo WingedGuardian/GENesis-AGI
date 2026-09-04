@@ -156,12 +156,23 @@ async def resolve_session_id(db: aiosqlite.Connection, session_id: str) -> str:
 
 
 async def set_mission(db: aiosqlite.Connection, session_id: str, mission: str | None) -> bool:
-    """Set/clear the living mission. Never touches origin columns."""
+    """Set/clear the living mission. Never touches origin columns.
+
+    Stamps ``mission_updated_at`` as well as ``updated_at``. The two are NOT
+    interchangeable and the difference is load-bearing: ``updated_at`` is a ROW
+    timestamp that ``set_pointers`` and the charter upsert also bump, so it
+    cannot answer "when was the mission set" — a pointer edit would make a stale
+    founding mission look freshly declared. The concurrent-session peer line
+    compares this column against the extraction job's own timestamp to decide
+    which topic is the more recent statement of what a session is doing.
+    """
     if mission is not None:
         mission = mission.strip()[:MAX_MISSION_CHARS] or None
+    now = _now_iso()
     cursor = await db.execute(
-        "UPDATE session_charters SET mission = ?, updated_at = ? WHERE session_id = ?",
-        (mission, _now_iso(), session_id),
+        "UPDATE session_charters SET mission = ?, updated_at = ?,"
+        " mission_updated_at = ? WHERE session_id = ?",
+        (mission, now, now, session_id),
     )
     await db.commit()
     return cursor.rowcount > 0
