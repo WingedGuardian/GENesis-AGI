@@ -182,6 +182,74 @@ class TestBuildSummary:
         assert s.response_text.endswith(tail), "the ENDING was dropped"
         assert s.response_text.startswith("H")
 
+    def test_a_multibyte_response_is_bounded_by_the_same_valve(self):
+        """The valve counts BYTES, and the unit is the point.
+
+        A character cap bounds nothing a model has to hold: 20,000 characters of
+        CJK is 60,000 UTF-8 bytes, and with a second independent character cap
+        on the request there was no combined bound at all. A BPE token is at
+        least one byte, so a byte valve is a proof about prompt size rather than
+        an estimate drawn from one alphabet.
+        """
+        from genesis.learning.triage.summarizer import _MAX_RESPONSE_TEXT
+
+        body = "漢" * _MAX_RESPONSE_TEXT  # inside a CHARACTER cap, 3x over a byte one
+        s = build_summary(_make_output(text=body), "s", "hi", "terminal")
+        assert len(body.encode()) > _MAX_RESPONSE_TEXT
+        assert len(s.response_text.encode()) <= _MAX_RESPONSE_TEXT + 200, (
+            "a multi-byte response passed the valve unbounded"
+        )
+        assert s.response_elided_chars > 0
+
+    def test_a_multibyte_request_is_bounded_too(self):
+        from genesis.learning.triage.summarizer import _MAX_USER_TEXT
+
+        body = "漢" * _MAX_USER_TEXT
+        s = build_summary(_make_output(), "s", body, "terminal")
+        assert len(s.user_text.encode()) <= _MAX_USER_TEXT + 200
+        assert s.user_text_elided_chars > 0
+
+    def test_a_multibyte_elision_stays_decodable_and_counts_honestly(self):
+        """Slicing the encoded form lands mid-codepoint. The partial bytes are
+        dropped, so the text stays valid — and the reported count is derived
+        from what SURVIVED rather than from the requested sizes, or the marker
+        would describe a different text than the one beside it."""
+        from genesis.learning.response_context import elision_marker
+
+        body = "漢" * 30_000
+        s = build_summary(_make_output(text=body), "s", "hi", "terminal")
+        s.response_text.encode("utf-8").decode("utf-8")  # raises if a codepoint split
+
+        marker = elision_marker(s.response_elided_chars)
+        assert marker in s.response_text, s.response_text[:200]
+        head, tail = s.response_text.split(f"\n\n{marker}\n\n")
+        # The exact identity the marker claims: what is shown plus what it says
+        # was removed accounts for the original, with nothing double-counted and
+        # nothing lost at the codepoint boundary.
+        assert len(head) + len(tail) + s.response_elided_chars == len(body)
+        assert body.startswith(head) and body.endswith(tail)
+        # And the kept halves are sized in BYTES — without this the identity
+        # above holds just as well under the old character slicing, so the test
+        # would pass while pinning nothing about the unit.
+        assert len(head.encode()) <= 12_000 and len(tail.encode()) <= 4_000
+        assert len(head) < 12_000, "head was sliced by characters, not bytes"
+
+    def test_ascii_behaviour_is_unchanged_by_the_byte_valve(self):
+        """The control: bytes == characters for ASCII, which is the
+        overwhelming majority of real traffic, so switching units must move
+        nothing for it."""
+        from genesis.learning.triage.summarizer import _MAX_RESPONSE_TEXT
+
+        at_valve = "E" * _MAX_RESPONSE_TEXT
+        assert (
+            build_summary(_make_output(text=at_valve), "s", "hi", "terminal").response_text
+            == at_valve
+        )
+        over = build_summary(
+            _make_output(text="E" * (_MAX_RESPONSE_TEXT + 1)), "s", "hi", "terminal"
+        )
+        assert over.response_elided_chars == 1 + _MAX_RESPONSE_TEXT - 12_000 - 4_000
+
     def test_tool_detection_tool_colon(self):
         out = _make_output(text="Tool: Read\nTool: Edit\nresult")
         s = build_summary(out, "s", "hi", "terminal")

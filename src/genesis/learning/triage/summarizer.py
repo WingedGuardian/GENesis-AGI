@@ -17,6 +17,17 @@ from genesis.learning.types import InteractionSummary
 # characters, the longest 5,924; `inbox/monitor.py` passes whole-file content
 # and `mail/monitor.py` a joined subject list, neither bounded by a messaging
 # limit. So this is a safety valve above real traffic, not a working limit.
+#
+# COUNTED IN BYTES, not characters, and that is the whole point of the unit.
+# A character cap bounds nothing a model cares about: 20,000 characters of CJK
+# or emoji is up to 80,000 UTF-8 bytes, and the two independent caps then had no
+# combined bound at all. A BPE token is at least one byte, so N bytes can never
+# be more than N tokens — a byte valve is a PROOF about the prompt's size rather
+# than an estimate from one alphabet. Both valves together therefore admit at
+# most 40,000 tokens of payload, against the 128k smallest context in the
+# graders' chains, leaving the instructions and calibration ample room.
+# For ASCII — the overwhelming majority of real traffic — bytes and characters
+# are the same number, so nothing about the common case changes.
 _MAX_USER_TEXT = 20_000
 
 # A SAFETY VALVE against a pathological payload, not a working limit. It has to
@@ -27,13 +38,16 @@ _MAX_USER_TEXT = 20_000
 # so on that channel this valve never opens. `build_summary` is also reached from
 # terminal/dashboard (`cc/conversation.py`), inbox and mail, whose responses are
 # NOT bounded by a messaging limit; those are the cases the elision path exists
-# for. 20k is roughly 5k tokens, which every chain model accepts (the smallest
-# context in the graders' chains is 128k).
+# for. In BYTES, for the reason given at `_MAX_USER_TEXT`: 20,000 bytes is at
+# most 20,000 tokens whatever alphabet the payload uses, where 20,000
+# CHARACTERS was only "roughly 5k tokens" for ASCII and unbounded otherwise.
 _MAX_RESPONSE_TEXT = 20_000
 
 # Kept for the elided case: the ending is the half a grader needs to judge
 # whether generation stopped early, so the tail is preserved and the MIDDLE is
-# dropped. Head is generous enough to carry the response's shape.
+# dropped. Head is generous enough to carry the response's shape. In BYTES, same
+# unit as the valves — mixing the two would let a multi-byte head overrun a
+# byte-counted valve.
 _ELIDE_HEAD = 12_000
 _ELIDE_TAIL = 4_000
 
@@ -91,13 +105,24 @@ def _fit(text: str, cap: int) -> tuple[str, int]:
     The COUNT is returned rather than left for a reader to recover from the
     marker. What this pipeline removed is a fact the pipeline holds; searching
     the returned text for it hands that decision to the text being graded.
+
+    MEASURED IN BYTES, REPORTED IN CHARACTERS, deliberately. The valve is a
+    bound on the prompt the model has to hold, and only bytes bound that (see
+    `_MAX_USER_TEXT`). The marker speaks to a grader reading prose, for whom
+    "characters" is the meaningful unit — and it must stay the unit the count
+    is computed in, or the marker reports a number that does not describe the
+    text beside it. Slicing on the encoded form can land mid-codepoint; the
+    partial bytes at that boundary are dropped rather than replaced, so the
+    fitted text is always valid and the reported count stays exact by being
+    derived from what SURVIVED, never from the requested sizes.
     """
-    if len(text) <= cap:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= cap:
         return text, 0
-    elided = len(text) - _ELIDE_HEAD - _ELIDE_TAIL
-    fitted = (
-        f"{text[:_ELIDE_HEAD]}\n\n{elision_marker(elided)}\n\n{text[-_ELIDE_TAIL:]}"
-    )
+    head = encoded[:_ELIDE_HEAD].decode("utf-8", "ignore")
+    tail = encoded[-_ELIDE_TAIL:].decode("utf-8", "ignore")
+    elided = len(text) - len(head) - len(tail)
+    fitted = f"{head}\n\n{elision_marker(elided)}\n\n{tail}"
     return fitted, elided
 
 

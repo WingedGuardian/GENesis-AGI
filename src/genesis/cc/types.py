@@ -508,7 +508,7 @@ class CCOutput:
     downgraded: bool = False
     via_proxy: bool = False
     # The roster model NAME selected at the chokepoint (genesis.cc.roster) — e.g.
-    # "claude" (native) or "glm-5.2". Ground truth for what we ROUTED to (set from
+    # "claude" (native) or a configured peer. Ground truth for what we ROUTED to (set from
     # apply_active), independent of the provider's self-reported model_used, which
     # may be a variant string or empty. Used for resume-endpoint persistence.
     roster_model: str = ""
