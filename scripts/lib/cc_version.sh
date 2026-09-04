@@ -174,7 +174,44 @@ _cc_ensure_updater_suppressed_inner() {
             # everything except the NEXT run, which then reports `failed`. The
             # exposure is narrow (file absent AND python3 missing) but the fix is
             # two lines of the same shell.
-            local _tmp_settings="${settings_file}.tmp.$$"
+            # A DANGLING SYMLINK reaches this branch, and must not be replaced.
+            #
+            # MEASURED: `[ -e ]` FOLLOWS the link, so a settings.json symlinked
+            # into a dotfiles checkout whose target does not exist yet tests as
+            # ABSENT — correct, there is nothing there. But `mv -f` then renames
+            # over the LINK ITSELF: the symlink disappears, the target is still
+            # missing, and this function reports `repaired`. The operator's
+            # dotfiles wiring is destroyed by a repair that claims success.
+            #
+            # So resolve the link and write to its TARGET. A plain redirect would
+            # also write through the link, but it gives up the atomic swap this
+            # branch deliberately has; renaming into the resolved path keeps both
+            # the atomicity and the operator's symlink.
+            local _write_to="$settings_file"
+            if [ -L "$settings_file" ]; then
+                local _link
+                _link="$(readlink "$settings_file" 2>/dev/null || true)"
+                if [ -z "$_link" ]; then
+                    umask "$_umask_prev"
+                    CC_SUPPRESSION_STATE=failed
+                    echo "  WARNING: cc_ensure_updater_suppressed: $settings_file is a" \
+                         "symlink whose target could not be read — leaving it alone" >&2
+                    return 1
+                fi
+                case "$_link" in
+                    /*) _write_to="$_link" ;;                             # absolute
+                    *)  _write_to="$(dirname "$settings_file")/$_link" ;; # relative to the LINK
+                esac
+                if ! mkdir -p "$(dirname "$_write_to")" 2>/dev/null; then
+                    umask "$_umask_prev"
+                    CC_SUPPRESSION_STATE=failed
+                    echo "  WARNING: cc_ensure_updater_suppressed: cannot create the directory" \
+                         "for $settings_file's symlink target ($_write_to) —" \
+                         "suppression NOT applied" >&2
+                    return 1
+                fi
+            fi
+            local _tmp_settings="${_write_to}.tmp.$$"
             if printf '%s\n' \
                 '{' \
                 '  "env": {' \
@@ -182,7 +219,7 @@ _cc_ensure_updater_suppressed_inner() {
                 '    "DISABLE_UPDATES": "1"' \
                 '  }' \
                 '}' > "$_tmp_settings" 2>/dev/null \
-                && mv -f "$_tmp_settings" "$settings_file" 2>/dev/null \
+                && mv -f "$_tmp_settings" "$_write_to" 2>/dev/null \
                 && grep -qF '"DISABLE_AUTOUPDATER": "1"' "$settings_file" 2>/dev/null \
                 && grep -qF '"DISABLE_UPDATES": "1"' "$settings_file" 2>/dev/null; then
                 # The greps are the post-write verification. This branch used to

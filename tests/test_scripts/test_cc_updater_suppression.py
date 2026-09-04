@@ -1208,6 +1208,52 @@ class TestVerifiedByConstruction:
         assert env["DISABLE_AUTOUPDATER"] == "1"
         assert env["DISABLE_UPDATES"] == "1"
 
+    def test_a_dangling_symlink_is_written_through_not_replaced(self, tmp_path: Path) -> None:
+        """A settings.json symlinked into a dotfiles checkout must survive.
+
+        MEASURED, and the reason this branch is reachable at all: ``[ -e ]``
+        FOLLOWS a symlink, so a link whose target does not exist yet tests as
+        ABSENT — correctly, there is nothing there. But ``mv -f`` then renames
+        over the LINK ITSELF:
+
+            ln -s ./missing target-link; mv -f tmp target-link
+              -> still a symlink? NO    target created? NO
+
+        so the operator's dotfiles wiring was destroyed by a repair that then
+        reported ``repaired``. The link must be resolved and its TARGET written.
+        """
+        bindir = self._bin_sans_python(tmp_path)
+        for tool in ("readlink", "ln"):
+            src = shutil.which(tool)
+            assert src, f"{tool} missing — this test would not exercise its branch"
+            if not (bindir / tool).exists():
+                (bindir / tool).symlink_to(src)
+
+        settings = _settings(tmp_path)
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        target = tmp_path / "home" / "dotfiles" / "claude-settings.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        settings.symlink_to(target)          # DANGLING: target does not exist
+        assert settings.is_symlink() and not target.exists()
+
+        r = _run(
+            tmp_path,
+            'cc_ensure_updater_suppressed || true; echo "STATE=${CC_SUPPRESSION_STATE:-unset}"',
+            path_dir=bindir,
+        )
+
+        assert "STATE=repaired" in r.stdout, (r.stdout, r.stderr)
+        assert settings.is_symlink(), (
+            "the symlink was replaced by a regular file — the operator's dotfiles "
+            "wiring is gone, and the function reported success"
+        )
+        assert target.exists(), "the symlink's target was never created"
+        env = json.loads(target.read_text())["env"]
+        assert env["DISABLE_AUTOUPDATER"] == "1"
+        assert env["DISABLE_UPDATES"] == "1"
+        # Reading back THROUGH the link is what proves the link still resolves.
+        assert json.loads(settings.read_text())["env"]["DISABLE_UPDATES"] == "1"
+
     def test_a_create_whose_write_did_not_land_reports_failed(self, tmp_path: Path) -> None:
         """Sabotaged mv: the rename 'succeeds' but the content never arrives.
 

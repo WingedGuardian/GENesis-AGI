@@ -1351,27 +1351,56 @@ fi
 # CREATED, which under sudo belongs to root and would otherwise be unwritable by
 # the operator's own CC.
 #
-# Skipped for a symlink: the reconciler follows the link and writes the real
-# target, so a blanket chown would reach into a dotfiles checkout and change
-# ownership there.
+# For a SYMLINK the link itself is never chowned — chown would follow it into a
+# dotfiles checkout and change ownership of files this script does not own.
+#
+# But skipping the symlink case ENTIRELY was wrong, and the failure it left is
+# the same one this block exists to prevent. When the link is DANGLING, the
+# reconciler CREATES the target, and under sudo that new file is root:root 0600
+# — unreadable by the operator's own CC. The `-L` guard then skipped the very
+# correction that case needs.
+#
+# So a symlink target IS chowned, under two conditions that keep it away from
+# anything this run did not create: the state must be `repaired` (this run
+# wrote), and the resolved target must live under the operator's own home. A
+# dotfiles checkout outside $HOME is still never touched.
 #
 # A FAILED chown is reported rather than swallowed — the failure mode is a
 # root-owned ~/.claude/settings.json that the operator's CC then cannot write,
 # which is worse than the drift this whole block exists to prevent, and silence
 # is how it would go unnoticed.
+# Resolve what actually needs the ownership fix: the file itself, or — when it
+# is a symlink — the target the reconciler just wrote through to.
+_chown_target="$_host_settings_file"
+if [ -L "$_host_settings_file" ]; then
+    _link="$(readlink "$_host_settings_file" 2>/dev/null || true)"
+    case "$_link" in
+        "")  _chown_target="" ;;                                        # unreadable link
+        /*)  _chown_target="$_link" ;;
+        *)   _chown_target="$(dirname "$_host_settings_file")/$_link" ;;
+    esac
+    # Only inside the operator's own home. A link into a dotfiles checkout
+    # elsewhere is left entirely alone, which is what the original guard was
+    # protecting and is still worth protecting.
+    case "$_chown_target" in
+        "$_host_home"/*) : ;;
+        *) _chown_target="" ;;
+    esac
+fi
+
 if [ "${CC_SUPPRESSION_STATE:-unverified}" = "repaired" ] &&
    [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] &&
-   [ ! -L "$_host_settings_file" ]; then
+   [ -n "$_chown_target" ] && [ -e "$_chown_target" ]; then
     # Owner ONLY — no trailing colon. MEASURED: `chown user:` resets the group
     # to the user's LOGIN group (a file at ubuntu:sudo became ubuntu:ubuntu),
     # which undoes the group preservation the reconciler's write path just
     # performed. Owner alone is what the failure mode needs: the operator's CC
     # must be able to write the file it owns.
-    if ! chown "$_host_user" "$_host_settings_file" 2>/dev/null; then
-        echo "  WARNING: could not chown $_host_settings_file to $_host_user —" \
+    if ! chown "$_host_user" "$_chown_target" 2>/dev/null; then
+        echo "  WARNING: could not chown $_chown_target to $_host_user —" \
              "it may be root-owned, which will stop the operator's Claude Code from"
         echo "           writing its own settings. Fix with:" \
-             "sudo chown $_host_user $_host_settings_file"
+             "sudo chown $_host_user $_chown_target"
     fi
 fi
 

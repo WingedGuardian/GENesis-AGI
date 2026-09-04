@@ -516,6 +516,27 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             "
             ok "Stopped Genesis services"
 
+            # Persistent= timers keep a stamp file under
+            # ~/.local/share/systemd/timers/. systemd.timer(5) says to clear it
+            # BEFORE the unit is uninstalled, or a reinstall inherits a stale
+            # "last run" and can immediately replay a run it should not.
+            #
+            # This is the SAME step the direct-container branch performs. It was
+            # added there and not here, which is the asymmetry worth naming: the
+            # later cleanup removes ~/.genesis but NOT the stamps under
+            # ~/.local/share/systemd, so a host-driven `--genesis-only` uninstall
+            # that keeps the container left them behind entirely.
+            if [ "$DRY_RUN" = true ]; then
+                echo "    [DRY RUN] Would clear persistent timer state inside the container"
+            else
+                container_exec "
+                    systemctl --user clean --what=state \
+                        genesis-cc-settings-align.timer genesis-cc-align.timer \
+                        genesis-disk-hygiene.timer genesis-watchdog.timer \
+                        genesis-cc-tmp-align.timer 2>/dev/null || true
+                "
+            fi
+
             # Wait for port 5000 to close inside container
             for _i in $(seq 1 10); do
                 if ! incus exec "$CONTAINER_NAME" -- ss -tlnp 2>/dev/null | grep -q ':5000 '; then break; fi
