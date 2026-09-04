@@ -190,6 +190,65 @@ string ends in `\n`). The acceptance replay is what exposed it. A matcher that
 finds nothing is indistinguishable from a matcher that looks at nothing —
 only replaying a known-positive tells them apart.
 
+### Select, don't amputate — truncation is the absence of a decision
+
+**Scope first, because bounding is often correct.** A bounded PREVIEW whose full
+value stays retrievable from its store is a selection with a pointer, not an
+amputation — `memory/proactive.py:418` renders `principle[:200]` into the
+injection block on purpose, and the whole record is one `memory_expand` away.
+Bounding is likewise correct against a hard external budget (a hook stdout cap, a
+DB column, a context window). This section is about the other case: a value that
+is the ONLY copy, where cutting it destroys the information for good.
+
+**There, do not truncate.** Not strings, not lists, not context, not output.
+Reaching for a character cap is a signal that a question was skipped, not
+answered. Omitting is legitimate — it is a judgement about relevance. Truncating
+is not: it is what happens when that judgement was never made, so the value gets
+cut at a point that has nothing to do with meaning. A truncated value is
+frequently worse than either alternative, because it still LOOKS complete, so
+nobody checks it — at which point you may as well not have passed it at all.
+
+Before bounding anything, answer: what is this value FOR, who reads it, why does
+it need budgeting at all, and what actually breaks if it is unbounded? Solve
+THAT. Usually the answer is "select less, whole" rather than "cut", and often the
+bound turns out not to be load-bearing.
+
+Three rules when a bound really is needed:
+
+- **Bound by MEANING, not by one blanket number.** A closed set is validated
+  against that set — a value outside it is INVALID, not "too long". A timestamp
+  is a shape; half a timestamp is not a shorter timestamp. Only genuinely free
+  text gets a length bound. A blanket cap turns 100,000 characters of foreign
+  data into 300 characters of foreign data and calls it bounded.
+- **Derive the number, and record how.** Measure the real population and report
+  `k/N` per the Acceptance Bar — then name the corpus, the query and the date, so
+  the next reader can re-derive it rather than take it on faith. Re-derivable
+  example: provider error prose lands in `activity_log.error_message` (written by
+  `routing/router.py`, already capped there at 1024), so
+  `SELECT SUM(LENGTH(error_message) > 300), COUNT(*) FROM activity_log WHERE
+  error_message IS NOT NULL AND error_message != '';` On one install on
+  2026-09-03 that gave **270/318 (84.9%)** cut by a 300-char cap — and since JSON
+  error bodies put the machine-readable cause last, the cap discards exactly the
+  part worth keeping. Your install will differ; the denominator is itself already
+  truncated at 1024, so treat it as a floor.
+- **Omit explicitly, with a constant-bounded marker** (`<omitted: 104,823
+  chars>`), never a mid-value cut. An honest gap beats a plausible-looking
+  fragment. Already the house pattern: repo-pulse's loud `limit_hit`
+  (`session_awareness/repo_pulse_gh.py:170`), and the bound-plus-flag-plus-stated
+  -consequence model in `memory/integrity_repair.py:27` ("Truncation asymmetry").
+
+One trap worth naming: a cap can manufacture a correctness bug in the data it was
+added to protect. Bounding an IDENTIFIER by truncation merges two distinct
+identities onto one key, and downstream code then attributes one subject's state
+to another.
+
+**A real need to truncate is a CONVERSATION to have, not a magic number to pick
+alone.** If you catch yourself choosing 300 or 200 or 1000, stop and raise it —
+and if there is nobody to raise it with (an unattended background session), the
+default is: emit the value WHOLE and record a follow-up naming the value, the
+population you could not measure, and the decision owed. Never pick the number
+just because no one was there to stop you.
+
 ### A blocked compound command loses EVERYTHING in it
 
 A PreToolUse block kills the **whole** Bash call, not the offending part — so a
