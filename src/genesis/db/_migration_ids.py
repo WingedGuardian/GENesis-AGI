@@ -55,11 +55,20 @@ DATA = "data migration"
 #: ``[0-9]`` and not ``\d``: ``\d`` also matches non-ASCII decimal digits, so
 #: ``\d{14}`` accepts full-width and Arabic-Indic numerals whose codepoints sort
 #: nowhere near the ASCII ids the ordering invariant is stated over.
-SCHEMA_MIGRATION_PATTERN = re.compile(r"^([0-9]{4}|[0-9]{14})_[A-Za-z0-9_]+\.py$")
+#:
+#: The ID is ASCII; the DESCRIPTION after the underscore is ``\w+``, and the
+#: asymmetry is the whole point. Only the id participates in ordering and
+#: uniqueness, so only the id needs a codepoint guarantee. Restricting the
+#: description too was collateral, and it broke names that already work:
+#: ``0094_café.py`` and ``d0012_修復.py`` import fine today (a Python module name
+#: may be any identifier), and a downstream fork carrying one would have had
+#: discovery start raising — aborting database init on the schema side, and
+#: skipping the whole batch on the data side — over a naming preference of ours.
+SCHEMA_MIGRATION_PATTERN = re.compile(r"^([0-9]{4}|[0-9]{14})_\w+\.py$")
 
 #: Data migrations: the same, ``d``-prefixed. The prefix keeps the two
 #: namespaces disjoint, so they can never cross-collide in one claims map.
-DATA_MIGRATION_PATTERN = re.compile(r"^(d(?:[0-9]{4}|[0-9]{14}))_[A-Za-z0-9_]+\.py$")
+DATA_MIGRATION_PATTERN = re.compile(r"^(d(?:[0-9]{4}|[0-9]{14}))_\w+\.py$")
 
 MIGRATION_PATTERNS: dict[str, re.Pattern[str]] = {
     SCHEMA: SCHEMA_MIGRATION_PATTERN,

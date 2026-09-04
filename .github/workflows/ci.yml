@@ -328,8 +328,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Check migration ids (uniqueness + legacy freeze)
-        run: python3 scripts/check_migration_prefixes.py
+        with:
+          # The immutability rule asks git what was ALREADY MERGED — the one
+          # question a list in the repo cannot answer for an unbounded id space.
+          # A shallow clone has no base commit to compare against, and the guard
+          # treats an unreadable --base as a violation rather than a pass.
+          fetch-depth: 0
+      - name: Check migration ids (uniqueness + immutability)
+        env:
+          # Passed via env, not interpolated into `run` — same handling the
+          # leak-detector job uses for PR_BASE_SHA.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # On a push build there is no PR base; fall back to the default branch,
+          # which the full-depth fetch above has. `--base` is passed only when a
+          # ref was resolved, so the guard never fails a build for a base that
+          # does not exist in that context.
+          base="${PR_BASE_SHA:-}"
+          if [[ -z "$base" ]] && git rev-parse --verify -q origin/main >/dev/null; then
+            base="origin/main"
+          fi
+          if [[ -n "$base" ]]; then
+            python3 scripts/check_migration_prefixes.py --base "$base"
+          else
+            python3 scripts/check_migration_prefixes.py
+          fi
 
   external-io-check:
     # WS5 regression guard: no NEW ungated autonomous external-world egress

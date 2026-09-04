@@ -384,3 +384,150 @@ def test_ci_command_line_exits_NONZERO_on_a_violation(tmp_path):
     proc = _run_as_ci(repo)
     assert proc.returncode == 1, f"exit {proc.returncode}\n{proc.stdout}\n{proc.stderr}"
     assert "0094" in proc.stdout and "frozen" in proc.stdout
+
+
+# --- Immutability against what is ALREADY MERGED (Codex P1, PR #1678) -------
+# FROZEN_LEGACY_FILES is a hand-maintained snapshot of one closed set. It cannot
+# grow to cover timestamp migrations — they are unbounded — so the moment the
+# first one merges, a later PR can delete it or rename it to another perfectly
+# valid timestamp and every other rule still reports CLEAN. "Already merged" is
+# a fact only git holds, so the guard asks git.
+
+
+def _git(repo: Path, *args: str) -> str:
+    out = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+    return out.stdout
+
+
+def _committed_repo(tmp_path: Path, *, extra_schema: list[str] | None = None) -> tuple[Path, str]:
+    """A fake repo whose CURRENT tree is committed. Returns (repo, base_sha)."""
+    schema, data = _full_legacy(extra_schema or [])
+    repo = _fake_repo(schema, data, tmp_path=tmp_path)
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    return repo, _git(repo, "rev-parse", "HEAD").strip()
+
+
+# A real, well-formed timestamp id — the namespace the enumerated list can
+# never cover, which is the whole point of the finding.
+_MERGED_TS = "20260101000000_add_a_column.py"
+
+
+def test_deleting_an_already_merged_timestamp_migration_is_caught(tmp_path):
+    """THE acceptance replay, and it shows the hole and the fix in one run.
+
+    Nothing in the enumerated frozen set mentions this file — the set is closed
+    and covers only legacy ids — so EVERY other rule reports clean while existing
+    installs keep its id in their ledger and skip the replacement forever. The
+    first assertion pins that: without a base there is nothing to notice with,
+    which is the state the finding describes rather than a bug in this test. The
+    second is what the base buys.
+    """
+    repo, base = _committed_repo(tmp_path, extra_schema=[_MERGED_TS])
+    (repo / "src/genesis/db/migrations" / _MERGED_TS).unlink()
+
+    assert _mod.check(repo) == [], (
+        "the deletion is invisible without a base — if this ever fails, some "
+        "other rule now covers it and this test is no longer measuring the base"
+    )
+    violations = _mod.check(repo, base_ref=base)
+    assert any(_MERGED_TS in v and "already-merged" in v for v in violations), violations
+
+
+def test_renaming_an_already_merged_timestamp_migration_is_caught(tmp_path):
+    """A rename is a delete plus an add, so it needs no rename detection to be
+    caught — and it is the more dangerous shape, because the id set still has
+    the same size and the body still exists to read."""
+    repo, base = _committed_repo(tmp_path, extra_schema=[_MERGED_TS])
+    d = repo / "src/genesis/db/migrations"
+    (d / _MERGED_TS).rename(d / "20260101000000_add_a_column_v2.py")
+
+    violations = _mod.check(repo, base_ref=base)
+    assert any(_MERGED_TS in v for v in violations), violations
+
+
+def test_an_unchanged_tree_is_clean_against_its_own_base(tmp_path):
+    """CONTROL. The rule must not fire on the ordinary case, or it fails every
+    PR and gets switched off."""
+    repo, base = _committed_repo(tmp_path, extra_schema=[_MERGED_TS])
+    assert _mod.check(repo, base_ref=base) == []
+
+
+def test_adding_a_new_timestamp_migration_is_clean(tmp_path):
+    """CONTROL, and the one that matters most: the rule freezes what exists, it
+    does not freeze the directory."""
+    repo, base = _committed_repo(tmp_path, extra_schema=[_MERGED_TS])
+    (repo / "src/genesis/db/migrations" / "20260202000000_new_work.py").write_text("")
+    assert _mod.check(repo, base_ref=base) == []
+
+
+def test_a_malformed_file_on_the_base_may_be_removed(tmp_path):
+    """Deleting a file that never RAN is a fix, not a regression — a 13-digit id
+    is discovered by nothing, so no install has it in a ledger. Filtering the
+    base list through the same classify() keeps the rule from defending files it
+    should be reporting."""
+    repo, base = _committed_repo(tmp_path)
+    d = repo / "src/genesis/db/migrations"
+    (d / "2026010100000_short.py").write_text("")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add a malformed file")
+    base2 = _git(repo, "rev-parse", "HEAD").strip()
+    (d / "2026010100000_short.py").unlink()
+
+    assert _mod.check(repo, base_ref=base2) == []
+
+
+def test_an_unreadable_explicit_base_is_a_violation_not_a_pass(tmp_path):
+    """A guard TOLD to compare, that then compares nothing, is the silent pass
+    this whole script exists to remove — a shallow CI checkout would produce
+    exactly this and read as clean."""
+    repo, _ = _committed_repo(tmp_path)
+    violations = _mod.check(repo, base_ref="no-such-ref-ffffffff")
+    assert violations and all("could not be read" in v for v in violations), violations
+
+
+def test_no_base_at_all_degrades_instead_of_failing(tmp_path):
+    """CONTROL on the fail direction. A fork running this from a tarball has no
+    base to compare against and must not be failed for it — the rule is skipped,
+    every other rule still applies."""
+    schema, data = _full_legacy()
+    repo = _fake_repo(schema, data, tmp_path=tmp_path)  # never git-init'ed
+    assert _mod.check(repo) == []
+
+
+# --- The ID is ASCII; the DESCRIPTION is not (Codex P2, PR #1678) -----------
+
+
+@pytest.mark.parametrize("name", ["0094_café.py", "20260101000000_修復.py"])
+def test_a_unicode_description_is_a_legal_migration(tmp_path, name):
+    """Only the id participates in ordering and uniqueness, so only the id needs
+    a codepoint guarantee. Restricting the description too was collateral, and
+    it broke names that import fine today: a fork carrying one would have had
+    discovery start RAISING — aborting database init on the schema side — over a
+    naming preference of ours.
+
+    `0094_café.py` is a hand-allocated legacy id, so the guard still refuses it
+    as a POLICY violation; what must not happen is MALFORMED, which means "no
+    runner will ever discover this".
+    """
+    assert _IDS.classify(_IDS.SCHEMA, name) != _IDS.MALFORMED
+
+
+def test_a_unicode_digit_in_the_ID_is_still_malformed(tmp_path):
+    """The control on the other side, and the reason the two halves differ: a
+    full-width digit sorts nowhere near the ASCII ids the ordering invariant is
+    stated over, so it must stay a violation."""
+    assert _IDS.classify(_IDS.SCHEMA, "２０２６０１０１０００００_x.py") == _IDS.MALFORMED

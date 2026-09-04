@@ -11,6 +11,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Two branches can no longer pick the same database-migration number.** Each
+  new migration is now named by the UTC time it was written rather than by the
+  next free number, so nobody has to check what anyone else took — and two
+  people working at once cannot both claim the same one. The numbers already in
+  use are frozen exactly as they are; an existing install is unaffected and runs
+  nothing again. A migration that has already shipped can no longer be renamed
+  or removed either: installs that already ran it would never run its
+  replacement, so the two would drift apart with nothing to notice. And a
+  migration whose name is subtly wrong — a digit too few, filed in the wrong
+  folder — is now reported instead of being quietly skipped, which is what used
+  to happen: the file simply never ran, and the change that needed it shipped
+  without it.
+
 - **The cold-marketing campaign no longer re-pitches the same person.** Once a
   marketing pitch is delivered to a prospect, that prospect is marked contacted and
   drops out of the campaign's target list — previously nothing recorded the contact,
