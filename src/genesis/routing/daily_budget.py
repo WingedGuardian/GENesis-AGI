@@ -68,7 +68,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_STATE_FILE = Path.home() / ".genesis" / "routing_budget_state.json"
+#: Statuses that must NOT spend the ledger: the vendor either refused before
+#: serving (429) or was never known to have served at all (408, which
+#: `litellm_delegate` returns for the local deadline as well as a provider
+#: timeout). Both would otherwise let a failing network exhaust a free tier.
+_NOT_USAGE_STATUSES = frozenset({408, 429})
+
+#: Resolved at CALL time, never frozen at import. `genesis_home()` is this
+#: repo's one answer to "where does runtime state live", and it honours
+#: GENESIS_HOME — which exists precisely so two installs can share a Unix
+#: account. A module-level `Path.home() / ".genesis"` ignores it, so both
+#: installs would read and overwrite ONE ledger: each would see the other's
+#: requests against its own limits and deselect providers it had barely used
+#: (Codex P2, PR #1624). Import-time is also too early to be correct — a test
+#: conftest or a CLI that sets GENESIS_HOME after import gets the stale path.
+_STATE_FILENAME = "routing_budget_state.json"
+
+
+def _state_file() -> Path:
+    from genesis.env import genesis_home
+
+    return genesis_home() / _STATE_FILENAME
 
 
 class DailyBudgetLedger:
@@ -93,7 +113,7 @@ class DailyBudgetLedger:
         clock: Callable[[], datetime] | None = None,
         persist: bool = True,
     ) -> None:
-        self._path = state_path or _STATE_FILE
+        self._path = state_path or _state_file()
         self._clock = clock or (lambda: datetime.now(UTC))
         self._persist = persist
         # name -> {"day": "YYYY-MM-DD", "requests": int, "tokens": int}
@@ -134,8 +154,21 @@ class DailyBudgetLedger:
         if daily_budget_disabled() or not _limited(cfg):
             return False
         # Undercount-biased counting rule — see module docstring.
+        #
+        # 429 was the only exclusion, and 408 belongs beside it for the same
+        # reason: `litellm_delegate` returns 408 for BOTH its timeout paths —
+        # including the LOCAL deadline, where Genesis gave up and the provider
+        # may never have been asked at all. Counting those spends a vendor's
+        # daily allowance on requests it did not serve, so a flaky network
+        # deselects an otherwise healthy free provider for the rest of the UTC
+        # day — the opposite of what a budget ledger is for, and undetectable
+        # because the provider simply stops being chosen (Codex P2, PR #1624).
+        #
+        # Stated as a SET of not-usage statuses rather than `!= 429`, because
+        # the next status that means "the vendor never served this" will be
+        # added here rather than discovered the same way.
         count_request = result.success or (
-            result.status_code is not None and result.status_code != 429
+            result.status_code is not None and result.status_code not in _NOT_USAGE_STATUSES
         )
         tokens = (result.input_tokens + result.output_tokens) if result.success else 0
         if not count_request and tokens == 0:

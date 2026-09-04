@@ -220,6 +220,56 @@ class TestRouterIntegration:
         assert [c["provider"] for c in delegate.calls] == ["second"]
 
     @pytest.mark.asyncio
+    async def test_the_budget_is_rechecked_after_the_rate_gate(self, tmp_path):
+        """The first check happens BEFORE a sleep that can last seconds.
+
+        `ProviderRateGate.acquire()` queues concurrent callers, so several can
+        pass a not-yet-exhausted budget, wait, and each resume into the delegate
+        after an earlier one has already crossed the limit — the classic
+        check-then-act race, with a real sleep in the middle (Codex P2,
+        PR #1624). The crossing is simulated INSIDE the gate here, which is
+        exactly where a concurrent caller's `record` would land.
+
+        The first check is still worth having: it avoids sleeping for a provider
+        we will not call. It is simply not the last word.
+        """
+        first = _cfg("first", rpd=1)
+        second = _cfg("second")
+        router, ledger, delegate = self._stack(
+            tmp_path, providers={"first": first, "second": second},
+            chain=["first", "second"],
+        )
+        real_acquire = router._rate_gates.acquire
+
+        async def _acquire_then_someone_else_spends_it(name, *a, **kw):
+            out = await real_acquire(name, *a, **kw)
+            if name == "first":
+                ledger.record(first, _ok())  # a concurrent caller crosses it
+            return out
+
+        router._rate_gates.acquire = _acquire_then_someone_else_spends_it
+        result = await router.route_call("site", [{"role": "user", "content": "x"}])
+
+        assert result.success is True
+        assert [c["provider"] for c in delegate.calls] == ["second"], (
+            "the call went to a provider whose budget was spent while it waited "
+            "in the rate gate — the pre-gate check was treated as final"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_provider_within_budget_still_passes_the_recheck(self, tmp_path):
+        """CONTROL. The recheck must not become a second way to reject a healthy
+        provider — without this, deleting the `continue` body would pass the test
+        above for the wrong reason."""
+        first = _cfg("first", rpd=10)
+        router, ledger, delegate = self._stack(
+            tmp_path, providers={"first": first}, chain=["first"],
+        )
+        result = await router.route_call("site", [{"role": "user", "content": "x"}])
+        assert result.success is True
+        assert [c["provider"] for c in delegate.calls] == ["first"]
+
+    @pytest.mark.asyncio
     async def test_route_records_the_visit(self, tmp_path):
         first = _cfg("first", rpd=10, tpd=1000)
         router, ledger, delegate = self._stack(
@@ -309,3 +359,76 @@ class TestParseValidationAndPeek:
             assert ledger.status(cfg)["requests_used"] == 0
         assert ledger._counters == {}
         assert not (tmp_path / "budget.json").exists()
+
+
+# --- the ledger's authority: counted right, stored right, read at the right
+# --- time (Codex P2 x4, PR #1624)
+
+
+class TestATimeoutDoesNotSpendTheBudget:
+    """`litellm_delegate` returns 408 for BOTH its timeout paths, including the
+    LOCAL deadline where Genesis gave up and the provider may never have been
+    asked. Counting those spends a vendor's daily allowance on requests it did
+    not serve, so a flaky network deselects a healthy free provider for the rest
+    of the UTC day — and undetectably, because the provider just stops being
+    chosen."""
+
+    def test_a_timeout_is_not_counted(self, tmp_path):
+        ledger, _ = _ledger(tmp_path)
+        cfg = _cfg(rpd=2)
+        for _ in range(5):
+            ledger.record(cfg, _fail(408))
+        assert not ledger.exhausted(cfg), "timeouts exhausted a 2-request budget"
+
+    def test_a_rate_limit_is_still_not_counted(self, tmp_path):
+        """CONTROL on the pre-existing exclusion — 408 was added beside 429, not
+        instead of it."""
+        ledger, _ = _ledger(tmp_path)
+        cfg = _cfg(rpd=2)
+        for _ in range(5):
+            ledger.record(cfg, _fail(429))
+        assert not ledger.exhausted(cfg)
+
+    def test_a_real_server_error_IS_counted(self, tmp_path):
+        """CONTROL on the other side, and it is what keeps the exclusion honest:
+        a 500 means the vendor took the request. Widening the exclusion set until
+        nothing counts would pass both tests above and make the ledger inert."""
+        ledger, _ = _ledger(tmp_path)
+        cfg = _cfg(rpd=2)
+        for _ in range(2):
+            ledger.record(cfg, _fail(500))
+        assert ledger.exhausted(cfg)
+
+
+class TestTheLedgerLivesUnderGenesisHome:
+    """GENESIS_HOME exists precisely so two installs can share a Unix account.
+    An import-time `Path.home() / ".genesis"` ignores it, so both would read and
+    overwrite ONE ledger — each seeing the other's requests against its own
+    limits and deselecting providers it had barely used."""
+
+    def test_the_path_follows_genesis_home(self, tmp_path, monkeypatch):
+        import genesis.routing.daily_budget as mod
+
+        monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "install-a"))
+        assert mod._state_file().parent == tmp_path / "install-a"
+        monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "install-b"))
+        assert mod._state_file().parent == tmp_path / "install-b", (
+            "the path was frozen — a second install shares the first's ledger"
+        )
+
+    def test_two_installs_do_not_share_a_ledger(self, tmp_path, monkeypatch):
+        """The consequence, end to end: exhausting install A must leave install
+        B untouched."""
+        import genesis.routing.daily_budget as mod
+
+        cfg = _cfg(rpd=1)
+        monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "a"))
+        (tmp_path / "a").mkdir()
+        a = DailyBudgetLedger(state_path=mod._state_file())
+        a.record(cfg, _ok())
+        assert a.exhausted(cfg)
+
+        monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "b"))
+        (tmp_path / "b").mkdir()
+        b = DailyBudgetLedger(state_path=mod._state_file())
+        assert not b.exhausted(cfg), "install B inherited install A's spend"

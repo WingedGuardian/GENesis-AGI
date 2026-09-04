@@ -320,6 +320,20 @@ class Router:
             # Rate gate — pace requests per provider RPM limit
             await self._rate_gates.acquire(provider_name)
 
+            # RECHECK after the gate. The check above happened BEFORE a sleep
+            # that can last seconds, and `acquire` queues concurrent callers —
+            # so several can pass a not-yet-exhausted budget, queue, and each
+            # resume into the delegate after an earlier one has already crossed
+            # the limit. The first check is still worth having (it avoids
+            # sleeping for a provider we will not call); it is simply not the
+            # last word, because its answer can change while we wait
+            # (Codex P2, PR #1624).
+            if self._daily_budget is not None and self._daily_budget.exhausted(
+                provider_cfg
+            ):
+                failed_providers.append(provider_name)
+                continue
+
             # Try with retry (timed for activity tracking)
             t0 = time.monotonic()
             result = await self._try_with_retry(

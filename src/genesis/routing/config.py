@@ -240,6 +240,17 @@ def _parse_daily_limit(provider: str, key: str, value) -> int | None:
     """
     if value is None:
         return None
+    # `int(value)` is NOT integer validation, and the docstring above promised
+    # it was. YAML gives `1.9` as a float and `true` as a bool (a subclass of
+    # int), and both survive: 1.9 truncates to 1 and True IS 1, so a typo in a
+    # user overlay silently becomes a ONE-REQUEST daily limit that deselects the
+    # provider after a single call, with no correction until the UTC day rolls
+    # over (Codex P2, PR #1624). Booleans are rejected before the int check
+    # because `isinstance(True, int)` is True — testing the type after coercion
+    # would let them through.
+    if isinstance(value, bool) or not isinstance(value, int | str):
+        msg = f"provider '{provider}': {key} must be an integer, got {value!r}"
+        raise ValueError(msg)
     try:
         parsed = int(value)
     except (TypeError, ValueError):

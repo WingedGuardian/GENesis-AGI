@@ -728,3 +728,46 @@ def test_detect_mislabeled_free_openrouter_flags_paid_slug_marked_free():
     # (substring checks collide: "or-paid" is inside "or-paid-as-free").
     flagged_names = {f.split(":", 1)[0] for f in flagged}
     assert flagged_names == {"or-paid-as-free", "or-curated-bad"}, flagged
+
+
+class TestDailyLimitValuesAreRejectedNotCoerced:
+    """`int(value)` is not integer validation, and the parser's docstring said it
+    was. YAML gives `1.9` as a float and `true` as a bool, and both survive it:
+    1.9 truncates to 1, and `True` IS 1. So a typo in a user overlay silently
+    becomes a ONE-REQUEST daily limit that deselects the provider after a single
+    call, with no correction until the UTC day rolls over (Codex P2, PR #1624).
+
+    Booleans matter twice over: `isinstance(True, int)` is True, so a type check
+    placed AFTER coercion would let them through.
+    """
+
+    @staticmethod
+    def _yaml(value: str) -> str:
+        return f"""
+providers:
+  p:
+    type: groq
+    model: m
+    free: true
+    rpd_limit: {value}
+call_sites:
+  s:
+    chain: [p]
+"""
+
+    @pytest.mark.parametrize("bad", ["1.9", "0.5", "true", "false", '"abc"', "[1]"])
+    def test_a_non_integer_limit_is_refused(self, bad):
+        with pytest.raises(ValueError, match="must be an integer|must be positive"):
+            load_config_from_string(self._yaml(bad))
+
+    @pytest.mark.parametrize("good", ["1", "1000"])
+    def test_an_integer_limit_still_loads(self, good):
+        """CONTROL: rejecting more must not reject the valid shape — and a
+        quoted integer string stays acceptable, which is why the check admits
+        `str` rather than demanding `int`."""
+        cfg = load_config_from_string(self._yaml(good))
+        assert cfg.providers["p"].rpd_limit == int(good)
+
+    def test_a_quoted_integer_string_is_accepted(self):
+        cfg = load_config_from_string(self._yaml('"250"'))
+        assert cfg.providers["p"].rpd_limit == 250
