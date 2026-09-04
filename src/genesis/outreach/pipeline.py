@@ -271,13 +271,22 @@ class OutreachPipeline:
 
     async def submit_raw(
         self, text: str, request: OutreachRequest,
-        *, reply_markup: object | None = None,
+        *, reply_markup: object | None = None, best_effort: bool = False,
     ) -> OutreachResult:
         """Deliver pre-formatted text. Skips governance and LLM drafter.
 
         For urgent infrastructure alerts where speed matters more than prose.
         Still applies dedup to prevent alert spam (e.g. sentinel approvals).
         ``reply_markup`` is forwarded to the adapter for inline keyboard buttons.
+
+        ``best_effort=True`` makes delivery fire-and-forget: a missing adapter/
+        recipient or a send failure returns a non-DELIVERED result WITHOUT
+        deferring to the recovery queue (no retries, no delivery-exhausted
+        observation). For notifications whose source data is already durably
+        recorded elsewhere, so a transient miss is acceptable — e.g. the
+        marketing reply-ping, where the reply lives in outreach_history/
+        email_threads regardless. Prevents an email-only install or a Telegram
+        outage from turning each such ping into hours of retry work + health noise.
         """
         outreach_id = str(uuid.uuid4())
 
@@ -303,7 +312,7 @@ class OutreachPipeline:
         format_target = _CHANNEL_FORMAT.get(channel, FormatTarget.GENERIC)
         formatted = self._formatter.format(text, format_target)
         return await self._deliver(outreach_id, channel, formatted, request, None,
-                                   reply_markup=reply_markup)
+                                   reply_markup=reply_markup, best_effort=best_effort)
 
     async def submit_urgent(self, request: OutreachRequest) -> OutreachResult:
         outreach_id = str(uuid.uuid4())
@@ -499,6 +508,7 @@ class OutreachPipeline:
         *,
         reply_markup: object | None = None,
         gate_cleared: bool = False,
+        best_effort: bool = False,
     ) -> OutreachResult:
         adapter = self._channels.get(channel)
         recipient = (
@@ -538,11 +548,16 @@ class OutreachPipeline:
                 )
 
         if not adapter or not recipient:
-            logger.warning("No adapter/recipient for channel %s — deferring", channel)
-            await self._defer(
-                outreach_id, channel, formatted.text, request,
-                f"No adapter or recipient for {channel}",
-            )
+            if best_effort:
+                logger.warning(
+                    "No adapter/recipient for channel %s — dropping (best-effort)", channel,
+                )
+            else:
+                logger.warning("No adapter/recipient for channel %s — deferring", channel)
+                await self._defer(
+                    outreach_id, channel, formatted.text, request,
+                    f"No adapter or recipient for {channel}",
+                )
             return OutreachResult(
                 outreach_id=outreach_id,
                 status=OutreachStatus.FAILED,
@@ -686,11 +701,13 @@ class OutreachPipeline:
                     logger.warning("DM copy failed for 'both' routing", exc_info=True)
         except Exception as exc:
             logger.error("Delivery failed on %s: %s", channel, exc, exc_info=True)
-            if not gate_cleared:
+            if not gate_cleared and not best_effort:
                 # Gate-cleared (resume) sends are retried by the WS-8 email-gate
                 # drain, NOT the deferred-work queue: deferring here would route
                 # the retry back through _deliver and re-gate it. The drain owns
                 # resume retries (it leaves the hold 'held' on failure).
+                # best_effort sends (e.g. the marketing reply-ping) intentionally
+                # drop on failure — no retry, no delivery-exhausted observation.
                 await self._defer(outreach_id, channel, formatted.text, request, str(exc))
             return OutreachResult(
                 outreach_id=outreach_id,
@@ -765,6 +782,33 @@ class OutreachPipeline:
                 await self._record_autonomous_send(
                     request, gate_cell, recipient, outreach_id, now,
                 )
+                # LOOP-FIX: autonomous (GRANTED-cell) delivery advances a matching
+                # curated prospect active → contacted (a no-op for a non-prospect
+                # recipient) so the campaign's list_active stops re-pitching it. The
+                # HELD → owner-approved path stamps in the email-gate drain; this is
+                # the GRANTED-cell path, which delivers INLINE here and never touches
+                # that drain — without this the loop-fix would silently regress once
+                # the cell graduates to autonomous. Same active-guarded CRUD.
+                #
+                # Wrapped best-effort (uniform with the ledger/shadow hooks above):
+                # this runs AFTER the irreversible adapter.send, so a transient DB/WAL
+                # error must NOT raise out of _deliver — that would strand the thread
+                # registration below (reply-tracking lost) and surface a post-send
+                # exception for an already-delivered message (re-attempt → dup risk).
+                # Unlike the drain-branch stamps (whose CronTrigger re-run + held-state
+                # owns retry, so fail-loud is correct there), this inline path has no
+                # retry owner; a logged miss is strictly safer than a post-send raise.
+                # A missed stamp here degrades to at most one re-pitch, not a re-send.
+                try:
+                    from genesis.db.crud import marketing_prospects as _mp
+
+                    await _mp.mark_contacted_by_email(self._db, recipient, contacted_at=now)
+                except Exception:  # noqa: BLE001 — stamp is best-effort post-send; never break the send
+                    logger.warning(
+                        "granted-cell prospect contact-stamp failed (post-send); "
+                        "list_active may re-pitch until next stamp",
+                        exc_info=True,
+                    )
 
         # Auto-register email threads for reply tracking
         if channel == "email" and self._thread_tracker is not None:

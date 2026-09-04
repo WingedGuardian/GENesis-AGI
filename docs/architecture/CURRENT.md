@@ -143,7 +143,18 @@ Easy-to-forget mechanisms:
   rediscovers historical fuzzy pairs. Settings lever `entity_adjudication`
   (off/propose_only/live) + `GENESIS_ENTITY_ADJUDICATION_DISABLED`. Distinct from
   `memory/entity_resolution.py`, which is near-duplicate memory-PAIR dedup.
-  Bitemporal timestamps are canonicalized at the write gate
+  **Human-approval apply gate** (`entity_adjudication_approve`/`_apply`/`_reject`
+  MCP tools + `approved_at`): a `proposed_merge` applies only after a human
+  approves. Apply runs per-row on an owned `get_raw_db()` `BEGIN IMMEDIATE`
+  transaction — re-checks identity/direction/norm staleness inside the lock,
+  atomically claims (`proposed_merge`→`merge`) so concurrent appliers can't
+  double-merge, and marks stale *conditionally* (only while still
+  `proposed_merge`) so a losing applier can't clobber an applied merge or a human
+  `distinct`. Approval is invalidated at the write boundary when a re-adjudication
+  changes the approved direction/identity/norms (`record_verdict`), and the three
+  write tools refuse in a dispatched/unsupervised session
+  (`is_dispatched_session_env`) so no autonomous path can self-approve an
+  irreversible merge. Bitemporal timestamps are canonicalized at the write gate
   (`db/timeutil.canonical_iso`, migration 0050).
 
 **Consolidation (dream cycle)** — `memory/dream_cycle.py` (~1480 LOC):
@@ -494,7 +505,7 @@ gated — that contract is one-directional.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 84c7259d 2026-08-31
+verified: 5808e7cd 2026-09-03
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -555,10 +566,35 @@ verified: 84c7259d 2026-08-31
   MUST be a curated, non-opted-out `marketing_prospects` row (authorization is
   DECOUPLED from send-lifecycle status, so a `contacted` follow-up still sends) —
   an unknown / opted-out recipient trips (`recipient_not_curated` / `opted_out`)
-  → demote + hold (fail-closed). PR2 will wire graduation, send-time contact
-  stamping, AND a hard per-window cap on hold-creation (the ASK-state
-  approval-flood guard) alongside the batch-approval card — `marketing_send` has
-  no autonomous caller until then.
+  → demote + hold (fail-closed). Graduation for the BULK cell rides the generic
+  capability-promotion path (`capability_grants.detect_promotable_cells` — no
+  risk-class filter → `email:send:bulk` qualifies once it has ≥5 owner-approved
+  successes + posterior ≥0.70). **Contact-stamping (loop-fix):** on a CONFIRMED
+  delivery a matching prospect is advanced active → `contacted` via one
+  active-guarded CRUD (`marketing_prospects.mark_contacted_by_email`) called from
+  BOTH delivery paths — the email-gate drain (`email_gate_watcher`) for a HELD →
+  owner-approved send, AND `pipeline._deliver` for a GRANTED-cell autonomous send
+  (which delivers inline and never touches the drain, so the fix survives
+  graduation). Keyed on the RECIPIENT being a curated prospect, NOT `cell_risk_class`
+  (a FINANCIAL-misclassified pitch is still stamped); a send that never delivers
+  (dropped/expired/rejected) leaves the prospect `active`, re-eligible. Without this,
+  `mark_contacted` had no caller and `list_active` re-returned a delivered prospect
+  every tick. **DEFERRED (hot follow-up, before arming at volume):** an atomic
+  per-prospect in-flight dedup + a per-window approval-flood cap + the batch-approval
+  card — `marketing_send` has no autonomous caller until the campaign is armed.
+- **Marketing reply → owner Telegram ping (notify-only).** When a GENUINE human
+  reply lands (auto-responders + foreign senders already gated out by the
+  reply→engagement bridge, `outreach/engagement.py`) AND the reply's recipient is
+  a curated `marketing_prospects` row (`get_by_email` — NOT the thread
+  `signal_type`, which the owner-approval resume path overwrites to
+  `email_gate_resume`, so it never survives a held→approved cold send), the owner
+  gets ONE brief `submit_raw` Telegram ping (`make_marketing_reply_notifier`,
+  wired in `runtime/init/outreach.py`). Owner-facing, so never gated; best-effort
+  (a non-DELIVERED ping is logged, not retried — the reply is already durably
+  recorded in `outreach_history`/`email_threads`). Attacker-controlled reply
+  fields are HTML-escaped + control-char-stripped (`_sanitize_ping_field`) because
+  the outreach telegram path delivers with `parse_mode="HTML"` unescaped. The
+  autonomous `ReplyHandler` auto-reply path is unchanged by this.
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
   PII scan for EXTERNAL channels and `content`-category drafts only. Never
   applied to owner channels — don't add them.
@@ -631,6 +667,10 @@ verified: 50b79ffb 2026-09-01
   `surplus/scheduler.py`.
 - `follow_ups/` = accountability ledger + dispatcher (every 5 min) that turns
   follow-ups into surplus tasks; retention sweep on the learning scheduler. The
+  `follow_up_create` MCP tool routes USER-OWNED and purely-local operational work
+  here; Genesis-repo work goes to the public GitHub tracker as an issue (CLAUDE.md
+  "Where deferred work goes"). Templated pipelines write via `crud.follow_ups.create()`
+  directly and are governed at their own call sites. The
   `follow_up_create`/`update` MCP tools take a `work_state`
   (ready/blocked_on_trigger/deferred_cold) and DERIVE the hot(`follow_up`)/
   cold(`tabled`) lane, so priority never picks the lane; `blocked_on_trigger`
@@ -1011,7 +1051,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 50b79ffb 2026-09-01
+verified: 29a382e7 2026-09-03
 ```
 
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
@@ -1138,6 +1178,21 @@ verified: 50b79ffb 2026-09-01
   `job.failed` is in the ego's `_REFLEX_OWNED_EVENT_TYPES` so it never spins a
   reactive ego cycle. Ingested by the reflex arc as of PR-2b (`ingest.py`
   consumes `job.failed`, guarded on `error_type` presence).
+- **A resumed reflection runs against a DIFFERENT tick than the one that asked.**
+  When a user approves a reflection's gated CC fallback, `_resume_approved_reflections`
+  dispatches it with `self._last_tick_result` — the CURRENT tick — because the
+  loop's own scoring may never reach that depth again. So what a person approved
+  and what runs are about different moments — and per that method's docstring
+  the reason is availability, not a preference for fresher state: the current
+  tick is the only one it has. The ORIGINATING tick is genuinely unrecoverable: the approval context is
+  built from a fixed key set with no tick field, and `_approval_key` excludes
+  per-invocation identity on purpose so recurring dispatches reuse one pending
+  row rather than minting a new approval every tick. The resume log therefore
+  names the approval, its age, and the tick being run against, and says outright
+  that this is not the requesting tick — rather than implying a lineage that
+  does not exist. Giving it one would mean a key-neutral carrier that does not
+  currently exist; do not smuggle a tick id into `action_label` or
+  `extra_context`, both of which feed the approval key.
 - **perception/**: the real-time reflection engine — MICRO (and LIGHT without
   a CC bridge) run in-process via the router; DEEP/STRATEGIC go to the CC
   reflection bridge. GROUNDWORK: user-model-synthesis, pre-execution-gate
@@ -1523,6 +1578,34 @@ verified: b8232425 2026-09-02
   hand-curated: L2 sheds nice-to-haves; **L3 keeps ONLY micro-reflection,
   embeddings, tagging** — changing those sets changes what survives an outage.
   Some call sites alias another site's chain — don't assume 1:1.
+- **routing/escalation.py**: breaker trips → a high-priority `provider_failure`
+  observation at 5 trips (~10 min), carrying `first_trip_at` — the only
+  per-provider "failing since" timestamp. Once the outage passes
+  `_NOTIFY_AFTER_S` (1h) it ALSO writes a `priority="critical"` observation on a
+  separate `provider_dead_notify:<name>` content hash, which the existing
+  fire-once path (`outreach/scheduler.py::_critical_observations_job` +
+  `mark_surfaced`) turns into exactly ONE Telegram. The age is read off the
+  unresolved observation, not in-memory state, so it survives a restart; the
+  EARLIEST unresolved row wins, because a duplicate would otherwise reset the
+  outage clock. **The hour check is CLOCK-driven, not trip-driven**: the
+  awareness tick (5 min) calls `sweep_due_notifications`, which reads the
+  durable rows and holds no in-memory state — the trip-driven version starved
+  when traffic stopped and its per-process flags produced four review defects.
+  Lever: `provider_outage_notify` domain (off/propose_only/live) +
+  `GENESIS_PROVIDER_NOTIFY_DISABLED`; off resolves open notify rows (so off→on
+  re-notifies a still-dead provider, deliberately). Recovery resolves BOTH
+  hashes — **notify hash FIRST**: the two
+  are separately committed (this connection has no transactions), so a failure
+  between them must leave the VISIBLE row open (a provider shown as failing when
+  it is not, which the next recovery clears) rather than the SILENT one (an open
+  notify row makes `skip_if_duplicate` suppress this provider's notifications
+  until some later recovery happens to succeed). Do not raise the 10-minute
+  observation to critical instead — it would page on every transient blip.
+  ONE KNOWN GAP remains documented in-code, not fixed: the row is stamped at
+  the 5th trip rather than the first (duration short by the ramp) — its fix
+  needs the `first_trip_at` anchor bounded first; see the follow-up. The
+  restart-gate gap that used to sit beside it is GONE by construction: the
+  sweep consults no in-memory flag, so a restart changes nothing.
 - **providers/**: the `ToolProvider` registry for NON-LLM tools (search,
   embeddings, STT/TTS, crawl, probes). Adapters register GATED ON ENV KEYS —
   silent non-registration is by design (absence ≠ bug). LLM breaker/health
@@ -1577,8 +1660,17 @@ verified: 50b79ffb 2026-09-01
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
   schema paths coexist: base DDL (`schema/_tables.py`, 118 CREATE TABLE; docs
-  still say "60+") plus versioned `migrations/` 0001..0089 run ONCE at startup
-  before any other init step touches data; a failed migration ABORTS bootstrap.
+  still say "60+") plus versioned `migrations/` run ONCE at startup before any
+  other init step touches data; a failed migration ABORTS bootstrap. Ids are
+  92 FROZEN legacy 4-digit ones (`0001`..`0093`, with a GAP at `0092` from a
+  rename) plus new `YYYYMMDDHHMMSS_*.py` UTC timestamps — nobody allocates an
+  id any more, which is what removed the cross-branch collisions. The legacy
+  set is ENUMERATED in `db/_migration_ids.FROZEN_LEGACY_FILES` (a range cannot
+  express the `0092` gap), and discovery REFUSES a directory holding any file
+  it cannot classify, because a name matching nothing is discovered by nothing
+  and would never run. Discovery enforces RUNNABLE; CI
+  (`scripts/check_migration_prefixes.py`) additionally enforces this repo's
+  freeze, so a fork's own 4-digit migration runs rather than bricking its boot.
   EVERY table must be in BOTH paths (fresh-install DDL + its numbered
   migration) — a design CONVENTION whose TABLE-set parity is NOT test-enforced:
   `test_db/test_schema.py`'s `EXPECTED_TABLES` allow-list only pins the DDL
@@ -1595,7 +1687,7 @@ verified: 50b79ffb 2026-09-01
   non-schema backfills (Qdrant payloads, entity graphs) that run POST-boot as a
   background `tracked_task` (kicked from `runtime/_core`), never abort boot, are
   idempotent, and are claimed atomically via the `data_migrations` ledger (so
-  server + bridge-fallback can't double-run). `dNNNN_*.py` modules expose sync
+  server + bridge-fallback can't double-run). `d`-prefixed modules expose sync
   `migrate()`+`verify()` (runner offloads via `to_thread`); `requires_operator`
   ones sit `operator_pending` and never auto-run. Shared file-discovery with the
   schema runner (`db/_migration_discovery.py`), deliberately NOT the atomic-txn

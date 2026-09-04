@@ -27,6 +27,16 @@ logger = logging.getLogger(__name__)
 # 5 trips ≈ 10 minutes of cycling (120s open duration × 5 cycles).
 _TRIP_THRESHOLD = 5
 
+# How long a provider must have been continuously failing before the user is
+# told. The escalation observation above fires at ~10 minutes, which is the
+# right threshold for a DASHBOARD row and far too eager for a notification —
+# most breaker trips resolve themselves well inside an hour, so anything shorter
+# pages on noise. An earlier version of this comment cited an
+# `_ONGOING_FLOOR_S` constant in the health subsystem as precedent; no such
+# symbol exists anywhere in the repo, so the hour stands on the reasoning above
+# rather than on a borrowed threshold.
+_NOTIFY_AFTER_S = 3600.0
+
 
 class ProviderEscalation:
     """Track per-provider failures and escalate to observations."""
@@ -63,14 +73,31 @@ class ProviderEscalation:
             state["first_trip_at"] = self._clock().isoformat()
 
         if state["trip_count"] >= _TRIP_THRESHOLD and not state["escalated"]:
-            state["escalated"] = True
-            # Defer DB write to a tracked background task — don't block emit()
+            # `escalated` is set by `_create_observation` on a SUCCESSFUL write,
+            # NOT here. Setting it before the deferred write meant a transient DB
+            # error — which that method swallows — permanently convinced this
+            # process the row existed, so no later trip ever retried and the
+            # outage never became visible. The flag means "the row exists", so
+            # only the code that knows it exists may set it. Several trips racing
+            # here can spawn several creates; that is harmless because
+            # `skip_if_duplicate` is a single guarded statement and yields at
+            # most one row.
             tracked_task(
                 self._create_observation(provider, state),
                 name=f"escalation-obs-{provider}",
                 event_bus=self._event_bus,
                 subsystem=Subsystem.ROUTING,
             )
+
+        # NO notification decision here, deliberately. "Has this outage lasted an
+        # hour" is a CLOCK question, and answering it from trip events made the
+        # answer depend on traffic: the check at the 5th trip is below the floor
+        # BY CONSTRUCTION, so delivery relied on a later trip that may never
+        # arrive. That single mismatch generated four separate defects across
+        # four review rounds (starvation; a replacement outage marked notified by
+        # an in-flight task; a restart-reset gate; an unbounded in-memory
+        # anchor). The decision now lives in `sweep_due_notifications()`, driven
+        # by the awareness tick and reading the durable row. See its docstring.
 
     def record_recovery(self, provider: str) -> None:
         """Called when a provider recovers (breaker → CLOSED).
@@ -139,10 +166,27 @@ class ProviderEscalation:
                 content=content,
                 priority="high",
                 category="system_health",
+                # KNOWN GAP, deliberately not fixed here: this stamps the row
+                # when the 5th trip lands, so the duration every consumer reads
+                # is short by the escalation ramp (~15-30 min, more under
+                # backoff). `first_trip_at` — the true start — is carried in the
+                # content JSON below but read by nothing. Backdating this column
+                # to it was tried and REVERTED: the anchor is written once per
+                # state entry (:72) and cleared only by `record_recovery`, so a
+                # flapping provider (success_threshold=2 means one clean call
+                # does not clear a trip) keeps a weeks-old anchor and the row is
+                # then born already past the 1h notification floor — a critical
+                # page with a fabricated multi-day duration. Fixing this needs
+                # the anchor bounded first; see the follow-up.
                 created_at=self._clock().isoformat(),
                 content_hash=content_hash,
                 skip_if_duplicate=True,
             )
+            # The row now provably exists — either we wrote it, or
+            # `skip_if_duplicate` found an unresolved one already there. BOTH
+            # are "escalated"; only an EXCEPTION leaves it unwritten, and that
+            # path deliberately does not set the flag so a later trip retries.
+            state["escalated"] = True
             if obs_id:
                 logger.warning(
                     "Created observation %s for provider '%s' failure (%d trips since %s)",
@@ -172,17 +216,45 @@ class ProviderEscalation:
         """
         from genesis.db.crud import observations
 
-        content_hash = self._provider_content_hash(provider)
+        # BOTH rows: the escalation record and the user-notification record.
+        # Leaving the notify row open would make the first outage in a
+        # provider's life the only one the user ever hears about, because
+        # `skip_if_duplicate` suppresses on an unresolved row of the same hash.
+        # KNOWN, ACCEPTED (raised twice at review): if the SECOND resolve
+        # fails, the stale failure row survives and will deduplicate the NEXT
+        # outage's record, so that outage reports a duration measured from the
+        # older row. Accepted because the earliest-row-wins clock semantics
+        # knowingly tolerate stale-row persistence, the liveness gate bounds
+        # the damage (no page unless the breaker really is non-closed), and
+        # the row self-heals on the next successful recovery resolve. The
+        # single-statement plural resolve that would close it was rejected on
+        # measured probability — a failure must land between two adjacent
+        # retried UPDATEs.
+        # NOTIFY FIRST, deliberately. These are two separately committed
+        # statements — there is no transaction facility on this connection
+        # (`SerializedConnection.__aenter__` is a no-op) — so one can succeed
+        # and the next fail. Order decides which row survives that. Notify-row
+        # open = `skip_if_duplicate` (which keys on an UNRESOLVED row of the
+        # same hash) silences this provider until some later recovery happens
+        # to succeed: silent. Failure-row open = the dashboard shows a provider
+        # as failing when it is not, and the next recovery clears it: visible.
+        # Visible beats silent at identical cost.
+        content_hashes = (
+            self._notify_content_hash(provider),
+            self._provider_content_hash(provider),
+        )
         try:
-            resolved = await observations.resolve_by_content_hash(
-                self._db,
-                source="routing",
-                content_hash=content_hash,
-                resolved_at=self._clock().isoformat(),
-                resolution_notes=(
-                    f"auto-resolved: provider '{provider}' recovered (circuit breaker closed)"
-                ),
-            )
+            resolved = 0
+            for content_hash in content_hashes:
+                resolved += await observations.resolve_by_content_hash(
+                    self._db,
+                    source="routing",
+                    content_hash=content_hash,
+                    resolved_at=self._clock().isoformat(),
+                    resolution_notes=(
+                        f"auto-resolved: provider '{provider}' recovered (circuit breaker closed)"
+                    ),
+                )
             if resolved:
                 logger.info(
                     "Auto-resolved %d provider_failure observation(s) for recovered provider '%s'",
@@ -197,6 +269,361 @@ class ProviderEscalation:
             )
 
     @staticmethod
+    def _outage_started_at(row: dict) -> datetime | None:
+        """Parse an observation's ``created_at`` into an aware UTC datetime.
+
+        Handles both shapes that reach this table: ``create()`` writes an
+        ISO string with an offset, while SQLite's ``datetime('now')`` DEFAULT
+        writes a naive UTC string. A naive value is therefore UTC, not local.
+        """
+        raw = row.get("created_at")
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(raw))
+        except (TypeError, ValueError):
+            return None
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+
+    async def _maybe_notify(self, provider: str) -> None:
+        """Thin delegate kept for the existing suite ONLY — no runtime caller.
+
+        The event path no longer notifies (see `sweep_due_notifications`), and
+        this shim bypasses the operator lever (it defaults priority="critical"
+        and consults no config). Do not add production callers.
+
+        The decision itself is module-level and stateless — see
+        `notify_provider_if_due`. Nothing here consults `self._state`: the
+        durable row is the state machine now.
+        """
+        await notify_provider_if_due(self._db, provider, clock=self._clock)
+
+    @staticmethod
+    def _notify_content_hash(provider: str) -> str:
+        return hashlib.sha256(f"provider_dead_notify:{provider}".encode()).hexdigest()
+
+    @staticmethod
     def _provider_content_hash(provider: str) -> str:
         """Deterministic per-provider hash — MUST match between create + resolve."""
         return hashlib.sha256(f"provider_failure:{provider}".encode()).hexdigest()
+
+
+async def notify_provider_if_due(
+    db,
+    provider: str,
+    *,
+    clock=None,
+    priority: str = "critical",
+    provider_still_failing=None,
+) -> bool:
+    """Tell the user ONCE that a provider has been dead long enough to matter.
+
+    Reads the age off the unresolved ``provider_failure`` row rather than
+    this object's in-memory state, for two reasons: that row IS the outage
+    clock (the same one `_resolve_observation` clears on recovery), and it
+    survives a restart, which the in-memory dict does not.
+
+    Delivery reuses the existing fire-once path rather than adding one — a
+    ``priority="critical"`` observation is picked up by
+    `outreach/scheduler.py::_critical_observations_job`, batched into a
+    single message, and `mark_surfaced` guarantees it is never re-sent.
+    `skip_if_duplicate` keys on an UNRESOLVED row with the same hash, so a
+    second notification cannot be written while the first is still open —
+    including from a freshly restarted process.
+    """
+    from genesis.db.crud import observations
+
+    clock = clock or (lambda: datetime.now(UTC))
+    failure_hash = ProviderEscalation._provider_content_hash(provider)
+    try:
+        rows = await observations.query(
+            db,
+            source="routing",
+            type="provider_failure",
+            resolved=False,
+            limit=100,
+        )
+    except Exception:
+        logger.error(
+            "could not read the outage clock for provider '%s'", provider, exc_info=True
+        )
+        return False
+
+    # The outage started at the EARLIEST unresolved record, not an arbitrary
+    # one. More than one can exist despite `skip_if_duplicate`: that check
+    # matches on (source, content_hash, resolved, origin_class), so a row
+    # written through a different origin_class — or present before this
+    # provider was first seen by THIS process — does not suppress a second.
+    # Taking the newest would reset the outage clock on every duplicate,
+    # which is the exact failure this whole change exists to remove.
+    starts = [
+        s
+        for r in rows
+        if r.get("content_hash") == failure_hash
+        and (s := ProviderEscalation._outage_started_at(r)) is not None
+    ]
+    if not starts:
+        # No unresolved failure record → nothing to measure an outage from.
+        # Absence of evidence is not an outage; say nothing.
+        return False
+    started = min(starts)
+    elapsed = (clock() - started).total_seconds()
+    if elapsed < _NOTIFY_AFTER_S:
+        return False
+
+    # Re-read the failure row's state immediately before writing. The query
+    # above and the create below are separated by awaits, so a recovery can
+    # land between them: `_resolve_observation` clears both hashes, and the
+    # create then fires anyway because `skip_if_duplicate` sees no UNRESOLVED
+    # notify row — reporting a multi-day outage for a provider that just came
+    # back. This does NOT close the window (there is no transaction facility
+    # on this connection), it narrows it to the gap between this check and
+    # the insert. Raised independently by two reviewers and reproduced by a
+    # test that resolves inside the query call.
+    try:
+        still_failing = await observations.exists_by_hash(
+            db,
+            source="routing",
+            content_hash=failure_hash,
+            unresolved_only=True,
+        )
+    except Exception:
+        # Fail CLOSED: an unreadable check must not authorise a user-facing
+        # alert. A missed notification is recoverable on the next trip; a
+        # false "your provider is dead for 5 days" is not.
+        logger.error(
+            "could not confirm provider '%s' is still failing; not notifying",
+            provider,
+            exc_info=True,
+        )
+        return False
+    if not still_failing:
+        return False
+
+    # LIVENESS GATE — the fence the deleted `escalated` conjunct used to be.
+    # The durable row proves the outage HAPPENED; it cannot prove the outage is
+    # still happening, and a row STRANDED by a half-completed recovery resolve
+    # (the failure hash is deliberately the survivor there — "visible beats
+    # silent") would otherwise become a false critical page claiming a
+    # multi-day outage. When the caller can consult live evidence — the breaker
+    # registry — a provider whose breaker reads CLOSED (real successes proved
+    # recovery) is never paged from a stale row. A provider whose breaker is
+    # OPEN or HALF_OPEN still pages: by this system's own evidence model
+    # (PR #1563), a recovery nothing has measured is not a recovery. A provider
+    # the callback cannot answer for (dropped from config, callback error) is
+    # SKIPPED — fail toward silence, since every defect class here fails that
+    # direction and a wrong page is the unrecoverable one.
+    if provider_still_failing is not None:
+        try:
+            if not provider_still_failing(provider):
+                logger.info(
+                    "outage row for '%s' is past the floor but the breaker "
+                    "reads recovered — stale row, not paging",
+                    provider,
+                )
+                return False
+        except Exception:
+            logger.warning(
+                "could not confirm provider '%s' is still failing (liveness "
+                "callback errored); not notifying",
+                provider,
+                exc_info=True,
+            )
+            return False
+
+    # ACK SUPPRESSION — "once per outage" must survive the user resolving the
+    # delivered notification. `skip_if_duplicate` keys on UNRESOLVED rows only,
+    # so a dashboard ack would otherwise re-arm the sweep and re-page five
+    # minutes later — alert fatigue, the disease this feature treats. A RESOLVED
+    # notify row younger than the outage start means this outage was already
+    # reported: suppress, UNLESS the resolution was the operator LEVER (its
+    # resolution notes are machine-written and prefixed detectably), because the
+    # off→on re-notify is a user-decided contract. A resolved notify row OLDER
+    # than the outage start belongs to a previous outage and blocks nothing.
+    try:
+        from genesis.db.crud import observations as _obs
+
+        prior = await _obs.query(
+            db,
+            source="routing",
+            type="provider_failure",
+            resolved=True,
+            limit=_SWEEP_ROW_LIMIT,
+        )
+        notify_hash = ProviderEscalation._notify_content_hash(provider)
+        for r in prior:
+            if r.get("content_hash") != notify_hash:
+                continue
+            r_at = ProviderEscalation._outage_started_at(r)
+            if r_at is None or r_at < started:
+                continue  # a previous outage's notification — irrelevant
+            notes = str(r.get("resolution_notes") or "")
+            # MACHINE resolutions permit a re-notify; only a USER ack
+            # suppresses. Three machine classes exist, each with a
+            # machine-written prefix: the lever (off→on re-notify is a
+            # user-decided contract), the lever upgrade, and RECOVERY's
+            # auto-resolve — a genuine recovery then re-death is a NEW
+            # outage and must be reported again (the original design
+            # decision, pinned by test_recovery_then_re_death_notifies_again).
+            if notes.startswith(
+                (
+                    "provider-outage notify lever",
+                    "superseded: lever",
+                    "auto-resolved:",
+                )
+            ):
+                continue
+            logger.debug(
+                "outage for '%s' already notified and acknowledged; not re-paging",
+                provider,
+            )
+            return False
+    except Exception:
+        # An unreadable ack-history must not BLOCK a due notification: the
+        # failure direction here is the opposite of the liveness gate's. A
+        # missed suppression re-sends a message the user has seen — annoying,
+        # recoverable. A false suppression silences a real outage — the
+        # unrecoverable direction for THIS check.
+        logger.warning(
+            "could not read ack history for '%s'; notifying anyway",
+            provider,
+            exc_info=True,
+        )
+
+    hours = elapsed / 3600.0
+    human = f"{hours / 24:.1f} days" if hours >= 24 else f"{hours:.1f} hours"
+    try:
+        obs_id = await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="routing",
+            type="provider_failure",
+            content=json.dumps(
+                {
+                    "provider": provider,
+                    "outage_started_at": started.isoformat(),
+                    "message": (
+                        f"Provider '{provider}' has been failing every call for "
+                        f"{human} and has not recovered. Calls are falling back to "
+                        f"other providers in each chain. If this provider is a paid "
+                        f"or entitlement-gated model, the account may need attention."
+                    ),
+                }
+            ),
+            priority=priority,
+            category="system_health",
+            created_at=clock().isoformat(),
+            content_hash=ProviderEscalation._notify_content_hash(provider),
+            skip_if_duplicate=True,
+        )
+    except Exception:
+        logger.error(
+            "failed to write dead-provider notification for '%s'", provider, exc_info=True
+        )
+        return False
+
+    if obs_id:
+        logger.warning(
+            "Notified user: provider '%s' has been failing for %s", provider, human
+        )
+    return bool(obs_id)
+
+
+# Bounded per sweep. HONEST LIMIT: `observations.query` orders created_at DESC
+# with no offset, so rows beyond the bound are the OLDEST — and they stay
+# excluded for as long as the unresolved population exceeds the bound, which is
+# starvation, not mere delay. Accepted because the population CANNOT approach
+# it: `skip_if_duplicate` caps open rows at ~2 per provider (failure + notify),
+# the type carries a 14-day TTL, and the measured all-time population is 27
+# rows across 8 providers. The warning below exists so that if some future
+# writer floods this type, the cap reads as a named condition instead of
+# silence.
+_SWEEP_ROW_LIMIT = 200
+
+
+async def sweep_due_notifications(
+    db, *, clock=None, priority: str = "critical", provider_still_failing=None
+) -> int:
+    """Notify for every provider whose unresolved outage has passed the floor.
+
+    THIS REPLACES the trip-driven notification path, and the replacement is the
+    point rather than an implementation detail.
+
+    "Has this outage lasted an hour" is a CLOCK question. Answering it from
+    `breaker.tripped` events made the answer depend on TRAFFIC: the check fired
+    at the 5th trip is below `_NOTIFY_AFTER_S` by construction, so delivery
+    relied on a later trip arriving — and if traffic to that provider stopped,
+    the user was never told at all. That one mismatch generated four defects
+    across four review rounds, each fixed in isolation and each replaced by the
+    next: starvation when trips stop; a replacement outage marked notified by an
+    in-flight task; a gate that a restart reset; an in-memory anchor with no
+    decay that, once backdated, fabricated multi-day durations.
+
+    None of those are reachable here, BY CONSTRUCTION rather than by guarding:
+    this function holds no state between calls, consults no in-memory flag, and
+    is driven by a clock instead of by traffic. Dedup is `skip_if_duplicate`,
+    which is a single ``INSERT … WHERE NOT EXISTS`` statement (see
+    `db/crud/observations.py`) and therefore race-free ACROSS PROCESSES — a
+    strictly stronger guarantee than the per-process flag it replaces, and one
+    that survives a restart, two overlapping sweeps, and a process dying
+    mid-write.
+
+    The provider name comes from the row's own content JSON. A row whose content
+    is not JSON, or carries no provider, is SKIPPED rather than guessed at: the
+    notification hash derives from the provider name, so a row we cannot
+    attribute is one we cannot notify about without risking naming the wrong
+    provider to the user.
+
+    Returns the number of notifications actually written.
+    """
+    from genesis.db.crud import observations
+
+    clock = clock or (lambda: datetime.now(UTC))
+    try:
+        rows = await observations.query(
+            db,
+            source="routing",
+            type="provider_failure",
+            resolved=False,
+            limit=_SWEEP_ROW_LIMIT,
+        )
+    except Exception:
+        logger.error("dead-provider sweep could not read outage rows", exc_info=True)
+        return 0
+
+    if len(rows) >= _SWEEP_ROW_LIMIT:
+        logger.warning(
+            "dead-provider sweep hit its %d-row bound; remaining rows are deferred "
+            "to the next tick, not dropped",
+            _SWEEP_ROW_LIMIT,
+        )
+
+    providers: set[str] = set()
+    for row in rows:
+        raw = row.get("content")
+        try:
+            blob = json.loads(raw) if raw else None
+        except (TypeError, ValueError):
+            continue
+        if isinstance(blob, dict):
+            name = blob.get("provider")
+            if isinstance(name, str) and name:
+                providers.add(name)
+
+    written = 0
+    for provider in sorted(providers):
+        try:
+            if await notify_provider_if_due(
+                db,
+                provider,
+                clock=clock,
+                priority=priority,
+                provider_still_failing=provider_still_failing,
+            ):
+                written += 1
+        except Exception:
+            # One provider's failure must not strand the rest of the sweep.
+            logger.error(
+                "dead-provider sweep failed for provider '%s'", provider, exc_info=True
+            )
+    return written
