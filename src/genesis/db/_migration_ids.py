@@ -92,7 +92,19 @@ MIGRATION_PATTERNS: dict[str, re.Pattern[str]] = {
 #: silence — the very outcome the ASCII restriction exists to prevent. Measured
 #: 2026-09-04: with ``[0-9]`` here, ``２０２６０９０４００００００_bad.py``
 #: (full-width digits) classified NOT_A_MIGRATION and the guard reported CLEAN.
-CANDIDATE_PATTERN = re.compile(r"^d?\d")
+#: ``[dDｄＤ]*`` and not ``d?``, for the same reason as ``\d``: the net must
+#: cover the MISTAKE space, not the legal space — and the mistake space is
+#: found by asking what the mistake GENERATORS produce, not by patching named
+#: instances. This net has been too narrow three times, each a different
+#: generator: ASCII ``[0-9]`` waved through an IME's full-width digits; ``d?``
+#: waved through a doubled keystroke (``dd2026…``) and a case habit
+#: (``D2026…``); and the review of THAT fix found the first generator still
+#: alive in the prefix position (full-width ``ｄ２０２６…``) — the same IME that
+#: produces full-width digits produces the full-width letter in the same
+#: keystroke. Every one of these presented as a migration to a human and to no
+#: code, so the file was skipped in silence, in runtime discovery AND in CI —
+#: the never-runs outcome this whole contract exists to refuse.
+CANDIDATE_PATTERN = re.compile(r"^[dDｄＤ]*\d")
 
 #: Timestamps must be at or after this year. This is the ORDERING INVARIANT
 #: made checkable, not a taste: every frozen legacy id begins with ``0``, so
@@ -310,8 +322,15 @@ def classify(namespace: str, filename: str) -> str:
     :data:`NOT_A_MIGRATION`, :data:`FROZEN_LEGACY`, :data:`TIMESTAMP`,
     :data:`DISALLOWED_LEGACY`, :data:`MALFORMED`.
     """
-    if CANDIDATE_PATTERN.match(filename) is None or not filename.endswith(".py"):
+    if CANDIDATE_PATTERN.match(filename) is None:
         return NOT_A_MIGRATION
+    if not filename.endswith(".py"):
+        # ``20260904000000_x.PY`` is a migration-shaped name Python will never
+        # import — the same never-runs silence, entering through the extension
+        # test instead of the digit test. A candidate with a case-mangled .py
+        # is refused; a candidate that is genuinely another filetype
+        # (``0094_notes.txt``, ``.pyc``) is not our business.
+        return MALFORMED if filename.lower().endswith(".py") else NOT_A_MIGRATION
 
     match = MIGRATION_PATTERNS[namespace].match(filename)
     if match is None:

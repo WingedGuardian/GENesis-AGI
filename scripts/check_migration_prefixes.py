@@ -130,8 +130,14 @@ def _runnable_names_at(repo_root: Path, ref: str, rel_dir: str, ids) -> set[str]
     rename detection to be caught — the old name is simply gone.
     """
     try:
+        # -z: NUL-delimited RAW paths. Without it git C-quotes any non-ASCII
+        # path ("…caf\303\251.py", quotes included), the quoted form matches no
+        # classify() verdict, and the file silently drops out of base_names —
+        # so a Unicode-named migration could be deleted or renamed undetected,
+        # the exact divergence this rule exists to catch. MEASURED 2026-09-04
+        # against a real tree (default output quoted; -z byte-exact).
         out = subprocess.run(  # noqa: S603 - fixed argv, no shell
-            ["git", "-C", str(repo_root), "ls-tree", "-r", "--name-only", ref, "--", rel_dir],
+            ["git", "-C", str(repo_root), "ls-tree", "-r", "--name-only", "-z", ref, "--", rel_dir],
             capture_output=True,
             text=True,
             timeout=30,
@@ -141,7 +147,7 @@ def _runnable_names_at(repo_root: Path, ref: str, rel_dir: str, ids) -> set[str]
         return None
     if out.returncode != 0:
         return None
-    names = {PurePosixPath(line).name for line in out.stdout.splitlines() if line.strip()}
+    names = {PurePosixPath(line).name for line in out.stdout.split("\0") if line.strip()}
     label = ids.SCHEMA if rel_dir.endswith("/migrations") else ids.DATA
     return {n for n in names if ids.classify(label, n) in ids.RUNNABLE}
 
@@ -330,7 +336,15 @@ def main() -> int:
         for v in violations:
             print(f"::error::{v}")
         return 1
-    scope = f"immutable against {args.base}" if args.base else "no base compared"
+    # Two honest labels, neither overclaiming: with --base the comparison is
+    # ENFORCED (an unreadable ref was a violation above); without it check()
+    # still tried the default ref best-effort, silently skipping the rule if
+    # that ref is absent — which is a weaker statement and must read as one.
+    scope = (
+        f"immutable against {args.base}"
+        if args.base
+        else f"immutability vs {_DEFAULT_BASE_REF} best-effort (pass --base to enforce)"
+    )
     print(
         "Migration id check: CLEAN (every file classified; no duplicates; "
         f"frozen legacy set intact; {scope})"

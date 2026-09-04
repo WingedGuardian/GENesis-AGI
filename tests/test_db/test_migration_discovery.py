@@ -107,6 +107,10 @@ def test_timestamp_ids_are_discovered_in_both_namespaces(tmp_path):
         "19990101000000_preepoch.py",  # sorts before the frozen namespace
         "２０２６０９０４００００００_fullwidth.py",
         "d0001_misfiled_data_in_schema_dir.py",
+        "dd20260904000000_doubled_prefix.py",  # ^d?\d never saw it — silent skip
+        "D20260904000000_capitalised.py",  # same class, capitalised d
+        "ｄ２０２６０９０４００００００_fullwidth_prefix.py",  # same IME generator, prefix position
+        "20260904000000_case_mangled.PY",  # perfect id, Python never imports it
     ],
 )
 def test_unrunnable_files_raise_instead_of_being_skipped(tmp_path, bad_name):

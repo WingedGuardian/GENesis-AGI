@@ -339,14 +339,38 @@ jobs:
           # Passed via env, not interpolated into `run` — same handling the
           # leak-detector job uses for PR_BASE_SHA.
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # For `push: main` builds. origin/main is USELESS there — it IS the
+          # just-pushed checkout, so `--base origin/main` compares the tree with
+          # itself and the immutability rule silently checks nothing. The push
+          # event's `before` SHA is the pre-push state, which is the base that
+          # makes the post-merge run able to see a deletion that reached main
+          # outside the PR check. All-zero on branch creation, hence the guards
+          # below.
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
-          # On a push build there is no PR base; fall back to the default branch,
-          # which the full-depth fetch above has. `--base` is passed only when a
-          # ref was resolved, so the guard never fails a build for a base that
-          # does not exist in that context.
+          # Base resolution, most-specific first:
+          #   PR build        -> the PR base (what "already merged" means there);
+          #   push build      -> the pre-push SHA (see PUSH_BEFORE_SHA above);
+          #   schedule/manual -> origin/main IF it differs from the checkout.
+          # `--base` is passed only when a ref was resolved, exists, AND is not
+          # the checkout itself. A base equal to HEAD is a self-comparison: the
+          # rule would examine nothing while the log claimed "immutable against
+          # origin/main" — a verified-grammar claim that is false, and the exact
+          # silent pass the guard's own doctrine forbids. So schedule/dispatch
+          # runs on main (and any degraded push case whose `before` is
+          # unreachable) drop --base and honestly print best-effort scope; the
+          # PR and push runs are the enforcement points for immutability.
+          # Known fail-NOISY edge, accepted: a re-run of an OLD build compares
+          # its old checkout against origin/main fetched NOW and can go red on
+          # migrations that merged since — loud and explainable, never silent.
           base="${PR_BASE_SHA:-}"
-          if [[ -z "$base" ]] && git rev-parse --verify -q origin/main >/dev/null; then
+          if [[ -z "$base" && -n "${PUSH_BEFORE_SHA:-}" && "${PUSH_BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]] \
+             && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE_SHA"
+          fi
+          if [[ -z "$base" ]] && git rev-parse --verify -q origin/main >/dev/null \
+             && [[ "$(git rev-parse origin/main)" != "$(git rev-parse HEAD)" ]]; then
             base="origin/main"
           fi
           if [[ -n "$base" ]]; then

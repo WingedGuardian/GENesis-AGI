@@ -170,6 +170,10 @@ def test_a_new_hand_allocated_legacy_data_id_is_refused(tmp_path, bad):
         "19990101000000_preepoch.py",  # would sort before the frozen namespace
         "２０２６０９０４００００００_fullwidth.py",
         "d0001_misfiled_data_in_schema_dir.py",
+        "dd20260904000000_doubled_prefix.py",  # candidate net was ^d?\d — skipped
+        "D20260904000000_capitalised.py",  # same class, capitalised d
+        "ｄ２０２６０９０４００００００_fullwidth_prefix.py",  # same IME generator, prefix position
+        "20260904000000_case_mangled.PY",  # perfect id, Python never imports it
     ],
 )
 def test_a_file_that_cannot_run_is_a_violation_not_a_skip(tmp_path, bad):
@@ -457,6 +461,35 @@ def test_renaming_an_already_merged_timestamp_migration_is_caught(tmp_path):
 
     violations = _mod.check(repo, base_ref=base)
     assert any(_MERGED_TS in v for v in violations), violations
+
+
+def test_a_unicode_named_merged_migration_deletion_is_still_caught(tmp_path):
+    """The immutability rule must survive git's own quoting layer.
+
+    ``git ls-tree --name-only`` C-quotes non-ASCII paths by default
+    (``"…caf\\303\\251.py"``, quotes included — MEASURED 2026-09-04), and the
+    quoted form matches no classify() verdict, so without ``-z`` a
+    Unicode-named migration silently drops out of base_names and its deletion
+    reads as CLEAN. This composes two earlier findings: Unicode descriptions
+    are legal (round 2), and already-merged migrations are immutable (round 2)
+    — legal name + immutability rule must not cancel each other at the
+    encoding boundary.
+    """
+    unicode_ts = "20260101000000_café.py"
+    repo, base = _committed_repo(tmp_path, extra_schema=[unicode_ts])
+    (repo / "src/genesis/db/migrations" / unicode_ts).unlink()
+
+    violations = _mod.check(repo, base_ref=base)
+    assert any(unicode_ts in v and "already-merged" in v for v in violations), violations
+
+
+def test_a_unicode_named_migration_present_on_both_sides_is_clean(tmp_path):
+    """CONTROL for the quoting fix: the raw-bytes name must round-trip through
+    ls-tree and match the on-disk scan, or every Unicode migration would fire
+    the missing-file arm on every build."""
+    unicode_ts = "20260101000000_café.py"
+    repo, base = _committed_repo(tmp_path, extra_schema=[unicode_ts])
+    assert _mod.check(repo, base_ref=base) == []
 
 
 def test_an_unchanged_tree_is_clean_against_its_own_base(tmp_path):
