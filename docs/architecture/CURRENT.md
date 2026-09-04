@@ -258,27 +258,29 @@ verified: 29a382e7 2026-09-03
   closed: per-field REPAIR of a foreign document (seven findings), and inferring
   whether credential discovery had succeeded from a config loader that degrades
   silently by design (two P1s).
-- **A failover attempt that EXECUTED TOOLS is never retried** (`cc/conversation.py`,
-  `note_stream_effect`). The loop used to model "what did this turn do" as answer
-  text alone, so a peer that ran an MCP tool — an outreach send, a database write —
-  and then returned nothing looked identical to one that did nothing, and the next
-  peer re-ran the same prompt with `skip_permissions=True` and the full user-scoped
-  toolset. Every advance path is now gated on effects, and a turn that acted but
-  produced no answer ends with an explicit message rather than a silent retry.
-  The gate reads `StreamEvent.event_type`, which rests on one measured property of
-  an EXTERNAL surface: CC's `stream-json` emits ONE content block per `assistant`
-  line, so `from_raw`'s first-block-wins parse loses nothing. MEASURED 2026-09-04
-  against CC 2.1.246, 8/8 lines across two probes, 0 multi-block — including a
+- **Failover records availability only when a peer DEMONSTRABLY served** — a
+  usable output, or answer text already streamed to the user. The degenerate
+  empty non-error output (a silent cap) keeps its long-standing behaviour and is
+  simply NOT recorded, so it cannot clear a real block with a turn that showed
+  nothing. What to DO about that empty reply — advance to the next peer, or stop
+  because this attempt may already have executed tools whose effects a re-run
+  would repeat — is retry policy, and it lives on the `feat/peer-effects-guard`
+  branch as its own change with its own review, together with the effects
+  tracking it needs and the provider-refusal classification redesign (a closed
+  allowlist rather than per-case exclusions).
+- **`StreamEvent.from_raw` is lossless on the live stream surface** — CC's
+  `stream-json` emits ONE content block per `assistant` line, so the
+  first-recognized-block parse drops nothing. MEASURED 2026-09-04 against CC
+  2.1.246, 8/8 lines across two probes, 0 multi-block — including a
   thinking→text→tool_use turn and three PARALLEL tool calls, which the API packs
   into a single message and the CLI splits across three lines. The version is
   part of the claim: this is a property of a CLI build, and eight lines is a thin
-  denominator for a negative property across versions and modes. A review round
-  argued the opposite from the code shape alone; the probe is what settled it, and
-  the assumption is RECORDED by a canary in `invoker.run_streaming` rather than
-  defended against with code for a condition that does not occur. That canary is a
-  log line and nothing polls it — it makes a future batching CC diagnosable in one
-  grep, it does not alert. If it ever fires, this gate and `invoker`'s
-  `collected_text` both need revisiting.
+  denominator for a negative property across versions and modes. The assumption
+  is RECORDED by a canary in `invoker.run_streaming` (counting via
+  `StreamEvent.recognized_blocks`, which lives beside the loop it mirrors so the
+  two cannot drift) — a log line nothing polls: it makes a future batching CC
+  diagnosable in one grep, it does not alert. If it ever fires, `invoker`'s
+  `collected_text` recovery and every `event_type` consumer need revisiting.
 - **Cross-session awareness — how concurrent CC sessions perceive each other.**
   LIVE. Two DISTINCT stores answer two different questions, and conflating them
   is the trap: `cc_sessions` (+ a `/proc` walk, `observability/cc_slots.

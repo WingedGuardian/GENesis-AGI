@@ -100,42 +100,6 @@ def _apply_research_routing(system_prompt: str | None, channel) -> str | None:
     return (system_prompt + _BG_RESEARCH_ROUTING) if system_prompt else _BG_RESEARCH_ROUTING
 
 
-#: Stream events proving the turn EXECUTED something outside this process.
-#:
-#: DELIBERATELY `tool_use` only. `tool_result` looks like a free second signal
-#: but is not trustworthy evidence: `types.py` maps EVERY `type: "user"` line to
-#: `tool_result` without inspecting its content blocks, so any other user-role
-#: line would latch this flag. `tool_use` fires one event earlier on the same
-#: call, so narrowing costs no coverage and removes a false-positive class that
-#: would dead-end failover at the first peer.
-_TOOL_EVENT_TYPES = frozenset({"tool_use"})
-
-
-def note_stream_effect(streamed: dict, ev: StreamEvent) -> None:
-    """Record what *ev* proves this turn DID. THE mapping, in one named place.
-
-    Two effect classes with different stakes: ``text`` reached the user (a retry
-    double-outputs), ``tools`` reached the world (a retry can send a second
-    message or write a second row). Callers read them via the failover loop's
-    ``_streamed_text`` / ``_executed_tools`` predicates.
-
-    Reads ``event_type`` rather than re-deriving the answer from ``ev.raw``.
-    ``StreamEvent.from_raw`` keeps only the first recognized content block, so
-    that would matter if CC ever batched blocks onto one ``assistant`` line — but
-    MEASURED 2026-09-04 on the real surface, it does not: 8/8 lines across two
-    probes carried exactly one block, 0 multi-block, including a
-    thinking→text→tool_use turn and three PARALLEL tool calls (which the API
-    packs into one message and the CLI splits across three lines). Scanning
-    ``ev.raw`` here would be indirection against a condition that does not occur.
-    The assumption is pinned where it is relied upon, by the canary in
-    ``invoker.run_streaming``; if that ever fires, revisit this.
-    """
-    if ev.event_type == "text" and ev.text:
-        streamed["text"] = True
-    elif ev.event_type in _TOOL_EVENT_TYPES:
-        streamed["tools"] = True
-
-
 class ConversationLoop:
     """Channel-agnostic conversation orchestrator.
 
@@ -713,7 +677,8 @@ class ConversationLoop:
             streamed = {"text": False, "tools": False}
 
             async def _failover_tracked(ev: StreamEvent) -> None:
-                note_stream_effect(streamed, ev)
+                if ev.event_type == "text" and ev.text:
+                    streamed["text"] = True
                 if on_event:
                     await on_event(ev)
 
@@ -1078,7 +1043,6 @@ class ConversationLoop:
         sticky: dict | None,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None,
         streamed: dict | None = None,
-        effects: dict | None = None,
     ) -> Any:
         """Run one peer turn. If this conversation has a STICKY session for THIS
         peer, resume it for continuity; on a stale resume (non-rate-limit CCError)
@@ -1100,11 +1064,9 @@ class ConversationLoop:
             # must not mark the sticky peer session stale.
             raise
         except CCError as exc:
-            # Don't re-run: nothing to recover if already fresh, never once answer
-            # text has reached the user (would double-output), and never once the
-            # attempt executed TOOLS — this is a full re-run of the same prompt on
-            # the same peer, so it repeats any effect the first attempt had. The
-            # tool guard was missing while only `text` was tracked.
+            # Don't re-run: nothing to recover if already fresh, and never once
+            # answer text has reached the user (would double-output) — this is a
+            # full re-run of the same prompt on the same peer.
             #
             # And never for a provider refusal. A DRAINED prepaid account arrives
             # here as a generic CCProcessError rather than CCQuotaExhaustedError,
@@ -1125,7 +1087,6 @@ class ConversationLoop:
             if (
                 inv.resume_session_id is None
                 or (streamed and streamed.get("text"))
-                or (effects and effects.get("tools"))
                 or peer_availability.is_provider_refusal(exc)
             ):
                 raise
@@ -1210,16 +1171,9 @@ class ConversationLoop:
             async def _remember_peer_session(out) -> None:
                 """Persist this peer's session id so the turn can be continued.
 
-                Every path that ENDS the turn on a peer needs this, not just the
-                success path. The effects guard's two safety returns skipped it,
-                so a peer that ran a tool and then produced nothing left no
-                sticky session — the user's next message during the same outage
-                started a FRESH peer session with no memory of the tool call.
-                That defeats the guard twice over: the user cannot continue the
-                interrupted turn in context, and a later attempt has no record of
-                the effect the guard exists to avoid repeating.
-
                 Only with a real session id: an empty one cannot resume anything.
+                One named writer rather than an inline block, so any future path
+                that ends the turn on a peer has exactly one thing to call.
                 """
                 if not getattr(out, "session_id", ""):
                     return
@@ -1231,115 +1185,15 @@ class ConversationLoop:
                     }},
                 )
 
-            # ATTEMPT-scoped, deliberately NOT the turn-scoped `streamed` dict.
-            # `streamed` is created once per turn and is already fed by the HOME
-            # model's invocation, so reading tools from it made this predicate
-            # answer "did anything in this turn use a tool" when the question is
-            # "did THIS PEER just act". Genesis turns use tools on most turns, so
-            # that latched True before the loop even started: the first peer's
-            # failure ended the whole chain and the user was told THAT peer had
-            # acted, when it may never have run. It suppressed the backup at
-            # exactly the moment the home model was down — the one thing
-            # peer_availability's docstring forbids — and did it while reporting
-            # something false. Reset per attempt, below.
-            peer_effects = {"tools": False}
-
-            async def _peer_tracked(ev: StreamEvent) -> None:
-                note_stream_effect(peer_effects, ev)
-                if on_event:
-                    await on_event(ev)
-
-            def _can_observe_effects() -> bool:
-                """Whether this call can see tool events AT ALL.
-
-                False on the non-streaming entry point (`handle_message`, used by
-                the OpenClaw gateway): it passes no `on_event`, so `_invoke_peer`
-                takes `invoker.run` and no StreamEvent is ever produced. Every
-                effects check is then hard-wired False — a guard that cannot fire
-                is worse than no guard, because it reads as protection. Callers
-                that cannot observe must fail closed instead of trusting it.
-                """
-                return on_event is not None
-
-            def _executed_tools() -> bool:
-                """True once THIS PEER ATTEMPT ran an MCP tool — i.e. it may have
-                had a REAL-WORLD EFFECT that a retry would repeat.
-
-                Note the asymmetry with `_streamed_text`: streamed text is only
-                visible to the user, but a tool call may have sent a message or
-                written a row. Advancing to another peer re-runs the whole prompt.
-                """
-                return bool(peer_effects.get("tools"))
-
-            def _streamed_text() -> bool:
-                """True once answer text has reached the user this turn.
-
-                Load-bearing in THREE places, so it is one predicate: once the
-                user can see text, we must neither advance to another peer nor
-                fall through to contingency, because either produces a SECOND
-                answer stacked on the first. Returning "" (not None) is what
-                stops the caller running contingency — the call sites test
-                `is not None`.
-                """
-                return bool(streamed and streamed.get("text"))
-
-            def _not_retried_after_effects(name: str, *, observed: bool = True) -> str:
-                """The turn ENDS here, and the user is told why.
-
-                Not a silent "" and not a fall-through to contingency: both of
-                those either hide the failure or re-run the prompt, and re-running
-                is the thing we are refusing to do. An honest dead end beats a
-                repeated side effect, and beats silence during an outage.
-                """
-                logger.warning(
-                    "failover peer %s returned no answer after %s — NOT retrying on "
-                    "another peer", name,
-                    "executing tools" if observed else "an unobservable attempt",
-                )
-                did = (
-                    "ran one or more tools and then returned no answer"
-                    if observed else
-                    "returned no answer, and this channel cannot observe whether it "
-                    "used any tools first"
-                )
-                # Markdown, NOT html. This is a REPLY, and replies go through
-                # md_to_telegram_html, which html.escape()s the payload before
-                # converting markdown — so literal <b> tags arrive visibly broken
-                # on Telegram and print raw on the terminal. The <b> precedent
-                # elsewhere in this file is on the ALERT path, which is a
-                # different pipeline (parse_mode=HTML, no markdown conversion).
-                return (
-                    f"The failover peer **{name}** {did}. I have not retried on "
-                    "another peer, because re-running the request could repeat "
-                    "whatever it already did (for example sending a message or "
-                    "writing to the database). Please check whether the action went "
-                    "through before retrying."
-                )
-
             sticky = self._session_fallback_session(session)
             for peer_name, peer_inv in peers:
-                # Per ATTEMPT. Currently DEFENSIVE rather than load-bearing:
-                # any tool use terminates the chain, so no later peer can inherit
-                # an earlier one's flag on a reachable path (mutation-verified —
-                # deleting this line changes no observable behaviour). Kept because
-                # the scope is what makes the predicate mean what its name says.
-                peer_effects["tools"] = False
                 if streamed and streamed.get("text"):
                     break  # a prior peer already streamed answer text — can't fail
                     # over to another without double-output; degrade instead.
                 try:
                     output = await self._run_failover_peer(
                         peer_name, peer_inv, sticky=sticky,
-                        # None when the caller is non-streaming, NOT the wrapper:
-                        # `_invoke_peer` picks `run_streaming` vs `run` on exactly
-                        # this being non-None, so passing the tracker
-                        # unconditionally would silently switch the gateway's
-                        # failover onto a different invoker code path (different
-                        # output parsing and is_error classification). That change
-                        # may be right, but it is deliberately NOT in this PR —
-                        # the blind path fails closed instead (_can_observe_effects).
-                        on_event=_peer_tracked if on_event is not None else None,
-                        streamed=streamed, effects=peer_effects,
+                        on_event=on_event, streamed=streamed,
                     )
                 except (CCRateLimitError, CCQuotaExhaustedError) as exc:
                     # The prose lives HERE, not in the availability record. This
@@ -1347,7 +1201,7 @@ class ConversationLoop:
                     # persisted the provider's text into a file that is read into
                     # every health snapshot and JSON-dumped into an LLM prompt.
                     # The log is both the better home for it and outside that
-                    # exposure path, so the record now carries no free text.
+                    # exposure path, so the record carries no free text.
                     logger.warning(
                         "failover peer %s refused: %s", peer_name, exc, exc_info=True,
                     )
@@ -1356,14 +1210,15 @@ class ConversationLoop:
                     # tried; it exists so a blocked standby is VISIBLE, since the
                     # roster admits a peer on credential presence alone.
                     # to_thread: the recorder takes a lock with bounded retry
-                    # sleeps, then a tempfile write, fsync and replace.
-                    # Run inline it blocks the event loop — stalling every other
-                    # conversation during the very outage it exists to observe.
+                    # sleeps, then a tempfile write, fsync and replace. Run inline
+                    # it blocks the event loop — stalling every other conversation
+                    # during the very outage it exists to observe.
                     await _record_peer(peer_availability.note_failure, peer_name, exc)
-                    if _streamed_text():
-                        return ""  # see _streamed_text
-                    if _executed_tools():
-                        return _not_retried_after_effects(peer_name)
+                    if streamed and streamed.get("text"):
+                        # Text already reached the user this turn. Returning ""
+                        # (not None) stops the caller running contingency, which
+                        # would stack a SECOND answer on the first.
+                        return ""
                     continue  # this peer is also down → try the next one
                 except CCError as exc:
                     logger.warning("failover peer %s failed", peer_name, exc_info=True)
@@ -1372,77 +1227,36 @@ class ConversationLoop:
                     # server crash, a stale sticky session) is a CCError here too,
                     # but is not evidence about the peer. note_failure declines it,
                     # so one local blip can't mark the whole standby fleet down.
-                    # Classify SEPARATELY from recording. `note_failure` returns
-                    # False for four different reasons — declined classification,
-                    # lock contention, a failed write, an internal fault — so
-                    # reading its return as "declined" let a transient write
-                    # failure flip a real provider refusal into a recorded
-                    # SUCCESS, which then stands until the next home outage.
+                    # Classified SEPARATELY from recording: `note_failure` returns
+                    # False for four different reasons, so reading its return as
+                    # "declined" let a transient write failure flip a refusal into
+                    # a recorded success.
                     declined = not peer_availability.is_provider_refusal(exc)
                     await _record_peer(peer_availability.note_failure, peer_name, exc)
-                    if _executed_tools() and not _streamed_text():
-                        # Tools ran, then a local fault ended the turn with nothing
-                        # shown. The peer may already have acted, so this is a dead
-                        # end rather than the next peer's problem.
-                        if declined:
-                            await _record_peer(peer_availability.note_success, peer_name)
-                        return _not_retried_after_effects(peer_name)
-                    if _streamed_text():
+                    if streamed and streamed.get("text"):
                         if declined:
                             # The peer ANSWERED — text is on the user's screen —
-                            # and then a local fault (an MCP crash, our own
-                            # timeout) ended the turn. note_failure declined it,
-                            # correctly, as not evidence about the peer. But a
-                            # PRIOR block would then survive an attempt that
-                            # demonstrably reached and served from this peer, and
-                            # records only refresh during a home outage, so that
-                            # false "blocked" can stand for days. Serving the turn
-                            # is the clearest evidence of availability there is.
-                            await _record_peer(peer_availability.note_success, peer_name)
-                        return ""
+                            # and then a local fault ended the turn. A PRIOR block
+                            # must not survive an attempt that demonstrably served
+                            # from this peer; records only refresh during a home
+                            # outage, so a stale "blocked" stands for days.
+                            await _record_peer(
+                                peer_availability.note_success, peer_name,
+                            )
+                        return ""  # double-output guard, as above
                     continue
+                # Record availability only when the peer DEMONSTRABLY served the
+                # turn: a usable output, or answer text already on the user's
+                # screen. The degenerate empty non-error output (a silent cap)
+                # otherwise takes the success path below — behaviour identical to
+                # what shipped before this feature — and recording "available" on
+                # it would clear a real block with a turn that showed nothing.
+                # What to DO about that empty reply (advance? dead-end?) is retry
+                # policy, deliberately out of scope here; the effects-guard
+                # follow-up owns it.
                 usable = not output.is_error and bool((output.text or "").strip())
-                if not usable and not _streamed_text() and not _can_observe_effects():
-                    # FAIL CLOSED where we are BLIND. With no event stream we
-                    # cannot prove this peer executed nothing, and advancing
-                    # re-runs the whole prompt on another peer with the full
-                    # toolset and permissions skipped. This advance is NEW on
-                    # this branch, so refusing it here restores the prior
-                    # behaviour on exactly the path that cannot be gated —
-                    # rather than shipping a replay the guard silently misses.
-                    logger.warning(
-                        "failover peer %s returned no usable answer on a "
-                        "non-observable path — not advancing", peer_name,
-                    )
-                    await _remember_peer_session(output)
-                    return _not_retried_after_effects(peer_name, observed=False)
-                if not usable and not _streamed_text() and _executed_tools():
-                    # The exposure this branch introduced. Advancing here re-runs
-                    # the prompt on a second peer, and the first one has already
-                    # executed tools — so an outreach send or a DB write can happen
-                    # twice. A literal revert of this gate would remove the replay
-                    # but restore the older bug it was added for (an empty reply
-                    # handed to the user while the peer is recorded available), so
-                    # the advance is gated on effects rather than deleted.
+                if usable or (streamed and streamed.get("text")):
                     await _record_peer(peer_availability.note_success, peer_name)
-                    await _remember_peer_session(output)
-                    return _not_retried_after_effects(peer_name)
-                if not usable and not _streamed_text():
-                    # No usable answer and nothing shown to the user: the invoker
-                    # returns normally in degenerate cases (a silent cap yields an
-                    # empty non-error output). Taking the success path on those
-                    # recorded the peer available, entered fallback state, and
-                    # handed back an EMPTY reply without trying anyone else.
-                    logger.warning(
-                        "failover peer %s returned no usable answer — trying the "
-                        "next peer", peer_name,
-                    )
-                    continue
-                # Either a usable output, or text already on the user's screen —
-                # both mean this peer SERVED the turn, so both clear a stale block.
-                # Recording only the first left the surface blind in exactly the
-                # degenerate case this feature exists to make visible.
-                await _record_peer(peer_availability.note_success, peer_name)
                 # Success on this peer. Record the account-wide flag + this session's
                 # sticky peer session (only with a real session id, else continuity
                 # can't resume). Home identity in cc_sessions stays on Claude.
