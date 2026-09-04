@@ -1,50 +1,65 @@
 #!/usr/bin/env python3
 """File a Genesis-repo issue on the SHARED public tracker, safely.
 
-Three consecutive cross-model review rounds on the prose version of this
-procedure each found a different way for it to target the wrong repository or
-execute its own inputs. The failures were not independent bugs — they were the
-same class, and prose cannot enforce any of the five properties that matter:
+Four cross-model review rounds on this procedure — three while it was prose, one
+after it became this script — found the same shape of defect each time: a step
+CLAIMING MORE CERTAINTY THAN IT HAD. Every guarantee below exists because a
+reviewer showed the previous version asserting something it could not know.
 
-1. Resolve the UPSTREAM tracker, not whatever repo the cwd happens to be in.
-   `gh repo view` with no argument reports the CURRENT directory's repo, so on a
-   fork-cloned install it returns the operator's own fork — where they are ADMIN,
-   so a permission check on it passes and the issue lands somewhere nobody reads.
-2. Check `viewerPermission` on THAT EXPLICIT SLUG. Identity is not permission:
-   a direct clone reports the right slug while the user still lacks push access,
-   and GitHub then silently DROPS the mandatory labels.
-3. Never let issue text reach a shell. A title containing backticks or `$(...)` —
-   ordinary in a technical title — is executed if it is interpolated into a
-   command line, and its output lands in the public title. Everything here goes
-   through argv lists; no shell is ever involved.
-4. Per-invocation temp files. Two concurrent sessions sharing a fixed draft path
-   can overwrite each other between the privacy scan and the post.
-5. Exact-title dedup. `gh issue list --search` interprets `repo:` / `is:` /
-   `label:` inside a title as query syntax, so a raw-title search both misses
-   duplicates and can match unrelated issues.
+Targeting (rounds 1-3, prose):
+  * `--repo <install-user>/<repo>` resolved to the operator's OWN FORK.
+  * Bare `gh` commands re-resolve their target from the current directory, so a
+    `cd` between check and post redirects an irreversible write.
+  * `gh repo view` with no argument reports the CURRENT repo — on a fork clone
+    that is the fork, where the operator IS ADMIN, so a permission check on it
+    PASSES and the issue lands where nobody reads it.
 
-Everything fails CLOSED: any check that cannot complete refuses to file.
+Certainty at boundaries (round 4, this script):
+  * A capped listing is not proof of absence. The duplicate check paginates to
+    exhaustion; it never infers "no duplicate" from a truncated window.
+  * One `parent` hop is not the fork-network root. A fork of a fork needs the
+    chain walked. (This `gh` exposes `parent` but NOT `source`, so walking is
+    the available mechanism, not a stylistic preference.)
+  * Check-then-act is not atomic. Lookup and creation are serialised under a
+    per-tracker lock, so two concurrent sessions cannot both pass the duplicate
+    check and both post.
+  * A failed `gh issue create` does NOT prove nothing was posted. If the server
+    committed the issue and the response was lost, the issue EXISTS. That case
+    is reported as INDETERMINATE, never as "refused" — telling an operator that
+    nothing was posted when something may have been is the worst outcome here,
+    because they then file a duplicate or a false local record.
 
-This does NOT decide whether the issue *should* be public. The caller is
-responsible for the two hard limits in CLAUDE.md — explicit user approval for an
-irreversible post, and never publishing an unfixed security defect.
+Shell safety: everything runs through argv lists with `shell=False`. A title
+containing backticks or `$(...)` — ordinary in a technical title — would execute
+if interpolated into a command line, after the privacy scan, with its output in
+the public title. The absence of a shell is the mechanism, not a precaution.
+
+This does NOT decide whether the issue SHOULD be public. The caller owns the two
+hard limits in CLAUDE.md — explicit user approval for an irreversible post, and
+never publishing an unfixed security defect.
 
 Usage:
     file_tracker_issue.py --title-file T --body-file B --area area:memory \\
         --difficulty "help wanted" [--dry-run]
 
-Exit codes: 0 filed (or dry-run OK) · 2 refused (a precondition failed) ·
-3 duplicate found · 1 unexpected error.
+Exit codes: 0 filed (or dry-run OK) · 2 refused, nothing posted · 3 duplicate
+found · 4 INDETERMINATE — a post may or may not exist, reconcile before retrying
+· 1 unexpected error.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import subprocess
 import sys
+import tempfile
 import unicodedata
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
+from pathlib import Path
 
 # Mirrors of the fail-closed sets enforced server-side by
 # ``src/genesis/mcp/health/contributor_issue.py``. Duplicated deliberately —
@@ -74,11 +89,23 @@ DIFFICULTY_LABELS = frozenset(
 )
 WRITE_PERMISSIONS = frozenset({"WRITE", "MAINTAIN", "ADMIN"})
 
+# A fork chain deeper than this is pathological; bound the walk so a cycle or a
+# misbehaving API can never spin.
+MAX_FORK_DEPTH = 10
+
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
 
 class Refused(Exception):
-    """A precondition failed. Nothing was posted."""
+    """A precondition failed. NOTHING was posted — this is a hard guarantee."""
+
+
+class Indeterminate(Exception):
+    """The post may or may not exist. Reconcile against the tracker.
+
+    Deliberately NOT a subclass of Refused: the entire point is that a caller
+    must not treat it as "nothing happened".
+    """
 
 
 def _run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -98,25 +125,43 @@ def _gh_json(run: Runner, argv: Sequence[str]) -> dict:
         raise Refused(f"`{' '.join(argv)}` returned unparseable JSON: {exc}") from exc
 
 
-def resolve_tracker(run: Runner = _run) -> str:
-    """The SHARED tracker slug — the fork's parent when this is a fork.
+def _parent_slug(data: dict) -> str | None:
+    parent = data.get("parent") or {}
+    owner = (parent.get("owner") or {}).get("login")
+    name = parent.get("name")
+    return f"{owner}/{name}" if owner and name else None
 
-    Never returns the current repo blindly: that is the round-3 defect.
+
+def resolve_tracker(run: Runner = _run) -> str:
+    """The SHARED tracker slug — the ROOT of the fork network.
+
+    Walks the parent chain rather than taking a single hop: a fork of a fork
+    would otherwise resolve to the intermediate fork, where the operator may
+    well have write access, so the permission check passes and the post lands on
+    the wrong tracker. This `gh` exposes ``parent`` but not ``source``, so the
+    walk is the available mechanism.
     """
     data = _gh_json(run, ["gh", "repo", "view", "--json", "isFork,parent,nameWithOwner"])
-    if data.get("isFork"):
-        parent = data.get("parent") or {}
-        owner = (parent.get("owner") or {}).get("login")
-        name = parent.get("name")
-        if not owner or not name:
-            raise Refused(
-                "this clone is a fork but its parent could not be resolved — "
-                "refusing to file into the fork"
-            )
-        return f"{owner}/{name}"
     slug = data.get("nameWithOwner")
     if not slug:
         raise Refused("could not resolve a repository from this directory")
+
+    depth = 0
+    while data.get("isFork"):
+        depth += 1
+        if depth > MAX_FORK_DEPTH:
+            raise Refused(
+                f"fork chain deeper than {MAX_FORK_DEPTH} from {slug} — refusing rather "
+                "than guessing which repository is the shared tracker"
+            )
+        parent = _parent_slug(data)
+        if not parent:
+            raise Refused(
+                f"{slug} is a fork but its parent could not be resolved — refusing to "
+                "file into the fork"
+            )
+        slug = parent
+        data = _gh_json(run, ["gh", "repo", "view", slug, "--json", "isFork,parent,nameWithOwner"])
     return str(slug)
 
 
@@ -137,25 +182,26 @@ def _normalize(title: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", title).casefold().split())
 
 
-def find_duplicate(slug: str, title: str, run: Runner = _run, limit: int = 200) -> int | None:
-    """Exact normalized-title match over structured output.
+def find_duplicate(slug: str, title: str, run: Runner = _run) -> int | None:
+    """Exact normalized-title match over an EXHAUSTIVE listing.
 
-    Deliberately does NOT use `--search`: a title containing `repo:` or `is:`
-    would be parsed as query syntax rather than searched literally.
+    Two things this deliberately does not do:
+
+    * It does not use ``--search``. A title containing ``repo:`` / ``is:`` /
+      ``label:`` would be parsed as query syntax rather than searched literally.
+    * It does not cap. A capped window that happens to exclude the match is
+      indistinguishable from no match — absence from a truncated read is not
+      absence. ``--paginate`` walks every page; the ``pull_request`` filter is
+      required because GitHub's issues endpoint returns PRs too.
     """
     proc = run(
         [
             "gh",
-            "issue",
-            "list",
-            "--repo",
-            slug,
-            "--state",
-            "all",
-            "--limit",
-            str(limit),
-            "--json",
-            "number,title",
+            "api",
+            "--paginate",
+            f"repos/{slug}/issues?state=all&per_page=100",
+            "--jq",
+            '.[] | select(has("pull_request")|not) | {number,title}',
         ]
     )
     if proc.returncode != 0:
@@ -163,12 +209,18 @@ def find_duplicate(slug: str, title: str, run: Runner = _run, limit: int = 200) 
             f"duplicate check failed on {slug}: {proc.stderr.strip() or proc.returncode}. "
             "Refusing to file — a failed lookup is not 'no duplicate'."
         )
-    try:
-        issues = json.loads(proc.stdout or "[]")
-    except json.JSONDecodeError as exc:
-        raise Refused(f"duplicate check returned unparseable JSON: {exc}") from exc
     target = _normalize(title)
-    for issue in issues:
+    for raw in (proc.stdout or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            issue = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise Refused(
+                f"duplicate check returned unparseable JSON: {exc}. Refusing — a partial "
+                "read cannot prove absence."
+            ) from exc
         if _normalize(str(issue.get("title", ""))) == target:
             return int(issue["number"])
     return None
@@ -189,16 +241,55 @@ def validate_labels(area: str, difficulty: str) -> list[str]:
     return [area, difficulty]
 
 
+def _lock_path(slug: str) -> Path:
+    """Per-tracker lock file. Home-based so a tmp cleaner cannot drop it."""
+    digest = hashlib.sha256(slug.encode()).hexdigest()[:16]
+    base = Path.home() / ".genesis" / "locks"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        base = Path(tempfile.gettempdir())
+    return base / f"tracker-issue-{digest}.lock"
+
+
+@contextmanager
+def tracker_lock(slug: str):
+    """Serialise duplicate-check + create for one tracker on this install.
+
+    Without it, two concurrent foreground sessions can both pass the duplicate
+    check before either posts, and both then post — defeating the check that
+    exists precisely for that case. Cross-INSTALL races remain possible; that is
+    inherent to client-side dedup and is stated here rather than hidden.
+    """
+    path = _lock_path(slug)
+    with open(path, "w", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def create_issue(
     slug: str, title: str, body_path: str, labels: Sequence[str], run: Runner = _run
 ) -> str:
-    """Post it. Title and body travel as argv, never through a shell."""
+    """Post it. Title and body travel as argv, never through a shell.
+
+    A nonzero exit raises Indeterminate, NOT Refused: GitHub may have committed
+    the issue before the response was lost, in which case the post exists. The
+    caller must reconcile rather than assume nothing happened.
+    """
     argv = ["gh", "issue", "create", "--repo", slug, "--title", title, "--body-file", body_path]
     for label in labels:
         argv += ["--label", label]
     proc = run(argv)
     if proc.returncode != 0:
-        raise Refused(f"gh issue create failed: {proc.stderr.strip() or proc.returncode}")
+        raise Indeterminate(
+            f"gh issue create on {slug} exited {proc.returncode}: "
+            f"{proc.stderr.strip() or '(no stderr)'}. The issue MAY have been created — "
+            "GitHub can commit the post and still lose the response. Check the tracker "
+            "for this title BEFORE retrying or recording a local row."
+        )
     return proc.stdout.strip()
 
 
@@ -229,18 +320,24 @@ def main(argv: Sequence[str] | None = None, run: Runner = _run) -> int:
         labels = validate_labels(args.area, args.difficulty)
         slug = resolve_tracker(run)
         perm = check_permission(slug, run)
-        dup = find_duplicate(slug, title, run)
-        if dup is not None:
-            print(
-                f"DUPLICATE: {slug}#{dup} already has this exact title. Nothing filed.",
-                file=sys.stderr,
-            )
-            return 3
-        if args.dry_run:
-            print(f"DRY RUN ok — would file to {slug} (perm={perm}) with labels {labels}")
-            return 0
-        print(create_issue(slug, title, args.body_file, labels, run))
+
+        # Lookup and creation are ONE critical section — see tracker_lock().
+        with tracker_lock(slug):
+            dup = find_duplicate(slug, title, run)
+            if dup is not None:
+                print(
+                    f"DUPLICATE: {slug}#{dup} already has this exact title. Nothing filed.",
+                    file=sys.stderr,
+                )
+                return 3
+            if args.dry_run:
+                print(f"DRY RUN ok — would file to {slug} (perm={perm}) with labels {labels}")
+                return 0
+            print(create_issue(slug, title, args.body_file, labels, run))
         return 0
+    except Indeterminate as exc:
+        print(f"INDETERMINATE: {exc}", file=sys.stderr)
+        return 4
     except Refused as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2

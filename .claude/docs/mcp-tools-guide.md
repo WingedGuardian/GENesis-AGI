@@ -69,9 +69,17 @@ live in code with `tests/test_scripts/test_file_tracker_issue.py` pinning each o
   not exist; a nonexistent mandatory label makes `gh issue create` fail. Use
   `area:other` when nothing fits.
 
-Exit codes: `0` filed (or dry-run clean) · `2` refused, nothing posted · `3` an
-identical title already exists · `1` unexpected error. **Run `--dry-run` first** —
-it performs every check and posts nothing.
+Exit codes: `0` filed (or dry-run clean) · `2` refused — **nothing was posted**, that
+is a hard guarantee · `3` an identical title already exists · `4` **INDETERMINATE** ·
+`1` unexpected error. **Run `--dry-run` first** — it performs every check and posts
+nothing.
+
+Exit `4` is the one that needs a human. It means `gh` failed but GitHub may already
+have committed the issue and lost the response — so the post may exist. Check the
+tracker for that title BEFORE retrying or writing a local row; a retry on a successful
+post creates a duplicate, and a local row records a falsehood. `2` and `4` are
+deliberately distinct: conflating them would tell you nothing was posted when
+something may have been.
 
 Use a fresh `mktemp -d` per invocation, and clean it WITHOUT `rm -rf` — this
 repo's own destructive-command guard refuses a recursive-force delete on a path it
