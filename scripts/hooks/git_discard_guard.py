@@ -226,21 +226,14 @@ def _snapshot_dir() -> str:
     where it is rather than migrated. Its rows point at unreachable stash objects git
     prunes on its own schedule, so it self-obsoletes within weeks; moving it would
     carry pointers that are about to stop resolving anyway."""
-    override = os.environ.get("GENESIS_DISCARD_SNAPSHOT_DIR")
-    if override and os.path.isabs(override):
-        return override
-    if override:
-        # A RELATIVE override resolves against the hook's cwd — the repo — putting
-        # durable recovery records inside the working tree, where they can be
-        # committed. The docstring above already claims the store "lives outside any
-        # repo"; this is what makes that true rather than aspirational, and matches
-        # the merge gate's identical refusal for its own store.
-        print(
-            "[audit-log] GENESIS_DISCARD_SNAPSHOT_DIR must be an absolute path; "
-            f"ignoring {override!r}",
-            file=sys.stderr,
-        )
-    return os.path.expanduser("~/.genesis/git_discard_snapshots")
+    # ONE resolver, shared with the other guard and the pruner. This rule
+    # was written out three times and the pruner's copy omitted the
+    # absolute-path refusal, so it trimmed an unrelated directory while the
+    # real store grew unbounded (Codex P2, PR #1609). See
+    # audit_jsonl.resolve_store_dir.
+    from audit_jsonl import resolve_store_dir
+
+    return resolve_store_dir("GENESIS_DISCARD_SNAPSHOT_DIR")
 
 
 def _segment_cwd(seg, payload: dict) -> str | None:

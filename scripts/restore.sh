@@ -817,7 +817,12 @@ fi
 # copy in its exit status and which coreutils warns may change behaviour.
 log "--- Hook audit stores ---"
 _AUDIT_SRC="$BACKUP_DIR/audit/merge_overrides"
-_AUDIT_DST="$HOME/.genesis/merge_overrides"
+# ASK, do not assume — same resolver the writer and the pruner use. Restoring to
+# the hardcoded default put an install with a custom GENESIS_MERGE_OVERRIDE_DIR
+# back together with its audit trail in a directory nothing reads (Codex P2,
+# PR #1609).
+_AUDIT_DST="$(python3 "$_SCRIPT_DIR/hooks/audit_jsonl.py" --store-dir GENESIS_MERGE_OVERRIDE_DIR 2>/dev/null \
+    || printf '%s' "$HOME/.genesis/merge_overrides")"
 if [ ! -d "$_AUDIT_SRC" ]; then
     log "Audit stores: no backup payload"
 elif $DRY_RUN; then
@@ -832,9 +837,20 @@ else
         # counting its status reported every skipped file as restored. Test the
         # destination's absence instead, which is the condition actually meant.
         if [ ! -e "$_dst" ]; then
-            if cp "$_f" "$_dst" 2>/dev/null; then
+            # Copy to a TEMP name and rename into place. A bare `cp` that fails
+            # partway — a full disk is the realistic one — leaves a truncated
+            # JSONL at the destination, adds no warning, and lets the restore
+            # report success; every later restore then SKIPS that file because
+            # `-e` is now true, even with --force, so the corruption is permanent
+            # and silent (Codex P2, PR #1609). rename(2) is atomic within the
+            # directory, so the destination either does not exist or is whole.
+            _tmp="$_dst.partial.$$"
+            if cp "$_f" "$_tmp" 2>/dev/null && mv -f "$_tmp" "$_dst" 2>/dev/null; then
                 chmod 0600 "$_dst" 2>/dev/null || true
                 _AUDIT_RESTORED=$(( _AUDIT_RESTORED + 1 ))
+            else
+                rm -f "$_tmp" 2>/dev/null || true
+                warn "audit record $(basename "$_f") could not be restored"
             fi
         fi
     done < <(find "$_AUDIT_SRC" -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)

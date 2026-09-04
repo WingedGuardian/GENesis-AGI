@@ -9,8 +9,10 @@ written.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -28,11 +30,25 @@ def _run(*args: str) -> subprocess.CompletedProcess:
     )
 
 
-def _seed(d: Path, n: int, size: int = 1000) -> None:
+def _seed(d: Path, n: int, size: int = 1000, *, age_s: float = 3600) -> None:
+    """Seed a store with n records, BACKDATED by default.
+
+    The mtime is set deliberately, not left at "now": the pruner refuses to
+    delete a file touched inside its active-writer grace window, because two
+    overlapping flushes mean the earlier writer's file is not the newest NAME and
+    was otherwise an ordinary deletion candidate (Codex P2, PR #1609). Fixtures
+    that write everything in the same millisecond are the one shape real stores
+    never have — a store being trimmed by the daily timer holds files hours old —
+    so backdating is what makes these tests model the thing they test. Pass
+    ``age_s=0`` to exercise the protection itself.
+    """
     d.mkdir(parents=True, exist_ok=True)
+    when = time.time() - age_s
     for i in range(n):
         body = json.dumps({"seeded": i, "pad": "x" * max(size - 30, 1)}) + "\n"
-        (d / f"20200101T000000_{i:06d}Z-1-0.jsonl").write_text(body)
+        f = d / f"20200101T000000_{i:06d}Z-1-0.jsonl"
+        f.write_text(body)
+        os.utime(f, (when, when))
 
 
 def test_an_oversize_store_is_trimmed_to_the_bound(tmp_path):
@@ -99,3 +115,30 @@ def test_disk_hygiene_actually_invokes_the_pruner():
     assert "prune_hook_audit_logs.py" in body, "the groom does not invoke the pruner"
     main_body = body.split("\nmain() {", 1)[-1] if "\nmain() {" in body else body
     assert "prune_hook_audit_logs.py" in main_body, "the invocation is outside main()"
+
+
+def test_a_recently_written_file_is_not_trimmed(tmp_path):
+    """The protection itself. Two overlapping flushes mean the EARLIER writer's
+    file is not the newest name — so excluding only `files[-1]` left it an
+    ordinary deletion candidate, and unlinking it made that writer return a path
+    that no longer exists as a successful write (Codex P2, PR #1609)."""
+    store = tmp_path / "store"
+    _seed(store, 20, size=1000, age_s=0)  # everything written just now
+    r = _run(str(store), "--max-bytes", "10")
+    assert r.returncode == 0, r.stderr
+    assert len(list(store.glob("*.jsonl"))) == 20, (
+        "the pruner deleted files a concurrent flush could still be writing"
+    )
+
+
+def test_old_files_are_still_trimmed_when_a_new_one_exists(tmp_path):
+    """CONTROL, and the one that stops the grace window becoming a no-op: a store
+    with one fresh file and many old ones must still shrink."""
+    store = tmp_path / "store"
+    _seed(store, 20, size=1000)  # backdated
+    fresh = store / "20990101T000000_000000Z-1-0.jsonl"
+    fresh.write_text(json.dumps({"fresh": True}) + "\n")
+    r = _run(str(store), "--max-bytes", "5000")
+    assert r.returncode == 0, r.stderr
+    assert fresh.exists(), "the newest file was taken"
+    assert sum(f.stat().st_size for f in store.glob("*.jsonl")) <= 5100

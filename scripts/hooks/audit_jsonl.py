@@ -64,6 +64,7 @@ import json
 import os
 import stat
 import sys
+import time
 from collections.abc import Sequence
 
 #: Own-user-only. These records carry local repo paths, branch names and PR numbers,
@@ -164,6 +165,51 @@ def write_batch(dir_path: str, rows: Sequence[dict], *, sort_keys: bool = False)
         return None
 
 
+#: Every audit store this module backs: env knob -> path under ``~/.genesis``.
+#: ONE table, because five consumers were each re-deriving the answer and three of
+#: them derived it differently (Codex P2 x3, PR #1609).
+STORES = {
+    "GENESIS_MERGE_OVERRIDE_DIR": "merge_overrides",
+    "GENESIS_DISCARD_SNAPSHOT_DIR": "git_discard_snapshots",
+}
+
+
+def resolve_store_dir(env_var: str) -> str:
+    """Where a store lives — the SINGLE answer, for every reader and writer.
+
+    The rule itself is unchanged: an ABSOLUTE override is honoured, a RELATIVE one
+    is refused in favour of the default because it would resolve against the hook's
+    cwd (the repo) and put durable audit files inside the working tree, where they
+    can be committed.
+
+    What changes is that there is now one copy of it. The rule was written out in
+    both guards, a THIRD time in the pruner WITHOUT the absolute-path refusal, and
+    the default was hardcoded a fourth and fifth time in backup.sh and restore.sh.
+    The consequences were not cosmetic: the pruner accepted a relative value and
+    trimmed an unrelated directory under its cwd while the real store grew unbounded,
+    and an install using a custom store had its audit trail silently excluded from
+    backup and restore. A rule that must be REMEMBERED at five call sites is a rule
+    that is already wrong at one of them.
+
+    Exposed to the shell too — ``python3 scripts/hooks/audit_jsonl.py --store-dir
+    <ENV_VAR>`` — so backup.sh and restore.sh ask rather than assume.
+    """
+    override = os.environ.get(env_var)
+    if override and os.path.isabs(override):
+        return override
+    if override:
+        warn(f"{env_var} must be an absolute path; ignoring {override!r}")
+    return os.path.expanduser(f"~/.genesis/{STORES[env_var]}")
+
+
+#: How recently a file must have been touched to be treated as possibly still
+#: being written. A flush is milliseconds; 300s is ~5 orders of magnitude of head
+#: room, chosen because the two errors are not symmetric — retaining a little
+#: extra costs bytes, deleting a live writer's file costs the only copy of a
+#: record.
+_ACTIVE_WRITER_GRACE_S = 300
+
+
 def trim_dir_by_size(dir_path: str, max_bytes: int) -> int:
     """Delete the OLDEST files until the directory fits ``max_bytes``; return bytes freed.
 
@@ -199,9 +245,27 @@ def trim_dir_by_size(dir_path: str, max_bytes: int) -> int:
         # newest record — the file a live writer may be mid-write on, and the one
         # least likely to be in a backup yet. A survivor invariant enforced by
         # arithmetic is not an invariant; slicing makes it structural.
+        # Excluding only the newest name is not enough when two flushes OVERLAP.
+        # The names are timestamp-prefixed, so the later flush creates the newer
+        # name — and the earlier writer can still have its file open. That earlier
+        # file is then an ordinary deletion candidate, and unlinking it leaves the
+        # writer returning a path that no longer exists as a successful write
+        # (Codex P2, PR #1609).
+        #
+        # So recency, not just position: nothing modified within the grace window is
+        # a candidate, however many newer names exist. The window is generous
+        # because the cost is asymmetric — keeping a few extra KB for a minute is
+        # nothing, and deleting a live writer's file loses an audit record that
+        # exists nowhere else yet.
+        cutoff = time.time() - _ACTIVE_WRITER_GRACE_S
         for _name, path, size in files[:-1]:
             if total <= max_bytes:
                 break
+            try:
+                if os.stat(path).st_mtime > cutoff:
+                    continue  # may be a live writer's file
+            except OSError:
+                continue
             try:
                 os.unlink(path)
             except OSError:
@@ -213,3 +277,28 @@ def trim_dir_by_size(dir_path: str, max_bytes: int) -> int:
     except OSError as exc:
         warn(f"{dir_path}: trim failed ({exc!r})")
     return freed
+
+
+def _main(argv: list[str] | None = None) -> int:
+    """``--store-dir <ENV_VAR>`` — print where that store lives, and exit.
+
+    A module that is otherwise a library, given one CLI verb, so backup.sh and
+    restore.sh can ASK where the store is instead of hardcoding the default.
+    They hardcoded it, which meant an install with a custom
+    ``GENESIS_MERGE_OVERRIDE_DIR`` had its audit trail silently excluded from the
+    backup and restored to the wrong place — the trail lost on exactly the rebuild
+    it exists for (Codex P2, PR #1609).
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    if len(args) == 2 and args[0] == "--store-dir" and args[1] in STORES:
+        print(resolve_store_dir(args[1]))
+        return 0
+    print(
+        f"usage: {__file__} --store-dir <{'|'.join(sorted(STORES))}>",
+        file=sys.stderr,
+    )
+    return 2
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    raise SystemExit(_main())

@@ -2124,16 +2124,14 @@ def _override_log_dir() -> str:
     absolute paths are "in a repo", which is a worse problem than the one being
     solved, and an operator who spells out such a path has chosen it. The default is
     what ``test_the_live_default_path_is_outside_any_repo`` keeps honest."""
-    override = os.environ.get("GENESIS_MERGE_OVERRIDE_DIR")
-    if override and os.path.isabs(override):
-        return override
-    if override:
-        print(
-            "[audit-log] GENESIS_MERGE_OVERRIDE_DIR must be an absolute path; "
-            f"ignoring {override!r}",
-            file=sys.stderr,
-        )
-    return os.path.expanduser("~/.genesis/merge_overrides")
+    # ONE resolver, shared with the other guard and the pruner. This rule
+    # was written out three times and the pruner's copy omitted the
+    # absolute-path refusal, so it trimmed an unrelated directory while the
+    # real store grew unbounded (Codex P2, PR #1609). See
+    # audit_jsonl.resolve_store_dir.
+    from audit_jsonl import resolve_store_dir
+
+    return resolve_store_dir("GENESIS_MERGE_OVERRIDE_DIR")
 
 
 def _note_override(

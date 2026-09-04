@@ -30,13 +30,18 @@ if str(HOOKS_DIR) not in sys.path:
 
 
 def _default_dirs() -> list[str]:
-    """The two live stores, honouring the same env knobs their writers read."""
-    return [
-        os.environ.get("GENESIS_MERGE_OVERRIDE_DIR")
-        or os.path.expanduser("~/.genesis/merge_overrides"),
-        os.environ.get("GENESIS_DISCARD_SNAPSHOT_DIR")
-        or os.path.expanduser("~/.genesis/git_discard_snapshots"),
-    ]
+    """The live stores, resolved by the WRITERS' own function.
+
+    It used to re-derive them here, and the copy was subtly different: it accepted
+    a RELATIVE override that both writers explicitly refuse. The pruner then
+    trimmed some unrelated directory under its working directory while the real
+    store — which the writers were still filling at the default path — grew with
+    no retention at all, for as long as that env var stayed set (Codex P2,
+    PR #1609). Asking the shared resolver makes the two impossible to disagree.
+    """
+    from audit_jsonl import STORES, resolve_store_dir
+
+    return [resolve_store_dir(var) for var in STORES]
 
 
 def _trim(directory: str, max_bytes: int) -> int:

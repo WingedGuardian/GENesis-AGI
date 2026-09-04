@@ -627,19 +627,41 @@ fi
 # while every recovery attempt fails, which is worse than an absent one. At a live
 # install, of 76 recorded shas one was already unresolvable in the repo that wrote
 # it. Making it genuinely restorable means backing up the objects, not the records.
-_OVERRIDE_STORE="$HOME/.genesis/merge_overrides"
+# ASK the writer where the store is; do not assume the default. An install that
+# sets GENESIS_MERGE_OVERRIDE_DIR to a supported absolute path had its audit trail
+# silently excluded here and restored to the wrong place — the trail lost on
+# exactly the rebuild it exists for (Codex P2, PR #1609). One resolver, five
+# consumers: see audit_jsonl.resolve_store_dir.
+_OVERRIDE_STORE="$(python3 "$_SCRIPT_DIR/hooks/audit_jsonl.py" --store-dir GENESIS_MERGE_OVERRIDE_DIR 2>/dev/null \
+    || printf '%s' "$HOME/.genesis/merge_overrides")"
 if [ -d "$_OVERRIDE_STORE" ]; then
     log "Backing up hook audit stores..."
     mkdir -p audit/merge_overrides
     _AUDIT_COUNT=0
+    _AUDIT_KEPT=""
     while IFS= read -r -d '' _f; do
-        if cp "$_f" "audit/merge_overrides/$(basename "$_f")"; then
+        _base="$(basename "$_f")"
+        if cp "$_f" "audit/merge_overrides/$_base"; then
             _AUDIT_COUNT=$(( _AUDIT_COUNT + 1 ))
+            _AUDIT_KEPT="$_AUDIT_KEPT$_base"$'\n'
         else
-            log "WARNING: failed to copy $(basename "$_f")"
+            log "WARNING: failed to copy $_base"
         fi
     done < <(find "$_OVERRIDE_STORE" -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
-    log "Hook audit stores: $_AUDIT_COUNT file(s)"
+    # MIRROR the store, do not merely add to it. A copy-only loop left every
+    # record the daily pruner had deleted in the backup forever: the mirror grows
+    # past the 5 MB bound the store advertises, and a disaster restore
+    # REINTRODUCES every record retention removed (Codex P2, PR #1609). Deleting
+    # only names the live store no longer has keeps the backup a snapshot of the
+    # store rather than its union over time.
+    _AUDIT_DROPPED=0
+    while IFS= read -r -d '' _b; do
+        _bbase="$(basename "$_b")"
+        if ! printf '%s' "$_AUDIT_KEPT" | grep -qxF "$_bbase"; then
+            rm -f "$_b" && _AUDIT_DROPPED=$(( _AUDIT_DROPPED + 1 ))
+        fi
+    done < <(find audit/merge_overrides -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
+    log "Hook audit stores: $_AUDIT_COUNT file(s), $_AUDIT_DROPPED pruned from mirror"
 fi
 
 # --- 7. Secrets (encrypted with GPG symmetric) ---
