@@ -382,6 +382,30 @@ def main() -> None:
     last_session_data = _load_last_session_data()
 
     if is_genesis_session:
+        # 1.9. THE SESSION'S OWN ID. A foreground session learns it from the
+        # per-turn `[Clock: … | Session: xxxxxxxx]` tag, which
+        # `genesis_urgent_alerts` writes — and that hook returns immediately for
+        # a dispatched session (GENESIS_CC_SESSION=1). So a dispatched session
+        # had no way to know its own id, and every provenance field it wrote was
+        # NULL by construction: not a bug in the writer, an input it was never
+        # given (Codex P2, PR #1622).
+        #
+        # Emitted once at session start rather than per turn: this is a
+        # session-lifetime constant, and the per-turn tag exists for the clock
+        # beside it, not for the id.
+        if _hook_session_id:
+            if not first:
+                _emit("\n\n---\n\n")
+            _emit(
+                "## This Session\n\n"
+                f"- **CC session id**: `{_hook_session_id}`\n\n"
+                "Pass it as `source_session` when a tool asks which session work "
+                "came from (`follow_up_create`, `session_ledger_add`). Without it "
+                "the row records no origin, and nothing downstream can attribute "
+                "the work back here.\n"
+            )
+            first = False
+
         # 2. Cognitive state from DB — for ego/background sessions only.
         # Foreground sessions get essential knowledge instead (see below).
         try:

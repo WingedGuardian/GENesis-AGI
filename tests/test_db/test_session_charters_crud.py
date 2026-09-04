@@ -135,6 +135,108 @@ async def test_resolve_prefix_via_cc_sessions_when_uncharted(db):
     assert await crud.resolve_session_id(db, SID[:8]) == SID
 
 
+# ─── resolve_session_id: three stores, one union (PR #1622) ──────────────────
+
+
+async def _seed_cc_session(db, sid: str, row_id: str = "g-x") -> None:
+    await db.execute(
+        "INSERT INTO cc_sessions (id, session_type, model, started_at,"
+        " last_activity_at, cc_session_id)"
+        " VALUES (?, 'foreground', 'test-model',"
+        " '2026-07-13T00:00:00+00:00', '2026-07-13T00:00:00+00:00', ?)",
+        (row_id, sid),
+    )
+    await db.commit()
+
+
+async def _seed_heartbeat(db, sid: str) -> None:
+    await db.execute(
+        "INSERT INTO session_heartbeats (cc_session_id, source_tag, updated_at)"
+        " VALUES (?, 'foreground', '2026-07-13T00:00:00+00:00')",
+        (sid,),
+    )
+    await db.commit()
+
+
+async def test_resolve_prefix_via_heartbeats_for_a_brand_new_session(db):
+    """THE common case, and it resolved to NOTHING before.
+
+    The UserPromptSubmit hook writes the heartbeat BEFORE the model runs, so for
+    a foreground session that has not compacted or been extracted yet, the
+    heartbeat table is the ONLY store holding its full id. That is exactly the
+    window in which a session creates a follow-up about its own work — so the
+    store the resolver did not consult was the one covering the case the feature
+    exists for.
+    """
+    sid = "beef0001-1111-2222-3333-444455556666"
+    await _seed_heartbeat(db, sid)
+    assert await crud.resolve_session_id(db, sid[:8]) == sid
+
+
+async def test_a_prefix_matching_two_DIFFERENT_sessions_across_stores_is_ambiguous(db):
+    """The wrong-attribution bug, and it is the reason the union exists.
+
+    Asking the charters table first and ACCEPTING its single hit decides
+    uniqueness from one store — but "unique" is a property of the union. A
+    prefix hitting one chartered session and a DIFFERENT unchartered one used to
+    return the charter's id, so the follow-up was permanently attributed to a
+    session that did not create it.
+    """
+    await crud.upsert_stub(db, "cafe0002-1111-2222-3333-444455556666")
+    await _seed_cc_session(db, "cafe0002-9999-8888-7777-666655554444")
+    assert await crud.resolve_session_id(db, "cafe0002") == "cafe0002"
+
+
+async def test_the_same_session_in_two_stores_is_still_one_answer(db):
+    """CONTROL on the union, and it is load-bearing: `UNION ALL` would return
+    two rows here and report a real, unambiguous session as ambiguous — which
+    is the ordinary state for any session that has both a charter and a
+    heartbeat, i.e. most of them."""
+    sid = "d00d0003-1111-2222-3333-444455556666"
+    await crud.upsert_stub(db, sid)
+    await _seed_heartbeat(db, sid)
+    await _seed_cc_session(db, sid, row_id="g-dup")
+    assert await crud.resolve_session_id(db, sid[:8]) == sid
+
+
+async def test_a_prefix_carrying_a_LIKE_wildcard_is_refused(db):
+    """The prefix is interpolated into a `LIKE`, where `%` and `_` are
+    WILDCARDS. A malformed prefix could match exactly one unrelated row and be
+    written as durable provenance — a wrong answer wearing the grammar of a
+    resolved one.
+
+    Refused rather than escaped: a session id is a UUID, so a token outside
+    hex-and-hyphen is not a prefix of one, and keeping it out of the query
+    entirely beats asking the question with an escape rule someone must remember
+    to apply.
+    """
+    sid = "face0004-1111-2222-3333-444455556666"
+    await crud.upsert_stub(db, sid)
+    for malformed in ("face000%", "face000_", "%", "_", "fa%e0004"):
+        assert await crud.resolve_session_id(db, malformed) == malformed, malformed
+
+
+async def test_a_non_hex_prefix_is_refused_before_it_reaches_the_query(db):
+    """The other half of the alphabet check — a token that is simply not a
+    session-id prefix."""
+    await crud.upsert_stub(db, "0bad0005-1111-2222-3333-444455556666")
+    assert await crud.resolve_session_id(db, "not-an-id!") == "not-an-id!"
+
+
+async def test_a_unique_prefix_still_resolves_from_each_store_alone(db):
+    """CONTROL. Without it, "refuse everything ambiguous" would score green on
+    every test above while making the resolver useless."""
+    charter = "1111000a-1111-2222-3333-444455556666"
+    ccrow = "2222000b-1111-2222-3333-444455556666"
+    beat = "3333000c-1111-2222-3333-444455556666"
+    await crud.upsert_stub(db, charter)
+    await _seed_cc_session(db, ccrow, row_id="g-solo")
+    await _seed_heartbeat(db, beat)
+    assert await crud.resolve_session_id(db, charter[:8]) == charter
+    assert await crud.resolve_session_id(db, ccrow[:8]) == ccrow
+    assert await crud.resolve_session_id(db, beat[:8]) == beat
+
+
 # ─── Ledger lifecycle ─────────────────────────────────────────────────────────
 
 

@@ -352,3 +352,180 @@ async def test_approved_but_pipeline_ignores_is_terminal(db):
     # The approval lifecycle is closed (consumed) so it doesn't linger as a
     # ghost approved/unconsumed row in operator views.
     assert (await ac.get_by_id(db, rid))["consumed_at"] is not None
+
+
+# --- loop-fix: prospect contact-stamping on CONFIRMED delivery -----------------
+
+
+async def _bulk_hold_for(db, *, prospect_email, rid, cell_risk_class="bulk", pid="pb"):
+    await pes.create(
+        db,
+        id=pid,
+        request_id=rid,
+        validated_recipient=prospect_email,
+        category="notification",
+        message="cold pitch",
+        held_at=_TS,
+        cell_domain="email",
+        cell_verb="send",
+        cell_risk_class=cell_risk_class,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delivered_bulk_hold_stamps_prospect_contacted(db, monkeypatch):
+    """Confirmed delivery of a cold-marketing (BULK) send advances the prospect
+    active → contacted at the DRAIN, so list_active stops re-pitching it — the
+    loop-fix (mark_contacted previously had no caller)."""
+    monkeypatch.setattr(egw, "_marketing_mode", lambda: "live")
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await _bulk_hold_for(db, prospect_email="prospect@example.com", rid=rid)
+
+    assert (
+        await drain_pending_email_sends(_FakeRt(db, _FakePipeline(OutreachStatus.DELIVERED))) == 1
+    )
+    row = await mp.get_by_id(db, "prospect")
+    assert row["status"] == "contacted"
+    assert row["last_contacted_at"] is not None
+    assert await mp.list_active(db) == []
+
+
+@pytest.mark.asyncio
+async def test_delivered_financial_misclassified_pitch_still_stamps(db):
+    """Provenance is RECIPIENT-based, NOT cell_risk_class: a cold pitch whose body
+    tripped the money-pattern classifier holds as FINANCIAL (not BULK), but on
+    delivery to a curated prospect it must STILL stamp them — else re-pitched."""
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await _bulk_hold_for(
+        db,
+        prospect_email="prospect@example.com",
+        rid=rid,
+        cell_risk_class="financial",
+        pid="pf",
+    )
+
+    assert (
+        await drain_pending_email_sends(_FakeRt(db, _FakePipeline(OutreachStatus.DELIVERED))) == 1
+    )
+    assert (await mp.get_by_id(db, "prospect"))["status"] == "contacted"
+
+
+@pytest.mark.asyncio
+async def test_non_delivery_outcome_leaves_prospect_active(db):
+    """Anti-burn: the stamp fires ONLY on confirmed delivery. An orphaned hold
+    (approval gone → expired, no delivery) leaves the prospect 'active', re-eligible
+    — a send that never delivers never closes a prospect. Owner-rejection likewise
+    leaves it active (re-eligible for a re-worded pitch; opt-out is the 'never')."""
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    await _bulk_hold_for(db, prospect_email="prospect@example.com", rid="gone")  # no approval
+
+    assert (
+        await drain_pending_email_sends(_FakeRt(db, _FakePipeline(OutreachStatus.DELIVERED))) == 1
+    )
+    assert (await mp.get_by_id(db, "prospect"))["status"] == "active"  # not burned
+    assert len(await mp.list_active(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconciled_consumed_hold_stamps_prospect(db):
+    """Crash-recovery: a hold whose approval was ALREADY consumed (delivered by a
+    prior cycle that crashed before marking 'sent') reconciles to sent AND stamps the
+    prospect — a crash between delivery and the stamp must not leave a delivered
+    prospect 'active' and re-pitchable. Not re-sent (pipe.calls stays empty)."""
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await ac.mark_consumed(db, rid, consumed_at=_TS)
+    await _bulk_hold_for(db, prospect_email="prospect@example.com", rid=rid)
+
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == []  # NOT re-sent
+    assert (await mp.get_by_id(db, "prospect"))["status"] == "contacted"
+
+
+@pytest.mark.asyncio
+async def test_reconciled_hold_stamps_prospect_before_terminalizing(db, monkeypatch):
+    """Crash-safety of the reconcile branch: the prospect stamp must be durable
+    BEFORE the hold goes terminal (mark_sent). If the terminal write fails (DB
+    error) — or the process stops right after mark_sent commits — the hold leaves
+    list_held forever while the prospect is still 'active' → re-pitched. Simulate
+    the terminal write raising at exactly that point and assert the prospect was
+    ALREADY advanced to 'contacted' (i.e. stamp precedes mark_sent, matching the
+    DELIVERED branch). RED on the old mark_sent-first order."""
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await ac.mark_consumed(db, rid, consumed_at=_TS)
+    await _bulk_hold_for(db, prospect_email="prospect@example.com", rid=rid)
+
+    async def _boom(*a, **k):
+        raise aiosqlite.OperationalError("simulated crash terminalizing the hold")
+
+    monkeypatch.setattr(pes, "mark_sent", _boom)
+
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+    with pytest.raises(aiosqlite.OperationalError):
+        await drain_pending_email_sends(_FakeRt(db, pipe))
+
+    assert pipe.calls == []  # reconcile never re-sends
+    # The stamp must have committed before the failed terminal write.
+    assert (await mp.get_by_id(db, "prospect"))["status"] == "contacted"
+
+
+@pytest.mark.asyncio
+async def test_reconciled_consumed_hold_records_owner_success(db):
+    """Crash-recovery must complete capability success accounting: a consumed-approval
+    reconcile (delivered by a prior crashed cycle that never terminalized) records the
+    owner-approved cg success exactly once — so a transient DELIVERED-branch failure
+    before mark_sent doesn't permanently drop the delivery from promotion evidence.
+    RED: the reconcile branch previously never called record_success."""
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    await cg.ensure_cell(db, domain="email", verb="send", risk_class="bulk", updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await ac.mark_consumed(db, rid, consumed_at=_TS)
+    await _bulk_hold_for(db, prospect_email="prospect@example.com", rid=rid)
+
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    assert pipe.calls == []  # reconcile never re-sends
+    assert (await pes.get_by_id(db, "pb"))["status"] == "sent"
+    cell = await cg.get_cell(db, "email", "send", "bulk")
+    assert cell["successes"] == 1  # owner-approved success accounted once via recovery
+
+
+@pytest.mark.asyncio
+async def test_owner_success_gated_on_mark_sent_claim(db, monkeypatch):
+    """record_success is gated on the mark_sent single-flip claim: if the hold was
+    already flipped out of 'held' (a lost race / double-drain), record_success is NOT
+    called, so an owner-approved success is counted AT MOST once (no double-count).
+    RED: the old code called record_success unconditionally after mark_sent."""
+    monkeypatch.setattr(egw, "_marketing_mode", lambda: "live")
+    from genesis.db.crud import marketing_prospects as mp
+
+    await mp.create(db, id="prospect", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    await cg.ensure_cell(db, domain="email", verb="send", risk_class="bulk", updated_at=_TS)
+    rid = await _approval(db, status="approved")
+    await _bulk_hold_for(db, prospect_email="prospect@example.com", rid=rid)
+
+    async def _not_claimed(*a, **k):  # hold already left 'held' → this cycle didn't win the flip
+        return False
+
+    monkeypatch.setattr(pes, "mark_sent", _not_claimed)
+
+    pipe = _FakePipeline(OutreachStatus.DELIVERED)
+    assert await drain_pending_email_sends(_FakeRt(db, pipe)) == 1
+    cell = await cg.get_cell(db, "email", "send", "bulk")
+    assert cell["successes"] == 0  # not claimed → success not recorded (no double-count)

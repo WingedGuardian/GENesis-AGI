@@ -40,6 +40,22 @@ _REAPER_INTERVAL_SECONDS = 120
 # written (the create_run -> update_campaign_state dispatch window).
 _ORPHAN_GRACE_SECONDS = 300
 
+# Campaign names the runner cannot host, because it registers a job of its OWN
+# under the same derived scheduler id.
+#
+# ``start()`` schedules every campaign as ``campaign_{name}`` and THEN registers
+# the reaper as ``campaign_pending_reaper``, both with ``replace_existing=True``.
+# So a campaign actually named ``pending_reaper`` is silently evicted at startup
+# — no error, no log, it simply never ticks again. The failure is invisible
+# precisely because ``replace_existing`` is the behaviour we want everywhere
+# else (it makes re-registration idempotent).
+#
+# Exported rather than checked inline so the write boundary and the startup heal
+# enforce the SAME set: a reserved name that only one of them knows about is how
+# this reopens.
+PENDING_REAPER_NAME = "pending_reaper"
+RESERVED_CAMPAIGN_NAMES = frozenset({PENDING_REAPER_NAME})
+
 
 class CampaignRunner:
     """Orchestrates campaign ticks. Owns an APScheduler instance."""
@@ -75,7 +91,7 @@ class CampaignRunner:
         self._scheduler.add_job(
             self._reap_pending_sessions,
             IntervalTrigger(seconds=_REAPER_INTERVAL_SECONDS),
-            id="campaign_pending_reaper",
+            id=f"campaign_{PENDING_REAPER_NAME}",
             max_instances=1,
             misfire_grace_time=60,
             replace_existing=True,

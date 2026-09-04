@@ -16,10 +16,17 @@ writers' uncommitted work).
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import UTC, datetime
 
 import aiosqlite
+
+# What a truncated session id may contain before it is allowed to become a
+# SQLite `LIKE` pattern. CC session ids are UUIDs, so hex plus the hyphen is the
+# whole alphabet — and `%` and `_`, the two LIKE wildcards, are outside it by
+# construction rather than by an escape rule someone has to remember to apply.
+_SESSION_PREFIX_RE = re.compile(r"[0-9a-fA-F-]+")
 
 VALID_LEDGER_STATUSES = frozenset({"open", "in_progress", "done", "absorbed", "dropped"})
 VALID_ADDED_BY = frozenset({"foreground", "ambient", "pulse"})
@@ -126,32 +133,55 @@ async def get(db: aiosqlite.Connection, session_id: str) -> dict | None:
 async def resolve_session_id(db: aiosqlite.Connection, session_id: str) -> str:
     """Resolve a truncated session id to the full one by unique prefix match.
 
-    Full-length ids (>= 32 chars) pass through unchanged. Prefixes are
-    matched against session_charters first, then against
-    cc_sessions.cc_session_id — the latter covers sessions that have not
-    chartered yet (pre-first-compaction), so a stub is never created under a
-    truncated id that later diverges from the hook's full id (Codex P2,
-    PR #1053). Ambiguous or unmatched prefixes return the input unchanged;
-    WRITE callers must refuse to create rows for unresolved short ids.
+    Full-length ids (>= 32 chars) pass through unchanged. Ambiguous or unmatched
+    prefixes return the INPUT unchanged; WRITE callers must refuse to create rows
+    for an unresolved short id.
+
+    THREE STORES, ONE QUERY, AND THE UNION IS THE POINT (Codex P2 x3, PR #1622).
+    A session's full id can live in any of them, and which one depends only on
+    how far through its life it is:
+
+      session_charters   — chartered sessions (post-first-compaction)
+      cc_sessions        — dispatched/recorded sessions, chartered or not
+      session_heartbeats — written by the UserPromptSubmit hook BEFORE the model
+                           runs, so for a newly started foreground session it is
+                           the ONLY store holding the id at all
+
+    Asking them in SEQUENCE was wrong in both directions. It MISSED the third
+    store entirely, which is the one covering exactly the window where a session
+    creates provenance about itself — so the common case stored NULL. And it
+    ACCEPTED the first store's single hit as unique without looking further, so
+    a prefix matching one chartered session AND a different unchartered one
+    returned the charter's id and attributed the work to the wrong session,
+    permanently. "Unique" is a property of the union; it cannot be decided one
+    store at a time.
+
+    `UNION` (not `UNION ALL`) deduplicates, so a session present in two stores
+    is still one answer; `LIMIT 2` is all the ambiguity check needs.
+
+    THE PREFIX IS VALIDATED BEFORE IT BECOMES A PATTERN. It is interpolated into
+    a `LIKE`, where `%` and `_` are WILDCARDS — a malformed prefix could match a
+    single unrelated row and be written as durable provenance. Session ids are
+    UUIDs, so anything outside hex-and-hyphen is not a prefix of one and is
+    refused rather than escaped: refusing keeps a non-id out of the query
+    entirely, where escaping would still ask the question.
     """
     sid = (session_id or "").strip()
     if len(sid) >= 32 or not sid:
         return sid
+    if not _SESSION_PREFIX_RE.fullmatch(sid):
+        return sid
     cursor = await db.execute(
-        "SELECT session_id FROM session_charters WHERE session_id LIKE ? LIMIT 2",
+        "SELECT session_id AS sid FROM session_charters WHERE session_id LIKE ?1"
+        " UNION SELECT cc_session_id FROM cc_sessions WHERE cc_session_id LIKE ?1"
+        " UNION SELECT cc_session_id FROM session_heartbeats"
+        " WHERE cc_session_id LIKE ?1"
+        " LIMIT 2",
         (sid + "%",),
     )
     rows = await cursor.fetchall()
     if len(rows) == 1:
         return rows[0][0]
-    if not rows:
-        cursor = await db.execute(
-            "SELECT DISTINCT cc_session_id FROM cc_sessions WHERE cc_session_id LIKE ? LIMIT 2",
-            (sid + "%",),
-        )
-        rows = await cursor.fetchall()
-        if len(rows) == 1:
-            return rows[0][0]
     return sid
 
 
