@@ -952,9 +952,24 @@ claude() {
             # peer-route exclusions); this only honours its verdict.
             _lg="$HOME/genesis/.venv/bin/python"
             _mode="${GENESIS_CC_SLOT_OAUTH:-conditional}"
-            if [ "$_mode" != "off" ] && [ -x "$_lg" ]; then
+            # `--bare` must skip this entirely. The canonical launcher does the
+            # same, because claude IGNORES CLAUDE_CODE_OAUTH_TOKEN under --bare:
+            # running the probe anyway would export an inert token and announce
+            # that the session is on the stored fallback when it is not,
+            # misleading exactly the person trying to diagnose their auth.
+            _bare=0
+            for _a in "$@"; do
+                if [ "$_a" = "--bare" ]; then _bare=1; fi
+            done
+            if [ "$_mode" != "off" ] && [ "$_bare" = "0" ] && [ -x "$_lg" ]; then
+                # stderr is NOT discarded: the gate's stderr is its OPERATOR
+                # diagnostic. With `always` and a missing or stale setup token
+                # it prints the exact provisioning instruction and declines —
+                # swallowing that leaves the operator with normal auth and no
+                # explanation, which is the whole reason they are reading this
+                # terminal.
                 if _notice=$(timeout 30 env GENESIS_CC_SLOT_OAUTH="$_mode" \
-                        "$_lg" -m genesis.cc.login_gate 2>/dev/null); then
+                        "$_lg" -m genesis.cc.login_gate); then
                     _tok=$("$_lg" -c 'import sys; from genesis.cc.login_health import read_fallback_token as r; sys.stdout.write(r() or str())' 2>/dev/null)
                     # Export ONLY when non-empty: a failed read must never
                     # export a blank credential over a working login.

@@ -325,7 +325,9 @@ verified: 1aedb682 2026-09-03
   traverses none of the create gates, which pre-dates this feature and is
   guarded for the plain attach path too, (5) the box can still afford another
   claude, re-asked with a freshly recounted session population, (6) the pane
-  environment is set, (7) the per-slot lock is held. Immune by construction and
+  environment is set, (7) the per-slot lock is HELD — failing to take it stands
+  the rebuild down, where it was previously best-effort and continued
+  unserialized on a timeout. Immune by construction and
   listed so the set is complete rather than convenient: the OAuth token is read
   at pane-exec time so it cannot go stale, and PATH/TMPDIR/permission mode/LANG
   come from the door's own environment. An eighth member would mean the

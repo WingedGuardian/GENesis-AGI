@@ -70,6 +70,15 @@ _probe_liveness() {
 # it only decides whether to print a note.
 _MAP_PROBE_BUDGET=3
 _MAP_PROBE_GAVE_UP=0
+# A WHOLE-MAP wall-clock ceiling, not a per-probe one. The give-up flag alone
+# only fires when a probe actually hits 124, so N slots that each finish just
+# under the per-probe budget still delay an interactive login by N x budget —
+# MEASURED as ~20s across seven slots at ~2.9s each, with nothing ever timing
+# out. `SECONDS` is inherited by the `$(...)` subshell the probe runs in, so an
+# ABSOLUTE deadline is readable there even though a variable set inside it can
+# never travel back out.
+_MAP_TOTAL_BUDGET=6
+_MAP_DEADLINE=0
 _map_verdict() {
     local out="" rc=0
     [ -x "${GENESIS_ROOT}/.venv/bin/python" ] || { printf '%s' ""; return 0; }
@@ -82,7 +91,14 @@ _map_verdict() {
     # variable set in here never reaches the loop — the first attempt did
     # exactly that and measured no better than per-slot.
     [ "$_MAP_PROBE_GAVE_UP" = "1" ] && { printf '%s' ""; return 0; }
-    out=$(timeout "$_MAP_PROBE_BUDGET" "${GENESIS_ROOT}/.venv/bin/python" \
+    local _budget="$_MAP_PROBE_BUDGET" _rem
+    if [ "$_MAP_DEADLINE" -gt 0 ]; then
+        _rem=$(( _MAP_DEADLINE - SECONDS ))
+        # The map is COSMETIC; it must never be what makes a login feel slow.
+        [ "$_rem" -le 0 ] && { printf '%s' "TIMEOUT"; return 0; }
+        [ "$_rem" -lt "$_budget" ] && _budget="$_rem"
+    fi
+    out=$(timeout "$_budget" "${GENESIS_ROOT}/.venv/bin/python" \
         -m genesis.cc.slot_liveness "$@" 2>/dev/null | sed -n '1p') || rc=$?
     # 124 is timeout(1)'s "deadline expired".
     [ "$rc" = "124" ] && { printf '%s' "TIMEOUT"; return 0; }
@@ -101,6 +117,10 @@ if [[ "$MODE_ARG" == "manual" ]]; then
         -F '#{session_name}|#{session_attached}|#{t:session_activity}' \
         2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
     if [[ -n "$slot_map" ]]; then
+        # Arm the whole-map deadline HERE, immediately before the only loop
+        # that probes: every probe below shares it, so the map costs at most
+        # _MAP_TOTAL_BUDGET no matter how many slots exist.
+        _MAP_DEADLINE=$(( SECONDS + _MAP_TOTAL_BUDGET ))
         echo "Existing slots (reattach: tmux attach -t <name>):" >&2
         while IFS='|' read -r name attached activity; do
             state="detached"
@@ -667,6 +687,11 @@ _PANE_ENV=(
     # value may be trusted. Pinning it here means the create and heal paths
     # resolve the same binary from one source.
     "PATH=${PATH}"
+    # The lever is read from ~/.genesis/cc-slot.env as a NON-exported shell
+    # variable, so without this the in-tmux wrapper cannot see it and defaults
+    # to `conditional` — ignoring both an explicit `always` and the `off` kill
+    # switch. Pass the RESOLVED value so both paths obey one setting.
+    "GENESIS_CC_SLOT_OAUTH=${_slot_oauth_mode}"
     "LANG=${LANG:-}"
 )
 _PANE_ENV_FLAGS=()
@@ -699,7 +724,13 @@ done
 #   4. the session still exists                         checked before the exec
 #   5. the box can afford another claude                _capacity_permits
 #   6. the pane environment is set                      set-environment, guarded
-#   7. the per-slot lock is held                        _acquire_heal_lock
+#   7. the per-slot lock is HELD                        _acquire_heal_lock
+#
+# On (7), a caution about this very list: it first shipped asserting (7) was
+# closed while `_acquire_heal_lock` was still best-effort — a flock TIMEOUT was
+# discarded and the rebuild continued unserialized. An enumeration is only
+# worth the checking behind each row, and that row had none. It is closed now:
+# failing to take the lock stands the rebuild down.
 #
 # Immune BY CONSTRUCTION, listed so this is a complete set rather than a
 # convenient one: the OAuth token is read at pane-exec time by `_OAUTH_SRC`, so
@@ -708,16 +739,24 @@ done
 #
 # If a review finds an eighth, this enumeration was wrong and the mechanism —
 # not the instance — is what needs to change.
+# Returns non-zero when the lock was NOT acquired, and the caller stands the
+# rebuild down. It used to be best-effort — a `flock -w 45` TIMEOUT was
+# discarded, and a missing `flock` or unwritable lock path continued silently.
+# That is wrong for a lock guarding a DESTRUCTIVE action: two confirmed doors
+# can both finish revalidation before either acts, and the second
+# `respawn-pane -k` then kills the claude the first just started. "Best effort"
+# is a reasonable posture for a lock that orders work; it is not one for a lock
+# that prevents a kill.
 _acquire_heal_lock() {
     _lock="${HOME}/.genesis/cc-slot-heal-${SLOT}.lock"
     _LOCK_HELD=0
-    if command -v flock >/dev/null 2>&1 \
-       && mkdir -p "${HOME}/.genesis" 2>/dev/null \
-       && : >>"$_lock" 2>/dev/null; then
-        exec 9>>"$_lock"
-        _LOCK_HELD=1
-        flock -w 45 9 2>/dev/null || true
-    fi
+    command -v flock >/dev/null 2>&1 || return 1
+    mkdir -p "${HOME}/.genesis" 2>/dev/null || return 1
+    : >>"$_lock" 2>/dev/null || return 1
+    exec 9>>"$_lock"
+    _LOCK_HELD=1
+    flock -w 45 9 2>/dev/null || return 1
+    return 0
 }
 
 # Re-read the pane and re-confirm POISONED from CURRENT reality. Called TWICE
@@ -759,16 +798,18 @@ _capacity_permits() {
     case "$_cap_action" in
         ALLOW) return 0 ;;
         RECLAIM)
-            # RECLAIM covers a full box (tradeable) and the OOM floor (not).
-            # Below the floor, starting a process risks an OOM that takes every
-            # session with it, so it is refused rather than offered — the same
-            # place the create path refuses when there is nothing to trade.
-            if [ "$_cap_reason" = "oom_floor" ]; then
-                echo "cc-slot: ${SESSION_NAME} has no claude running, but ${_cap_msg}" >&2
-                echo "cc-slot: attaching to the slot's shell instead — free memory and reconnect to rebuild." >&2
-                return 1
-            fi
-            return 0
+            # RECLAIM means "not without ending something else" — for a full
+            # box (tradeable) or the OOM floor (not). Neither is a warning.
+            # The CREATE path this rebuild is modelled on does not proceed on a
+            # RECLAIM either: it runs the interactive reclaim flow. Treating it
+            # as a note here made the rebuild strictly MORE permissive than the
+            # create it imitates, growing the live population past the
+            # configured emergency limit — the exact thing the cap governs.
+            # Standing down is the honest reading and needs no second prompt:
+            # the operator frees a slot and reconnects.
+            echo "cc-slot: ${SESSION_NAME} has no claude running, but ${_cap_msg}" >&2
+            echo "cc-slot: attaching to the slot's shell instead — free a slot and reconnect to rebuild." >&2
+            return 1
             ;;
         DENY)
             echo "cc-slot: ${SESSION_NAME} has no claude running, but the capacity gate declined to start one: ${_cap_msg}" >&2
@@ -814,11 +855,7 @@ if [ "$_HEAL" = "1" ]; then
     # Dependency 5, asked here so a RECLAIM can be DISCLOSED in the prompt. The
     # verdict acted on is the one taken again in the final gate below; this one
     # only shapes what the operator is told.
-    if _capacity_permits; then
-        if [ "$_cap_action" = "RECLAIM" ]; then
-            _cap_warn="   NOTE: ${_cap_msg}"
-        fi
-    else
+    if ! _capacity_permits; then
         _HEAL=0
     fi
 fi
@@ -908,8 +945,13 @@ if [ "$_HEAL" = "1" ]; then
     # facts the respawn depends on — the pane is still the one that was probed,
     # and still has no claude in it. Everything above was read before a human
     # was asked, and a human takes unbounded time.
-    _acquire_heal_lock
-    _revalidate_heal
+    if _acquire_heal_lock; then
+        _revalidate_heal
+    else
+        echo "cc-slot: could not take the per-slot rebuild lock — another door may be" >&2
+        echo "cc-slot: rebuilding this slot right now. Attaching without rebuilding." >&2
+        _HEAL=0
+    fi
 fi
 
 if [ "$_HEAL" = "1" ] && ! _capacity_permits; then

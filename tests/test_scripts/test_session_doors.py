@@ -153,7 +153,13 @@ def door(tmp_path):
         # Ordered call log: which probe ran, in which order. The ORDER is the
         # invariant under test — the verdict that gates a destructive action
         # must be the freshest one taken.
-        'if [[ "$*" == *slot_liveness* ]]; then echo liveness >> "$FAKE_PROBE_LOG"; fi\n'
+        'if [[ "$*" == *slot_liveness* ]]; then\n'
+        '  echo liveness >> "$FAKE_PROBE_LOG"\n'
+        # Lets a probe BURN TIME. Without it the slot map's whole-map deadline
+        # cannot be exercised at all: every fake probe returns instantly, so a
+        # per-probe budget and a shared one are indistinguishable.
+        '  if [[ -n "${FAKE_PROBE_SLEEP:-}" ]]; then sleep "$FAKE_PROBE_SLEEP"; fi\n'
+        "fi\n"
         'if [[ "$*" == *slot_liveness* ]]; then\n'
         # FAKE_LIVENESS may be a comma-separated SEQUENCE; each call consumes
         # the next entry (last one repeats). This is how the probe/re-probe
@@ -182,6 +188,16 @@ def door(tmp_path):
         "exit 1\n"
     )
     fake_py.chmod(fake_py.stat().st_mode | stat.S_IEXEC)
+    fake_flock = bin_dir / "flock"
+    # A lock guarding a DESTRUCTIVE action cannot be best-effort, so its failure
+    # must be reachable in a test — without this the whole `_acquire_heal_lock`
+    # failure path is unexercised, which is how it shipped claiming to be closed.
+    fake_flock.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ -n "${FAKE_FLOCK_FAIL:-}" ]]; then exit 1; fi\n'
+        'exec /usr/bin/flock "$@"\n'
+    )
+    fake_flock.chmod(0o755)
     log = tmp_path / "tmux.log"
     sessions = tmp_path / "sessions.txt"
     listing = tmp_path / "list.txt"
@@ -199,6 +215,7 @@ def door(tmp_path):
             "FAKE_LIVENESS": os.environ.get("_TEST_FAKE_LIVENESS", ""),
             "FAKE_LIVENESS_N": str(tmp_path / "liveness_calls.txt"),
             "FAKE_PROBE_LOG": str(tmp_path / "probe_order.txt"),
+            "FAKE_PROBE_SLEEP": os.environ.get("_TEST_FAKE_PROBE_SLEEP", ""),
             "FAKE_TMUX_PANES_N": str(tmp_path / "panes_calls.txt"),
             "FAKE_TMUX_PANES2": os.environ.get("_TEST_FAKE_PANES2", ""),
             "FAKE_TMUX_PANES3": os.environ.get("_TEST_FAKE_PANES3", ""),
@@ -206,6 +223,7 @@ def door(tmp_path):
             "FAKE_TMUX_RESPAWN_FAIL": os.environ.get("_TEST_FAKE_RESPAWN_FAIL", ""),
             "FAKE_TMUX_SETENV_FAIL": os.environ.get("_TEST_FAKE_SETENV_FAIL", ""),
             "FAKE_TMUX_FDS": str(tmp_path / "tmux_fds.txt"),
+            "FAKE_FLOCK_FAIL": os.environ.get("_TEST_FAKE_FLOCK_FAIL", ""),
             "FAKE_HEAL_CAP": os.environ.get("_TEST_FAKE_HEAL_CAP", ""),
             "FAKE_HEAL_CAP_N": str(tmp_path / "cap_calls.txt"),
             "FAKE_SESSION_VANISHES": os.environ.get("_TEST_FAKE_VANISH", ""),
@@ -519,6 +537,39 @@ class TestManualMode:
         assert "exec claude" not in line, "inner exec must be dropped so the trailer runs"
 
 
+class TestSlotMapBudget:
+    """The slot map is COSMETIC and must never be what makes a login feel slow."""
+
+    def test_one_deadline_is_shared_across_probes(self, door):
+        """A per-probe timeout is not a budget.
+
+        The give-up flag only trips when a probe actually hits its own ceiling,
+        so N slots that each finish JUST under it still cost N x budget —
+        measured at roughly 20s across seven slots at ~2.9s each, with nothing
+        ever timing out. Twelve slots at 1s each here: with a shared deadline
+        the map stops probing partway through, so strictly fewer than twelve
+        probes run.
+        """
+        run, _log, _sessions, listing, panes = door
+        listing.write_text("".join(f"cc-{i}|0|ts\n" for i in range(1, 13)))
+        # The map reads pane pids before probing; with no panes there is
+        # nothing to probe and the budget is never exercised.
+        panes.write_text("%0 4242 bash\n")
+        os.environ["_TEST_FAKE_PROBE_SLEEP"] = "1"
+        try:
+            result = run("manual")
+        finally:
+            os.environ.pop("_TEST_FAKE_PROBE_SLEEP", None)
+        # The cap denies a 12th session and exits non-zero; irrelevant here —
+        # the map is printed BEFORE that decision and is what is under test.
+        assert "Existing slots" in result.stderr
+        probes = run.probe_log.read_text().split().count("liveness")
+        assert probes < 12, (
+            f"every slot was probed ({probes}); the map is spending per-probe "
+            f"budget rather than one shared deadline"
+        )
+
+
 class TestHostnameMode:
     def test_hostname_parses_trailing_slot(self, door):
         run, log, _sessions, _listing, _panes = door
@@ -614,6 +665,7 @@ class TestSlotHeal:
         panes2_text=None,
         heal_cap="ALLOW|ok",
         vanish=None,
+        flock_fail=False,
         stdin_text=None,
         wait_for=None,
         panes3_text=None,
@@ -638,6 +690,8 @@ class TestSlotHeal:
             os.environ["_TEST_FAKE_HEAL_CAP"] = heal_cap
         if vanish is not None:
             os.environ["_TEST_FAKE_VANISH"] = str(vanish)
+        if flock_fail:
+            os.environ["_TEST_FAKE_FLOCK_FAIL"] = "1"
         if panes3_text is not None:
             p3 = run.panes2.parent / "panes3.txt"
             p3.write_text(panes3_text)
@@ -657,6 +711,7 @@ class TestSlotHeal:
             os.environ.pop("_TEST_FAKE_PANES2", None)
             os.environ.pop("_TEST_FAKE_HEAL_CAP", None)
             os.environ.pop("_TEST_FAKE_VANISH", None)
+            os.environ.pop("_TEST_FAKE_FLOCK_FAIL", None)
             os.environ.pop("_TEST_FAKE_PANES3", None)
             os.environ.pop("_TEST_FAKE_RESPAWN_FAIL", None)
             os.environ.pop("_TEST_FAKE_SETENV_FAIL", None)
@@ -1085,12 +1140,23 @@ class TestSlotHeal:
         assert "respawn-pane" not in log, f"rebuilt below the OOM floor:\n{log}"
         assert "Rebuild this slot?" not in proc.stdout, "offered a choice it should not have"
 
-    def test_reclaim_surfaces_the_gates_own_wording(self, door):
-        """Not an invented sentence: the gate's own message is the honest one,
-        because RECLAIM covers both a full box and an OOM floor."""
-        proc, log = self._run_with(door, "POISONED", heal_cap="RECLAIM|cap_full", confirm="y")
-        assert "cap message" in proc.stdout, f"invented its own wording:\n{proc.stdout}"
-        assert "respawn-pane" in log
+    def test_a_reclaim_stands_the_rebuild_down(self, door):
+        """RECLAIM means "not without ending something else" — never a warning.
+
+        The CREATE path this rebuild is modelled on does not proceed on a
+        RECLAIM either; it runs the interactive reclaim flow. Treating it as a
+        note made the rebuild strictly MORE permissive than the create it
+        imitates, growing the live population past the configured emergency
+        limit — exactly what the cap governs. Covers BOTH causes.
+        """
+        for reason in ("cap_full", "oom_floor"):
+            proc, log = self._run_with(
+                door, "POISONED", heal_cap=f"RECLAIM|{reason}", confirm="y",
+            )
+            assert "respawn-pane" not in log, f"rebuilt past a RECLAIM ({reason}):\n{log}"
+            assert "cap message" in proc.stdout, (
+                f"did not use the gate's own wording ({reason}):\n{proc.stdout}"
+            )
 
     def test_the_rebuild_takes_the_per_slot_lock(self, door):
         """Pins that the lock is TAKEN, not merely released correctly.
@@ -1184,6 +1250,34 @@ class TestSlotHeal:
         assert proc.returncode != 0, "exited 0 on a race it did not handle"
         assert "disappeared while this door was preparing" in proc.stdout
 
+    def test_an_unacquired_lock_stands_the_rebuild_down(self, door):
+        """Dependency 7 — which my own enumeration claimed was already closed.
+
+        The lock was best-effort: a `flock -w 45` TIMEOUT was discarded, and a
+        missing flock or unwritable path continued silently. Two confirmed
+        doors could then both finish revalidation before either acted, and the
+        second `respawn-pane -k` would kill the claude the first just started.
+        Best-effort is a fine posture for a lock that ORDERS work; it is not
+        one for a lock that prevents a kill.
+        """
+        proc, log = self._run_with(door, "POISONED", confirm="y", flock_fail=True)
+        assert "respawn-pane" not in log, f"rebuilt without holding the lock:\n{log}"
+        assert "could not take the per-slot rebuild lock" in proc.stdout
+
+    def test_the_oauth_lever_reaches_the_pane(self, door):
+        """The lever is a NON-exported shell var from ~/.genesis/cc-slot.env.
+
+        Without passing it explicitly the in-tmux wrapper cannot see it and
+        defaults to `conditional`, ignoring both an explicit `always` and the
+        `off` kill switch — so a hand relaunch inside the slot could inject a
+        token the operator had deliberately disabled.
+        """
+        _proc, log = self._run_with(door, "POISONED", confirm="y")
+        line = [ln for ln in log.splitlines() if "new-session" in ln]
+        assert line and "GENESIS_CC_SLOT_OAUTH=" in line[0], (
+            f"the OAuth lever never reaches the pane:\n{line}"
+        )
+
     def test_confirming_rebuilds_the_slot(self, door):
         _proc, log = self._run_with(door, "POISONED", confirm="y")
         assert "respawn-pane" in log
@@ -1234,7 +1328,12 @@ class TestWrapperInsideTmux:
             py.write_text(
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
-                '  *login_gate*) echo "using the stored fallback login"; exit 0 ;;\n'
+                '  *login_gate*)\n'
+                '     if [[ -n "${FAKE_GATE_DECLINES:-}" ]]; then\n'
+                '       echo "run: claude setup-token (the stored one is stale)" >&2\n'
+                '       exit 1\n'
+                '     fi\n'
+                '     echo "using the stored fallback login"; exit 0 ;;\n'
                 '  *read_fallback_token*) printf %s "sk-fake-fallback"; exit 0 ;;\n'
                 "esac\nexit 1\n"
             )
@@ -1259,6 +1358,7 @@ echo "RC=$?" >> {str(rec)!r}
             # Deliberate: the pty child must BECOME the shell so the
             # wrapper sees a real tty on fd 0/1. Test-only, fixed argv.
             os.execvp("bash", ["bash", "-c", script])  # noqa: S606
+        seen: list[bytes] = []
         try:
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
@@ -1266,10 +1366,12 @@ echo "RC=$?" >> {str(rec)!r}
                 if done:
                     break
                 try:
-                    if not os.read(fd, 4096):
-                        break
+                    chunk = os.read(fd, 4096)
                 except OSError:
                     break
+                if not chunk:
+                    break
+                seen.append(chunk)
             else:  # pragma: no cover - only on a hang
                 os.kill(pid, 9)
                 os.waitpid(pid, 0)
@@ -1278,7 +1380,8 @@ echo "RC=$?" >> {str(rec)!r}
             # Reap unconditionally: the read loop can exit before the child does.
             with contextlib.suppress(ChildProcessError):
                 os.waitpid(pid, 0)
-        return None, (rec.read_text() if rec.exists() else "")
+        return (b"".join(seen).decode(errors="replace"),
+                rec.read_text() if rec.exists() else "")
 
     def test_a_hand_relaunch_gets_the_slot_fallback_login(self, tmp_path):
         """The path this feature makes likely must not be auth-degraded.
@@ -1309,6 +1412,40 @@ echo "RC=$?" >> {str(rec)!r}
             bootstrap_text=text, oauth=True,
         )
         assert "OAUTH=none" in rec, f"honoured a token despite the off lever:\n{rec}"
+
+    def test_bare_skips_the_fallback_entirely(self, tmp_path):
+        """`claude --bare` IGNORES CLAUDE_CODE_OAUTH_TOKEN.
+
+        Probing for one anyway is worse than useless: it exports an inert token
+        and announces the session is on the stored fallback when it is not,
+        misleading exactly the person trying to diagnose their authentication.
+        The canonical launcher skips the gate for --bare; this path must match.
+        """
+        text = Path(_BOOTSTRAP).read_text()
+        _out, rec = self._harness(
+            tmp_path, 'export TMUX=/tmp/fake,1,0\nexport GENESIS_SLOT=7',
+            bootstrap_text=text, args='--bare', oauth=True,
+        )
+        assert "OAUTH=none" in rec, f"probed and exported a token --bare ignores:\n{rec}"
+
+    def test_the_gates_own_diagnostic_reaches_the_operator(self, tmp_path):
+        """When the gate DECLINES it prints the fix; swallowing that leaves the
+        operator on ordinary auth with no explanation of why.
+
+        MEASURED before: the wrapper sent the gate's stderr to /dev/null, so
+        `always` with a stale token fell back silently.
+        """
+        text = Path(_BOOTSTRAP).read_text()
+        out, rec = self._harness(
+            tmp_path,
+            'export TMUX=/tmp/fake,1,0\nexport GENESIS_SLOT=7\n'
+            'export FAKE_GATE_DECLINES=1',
+            bootstrap_text=text, oauth=True,
+        )
+        assert "claude setup-token" in out, (
+            f"the gate's operator diagnostic was swallowed:\n{out}"
+        )
+        assert "OAUTH=none" in rec, "injected a token the gate declined"
 
     def test_temp_dir_falls_back_when_the_slot_dir_cannot_be_made(self, tmp_path):
         """The fallback has to NAME a different directory, not "the ambient one".
