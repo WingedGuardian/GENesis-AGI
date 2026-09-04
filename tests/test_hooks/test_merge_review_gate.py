@@ -1268,6 +1268,127 @@ class TestCheckInlineReviewFindings:
         assert block, "a Security & Privacy Major was read and then dropped"
         assert "Track unresolved reparsing prefixes" in msg
 
+    # ── Quoted content is not a finding, and an answered finding is not news ──
+
+    _CR_QUOTED_RULE_BODY = (
+        "_📐 Maintainability & Code Quality_ | _🟡 Minor_ | _⚡ Quick win_\n"
+        "\n"
+        "**Reword the section header**\n"
+        "\n"
+        "```suggestion\n"
+        "## Review severities\n"
+        "\n"
+        "---\n"
+        "\n"
+        "_Security & Privacy_ | _🟠 Major_\n"
+        "```\n"
+    )
+
+    def test_a_rule_inside_a_fence_does_not_manufacture_a_major(self, guard_module):
+        """A MINOR finding must not block because its SUGGESTION quotes markdown.
+
+        MEASURED before the fix: the splitter cut on the rule inside the fenced
+        suggestion, the fragment after it read as a header naming Major, and one
+        non-blocking finding became a blocking one — titled with the severity
+        header, since there is no real title inside quoted code. That is the same
+        precision failure this feature exists to remove, one level down, and poor
+        precision is what trains reflexive overrides (issue #1642).
+        """
+        with self._mock(guard_module, [self._coderabbit(1, self._CR_QUOTED_RULE_BODY)]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert not block, f"quoted markdown blocked the merge: {msg}"
+        assert "Major" not in msg or "Reword" in msg
+
+    def test_a_real_bundled_major_after_a_minor_still_blocks(self, guard_module):
+        """The control that makes the test above mean something.
+
+        Fence-awareness must not be bought by giving up the split: CodeRabbit
+        genuinely bundles findings behind a rule, and a Major hidden after a Minor
+        disappearing entirely is the bug the splitter was added for.
+        """
+        bundled = (
+            "_🎯 Functional Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n"
+            "**Rename the variable**\n\nSome prose.\n\n"
+            "---\n\n"
+            "_🔒 Security & Privacy_ | _🟠 Major_ | _🏗️ Heavy lift_\n\n"
+            "**Unbounded read on the hot path**\n"
+        )
+        with self._mock(guard_module, [self._coderabbit(1, bundled)]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block, "a real bundled Major must still be found"
+        assert "Unbounded read on the hot path" in msg
+
+    def test_a_rule_inside_details_does_not_manufacture_a_major(self, guard_module):
+        """`<details>` carries collapsed tool output — also not finding content."""
+        body = (
+            "_🎯 Functional Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n"
+            "**A real title**\n\n"
+            "<details>\n<summary>static analysis</summary>\n\n"
+            "---\n\n"
+            "_Security & Privacy_ | _🟠 Major_\n"
+            "</details>\n"
+        )
+        with self._mock(guard_module, [self._coderabbit(1, body)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_maintainer_reply_silences_a_minor_advisory(self, guard_module, capsys):
+        """Engagement must apply to EVERY CodeRabbit severity, not just blocking ones.
+
+        The check used to sit inside the blocking branch, so a Minor a maintainer
+        had consciously answered was re-listed on every single run. Nothing about
+        that is harmless: an advisory list that never shrinks is how a genuinely
+        unresolved finding gets buried in it.
+        """
+        # CONTROL FIRST: unanswered, the Minor IS listed as an advisory. Without
+        # this the test below would pass on a gate that never mentions Minors at all.
+        # The advisory list is SURFACED on stderr, not returned — a non-blocking
+        # verdict returns an empty message, so asserting on the return value alone
+        # would pass no matter what the gate did.
+        with self._mock(guard_module, [self._coderabbit(1, _CR_MINOR_BODY)]):
+            guard_module._check_inline_review_findings("100")
+        before = capsys.readouterr().err
+        assert "Prefer an explicit tie-break" in before, before
+
+        replied = [
+            self._coderabbit(1, _CR_MINOR_BODY),
+            {
+                "id": 2,
+                "reply_to": 1,
+                "login": "a-maintainer",
+                "type": "User",
+                "assoc": "OWNER",
+                "body": "thanks — accepted, documented in the PR body",
+            },
+        ]
+        with self._mock(guard_module, replied):
+            block, _ = guard_module._check_inline_review_findings("100")
+        after = capsys.readouterr().err
+        assert not block
+        assert "Prefer an explicit tie-break" not in after, (
+            f"an answered Minor was reported again: {after}"
+        )
+
+    def test_maintainer_reply_still_clears_a_blocking_major(self, guard_module):
+        """The control in the other direction — hoisting must not lose the block."""
+        with self._mock(guard_module, [self._coderabbit(1, _CR_MAJOR_BODY)]):
+            unanswered, _ = guard_module._check_inline_review_findings("100")
+        assert unanswered, "control: an unanswered Major must block"
+        answered = [
+            self._coderabbit(1, _CR_MAJOR_BODY),
+            {
+                "id": 2,
+                "reply_to": 1,
+                "login": "a-maintainer",
+                "type": "User",
+                "assoc": "OWNER",
+                "body": "accepted, documented in the PR body",
+            },
+        ]
+        with self._mock(guard_module, answered):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
     def test_coderabbit_critical_blocks(self, guard_module):
         with self._mock(guard_module, [self._coderabbit(1, _CR_CRITICAL_BODY)]):
             block, _ = guard_module._check_inline_review_findings("100")

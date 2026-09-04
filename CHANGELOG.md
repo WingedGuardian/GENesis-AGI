@@ -9,6 +9,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **The pre-merge check now reads the second review bot it was already fetching.**
+  Two automated reviewers comment on every pull request, and the gate that decides
+  whether a change is ready to merge only understood the format of one of them. The
+  other's comments were downloaded, iterated, matched nothing, and contributed
+  nothing — so a change carrying an unaddressed high-severity finding reported
+  exactly the same as a clean one. Both reviewers' findings now count, at the
+  severity weighting already used for the first, and a single comment carrying
+  several bundled findings is read as several rather than one.
+
+  Two things that come with reading a second format, both of which decide a merge:
+  quoted content is not a finding — a horizontal rule inside a suggested code block
+  no longer splits one advisory finding into a second, invented, blocking one; and a
+  finding a maintainer has replied to is treated as answered at every severity, not
+  only the blocking ones, so an advisory list stops re-reporting settled findings and
+  burying the unsettled.
+
 ### Changed
 
 - **Mistral Large is now tracked as a paid provider.** Mistral removed the Large

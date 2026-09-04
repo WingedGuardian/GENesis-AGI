@@ -1182,6 +1182,49 @@ def _cr_severity(body: str) -> tuple[str | None, bool]:
     return None, False
 
 
+def _cr_markup_mask(body: str) -> list[bool]:
+    """Per line: True when it sits inside a fenced block or a ``<details>`` section.
+
+    Shared by the splitter and the title extractor because they MUST agree about
+    what is quoted content. They did not: the title extractor skipped fences while
+    the splitter cut across them, so a horizontal rule inside a ```suggestion```
+    manufactured a finding out of quoted markdown — which the title extractor then
+    could only name by its severity header.
+
+    MEASURED before the fix, on a body CodeRabbit plausibly emits (a Minor whose
+    suggestion edits a markdown file containing a rule and an italic two-field
+    line): one Minor finding split into two, the second reading as a MAJOR, and a
+    non-blocking review blocking the merge on the strength of quoted code.
+
+    Fence lines and the ``<details>`` tags themselves count as markup — they are
+    never finding content. ``<details>`` is tracked only OUTSIDE a fence, matching
+    how a markdown renderer reads it.
+    """
+    mask: list[bool] = []
+    in_fence = False
+    in_details = False
+    for line in body.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            in_fence = not in_fence
+            mask.append(True)
+            continue
+        if in_fence:
+            mask.append(True)
+            continue
+        low = stripped.casefold()
+        if low.startswith("<details"):
+            in_details = True
+            mask.append(True)
+            continue
+        if low.startswith("</details"):
+            in_details = False
+            mask.append(True)
+            continue
+        mask.append(in_details)
+    return mask
+
+
 def _cr_findings(body: str) -> list[str]:
     """Split one CodeRabbit comment into its individual findings.
 
@@ -1198,11 +1241,24 @@ def _cr_findings(body: str) -> list[str]:
     a Major that was never seen at all.
 
     A segment carrying no header is folded into the previous one rather than
-    treated as a finding: a rule inside prose or a fenced block is not a
-    finding boundary, and splitting on it would invent findings that
-    do not exist.
+    treated as a finding: a rule inside prose is not a finding boundary, and
+    splitting on it would invent findings that do not exist. That fold is not
+    sufficient on its own — it only catches a rule whose following segment has no
+    header, and quoted markdown routinely supplies one. Rules inside fenced or
+    ``<details>`` content are therefore not boundaries at all (see
+    ``_cr_markup_mask``).
     """
-    parts = _CR_FINDING_SPLIT_RE.split(body)
+    lines = body.split("\n")
+    markup = _cr_markup_mask(body)
+    parts: list[str] = []
+    current: list[str] = []
+    for line, is_markup in zip(lines, markup, strict=True):
+        if not is_markup and _CR_FINDING_SPLIT_RE.match(line):
+            parts.append("\n".join(current))
+            current = []
+            continue
+        current.append(line)
+    parts.append("\n".join(current))
     out: list[str] = []
     for part in parts:
         if not part.strip():
@@ -1229,24 +1285,10 @@ def _coderabbit_title(body: str) -> str:
     the finding, and reporting one of those as the title misnames the finding in
     the pre-merge report a human reads to decide a merge.
     """
-    in_fence = False
-    in_details = False
-    for line in body.split("\n"):
+    for line, is_markup in zip(body.split("\n"), _cr_markup_mask(body), strict=True):
+        if is_markup:
+            continue
         stripped = line.strip()
-        if stripped.startswith("```"):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        low = stripped.casefold()
-        if low.startswith("<details"):
-            in_details = True
-            continue
-        if low.startswith("</details"):
-            in_details = False
-            continue
-        if in_details:
-            continue
         if stripped.startswith("**") and stripped.rstrip("*").strip():
             return _INLINE_MARKUP_RE.sub("", stripped).strip().strip("*").strip()[:120]
     return _inline_title(body)
@@ -1451,6 +1493,20 @@ def _check_inline_review_findings(
         if c.get("reply_to"):
             continue  # replies aren't findings
         if login in _CODERABBIT_LOGINS:
+            # Engagement is checked ONCE, for the whole comment, BEFORE severity —
+            # not per-severity below. It used to sit inside the blocking branch, so
+            # only Critical/Major honoured a maintainer reply while every Minor,
+            # Trivial, Info and unknown-severity finding was re-reported on every
+            # run no matter how many times it had been consciously answered. That
+            # contradicted the promise made two comments down ("the same engagement
+            # treatment the Codex path gets"), and a growing list of already-settled
+            # advisories is how a genuinely unresolved one gets buried.
+            #
+            # Comment-level granularity is the only granularity GitHub offers — a
+            # reply attaches to the comment, not to one finding inside a bundle —
+            # and it matches what the Codex P1/P2 paths already do.
+            if c.get("id") in replied_to:
+                continue
             # ONE COMMENT CAN CARRY SEVERAL FINDINGS — see _cr_findings. Scoring
             # the comment rather than each finding undercounts, and a Major
             # bundled after a Minor disappears entirely.
@@ -1466,8 +1522,6 @@ def _check_inline_review_findings(
                         cr_unknown.append(title)
                     else:
                         cr_advisory.append(title)
-                    continue
-                if c.get("id") in replied_to:
                     continue
                 if _is_doc_path(c.get("path") or ""):
                     # Its OWN list, not the Codex `doc_skipped` one — landing a
