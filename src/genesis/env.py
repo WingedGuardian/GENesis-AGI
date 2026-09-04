@@ -500,6 +500,47 @@ def ollama_enabled() -> bool:
     return False
 
 
+def embed_priority_tier() -> bool:
+    """Whether RECALL embeddings request DeepInfra's paid priority tier.
+
+    Defaults to TRUE, and that default is a deliberate cost/quality call worth
+    stating rather than burying.
+
+    DeepInfra queues default-tier requests when a model is under load (their
+    Priority Service Tier announcement, 2026-06-29). MEASURED 2026-09-04 on
+    Qwen3-Embedding-0.6B: default 8.6-13.3s, priority ~650ms flat across input
+    sizes. The proactive-recall route has a 4.5s deadline, so on the default
+    tier recall failed 100% of the time — 20 of 20 through the live endpoint.
+
+    The premium is 1.5x: $0.010 -> $0.015 per 1M tokens. MEASURED volume on this
+    install is 217 recall requests in 24h at ~120 tokens each, so the difference
+    is roughly HALF A CENT PER MONTH. Defaulting to False would ship a feature
+    that does not work, to save an amount too small to measure — which the
+    project's stated "quality over cost, always" principle rules out.
+
+    Only the deadline-bound RECALL chain uses this. Storage embedding is a
+    background write with no deadline and stays on the normal rate.
+
+    Set GENESIS_EMBED_PRIORITY_TIER=false in secrets.env, or
+    memory.embed_priority_tier: false in ~/.genesis/config/genesis.yaml, to opt
+    out — recall then degrades to the keyword-only path whenever the queue runs
+    deeper than the deadline.
+    """
+    env_val = os.environ.get("GENESIS_EMBED_PRIORITY_TIER")
+    if env_val is not None:
+        return env_val.strip().lower() not in {"0", "false", "no", "off"}
+    # `or {}` and not `.get("memory", {})`: the default only applies to a MISSING
+    # key, not a null one. A user following the docstring above and then commenting
+    # the child back out leaves `memory:` with no value, which yaml loads as None —
+    # and `None.get(...)` raises straight out of the memory bootstrap that calls
+    # this, taking the whole memory subsystem down. The documented opt-out must not
+    # be able to break the thing it opts out of.
+    local_val = (_local_config().get("memory") or {}).get("embed_priority_tier")
+    if local_val is not None:
+        return bool(local_val)
+    return True
+
+
 def build_lane_enabled() -> bool:
     """Check if the autonomous capability-build lane is active.
 

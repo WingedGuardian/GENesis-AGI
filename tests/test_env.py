@@ -262,3 +262,89 @@ class TestUserTimezonePrecedence:
 
         _invalidate_local_config()
         assert user_timezone() == "UTC"
+
+
+class TestEmbedPriorityTier:
+    """The default here is a COST decision, so it gets an explicit lock.
+
+    Recall embeddings default to DeepInfra's paid priority tier (1.5x:
+    $0.010 -> $0.015 per 1M tokens). MEASURED 2026-09-04: on the default tier
+    that endpoint took 8.6-13.3s under load against a 4.5s route deadline, so
+    recall failed 100% of the time (20/20 live). At this install's measured
+    volume — 217 recall requests in 24h, ~120 tokens each — the premium is about
+    half a cent per month.
+
+    A regression that silently flips this to False would restore the outage; one
+    that ignores the opt-out would bill another install without consent. Both
+    directions are pinned.
+    """
+
+    def test_defaults_on(self, monkeypatch: pytest.MonkeyPatch):
+        """Deliberately NOT using the `home` fixture — it would not isolate this.
+
+        `home` sets GENESIS_HOME, while `_local_config` reads Path.home(), so an
+        operator who exercises the documented opt-out would turn this test red for
+        a reason its name actively misleads about. Patch the module globals.
+        """
+        import genesis.env as env_mod
+
+        monkeypatch.delenv("GENESIS_EMBED_PRIORITY_TIER", raising=False)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {})
+        assert env_mod.embed_priority_tier() is True
+
+    def test_null_memory_key_does_not_crash_the_boot_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """`memory:` with its child commented out loads as {'memory': None}.
+
+        `.get("memory", {})` returns None there — a dict default applies to a
+        MISSING key, not a null one — and `None.get(...)` raises straight out of
+        the memory bootstrap that calls this. The documented opt-out must not be
+        able to break the subsystem it opts out of.
+        """
+        import genesis.env as env_mod
+
+        monkeypatch.delenv("GENESIS_EMBED_PRIORITY_TIER", raising=False)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {"memory": None})
+        assert env_mod.embed_priority_tier() is True  # falls through to the default
+
+    @pytest.mark.parametrize("value", ["false", "False", "0", "no", "off", "OFF"])
+    def test_env_can_opt_out(self, home: Path, monkeypatch: pytest.MonkeyPatch, value: str):
+        monkeypatch.setenv("GENESIS_EMBED_PRIORITY_TIER", value)
+        from genesis.env import embed_priority_tier
+
+        assert embed_priority_tier() is False
+
+    @pytest.mark.parametrize("value", ["true", "1", "yes", "on"])
+    def test_env_can_opt_in_explicitly(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ):
+        monkeypatch.setenv("GENESIS_EMBED_PRIORITY_TIER", value)
+        from genesis.env import embed_priority_tier
+
+        assert embed_priority_tier() is True
+
+    def test_local_config_can_opt_out(self, monkeypatch: pytest.MonkeyPatch):
+        """A fresh clone with no env var must still be able to say no in yaml.
+
+        The local config is cached in MODULE GLOBALS and resolves against
+        Path.home() rather than GENESIS_HOME, so it is patched directly here —
+        writing a yaml file under the tmp home would simply not be read.
+        """
+        import genesis.env as env_mod
+
+        monkeypatch.delenv("GENESIS_EMBED_PRIORITY_TIER", raising=False)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {"memory": {"embed_priority_tier": False}})
+        assert env_mod.embed_priority_tier() is False
+
+    def test_env_overrides_local_config(self, monkeypatch: pytest.MonkeyPatch):
+        """Env beats yaml, matching every sibling accessor in this module."""
+        import genesis.env as env_mod
+
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {"memory": {"embed_priority_tier": False}})
+        monkeypatch.setenv("GENESIS_EMBED_PRIORITY_TIER", "true")
+        assert env_mod.embed_priority_tier() is True

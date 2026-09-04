@@ -11,6 +11,25 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Proactive memory recall could time out completely.** The embedding provider
+  queues standard-rate requests when a model is busy, and that wait can run past
+  recall's four-and-a-half-second budget — measured at eight to thirteen seconds
+  against a budget of four and a half — so every lookup fails and sessions run with
+  no recalled memory at all. Recall now asks for the provider's priority lane, which
+  answers in about 650 milliseconds regardless of how long the prompt is.
+
+  **This costs a little more, and the amount is worth knowing: one and a half times
+  the standard embedding rate, on recall only.** At one person's usage that is a
+  fraction of a cent a month, and declining it means keeping a feature that does not
+  work. Storing memories stays on the standard rate — that runs in the background
+  with nothing waiting on it. Set `GENESIS_EMBED_PRIORITY_TIER=false` to decline the
+  faster lane; recall then falls back to keyword-only search whenever the queue is
+  longer than the deadline.
+
+  Scope: this covers the proactive-recall path served by genesis-server. An explicit
+  `memory_recall` tool call through a standalone MCP process still uses the standard
+  lane, so it can be slow without failing.
+
 - **The cold-marketing campaign no longer re-pitches the same person.** Once a
   marketing pitch is delivered to a prospect, that prospect is marked contacted and
   drops out of the campaign's target list — previously nothing recorded the contact,
