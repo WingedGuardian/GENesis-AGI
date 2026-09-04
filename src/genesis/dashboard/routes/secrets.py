@@ -40,6 +40,8 @@ _LABEL_RE = re.compile(r"^#\s*---\s*(.+?)\s*---")
 _USED_BY_RE = re.compile(r"^#\s*Used by:\s*(.+)", re.IGNORECASE)
 _SIGNUP_RE = re.compile(r"^#\s*Signup:\s*(.+)", re.IGNORECASE)
 _KEY_RE = re.compile(r"^([A-Z][A-Z0-9_]+)=")
+# A key the template ships commented out — still registered, just unset.
+_COMMENTED_KEY_RE = re.compile(r"^#\s*([A-Z][A-Z0-9_]+)=")
 # Note: ``_PASS`` covers NAS/SMB passwords (GENESIS_BACKUP_NAS_PASS) and any
 # *_PASSWORD key; it also subsumes _PASSPHRASE but that is kept for clarity.
 _SENSITIVE_RE = re.compile(r"API_KEY_|_API_KEY|_TOKEN|_PASSPHRASE|_PASS|FIRECRAWL_API")
@@ -90,13 +92,21 @@ def _parse_example_file() -> list[SecretKeyDef]:
             signup_url = m.group(1).strip()
             continue
 
-        # Key definition: KEY_NAME=
-        m = _KEY_RE.match(line_s)
+        # Key definition: KEY_NAME=  — or `# KEY_NAME=`, a key the template ships
+        # COMMENTED so its default is not force-assigned into secrets.env.
+        #
+        # A commented key is still a REAL, settable key and must stay in this
+        # registry: the PUT route rejects anything not in _KNOWN_KEYS, so dropping
+        # it makes the dashboard field vanish and an update 4xx. That bites hardest
+        # on exactly the keys the template comments ON PURPOSE — the local-inference
+        # URLs and the embedding priority lever are commented precisely so the
+        # genesis.yaml equivalents keep working, and the TTS tuning knobs and the
+        # dashboard auth toggle were already invisible here for the same reason.
+        # `_KEY_RE` anchors at the line start, so the comment form needs its own
+        # match rather than the (unreachable) startswith check this replaced.
+        m = _KEY_RE.match(line_s) or _COMMENTED_KEY_RE.match(line_s)
         if m:
             key_name = m.group(1)
-            # Skip commented-out keys
-            if line_s.startswith("#"):
-                continue
             keys.append(SecretKeyDef(
                 key=key_name,
                 group=group,

@@ -57,6 +57,28 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   those settings fail toward spending money and toward running an autonomous job the
   operator had switched off.
 
+- **A quoted "false" in the install config meant true.** Settings written in
+  `genesis.yaml` are read as booleans, but a value in quotes arrives as text, and
+  any non-empty text counted as on — so `embed_priority_tier: "false"` kept the
+  paid lane running, while the same word unquoted, or written in `secrets.env`,
+  correctly turned it off. One intention, three places to write it, two answers.
+  The same spellings now mean the same thing everywhere, for every on/off setting
+  in that file.
+
+- **The timezone control could delete the config it exists to repair.** If the
+  file was malformed in a way that left its contents unreadable as settings, the
+  dropdown rewrote it with the timezone alone — discarding whatever else was in
+  there, silently, on the one control documented as the way to recover. It now
+  copies the original alongside first, writes the timezone, and says plainly what
+  it did and where the copy went.
+
+- **Settings the template ships commented out disappeared from the dashboard.**
+  Some defaults are deliberately left commented so the equivalent setting in
+  `genesis.yaml` keeps working. The dashboard's editor only recognised
+  uncommented lines, so those keys vanished from it and updates were rejected as
+  unknown — including several that had been invisible this way for some time.
+  They are listed again, simply with no value set.
+
 - **A one-line typo in the install config could silently disable vector memory.**
   Accessors that read a nested setting out of `~/.genesis/config/genesis.yaml`
   assumed the section around it was a mapping. Two shapes an ordinary edit produces

@@ -90,3 +90,67 @@ def test_secrets_put_rejects_timezone_keys(client):
     resp = client.put("/api/genesis/secrets", json={"keys": {"USER_TIMEZONE": "Europe/Paris"}})
     assert resp.status_code == 422
     assert "Unknown key" in str(resp.get_json())
+
+
+# ── A malformed config must survive the control that recovers it ──────────────
+
+
+def _write_malformed(tmp_path: Path) -> Path:
+    """A genesis.yaml whose ROOT is a list — a plausible hand-edit slip — but that
+    still carries real settings the operator would not want to lose."""
+    cfg = tmp_path / ".genesis" / "config" / "genesis.yaml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(
+        "- network:\n"
+        "    ollama_url: http://inference.invalid:11434\n"
+        "- github:\n"
+        "    user: someone\n"
+    )
+    return cfg
+
+
+def test_malformed_root_is_backed_up_not_deleted(client, tmp_path):
+    """REGRESSION: coercing a non-mapping root to {} and writing back DELETED it.
+
+    The previous behaviour raised TypeError into an opaque 500 and left the file
+    untouched. "Fixing" that by coercing to {} turned a loud, non-destructive
+    error into SILENT PERMANENT DATA LOSS — on the one control documented as the
+    recovery surface for a broken genesis.yaml. Losing the operator's network and
+    github settings to a timezone change is strictly worse than the 500.
+    """
+    cfg = _write_malformed(tmp_path)
+    original = cfg.read_text()
+
+    resp = client.post("/api/genesis/settings/timezone", json={"timezone": "Europe/Paris"})
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    # The rewritten file carries the timezone...
+    assert yaml.safe_load(cfg.read_text()) == {"timezone": "Europe/Paris"}
+
+    # ...and the original content still exists, byte-identical, beside it.
+    backups = sorted(cfg.parent.glob("genesis.malformed-*.yaml"))
+    assert len(backups) == 1, f"no backup written; original content is GONE: {backups}"
+    assert backups[0].read_text() == original
+
+    # And the operator is TOLD, rather than discovering it later.
+    warning = resp.get_json().get("warning", "")
+    assert "malformed" in warning.lower()
+    assert backups[0].name in warning, "the warning must name where the original went"
+
+
+def test_a_well_formed_config_is_not_backed_up(client, tmp_path):
+    """The control. A backup on every write would be noise, and would hide the
+    signal this test exists to protect."""
+    cfg = tmp_path / ".genesis" / "config" / "genesis.yaml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("network:\n  ollama_url: http://inference.invalid:11434\n")
+
+    resp = client.post("/api/genesis/settings/timezone", json={"timezone": "Europe/Paris"})
+    assert resp.status_code == 200
+    assert not list(cfg.parent.glob("genesis.malformed-*.yaml"))
+    assert "warning" not in resp.get_json()
+    # And the sibling settings SURVIVE a normal write — the whole point of merging
+    # into `existing` rather than replacing it.
+    data = yaml.safe_load(cfg.read_text())
+    assert data["timezone"] == "Europe/Paris"
+    assert data["network"]["ollama_url"] == "http://inference.invalid:11434"

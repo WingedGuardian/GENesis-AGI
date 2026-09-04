@@ -77,6 +77,32 @@ def _local_config() -> dict:
     return _LOCAL_CONFIG
 
 
+#: The spellings every env-var branch in this module already treats as FALSE.
+#: Kept as one set so the yaml branch cannot drift from the environment branch.
+_FALSEY_TOKENS = frozenset({"0", "false", "no", "off"})
+
+
+def _yaml_bool(value: object) -> bool:
+    """Interpret a yaml scalar as a boolean the SAME way the env branch does.
+
+    ``bool()`` alone is wrong here and the failure is silent: PyYAML returns a
+    plain string for a QUOTED scalar, so ``embed_priority_tier: "false"`` is a
+    non-empty string and ``bool()`` reads it as TRUE — the opposite of what the
+    operator wrote, and in that particular case it keeps the PAID lane running.
+    The same yaml written unquoted parses to a real ``False``, so the meaning of
+    an identical setting would depend on quoting alone; written in secrets.env
+    instead, the env branch already reads it correctly. Three spellings of one
+    intention must not disagree.
+
+    Strings are matched case-insensitively against the same token set the env
+    branches use; every other type falls back to ``bool()`` (a real yaml
+    ``false``, ``0``, an empty list — all already correct under it).
+    """
+    if isinstance(value, str):
+        return value.strip().lower() not in _FALSEY_TOKENS
+    return bool(value)
+
+
 def _local_section(name: str) -> dict:
     """Return the named local-config section, or ``{}`` if it is not a mapping.
 
@@ -537,7 +563,7 @@ def ollama_enabled() -> bool:
         return env_val.strip().lower() not in {"0", "false", "no", "off"}
     local_val = _local_section("network").get("ollama_enabled")
     if local_val is not None:
-        return bool(local_val)
+        return _yaml_bool(local_val)
     return False
 
 
@@ -575,7 +601,7 @@ def embed_priority_tier() -> bool:
     # out of. See that helper for what an unguarded read costs here specifically.
     local_val = _local_section("memory").get("embed_priority_tier")
     if local_val is not None:
-        return bool(local_val)
+        return _yaml_bool(local_val)
     return True
 
 
@@ -595,7 +621,7 @@ def build_lane_enabled() -> bool:
         return env_val.strip().lower() not in {"0", "false", "no", "off"}
     local_val = _local_section("build_lane").get("enabled")
     if local_val is not None:
-        return bool(local_val)
+        return _yaml_bool(local_val)
     return False
 
 
@@ -622,7 +648,7 @@ def models_md_synthesis_enabled() -> bool:
         return env_val.strip().lower() not in {"1", "true", "yes", "on"}
     local_val = _local_section("models_md_synthesis").get("enabled")
     if local_val is not None:
-        return bool(local_val)
+        return _yaml_bool(local_val)
     return True
 
 

@@ -492,11 +492,100 @@ class TestSecretsTemplateDoesNotShadowYaml:
         Without the assignment `${GENESIS_ENABLE_OLLAMA:-true}` turns Ollama ON for
         every fresh install. If this ever goes red because someone "swept the class",
         the sweep used the wrong rule.
+
+        BUT THIS LOCK PRESERVES A DEFECT, and saying so is the point of the note:
+        because the assignment is present, it shadows `network.ollama_enabled`, so
+        the "Ollama enabled (true/false)" answer that setup-local-config.sh prompts
+        for lands in genesis.yaml and does nothing. Removing the assignment is NOT
+        the fix — MEASURED: `routing/config.py::_expand_env_vars` resolves
+        `${VAR:-default}` from `os.environ` ALONE and never consults
+        `env.ollama_enabled()`, so the yaml lever cannot reach the router either
+        way. Aligning the routing default would only make the two agree when both
+        are unset. The real fix is to make routing read the accessor rather than
+        raw environment, which is a routing-config change, not a template one.
+        Tracked; until then this assignment is load-bearing and must stay.
         """
         assert self._assignments("GENESIS_ENABLE_OLLAMA"), (
             "GENESIS_ENABLE_OLLAMA must stay UNCOMMENTED in secrets.env.example: "
             "config/model_routing.yaml expands it to `true` when unset."
         )
+
+
+class TestYamlBooleanSpellings:
+    """A quoted yaml boolean must mean what it says.
+
+    PyYAML returns a plain STRING for a quoted scalar, so `bool()` reads
+    `embed_priority_tier: "false"` as True — the opposite of the operator's
+    intent, and on that particular setting it silently keeps the PAID lane
+    running. The same value written unquoted parses to a real False, and written
+    in secrets.env the env branch reads it correctly, so an identical intention
+    had three spellings and two answers.
+    """
+
+    _ACCESSORS = [
+        ("ollama_enabled", "network", "ollama_enabled"),
+        ("embed_priority_tier", "memory", "embed_priority_tier"),
+        ("build_lane_enabled", "build_lane", "enabled"),
+        ("models_md_synthesis_enabled", "models_md_synthesis", "enabled"),
+    ]
+
+    @pytest.fixture(autouse=True)
+    def _no_env_shortcircuit(self, monkeypatch: pytest.MonkeyPatch):
+        for name in _SECTION_ACCESSOR_ENV:
+            monkeypatch.delenv(name, raising=False)
+
+    @pytest.mark.parametrize(("accessor", "section", "key"), _ACCESSORS)
+    @pytest.mark.parametrize("falsey", ["false", "False", "FALSE", "no", "off", "0", " false "])
+    def test_quoted_false_means_false(
+        self, monkeypatch: pytest.MonkeyPatch, accessor, section, key, falsey
+    ):
+        import genesis.env as env_mod
+
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {section: {key: falsey}})
+        assert getattr(env_mod, accessor)() is False, f"{accessor} read {falsey!r} as true"
+
+    @pytest.mark.parametrize(("accessor", "section", "key"), _ACCESSORS)
+    @pytest.mark.parametrize("truthy", ["true", "yes", "on", "1"])
+    def test_quoted_true_still_means_true(
+        self, monkeypatch: pytest.MonkeyPatch, accessor, section, key, truthy
+    ):
+        """The control. A guard that read everything as false would pass the test
+        above and break every opt-IN."""
+        import genesis.env as env_mod
+
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {section: {key: truthy}})
+        assert getattr(env_mod, accessor)() is True
+
+    @pytest.mark.parametrize(("accessor", "section", "key"), _ACCESSORS)
+    def test_native_yaml_booleans_are_unaffected(
+        self, monkeypatch: pytest.MonkeyPatch, accessor, section, key
+    ):
+        """Unquoted yaml already parsed to a real bool; that path must not move."""
+        import genesis.env as env_mod
+
+        for native, expected in ((False, False), (True, True)):
+            monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+            monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {section: {key: native}})
+            assert getattr(env_mod, accessor)() is expected
+
+    def test_yaml_and_env_agree_on_every_spelling(self, monkeypatch: pytest.MonkeyPatch):
+        """The property that actually matters: same token, same answer, either home.
+
+        Asserted against the env branch itself rather than a hardcoded expectation,
+        so the two cannot drift apart without this failing.
+        """
+        import genesis.env as env_mod
+
+        for token in ("false", "FALSE", "no", "off", "0", "true", "yes", "on", "1", "x"):
+            monkeypatch.setenv("GENESIS_EMBED_PRIORITY_TIER", token)
+            via_env = env_mod.embed_priority_tier()
+            monkeypatch.delenv("GENESIS_EMBED_PRIORITY_TIER", raising=False)
+            monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+            monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {"memory": {"embed_priority_tier": token}})
+            via_yaml = env_mod.embed_priority_tier()
+            assert via_env == via_yaml, f"{token!r}: env={via_env} yaml={via_yaml}"
 
 
 class TestNestedConfigReadsAreRouted:
