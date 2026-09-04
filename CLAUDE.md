@@ -495,9 +495,13 @@ When a user shares a file path or URL in conversation:
   defect, also fails identically every time. If a value ran PAST where it should
   have ended and swallowed the parameters after it, fix the STRUCTURE, not the
   text. If it ended where it should have, the structure is fine and the value or
-  the tool is the problem — and whether that same tool already succeeded earlier
-  in the session separates those two. Most likely on long, multi-sentence
-  values. Never file a bug report from a payload you have not read.
+  the tool is the problem — and what separates those two is the value checked
+  against the tool's own documented contract, not whether that tool worked
+  earlier. Prior success proves nothing here: a defect can be input-dependent,
+  accepting one payload and wrongly rejecting the next. If the value is
+  documented-valid and still rejected, that IS the bug report. Most likely on
+  long, multi-sentence values. Never file a bug report from a payload you have
+  not read — and never suppress one because the tool worked a moment ago.
 
   **In Claude Code specifically**, parameters are
   `<parameter name="X">…</parameter>`. A bare `<X>…</X>` is not a shorthand: the
