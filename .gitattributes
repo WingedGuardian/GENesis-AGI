@@ -10,12 +10,27 @@
 # pairs built to collide on this file: 409 Conflict WITH the union attribute
 # present in both commits, and 409 for the no-attribute control. So a PR that
 # collides here still shows CONFLICTING, and scripts/hooks/git_push_guard.py
-# still blocks `gh pr merge` on GitHub's `mergeable` field — which this rule
-# provably cannot move. Clearing that block means merging the base branch into
-# the PR branch LOCALLY, which is what the gate itself instructs. THAT is what
-# this rule changes: the local merge resolves the changelog with no hand-editing.
-# Measured on the 18 open PRs that collided only on this file: 18/18 merge clean
-# locally, every bullet from both sides intact.
+# still blocks the merge on GitHub's `mergeable` field — which this rule
+# provably cannot move.
+#
+# AND IT DOES NOT HELP A BRANCH'S FIRST MERGE EITHER, which is the one that
+# matters for a PR that is already open. Attributes resolve from the CHECKOUT,
+# not from the commits being merged, so on a branch created before this file
+# existed, `git merge origin/main` still conflicts — the rule arrives IN that
+# merge and is not in effect during it. MEASURED on a real open PR: checked out
+# at its head and merging in the branch carrying this rule, CHANGELOG.md
+# conflicts. An earlier measurement here claimed "18/18 merge clean locally";
+# that replayed the OPPOSITE direction (merging each PR into a checkout that
+# already had the rule) and did not describe the workflow anyone performs. It
+# has been withdrawn.
+#
+# So what this actually buys is narrow and worth stating plainly: once a branch
+# CONTAINS this file — every branch cut after it lands, and any older branch
+# after its first merge — subsequent merges of the base branch resolve the
+# changelog with no hand-editing. Measured in that direction: 18/18 clean with
+# every bullet from both sides intact. The structural fix for the collision
+# itself is one changelog fragment per change (see changelog.d/), which this
+# rule does not replace.
 #
 # The pattern is ANCHORED. A gitattributes pattern with no slash matches the
 # basename at every depth, like .gitignore (gitattributes(5)) — unanchored, this

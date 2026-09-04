@@ -25,20 +25,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   Measured before the change, against the repository's own open work: of 49
   open pull requests, 21 could not merge, and **18 of those 21 conflicted on
   this file and nothing else** — every other file in them merged cleanly.
-  Replaying all 18 locally with the rule in place, every one of them merges
-  without conflict, while the three genuine conflicts (in source, a shell
-  script and an architecture document) still conflict exactly as before.
+  **Two things it deliberately does not do**, because the measurement above is
+  easy to over-read. It does not make a conflicting pull request mergeable on
+  GitHub: GitHub ignores a repository's `.gitattributes` in its server-side
+  merge, measured against GitHub's own merge engine on two branch pairs built to
+  collide on this file, which conflicted both with the attribute present and
+  without it. And it does not help a branch's *first* merge, which is the one an
+  already-open pull request needs — attributes resolve from the checkout rather
+  than from the commits being merged, so on a branch created before this file
+  existed the merge that introduces the rule is not governed by it. Measured on
+  a real open pull request: the changelog still conflicts.
 
-  **What this does not do, since that measurement is easy to over-read: it does
-  not make a conflicting pull request mergeable on GitHub.** GitHub ignores a
-  repository's `.gitattributes` in its server-side merge — measured directly
-  against GitHub's own merge engine on two branch pairs built to collide on this
-  file, which returned a conflict both with the union attribute present and
-  without it. Such a pull request still shows as conflicting, and the merge gate
-  still refuses it. Clearing that requires merging the base branch into the
-  branch locally, which is what the gate already instructs. What changes is the
-  cost of that step: the changelog now resolves itself instead of being
-  hand-edited every time.
+  What it does buy, stated narrowly: once a branch contains the file — every
+  branch cut after this lands, and any older branch after its first merge —
+  later merges of the base branch resolve the changelog with no hand-editing.
+  Measured in that direction across the same 18: all of them clean, with every
+  bullet from both sides intact. The structural fix is one fragment per change
+  under `changelog.d/`; this rule does not replace it.
 
   The rule is scoped to the one file at the repository root, and the tests
   enforce that scope over the complete tracked-file list rather than a sample.
