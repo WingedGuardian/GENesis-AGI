@@ -781,6 +781,33 @@ class OutreachPipeline:
                 await self._record_autonomous_send(
                     request, gate_cell, recipient, outreach_id, now,
                 )
+                # LOOP-FIX: autonomous (GRANTED-cell) delivery advances a matching
+                # curated prospect active → contacted (a no-op for a non-prospect
+                # recipient) so the campaign's list_active stops re-pitching it. The
+                # HELD → owner-approved path stamps in the email-gate drain; this is
+                # the GRANTED-cell path, which delivers INLINE here and never touches
+                # that drain — without this the loop-fix would silently regress once
+                # the cell graduates to autonomous. Same active-guarded CRUD.
+                #
+                # Wrapped best-effort (uniform with the ledger/shadow hooks above):
+                # this runs AFTER the irreversible adapter.send, so a transient DB/WAL
+                # error must NOT raise out of _deliver — that would strand the thread
+                # registration below (reply-tracking lost) and surface a post-send
+                # exception for an already-delivered message (re-attempt → dup risk).
+                # Unlike the drain-branch stamps (whose CronTrigger re-run + held-state
+                # owns retry, so fail-loud is correct there), this inline path has no
+                # retry owner; a logged miss is strictly safer than a post-send raise.
+                # A missed stamp here degrades to at most one re-pitch, not a re-send.
+                try:
+                    from genesis.db.crud import marketing_prospects as _mp
+
+                    await _mp.mark_contacted_by_email(self._db, recipient, contacted_at=now)
+                except Exception:  # noqa: BLE001 — stamp is best-effort post-send; never break the send
+                    logger.warning(
+                        "granted-cell prospect contact-stamp failed (post-send); "
+                        "list_active may re-pitch until next stamp",
+                        exc_info=True,
+                    )
 
         # Auto-register email threads for reply tracking
         if channel == "email" and self._thread_tracker is not None:
