@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -458,3 +459,63 @@ def test_the_tilde_ambiguity_is_reported_through_the_production_path(tmp_path, m
     got = hook._effective_cwd("cd ~/wt && git push origin main", str(tmp_path))
 
     assert got is hook._CWD_UNRESOLVED
+
+
+def test_the_tilde_ambiguity_is_checked_against_the_tracked_cwd(tmp_path, monkeypatch):
+    """REGRESSION PIN. The literal candidate was resolved against the HOOK's cwd.
+
+    `~/wt` read literally is a RELATIVE path, so `os.path.isdir(token)` asked
+    about `<hook process cwd>/~/wt` — a directory with nothing to do with where
+    the command runs. After `cd sub && cd "~/wt"` bash is in
+    `<base>/sub/~/wt`, so the ambiguity was missed exactly when a preceding
+    relative `cd` had moved the base, and the hook scanned the expansion instead.
+
+    The process cwd is deliberately somewhere else here, which is what makes this
+    discriminate: if the check still used it, the literal would not be found.
+    """
+    base = tmp_path / "base"
+    (base / "sub" / "~" / "wt").mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    got = hook._effective_cwd('cd sub && cd "~/wt" && git push origin main', str(base))
+
+    assert got is hook._CWD_UNRESOLVED
+
+
+def test_a_git_dash_c_path_keeps_its_traversal_for_the_filesystem(tmp_path):
+    """REGRESSION PIN. `normpath` collapsed `..` lexically for `git -C`.
+
+    Git performs a real chdir, so `link/..` is the parent of the link's TARGET.
+    Folding it against the text names a different directory: with
+    `/base/link -> /other/child`, git ends up in `/other` while normpath says
+    `/base`. The unfolded path goes to `subprocess(cwd=)`, which resolves it with
+    the same semantics git would.
+
+    Note the asymmetry this pins: bash's `cd` resolves LOGICALLY by default, so
+    collapsing is correct there and only the `-C` path changes.
+    """
+    (tmp_path / "other" / "child").mkdir(parents=True)
+    (tmp_path / "base").mkdir()
+    (tmp_path / "base" / "link").symlink_to(tmp_path / "other" / "child")
+
+    got = hook._effective_cwd("git -C link/.. push origin main", str(tmp_path / "base"))
+
+    assert got is not hook._CWD_UNRESOLVED
+    # The lexical answer would be the base itself; the filesystem answer is
+    # `other`. Asserting the resolved form is what proves traversal survived.
+    assert os.path.realpath(got) == os.path.realpath(tmp_path / "other")
+
+
+def test_a_cd_path_still_collapses_traversal_like_bash(tmp_path):
+    """TRUE-NEGATIVE CONTROL for the asymmetry above.
+
+    Without this, "stop collapsing" would look equally correct applied to BOTH
+    callers — and it would be wrong for `cd`, which bash resolves logically.
+    """
+    (tmp_path / "a" / "b").mkdir(parents=True)
+
+    got = hook._effective_cwd("cd a/b/.. && git push origin main", str(tmp_path))
+
+    assert got == str(tmp_path / "a")

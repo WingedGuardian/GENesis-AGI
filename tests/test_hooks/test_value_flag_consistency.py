@@ -213,6 +213,53 @@ _KNOWN_CD_DIVERGENCES = {
 }
 
 
+# The FULL verdict each documented divergence produces, per module. Recorded so
+# the lock below can assert equality rather than mere disagreement: a documented
+# divergence that changes to a DIFFERENT still-divergent verdict, or a construct
+# that vanishes from the generated sweep, both used to pass while the comments
+# claimed they were caught.
+#
+# Regenerate deliberately, never to make a red test green: a change here is a
+# statement that the copies' semantics moved on purpose.
+_KNOWN_CD_VERDICT_MAPS = {
+    f"cd ~{_ABSENT_USER}/wt": {
+        "git_push_guard": f"'~{_ABSENT_USER}/wt'",
+        "review_enforcement_commit": f"'~{_ABSENT_USER}/wt'",
+        "pre_push_privacy_review": "UNRESOLVABLE",
+    },
+    "cd '$W'": {
+        "git_push_guard": "'$W'",
+        "review_enforcement_commit": "'$W'",
+        "pre_push_privacy_review": "UNRESOLVABLE",
+    },
+    "cd /a/b[1]": {
+        "git_push_guard": "'/a/b[1]'",
+        "review_enforcement_commit": "UNRESOLVABLE",
+        "pre_push_privacy_review": "UNRESOLVABLE",
+    },
+    "cd /a/{x}": {
+        "git_push_guard": "'/a/{x}'",
+        "review_enforcement_commit": "UNRESOLVABLE",
+        "pre_push_privacy_review": "UNRESOLVABLE",
+    },
+    "cd /a/(x)": {
+        "git_push_guard": "'/a/(x)'",
+        "review_enforcement_commit": "UNRESOLVABLE",
+        "pre_push_privacy_review": "UNRESOLVABLE",
+    },
+    "cd /a/<x>": {
+        "git_push_guard": "'/a/<x>'",
+        "review_enforcement_commit": "UNRESOLVABLE",
+        "pre_push_privacy_review": "UNRESOLVABLE",
+    },
+    "cd /a/b\\c": {
+        "git_push_guard": r"'/a/b\\c'",
+        "review_enforcement_commit": "UNRESOLVABLE",
+        "pre_push_privacy_review": "'/a/bc'",
+    },
+}
+
+
 def _cd_verdict(mod, segment: str) -> str:
     """Classify through each copy's REAL call path, normalised for comparison.
 
@@ -264,14 +311,48 @@ def test_cd_semantics_have_no_undocumented_divergence():
     )
 
 
-def test_known_cd_divergences_still_diverge():
-    """The other direction, so the table cannot rot into a permanent excuse list.
-    If a documented divergence has been fixed, the entry must go."""
+def test_every_known_divergence_still_produces_exactly_its_recorded_verdict():
+    """The other direction, and genuinely EXACT this time.
+
+    The previous version only detected CONVERGENCE, and skipped any key missing
+    from the sweep (``if seg in swept``). So a documented divergence changing to
+    a DIFFERENT still-divergent verdict passed, and a construct disappearing
+    from the generated space passed — while the comments claimed both were
+    caught. That is this lock's own failure mode, inside the lock.
+
+    Asserting the full per-module map covers all three at once: a fixed
+    divergence converges and fails, a drifted one mismatches and fails, and a
+    removed construct is absent and fails.
+    """
     swept = _sweep_cd_constructs()
-    stale = [
-        seg for seg in _KNOWN_CD_DIVERGENCES if seg in swept and len(set(swept[seg].values())) == 1
-    ]
-    assert not stale, f"these no longer diverge — remove them from _KNOWN_CD_DIVERGENCES: {stale}"
+
+    missing = [seg for seg in _KNOWN_CD_DIVERGENCES if seg not in swept]
+    assert not missing, (
+        "the generated construct space no longer produces these documented "
+        f"divergences, so nothing is checking them: {missing}"
+    )
+
+    undocumented = [seg for seg in _KNOWN_CD_DIVERGENCES if seg not in _KNOWN_CD_VERDICT_MAPS]
+    assert not undocumented, (
+        "every entry in _KNOWN_CD_DIVERGENCES needs a recorded verdict map in "
+        f"_KNOWN_CD_VERDICT_MAPS, else it is only half-locked: {undocumented}"
+    )
+
+    drifted = {
+        seg: {"recorded": _KNOWN_CD_VERDICT_MAPS[seg], "actual": swept[seg]}
+        for seg in _KNOWN_CD_DIVERGENCES
+        if swept[seg] != _KNOWN_CD_VERDICT_MAPS[seg]
+    }
+    assert not drifted, (
+        "a documented divergence no longer produces its recorded verdict. If a "
+        "copy was FIXED, drop the entry from both tables; if the semantics moved "
+        f"deliberately, update the recorded map and say why: {drifted}"
+    )
+
+    converged = [seg for seg in _KNOWN_CD_DIVERGENCES if len(set(swept[seg].values())) == 1]
+    assert not converged, (
+        f"these no longer diverge — remove them from _KNOWN_CD_DIVERGENCES: {converged}"
+    )
 
 
 def test_the_sweep_actually_covers_the_dangerous_shapes():

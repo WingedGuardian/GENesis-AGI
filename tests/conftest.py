@@ -26,6 +26,7 @@
 # - This is the structural fix for the 2026-04-10 worktree-test-isolation
 #   footgun: before this guard, every sibling-worktree test run needed an
 #   explicit ``PYTHONPATH=src`` prefix or it silently tested main instead.
+import subprocess
 import sys
 from pathlib import Path
 
@@ -56,8 +57,38 @@ if _WORKTREE_SRC.is_dir():
 # actually ambiguous: the main checkout of a repo that has worktrees. CI has no
 # worktrees, so CI stays silent. Advisory — it never fails a run.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_GIT = _REPO_ROOT / ".git"
-if _GIT.is_dir() and (_GIT / "worktrees").is_dir():
+
+
+def _common_git_dir(root: Path) -> Path | None:
+    """The repo's COMMON git dir, or None if this is not a checkout.
+
+    Not ``root / ".git"``: with ``git init --separate-git-dir`` (and some clone
+    topologies) that is a FILE pointing elsewhere, and the ``worktrees/``
+    directory lives under the real common dir. Assuming a directory made the
+    banner go silent on exactly such a checkout — a supported topology where a
+    wrong-tree run is just as possible. ``.claude/hooks/genesis-hook`` already
+    accounts for separate git dirs elsewhere in this repo.
+    """
+    git = root / ".git"
+    if git.is_dir():
+        return git
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    resolved = Path(out.stdout.strip())
+    return resolved if resolved.is_absolute() else (root / resolved)
+
+
+_GIT = _common_git_dir(_REPO_ROOT)
+if _GIT is not None and (_GIT / "worktrees").is_dir():
     try:
         _siblings = [p.name for p in (_GIT / "worktrees").iterdir() if p.is_dir()]
     except OSError:  # pragma: no cover - unreadable .git is not a test concern

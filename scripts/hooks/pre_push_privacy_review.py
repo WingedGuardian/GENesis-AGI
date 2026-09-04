@@ -208,7 +208,7 @@ _CWD_UNRESOLVED = object()
 _UNRESOLVABLE_CD_CHARS = "$`*?[{()<>"
 
 
-def _cd_target(token: str | None):
+def _cd_target(token: str | None, base=None):
     """The directory a ``cd`` moves to, or ``_CWD_UNRESOLVED`` if unknowable.
 
     ``token`` is already shlex-split, so quotes are gone: ``cd "$W"`` and
@@ -252,7 +252,16 @@ def _cd_target(token: str | None):
         # while this resolves to the expansion. Undetectable from the token, and
         # it costs a wrong-tree scan only for a mis-quoted command that also
         # ignored the cd's failure.
-        if os.path.isdir(token):
+        # Resolved against the TRACKED shell cwd, not the hook process's.
+        # `~/wt` read literally is a RELATIVE path, so `os.path.isdir(token)`
+        # asked about `<hook process cwd>/~/wt` — a directory that has nothing
+        # to do with where the command runs. After `cd sub && cd "~/wt"` bash is
+        # in `<base>/sub/~/wt`, and checking the wrong base means the ambiguity
+        # is missed exactly when a preceding relative `cd` has moved things.
+        literal = token
+        if not os.path.isabs(literal) and isinstance(base, str) and base:
+            literal = os.path.join(base, token)
+        if os.path.isdir(literal):
             return _CWD_UNRESOLVED
         token = expanded
     if any(ch in token for ch in _UNRESOLVABLE_CD_CHARS):
@@ -260,7 +269,7 @@ def _cd_target(token: str | None):
     return token
 
 
-def _resolve(base, path):
+def _resolve(base, path, *, collapse: bool = True):
     """Resolve ``path`` against ``base``; either may be ``_CWD_UNRESOLVED``.
 
     An ABSOLUTE path recovers from an unresolved base — ``cd $W && git -C /wt
@@ -268,14 +277,28 @@ def _resolve(base, path):
     known base there is nothing to join it to, and returning the bare relative
     string (the old behaviour) meant it was later handed to ``subprocess(cwd=)``
     and silently resolved against the HOOK's own directory.
+
+    ``collapse`` decides whether ``..`` is folded LEXICALLY, and the two callers
+    genuinely differ:
+
+    * ``cd`` — bash resolves logically by default (``-L``), folding ``..``
+      against the path text, so collapsing MATCHES the shell. Keep it.
+    * ``git -C`` — git performs a real ``chdir``, so ``link/..`` lands in the
+      parent of the link's TARGET, not the parent of the link. Collapsing it
+      lexically names a different directory; with ``/base/link -> /other/child``
+      git ends up in ``/other`` while normpath says ``/base``. The unfolded path
+      is handed to ``subprocess(cwd=)``, which resolves it with the same
+      filesystem semantics git would — so passing it through is not a
+      shortcoming, it is the accurate answer.
     """
     if path is _CWD_UNRESOLVED:
         return _CWD_UNRESOLVED
     if os.path.isabs(path):
-        return os.path.normpath(path)
+        return os.path.normpath(path) if collapse else path
     if base is _CWD_UNRESOLVED or not base:
         return _CWD_UNRESOLVED
-    return os.path.normpath(os.path.join(base, path))
+    joined = os.path.join(base, path)
+    return os.path.normpath(joined) if collapse else joined
 
 
 def _emit(context: str) -> None:
@@ -355,7 +378,7 @@ def _effective_cwd(cmd: str, payload_cwd: str | None):
             if len(toks) > 2:
                 cwd = _CWD_UNRESOLVED
                 continue
-            cwd = _resolve(cwd, _cd_target(toks[1] if len(toks) == 2 else None))
+            cwd = _resolve(cwd, _cd_target(toks[1] if len(toks) == 2 else None, cwd))
             continue
         k = 0
         while k < len(toks) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[k]):
@@ -378,7 +401,11 @@ def _effective_cwd(cmd: str, payload_cwd: str | None):
                 m += 1
                 continue
             if tok == "push":
-                return _resolve(cwd, _cd_target(c_dir)) if c_dir is not None else cwd
+                return (
+                    _resolve(cwd, _cd_target(c_dir, cwd), collapse=False)
+                    if c_dir is not None
+                    else cwd
+                )
             break
     return cwd
 
