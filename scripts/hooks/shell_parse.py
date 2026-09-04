@@ -613,9 +613,111 @@ def has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     return _has_trailing_override(seg, sigil)
 
 
+def _ansi_c_spans(text: str) -> list[tuple[int, int, str, bool]]:
+    """Locate bash ANSI-C ``$'...'`` quoting spans in SHELL-WORD context.
+
+    Returns ``(start, end, content, has_escape)`` per span, where ``end`` is the
+    index past the closing ``'`` and ``content`` is the raw bytes between the
+    quotes. ``has_escape`` is True if the span contains a backslash escape.
+
+    Only spans OUTSIDE single- and double-quoted regions are ANSI-C: bash does
+    NOT treat ``$'...'`` as ANSI-C inside ``"..."`` (there it is a literal ``$``
+    followed by a quoted string), and everything inside ``'...'`` is literal.
+    Getting this dq/sq state right is what keeps the scan off heredoc-body and
+    quoted text — MEASURED to matter: a naive ``$'`` scan over 38,140 real
+    commands flagged 89, dq-awareness cut that to 45, nearly all the remainder
+    being heredoc bodies this segment-level path never tokenizes as commands.
+    """
+    spans: list[tuple[int, int, str, bool]] = []
+    i, n = 0, len(text)
+    in_sq = in_dq = False
+    while i < n:
+        c = text[i]
+        if in_sq:
+            if c == "'":
+                in_sq = False
+            i += 1
+            continue
+        if in_dq:
+            if c == "\\" and i + 1 < n:  # backslash escapes the next char in "..."
+                i += 2
+                continue
+            if c == '"':
+                in_dq = False
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:  # word-level escape, e.g. \$ — not an opener
+            i += 2
+            continue
+        if c == '"':
+            in_dq = True
+            i += 1
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "'":
+            j = i + 2
+            content: list[str] = []
+            has_escape = False
+            while j < n and text[j] != "'":
+                if text[j] == "\\" and j + 1 < n:  # ANSI-C escape (incl. \' \\)
+                    has_escape = True
+                    content.append(text[j : j + 2])
+                    j += 2
+                    continue
+                content.append(text[j])
+                j += 1
+            end = j + 1 if j < n else n
+            spans.append((i, end, "".join(content), has_escape))
+            i = end
+            continue
+        if c == "'":
+            in_sq = True
+            i += 1
+            continue
+        i += 1
+    return spans
+
+
+def _decode_escape_free_ansi_c(text: str) -> str:
+    """Rewrite ESCAPE-FREE ``$'...'`` spans to a plain-quoted literal of content.
+
+    shlex does not implement ANSI-C decoding: it strips the quotes from
+    ``$'push'`` but LEAVES the ``$``, yielding the token ``$push`` — one
+    character off from what bash runs (``push``). That is enough to hide a verb
+    (``git $'push'``) or a flag (``git commit --$'no-verify'``) from every gate
+    that reads the resolved subcommand/flag. Rewriting the span to what bash
+    would produce restores the parser's fidelity to the shell, so the ordinary
+    gate fires its ordinary verdict.
+
+    ONLY the escape-free case is rewritten, and deliberately so: a span with a
+    backslash (``$'\\x70...'`` hex, ``$'\\n'``) needs the full bash ANSI-C escape
+    grammar to decode, and a PARTIAL decoder is the exact "false confidence from
+    partial coverage" failure a sibling review flagged. Escape-bearing spans are
+    left untouched here and reported untrustworthy by :func:`untokenizable`, so
+    they route to the caller's fail-closed net rather than a guessed decode.
+    """
+    spans = _ansi_c_spans(text)
+    if not spans:
+        return text
+    out: list[str] = []
+    last = 0
+    for start, end, content, has_escape in spans:
+        out.append(text[last:start])
+        out.append(text[start:end] if has_escape else shlex.quote(content))
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _argv(seg: str) -> list[str]:
-    """shlex argv of a comment-stripped segment; naive split on tokenizer error."""
-    core = _strip_trailing_comment(seg)
+    """shlex argv of a comment-stripped segment; naive split on tokenizer error.
+
+    ANSI-C ``$'...'`` spans are decoded to their bash value FIRST, so a verb or
+    flag hidden in one (``git $'push'``, ``--$'no-verify'``) resolves to the
+    token bash actually runs rather than the ``$``-prefixed token shlex leaves.
+    Decoding precedes comment-stripping so a ``#`` inside a decoded span is
+    re-quoted and cannot be mistaken for a trailing comment.
+    """
+    core = _strip_trailing_comment(_decode_escape_free_ansi_c(seg))
     try:
         return shlex.split(core)
     except ValueError:
@@ -658,6 +760,19 @@ def untokenizable(command: str) -> bool:
     MEASURED over 12,099 real commands: folding and not folding classify
     IDENTICALLY (339 un-tokenizable either way, zero commands differ), so the
     normalization bought nothing and is removed rather than documented.
+
+    ANSI-C ``$'...'`` is handled in the analyze path, NOT here. shlex SUCCEEDS on
+    ``$'push'`` but leaves the ``$`` (a token one char off from what bash runs),
+    so :func:`_decode_escape_free_ansi_c` rewrites the escape-free case to what
+    bash produces BEFORE tokenizing — the verb/flag then resolves normally and
+    the ordinary gate fires. This function is deliberately NOT broadened to flag
+    ANSI-C, because a benign ``$'...'`` in a MESSAGE argument
+    (``git commit -m $'l1\\nl2'``) is legitimate and flagging it would over-ask;
+    distinguishing verb-position from argument-position is exactly what the
+    per-segment analyze path can do and a whole-command probe cannot. The one
+    residual — a HEX-encoded verb (``$'\\x70\\x75\\x73\\x68'``), which the
+    escape-free decode does not touch — is tracked separately rather than closed
+    here with a message-hostile broadening.
     """
     try:
         shlex.split(command)
