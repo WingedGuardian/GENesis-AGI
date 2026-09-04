@@ -2619,7 +2619,21 @@
         },
 
         // Map env var names → provider_type values from model_routing.yaml.
-        // MAINTENANCE: update when adding new providers to config/model_routing.yaml.
+        //
+        // A MISSING entry fails silently and in the worse direction: with no
+        // mapping, secretHealthStatus() returns the raw PERSISTED status, so the
+        // Settings row keeps reporting the key as configured while that
+        // provider's circuit breaker is open and its chains are falling through
+        // to paid fallbacks. Nothing on screen says so.
+        //
+        // "MAINTENANCE: update when adding a provider" was the whole mechanism,
+        // and a convention that must be REMEMBERED is a convention that gets
+        // missed — measured 2026-09-04, TWO of the thirteen key-bearing provider
+        // types were absent: zhipu (added in this PR, Codex P2 #1626) and
+        // nvidia_nim, which had been missing since it was added and which the
+        // review did not name. `test_every_keyed_provider_type_is_mapped` now
+        // fails CI on the next omission instead of leaving it to be noticed.
+        // (ollama and lmstudio are deliberately absent — local, no key.)
         _KEY_TO_PROVIDER_TYPES: {
           API_KEY_GROQ: ['groq'],
           API_KEY_MISTRAL: ['mistral'],
@@ -2635,6 +2649,8 @@
           API_KEY_CEREBRAS: ['cerebras'],
           API_KEY_GITHUB: ['github'],
           API_KEY_SAMBANOVA: ['sambanova'],
+          API_KEY_NVIDIA_NIM: ['nvidia_nim'],
+          ZHIPU_API_KEY: ['zhipu'],
         },
         secretHealthStatus(keyEntry) {
           if (keyEntry.status === 'not_set') return 'not_set';
