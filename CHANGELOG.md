@@ -20,6 +20,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   days after a failed last run (matching the job-health floor), while
   non-critical sites keep the tight 24h window so long-abandoned one-off
   sites still don't nag.
+- **The cold-marketing campaign no longer re-pitches the same person.** Once a
+  marketing pitch is delivered to a prospect, that prospect is marked contacted and
+  drops out of the campaign's target list — previously nothing recorded the contact,
+  so the campaign would have re-pitched every delivered target on each run. Works on
+  both the owner-approved and (future) autonomous send paths; a pitch that never
+  delivers (dropped, expired, or rejected) leaves the prospect eligible for a later,
+  re-worked pitch. (The substrate still ships off by default.)
+
+### Changed
+
+- **Mistral Large is now tracked as a paid provider.** Mistral removed the Large
+  model family from free-tier entitlement (unannounced; surfaces as
+  `403 tier_not_allowed`). The `mistral-large-free` provider is now flagged
+  `free: false`, so its spend is recorded at real rates ($0.5/$1.5 per MTok)
+  instead of $0, and call sites marked `never_pays` no longer route to it. The
+  provider name keeps its historical `-free` suffix to avoid churning the 30
+  chains that reference it. If your account tier still gets Large at $0,
+  override `free: true` in your local routing overlay.
 
 ### Added
 
@@ -170,7 +188,88 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   session and fail-open: a fresh session stays silent, and any read/parse miss emits
   nothing.
 
+### Changed
+
+- **The Claude Code model roster now ships infrastructure, not a preconfigured
+  provider.** `config/cc_roster.yaml` previously shipped a `glm-5.2` peer pointed at
+  `open.bigmodel.cn`, which requires Chinese real-name identity verification (实名认证)
+  to buy a Coding Plan — so on any install outside China the documented rate-limit
+  fallback could not be provisioned at all. The base config now ships only the native `claude` entry
+  plus commented examples for both Z.AI platforms (`api.z.ai` international,
+  `open.bigmodel.cn` China) and several other Anthropic-compatible providers.
+
+  **If you were using the shipped peer, you must now declare it yourself** in
+  `~/.genesis/config/cc_roster.local.yaml`, which is deep-merged over the base file
+  and is where the `cc_roster` settings domain already writes:
+
+  ```yaml
+  models:
+    glm-5.3:
+      anthropic_base_url: "https://api.z.ai/api/anthropic"
+      auth_env: ZAI_CODING_API_KEY
+      model_id: glm-5.3
+      failover_order: 1
+  ```
+
+  This matters because the failure is quiet FOR THE USER: an overlay setting
+  `default: glm-5.2` with no matching entry falls back to native Claude, so a
+  subscription-cap fallback you believed was configured would simply not engage.
+  It is not silent in the logs (`apply_active` logs an error with a traceback),
+  and the `cc_roster` settings domain rejects such a write outright — the quiet
+  path is a hand-edited overlay.
+
+  `secrets.env.example` now documents all three GLM key slots and which endpoint
+  each one serves: a Coding Plan key (`ZAI_CODING_API_KEY`) is required for a roster peer
+  because Claude Code speaks the Anthropic protocol, while a general/prepaid key
+  (`ZHIPU_API_KEY`) works only on `/api/paas/v4`. Using the general key on a coding
+  endpoint returns `1113 Insufficient balance` even when the account is funded.
+
+  The `validated:` field is unchanged but now documented as advisory only: it is
+  parsed into `RosterEntry.validated` and then acted on by nothing, so it gates
+  nothing. Stale stamps were dropped rather than carried forward unverified.
+
 ### Fixed
+
+- **Campaign names stored before the control-character fix are now cleaned at
+  startup.** Names have been sanitized at the write boundary since the previous
+  release, so nothing new lands malformed, but rows written earlier were never
+  repaired. The cleanup now runs during campaign initialization, before the
+  scheduler registers its jobs — the ordering matters, because each campaign's
+  scheduled job is keyed by its name, and renaming afterwards would leave the
+  running job pointing at a name that no longer exists. A campaign whose cleaned
+  name would collide with another campaign's is left untouched and logged rather
+  than merged.
+
+  A campaign's history now travels with the rename — both its durable health
+  record and its individual run history. Leaving either behind was not merely
+  untidy: an abandoned health record keeps reporting the job as stale on every
+  health sweep, indefinitely, because nothing checks whether the job still
+  exists; and the run history is looked up by exact name, so a scheduled-job
+  prediction spanning the cleanup would have been scored against a series with a
+  hole in it, or discarded as having no runs at all. Where the name being moved
+  into already carried an abandoned record from a deleted campaign, the campaign's
+  own live history now wins and the leftover is removed — previously the reverse
+  happened, keeping the record that could never be written to again.
+
+  One name is now refused outright: a campaign called `pending_reaper` collides
+  with an internal job the scheduler registers for itself, and would have been
+  evicted at startup with no error and no log — it would simply never run again.
+  It is rejected when a campaign is created, and a stored name that would clean up
+  into it is left alone, since a name with a stray invisible character still runs.
+
+- **YouTube transcripts are less likely to come back quietly incomplete.** When
+  Genesis fetches a video transcript it now asks for both English caption tracks and
+  prefers the original ASR (`en-orig`) over the `en` variant. Observed once: the two
+  were served as different transcriptions — different cue segmentation, and different
+  wording in the closing lines — while the same video served identical tracks hours
+  later. The cause is unknown and it did not reproduce, so this is insurance rather
+  than a diagnosed fix, but preferring `en-orig` costs only one extra small download.
+  Two real bugs fixed alongside it: the cleaning step left a stray whitespace-only
+  line in every transcript (a caption file carries both empty and single-space lines,
+  and the old filter matched only the empty ones), and the documented recovery path
+  for a video with no English captions could not work — dropping `--sub-langs`
+  narrows the request to one English-first track instead of broadening it, so it
+  could never surface the other languages it promised.
 
 - **The `deliberate` MCP tool ("Model Fusion") no longer fails on real prompts.** Two
   distinct bugs: (1) analysis mode 404'd because the orchestrator slug
@@ -702,6 +801,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Security
 
+- **Invisible-character stripping now covers every invisible Unicode format
+  character, not a hand-picked 13 of them.** Campaign names and awareness-signal
+  text are normalized before they reach a line-parsed prompt, to stop injected text
+  forging or concealing a line. That normalizer enumerated 13 of Unicode's 170 `Cf`
+  format characters, silently omitting concealment characters from the very families
+  it did cover — most pointedly U+061C ARABIC LETTER MARK, sibling of the
+  already-stripped LRM/RLM, plus SOFT HYPHEN, WORD JOINER and the invisible U+E0000
+  tag block. The set is now derived from Python's Unicode database by an explicit
+  rule (strip a format character only when it is genuinely invisible — zero-width,
+  a bidi override, an invisible direction mark, or an annotation control), with a
+  test that regenerates it and fails if the two ever diverge.
+
+  Format characters that are *visible* content are deliberately preserved, so the
+  wider net does not corrupt real text: the Arabic number and end-of-ayah signs,
+  Syriac abbreviation mark, Kaithi number signs and Egyptian hieroglyph joiners all
+  pass through, as do zero-width joiner and non-joiner — stripping those would break
+  every emoji sequence (👨‍👩‍👧 → three separate people) and change Persian and Indic
+  words, where the non-joiner is orthographically required.
+
+- **A campaign name made only of invisible characters is now rejected instead of
+  being created with an empty name.**
 - **A malformed Claude Code session id can no longer create directories outside
   the session tree.** Hooks store per-session state under
   `~/.genesis/sessions/<session-id>/`, interpolating the id straight into the

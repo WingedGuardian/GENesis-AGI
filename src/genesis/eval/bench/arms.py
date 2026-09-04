@@ -38,6 +38,7 @@ from genesis.eval.bench.types import ARM_BARE, ARM_GENESIS, BenchTask
 BENCH_MEMORY_READONLY_ALLOWED: frozenset[str] = frozenset({
     "conversation_history",
     "document_query",
+    "entity_adjudication_list",
     "knowledge_recall",
     "knowledge_status",
     "locate",
@@ -63,6 +64,9 @@ BENCH_MEMORY_WRITE_DISALLOWED: frozenset[str] = frozenset({
     "bookmark_unshelve",
     "document_delete",
     "document_index",
+    "entity_adjudication_apply",
+    "entity_adjudication_approve",
+    "entity_adjudication_reject",
     "knowledge_ingest",
     "knowledge_ingest_batch",
     "knowledge_ingest_source",
