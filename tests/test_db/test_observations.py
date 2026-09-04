@@ -566,3 +566,118 @@ async def test_dedup_is_scoped_by_origin(db):
     # A THIRD identical owner request IS a duplicate (same origin) → skipped.
     r3 = await observations.create(db, id="dup_owner2", origin_class="owner", **common)
     assert r3 is None
+
+
+# ── one snapshot: the page and its denominator (PR #1639) ───────────────────
+
+
+async def test_query_with_total_returns_the_unlimited_count_beside_the_page(db):
+    """The denominator counts EVERY match, not the page.
+
+    A caller that pages and then counts separately holds two snapshots of a WAL
+    database with concurrent writers, and any claim relating the two — "showing
+    15 of 42", "N older ones exist" — is then false in a way nothing detects.
+    `COUNT(*) OVER ()` is evaluated over the same result set the LIMIT is
+    applied to, so page and total cannot disagree.
+    """
+    for i in range(7):
+        await observations.create(
+            db, id=f"t{i}", **{**_COMMON, "created_at": f"2026-01-0{i + 1}T00:00:00"}
+        )
+    rows, total = await observations.query_with_total(db, resolved=False, limit=3)
+    assert len(rows) == 3
+    assert total == 7, "the total must count past the limit, or it is just len(rows)"
+
+
+async def test_query_with_total_counts_only_what_the_filters_match(db):
+    """The denominator is scoped by the SAME filters as the page. A total over
+    the whole table would make every filtered digest claim truncation it does
+    not have."""
+    for i in range(4):
+        await observations.create(db, id=f"u{i}", **{**_COMMON, "source": "sensor"})
+    for i in range(3):
+        await observations.create(db, id=f"v{i}", **{**_COMMON, "source": "other"})
+    rows, total = await observations.query_with_total(db, source="sensor", limit=2)
+    assert len(rows) == 2
+    assert total == 4, "counted rows the filter excludes"
+
+
+async def test_query_with_total_and_query_describe_the_same_population(db):
+    """THE anti-drift lock. Both readers build their WHERE from one helper; a
+    second hand-written clause would be free to diverge, and a divergence here
+    reports a denominator for a DIFFERENT population than the rows — the exact
+    defect the single snapshot exists to remove, one level down.
+
+    Exercised across several filter shapes rather than one, because a copy
+    typically drifts on the clause nobody re-read.
+    """
+    for i in range(5):
+        await observations.create(
+            db, id=f"w{i}", **{**_COMMON, "source": "sensor", "priority": "high"}
+        )
+    for i in range(2):
+        await observations.create(
+            db, id=f"x{i}", **{**_COMMON, "source": "other", "priority": "low"}
+        )
+    for filters in (
+        {"resolved": False},
+        {"source": "sensor"},
+        {"priority": "low"},
+        {"type": "metric"},
+        {"source_prefix": "sen"},
+        {"exclude_types": ("metric",)},
+    ):
+        plain = await observations.query(db, limit=50, **filters)
+        paged, total = await observations.query_with_total(db, limit=50, **filters)
+        assert [r["id"] for r in paged] == [r["id"] for r in plain], filters
+        assert total == len(plain), filters
+
+
+async def test_query_with_total_reports_zero_for_an_empty_match(db):
+    """An empty page IS a complete answer, so zero is the honest total — there
+    is no window to read a count off, and 'unknown' would be a lie."""
+    rows, total = await observations.query_with_total(db, source="nothing-here", limit=5)
+    assert rows == []
+    assert total == 0
+
+
+async def test_query_with_total_does_not_leak_its_counter_column(db):
+    """`COUNT(*) OVER ()` needs a name in the SELECT, and callers spread these
+    rows into dicts that reach a briefing and the dashboard. The column must not
+    ride along as a phantom field."""
+    await observations.create(db, id="y0", **_COMMON)
+    rows, _total = await observations.query_with_total(db, limit=5)
+    assert rows and "_total" not in rows[0]
+
+
+async def test_query_with_total_issues_exactly_one_statement():
+    """THE property, asserted directly rather than through its consequences.
+
+    "One snapshot" is not observable from the VALUES in a quiescent test
+    database — a two-statement implementation returns identical numbers here and
+    diverges only when a writer commits between them. Counting the statements is
+    what makes the invariant testable at all; without this, a later
+    "optimisation" back to two queries passes every other test in this file
+    while restoring the skew.
+
+    Run against a recording stand-in rather than the real connection, because
+    what is under test is the SHAPE of the call, not the SQL engine — the
+    engine's own behaviour is covered by the real-database tests above.
+    """
+
+    class _Recorder:
+        def __init__(self):
+            self.statements: list[str] = []
+
+        async def execute_fetchall(self, sql, params=None):
+            self.statements.append(sql)
+            return [{"id": "a", "content": "x", "_total": 9}]
+
+    conn = _Recorder()
+    rows, total = await observations.query_with_total(conn, resolved=False, limit=5)
+    assert total == 9
+    assert rows == [{"id": "a", "content": "x"}]
+    assert len(conn.statements) == 1, (
+        f"page and total came from {len(conn.statements)} snapshots: {conn.statements}"
+    )
+    assert "COUNT(*) OVER ()" in conn.statements[0]

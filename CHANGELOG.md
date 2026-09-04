@@ -11,6 +11,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The guardian briefing's observation digest announces truncation.** The
+  dynamic briefing showed the 15 newest unresolved observations with no hint
+  that more existed — on a busy install the oldest (longest-standing)
+  problems silently vanished from the recovery brain's context. A full
+  digest now carries a "showing the 15 newest of N" marker (or an honest
+  "total unavailable" note if the count fails); a short read needs neither.
 - **Two branches can no longer pick the same database-migration number.** Each
   new migration is now named by the UTC time it was written rather than by the
   next free number, so nobody has to check what anyone else took — and two

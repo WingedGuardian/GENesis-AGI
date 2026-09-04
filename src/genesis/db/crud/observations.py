@@ -494,9 +494,115 @@ async def query(
     origin_class_in: list[str] | None = None,
     limit: int = 50,
 ) -> list[dict]:
+    where, params = _query_filters(
+        person_id=person_id,
+        source=source,
+        source_in=source_in,
+        source_prefix=source_prefix,
+        type=type,
+        priority=priority,
+        category=category,
+        resolved=resolved,
+        exclude_types=exclude_types,
+        origin_class_in=origin_class_in,
+    )
+    rows = await db.execute_fetchall(
+        f"SELECT * FROM observations {where} ORDER BY created_at DESC LIMIT ?",
+        [*params, limit],
+    )
+    return [dict(r) for r in rows]
+
+
+async def query_with_total(
+    db: aiosqlite.Connection,
+    *,
+    person_id: str | None = None,
+    source: str | None = None,
+    source_in: list[str] | None = None,
+    source_prefix: str | None = None,
+    type: str | None = None,
+    priority: str | None = None,
+    category: str | None = None,
+    resolved: bool | None = None,
+    exclude_types: tuple[str, ...] | frozenset[str] | None = None,
+    origin_class_in: list[str] | None = None,
+    limit: int = 50,
+) -> tuple[list[dict], int]:
+    """``query()``'s rows AND the unlimited match count, from ONE statement.
+
+    A caller that reads the page and then counts separately holds two SNAPSHOTS,
+    and this database runs in WAL with concurrent writers — so between the two
+    reads a row can be inserted or resolved, and any claim relating them is
+    then false in a way nothing detects. Two shapes, both real:
+
+    * an INSERT lands after the page read. The page is the 15 newest AS OF the
+      first snapshot; the count is bigger; the caller reports "N older ones
+      exist beyond this digest" while the omitted row is the NEWEST one.
+    * a row ON THE PAGE is resolved before the count. The count can then fall to
+      the page length and the truncation marker disappears — while unresolved
+      rows outside the page still exist.
+
+    `COUNT(*) OVER ()` is evaluated over the same result set the LIMIT is
+    applied to, in one statement, so the page and its denominator cannot
+    disagree. The filters come from the SAME builder `query()` uses: a second
+    hand-written WHERE clause here would be a copy free to drift, and the
+    drifted version would report a denominator for a different population than
+    the rows — which is the exact defect this function exists to remove, one
+    level up.
+
+    Returns ``(rows, total)``. ``total`` is the count BEFORE the limit, so
+    ``total > len(rows)`` is exactly "this page is truncated".
+    """
+    where, params = _query_filters(
+        person_id=person_id,
+        source=source,
+        source_in=source_in,
+        source_prefix=source_prefix,
+        type=type,
+        priority=priority,
+        category=category,
+        resolved=resolved,
+        exclude_types=exclude_types,
+        origin_class_in=origin_class_in,
+    )
+    rows = await db.execute_fetchall(
+        f"SELECT *, COUNT(*) OVER () AS _total FROM observations {where} "
+        "ORDER BY created_at DESC LIMIT ?",
+        [*params, limit],
+    )
+    if not rows:
+        # No rows means no window to count over — and an empty page IS a
+        # complete answer, so zero is the honest total rather than "unknown".
+        return [], 0
+    dicts = [dict(r) for r in rows]
+    total = int(dicts[0]["_total"])
+    for d in dicts:
+        d.pop("_total", None)
+    return dicts, total
+
+
+def _query_filters(
+    *,
+    person_id: str | None = None,
+    source: str | None = None,
+    source_in: list[str] | None = None,
+    source_prefix: str | None = None,
+    type: str | None = None,
+    priority: str | None = None,
+    category: str | None = None,
+    resolved: bool | None = None,
+    exclude_types: tuple[str, ...] | frozenset[str] | None = None,
+    origin_class_in: list[str] | None = None,
+) -> tuple[str, list]:
+    """The shared WHERE clause + params for the observation readers.
+
+    Extracted so `query` and `query_with_total` cannot describe different
+    populations. Ordering and LIMIT stay with the callers, because that is where
+    they differ.
+    """
     if sum(map(bool, (source, source_in, source_prefix))) > 1:
         raise ValueError("Specify at most one of 'source', 'source_in', 'source_prefix'")
-    sql = "SELECT * FROM observations WHERE 1=1"
+    sql = "WHERE 1=1"
     params: list = []
     if person_id is not None:
         sql += " AND person_id = ?"
@@ -538,10 +644,7 @@ async def query(
         oc_placeholders = ",".join("?" for _ in origin_class_in)
         sql += f" AND origin_class IN ({oc_placeholders})"
         params.extend(origin_class_in)
-    sql += " ORDER BY created_at DESC LIMIT ?"
-    params.append(limit)
-    rows = await db.execute_fetchall(sql, params)
-    return [dict(r) for r in rows]
+    return sql, params
 
 
 async def distinct_unresolved_types(db: aiosqlite.Connection) -> list[str]:
