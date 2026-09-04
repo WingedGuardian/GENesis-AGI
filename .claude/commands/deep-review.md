@@ -14,9 +14,13 @@ Note: `/deep-review` is the LOCAL pre-push adversarial pass (Claude-model review
 NOT replace the independent-model Codex review, which still runs on the PR and is required by the
 merge gate — the two are complementary (Codex catches cross-model blind spots). This command
 clears the local commit review-depth gate; it does not certify the PR by itself.
-Clearing that gate is where a **build session's** work on an item ENDS — the Codex round
-and everything after it belong to a **closing session** (`.claude/skills/closing-session/`),
-which is why this command does not tell you to wait for a review it never triggers.
+A build session's work on an item ends when the **PR EXISTS** — not here. Clearing this
+gate merely unblocks the commit that this command's own later steps make, and the push and
+`gh pr create` after it: stopping at the gate would end the session before the durable
+handoff exists, leaving finished work in a local worktree that no closing session can see
+(Codex P2, PR #1638). From the open PR onward — the Codex round, the findings, the merge —
+the item belongs to a **closing session** (`.claude/skills/closing-session/`), which is why
+this command does not tell you to wait for a review it never triggers.
 
 ## 1. Stage everything, then scope the FULL branch diff
 

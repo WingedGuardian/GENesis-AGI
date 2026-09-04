@@ -3211,6 +3211,15 @@ class TestReportRendersGateDetail:
             ("\u200b", "ZERO WIDTH SPACE"),
             ("\ufeff", "BOM / ZWNBSP"),
             ("\t", "TAB (fake column alignment)"),
+            # The character an ENUMERATION missed. U+061C ARABIC LETTER MARK is a
+            # bidi-formatting character (category Cf) and sat outside every range
+            # the old regex listed, so a title carrying it reached the terminal able
+            # to reorder the line around it (Codex P2, PR #1638). Parametrized here
+            # rather than fixed in isolation because the point is the CLASS: the
+            # sanitizer now asks unicodedata what a character IS.
+            ("\u061c", "ARABIC LETTER MARK"),
+            ("\u00ad", "SOFT HYPHEN"),
+            ("\U000e0001", "LANGUAGE TAG"),
         ],
     )
     def test_a_finding_title_cannot_forge_a_report_line(
@@ -3378,3 +3387,59 @@ class TestReportRendersGateDetail:
         assert len(detail) <= guard_module._GATE_TEXT_MAX_LINES
         assert all(len(ln) <= guard_module._GATE_TEXT_MAX_CHARS + 2 for ln in detail)
         assert "verdict" in out
+
+
+class TestGateDetailSelectsRatherThanAmputates:
+    """The line cap bounds a hostile message; it must not eat the recovery line.
+
+    Every gate puts its remedy LAST — "Or append '# scheduled-review-override' to
+    merge without the missing review(s)" — so a plain head-slice tells the
+    operator they are blocked and not how to proceed. That is the failure mode
+    of truncation generally: it is the ABSENCE of a decision about what matters
+    (Codex P2, PR #1638).
+    """
+
+    def test_a_long_message_keeps_its_head_its_tail_and_says_what_it_dropped(
+        self, guard_module
+    ):
+        cap = guard_module._GATE_TEXT_MAX_LINES
+        tail = guard_module._GATE_TEXT_TAIL_LINES
+        body = [f"detail row {i}" for i in range(cap * 3)]
+        remedy = "Or append '# scheduled-review-override' to merge."
+        msg = "\n".join(["summary:", *body, remedy])
+
+        out = guard_module._sanitize_gate_text(msg)
+        lines = out.split("\n")
+
+        assert len(lines) <= cap, f"the cap stopped bounding the output: {len(lines)}"
+        assert lines[0] == "summary:"
+        assert lines[-1] == remedy, (
+            "the recovery instruction was truncated away — the one line the "
+            f"operator needs. Tail was: {lines[-3:]}"
+        )
+        assert any("omitted here to bound this output" in ln for ln in lines), (
+            "lines vanished with no statement that anything was dropped"
+        )
+        # The rows immediately BEFORE the remedy — the diagnosis it refers to —
+        # must survive with it. `tail` covers the remedy plus tail-1 body rows.
+        for i in range(len(body) - (tail - 1), len(body)):
+            assert f"detail row {i}" in out, f"tail row {i} was dropped"
+        assert "detail row 0" in out, "the head rows were not kept"
+
+    def test_a_short_message_is_untouched(self, guard_module):
+        """CONTROL: the selection path must not disturb the ordinary case, which
+        is every message the gate actually emits."""
+        msg = "summary:\n  [P1] a finding\nOr append '# review-override'."
+        assert guard_module._sanitize_gate_text(msg) == msg
+
+    def test_the_omission_count_is_honest(self, guard_module):
+        """The stated number must equal what was actually dropped — a count that
+        drifts is worse than none, because it reads as measured."""
+        import re as _re
+
+        cap = guard_module._GATE_TEXT_MAX_LINES
+        msg = "\n".join(f"row {i}" for i in range(cap * 2))
+        out = guard_module._sanitize_gate_text(msg)
+        stated = int(_re.search(r"… (\d+) more line\(s\) omitted", out).group(1))
+        kept = len([ln for ln in out.split("\n") if _re.fullmatch(r"row \d+", ln)])
+        assert stated + kept == cap * 2, f"stated {stated} + kept {kept} != {cap * 2}"

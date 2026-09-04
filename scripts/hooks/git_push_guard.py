@@ -108,6 +108,7 @@ import shlex
 import subprocess
 import sys
 import time
+import unicodedata
 
 # Self-locate so `from hook_input import …` resolves both when CC runs this as a
 # script (sys.path[0] is this dir) AND when it is imported as a module for tests
@@ -6066,19 +6067,36 @@ def _parse_check_pr_repo(argv: list[str]):
 # to remove.
 _GATE_TEXT_MAX_LINES = 40
 _GATE_TEXT_MAX_CHARS = 200
+# How many lines are kept from the END when the cap bites. A gate's recovery
+# instruction is the last thing it prints, so the tail is the half that must
+# survive; 8 covers the longest such trailer measured (the scheduled-review
+# marker explanation, 6 lines).
+_GATE_TEXT_TAIL_LINES = 8
 # Everything a terminal would ACT on rather than display, plus everything
-# `str.splitlines()` treats as a line break:
-#   \x00-\x1f, \x7f  C0 controls + DEL — includes \t (fake column alignment),
-#                    \x1b (ESC: strips the lead byte of ANSI CSI/OSC sequences,
-#                    leaving them inert text) and \x0b/\x1c-\x1e (splitlines breaks)
-#   \u0085 \u2028 \u2029   NEL / LINE SEPARATOR / PARAGRAPH SEPARATOR
-#   \u200b-\u200f          zero-width chars + LRM/RLM
-#   \u202a-\u202e \u2066-\u2069   bidi embeddings, overrides and isolates — these
-#                    visually REORDER a line's characters without changing its bytes
-#   \ufeff           BOM / zero-width no-break space
-_GATE_TEXT_UNSAFE_RE = re.compile(
-    "[\x00-\x1f\x7f\u0085\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]"
-)
+# CLASSIFIED, not enumerated. The previous version listed the ranges it knew
+# about, and an enumeration of a Unicode property is a list that is wrong the
+# moment the property has a member nobody listed: U+061C ARABIC LETTER MARK is a
+# bidi-formatting character and sat outside every range here, so a finding title
+# carrying it reached the operator's terminal able to reorder the line around it
+# (Codex P2, PR #1638). Widening the list by one range would have fixed that
+# character and left the class.
+#
+# What must be stripped, stated as the property rather than as codepoints:
+#   Cc  C0/C1 controls + DEL — includes \t (fake column alignment), \x1b (ESC:
+#       strips the lead byte of ANSI CSI/OSC sequences, leaving them inert text),
+#       \x0b/\x1c-\x1e and \u0085 NEL (all `splitlines()` breaks)
+#   Cf  every format character — the bidi embeddings/overrides/isolates that
+#       visually REORDER a line without changing its bytes, the zero-width
+#       family, LRM/RLM, ALM, the BOM, and the Unicode tag block
+#   Zl  U+2028 LINE SEPARATOR
+#   Zp  U+2029 PARAGRAPH SEPARATOR
+# `unicodedata` is the canonical answer to "which characters are these", and it
+# tracks the standard without anyone re-reading it.
+_GATE_TEXT_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+
+def _gate_text_unsafe(char: str) -> bool:
+    return unicodedata.category(char) in _GATE_TEXT_UNSAFE_CATEGORIES
 
 
 def _sanitize_gate_text(text: str) -> str:
@@ -6096,8 +6114,31 @@ def _sanitize_gate_text(text: str) -> str:
     and the line count capped, so a hostile message can neither forge structure nor
     flood the verdict off the screen.
     """
-    lines = text.split("\n")[:_GATE_TEXT_MAX_LINES]
-    return "\n".join(_GATE_TEXT_UNSAFE_RE.sub(" ", ln)[:_GATE_TEXT_MAX_CHARS] for ln in lines)
+    def _clean(line: str) -> str:
+        return "".join(
+            " " if _gate_text_unsafe(ch) else ch for ch in line[:_GATE_TEXT_MAX_CHARS]
+        )
+
+    lines = [_clean(ln) for ln in text.split("\n")]
+    if len(lines) <= _GATE_TEXT_MAX_LINES:
+        return "\n".join(lines)
+    # SELECT, do not amputate. A plain head-slice drops the TAIL, and the tail is
+    # where every gate puts its recovery instruction — the one line the operator
+    # needs. MEASURED shape: a PR with many stale/refused/malformed scheduled-review
+    # markers produces enough detail rows to push "Or append '# scheduled-review-
+    # override' to merge without the missing review(s)" past the cap, so the reader
+    # is told they are blocked and not how to proceed. Keeping both ends preserves
+    # the flood protection the cap exists for while losing nothing actionable, and
+    # the omission is STATED rather than silent.
+    head = _GATE_TEXT_MAX_LINES - _GATE_TEXT_TAIL_LINES - 1
+    omitted = len(lines) - head - _GATE_TEXT_TAIL_LINES
+    return "\n".join(
+        [
+            *lines[:head],
+            f"  … {omitted} more line(s) omitted here to bound this output …",
+            *lines[-_GATE_TEXT_TAIL_LINES:],
+        ]
+    )
 
 
 def _print_gate_detail(msg: str) -> None:

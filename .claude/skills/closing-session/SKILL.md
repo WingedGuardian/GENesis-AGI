@@ -9,7 +9,13 @@ description: >
   stops at the merge gate for the user's per-PR approval. Do NOT load it for
   building a feature and opening its PR — that is a build session
   (`genesis-development`).
-keywords: [prs, codex, merge, merging, mergeable, unmerged]
+# `_extract_keywords()` reduces a prompt to bare words and `_score_skill()`
+# reads THIS list only — never the description prose above. So every trigger
+# phrase advertised there has to appear here as the words it decomposes into:
+# "work the PR queue" -> work, queue; "drive #1234 to green" -> drive, green.
+# Without them the skill advertises triggers that cannot fire (Codex P2, #1638).
+keywords: [prs, codex, merge, merging, mergeable, unmerged, work, queue, drive,
+  green, closing, blocking]
 consumer: cc_foreground
 phase: 10
 skill_type: workflow
@@ -141,12 +147,23 @@ matching the message text.** The exact strings get reworded; keying a habit to
 them is how a doc silently goes stale. Where a state below is quoted it is
 because the WORD carries the meaning.
 
+**But the label is where you START, not where you stop: several distinct
+situations deliberately share one `BLOCK`, and they do not share a remedy.**
+`base-branch` blocks both a non-default base and an UNREADABLE query;
+`codex-at-head` blocks both "no review found" and "review is stale"; `ci` folds
+`absent` and `incomplete` together. The discriminating fact is always in the
+DETAIL LINES underneath — that is what they are for, and why the report prints
+them. Acting on the gate name alone means picking one of two remedies by coin
+toss, and the wrong one (retargeting a base that was only unreadable, pushing a
+fix for a review that was never requested) looks like progress. Read the
+diagnosis before choosing the move (Codex P2, PR #1638).
+
 | Gate | Not-passing states | Move |
 |---|---|---|
 | `mergeable` | anything other than `MERGEABLE` — including `CONFLICTING`, `UNKNOWN`, and `unreadable` | Rebase/merge main and push for a conflict; re-read for the other two. **Check this FIRST when CI looks odd — a conflicting PR silently suppresses the whole suite.** `unreadable`/`UNKNOWN` mean the query failed: not "fine", never a pass. |
 | `ci` | `red` | Classify `introduced \| inherited \| environment` WITH evidence. Do §0 first — an inherited red is very often already fixed on main. |
 | `ci` | `pending` | Still running. Wait and re-read; never propose a merge on pending. |
-| `ci` | `absent` / `incomplete` | The suite never ran, or a required workflow is missing from the rollup. Usually a conflicting branch or a dropped trigger — check `mergeable` before anything else. |
+| `ci` | `absent` / `incomplete` | The suite never ran, or a required workflow is missing from the rollup. Usually a conflicting branch or a dropped trigger — check `mergeable` before anything else. **Counts as a failure ONLY in the canonical public repo** (`check_pr_report` increments on these two states only where `_scheduled_gate_applies(repo)` holds): a private fork, the voice repo and the backups repo run no such workflow, so `absent` there is the normal state and not a block. Read the repo before treating it as one. |
 | `base-branch` | `BLOCK` | PR targets a non-default base. Retarget. |
 | `pin-receipts` | `BLOCK` | Moves the CC pin without its receipts. The detail lines name what is missing. |
 | `codex-at-head` | `BLOCK` | Covers BOTH "no Codex review found" and "review is stale" — they are different situations with the same remedy shape. The detail lines say which, and carry the `git log <reviewed>..<head>` command. Push any pending fix, comment `@codex review`, wait. |
