@@ -519,6 +519,20 @@ class CCOutput:
     # user and/or a cc.bg_truncated observability event — so the silent-death
     # class (2026-07-20 deep-research) can never recur unremarked.
     bg_truncated: bool = False
+    # Tool names the RUNTIME observed, in first-seen order, from the stream's
+    # `tool_use` events. Out-of-band by construction: the model's own text
+    # cannot write this, whereas scraping tool names out of `text` cannot tell
+    # a tool that RAN from one the response merely talked about.
+    #
+    # THREE states, and the third is why this is not a plain tuple:
+    #   None -> no runtime report at all (a non-streaming `run()`, or a
+    #           hand-built CCOutput). Consumers fall back to whatever they can
+    #           derive, and must NOT read this as "no tools ran".
+    #   ()   -> the runtime watched the stream and saw no tool_use event.
+    #   (…,) -> the tools it saw.
+    # Collapsing the first two into () made "no report" indistinguishable from
+    # "reported zero", which turned an absence of evidence into a claim.
+    tools_used: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import aiosqlite
 import pytest
 
+from genesis.cc.types import CCOutput
 from genesis.db import schema
 from genesis.learning.pipeline import build_triage_pipeline
 from genesis.learning.types import (
@@ -31,20 +32,30 @@ async def db():
         yield conn
 
 
-@dataclass
-class FakeCCOutput:
-    session_id: str = "sess-1"
-    text: str = "Here is a long response with enough content to pass the filter"
-    model_used: str = "test"
-    cost_usd: float = 0.01
-    input_tokens: int = 200
-    output_tokens: int = 300
-    duration_ms: int = 1000
-    exit_code: int = 0
-    is_error: bool = False
-    error_message: str | None = None
-    model_requested: str = ""
-    downgraded: bool = False
+def FakeCCOutput(**overrides) -> CCOutput:  # noqa: N802 - reads as a type at call sites
+    """A real ``CCOutput`` with test defaults — deliberately NOT a stand-in class.
+
+    This was a hand-written dataclass mirroring CCOutput's fields, and it drifted
+    twice: once when ``bg_truncated`` was added (a comment was left warning about
+    exactly this) and again when ``tools_used`` was, which broke 18 tests here
+    with an AttributeError raised from production code. A fake that re-declares a
+    contract has to be maintained in step with it forever, and nothing enforces
+    that. Building the real object instead makes drift impossible: a new field
+    with a default is inherited silently, and one without a default fails loudly
+    at construction — which is the correct signal.
+    """
+    defaults: dict = {
+        "session_id": "sess-1",
+        "text": "Here is a long response with enough content to pass the filter",
+        "model_used": "test",
+        "cost_usd": 0.01,
+        "input_tokens": 200,
+        "output_tokens": 300,
+        "duration_ms": 1000,
+        "exit_code": 0,
+    }
+    defaults.update(overrides)
+    return CCOutput(**defaults)
 
 
 @dataclass

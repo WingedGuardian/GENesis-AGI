@@ -17,6 +17,7 @@ from unittest.mock import patch
 import aiosqlite
 import pytest
 
+from genesis.cc.types import CCOutput
 from genesis.db.crud import immunity_shadow as crud
 from genesis.db.schema import create_all_tables
 from genesis.learning.procedural import judge as judge_mod
@@ -163,11 +164,22 @@ async def test_gate2_steering_chain_end_to_end():
             def add_steering_rule(self, rule):
                 written.append(rule)
 
-        class _Out:
-            text = "done."
-            session_id = "e2e-steer"
-            input_tokens = 900  # clears the prefilter token gate
-            output_tokens = 100
+        # A REAL CCOutput, not a stand-in class. This was four class
+        # attributes mirroring part of the contract, and it broke the moment
+        # the real dataclass grew a field the pipeline reads. Building the real
+        # object makes that impossible: a new field with a default is inherited
+        # silently, and one without fails loudly at construction.
+        def _Out():
+            return CCOutput(
+                session_id="e2e-steer",
+                text="done.",
+                model_used="test",
+                cost_usd=0.0,
+                input_tokens=900,  # clears the prefilter token gate
+                output_tokens=100,
+                duration_ms=0,
+                exit_code=0,
+            )
 
         pipeline = build_triage_pipeline(
             db=db,

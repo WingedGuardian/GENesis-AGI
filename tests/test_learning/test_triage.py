@@ -83,15 +83,172 @@ class TestBuildSummary:
         assert s.channel == "terminal"
         assert s.token_count == 300  # 100 + 200
 
-    def test_user_text_truncation(self):
+    def test_an_ordinary_request_reaches_the_grader_whole(self):
+        """The cap was 500 and it was a WORKING limit: MEASURED on this
+        install, 222 of 1481 inbound messages (15.0%) exceed it, the longest
+        5,924 chars. Every one arrived at the delta assessor — the grader whose
+        job is comparing what was asked against what was delivered — as a bare
+        prefix with nothing saying so."""
         long = "x" * 1000
         s = build_summary(_make_output(), "s", long, "terminal")
-        assert len(s.user_text) == 500
+        assert s.user_text == long
+        assert s.user_text_elided_chars == 0
 
-    def test_response_text_truncation(self):
-        long = "y" * 2000
-        s = build_summary(_make_output(text=long), "s", "hi", "terminal")
-        assert len(s.response_text) == 1000
+    def test_a_pathological_request_is_elided_from_the_middle_and_says_so(self):
+        from genesis.learning.triage.summarizer import _MAX_USER_TEXT
+
+        head, tail = "H" * (_MAX_USER_TEXT + 50), "TAIL"
+        s = build_summary(_make_output(), "s", head + tail, "terminal")
+        assert s.user_text_elided_chars > 0
+        assert s.user_text.startswith("H")
+        assert s.user_text.endswith(tail), "the ENDING of the request was dropped"
+        assert "elided" in s.user_text
+
+    def test_the_reported_request_count_is_the_real_one(self):
+        """Same rule as the response: the count is a fact the pipeline holds,
+        so it is computed from the inputs rather than pinned to a literal."""
+        from genesis.learning.triage.summarizer import (
+            _ELIDE_HEAD,
+            _ELIDE_TAIL,
+            _MAX_USER_TEXT,
+        )
+
+        body = "Q" * (_MAX_USER_TEXT + 5_000)
+        s = build_summary(_make_output(), "s", body, "terminal")
+        assert s.user_text_elided_chars == len(body) - _ELIDE_HEAD - _ELIDE_TAIL
+
+    def test_ordinary_response_reaches_the_grader_whole(self):
+        """An ordinary reply must not be cut.
+
+        The graders are asked to judge a response; if the pipeline hands them a
+        fragment that stops mid-word, the honest reading of that fragment is
+        that generation was cut off — and that verdict then lands in permanent
+        memory as a fact about the model. Sizing is MEASURED, not guessed: over
+        30 days of real outbound messages, mean length 1033 and max 6006, so a
+        limit of 1000 silently truncated about two in five graded responses.
+        """
+        body = "y" * 3213  # the length of the reply that first exposed this
+        s = build_summary(_make_output(text=body), "s", "hi", "terminal")
+        assert s.response_text == body
+        assert s.response_text.endswith(body[-40:]), "the ENDING must survive"
+
+    def test_response_truncated_flag_reflects_real_truncation_only(self):
+        """`response_truncated` reports what the RUNTIME did, never what this
+        summarizer did. CCOutput.bg_truncated is the real signal."""
+        s = build_summary(_make_output(text="short"), "s", "hi", "terminal")
+        assert s.response_truncated is False
+        s2 = build_summary(
+            _make_output(text="short", bg_truncated=True), "s", "hi", "terminal"
+        )
+        assert s2.response_truncated is True
+
+    def test_summarizer_slicing_never_sets_the_truncated_flag(self):
+        """A response elided by THIS code is not a truncated response."""
+        s = build_summary(_make_output(text="z" * 40000), "s", "hi", "terminal")
+        assert s.response_truncated is False
+
+    def test_response_at_exactly_the_valve_is_untouched(self):
+        from genesis.learning.triage.summarizer import _MAX_RESPONSE_TEXT
+
+        body = "E" * _MAX_RESPONSE_TEXT
+        s = build_summary(_make_output(text=body), "s", "hi", "terminal")
+        assert s.response_text == body
+
+    def test_one_char_over_the_valve_reports_a_positive_elided_count(self):
+        """Just past the valve is where an over-generous head+tail would render
+        a NEGATIVE count — the existing 30k-char test would not notice."""
+        import re
+
+        from genesis.learning.triage.summarizer import _MAX_RESPONSE_TEXT
+
+        s = build_summary(
+            _make_output(text="E" * (_MAX_RESPONSE_TEXT + 1)), "s", "hi", "terminal"
+        )
+        m = re.search(r"\[(-?\d+) characters elided", s.response_text)
+        assert m, s.response_text[:200]
+        assert int(m.group(1)) > 0, f"negative elided count: {m.group(1)}"
+
+    def test_oversized_response_is_elided_with_a_marker_and_keeps_its_tail(self):
+        """Past the safety valve, elide the MIDDLE and say so.
+
+        A grader asked "was this cut off?" answers from the ENDING, so the tail
+        is the part that must survive; and the marker tells it the gap was
+        imposed here rather than by the model.
+        """
+        head, tail = "H" * 30000, "T" * 30
+        s = build_summary(_make_output(text=head + tail), "s", "hi", "terminal")
+        assert len(s.response_text) < len(head + tail)
+        assert "elided" in s.response_text
+        assert s.response_text.endswith(tail), "the ENDING was dropped"
+        assert s.response_text.startswith("H")
+
+    def test_a_multibyte_response_is_bounded_by_the_same_valve(self):
+        """The valve counts BYTES, and the unit is the point.
+
+        A character cap bounds nothing a model has to hold: 20,000 characters of
+        CJK is 60,000 UTF-8 bytes, and with a second independent character cap
+        on the request there was no combined bound at all. A BPE token is at
+        least one byte, so a byte valve is a proof about prompt size rather than
+        an estimate drawn from one alphabet.
+        """
+        from genesis.learning.triage.summarizer import _MAX_RESPONSE_TEXT
+
+        body = "漢" * _MAX_RESPONSE_TEXT  # inside a CHARACTER cap, 3x over a byte one
+        s = build_summary(_make_output(text=body), "s", "hi", "terminal")
+        assert len(body.encode()) > _MAX_RESPONSE_TEXT
+        assert len(s.response_text.encode()) <= _MAX_RESPONSE_TEXT + 200, (
+            "a multi-byte response passed the valve unbounded"
+        )
+        assert s.response_elided_chars > 0
+
+    def test_a_multibyte_request_is_bounded_too(self):
+        from genesis.learning.triage.summarizer import _MAX_USER_TEXT
+
+        body = "漢" * _MAX_USER_TEXT
+        s = build_summary(_make_output(), "s", body, "terminal")
+        assert len(s.user_text.encode()) <= _MAX_USER_TEXT + 200
+        assert s.user_text_elided_chars > 0
+
+    def test_a_multibyte_elision_stays_decodable_and_counts_honestly(self):
+        """Slicing the encoded form lands mid-codepoint. The partial bytes are
+        dropped, so the text stays valid — and the reported count is derived
+        from what SURVIVED rather than from the requested sizes, or the marker
+        would describe a different text than the one beside it."""
+        from genesis.learning.response_context import elision_marker
+
+        body = "漢" * 30_000
+        s = build_summary(_make_output(text=body), "s", "hi", "terminal")
+        s.response_text.encode("utf-8").decode("utf-8")  # raises if a codepoint split
+
+        marker = elision_marker(s.response_elided_chars)
+        assert marker in s.response_text, s.response_text[:200]
+        head, tail = s.response_text.split(f"\n\n{marker}\n\n")
+        # The exact identity the marker claims: what is shown plus what it says
+        # was removed accounts for the original, with nothing double-counted and
+        # nothing lost at the codepoint boundary.
+        assert len(head) + len(tail) + s.response_elided_chars == len(body)
+        assert body.startswith(head) and body.endswith(tail)
+        # And the kept halves are sized in BYTES — without this the identity
+        # above holds just as well under the old character slicing, so the test
+        # would pass while pinning nothing about the unit.
+        assert len(head.encode()) <= 12_000 and len(tail.encode()) <= 4_000
+        assert len(head) < 12_000, "head was sliced by characters, not bytes"
+
+    def test_ascii_behaviour_is_unchanged_by_the_byte_valve(self):
+        """The control: bytes == characters for ASCII, which is the
+        overwhelming majority of real traffic, so switching units must move
+        nothing for it."""
+        from genesis.learning.triage.summarizer import _MAX_RESPONSE_TEXT
+
+        at_valve = "E" * _MAX_RESPONSE_TEXT
+        assert (
+            build_summary(_make_output(text=at_valve), "s", "hi", "terminal").response_text
+            == at_valve
+        )
+        over = build_summary(
+            _make_output(text="E" * (_MAX_RESPONSE_TEXT + 1)), "s", "hi", "terminal"
+        )
+        assert over.response_elided_chars == 1 + _MAX_RESPONSE_TEXT - 12_000 - 4_000
 
     def test_tool_detection_tool_colon(self):
         out = _make_output(text="Tool: Read\nTool: Edit\nresult")
