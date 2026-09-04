@@ -143,7 +143,18 @@ Easy-to-forget mechanisms:
   rediscovers historical fuzzy pairs. Settings lever `entity_adjudication`
   (off/propose_only/live) + `GENESIS_ENTITY_ADJUDICATION_DISABLED`. Distinct from
   `memory/entity_resolution.py`, which is near-duplicate memory-PAIR dedup.
-  Bitemporal timestamps are canonicalized at the write gate
+  **Human-approval apply gate** (`entity_adjudication_approve`/`_apply`/`_reject`
+  MCP tools + `approved_at`): a `proposed_merge` applies only after a human
+  approves. Apply runs per-row on an owned `get_raw_db()` `BEGIN IMMEDIATE`
+  transaction — re-checks identity/direction/norm staleness inside the lock,
+  atomically claims (`proposed_merge`→`merge`) so concurrent appliers can't
+  double-merge, and marks stale *conditionally* (only while still
+  `proposed_merge`) so a losing applier can't clobber an applied merge or a human
+  `distinct`. Approval is invalidated at the write boundary when a re-adjudication
+  changes the approved direction/identity/norms (`record_verdict`), and the three
+  write tools refuse in a dispatched/unsupervised session
+  (`is_dispatched_session_env`) so no autonomous path can self-approve an
+  irreversible merge. Bitemporal timestamps are canonicalized at the write gate
   (`db/timeutil.canonical_iso`, migration 0050).
 
 **Consolidation (dream cycle)** — `memory/dream_cycle.py` (~1480 LOC):
