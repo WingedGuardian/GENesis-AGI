@@ -192,13 +192,19 @@ only replaying a known-positive tells them apart.
 
 ### Select, don't amputate — truncation is the absence of a decision
 
-**Scope first, because bounding is often correct.** A bounded PREVIEW is a
-selection with a pointer, not an amputation — but only if the pointer actually
-resolves, and that is a claim to CHECK for the case in hand, never one to inherit
-from the mechanism. Bounding against a hard external budget is likewise correct:
-a hook's stdout cap, a database column, a context window. So is refusing an
-oversized value outright. This section is about the other case: a value that is
-the ONLY copy, where cutting it destroys the information.
+**Scope first, because bounding is often correct.** What makes something an
+amputation is LOSS — the value cut here was the only copy. Nothing else. A
+bounded PREVIEW of something stored intact elsewhere is a selection, and stays
+one even if its handle is useless. Bounding against a hard external budget is
+likewise correct: a hook's stdout cap, a database column, a context window. So is
+refusing an oversized value outright. This section is about the loss case.
+
+**A handle that does not resolve is a separate defect, and do not conflate the
+two** — that conflation is the mistake this section made about itself, twice.
+Check the pointer, because a preview advertising a retrieval path that does not
+exist teaches a lie; but when the full value survives somewhere, the fix is to
+mend or drop the handle, never to remove the cap. Removing a cap to prevent a
+loss that never happened is how this rule causes the damage it exists to stop.
 
 **There, do not truncate.** Not strings, not lists, not context, not output.
 Reaching for a character cap is a signal that a question was skipped, not
@@ -226,8 +232,15 @@ Three rules when a bound really is needed:
   and refusing it is a resource guard, not an amputation. What is forbidden is
   silently CUTTING them to fit. Only free text gets a bound it is expected to sit
   under; everything else gets one it must not cross.
-- **Derive the number, and record how — against a corpus that OUTLIVES the
-  claim.** Measure the real population and report `k/N` per the Acceptance Bar,
+- **Derive the number from the right thing, and record how.** A SAFETY bound —
+  memory exhaustion, an abuse ceiling, untrusted input — does not come from the
+  corpus at all: historical traffic says nothing about adversarial input,
+  concurrency, or the memory you actually have, and a cap chosen from observed
+  values will be exactly the wrong size when it matters. Derive those from the
+  protocol, the capacity and the threat model FIRST, then use `k/N` only to price
+  what the bound rejects. It is the COMPATIBILITY bounds — how long is this field
+  in practice, what does this cap cost real readers — that a corpus answers, and
+  for those: measure the real population and report `k/N` per the Acceptance Bar,
   then name the corpus, the query and the date. Naming them is necessary and not
   sufficient: the query is only re-derivable if the rows are still there when the
   next reader runs it, so a table with a retention window yields an EPHEMERAL
@@ -239,6 +252,12 @@ Three rules when a bound really is needed:
   fragment. The bound-plus-loud-flag half of this is already the house pattern;
   the character-count marker is a proposal, so do not go looking for a precedent
   that is not there.
+  **When the total is not already known, say that instead of computing it.**
+  Bounding a stream is the case: learning the exact discarded length means
+  reading the whole source, which is the cost the bound existed to avoid. So
+  `<omitted: ≥40,000 chars>` or `<omitted: rest of stream>` is the correct
+  marker there, and demanding an exact figure would force either an unbounded
+  read or an invented number — the two things this whole section is against.
 
 One trap deserves naming, because it is what produced this rule: **a cap can
 manufacture a correctness bug in the very data it was added to protect.**
@@ -265,11 +284,20 @@ What made the original defect dangerous was never that 300 existed — it was th
 
 That default is about SIZE, never about secrecy, and the two must not be
 confused. If a value may carry a credential, token, or personal data, the
-unbounded default does NOT apply: fail closed and omit it wholesale with a
-marker, exactly as the "omit explicitly" rule says, and record only
-non-sensitive metadata. Losing diagnostic prose is recoverable; leaking a token
-is not. Emitting whole and omitting wholesale are the same discipline — both
-refuse to hand on a fragment that looks complete.
+unbounded default does NOT apply — but what replaces it depends on WHERE the
+value is going, not on what it contains. Bound for unauthorized egress and for
+storage you cannot vouch for: fail closed, omit wholesale with a marker as the
+"omit explicitly" rule says, and keep only non-sensitive metadata. Losing
+diagnostic prose is recoverable; leaking a token is not.
+
+**Do not apply that to an authorized destination.** The user's own messages,
+memories and diagnostics flowing to the user, or into a private store, are
+personal data arriving exactly where it belongs; stripping them there is not a
+safeguard, it is data loss dressed as one — and this repo already draws that
+line, scanning and quarantining on the OUTBOUND path while leaving owner-facing
+content untouched. Ask which boundary the value is crossing before deciding.
+Where it is crossing one, emitting whole and omitting wholesale are the same
+discipline: both refuse to hand on a fragment that looks complete.
 
 **One last thing, learned the hard way from this section itself.** Four review
 rounds found defects in it, and every single one had the same shape: the cited
