@@ -21,8 +21,13 @@ built before the numbered runner, so the unique index would crash a legacy-DB
 bootstrap if the column were added only here (the #1123/#1127 class;
 tests/test_db/test_schema_base_path_parity.py guards it).
 
-(Numbered 0092: 0091_topic_recency_stamps is the highest present on disk. The runner
-applies by per-id tracking; only duplicate prefixes are fatal.)
+(UTC-TIMESTAMP id, not a hand-allocated number. The legacy numeric namespace is
+FROZEN to its enumerated set — `scripts/check_migration_prefixes.py` refuses a new
+`00NN` file, because hand-allocation is what let two branches claim one id. This
+file was `0092_tco_tool_use_id.py` and was renamed when that freeze landed on
+main; the runner tracks applied migrations by id, so the rename means this
+migration is applied under its new id. That is correct here and only here: it has
+never been applied anywhere, having lived on an unmerged branch throughout.)
 """
 
 from __future__ import annotations
@@ -30,12 +35,14 @@ from __future__ import annotations
 import aiosqlite
 
 
-async def _add_column(db: aiosqlite.Connection, table: str, col: str, decl: str) -> None:
+async def _table_exists(db: aiosqlite.Connection, table: str) -> bool:
     cursor = await db.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
     )
-    if not await cursor.fetchone():
-        return  # fresh DB — CREATE TABLE / base-path ALTER already carries the column
+    return await cursor.fetchone() is not None
+
+
+async def _add_column(db: aiosqlite.Connection, table: str, col: str, decl: str) -> None:
     cursor = await db.execute(f"PRAGMA table_info({table})")
     cols = {row[1] for row in await cursor.fetchall()}
     if col not in cols:
@@ -43,6 +50,22 @@ async def _add_column(db: aiosqlite.Connection, table: str, col: str, decl: str)
 
 
 async def up(db: aiosqlite.Connection) -> None:
+    # THE TABLE-EXISTENCE CHECK GOVERNS BOTH STATEMENTS, not just the ALTER.
+    # `IF NOT EXISTS` on a CREATE INDEX guards against the INDEX already being
+    # there; it does nothing about a missing TABLE, and SQLite raises
+    # `no such table` — so on any database that does not carry
+    # `tool_call_outcomes` this migration failed outright and took the whole
+    # numbered run down with it. That is not hypothetical: the migrations-runner
+    # suite applies migrations against a bare database by design, and it went
+    # red (Codex P2, PR #1616).
+    #
+    # Skipping is the correct answer rather than creating the table here: this
+    # migration's job is to ADD a column and an index to a table the base schema
+    # path owns. A database without that table has never had the base path run,
+    # and inventing a table shape in a numbered migration is how two definitions
+    # of one table start to drift.
+    if not await _table_exists(db, "tool_call_outcomes"):
+        return  # base schema path has not created it — nothing to add it to
     await _add_column(db, "tool_call_outcomes", "tool_use_id", "TEXT")
     await db.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_tco_tool_use_id ON tool_call_outcomes(tool_use_id)"
