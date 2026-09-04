@@ -10,9 +10,12 @@ No network, no `gh`, no live repo — the runner is injected.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -22,6 +25,14 @@ _spec = importlib.util.spec_from_file_location("file_tracker_issue", _SCRIPT)
 assert _spec and _spec.loader
 fti = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fti)
+
+
+
+class _PathWithFailingMkdir(Path):
+    """Scoped stand-in: only THIS class fails, not pathlib.Path process-wide."""
+
+    def mkdir(self, *a, **k):
+        raise OSError("read-only file system")
 
 
 def _proc(
@@ -441,10 +452,20 @@ def test_partial_json_in_the_listing_refuses_rather_than_reporting_absence():
         fti.find_duplicate("Org/Repo", "anything", run)
 
 
-def test_create_failure_is_indeterminate_not_refused():
-    """A lost response after the server committed means the issue EXISTS."""
-    run = _runner({"issue create": _proc(returncode=1, stderr="connection reset")})
-    with pytest.raises(fti.Indeterminate, match="MAY have been created"):
+def test_create_failure_reconciles_against_the_tracker():
+    """Superseded round-4 behaviour: the outcome is RESOLVED, not reported.
+
+    Kept as a test because the guarantee still matters — a lost response after
+    the server committed means the issue EXISTS — but the script now answers the
+    question instead of handing it to the operator.
+    """
+
+    def run(argv):
+        if "issue create" in " ".join(argv):
+            return _proc(returncode=1, stderr="connection reset")
+        return _proc("")
+
+    with pytest.raises(fti.Refused, match="Reconciled against"):
         fti.create_issue("Org/Repo", "t", "/tmp/b.md", ["area:eval", "help wanted"], run)
 
 
@@ -455,16 +476,25 @@ def test_indeterminate_is_not_a_refused_subclass():
 
 
 def test_main_reports_exit_4_for_an_indeterminate_post(tmp_path, capsys):
-    run = _runner(
-        {
-            "isFork": _proc(
+    """Exit 4 now means only one thing: the reconciling lookup ALSO failed."""
+    calls = {"api": 0}
+
+    def run(argv):
+        joined = " ".join(argv)
+        if "isFork" in joined:
+            return _proc(
                 json.dumps({"isFork": False, "nameWithOwner": "Org/Repo", "parent": None})
-            ),
-            "viewerPermission": _proc(json.dumps({"viewerPermission": "ADMIN"})),
-            "gh api": _proc(""),
-            "issue create": _proc(returncode=1, stderr="connection reset"),
-        }
-    )
+            )
+        if "viewerPermission" in joined:
+            return _proc(json.dumps({"viewerPermission": "ADMIN"}))
+        if "gh api" in joined:
+            calls["api"] += 1
+            # first call = the pre-flight dup check; second = the reconcile
+            return _proc("") if calls["api"] == 1 else _proc(returncode=1, stderr="network down")
+        if "issue create" in joined:
+            return _proc(returncode=1, stderr="connection reset")
+        raise AssertionError(joined)
+
     t, b = _drafts(tmp_path)
     rc = fti.main(
         ["--title-file", t, "--body-file", b, "--area", "area:memory",
@@ -475,6 +505,7 @@ def test_main_reports_exit_4_for_an_indeterminate_post(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "INDETERMINATE" in err
     assert "BEFORE retrying" in err
+    assert calls["api"] == 2, "must have attempted a reconcile"
 
 
 def test_lookup_and_create_run_inside_the_tracker_lock(tmp_path, monkeypatch):
@@ -523,7 +554,9 @@ def test_lookup_and_create_run_inside_the_tracker_lock(tmp_path, monkeypatch):
 
 def test_tracker_lock_is_per_tracker_and_actually_excludes(tmp_path, monkeypatch):
     """Different trackers get different locks; the same tracker serialises."""
-    monkeypatch.setattr(fti.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(fti, "Path", type("P", (fti.Path.__class__ if False else Path,), {}))
+    monkeypatch.setattr(fti, "_lock_base_override", tmp_path, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
     a1 = fti._lock_path("Org/Repo")
     a2 = fti._lock_path("Org/Repo")
     b1 = fti._lock_path("Other/Repo")
@@ -537,3 +570,285 @@ def test_tracker_lock_is_per_tracker_and_actually_excludes(tmp_path, monkeypatch
         pytest.raises(BlockingIOError),
     ):
         _f.flock(second, _f.LOCK_EX | _f.LOCK_NB)
+
+
+# ===========================================================================
+# round 5 — same class again, at the outer edges: the script inferring whether
+# it posted. Resolved by asking the TRACKER instead of the exit status.
+# ===========================================================================
+
+
+def test_create_timeout_is_reconciled_not_an_uncaught_exception():
+    """A timeout is EXACTLY when the post may exist — it must not escape."""
+    calls: list = []
+
+    def run(argv):
+        calls.append(list(argv))
+        if "issue create" in " ".join(argv):
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=120)
+        return _proc(json.dumps({"number": 77, "title": "A real title"}))
+
+    out = fti.create_issue(
+        "Org/Repo", "A real title", "/tmp/b.md", ["area:eval", "help wanted"], run
+    )
+    assert "Org/Repo#77" in out
+    assert "EXISTS" in out
+    assert any("gh api" in " ".join(c) for c in calls), "must reconcile against the tracker"
+
+
+def test_timeout_with_no_issue_on_the_tracker_is_a_clean_refusal():
+    """Reconciling can also prove the post did NOT happen — say so definitively."""
+
+    def run(argv):
+        if "issue create" in " ".join(argv):
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=120)
+        return _proc("")
+
+    with pytest.raises(fti.Refused, match="nothing was posted"):
+        fti.create_issue("Org/Repo", "t", "/tmp/b.md", ["area:eval", "help wanted"], run)
+
+
+def test_nonzero_exit_with_the_issue_present_reports_success():
+    """The old code called this 'indeterminate'; the tracker knows the answer."""
+
+    def run(argv):
+        if "issue create" in " ".join(argv):
+            return _proc(returncode=1, stderr="connection reset")
+        return _proc(json.dumps({"number": 42, "title": "A real title"}))
+
+    out = fti.create_issue(
+        "Org/Repo", "A real title", "/tmp/b.md", ["area:eval", "help wanted"], run
+    )
+    assert "Org/Repo#42" in out
+
+
+def test_indeterminate_only_when_the_reconciling_lookup_also_fails():
+    """The one genuinely unknowable case — and the only one left."""
+
+    def run(argv):
+        if "issue create" in " ".join(argv):
+            return _proc(returncode=1, stderr="connection reset")
+        return _proc(returncode=1, stderr="network down")
+
+    with pytest.raises(fti.Indeterminate, match="MAY exist"):
+        fti.create_issue("Org/Repo", "t", "/tmp/b.md", ["area:eval", "help wanted"], run)
+
+
+def test_lock_directory_failure_refuses_rather_than_using_a_tmpdir_fallback(monkeypatch):
+    """A TMPDIR-dependent fallback is not a lock: CC sets TMPDIR, a shell does not."""
+
+
+    monkeypatch.setattr(fti, "Path", _PathWithFailingMkdir)
+    with pytest.raises(fti.Refused, match="TMPDIR-dependent fallback"):
+        fti._lock_path("Org/Repo")
+
+
+def test_no_tempfile_fallback_remains_in_the_source():
+    """Guard the guard: the fallback must be gone, not merely unreachable.
+
+    Asserts on the IMPORT, not on the word — the docstring deliberately names
+    `tempfile.gettempdir()` to explain why the fallback was removed, and a guard
+    that fires on its own rationale is one the next reader deletes.
+    """
+    src = (
+        Path(__file__).resolve().parents[2] / "scripts" / "file_tracker_issue.py"
+    ).read_text()
+    tree = ast.parse(src)
+    imported = {
+        alias.name.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        node.module.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert "tempfile" not in imported, "cannot call gettempdir() without importing it"
+
+
+def test_a_reporting_failure_does_not_reclassify_a_posted_issue(tmp_path, capsys, monkeypatch):
+    """In-process half of the guarantee; the exit-code half is the subprocess test below.
+
+    Kept deliberately narrow: this proves main() RETURNS 0 when the URL cannot be
+    written. It cannot prove the PROCESS exits 0 — the shutdown flush happens
+    after main() returns — which is why the subprocess test exists and why the
+    version of this test that only did the former was false assurance.
+    """
+    run = _runner(
+        {
+            "isFork": _proc(
+                json.dumps({"isFork": False, "nameWithOwner": "Org/Repo", "parent": None})
+            ),
+            "viewerPermission": _proc(json.dumps({"viewerPermission": "ADMIN"})),
+            "gh api": _proc(""),
+            "issue create": _proc("https://example/1"),
+        }
+    )
+    real_print = print
+    state = {"failed": False}
+
+    def flaky(*a, **k):
+        if not state["failed"] and a and str(a[0]).startswith("https://"):
+            state["failed"] = True
+            raise BrokenPipeError("stdout closed")
+        return real_print(*a, **k)
+
+    monkeypatch.setattr("builtins.print", flaky)
+    tf, bf = _drafts(tmp_path)
+    rc = fti.main(
+        ["--title-file", tf, "--body-file", bf, "--area", "area:memory",
+         "--difficulty", "help wanted"],
+        run,
+    )
+    assert rc == 0, "a confirmed post must not be reported as failure"
+    assert state["failed"], "the print failure must actually have been exercised"
+    assert "POSTED" in capsys.readouterr().err
+
+
+# ===========================================================================
+# fresh-context audit — the exception surface. Each of these is a type that
+# escaped EVERY handler, so the documented exit-code contract was not real.
+# ===========================================================================
+
+
+def test_reconcile_timeout_does_not_escape_as_exit_1():
+    """TimeoutExpired is not an OSError — it was caught nowhere on this path."""
+
+    def run(argv):
+        if "issue create" in " ".join(argv):
+            return _proc(returncode=1, stderr="connection reset")
+        raise subprocess.TimeoutExpired(cmd=list(argv), timeout=120)
+
+    # the reconcile's own lookup timing out is Refused (nothing proven posted),
+    # never an uncaught exception
+    with pytest.raises(fti.Indeterminate):
+        fti.create_issue("Org/Repo", "t", "/tmp/b.md", ["area:eval", "help wanted"], run)
+
+
+def test_preflight_duplicate_timeout_is_refused_not_uncaught():
+    def run(argv):
+        raise subprocess.TimeoutExpired(cmd=list(argv), timeout=120)
+
+    with pytest.raises(fti.Refused, match="did not complete"):
+        fti.find_duplicate("Org/Repo", "t", run)
+
+
+def test_interrupt_during_create_reconciles():
+    """KeyboardInterrupt is a BaseException — it escapes `except Exception`."""
+
+    def run(argv):
+        if "issue create" in " ".join(argv):
+            raise KeyboardInterrupt
+        return _proc(json.dumps({"number": 5, "title": "t"}))
+
+    out = fti.create_issue("Org/Repo", "t", "/tmp/b.md", ["area:eval", "help wanted"], run)
+    assert "Org/Repo#5" in out
+
+
+def test_gh_returning_a_non_object_is_refused_not_attributeerror():
+    run = _runner({"isFork": _proc("[]")})
+    with pytest.raises(fti.Refused, match="expected an object"):
+        fti.resolve_tracker(run)
+
+
+def test_rc_zero_with_no_url_is_reconciled_not_reported_as_filed():
+    """Success with nothing to cite is the same false certainty, inverted."""
+
+    def run(argv):
+        if "issue create" in " ".join(argv):
+            return _proc("")
+        return _proc("")
+
+    with pytest.raises(fti.Refused, match="printed no URL"):
+        fti.create_issue("Org/Repo", "t", "/tmp/b.md", ["area:eval", "help wanted"], run)
+
+
+def test_unreadable_or_non_utf8_draft_is_exit_2_not_1(tmp_path, capsys):
+    """UnicodeDecodeError is a ValueError — no handler caught it."""
+    t = tmp_path / "title.txt"
+    t.write_bytes(b"\xff\xfe not utf-8")
+    b = tmp_path / "body.md"
+    b.write_text("body", encoding="utf-8")
+    rc = fti.main(
+        ["--title-file", str(t), "--body-file", str(b), "--area", "area:memory",
+         "--difficulty", "help wanted"],
+        _runner({}),
+    )
+    assert rc == 2, "a draft we cannot read means nothing was posted"
+    assert "cannot read the draft files" in capsys.readouterr().err
+
+
+def test_missing_title_file_is_exit_2(tmp_path, capsys):
+    b = tmp_path / "body.md"
+    b.write_text("body", encoding="utf-8")
+    rc = fti.main(
+        ["--title-file", str(tmp_path / "nope.txt"), "--body-file", str(b),
+         "--area", "area:memory", "--difficulty", "help wanted"],
+        _runner({}),
+    )
+    assert rc == 2
+    assert "cannot read the draft files" in capsys.readouterr().err
+
+
+def test_over_long_and_multiline_titles_refuse_before_any_network_call(tmp_path):
+    """A title GitHub will reject would otherwise loop forever on 'safe to retry'."""
+    b = tmp_path / "body.md"
+    b.write_text("body", encoding="utf-8")
+
+    def run(argv):
+        raise AssertionError("must refuse before touching the network")
+
+    for bad in ("x" * 257, "line one\nline two"):
+        t = tmp_path / "title.txt"
+        t.write_text(bad, encoding="utf-8")
+        rc = fti.main(
+            ["--title-file", str(t), "--body-file", str(b), "--area", "area:memory",
+             "--difficulty", "help wanted"],
+            run,
+        )
+        assert rc == 2
+
+
+# --- the exit code must survive interpreter shutdown ------------------------
+
+
+def test_confirmed_post_does_not_exit_120_when_stdout_is_full(tmp_path):
+    """The real defect: CPython's shutdown flush overrides the return code.
+
+    Runs the script as a SUBPROCESS with stdout on /dev/full, because the
+    previous version of this test injected a `print` that raises — which the
+    real `print` does not — and passed green while the script exited 120.
+    Asserting on the process's actual exit status is the only way to see it.
+    """
+    stub = tmp_path / "gh"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '  *"--json isFork"*) echo \'{"isFork":false,"nameWithOwner":"Org/Repo","parent":null}\' ;;\n'
+        '  *viewerPermission*) echo \'{"viewerPermission":"ADMIN"}\' ;;\n'
+        '  *"api"*) : ;;\n'
+        '  *"issue create"*) echo "https://example/1" ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    title = tmp_path / "title.txt"
+    title.write_text("A real title", encoding="utf-8")
+    body = tmp_path / "body.md"
+    body.write_text("body", encoding="utf-8")
+    home = tmp_path / "home"
+    home.mkdir()
+
+    env = dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}", HOME=str(home))
+    with open("/dev/full", "w", encoding="utf-8") as full:
+        proc = subprocess.run(
+            [sys.executable, str(_SCRIPT), "--title-file", str(title), "--body-file",
+             str(body), "--area", "area:memory", "--difficulty", "help wanted"],
+            stdout=full, stderr=subprocess.PIPE, text=True, timeout=60, check=False,
+            env=env,
+        )
+    assert proc.returncode != 120, (
+        "a CONFIRMED post exited 120 — CPython's shutdown flush overrode the exit code"
+    )
+    assert proc.returncode == 0, f"expected 0 for a successful post, got {proc.returncode}"

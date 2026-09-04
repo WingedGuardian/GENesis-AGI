@@ -23,11 +23,16 @@ Certainty at boundaries (round 4, this script):
   * Check-then-act is not atomic. Lookup and creation are serialised under a
     per-tracker lock, so two concurrent sessions cannot both pass the duplicate
     check and both post.
-  * A failed `gh issue create` does NOT prove nothing was posted. If the server
-    committed the issue and the response was lost, the issue EXISTS. That case
-    is reported as INDETERMINATE, never as "refused" — telling an operator that
-    nothing was posted when something may have been is the worst outcome here,
-    because they then file a duplicate or a false local record.
+  * A failed `gh issue create` does NOT prove nothing was posted. Every route
+    the process SURVIVES — nonzero exit, timeout, SIGINT/SIGTERM, an rc=0 with
+    no URL — is resolved against the tracker rather than inferred from the exit
+    status. INDETERMINATE survives only when that reconciling lookup ALSO
+    fails. A SIGKILL cannot be caught by anything, so it remains the one route
+    that can leave an unreported issue; that is a property of SIGKILL, not a
+    gap this script can close.
+  * The exit code itself is guaranteed. CPython flushes stdout during shutdown
+    AFTER main() returns, and a failed flush exits 120 — silently replacing a
+    successful result. `_finish()` flushes while we can still react.
 
 Shell safety: everything runs through argv lists with `shell=False`. A title
 containing backticks or `$(...)` — ordinary in a technical title — would execute
@@ -50,12 +55,14 @@ found · 4 INDETERMINATE — a post may or may not exist, reconcile before retry
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
+import os
+import signal
 import subprocess
 import sys
-import tempfile
 import unicodedata
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
@@ -108,11 +115,40 @@ class Indeterminate(Exception):
     """
 
 
+#: Every `gh` call is bounded. A tracker large enough to exceed this on the
+#: paginated listing (order 10k+ issues) will time out rather than hang — that
+#: surfaces as a Refused, never as a silent partial read.
+GH_TIMEOUT_S = 120
+
+
 def _run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
     """Execute argv with NO shell. The absence of a shell is the point."""
     return subprocess.run(  # noqa: S603 - argv list, shell=False, no interpolation
-        list(argv), capture_output=True, text=True, timeout=120, check=False
+        list(argv), capture_output=True, text=True, timeout=GH_TIMEOUT_S, check=False
     )
+
+
+def _finish(code: int) -> int:
+    """Return `code` and make sure the interpreter cannot override it.
+
+    CPython flushes stdout during shutdown, AFTER main() returns. If stdout is
+    closed or full that flush fails and the process exits 120 — silently
+    replacing whatever we returned. MEASURED: a run whose issue was created
+    successfully exited 120 under `> /dev/full`, i.e. a confirmed post reported
+    as an undocumented failure, sending the operator to retry into a duplicate.
+
+    So: flush here, where we can still react, and if that fails put a usable fd
+    under stdout so the shutdown flush has nothing to fail on.
+    """
+    try:
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass  # nothing further to try; the exit code is still ours
+    return code
 
 
 def _gh_json(run: Runner, argv: Sequence[str]) -> dict:
@@ -120,9 +156,16 @@ def _gh_json(run: Runner, argv: Sequence[str]) -> dict:
     if proc.returncode != 0:
         raise Refused(f"`{' '.join(argv)}` failed: {proc.stderr.strip() or proc.returncode}")
     try:
-        return json.loads(proc.stdout or "{}")
+        data = json.loads(proc.stdout or "{}")
     except json.JSONDecodeError as exc:
         raise Refused(f"`{' '.join(argv)}` returned unparseable JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        # `gh` returning a list or null here would surface as an AttributeError
+        # from the caller's .get(), which is not in any handler's except clause.
+        raise Refused(
+            f"`{' '.join(argv)}` returned {type(data).__name__}, expected an object"
+        )
+    return data
 
 
 def _parent_slug(data: dict) -> str | None:
@@ -194,16 +237,28 @@ def find_duplicate(slug: str, title: str, run: Runner = _run) -> int | None:
       absence. ``--paginate`` walks every page; the ``pull_request`` filter is
       required because GitHub's issues endpoint returns PRs too.
     """
-    proc = run(
-        [
-            "gh",
-            "api",
-            "--paginate",
-            f"repos/{slug}/issues?state=all&per_page=100",
-            "--jq",
-            '.[] | select(has("pull_request")|not) | {number,title}',
-        ]
-    )
+    try:
+        proc = run(
+            [
+                "gh",
+                "api",
+                "--paginate",
+                f"repos/{slug}/issues?state=all&per_page=100",
+                "--jq",
+                '.[] | select(has("pull_request")|not) | {number,title}',
+            ]
+        )
+    except subprocess.SubprocessError as exc:
+        # TimeoutExpired is NOT an OSError and is caught by no handler upstream.
+        raise Refused(
+            f"duplicate check on {slug} did not complete ({exc}). Refusing to file — "
+            "a lookup that never finished is not 'no duplicate'."
+        ) from exc
+    # returncode is checked BEFORE stdout is parsed, deliberately: `gh api
+    # --paginate` writes each page as it arrives and only then reports a later
+    # page's failure, so parsing first would read a PARTIAL listing as an
+    # exhaustive one — the exact defect this function's docstring promises
+    # against. Do not reorder.
     if proc.returncode != 0:
         raise Refused(
             f"duplicate check failed on {slug}: {proc.stderr.strip() or proc.returncode}. "
@@ -242,13 +297,29 @@ def validate_labels(area: str, difficulty: str) -> list[str]:
 
 
 def _lock_path(slug: str) -> Path:
-    """Per-tracker lock file. Home-based so a tmp cleaner cannot drop it."""
+    """Per-tracker lock file, at a path that is STABLE across sessions.
+
+    No tempdir fallback, deliberately. ``tempfile.gettempdir()`` follows
+    ``TMPDIR``, and on this project a Claude Code session has ``TMPDIR`` pointed
+    at its own cc-tmp BY DESIGN while a manual shell has ``/tmp`` — so a
+    fallback would hand two concurrent sessions DIFFERENT lock files for the
+    same tracker, both would pass duplicate detection, and both would post. A
+    lock whose identity varies by caller is not a lock; refuse instead.
+    """
+    # NOTE: unlinking this file while a peer holds it destroys mutual
+    # exclusion — flock is on the inode, so the next caller creates a fresh
+    # one and locks nothing. `scripts/disk_hygiene.sh` does not currently reap
+    # ~/.genesis/locks; if a broad sweep is ever added, exclude this path.
     digest = hashlib.sha256(slug.encode()).hexdigest()[:16]
     base = Path.home() / ".genesis" / "locks"
     try:
         base.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        base = Path(tempfile.gettempdir())
+    except OSError as exc:
+        raise Refused(
+            f"cannot establish the per-install lock directory ({base}): {exc}. "
+            "Refusing rather than using a TMPDIR-dependent fallback, which would "
+            "let two sessions lock different files and both post."
+        ) from exc
     return base / f"tracker-issue-{digest}.lock"
 
 
@@ -263,11 +334,48 @@ def tracker_lock(slug: str):
     """
     path = _lock_path(slug)
     with open(path, "w", encoding="utf-8") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Blocking silently for a peer's full paginated listing looks like a
+            # hang. Say so, then wait.
+            print(f"waiting for the {slug} tracker lock…", file=sys.stderr)
+            fcntl.flock(handle, fcntl.LOCK_EX)
         try:
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _reconcile_uncertain_create(slug: str, title: str, cause: str, run: Runner) -> str:
+    """Resolve an uncertain create by asking the TRACKER, not the exit status.
+
+    Every way a create's outcome can be lost — a nonzero exit, a timeout, a
+    killed process — is another path where the issue may exist anyway. Inferring
+    the answer from the call means patching each path as it is discovered.
+    Asking the tracker answers all of them the same way, from ground truth.
+
+    Raises Indeterminate ONLY when the reconciling lookup itself fails, which is
+    the one case where the outcome is genuinely unknowable here.
+    """
+    # PRECONDITION, asserted by the caller's flow rather than assumed: main()
+    # ran the duplicate check under the SAME tracker lock immediately before the
+    # create, and it found nothing. So an issue carrying this exact title now is
+    # necessarily the one this invocation created — not a pre-existing one.
+    try:
+        found = find_duplicate(slug, title, run)
+    except Refused as exc:
+        raise Indeterminate(
+            f"{cause}, and the reconciling lookup then failed ({exc}). The issue MAY "
+            f"exist on {slug}. Check the tracker for this exact title BEFORE retrying "
+            "or recording a local row."
+        ) from exc
+    if found is not None:
+        return f"{slug}#{found} (reconciled: {cause}, but the issue EXISTS)"
+    raise Refused(
+        f"{cause}. Reconciled against {slug}: no issue with this title exists, so "
+        "nothing was posted. Safe to retry."
+    )
 
 
 def create_issue(
@@ -275,22 +383,61 @@ def create_issue(
 ) -> str:
     """Post it. Title and body travel as argv, never through a shell.
 
-    A nonzero exit raises Indeterminate, NOT Refused: GitHub may have committed
-    the issue before the response was lost, in which case the post exists. The
-    caller must reconcile rather than assume nothing happened.
+    An uncertain outcome is RESOLVED, not reported: a nonzero exit or a timeout
+    both mean "the post may exist", so the tracker is queried and the real answer
+    returned. Indeterminate survives only for the case where that query also
+    fails.
     """
     argv = ["gh", "issue", "create", "--repo", slug, "--title", title, "--body-file", body_path]
     for label in labels:
         argv += ["--label", label]
-    proc = run(argv)
-    if proc.returncode != 0:
-        raise Indeterminate(
-            f"gh issue create on {slug} exited {proc.returncode}: "
-            f"{proc.stderr.strip() or '(no stderr)'}. The issue MAY have been created — "
-            "GitHub can commit the post and still lose the response. Check the tracker "
-            "for this title BEFORE retrying or recording a local row."
+    try:
+        proc = run(argv)
+    except subprocess.SubprocessError as exc:
+        # TimeoutExpired is the common case and is EXACTLY when the server may
+        # have committed the issue. Catch the whole SubprocessError family: none
+        # of it is an OSError, so none of it is caught anywhere upstream.
+        return _reconcile_uncertain_create(
+            slug, title, f"gh issue create on {slug} did not complete ({exc})", run
         )
-    return proc.stdout.strip()
+    except KeyboardInterrupt:
+        # SIGINT/SIGTERM after the request went out. KeyboardInterrupt is a
+        # BaseException, so it escapes every `except Exception` handler — and it
+        # arrives precisely when the post may already exist.
+        return _reconcile_uncertain_create(
+            slug, title, f"gh issue create on {slug} was interrupted", run
+        )
+    if proc.returncode != 0:
+        return _reconcile_uncertain_create(
+            slug,
+            title,
+            f"gh issue create on {slug} exited {proc.returncode} "
+            f"({proc.stderr.strip() or 'no stderr'})",
+            run,
+        )
+    url = proc.stdout.strip()
+    if not url:
+        # rc=0 with no URL: reporting success with nothing to cite would be the
+        # same false certainty in the opposite direction.
+        return _reconcile_uncertain_create(
+            slug, title, f"gh issue create on {slug} exited 0 but printed no URL", run
+        )
+    return url
+
+
+def _warn(message: str) -> None:
+    """stderr write that cannot itself become the failure being reported."""
+    with contextlib.suppress(OSError):
+        print(message, file=sys.stderr)
+
+
+def _sigterm_as_interrupt(signum, frame):  # noqa: ARG001 - signal handler signature
+    """Make SIGTERM take the same reconciling path as SIGINT.
+
+    Default SIGTERM kills the process outright, so a create that had already
+    reached GitHub would leave an issue nobody knows about.
+    """
+    raise KeyboardInterrupt
 
 
 def main(argv: Sequence[str] | None = None, run: Runner = _run) -> int:
@@ -308,14 +455,33 @@ def main(argv: Sequence[str] | None = None, run: Runner = _run) -> int:
     ap.add_argument("--dry-run", action="store_true", help="run every check, post nothing")
     args = ap.parse_args(argv)
 
+    # not the main thread, or no signals here — best-effort only
+    with contextlib.suppress(ValueError, OSError):
+        signal.signal(signal.SIGTERM, _sigterm_as_interrupt)
+
     try:
-        with open(args.title_file, encoding="utf-8") as fh:
-            title = fh.read().strip()
+        try:
+            with open(args.title_file, encoding="utf-8") as fh:
+                title = fh.read().strip()
+            with open(args.body_file, encoding="utf-8") as fh:
+                body = fh.read().strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            # Unreadable or non-UTF-8 drafts are a "nothing was posted" outcome,
+            # so they belong on exit 2 with everything else that refused — not on
+            # the generic exit 1. UnicodeDecodeError is a ValueError, which no
+            # handler here caught before.
+            raise Refused(f"cannot read the draft files: {exc}") from exc
         if not title:
             raise Refused("title file is empty")
-        with open(args.body_file, encoding="utf-8") as fh:
-            if not fh.read().strip():
-                raise Refused("body file is empty")
+        if not body:
+            raise Refused("body file is empty")
+        if len(title) > 256:
+            raise Refused(
+                f"title is {len(title)} chars; GitHub rejects titles beyond ~256, so "
+                "this would fail every retry"
+            )
+        if "\n" in title or "\r" in title:
+            raise Refused("title contains a newline — GitHub's handling of that is unverified")
 
         labels = validate_labels(args.area, args.difficulty)
         slug = resolve_tracker(run)
@@ -333,17 +499,33 @@ def main(argv: Sequence[str] | None = None, run: Runner = _run) -> int:
             if args.dry_run:
                 print(f"DRY RUN ok — would file to {slug} (perm={perm}) with labels {labels}")
                 return 0
-            print(create_issue(slug, title, args.body_file, labels, run))
-        return 0
+            # Create FIRST, report second. If stdout is closed or full, the post
+            # has already happened — letting the print's OSError fall through to
+            # the generic handler would report exit 1 for a CONFIRMED issue and
+            # send the operator to retry into a duplicate.
+            posted = create_issue(slug, title, args.body_file, labels, run)
+        try:
+            print(posted)
+        except OSError:
+            # The post is already durable; a reporting failure must not
+            # reclassify it. The stderr fallback is itself guarded, because it
+            # can fail for the same reason.
+            with contextlib.suppress(OSError):
+                print(f"POSTED (could not write the URL to stdout): {posted}", file=sys.stderr)
+        return _finish(0)
     except Indeterminate as exc:
-        print(f"INDETERMINATE: {exc}", file=sys.stderr)
-        return 4
+        _warn(f"INDETERMINATE: {exc}")
+        return _finish(4)
     except Refused as exc:
-        print(f"REFUSED: {exc}", file=sys.stderr)
-        return 2
-    except OSError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+        _warn(f"REFUSED: {exc}")
+        return _finish(2)
+    except KeyboardInterrupt:
+        # Outside the create window, so nothing was posted.
+        _warn("REFUSED: interrupted before the issue was created.")
+        return _finish(2)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        _warn(f"ERROR: {exc}")
+        return _finish(1)
 
 
 if __name__ == "__main__":

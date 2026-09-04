@@ -74,12 +74,17 @@ is a hard guarantee · `3` an identical title already exists · `4` **INDETERMIN
 `1` unexpected error. **Run `--dry-run` first** — it performs every check and posts
 nothing.
 
-Exit `4` is the one that needs a human. It means `gh` failed but GitHub may already
-have committed the issue and lost the response — so the post may exist. Check the
-tracker for that title BEFORE retrying or writing a local row; a retry on a successful
-post creates a duplicate, and a local row records a falsehood. `2` and `4` are
-deliberately distinct: conflating them would tell you nothing was posted when
-something may have been.
+Exit `4` is the one that needs a human, and it is now RARE. When a create fails or
+times out, the script does not guess — it re-queries the tracker for that exact title
+and tells you what actually happened: the issue exists (success, reported as
+reconciled) or it does not (a clean `2`, safe to retry). `4` survives only when that
+reconciling lookup ALSO fails, which is the one genuinely unknowable case; check the
+tracker by hand before retrying or writing a local row.
+
+That design is deliberate. Every route by which a create's outcome can be lost —
+nonzero exit, timeout, a broken pipe while printing the URL — is another way to be
+wrong about whether the post happened. Asking the tracker answers all of them from
+ground truth instead of patching each one as it is found.
 
 Use a fresh `mktemp -d` per invocation, and clean it WITHOUT `rm -rf` — this
 repo's own destructive-command guard refuses a recursive-force delete on a path it
