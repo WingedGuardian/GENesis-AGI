@@ -403,8 +403,12 @@ When a user shares a file path or URL in conversation:
   the queue grows without bound no matter how disciplined any single session is.
   Treat an open PR whose originating session is gone as ordinary pickup work,
   not as someone else's. Check the rate with `scripts/pr_flow_rate.py` rather
-  than by feel (measured 2026-09-02: 78.3 opened/wk vs 76.3 closed/wk — a ~3%
-  leak, not a 10x problem).
+  than by feel (measured 2026-09-04 over 9 complete weeks: 83.0 opened/wk vs
+  75.1 closed/wk — a ~10% leak, not a 10x problem). That figure REPLACES the
+  ~3% first published here: it came from a capped, creation-ordered query that
+  understated closures and dropped the most recent seven days, and the same
+  run under the corrected method reports 2.5x the leak. Re-measure rather than
+  quoting this line — it is a snapshot, and the number is the point.
 - **Procedure recall is automatic** — the proactive hook surfaces relevant
   procedures. Store new procedures immediately when you discover them.
 - **Never insert directly into `task_states`.** Use `task_submit` MCP
