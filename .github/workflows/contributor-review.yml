@@ -75,8 +75,10 @@ concurrency:
 jobs:
   request-review:
     runs-on: ubuntu-latest
-    # Only outside contributions. The maintainer's own PRs already get an
-    # automatic review, so triggering here would spend a second one for nothing.
+    # A cheap pre-filter ONLY. It is not the eligibility rule and must not be
+    # read as one: the script applies the real predicate to this PR as well, via
+    # exactly the same function it applies to every other PR. Duplicating a
+    # condition here that the script does not also enforce is how the two drift.
     if: >-
       github.event.pull_request.head.repo.full_name != github.repository &&
       github.event.pull_request.draft == false
@@ -85,63 +87,98 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            // Labels that mark an issue as one we invited work on. An issue
-            // carrying none of these is not part of the contributor pipeline,
-            // and its PR waits for a human like any other outside change.
+            // ─────────────────────────────────────────────────────────────
+            // ONE DEFINITION OF "ELIGIBLE", APPLIED TO EVERY PR — THIS ONE TOO.
+            //
+            // Read this before changing anything below, because the shape of
+            // the bug this replaces is not obvious from any single line.
+            //
+            // Eight review findings landed on this workflow, and re-read as a
+            // matrix they are all ONE defect. The rows are the objects the
+            // workflow reasons about (the issue, THIS pull request, the SIBLING
+            // pull requests that close the same issue); the columns are the
+            // properties that decide whether a review may be spent. Every round
+            // found a different EMPTY CELL:
+            //
+            //     issue    open?            -> missed
+            //     issue    assigned?        -> missed (the original P1)
+            //     THIS pr  open?            -> missed
+            //     sibling  draft/closed?    -> missed
+            //     sibling  author assigned? -> missed
+            //     sibling  from a fork?     -> still empty, and nobody had
+            //                                  raised it yet
+            //
+            // Patching cells one at a time is what produced four rounds. The
+            // cause was never a missing check — it was that "eligible" had no
+            // single definition, so each object got its own ad-hoc subset and
+            // the asymmetries were invisible.
+            //
+            // So: `isEligible` below is the ONLY place eligibility is decided,
+            // and it is applied to this PR and to every sibling identically. A
+            // new property is added in one place and every object gets it. The
+            // job-level `if:` above is a cheap pre-filter, not a second rule —
+            // this PR is put through the same predicate regardless.
+            // ─────────────────────────────────────────────────────────────
+
+            // Labels that mark an issue as one we invited work on.
             const INVITED = ['good first issue', 'first-timers-only'];
 
-            // How many linked PRs we will examine before giving up. Hitting this
-            // means we cannot prove the issue's budget is unspent, so we decline.
+            // Bounds. An author controls how many links their body carries and
+            // how many PRs point at an issue, so both walks are capped and both
+            // FAIL CLOSED: past the cap we cannot prove the budget is unspent,
+            // and not knowing resolves to declining. Failing closed costs a
+            // human one comment; failing open costs the quota this exists for.
             const MAX_LINKED_PRS = 30;
-
-            // Same idea in the other direction: an author controls how many
-            // "Closes #N" links their body carries, and each one costs an API
-            // call (plus a whole budget walk if it turns out to be invited).
-            // Past this we decline rather than fan out on request.
             const MAX_LINKED_ISSUES = 20;
 
             const pr = context.payload.pull_request;
-            const author = ((pr.user && pr.user.login) || '').toLowerCase();
 
-            // ── WHAT AUTHORISES A REVIEW, AND WHAT MERELY BOUNDS IT ──────────
-            //
-            // TWO CHECKS BELOW, AND THEY ARE NOT EQUALS. Read this before
-            // editing either, because the weaker one looks like the stronger.
-            //
-            // 1. ASSIGNMENT — the load-bearing one, and the ONLY security
-            //    control here. The invited issue must be ASSIGNED to the PR's
-            //    author. Assignment requires triage permission, so an outside
-            //    contributor cannot grant it to themselves; it is maintainer
-            //    state, tied to a specific person, and nothing the author writes
-            //    can forge it.
-            //
-            // 2. A ONE-REVIEW BUDGET PER INVITED ISSUE — a courtesy bound, NOT
-            //    a security control, and it must never be described as one.
-            //    It is derived from `closedByPullRequestsReferences`, which is
-            //    author-MUTABLE: remove "Closes #N" from a PR body and that PR
-            //    leaves the graph, so the budget reads as unspent again.
-            //    Unlink-and-reopen defeats it by construction. It is kept only
-            //    because it stops an ASSIGNED contributor from spending several
-            //    reviews by opening several PRs — a politeness problem, not an
-            //    attack — and it costs nothing now that it is written.
-            //
-            // WHY NOT THE OTHER WAY ROUND. An earlier revision relied on the
-            // budget alone, on the reasoning that N invited labels cost at most
-            // N reviews. That reasoning is wrong wherever the spent-state is
-            // author-mutable, which it is: the bound held against a racing
-            // attacker and not against an editing one. The tie-break below is
-            // still here and still correct about ordering, but ordering was
-            // never the thing standing between a fork author and the quota.
-            //
-            // THE PRICE, STATED SO IT IS NOT REDISCOVERED. Assignment was
-            // measured against the real case before being adopted: issue #1480
-            // carried both invited labels and NO assignee, so PR #1529 — the
-            // genuine first-time contributor this workflow exists for — does
-            // not qualify under it. Inviting work is now two maintainer actions,
-            // label AND assign. An unassigned contributor is not turned away,
-            // only un-automated: a human types "@codex review", which is the
-            // behaviour before this workflow existed.
-            const q = `
+            /**
+             * THE predicate. `candidate` is a plain shape so this one function
+             * serves both the webhook payload for THIS pr and a GraphQL node
+             * for a sibling — the point is that neither gets its own rules.
+             *
+             * `issue` is the REST issue object: labels, state and assignees all
+             * arrive inline, so nothing here can be truncated by a nested
+             * connection.
+             */
+            function isEligible(candidate, issue, why) {
+              const author = (candidate.author || '').toLowerCase();
+              const checks = {
+                'pr is open':        candidate.state === 'OPEN',
+                'pr is not a draft': candidate.isDraft === false,
+                'pr is from a fork': candidate.isCrossRepository === true,
+                'issue is open':     issue.state === 'open',
+                'issue is invited':  (issue.labels || []).some(l =>
+                  INVITED.includes(((typeof l === 'string' ? l : l.name) || '').toLowerCase())),
+                'issue is assigned to the pr author': (issue.assignees || []).some(
+                  a => ((a && a.login) || '').toLowerCase() === author && author !== ''),
+              };
+              const failed = Object.keys(checks).filter(k => !checks[k]);
+              if (failed.length && why) {
+                core.info(`  ${why}: not eligible — ${failed.join('; ')}`);
+              }
+              return failed.length === 0;
+            }
+
+            // Normalise THIS pr into the same shape a sibling arrives in, so it
+            // is genuinely the same object to the predicate rather than a
+            // lookalike. `state` is upper-cased to match GraphQL's enum.
+            const self = {
+              number: pr.number,
+              author: (pr.user && pr.user.login) || '',
+              state: String(pr.state || '').toUpperCase(),
+              isDraft: pr.draft === true,
+              isCrossRepository:
+                (pr.head && pr.head.repo && pr.head.repo.full_name) !==
+                `${context.repo.owner}/${context.repo.repo}`,
+            };
+
+            // ── Which issues does this PR close? ──────────────────────────
+            // A formal closing link, not a mention: `closingIssuesReferences` is
+            // populated only by "Closes #N"-style keywords. It authorises
+            // nothing on its own — it only selects which issue to evaluate.
+            const linkQ = `
               query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
                 repository(owner:$owner, name:$repo) {
                   pullRequest(number:$number) {
@@ -153,106 +190,40 @@ jobs:
                 }
               }`;
 
-            // Paginate: treating the first page as exhaustive silently drops
-            // eligible contributors once a PR links past the page size.
             const linked = [];
             let cursor = null;
-            let overLinked = false;
             for (;;) {
-              const data = await github.graphql(q, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                number: pr.number,
-                cursor,
+              const d = await github.graphql(linkQ, {
+                owner: context.repo.owner, repo: context.repo.repo,
+                number: pr.number, cursor,
               });
-              const conn = data.repository.pullRequest.closingIssuesReferences;
+              const conn = d.repository.pullRequest.closingIssuesReferences;
               linked.push(...(conn.nodes || []));
-              if (linked.length > MAX_LINKED_ISSUES) { overLinked = true; break; }
+              if (linked.length > MAX_LINKED_ISSUES) {
+                core.info(
+                  `PR #${pr.number} closes more than ${MAX_LINKED_ISSUES} issues — ` +
+                  `declining rather than fanning out on request.`
+                );
+                return;
+              }
               if (!conn.pageInfo.hasNextPage) break;
               cursor = conn.pageInfo.endCursor;
-            }
-            if (overLinked) {
-              core.info(
-                `PR #${pr.number} closes more than ${MAX_LINKED_ISSUES} issues — ` +
-                `declining rather than fanning out on request.`
-              );
-              return;
             }
 
             // Only issues in THIS repository decide. A reference into a repo the
             // author controls would let them supply their own labels.
             const ours = linked.filter(i =>
-              i.repository && i.repository.nameWithOwner === `${context.repo.owner}/${context.repo.repo}`
+              i.repository &&
+              i.repository.nameWithOwner === `${context.repo.owner}/${context.repo.repo}`
             );
-
-            // REST returns every label AND every assignee inline, so there is no
-            // nested connection left to truncate on either check.
-            const invitedIssues = [];
-            for (const ref of ours) {
-              const { data: issue } = await github.rest.issues.get({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: ref.number,
-              });
-              // A CLOSED issue is off the board, and closing it does not strip
-              // its labels — so without this, every historical invited issue
-              // stays a permanent authorization token for work that is already
-              // done or abandoned.
-              const open = issue.state === 'open';
-              const invited = (issue.labels || []).some(l =>
-                INVITED.includes(((typeof l === 'string' ? l : l.name) || '').toLowerCase())
-              );
-              // The security control. Assignment needs triage permission, so a
-              // fork author cannot put their own name here.
-              const assigned = (issue.assignees || []).some(
-                a => ((a && a.login) || '').toLowerCase() === author
-              );
-              if (open && invited && assigned) {
-                invitedIssues.push(ref.number);
-              } else if (invited) {
-                core.info(
-                  `PR #${pr.number}: issue #${ref.number} invited but not eligible ` +
-                  `(open=${open}, assigned-to-@${pr.user.login}=${assigned}).`
-                );
-              }
-            }
-
-            if (!invitedIssues.length) {
-              core.info(
-                `PR #${pr.number} closes no issue that is both labelled ` +
-                `${JSON.stringify(INVITED)} and assigned to its author — ` +
-                `no review requested. Linked issues in this repo: ` +
-                (ours.map(i => `#${i.number}`).join(', ') || 'none')
-              );
+            if (!ours.length) {
+              core.info(`PR #${pr.number} closes no issue in this repository — no review requested.`);
               return;
             }
 
-            // ── HAS THIS ISSUE'S ONE REVIEW ALREADY BEEN SPENT? ──────────────
-            // Walk every PR that closes the invited issue — this one included,
-            // which also subsumes the draft-then-ready double fire — and look
-            // for a review request. Absence must be PROVEN: a truncated page or
-            // an over-large fan-out means we do not know, and not knowing
-            // resolves to declining. Failing closed costs a human one comment;
-            // failing open costs the quota this whole guard exists to protect.
-            //
-            // ── AND WHO GETS IT, WHEN TWO PRs ARRIVE AT ONCE ─────────────────
-            // "No request exists yet" is a read, and the comment is a later
-            // write, so on its own it is check-then-act: two PRs closing the
-            // same issue, opened seconds apart, could both read "unspent" and
-            // both post. `concurrency` cannot fix this — its group is keyed by
-            // PR number, so it serialises one PR's own events and nothing
-            // across PRs.
-            //
-            // Rather than take a lock, make the winner DETERMINISTIC: the
-            // budget belongs to the LOWEST-NUMBERED PR closing the issue.
-            // Every racer computes the same answer from the same data, so at
-            // most one of them can conclude it is the winner — no ordering
-            // between the runs is required. This holds because PR numbers are
-            // monotonic: a PR created later is guaranteed to see the earlier
-            // ones in this connection, so it can never mistake itself for the
-            // lowest. The earlier PR may or may not see the later one, and it
-            // does not matter — it is the winner either way.
-            const spentQ = `
+            // ── Every PR that closes a given issue, with the fields the
+            // predicate needs. Same fields for siblings as for self.
+            const siblingQ = `
               query($owner:String!, $repo:String!, $issue:Int!, $cursor:String) {
                 repository(owner:$owner, name:$repo) {
                   issue(number:$issue) {
@@ -260,8 +231,10 @@ jobs:
                       pageInfo { hasNextPage endCursor }
                       nodes {
                         number
-                        isDraft
                         state
+                        isDraft
+                        isCrossRepository
+                        author { login }
                         comments(first: 100) {
                           pageInfo { hasNextPage }
                           nodes { body }
@@ -272,18 +245,41 @@ jobs:
                 }
               }`;
 
-            async function budgetIsOurs(issueNumber) {
-              let cursor = null;
+            /**
+             * Decide for ONE invited issue. Returns true only if this PR is
+             * eligible for it, no eligible PR has already spent its review, and
+             * this PR is the lowest-numbered eligible contender.
+             */
+            async function mayClaim(issueNumber) {
+              const { data: issue } = await github.rest.issues.get({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber,
+              });
+
+              // THIS pr goes through the predicate first, and through the SAME
+              // function every sibling will. A closed PR reaching the job via
+              // an `edited` event is rejected here, by the same line that
+              // rejects a closed sibling.
+              if (!isEligible(self, issue, `PR #${pr.number} vs issue #${issueNumber}`)) {
+                return false;
+              }
+
+              // The budget: one automatic review per invited issue.
+              //
+              // Stated plainly so it is never mistaken for a control: this is
+              // derived from `closedByPullRequestsReferences`, which is
+              // author-MUTABLE — unlink "Closes #N" and a PR leaves the graph.
+              // It is a COURTESY BOUND that stops an already-eligible
+              // contributor spending several reviews on one issue. The security
+              // property is `isEligible`, and specifically the assignment,
+              // which no author can grant themselves.
+              let lowest = self.number;
               let seen = 0;
-              // Seed with our own number: the connection may not list this PR
-              // yet, and it must still take part in the comparison.
-              let lowest = pr.number;
+              let cur = null;
               for (;;) {
-                const d = await github.graphql(spentQ, {
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue: issueNumber,
-                  cursor,
+                const d = await github.graphql(siblingQ, {
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue: issueNumber, cursor: cur,
                 });
                 const conn = d.repository.issue.closedByPullRequestsReferences;
                 for (const node of conn.nodes || []) {
@@ -295,6 +291,28 @@ jobs:
                     );
                     return false;
                   }
+                  // SELF APPEARS IN THIS WALK TOO, and is treated the same.
+                  // An earlier draft skipped it outright as "already judged" —
+                  // which silently skipped its COMMENT check as well, so a PR
+                  // that had already been sent to the reviewer would be sent
+                  // again on its next `edited` or `ready_for_review` event.
+                  // That is the very "self is special" asymmetry this rewrite
+                  // exists to remove, reintroduced in one line. Eligibility is
+                  // not re-judged for self only because it was judged above by
+                  // the same function; everything else applies uniformly.
+                  const candidate = {
+                    number: node.number,
+                    author: (node.author && node.author.login) || '',
+                    state: node.state,
+                    isDraft: node.isDraft,
+                    isCrossRepository: node.isCrossRepository,
+                  };
+                  const isSelf = node.number === self.number;
+                  // An INELIGIBLE PR can neither spend the review nor hold the
+                  // budget. Skipping it here is what stops an ineligible PR
+                  // suppressing an eligible one forever.
+                  if (!isSelf && !isEligible(candidate, issue)) continue;
+
                   if (node.comments.pageInfo.hasNextPage) {
                     core.info(
                       `PR #${node.number} (closing #${issueNumber}) has more comments than ` +
@@ -302,49 +320,45 @@ jobs:
                     );
                     return false;
                   }
-                  const asked = (node.comments.nodes || []).some(
-                    c => c.body && c.body.includes('@codex review')
-                  );
-                  if (asked) {
+                  if ((node.comments.nodes || []).some(
+                        c => c.body && c.body.includes('@codex review'))) {
                     core.info(
                       `Issue #${issueNumber} already spent its automatic review on ` +
-                      `PR #${node.number} — not requesting another.`
+                      `PR #${node.number}${isSelf ? ' (this PR)' : ''} — not requesting another.`
                     );
                     return false;
                   }
-                  // Only a CONTENDER can hold the budget. A draft is skipped by
-                  // this workflow's own `if:`, and a closed-unmerged PR was
-                  // abandoned — neither will ever spend the review, so letting
-                  // either win the tie-break would park the budget on a PR that
-                  // cannot use it and starve every later real contribution.
-                  // A MERGED PR is left in deliberately: it genuinely consumed
-                  // the issue, and the issue is closed by then anyway.
-                  const contender = !node.isDraft && node.state !== 'CLOSED';
-                  if (contender && node.number < lowest) lowest = node.number;
+                  if (node.number < lowest) lowest = node.number;
                 }
                 if (!conn.pageInfo.hasNextPage) break;
-                cursor = conn.pageInfo.endCursor;
+                cur = conn.pageInfo.endCursor;
               }
-              if (lowest !== pr.number) {
+
+              // Deterministic winner when several ELIGIBLE PRs race: the lowest
+              // number. Every racer computes the same answer from the same data,
+              // so at most one concludes it has won and no lock is needed. It
+              // holds because PR numbers are monotonic — a PR created later
+              // always sees the earlier ones.
+              if (lowest !== self.number) {
                 core.info(
-                  `Issue #${issueNumber}'s review belongs to PR #${lowest}, which was ` +
-                  `opened before PR #${pr.number} — declining.`
+                  `Issue #${issueNumber}'s review belongs to PR #${lowest}, an eligible ` +
+                  `contribution opened before PR #${pr.number} — declining.`
                 );
                 return false;
               }
               return true;
             }
 
-            let matched = null;
-            for (const issueNumber of invitedIssues) {
-              if (await budgetIsOurs(issueNumber)) { matched = issueNumber; break; }
+            let claimed = null;
+            for (const ref of ours) {
+              if (await mayClaim(ref.number)) { claimed = ref.number; break; }
             }
 
-            if (matched === null) {
+            if (claimed === null) {
               core.info(
-                `PR #${pr.number}: every invited issue it closes ` +
-                `(${invitedIssues.map(n => `#${n}`).join(', ')}) has already spent its ` +
-                `automatic review, or could not be proven unspent — no review requested.`
+                `PR #${pr.number}: no invited issue it closes is claimable — ` +
+                `no review requested. Linked issues in this repo: ` +
+                ours.map(i => `#${i.number}`).join(', ')
               );
               return;
             }
@@ -357,5 +371,6 @@ jobs:
             });
             core.info(
               `Requested a review on PR #${pr.number} — it closes invited issue ` +
-              `#${matched}, whose automatic review had not been spent.`
+              `#${claimed}, which is assigned to @${self.author} and whose automatic ` +
+              `review had not been spent.`
             );
