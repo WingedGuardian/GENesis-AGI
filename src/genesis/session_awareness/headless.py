@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 
+from genesis.cc.types import background_session_dir
 from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 
@@ -85,6 +86,15 @@ async def run_headless_json(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            # Run OUTSIDE the project tree (same convention as CCInvoker
+            # dispatches): the child's transcript lands under the
+            # background-sessions project key, so CC's resume picker never
+            # lists ambient workers next to interactive sessions, and the
+            # repo's SessionStart hooks don't inject context into a
+            # one-turn judgment call. Measured 2026-09-04: without this,
+            # arbiter/ledger/repo-pulse transcripts accumulated in the
+            # interactive project dir and surfaced in /resume.
+            cwd=background_session_dir(),
             # Own session/group (setsid in the C helper — never preexec_fn:
             # post-fork Python can deadlock in the threaded server) so the
             # timeout below can killpg the whole claude tree.

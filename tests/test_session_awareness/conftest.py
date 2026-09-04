@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from genesis.session_awareness.statefiles import empty_state, save_state
 
 DIM = 8
@@ -28,3 +30,18 @@ def seed_theme(
     s["entities"] = {"genesis": 2.0, "voice": 1.1, "faint": 0.06}
     s["updated_at"] = datetime.now(UTC).isoformat()
     save_state(session_id, s, base=sessions_root)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_background_session_dir(tmp_path, monkeypatch):
+    """Keep every headless spawn's cwd out of the real HOME.
+
+    run_headless_json now runs children from background_session_dir(),
+    whose accessor mkdirs under ``Path.home()`` — an autouse redirect
+    keeps the whole suite hermetic instead of provisioning a real
+    ``~/.genesis/background-sessions`` on every test machine."""
+    import genesis.cc.types as _cc_types
+
+    monkeypatch.setattr(
+        _cc_types, "_BACKGROUND_SESSION_DIR", tmp_path / "bg-sessions"
+    )

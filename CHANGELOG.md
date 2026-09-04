@@ -37,6 +37,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Ambient background workers no longer clutter the session-resume picker.**
+  The shared headless runner (memory arbiter, session-ledger extractor,
+  repo-pulse matcher) spawned its one-turn `claude -p` calls from the server's
+  own working directory, so their transcripts accumulated under the interactive
+  project and surfaced in Claude Code's `--resume` list — previewing as
+  injected hook text, since they contain no human prompt. The runner now uses
+  the same out-of-repo working directory as dispatched background sessions,
+  which both keeps the resume picker clean and stops the project's
+  session-start hooks from injecting kilobytes of context into calls that
+  cannot use it.
+
 - **Two branches that each add a changelog entry no longer collide over it.**
   This file is an append-only list of independent bullets, so two branches
   adding an entry under the same heading are not disagreeing about anything —

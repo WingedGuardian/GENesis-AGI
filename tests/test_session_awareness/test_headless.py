@@ -234,3 +234,37 @@ async def test_cancel_group_kills_and_reraises(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert killpg_calls and killpg_calls[0][0] == 424243
+
+
+@pytest.mark.asyncio
+async def test_spawns_from_background_session_dir(tmp_path, monkeypatch):
+    """The child runs with cwd = the background-sessions dir, NOT the
+    inherited server cwd (~/genesis) — otherwise every ambient worker's
+    transcript lands in the interactive project key and CC's resume
+    picker lists it (measured 2026-09-04: arbiter / ledger-extractor /
+    repo-pulse transcripts previewing as SessionStart hook text)."""
+    import genesis.cc.types as cc_types
+
+    bg = tmp_path / "bg-sessions"
+    monkeypatch.setattr(cc_types, "_BACKGROUND_SESSION_DIR", bg)
+    captured: dict = {}
+
+    async def fake_exec(*argv, **kwargs):
+        captured.update(kwargs)
+
+        class _P:
+            returncode = 0
+            pid = 12345
+
+            async def communicate(self, _in):
+                return b"{}", b""
+
+        return _P()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    res = await run_headless_json(
+        "p", model=MODEL, claude_path="claude", no_mcp_config="/dev/null", timeout_s=5
+    )
+    assert res["status"] == "ok"
+    assert captured.get("cwd") == str(bg)
+    assert bg.is_dir()  # accessor provisions it (empty-state: fresh install)
