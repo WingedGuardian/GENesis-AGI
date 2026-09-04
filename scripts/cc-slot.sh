@@ -461,9 +461,75 @@ if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
             %[0-9]*) ;;
             *) _first_pane="" ;;
         esac
-        if [ "$_live_out" = "POISONED" ] && [ -n "$_first_pane" ]; then
+        # Nobody may be sitting at this shell. Child-presence answers "is a
+        # PROCESS running here" and cannot see shell-NATIVE work: `source
+        # deploy.sh`, a `read` waiting on input, a loop of builtins — all run
+        # inside the pane's own shell, spawn no child, and report `bash`. The
+        # probe calls that IDLE and the door would then C-c a human's task.
+        #
+        # Attachment is a CLOSED-SET fact rather than another heuristic, and it
+        # is the right question: is anyone there. The door heals BEFORE it
+        # attaches, so at this moment a non-zero count means some OTHER client
+        # is already in the session — a person who may be mid-keystroke.
+        # Accepted cost, stated rather than hidden: a poisoned slot held open
+        # in a second window will not self-heal until that window closes. That
+        # is a stall; interrupting someone's deploy is damage.
+        _attached=$(tmux display-message -p -t "=$SESSION_NAME" '#{session_attached}' 2>/dev/null || echo "")
+        # Fail toward SPARING, like every other gate here: only an affirmative
+        # "nobody is attached" permits keystrokes. Coercing an empty or
+        # non-numeric answer to 0 would read a BROKEN query as "nobody there"
+        # and type anyway — caught by test, which asked an unreadable count to
+        # spare the session and watched it heal instead.
+        case "$_attached" in
+            ''|*[!0-9]*) _attached=1 ;;
+        esac
+        if [ "$_live_out" = "POISONED" ] && [ -n "$_first_pane" ] && [ "$_attached" -gt 0 ]; then
+            echo "cc-slot: slot ${SLOT} is running no claude, but another client is attached — not typing into a session someone may be using." >&2
+            echo "cc-slot: close the other window and reconnect to relaunch it." >&2
+        fi
+        if [ "$_live_out" = "POISONED" ] && [ -n "$_first_pane" ] && [ "$_attached" -eq 0 ]; then
             _HEAL=1
             _HEAL_PANE="$_first_pane"
+            # A heal is create-like for MEMORY, not just for the OAuth gate.
+            # The bypass above is justified for an ATTACH — it adds no session,
+            # so the slot's footprint is already counted. That reasoning does
+            # NOT carry to a heal: this slot is poisoned precisely because no
+            # claude is running in it, so healing STARTS one. On a swapless box
+            # that is a real allocation, and the capacity gate exists to decide
+            # whether the box can take it.
+            #
+            # `--existing $((existing - 1))` and not `$existing`: for a CREATE
+            # the count excludes the session about to be made, so passing the
+            # raw count would judge a heal one session busier than the create
+            # it is modelled on — and at the cap that means a poisoned slot can
+            # NEVER be healed, stranding the operator on the one slot that is
+            # broken. Excluding this slot asks the question the gate is for:
+            # "may one more claude start right now", given this one is not
+            # currently running.
+            #
+            # ONLY an explicit DENY stands the heal down, and it never exits:
+            # the operator still gets their shell, exactly as before this
+            # feature existed. A gate that is unavailable, slow or unparseable
+            # heals — same fail-open direction the create path takes, for the
+            # same reason (an unreachable gate must not become an outage).
+            _heal_cap_py="${GENESIS_ROOT}/.venv/bin/python"
+            if [ -x "$_heal_cap_py" ]; then
+                # Clamped: `existing` is a counted value and nothing
+                # guarantees it is >= 1 here (a listing that raced the session
+                # into being, or a count that excludes it). A negative would
+                # reach the gate as a nonsense population — caught by test,
+                # which asked for `--existing 0` and got `-1`.
+                _heal_existing=$(( existing > 0 ? existing - 1 : 0 ))
+                _heal_cap_out=$(timeout 15 "$_heal_cap_py" \
+                    -m genesis.cc.session_cap --existing "$_heal_existing" \
+                    2>/dev/null || true)
+                if [ "$(printf '%s\n' "$_heal_cap_out" | sed -n '1p')" = "DENY" ]; then
+                    _HEAL=0
+                    _HEAL_PANE=""
+                    echo "cc-slot: slot ${SLOT} has no claude running, but the capacity gate declined to start one: $(printf '%s\n' "$_heal_cap_out" | sed -n '2p')" >&2
+                    echo "cc-slot: attaching to the slot's shell instead — free a slot and reconnect to relaunch." >&2
+                fi
+            fi
         fi
     fi
 else

@@ -44,6 +44,13 @@ if [[ "$args" == *has-session* ]]; then
     [[ -f "$FAKE_TMUX_SESSIONS" ]] && grep -qxF "$name" "$FAKE_TMUX_SESSIONS" && exit 0
     exit 1
 fi
+if [[ "$args" == *display-message* && "$args" == *session_attached* ]]; then
+    # Whether another client is already in the session. Real tmux prints a
+    # count; absent fake -> 0, i.e. nobody there, which is the case every
+    # pre-existing heal test assumes.
+    echo "${FAKE_TMUX_ATTACHED:-0}"
+    exit 0
+fi
 if [[ "$args" == *list-panes* && -n "${FAKE_TMUX_LIST_PANES_FAIL:-}" ]]; then
     # A real tmux exits 1 for a session that has gone away. The fake used to
     # exit 0 unconditionally here, which made the door's failure path
@@ -132,8 +139,16 @@ def door(tmp_path):
         '  echo $(( n + 1 )) > "$FAKE_LIVENESS_N"\n'
         "  exit 0\n"
         "fi\n"
-        # Any other module (the capacity gate, the login gate) -> no verdict,
-        # which those paths already treat as unavailable.
+        # The capacity gate, when a test wants it to answer. A heal STARTS a
+        # claude, so it consults this the way a create does; without an answer
+        # the path fails open, which is why every heal test passed before this
+        # branch existed.
+        'if [[ "$*" == *session_cap* && -n "${FAKE_HEAL_CAP:-}" ]]; then\n'
+        '  echo "session_cap $*" >> "$FAKE_PROBE_LOG"\n'
+        '  printf \'%s\\n\' "$FAKE_HEAL_CAP" "cap message"; exit 0\n'
+        "fi\n"
+        # Any other module (the capacity gate with no fake, the login gate) ->
+        # no verdict, which those paths already treat as unavailable.
         "exit 1\n"
     )
     fake_py.chmod(fake_py.stat().st_mode | stat.S_IEXEC)
@@ -158,6 +173,8 @@ def door(tmp_path):
             "FAKE_TMUX_PANES2": os.environ.get("_TEST_FAKE_PANES2", ""),
             "FAKE_TMUX_SENDKEYS_FAIL": os.environ.get("_TEST_FAKE_SENDKEYS_FAIL", ""),
             "FAKE_TMUX_LIST_PANES_FAIL": os.environ.get("_TEST_FAKE_LIST_PANES_FAIL", ""),
+            "FAKE_HEAL_CAP": os.environ.get("_TEST_FAKE_HEAL_CAP", ""),
+            "FAKE_TMUX_ATTACHED": os.environ.get("_TEST_FAKE_ATTACHED", ""),
             "FAKE_TMUX_FDS": str(tmp_path / "tmux_fds.txt"),
         }
         # Per-invocation call counters: two run() calls in one test must not
@@ -456,6 +473,8 @@ class TestSlotHeal:
         idle=None,
         panes2_text=None,
         sendkeys_fail=False,
+        heal_cap=None,
+        attached=None,
     ):
         run, log, sessions, _listing, panes = door
         sessions.write_text(f"{session}\n")
@@ -468,6 +487,10 @@ class TestSlotHeal:
             os.environ["_TEST_FAKE_PANES2"] = str(run.panes2)
         if sendkeys_fail:
             os.environ["_TEST_FAKE_SENDKEYS_FAIL"] = "1"
+        if heal_cap is not None:
+            os.environ["_TEST_FAKE_HEAL_CAP"] = heal_cap
+        if attached is not None:
+            os.environ["_TEST_FAKE_ATTACHED"] = attached
         try:
             proc = run(f"genesis-3-{session.split('-')[1]}")
         finally:
@@ -475,7 +498,80 @@ class TestSlotHeal:
             os.environ.pop("_TEST_FAKE_IDLE", None)
             os.environ.pop("_TEST_FAKE_PANES2", None)
             os.environ.pop("_TEST_FAKE_SENDKEYS_FAIL", None)
+            os.environ.pop("_TEST_FAKE_HEAL_CAP", None)
+            os.environ.pop("_TEST_FAKE_ATTACHED", None)
         return proc, log.read_text()
+
+    def test_a_denied_capacity_gate_stands_the_heal_down(self, door):
+        """A heal STARTS a claude, so it is create-like for memory.
+
+        The attach bypass above is justified for an ATTACH — it adds no
+        session, so the footprint is already counted. That does not carry to a
+        heal: the slot is poisoned precisely because no claude is running, so
+        healing is a real allocation on a swapless box.
+        """
+        proc, log = self._run_with(door, "POISONED", heal_cap="DENY")
+        assert "send-keys" not in log, "typed a launch line the gate declined"
+        assert "capacity gate declined" in proc.stderr, proc.stderr
+
+    def test_a_denied_heal_still_attaches_instead_of_exiting(self, door):
+        """Standing the heal down must not lock the operator out of the slot.
+
+        Denying is about not starting a second claude, not about refusing the
+        session — before this feature existed they got the shell, and they
+        still do."""
+        proc, log = self._run_with(door, "POISONED", heal_cap="DENY")
+        assert proc.returncode == 0, proc.stderr
+        assert "new-session" in log, "the door failed to attach at all"
+
+    def test_the_heal_asks_the_gate_about_one_FEWER_session(self, door):
+        """`--existing` excludes this slot, and that is load-bearing.
+
+        For a CREATE the count excludes the session about to be made. Passing
+        the raw count would judge a heal one session busier than the create it
+        is modelled on — and at the cap that means a poisoned slot could never
+        be healed, stranding the operator on the one slot that is broken.
+        """
+        _proc, _log = self._run_with(door, "POISONED", heal_cap="ALLOW")
+        recorded = door[0].probe_log.read_text()
+        cap_lines = [ln for ln in recorded.splitlines() if ln.startswith("session_cap")]
+        assert cap_lines, f"the heal never consulted the gate:\n{recorded}"
+        # One session live (this slot), excluded -> the gate is asked about 0.
+        # Raw would be 1, and THAT is the bug: at the cap, the raw count makes
+        # a poisoned slot permanently unhealable.
+        assert "--existing 0" in cap_lines[0], cap_lines
+
+    def test_an_unavailable_capacity_gate_still_heals(self, door):
+        """Fail OPEN, matching the create path. An unreachable gate must not
+        become an outage — and the pre-existing behaviour for this slot was a
+        dead prompt, which is worse than an unchecked relaunch."""
+        _proc, log = self._run_with(door, "POISONED")  # no fake -> gate exits 1
+        assert "send-keys" in log
+
+    def test_an_attached_session_is_never_typed_into(self, door):
+        """Child-presence cannot see shell-NATIVE work.
+
+        `source deploy.sh`, a `read` waiting on input, a loop of builtins — all
+        run inside the pane's own shell, spawn no child, and report `bash`. The
+        idleness probe calls that IDLE, and the door would then C-c a human's
+        task. Attachment is a closed-set fact instead of another heuristic, and
+        it asks the right question: is anyone there.
+        """
+        proc, log = self._run_with(door, "POISONED", attached="1")
+        assert "send-keys" not in log, "typed into a session with a client attached"
+        assert "another client is attached" in proc.stderr, proc.stderr
+
+    def test_an_unattached_poisoned_slot_still_heals(self, door):
+        """Guard the guard: the test above must not pass by killing the heal."""
+        _proc, log = self._run_with(door, "POISONED", attached="0")
+        assert "send-keys" in log
+
+    def test_an_unreadable_attachment_count_spares_the_session(self, door):
+        """Same fail direction as every other gate here: only a positive
+        answer permits keystrokes. A tmux that prints nothing usable must not
+        be read as 'nobody is there'."""
+        proc, log = self._run_with(door, "POISONED", attached="not-a-number")
+        assert "send-keys" not in log or "another client is attached" in proc.stderr
 
     def test_poisoned_slot_is_healed_with_the_full_launch_line(self, door):
         proc, log = self._run_with(door, "POISONED")

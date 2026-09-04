@@ -23,7 +23,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   — it will never type into a session that is in use, nor over a job the slot's
   shell is running. The slot list printed by a manual connection now also marks
   a slot that is running no Claude Code, and says that reattaching to it will
-  not relaunch it: only that slot's own door does.
+  not relaunch it: only that slot's own door does. Two things it will not do:
+  relaunch when someone else already has that slot open in another window (it
+  cannot tell a quiet shell from one running a script that spawns nothing, so
+  it declines rather than risk interrupting you), and relaunch when the machine
+  is already at its session limit — recovering a slot starts a real Claude Code
+  process, so it asks the same capacity question opening a new one would.
 - **Launching Claude Code by hand inside a slot no longer produces a degraded
   session.** The `claude` shell wrapper only did its work outside tmux, so running
   `claude` from a slot's prompt skipped the permission mode, the temp directories

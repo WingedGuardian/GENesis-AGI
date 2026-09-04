@@ -243,7 +243,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 4d8bf173 2026-09-02
+verified: 1aedb682 2026-09-03
 ```
 
 - **The interactive slot door SELF-HEALS a session that lost its claude.**
@@ -287,6 +287,27 @@ verified: 4d8bf173 2026-09-02
   `new-session -e` (one `_PANE_ENV` source), closes its per-slot lock fd before
   the client `exec` (an inherited fd would hold the flock for the whole
   session), and reports undeliverable keystrokes instead of claiming a heal.
+  Two further gates, both added because child-presence and session-count each
+  answer a NARROWER question than they appear to. (1) A session with another
+  client ATTACHED is never typed into: child-presence cannot see shell-NATIVE
+  work — `source deploy.sh`, a `read` awaiting input, a loop of builtins all
+  run inside the pane's own shell, spawn nothing, and report `bash`, so the
+  idleness probe calls them IDLE. Attachment is a closed-set fact rather than
+  another heuristic, and the door heals BEFORE it attaches, so a non-zero count
+  means somebody else is already there. An unreadable count spares the session,
+  like every other gate here. Accepted cost, stated rather than hidden: a
+  poisoned slot held open in a second window will not self-heal until that
+  window closes — a stall, where interrupting a deploy would be damage. (2) The
+  heal consults the CAPACITY gate, because it is create-like for MEMORY and not
+  only for the OAuth gate. The attach bypass is justified for an attach — it
+  adds no session, so the footprint is already counted — and that reasoning does
+  NOT carry to a heal, which STARTS a claude on a swapless box. It asks about
+  `existing - 1` (clamped at zero): for a create the count excludes the session
+  about to be made, so the raw count would judge a heal one session busier than
+  the create it models, and AT the cap a poisoned slot could then never be
+  healed — stranding the operator on the one slot that is broken. Only an
+  explicit DENY stands the heal down, and it never exits: the operator still
+  gets their shell, exactly as before the feature existed.
 
 - **Cross-session awareness — how concurrent CC sessions perceive each other.**
   LIVE. Two DISTINCT stores answer two different questions, and conflating them
