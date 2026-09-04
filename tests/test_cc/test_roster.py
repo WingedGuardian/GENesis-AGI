@@ -192,12 +192,45 @@ def test_non_dict_config_is_ignored(tmp_path):
 
 # --- apply_routing_env: the shared invoker/gmodel routing-env contract ----------
 
-_MODEL_SLOTS = (
-    "ANTHROPIC_MODEL",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-)
+# Bound to the production constant, NOT restated. A hardcoded copy here went
+# stale the moment two slots were added to `_ROSTER_MODEL_ENV_VARS`
+# (ANTHROPIC_DEFAULT_FABLE_MODEL, CLAUDE_CODE_SUBAGENT_MODEL): both tests below
+# iterated the old 4-tuple, so deleting either new slot from production left
+# the whole suite green — zero coverage on the exact mechanism this PR adds
+# them for. A duplicated literal in a test is a silent drift generator; every
+# future slot is now covered the moment it is added.
+_MODEL_SLOTS = R._ROSTER_MODEL_ENV_VARS
+
+
+def test_model_slots_is_the_production_tuple_and_its_contents_are_pinned():
+    """Binding fixes ADD-drift but makes DELETION self-cancelling — pin both.
+
+    `_MODEL_SLOTS = R._ROSTER_MODEL_ENV_VARS` means the loops below shorten
+    with the tuple, so removing a slot from production removes it from the
+    assertions too and every test stays green. Membership checks on two names
+    were not enough: mutation showed the other four are caught only by the
+    surviving hardcoded duplicate in `test_invoker_roster_env.py`, which this
+    file's own comment calls a drift generator — so the obvious tidy-up of
+    deleting that duplicate would silently strip deletion coverage from four
+    slots.
+
+    One explicit set contract, in one place, closes the delete direction. Any
+    change to the slot list is now a deliberate edit here, which is the point.
+    """
+    assert _MODEL_SLOTS is R._ROSTER_MODEL_ENV_VARS
+    assert set(_MODEL_SLOTS) == {
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        # CC 2.1.x routes sub-agents and background tasks through these two; an
+        # unset slot makes a peer endpoint reject with model-not-found.
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+    }
+    # No duplicates — the tuple is iterated to set env vars, and a repeat would
+    # hide a typo'd name behind a correct one.
+    assert len(_MODEL_SLOTS) == len(set(_MODEL_SLOTS))
 
 
 def test_apply_routing_env_peer_sets_all_and_drops_api_key():
@@ -321,3 +354,59 @@ def test_every_documented_auth_env_has_a_secrets_slot():
         "provider genuinely uses one key for both, rename the slot so the "
         "convention still reads true."
     )
+
+
+def test_shipped_examples_obey_the_key_equals_model_id_rule() -> None:
+    """The shipped file states this rule in prose; nothing enforced it.
+
+    ``config/cc_roster.yaml`` says, at the top of its EXAMPLE PEERS section,
+    "NAME YOUR PEER EXACTLY WHAT ITS ``model_id`` IS", and gives the reason: a
+    peer whose key differs from its model_id never persists its resume endpoint
+    (``endpoint_payload`` looks the NAME up and misses), so session continuity
+    can later target the wrong provider.
+
+    The examples are COMMENTED, so no YAML parse and no schema check ever looks
+    at them — and the Kimi example shipped violating the rule stated four lines
+    above it. A rule that only exists as prose is a rule the next example
+    breaks; this makes it a check instead.
+    """
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[2] / "config" / "cc_roster.yaml"
+    lines = src.read_text(encoding="utf-8").splitlines()
+
+    key_re = re.compile(r"^#\s{4,}([A-Za-z0-9][A-Za-z0-9._-]*):\s*$")
+    mid_re = re.compile(r"^#\s+model_id:\s*(\S+)\s*$")
+
+    pairs: list[tuple[int, str, str | None]] = []
+    for i, line in enumerate(lines):
+        m = key_re.match(line)
+        if not m:
+            continue
+        model_id = None
+        # The block is a handful of commented lines; stop at the first
+        # non-comment or the next example key.
+        for nxt in lines[i + 1 : i + 12]:
+            if not nxt.lstrip().startswith("#") or key_re.match(nxt):
+                break
+            mm = mid_re.match(nxt)
+            if mm:
+                model_id = mm.group(1)
+                break
+        pairs.append((i + 1, m.group(1), model_id))
+
+    assert pairs, (
+        "no commented example peers found — the parser drifted from the file's "
+        "format, so this test is silently checking nothing"
+    )
+    for lineno, key, model_id in pairs:
+        assert model_id is not None, (
+            f"example peer {key!r} at cc_roster.yaml:{lineno} declares no model_id"
+        )
+        assert key == model_id, (
+            f"example peer at cc_roster.yaml:{lineno} has key {key!r} but "
+            f"model_id {model_id!r}. The file's own EXAMPLE PEERS note requires "
+            "them to match: a copied peer whose key differs never persists its "
+            "resume endpoint, so continuity can target the wrong provider."
+        )
