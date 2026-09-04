@@ -12,7 +12,18 @@ ExecStart=/bin/bash __REPO_DIR__/scripts/cc_settings_align.sh
 # Bounded well above the work (a JSON read-modify-write plus up to 3 CAS retries,
 # milliseconds in practice). The cap exists only so a pathological filesystem
 # stall cannot leave a oneshot hanging indefinitely.
-TimeoutStartSec=60
+# The project timeout floor (CLAUDE.md): a timeout needs a specific failure mode
+# and evidence for its value, and absent both the default is 2 hours. The old 60s
+# had neither — only "the normal case takes milliseconds", which is an argument
+# about the normal case, not about the one this bound governs.
+#
+# The failure it must not cause: a home filesystem stalling in stat / JSON I/O /
+# fsync for over a minute gets this oneshot KILLED before it can verify or
+# restore suppression, and the calendar timer does not retry until the next day.
+# That trades a slow run for a silently unprotected auto-updater — the exact
+# outcome this unit exists to prevent. A generous bound costs an idle process; a
+# tight one costs the protection.
+TimeoutStartSec=7200
 # Needs python3 (the reconciler's merge helper) and flock, both in /usr/bin. No
 # npm, no sudo, no ssh.
 Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin

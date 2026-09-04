@@ -1339,6 +1339,72 @@ class TestVerifiedByConstruction:
                            'echo "S=$CC_SUPPRESSION_STATE C=$CC_SUPPRESSION_CREATED"')
         assert "S=ok" in r.stdout and "C=0" in r.stdout, (r.stdout, r.stderr)
 
+    def test_a_lost_breadcrumb_is_reported_and_does_not_abort_the_caller(
+        self, tmp_path: Path
+    ) -> None:
+        """Two properties that pull in opposite directions, both required.
+
+        The breadcrumb is the ONLY channel a repair made inside the bootstrap
+        subprocess has for reaching update_history, so a write failure must not
+        be discarded — a real repair would be reported as a clean deploy.
+
+        But it must also not ABORT the caller. install.sh, bootstrap.sh and
+        host-setup.sh all run `set -euo pipefail`, and the suppression itself
+        succeeded; failing the whole installer over a REPORTING failure would
+        turn a cosmetic problem into an outage.
+        """
+        home = tmp_path / "home"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".genesis").mkdir()
+        (home / ".genesis").chmod(0o500)          # readable, NOT writable
+        try:
+            r = subprocess.run(
+                ["bash", "-c",
+                 f'set -euo pipefail; source "{_LIB}"; '
+                 'cc_ensure_updater_suppressed || true; '
+                 'echo "S=$CC_SUPPRESSION_STATE L=$CC_SUPPRESSION_BREADCRUMB_LOST"'],
+                capture_output=True, text=True, timeout=60,
+                env={"HOME": str(home), "PATH": str(_minimal_bin(tmp_path)),
+                     "CC_VERSION": "9.9.9"},
+            )
+        finally:
+            (home / ".genesis").chmod(0o700)
+
+        assert r.returncode == 0, (
+            "an unwritable breadcrumb aborted a `set -e` caller; the suppression "
+            f"had already succeeded. stdout={r.stdout!r} stderr={r.stderr!r}"
+        )
+        assert "S=repaired" in r.stdout, (r.stdout, r.stderr)
+        assert "L=1" in r.stdout, "the lost breadcrumb was silently discarded"
+        assert "could not persist the outcome" in r.stderr
+
+    def test_sigterm_removes_the_temporary_settings_file(self, tmp_path: Path) -> None:
+        """SIGTERM must RAISE, or the cleanup arm around the write is decorative.
+
+        The arm's own comment claimed it covered "SIGTERM mid-write". It did
+        not: SIGTERM's default disposition terminates the process outright, so
+        no exception is raised and no `except` runs. The abandoned temp holds
+        the FULL settings content, which is credential-adjacent.
+        """
+        # Structural rather than behavioural: delivering a real SIGTERM at the
+        # exact moment of a stalled fsync is not reproducible in a unit test
+        # without stalling a filesystem. What IS checkable, and what the defect
+        # actually was, is whether the handler exists and covers the window.
+        #
+        # The handler must be installed BEFORE the
+        # mkstemp it protects. A handler registered afterwards leaves the same
+        # window open.
+        src = _LIB.read_text(encoding="utf-8")
+        assert "signal.signal(signal.SIGTERM" in src, (
+            "no SIGTERM handler — the `except BaseException` cleanup arm cannot "
+            "run, because a default-disposition SIGTERM raises nothing"
+        )
+        assert src.index("signal.signal(signal.SIGTERM") < src.index("tempfile.mkstemp"), (
+            "the SIGTERM handler is installed after the temp file is created — "
+            "the unprotected window is exactly the one being closed"
+        )
+        assert "import json, os, random, shutil, signal, sys, tempfile, time" in src
+
     def test_a_create_whose_write_did_not_land_reports_failed(self, tmp_path: Path) -> None:
         """Sabotaged mv: the rename 'succeeds' but the content never arrives.
 

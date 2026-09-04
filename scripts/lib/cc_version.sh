@@ -83,9 +83,21 @@ _cc_supp_persist_outcome() {
     # `date` being on PATH. A zero stamp is not harmless — the reader compares
     # it against a watermark, so `0` makes a real repair invisible rather than
     # merely undated. `date` remains the fallback for bash < 5.0.
-    printf '%s %s\n' "${CC_SUPPRESSION_STATE:-unverified}" \
+    if ! printf '%s %s\n' "${CC_SUPPRESSION_STATE:-unverified}" \
         "${EPOCHSECONDS:-$(date -u +%s 2>/dev/null || echo 0)}" \
-        > "$_CC_SUPP_OUTCOME_FILE" 2>/dev/null || true
+        > "$_CC_SUPP_OUTCOME_FILE" 2>/dev/null; then
+        # NOT swallowed. This file is the only channel a repair made inside
+        # bootstrap has for reaching update_history — losing it means a real
+        # repair is reported as a clean deploy, which is the exact silence this
+        # change set exists to remove. The suppression itself WAS applied, so
+        # the state stays honest; the lost REPORTING is surfaced separately.
+        CC_SUPPRESSION_BREADCRUMB_LOST=1
+        echo "  WARNING: cc_ensure_updater_suppressed: could not persist the outcome" \
+             "breadcrumb to $_CC_SUPP_OUTCOME_FILE — a repair made in a subprocess" \
+             "will not reach update_history (suppression state:" \
+             "${CC_SUPPRESSION_STATE:-unverified})" >&2
+        return 1
+    fi
     return 0
 }
 
@@ -112,12 +124,20 @@ cc_ensure_updater_suppressed() {
     # path ($1) and optional extra defaults ("$@"). Dropping it silently
     # discards both for any caller that uses them.
     # shellcheck disable=SC2120  # optional args by design; no current caller passes any
+    # shellcheck disable=SC2034  # cross-file: update.sh folds this into HOST_CC_DEGRADED
+    CC_SUPPRESSION_BREADCRUMB_LOST=0
     _cc_ensure_updater_suppressed_inner "$@" || _rc=$?
     # A run that did not end in `repaired` wrote nothing, so it created nothing.
     # shellcheck disable=SC2034  # cross-file: host-setup.sh reads this, the linter
     # only sees this file (same blindness already noted for CC_SUPPRESSION_STATE)
     [ "${CC_SUPPRESSION_STATE:-}" = "repaired" ] || CC_SUPPRESSION_CREATED=0
-    _cc_supp_persist_outcome
+    # `|| true` is REQUIRED, not defensive: this now returns non-zero when the
+    # breadcrumb cannot be written, and install.sh/bootstrap.sh/host-setup.sh all
+    # run `set -euo pipefail`. A bare failing call here would abort the installer
+    # over a REPORTING failure, after the suppression itself succeeded. The
+    # failure is already surfaced by its own warning and by
+    # CC_SUPPRESSION_BREADCRUMB_LOST; it must not also change control flow.
+    _cc_supp_persist_outcome || true
     return "$_rc"
 }
 
@@ -320,7 +340,29 @@ _cc_ensure_updater_suppressed_inner() {
     #     makes the function honest regardless of how the next one is written.
     rc=0
     out="$(python3 - "$settings_file" "${extra_defaults[@]}" <<'PYEOF'
-import json, os, random, shutil, sys, tempfile, time
+import json, os, random, shutil, signal, sys, tempfile, time
+
+# SIGTERM must RAISE, or the cleanup arm below is decorative.
+#
+# The `except BaseException` guard around the write says it covers "SIGTERM
+# mid-write". It did not: SIGTERM's default disposition TERMINATES the process
+# outright, so no exception is ever raised and no `except`/`finally` runs. A
+# systemd stop, a TimeoutStartSec kill, or an operator's `kill` during a stalled
+# fsync therefore left the temporary file on disk — and that file holds the
+# FULL settings content, which is credential-adjacent.
+#
+# Converting it to KeyboardInterrupt makes the existing arm real: it unlinks the
+# temp and re-raises, so the exit is still a failure and nothing is silently
+# swallowed. SIGINT already behaves this way, which is why the arm looked
+# correct when it was written.
+def _term_raises(_signum, _frame):
+    raise KeyboardInterrupt("SIGTERM")
+
+
+try:
+    signal.signal(signal.SIGTERM, _term_raises)
+except (ValueError, OSError):
+    pass   # not the main thread, or a platform without it — best effort
 
 # Resolve symlinks FIRST: a dotfiles-managed settings.json is common, and
 # write-by-rename onto the link would replace it with a regular file — forking
