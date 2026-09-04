@@ -417,14 +417,6 @@ When a user shares a file path or URL in conversation:
   anything that resolves its target from the directory it runs in (e.g.
   `review_state.py` `evidence-path`/`mark`). Run those from the worktree they
   are about. Detail in the genesis-development skill.
-- **Check closing tags on long tool-call parameters.** A closing tag that does
-  not match its opening tag silently swallows every following parameter into the
-  preceding string; the tool then reports those parameters as *missing*, which
-  reads like a tool bug and is not one. It recurs on long, multi-sentence values.
-  Repeated IDENTICAL validation errors mean the CALL is malformed — the error
-  echoes `input_value`, which holds the proof; read it, and check whether the
-  same tool succeeded earlier in the session, before concluding anything about
-  the tool.
 - **AskUserQuestion — always pass ≥2 questions.** Never call `AskUserQuestion`
   with a single question — a Claude Code rendering bug rejects single-question
   calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
@@ -487,7 +479,37 @@ When a user shares a file path or URL in conversation:
 - **Read before writing.** Never modify code you haven't fully read.
   Don't assume what a function does based on its name.
 - **Self-correction loop**: persist lessons as concrete rules that PREVENT
-  mistakes, not just document them.
+  mistakes, not just document them. A rule that only names the error is not
+  preventive — state the CORRECT action, or it will be re-read while the same
+  mistake repeats.
+- **A tool call that reports parameters *missing* is usually malformed, not
+  buggy — and the echoed payload is what tells you which.** The diagnosis below
+  is encoding-independent; the concrete form is not, so take the form from your
+  own client.
+
+  **Read the echoed `input_value` first.** It shows how far each value actually
+  ran, which is what separates a malformed CALL from a wrong value or a genuine
+  tool defect — repeated identical errors on their own establish none of the
+  three, since resubmitting an invalid enum, or hitting a deterministic callee
+  defect, also fails identically every time. If a value ran PAST where it should
+  have ended and swallowed the parameters after it, fix the STRUCTURE, not the
+  text. If it ended where it should have, the structure is fine and the value or
+  the tool is the problem — and what separates those two is the value checked
+  against the tool's own documented contract, not whether that tool worked
+  earlier. Prior success proves nothing here: a defect can be input-dependent,
+  accepting one payload and wrongly rejecting the next. If the value is
+  documented-valid and still rejected, that IS the bug report. Most likely on
+  long, multi-sentence values. Never file a bug report from a payload you have
+  not read — and never suppress one because the tool worked a moment ago.
+
+  **In Claude Code specifically**, parameters are
+  `<parameter name="X">…</parameter>`. A bare `<X>…</X>` is not a shorthand: the
+  wrapper is the only recognised form, so the opening tag never starts a
+  parameter and its `</X>` closes nothing — which is what produces the run-on
+  above. This file is also the canonical instruction set for Codex, Cursor,
+  OpenCode and others (see `AGENTS.md`), whose call encodings are client-defined
+  and may be JSON or another protocol entirely. **Do not apply this
+  serialization outside Claude Code** — there it would corrupt a valid call.
 - **NEVER hide broken things — FIX THEM.** Fix the root cause, not the
   symptom. This is a thinking rule, not just a code rule.
 - **Bugs you see get fixed or tracked — never ignored.** Fix now by default; a
