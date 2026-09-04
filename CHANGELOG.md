@@ -32,6 +32,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **A `tmux kill-server` with no socket binding now draws an advisory.** tmux
+  resolves its target server from the inherited `$TMUX` variable before
+  `TMUX_TMPDIR`, so a cleanup aimed at a scratch or probe server can address
+  the main server instead and take down every live session on it — including
+  the one issuing the command. A new advisory-tier guard flags the unbound
+  form and suggests binding the kill to its socket (`-S`/`-L`) or clearing the
+  inherited variable. Session-scoped kills (`kill-session`) are deliberately
+  not flagged, and the advisory never blocks anything.
+
 - **The review-round limit now has an end, not just a speed bump.** The existing
   limit pauses after three rounds in which an independent reviewer keeps finding new
   problems, and asks for a conscious decision to continue — but acknowledging it

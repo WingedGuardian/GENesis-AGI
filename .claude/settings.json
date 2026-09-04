@@ -171,6 +171,16 @@
                 "hooks": [
                     {
                         "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/tmux_kill_server_guard.py",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/destructive_command_guard.py",
                         "timeout": 10
                     },
