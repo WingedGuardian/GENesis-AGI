@@ -116,3 +116,64 @@ async def test_mark_opted_out_is_permanent_suppression(db):
     assert row["opted_out"] == 1
     # An opted-out prospect never re-enters the active set.
     assert await mp.list_active(db) == []
+
+
+@pytest.mark.asyncio
+async def test_mark_contacted_by_email_only_advances_active(db):
+    """The shared by-email stamp used by BOTH delivery paths (drain + granted
+    pipeline). Advances an ACTIVE match → contacted; no-ops (returns False) on an
+    absent recipient or a non-'active' row (never downgrades 'replied'/'contacted',
+    never touches a non-marketing address). Case-insensitive on the email."""
+    await mp.create(db, id="p1", email="Prospect@Example.com", created_at=_TS, updated_at=_TS)
+    # active → contacted (email match is normalized/case-insensitive)
+    assert await mp.mark_contacted_by_email(db, "prospect@example.com", contacted_at=_TS) is True
+    assert (await mp.get_by_id(db, "p1"))["status"] == "contacted"
+    # second call is a no-op — already non-active, never re-stamped/downgraded
+    assert await mp.mark_contacted_by_email(db, "prospect@example.com", contacted_at=_TS) is False
+    # a 'replied' prospect is NEVER downgraded to 'contacted'
+    await mp.create(
+        db, id="p2", email="replied@example.com", status="replied", created_at=_TS, updated_at=_TS
+    )
+    assert await mp.mark_contacted_by_email(db, "replied@example.com", contacted_at=_TS) is False
+    assert (await mp.get_by_id(db, "p2"))["status"] == "replied"
+    # absent recipient → no-op, no crash
+    assert await mp.mark_contacted_by_email(db, "nobody@example.com", contacted_at=_TS) is False
+
+
+@pytest.mark.asyncio
+async def test_mark_contacted_by_email_matches_mixed_case_seeded_row(db):
+    """A directly-seeded row with a mixed-case email (bypassing create()'s
+    normalization — e.g. a future bulk-import path) is still matched
+    case-insensitively (get_by_email COLLATE NOCASE), so the delivery stamp never
+    misses it and re-pitches a delivered prospect."""
+    await db.execute(
+        "INSERT INTO marketing_prospects (id, email, status, opted_out, created_at, updated_at) "
+        "VALUES ('mc', 'Mixed@Example.com', 'active', 0, ?, ?)",
+        (_TS, _TS),
+    )
+    await db.commit()
+    assert await mp.mark_contacted_by_email(db, "mixed@example.com", contacted_at=_TS) is True
+    assert (await mp.get_by_id(db, "mc"))["status"] == "contacted"
+
+
+@pytest.mark.asyncio
+async def test_mark_contacted_by_email_is_atomic_no_read_then_write(db, monkeypatch):
+    """The stamp is a single conditional UPDATE (`WHERE ... AND status = 'active'`),
+    NOT a read-then-write — so a concurrent active→replied flip between a lookup and an
+    update can't clobber the newer state back to 'contacted' (the never-downgrade
+    guarantee holds under concurrency). Proven structurally: it performs NO get_by_email
+    read before its write. RED on the old read-then-write (get_by_email → unconditional
+    mark_contacted)."""
+    calls: list[str] = []
+    orig = mp.get_by_email
+
+    async def spy_get_by_email(conn, email):
+        calls.append(email)
+        return await orig(conn, email)
+
+    monkeypatch.setattr(mp, "get_by_email", spy_get_by_email)
+
+    await mp.create(db, id="p1", email="prospect@example.com", created_at=_TS, updated_at=_TS)
+    assert await mp.mark_contacted_by_email(db, "prospect@example.com", contacted_at=_TS) is True
+    assert (await mp.get_by_id(db, "p1"))["status"] == "contacted"
+    assert calls == []  # atomic: no read-before-write window a concurrent flip could exploit

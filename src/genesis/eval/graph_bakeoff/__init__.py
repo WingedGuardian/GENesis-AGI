@@ -2,8 +2,8 @@
 
 Collects DATA to inform the 2026-08-14 engine decision (NetworkX-incremental vs
 LadybugDB vs FalkorDB) for Genesis's memory graph. It does NOT compute a winner:
-the findings doc reports raw numbers; Jay + Genesis make the subjective call
-jointly (decision protocol, 2026-08-06).
+the findings doc reports raw numbers; the owner and Genesis make the subjective
+call jointly (decision protocol, 2026-08-06).
 
 Design invariants:
 - Read-only against a FROZEN snapshot (every number cites the snapshot sha256).
