@@ -1313,7 +1313,14 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   paths at ANY size, and `_classify_post_review_delta` tests the DELTA's files
   rather than the PR's — so a CHANGELOG-only fix stays trivial even on a
   hook-surface PR (verified: CHANGELOG-only → `inline`; a 1-line guard change →
-  `substantial`). Zero blocks, zero review rounds, one commit.
+  `substantial`). So it costs zero CODEX rounds — but not zero blocks, and the
+  difference matters when you are budgeting the follow-up. On the canonical
+  public repo the SCHEDULED-review gate is head-pinned per kind, and only
+  `leaks` has ancestor relief (`_MECHANICAL_RESCAN_BY_KIND`); `code-review` has
+  none. So the push moves the head, the earlier `code-review` marker stops
+  counting, and that gate blocks until a fresh scheduled review lands at the new
+  head. Budget the follow-up as: one commit, no Codex round, one scheduled
+  `code-review` at the new head.
   So: read every finding the report prints, fix the cheap ones, then merge.
   The read is what the standing merge-when-green policy is buying — a gate
   verdict of `ok` is not a report that there is nothing there.
@@ -1742,8 +1749,16 @@ The review-findings gate specifically:
    it, or when it is on a DOCUMENTATION path — and the doc-path exclusion covers
    **P1s as well as P2s** (`_is_doc_path`: CHANGELOG/README/LICENSE/NOTICE, any
    `*.rst`, and `*.md` under a top-level `docs/`). Codex is a CODE reviewer by
-   standing user directive (2026-08-10, PR #1362), so its prose findings never
-   block. Pure WARNINGs/NOTEs (non-P1/P2) → merge allowed.
+   standing user directive (2026-08-10, PR #1362), and that exclusion is how the
+   directive is enforced — but it is an ALLOWLIST OF PATHS, not a judgement about
+   prose, so "its prose findings never block" is broader than the gate. Prose
+   OUTSIDE the list still blocks, and the near misses are the files this repo
+   edits constantly: `AGENTS.md`, `.claude/skills/**/SKILL.md`, `.claude/**/*.md`
+   and any `*.md` outside a top-level `docs/` all return False from
+   `_is_doc_path`, so a P1 anchored on one contributes its full 1.0. Read the
+   PATH, not the file type — the paragraph below exists because a broader claim
+   than the code cost a session, and this sentence was the same mistake one
+   clause over. Pure WARNINGs/NOTEs (non-P1/P2) → merge allowed.
 
    **This paragraph used to say "any P1" blocks, which was FALSE, and the
    divergence cost a whole session.** A P1 anchored on `CHANGELOG.md` merged
