@@ -49,10 +49,17 @@ from shell_parse import (  # noqa: E402
 # as the verdict. As the verdict it was quote-blind: it matched the phrase inside
 # a quoted grep pattern, a heredoc body or a commit message, and target
 # extraction then read the following word as a path, so a read-only search was
-# refused with "use the lifecycle manager". MEASURED over 51,052 (command,
+# refused with "use the lifecycle manager". Observed over 51,052 (command,
 # directory) pairs, replayed from the directory each was typed in: this coarse
 # predicate blocks 154, the parser below also blocks 154, and 148 are common —
 # so the swap releases 6 mentions and catches 6 real removals.
+#
+# PROVENANCE, because the distinction matters: this is one operator's local
+# session history at 2026-09-03, not a published result. The corpus is built
+# from real transcripts and holds secrets passed in argv, so it can never be
+# checked in and no reader or fork can reproduce or falsify these totals. Treat
+# them as the SCALE at which the swap was observed. The composition is the
+# claim; the totals are context.
 #
 # The numbers here churned twice, which is the reason for the precision: an
 # earlier draft said 147/3, a later one 150/146/4 over a 48,363-command corpus
@@ -70,15 +77,21 @@ _OPERATION = "remove"
 # `eval '<removal>'`, `ssh box "<removal>"`, `find -exec`, `parallel`, `watch`,
 # `script -c` all tokenize PERFECTLY. The parser reads the carrier as the
 # executable, skips the segment, finds no target, and the removal is allowed.
-# MEASURED against the pre-parser version: 9 real removals it blocked and the
-# parser let through.
+# Observed against the pre-parser version: 9 real removals it blocked and the
+# parser let through (same local corpus and caveat as above).
 #
 # This list IS an open set, and unlike the shell-side arms that fact is
 # tolerable here, because of the direction it fails in: a carrier absent from
 # the list costs a missed block (bad, but no worse than not having the list),
 # while every ADDITION only ever routes more commands to the coarse extractor.
-# The list grows toward safety and each entry was measured free or nearly so.
-# Adding one is a one-line change with no design question attached.
+# The list grows toward safety, which is why adding an entry is a one-line
+# change with no design question attached.
+#
+# Read that as a claim about DIRECTION, not about cost. The entries present were
+# observed cheap on one install's history; that measurement is not something a
+# later contributor can repeat, so the safety of an addition rests on the
+# argument above — it can only route MORE commands to the coarse extractor —
+# and never on a number. Do not add one believing its cost has been checked.
 _COMMAND_CARRIER = re.compile(
     r"(?:^|[\s;&|(])(?:eval|ssh|find|parallel|watch|script|su|docker|flock|xargs)(?:\s|$)"
     r"|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{"
@@ -262,7 +275,8 @@ def _handle_bash(data: dict) -> int:
         # Ordered deliberately: the carrier test runs ONLY when the parser found
         # nothing, so a normally-parsed command never touches it, and a mention
         # inside `grep`/`echo`/`git commit -m` is unaffected because no carrier
-        # is present. MEASURED over 51,052 real commands: +2 blocks (0.004%).
+        # is present. Observed over the same local 51,052-command history:
+        # +2 blocks (0.004%) — scale, not a reproducible result.
         if not targets and _WORKTREE_REMOVE.search(cmd) and _COMMAND_CARRIER.search(cmd):
             targets = _legacy_targets(cmd)
     if not targets:

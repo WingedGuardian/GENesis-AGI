@@ -253,12 +253,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   friction: a blocked command is discarded *whole*, so a false match on the last
   step silently threw away the file writes in the earlier ones while the error
   mentioned only the rule that fired. The check now keys on the parsed command —
-  the executable, its subcommand and its real arguments. Measured over 51,052
-  unique (command, directory) pairs from real session history, each replayed from
-  the directory it was typed in: 154 commands blocked before and 154 after, but
-  it is a different set — 6 refusals of commands that merely *mention* a removal
-  are released, and 6 real removals that were previously allowed are caught. The
-  unchanged total is why the composition is quoted rather than the count.
+  the executable, its subcommand and its real arguments. Replayed over 51,052
+  unique (command, directory) pairs from one install's own session history, each
+  from the directory it was typed in: 154 commands blocked before and 154 after,
+  but it is a different set — 6 refusals of commands that merely *mention* a
+  removal are released, and 6 real removals that were previously allowed are
+  caught. The unchanged total is why the composition is quoted rather than the
+  count. That corpus is built from real transcripts and cannot be published, so
+  these totals are the scale at which the change was observed rather than a
+  result anyone else can reproduce; the composition is the claim.
 - **A worktree removal hidden behind a global git flag is now caught.** The
   check required `git` to be followed immediately by the subcommand, so
   `git -C <path> worktree remove <target>` slipped past it entirely. Two shapes

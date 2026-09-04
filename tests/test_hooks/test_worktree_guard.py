@@ -361,10 +361,12 @@ class TestFailOpen:
 # because the regex required `git` immediately followed by `worktree` —
 # `git -C <path> worktree remove <target>` slipped straight through.
 #
-# MEASURED over 51,052 (command, directory) pairs from this install's
+# Observed over 51,052 (command, directory) pairs from this install's
 # transcripts, each replayed from the directory it was typed in: 154 blocked
 # before and 154 after — a DIFFERENT set, freeing 6 mention-only refusals and
-# catching 6 real removals the old predicate allowed.
+# catching 6 real removals the old predicate allowed. Those transcripts hold
+# real commands and cannot be published, so this is the scale at which the swap
+# was observed on one install, not a result another reader can re-derive.
 #
 # An earlier draft of this comment said "48,363 … frees 4 … 150 -> 152". That
 # was a superseded corpus (before the harness replayed each command from its own
