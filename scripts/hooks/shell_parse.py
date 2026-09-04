@@ -101,8 +101,44 @@ _WRAPPER_SPEC = {
         },
         0,
     ),
+    # Tool-runner front-ends that take the wrapped command directly, with no
+    # subcommand between: `uvx pytest …`, `xvfb-run pytest …`.
+    "uvx": ({"--from", "--with", "--python", "-p", "--index", "--constraints"}, 0),
+    "xvfb-run": ({"-n", "--server-num", "-s", "--server-args", "-f", "--auth-file", "-e"}, 0),
 }
 _WRAPPERS = set(_WRAPPER_SPEC)
+# Package managers / task runners that carry a real command after a literal
+# `run` subcommand: `uv run pytest …`, `poetry run pytest …`.
+#
+# Gated on the subcommand LITERAL rather than modelled as a positional-consuming
+# _WRAPPER_SPEC entry, and that distinction is load-bearing for safety. A blanket
+# `("uv", (set(), 1))` would consume the first bare word of EVERY uv subcommand,
+# so `uv rm -rf /` would eat `rm` and resolve the exe past it — HIDING a command
+# the destructive gate catches today. Revealing a wrapped command is the
+# monotonic-safe direction this resolver promises; skipping past one is not.
+# A front-end invoked with any other subcommand (`uv pip install …`) is therefore
+# left resolving to the front-end itself, exactly as before.
+_RUN_CARRIERS = frozenset({"uv", "poetry", "hatch", "pdm", "pipenv", "rye"})
+# Value-consuming flags accepted BEFORE the wrapped command, on either the
+# front-end or its `run` subcommand. Non-exhaustive BY DESIGN: an unlisted
+# `--flag value` leaves `value` resolving as the exe, which can only ADD a
+# gate hit (an over-block on an exotic form), never remove one.
+_RUN_CARRIER_VALUE_FLAGS = frozenset(
+    {
+        "--with",
+        "--with-requirements",
+        "--python",
+        "-p",
+        "--directory",
+        "-C",
+        "--project",
+        "--extra",
+        "--group",
+        "--index",
+        "--env-file",
+        "--isolated",
+    }
+)
 # Interpreters that run a script string passed after -c; recurse into it.
 _NESTED = {"bash", "sh", "dash", "zsh", "ksh", "ash"}
 # Shell tokens that can front a SIMPLE COMMAND within a segment (after
@@ -678,6 +714,37 @@ def _basename(token: str) -> str:
     return token.rsplit("/", 1)[-1]
 
 
+def _run_carrier_command_start(argv: list[str], i: int) -> int | None:
+    """Index of the command wrapped by a ``<front-end> run …`` invocation, else None.
+
+    ``argv[i]`` is the front-end (``uv``/``poetry``/…). Returns the index of the
+    first token of the WRAPPED command only when the front-end's first bare word
+    is the literal ``run``; any other subcommand (``uv pip install …``) returns
+    None so the front-end resolves as its own exe and NOTHING is skipped past.
+    That asymmetry is the safety property — see ``_RUN_CARRIERS``.
+    """
+    j = i + 1
+    while j < len(argv):  # the front-end's own flags, ahead of its subcommand
+        t = argv[j]
+        if t == "--":
+            j += 1
+            break
+        if not t.startswith("-"):
+            break
+        j += 2 if (t in _RUN_CARRIER_VALUE_FLAGS and "=" not in t) else 1
+    if j >= len(argv) or argv[j] != "run":
+        return None
+    j += 1
+    while j < len(argv):  # `run`'s own flags, ahead of the wrapped command
+        t = argv[j]
+        if t == "--":
+            return j + 1
+        if not t.startswith("-"):
+            return j
+        j += 2 if (t in _RUN_CARRIER_VALUE_FLAGS and "=" not in t) else 1
+    return None  # `uv run --flag` with no command after it
+
+
 def _strip_wrappers(argv: list[str]) -> list[str]:
     """Drop leading shell command-position tokens, env-assignments (VAR=x), and
     wrapper commands (sudo/env/…) so the returned argv[0] is the ACTUAL executed
@@ -738,6 +805,12 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
             continue
         if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
             i += 1  # leading VAR=value assignment
+            continue
+        if _basename(tok) in _RUN_CARRIERS:
+            j = _run_carrier_command_start(argv, i)
+            if j is None:
+                break  # not a `run` invocation — the front-end IS the command
+            i = j
             continue
         spec = _WRAPPER_SPEC.get(_basename(tok))
         if spec is None:
