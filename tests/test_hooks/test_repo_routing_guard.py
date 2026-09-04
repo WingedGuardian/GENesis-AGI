@@ -364,3 +364,197 @@ def test_empty_tool_input_passes(agi_repo, topology):
         timeout=20,
     )
     assert r.returncode == 0
+
+
+# ── the check that did not run: audible, never blocking ─────────────────
+#
+# The guard joined an unexpanded `cd` token onto the current directory, so
+# `cd $W && git add .` produced a path like `<cwd>/$W`. That cannot exist, so
+# every git lookup failed, `origin` came back empty, and the invocation was
+# dropped at the `if not origin` guard — the SAME branch that means "this repo
+# is not in the topology". A command the guard could not scope was therefore
+# indistinguishable from one it deliberately ignored.
+#
+# MEASURED before fixing, on the SAME population the notice fires for: of the
+# 119 real commands (out of 2,264 carrying a `git add`/`commit`) whose directory
+# the guard cannot derive, the pre-change guard blocked 0 — the check was
+# skipped silently every time. It fails OPEN. That is why this is an ADVISORY
+# and not a new refusal: making it fail closed would newly stop 119 ordinary
+# commands, and nobody has ever been wrongly blocked by the bug.
+#
+# An earlier draft quoted "0 of 70" beside "119 of 2,264" as though they were
+# one measurement. They were two populations from two corpora. One population,
+# both numbers, or neither.
+
+
+def _advisory(result) -> str:
+    """The additionalContext string, or '' when the guard said nothing."""
+    if not result.stdout.strip():
+        return ""
+    return json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cd $WORKTREE && git add .",
+        "cd ${W}/sub && git add .",
+        "cd $(pwd)/x && git add .",
+        "cd /nope/*/x && git add .",
+        "git -C $W add .",
+    ],
+)
+def test_an_unscopeable_directory_is_reported_not_swallowed(agi_repo, topology, cmd):
+    """REGRESSION PIN. Exit stays 0 — this must never become a block."""
+    r = _run(cmd, agi_repo, topology)
+
+    assert r.returncode == 0, r.stderr
+    assert "did NOT run" in _advisory(r)
+
+
+def test_a_directory_that_does_not_exist_is_reported(agi_repo, topology):
+    """Positive validation, not just metacharacter enumeration.
+
+    Listing the constructs bash expands only ever catches the ones somebody
+    thought of. Asking whether the answer is a real directory closes the class.
+    """
+    r = _run("cd /definitely/not/here && git add .", agi_repo, topology)
+
+    assert r.returncode == 0
+    assert "did NOT run" in _advisory(r)
+
+
+def test_a_scopeable_command_stays_silent(agi_repo, topology):
+    """TRUE-NEGATIVE CONTROL — the notice must not fire on ordinary work.
+
+    Without this, a guard that emitted the notice unconditionally would pass
+    every test above.
+    """
+    _write(agi_repo, "src/genesis/core.py")
+    r = _run("git add src/genesis/core.py", agi_repo, topology)
+
+    assert r.returncode == 0
+    assert _advisory(r) == ""
+
+
+def test_a_repo_with_no_origin_stays_silent(tmp_path, topology):
+    """The OTHER skip that shares the same `continue`, and it must stay quiet.
+
+    A real directory whose repo is not in the topology is documented as
+    unguarded. Only the could-not-scope case is new and reportable; conflating
+    them would make the notice fire on every unrelated repository on the box.
+    """
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(plain)], check=True)
+    _write(plain, "a.txt")
+
+    r = _run("git add a.txt", plain, topology)
+
+    assert r.returncode == 0
+    assert _advisory(r) == ""
+
+
+def test_a_strong_hit_before_an_unscopeable_leg_still_blocks(agi_repo, topology):
+    """A hit in the FIRST leg still blocks, and the unscoped leg is mentioned
+    rather than replacing it.
+
+    Pins one ORDERING only. The docstring used to claim the general property
+    ("the verdict is unchanged by the new bookkeeping") while asserting just
+    this safe direction — and the reversed order was exactly where an
+    allow-regression hid. The sibling test below pins that one.
+    """
+    _write(agi_repo, "firmware/boot.py")
+    r = _run("git add firmware/boot.py && cd $W && git add .", agi_repo, topology)
+
+    assert r.returncode == 2
+    assert "GENesis-Voice" in r.stderr
+    assert "could not be scoped" in r.stderr
+
+
+def test_an_absolute_leg_still_scopes_after_an_unresolvable_cd(agi_repo, topology):
+    """REGRESSION PIN for an allow-regression an adversarial audit found.
+
+    `_resolve_dir` consulted the base BEFORE testing whether the token was
+    absolute, so one unresolvable `cd` blinded every later leg — including legs
+    naming their directory absolutely. MEASURED old=BLOCK / broken=ALLOW /
+    fixed=BLOCK on three real wrong-repo shapes. An absolute path is knowable
+    whatever the earlier `cd` did.
+    """
+    _write(agi_repo, "firmware/boot.py")
+    r = _run(f"cd $W && git -C {agi_repo} add firmware/boot.py", agi_repo.parent, topology)
+
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "GENesis-Voice" in r.stderr
+
+
+def test_an_absolute_cd_also_recovers_from_an_unresolvable_one(agi_repo, topology):
+    """The `cd` form of the same recovery, not just the `-C` form."""
+    _write(agi_repo, "firmware/boot.py")
+    r = _run(f"cd $W && cd {agi_repo} && git add firmware/boot.py", agi_repo.parent, topology)
+
+    assert r.returncode == 2, r.stdout + r.stderr
+
+
+def test_a_quoted_literal_path_is_not_treated_as_an_expansion(tmp_path, topology):
+    """The metacharacter class must not reject a real directory.
+
+    shlex erases the quoting before the token arrives, so a wider class cannot
+    tell `cd '/srv/a (wt)'` — a directory that exists and holds a wrong-repo hit
+    — from a subshell. MEASURED: adding `[{()<>` to the class stopped the guard
+    checking this directory entirely. The narrow class plus the positive
+    is-it-a-real-directory validation covers both sides.
+    """
+    spaced = _make_repo(tmp_path / "agi (wt)", AGI)
+    _write(spaced, "firmware/boot.py")
+
+    r = _run(f"cd '{spaced}' && git add firmware/boot.py", tmp_path, topology)
+
+    assert r.returncode == 2, r.stdout + r.stderr
+
+
+def test_the_notice_composes_with_a_weak_hit(agi_repo, topology):
+    """Both advisories reach the caller. Only ONE JSON object may be printed,
+    so a second `print` would have produced two concatenated objects and the
+    harness would have parsed neither."""
+    _write(agi_repo, "satellite/config.py")
+    r = _run("git add satellite/config.py && cd $W && git add .", agi_repo, topology)
+
+    assert r.returncode == 0
+    note = _advisory(r)
+    assert "satellite/config.py" in note
+    assert "did NOT run" in note
+
+
+def test_a_directory_literally_containing_expansion_syntax_is_checked(tmp_path, topology):
+    """REGRESSION PIN for a BLOCK -> ALLOW the character class caused.
+
+    A directory can literally be named `$repo`. shlex removes the quoting
+    before the token arrives, so `cd '$repo'` and `cd $repo` are
+    indistinguishable — and refusing on the `$` skipped the check entirely on
+    a real wrong-repo add inside a directory that exists.
+
+    Same class as the `[{()<>` over-coverage a round earlier, for the four
+    characters that survived that narrowing. Fixed the same way: ask whether
+    the answer EXISTS before consulting any character class.
+    """
+    odd = _make_repo(tmp_path / "$repo", AGI)
+    _write(odd, "firmware/boot.py")
+
+    r = _run(f"cd '{odd}' && git add firmware/boot.py", tmp_path, topology)
+
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "GENesis-Voice" in r.stderr
+
+
+def test_an_unexpanded_variable_naming_nothing_is_still_unresolvable(agi_repo, topology):
+    """TRUE-NEGATIVE CONTROL — the character class must still do its job.
+
+    Without this, "accept anything that exists" would degrade into "accept
+    everything": an unexpanded `$W` names no directory, so it must still be
+    reported as unscopeable rather than silently joined onto the cwd.
+    """
+    r = _run("cd $NOSUCHVAR_XYZ && git add .", agi_repo, topology)
+
+    assert r.returncode == 0
+    assert "did NOT run" in _advisory(r)

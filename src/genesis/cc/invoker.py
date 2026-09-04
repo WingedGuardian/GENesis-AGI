@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import signal
+import subprocess
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -70,7 +71,38 @@ def set_oom_score_adj(pid: int, score: int = 500) -> bool:
         return False
 
 
-def _build_scope_args() -> list[str]:
+# The unit properties the scope actually carries. ONE tuple, consumed by BOTH
+# the probe and the real invocation, because a probe that omits them answers a
+# weaker question than the one that matters. systemd-run exits non-zero on a
+# property it cannot accept — MEASURED on systemd 255: an unknown assignment
+# ("Unknown assignment: BogusProperty=1") and an unparseable value ("Failed to
+# parse MemoryMax=...") both exit 1 — and older systemd predates the ``N%``
+# syntax these use. A property-free probe therefore SUCCEEDS on such a box, its
+# verdict is cached for the process lifetime, and every real dispatch then dies
+# inside systemd-run before Claude starts: the exact fail-closed-to-dead outcome
+# the probe was added to prevent, converted from "no isolation" to "no CC".
+# The sibling probe-then-commit sites (.claude/mcp/run-codebase-memory,
+# scripts/lib/code_intel_index.sh) already set their own properties at probe
+# time for this reason; this was the one that did not.
+_SCOPE_PROPERTIES = ("IOWeight=100", "MemoryHigh=62%", "MemoryMax=75%")
+
+
+def _scope_argv(*trailing: str) -> list[str]:
+    """`systemd-run` argv carrying `_SCOPE_PROPERTIES`, then `trailing` after `--`.
+
+    With no `trailing` this is the prefix a caller prepends to its own command;
+    with `/bin/true` it is the probe. Sharing the builder is what keeps the two
+    from drifting apart again.
+    """
+    argv = ["systemd-run", "--user", "--scope", "--quiet"]
+    for prop in _SCOPE_PROPERTIES:
+        argv += ["-p", prop]
+    argv.append("--")
+    argv.extend(trailing)
+    return argv
+
+
+def _build_scope_args(announce: bool = True) -> list[str]:
     """Build systemd-run prefix for CC subprocess I/O isolation.
 
     Wraps the CC subprocess in a transient systemd scope with resource
@@ -83,34 +115,151 @@ def _build_scope_args() -> list[str]:
     a heavy CC build from OOM-ing the box while auto-scaling up on larger
     installs and down on the 8 GiB floor — no hardcoded ceiling to re-tune.
 
-    Returns an empty list if systemd-run is unavailable (graceful degradation).
+    Returns an empty list if systemd-run is unavailable (graceful degradation)
+    OR has no reachable user manager. The probe matters: ``which`` alone is not
+    enough — an env-scrubbed spawner (some agent CLIs' shell tooling, CI
+    runners, a stripped systemd context) has the binary but no
+    DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR, and ``systemd-run --user`` then
+    dies instantly with "Failed to connect to bus", taking the CC subprocess
+    down with it at 0.0s. Measured on a live install.
+    Same probe-then-commit pattern as .claude/mcp/run-codebase-memory, and the
+    probe sets the SAME properties as the real invocation (`_SCOPE_PROPERTIES`)
+    so a property the manager rejects fails at probe time rather than on every
+    dispatch afterwards.
+
+    Caching is asymmetric and lives in `_get_scope_args`: a SUCCESS is cached
+    for the process lifetime, a FAILURE only until a backoff elapses. Set
+    ``announce`` False on a retry so a permanently-unscoped box logs the
+    warning once rather than on every re-probe forever.
     """
     if not shutil.which("systemd-run"):
         return []
-    return [
-        "systemd-run",
-        "--user",
-        "--scope",
-        "--quiet",
-        "-p",
-        "IOWeight=100",
-        "-p",
-        "MemoryHigh=62%",
-        "-p",
-        "MemoryMax=75%",
-        "--",
-    ]
+    try:
+        probe = subprocess.run(
+            _scope_argv("/bin/true"),
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        # Same announced degradation as the non-zero-exit branch below. Without
+        # it a timeout or a systemd-run that vanished between `shutil.which` and
+        # exec drops MemoryHigh/MemoryMax silently, and the operator has no way
+        # to tell an unscoped box from a scoped one.
+        _log = logger.warning if announce else logger.debug
+        _log(
+            "systemd-run --user probe raised (%s: %s) — CC subprocesses will run "
+            "WITHOUT the cgroup scope (no MemoryHigh/MemoryMax isolation)",
+            type(exc).__name__,
+            exc,
+        )
+        return []
+    if probe.returncode != 0:
+        _log = logger.warning if announce else logger.debug
+        _log(
+            "systemd-run --user probe failed (no user manager?) — CC subprocesses "
+            "will run WITHOUT the cgroup scope (no MemoryHigh/MemoryMax isolation): %s",
+            probe.stderr.decode(errors="replace").strip()[:200],
+        )
+        return []
+    return _scope_argv()
 
 
-# Cache the scope args — they don't change during a process's lifetime.
+# Cache the scope args. SUCCESS is cached for the process lifetime — a working
+# user manager does not stop working, and the probe costs a subprocess.
+#
+# FAILURE is not, and the difference is the whole point. The old comment here
+# ("they don't change during a process's lifetime") was written when this
+# guarded a deterministic `shutil.which` result. It now guards a PROBE, which
+# can fail transiently: a timeout under load, or `systemd --user` restarting
+# during an update. genesis-server is long-lived, so caching one such failure
+# forever silently drops MemoryHigh=62%/MemoryMax=75% from EVERY subsequent CC
+# subprocess, for days — on a swapless box, which is the exact scenario the
+# scope exists to prevent (see _build_scope_args). The degradation is announced
+# once in a log line and then never re-evaluated, so the fail-open outlives its
+# cause.
+#
+# The retry schedule ESCALATES rather than repeating at a fixed interval,
+# because the two documented failure causes have opposite lifetimes. A user
+# manager bouncing during a deploy resolves in seconds to minutes — worth
+# re-probing soon. An env-scrubbed spawner with no reachable bus
+# (_build_scope_args's docstring) is a PERMANENT property of that box, and a
+# fixed 300s retry would probe it forever and log a warning 288x/day, turning
+# a once-per-process announcement into noise. Escalating recovers fast from the
+# transient case and decays to hourly on the permanent one.
+_SCOPE_RETRY_SCHEDULE_S = (300.0, 900.0, 3600.0)
+
 _SCOPE_ARGS: list[str] | None = None
+_SCOPE_PROBE_FAILED_AT: float | None = None
+_SCOPE_PROBE_FAILURES = 0
+_SCOPE_PROBE_LOCK: asyncio.Lock | None = None
 
 
-def _get_scope_args() -> list[str]:
-    global _SCOPE_ARGS  # noqa: PLW0603
-    if _SCOPE_ARGS is None:
-        _SCOPE_ARGS = _build_scope_args()
-    return _SCOPE_ARGS
+def _now() -> float:
+    """Monotonic clock seam.
+
+    Tests patch THIS, not `time.monotonic`. `invoker.time` is the stdlib module
+    object, so monkeypatching its attribute replaces the clock for the whole
+    interpreter for the duration of the test — including anything else pytest
+    or a plugin is timing.
+    """
+    return time.monotonic()
+
+
+def reset_scope_cache() -> None:
+    """Test hook: clear the cached probe verdict and its backoff state."""
+    global _SCOPE_ARGS, _SCOPE_PROBE_FAILED_AT, _SCOPE_PROBE_FAILURES  # noqa: PLW0603
+    _SCOPE_ARGS = None
+    _SCOPE_PROBE_FAILED_AT = None
+    _SCOPE_PROBE_FAILURES = 0
+
+
+def _scope_probe_lock() -> asyncio.Lock:
+    """Single-flight guard: concurrent dispatches share one probe, not N."""
+    global _SCOPE_PROBE_LOCK  # noqa: PLW0603
+    if _SCOPE_PROBE_LOCK is None:
+        _SCOPE_PROBE_LOCK = asyncio.Lock()
+    return _SCOPE_PROBE_LOCK
+
+
+def _scope_cooldown_active() -> bool:
+    if _SCOPE_PROBE_FAILED_AT is None:
+        return False
+    idx = min(max(_SCOPE_PROBE_FAILURES - 1, 0), len(_SCOPE_RETRY_SCHEDULE_S) - 1)
+    return _now() - _SCOPE_PROBE_FAILED_AT < _SCOPE_RETRY_SCHEDULE_S[idx]
+
+
+async def _get_scope_args() -> list[str]:
+    """Cached scope args. Success is permanent; failure retries on a backoff.
+
+    ASYNC because the probe is a blocking `subprocess.run` with a 15s ceiling
+    and both callers sit on the event loop. Retrying a failed probe on a timer
+    — which is the whole point of the backoff — would otherwise reintroduce
+    that stall periodically instead of once per process, on exactly the path
+    (a probe that already failed, possibly by timing out) where it is most
+    likely to be slow.
+    """
+    global _SCOPE_ARGS, _SCOPE_PROBE_FAILED_AT, _SCOPE_PROBE_FAILURES  # noqa: PLW0603
+    if _SCOPE_ARGS:
+        return _SCOPE_ARGS
+    if _scope_cooldown_active():
+        return []
+    async with _scope_probe_lock():
+        # Re-check under the lock: a concurrent dispatch may have probed while
+        # this one waited, and its verdict is the one to honour.
+        if _SCOPE_ARGS:
+            return _SCOPE_ARGS
+        if _scope_cooldown_active():
+            return []
+        first_failure = _SCOPE_PROBE_FAILURES == 0
+        args = await asyncio.to_thread(_build_scope_args, first_failure)
+        if args:
+            _SCOPE_ARGS = args
+            _SCOPE_PROBE_FAILED_AT = None
+            _SCOPE_PROBE_FAILURES = 0
+        else:
+            _SCOPE_PROBE_FAILED_AT = _now()
+            _SCOPE_PROBE_FAILURES += 1
+        return _SCOPE_ARGS or []
 
 
 # A minimal, runtime-generated CC settings file that registers ONLY the span
@@ -856,7 +1005,7 @@ class CCInvoker:
         # write is denied that premise never held. False until the write succeeds.
         oom_adjusted = False
         try:
-            scope_args = _get_scope_args()
+            scope_args = await _get_scope_args()
             proc = await asyncio.create_subprocess_exec(
                 *scope_args,
                 *args,
@@ -1067,7 +1216,7 @@ class CCInvoker:
         # DirectSessionRunner take, so a reap here is the one a human is waiting on.
         oom_probe = OomProbe.sample()
         try:
-            scope_args = _get_scope_args()
+            scope_args = await _get_scope_args()
             proc = await asyncio.create_subprocess_exec(
                 *scope_args,
                 *args,
