@@ -58,6 +58,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A test run fronted by a package-manager runner no longer slips past the
+  full-suite guard.** The guard that stops a whole-suite pytest run on a shared
+  box keyed on the command being `pytest` itself, so `uv run pytest tests/`,
+  `uvx pytest tests/`, `poetry run pytest tests/` and their hatch/pdm/xvfb-run
+  equivalents sailed through while the bare form was blocked. The shell parser
+  now sees through these runners to the command they carry — but only through
+  their `run` subcommand, deliberately: treating the whole tool as a
+  pass-through would have made the parser skip past the first word of *every*
+  subcommand, hiding commands that other guards catch today. Any other
+  subcommand still resolves to the tool itself. Replayed against 37,568 real
+  commands from this install's history: one resolution changed, and it was a
+  `poetry run python` the parser had been reading as `poetry` — the fix
+  behaving, not a casualty.
+
 - **Two branches that each add a changelog entry no longer collide over it.**
   This file is an append-only list of independent bullets, so two branches
   adding an entry under the same heading are not disagreeing about anything —
