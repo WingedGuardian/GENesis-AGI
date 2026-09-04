@@ -195,10 +195,14 @@ only replaying a known-positive tells them apart.
 **Scope first, because bounding is often correct.** A bounded PREVIEW whose full
 value stays retrievable from its store is a selection with a pointer, not an
 amputation — `memory/proactive.py:418` renders `principle[:200]` into the
-injection block on purpose, and the whole record is one `memory_expand` away.
-Bounding is likewise correct against a hard external budget (a hook stdout cap, a
-DB column, a context window). This section is about the other case: a value that
-is the ONLY copy, where cutting it destroys the information for good.
+injection block on purpose, and the whole record comes back from
+`procedure_recall`. Name the RIGHT retrieval path when you claim one: procedures
+live in SQLite `procedural_memory`, so `memory_expand` — which retrieves from the
+Qdrant collections only — cannot recover them, and a preview whose pointer does
+not resolve is an amputation wearing a citation. Bounding is likewise correct
+against a hard external budget (a hook stdout cap, a DB column, a context
+window). This section is about the other case: a value that is the ONLY copy,
+where cutting it destroys the information for good.
 
 **There, do not truncate.** Not strings, not lists, not context, not output.
 Reaching for a character cap is a signal that a question was skipped, not
@@ -248,6 +252,14 @@ and if there is nobody to raise it with (an unattended background session), the
 default is: emit the value WHOLE and record a follow-up naming the value, the
 population you could not measure, and the decision owed. Never pick the number
 just because no one was there to stop you.
+
+That default is about SIZE, never about secrecy, and the two must not be
+confused. If a value may carry a credential, token, or personal data, the
+unbounded default does NOT apply: fail closed and omit it wholesale with a
+marker, exactly as the "omit explicitly" rule says, and keep only non-sensitive
+metadata in the follow-up. Losing diagnostic prose is recoverable; leaking a
+token is not. Emitting whole and omitting wholesale are the same discipline —
+both refuse to hand on a fragment that looks complete.
 
 ### A blocked compound command loses EVERYTHING in it
 
