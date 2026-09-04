@@ -64,7 +64,7 @@ import signal
 import subprocess
 import sys
 import unicodedata
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -482,7 +482,41 @@ def _sigterm_as_interrupt(signum, frame):  # noqa: ARG001 - signal handler signa
     raise KeyboardInterrupt
 
 
+@contextmanager
+def _sigterm_reconciles() -> Iterator[None]:
+    """Route SIGTERM through the reconciling path, then put the old handler back.
+
+    Installing this globally and LEAVING it there is a bug, not a detail. main()
+    is importable and is called in-process (the tests do exactly that), and a
+    leaked SIGTERM handler is inherited by every process forked afterwards. An
+    unrelated test's multiprocessing children then raised KeyboardInterrupt
+    instead of dying on terminate(), so the parent's join() never returned --
+    MEASURED in CI as two tests hanging for the full 1800s timeout, in a file
+    this change does not touch.
+
+    Restoring is therefore part of the contract: the handler is a property of
+    THIS call, not of the interpreter.
+    """
+    try:
+        prior = signal.signal(signal.SIGTERM, _sigterm_as_interrupt)
+    except (ValueError, OSError):
+        # not the main thread, or no signals here -- best-effort, nothing to undo
+        yield
+        return
+    try:
+        yield
+    finally:
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(signal.SIGTERM, prior)
+
+
 def main(argv: Sequence[str] | None = None, run: Runner = _run) -> int:
+    """Thin wrapper so the signal scope covers every return path in _run_main."""
+    with _sigterm_reconciles():
+        return _run_main(argv, run)
+
+
+def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -496,10 +530,6 @@ def main(argv: Sequence[str] | None = None, run: Runner = _run) -> int:
     )
     ap.add_argument("--dry-run", action="store_true", help="run every check, post nothing")
     args = ap.parse_args(argv)
-
-    # not the main thread, or no signals here — best-effort only
-    with contextlib.suppress(ValueError, OSError):
-        signal.signal(signal.SIGTERM, _sigterm_as_interrupt)
 
     posted: str | None = None
     # Set the instant before the create is attempted. An interrupt between

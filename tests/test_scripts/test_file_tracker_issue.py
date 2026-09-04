@@ -14,6 +14,7 @@ import ast
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -1060,3 +1061,87 @@ def test_interrupt_while_creating_is_indeterminate_not_refused(tmp_path, capsys)
         )
     assert rc == 4, "the request may have reached GitHub — refusing would invite a duplicate"
     assert "INDETERMINATE" in capsys.readouterr().err
+
+
+class TestSigtermHandlerIsScoped:
+    """main() must not leave the SIGTERM handler installed process-wide.
+
+    REGRESSION (MEASURED in CI): main() installed `_sigterm_as_interrupt`
+    globally and never restored it. These tests call main() in-process, so the
+    handler outlived them and was inherited by every process forked later in the
+    same pytest run. tests/test_scripts/test_session_heartbeat_throttle.py forks
+    multiprocessing children and terminate()s them; the inherited handler turned
+    that SIGTERM into a KeyboardInterrupt instead of death, join() never
+    returned, and TWO tests in a file this PR does not touch hung for the full
+    1800s pytest-timeout. Test files run alphabetically, so this one poisoned it.
+    """
+
+    @staticmethod
+    def _ok_runner(calls=None):
+        return _runner(
+            {
+                "isFork": _proc(
+                    json.dumps({"isFork": False, "nameWithOwner": "Org/Repo", "parent": None})
+                ),
+                "viewerPermission": _proc(json.dumps({"viewerPermission": "ADMIN"})),
+                "gh api": _proc(""),
+            },
+            calls,
+        )
+
+    @staticmethod
+    def _argv(tmp_path):
+        t_, b_ = _drafts(tmp_path)
+        return [
+            "--title-file", t_,
+            "--body-file", b_,
+            "--area", "area:memory",
+            "--difficulty", "help wanted",
+            "--dry-run",
+        ]
+
+    def test_main_restores_the_previous_sigterm_handler(self, tmp_path, capsys):
+        """The leak itself: after main() returns, the handler is what it was.
+
+        A DISTINCTIVE sentinel is installed first rather than reading whatever
+        happens to be current. Reading the current handler makes this test
+        order-dependent and nearly vacuous: any earlier test in this file that
+        calls main() would already have leaked the handler, so `before` and
+        `after` would both be the leaked one and compare equal. MEASURED — that
+        weaker form passed against the unfixed script.
+        """
+
+        def _sentinel(signum, frame):  # pragma: no cover - never delivered
+            raise AssertionError("sentinel handler should not run")
+
+        prior = signal.signal(signal.SIGTERM, _sentinel)
+        try:
+            rc = fti.main(self._argv(tmp_path), self._ok_runner())
+            capsys.readouterr()
+
+            assert rc == 0
+            assert signal.getsignal(signal.SIGTERM) is _sentinel
+        finally:
+            signal.signal(signal.SIGTERM, prior)
+
+    def test_the_handler_is_active_while_main_runs(self, tmp_path, capsys):
+        """The guarantee the scope must not cost us — untested until now.
+
+        Restoring is only correct if the handler is genuinely installed FOR the
+        duration. A "fix" that simply stopped installing it would pass the leak
+        test above while silently dropping the reconcile-on-SIGTERM property the
+        handler exists for, so both halves are pinned.
+        """
+        seen = []
+        inner = self._ok_runner()
+
+        def watching_run(argv):
+            seen.append(signal.getsignal(signal.SIGTERM))
+            return inner(argv)
+
+        rc = fti.main(self._argv(tmp_path), watching_run)
+        capsys.readouterr()
+
+        assert rc == 0
+        assert seen, "the runner was never called, so nothing was observed"
+        assert all(h is fti._sigterm_as_interrupt for h in seen)
