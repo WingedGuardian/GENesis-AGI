@@ -25,6 +25,7 @@ from genesis.cc.exceptions import (
     CCRateLimitError,
     CCSessionError,
     CCTimeoutError,
+    annotate_oom,
 )
 from genesis.cc.types import (
     CCInvocation,
@@ -35,6 +36,7 @@ from genesis.cc.types import (
     clamp_effort,
     model_supports_effort,
 )
+from genesis.observability.oom import OomProbe
 from genesis.observability.spans import SpanKind, start_span
 from genesis.util.proc_kill import (
     kill_process_group,
@@ -45,19 +47,28 @@ from genesis.util.proc_kill import (
 logger = logging.getLogger(__name__)
 
 
-def set_oom_score_adj(pid: int, score: int = 500) -> None:
-    """Set OOM score adjustment for a process.
+def set_oom_score_adj(pid: int, score: int = 500) -> bool:
+    """Set OOM score adjustment for a process. Returns whether the write landed.
 
     Higher scores make the process more likely to be OOM-killed.
     CC subprocesses get +500 so the kernel kills them before genesis-server
     (-500) or qdrant. This is the container-side complement to the
     host VM's cgroup OOM scoring.
+
+    The return value is NOT decoration: the OOM attribution note cites this
+    preference as the reason the dispatched process was the likely victim, and
+    that premise is false on a host where procfs denied the write, is read-only,
+    or the process exited before it could be adjusted. Callers pass the result to
+    :meth:`genesis.observability.oom.OomProbe.describe` so an unestablished
+    premise is omitted from the diagnostic rather than asserted.
     """
     try:
         Path(f"/proc/{pid}/oom_score_adj").write_text(str(score))
         logger.debug("Set oom_score_adj=%d for PID %d", score, pid)
+        return True
     except OSError as exc:
         logger.warning("Could not set oom_score_adj for PID %d: %s", pid, exc)
+        return False
 
 
 # The unit properties the scope actually carries. ONE tuple, consumed by BOTH
@@ -688,8 +699,30 @@ class CCInvoker:
             proc.send_signal(signal.SIGINT)
 
     @staticmethod
-    def _classify_error(stderr_text: str, stdout_text: str = "") -> CCError:
-        """Classify CC output into a typed CC exception.
+    def _classify_error(
+        stderr_text: str, stdout_text: str = "", *, oom_note: str | None = None
+    ) -> CCError:
+        """Classify CC output into a typed CC exception, then annotate the cause.
+
+        TWO INDEPENDENT FACTS, applied in that order and never traded for each
+        other: what the process managed to SAY before it died (the text patterns
+        below), and what KILLED it (``oom_note``, which no amount of text can
+        reveal — a reaped process dies by SIGKILL writing nothing).
+
+        The annotation used to be applied only on the generic fallthrough, on the
+        reasoning that a reaped process matches no pattern. Usually true, and
+        wrong in exactly the case that matters: a process that emitted an MCP
+        startup error, a session-expiry line, or buffered quota text BEFORE the
+        kernel took it returns a typed exception from an earlier branch, and the
+        attribution was dropped on the floor. Those exits then took the worst
+        available branch — MCP and session errors entered stale-resume recovery
+        and re-ran the memory-heavy workload, and a quota match could park the
+        turn for a capacity reset that was never the problem. So the note is
+        applied at the ONE exit, to whatever was classified.
+
+        Callers that must BRANCH on the cause read ``CCError.oom_suspected``
+        (set by ``annotate_oom`` alongside the human note) — never the message
+        text, which is prose and will be reworded.
 
         Checks both stderr and stdout — when CC runs in streaming-JSON
         mode the rate-limit / quota signal often appears in stdout
@@ -697,6 +730,18 @@ class CCInvoker:
         Limiting classification to stderr would mis-categorize those as
         generic CCProcessError and skip downstream retry branches that
         key off the typed exception.
+        """
+        err = CCInvoker._classify_error_text(stderr_text, stdout_text)
+        return annotate_oom(err, oom_note) if oom_note else err
+
+    @staticmethod
+    def _classify_error_text(stderr_text: str, stdout_text: str = "") -> CCError:
+        """The TEXT half of ``_classify_error`` — what the process said, only.
+
+        Split out so the OOM annotation has exactly one place to attach. It is
+        deliberately ignorant of the kill cause: every ``return`` below answers
+        "what does this output look like", and none of them may decide whether an
+        attribution survives.
         """
         combined = f"{stderr_text}\n{stdout_text}"
         lower = combined.lower()
@@ -760,7 +805,11 @@ class CCInvoker:
         # CCError on resumes, so this only improves classification fidelity.
         if "thinking" in lower and "cannot be modified" in lower:
             return CCSessionError(source)
-        # Generic process error
+        # Generic process error — where a reaped process lands, since SIGKILL
+        # writes nothing and none of the patterns above can match. The OOM note
+        # is NOT applied here: `_classify_error` attaches it to whatever this
+        # returns, so a process that DID say something on its way out keeps both
+        # its classification and its cause.
         return CCProcessError(source)
 
     async def _notify_status_change(self, error: CCError | None) -> None:
@@ -946,6 +995,15 @@ class CCInvoker:
 
         proc = None
         reg_key: str | None = None
+        # Sample the OOM counter BEFORE the spawn, because attribution is a delta and
+        # there is no way to take a "before" reading after the fact. Cheap (one small
+        # read), never raises, and degrades to a probe that declines to attribute
+        # anything on a host where the counter is unreadable.
+        oom_probe = OomProbe.sample()
+        # Whether the +500 preference was actually WRITTEN — the annotation cites it
+        # as the reason this process was the likely victim, and on a host where the
+        # write is denied that premise never held. False until the write succeeds.
+        oom_adjusted = False
         try:
             scope_args = await _get_scope_args()
             proc = await asyncio.create_subprocess_exec(
@@ -964,7 +1022,7 @@ class CCInvoker:
             reg_key = invocation.session_key or f"pid:{proc.pid}"
             self._register_proc(reg_key, proc)
             logger.info("CC subprocess spawned (PID %s)", proc.pid)
-            set_oom_score_adj(proc.pid, 500)
+            oom_adjusted = set_oom_score_adj(proc.pid, 500)
             if invocation.on_spawn is not None:
                 try:
                     await invocation.on_spawn(proc.pid)
@@ -1043,13 +1101,23 @@ class CCInvoker:
         if proc.returncode != 0:
             stderr_text = stderr.decode(errors="replace").strip()
             stdout_text = stdout.decode(errors="replace").strip()
+            # An OOM reap is the one failure that arrives with NOTHING to classify:
+            # SIGKILL leaves no message, so stderr and stdout are typically empty and
+            # every text-matching branch below falls through to a generic error. The
+            # cause has to come from outside the process's own output, and the cgroup
+            # counter is the only source that does not depend on a log line the
+            # journal usually does not have. `self_killed` is False here by
+            # construction: this is the normal-completion path, and the timeout and
+            # reaper paths that DO send SIGKILL return before reaching it.
+            oom_note = oom_probe.describe(proc.returncode, score_adjusted=oom_adjusted)
             logger.error(
-                "CC subprocess failed (exit=%s): stderr=%s stdout=%s",
+                "CC subprocess failed (exit=%s): stderr=%s stdout=%s%s",
                 proc.returncode,
                 stderr_text[:500] or "(no stderr)",
                 stdout_text[:500] or "(no stdout)",
+                f" [{oom_note}]" if oom_note else "",
             )
-            err = self._classify_error(stderr_text, stdout_text)
+            err = self._classify_error(stderr_text, stdout_text, oom_note=oom_note)
             await self._notify_status_change(err)
             raise err
 
@@ -1142,6 +1210,11 @@ class CCInvoker:
             prompt_preview,
         )
 
+        # Same pre-spawn sample as _run_inner, for the same reason: attribution is a
+        # delta and the "before" reading cannot be taken after the fact. Streaming is
+        # NOT a lesser case — it is the path foreground conversations and
+        # DirectSessionRunner take, so a reap here is the one a human is waiting on.
+        oom_probe = OomProbe.sample()
         try:
             scope_args = await _get_scope_args()
             proc = await asyncio.create_subprocess_exec(
@@ -1170,7 +1243,7 @@ class CCInvoker:
                 f"and ~/.npm-global/bin is on PATH."
             ) from None
         logger.info("CC streaming subprocess spawned (PID %s)", proc.pid)
-        set_oom_score_adj(proc.pid, 500)
+        oom_adjusted = set_oom_score_adj(proc.pid, 500)
         # cc-loop-01: register immediately (before the stdin feed) so the proc is
         # interruptible from spawn. If on_spawn or the stdin feed fails (broken
         # pipe, task cancellation), reap the proc and drop the registry entry —
@@ -1204,6 +1277,14 @@ class CCInvoker:
         timed_out = False
         terminated_after_result = False
         line_count = 0
+        # Did WE signal this process? Unlike _run_inner (where every self-kill path
+        # returns or raises before the exit is inspected), the streaming path can
+        # reach the post-stream branches after its own terminate/group-kill — and a
+        # group-kill sets returncode to -9, which is exactly what an OOM reap looks
+        # like. Without this flag a self-inflicted SIGKILL that happened to coincide
+        # with someone else's reap in the same cgroup would be reported as a probable
+        # OOM: a plausible wrong cause replacing a known true one.
+        self_killed = False
 
         try:
             async with asyncio.timeout(invocation.timeout_s):
@@ -1250,6 +1331,7 @@ class CCInvoker:
                         # overwrite the real answer with a throwaway response).
                         proc.terminate()
                         terminated_after_result = True
+                        self_killed = True
                         if on_event:
                             await on_event(event)
                         break
@@ -1263,6 +1345,7 @@ class CCInvoker:
                 time.monotonic() - start,
                 proc.pid,
             )
+            self_killed = True
             kill_process_group(proc)
         except asyncio.CancelledError:
             # Task cancellation (runtime shutdown cancelling an in-flight
@@ -1303,7 +1386,22 @@ class CCInvoker:
             # short beat (stdio children normally exit sub-second on parent
             # death); costs latency only when a survivor actually exists.
             await asyncio.sleep(_ESCALATION_GRACE_S)
-        if proc.returncode is None or process_group_alive(proc):
+        leader_alive = proc.returncode is None
+        if leader_alive or process_group_alive(proc):
+            # `self_killed` answers ONE question: did WE produce the leader's exit
+            # code? Only a kill that lands on a LIVE leader can. When the leader is
+            # already dead and only an MCP/helper descendant survives, this branch is
+            # descendant CLEANUP — our signal cannot change an exit code that is
+            # already set, so claiming it here would discard someone else's news.
+            #
+            # And the news is precisely the case this file exists for: the OOM killer
+            # reaps the CC leader, a helper in its group outlives it, `returncode` is
+            # already -9, and marking that as self-inflicted made `describe` decline a
+            # VALID attribution — sending the no-result path back to an empty, and
+            # therefore SUCCESSFUL-looking, CCOutput. A common process-tree shape,
+            # silently recorded as work that completed.
+            if leader_alive:
+                self_killed = True
             logger.warning(
                 "CC streaming group survived graceful stop/kill "
                 "(PID %s, rc=%s) — group-killing",
@@ -1404,7 +1502,36 @@ class CCInvoker:
                 await self._fire_empty_output_callback(invocation, output)
             return output
 
-        # No result event — treat collected text as response (success path)
+        # No result event. This branch is the streaming path's silent-loss hole: it
+        # builds a CCOutput with the default is_error=False regardless of
+        # proc.returncode, so a subprocess that was REAPED mid-stream is handed back
+        # as an ordinary (usually empty) answer — DirectSessionRunner then persists
+        # `success=not output.is_error` (direct_session.py:892) as True, and a
+        # foreground turn shows the user nothing at all about why their work
+        # vanished. Raise instead when, and only when, the counter actually
+        # attributed the death: SIGKILL, not our own, with a real delta. Everything
+        # short of that keeps the existing return-what-we-collected behaviour —
+        # a nonzero exit alone is ambiguous, and turning it into an exception would
+        # discard partial text that today reaches the user.
+        oom_note = oom_probe.describe(
+            proc.returncode, self_killed=self_killed, score_adjusted=oom_adjusted
+        )
+        if oom_note:
+            partial = "".join(collected_text)
+            logger.error(
+                "CC streaming subprocess reaped (exit=%s, partial=%d chars) [%s]",
+                proc.returncode,
+                len(partial),
+                oom_note,
+            )
+            # stderr only, never the collected assistant text: a partial answer that
+            # happens to discuss "usage limits" must not be classified as a quota
+            # failure and parked. A SIGKILL writes nothing, so this is normally "".
+            err = self._classify_error(stderr_str.strip(), oom_note=oom_note)
+            await self._notify_status_change(err)
+            raise err
+
+        # Treat collected text as the response (success path)
         if self._last_was_error:
             await self._notify_status_change(None)
         output = CCOutput(
