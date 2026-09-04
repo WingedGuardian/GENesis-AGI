@@ -31,3 +31,19 @@ dispatch_max_turns: 80
 # autorun_note: appended to the AUTO-RUN prompt only (never the read prompt). Ships
 # empty; put any install-specific gate guidance in career_outreach.local.yaml.
 autorun_note: ""
+
+# ── Bite-relay: an INDEPENDENT lever for a pure READ + owner-nudge when a company
+# advances through the external pipeline (in_conversation / interviewing / offer).
+# Decoupled from the auto-run above — no CLI dispatch, no outreach send — so it can run
+# `live` while `mode` stays gated.
+# bite_relay_mode: off | observe | live
+#   off     — the bite-relay does not run. SHIPPED DEFAULT.
+#   observe — READ the pipeline and SEED the dedup ledger (mark current advances as
+#             already-seen), but NEVER nudge (flip off -> observe to seed, then -> live).
+#   live    — read, diff against the ledger, nudge the owner on a NEW advance.
+bite_relay_mode: off
+# data_module: name of the external DATA module (a structured HTTP read exposing a
+# `pipeline` op — distinct from reasoning_module's SSH dispatch). Ships EMPTY; set the
+# install's module name in the gitignored career_outreach.local.yaml. Empty/absent →
+# the bite-relay no-ops cleanly.
+data_module: ""

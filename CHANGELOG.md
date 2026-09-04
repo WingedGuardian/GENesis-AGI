@@ -167,6 +167,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Career pipeline "bite" notifications (opt-in, off by default).** Genesis can now
+  ping you on Telegram when a company advances into an engaged stage (in conversation /
+  interviewing / offer) in your job-search pipeline — so you hear about momentum
+  without watching the board. It only READS your pipeline and notifies you (no
+  autonomous action, no sending), on an independent lever separate from the
+  draft-staging driver. Ships OFF: enable it by pointing `data_module` at your
+  career-agent module and setting `bite_relay_mode` to `observe` then `live`.
 - **Telegram ping when someone replies to a marketing pitch.** When a real person
   replies to one of Genesis's cold marketing emails, you now get one brief
   Telegram notification — the sender and the first line of their reply.
