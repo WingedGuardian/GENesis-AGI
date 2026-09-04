@@ -51,16 +51,23 @@ _PARAM_OPEN = re.compile(r"""<parameter\s+name\s*=\s*["']([A-Za-z_][A-Za-z0-9_]*
 # A bare closing tag at the very END of a value: the truncation fingerprint.
 _TRAILING_CLOSE = re.compile(r"</[A-Za-z_][A-Za-z0-9_]*>$")
 
-# Bound the scan, but from BOTH ENDS. Absorption appends the swallowed markup to
-# the TAIL of the value, so a head-only window goes blind on exactly the long
-# arguments this module exists for: measured, a prefix-only cap of this size
-# fired at 199,000 characters and went SILENT at 200,000, while the docstring
-# above and the hint's own closing advice both talk about LONG arguments. The
-# cap is for pathological payloads, not for prose — full-scan cost is roughly
-# 0.8 ms/MB on a call that is already failing.
-_SCAN_WINDOW = 200_000
-# The fingerprint needs only the last few bytes; scanning a multi-megabyte value
-# to find a tag anchored at its end is pure waste.
+# NO scan window. There were two, and both were wrong in ways that only showed up
+# under review:
+#   * a HEAD-only cap went blind on long values, because absorption appends to
+#     the TAIL — it fired at 199,000 characters and went silent at 200,000, while
+#     this module's whole subject is LONG arguments;
+#   * splicing head+tail to fix that could FABRICATE a marker spanning the join
+#     that existed in neither half, and DROPPED a marker sitting in the middle of
+#     a value longer than twice the window (verified: a real marker between two
+#     200k runs disappeared).
+# Both are artifacts of a bound that no measurement ever justified. A full scan
+# costs roughly 0.8 ms/MB, on a call that has ALREADY failed validation, and
+# `finditer` does not copy the string. Scanning everything is cheaper than being
+# wrong in two directions.
+#
+# The fingerprint below is the one place a bound is still correct: the tag is
+# anchored at the very end, the slice is a SUFFIX (so no join is created), and
+# the `$` anchor means a tag clipped by the window start cannot match.
 _TAIL_WINDOW = 4_096
 
 
@@ -90,11 +97,20 @@ def missing_argument_names(exc: Any) -> list[str]:
     return names
 
 
-def _scannable(value: str) -> str:
-    """Head AND tail of a value, so tail-appended evidence is never missed."""
-    if len(value) <= 2 * _SCAN_WINDOW:
-        return value
-    return value[:_SCAN_WINDOW] + value[-_SCAN_WINDOW:]
+def _total_error_count(exc: Any) -> int:
+    """How many validation entries the error carries, of any type.
+
+    Used to refuse the substitution when the error is MIXED. Returns -1 when the
+    count cannot be read, which never equals the missing count and so also
+    refuses — the safe direction for an uncertain read.
+    """
+    errors = getattr(exc, "errors", None)
+    if not callable(errors):
+        return -1
+    try:
+        return len(errors() or [])
+    except Exception:
+        return -1
 
 
 def _absorbing_argument(
@@ -114,7 +130,16 @@ def _absorbing_argument(
     for name, value in (arguments or {}).items():
         if not isinstance(value, str) or not value:
             continue
-        found = {m for m in _PARAM_OPEN.findall(_scannable(value)) if m in wanted}
+        # A marker ALONE is weak evidence: prose describing tool-call syntax
+        # contains one, and this repository's own documentation does. A real
+        # absorbed emission also carries the CLOSING tag, because the parameter
+        # that got swallowed was itself well-formed. Requiring both is strictly
+        # stronger and costs no true positive.
+        if "</parameter>" not in value:
+            continue
+        # finditer over the WHOLE value — no slice, so no join to fabricate a
+        # marker across and no middle to drop.
+        found = {m.group(1) for m in _PARAM_OPEN.finditer(value)} & wanted
         if found:
             # Preserve pydantic's ordering rather than set order.
             return name, [m for m in missing if m in found]
@@ -148,6 +173,14 @@ def absorbed_parameter_hint(exc: Any, arguments: dict[str, Any]) -> str | None:
     """
     missing = missing_argument_names(exc)
     if not missing:
+        return None
+    # A ValidationError can carry a missing_argument AND an independent error —
+    # a wrong type on some other argument. Replacing the whole exception would
+    # discard that second problem, and the caller could not fix everything on the
+    # "first retry" this feature exists to enable. So the replacement is offered
+    # only when EVERY entry is a diagnosed missing argument; otherwise the
+    # original error, which names all of them, is the more useful one.
+    if _total_error_count(exc) != len(missing):
         return None
 
     hit = _absorbing_argument(arguments, missing)

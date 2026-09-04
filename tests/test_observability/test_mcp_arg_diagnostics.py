@@ -21,7 +21,6 @@ from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import ValidationError, validate_call
 
-from genesis.observability import mcp_arg_diagnostics as diag
 from genesis.observability.mcp_arg_diagnostics import (
     absorbed_parameter_hint,
     missing_argument_names,
@@ -222,7 +221,7 @@ def test_evidence_at_the_tail_of_a_very_long_argument_is_still_found():
     both talk about LONG arguments, so it contradicted itself.
     """
     marker = '</content>\n<parameter name="reason">because</parameter>'
-    for prefix_len in (diag._SCAN_WINDOW - 1, diag._SCAN_WINDOW, diag._SCAN_WINDOW * 4):
+    for prefix_len in (199_000, 200_000, 800_000):
         value = ("x" * prefix_len) + marker
         hint = absorbed_parameter_hint(_missing_error(content=value), {"content": value})
         assert hint is not None, f"went silent at prefix length {prefix_len:,}"
@@ -347,3 +346,82 @@ def test_the_feature_depends_on_a_fastmcp_default_that_is_pinned_here():
     from fastmcp import settings
 
     assert settings.strict_input_validation is False
+
+
+# ── the three defects a second cross-model round found ──────────────────
+
+
+def test_a_marker_in_the_middle_of_a_huge_value_is_still_found():
+    """REGRESSION PIN. Splicing head+tail dropped the middle entirely.
+
+    The splice was itself the fix for an earlier finding (a HEAD-only window
+    went blind on long values, because absorption appends to the TAIL). It
+    replaced one blind spot with two: a marker in the middle of a value longer
+    than twice the window vanished, and a marker could be FABRICATED across the
+    join from fragments adjacent in neither half. Both are gone because there is
+    no window any more — `finditer` scans the whole value without copying it, at
+    roughly 0.8 ms/MB on a call that has already failed.
+    """
+    marker = '<parameter name="reason">because</parameter>'
+    value = ("a" * 200_050) + marker + ("b" * 200_050)
+
+    hint = absorbed_parameter_hint(_missing_error(content=value), {"content": value})
+
+    assert hint is not None, "a marker in the middle of a large value was dropped"
+    assert "reason" in hint
+
+
+def test_a_spliced_window_can_no_longer_fabricate_a_marker():
+    """The other half of the same defect, asserted structurally.
+
+    Concatenating a head slice and a tail slice can create a substring spanning
+    the join that exists in NEITHER — including a well-formed parameter marker
+    naming a genuinely-absent argument. Scanning the value itself makes the class
+    unreachable: what is searched is exactly what was sent.
+    """
+    half_open = '<parameter name="rea'
+    half_close = 'son">y</parameter>'
+    value = ("x" * 199_980) + half_open + ("M" * 400) + half_close + ("z" * 199_980)
+
+    assert '<parameter name="reason">' not in value, "the probe itself is malformed"
+
+    hint = absorbed_parameter_hint(_missing_error(content=value), {"content": value})
+
+    assert hint is None, "a marker was fabricated from fragments never adjacent"
+
+
+def test_a_mixed_validation_error_is_left_intact():
+    """REGRESSION PIN. Replacing the whole exception discarded the other errors.
+
+    Pydantic can report a missing_argument AND an independent type error in one
+    ValidationError. Substituting a hint that mentions only the tag mismatch
+    silently dropped the second problem — so the caller could not fix everything
+    on the "first retry" this feature exists to enable, which defeats its whole
+    purpose. The replacement is now offered only when EVERY entry is a diagnosed
+    missing argument.
+    """
+
+    @validate_call
+    def mixed(content: str, count: int, reason: str) -> str:
+        return content
+
+    absorbed = 'body<parameter name="reason">r</parameter>'
+    with pytest.raises(ValidationError) as excinfo:
+        mixed(content=absorbed, count="not-an-int")
+
+    hint = absorbed_parameter_hint(excinfo.value, {"content": absorbed, "count": "not-an-int"})
+
+    assert hint is None, "a mixed error was replaced, hiding the type error"
+
+
+def test_a_marker_without_a_closing_tag_is_not_enough_evidence():
+    """A marker ALONE is weak: prose describing the syntax contains one.
+
+    A real absorbed emission also carries the closing tag, because the parameter
+    that got swallowed was itself well-formed. Requiring both is strictly
+    stronger evidence and costs no true positive — every genuine case in this
+    file still fires.
+    """
+    prose = 'the docs mention <parameter name="reason"> as the opening form'
+
+    assert absorbed_parameter_hint(_missing_error(content=prose), {"content": prose}) is None
