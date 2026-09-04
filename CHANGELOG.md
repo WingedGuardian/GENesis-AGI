@@ -11,6 +11,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The pre-push privacy check was quietly scanning nothing on a quarter of all
+  pushes.** It looks at an outgoing push to the public repo for private data —
+  install addresses, personal emails, local fingerprints — but it worked out which
+  directory to look in by reading the command text, and it did that badly. A `~` was
+  never expanded, so the everyday `cd ~/genesis/… && git push` resolved to a path
+  with a literal `~` in it, which cannot exist. Every lookup against it failed and
+  the check returned **no output at all** — identical to a clean result. Measured
+  against real session history: **126 of 508 pushes (24.8%)** were never actually
+  scanned for this reason, plus another 13 (2.6%) where the path came from a shell
+  variable. Paths now expand properly; where the target genuinely cannot be worked
+  out — a variable, a subshell, a glob — it says so instead of going silent, which
+  fires on 2.6% of pushes. It still never blocks a push. A related case was worse
+  than silence: `( cd elsewhere && git push )` scoped its directory change inside a
+  subshell, so the check scanned a **different repository** and reported that one
+  clean.
+
 - **The cold-marketing campaign no longer re-pitches the same person.** Once a
   marketing pitch is delivered to a prospect, that prospect is marked contacted and
   drops out of the campaign's target list — previously nothing recorded the contact,

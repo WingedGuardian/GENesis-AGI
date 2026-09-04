@@ -154,18 +154,128 @@ def _push_remote(cmd: str) -> str | None:
     return None
 
 
-def _effective_cwd(cmd: str, payload_cwd: str | None) -> str | None:
+# The push's directory could not be determined from the command text — a shell
+# variable, a command substitution, a glob, `cd -`, a bare `cd`, or a relative
+# `cd` with no payload cwd to resolve against.
+#
+# ADVISORY semantics, and they INVERT the guards' meaning of the same idea: in
+# git_push_guard an unresolvable cwd means "fail closed / block", because that
+# hook authorizes. This one only informs, so here it means "say so" — never
+# block, and above all never fabricate a path.
+#
+# Fabricating is what it used to do: an unresolved target was joined onto the
+# payload cwd, yielding a directory that cannot exist (``<cwd>/$W``). Every git
+# call against it then failed, ``_outgoing_diff`` returned "", and ``main``
+# returned with NO output — so a push this hook could not scope was
+# indistinguishable from a clean one.
+#
+# MEASURED on this install's 508 real pushes, by replaying each through the OLD
+# resolver and asking whether its answer was a directory that can EXIST:
+#   126 (24.8%)  impossible because `~` was never expanded  <- the big one
+#    13  (2.6%)  impossible because `$`/backtick was never expanded
+# Every one of those scans silently produced nothing. The tilde class is the
+# larger by ~10x, which is why the fix is not just about shell variables.
+# 13/508 (2.6%) is also the rate at which the new notice fires.
+_CWD_UNRESOLVED = object()
+
+# Every character bash would ACT on, so a literal read of the token would check a
+# DIFFERENT directory than the one bash enters: expansion triggers (`$` parameter,
+# backtick command-substitution, `{` brace, `\` escape), globs (`*?[`), and the
+# in-segment metacharacters `()<>` (e.g. process substitution). Taken verbatim from
+# review_enforcement_commit._cd_target, the most evolved of the sibling copies —
+# an earlier version of this hook used only "$`*?" and therefore still resolved
+# `cd /a/b[1]` to a literal path that cannot exist, which failed SILENTLY.
+# Kept in step by tests/test_hooks/test_value_flag_consistency.py.
+#
+# `\` is deliberately ABSENT from this set, and that is a real divergence from
+# the raw-segment copies rather than an oversight. They read the segment before
+# any shell processing, so a backslash is still ambiguous to them and they refuse.
+# This copy is handed an already-shlex-split token, and shlex has ALREADY applied
+# bash's escape semantics — `cd /a/b\c` arrives as `/a/bc`, which is precisely the
+# directory bash enters. Keeping `\` here would be dead (the token can no longer
+# contain one) and would refuse a path we resolve correctly. The positive
+# is-it-a-real-directory check in main() backstops any residual mismatch.
+_UNRESOLVABLE_CD_CHARS = "$`*?[{()<>"
+
+
+def _cd_target(token: str | None):
+    """The directory a ``cd`` moves to, or ``_CWD_UNRESOLVED`` if unknowable.
+
+    ``token`` is already shlex-split, so quotes are gone: ``cd "$W"`` and
+    ``cd $W`` both arrive as ``$W``. That is why the check is on the characters
+    rather than on the quoting — and why a token that still contains whitespace
+    got there from a QUOTED path, which is faithful and therefore allowed.
+
+    DELIBERATE DIVERGENCE from the sibling copies, recorded rather than silent:
+    an unresolvable ``~user`` returns UNRESOLVED here, where they return the
+    literal ``~user/...``. Theirs then resolves to a path that cannot exist,
+    which for an advisory means a silent no-op; refusing to guess is strictly
+    safer and costs only a notice. See the divergence table in the parity lock.
+    """
+    if token is None:
+        return _CWD_UNRESOLVED  # bare `cd` -> $HOME; not knowable from the text
+    if token.startswith("-"):
+        return _CWD_UNRESOLVED  # `cd -` (previous dir), or an option like `-P`
+    if token.startswith("~"):
+        # Expand BEFORE the metacharacter check, as the siblings do: `~` is not
+        # itself in the set, and expanding first is what makes `cd ~/wt` resolve.
+        expanded = os.path.expanduser(token)
+        if expanded.startswith("~"):
+            return _CWD_UNRESOLVED  # `~otheruser` the passwd db cannot resolve
+        token = expanded
+    if any(ch in token for ch in _UNRESOLVABLE_CD_CHARS):
+        return _CWD_UNRESOLVED
+    return token
+
+
+def _resolve(base, path):
+    """Resolve ``path`` against ``base``; either may be ``_CWD_UNRESOLVED``.
+
+    An ABSOLUTE path recovers from an unresolved base — ``cd $W && git -C /wt
+    push`` is fully determined by the ``-C``. A relative one cannot: with no
+    known base there is nothing to join it to, and returning the bare relative
+    string (the old behaviour) meant it was later handed to ``subprocess(cwd=)``
+    and silently resolved against the HOOK's own directory.
+    """
+    if path is _CWD_UNRESOLVED:
+        return _CWD_UNRESOLVED
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+    if base is _CWD_UNRESOLVED or not base:
+        return _CWD_UNRESOLVED
+    return os.path.normpath(os.path.join(base, path))
+
+
+def _emit(context: str) -> None:
+    """Write the ONE output shape this hook is allowed to produce.
+
+    additionalContext only: no ``permissionDecision``, so it composes with
+    git_push_guard's ask/allow/deny on the same matcher and can never block.
+    Both callers go through here so the contract has a single site.
+    """
+    json.dump(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": context,
+            }
+        },
+        sys.stdout,
+    )
+
+
+def _effective_cwd(cmd: str, payload_cwd: str | None):
     """The directory the ``git push`` actually runs in.
 
     Honors a preceding ``cd <dir>`` segment and a ``git -C <dir>`` on the push
     itself (either overrides the payload cwd) — so a ``git -C <worktree> push``
     or ``cd <worktree> && git push`` is scanned against the repo actually being
     pushed, not the hook's payload cwd. Falls back to ``payload_cwd``.
+
+    Returns ``_CWD_UNRESOLVED`` when the command text does not determine the
+    directory; the caller reports that rather than scanning the wrong tree.
     """
     cwd = payload_cwd
-
-    def _resolve(base: str | None, path: str) -> str:
-        return path if os.path.isabs(path) else (os.path.join(base, path) if base else path)
 
     for seg in re.split(r"\|\||&&|[;|&]", cmd):
         try:
@@ -174,9 +284,32 @@ def _effective_cwd(cmd: str, payload_cwd: str | None) -> str | None:
             continue
         if not toks:
             continue
-        # A bare `cd <dir>` changes cwd for the following segments.
-        if toks[0] == "cd" and len(toks) >= 2 and not toks[1].startswith("-"):
-            cwd = _resolve(cwd, toks[1])
+        # A subshell or group SCOPES its cd, so the text cannot tell us what the
+        # push's directory is. `toks[0]` would be "(" here, never "cd", so
+        # without this the cd is invisible and the payload cwd survives — the
+        # hook then scans a DIFFERENT repository and, if that one is clean, says
+        # nothing. That is a false all-clear about a tree that was not pushed,
+        # i.e. strictly worse than the bare-variable case this class began with.
+        # Both sibling copies already model it (git_push_guard, and
+        # review_enforcement_commit which is where this spelling comes from).
+        if seg.lstrip()[:1] in ("(", "{"):
+            cwd = _CWD_UNRESOLVED
+            continue
+        # A `cd <dir>` changes cwd for the following segments. A `cd` whose
+        # target is not knowable poisons cwd rather than being skipped — being
+        # skipped is what silently left the payload cwd in place and scanned a
+        # different repository than the one being pushed.
+        if toks[0] == "cd":
+            # More than one operand is not a plain `cd <dir>`: either options
+            # (`cd -P /x`) or an UNQUOTED path with whitespace, which shlex has
+            # already split into separate tokens. Taking toks[1] there silently
+            # resolved `cd /a b` to `/a` — a real directory that is not the one
+            # bash would be in. Found by sweeping a generated construct space
+            # against the sibling copies, which both refuse this.
+            if len(toks) > 2:
+                cwd = _CWD_UNRESOLVED
+                continue
+            cwd = _resolve(cwd, _cd_target(toks[1] if len(toks) == 2 else None))
             continue
         k = 0
         while k < len(toks) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[k]):
@@ -199,7 +332,7 @@ def _effective_cwd(cmd: str, payload_cwd: str | None) -> str | None:
                 m += 1
                 continue
             if tok == "push":
-                return _resolve(cwd, c_dir) if c_dir else cwd
+                return _resolve(cwd, _cd_target(c_dir)) if c_dir is not None else cwd
             break
     return cwd
 
@@ -274,6 +407,29 @@ def main() -> None:
         # and a preceding `cd <dir>` — so we scan the branch being pushed, not
         # the payload cwd (Codex P2 on #1267).
         cwd = _effective_cwd(cmd, payload_cwd)
+        # POSITIVE VALIDATION, deliberately here rather than in _effective_cwd
+        # (which stays a pure text function so it can be unit-tested on synthetic
+        # paths). Enumerating the constructs bash would expand can only ever catch
+        # the ones somebody thought of; asking whether the answer is a real
+        # directory closes the class categorically. A path that does not exist
+        # means every git call below would fail and the scan would silently
+        # produce nothing — which is the exact failure this hook is being fixed
+        # for. Covers a falsy payload cwd with no `cd` to override it, too.
+        if cwd is not _CWD_UNRESOLVED and (not cwd or not os.path.isdir(cwd)):
+            cwd = _CWD_UNRESOLVED
+        if cwd is _CWD_UNRESOLVED:
+            # Say so. The scan did NOT run, and silence here reads as a clean
+            # bill of health — the failure mode this hook exists to prevent.
+            # Still advisory: additionalContext only, no decision, exit 0.
+            _emit(
+                "[Pre-push privacy review] ⚠️ Could not determine which repository "
+                "this push targets — the command reaches it through a shell "
+                "variable, a substitution, or a relative path with no known base, "
+                "so the private-data scan DID NOT RUN. This is not an all-clear. "
+                "Either re-run the push with a literal path so the scan can scope "
+                "itself, or check the outgoing diff by hand before it lands."
+            )
+            return
         if not _targets_public_repo(remote, cwd):
             return  # private-fork / non-origin push — real IPs allowed there
         diff_text = _outgoing_diff(cwd)
@@ -290,20 +446,11 @@ def main() -> None:
                 continue
             seen.add(key)
             lines.append(f"  {finding.file or '?'}:{finding.line or '?'}  {finding.message}")
-        context = (
+        _emit(
             "[Pre-push privacy review] ⚠️ This push to the PUBLIC repo "
             "adds lines matching private-data patterns. Before it lands, confirm "
             "each is a generic placeholder (safe) or scrub the real value:\n"
             + "\n".join(lines[:_MAX_LINES])
-        )
-        json.dump(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "additionalContext": context,
-                }
-            },
-            sys.stdout,
         )
     except Exception:
         # An advisory must NEVER block a push — swallow everything, exit 0.

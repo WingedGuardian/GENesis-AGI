@@ -38,6 +38,39 @@ if _WORKTREE_SRC.is_dir():
         sys.path.remove(_src_str)
     sys.path.insert(0, _src_str)
 
+# ── which tree am I? ──────────────────────────────────────────────────────
+# The guard above shadows the editable install for ``genesis.*``. It does NOT
+# cover the hook modules under ``scripts/hooks/``, which tests import by bare
+# name — those resolve against ``sys.path[0]``, i.e. the directory pytest was
+# invoked from. So running from the MAIN checkout while believing you are in a
+# worktree grades main's code and reports it as yours. Same failure the guard
+# above was written for, one directory over.
+#
+# pytest already prints ``rootdir:``, which names the tree exactly — but ``-q``
+# suppresses the header, and ``-q`` piped through ``tail`` is the house habit
+# for targeted runs. So the signal existed and was invisible precisely when it
+# was needed. MEASURED 2026-09-03: twenty minutes of edits and four test runs
+# went to the wrong tree before an impossible AttributeError gave it away.
+#
+# Printed to stderr so ``-q`` cannot hide it, and ONLY in the case that is
+# actually ambiguous: the main checkout of a repo that has worktrees. CI has no
+# worktrees, so CI stays silent. Advisory — it never fails a run.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_GIT = _REPO_ROOT / ".git"
+if _GIT.is_dir() and (_GIT / "worktrees").is_dir():
+    try:
+        _siblings = [p.name for p in (_GIT / "worktrees").iterdir() if p.is_dir()]
+    except OSError:  # pragma: no cover - unreadable .git is not a test concern
+        _siblings = []
+    if _siblings:
+        print(
+            f"NOTE: tests are running in the MAIN checkout ({_REPO_ROOT}), not a "
+            f"worktree, while {len(_siblings)} worktree(s) exist. Hook modules "
+            f"under scripts/hooks/ will resolve HERE. If you meant to test a "
+            f"branch, cd to its worktree first.",
+            file=sys.stderr,
+        )
+
 import os  # noqa: E402
 
 import aiosqlite  # noqa: E402
