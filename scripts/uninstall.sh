@@ -428,10 +428,21 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         # it, and systemd.timer(5) says to run this BEFORE uninstalling a timer
         # unit — otherwise a reinstall inherits a stale "last run" and can
         # immediately replay a run it should not.
-        systemctl --user clean --what=state \
-            genesis-cc-settings-align.timer genesis-cc-align.timer \
-            genesis-disk-hygiene.timer genesis-watchdog.timer \
-            genesis-cc-tmp-align.timer 2>/dev/null || true
+        # `clean --what=state` is a real mutation, not a query — it deletes the
+        # stamp files. Every neighbouring uninstall step is DRY_RUN-guarded, and
+        # this one must be too: a --dry-run that silently discards persistent
+        # timer state changes whether a later reinstall replays a missed run,
+        # which is exactly the outcome someone runs --dry-run to avoid.
+        if [ "$DRY_RUN" = true ]; then
+            echo "    [DRY RUN] Would clear persistent timer state for:" \
+                 "genesis-cc-settings-align, genesis-cc-align, genesis-disk-hygiene," \
+                 "genesis-watchdog, genesis-cc-tmp-align"
+        else
+            systemctl --user clean --what=state \
+                genesis-cc-settings-align.timer genesis-cc-align.timer \
+                genesis-disk-hygiene.timer genesis-watchdog.timer \
+                genesis-cc-tmp-align.timer 2>/dev/null || true
+        fi
 
         # Wait for genesis-server port to close
         for _i in $(seq 1 10); do

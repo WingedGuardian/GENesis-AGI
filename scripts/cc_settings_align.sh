@@ -51,6 +51,57 @@ fi
 GENESIS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CC_ENV="$GENESIS_ROOT/scripts/lib/cc_version.sh"
 
+# ── OUTCOME PERSISTENCE — read the previous state, and define the ONE writer ──
+#
+# This lives ABOVE the lock because BOTH exit paths that verify something have
+# to record an outcome: the ordinary path below, and the contended read-only
+# path inside the `flock` failure branch. Having two places that exit 0 and only
+# one that persists is what made a verified-clean run invisible to the
+# repeat-repair escalation — the sequence repair -> clean-under-contention ->
+# repair read as "SECOND consecutive repair" and failed the unit, because the
+# clean run in the middle never overwrote the stored `repaired`.
+#
+# So the obligation is a function rather than a convention: every path that
+# learned something calls `_persist_outcome`, and a path that adds a new exit
+# without calling it is visibly missing a line rather than silently wrong.
+_STATE_FILE="$HOME/.genesis/cc_settings_align.last"
+_prev_raw="$(cat "$_STATE_FILE" 2>/dev/null || true)"
+_prev="${_prev_raw%% *}"                    # first field = the state
+_prev_since="${_prev_raw#* }"               # remainder = when it first appeared
+[ "$_prev_since" = "$_prev_raw" ] && _prev_since=""   # old single-field format
+
+# Persist THIS run's outcome. Returns non-zero if it could not, having already
+# explained why — the caller turns that into exit 3.
+# `_since` is deliberately GLOBAL, not local: the message block below reports
+# "unchanged since <date>", so the value has to outlive this call.
+_since=""
+_persist_outcome() {
+    local state="$1" now
+    now="$(date -u +%Y-%m-%d 2>/dev/null || echo unknown)"
+    # Carry the date the CURRENT state first appeared, so a repeat can say how
+    # long it has been failing for the same reason. A unit reporting an
+    # identical fresh failure every day is one an operator learns to scroll
+    # past; "unchanged since <date>" is a different message at the same severity.
+    if [ "$_prev" = "$state" ] && [ -n "$_prev_since" ]; then
+        _since="$_prev_since"
+    else
+        _since="$now"
+    fi
+    if ! printf '%s %s\n' "$state" "$_since" > "$_STATE_FILE" 2>/dev/null; then
+        # Swallowing this made every repair look like a FIRST repair forever:
+        # the repeat-repair escalation reads this file, so an unwritable state
+        # file (e.g. root-owned after a restore) silently disarmed the one
+        # durable "something keeps rewriting settings.json" signal. The
+        # escalation channel is load-bearing; a run that cannot persist it has
+        # not done its job.
+        echo "cc_settings_align: cannot persist repeat-repair state to $_STATE_FILE —" \
+             "the repeat-repair escalation is disarmed until this is fixed" \
+             "(this run's suppression state was: ${state})"
+        return 1
+    fi
+    return 0
+}
+
 # ── Single-flight guard: two concurrent reconciles would race each other on the
 # same read-modify-write. Non-blocking — a run already in flight makes this one
 # redundant. (The function itself also compare-and-swaps, which covers writers
@@ -94,6 +145,11 @@ sys.exit(0 if env.get("DISABLE_AUTOUPDATER") == "1"
          and env.get("DISABLE_UPDATES") == "1" else 1)
 RONLY
     then
+        # A verified-clean run, even under contention, is a real `ok` outcome and
+        # MUST land in the state file. Exiting 0 here without recording it left a
+        # stale `repaired` in place, so the next genuine repair was misread as
+        # the second consecutive one and failed the unit.
+        _persist_outcome ok || exit 3
         echo "cc_settings_align: another run is in progress — verified read-only:" \
              "both suppression keys present"
         exit 0
@@ -143,33 +199,7 @@ fi
 # channel left. Remember the last outcome so the second consecutive repair can
 # escalate to a failed unit instead of accumulating identical journal lines in a
 # unit that stays green.
-_STATE_FILE="$HOME/.genesis/cc_settings_align.last"
-_prev_raw="$(cat "$_STATE_FILE" 2>/dev/null || true)"
-_prev="${_prev_raw%% *}"                    # first field = the state
-_prev_since="${_prev_raw#* }"               # remainder = when it first appeared
-[ "$_prev_since" = "$_prev_raw" ] && _prev_since=""   # old single-field format
-
-_now="$(date -u +%Y-%m-%d 2>/dev/null || echo unknown)"
-# Carry the date the CURRENT state first appeared, so a repeat can say how long
-# it has been failing for the same reason. A unit that reports an identical
-# fresh failure every day is one an operator learns to scroll past; one that
-# says "unchanged since <date>" is a different message even at the same severity.
-if [ "$_prev" = "${CC_SUPPRESSION_STATE}" ] && [ -n "$_prev_since" ]; then
-    _since="$_prev_since"
-else
-    _since="$_now"
-fi
-if ! printf '%s %s\n' "${CC_SUPPRESSION_STATE}" "$_since" > "$_STATE_FILE" 2>/dev/null; then
-    # Swallowing this made every repair look like a FIRST repair forever: the
-    # repeat-repair escalation reads this file, so an unwritable state file
-    # (e.g. root-owned after a restore) silently disarmed the one durable
-    # "something keeps rewriting settings.json" signal. The escalation channel
-    # is load-bearing; a run that cannot persist it has not done its job.
-    echo "cc_settings_align: cannot persist repeat-repair state to $_STATE_FILE —" \
-         "the repeat-repair escalation is disarmed until this is fixed" \
-         "(this run's suppression state was: ${CC_SUPPRESSION_STATE})"
-    exit 3
-fi
+_persist_outcome "${CC_SUPPRESSION_STATE}" || exit 3
 
 case "${CC_SUPPRESSION_STATE:-unverified}" in
     ok)

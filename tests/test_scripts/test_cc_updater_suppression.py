@@ -1294,6 +1294,52 @@ class TestAlignVerifiesNotAssumes:
         assert "verified read-only" in r.stdout
         assert "both suppression keys present" in r.stdout
 
+    def test_a_clean_contended_run_resets_the_repair_history(self, tmp_path: Path) -> None:
+        """repair -> clean-under-contention -> repair must NOT read as a repeat.
+
+        The contended read-only path exits 0 directly. When it did so without
+        recording an outcome, the stored `repaired` from run 1 survived, so the
+        unrelated repair in run 3 was misclassified as the SECOND consecutive
+        one and failed the unit — a false "something keeps rewriting
+        settings.json" alarm with a verified-clean run sitting between the two.
+
+        The observed sequence before the fix was exit 0, 0, 3; it must be
+        0, 0, 0.
+        """
+        import fcntl as _fcntl
+
+        both = {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}
+        settings = tmp_path / "h" / ".claude" / "settings.json"
+
+        # 1. a genuine repair — one key missing
+        home = self._seed(tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1"}})
+        r1 = self._run_script(home)
+        assert r1.returncode == 0, (r1.returncode, r1.stdout, r1.stderr)
+
+        # 2. a VERIFIED-CLEAN run that happens to hit a held lock
+        with self._hold_lock(home) as fh:
+            _fcntl.flock(fh, _fcntl.LOCK_EX)
+            r2 = self._run_script(home)
+        assert r2.returncode == 0, (r2.returncode, r2.stdout, r2.stderr)
+        assert "verified read-only" in r2.stdout
+
+        state = (home / ".genesis" / "cc_settings_align.last").read_text().split()[0]
+        assert state == "ok", (
+            f"a verified-clean contended run left the state as {state!r} — the "
+            "next genuine repair will be misread as the second consecutive one"
+        )
+
+        # 3. an UNRELATED later repair — must be a FIRST repair, not a repeat
+        settings.write_text(json.dumps({"env": {"DISABLE_AUTOUPDATER": "1"}}))
+        r3 = self._run_script(home)
+        assert r3.returncode == 0, (
+            "the clean run in between was not recorded, so this repair was "
+            f"escalated as a repeat; rc={r3.returncode} stdout={r3.stdout!r}"
+        )
+        assert "SECOND consecutive repair" not in r3.stdout
+        assert json.loads(settings.read_text())["env"]["DISABLE_UPDATES"] == "1"
+        assert both  # the pair this whole mechanism exists to keep on disk
+
     def test_a_held_lock_with_keys_absent_fails_the_unit(self, tmp_path: Path) -> None:
         import fcntl as _fcntl
 
@@ -1334,6 +1380,100 @@ class TestConsumersReadTheChannel:
             "clean update_history row"
         )
         assert "unset CC_SUPPRESSION_STATE" in src
+
+    def test_a_repair_leaves_a_breadcrumb_that_survives_the_subprocess(
+        self, tmp_path: Path
+    ) -> None:
+        """The in-process state variable cannot cross a subprocess boundary.
+
+        During a real update, bootstrap.sh runs FIRST as a subprocess and can
+        repair the keys; that shell state dies with it, and update.sh's own
+        later call then finds an already-correct file and reports `ok`. The
+        repair reached neither update_history nor the deploy output. This
+        breadcrumb is the surviving channel — and it is written by a wrapper, so
+        every early `return` in the inner function records it too.
+
+        `ok` must NOT be written: absence means "nothing to report", so a stale
+        file can never manufacture a degradation on a later clean deploy.
+        """
+        # `_run` sources the library under tmp_path/"home" — use its own helper
+        # rather than a hand-built path, or the library repairs a DIFFERENT file
+        # and still reports `repaired`, which reads like a missing breadcrumb.
+        settings = _settings(tmp_path)
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        crumb = tmp_path / "home" / ".genesis" / "cc_suppression_outcome"
+
+        # A repair: one key present, one missing.
+        settings.write_text(json.dumps({"env": {"DISABLE_AUTOUPDATER": "1"}}))
+        r = _run(tmp_path, 'cc_ensure_updater_suppressed || true; echo "state=$CC_SUPPRESSION_STATE"')
+        assert "state=repaired" in r.stdout, (r.stdout, r.stderr)
+        assert crumb.exists(), (
+            "a repair left no breadcrumb — it cannot survive the bootstrap "
+            "subprocess, so update.sh will report a clean deploy"
+        )
+        recorded, _, at = crumb.read_text().strip().partition(" ")
+        assert recorded == "repaired", recorded
+        assert at.isdigit() and int(at) > 0, f"breadcrumb has no usable epoch: {at!r}"
+
+        # A subsequent CLEAN run must not overwrite it with `ok`: the reader
+        # compares epochs against a watermark, and `ok` carries no information.
+        before = crumb.read_text()
+        r2 = _run(tmp_path, 'cc_ensure_updater_suppressed || true; echo "state=$CC_SUPPRESSION_STATE"')
+        assert "state=ok" in r2.stdout, (r2.stdout, r2.stderr)
+        assert crumb.read_text() == before, "an `ok` run overwrote the breadcrumb"
+
+    def test_update_sh_consults_the_breadcrumb_when_its_own_check_is_ok(self) -> None:
+        """`ok` in update.sh's own call does not mean nothing happened.
+
+        Structural, because the branch only fires inside a real deploy: the
+        watermark must be taken BEFORE bootstrap.sh runs, and the consumer must
+        compare against it. A watermark read after the subprocess would always
+        equal the breadcrumb and the branch would be dead.
+        """
+        src = (_REPO_ROOT / "scripts" / "update.sh").read_text()
+
+        # TEXTUAL position cannot prove EXECUTION order in a shell script, and
+        # two earlier versions of this test got that wrong in different ways:
+        #   1. `"_CC_SUPP_MARK=" in src` was satisfied by the fallback line
+        #      `_CC_SUPP_MARK=0` alone, so deleting the real read stayed green.
+        #   2. comparing against the position of `scripts/bootstrap.sh` was
+        #      satisfied by the CONSUMER's own `cat` of the breadcrumb — which
+        #      lives inside `_sync_deploy_targets`, a function DEFINED near the
+        #      top of the file and CALLED long after bootstrap.
+        # What actually matters is that the watermark is read at top level,
+        # ahead of the function that later consumes it.
+        assert '_CC_SUPP_MARK="$(cut' in src, (
+            "the watermark is never read from the breadcrumb file"
+        )
+        mark_read = src.index('_CC_SUPP_MARK="$(cut')
+        consumer_def = src.index("_sync_deploy_targets() {")
+        assert mark_read < consumer_def, (
+            "the watermark must be taken at top level BEFORE the function that "
+            "consumes it is even defined — inside it, the value would be read "
+            "after bootstrap has already repaired, and a real repair would be "
+            "indistinguishable from one recorded weeks ago"
+        )
+        assert '-gt "${_CC_SUPP_MARK:-0}"' in src, (
+            "the breadcrumb is never compared against the watermark"
+        )
+
+    def test_uninstall_dry_run_does_not_clear_timer_state(self) -> None:
+        """`systemctl --user clean --what=state` is a MUTATION, not a query.
+
+        Every neighbouring uninstall step is DRY_RUN-guarded. Unguarded, a
+        --dry-run silently deletes the persistent timer stamps, changing whether
+        a later reinstall replays a missed run — precisely the class of outcome
+        someone runs --dry-run to avoid.
+        """
+        src = (_REPO_ROOT / "scripts" / "uninstall.sh").read_text()
+        idx = src.index("systemctl --user clean --what=state")
+        window = src[max(0, idx - 500):idx]
+        assert 'DRY_RUN" = true' in window, (
+            "the timer-state clean is not inside a DRY_RUN guard"
+        )
+        assert "Would clear persistent timer state" in src, (
+            "--dry-run must still SAY what it would have done, like its neighbours"
+        )
 
     def test_bootstrap_reads_the_state_it_used_to_drop(self) -> None:
         src = (_REPO_ROOT / "scripts" / "bootstrap.sh").read_text()

@@ -156,6 +156,22 @@ _on_signal_prestop() {
     exit 1
 }
 
+# ── Suppression-outcome watermark, taken BEFORE anything in this deploy can
+# repair the keys.
+#
+# bootstrap.sh runs as a SUBPROCESS later in this script and calls
+# cc_ensure_local, which may repair CC's auto-updater suppression. That repair
+# sets CC_SUPPRESSION_STATE in the SUBPROCESS, where it dies; the in-process
+# call in _sync_deploy_targets then finds an already-correct file and reports
+# `ok`, so a real repair reaches neither update_history nor the deploy output —
+# and bootstrap's own message is usually cut by its `tail -10`.
+#
+# cc_ensure_updater_suppressed leaves a durable breadcrumb on any non-ok
+# outcome. Recording the epoch now is what lets the consumer tell "repaired
+# during THIS deploy" from a breadcrumb left weeks ago.
+_CC_SUPP_MARK="$(cut -d' ' -f2 "$HOME/.genesis/cc_suppression_outcome" 2>/dev/null || true)"
+case "${_CC_SUPP_MARK:-}" in ''|*[!0-9]*) _CC_SUPP_MARK=0 ;; esac
+
 # Refuse to run from a worktree — pip install -e in bootstrap.sh would
 # redirect system-wide imports and cause I/O death spiral.
 if [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || \
@@ -531,6 +547,23 @@ _sync_deploy_targets() {
             HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_unverified"
         elif [ "$CC_SUPPRESSION_STATE" != "ok" ]; then
             HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_${CC_SUPPRESSION_STATE}"
+        else
+            # `ok` HERE does not mean nothing happened. bootstrap.sh ran earlier
+            # in this same deploy, as a subprocess, and may already have repaired
+            # the keys — leaving this call nothing to do and nothing to report.
+            # The breadcrumb is the only surviving evidence; the watermark taken
+            # at the top of this script is what distinguishes a repair made
+            # DURING this deploy from one recorded long ago.
+            _supp_line="$(cat "$HOME/.genesis/cc_suppression_outcome" 2>/dev/null || true)"
+            _supp_state="${_supp_line%% *}"
+            _supp_at="${_supp_line##* }"
+            case "${_supp_at:-}" in ''|*[!0-9]*) _supp_at=0 ;; esac
+            if [ -n "$_supp_state" ] && [ "$_supp_at" -gt "${_CC_SUPP_MARK:-0}" ]; then
+                HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_${_supp_state}"
+                echo "  NOTE: auto-updater suppression was '${_supp_state}' earlier in this" \
+                     "deploy (bootstrap) — recording it, since this later check found the" \
+                     "file already correct and would otherwise have reported a clean run"
+            fi
         fi
         cc_shadow_scan || true
     else

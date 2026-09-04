@@ -64,7 +64,48 @@ CC_PROBE_DIRS="${CC_PROBE_DIRS:-/usr/local/bin:/usr/bin:$HOME/.npm-global/bin}"
 # In reality host-setup.sh passes the host operator's settings path, and update.sh
 # consumes CC_SUPPRESSION_STATE (folding it into HOST_CC_DEGRADED).
 # shellcheck disable=SC2120,SC2034
+# Durable breadcrumb for the suppression outcome, so it survives a SUBPROCESS
+# boundary. During a real update, update.sh runs bootstrap.sh first; bootstrap
+# calls cc_ensure_local, which can REPAIR the keys — and that shell state dies
+# with the subprocess. update.sh's own later call then sees an already-correct
+# file, reports `ok`, and the repair reaches neither update_history nor the
+# visible deploy output. This file is that missing channel.
+#
+# `ok` is deliberately NOT written: absence means "nothing to report", so a
+# stale breadcrumb can never manufacture a degradation. Readers compare the
+# recorded epoch against a mark they took before the subprocess ran.
+_CC_SUPP_OUTCOME_FILE="${HOME:-}/.genesis/cc_suppression_outcome"
+
+_cc_supp_persist_outcome() {
+    [ "${CC_SUPPRESSION_STATE:-unverified}" = "ok" ] && return 0
+    mkdir -p "$(dirname "$_CC_SUPP_OUTCOME_FILE")" 2>/dev/null || return 0
+    # EPOCHSECONDS first: it is a bash builtin, so the stamp does not depend on
+    # `date` being on PATH. A zero stamp is not harmless — the reader compares
+    # it against a watermark, so `0` makes a real repair invisible rather than
+    # merely undated. `date` remains the fallback for bash < 5.0.
+    printf '%s %s\n' "${CC_SUPPRESSION_STATE:-unverified}" \
+        "${EPOCHSECONDS:-$(date -u +%s 2>/dev/null || echo 0)}" \
+        > "$_CC_SUPP_OUTCOME_FILE" 2>/dev/null || true
+    return 0
+}
+
+# Thin wrapper so the breadcrumb is written on EVERY exit path. The inner
+# function has several early `return`s; recording at each of them would be a
+# convention, and a convention is what the next `return` forgets.
+# shellcheck disable=SC2120  # optional args by design (settings path + extra defaults)
 cc_ensure_updater_suppressed() {
+    local _rc=0
+    # "$@" MUST be forwarded: the inner function takes an optional settings
+    # path ($1) and optional extra defaults ("$@"). Dropping it silently
+    # discards both for any caller that uses them.
+    # shellcheck disable=SC2120  # optional args by design; no current caller passes any
+    _cc_ensure_updater_suppressed_inner "$@" || _rc=$?
+    _cc_supp_persist_outcome
+    return "$_rc"
+}
+
+# shellcheck disable=SC2120  # optional args by design (settings path + extra defaults)
+_cc_ensure_updater_suppressed_inner() {
     local settings_file="${1:-$HOME/.claude/settings.json}"
     shift || true
     # Any remaining args are KEY=VALUE **set-if-absent** defaults applied in the

@@ -46,6 +46,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   busy lock, a missing library, a write never read back, and callers that
   discarded the outcome entirely), and each now either verifies or says plainly
   that it could not.
+
+  Three follow-ons keep that honesty intact where it was still leaking. A repair
+  performed during the early part of a deploy is now recorded even though the
+  later check finds nothing left to fix — previously that repair vanished
+  entirely, because it happened in a separate process whose result could not
+  travel back. A verified-clean run that happens to overlap another run now
+  counts as clean, so the next unrelated repair is no longer misreported as "the
+  second in a row" and does not raise a false alarm about something repeatedly
+  rewriting the settings file. And `uninstall.sh --dry-run` no longer clears the
+  saved timer schedules for real: that was the one step in the uninstall that
+  ignored dry-run, and it can change whether a missed scheduled run replays
+  after a later reinstall.
 - **Telegram ping when someone replies to a marketing pitch.** When a real person
   replies to one of Genesis's cold marketing emails, you now get one brief
   Telegram notification — the sender and the first line of their reply.
