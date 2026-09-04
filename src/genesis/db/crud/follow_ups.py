@@ -7,6 +7,16 @@ from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
+from genesis.observability.session_context import get_session_id
+
+# Sentinel for ``create``'s source_session: distinguishes "caller said nothing"
+# (default from the ambient session scope) from an INTENDED NULL (store
+# nothing). Without it, a caller that resolved provenance and failed — e.g. the
+# MCP tool refusing to store a truncated id — could not express that refusal:
+# ``None`` would fall through to the ContextVar and store a substituted ambient
+# id, the exact outcome the contract forbids.
+_UNSET: object = object()
+
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -46,7 +56,7 @@ async def create(
     source: str,
     strategy: str,
     reason: str | None = None,
-    source_session: str | None = None,
+    source_session: str | None | object = _UNSET,
     scheduled_at: str | None = None,
     priority: str = "medium",
     pinned: bool = False,
@@ -59,6 +69,26 @@ async def create(
 ) -> str:
     """Create a follow-up and return its ID.
 
+    source_session: which session this work originated from — the CC TRANSCRIPT
+    session id, the namespace every live producer writes and every consumer
+    joins on (repo_pulse reads it as ``item_session_id``; charter/dashboard key
+    on transcript ids). Three-valued:
+      - a string: stored (empty normalizes to NULL — a degraded CC result can
+        carry ``session_id=""``, and "" is invisible to IS NULL consumers);
+      - None: an INTENDED NULL — the caller resolved provenance and refused to
+        substitute (e.g. an unresolvable prefix). Stored as NULL, never
+        defaulted away;
+      - omitted: defaults from the runtime session ContextVar
+        (``observability.session_context``). FORWARD-PROVISION, honestly: at
+        this writing NO ``create`` caller runs inside a scoped task tree, so
+        the branch has no live producer — and any future producer MUST set the
+        ContextVar to the CC transcript id, NOT ``cc_sessions.id`` (today's
+        setters store the internal row id, an indistinguishable-but-wrong
+        namespace for this column).
+    NOTHING guesses: a wrong id is worse than none — measured 513/513 NULL
+    before this existed, while repo_pulse_worker read the column on every row
+    it ever annotated.
+
     kind:     'follow_up' (intended for action) or 'tabled' (tracked, not for action).
     domain:   'internal' | 'user_world' | None (None = not yet classified).
     goal_id:  optional link to a unified goal (user_goals.id) for future promotion.
@@ -66,6 +96,13 @@ async def create(
               re-evaluation) pass a stable hash so the same recommendation does
               not create duplicate rows; a partial unique index backstops races.
     """
+    if source_session is _UNSET:
+        source_session = get_session_id()
+    # One chokepoint, every caller: "" is not provenance. A degraded CC result
+    # constructs CCOutput with session_id="" on three invoker paths, and a
+    # per-site `or None` convention would have to be REMEMBERED at each of the
+    # six call sites (one already forgot).
+    source_session = source_session or None
     fid = id or _new_id()
     await db.execute(
         """INSERT INTO follow_ups
