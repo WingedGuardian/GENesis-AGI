@@ -624,9 +624,13 @@ def _ansi_c_spans(text: str) -> list[tuple[int, int, str, bool]]:
     NOT treat ``$'...'`` as ANSI-C inside ``"..."`` (there it is a literal ``$``
     followed by a quoted string), and everything inside ``'...'`` is literal.
     Getting this dq/sq state right is what keeps the scan off heredoc-body and
-    quoted text — MEASURED to matter: a naive ``$'`` scan over 38,140 real
-    commands flagged 89, dq-awareness cut that to 45, nearly all the remainder
-    being heredoc bodies this segment-level path never tokenizes as commands.
+    quoted text. MEASURED to matter (author, 2026-09-04, over a corpus of 38,140
+    real Bash commands harvested from this install's CC transcripts): a naive
+    ``$'`` scan flagged 89, dq-awareness cut that to 45, and the residue is
+    almost entirely heredoc bodies — which this segment-level path never
+    tokenizes as commands anyway. The counts are provenance for the design
+    choice, not a runtime invariant; the invariant is the dq/sq/backslash state
+    machine below, which a security review verified against bash's own rules.
     """
     spans: list[tuple[int, int, str, bool]] = []
     i, n = 0, len(text)
