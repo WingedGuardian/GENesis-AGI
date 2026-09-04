@@ -240,22 +240,34 @@ Three rules when a bound really is needed:
   `dashboard/routes/follow_ups.py` rejects a batch over 200 ids). What is
   forbidden is silently CUTTING them to fit. Only free text gets a bound it is
   expected to sit under; everything else gets one it must not cross.
-- **Derive the number, and record how.** Measure the real population and report
-  `k/N` per the Acceptance Bar — then name the corpus, the query and the date, so
-  the next reader can re-derive it rather than take it on faith. Re-derivable
-  example: provider error prose lands in `activity_log.error_message` (written by
-  `routing/router.py`, already capped there at 1024), so
-  `SELECT SUM(LENGTH(error_message) > 300), COUNT(*) FROM activity_log WHERE
-  error_message IS NOT NULL AND error_message != '';` On one install on
-  2026-09-03 that gave **270/318 (84.9%)** cut by a 300-char cap — and since JSON
-  error bodies put the machine-readable cause last, the cap discards exactly the
-  part worth keeping. Your install will differ.
-  This rule failed on itself once, which is why the correction stays: an earlier
-  draft hedged that rate as "a floor" because the corpus is capped at 1024
-  upstream. Wrong — a 1024-cap cannot change whether a length exceeds 300, and
-  `COUNT(*)` counts rows, so the rate is EXACT and only the CONTENT LOST is a
+- **Derive the number, and record how — against a corpus that OUTLIVES the
+  claim.** Measure the real population and report `k/N` per the Acceptance Bar,
+  then name the corpus, the query and the date. Naming them is necessary and not
+  sufficient: a query is only re-derivable if the rows are still there when the
+  next reader runs it.
+  Worked example, and it fails that second test — deliberately, because the
+  failure is the lesson. Provider error prose lands in
+  `activity_log.error_message` (written by `routing/router.py`, already capped
+  there at 1024), so `SELECT SUM(LENGTH(error_message) > 300), COUNT(*) FROM
+  activity_log WHERE error_message IS NOT NULL AND error_message != '';` On one
+  install on 2026-09-03 that gave **270/318 (84.9%)** cut by a 300-char cap —
+  and since JSON error bodies put the machine-readable cause last, the cap
+  discards exactly the part worth keeping.
+  That is an EPHEMERAL OBSERVATION, not a re-derivable one. `activity_log` is
+  reaped at 24 hours (`observability/provider_activity.py` `reap_old_records`,
+  scheduled four times daily by `runtime/init/learning.py`), and the query carries
+  no `created_at` predicate or snapshot id — so re-running it later measures a
+  different rolling window on the same install, and nobody can reproduce the
+  original. To make a number like this re-derivable you must pin the window in
+  the query AND export the rows, or measure something durable (git history, a
+  committed fixture) instead. Label it honestly when you cannot.
+  This rule has now failed on itself twice, which is why both corrections stay.
+  An earlier draft hedged that rate as "a floor" because the corpus is capped at
+  1024 upstream. Wrong — a 1024-cap cannot change whether a length exceeds 300,
+  and `COUNT(*)` counts rows, so the rate is EXACT and only the CONTENT LOST is a
   lower bound. Hedging a number you have not thought through is the same failure
-  as asserting one.
+  as asserting one; and calling a number re-derivable without checking that its
+  corpus survives is the same failure wearing the opposite face.
 - **Omit explicitly, with a constant-bounded marker** (`<omitted: 104,823
   chars>`), never a mid-value cut. An honest gap beats a plausible-looking
   fragment. Already the house pattern: repo-pulse's loud `limit_hit`
@@ -282,10 +294,18 @@ channel on purpose: every earlier draft prescribed one, and each was wrong for
 some surface. Three worked examples of getting it wrong, because the failures
 teach the check better than a rule does:
 
-- **Reachable, preserves nothing.** An executor step's `result` field exists
-  everywhere and its contract calls it a "brief description"; every consumer cuts
-  it — `[:200]` into the next step's prompt and into the trace, `[:2000]` on the
-  write path. Availability said yes; preservation said no.
+- **Reachable everywhere, preserving on only SOME paths.** An executor step's
+  `result` field exists everywhere and its contract calls it a "brief
+  description". The carry-forward paths cut it — `[:200]` into the next step's
+  prompt and into the trace, `[:2000]` on the write path — so a value left there
+  for a LATER step to read is not preserved. But a step that COMPLETES has its
+  result carried whole into the synthesized deliverable
+  (`autonomy/executor/dispatch.py` `synthesize_deliverable`, which interpolates
+  `r.result` unsliced) and persisted from there. An earlier draft of this bullet
+  said "every consumer cuts it" and was wrong: that ruled out a channel that
+  works, which would push a step toward halting on `blocker_description` when it
+  did not need to. Preservation is a property of the PATH, not of the field —
+  which is the whole point of checking rather than assuming.
 - **Preserves whole, not reachable.** `TASK_NOTEPAD.md` is promoted to memory
   uncut — but it is seeded in a CODE task's worktree, and a VERIFICATION step runs
   in the background-session directory, so for that step it is a file in the wrong
