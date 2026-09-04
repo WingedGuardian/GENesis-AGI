@@ -40,7 +40,19 @@ on:
   pull_request_target:
     # `opened` covers the normal case; `ready_for_review` covers a PR that was
     # opened as a draft, since the reviewer treats leaving draft as the start.
-    types: [opened, ready_for_review]
+    #
+    # `edited` is here because the closing link usually arrives LATE. A
+    # contributor opens the PR and then adds "Closes #N" to the body — under
+    # opened/ready_for_review alone that PR silently never qualifies, which is
+    # the common path, not the edge case. Same for a draft marked ready before
+    # its link is added.
+    #
+    # It is safe to widen here only because nothing downstream trusts the body:
+    # the job reads the CLOSING GRAPH, and eligibility rests on maintainer state
+    # (an invited label plus an assignment the author cannot grant themselves).
+    # Re-running on every edit therefore cannot manufacture eligibility — it can
+    # only notice that the maintainer's own state now matches.
+    types: [opened, ready_for_review, edited]
 
 # Least privilege. `pull-requests: write` is the ONLY elevated scope, and it
 # exists solely to post the trigger comment.
@@ -50,9 +62,15 @@ permissions:
   pull-requests: write
 
 concurrency:
-  # One trigger per PR. A draft opened and then marked ready fires twice.
+  # One trigger per PR. A draft opened and then marked ready fires twice, and
+  # with `edited` an author can fire it many more times.
   group: contributor-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: false
+  # Supersede rather than queue. Every run recomputes eligibility from current
+  # state, so an in-flight run is never worth more than the one behind it, and
+  # queueing a burst of body edits would just serialise identical work. The run
+  # that survives sees the latest state; the budget check still prevents a
+  # second request if an earlier run already posted.
+  cancel-in-progress: true
 
 jobs:
   request-review:
@@ -176,6 +194,11 @@ jobs:
                 repo: context.repo.repo,
                 issue_number: ref.number,
               });
+              // A CLOSED issue is off the board, and closing it does not strip
+              // its labels — so without this, every historical invited issue
+              // stays a permanent authorization token for work that is already
+              // done or abandoned.
+              const open = issue.state === 'open';
               const invited = (issue.labels || []).some(l =>
                 INVITED.includes(((typeof l === 'string' ? l : l.name) || '').toLowerCase())
               );
@@ -184,13 +207,12 @@ jobs:
               const assigned = (issue.assignees || []).some(
                 a => ((a && a.login) || '').toLowerCase() === author
               );
-              if (invited && assigned) {
+              if (open && invited && assigned) {
                 invitedIssues.push(ref.number);
               } else if (invited) {
                 core.info(
-                  `PR #${pr.number}: issue #${ref.number} is invited but is not ` +
-                  `assigned to @${pr.user.login} — label and assign it to automate ` +
-                  `the review request.`
+                  `PR #${pr.number}: issue #${ref.number} invited but not eligible ` +
+                  `(open=${open}, assigned-to-@${pr.user.login}=${assigned}).`
                 );
               }
             }
@@ -238,6 +260,8 @@ jobs:
                       pageInfo { hasNextPage endCursor }
                       nodes {
                         number
+                        isDraft
+                        state
                         comments(first: 100) {
                           pageInfo { hasNextPage }
                           nodes { body }
@@ -288,7 +312,15 @@ jobs:
                     );
                     return false;
                   }
-                  if (node.number < lowest) lowest = node.number;
+                  // Only a CONTENDER can hold the budget. A draft is skipped by
+                  // this workflow's own `if:`, and a closed-unmerged PR was
+                  // abandoned — neither will ever spend the review, so letting
+                  // either win the tie-break would park the budget on a PR that
+                  // cannot use it and starve every later real contribution.
+                  // A MERGED PR is left in deliberately: it genuinely consumed
+                  // the issue, and the issue is closed by then anyway.
+                  const contender = !node.isDraft && node.state !== 'CLOSED';
+                  if (contender && node.number < lowest) lowest = node.number;
                 }
                 if (!conn.pageInfo.hasNextPage) break;
                 cursor = conn.pageInfo.endCursor;
