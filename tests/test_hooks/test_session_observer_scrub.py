@@ -24,7 +24,20 @@ _TOKEN = "ghp_" + "a" * 36  # a realistic GitHub PAT shape
 
 
 def _run(payload: dict, home: Path) -> subprocess.CompletedProcess:
-    env = {**os.environ, "HOME": str(home)}
+    # GENESIS_DB_PATH is isolated as well as HOME, and the distinction is the
+    # whole point: genesis_db_path() resolves to repo_root()/data/genesis.db,
+    # which is NOT under HOME -- so overriding HOME alone leaves the hook writing
+    # to the REAL database. It became reachable when the hook gained a liveness
+    # refresh; MEASURED 2026-08-31, a run of this file wrote a live
+    # session_heartbeats row for this test's synthetic session id.
+    # CI cannot catch this class: with no database there the refresh returns
+    # early at its exists() guard, so it is silently a no-op on the one machine
+    # that runs the whole suite, and live-writes on every developer box.
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "GENESIS_DB_PATH": str(home / "isolated-never-created.db"),
+    }
     env.pop("GENESIS_CC_SESSION", None)  # must not short-circuit
     return subprocess.run(
         [sys.executable, str(HOOK)],

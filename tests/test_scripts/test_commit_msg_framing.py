@@ -187,7 +187,14 @@ class TestMeasuredRates:
         )
         if proc.returncode != 0:
             pytest.skip("git history unavailable")
-        subjects = [s for s in proc.stdout.splitlines() if s.strip()]
+        # Split on the LF RECORD DELIMITER only. `str.splitlines()` also breaks
+        # on U+0085, U+2028 and U+2029, which a commit subject may legitimately
+        # contain — the shell hook's `head`/`grep` pipeline keeps them INSIDE the
+        # subject, so a subject that really does fire would be cut into two
+        # non-matching strings here and the measured rate would UNDERCOUNT the
+        # hook's real behaviour. A rate that measures something other than what
+        # ships is worse than no rate (Codex P2, PR #1623).
+        subjects = [s for s in proc.stdout.split("\n") if s.strip()]
         if len(subjects) < 200:
             pytest.skip(f"shallow history ({len(subjects)} subjects); rate not meaningful")
         rx = _pattern()
@@ -266,4 +273,136 @@ class TestAdvisoryDoesNotSitOnTheBlockRemedy:
         assert "incident framing" in out.lower()
         assert out.lower().index("incident framing") > out.index("--no-verify"), (
             "the advisory printed above the block's --no-verify remedy:\n" + out
+        )
+
+
+class TestCredentialNounsAreWordsNotSubstrings:
+    """Two alternatives are short enough to live inside ordinary words.
+
+    `cred` sits in `sacred`, `key` in `monkey`, `turnkey`, `keyboard`. Unbounded,
+    they fire on neutral subjects — and this is the ADVISORY axis, where a false
+    fire teaches whoever hits it to ignore the next one, taking the true
+    positives with it. That is the same reasoning that scoped the check to the
+    subject line and rejected the second axis; it applies inside the pattern too.
+    """
+
+    @pytest.mark.parametrize(
+        "subject",
+        [
+            "fix: logged monkey patch state for the retry loop",
+            "refactor: store the sacred ordering the parser relies on",
+            "feat: log turnkey provisioning progress to the dashboard",
+            "chore: stop writing keyboard shortcuts into the cache",
+            "docs: record the sacred invariants nobody may change",
+        ],
+    )
+    def test_a_credential_noun_inside_a_word_does_not_fire(self, subject, tmp_path):
+        assert not _advises(subject + "\n", tmp_path), subject
+
+    @pytest.mark.parametrize(
+        "subject",
+        [
+            "the key was persisted in plaintext",
+            "we logged the creds during startup",
+            "keys were written to the log unredacted",
+        ],
+    )
+    def test_the_bare_nouns_STILL_fire_as_whole_words(self, subject, tmp_path):
+        """CONTROL, and load-bearing: deleting `cred`/`key` from the alternation
+        would also pass every test above while dropping real coverage. The
+        boundary is the fix, not the removal."""
+        assert _advises(subject + "\n", tmp_path), subject
+
+
+class TestTheAdvisoryNeverEchoesABlockedFingerprint:
+    """Layer 2 reports LINE NUMBERS ONLY because the matched text IS the private
+    value. The advisory printed the whole subject underneath it — handing back,
+    into commit output and the session transcript, exactly what the block above
+    had just refused to name.
+    """
+
+    @staticmethod
+    def _run_with_fingerprint(subject: str, tmp_path: Path):
+        fp = tmp_path / "fingerprints.txt"
+        fp.write_text("# an install fingerprint\nULTRA_PRIVATE_TOKEN_123\n")
+        f = tmp_path / "COMMIT_EDITMSG"
+        f.write_text(subject + "\n")
+        return subprocess.run(
+            ["bash", str(HOOK), str(f)],
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": "/usr/bin:/bin:/usr/local/bin",
+                "HOME": str(tmp_path),
+                "GENESIS_RELEASE_FINGERPRINTS": str(fp),
+            },
+        )
+
+    def test_a_blocked_fingerprint_is_not_echoed_by_the_advisory(self, tmp_path):
+        subject = "fix: API key ULTRA_PRIVATE_TOKEN_123 was stored in plaintext"
+        r = self._run_with_fingerprint(subject, tmp_path)
+        out = r.stdout + r.stderr
+        assert "install-specific private identifier" in out, "layer 2 must have blocked"
+        assert "incident framing" in out.lower(), "the framing advisory must still fire"
+        assert "ULTRA_PRIVATE_TOKEN_123" not in out, (
+            "the advisory echoed the private value the block above withheld"
+        )
+        assert "subject withheld" in out
+
+    def test_an_ordinary_framing_subject_is_STILL_quoted(self, tmp_path):
+        """CONTROL. Withholding always would make the advisory useless — the
+        author needs to see which line is being flagged. Only the fingerprint
+        case is suppressed, and only because that layer's whole contract is not
+        naming what it matched.
+        """
+        subject = "the key was persisted in plaintext"
+        r = self._run_with_fingerprint(subject, tmp_path)
+        out = r.stdout + r.stderr
+        assert "install-specific private identifier" not in out
+        assert subject in out, "a non-fingerprint subject must still be quoted"
+
+
+class TestTheVersionLedgerIsAppendOnly:
+    """A removed hash wedges the hook OFF on every install still carrying it.
+
+    `sync-hooks.sh` treats an installed hash that is absent from the ledger as
+    USER-MODIFIED and skips the update — so dropping the immediate parent's hash
+    means the new advisory, and every later commit-msg change, never deploys
+    there. The ledger's own header records this happening once already
+    (`commit-msg:f239fd3e` was found live-wedged on this install), which is why
+    the backfill section exists at all.
+    """
+
+    LEDGER = REPO / ".genesis-hook-versions"
+
+    def test_every_hash_main_shipped_is_still_present(self):
+        proc = subprocess.run(
+            ["git", "-C", str(REPO), "show", "origin/main:.genesis-hook-versions"],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            pytest.skip("origin/main unavailable")
+        def _hashes(text):
+            return {
+                line.strip()
+                for line in text.split("\n")
+                if line.strip() and not line.lstrip().startswith("#")
+            }
+        before = _hashes(proc.stdout)
+        after = _hashes(self.LEDGER.read_text())
+        dropped = before - after
+        assert not dropped, (
+            "hashes removed from the ledger — every install carrying one of these "
+            f"stops receiving hook updates: {sorted(dropped)}"
+        )
+
+    def test_the_current_commit_msg_hash_is_recorded(self):
+        """The other direction: an unrecorded CURRENT hash means a fresh install
+        gets the hook and then treats it as user-modified on the next update."""
+        import hashlib
+
+        digest = hashlib.sha256(HOOK.read_bytes()).hexdigest()
+        assert f"commit-msg:{digest}" in self.LEDGER.read_text(), (
+            "the shipped commit-msg hook's hash is not in the ledger"
         )

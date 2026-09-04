@@ -43,6 +43,7 @@ MSG_FILE="$1"
 CLASS_PATTERNS='\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b|\b192\.168\.[0-9]{1,3}\.[0-9]{1,3}\b|\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b|\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b|\b[fF][cdCD][0-9a-fA-F]{2}:'
 
 blocked=0
+fingerprint_blocked=0
 
 if grep -qE "$CLASS_PATTERNS" "$MSG_FILE"; then
     echo ""
@@ -62,6 +63,7 @@ if [ -f "$FP_FILE" ]; then
         echo "BLOCKED: Commit message contains an install-specific private identifier."
         printf '%s\n' "$FP_PATTERNS" | grep -nE -f - "$MSG_FILE" | cut -d: -f1 | sort -un | sed 's/^/  line /'
         blocked=1
+        fingerprint_blocked=1
     fi
 fi
 
@@ -97,7 +99,15 @@ fi
 # separates the two. `(was|were) vulnerable` was dropped outright — it carried
 # no credential-noun requirement, had zero support in the corpus, and fires on
 # an ordinary CVE dependency bump.
-_FRAMING_NOUN='(credential|secret|token|api[ _-]?key|private[ _-]?key|signing[ _-]?key|password|passphrase|cred|cookie|key)s?'
+# The noun group is BOUNDED on both sides. Two of its alternatives are short
+# enough to live inside ordinary words — `cred` in `sacred`, `key` in `monkey`,
+# `turnkey`, `keyboard` — so unbounded they fire on neutral subjects
+# (`fix: logged monkey patch state` matched, via `logged` + the `key` inside
+# `monkey`). That is precisely the noise this checker was measured to avoid, and
+# it lands on the ADVISORY axis, where a false fire teaches the reader to ignore
+# the next one. Bounding the group rather than the two offenders keeps the rule
+# one thing: a credential noun is a WORD, not a substring (Codex P2, PR #1623).
+_FRAMING_NOUN='\b(credential|secret|token|api[ _-]?key|private[ _-]?key|signing[ _-]?key|password|passphrase|cred|cookie|key)s?\b'
 _FRAMING_STATE='(plaintext|cleartext|unencrypted|unredacted|verbatim|in the clear|recoverable)'
 _FRAMING_PAST='(leaked|exposed|persisted|stored|storing|wrote|written|writing|logged|logging|printed|recorded|contained|revealed|leaking|exposing|persisting)'
 _FRAMING_STOPV='(leaking|exposing|persisting|storing|writing|logging|persists|leaks|exposes|stores|writes|logs|write|store|log|leak|expose)'
@@ -113,7 +123,22 @@ _emit_framing_advisory() {
     [ -n "$framing_hit" ] || return 0
     echo ""
     echo "ADVISORY (not blocking): possible security-incident framing in the subject."
-    echo "  $framing_hit"
+    # THE SUBJECT IS NOT PRINTED WHEN THE FINGERPRINT LAYER MATCHED. That layer
+    # deliberately reports line numbers only, because the matched text IS the
+    # private value — and echoing the whole subject here would have handed it
+    # straight back, into commit output and the session transcript, after the
+    # block above had just refused to name it (Codex P1, PR #1623).
+    #
+    # The advisory still fires: the framing is worth flagging either way, and
+    # the author is looking at the subject they just wrote. Only layer 1's
+    # matches stay quotable — it already echoes its own matching lines, so
+    # withholding the subject there would cost the advisory its clarity while
+    # concealing nothing.
+    if [ "$fingerprint_blocked" -eq 1 ]; then
+        echo "  (subject withheld — it matched an install fingerprint above)"
+    else
+        echo "  $framing_hit"
+    fi
     echo ""
     echo "  Public artifacts describe what the code NOW DOES; they do not assert"
     echo "  in past tense that this system leaked or exposed anything. A fix does"
