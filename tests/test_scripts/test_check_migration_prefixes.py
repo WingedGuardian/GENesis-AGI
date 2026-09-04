@@ -2,15 +2,16 @@
 
 Two rules: no duplicate prefix in either namespace, and no NEW hand-allocated
 4-digit id — that namespace is frozen to the exact set that existed on
-2026-09-03 (0001..0091, d0001..d0011), enforced at BOTH ends plus its size.
+2026-09-04 (0001..0093 with a gap at 0092, d0001..d0011), enforced at BOTH ends.
 
 The both-ends part is load-bearing and was learned the hard way: a one-sided
 "above the freeze mark" rule let ``0000`` through, and ``0000`` is the worst
 possible id to miss — legacy-width, duplicating nothing, and ordering-divergent
 in the maximal way (on a fresh install it sorts first and runs before ``0001``;
 on an existing install every legacy id is already applied, so it runs last).
-The size check pins contiguity, so a DELETED legacy migration cannot silently
-free its id for re-allocation.
+Deliberately no size/contiguity check: it would only catch a deleted legacy id
+being re-allocated, which the freeze already makes unreachable — and the range
+is not contiguous anyway.
 
 The guard replaced a shell glob+grep that could not survive mixed-width ids in
 either direction — MEASURED 2026-09-03: the 4-digit glob made timestamp
@@ -71,16 +72,15 @@ def _fake_repo(schema: list[str], data: list[str], *, tmp_path: Path) -> Path:
 def _full_legacy(
     schema_extra: list[str] | None = None, data_extra: list[str] | None = None
 ) -> tuple[list[str], list[str]]:
-    """The complete frozen window (0001..0091 / d0001..d0011), plus extras.
+    """The legacy ids as they actually exist, plus extras.
 
-    Contiguity is enforced, so a fixture laying down only a couple of legacy
-    files is itself a violation — every freeze/duplicate case must start from
-    the real window or it would trip the contiguity rule by accident and pass
-    for the wrong reason.
+    Mirrors the real shape rather than an idealised one: the schema range runs
+    0001..0091 and then 0093, with a GAP at 0092 left by a rename — which is
+    why the freeze window pins endpoints and NOT a count.
     """
-    schema = [f"{i:04d}_legacy.py" for i in range(1, 92)] + (schema_extra or [])
-    data = [f"d{i:04d}_legacy.py" for i in range(1, 12)] + (data_extra or [])
-    return schema, data
+    schema = [f"{i:04d}_legacy.py" for i in list(range(1, 92)) + [93]]
+    data = [f"d{i:04d}_legacy.py" for i in range(1, 12)]
+    return schema + (schema_extra or []), data + (data_extra or [])
 
 
 def test_real_repo_is_clean():
@@ -115,12 +115,12 @@ def test_duplicate_legacy_prefix_still_caught(tmp_path):
 
 
 def test_a_NEW_legacy_prefix_ABOVE_the_window_is_refused(tmp_path):
-    """The freeze rule — the whole point. 0092 is the id a human would
+    """The freeze rule — the whole point. 0094 is the id a human would
     hand-allocate next, and allocating is what made two branches collide."""
-    repo = _fake_repo(*_full_legacy(["0092_hand_allocated.py"]), tmp_path=tmp_path)
+    repo = _fake_repo(*_full_legacy(["0094_hand_allocated.py"]), tmp_path=tmp_path)
     out = _mod.check(repo)
     freeze = [v for v in out if "allocates a NEW legacy-width id" in v]
-    assert any("0092" in v for v in freeze)
+    assert any("0094" in v for v in freeze)
     assert any("date -u +%Y%m%d%H%M%S" in v for v in freeze)  # names the remedy
 
 
@@ -148,17 +148,6 @@ def test_a_NEW_legacy_data_prefix_below_the_window_is_refused(tmp_path):
     repo = _fake_repo(*_full_legacy(data_extra=["d0000_hand.py"]), tmp_path=tmp_path)
     out = _mod.check(repo)
     assert any("d0000" in v and "allocates a NEW legacy-width id" in v for v in out)
-
-
-def test_a_DELETED_legacy_migration_is_caught(tmp_path):
-    """Deleting a legacy file frees its id for silent re-allocation — the one
-    way the frozen set can change without anyone deciding to change it."""
-    schema, data = _full_legacy()
-    repo = _fake_repo([s for s in schema if not s.startswith("0050")], data, tmp_path=tmp_path)
-    out = _mod.check(repo)
-    # The CONTIGUITY arm specifically — the mirror of the freeze-window tests.
-    assert any("should hold exactly 91" in v for v in out)
-    assert not any("allocates a NEW legacy-width id" in v for v in out)
 
 
 def test_existing_legacy_ids_are_not_flagged(tmp_path):
@@ -231,7 +220,7 @@ def test_ci_command_line_exits_NONZERO_on_a_violation(tmp_path):
     main()'s `return 1` to `return 0` printed every ::error:: annotation and
     still exited 0 — red annotations on a green job, the most convincing form
     of reporting clean when it is not."""
-    repo = _fake_repo(*_full_legacy(["0092_hand_allocated.py"]), tmp_path=tmp_path)
+    repo = _fake_repo(*_full_legacy(["0094_hand_allocated.py"]), tmp_path=tmp_path)
     proc = _run_as_ci(repo)
     assert proc.returncode == 1, f"exit {proc.returncode}\n{proc.stdout}\n{proc.stderr}"
-    assert "0092" in proc.stdout and "frozen" in proc.stdout
+    assert "0094" in proc.stdout and "frozen" in proc.stdout

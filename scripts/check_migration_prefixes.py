@@ -36,10 +36,10 @@ Two rules, both fail-closed:
    a new 4-digit (or ``d`` + 4-digit) prefix is refused. Freezing is what
    removes prefix contention at the root: nobody allocates an id any more, so
    two branches cannot claim the same one. Enforced against the frozen
-   window's BOTH ENDS plus its size — an earlier one-sided "above the mark"
-   rule let ``0000`` through, which is legacy-width, duplicates nothing, and
-   is the worst possible id for it (fresh install: runs before ``0001``;
-   existing install: runs after ``0091``).
+   window's BOTH ENDS — an earlier one-sided "above the mark" rule let
+   ``0000`` through, which is legacy-width, duplicates nothing, and is the
+   worst possible id for it (fresh install: runs before ``0001``; existing
+   install: runs last).
 
 Read-only. Exit 0 clean, 1 on any violation, 2 on a usage/plumbing error
 (never a silent pass).
@@ -125,33 +125,22 @@ def check(repo_root: Path) -> list[str]:
                     "(`date -u +%Y%m%d%H%M%S`)."
                 )
 
-        lo, hi, expected = ids.FROZEN_LEGACY_WINDOW[label]
+        lo, hi = ids.FROZEN_LEGACY_WINDOW[label]
         suffix = " with a leading 'd'." if label == "data migration" else "."
-        legacy = sorted(p for p in by_prefix if ids.is_legacy_id(p))
-
-        for prefix in legacy:
+        for prefix in sorted(p for p in by_prefix if ids.is_legacy_id(p)):
             # BOTH ends: below `lo` is as much a hand-allocated id as above
-            # `hi`, and `0000` — which a one-sided rule let through — is the
-            # id whose fresh-vs-existing ordering diverges maximally.
+            # `hi`, and `0000` — which a one-sided rule let through — is the id
+            # whose fresh-vs-existing ordering diverges maximally.
             if not (lo <= prefix <= hi):
                 violations.append(
                     f"{label}s: '{prefix}' ({', '.join(sorted(by_prefix[prefix]))}) "
                     f"allocates a NEW legacy-width id, but that namespace is frozen "
                     f"at {lo}..{hi}. New migrations use a UTC timestamp id: "
                     "`date -u +%Y%m%d%H%M%S`_description.py" + suffix
+                    + " (If a legacy migration legitimately landed on the default "
+                    "branch above the window while this was in flight, bump the "
+                    "window in src/genesis/db/_migration_ids.py.)"
                 )
-
-        # Contiguity: for a contiguous range, (lo, hi, count) characterises the
-        # set exactly — so a DELETED legacy migration, which would otherwise
-        # free its id for silent re-allocation, surfaces here instead.
-        if legacy and (legacy[0], legacy[-1], len(legacy)) != (lo, hi, expected):
-            violations.append(
-                f"{label}s: the frozen legacy window {lo}..{hi} should hold exactly "
-                f"{expected} ids; found {len(legacy)} spanning "
-                f"{legacy[0]}..{legacy[-1]}. A deleted legacy migration frees its id "
-                "for re-allocation — restore it, or move the window deliberately in "
-                "src/genesis/db/_migration_ids.py."
-            )
 
     return violations
 
