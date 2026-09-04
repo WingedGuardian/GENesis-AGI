@@ -57,6 +57,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   those settings fail toward spending money and toward running an autonomous job the
   operator had switched off.
 
+- **Model routing ignored the install config, so half the system talked to the
+  wrong machine.** Settings like the local inference server's address are resolved
+  in one documented order — environment, then the install config file, then a
+  built-in default — but the routing layer expanded its placeholders from the
+  environment alone. That was invisible while the template forced the same values
+  into the environment anyway; removing those assignments so the config file could
+  work is what exposed it. An install pointing at a remote inference server ended
+  up with its dashboard, health check and embeddings reaching that server while
+  routed model calls still went to localhost. Routing now resolves those settings
+  the same way everything else does, which also means the setup script's questions
+  about local inference finally take effect. An environment variable still wins
+  where one is set, and any placeholder without a matching setting behaves exactly
+  as before.
+
 - **A quoted "false" in the install config meant true.** Settings written in
   `genesis.yaml` are read as booleans, but a value in quotes arrives as text, and
   any non-empty text counted as on — so `embed_priority_tier: "false"` kept the

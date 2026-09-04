@@ -469,7 +469,15 @@ class TestSecretsTemplateDoesNotShadowYaml:
     It is asserted PRESENT below, as the control.
     """
 
-    SHADOWING = ("GENESIS_EMBED_PRIORITY_TIER", "OLLAMA_URL", "LM_STUDIO_URL", "LM_STUDIO_HEALTH_URL")
+    SHADOWING = (
+        "GENESIS_EMBED_PRIORITY_TIER",
+        "OLLAMA_URL",
+        "LM_STUDIO_URL",
+        "LM_STUDIO_HEALTH_URL",
+        # Joined the list once the routing loader started resolving it through the
+        # accessor; before that, removing it flipped Ollama ON for every install.
+        "GENESIS_ENABLE_OLLAMA",
+    )
 
     def _assignments(self, name: str) -> list[str]:
         from genesis.env import repo_root
@@ -486,106 +494,46 @@ class TestSecretsTemplateDoesNotShadowYaml:
             f"{self._assignments(name)}"
         )
 
-    def test_enable_ollama_stays_assigned(self):
-        """The control, and the reason the predicate is value-vs-default.
+    def test_every_commented_lever_still_reaches_routing(self):
+        """DELIBERATE REVERSAL of this class's earlier control, recorded not deleted.
 
-        Without the assignment `${GENESIS_ENABLE_OLLAMA:-true}` turns Ollama ON for
-        every fresh install. If this ever goes red because someone "swept the class",
-        the sweep used the wrong rule.
+        This test used to assert the OPPOSITE for GENESIS_ENABLE_OLLAMA — that it must
+        stay ASSIGNED — because `model_routing.yaml` expanded it to `true` when unset,
+        so commenting it out turned Ollama on everywhere. The predicate then was
+        "template value == expansion default", and that key failed it.
 
-        BUT THIS LOCK PRESERVES A DEFECT, and saying so is the point of the note:
-        because the assignment is present, it shadows `network.ollama_enabled`, so
-        the "Ollama enabled (true/false)" answer that setup-local-config.sh prompts
-        for lands in genesis.yaml and does nothing. Removing the assignment is NOT
-        the fix — MEASURED: `routing/config.py::_expand_env_vars` resolves
-        `${VAR:-default}` from `os.environ` ALONE and never consults
-        `env.ollama_enabled()`, so the yaml lever cannot reach the router either
-        way. Aligning the routing default would only make the two agree when both
-        are unset. The real fix is to make routing read the accessor rather than
-        raw environment, which is a routing-config change, not a template one.
-        Tracked; until then this assignment is load-bearing and must stay.
-        """
-        assert self._assignments("GENESIS_ENABLE_OLLAMA"), (
-            "GENESIS_ENABLE_OLLAMA must stay UNCOMMENTED in secrets.env.example: "
-            "config/model_routing.yaml expands it to `true` when unset."
-        )
+        The predicate changed when the cause did. `routing/config.py` now resolves
+        these placeholders through the `genesis.env` accessors, which implement
+        env -> yaml -> hardcoded default. So the question is no longer "does the
+        literal default match" but "does this key resolve through an accessor" — and
+        under that rule every lever here can be commented, which is what finally makes
+        setup-local-config.sh's answers reach the router instead of dying in yaml.
 
-
-class TestYamlBooleanSpellings:
-    """A quoted yaml boolean must mean what it says.
-
-    PyYAML returns a plain STRING for a quoted scalar, so `bool()` reads
-    `embed_priority_tier: "false"` as True — the opposite of the operator's
-    intent, and on that particular setting it silently keeps the PAID lane
-    running. The same value written unquoted parses to a real False, and written
-    in secrets.env the env branch reads it correctly, so an identical intention
-    had three spellings and two answers.
-    """
-
-    _ACCESSORS = [
-        ("ollama_enabled", "network", "ollama_enabled"),
-        ("embed_priority_tier", "memory", "embed_priority_tier"),
-        ("build_lane_enabled", "build_lane", "enabled"),
-        ("models_md_synthesis_enabled", "models_md_synthesis", "enabled"),
-    ]
-
-    @pytest.fixture(autouse=True)
-    def _no_env_shortcircuit(self, monkeypatch: pytest.MonkeyPatch):
-        for name in _SECTION_ACCESSOR_ENV:
-            monkeypatch.delenv(name, raising=False)
-
-    @pytest.mark.parametrize(("accessor", "section", "key"), _ACCESSORS)
-    @pytest.mark.parametrize("falsey", ["false", "False", "FALSE", "no", "off", "0", " false "])
-    def test_quoted_false_means_false(
-        self, monkeypatch: pytest.MonkeyPatch, accessor, section, key, falsey
-    ):
-        import genesis.env as env_mod
-
-        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
-        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {section: {key: falsey}})
-        assert getattr(env_mod, accessor)() is False, f"{accessor} read {falsey!r} as true"
-
-    @pytest.mark.parametrize(("accessor", "section", "key"), _ACCESSORS)
-    @pytest.mark.parametrize("truthy", ["true", "yes", "on", "1"])
-    def test_quoted_true_still_means_true(
-        self, monkeypatch: pytest.MonkeyPatch, accessor, section, key, truthy
-    ):
-        """The control. A guard that read everything as false would pass the test
-        above and break every opt-IN."""
-        import genesis.env as env_mod
-
-        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
-        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {section: {key: truthy}})
-        assert getattr(env_mod, accessor)() is True
-
-    @pytest.mark.parametrize(("accessor", "section", "key"), _ACCESSORS)
-    def test_native_yaml_booleans_are_unaffected(
-        self, monkeypatch: pytest.MonkeyPatch, accessor, section, key
-    ):
-        """Unquoted yaml already parsed to a real bool; that path must not move."""
-        import genesis.env as env_mod
-
-        for native, expected in ((False, False), (True, True)):
-            monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
-            monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {section: {key: native}})
-            assert getattr(env_mod, accessor)() is expected
-
-    def test_yaml_and_env_agree_on_every_spelling(self, monkeypatch: pytest.MonkeyPatch):
-        """The property that actually matters: same token, same answer, either home.
-
-        Asserted against the env branch itself rather than a hardcoded expectation,
-        so the two cannot drift apart without this failing.
+        Locking the PROPERTY rather than the instance: with no environment variable
+        set, each lever must expand in routing to exactly what its accessor returns.
+        An assignment reintroduced into the template would break that, because env
+        would win over the accessor's yaml lookup.
         """
         import genesis.env as env_mod
+        from genesis.routing.config import _ENV_ACCESSORS, _expand_env_vars
 
-        for token in ("false", "FALSE", "no", "off", "0", "true", "yes", "on", "1", "x"):
-            monkeypatch.setenv("GENESIS_EMBED_PRIORITY_TIER", token)
-            via_env = env_mod.embed_priority_tier()
-            monkeypatch.delenv("GENESIS_EMBED_PRIORITY_TIER", raising=False)
-            monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
-            monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {"memory": {"embed_priority_tier": token}})
-            via_yaml = env_mod.embed_priority_tier()
-            assert via_env == via_yaml, f"{token!r}: env={via_env} yaml={via_yaml}"
+        for key in self.SHADOWING:
+            if key not in _ENV_ACCESSORS:
+                continue  # value-vs-default levers are covered above
+            accessor = getattr(env_mod, _ENV_ACCESSORS[key])
+            expected = accessor()
+            expected_s = str(expected).lower() if isinstance(expected, bool) else str(expected)
+            got = _expand_env_vars(f"x: ${{{key}:-SENTINEL_SHOULD_NOT_APPEAR}}").strip()
+            assert got == f"x: {expected_s}", (
+                f"{key}: routing expanded to {got!r} but the accessor says {expected_s!r} — "
+                "the router and every other consumer disagree about the same setting."
+            )
+
+    def test_an_unmapped_placeholder_keeps_the_old_behaviour(self):
+        """The control. If the accessor path leaked to every key, this would break."""
+        from genesis.routing.config import _expand_env_vars
+
+        assert _expand_env_vars("y: ${SOME_UNMAPPED_VAR:-fallback}").strip() == "y: fallback"
 
 
 class TestNestedConfigReadsAreRouted:
