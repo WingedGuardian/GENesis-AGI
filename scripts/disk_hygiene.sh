@@ -24,7 +24,10 @@
 #  11. Retention prune of pending_issue_posts terminal rows (>30d)
 #      → scripts/prune_contributor_issue_posts.py (Contributor Work-Log hold
 #      store; held rows never pruned)
-#  12. Size trim of the hook audit stores (>5MB each) → scripts/prune_hook_audit_logs.py
+#  12. Retention prune of entity_merge_journal (>180d) → scripts/prune_entity_merge_journal.py
+#      (reversibility snapshot store; generous window so unmerge_entity outlives
+#      the mis-merge discovery horizon)
+#  13. Size trim of the hook audit stores (>5MB each) → scripts/prune_hook_audit_logs.py
 #      (merge-override + git-discard records, one file per flush — oldest whole
 #      files dropped; an age prune cannot bound an append-forever store)
 #
@@ -149,6 +152,10 @@ main() {
     echo "--- ego proposal-revision audit retention prune (ego_reconcile config) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_proposal_revisions.py" \
         || echo "prune_proposal_revisions exited $?"
+
+    echo "--- entity merge-journal reversibility retention prune (>180d) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/prune_entity_merge_journal.py" --days 180 \
+        || echo "prune_entity_merge_journal exited $?"
 
     echo "--- retrieval-efficacy report retention prune (>45d) ---"
     # WS2-0: retrieval_efficacy_report.py writes a dated md per run; bound the

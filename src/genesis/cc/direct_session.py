@@ -129,6 +129,16 @@ def _bg_session_sandbox(session_id: str) -> str:
 # cannot see or call them. Validated empirically: the init event's tools
 # list shrinks by the disallowed count.
 
+# The HUMAN half of the entity-merge approval gate. Denied universally AND
+# protected from re-enablement via `tool_exceptions` (see _NO_TOOL_EXCEPTIONS):
+# an autonomous session that could call approve+apply would self-approve the
+# gate, and reject carries the same human-review authority.
+_NO_ENTITY_ADJUDICATION_WRITE = [
+    "mcp__genesis-memory__entity_adjudication_approve",
+    "mcp__genesis-memory__entity_adjudication_apply",
+    "mcp__genesis-memory__entity_adjudication_reject",
+]
+
 _UNIVERSAL_DISALLOW = [
     "Bash",
     "Edit",
@@ -152,6 +162,17 @@ _UNIVERSAL_DISALLOW = [
     "mcp__genesis-memory__knowledge_ingest",
     "mcp__genesis-memory__knowledge_ingest_batch",
     "mcp__genesis-memory__knowledge_ingest_source",
+    # ── Entity-merge human-approval gate ──────────────────────────
+    # entity_adjudication_approve/_apply/_reject are the HUMAN half of the
+    # entity-merge gate: a proposed_merge is applied ONLY after a person
+    # approves it, and applying tombstones one entity into another
+    # irreversibly. An autonomous session that could call approve+apply would
+    # self-approve the gate — defeating its entire purpose — and reject is the
+    # same human-review authority (it could bury legitimate proposals). Denied
+    # UNIVERSALLY (every profile, present and future), not just the read-leaning
+    # ones, so no background profile can usurp the human decision. The read-only
+    # `entity_adjudication_list` stays reachable (surfacing proposals is safe).
+    *_NO_ENTITY_ADJUDICATION_WRITE,
     # ── User-scoped MCP servers (defense-in-depth) ────────────────
     # strict_mcp_config (CCInvocation default True) already drops these by making
     # --mcp-config authoritative; deny them by name too so a site that opts out of
@@ -223,6 +244,22 @@ _NO_OUTREACH_EXTRAS = [
     "mcp__genesis-outreach__outreach_digest",
 ]
 
+# Cold-marketing tools. marketing_send resolves its recipient in-code from the
+# owner-curated marketing_prospects store and enqueues a BULK cold send;
+# marketing_prospects_list ENUMERATES that same private store (names + addresses).
+# Both must be reachable ONLY from the `campaign` profile (the intended autonomous
+# marketing caller). Deny them in every other profile: mandatorily for the
+# untrusted-inbound perimeter profiles (mail, community-responder), where an injected
+# inbound message could otherwise reach the actuator OR exfiltrate the prospect list
+# by echoing it back through the profile's reply tool, and belt-and-suspenders on
+# profiles that don't mount genesis-outreach today (guards an MCP-config
+# fallback-to-full). NOTE: the tool code-gates on effective_mode()==off (returns
+# empty), so this denial is what protects the store once marketing mode is ARMED.
+_NO_MARKETING_SEND = [
+    "mcp__genesis-outreach__marketing_send",
+    "mcp__genesis-outreach__marketing_prospects_list",
+]
+
 # The venv Python interpreter running genesis-server. Exposed to profile
 # overlays (see _load_profile_overlays) so a locally-defined Bash profile can
 # allowlist exactly this path and run `<this> -m <module>`. Using
@@ -239,9 +276,16 @@ PROFILES: dict[str, list[str]] = {
         + _NO_FOLLOW_UPS
         + _NO_OUTREACH_ENGAGEMENT
         + _NO_RECON_WRITES
+        + _NO_MARKETING_SEND
     ),
-    "interact": (_UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES),
-    "research": (_UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION),
+    "interact": (
+        _UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES + _NO_MARKETING_SEND
+    ),
+    "research": (
+        _UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION + _NO_MARKETING_SEND
+    ),
+    # `campaign` is the ONLY profile that may call marketing_send — the intended
+    # autonomous cold-marketing caller. Every other profile denies it above/below.
     "campaign": (_UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION),
     # ── Steward profile ──────────────────────────────────────────
     # For the upstream-PR stewardship campaign. UNIQUE among profiles: it
@@ -251,7 +295,10 @@ PROFILES: dict[str, list[str]] = {
     # stay blocked — the campaign comments/reopens/closes PRs and ESCALATES
     # code fixes rather than editing/pushing itself.
     "steward": (
-        [t for t in _UNIVERSAL_DISALLOW if t != "Bash"] + _NO_BROWSER_INTERACTION + _NO_FILE_WRITE
+        [t for t in _UNIVERSAL_DISALLOW if t != "Bash"]
+        + _NO_BROWSER_INTERACTION
+        + _NO_FILE_WRITE
+        + _NO_MARKETING_SEND
     ),
     # ── Community responder profile ─────────────────────────────
     # Reactive community responder: reads a community's channels and replies
@@ -259,7 +306,11 @@ PROFILES: dict[str, list[str]] = {
     # outreach (no memory server). Belt-and-suspenders: block memory writes at
     # tool level too, in case MCP config generation fails and falls back to full.
     "community-responder": (
-        _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION + _NO_MEMORY_WRITES + _NO_FOLLOW_UPS
+        _UNIVERSAL_DISALLOW
+        + _NO_BROWSER_INTERACTION
+        + _NO_MEMORY_WRITES
+        + _NO_FOLLOW_UPS
+        + _NO_MARKETING_SEND
     ),
     # ── Perimeter profile ────────────────────────────────────────
     # For sessions that process untrusted inbound content (email
@@ -277,6 +328,7 @@ PROFILES: dict[str, list[str]] = {
         + _NO_RECON_WRITES
         + _NO_WEB_TOOLS
         + _NO_OUTREACH_EXTRAS
+        + _NO_MARKETING_SEND
     ),
 }
 
@@ -472,6 +524,7 @@ class ProfileOverlayContext:
     no_outreach_engagement: list[str]
     no_recon_writes: list[str]
     no_web_tools: list[str]
+    no_marketing_send: list[str]
     venv_python: str
 
     def add_profile(
@@ -522,6 +575,7 @@ def _load_profile_overlays() -> None:
         no_outreach_engagement=_NO_OUTREACH_ENGAGEMENT,
         no_recon_writes=_NO_RECON_WRITES,
         no_web_tools=_NO_WEB_TOOLS,
+        no_marketing_send=_NO_MARKETING_SEND,
         venv_python=_VENV_PYTHON,
     )
     try:
@@ -602,9 +656,10 @@ class DirectSessionRequest:
     planning_instruction: str | None = None  # opt-in: prepended to prompt
     skills: list[str] | None = None  # explicit skill injection (overrides auto-detect)
     tool_exceptions: tuple[str, ...] = ()  # tools to UN-block from the profile disallow list
-    # Intentional per-dispatch model SELECTION (not failover): a roster name
-    # (e.g. "glm-5.2") to run this background session on instead of the global
-    # default. None → the chokepoint applies the active default as usual.
+    # Intentional per-dispatch model SELECTION (not failover): a roster name —
+    # a peer from the cc_roster overlay — to run this background session on
+    # instead of the global default. None → the chokepoint applies the active
+    # default as usual.
     roster_model: str | None = None
     # Delivery of the terminal outcome. None → derived from the legacy
     # notify/notify_on_failure_only bools in __post_init__ (SILENT/FAILURE_ONLY),
@@ -648,7 +703,7 @@ class DirectSessionResult:
     duration_s: float = 0.0
     tools_called: list[dict] = field(default_factory=list)
     model_used: str = ""
-    roster_model: str = ""  # roster NAME the chokepoint selected ("glm-5.2"/"claude")
+    roster_model: str = ""  # roster NAME the chokepoint selected (peer name or "claude")
 
 
 # ---------------------------------------------------------------------------
@@ -976,13 +1031,18 @@ class DirectSessionRunner:
             )
             try:
                 await self._store_result(session_id, request, cancel_result)
-                # Feed the outcome back to an ego proposal, matching the
-                # generic failure path below.
-                await self._record_proposal_outcome(request, cancel_result)
+                # Write the terminal 'failed' status BEFORE the outcome embed:
+                # _record_proposal_outcome vectorizes (Qdrant), and a slow embed
+                # during the ~10s shutdown grace could push fail() past DB close,
+                # leaving the row 'active' across a restart. _store_result stays
+                # first so the on-end hook fail() fires sees full metadata.
                 await self._session_manager.fail(
                     session_id,
                     reason="cancelled",
                 )
+                # Feed the outcome back to an ego proposal, matching the
+                # generic failure path below.
+                await self._record_proposal_outcome(request, cancel_result)
             except Exception:
                 logger.error(
                     "Failed to record session %s cancellation",
@@ -1077,14 +1137,17 @@ class DirectSessionRunner:
             tools_called=telemetry,
         )
 
-        # Best-effort: persist failure and notify
+        # Best-effort: persist failure and notify. Terminal status BEFORE the
+        # outcome embed (same ordering as the cancel handler): _record_proposal_outcome
+        # vectorizes, and the status write must not be stranded behind a slow embed.
+        # _store_result stays first so the on-end hook fail() fires sees full metadata.
         try:
             await self._store_result(session_id, request, error_result)
-            await self._record_proposal_outcome(request, error_result)
             await self._session_manager.fail(
                 session_id,
                 reason=str(exc)[:500],
             )
+            await self._record_proposal_outcome(request, error_result)
         except Exception:
             logger.error(
                 "Failed to record session %s failure",
@@ -1144,6 +1207,7 @@ class DirectSessionRunner:
         dispatch_origin = _PROFILE_ORIGIN.get(request.profile)
         try:
             from genesis.db.crud.ego import (
+                get_proposal,
                 mark_proposal_verification_failed,
                 update_proposal_outcome,
             )
@@ -1222,11 +1286,28 @@ class DirectSessionRunner:
             try:
                 store = getattr(self._rt, "_memory_store", None)
                 if store is not None:
+                    # Prepend a human subject from the proposal so the memory has
+                    # task terms to recall on, not just the opaque UUID (#1487 :1212).
+                    # One cheap read; the row is not otherwise loaded on this path.
+                    # Its own try: a subject-fetch failure must degrade to no subject,
+                    # NOT skip the (more valuable) outcome memory itself.
+                    _subj = ""
+                    try:
+                        _prop = await get_proposal(db, proposal_id)
+                        _subj = ((_prop.get("content") if _prop else None) or "").strip()[:80]
+                    except Exception:
+                        logger.debug("Failed to fetch proposal subject", exc_info=True)
+                    _subj_tag = f" ({_subj})" if _subj else ""
                     if result.success:
-                        content = f"Ego dispatch SUCCEEDED for proposal {proposal_id}: {summary}"
+                        content = (
+                            f"Ego dispatch SUCCEEDED for proposal "
+                            f"{proposal_id}{_subj_tag}: {summary}"
+                        )
                         outcome_tag = "dispatch_success"
                     else:
-                        content = f"Ego dispatch FAILED for proposal {proposal_id}: {summary}"
+                        content = (
+                            f"Ego dispatch FAILED for proposal {proposal_id}{_subj_tag}: {summary}"
+                        )
                         outcome_tag = "dispatch_failure"
                     await store.store(
                         content=content,
@@ -1368,6 +1449,17 @@ class DirectSessionRunner:
             # invariant (GENESIS_SESSION_ID is always a foreground row) depends
             # on direct_session_run staying unreachable from background sessions.
             exceptions.discard("mcp__genesis-health__direct_session_run")
+            # Same protection for the cold-marketing actuator: a tool_exception
+            # must never re-enable marketing_send on a non-campaign profile
+            # (esp. the untrusted-inbound mail/community-responder perimeter). The
+            # profile disallow lists are the belt; this keeps the exception
+            # mechanism from becoming a hole in them, regardless of caller.
+            exceptions -= set(_NO_MARKETING_SEND)
+            # Same protection for the entity-merge human-approval gate: a
+            # tool_exception must never re-grant approve/apply/reject to a
+            # background session (that would let it self-approve the gate,
+            # defeating the whole point of the universal deny above).
+            exceptions -= set(_NO_ENTITY_ADJUDICATION_WRITE)
             disallowed = [t for t in disallowed if t not in exceptions]
 
         # Give background sessions access to Genesis MCP servers. Profile

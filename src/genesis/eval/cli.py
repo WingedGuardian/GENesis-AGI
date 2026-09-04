@@ -128,7 +128,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "--model",
         "-m",
         required=True,
-        help="Roster model name (e.g. claude, glm-5.2)",
+        help="Roster model name (claude, or a peer from your cc_roster overlay)",
     )
     gauntlet_cmd.add_argument(
         "--no-db",

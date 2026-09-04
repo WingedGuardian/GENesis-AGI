@@ -75,6 +75,8 @@ contribution_forbidden:
   # Security scanner config — a contribution must never weaken the gate that scans it
   - pattern: ".gitleaks.toml"
     reason: "The sanitizer's own secret-scan rules; a contribution that edits them could silently disable secret detection for every future contribution"
+  - pattern: ".github/secret_scanning.yml"
+    reason: "GitHub-native secret-scanning config; a contribution that widens its paths-ignore could silently disable GitHub's own secret detection for every future contribution"
   # User-specific configs
   - pattern: "config/research-profiles/**"
     reason: "Private research interests"

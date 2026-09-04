@@ -616,6 +616,34 @@ async def test_record_outcome_failure_memory_is_recallable(db):
     )
 
 
+# --- #1487 P2 polish: proposal subject in the outcome memory + cancel ordering ---
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_content_includes_proposal_subject(db):
+    """The outcome memory must carry a human subject from the proposal, not just
+    an opaque UUID — else the memory has no task terms to recall on (#1487 :1212)."""
+    from genesis.db.crud.ego import create_proposal
+
+    store = _RecordingStore()
+    await create_proposal(
+        db,
+        id="prop-subj",
+        action_type="dispatch",
+        content="Refactor the memory retrieval stack",
+        status="executed",
+    )
+    req = DirectSessionRequest(prompt="t", caller_context="ego_proposal:prop-subj")
+    res = DirectSessionResult(session_id="s-subj", success=True, output_text="done")
+    await _recording_runner(db, store)._record_proposal_outcome(req, res)
+
+    succ = [c for c in store.calls if "dispatch_success" in (c.get("tags") or [])]
+    assert len(succ) == 1
+    assert "Refactor the memory retrieval" in succ[0]["content"], (
+        "outcome memory must carry the proposal subject for recall, not just the UUID"
+    )
+
+
 # --- park→resume proposal-lineage survival (PR-3) ---
 #
 # A rate-limit-parked ego dispatch resumes with caller_context rewritten to
@@ -665,6 +693,111 @@ async def test_record_outcome_plain_resume_prefix_without_origin_is_noop(db):
     res = DirectSessionResult(session_id="s-none", success=True, output_text="x")
     await _recording_runner(db, store)._record_proposal_outcome(req, res)
     assert store.calls == [], "a non-ego resumed job must not record a proposal outcome"
+
+
+@pytest.mark.asyncio
+async def test_cancel_records_terminal_status_before_embedding(db):
+    """On cancel, the terminal 'failed' status must be written BEFORE the outcome
+    embed — a slow vectorize during the 10s shutdown grace must not push the
+    status write past DB close, leaving the row 'active' (#1487 :1217)."""
+    from types import SimpleNamespace
+
+    from genesis.cc.types import CCInvocation, CCModel, EffortLevel, SessionType
+    from genesis.db.crud.ego import create_proposal
+
+    order: list[str] = []
+
+    class _OrderStore:
+        async def store(self, **_kwargs):
+            order.append("embed")
+            return "mem-id"
+
+    sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+    real_fail = sm.fail
+
+    async def _recording_fail(*a, **k):
+        order.append("fail")
+        return await real_fail(*a, **k)
+
+    sm.fail = _recording_fail
+
+    invoker = AsyncMock()
+    invoker.run_streaming = AsyncMock(side_effect=asyncio.CancelledError())
+    runner = DirectSessionRunner(
+        invoker=invoker,
+        session_manager=sm,
+        config_builder=AsyncMock(),
+        runtime=SimpleNamespace(_db=db, _memory_store=_OrderStore()),
+    )
+    runner._build_invocation = lambda _req, _sid: CCInvocation(prompt="x")
+
+    await create_proposal(db, id="prop-cxl", action_type="dispatch", content="y", status="executed")
+    sess = await sm.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM,
+    )
+    req = DirectSessionRequest(prompt="t", caller_context="ego_proposal:prop-cxl")
+    with pytest.raises(asyncio.CancelledError):
+        await runner._run_session(req, sess["id"])
+
+    assert "fail" in order and "embed" in order, f"expected both events, got {order}"
+    assert order.index("fail") < order.index("embed"), (
+        f"terminal status must be recorded before the outcome embed, got {order}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_generic_failure_records_terminal_status_before_embedding(db):
+    """The generic (non-cancel) failure path has the SAME ordering invariant:
+    terminal 'failed' status before the outcome embed. Locks the whole class,
+    not just the cancel instance."""
+    from types import SimpleNamespace
+
+    from genesis.cc.types import CCInvocation, CCModel, EffortLevel, SessionType
+    from genesis.db.crud.ego import create_proposal
+
+    order: list[str] = []
+
+    class _OrderStore:
+        async def store(self, **_kwargs):
+            order.append("embed")
+            return "mem-id"
+
+    sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+    real_fail = sm.fail
+
+    async def _recording_fail(*a, **k):
+        order.append("fail")
+        return await real_fail(*a, **k)
+
+    sm.fail = _recording_fail
+
+    invoker = AsyncMock()
+    invoker.run_streaming = AsyncMock(side_effect=ValueError("boom"))
+    runner = DirectSessionRunner(
+        invoker=invoker,
+        session_manager=sm,
+        config_builder=AsyncMock(),
+        runtime=SimpleNamespace(_db=db, _memory_store=_OrderStore()),
+    )
+    runner._build_invocation = lambda _req, _sid: CCInvocation(prompt="x")
+
+    await create_proposal(db, id="prop-gf", action_type="dispatch", content="z", status="executed")
+    sess = await sm.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM,
+    )
+    req = DirectSessionRequest(prompt="t", caller_context="ego_proposal:prop-gf")
+    # generic failure path records the outcome best-effort, then re-raises
+    with pytest.raises(ValueError):
+        await runner._run_session(req, sess["id"])
+
+    assert "fail" in order and "embed" in order, f"expected both events, got {order}"
+    assert order.index("fail") < order.index("embed"), (
+        f"terminal status must precede the outcome embed on the generic path, got {order}"
+    )
 
 
 # --- WS-3 provenance: dispatch outcomes inherit the SESSION's origin (Codex #1487) ---

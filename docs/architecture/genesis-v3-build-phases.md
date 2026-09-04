@@ -1302,6 +1302,14 @@ a burn-in period. Rationale:
 Start prediction logging early so calibration data accumulates before Phase 9
 needs it. This is pure instrumentation — zero LLM cost.
 
+> **SUPERSEDED (WS-2 P5 sunset, migration 0090).** This entire legacy calibration
+> subsystem — the `predictions` logging table, the prediction→outcome reconciler,
+> and the per-domain `calibration_curves` computation — has been retired. The
+> unified `calibration_cells` table (WS-2 P3) is the live calibration surface
+> (perception reads it; the graded cognitive ledger computes it). `predictions` is
+> archived to `predictions_legacy_ws2`; `calibration_curves` is dropped. The
+> descriptions and the checklist below are the historical Phase-8 record.
+
 - **Prediction logging table** (`predictions`):
   - Schema: `{id, action_id, timestamp, prediction, confidence, confidence_bucket,
     domain, reasoning, outcome (nullable), correct (nullable), matched_at (nullable)}`
@@ -1399,6 +1407,9 @@ Phase 8 accumulates prediction data. Phase 9 uses it to inform autonomy decision
   you're historically right ~60% of the time. Adjust accordingly." Per-domain
   curves from Phase 8's `calibration_curves` table. This is the "symbolic +
   neural" pairing validated by Google's Bayesian Teaching research.
+  **SUPERSEDED (WS-2):** perception now reads the unified `calibration_cells`
+  table (P3); the legacy `calibration_curves` table was retired in the P5 sunset
+  (migration 0090).
 - **Hard disagreement gates** — when cross-vendor review (call sites #17/#20)
   disagrees with primary model, the action BLOCKS until resolved:
   - Third model tiebreaker, OR

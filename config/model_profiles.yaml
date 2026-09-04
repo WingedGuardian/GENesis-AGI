@@ -167,13 +167,18 @@ profiles:
     anti_sycophancy: B
     context_window: 131072
     cost_tier: moderate
-    cost_per_mtok_in: 2.00
-    cost_per_mtok_out: 6.00
+    # Paid-plan list price. Kept in step with the `free: false` flip on
+    # `mistral-large-free` in model_routing.yaml — that flip activates the
+    # profile-based cost fallback in litellm_delegate._cost_from_profile
+    # (used whenever litellm.completion_cost() raises), so a stale figure here
+    # is silently recorded as real spend. These were 2.00/6.00, which would
+    # have over-recorded every fallback-priced call by 4x.
+    cost_per_mtok_in: 0.50
+    cost_per_mtok_out: 1.50
     latency: moderate
     strengths:
       - JSON instruction following
       - multilingual mastery
-      - data privacy (free tier data NOT used for training)
     weaknesses:
       - creative output is boring
       - 128k context is small
@@ -181,11 +186,15 @@ profiles:
     best_for: [memory_consolidation, fact_extraction, triage, outreach_draft]
     avoid_for: [creative_writing, long_context_work]
     free_tier:
-      available: true
+      # Revoked 2026-08: Mistral removed Large from free-tier entitlement,
+      # surfacing as 403 tier_not_allowed. Consumers selecting on
+      # `require_free=True` must stop treating this as a $0 option — leaving it
+      # true is what makes a never-pays selector pick a paid model.
+      available: false
       provider: mistral
-      limits: "2 RPM, 4M tokens/month"
-    last_reviewed: "2026-04-01"
-    review_source: api_headers
+      note: "Large is paid-plan only since 2026-08; Small remains free-tier."
+    last_reviewed: "2026-09-03"
+    review_source: provider_pricing_page
 
   mistral-small:
     display_name: "Mistral Small (latest)"
