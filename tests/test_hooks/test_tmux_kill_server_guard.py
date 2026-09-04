@@ -3,8 +3,9 @@
 Origin (2026-09-04): a session's scratch-server cleanup ran a bare
 `tmux kill-server` — the inherited $TMUX env var outranks TMUX_TMPDIR, so
 the kill addressed the MAIN default server and reaped every live CC
-session at once. The guard nudges toward binding the kill to its socket
-(`-S <path>` / `-L <name>`) or clearing the inherited env first.
+session at once. The guard nudges toward the one safe form — binding
+the kill to its own socket (`-S <path>` / `-L <name>`); clearing $TMUX
+only re-targets the default socket, usually the main server too.
 
 Advisory invariants under test: never blocks (exit 0 on every input),
 silent on bound kills, silent on kill-session (legitimately used against
@@ -63,6 +64,21 @@ class TestFiresOnTheRealTrap:
         advice = _advice("bash -c 'tmux kill-server'")
         assert "kill-server" in advice
 
+    def test_clearing_tmux_still_fires(self):
+        """Clearing $TMUX only re-targets the DEFAULT socket — which is
+        usually the main server. Only an explicit -S/-L binding is safe;
+        an earlier draft suppressed on these shapes and was wrong."""
+        assert "kill-server" in _advice("env -u TMUX tmux kill-server")
+        assert "kill-server" in _advice("TMUX= tmux kill-server")
+
+    def test_dash_s_consumed_by_another_option_is_no_binding(self):
+        """`tmux -f -S kill-server`: -f takes a file, so -S is its VALUE,
+        not a server binding — the kill still hits the inherited server."""
+        assert "kill-server" in _advice("tmux -f -S kill-server")
+
+    def test_config_file_option_is_not_a_binding(self):
+        assert "kill-server" in _advice("tmux -f /dev/null kill-server")
+
     def test_env_wrapper_without_socket_still_fires(self):
         """TMUX_TMPDIR does NOT bind the target — $TMUX outranks it. Only an
         explicit -S/-L (or clearing TMUX) does; the wrapper alone still fires."""
@@ -81,6 +97,12 @@ class TestStaysSilent:
         assert _advice("tmux -S/tmp/s.sock kill-server") == ""
         assert _advice("tmux -Lprobe kill-server") == ""
 
+    def test_kill_server_as_argument_of_another_command(self):
+        """The command word decides, not membership: these pass the literal
+        string to a different tmux command and kill nothing."""
+        assert _advice("tmux display-message kill-server") == ""
+        assert _advice("tmux set-environment X kill-server") == ""
+
     def test_kill_session_unguarded(self):
         """The slot launcher legitimately kill-sessions on the default server."""
         assert _advice("tmux kill-session -t '=cc-3'") == ""
@@ -91,19 +113,6 @@ class TestStaysSilent:
     def test_unrelated_commands(self):
         assert _advice("tmux ls") == ""
         assert _advice("echo tmux kill-server is dangerous") == ""
-
-    def test_env_unset_tmux_is_the_remedy_not_a_repeat_offense(self):
-        """Clearing the inherited $TMUX is exactly what the advisory asks
-        for — the compliant retry must not draw the identical advisory."""
-        assert _advice("env -u TMUX tmux kill-server") == ""
-        assert _advice("env --unset TMUX tmux kill-server") == ""
-        assert _advice("TMUX= tmux kill-server") == ""
-
-    def test_tmux_assignment_to_a_value_still_fires(self):
-        """Pointing $TMUX somewhere is a redirect, not a clearing — and
-        TMUX_TMPDIR alone never overrides an inherited $TMUX."""
-        advice = _advice("TMUX=/tmp/other/sock,1,0 tmux kill-server")
-        assert "kill-server" in advice
 
     def test_untokenizable_stays_silent(self):
         """Degraded parse → silence: an advisory has no block to fail open

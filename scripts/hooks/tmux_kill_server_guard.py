@@ -27,7 +27,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -38,12 +37,13 @@ from shell_parse import analyze, untokenizable  # noqa: E402
 _ADVICE = (
     "ADVISORY: this runs `tmux kill-server` with no explicit socket binding "
     "(-S/-L). tmux resolves the target server from an inherited $TMUX first — "
-    "TMUX_TMPDIR does NOT override it — so inside a tmux pane this kills the "
-    "MAIN server and every CC session on it, including this one. If a scratch "
-    "or probe server is the target, bind the kill to its socket "
-    "(`tmux -S <path> kill-server` / `tmux -L <name> kill-server`) or clear "
-    "the inherited variable first (`env -u TMUX tmux ...`). If the default "
-    "server really is the target, proceed knowingly."
+    "TMUX_TMPDIR does NOT override it, and clearing $TMUX only re-targets the "
+    "DEFAULT socket, which is usually the main server too — so inside a tmux "
+    "pane this kills the MAIN server and every CC session on it, including "
+    "this one. If a scratch or probe server is the target, bind the kill to "
+    "ITS socket explicitly: `tmux -S <path> kill-server` / `tmux -L <name> "
+    "kill-server`. If the default server really is the target, proceed "
+    "knowingly."
 )
 
 
@@ -61,15 +61,41 @@ def _has_socket_binding(argv: list[str]) -> bool:
     )
 
 
-# The guard's own remedy must not re-trigger it: `env -u TMUX` / a bare
-# `TMUX=` clearing IS the deliberate act the advisory asks for, but
-# analyze() strips env wrappers from argv, so the evidence survives only
-# in the segment's RAW text. `TMUX\b` does not match TMUX_TMPDIR (the
-# underscore is a word character), so the wrapper that does NOT bind the
-# target still draws the advisory.
-_TMUX_CLEARED = re.compile(
-    r"(?:\benv\b[^;|&]*?(?:-u\s+|--unset(?:=|\s+))TMUX\b|(?:^|\s)TMUX=(?:\s|$))"
-)
+# tmux global options that CONSUME a value, per the tmux(1) synopsis — a
+# closed set, which is the whole design: the guard walks the option prefix
+# with this table, takes the first non-option token as the COMMAND WORD, and
+# advises only when that word is kill-server with no genuinely-consumed
+# -S/-L binding. No raw-text scanning, no env/quoting semantics modeled —
+# an earlier draft suppressed on `env -u TMUX` in the raw segment and was
+# wrong three ways at once (matched inside comments and quoted values, and
+# the "remedy" it honored still kills the default server). Mis-classifying
+# a future tmux option here shifts one advisory line, never a verdict that
+# authorizes anything.
+_VALUE_OPTS = {"-c", "-f", "-L", "-S", "-T"}
+
+
+def _command_word_and_binding(argv: list[str]) -> tuple[str | None, bool]:
+    """(first command word, saw a real -S/-L server binding) for a tmux argv.
+
+    Separate (``-S path``) and glued (``-Spath``) forms both bind; a ``-S``
+    consumed as ANOTHER option's value (``tmux -f -S kill-server`` — ``-f``
+    takes a file) does not. Glued values of other options (``-f/dev/null``)
+    are one token and consume nothing extra."""
+    bound = False
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if not tok.startswith("-") or tok == "-":
+            return tok, bound
+        if tok in _VALUE_OPTS:
+            if tok in ("-S", "-L"):
+                bound = True
+            i += 2  # the next token is this option's value, whatever it looks like
+            continue
+        if len(tok) > 2 and tok[:2] in ("-S", "-L"):
+            bound = True
+        i += 1
+    return None, bound
 
 
 def _advisory(command: str) -> str | None:
@@ -78,11 +104,8 @@ def _advisory(command: str) -> str | None:
     for seg in analyze(command):
         if seg.exe != "tmux":
             continue
-        if (
-            "kill-server" in seg.argv
-            and not _has_socket_binding(seg.argv)
-            and not _TMUX_CLEARED.search(seg.raw)
-        ):
+        word, bound = _command_word_and_binding(seg.argv)
+        if word == "kill-server" and not bound:
             return _ADVICE
     return None
 

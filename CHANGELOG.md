@@ -36,10 +36,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   resolves its target server from the inherited `$TMUX` variable before
   `TMUX_TMPDIR`, so a cleanup aimed at a scratch or probe server can address
   the main server instead and take down every live session on it — including
-  the one issuing the command. A new advisory-tier guard flags the unbound
-  form and suggests binding the kill to its socket (`-S`/`-L`) or clearing the
-  inherited variable. Session-scoped kills (`kill-session`) are deliberately
-  not flagged, and the advisory never blocks anything.
+  the one issuing the command. Clearing `$TMUX` does not help: that only
+  re-targets the default socket, which is usually the main server too. A new
+  advisory-tier guard flags a `kill-server` carrying no explicit `-S`/`-L`
+  binding and points at the one safe form — binding the kill to its own
+  socket. Session-scoped kills (`kill-session`) are deliberately not flagged,
+  and the advisory never blocks anything.
 
 - **The review-round limit now has an end, not just a speed bump.** The existing
   limit pauses after three rounds in which an independent reviewer keeps finding new
