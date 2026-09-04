@@ -192,17 +192,25 @@ only replaying a known-positive tells them apart.
 
 ### Select, don't amputate — truncation is the absence of a decision
 
-**Scope first, because bounding is often correct.** A bounded PREVIEW whose full
-value stays retrievable from its store is a selection with a pointer, not an
-amputation — `memory/proactive.py:418` renders `principle[:200]` into the
-injection block on purpose, and the whole record comes back from
-`procedure_recall`. Name the RIGHT retrieval path when you claim one: procedures
-live in SQLite `procedural_memory`, so `memory_expand` — which retrieves from the
-Qdrant collections only — cannot recover them, and a preview whose pointer does
-not resolve is an amputation wearing a citation. Bounding is likewise correct
-against a hard external budget (a hook stdout cap, a DB column, a context
-window). This section is about the other case: a value that is the ONLY copy,
-where cutting it destroys the information for good.
+**Scope first, because bounding is often correct.** A bounded PREVIEW is a
+selection with a pointer, not an amputation — but ONLY if the pointer actually
+resolves. The proactive memory hook is the worked example: it renders a snippet
+plus `id:xxxxxxxx`, and `memory_expand` takes exactly that handle (it resolves
+short prefixes and reports `ambiguous` rather than guessing) and returns the full
+record. Bounding is likewise correct against a hard external budget — a hook
+stdout cap, a DB column, a context window — and a log line or diagnostic
+rendering of something stored intact elsewhere is a preview like any other. This
+section is about the other case: a value that is the ONLY copy, where cutting it
+destroys the information.
+
+**Test the pointer before you call something a preview.** The same hook renders
+`principle[:200]` for procedures with an id beside it, and that one does NOT
+resolve: procedures live in SQLite `procedural_memory`, `memory_expand` retrieves
+only the Qdrant collections, and `procedure_recall` takes a task description and
+tags with no id lookup at all. So it looks exactly like the memory case and is an
+amputation — and successive drafts of this very section cited it as the carve-out,
+each naming a different wrong tool. A pointer you have not followed is not a
+pointer.
 
 **There, do not truncate.** Not strings, not lists, not context, not output.
 Reaching for a character cap is a signal that a question was skipped, not
@@ -241,8 +249,13 @@ Three rules when a bound really is needed:
   error_message IS NOT NULL AND error_message != '';` On one install on
   2026-09-03 that gave **270/318 (84.9%)** cut by a 300-char cap — and since JSON
   error bodies put the machine-readable cause last, the cap discards exactly the
-  part worth keeping. Your install will differ; the denominator is itself already
-  truncated at 1024, so treat it as a floor.
+  part worth keeping. Your install will differ.
+  This rule failed on itself once, which is why the correction stays: an earlier
+  draft hedged that rate as "a floor" because the corpus is capped at 1024
+  upstream. Wrong — a 1024-cap cannot change whether a length exceeds 300, and
+  `COUNT(*)` counts rows, so the rate is EXACT and only the CONTENT LOST is a
+  lower bound. Hedging a number you have not thought through is the same failure
+  as asserting one.
 - **Omit explicitly, with a constant-bounded marker** (`<omitted: 104,823
   chars>`), never a mid-value cut. An honest gap beats a plausible-looking
   fragment. Already the house pattern: repo-pulse's loud `limit_hit`
@@ -263,20 +276,39 @@ default is: emit the value WHOLE and record the decision owed — the value, the
 population you could not measure, and what you could not decide. Never pick the
 number just because no one was there to stop you.
 
-Record it somewhere that session can actually reach AND that PRESERVES it —
-availability is not preservation, and checking only the first is how this very
-paragraph came out wrong the first time. An autonomy executor CODE or VERIFICATION
-step is tool-scoped (`step_dispatcher.py` hands those two the reflection denylist,
-whose allowed set in `cc/session_config.py` carries `follow_up_list` but not
-`follow_up_create`), so there "file a follow-up" is not an instruction it can
-execute. Its `result` field is no answer either: the contract calls it a "brief
-description" and every consumer cuts it — `[:200]` into the next step's prompt and
-into the trace, `[:2000]` on the write path — so a decision placed there is
-amputated by the machinery, which is the failure this section exists to name. Use
-`TASK_NOTEPAD.md`'s `## Decisions` section, which steps are already instructed to
-append to and which `engine._promote_notepad` stores WHOLE. Other unattended
-profiles differ — `interact` and `research` keep `follow_up_create` — so check the
-surface you are actually on instead of assuming the strictest case.
+Record it somewhere that session can actually REACH and that PRESERVES it whole.
+Both halves, checked against the surface you are on. This instruction names no
+channel on purpose: every earlier draft prescribed one, and each was wrong for
+some surface. Three worked examples of getting it wrong, because the failures
+teach the check better than a rule does:
+
+- **Reachable, preserves nothing.** An executor step's `result` field exists
+  everywhere and its contract calls it a "brief description"; every consumer cuts
+  it — `[:200]` into the next step's prompt and into the trace, `[:2000]` on the
+  write path. Availability said yes; preservation said no.
+- **Preserves whole, not reachable.** `TASK_NOTEPAD.md` is promoted to memory
+  uncut — but it is seeded in a CODE task's worktree, and a VERIFICATION step runs
+  in the background-session directory, so for that step it is a file in the wrong
+  place. Preservation said yes; reachability said no.
+- **A ranking assumed instead of read.** A draft called CODE/VERIFICATION the
+  strictest executor scope because `follow_up_create` is denied there. Backwards:
+  the MCP setup is gated on `is_code_or_verify`, so RESEARCH/ANALYSIS/SYNTHESIS
+  get *zero* MCP tools — the denied-list surface is the most permissive one.
+  Membership facts were right; the ordering derived from them was never checked.
+
+The rule is the property, not the mechanism: **availability is not preservation,
+neither is portable between surfaces, and a ranking is a separate claim from the
+facts it sorts.** Verify each for the surface you are on. If nothing obvious
+qualifies, look harder before declaring a dead end — grep the sibling fields of
+whatever you were about to give up on. (The same `result` write that slices to
+`[:2000]` stores `blocker_description` and `artifacts` UNSLICED, and the step
+contract defines the first as "what decision is needed from the user", which is
+close to exactly this. It costs a `blocked` status, which is a real price worth
+naming — but it is an answer, and the earlier draft asserted there was none.)
+This is the one carve-out from "never leave a follow-up as just text": that rule
+assumes a surface where `follow_up_create` exists. Where it does not, an
+unrecorded debt is worse than a differently-recorded one — but say which surface
+forced it, so the exception cannot quietly become the habit.
 
 That default is about SIZE, never about secrecy, and the two must not be
 confused. If a value may carry a credential, token, or personal data, the
