@@ -9,6 +9,28 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **A review comment on documentation no longer blocks a merge.** The pre-merge
+  check already declined to count findings on prose, but its idea of prose was
+  narrow: markdown counted only underneath `docs/`, so a comment on a top-level
+  guide, or on one of the instruction files that shape how the assistant works,
+  was treated as a finding on code and held the merge. Any markdown, reStructured-
+  Text or AsciiDoc file now counts as documentation wherever it lives.
+
+  The narrowness was deliberate, and it is being relaxed on one specific ground:
+  a separate check, at the moment work is committed rather than merged, classifies
+  those instruction files independently and still requires a proper review before
+  they can change. So what moves is only whether a reviewer's comment on prose can
+  hold up a merge — not whether prose gets reviewed.
+
+  Reversible without another change: `merge_gate.doc_findings` accepts `skip`
+  (the default, prose never blocks), `p1_only` (only the highest severity blocks
+  on prose), or `score` (prose is treated exactly like code, the previous
+  behaviour). Findings are listed in the pre-merge report under every setting —
+  the lever decides whether they count, never whether anyone sees them.
+
+
 ### Fixed
 
 - **Two branches can no longer pick the same database-migration number.** Each
