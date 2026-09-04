@@ -41,7 +41,8 @@ DRAFT="$(mktemp -d)"                       # per-invocation, never a shared path
 python3 scripts/file_tracker_issue.py \
   --title-file "$DRAFT/title.txt" --body-file "$DRAFT/body.md" \
   --area area:memory --difficulty "help wanted" --dry-run   # drop --dry-run to post
-rm -f "$DRAFT"/*.txt "$DRAFT"/*.md && rmdir "$DRAFT"
+# KEEP $DRAFT until the real filing reaches a known outcome — see below
+# rm -f "$DRAFT"/*.txt "$DRAFT"/*.md && rmdir "$DRAFT"
 ```
 
 The script exists because three cross-model review rounds each found a different
@@ -86,9 +87,19 @@ nonzero exit, timeout, a broken pipe while printing the URL — is another way t
 wrong about whether the post happened. Asking the tracker answers all of them from
 ground truth instead of patching each one as it is found.
 
-Use a fresh `mktemp -d` per invocation, and clean it WITHOUT `rm -rf` — this
-repo's own destructive-command guard refuses a recursive-force delete on a path it
-cannot prove is deep enough, so `rm -rf "$DRAFT"` is blocked for every session. Foreground and background sessions run
+**Do not delete the drafts after the dry run.** The dry run validates the exact files
+the real invocation will use; deleting them means the real post either fails for want
+of files or uses drafts that were never validated. Keep `$DRAFT` until the real filing
+returns a KNOWN outcome — and on exit 4 keep it longer, because the title and body are
+what you need to reconcile against the tracker. Clean up only after 0, 2 or 3:
+
+```bash
+rm -f "$DRAFT"/*.txt "$DRAFT"/*.md && rmdir "$DRAFT"
+```
+
+Use a fresh `mktemp -d` per invocation, and clean it WITHOUT `rm -rf` — this repo's own
+destructive-command guard refuses a recursive-force delete on a path it cannot prove is
+deep enough, so `rm -rf "$DRAFT"` is blocked for every session. Foreground and background sessions run
 concurrently here, and a shared draft path lets one session overwrite the body
 another has already scanned and approved, between the scan and the post.
 

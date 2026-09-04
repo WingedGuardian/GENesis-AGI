@@ -147,24 +147,33 @@ def _finish(code: int) -> int:
       * a full or broken pipe     (flush raises OSError; put a usable fd under
         it so shutdown has nothing to fail on).
     """
-    stream = getattr(sys, "stdout", None)
+    # BOTH streams: CPython flushes stderr at shutdown too, so a diagnostic
+    # written to a failing stderr replaces the exit code with 120 exactly as a
+    # failing stdout does. MEASURED: the missing-title path returned 120 instead
+    # of 2 with stderr on /dev/full.
+    for name in ("stdout", "stderr"):
+        _repair_stream(getattr(sys, name, None))
+    return code
+
+
+def _repair_stream(stream) -> None:
+    """Flush one stream, or put a usable fd under it. Never raises."""
     if stream is None:
-        return code
+        return
     try:
         stream.flush()
-        return code
+        return
     except (OSError, ValueError):
         pass
     except Exception:  # noqa: BLE001 - a guarantee must never raise
-        return code
+        return
     try:
         fd = stream.fileno()
     except (OSError, ValueError, AttributeError):
-        return code  # no fd to repair; shutdown has nothing usable to flush
+        return  # no fd to repair; shutdown has nothing usable to flush
     with contextlib.suppress(OSError):
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, fd)
-    return code
 
 
 def _gh_json(run: Runner, argv: Sequence[str]) -> dict:
@@ -493,6 +502,10 @@ def main(argv: Sequence[str] | None = None, run: Runner = _run) -> int:
         signal.signal(signal.SIGTERM, _sigterm_as_interrupt)
 
     posted: str | None = None
+    # Set the instant before the create is attempted. An interrupt between
+    # that point and create_issue() returning leaves the outcome UNKNOWN, not
+    # refused — the request may already have reached GitHub.
+    create_attempted = False
 
     try:
         try:
@@ -535,6 +548,7 @@ def main(argv: Sequence[str] | None = None, run: Runner = _run) -> int:
             # has already happened — letting the print's OSError fall through to
             # the generic handler would report exit 1 for a CONFIRMED issue and
             # send the operator to retry into a duplicate.
+            create_attempted = True
             posted = create_issue(slug, title, args.body_file, labels, run)
         # From here the issue EXISTS. Nothing below may report otherwise — see
         # the handlers, which all check `posted` first.
@@ -563,11 +577,21 @@ def main(argv: Sequence[str] | None = None, run: Runner = _run) -> int:
         # would send the operator to retry into a duplicate.
         if posted:
             return _report_posted(posted, "interrupted after creation")
+        if create_attempted:
+            _warn(
+                "INDETERMINATE: interrupted while creating the issue on "
+                f"{slug}. The request MAY have reached GitHub. Check the tracker "
+                "for this exact title BEFORE retrying."
+            )
+            return _finish(4)
         _warn("REFUSED: interrupted before the issue was created.")
         return _finish(2)
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         if posted:
             return _report_posted(posted, f"after creation: {exc}")
+        if create_attempted:
+            _warn(f"INDETERMINATE: {exc} — raised while creating on {slug}; the post MAY exist.")
+            return _finish(4)
         _warn(f"ERROR: {exc}")
         return _finish(1)
 

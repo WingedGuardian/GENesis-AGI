@@ -1009,3 +1009,54 @@ def test_duplicate_path_is_finalized_through_finish(tmp_path, monkeypatch):
     )
     assert rc == 3
     assert seen.get("code") == 3
+
+
+# --- round 7: the last three -------------------------------------------------
+
+
+def test_stderr_is_finalized_too(monkeypatch):
+    """CPython flushes stderr at shutdown as well — it can also force exit 120."""
+    flushed = []
+
+    class S:
+        def __init__(self, name):
+            self.name = name
+
+        def flush(self):
+            flushed.append(self.name)
+
+        def fileno(self):
+            return 1
+
+    monkeypatch.setattr(sys, "stdout", S("out"))
+    monkeypatch.setattr(sys, "stderr", S("err"))
+    assert fti._finish(2) == 2
+    assert flushed == ["out", "err"], f"both streams must be finalized, got {flushed}"
+
+
+def test_interrupt_while_creating_is_indeterminate_not_refused(tmp_path, capsys):
+    """Between attempting the create and it returning, the outcome is UNKNOWN."""
+    run = _runner(
+        {
+            "isFork": _proc(
+                json.dumps({"isFork": False, "nameWithOwner": "Org/Repo", "parent": None})
+            ),
+            "viewerPermission": _proc(json.dumps({"viewerPermission": "ADMIN"})),
+            "gh api": _proc(""),
+        }
+    )
+
+    def interrupting(*a, **k):
+        raise KeyboardInterrupt
+
+    import unittest.mock
+
+    with unittest.mock.patch.object(fti, "create_issue", interrupting):
+        tf, bf = _drafts(tmp_path)
+        rc = fti.main(
+            ["--title-file", tf, "--body-file", bf, "--area", "area:memory",
+             "--difficulty", "help wanted"],
+            run,
+        )
+    assert rc == 4, "the request may have reached GitHub — refusing would invite a duplicate"
+    assert "INDETERMINATE" in capsys.readouterr().err
