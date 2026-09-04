@@ -852,20 +852,28 @@ def test_a_drained_account_is_evidence_when_the_classifier_can_see_it(
 def test_a_drained_account_is_INVISIBLE_when_mcp_shadows_the_classifier(
     stderr_text, stdout_text,
 ):
-    """A KNOWN GAP, pinned as a DECISION rather than left as an accident.
+    """A KNOWN COST, pinned as a DECISION rather than left as an accident.
 
-    `_classify_error` tests `"mcp" in lower` over the combined stderr+stdout
-    BEFORE its generic fallback, and CCMCPError is a sibling of CCProcessError —
-    so a drained account whose output mentions MCP anywhere is typed CCMCPError
-    and never recorded. An adversarial audit called this a defect and proposed
-    widening the predicate to CCMCPError. That was tried and reverted: it
-    reverses the module's central invariant, and
-    `test_an_mcp_error_mentioning_funds_is_not_a_peer_refusal` pins the exact
-    false positive it would create. A wrong "down" is worse than no record.
+    The rule is now uniform: anything carrying MCP evidence is not evidence about
+    the PEER, tested before any type check. That is there for the FALSE-POSITIVE
+    direction — a Genesis tool hitting its own 429 was being recorded as the peer
+    being quota-blocked (see
+    `test_an_mcp_tools_own_ceiling_is_never_the_peers_fault`), which is the
+    expensive way to be wrong.
 
-    If this test ever fails, someone has widened the predicate — read that test
-    and the tradeoff in `_BALANCE_REFUSALS`' comment before deciding they were
-    right to.
+    This test pins what that costs: a GENUINE drained peer whose output happens
+    to mention MCP — an ordinary session start-up line — also goes unrecorded.
+    That is a missing observation, the cheap direction: the peer is still tried,
+    and a human simply is not told. No field separates the two cases; MEASURED
+    2026-09-04, `CCMCPError.server_name` is populated for both a real tool
+    failure and a drained peer with MCP chatter, so it cannot discriminate.
+
+    An earlier audit proposed widening the predicate to CCMCPError to close this.
+    It was tried and reverted — it buys back this observation by paying in false
+    positives, which is the trade the wrong way round.
+
+    If this test ever fails, someone has narrowed the MCP exclusion. Read
+    `test_an_mcp_tools_own_ceiling_is_never_the_peers_fault` first.
     """
     from genesis.cc.invoker import CCInvoker
 
@@ -956,3 +964,94 @@ def test_a_repaired_then_re_broken_file_warns_again(tmp_path, caplog):
         PA.read()
     again = [r for r in caplog.records if "unusable" in r.getMessage()]
     assert len(again) == 1, f"a re-broken file must warn again, got {len(again)}"
+
+
+@pytest.mark.parametrize("wording", [
+    "MCP server 'web-search' returned error: 429 rate limit",
+    "MCP server 'payments' returned error: usage limit reached",
+    "MCP server 'payments' returned error: insufficient funds",
+])
+def test_an_mcp_tools_own_ceiling_is_never_the_peers_fault(wording):
+    """The FALSE-POSITIVE direction, which is the expensive one here.
+
+    `_classify_error` matches the rate-limit and quota families BEFORE its MCP
+    branch, so a Genesis tool that hits its own 429 inside a peer's turn arrives
+    typed CCRateLimitError — indistinguishable from a real peer refusal. The
+    predicate accepted those types unconditionally, so the PEER was recorded as
+    quota-blocked and that false "down" stood in every health snapshot until the
+    next home-model outage.
+
+    An earlier round measured only the MISS direction (a drained peer going
+    unrecorded) and called the tradeoff settled. Measuring one side of a tradeoff
+    is half a measurement, and this is the half that was missing.
+    """
+    from genesis.cc.invoker import CCInvoker
+
+    exc = CCInvoker._classify_error(wording)
+    assert PA.is_provider_refusal(exc) is False, (
+        f"an MCP tool's own failure, typed {type(exc).__name__}, was blamed on the peer"
+    )
+    assert PA.note_failure("peer-x", exc) is False
+    assert PA.read_peer("peer-x") is None
+
+
+def test_a_genuine_peer_refusal_is_still_recorded():
+    """The control. Without it the fix above is satisfiable by recording nothing."""
+    from genesis.cc.invoker import CCInvoker
+
+    exc = CCInvoker._classify_error("API error: 429 rate limit exceeded")
+    assert PA.is_provider_refusal(exc) is True
+    assert PA.note_failure("peer-x", exc) is True
+    assert PA.read_peer("peer-x").reason == PA.QUOTA
+
+
+def test_an_unreadable_state_file_is_reported_not_silently_empty(tmp_path, caplog):
+    """A file that exists but cannot be read must not look like no file at all.
+
+    `except (FileNotFoundError, OSError)` was not two cases — FileNotFoundError
+    IS an OSError — so a PermissionError or EIO returned an empty map on the
+    silent branch, every peer observation vanished from every health snapshot,
+    and nothing said why. It also made the `except Exception` below it
+    unreachable for the failure it was written to report.
+    """
+    f = tmp_path / "cc_peer_availability.json"
+    f.write_text(json.dumps({"peers": {"ok": _valid_row()}}))
+    assert set(PA.read()) == {"ok"}, "fixture must be readable first"
+
+    f.chmod(0o000)
+    try:
+        with caplog.at_level("WARNING", logger="genesis.cc.peer_availability"):
+            assert PA.read() == {}
+        hits = [r for r in caplog.records if "Unreadable" in r.getMessage()]
+        assert len(hits) == 1, f"an unreadable file must say so, got {len(hits)} warnings"
+    finally:
+        f.chmod(0o600)
+
+
+def test_a_missing_state_file_stays_silent(tmp_path, caplog):
+    """The other side of the same branch: no file yet is the NORMAL state before
+    any failover has run, and must not warn on every health poll."""
+    with caplog.at_level("WARNING", logger="genesis.cc.peer_availability"):
+        assert PA.read() == {}
+        assert PA.read() == {}
+    assert not [r for r in caplog.records if "Unreadable" in r.getMessage()]
+
+
+def test_a_failed_setup_does_not_leak_the_temp_descriptor(tmp_path, monkeypatch):
+    """os.fchmod raising after mkstemp left the descriptor open — ownership does
+    not pass to the file object until os.fdopen, and the failure path cleaned up
+    the pathname only. This module writes on every failover during an outage, so
+    one leak per attempt walks a long-running server into its descriptor limit.
+    """
+    import os as _os
+
+    def _boom(*a, **k):
+        raise OSError("filesystem refuses mode changes")
+
+    monkeypatch.setattr(PA.os, "fchmod", _boom)
+
+    before = len(_os.listdir("/proc/self/fd"))
+    for _ in range(25):
+        assert PA.note_success("peer-x") is False, "the write must report failure"
+    after = len(_os.listdir("/proc/self/fd"))
+    assert after - before < 5, f"leaked ~{after - before} descriptors over 25 writes"

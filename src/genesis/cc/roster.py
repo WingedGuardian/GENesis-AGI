@@ -24,6 +24,11 @@ from pathlib import Path
 import yaml
 
 from genesis._config_overlay import merge_local_overlay
+
+# The observability record's own bound, imported rather than restated so the two
+# cannot drift into disagreeing about which peers are visible. peer_availability
+# imports only stdlib and genesis.env, so this is cycle-free.
+from genesis.cc.peer_availability import _MAX_PEER_NAME as _MAX_OBSERVABLE_NAME
 from genesis.cc.types import CCInvocation
 
 logger = logging.getLogger(__name__)
@@ -343,6 +348,19 @@ def failover_chain(active: str, roster: dict | None = None) -> list[str]:
             continue
         entry = _entry_from(name, raw)
         if _is_native(entry) or (entry.auth_env and os.environ.get(entry.auth_env)):
+            if len(name) > _MAX_OBSERVABLE_NAME:
+                # Selection accepts any configured name, but the availability
+                # record rejects one this long rather than truncating it — a
+                # truncated key would merge two peers into one and let one
+                # peer's success clear another's failure. So such a peer works
+                # and is simply INVISIBLE in health. Say so at load time; a
+                # silent hole in an observability surface is the thing that
+                # surface exists to prevent.
+                logger.warning(
+                    "roster peer name is %d chars (max observable %d) — it will "
+                    "serve traffic but never appear in peer-availability health",
+                    len(name), _MAX_OBSERVABLE_NAME,
+                )
             peers.append((entry.failover_order, name))
     peers.sort()
     return [name for _, name in peers]

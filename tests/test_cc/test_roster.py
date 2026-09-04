@@ -321,3 +321,30 @@ def test_every_documented_auth_env_has_a_secrets_slot():
         "provider genuinely uses one key for both, rename the slot so the "
         "convention still reads true."
     )
+
+
+def test_a_peer_too_long_to_observe_is_announced_at_load(monkeypatch, caplog):
+    """Selection accepts any configured name; the availability record rejects one
+    over its bound rather than truncating it, because a truncated key would merge
+    two peers and let one peer's success clear another's failure.
+
+    So such a peer serves traffic while being permanently invisible in health.
+    That is a silent hole in an observability surface, which is the one thing
+    that surface exists to prevent — so it is announced at load time.
+    """
+    from genesis.cc import roster as R
+
+    long_name = "p" * (R._MAX_OBSERVABLE_NAME + 1)
+    monkeypatch.setenv("FAKE_PEER_TOKEN", "x")
+    fake = {"models": {
+        "active-one": {"failover_order": 0, "auth_env": "FAKE_PEER_TOKEN"},
+        long_name: {"failover_order": 1, "auth_env": "FAKE_PEER_TOKEN"},
+    }}
+
+    with caplog.at_level("WARNING", logger="genesis.cc.roster"):
+        chain = R.failover_chain("active-one", roster=fake)
+
+    assert long_name in chain, "selection must still route to it — this is not a gate"
+    hits = [r for r in caplog.records if "never appear in peer-availability" in r.getMessage()]
+    assert len(hits) == 1, f"an unobservable peer must be announced, got {len(hits)}"
+    assert long_name not in caplog.text, "the name itself must not be logged whole"

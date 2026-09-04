@@ -102,8 +102,11 @@ _STATE_FILE = "cc_peer_availability.json"
 #: Sanity bound on a peer NAME. NOT a truncation bound — a longer name is
 #: DROPPED, never cut, because cutting two names to a shared prefix merges two
 #: peers onto one key and lets one peer's success clear another's failure.
-#: `roster.py` applies no length bound of its own (zero `len()` calls), so this
-#: is the only backstop, and it is set far above any plausible roster name.
+#: Selection in `roster.py` still admits a name of ANY length — bounding what it
+#: will route to is not this module's call — but it now imports this constant and
+#: warns at load time when a configured peer exceeds it, so a peer that serves
+#: traffic while staying invisible here is announced rather than silent. This
+#: remains the enforcing backstop, set far above any plausible roster name.
 _MAX_PEER_NAME = 512
 
 #: Refuse to PARSE a state file larger than this. `read()` runs synchronously on
@@ -194,7 +197,23 @@ def _read_raw() -> dict:
             return {}
         _complaint_resolved("oversize")
         raw = path.read_text(encoding="utf-8", errors="replace")
-    except (FileNotFoundError, OSError):
+    except FileNotFoundError:
+        # The ONLY silent case: no file yet is the normal state before any
+        # failover has ever run.
+        return {}
+    except OSError:
+        # Everything else — PermissionError, EIO, a vanished mount — used to
+        # share the branch above, so a readable-yesterday file becoming
+        # unreadable made every peer observation disappear from every health
+        # snapshot with no line saying why. FileNotFoundError is an OSError
+        # subclass, so the old `(FileNotFoundError, OSError)` tuple was not two
+        # cases; it was one, and it swallowed the interesting half. It also made
+        # the `except Exception` below unreachable for the failure it was
+        # written for.
+        _complain_on_change(
+            "unreadable", "Unreadable %s — treating as empty", _STATE_FILE,
+            identity=(_STATE_FILE,), exc_info=True,
+        )
         return {}
     except Exception:  # pragma: no cover — defence in depth on a hot path
         _complain_on_change(
@@ -483,6 +502,22 @@ def is_provider_refusal(exc: BaseException) -> bool:
         return False
 
 
+def _mentions_mcp(exc: BaseException) -> bool:
+    """True if *exc* carries any sign of having come from an MCP tool.
+
+    Substring-crude on purpose. This decides only whether to DISCARD evidence,
+    so a false positive costs one unrecorded observation while a false negative
+    writes a wrong "down" into a surface a human reads — and between those two
+    this module always takes the first. A hostile ``__str__`` is treated as
+    "cannot tell", which falls through to the type check exactly as before, so
+    adding this never turns a previously-recorded refusal into a raise.
+    """
+    try:
+        return "mcp" in str(exc).lower()
+    except Exception:
+        return False
+
+
 def _is_provider_refusal(exc: BaseException) -> bool:
     """True only for an error the PROVIDER returned about capacity or credit.
 
@@ -490,32 +525,38 @@ def _is_provider_refusal(exc: BaseException) -> bool:
     ambiguous about the peer (see the module docstring), and a wrong "down" is
     worse than no record.
     """
-    from genesis.cc.exceptions import CCQuotaExhaustedError, CCRateLimitError
+    from genesis.cc.exceptions import CCProcessError, CCQuotaExhaustedError, CCRateLimitError
+
+    # ONE rule, applied before any type check: anything wearing MCP evidence is
+    # not evidence about the PEER. A Genesis MCP tool that hits ITS OWN ceiling —
+    # a search API answering 429, a paid endpoint reporting no credit — fails
+    # inside a peer's turn and is not the peer's fault.
+    #
+    # It has to be tested FIRST because the type does not separate the cases.
+    # `_classify_error` matches the rate-limit and quota families BEFORE its MCP
+    # branch, so a tool's own 429 arrives typed CCRateLimitError, identical to a
+    # real peer refusal. MEASURED 2026-09-04 through the real classifier:
+    #   "MCP server 'web-search' returned error: 429 rate limit"
+    #     -> CCRateLimitError      -> recorded the PEER as quota-blocked
+    #   "MCP server 'payments' returned error: usage limit reached"
+    #     -> CCQuotaExhaustedError -> recorded the PEER as quota-blocked
+    # That is a false "down" standing in every health snapshot until the next
+    # home-model outage — the exact failure this module exists to prevent, and
+    # by its own tradeoff the expensive direction to be wrong in.
+    #
+    # The cost is the mirror case, and it is accepted deliberately: a genuine
+    # peer refusal whose text happens to mention MCP goes unrecorded. That is a
+    # MISSING observation, the cheap direction — the peer is still tried, and a
+    # human simply is not told. It also makes CCMCPError's exclusion no longer a
+    # special case but this same rule, uniformly applied.
+    if _mentions_mcp(exc):
+        return False
 
     if isinstance(exc, (CCRateLimitError, CCQuotaExhaustedError)):
         return True
     # A drained account is a refusal in substance but reaches us as a generic
     # process error, because the global classifier deliberately does not know
     # these phrases (see above). Text-matching is confined to this advisory path.
-    #
-    # A KNOWN, DELIBERATE GAP, recorded here so it is not rediscovered as a bug.
-    # CCMCPError is a SIBLING of CCProcessError, not a subclass, and
-    # `_classify_error`'s `"mcp" in lower` branch runs BEFORE the generic
-    # fallback over the COMBINED stderr+stdout. MEASURED 2026-09-04: a drained
-    # account whose output mentions MCP anywhere — an ordinary session start-up
-    # line — arrives typed as CCMCPError and is therefore NOT recorded.
-    #
-    # Widening to CCMCPError was tried and REVERTED. It reverses this module's
-    # central invariant (a local fault is never blamed on the peer), which
-    # `test_local_fault_is_never_blamed_on_the_peer` and
-    # `test_an_mcp_error_mentioning_funds_is_not_a_peer_refusal` both pin: an MCP
-    # tool relaying a PROVIDER's credit error is indistinguishable, by type or by
-    # text, from the peer's own account being drained. The tradeoff is already
-    # stated above and it decides this: a wrong "down" is worse than no record,
-    # so the missed observation is the cheaper error. The cost is bounded — the
-    # peer is simply not recorded, and the failover loop tries it regardless.
-    from genesis.cc.exceptions import CCProcessError
-
     if isinstance(exc, CCProcessError):
         blob = str(exc).lower()
         return any(p in blob for p in _BALANCE_REFUSALS)
@@ -780,6 +821,7 @@ def _write(payload: dict) -> bool:
     """
     path = _state_path()
     tmp: str | None = None
+    fd: int | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
@@ -793,7 +835,15 @@ def _write(payload: dict) -> bool:
         # preserves it, but this file can hold provider prose, so the mode is
         # load-bearing and should not depend on a default staying put.
         os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as fh:
+        # Ownership of the descriptor passes to the file object HERE, and only
+        # here — the `with` closes it from this point on. Anything that raises
+        # between mkstemp and this line (fchmod on a filesystem that refuses
+        # mode changes, fdopen itself) leaves the descriptor ours to close, and
+        # the failure path below does it. This module writes on every failover
+        # during an outage, so a leak per attempt walks a long-running server
+        # into its descriptor limit.
+        fd_owned, fd = fd, None
+        with os.fdopen(fd_owned, "wb") as fh:
             fh.write(json.dumps(payload, indent=2).encode())
             fh.flush()
             os.fsync(fh.fileno())
@@ -804,6 +854,13 @@ def _write(payload: dict) -> bool:
         # unserialisable value, which left the temp file behind while the
         # docstring promised cleanup.
         logger.error("Failed to write %s", _STATE_FILE, exc_info=True)
+        # Descriptor FIRST, then the name. `fd` is None once os.fdopen has taken
+        # ownership, so this closes only what we still hold; an earlier revision
+        # cleaned up the pathname and left the descriptor open, which leaks one
+        # per write for as long as the failure persists.
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
         if tmp is not None:
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
