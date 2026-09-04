@@ -527,3 +527,79 @@ async def test_terminal_status_set_is_a_subset_of_the_crud_allow_list():
         "open",
         "in_progress",
     } == crud.VALID_LEDGER_STATUSES - tools._TERMINAL_LEDGER_STATUSES
+
+
+# --- The SHORT form the caller was shown (Codex P2, PR #1617) ---------------
+# `_unresolved_short_id_error` tells a caller the [Clock | Session: x] tag shows
+# the first 8 characters — so 8 chars is a prefix Genesis itself hands out. An
+# exact self-comparison missed it, and the two tools then disagreed: the read
+# path said update/add could create the charter while the write path rejected
+# the same prefix as unresolved.
+
+
+async def test_self_write_under_the_advertised_short_prefix_is_refused(
+    db, sessions_dir, monkeypatch
+):
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.setenv("GENESIS_SESSION_ID", SID)
+    with patch.object(tools, "_get_db", return_value=db):
+        res = await tools._impl_session_ledger_add(SID[:8], "survives to Friday")
+    assert "never re-injected" in res["error"].lower(), res
+    assert await crud.ledger_counts(db, SID) == {}
+
+
+async def test_the_read_path_agrees_with_the_write_path_on_a_short_prefix(
+    db, sessions_dir, monkeypatch
+):
+    """The contradiction itself, through the PUBLIC tools rather than the helper.
+
+    Before this, reading a missing charter under an 8-char prefix omitted the
+    self warning — leaving the base message's "or on the first
+    session_charter_update / session_ledger_add call", i.e. telling the caller a
+    write would create it — while the very next write call refused that prefix.
+    Two tools, two incompatible answers, both from Genesis.
+
+    Asserted end-to-end deliberately: a direct `_resolves_to_own` call would fail
+    on the old code with AttributeError, which proves the helper is new and
+    nothing about behaviour.
+    """
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.setenv("GENESIS_SESSION_ID", SID)
+    with patch.object(tools, "_get_db", return_value=db):
+        read = await tools._impl_session_charter(SID[:8])
+        write = await tools._impl_session_ledger_add(SID[:8], "a promise")
+    assert "no charter will ever appear here" in read["error"], read
+    assert "never re-injected" in write["error"].lower(), write
+
+
+async def test_a_prefix_shorter_than_the_advertised_form_is_not_claimed(
+    monkeypatch,
+):
+    """CONTROL (passes on both sides by design — the helper is new).
+
+    A 'prefix' shorter than anything Genesis advertises is a guess, and claiming
+    it as self would refuse a legitimate cross-session write under an id that
+    merely happens to share a first character."""
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.setenv("GENESIS_SESSION_ID", SID)
+    assert tools._resolves_to_own(SID[:7]) is False
+
+
+async def test_another_session_s_prefix_is_still_not_self(monkeypatch):
+    """CONTROL. Widening to prefixes must not swallow the ambient path — a
+    dispatched session writing to a FOREGROUND charter is the legitimate case
+    this gate deliberately leaves open."""
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.setenv("GENESIS_SESSION_ID", OTHER_SID)
+    assert tools._resolves_to_own(SID[:8]) is False
+    assert tools._resolves_to_own(SID) is False
+
+
+async def test_with_no_own_id_nothing_is_claimed_as_self(monkeypatch):
+    """CONTROL. Fail-open is the documented direction for an unknown own id — a
+    prefix must not become the exception that fails closed."""
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.delenv("GENESIS_SESSION_ID", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    assert tools._resolves_to_own(SID[:8]) is False
+    assert tools._resolves_to_own(SID) is False

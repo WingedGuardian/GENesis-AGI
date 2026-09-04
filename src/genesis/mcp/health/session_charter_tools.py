@@ -108,6 +108,47 @@ def _own_session_ids() -> set[str]:
     return ids
 
 
+# The advertised SHORT form of a session id: the per-turn `[Clock | Session: x]`
+# tag prints the first 8 characters, and `_unresolved_short_id_error` names that
+# tag when it asks for the full id — so 8 is the shortest prefix a caller is ever
+# told exists. Below it, a "prefix" is a guess.
+_ADVERTISED_PREFIX_CHARS = 8
+
+
+def _resolves_to_own(sid: str) -> bool:
+    """Is *sid* this session's own id — including the advertised short prefix?
+
+    ONE predicate, shared by the write gate and the read path's guidance,
+    because a disagreement between them is not a cosmetic inconsistency. With an
+    exact comparison, a caller passing the 8-char prefix it was SHOWN slipped
+    past this classification: the read path then said "update/add can create the
+    charter" while the write tools rejected that same prefix as unresolved. Two
+    calls, two incompatible answers, both from Genesis.
+
+    Resolved against OUR OWN ids rather than through
+    ``crud.resolve_session_id``, which cannot answer this question: it searches
+    ``session_charters.session_id`` and ``cc_sessions.cc_session_id``, while a
+    channel session is advertised its ``cc_sessions.id`` — a different namespace
+    — and may have no charter row yet. The prefix therefore comes back
+    unchanged, which is exactly how it reached the failing comparison. Matching
+    against the at-most-two ids we hold needs no query and cannot be made
+    ambiguous by another session's rows.
+
+    Uniqueness is required, not assumed: if a prefix matched BOTH own ids they
+    would have to differ later on, so the caller has still named us — but a
+    prefix that matches neither is not ours, and one shorter than the advertised
+    form is not a prefix we ever handed out.
+    """
+    own = _own_session_ids()
+    if not own:
+        return False
+    if sid in own:
+        return True
+    if len(sid) < _ADVERTISED_PREFIX_CHARS:
+        return False
+    return any(o.startswith(sid) for o in own)
+
+
 def _self_write_unreadable_error(sid: str) -> dict | None:
     """Refuse a charter/ledger write a DISPATCHED session makes to ITS OWN charter.
 
@@ -166,7 +207,7 @@ def _self_write_unreadable_error(sid: str) -> dict | None:
     """
     if not _is_dispatched():
         return None
-    if sid not in _own_session_ids():
+    if not _resolves_to_own(sid):
         return None
     return {
         "error": "Refusing the write: this is a dispatched/channel session "
@@ -203,10 +244,11 @@ def _missing_charter_suffix(sid: str) -> str:
     if not _is_dispatched():
         return ""
     own = _own_session_ids()
-    if sid in own:
-        # The caller's own charter. Both write routes are refused and the
-        # PreCompact maintainer returns early on GENESIS_CC_SESSION=1, so
-        # nothing can ever create it.
+    if _resolves_to_own(sid):
+        # The caller's own charter — by the SAME predicate the write gate uses,
+        # short prefix included, so the two calls cannot contradict each other.
+        # Both write routes are refused and the PreCompact maintainer returns
+        # early on GENESIS_CC_SESSION=1, so nothing can ever create it.
         return (
             " NOTE: that is THIS dispatched/channel session's own id — neither"
             " route fires for it (compaction skips this session class and both"
@@ -319,9 +361,14 @@ async def _impl_session_charter_update(
         from genesis.db.crud import session_charters as crud
 
         sid = await crud.resolve_session_id(db, session_id)
-        if err := _unresolved_short_id_error(sid):
-            return err
+        # SELF first, then the id FORM. Both refuse, so the order only decides
+        # which reason the caller is given — and "pass the full id" implies the
+        # write would then land, which for this session's own charter it never
+        # will. Answering the id form first costs the caller a round trip to
+        # fetch an id that is about to be refused anyway.
         if err := _self_write_unreadable_error(sid):
+            return err
+        if err := _unresolved_short_id_error(sid):
             return err
         # A stub row lets mission/pointers precede the first compaction; the
         # PreCompact hook fills origin later (WHERE origin_prompt IS NULL).
@@ -370,9 +417,14 @@ async def _impl_session_ledger_add(
         from genesis.db.crud import session_charters as crud
 
         sid = await crud.resolve_session_id(db, session_id)
-        if err := _unresolved_short_id_error(sid):
-            return err
+        # SELF first, then the id FORM. Both refuse, so the order only decides
+        # which reason the caller is given — and "pass the full id" implies the
+        # write would then land, which for this session's own charter it never
+        # will. Answering the id form first costs the caller a round trip to
+        # fetch an id that is about to be refused anyway.
         if err := _self_write_unreadable_error(sid):
+            return err
+        if err := _unresolved_short_id_error(sid):
             return err
         await crud.upsert_stub(db, sid)
         item_id = await crud.ledger_add(
