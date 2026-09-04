@@ -59,35 +59,62 @@ MUST_NOT_BE_UNION = (
 )
 
 
-# Ambient git configuration can decide the outcome of these tests, and
-# neutralising settings one at a time is whack-a-mole: `merge.default` routes
-# unspecified paths to a driver, `core.attributesFile` injects attributes from
-# outside the repo, `init.templateDir` can plant a `.git/info/attributes` (the
-# HIGHEST-precedence attribute source), `core.autocrlf` rewrites content before
-# a merge ever sees it. Rather than keep a list of them current, every git
-# subprocess here runs with global and system configuration switched off
-# outright, plus the system attributes file. One control instead of a checklist.
-_HERMETIC_ENV = {
+# Ambient git state can decide the outcome of these tests, and naming the
+# offending settings one at a time has already failed twice here: first
+# `commit.gpgsign`/`core.hooksPath`, then `merge.default`/`core.attributesFile`,
+# and each time the NEXT source was the finding. The sources are not a list one
+# can keep current — config comes from system, global, XDG, the environment and
+# command-scoped `GIT_CONFIG_COUNT` pairs, while ATTRIBUTES come from the system
+# file, `core.attributesFile`, its `$XDG_CONFIG_HOME/git/attributes` default,
+# `$GIT_DIR/info/attributes` (highest precedence) and a template dir that can
+# plant one.
+#
+# So this is subtractive, not a denylist: drop EVERY `GIT_*` variable inherited
+# from the caller, point HOME and XDG_CONFIG_HOME at an empty directory so the
+# per-user config and attributes files resolve to nothing, and disable the
+# system sources explicitly. Anything new git grows is covered by construction
+# unless it is reachable without a `GIT_*` variable and without HOME.
+_HERMETIC_ENV: dict[str, str] = {
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_SYSTEM": os.devnull,
     "GIT_ATTR_NOSYSTEM": "1",
 }
 
 
-def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+@pytest.fixture(scope="session", autouse=True)
+def _empty_home(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Point HOME/XDG_CONFIG_HOME at an empty dir for every git call here.
+
+    Without this, `$XDG_CONFIG_HOME/git/attributes` — which is where
+    `core.attributesFile` DEFAULTS to, and needs no config entry to take effect
+    — still reaches these subprocesses even with global config disabled.
+    """
+    empty = tmp_path_factory.mktemp("hermetic-home")
+    _HERMETIC_ENV["HOME"] = str(empty)
+    _HERMETIC_ENV["XDG_CONFIG_HOME"] = str(empty)
+
+
+def _hermetic_env() -> dict[str, str]:
+    """The caller's environment with every git-controlling variable removed."""
+    base = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    return {**base, **_HERMETIC_ENV}
+
+
+def _git(*args: str, cwd: Path, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
         cwd=cwd,
         capture_output=True,
         text=True,
         check=False,
-        env={**os.environ, **_HERMETIC_ENV},
+        input=stdin,
+        env=_hermetic_env(),
     )
 
 
-def _git_ok(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+def _git_ok(*args: str, cwd: Path, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
     """Run git and fail the test on a non-zero exit rather than sailing on."""
-    proc = _git(*args, cwd=cwd)
+    proc = _git(*args, cwd=cwd, stdin=stdin)
     assert proc.returncode == 0, (
         f"git {' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip()}"
     )
@@ -204,20 +231,23 @@ def test_union_applies_to_exactly_one_tracked_path() -> None:
     the invariant has to be an equality over every tracked file.
 
     Scope of the guarantee, stated so it is not read as more than it is: this
-    grades the repository's own attribute surface. A developer who sets
-    ``merge.default`` locally routes every *unspecified* path to that driver,
-    and no committed file can prevent it — that is a per-machine choice, not
-    something this repo controls.
+    grades the repository's own attribute surface, under a git environment
+    stripped of the caller's config and attribute sources. It says nothing about
+    what a merge does on a machine whose own ``merge.default`` routes unspecified
+    paths to a driver — that is a per-machine choice no committed file can pin.
     """
     assert GITATTRIBUTES.is_file(), "repo-root .gitattributes is missing"
     files = _git_ok("ls-files", "-z", cwd=REPO_ROOT)
-    proc = subprocess.run(
-        ["git", "check-attr", "--stdin", "-z", "merge"],
+    # Through the same helper as everything else: a second subprocess spelled by
+    # hand is how this call silently kept the caller's git environment while the
+    # module claimed to have none.
+    proc = _git_ok(
+        "check-attr",
+        "--stdin",
+        "-z",
+        "merge",
         cwd=REPO_ROOT,
-        input=files.stdout,
-        capture_output=True,
-        text=True,
-        check=True,
+        stdin=files.stdout,
     )
     # -z output is a flat NUL-separated stream of (path, attribute, value).
     fields = proc.stdout.split("\0")
