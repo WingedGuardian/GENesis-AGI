@@ -30,6 +30,20 @@ with the repo's `.gitleaks.toml` PII/infrastructure rules + portability
 + email scans). Releases are cut by tagging `vX.Y` on `main` and publishing a
 GitHub Release from the matching `CHANGELOG.md` section.
 
+**Read the section before you publish it.** `CHANGELOG.md` merges with git's
+`union` driver (see `.gitattributes`), which resolves same-position insertions
+without a conflict — that is what keeps ordinary PRs from colliding over it.
+The tradeoff lands here and nowhere else: union cannot express a *move* or a
+*removal*, so a release cut, which moves entries beneath a new version heading,
+can absorb another branch's later bullet into the section you are about to
+publish, and can restore an entry someone pruned. It does this with a zero exit
+code and no conflict to stop you. Union also makes no promise about ordering
+("tends to leave the added lines in the resulting file in random order" —
+`gitattributes(5)`), so entries may need re-sorting. Diff the version section
+against the tag's commit range and confirm every bullet belongs to it. Ordinary
+"add a bullet" merges cannot hit any of this; the release cut is the one
+operation that can.
+
 ## Current Recovery Anchors
 
 - Genesis repo state is preserved by git plus captured diffs/untracked-file
