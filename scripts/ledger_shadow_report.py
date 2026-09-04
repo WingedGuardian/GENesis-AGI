@@ -80,6 +80,21 @@ def build_report(
     from genesis.session_awareness.ledger_extractor import best_match
 
     live_runs = [r for r in runs if include_backfill or r["trigger"] != "backfill"]
+
+    # PRECISION IS PER PROMPT VERSION. Runs record the version that produced
+    # them, and mixing versions makes the headline number describe a population
+    # that no longer exists: on an upgraded install, up to the full retention
+    # window of v1 events would be scored as if the current prompt had emitted
+    # them, so a v2 regression could hide behind v1's history — or v1's
+    # mistakes could indict a v2 that never made them.
+    #
+    # Runs predating the column (version None) are counted as legacy, not as
+    # current: an unknown version is not evidence about this one.
+    from genesis.session_awareness.ledger_extractor import PROMPT_VERSION
+
+    versions = {(r.get("prompt_version") or "unknown") for r in live_runs}
+    legacy_runs = [r for r in live_runs if (r.get("prompt_version") or None) != PROMPT_VERSION]
+    live_runs = [r for r in live_runs if (r.get("prompt_version") or None) == PROMPT_VERSION]
     live_run_ids = {r["run_id"] for r in live_runs}
     live_events = [e for e in events if e["run_id"] in live_run_ids]
     backfill_events = [e for e in events if e["run_id"] not in live_run_ids]
@@ -164,19 +179,66 @@ def build_report(
     extractor_rows = [
         r for r in ledger_rows if r.get("added_by") == "ambient_ledger_extractor"
     ]
+    run_mode = {r["run_id"]: (r.get("mode") or "shadow") for r in runs}
+    promoted_under_other = {
+        e["promoted_item_id"]
+        for e in events
+        if e.get("promoted_item_id") and run_mode.get(e["run_id"]) != "live"
+    }
     if mode is None:
         from genesis.session_awareness.ledger_shadow_config import effective_mode
 
         mode = effective_mode()
-    if mode == "live":
-        leaks = [r for r in extractor_rows if not r.get("evidence")]
-        leak_label = "live: every extractor row carries its source quote"
-    else:
-        leaks = extractor_rows
-        leak_label = f"{mode}: zero extractor rows in the live ledger"
+    # A row is judged by the mode active WHEN IT WAS WRITTEN, not by the mode
+    # now. The documented emergency rollback is live -> shadow, and those rows
+    # persist — so keying on the current mode made every legitimately-promoted
+    # row retroactively a leak the moment an operator rolled back. The report
+    # would then scream about the very rows the rollback was protecting, which
+    # is how an operator learns to ignore it.
+    #
+    # Each event records the row it promoted, and its run records the mode it
+    # ran under. That is the provenance; the current mode is not.
+    promoted_under_live = {
+        e["promoted_item_id"]
+        for e in events
+        if e.get("promoted_item_id") and run_mode.get(e["run_id"]) == "live"
+    }
+    # UNATTRIBUTED rows are leaks, and the most serious kind. Every legitimate
+    # promotion stamps `promoted_item_id` on its shadow event, so a row wearing
+    # the extractor's provenance that NO event claims was written by something
+    # else using that identity — which is precisely what this invariant exists
+    # to catch. Counting it separately keeps the three causes distinguishable
+    # in the report; folding it into "not a leak" would have made the invariant
+    # weaker than the version this change set replaced.
+    unattributed = [
+        r for r in extractor_rows
+        if r["id"] not in promoted_under_live and r["id"] not in promoted_under_other
+    ]
+    leaks = [
+        r for r in extractor_rows
+        if r["id"] in promoted_under_other                       # written while NOT live
+        or r in unattributed                                     # no event claims it
+        # `source_quote` is the provenance field; `evidence` is a fallback for
+        # rows promoted before the column existed. Asking `evidence` alone is
+        # what made a repo-pulse absorption look like a leak — it replaces that
+        # column with PR attribution, so the quote was simply gone.
+        or (r["id"] in promoted_under_live
+            and not (r.get("source_quote") or r.get("evidence")))
+    ]
+    leak_label = (
+        "extractor rows are legitimate only if promoted by a run in live mode "
+        "AND carrying their source quote"
+    )
 
     return {
         "n_runs": n_runs,
+        # The population this report DESCRIBES, stated rather than implied. A
+        # narrowed denominator that is not reported reads as a complete one,
+        # and precision computed over a silently-filtered set is the number
+        # most likely to be quoted without its caveat.
+        "prompt_version": PROMPT_VERSION,
+        "prompt_versions_present": sorted(versions),
+        "n_runs_excluded_other_version": len(legacy_runs),
         "status_histogram": status_hist,
         "failure_rate": (n_bad / n_runs) if n_runs else None,
         "latency_p50_ms": _pct(0.5),
@@ -190,6 +252,11 @@ def build_report(
         "precision": precision,
         "recall": recall,
         "quote_verified_rate": quote_verified_rate,
+        # Extractor rows that NO shadow event claims to have promoted. Not
+        # leaks by the write-time-mode rule — nothing says which mode wrote
+        # them — but not clean either, and lumping them into either bucket
+        # would state more than the data supports.
+        "n_extractor_rows_unattributed": len(unattributed),
         "truncation_rate": truncation_rate,
         "pivots": pivots,
         "backfill_events": backfill_events,

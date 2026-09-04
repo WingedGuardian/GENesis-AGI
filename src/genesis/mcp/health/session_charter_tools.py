@@ -199,6 +199,16 @@ async def _impl_session_ledger_add(
         sid = await crud.resolve_session_id(db, session_id)
         if err := _unresolved_short_id_error(sid):
             return err
+        # Internal provenance is not a caller-supplied input. Without this,
+        # any caller of this tool could claim `ambient_ledger_extractor` and
+        # make a forged row indistinguishable from a real extractor leak — the
+        # exact thing the shadow report's leak invariant exists to detect.
+        if added_by and added_by not in crud.CALLER_SETTABLE_ADDED_BY:
+            return {
+                "error": f"added_by must be one of "
+                f"{sorted(crud.CALLER_SETTABLE_ADDED_BY)} — {added_by!r} is "
+                "internal provenance and cannot be set by a caller"
+            }
         await crud.upsert_stub(db, sid)
         item_id = await crud.ledger_add(
             db,

@@ -1920,6 +1920,7 @@ TABLES = {
                         CHECK(added_by IN ('foreground','ambient','pulse',
                                            'ambient_ledger_extractor')),
             evidence    TEXT,
+            source_quote TEXT,   -- provenance; resolvers write `evidence`, never this
             created_at  TEXT NOT NULL,
             updated_at  TEXT
         )

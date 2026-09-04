@@ -14,6 +14,10 @@ _spec = importlib.util.spec_from_file_location(
 _rep = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_rep)
 
+from genesis.session_awareness.ledger_extractor import (  # noqa: E402
+    PROMPT_VERSION,
+)
+
 SID = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
 
 
@@ -30,6 +34,12 @@ def _run(run_id: str, status: str = "ok", *, trigger: str = "manual", started: s
         truncated=0,
         latency_ms=12000,
         mode="shadow",
+        # The report now scopes its precision population to the CURRENT prompt
+        # version — mixing versions makes the headline number describe a
+        # population that no longer exists. A fixture without this field is a
+        # legacy run by definition, so it would be excluded and every metric
+        # would read zero. Tests that WANT the legacy case override it.
+        prompt_version=PROMPT_VERSION,
     )
     row.update(over)
     return row
@@ -145,11 +155,26 @@ def test_backfill_excluded_by_default_included_on_flag():
     assert rep2["backfill_events"] == []
 
 
-def _extractor_row(rid, text, *, evidence=None):
+def _extractor_row(rid, text, *, evidence=None, source_quote=None):
     """A ledger row shaped exactly as `_promote_live` writes one."""
     return dict(
-        _fg_row(rid, text), added_by="ambient_ledger_extractor", evidence=evidence
+        _fg_row(rid, text),
+        added_by="ambient_ledger_extractor",
+        evidence=evidence,
+        source_quote=source_quote,
     )
+
+
+def _promotion_event(eid, rid, *, run_id):
+    """The shadow event that ATTRIBUTES a promoted ledger row to its run.
+
+    Every real promotion writes one — `_promote_live` stamps
+    `promoted_item_id` immediately after `ledger_add`. A test row without it
+    describes a shape the system cannot produce, and the report now treats an
+    unattributable extractor row as a leak precisely because something other
+    than the promotion path must have written it.
+    """
+    return _event(eid, "promoted proposal", run_id=run_id, promoted_item_id=rid)
 
 
 def test_leak_invariant_flags_an_extractor_row_in_shadow_mode():
@@ -190,19 +215,78 @@ def test_live_mode_holds_when_every_extractor_row_carries_its_quote():
     in, so every promoted row failed and the report screamed on every normal
     run. An alarm that always fires is an alarm nobody reads.
     """
-    runs = [_run("r1", started=T1)]
+    runs = [_run("r1", started=T1, mode="live")]
     rep = _rep.build_report(
-        runs, [], [_extractor_row("LZ", "promoted", evidence="the source quote")],
+        runs,
+        [_promotion_event("e1", "LZ", run_id="r1")],
+        [_extractor_row("LZ", "promoted", source_quote="the source quote")],
         mode="live",
     )
-    assert rep["leak_invariant_ok"] is True
+    assert rep["leak_invariant_ok"] is True, rep["leaks"]
+
+
+def test_a_rollback_does_not_retroactively_brand_rows_promoted_while_live():
+    """The emergency rollback live -> shadow must not indict its own history.
+
+    Rows promoted WHILE live are legitimate, and they persist across the
+    rollback. Judging them by the mode active NOW turned every one of them into
+    a leak the moment an operator rolled back — so the report screamed loudest
+    about exactly the rows the rollback was protecting, which is how an operator
+    learns to stop reading it.
+
+    A row is judged by the mode of the run that promoted it, which each shadow
+    event records.
+    """
+    runs = [_run("r_live", started=T1, mode="live"), _run("r_now", started="2026-07-15T12:00:00+00:00", mode="shadow")]
+    rep = _rep.build_report(
+        runs,
+        [_promotion_event("e1", "LOLD", run_id="r_live")],
+        [_extractor_row("LOLD", "promoted before the rollback",
+                        source_quote="the source quote")],
+        mode="shadow",          # rolled back since
+    )
+    assert rep["leak_invariant_ok"] is True, rep["leaks"]
+
+
+def test_a_row_promoted_while_not_live_is_a_leak_even_after_going_live():
+    """The other direction: going live does not launder a row written in shadow."""
+    runs = [_run("r_shadow", started=T1, mode="shadow")]
+    rep = _rep.build_report(
+        runs,
+        [_promotion_event("e1", "LBAD", run_id="r_shadow")],
+        [_extractor_row("LBAD", "written while shadow", source_quote="q")],
+        mode="live",
+    )
+    assert rep["leak_invariant_ok"] is False
+
+
+def test_a_repo_pulse_absorption_does_not_look_like_a_leak():
+    """`evidence` is a RESOLUTION field — repo-pulse replaces it with PR text.
+
+    Sharing one column for provenance and resolution meant a promoted row lost
+    its quote the moment repo-pulse absorbed it, and then failed the invariant
+    it had satisfied the day before. `source_quote` is the provenance field and
+    no resolver writes it.
+    """
+    runs = [_run("r1", started=T1, mode="live")]
+    rep = _rep.build_report(
+        runs,
+        [_promotion_event("e1", "LABS", run_id="r1")],
+        [_extractor_row("LABS", "absorbed by repo-pulse",
+                        evidence="PR #1234: something (merged) [repo-pulse exact]",
+                        source_quote="the original transcript quote")],
+        mode="live",
+    )
+    assert rep["leak_invariant_ok"] is True, rep["leaks"]
 
 
 def test_live_mode_flags_an_extractor_row_with_no_quote():
     """The other direction — the invariant must still be able to fire."""
-    runs = [_run("r1", started=T1)]
+    runs = [_run("r1", started=T1, mode="live")]
     rep = _rep.build_report(
-        runs, [], [_extractor_row("LW", "promoted, unsourced")], mode="live"
+        runs,
+        [_promotion_event("e1", "LW", run_id="r1")],
+        [_extractor_row("LW", "promoted, unsourced")], mode="live"
     )
     assert rep["leak_invariant_ok"] is False
 

@@ -23,6 +23,9 @@ from genesis.session_awareness import ledger_worker as lw
 
 M58 = importlib.import_module("genesis.db.migrations.0058_session_charters")
 M59 = importlib.import_module("genesis.db.migrations.0059_session_ledger_shadow")
+M95 = importlib.import_module(
+    "genesis.db.migrations.0095_session_ledger_ambient_extractor"
+)
 
 SID = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
 
@@ -44,11 +47,22 @@ def shadow_mode(monkeypatch):
 
 @pytest.fixture
 async def db_path(tmp_path) -> Path:
+    """The schema a real install has once this release's migrations have run.
+
+    0095 is included even though these tests exercise SHADOW mode: migrations
+    run in order, so a DB carrying 0059 but not 0095 is not a state any install
+    reaches. Stopping at 0059 made the fixture describe a shape that cannot
+    exist, and the first writer to depend on 0095's column failed here while
+    being correct everywhere real.
+
+    Mode is what keeps these tests shadow-only, not the absence of a column.
+    """
     path = tmp_path / "genesis.db"
     shadow_crud._tables_verified = False
     async with aiosqlite.connect(str(path)) as db:
         await M58.up(db)
         await M59.up(db)
+        await M95.up(db)
         await db.commit()
     yield path
     shadow_crud._tables_verified = False
@@ -484,9 +498,7 @@ async def test_telemetry_row_recorded(tmp_path, sessions_root, shadow_mode, db_p
 # one-token edit that makes the shadow lane write to the live ledger — left the
 # suite fully green. A mode gate that nothing holds is not a gate.
 
-M90 = importlib.import_module(
-    "genesis.db.migrations.0095_session_ledger_ambient_extractor"
-)
+M90 = M95   # historical alias; the module is 0095
 
 
 @pytest.fixture
@@ -741,7 +753,22 @@ async def test_a_failed_promotion_is_retried_by_the_next_run(
 
     monkeypatch.setattr(charters_crud, "ledger_add", _always_fails)
     first = await _run_once(tmp_path, transcript, live_db_path, [AGREEMENT])
-    assert first["status"] == "ok", "the shadow write must survive a live failure"
+    # Two SEPARATE claims that this assertion used to conflate. The shadow
+    # write surviving is about the ROW; the run's status is about whether every
+    # write this run attempted succeeded — and one of them did not.
+    #
+    # Reporting `ok` here is what let a sweep whose every live promotion raised
+    # look identical to a clean one, to the neural monitor AND to
+    # scripts/ledger_shadow_worker.py, which prints to stderr only on
+    # failed/timeout and therefore stayed silent about it.
+    assert first["status"] == "failed", (
+        "a run whose live writes all failed is not an `ok` run"
+    )
+    assert first["promotion_failed_rows"] >= 1
+    assert len(await _events(live_db_path)) >= 1, (
+        "the shadow write must survive a live failure — that is the guarantee, "
+        "and it is about the ROW, not about the status"
+    )
     assert first["promoted"] == 0
     assert await _ledger(live_db_path) == []
     assert _cursor(sessions_root)["last_byte"] > 0, (

@@ -39,9 +39,11 @@ from genesis.db.crud.session_charters import ledger_list
 from genesis.env import genesis_db_path
 from genesis.session_awareness.headless import run_headless_json
 from genesis.session_awareness.ledger_extractor import (
+    ASSISTANT_SNIPPET_CHARS,
     EXTRACTOR_MODEL,
     EXTRACTOR_TIMEOUT_S,
     PROMPT_VERSION,
+    USER_TURN_CHARS,
     build_prompt,
     match_proposals,
     parse_verdict,
@@ -300,8 +302,18 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
                     # committed after it, and that stale novelty answer is the
                     # TOCTOU this transaction exists to close.
                     await db.execute("BEGIN IMMEDIATE")
+                    # OPEN rows only. A CLOSED row is a finished agreement,
+                    # and the same agreement being renewed later is a NEW
+                    # commitment, not a duplicate of the old one — but matching
+                    # against closed rows called it a late match and, because
+                    # that verdict is written onto the event, disqualified it
+                    # from every future sweep. Permanently: the closed row never
+                    # goes away, so the renewal could never be promoted.
+                    #
+                    # `in_progress` counts as open — that IS a live duplicate.
                     cur = await db.execute(
-                        "SELECT id, text FROM session_ledger WHERE session_id = ?",
+                        "SELECT id, text FROM session_ledger "
+                        "WHERE session_id = ? AND status IN ('open','in_progress')",
                         (session_id,),
                     )
                     rows = await cur.fetchall()
@@ -333,7 +345,16 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
                         # added row AND an automatic failure of the live-mode
                         # leak invariant, which asks each extractor row for its
                         # source text.
+                        #
+                        # Written to BOTH columns on purpose. `evidence` is what
+                        # a human reading the row today sees, and stays useful
+                        # until a resolver replaces it with its own attribution.
+                        # `source_quote` is the durable provenance no resolver
+                        # writes — without it, repo-pulse absorbing this row
+                        # erases the quote and the invariant it satisfied
+                        # yesterday fails today.
                         evidence=ev.get("quote_preview"),
+                        source_quote=ev.get("quote_preview"),
                     )
                     # ledger_add commits (closing the IMMEDIATE transaction).
                     # If we die between that commit and this update, the next
@@ -612,7 +633,16 @@ async def _run_locked(
         await _record_telemetry(db_path, "empty_delta", "no_new_bytes")
         return {"status": "empty_delta"}
 
-    turns = parse_delta(transcript, start_byte, end_byte)
+    # The extractor owns these budgets; parse_delta truncates FIRST, so its
+    # defaults silently win unless they are passed. That is not hypothetical:
+    # v2 raised ASSISTANT_SNIPPET_CHARS to 1400 while parse_delta kept cutting
+    # at 500, so the whole point of the bump — giving the model the actual
+    # proposal being ratified — never reached it.
+    turns = parse_delta(
+        transcript, start_byte, end_byte,
+        max_user_chars=USER_TURN_CHARS,
+        max_assistant_chars=ASSISTANT_SNIPPET_CHARS,
+    )
     if not turns:
         recorded = await _record_run(db_path, **_base_row(status="empty_delta"))
         if recorded:
@@ -717,9 +747,17 @@ async def _run_locked(
     # nobody tails. A silent write failure reads downstream as "the extractor
     # found nothing", which is the exact misreading this whole subsystem's
     # cap-logging convention exists to prevent.
+    # A run that FAILED to write is not an `ok` run, whichever write failed.
+    # `recorded` covers only the SHADOW row, so a sweep whose every live
+    # promotion raised still reported `ok` — to the neural monitor AND to
+    # scripts/ledger_shadow_worker.py, which prints to stderr only on
+    # failed/timeout and so stayed silent. The failure count was carried in the
+    # detail string, where nothing reads it. The counters below still separate
+    # "nothing qualified" from "everything failed"; the STATUS now does too.
+    _write_failed = (not recorded) or bool(promotion.get("failed_rows", 0))
     await _record_telemetry(
         db_path,
-        "ok" if recorded else "failed",
+        "failed" if _write_failed else "ok",
         f"turns={len(included)}|proposals={len(events)}|recorded={recorded}"
         f"|qualifying={promotion.get('qualifying', 0)}"
         f"|promoted={promotion.get('promoted', 0)}"
@@ -728,7 +766,7 @@ async def _run_locked(
         + (f"|{'; '.join(detail_notes)}" if detail_notes else ""),
     )
     return {
-        "status": "ok" if recorded else "failed",
+        "status": "failed" if _write_failed else "ok",
         "n_proposals": len(events),
         "recorded": recorded,
         "promoted": promotion.get("promoted", 0),
@@ -811,7 +849,11 @@ async def _run_backfill(
         except OSError:
             return {"status": "lock_busy"}
 
-        all_turns = parse_delta(transcript, 0, size)
+        all_turns = parse_delta(
+            transcript, 0, size,
+            max_user_chars=USER_TURN_CHARS,
+            max_assistant_chars=ASSISTANT_SNIPPET_CHARS,
+        )
         if not all_turns:
             return {"status": "empty_delta", "windows": 0}
         windows = [

@@ -90,16 +90,33 @@ class TestTheRebuild:
 
     @pytest.mark.asyncio
     async def test_preserves_every_row_and_column(self, db):
-        """A rebuild copies data by hand, so a dropped column is silent."""
+        """A rebuild copies data by hand, so a dropped column is silent.
+
+        Compares the ORIGINAL columns by name rather than `SELECT *`. The
+        rebuild deliberately ADDS `source_quote`, so a positional star-compare
+        would fail on a correct migration — and, worse, a future additive
+        column would make this test look like a regression it is not. Naming
+        the columns keeps it testing what it claims: nothing that existed was
+        lost or reordered.
+        """
+        cols = "id, session_id, text, status, source_ref, added_by, evidence, created_at, updated_at"
         await _seed_old(db)
-        cur = await db.execute("SELECT * FROM session_ledger ORDER BY id")
+        cur = await db.execute(f"SELECT {cols} FROM session_ledger ORDER BY id")
         before = [tuple(r) for r in await cur.fetchall()]
 
         await M90.up(db)
 
-        cur = await db.execute("SELECT * FROM session_ledger ORDER BY id")
+        cur = await db.execute(f"SELECT {cols} FROM session_ledger ORDER BY id")
         after = [tuple(r) for r in await cur.fetchall()]
-        assert after == before, "the rebuild lost or reordered data"
+        assert after == before, "the rebuild lost or reordered pre-existing data"
+
+        # And the new column exists, NULL for every pre-existing row: those rows
+        # were never promoted by the extractor, so they have no source quote to
+        # claim. A non-NULL here would mean the migration invented provenance.
+        cur = await db.execute("SELECT source_quote FROM session_ledger")
+        assert all(r[0] is None for r in await cur.fetchall()), (
+            "the rebuild fabricated a source_quote for a pre-existing row"
+        )
 
     @pytest.mark.asyncio
     async def test_restores_the_index(self, db):

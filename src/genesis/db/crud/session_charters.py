@@ -31,6 +31,17 @@ VALID_LEDGER_STATUSES = frozenset({"open", "in_progress", "done", "absorbed", "d
 VALID_ADDED_BY = frozenset(
     {"foreground", "ambient", "pulse", "ambient_ledger_extractor"}
 )
+# The subset a CALLER may name. `ambient_ledger_extractor` is INTERNAL
+# provenance — the detached worker sets it on its own writes — and it is not an
+# input any caller supplies. Leaving it in the one shared allow-list let anyone
+# calling the public `session_ledger_add` MCP tool claim that identity, which
+# breaks the shadow report's leak invariant precisely: that check asserts the
+# extractor has written nothing live, so a caller able to forge the value makes
+# a real leak and a forged row indistinguishable.
+#
+# Two names because they answer two questions — "is this value storable?" and
+# "may this value be asked for?" — and the public surface needs the second.
+CALLER_SETTABLE_ADDED_BY = frozenset({"foreground", "ambient", "pulse"})
 
 # Living-field bounds (enforced here so every writer shares them)
 MAX_POINTERS = 12
@@ -207,14 +218,23 @@ async def ledger_add(
     source_ref: str | None = None,
     added_by: str = "foreground",
     evidence: str | None = None,
+    source_quote: str | None = None,
 ) -> str:
     """Add an open ledger item and return its id.
 
-    *evidence* is the source text a row is derived from. It matters most for
-    rows a human did not type: a machine-added row that cannot show where it
-    came from is unauditable, and the shadow report's live-mode leak invariant
-    asks exactly that question of every extractor row. The column existed and
-    the INSERT did not write it, so every such row would have answered "no".
+    TWO PROVENANCE FIELDS, because two different writers answer two different
+    questions and they must not share a column:
+
+    *source_quote* is where the row CAME FROM — the extractor's verified
+    transcript quote. Only the writer that created the row sets it, and no
+    resolver overwrites it. The shadow report's live-mode leak invariant asks
+    each extractor row exactly this, so it has to survive the row's whole life.
+
+    *evidence* is how the row was RESOLVED — `repo_pulse_worker` replaces it
+    with PR attribution when it absorbs an item. That is correct behaviour for
+    a resolution field and fatal for a provenance one: sharing the column meant
+    a promoted extractor row lost its quote the moment repo-pulse touched it,
+    and then failed the invariant it had satisfied the day before.
     """
     if added_by not in VALID_ADDED_BY:
         raise ValueError(f"invalid added_by: {added_by!r}")
@@ -225,9 +245,10 @@ async def ledger_add(
     await db.execute(
         """INSERT INTO session_ledger
            (id, session_id, text, status, source_ref, added_by, evidence,
-            created_at)
-           VALUES (?, ?, ?, 'open', ?, ?, ?, ?)""",
-        (item_id, session_id, text, source_ref, added_by, evidence, _now_iso()),
+            source_quote, created_at)
+           VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?)""",
+        (item_id, session_id, text, source_ref, added_by, evidence,
+         source_quote, _now_iso()),
     )
     await db.commit()
     return item_id
