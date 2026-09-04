@@ -753,7 +753,9 @@ def main() -> None:
     try:
         from review_state import (
             ESCALATION_ROUND_CAP,
+            FINAL_ROUND_CAP,
             get_current_branch,
+            get_review_lifetime,
             get_review_round,
             has_code_changes,
             has_valid_review_marker,
@@ -951,6 +953,57 @@ def main() -> None:
     # documented `git commit … # escalation-ack` form is a plain segment.
     round_n = get_review_round(cwd=cwd)
     commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
+
+    # Rule 3a: the FINAL-ROUND terminal. Checked BEFORE the consecutive cap below,
+    # and that ordering is the entire point — at the terminal the round counter has
+    # typically just been reset by an earlier '# escalation-ack', so the cap would
+    # not fire and an escalation-ack must not be able to clear this.
+    #
+    # The cap below is REPEATABLE by construction: its ack calls
+    # reset_review_round, so a change can cycle 1-2-3-ack, 4-5-6-ack, without end.
+    # This tier is the terminal that cycle never reaches. It is deliberately NOT
+    # resettable by its own ack: '# final-round-accept' clears exactly ONE commit
+    # and the block returns on the next one. A sigil that kept working would just
+    # be a fourth repeatable sigil, which is the defect being closed.
+    #
+    # Counted the same way as the streak — EXTERNAL cross-model rounds only
+    # (see review_state.bump_review_round). Internal self/subagent audits stay
+    # free, including the one the mode-switch tier itself mandates; counting those
+    # would make the machine penalise the remedy it demands.
+    lifetime_n = get_review_lifetime(cwd=cwd)
+    if lifetime_n >= FINAL_ROUND_CAP:
+        final_acked = bool(commit_segs) and all(
+            has_trailing_override(s.raw, sigil="final-round-accept") for s in commit_segs
+        )
+        if not final_acked:
+            # The terminal deliberately does NOT reset the streak, so streak>=3 and
+            # lifetime>=7 is a REACHABLE state in which BOTH sigils are genuinely
+            # required — the escalation cap below is still live once this one clears.
+            # Printing only one would send a session round a loop of alternating
+            # blocks, so name the co-required form when it applies.
+            escalation_hint = " escalation-ack" if round_n >= ESCALATION_ROUND_CAP else ""
+            _deny(
+                f"BLOCKED: FINAL ROUND reached — {lifetime_n} EXTERNAL cross-model review "
+                f"rounds on this branch (terminal {FINAL_ROUND_CAP}; internal same-model "
+                "audits are not counted). Two full escalation cycles have already run and "
+                "each already asked for a fresh decision; a change still surfacing new "
+                "defects from an independent reviewer after that is not converging, and "
+                "another round is not the answer.\n\n"
+                "This is a judgement call, and there are exactly two ways out:\n"
+                "  (a) ACCEPT the outstanding findings and merge — document each one and "
+                "why it is acceptable in the PR body, then:\n"
+                f'        git commit -m "your message"  # final-round-accept{escalation_hint}\n'
+                "      That clears ONE commit; the block returns on the next, so the "
+                "decision has to actually end the loop.\n"
+                "  (b) ABANDON the branch and restart from a design that does not need "
+                "seven rounds. No sigil — just stop committing here.\n\n"
+                "Take this to the user before choosing; neither option is yours to make "
+                "alone." + _merge_note(cwd)
+            )
+            return
+        # Acked = the accept decision was made. Deliberately NO reset: the counter
+        # stays at/above the terminal so the next commit blocks again.
+
     if round_n >= ESCALATION_ROUND_CAP:
         acked = bool(commit_segs) and all(
             has_trailing_override(s.raw, sigil="escalation-ack") for s in commit_segs
