@@ -381,3 +381,96 @@ class TestCodexRemediationE3:
             "SELECT link_type, confidence FROM entity_links ORDER BY link_type",
         )
         assert [(r[0], r[1]) for r in rows] == [("is_a", 1.0), ("part_of", 0.0)]
+
+
+class TestAnchorWritesGoWhereTheCallerSaid:
+    """``db_path`` names WHICH database, since the connection is no longer the
+    caller's to pass (Codex P2, PR #1653).
+
+    ``scripts/entity_backfill.py`` supports ``--db`` to run against a copy or a
+    restored backup. Dropping the old positional connection without replacing
+    the target would have sent every anchor write to the live default while the
+    run reported success against the file the operator named — silent, and
+    against the wrong database.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_db_path_is_honoured(self, tmp_path):
+        from genesis.env import genesis_db_path
+
+        target = tmp_path / "operator-chosen.db"
+        conn = await aiosqlite.connect(str(target))
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA journal_mode=WAL")
+        for table in ("entities", "entity_mentions", "entity_links",
+                      "deferred_work_queue"):
+            await conn.execute(TABLES[table])
+        await conn.commit()
+        try:
+            n = await record_anchors(
+                "mem-target", "touched src/genesis/memory/store.py in PR #977",
+                db_path=str(target),
+            )
+            assert n == 2
+            rows = await conn.execute_fetchall(
+                "SELECT entity_id FROM entity_mentions WHERE memory_id = 'mem-target'"
+            )
+            assert len(rows) == 2, "the write did not land in the named database"
+        finally:
+            await conn.close()
+
+        # ...and NOWHERE ELSE. The control that makes this test mean something:
+        # without it, a call that wrote to BOTH databases would pass.
+        default = await aiosqlite.connect(str(genesis_db_path()))
+        try:
+            for table in ("entities", "entity_mentions", "entity_links",
+                          "deferred_work_queue"):
+                await default.execute(TABLES[table])
+            await default.commit()
+            leaked = await default.execute_fetchall(
+                "SELECT 1 FROM entity_mentions WHERE memory_id = 'mem-target'"
+            )
+            assert not leaked, "anchors leaked into the default database"
+        finally:
+            await default.close()
+
+    @pytest.mark.asyncio
+    async def test_no_db_path_still_uses_the_resolved_default(self, file_db):
+        """CONTROL. Every other caller passes no target and must keep landing in
+        ``genesis_db_path()`` — the parameter is additive."""
+        n = await record_anchors("mem-default", "see src/genesis/memory/store.py")
+        assert n == 1
+        rows = await file_db.execute_fetchall(
+            "SELECT entity_id FROM entity_mentions WHERE memory_id = 'mem-default'"
+        )
+        assert len(rows) == 1
+
+    def test_the_backfill_script_calls_it_the_new_way(self):
+        """The caller the finding is actually about. It passes three positionals
+        against a two-positional signature, so the run aborts with TypeError at
+        the FIRST memory carrying an anchor — read from the script's source
+        because importing it pulls argparse/aiosqlite plumbing this test does
+        not need."""
+        import ast
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parents[2] / "scripts" / "entity_backfill.py"
+        ).read_text()
+        calls = [
+            node
+            for node in ast.walk(ast.parse(src))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "record_anchors"
+        ]
+        assert len(calls) == 1, "the backfill's call site moved — retarget this test"
+        call = calls[0]
+        assert len(call.args) == 2, (
+            f"{len(call.args)} positional args; the signature takes memory_id and "
+            "content only, so anything else raises TypeError mid-backfill"
+        )
+        assert "db_path" in {kw.arg for kw in call.keywords}, (
+            "--db is not honoured: writes would go to the default database while "
+            "the run reports against the file the operator named"
+        )

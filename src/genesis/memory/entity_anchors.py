@@ -59,8 +59,22 @@ async def record_anchors(
     content: str,
     *,
     source: str = "mechanical",
+    db_path: str | None = None,
 ) -> int:
     """Resolve + mention every anchor in *content*. Returns count.
+
+    ``db_path`` names WHICH database to own a connection to; ``None`` resolves
+    ``genesis_db_path()`` at call time. A PATH and not a connection, and the
+    distinction is the whole point of this function: taking the caller's
+    connection is exactly what reintroduces the shared-``SerializedConnection``
+    hazard described below, so ownership stays here while the TARGET stays the
+    caller's to choose.
+
+    It exists because ``scripts/entity_backfill.py`` supports ``--db`` to run
+    against an arbitrary database — a copy, a restored backup — and dropping the
+    old positional connection without replacing the target would have sent every
+    anchor write to the live default instead, silently and while reporting
+    success against the file the operator named (Codex P2, PR #1653).
 
     Writes run on a DEDICATED ``get_raw_db()`` connection under a single
     ``BEGIN IMMEDIATE`` … ``COMMIT`` envelope — NOT the caller's shared
@@ -92,7 +106,7 @@ async def record_anchors(
 
     # Function-scope genesis_db_path() (NOT a module-frozen DEFAULT_DB_PATH) so the
     # test conftest redirect applies and a worktree never opens a stray DB.
-    async with get_raw_db(genesis_db_path()) as own:
+    async with get_raw_db(db_path or genesis_db_path()) as own:
         try:
             await own.execute("BEGIN IMMEDIATE")
             for name, entity_type in anchors:

@@ -387,3 +387,163 @@ async def test_reingest_no_units_source_detects_unchanged(tmp_path: Path):
     assert "no_units_extracted" in r1.quality_flags
     r2 = await orch.ingest_source(str(file), project_type="test")
     assert "duplicate_source" in r2.quality_flags
+
+
+# ─── the SQLite envelope holds no cross-connection write (Codex P1, PR #1653) ──
+
+
+def _units(n: int) -> list:
+    return [
+        KnowledgeUnit(
+            domain="test", concept=f"concept_{i}", body=f"body {i}",
+            tags=["t"], confidence=0.9,
+        )
+        for i in range(n)
+    ]
+
+
+async def test_no_qdrant_write_happens_inside_the_sqlite_transaction(tmp_path: Path):
+    """THE regression. ``MemoryStore.store`` writes through the SHARED memory
+    connection, not the owned one. Called from inside ``BEGIN IMMEDIATE`` it
+    asked SQLite for the sole writer slot this coroutine was already holding —
+    a self-deadlock nothing external could break, so every non-duplicate unit
+    waited out busy_timeout and raised. Normal ingestion failed.
+
+    Asserted as an ORDERING over one shared trace, because that is the actual
+    invariant: no ``store`` may appear after the BEGIN. A test that only checked
+    "ingestion succeeds" would go green again the moment someone moved one call
+    back inside.
+    """
+    orch = _make_orchestrator(tmp_path, mock_distill_result=_units(3))
+    trace: list[str] = []
+
+    mock_own = AsyncMock()
+
+    async def _exec(sql, *a, **kw):
+        trace.append(f"sql:{sql}")
+        return MagicMock()
+
+    mock_own.execute = AsyncMock(side_effect=_exec)
+
+    @contextlib.asynccontextmanager
+    async def _fake_get_raw_db(_path):
+        yield mock_own
+
+    async def _store(*_a, **_kw):
+        trace.append("qdrant-store")
+        return f"qid-{len([t for t in trace if t == 'qdrant-store']) - 1}"
+
+    mock_store = MagicMock()
+    mock_store.store = AsyncMock(side_effect=_store)
+    mock_store._qdrant = MagicMock()
+    mock_store._embeddings = MagicMock(model_name="test-model")
+
+    mock_knowledge = MagicMock()
+    mock_knowledge.find_by_unique_key = AsyncMock(return_value=None)
+    mock_knowledge.upsert = AsyncMock(side_effect=[(f"uid-{i}", True) for i in range(3)])
+
+    with patch("genesis.mcp.memory_mcp._require_init"), \
+         patch("genesis.mcp.memory_mcp._store", mock_store), \
+         patch("genesis.mcp.memory_mcp.knowledge", mock_knowledge), \
+         patch("genesis.db.connection.get_raw_db", _fake_get_raw_db), \
+         patch("genesis.qdrant.collections.delete_point"):
+        file = tmp_path / "test.txt"
+        file.write_text("some content")
+        result = await orch.ingest_source(str(file), project_type="test")
+
+    assert result.error is None, result.error
+    assert trace.count("qdrant-store") == 3, trace
+    begin = trace.index("sql:BEGIN IMMEDIATE")
+    assert all(i < begin for i, t in enumerate(trace) if t == "qdrant-store"), (
+        f"a Qdrant write ran inside the SQLite transaction: {trace}"
+    )
+
+
+async def test_a_rollback_does_not_delete_the_vector_a_surviving_row_points_at(
+    tmp_path: Path,
+):
+    """Found while fixing the P1, and not raised by the review.
+
+    On re-ingestion the SUPERSEDED vector was deleted inside the transaction —
+    an irreversible act guarded by a reversible one. A rollback after that line
+    restores a row whose ``qdrant_id`` names a point that no longer exists, so
+    the unit survives as permanently un-retrievable. Worse than the orphaned
+    vector the compensation path already handles: an orphan wastes space, this
+    loses the knowledge.
+    """
+    orch = _make_orchestrator(tmp_path, mock_distill_result=_units(2))
+
+    mock_own = AsyncMock()
+
+    @contextlib.asynccontextmanager
+    async def _fake_get_raw_db(_path):
+        yield mock_own
+
+    mock_store = MagicMock()
+    mock_store.store = AsyncMock(side_effect=["qid-new-0", "qid-new-1"])
+    mock_store._qdrant = MagicMock()
+    mock_store._embeddings = MagicMock(model_name="test-model")
+
+    mock_knowledge = MagicMock()
+    # Both units already exist, each pointing at a live vector.
+    mock_knowledge.find_by_unique_key = AsyncMock(
+        side_effect=[
+            {"id": "uid-0", "qdrant_id": "qid-old-0"},
+            {"id": "uid-1", "qdrant_id": "qid-old-1"},
+        ]
+    )
+    mock_knowledge.upsert = AsyncMock(side_effect=[("uid-0", False), Exception("boom")])
+
+    with patch("genesis.mcp.memory_mcp._require_init"), \
+         patch("genesis.mcp.memory_mcp._store", mock_store), \
+         patch("genesis.mcp.memory_mcp.knowledge", mock_knowledge), \
+         patch("genesis.db.connection.get_raw_db", _fake_get_raw_db), \
+         patch("genesis.qdrant.collections.delete_point") as mock_delete_point:
+        file = tmp_path / "test.txt"
+        file.write_text("some content")
+        result = await orch.ingest_source(str(file), project_type="test")
+
+    assert result.error is not None
+    mock_own.rollback.assert_awaited_once()
+    deleted = {c.kwargs["point_id"] for c in mock_delete_point.call_args_list}
+    assert deleted == {"qid-new-0", "qid-new-1"}, (
+        f"the rollback deleted a vector a restored row still points at: {deleted}"
+    )
+
+
+async def test_a_successful_batch_still_drops_the_superseded_vector(tmp_path: Path):
+    """CONTROL. Deferring the delete must not turn it into a leak — on the happy
+    path the old point is still cleaned up, just after the commit that makes the
+    new one authoritative."""
+    orch = _make_orchestrator(tmp_path, mock_distill_result=_units(1))
+
+    mock_own = AsyncMock()
+
+    @contextlib.asynccontextmanager
+    async def _fake_get_raw_db(_path):
+        yield mock_own
+
+    mock_store = MagicMock()
+    mock_store.store = AsyncMock(return_value="qid-new")
+    mock_store._qdrant = MagicMock()
+    mock_store._embeddings = MagicMock(model_name="test-model")
+
+    mock_knowledge = MagicMock()
+    mock_knowledge.find_by_unique_key = AsyncMock(
+        return_value={"id": "uid-0", "qdrant_id": "qid-old"}
+    )
+    mock_knowledge.upsert = AsyncMock(return_value=("uid-0", False))
+
+    with patch("genesis.mcp.memory_mcp._require_init"), \
+         patch("genesis.mcp.memory_mcp._store", mock_store), \
+         patch("genesis.mcp.memory_mcp.knowledge", mock_knowledge), \
+         patch("genesis.db.connection.get_raw_db", _fake_get_raw_db), \
+         patch("genesis.qdrant.collections.delete_point") as mock_delete_point:
+        file = tmp_path / "test.txt"
+        file.write_text("some content")
+        result = await orch.ingest_source(str(file), project_type="test")
+
+    assert result.error is None, result.error
+    mock_own.commit.assert_awaited()
+    deleted = [c.kwargs["point_id"] for c in mock_delete_point.call_args_list]
+    assert deleted == ["qid-old"], deleted

@@ -431,32 +431,51 @@ class KnowledgeOrchestrator:
         # out busy_timeout, and retrying the whole batch would re-issue (and orphan) the
         # per-unit Qdrant writes — a rare post-timeout BUSY instead fails cleanly through
         # the compensation path below.
-        async with get_raw_db(genesis_db_path()) as own:
-            try:
-                await own.execute("BEGIN IMMEDIATE")
-                for unit in units:
-                    # Existing unit? (idempotent re-ingestion). Reads on the owned conn
-                    # see prior COMMITTED units (WAL) and this batch's own uncommitted
-                    # upserts (same connection) — identical to the shared-conn behavior.
-                    existing = await memory_mod.knowledge.find_by_unique_key(
-                        own,
-                        project_type=project_type,
-                        domain=unit.domain,
-                        concept=unit.concept,
-                    )
-                    unit_id = existing["id"] if existing else str(uuid.uuid4())
-                    old_qdrant_id = existing.get("qdrant_id") if existing else None
-
-                    # Store to Qdrant via MemoryStore (non-transactional, immediate)
-                    # WS-3: curated ingest is external_untrusted (authority tier,
-                    # not authorship); derived once, mirrored to both stores.
-                    from genesis.memory.provenance import derive_origin_class
-
-                    resolved_origin = derive_origin_class(
-                        source_pipeline="curated",
+        def _drop_vectors(ids: list[str], why: str) -> None:
+            """Delete Qdrant points, best-effort. ONE implementation, two callers."""
+            for qid in ids:
+                try:
+                    delete_point(
+                        memory_mod._store.qdrant_client,
                         collection="knowledge_base",
+                        point_id=qid,
                     )
-                    qdrant_id = await memory_mod._store.store(
+                except Exception:
+                    logger.warning("Qdrant delete failed (%s) for %s", why, qid)
+
+        # WS-3: curated ingest is external_untrusted (authority tier, not
+        # authorship); derived once, mirrored to both stores.
+        from genesis.memory.provenance import derive_origin_class
+
+        resolved_origin = derive_origin_class(
+            source_pipeline="curated",
+            collection="knowledge_base",
+        )
+
+        # PHASE 1 — every Qdrant write happens BEFORE the SQLite envelope opens,
+        # and this ordering is the fix rather than a tidy-up.
+        #
+        # `MemoryStore.store` writes and commits through the SHARED memory
+        # connection, not `own`. Called from inside `BEGIN IMMEDIATE` it asked
+        # SQLite for the sole writer slot that this very coroutine was holding —
+        # a self-deadlock that no other process could break, so it waited out
+        # busy_timeout and raised on EVERY non-duplicate unit. Normal ingestion
+        # failed, and failed in the worst possible place: `store` upserts to
+        # Qdrant BEFORE its SQLite write, so the vector existed while the id it
+        # returns was never assigned, and `qdrant_ids` — the compensation list —
+        # never saw it. The batch rolled back leaving an orphaned vector nothing
+        # could name.
+        #
+        # Hoisting it out fixes both at once. The envelope exists to isolate the
+        # SQLite batch from a concurrent MCP commit; Qdrant is a different store
+        # with no transaction to join (the code already called these writes
+        # "non-transactional, immediate"), so it was never covered by it and
+        # loses nothing by moving. Each id is appended the moment it exists, so a
+        # failure anywhere after that has the full list to compensate with.
+        try:
+            for unit in units:
+                qdrant_ids.append(
+                    await memory_mod._store.store(
                         unit.body,
                         f"knowledge:{project_type}/{unit.domain}",
                         memory_type="knowledge",
@@ -467,21 +486,49 @@ class KnowledgeOrchestrator:
                         source_pipeline="curated",
                         origin_class=resolved_origin,
                     )
-                    qdrant_ids.append(qdrant_id)
+                )
+        except Exception:
+            logger.error(
+                "Qdrant write failed after %d/%d units from %s — compensating",
+                len(qdrant_ids),
+                len(units),
+                source,
+                exc_info=True,
+            )
+            _drop_vectors(qdrant_ids, "phase-1 failure")
+            raise
 
-                    # Clean up stale Qdrant point if re-ingesting
+        # PHASE 2 — the owned SQLite envelope. Nothing inside it writes through
+        # another connection, so the writer slot it holds is uncontended by us.
+        stale_ids: list[str] = []
+        async with get_raw_db(genesis_db_path()) as own:
+            try:
+                await own.execute("BEGIN IMMEDIATE")
+                for unit, qdrant_id in zip(units, qdrant_ids, strict=True):
+                    # Existing unit? (idempotent re-ingestion). Reads on the owned conn
+                    # see prior COMMITTED units (WAL) and this batch's own uncommitted
+                    # upserts (same connection) — identical to the shared-conn behavior.
+                    # The loop stays ONE pass for that reason: two units in a batch can
+                    # share a unique key, and the second must see the first's
+                    # uncommitted row rather than minting a second id for it.
+                    existing = await memory_mod.knowledge.find_by_unique_key(
+                        own,
+                        project_type=project_type,
+                        domain=unit.domain,
+                        concept=unit.concept,
+                    )
+                    unit_id = existing["id"] if existing else str(uuid.uuid4())
+                    old_qdrant_id = existing.get("qdrant_id") if existing else None
+
+                    # DEFERRED, not done here. Deleting the superseded vector inside
+                    # the transaction is irreversible while the row that points at it
+                    # is not: a rollback after this line restores a row whose
+                    # qdrant_id names a vector that no longer exists — the unit
+                    # survives as un-retrievable, which is worse than the orphan the
+                    # compensation path already handles. Collected and dropped only
+                    # once the commit has made the new id the real one.
                     if old_qdrant_id and old_qdrant_id != qdrant_id:
-                        try:
-                            delete_point(
-                                memory_mod._store.qdrant_client,
-                                collection="knowledge_base",
-                                point_id=old_qdrant_id,
-                            )
-                        except Exception:
-                            logger.warning(
-                                "Failed to clean up stale Qdrant point %s",
-                                old_qdrant_id,
-                            )
+                        stale_ids.append(old_qdrant_id)
 
                     # Upsert to SQLite on the OWNED conn (_commit=False — batch txn)
                     actual_id, _inserted = await memory_mod.knowledge.upsert(
@@ -515,6 +562,10 @@ class KnowledgeOrchestrator:
                 # Single commit for all units in the batch (owned conn)
                 await own.commit()
 
+                # NOW the superseded vectors are safe to drop: every row that
+                # pointed at one is durably pointing at its replacement.
+                _drop_vectors(stale_ids, "superseded")
+
             except Exception:
                 logger.error(
                     "Batch storage failed after %d/%d units (%d qdrant vectors) from %s — rolling back",
@@ -530,16 +581,10 @@ class KnowledgeOrchestrator:
                 with contextlib.suppress(Exception):
                     await own.rollback()
 
-                # Compensate: delete orphaned Qdrant vectors
-                for qid in qdrant_ids:
-                    try:
-                        delete_point(
-                            memory_mod._store.qdrant_client,
-                            collection="knowledge_base",
-                            point_id=qid,
-                        )
-                    except Exception:
-                        logger.warning("Qdrant compensation delete failed for %s", qid)
+                # Compensate: delete the vectors this batch wrote. `stale_ids` is
+                # deliberately NOT touched — those points are still the live ones
+                # for rows the rollback has just restored.
+                _drop_vectors(qdrant_ids, "batch rollback")
 
                 raise
 
