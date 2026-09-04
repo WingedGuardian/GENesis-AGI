@@ -1165,6 +1165,29 @@ class TestMergeGateIntegration:
 
 # ── _check_inline_review_findings tests ──────────────────────────────
 
+# CodeRabbit severity headers, copied VERBATIM from live PRs rather than written
+# from memory — the format is what the matcher keys on, so a paraphrase would
+# test the paraphrase. Sources: PR #1615 and #1621 (Major), PR #1603 (Minor).
+_CR_MAJOR_BODY = (
+    "_🔒 Security & Privacy_ | _🟠 Major_ | _🏗️ Heavy lift_\n\n"
+    "**Track unresolved reparsing prefixes through wrapper chains.**\n\n"
+    "Line 339 only checks the first raw word."
+)
+_CR_MINOR_BODY = (
+    "_🎯 Functional Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n"
+    "**Prefer an explicit tie-break.**\n\nDetails here."
+)
+_CR_CRITICAL_BODY = (
+    "_🗄️ Data Integrity_ | _🔴 Critical_ | _🏗️ Heavy lift_\n\n"
+    "**Data loss on concurrent write.**\n\nDetails here."
+)
+# The parse trap, observed live: the header is NOT always three fields. This one
+# omits the severity entirely, so a POSITIONAL regex reads the effort field as
+# the severity and reports "Heavy lift" as a blocking level.
+_CR_NO_SEVERITY_BODY = (
+    "_📐 Maintainability_ | _🏗️ Heavy lift_\n\n**Consider extracting a helper.**"
+)
+
 _P1_BODY = (
     "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-red)"
     "</sub></sub>  Make queue claim atomic across concurrent pollers**"
@@ -1209,6 +1232,306 @@ class TestCheckInlineReviewFindings:
         if path is not None:
             d["path"] = path
         return d
+
+    def _coderabbit(self, cid, body, reply_to=None, path=None):
+        d = {
+            "id": cid,
+            "reply_to": reply_to,
+            "login": "coderabbitai[bot]",
+            "type": "Bot",
+            "body": body,
+        }
+        if path is not None:
+            d["path"] = path
+        return d
+
+    # ── CodeRabbit findings, which the gate read and then silently dropped ──
+    #
+    # The failure was never at the fetch or author layer, and locating it wrongly
+    # sends the fix to the wrong place. MEASURED on live PR #1615: the comment has
+    # `user.type == "Bot"`, so it PASSES the permissive author filter, is fetched,
+    # and is iterated in the same loop as the Codex findings. It then reaches
+    # `if P1 / elif P2`, matches neither, falls out with no `else`, and scores 0.
+    # Read, then dropped — and `inline-findings: ok` on a PR carrying a Major
+    # reads exactly like `inline-findings: ok` on a clean one.
+
+    def test_coderabbit_major_blocks(self, guard_module):
+        """The KNOWN POSITIVE, verbatim from live PR #1615.
+
+        This case is the acceptance bar for the whole matcher: a matcher that
+        finds nothing is indistinguishable from one that looks at nothing, so a
+        real finding must be shown to be caught before any negative result here
+        is trusted.
+        """
+        with self._mock(guard_module, [self._coderabbit(1, _CR_MAJOR_BODY)]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block, "a Security & Privacy Major was read and then dropped"
+        assert "Track unresolved reparsing prefixes" in msg
+
+    def test_coderabbit_critical_blocks(self, guard_module):
+        with self._mock(guard_module, [self._coderabbit(1, _CR_CRITICAL_BODY)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_coderabbit_minor_does_not_block(self, guard_module):
+        """Scoring policy: Critical and Major score 1.0, EVERY other level 0.
+
+        Minor is by far the most common level observed (73 of 104 findings), so
+        blocking on it would train reflexive overrides — which is worse than not
+        gating at all.
+        """
+        with self._mock(guard_module, [self._coderabbit(1, _CR_MINOR_BODY)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_coderabbit_absent_severity_field_does_not_block(self, guard_module):
+        """The parse trap, observed live: the header is not always three fields.
+
+        A POSITIONAL regex reads the effort field as the severity here and would
+        report "Heavy lift" as a blocking level. Matching the severity WORD inside
+        its own delimited span is what makes this case fall through correctly.
+        """
+        with self._mock(guard_module, [self._coderabbit(1, _CR_NO_SEVERITY_BODY)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_coderabbit_major_on_doc_path_does_not_block(self, guard_module):
+        """Same doc-path treatment the Codex path already gets.
+
+        Without this the two reviewers are inconsistent: a finding on CHANGELOG.md
+        would block from one and not the other, for no stated reason.
+        """
+        with self._mock(
+            guard_module, [self._coderabbit(1, _CR_MAJOR_BODY, path="CHANGELOG.md")]
+        ):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    # ── the body is a CODE-BEARING document, so the severity read is anchored ──
+    #
+    # A review comment quotes the diff and embeds ```suggestion``` blocks, and `_`
+    # is at once CodeRabbit's severity delimiter, markdown emphasis, AND the
+    # snake_case separator. A body-wide search for a `_`-delimited severity word
+    # therefore matches ordinary source: MEASURED at 152 such tokens in this repo,
+    # including this feature's own `_CR_MAJOR_BODY` fixture. Each case below is a
+    # real shape from that measurement, and each one BLOCKED before the read was
+    # anchored to the header line — a *Minor* finding reported as "Critical/Major".
+
+    @pytest.mark.parametrize(
+        "quoted,label",
+        [
+            ("```suggestion\nMAX_CRITICAL_ERRORS = 5\n```", "a constant in a suggestion"),
+            ("```python\ndef is_major_bump(x):\n    ...\n```", "a snake_case function"),
+            ("This is a _major_ readability win.", "italic prose"),
+            ("This is _not critical_ but worth noting.", "a NEGATION"),
+            ("See `runtime_critical_path.py` for context.", "a file path"),
+            ("The constant `_CR_MAJOR_BODY` is the fixture.", "this feature's own fixture"),
+        ],
+    )
+    def test_coderabbit_minor_quoting_severity_word_does_not_block(
+        self, guard_module, quoted, label
+    ):
+        """A Minor finding whose BODY quotes a severity word must not block."""
+        body = f"_🟡 Minor_ | _⚡ Quick win_\n\n**A trivial nit.**\n\n{quoted}"
+        assert guard_module._cr_severity(body)[0] == "minor", label
+        with self._mock(guard_module, [self._coderabbit(1, body)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block, f"{label} in the body was read as the severity"
+
+    # ── one COMMENT is not one FINDING ────────────────────────────────────
+    #
+    # CodeRabbit bundles several findings into a single inline comment,
+    # separated by a markdown rule, when they land near each other in the diff.
+    # Reading only the first is this feature's ORIGINAL BUG one level down:
+    # read, then silently dropped. MEASURED on live PR #1647 comment 3925021846
+    # — one comment, two distinct Major findings, of which the gate saw one.
+
+    def test_bundled_findings_are_each_scored(self, guard_module):
+        """A Major bundled AFTER a Minor must not disappear.
+
+        This ordering is the dangerous one: the comment scores as `minor`, lands
+        in the advisory list, and prints "below Major, NOT counted" — a false
+        claim about a Major that was never read at all.
+        """
+        body = (
+            "_📐 Maintainability_ | _🟡 Minor_ | _⚡ Quick win_\n\n"
+            "**Prefer an explicit tie-break.**\n\n"
+            "---\n\n"
+            "_🗄️ Data Integrity_ | _🟠 Major_ | _🏗️ Heavy lift_\n\n"
+            "**Data loss on concurrent write.**\n"
+        )
+        assert [guard_module._cr_severity(s)[0] for s in guard_module._cr_findings(body)] == [
+            "minor",
+            "major",
+        ]
+        with self._mock(guard_module, [self._coderabbit(1, body)]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block, "a Major bundled after a Minor was dropped"
+        assert "Data loss on concurrent write" in msg
+
+    def test_two_bundled_majors_score_twice(self, guard_module):
+        """Scoring the COMMENT instead of each finding undercounts."""
+        body = (
+            "_🗄️ Data Integrity_ | _🟠 Major_ | _🏗️ Heavy lift_\n\n**First problem.**\n\n"
+            "---\n\n"
+            "_🎯 Functional Correctness_ | _🟠 Major_ | _⚡ Quick win_\n\n**Second problem.**\n"
+        )
+        with self._mock(guard_module, [self._coderabbit(1, body)]):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "First problem" in msg and "Second problem" in msg
+        assert "2 CodeRabbit" in msg
+
+    def test_rule_in_prose_does_not_invent_a_finding(self, guard_module):
+        """A markdown rule is only a boundary when a header follows it.
+
+        Splitting on every rule would fabricate findings out of ordinary prose,
+        which is the opposite failure and just as wrong.
+        """
+        body = (
+            "_🎯 Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n**A nit.**\n\n"
+            "---\n\nJust some trailing prose, not a finding.\n"
+        )
+        assert len(guard_module._cr_findings(body)) == 1
+
+    def test_oversized_category_field_keeps_its_severity(self, guard_module):
+        """The field bound must not sit exactly on live data.
+
+        MEASURED across 124 real findings, the longest category is
+        `📐 Maintainability & Code Quality` at EXACTLY 32 characters. A 32-char
+        bound therefore has zero margin: one vendor rename and a genuine Major
+        stops parsing and is reported as "below Major".
+        """
+        for cat in ("📐 Maintainability & Code Quality", "📐 Maintainability & Code Quality Now"):
+            body = f"_{cat}_ | _🟠 Major_ | _🏗️ Heavy lift_\n\n**Something.**"
+            assert guard_module._cr_severity(body)[0] == "major", f"len {len(cat)} lost its Major"
+
+    def test_header_shaped_but_unparseable_is_a_canary(self, guard_module, capsys):
+        """"Not a header" and "a header I could not parse" are different.
+
+        Conflating them prints an unparsed finding as "below Major" — a
+        confident false statement about a level that was never read.
+        """
+        body = "_🔒 Security | Privacy_ | _🟠 Major_ | _🏗️ x_\n\n**Something.**"
+        severity, header_seen = guard_module._cr_severity(body)
+        assert (severity, header_seen) == (None, True)
+        with self._mock(guard_module, [self._coderabbit(1, body)]):
+            guard_module._check_inline_review_findings("100")
+        assert "unknown-severity" in capsys.readouterr().err
+
+    def test_coderabbit_unknown_severity_fails_open_with_canary(
+        self, guard_module, capsys
+    ):
+        """A level this gate does not know must NOT silently start blocking.
+
+        Failing closed here would wedge every merge the moment the vendor adds a
+        rung to the ladder. It is surfaced instead, so an unrecognised level is
+        never invisible — which is the whole point of this PR.
+        """
+        body = "_🔒 Security_ | _🟣 Catastrophic_ | _🏗️ Heavy lift_\n\n**Something.**"
+        severity, header_seen = guard_module._cr_severity(body)
+        assert (severity, header_seen) == (None, True)
+        with self._mock(guard_module, [self._coderabbit(1, body)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+        assert "unknown-severity" in capsys.readouterr().err
+
+    def test_coderabbit_major_replied_by_maintainer_does_not_block(self, guard_module):
+        """The line that turns a BLOCK into a PASS, which had no test.
+
+        A maintainer reply is a conscious acceptance and clears the finding — so
+        this branch can silence a real Major, and an untested branch that can
+        silence a Major is the one most worth locking.
+        """
+        with self._mock(
+            guard_module,
+            [
+                self._coderabbit(1, _CR_MAJOR_BODY),
+                {
+                    "id": 2,
+                    "reply_to": 1,
+                    "login": "a-maintainer",
+                    "type": "User",
+                    "assoc": "OWNER",
+                    "body": "Accepted — tracked separately.",
+                },
+            ],
+        ):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_coderabbit_major_reply_from_non_maintainer_still_blocks(self, guard_module):
+        """A drive-by reply must NOT be able to silence a Major."""
+        with self._mock(
+            guard_module,
+            [
+                self._coderabbit(1, _CR_MAJOR_BODY),
+                {
+                    "id": 2,
+                    "reply_to": 1,
+                    "login": "a-passer-by",
+                    "type": "User",
+                    "assoc": "NONE",
+                    "body": "lgtm",
+                },
+            ],
+        ):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_unrecognised_review_bot_is_surfaced_not_dropped(self, guard_module, capsys):
+        """The silent-drop CLASS, which is not CodeRabbit-specific.
+
+        MEASURED on live PR #1621 while building this: Codex **P3** findings hit
+        the same hole — `_INLINE_P1_RE`/`_INLINE_P2_RE` match only P1 and P2, so
+        every P3 ever posted fell out of the if/elif with no `else` and scored 0,
+        exactly as CodeRabbit's did. `github-advanced-security[bot]` is allowlisted
+        today with no matcher at all and would have been next.
+
+        Surfaced, never scored: recognising a format is what earns a weight, and
+        guessing a severity from an unknown one would be worse than the blindness.
+        """
+        p3 = (
+            "**<sub><sub>![P3 Badge](https://img.shields.io/badge/P3-lightgrey)"
+            "</sub></sub>  Keep extglob parentheses inside the pattern word**"
+            "\n\nDetails."
+        )
+        with self._mock(guard_module, [self._codex(1, p3)]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block, "an unrecognised format must not be guessed at"
+        err = capsys.readouterr().err
+        assert "unrecognised" in err
+        assert "Keep extglob parentheses" in err
+
+    def test_coderabbit_title_ignores_bold_inside_quoted_code(self, guard_module):
+        """The title must name the FINDING, not something out of a fence.
+
+        CodeRabbit embeds fenced blocks and collapsed `<details>` static-analysis
+        output, both of which routinely carry bold text belonging to quoted code.
+        Reporting that as the title misnames the finding in the very report a
+        human reads to decide a merge.
+        """
+        body = (
+            "_🔒 Security_ | _🟠 Major_ | _🏗️ Heavy lift_\n\n"
+            "<details>\n<summary>x</summary>\n\n**Script executed:**\n\n</details>\n\n"
+            "```shell\n**not the title**\n```\n\n"
+            "**The actual finding title.**\n\nBody."
+        )
+        assert guard_module._coderabbit_title(body) == "The actual finding title."
+
+    def test_coderabbit_major_combines_with_codex_score(self, guard_module):
+        """One CodeRabbit Major (1.0) alone reaches the existing threshold.
+
+        Deliberately fed through #1589's weighted machinery rather than a second
+        blocking path, so there is one score and one threshold to reason about.
+        """
+        with self._mock(
+            guard_module,
+            [self._coderabbit(1, _CR_MAJOR_BODY), self._codex(2, _P2_BODY)],
+        ):
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "score" in msg.lower()
 
     def test_inline_p1_blocks_with_title(self, guard_module):
         with self._mock(guard_module, [self._codex(1, _P1_BODY)]):

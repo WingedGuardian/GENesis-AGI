@@ -971,6 +971,45 @@ _REVIEW_BOTS = {"chatgpt-codex-connector[bot]", "github-actions[bot]"}
 # 118 merged PRs passed unseen, 64 of them P1).
 _INLINE_P1_RE = re.compile(r"!\[P1 Badge\]")
 _INLINE_P2_RE = re.compile(r"!\[P2 Badge\]")
+
+# CodeRabbit states severity in a pipe-separated italic header on its FIRST line:
+#   _🔒 Security & Privacy_ | _🟠 Major_ | _🏗️ Heavy lift_
+# Its findings were already REACHED by the scan below — `user.type` is "Bot", so
+# they pass the author filter — and then dropped, because neither badge pattern
+# above matches and the if/elif has no else. Read, not recognised; a PR carrying
+# a Major reported `inline-findings: ok`, indistinguishable from a clean one.
+_CODERABBIT_LOGINS = {"coderabbitai[bot]"}
+# The documented ladder. An unrecognised level is NON-BLOCKING (surfaced with a
+# canary) — a severity name this set has not seen must not silently start
+# blocking every PR the moment the vendor adds one.
+_CR_SEVERITIES = frozenset({"critical", "major", "minor", "trivial", "info"})
+_CR_BLOCKING_SEVERITIES = frozenset({"critical", "major"})
+# ONE header field: an italic span carrying no interior underscore. Anchored
+# whole (`^…$`) so a field is recognised only as a complete span, never as a
+# substring found somewhere inside one.
+#
+# The 64-char bound is deliberately double the observed ceiling, not tight to
+# it. MEASURED across 124 real findings, the longest category field is
+# `📐 Maintainability & Code Quality` at EXACTLY 32 characters — so a 32-char
+# bound sits precisely on live data, and a vendor renaming one category one
+# character longer would push a genuine Critical into the non-blocking path.
+# The bound is a sanity check against runaway prose, not a filter doing real
+# work, so it costs nothing to give it real headroom.
+_CR_HEADER_FIELD_RE = re.compile(r"^_([^_\n]{1,64})_$")
+# A line that LOOKS like an attempted severity header — italic markers and a
+# field separator — used only to tell "not a header" apart from "a header this
+# code failed to parse". Conflating those two makes an unparsed finding print
+# as "below Major", a false statement about a level that was never read.
+_CR_HEADER_SHAPE_RE = re.compile(r"^_.*\|.*_$")
+# CodeRabbit bundles SEVERAL findings into ONE inline comment, separated by a
+# markdown rule, when they land near each other in the diff. Each segment is
+# its own finding with its own severity.
+_CR_FINDING_SPLIT_RE = re.compile(r"^\s*-{3,}\s*$", re.M)
+# Scoring policy (2026-09-03, issue #1642): Critical and Major each score a full
+# 1.0; every other level scores 0 and is surfaced only. Deliberately fed through
+# the SAME weighted machinery as the Codex findings rather than a second blocking
+# path, so there is one score and one threshold to reason about.
+_CR_BLOCKING_WEIGHT = 1.0
 # Weighted review score for inline findings: a P1 is a full blocker (1.0), a P2
 # is half (0.5), so the gate blocks at any unresolved P1 OR >= 2 unresolved P2s.
 # Doc-path and maintainer-replied (consciously-accepted) findings are excluded
@@ -1096,6 +1135,121 @@ def _inline_title(body: str) -> str:
     # which line is shown as the title (consistent with the JSONL parser).
     first = _INLINE_MARKUP_RE.sub("", body).strip().split("\n")
     return (first[0].strip() if first else "")[:120]
+
+
+def _cr_severity(body: str) -> tuple[str | None, bool]:
+    """Severity read from a CodeRabbit finding's header LINE. -> (level, header_seen)
+
+    Anchored to the header rather than searched for anywhere in the body, because
+    a review-bot comment is a CODE-BEARING DOCUMENT: it quotes the diff and embeds
+    ```suggestion``` blocks. `_` is simultaneously CodeRabbit's severity delimiter,
+    markdown emphasis, AND the snake_case separator, so a body-wide search for a
+    `_`-delimited severity word matches ordinary source. MEASURED against this
+    repo, a whole-body search matched `MAX_CRITICAL_ERRORS`, `def is_major_bump`,
+    the prose NEGATION `_not critical_`, the path `runtime_critical_path.py` —
+    152 such tokens — and, self-demonstratingly, this feature's own test fixture
+    `_CR_MAJOR_BODY`. A *Minor* finding quoting any one of them would have blocked
+    the merge and been reported as "Critical/Major": worse than the blindness it
+    replaces, since issue #1642 warns that poor precision trains reflex overrides.
+
+    Every field must be a COMPLETE italic span, so a line is accepted as a header
+    only if it is entirely one. Severity is read as the field's LAST word, never
+    by position — one observed finding omits the severity field entirely, and a
+    positional read would take the effort field ("Heavy lift") for a severity.
+    The emoji is deliberately not matched: only Minor and Major were ever observed
+    across 104 findings, so the emoji for Critical, Trivial and Info is unknown
+    here and guessing it would silently miss the most severe level.
+
+    `header_seen` separates "a CodeRabbit finding whose level we do not recognise"
+    from "a comment with no severity header at all". Neither blocks; only the
+    first is a canary worth printing. A line that LOOKS like a header but does
+    not fully parse counts as SEEN — reporting it as "below Major" would be a
+    false statement about a level this code never actually read.
+    """
+    for line in body.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        fields = [_CR_HEADER_FIELD_RE.match(f.strip()) for f in stripped.split("|")]
+        if not all(fields):
+            # Header-SHAPED but unparseable is a canary, not a clean miss.
+            return None, bool(_CR_HEADER_SHAPE_RE.match(stripped))
+        for fld in fields:
+            words = fld.group(1).split()  # type: ignore[union-attr]
+            if words and words[-1].casefold() in _CR_SEVERITIES:
+                return words[-1].casefold(), True
+        return None, True  # a header, but no field names a level we know
+    return None, False
+
+
+def _cr_findings(body: str) -> list[str]:
+    """Split one CodeRabbit comment into its individual findings.
+
+    ONE GitHub comment is not one finding. CodeRabbit bundles several into a
+    single inline comment, separated by a markdown rule, when they land near
+    each other in the diff. Reading only the first is the ORIGINAL BUG of this
+    feature reincarnated one level down — read, then silently dropped.
+
+    MEASURED on live PR #1647, comment id 3925021846: one comment carrying two
+    distinct Major findings. Before this split, `_cr_severity` returned the
+    first and the second existed nowhere in the gate's output. The dangerous
+    ordering is Minor-then-Major: the comment scored as `minor`, landed in the
+    advisory list, and printed "below Major, NOT counted" — a false claim about
+    a Major that was never seen at all.
+
+    A segment carrying no header is folded into the previous one rather than
+    treated as a finding: a rule inside prose or a fenced block is not a
+    finding boundary, and splitting on it would invent findings that
+    do not exist.
+    """
+    parts = _CR_FINDING_SPLIT_RE.split(body)
+    out: list[str] = []
+    for part in parts:
+        if not part.strip():
+            continue
+        _, header_seen = _cr_severity(part)
+        if header_seen or not out:
+            out.append(part)
+        else:
+            out[-1] = out[-1] + "\n---\n" + part
+    return out or [body]
+
+
+def _coderabbit_title(body: str) -> str:
+    """The finding's title, which for CodeRabbit is not its first line.
+
+    Codex leads with badge-plus-title, so `_inline_title` reads correctly there.
+    CodeRabbit leads with the severity header (`_category_ | _severity_ |
+    _effort_`) and puts the title in the first BOLD line beneath it — using the
+    generic extractor here reports the severity header as the finding's name,
+    which tells a reader nothing about what is wrong.
+
+    Fenced blocks and `<details>` sections are skipped: both routinely carry bold
+    text belonging to QUOTED CODE or to collapsed static-analysis output, not to
+    the finding, and reporting one of those as the title misnames the finding in
+    the pre-merge report a human reads to decide a merge.
+    """
+    in_fence = False
+    in_details = False
+    for line in body.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        low = stripped.casefold()
+        if low.startswith("<details"):
+            in_details = True
+            continue
+        if low.startswith("</details"):
+            in_details = False
+            continue
+        if in_details:
+            continue
+        if stripped.startswith("**") and stripped.rstrip("*").strip():
+            return _INLINE_MARKUP_RE.sub("", stripped).strip().strip("*").strip()[:120]
+    return _inline_title(body)
 
 
 def _scan_unreadable(what: str) -> tuple[bool, str]:
@@ -1284,6 +1438,11 @@ def _check_inline_review_findings(
     p2: list[str] = []
     doc_skipped: list[str] = []  # P1s on doc paths — surfaced, never blocking
     doc_skipped_p2: list[str] = []  # P2s on doc paths — surfaced, excluded from score
+    cr_block: list[str] = []  # CodeRabbit Critical/Major — 1.0 each
+    cr_advisory: list[str] = []  # every other CodeRabbit level — surfaced, 0.0
+    cr_unknown: list[str] = []  # a severity header naming a level we don't know
+    cr_doc_skipped: list[str] = []  # CodeRabbit Critical/Major on a doc path
+    unmatched_bot: list[tuple[str, str]] = []  # (login, title) — read, unrecognised
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
         body = c.get("body") or ""
@@ -1291,6 +1450,34 @@ def _check_inline_review_findings(
             continue
         if c.get("reply_to"):
             continue  # replies aren't findings
+        if login in _CODERABBIT_LOGINS:
+            # ONE COMMENT CAN CARRY SEVERAL FINDINGS — see _cr_findings. Scoring
+            # the comment rather than each finding undercounts, and a Major
+            # bundled after a Minor disappears entirely.
+            for seg in _cr_findings(body):
+                # Same engagement and doc-path treatment the Codex path gets
+                # below — otherwise the two reviewers are inconsistent for no
+                # stated reason, and a maintainer-accepted finding from one
+                # would still block.
+                severity, header_seen = _cr_severity(seg)
+                if severity not in _CR_BLOCKING_SEVERITIES:
+                    title = _coderabbit_title(seg)
+                    if header_seen and severity is None:
+                        cr_unknown.append(title)
+                    else:
+                        cr_advisory.append(title)
+                    continue
+                if c.get("id") in replied_to:
+                    continue
+                if _is_doc_path(c.get("path") or ""):
+                    # Its OWN list, not the Codex `doc_skipped` one — landing a
+                    # CodeRabbit finding there printed it as "[doc P1]" under a
+                    # heading that names Codex severities, which misattributes
+                    # both the reviewer and the level.
+                    cr_doc_skipped.append(_coderabbit_title(seg))
+                    continue
+                cr_block.append(_coderabbit_title(seg))
+            continue
         if _INLINE_P1_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — treated as acknowledged
@@ -1312,7 +1499,46 @@ def _check_inline_review_findings(
                 doc_skipped_p2.append(_inline_title(body))
                 continue
             p2.append(_inline_title(body))
+        else:
+            # The silent-drop CLASS, not just its CodeRabbit instance. A comment
+            # that reached this loop was authored by a Bot or an allowlisted review
+            # account, so it is review output by construction — and until this
+            # branch existed, any such comment matching no known severity format
+            # fell out of the if/elif and contributed nothing, indistinguishable
+            # from a clean PR. That is exactly how 104 CodeRabbit findings went
+            # unseen. `github-advanced-security[bot]` is allowlisted TODAY with no
+            # matcher of its own and would have been the next one.
+            # Surfaced, never scored: recognising a format is what earns a weight,
+            # and guessing a severity from an unknown format would be worse than
+            # the blindness. The point is that it can no longer be INVISIBLE.
+            unmatched_bot.append((login, _inline_title(body)))
 
+    if unmatched_bot:
+        print(
+            f"NOTE: PR #{pr_num} — {len(unmatched_bot)} review-bot comment(s) in a "
+            f"format this gate does not recognise. NOT scored; listed so an "
+            f"unrecognised reviewer cannot be silently invisible:",
+            file=sys.stderr,
+        )
+        for bot_login, title in unmatched_bot[:5]:
+            print(f"  [unrecognised: {bot_login}] {title}", file=sys.stderr)
+    if cr_unknown:
+        print(
+            f"NOTE: PR #{pr_num} — {len(cr_unknown)} CodeRabbit finding(s) carry a "
+            f"severity this gate does not know (the ladder may have changed). "
+            f"NOT scored — verify the level by hand before merging:",
+            file=sys.stderr,
+        )
+        for title in cr_unknown[:5]:
+            print(f"  [CodeRabbit unknown-severity] {title}", file=sys.stderr)
+    if cr_doc_skipped:
+        print(
+            f"NOTE: PR #{pr_num} — {len(cr_doc_skipped)} CodeRabbit Critical/Major "
+            f"finding(s) on documentation paths, NOT blocking:",
+            file=sys.stderr,
+        )
+        for title in cr_doc_skipped[:5]:
+            print(f"  [doc CodeRabbit Critical/Major] {title}", file=sys.stderr)
     if doc_skipped:
         print(
             f"NOTE: PR #{pr_num} — {len(doc_skipped)} inline [P1] finding(s) on "
@@ -1334,7 +1560,26 @@ def _check_inline_review_findings(
     # Weighted review score: P1 = 1.0 (full blocker), P2 = 0.5. Blocks at
     # score >= threshold — any unresolved P1, OR >= 2 unresolved P2s. Doc-path
     # and maintainer-replied findings were already excluded from p1/p2 above.
-    score = len(p1) + _INLINE_P2_SCORE_WEIGHT * len(p2)
+    score = (
+        len(p1) + _INLINE_P2_SCORE_WEIGHT * len(p2) + _CR_BLOCKING_WEIGHT * len(cr_block)
+    )
+    if cr_advisory:
+        print(
+            f"NOTE: PR #{pr_num} — {len(cr_advisory)} CodeRabbit finding(s) below "
+            f"Major, surfaced and NOT counted toward the review score:",
+            file=sys.stderr,
+        )
+        for title in cr_advisory[:5]:
+            print(f"  [CodeRabbit] {title}", file=sys.stderr)
+    if cr_block:
+        print(
+            f"WARNING: PR #{pr_num} has {len(cr_block)} CodeRabbit "
+            f"Critical/Major finding(s) (each adds "
+            f"{_CR_BLOCKING_WEIGHT:.0f} to the review score):",
+            file=sys.stderr,
+        )
+        for title in cr_block[:8]:
+            print(f"  [CodeRabbit Critical/Major] {title}", file=sys.stderr)
     if p2:
         print(
             f"WARNING: PR #{pr_num} has {len(p2)} inline [P2] review finding(s) "
@@ -1347,12 +1592,16 @@ def _check_inline_review_findings(
             print(f"  [P2] {title}", file=sys.stderr)
     if score >= _INLINE_SCORE_BLOCK_THRESHOLD:
         listing = "\n".join(
-            [f"  [P1] {t}" for t in p1[:5]] + [f"  [P2] {t}" for t in p2[:5]]
+            [f"  [P1] {t}" for t in p1[:5]]
+            + [f"  [P2] {t}" for t in p2[:5]]
+            + [f"  [CodeRabbit Critical/Major] {t}" for t in cr_block[:5]]
         )
         return True, (
             f"review score {score:.1f} >= {_INLINE_SCORE_BLOCK_THRESHOLD:.1f} blocks "
-            f"(P1=1.0, P2={_INLINE_P2_SCORE_WEIGHT} each): {len(p1)} unresolved [P1] + "
-            f"{len(p2)} unresolved [P2] finding(s), none maintainer-replied:\n{listing}\n"
+            f"(P1=1.0, P2={_INLINE_P2_SCORE_WEIGHT}, CodeRabbit Critical/Major="
+            f"{_CR_BLOCKING_WEIGHT:.0f} each): {len(p1)} unresolved [P1] + "
+            f"{len(p2)} unresolved [P2] + {len(cr_block)} CodeRabbit "
+            f"Critical/Major finding(s), none maintainer-replied:\n{listing}\n"
             f"Fix and reply in-thread, or append '# review-override' "
             f"to the merge command to acknowledge and proceed."
         )
