@@ -23,6 +23,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parents[2]
 # The guard hooks live in scripts/hooks/ (shell_parse, git_push_guard,
 # pre_push_privacy_review) and scripts/ (review_enforcement_commit); the privacy
@@ -83,6 +85,8 @@ def test_push_value_flags_identical_across_all_copies():
             f"Missing={set(_CANONICAL_PUSH_VALUE_FLAGS) - members}, "
             f"Extra={members - set(_CANONICAL_PUSH_VALUE_FLAGS)}"
         )
+
+
 # ── cd-target semantics ──────────────────────────────────────────────────────
 #
 # The SECOND spec duplicated across these hooks: which `cd` targets are
@@ -120,6 +124,40 @@ def test_push_value_flags_identical_across_all_copies():
 
 _CD_BASE = "/BASE"
 
+
+def _absent_user() -> str:
+    """A username the host's passwd db provably cannot resolve.
+
+    The sweep needs a `~user` that stays UNRESOLVABLE. A hard-coded
+    "nosuchuser" is a guess about the host: if such an account exists the case
+    silently resolves and the lock reports a divergence that is really a
+    property of the machine. Probing until one is absent makes the case
+    deterministic wherever this suite runs, including CI.
+    """
+    import pwd
+
+    for n in range(1000):
+        cand = f"genesis_absent_user_{n}"
+        try:
+            pwd.getpwnam(cand)
+        except KeyError:
+            return cand
+    raise AssertionError("no absent username found — the passwd db is implausible")
+
+
+_ABSENT_USER = _absent_user()
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_cd_environment(monkeypatch):
+    """CDPATH changes what `cd relative/sub` means, and the copies read it
+    differently, so a non-empty CDPATH in the developer's shell makes this lock
+    fail as an "undocumented divergence" with no drift at all. The sweep is
+    about the COPIES agreeing, not about the host, so pin the environment.
+    """
+    monkeypatch.delenv("CDPATH", raising=False)
+
+
 _CD_TARGETS = [
     "/abs/path",
     "'single quoted'",
@@ -127,7 +165,7 @@ _CD_TARGETS = [
     "relative/sub",
     "~",
     "~/wt",
-    "~nosuchuser/wt",
+    f"~{_ABSENT_USER}/wt",
     "$W",
     '"$W"',
     "'$W'",
@@ -154,7 +192,7 @@ _CD_PREFIXES = ["cd {t}", "( cd {t}", "{{ cd {t}"]
 # divergence fails, and so does an entry that no longer diverges — otherwise the
 # table rots into a permanent excuse list.
 _KNOWN_CD_DIVERGENCES = {
-    "cd ~nosuchuser/wt": (
+    f"cd ~{_ABSENT_USER}/wt": (
         "ppr refuses a ~user the passwd db cannot resolve; the others return the "
         "literal, which then cannot exist. ppr is stricter and safer for an advisory."
     ),

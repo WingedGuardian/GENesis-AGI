@@ -407,3 +407,54 @@ def test_quoted_path_with_spaces_still_resolves():
     A token that still contains whitespace after shlex got there from a QUOTED
     path, which is a faithful literal."""
     assert hook._effective_cwd(f"cd '/a b' && {_PUSH} origin br", "/main") == "/a b"
+
+
+# --- tilde quoting: bash expands it, shlex has already thrown the quotes away --
+
+
+def test_a_tilde_whose_literal_form_also_exists_is_unresolved(tmp_path, monkeypatch):
+    """REGRESSION PIN for the wrong-repo scan cross-model review found.
+
+    Bash expands a leading `~` only when it is UNQUOTED: `cd "~/wt"` enters a
+    LITERAL directory named `~/wt`. This hook is handed a shlex-split token, so
+    the quoting is already gone and both readings are candidates. It expanded
+    unconditionally, so when a literal `~`-named directory also existed it
+    resolved to a DIFFERENT real tree and scanned that one — reporting a clean
+    result about a repository nobody pushed.
+    """
+    (tmp_path / "~" / "wt").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    assert hook._cd_target("~/wt") is hook._CWD_UNRESOLVED
+
+
+def test_an_ordinary_tilde_still_resolves(tmp_path, monkeypatch):
+    """The other direction, and the reason the refusal is narrow.
+
+    `cd ~/<repo> && git push` is 172 of 708 real pushes on this install (24.3%).
+    Refusing every `~` — the first proposal — would have cost a quarter of all
+    pushes the scan this hook exists to perform, to close a case measured at
+    zero occurrences. Without a literal counterpart there is no ambiguity, so
+    the expansion stands.
+    """
+    monkeypatch.chdir(tmp_path)  # no literal `~` directory here
+
+    import os
+
+    assert hook._cd_target("~/wt") == os.path.expanduser("~/wt")
+
+
+def test_the_tilde_ambiguity_is_reported_through_the_production_path(tmp_path, monkeypatch):
+    """Through `_effective_cwd`, not `_cd_target` alone.
+
+    Production never calls `_cd_target` directly. A sibling lock records that
+    routing a check through the wrong entry point once hid a fix that had
+    already landed, so the ambiguity is asserted where the caller actually
+    reads it.
+    """
+    (tmp_path / "~" / "wt").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    got = hook._effective_cwd("cd ~/wt && git push origin main", str(tmp_path))
+
+    assert got is hook._CWD_UNRESOLVED

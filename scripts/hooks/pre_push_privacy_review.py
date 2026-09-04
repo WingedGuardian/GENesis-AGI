@@ -169,13 +169,23 @@ def _push_remote(cmd: str) -> str | None:
 # returned with NO output — so a push this hook could not scope was
 # indistinguishable from a clean one.
 #
-# MEASURED on this install's 508 real pushes, by replaying each through the OLD
-# resolver and asking whether its answer was a directory that can EXIST:
-#   126 (24.8%)  impossible because `~` was never expanded  <- the big one
-#    13  (2.6%)  impossible because `$`/backtick was never expanded
-# Every one of those scans silently produced nothing. The tilde class is the
-# larger by ~10x, which is why the fix is not just about shell variables.
-# 13/508 (2.6%) is also the rate at which the new notice fires.
+# MEASURED on this install's 708 real pushes, by replaying each through the OLD
+# resolver and asking whether its answer could name a directory on ANY day:
+#   175 (24.7%)  impossible because `~` was never expanded  <- the big one
+#    20  (2.8%)  impossible because `$`/backtick was never expanded
+#   ---
+#   195 (27.5%)  total, every one of which scanned nothing, silently
+# The tilde class is the larger by ~9x, which is why the fix is not just about
+# shell variables.
+#
+# The test is STRUCTURAL — does the answer still carry a `~`, `$`, backtick or
+# glob — not `isdir`. `isdir` is evaluated today, so a historical push into a
+# since-deleted worktree would score as impossible although it resolved
+# perfectly at the time; that artifact reads as 46.3% and would have been wrong.
+#
+# AFTER, on the same corpus: 664/708 (93.8%) answer a concrete directory,
+# 0/708 answer an impossible one, and 44/708 (6.2%) raise this notice. The
+# earlier figure of 2.6% counted only the shell-variable class, not the notice.
 _CWD_UNRESOLVED = object()
 
 # Every character bash would ACT on, so a literal read of the token would check a
@@ -222,6 +232,28 @@ def _cd_target(token: str | None):
         expanded = os.path.expanduser(token)
         if expanded.startswith("~"):
             return _CWD_UNRESOLVED  # `~otheruser` the passwd db cannot resolve
+        # shlex has already discarded the quoting, and bash expands `~` ONLY
+        # when it is UNQUOTED: `cd "~/wt"` and `cd '~/wt'` enter a LITERAL
+        # directory named `~/wt`. Both readings are therefore candidates here,
+        # and the token alone cannot say which bash took.
+        #
+        # Refusing every `~` was the first proposal. MEASURED against 708 real
+        # pushes from this install's corpus: 172 (24.3%) cd to a `~` target, and
+        # 0 of them have an existing literal counterpart. So refusing outright
+        # would cost a QUARTER of all pushes their scan — the coverage this hook
+        # was repaired to provide — to close a case that does not occur. It is
+        # closed narrowly instead: refuse only where the literal reading also
+        # names a real directory, which is the only situation in which this hook
+        # could confidently scan a DIFFERENT existing tree.
+        #
+        # Residual, stated rather than hidden: a quoted `~` whose literal form
+        # does NOT exist makes bash's `cd` FAIL. After `&&` the push never runs,
+        # so nothing is mis-scanned; after `;` the push runs in the original cwd
+        # while this resolves to the expansion. Undetectable from the token, and
+        # it costs a wrong-tree scan only for a mis-quoted command that also
+        # ignored the cd's failure.
+        if os.path.isdir(token):
+            return _CWD_UNRESOLVED
         token = expanded
     if any(ch in token for ch in _UNRESOLVABLE_CD_CHARS):
         return _CWD_UNRESOLVED
@@ -292,6 +324,20 @@ def _effective_cwd(cmd: str, payload_cwd: str | None):
         # i.e. strictly worse than the bare-variable case this class began with.
         # Both sibling copies already model it (git_push_guard, and
         # review_enforcement_commit which is where this spelling comes from).
+        #
+        # This OVER-refuses, and deliberately so. Cross-model review noted that a
+        # group which opens and closes before the push — `(cd /tmp); git push` —
+        # leaves the directory fully knowable, so refusing there is a false
+        # notice. Recovering it means deciding from text where the group ENDS.
+        # An attempt to do that (`endswith(")")`) was caught by the parity lock
+        # on three constructs where the closing character belonged to the PATH
+        # rather than the group: `( cd /a/(x)`, `{ cd ${W}`, `{ cd /a/{x}`.
+        #
+        # MEASURED over 708 real pushes from this install: 3 carry a group
+        # segment at all, and 0 carry a closed group holding a cd — the shape
+        # the recovery would rescue. An open-set text predicate that fixes zero
+        # measured commands, on an advisory whose current answer is already the
+        # safe one, is not worth its failure modes. Refusing stays.
         if seg.lstrip()[:1] in ("(", "{"):
             cwd = _CWD_UNRESOLVED
             continue
