@@ -282,7 +282,7 @@ def test_a_heading_below_line_one_is_rejected(tmp_path: Path) -> None:
     """
     d = tmp_path / "changelog.d"
     _fragment(d, "20260904210000-fixed-x.md", body="- a bullet\n\n## Injected\n\n- more")
-    with pytest.raises(ac.FragmentError, match="section heading"):
+    with pytest.raises(ac.FragmentError, match="Markdown heading"):
         ac.collect_fragments(d)
 
 
@@ -293,11 +293,26 @@ def test_a_top_level_code_fence_is_rejected(tmp_path: Path) -> None:
         ac.collect_fragments(d)
 
 
-def test_an_indented_code_fence_is_allowed(tmp_path: Path) -> None:
-    """Indented, it stays inside the bullet — which is the documented remedy."""
+def test_a_four_space_indented_code_fence_is_allowed(tmp_path: Path) -> None:
+    """Four spaces is the documented remedy, so it must keep working.
+
+    TWO is not, and used to be what the error message told people to do: under
+    a wider bullet (`-   text`) a two-space indent is still column 2 of the
+    document, and CommonMark treats up to three spaces as unindented anyway.
+    """
     d = tmp_path / "changelog.d"
-    _fragment(d, "20260904210000-fixed-x.md", body="- a bullet\n\n  ```\n  code\n  ```")
+    _fragment(
+        d, "20260904210000-fixed-x.md", body="- a bullet\n\n    ```\n    code\n    ```"
+    )
     assert len(ac.collect_fragments(d)) == 1
+
+
+def test_a_two_space_indented_fence_is_rejected(tmp_path: Path) -> None:
+    """The old error message recommended exactly this, and it was wrong."""
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-x.md", body="- a bullet\n\n  ```\n  code\n")
+    with pytest.raises(ac.FragmentError, match="code fence"):
+        ac.collect_fragments(d)
 
 
 # ── local debris and unreadable files ────────────────────────────────────────
@@ -517,7 +532,7 @@ def test_deleting_a_fragment_without_touching_the_changelog_is_refused(
     _patch_module_to(repo, monkeypatch)
     (repo / "changelog.d" / "20260904210000-fixed-kept.md").unlink()
     assert ac.main(["--check", "--base", base]) == 2
-    assert "gone and CHANGELOG.md is unchanged" in capsys.readouterr().err
+    assert "entries are not in CHANGELOG.md" in capsys.readouterr().err
 
 
 def test_the_release_fold_may_delete_every_fragment(
@@ -556,3 +571,310 @@ def test_an_unreadable_base_fails_closed(
     _patch_module_to(repo, monkeypatch)
     assert ac.main(["--check", "--base", "0" * 40]) == 2
     assert "cannot read fragments at base" in capsys.readouterr().err
+# ── the heading/fence checks are CLASSES, not the reported spellings ─────────
+
+
+@pytest.mark.parametrize(
+    "bad_line",
+    [
+        "# Injected",
+        "## Injected",
+        "### Fixed",
+        "###### Deep",
+        "#\tTab separated",
+        "##",
+    ],
+)
+def test_every_unindented_heading_level_is_rejected(tmp_path: Path, bad_line: str) -> None:
+    """`## ` was the reported spelling; the class is any ATX heading.
+
+    A `# ` or `### ` at column zero restructures the spliced result just as
+    thoroughly, and enumerating only the reported case would have left the rest
+    of the class shipping.
+    """
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-x.md", body=f"- a bullet\n\n{bad_line}\n\n- more")
+    with pytest.raises(ac.FragmentError, match="Markdown heading"):
+        ac.collect_fragments(d)
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~", "````", "~~~~~"])
+def test_both_fence_characters_are_rejected(tmp_path: Path, fence: str) -> None:
+    """Markdown has two fence characters; only backticks were covered."""
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-x.md", body=f"- a bullet\n\n{fence}\ncode\n")
+    with pytest.raises(ac.FragmentError, match="code fence"):
+        ac.collect_fragments(d)
+
+
+@pytest.mark.parametrize(
+    "ok_line", ["    # indented", "    ```", "    ~~~", "not a heading"]
+)
+def test_four_space_indented_constructs_stay_allowed(
+    tmp_path: Path, ok_line: str
+) -> None:
+    """Four-space indenting is the documented remedy, so it must keep working."""
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-x.md", body=f"- a bullet\n\n{ok_line}\n")
+    assert len(ac.collect_fragments(d)) == 1
+
+
+# ── the dotfile exemption stops at Markdown ──────────────────────────────────
+
+
+def test_a_committed_dot_markdown_fragment_is_not_skipped(tmp_path: Path) -> None:
+    """The debris exemption must not become a way to hide an entry.
+
+    A committed `.20260904…-fixed-hidden.md` would be skipped in a clean CI
+    checkout, --check would report success, and release assembly would omit the
+    entry — the silent omission this directory's classification exists to stop.
+    """
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-real.md")
+    (d / ".20260904210000-fixed-hidden.md").write_text("- hidden entry\n")
+    with pytest.raises(ac.FragmentError, match="not a valid fragment name"):
+        ac.collect_fragments(d)
+
+
+@pytest.mark.parametrize("debris", [".DS_Store", ".gitkeep", ".x.md.swp", ".foo.txt"])
+def test_non_markdown_debris_is_still_skipped(tmp_path: Path, debris: str) -> None:
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-real.md")
+    (d / debris).write_text("junk")
+    assert len(ac.collect_fragments(d)) == 1
+
+
+# ── cleanup failure rolls back, so a rerun stays correct ─────────────────────
+
+
+def test_a_failed_cleanup_rolls_the_changelog_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Half-done is worse than not-done here, because the obvious remedy is wrong.
+
+    With the changelog already rewritten and the fragments still present,
+    re-running the documented command folds them in a SECOND time and duplicates
+    the entries in the release notes. All-or-nothing keeps a rerun correct.
+    """
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-thing.md", body="- **Landed.** body")
+    cl = tmp_path / "CHANGELOG.md"
+    cl.write_text(CHANGELOG_SKELETON)
+    monkeypatch.setattr(ac, "FRAGMENT_DIR", d)
+    monkeypatch.setattr(ac, "CHANGELOG", cl)
+
+    def boom(self, *a, **k):
+        raise OSError("directory not writable")
+
+    monkeypatch.setattr(Path, "unlink", boom)
+    assert ac.main([]) == 2
+    assert cl.read_text() == CHANGELOG_SKELETON, (
+        "CHANGELOG.md kept its new content while the fragments survived — a "
+        "rerun would fold them in again and duplicate the entries"
+    )
+    assert len(list(d.iterdir())) == 1
+    assert "have been restored" in capsys.readouterr().err
+# ── the failure path that actually destroys data ─────────────────────────────
+
+
+def test_a_cleanup_failure_partway_restores_every_fragment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The rollback must be all-or-nothing, not all-or-PARTIAL.
+
+    MEASURED before the fix: with unlink failing on the SECOND fragment, the
+    changelog rolled back but the first fragment stayed deleted — its entry in
+    neither place — while the message told the operator state was consistent and
+    to re-run, which would ship a release missing it.
+
+    The previous test for this stubbed unlink to raise on the FIRST call, so
+    nothing was ever deleted and the property it named was never exercised. The
+    stub here fails on the second call for exactly that reason.
+    """
+    d = tmp_path / "changelog.d"
+    for i, slug in enumerate(("one", "two", "three")):
+        _fragment(d, f"2026090421000{i}-fixed-{slug}.md", body=f"- **{slug}.** body")
+    cl = tmp_path / "CHANGELOG.md"
+    cl.write_text(CHANGELOG_SKELETON)
+    monkeypatch.setattr(ac, "FRAGMENT_DIR", d)
+    monkeypatch.setattr(ac, "CHANGELOG", cl)
+
+    before = {p.name for p in d.iterdir()}
+    real_unlink = Path.unlink
+    calls = {"n": 0}
+
+    def fail_on_second(self, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("directory not writable")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", fail_on_second)
+    assert ac.main([]) == 2
+    assert {p.name for p in d.iterdir()} == before, (
+        "a fragment deleted before the failure was not restored — its entry is "
+        "now in neither the changelog nor changelog.d"
+    )
+    assert cl.read_text() == CHANGELOG_SKELETON
+    assert "have been restored" in capsys.readouterr().err
+
+
+# ── --base cannot be disarmed by merely touching the changelog ───────────────
+
+
+def test_an_unrelated_changelog_edit_does_not_excuse_a_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ "The file changed" is not "the entry arrived".
+
+    A typo fix or a stray newline in CHANGELOG.md satisfied the old test and
+    disarmed the deletion rule for the whole change — and hand-editing the
+    changelog is precisely what the convention forbids, so the two gaps
+    compounded.
+    """
+    repo, base = _repo_with_a_committed_fragment(tmp_path)
+    _patch_module_to(repo, monkeypatch)
+    (repo / "changelog.d" / "20260904210000-fixed-kept.md").unlink()
+    (repo / "CHANGELOG.md").write_text(
+        CHANGELOG_SKELETON.replace("- an entry that was already here", "- a typo fixed")
+    )
+    assert ac.main(["--check", "--base", base]) == 2
+    assert "entries are not in CHANGELOG.md" in capsys.readouterr().err
+
+
+def test_a_trailing_newline_touch_does_not_excuse_a_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, base = _repo_with_a_committed_fragment(tmp_path)
+    _patch_module_to(repo, monkeypatch)
+    (repo / "changelog.d" / "20260904210000-fixed-kept.md").unlink()
+    (repo / "CHANGELOG.md").write_text(CHANGELOG_SKELETON + "\n")
+    assert ac.main(["--check", "--base", base]) == 2
+
+
+def test_renaming_a_fragment_is_refused_like_a_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rename is a deletion under a new name as far as the entry is concerned."""
+    repo, base = _repo_with_a_committed_fragment(tmp_path)
+    _patch_module_to(repo, monkeypatch)
+    old = repo / "changelog.d" / "20260904210000-fixed-kept.md"
+    old.rename(repo / "changelog.d" / "20260904220000-fixed-renamed.md")
+    assert ac.main(["--check", "--base", base]) == 2
+
+
+# ── --base is a guard flag, never a way to trigger the fold ──────────────────
+
+
+def test_base_without_check_refuses_instead_of_folding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reaching for the guard flag must not perform the irreversible operation.
+
+    MEASURED before the fix: `--base origin/main` alone folded the fragments and
+    deleted them, exit 0, because the base handling sat inside the check branch
+    and argparse accepted the combination without comment.
+    """
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-thing.md", body="- **Landed.** body")
+    cl = tmp_path / "CHANGELOG.md"
+    cl.write_text(CHANGELOG_SKELETON)
+    monkeypatch.setattr(ac, "FRAGMENT_DIR", d)
+    monkeypatch.setattr(ac, "CHANGELOG", cl)
+    with pytest.raises(SystemExit) as exc:
+        ac.main(["--base", "origin/main"])
+    assert exc.value.code == 2
+    assert cl.read_text() == CHANGELOG_SKELETON
+    assert len(list(d.iterdir())) == 1
+@pytest.mark.parametrize(
+    "bad_line",
+    [
+        " ## One space",
+        "  ## Two spaces",
+        "   ## Three spaces",
+        "  # Under a wide bullet",
+    ],
+)
+def test_a_heading_indented_up_to_three_spaces_is_still_rejected(
+    tmp_path: Path, bad_line: str
+) -> None:
+    """CommonMark treats up to three spaces of indent as unindented.
+
+    This is why the error message says FOUR spaces: under `-   a bullet` the
+    content column is 4, so a two-space indent is still column 2 of the document
+    and still a heading. The message used to say two, and a test pinned that as
+    allowed — the advice and its test were wrong together.
+    """
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-x.md", body=f"-   a bullet\n\n{bad_line}\n")
+    with pytest.raises(ac.FragmentError, match="heading or rule"):
+        ac.collect_fragments(d)
+
+
+@pytest.mark.parametrize(
+    "bad_body",
+    [
+        "- a bullet\n\nA heading\n===\n",  # setext H1
+        "- a bullet\n\nA heading\n---\n",  # setext H2
+        "- a bullet\n\n***\n",  # thematic break
+        "- a bullet\n\n___\n",  # thematic break, underscores
+        "- a bullet\n\n<div>raw</div>\n",  # HTML block
+    ],
+)
+def test_headings_without_a_hash_and_html_blocks_are_rejected(
+    tmp_path: Path, bad_body: str
+) -> None:
+    """A heading does not need a '#'.
+
+    Setext underlines a line with = or -, and a thematic break or HTML block
+    ends the surrounding block just as decisively. Matching only '#' would have
+    left the whole no-hash half of the class shipping.
+    """
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-x.md", body=bad_body)
+    with pytest.raises(ac.FragmentError):
+        ac.collect_fragments(d)
+
+
+def test_fragments_are_read_as_utf8_regardless_of_the_ambient_locale(
+    tmp_path: Path,
+) -> None:
+    """The reads must not depend on the operator's locale.
+
+    Otherwise `--check` certifies green in CI's UTF-8 environment while the
+    actual fold tracebacks on a machine with an 8-bit locale — the same
+    split-surface failure the dotfile exemption is scoped to avoid. The env
+    below defeats PEP 538 coercion, which would otherwise hide the difference.
+    """
+    import subprocess
+
+    d = tmp_path / "changelog.d"
+    _fragment(d, "20260904210000-fixed-x.md", body="- **Café.** Prose with an em—dash.")
+    cl = tmp_path / "CHANGELOG.md"
+    cl.write_text(CHANGELOG_SKELETON)
+    driver = tmp_path / "drive.py"
+    driver.write_text(
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('ac', {str(_MODULE_PATH)!r})\n"
+        "ac = importlib.util.module_from_spec(spec); spec.loader.exec_module(ac)\n"
+        "from pathlib import Path\n"
+        f"ac.FRAGMENT_DIR = Path({str(d)!r})\n"
+        f"ac.CHANGELOG = Path({str(cl)!r})\n"
+        "sys.exit(ac.main(['--dry-run']))\n"
+    )
+    proc = subprocess.run(
+        [os.sys.executable, str(driver)],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "LC_ALL": "C",
+            "LANG": "C",
+            "PYTHONUTF8": "0",
+            "PYTHONCOERCECLOCALE": "0",
+        },
+    )
+    assert "UnicodeDecodeError" not in proc.stderr, (
+        f"reading depended on the ambient locale: {proc.stderr[-400:]}"
+    )
+    assert proc.returncode == 0, proc.stderr[-400:]

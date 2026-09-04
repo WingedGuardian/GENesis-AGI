@@ -404,15 +404,31 @@ jobs:
       - name: Validate changelog.d fragments
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # For `push: main` builds. origin/main is useless there — it IS the
+          # just-pushed checkout — but the push event's `before` SHA is the
+          # pre-push state, which is what lets the post-merge run see a fragment
+          # that vanished outside the PR check (a direct push, an admin merge, a
+          # PR whose base was unreadable). Same resolution the migration-id job
+          # uses, for the same reason. All-zero on branch creation.
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
-          # The deletion rule needs a base to compare against. On a PR that is
-          # the PR's base; on a push build there is nothing meaningful to
-          # compare with (the checkout IS the new main), so the fragment
-          # validation still runs and only the deletion rule is skipped.
-          if [ -n "${PR_BASE_SHA:-}" ] && git cat-file -e "$PR_BASE_SHA^{commit}" 2>/dev/null; then
-            python scripts/assemble_changelog.py --check --base "$PR_BASE_SHA"
+          base="${PR_BASE_SHA:-}"
+          if [ -z "$base" ] && [ -n "${PUSH_BEFORE_SHA:-}" ] \
+             && [ "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE_SHA"
+          fi
+          if [ -n "$base" ]; then
+            # Deliberately NOT guarded by `git cat-file`: the deletion rule fails
+            # CLOSED on a base it cannot read, and swallowing that here would
+            # turn its refusal into a silent pass — the one outcome its own
+            # docstring says must never happen.
+            python scripts/assemble_changelog.py --check --base "$base"
           else
+            # schedule/dispatch only. Say what is NOT being enforced rather than
+            # reporting a green that covers less than it appears to.
+            echo "note: no base ref on this event; the deletion rule is not enforced"
             python scripts/assemble_changelog.py --check
           fi
 

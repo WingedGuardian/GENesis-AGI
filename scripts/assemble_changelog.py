@@ -54,6 +54,19 @@ NON_FRAGMENTS = frozenset({"README.md"})
 
 UNRELEASED_HEADING = "## [Unreleased]"
 
+# Block constructs that stay block constructs when spliced in. CommonMark allows
+# up to THREE spaces of indent before each of these, and a list item's content
+# column is set by its own bullet width — so under `-   a bullet` a two-space
+# indent is still column 2 of the document and still a heading. "Indent it" is
+# only a remedy at four spaces, which is what the error messages now say.
+_ATX_HEADING = re.compile(r"^ {0,3}#{1,6}([ \t]|$)")
+_CODE_FENCE = re.compile(r"^ {0,3}(?:`{3,}|~{3,})")
+# Setext headings underline the line above with = or -, so they are headings
+# without a leading '#'. `---` is also a thematic break; either way it is a
+# top-level block, and the rule is the same: indent it or drop it.
+_SETEXT_OR_RULE = re.compile(r"^ {0,3}(?:=+|-{2,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}) *$")
+_HTML_BLOCK = re.compile(r"^ {0,3}<[A-Za-z!/?]")
+
 
 class FragmentError(Exception):
     """A fragment (or the directory) violates the contract."""
@@ -96,17 +109,30 @@ def parse_fragment_name(name: str) -> tuple[str, str, str]:
 def _validate_body(name: str, body: str) -> None:
     """Reject a body that would restructure CHANGELOG.md when spliced verbatim.
 
-    Validating only the FIRST line is not enough, and the failure is permanent
-    rather than cosmetic. A body whose first line is a legal bullet but which
-    contains a ``## `` heading further down injects that heading INTO the
-    [Unreleased] section; every later assembly then treats it as the section's
-    end, orphaning everything below it into a phantom release and starting a
-    duplicate category group above. Exit 0, no warning, and each subsequent run
-    inherits the damage. An unindented code fence does the same thing by
-    swallowing the structure between its markers.
+    Validating only the FIRST line is not enough: a body can open with a legal
+    bullet and carry a block construct three lines down, and it is spliced in
+    exactly as written.
 
-    Both are avoidable by indenting: a fence indented two spaces stays inside
-    the bullet, which is where it belongs anyway.
+    WHAT THE DAMAGE ACTUALLY IS — stated precisely, because an earlier version
+    of this docstring overstated it and the overstatement outlived the code it
+    described. The assembler is NOT affected: :func:`splice` anchors on the
+    ``[Unreleased]`` heading and never computes a section END, so a stray ``## ``
+    does not orphan anything and a later fold still lands correctly (verified
+    against the shipped code). The damage is to how the file READS: an injected
+    ``## `` produces a phantom release that a human — or any tool that splits on
+    ``^## ``, which is what release step 6 does by hand — will mistake for a real
+    one. An unclosed fence is the worst of them, because every entry below it
+    renders as code on GitHub.
+
+    So this is a rendering and release-notes gate, not a data-integrity one. It
+    is still worth having: the failure is invisible in the assembler's output and
+    surfaces at publish time.
+
+    The checks are written as CLASSES, not as the spellings that were reported.
+    ``## `` was the reported case, but every ATX level, both fence characters,
+    setext underlines and thematic breaks are the same construct, and CommonMark
+    allows all of them up to three spaces of indent. Enumerating the reported
+    spelling is how a class ships in pieces — which happened here twice.
     """
     if not body.startswith("- "):
         raise FragmentError(
@@ -115,18 +141,27 @@ def _validate_body(name: str, body: str) -> None:
             f"{body.splitlines()[0][:60]!r}"
         )
     for i, line in enumerate(body.splitlines(), start=1):
-        if line.startswith("## "):
+        if _ATX_HEADING.match(line) or _SETEXT_OR_RULE.match(line):
             raise FragmentError(
-                f"{name}: line {i} starts a Markdown section heading "
-                f"({line[:40]!r}). A fragment is spliced verbatim INSIDE the "
-                "[Unreleased] section, so this heading would end that section "
-                "early and orphan everything below it on every future assembly."
+                f"{name}: line {i} is a top-level Markdown heading or rule "
+                f"({line[:40]!r}). A fragment is spliced verbatim into the "
+                "[Unreleased] section, so this reads as a new release heading "
+                "there — to a person, and to anything that splits the file on "
+                "'## '. Indent it FOUR spaces to keep it inside the bullet "
+                "(two is not enough under a wider bullet, and CommonMark treats "
+                "up to three spaces as unindented)."
             )
-        if line.startswith("```"):
+        if _CODE_FENCE.match(line):
             raise FragmentError(
                 f"{name}: line {i} opens a top-level code fence ({line[:40]!r}). "
-                "Indent it two spaces so it stays inside the bullet — at column "
-                "zero it swallows the surrounding structure when spliced."
+                "Unclosed, it renders every entry below it as code. Indent it "
+                "FOUR spaces so it stays inside the bullet."
+            )
+        if _HTML_BLOCK.match(line):
+            raise FragmentError(
+                f"{name}: line {i} opens a top-level HTML block ({line[:40]!r}), "
+                "which ends the surrounding Markdown block when spliced. Indent "
+                "it FOUR spaces, or write it as prose."
             )
 
 
@@ -160,13 +195,17 @@ def collect_fragments(directory: Path | None = None) -> list[tuple[str, str, Pat
             )
         if path.name in NON_FRAGMENTS:
             continue
-        # Editor and VCS debris (.DS_Store, .gitkeep, vim swapfiles). A fragment
-        # name always starts with a digit, so nothing that starts with a dot can
-        # be one — and refusing to run a RELEASE because of an untracked local
-        # file git never sees would also split the two surfaces: CI runs on a
-        # clean checkout and would stay green while the maintainer's own run
-        # failed. The "never silently skipped" property lives on *.md files.
-        if path.name.startswith("."):
+        # Editor and VCS debris (.DS_Store, .gitkeep, .foo.md.swp). Refusing to
+        # run a RELEASE because of an untracked local file git never sees would
+        # split the two surfaces: CI on a clean checkout stays green while the
+        # maintainer's own run fails on their own debris.
+        #
+        # But the exemption stops at Markdown. A committed `.20260904…-fixed-x.md`
+        # is a would-be fragment, and skipping it in a clean CI checkout would
+        # report success while release assembly omitted its entry — the exact
+        # silent omission this directory's classification exists to prevent. So
+        # a dot-prefixed *.md is classified like any other .md and errors.
+        if path.name.startswith(".") and path.suffix != ".md":
             continue
         ts, category, _slug = parse_fragment_name(path.name)
         try:
@@ -192,7 +231,7 @@ def render_sections(fragments: list[tuple[str, str, Path]]) -> dict[str, list[st
     """Category -> the fragment bodies belonging to it, in timestamp order."""
     sections: dict[str, list[str]] = {}
     for _ts, category, path in fragments:
-        sections.setdefault(category, []).append(path.read_text().strip())
+        sections.setdefault(category, []).append(path.read_text(encoding="utf-8").strip())
     return sections
 
 
@@ -298,20 +337,48 @@ def _check_no_fragment_lost(base: str) -> None:
     lost = sorted(was - now)
     if not lost:
         return
-    changed = subprocess.run(
-        ["git", "diff", "--name-only", base, "--", CHANGELOG.name],
+    # A fold is not "CHANGELOG.md was touched" — that test is satisfied by a
+    # typo fix or a stray newline, which would disarm this rule for the whole
+    # change. The question is whether each dropped fragment's entry ARRIVED in
+    # the changelog, so compare against the lines the diff actually ADDED.
+    diffed = subprocess.run(
+        ["git", "diff", "-U0", base, "--", CHANGELOG.name],
         capture_output=True,
         text=True,
         check=False,
         cwd=REPO_ROOT,
     )
-    if changed.returncode == 0 and changed.stdout.strip():
-        return  # the release fold: fragments consumed INTO the changelog
+    added = (
+        "\n".join(
+            ln[1:]
+            for ln in diffed.stdout.splitlines()
+            if ln.startswith("+") and not ln.startswith("+++")
+        )
+        if diffed.returncode == 0
+        else ""
+    )
+    still_lost: list[str] = []
+    for name in lost:
+        blob = subprocess.run(
+            ["git", "show", f"{base}:{FRAGMENT_DIR.name}/{name}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=REPO_ROOT,
+        )
+        first = next((ln for ln in blob.stdout.splitlines() if ln.strip()), "")
+        # Fail CLOSED on an unreadable blob: not being able to tell is not the
+        # same as being satisfied.
+        if blob.returncode != 0 or not first or first not in added:
+            still_lost.append(name)
+    if not still_lost:
+        return  # every dropped fragment's entry is now IN the changelog
     raise FragmentError(
-        f"{len(lost)} fragment(s) present at {base} are gone and CHANGELOG.md is "
-        f"unchanged: {', '.join(lost[:5])}. Before assembly a fragment is the only "
-        "copy of its entry, so this drops it from the next release silently. If "
-        "this IS the release fold, it must also rewrite CHANGELOG.md."
+        f"{len(still_lost)} fragment(s) present at {base} are gone and their "
+        f"entries are not in CHANGELOG.md: {', '.join(still_lost[:5])}. Before "
+        "assembly a fragment is the only copy of its entry, so this drops it "
+        "from the next release silently. If this IS the release fold, the "
+        "entries must appear in CHANGELOG.md — touching the file is not enough."
     )
 
 
@@ -338,6 +405,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    if args.base and not args.check:
+        # Reaching for the guard flag must never perform the irreversible
+        # fold. Argparse accepts the combination without comment.
+        parser.error("--base is only meaningful with --check")
 
     try:
         fragments = collect_fragments()
@@ -365,7 +436,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        result = splice(CHANGELOG.read_text(), render_sections(fragments))
+        result = splice(CHANGELOG.read_text(encoding="utf-8"), render_sections(fragments))
     except FragmentError as exc:
         print(f"changelog.d: {exc}", file=sys.stderr)
         return 2
@@ -377,7 +448,12 @@ def main(argv: list[str] | None = None) -> int:
         # stdout first so the interpreter does not try to flush it again at
         # shutdown and print a second error on the way out.
         try:
-            print(result, end="")
+            # Written as UTF-8 BYTES rather than through the text layer, whose
+            # encoding follows the ambient locale: on an 8-bit locale `print`
+            # raises UnicodeEncodeError on any accented character, so --check
+            # would certify green while --dry-run died on the same content.
+            sys.stdout.buffer.write(result.encode("utf-8"))
+            sys.stdout.buffer.flush()
         except BrokenPipeError:
             devnull = os.open(os.devnull, os.O_WRONLY)
             try:
@@ -391,15 +467,43 @@ def main(argv: list[str] | None = None) -> int:
     # entries, so a write that fails half-way must not be followed by deleting
     # them. `replace` is atomic on the same filesystem, so CHANGELOG.md is
     # either the old file or the complete new one, never a truncated middle.
+    original = CHANGELOG.read_text(encoding="utf-8")
     tmp = CHANGELOG.with_name(CHANGELOG.name + ".tmp")
-    tmp.write_text(result)
+    tmp.write_text(result, encoding="utf-8")
     try:
         tmp.replace(CHANGELOG)
     except OSError:
         tmp.unlink(missing_ok=True)  # never leave a half-finished twin behind
         raise
-    for _ts, _category, path in fragments:
-        path.unlink()
+    # Cleanup is part of the same operation, not a tidy-up after it. If a
+    # fragment cannot be removed — an unwritable directory, a partial loop —
+    # the changelog is rolled back to what it was, because the alternative is a
+    # half-done state whose obvious remedy makes it worse: re-running the
+    # documented command would fold the surviving fragments in a SECOND time and
+    # duplicate those entries in the release notes. All-or-nothing keeps a rerun
+    # correct.
+    removed: list[tuple[Path, str]] = []
+    try:
+        for _ts, _category, path in fragments:
+            text = path.read_text(encoding="utf-8")
+            path.unlink()
+            removed.append((path, text))
+    except OSError as exc:
+        # Put back everything already destroyed, not just the changelog. Rolling
+        # back only CHANGELOG.md would leave the fragments deleted BEFORE the
+        # failure in neither place — the exact silent loss this directory exists
+        # to prevent, reintroduced by its own recovery path, and the message
+        # would then send the operator to re-run and ship without them.
+        for done, text in removed:
+            done.write_text(text, encoding="utf-8")
+        CHANGELOG.write_text(original, encoding="utf-8")
+        print(
+            f"changelog.d: could not remove {path.name} ({exc}); every fragment "
+            "and CHANGELOG.md have been restored, so nothing was lost and a "
+            "rerun after fixing the permissions is correct.",
+            file=sys.stderr,
+        )
+        return 2
     print(
         f"changelog.d: folded {len(fragments)} fragment(s) into CHANGELOG.md "
         "and removed them. Review the [Unreleased] section before tagging."

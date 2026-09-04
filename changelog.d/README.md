@@ -65,5 +65,30 @@ Every entry in this directory is classified, and anything that is neither a
 fragment nor this README is an error rather than a skipped file — a silently
 ignored fragment is a changelog entry that never ships. That covers a malformed
 name, a timestamp that is fourteen digits but not a real date, an unknown
-category, an empty file, content that does not start with a bullet, and a nested
-subdirectory.
+category, an empty or unreadable file, content that does not start with a
+bullet, and a nested subdirectory.
+
+Because the body is spliced in **verbatim**, it also rejects anything that would
+read as a new top-level block once it lands inside `[Unreleased]`: a Markdown
+heading of any level, a setext underline or thematic break, a code fence in
+either fence character, and an HTML block. Indent it **four** spaces and it
+stays inside the bullet, which is where it belongs — two is not enough under a
+wider bullet, and CommonMark treats up to three spaces as unindented.
+
+What that protects is how the file *reads*, not the assembler: the fold anchors
+on the `[Unreleased]` heading and never computes a section end, so a stray `## `
+cannot orphan anything. It can, though, produce a phantom release that a person
+— or anything splitting the file on `## `, which is what publishing a release
+does — mistakes for a real one, and an unclosed fence renders every entry below
+it as code.
+
+Editor debris (`.DS_Store`, `.gitkeep`, `.foo.md.swp`) is skipped so local mess
+cannot block a release — but that exemption stops at Markdown. A committed
+`.20260904…-fixed-x.md` is classified like any other `.md` and errors, because
+skipping it would hide an entry in exactly the way this directory exists to
+prevent.
+
+CI validates every fragment on every pull request, and also refuses a change
+that deletes a fragment the base branch already had — before assembly a fragment
+is the only copy of its entry. The one legitimate deletion is the release fold,
+which removes the fragments and rewrites `CHANGELOG.md` together.

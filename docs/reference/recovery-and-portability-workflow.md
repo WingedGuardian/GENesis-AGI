@@ -46,8 +46,17 @@ gets its own branch like any other change:
    `union` caveats below.
 4. **PR and merge.** This is the one PR that may edit `CHANGELOG.md`: its diff
    there is produced by the assembler and the rename, not hand-written. The
-   fragment-validation CI job recognises the pairing — fragments may only
-   disappear in a change that also rewrites `CHANGELOG.md`.
+   fragment-validation CI job recognises the pairing — a fragment may only
+   disappear in a change whose `CHANGELOG.md` diff actually contains its entry.
+
+   **Merge this last, and re-run step 2 first if anything else landed while it
+   was open.** Other PRs keep merging while the release PR sits in review, and
+   git carries their fragments forward without touching the version section you
+   already generated. Nothing is lost — those fragments survive and appear in
+   the *next* release — but they are filed under the wrong version, and neither
+   CI nor the assembler can see it, because the fragment still exists and still
+   validates. Re-running the assembler immediately before merging is what makes
+   the section match the tag.
 5. **Tag** `vX.Y` on `main` once that PR has merged.
 6. **Publish** the GitHub Release from the matching `CHANGELOG.md` section.
 
