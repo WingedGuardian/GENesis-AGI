@@ -13,12 +13,14 @@ import logging
 import time
 from typing import Any
 
+from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware
 
 from genesis.observability.commit_identity import is_stale
 from genesis.observability.commit_identity import (
     same_commit as _same_commit,  # noqa: F401 — re-exported for Part A's guard test
 )
+from genesis.observability.mcp_arg_diagnostics import absorbed_parameter_hint
 from genesis.observability.mcp_guarded_tools import GUARDED_MCP_TOOLS
 from genesis.observability.provider_activity import ProviderActivityTracker
 
@@ -79,8 +81,33 @@ class InstrumentationMiddleware(Middleware):
                 await self._enforce_freshness(tool_name)
             result = await call_next(context)
             return result
-        except Exception:
+        except Exception as exc:
             success = False
+            # A "missing argument" error is sometimes the WRONG explanation: if a
+            # long free-text argument was emitted with a mismatched closing tag,
+            # it swallowed every parameter after it, and those are then reported
+            # missing though they were sent. Replace the message with the real
+            # cause when the evidence is in the arguments themselves.
+            #
+            # Only ever runs on a call that is ALREADY failing, never alters
+            # arguments, and returns None on every uncertain path — so it cannot
+            # make a well-formed call fail, and a false positive costs only a
+            # slightly wrong explanation on a call that was refused regardless.
+            hint = None
+            try:
+                hint = absorbed_parameter_hint(
+                    exc, getattr(context.message, "arguments", None) or {}
+                )
+            except Exception:  # diagnosis must never replace the real error
+                # WARNING, not debug: this only fires when the diagnosis ITSELF
+                # is broken, on a path that is already an error, so it cannot
+                # spam — and at debug a persistent bug here would stay invisible
+                # across all four servers.
+                logger.warning(
+                    "argument diagnosis failed for %s", provider, exc_info=True
+                )
+            if hint:
+                raise ToolError(hint) from exc
             raise
         finally:
             if self._db is not None:
@@ -131,8 +158,9 @@ class InstrumentationMiddleware(Middleware):
             )
             return
         # block (default; any unexpected mode already degraded to block upstream)
-        from fastmcp.exceptions import ToolError
-
+        # ToolError is imported at module level now (the absorbed-parameter
+        # diagnosis needs it too), so the local re-import here would shadow it
+        # with the identical symbol.
         from genesis.observability import mcp_spawn_identity as si
 
         raise ToolError(

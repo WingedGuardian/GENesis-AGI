@@ -11,6 +11,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A malformed tool call no longer reports itself as a missing value.** When a long
+  free-text argument is sent with a closing tag that does not match its opening tag,
+  every parameter declared after it is absorbed into that string, and the server then
+  reports those parameters as *missing* — which reads like the caller forgot them, or
+  like a broken tool. One such call was refused six times in a row before the shape was
+  recognised, with the evidence sitting in the error's own echoed input the whole time.
+  The MCP middleware now inspects a missing-argument error, and when a *provided*
+  argument's text contains the markup for a parameter reported *missing*, it replaces
+  the message with the real cause and what to do about it. This runs on every MCP tool
+  rather than the handful that happen to have that shape, and only ever on a call that
+  is already failing — it never alters arguments and cannot make a well-formed call
+  fail.
+
 - **The cold-marketing campaign no longer re-pitches the same person.** Once a
   marketing pitch is delivered to a prospect, that prospect is marked contacted and
   drops out of the campaign's target list — previously nothing recorded the contact,
