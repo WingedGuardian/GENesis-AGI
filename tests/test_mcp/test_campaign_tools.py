@@ -269,6 +269,41 @@ class TestCampaignCreateValidation:
             ct_mod._runner = old_runner
 
     @pytest.mark.asyncio
+    async def test_create_rejects_a_reserved_scheduler_name(self, _test_db):
+        """A campaign named after one of the runner's own jobs never runs.
+
+        ``CampaignRunner.start()`` schedules every campaign as
+        ``campaign_{name}`` and THEN registers its pending-session reaper as
+        ``campaign_pending_reaper``, both with ``replace_existing=True``. The
+        reaper therefore evicts a campaign of that name at startup — silently:
+        no exception, no log, it simply stops ticking. Refusing at the write
+        boundary is the only point where a human is told why.
+
+        The name is checked AFTER control-character stripping, so a decorated
+        variant cannot slip past by normalizing into the reserved value later.
+        """
+        from genesis.campaigns.runner import RESERVED_CAMPAIGN_NAMES
+
+        old_db, old_runner = ct_mod._db, ct_mod._runner
+        try:
+            ct_mod._db = _test_db
+            ct_mod._runner = None
+            for reserved in RESERVED_CAMPAIGN_NAMES:
+                for supplied in (reserved, f"{reserved}​"):
+                    result = await ct_mod._impl_campaign_create(
+                        name=supplied,
+                        strategy_doc_path="/tmp/s.md",
+                        cron_cadence="0 */8 * * *",
+                    )
+                    assert "error" in result, (
+                        f"{supplied!r} was accepted; it would be evicted at startup"
+                    )
+                    assert "reserved" in result["error"], result
+        finally:
+            ct_mod._db = old_db
+            ct_mod._runner = old_runner
+
+    @pytest.mark.asyncio
     async def test_create_accepts_valid_profile(self, _test_db):
         """A valid profile passes validation and flows through to creation."""
         from unittest.mock import AsyncMock

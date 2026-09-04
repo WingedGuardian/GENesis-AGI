@@ -1108,6 +1108,23 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         # the pre-rebuild table, so nothing is lost or half-rebuilt.
         raise
 
+    # Entity human-approval gate (0090): approved_at/approved_by on
+    # entity_adjudications. Mirrored here because create_all_tables runs
+    # _migrate_add_columns but NOT the numbered runner (schema_both_build_paths),
+    # and — critically — the INDEXES pass that follows this function creates
+    # idx_entity_adjud_approved ON entity_adjudications(verdict, approved_at). On a
+    # legacy DB the table pre-exists WITHOUT these columns (CREATE TABLE IF NOT
+    # EXISTS is a no-op), so without these ALTERs the index build crashes bootstrap
+    # with 'no such column: approved_at' before the numbered runner ever runs (the
+    # #1123/#1127 class). NULL = unreviewed; the apply path filters on approved_at
+    # IS NOT NULL so no merge is ever auto-applied.
+    await _try_alter(db,
+        "ALTER TABLE entity_adjudications ADD COLUMN approved_at TEXT",
+        "entity_adjudications.approved_at")
+    await _try_alter(db,
+        "ALTER TABLE entity_adjudications ADD COLUMN approved_by TEXT",
+        "entity_adjudications.approved_by")
+
     # Bookmark fix: add source column to session_bookmarks
     await _try_alter(db,
         "ALTER TABLE session_bookmarks ADD COLUMN source TEXT NOT NULL DEFAULT 'auto'",
