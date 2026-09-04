@@ -2713,6 +2713,29 @@ async def perform_tick(
     return result
 
 
+def _approval_age(resolved_at: str | None) -> str:
+    """How long ago an approval was granted, for a log line — never a raise.
+
+    `resolved_at` is a DB column reached through a resume path that dispatches
+    real work; a log line must not be what breaks it. Anything unparseable or
+    absent degrades to "age unknown", which is also the honest rendering.
+    """
+    if not resolved_at:
+        return "age unknown"
+    try:
+        resolved = datetime.fromisoformat(str(resolved_at))
+    except (TypeError, ValueError):
+        return "age unknown"
+    if resolved.tzinfo is None:
+        resolved = resolved.replace(tzinfo=UTC)
+    minutes = int((datetime.now(UTC) - resolved).total_seconds() // 60)
+    if minutes < 0:
+        return "age unknown"
+    if minutes < 60:
+        return f"{minutes}m ago"
+    return f"{minutes // 60}h{minutes % 60:02d}m ago"
+
+
 class AwarenessLoop:
     """The metronome — drives the 5-minute awareness tick via APScheduler."""
 
@@ -3616,10 +3639,28 @@ class AwarenessLoop:
                 consumed = await gate.mark_consumed(approved["id"])
                 if not consumed:
                     continue  # Another tick already consumed it
+                # Name the tick this actually runs against, and say plainly
+                # that it is not the tick that asked. A resumed reflection is
+                # dispatched with `self._last_tick_result` — the CURRENT tick —
+                # so what a person approved and what runs are about different
+                # moments. Per this method's own docstring the current tick is
+                # the only one available (the loop's scoring may never reach
+                # that depth again), NOT a freshness preference; either way the
+                # gap was invisible, because the line named only the approval.
+                #
+                # The ORIGINATING tick is not recoverable. Nothing records it:
+                # the approval context is built from a fixed key set with no
+                # tick field, and the approval key deliberately excludes
+                # per-invocation identity so recurring dispatches reuse one
+                # pending row. So this states what is known, and what is not.
                 logger.info(
-                    "Resuming %s reflection from approved request %s",
+                    "Resuming %s reflection from approval %s (approved %s) — "
+                    "running against the current tick %s, NOT the tick that "
+                    "requested it, which is not recorded",
                     depth_name,
                     approved["id"][:8],
+                    _approval_age(approved.get("resolved_at")),
+                    tick.tick_id[:8],
                 )
                 await self._cc_reflection_bridge.reflect(
                     depth,
