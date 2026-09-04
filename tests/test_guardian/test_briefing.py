@@ -199,7 +199,7 @@ def _make_db():
 
 
 # Patch targets — the actual CRUD modules, not the local import names
-_OBS = "genesis.db.crud.observations.query"
+_OBS = "genesis.db.crud.observations.query_with_total"
 _EVENTS = "genesis.db.crud.events.query"
 _TICKS_LAST = "genesis.db.crud.awareness_ticks.last_tick"
 _TICKS_COUNT = "genesis.db.crud.awareness_ticks.count_in_window_all"
@@ -213,10 +213,10 @@ class TestBuildDynamicBriefing:
     async def test_populates_observations(self) -> None:
         db = _make_db()
         with (
-            patch(_OBS, new=AsyncMock(return_value=[
+            patch(_OBS, new=AsyncMock(return_value=([
                 {"content": "Memory trending up", "source": "infra_forecast", "priority": "high"},
                 {"content": "Disk usage stable", "source": "awareness_tick", "priority": "low"},
-            ])),
+            ], 2))),
             patch(_EVENTS, new=AsyncMock(return_value=[])),
             patch(_TICKS_LAST, new=AsyncMock(return_value=None)),
             patch(_TICKS_COUNT, new=AsyncMock(return_value=0)),
@@ -232,7 +232,7 @@ class TestBuildDynamicBriefing:
     async def test_populates_errors(self) -> None:
         db = _make_db()
         with (
-            patch(_OBS, new=AsyncMock(return_value=[])),
+            patch(_OBS, new=AsyncMock(return_value=([], 0))),
             patch(_EVENTS, new=AsyncMock(return_value=[
                 {"subsystem": "router", "message": "Provider timeout", "timestamp": "2026-04-03T10:00:00Z"},
             ])),
@@ -249,7 +249,7 @@ class TestBuildDynamicBriefing:
     async def test_populates_cc_sessions(self) -> None:
         db = _make_db()
         with (
-            patch(_OBS, new=AsyncMock(return_value=[])),
+            patch(_OBS, new=AsyncMock(return_value=([], 0))),
             patch(_EVENTS, new=AsyncMock(return_value=[])),
             patch(_TICKS_LAST, new=AsyncMock(return_value=None)),
             patch(_TICKS_COUNT, new=AsyncMock(return_value=0)),
@@ -266,7 +266,7 @@ class TestBuildDynamicBriefing:
     async def test_populates_tick_info(self) -> None:
         db = _make_db()
         with (
-            patch(_OBS, new=AsyncMock(return_value=[])),
+            patch(_OBS, new=AsyncMock(return_value=([], 0))),
             patch(_EVENTS, new=AsyncMock(return_value=[])),
             patch(_TICKS_LAST, new=AsyncMock(return_value={"created_at": "2026-04-03T11:00:00Z"})),
             patch(_TICKS_COUNT, new=AsyncMock(return_value=12)),
@@ -281,7 +281,7 @@ class TestBuildDynamicBriefing:
     async def test_handles_empty_db(self) -> None:
         db = _make_db()
         with (
-            patch(_OBS, new=AsyncMock(return_value=[])),
+            patch(_OBS, new=AsyncMock(return_value=([], 0))),
             patch(_EVENTS, new=AsyncMock(return_value=[])),
             patch(_TICKS_LAST, new=AsyncMock(return_value=None)),
             patch(_TICKS_COUNT, new=AsyncMock(return_value=0)),
@@ -320,9 +320,9 @@ class TestBuildDynamicBriefing:
         long_text = "x" * 300
         db = _make_db()
         with (
-            patch(_OBS, new=AsyncMock(return_value=[
+            patch(_OBS, new=AsyncMock(return_value=([
                 {"content": long_text, "source": "test", "priority": "low"},
-            ])),
+            ], 1))),
             patch(_EVENTS, new=AsyncMock(return_value=[])),
             patch(_TICKS_LAST, new=AsyncMock(return_value=None)),
             patch(_TICKS_COUNT, new=AsyncMock(return_value=0)),
@@ -341,9 +341,9 @@ class TestWriteDynamicGuardianBriefing:
     async def test_writes_file(self, tmp_path: Path) -> None:
         db = _make_db()
         with (
-            patch(_OBS, new=AsyncMock(return_value=[
+            patch(_OBS, new=AsyncMock(return_value=([
                 {"content": "Test obs", "source": "test", "priority": "medium"},
-            ])),
+            ], 1))),
             patch(_EVENTS, new=AsyncMock(return_value=[])),
             patch(_TICKS_LAST, new=AsyncMock(return_value={"created_at": "2026-04-03T11:00:00Z"})),
             patch(_TICKS_COUNT, new=AsyncMock(return_value=3)),
@@ -411,18 +411,20 @@ class TestObservationDigestMarker:
     the ones dropped."""
 
     @staticmethod
-    def _rows(n):
-        return [
+    def _page(n, total=None):
+        """(rows, total) as ONE snapshot returns them — the shape the digest now
+        reads. `total` defaults to the page length, i.e. an untruncated page."""
+        rows = [
             {"content": f"obs {i}", "source": "s", "priority": "low"}
             for i in range(n)
         ]
+        return rows, (n if total is None else total)
 
     @pytest.mark.asyncio
     async def test_a_full_read_with_more_beyond_gets_a_marker(self) -> None:
         db = _make_db()
         with (
-            patch(_OBS, new=AsyncMock(return_value=self._rows(15))),
-            patch(_OBS_COUNT, new=AsyncMock(return_value=42)),
+            patch(_OBS, new=AsyncMock(return_value=self._page(15, 42))),
             patch(_EVENTS, new=AsyncMock(return_value=[])),
             patch(_TICKS_LAST, new=AsyncMock(return_value=None)),
             patch(_TICKS_COUNT, new=AsyncMock(return_value=0)),
@@ -435,12 +437,21 @@ class TestObservationDigestMarker:
         assert "27 older" in marker
 
     @pytest.mark.asyncio
-    async def test_a_short_read_proves_completeness_no_marker_no_count(self) -> None:
-        """< cap rows = the set is complete; the count must not even run."""
+    async def test_a_short_read_gets_no_marker_and_costs_no_second_query(self) -> None:
+        """< cap rows = the set is complete, so no marker.
+
+        The old version of this test asserted the separate count "must not even
+        run" — an optimisation that only existed because the count WAS a second
+        query. It is now a window function inside the page read, so there is no
+        second query to skip; the property worth keeping is that the standalone
+        counter is not called AT ALL any more, on any path. That is asserted
+        here, because a caller that quietly kept using it would reintroduce the
+        two-snapshot skew this change removes.
+        """
         db = _make_db()
         count = AsyncMock(return_value=999)
         with (
-            patch(_OBS, new=AsyncMock(return_value=self._rows(3))),
+            patch(_OBS, new=AsyncMock(return_value=self._page(3))),
             patch(_OBS_COUNT, new=count),
             patch(_EVENTS, new=AsyncMock(return_value=[])),
             patch(_TICKS_LAST, new=AsyncMock(return_value=None)),
@@ -455,8 +466,7 @@ class TestObservationDigestMarker:
     async def test_exactly_cap_rows_total_equal_no_marker(self) -> None:
         db = _make_db()
         with (
-            patch(_OBS, new=AsyncMock(return_value=self._rows(15))),
-            patch(_OBS_COUNT, new=AsyncMock(return_value=15)),
+            patch(_OBS, new=AsyncMock(return_value=self._page(15, 15))),
             patch(_EVENTS, new=AsyncMock(return_value=[])),
             patch(_TICKS_LAST, new=AsyncMock(return_value=None)),
             patch(_TICKS_COUNT, new=AsyncMock(return_value=0)),
@@ -466,18 +476,89 @@ class TestObservationDigestMarker:
         assert len(content.active_observations) == 15
 
     @pytest.mark.asyncio
-    async def test_a_failed_count_degrades_to_an_unknown_total_marker(self) -> None:
-        """A broken denominator must not silently re-create the truncation."""
+    async def test_a_failed_read_reports_nothing_rather_than_a_page_with_no_total(
+        self,
+    ) -> None:
+        """REPLACES "a failed count degrades to an unknown-total marker".
+
+        That state is now unreachable, and removing it is the point rather than
+        a side effect: the page and the denominator are one read, so there is no
+        way to hold a page whose denominator failed. What can still fail is the
+        single read, and the honest answer there is an empty section — the
+        previous shape could print 15 rows while silently losing the number that
+        says whether 15 was all of them.
+        """
         db = _make_db()
         with (
-            patch(_OBS, new=AsyncMock(return_value=self._rows(15))),
-            patch(_OBS_COUNT, new=AsyncMock(side_effect=RuntimeError("boom"))),
+            patch(_OBS, new=AsyncMock(side_effect=RuntimeError("boom"))),
             patch(_EVENTS, new=AsyncMock(return_value=[])),
             patch(_TICKS_LAST, new=AsyncMock(return_value=None)),
             patch(_TICKS_COUNT, new=AsyncMock(return_value=0)),
             patch(_CC_ACTIVE, new=AsyncMock(return_value=[])),
         ):
             content = await build_dynamic_briefing(db)
-        assert content.active_observations[-1] == (
-            "(digest capped at 15 — total unresolved count unavailable)"
-        )
+        assert content.active_observations == []
+
+
+class TestTheDigestReadsOneSnapshot:
+    """The page and its denominator must come from ONE read.
+
+    Two awaited queries are two snapshots of a WAL database with concurrent
+    writers, and the marker relates them. MEASURED as a defect class rather than
+    a hypothetical — both skews below are reachable on a live install:
+
+    * an INSERT between the reads: the page is the 15 newest as of the FIRST
+      snapshot, the count is larger, and the briefing says "N older ones exist
+      beyond this digest" about a row that is the NEWEST one;
+    * a RESOLVE of a row that is ON the page: the count falls to the page length
+      and the marker vanishes, while unresolved rows outside the page remain.
+
+    The second one is the worse of the two — a recovery briefing that has
+    silently dropped the longest-standing problems is exactly the failure the
+    marker was added to prevent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_standalone_counter_is_never_called(self) -> None:
+        """The structural lock. Any path that still reaches `count_unresolved`
+        has re-created the second snapshot, whatever the marker looks like."""
+        db = _make_db()
+        count = AsyncMock(return_value=999)
+        page = AsyncMock(return_value=(
+            [{"content": f"o{i}", "source": "s", "priority": "low"} for i in range(15)],
+            42,
+        ))
+        with (
+            patch(_OBS, new=page),
+            patch(_OBS_COUNT, new=count),
+            patch(_EVENTS, new=AsyncMock(return_value=[])),
+            patch(_TICKS_LAST, new=AsyncMock(return_value=None)),
+            patch(_TICKS_COUNT, new=AsyncMock(return_value=0)),
+            patch(_CC_ACTIVE, new=AsyncMock(return_value=[])),
+        ):
+            content = await build_dynamic_briefing(db)
+        count.assert_not_awaited()
+        assert page.await_count == 1, "one snapshot means exactly one read"
+        assert "15 NEWEST of 42" in content.active_observations[-1]
+
+    @pytest.mark.asyncio
+    async def test_the_marker_is_decided_by_the_totals_the_same_read_returned(
+        self,
+    ) -> None:
+        """A total EQUAL to the page length is a complete set, even at the cap —
+        and the old shape could not tell that apart from a stale count, because
+        the two numbers came from different moments."""
+        db = _make_db()
+        with (
+            patch(_OBS, new=AsyncMock(return_value=(
+                [{"content": f"o{i}", "source": "s", "priority": "low"} for i in range(15)],
+                15,
+            ))),
+            patch(_EVENTS, new=AsyncMock(return_value=[])),
+            patch(_TICKS_LAST, new=AsyncMock(return_value=None)),
+            patch(_TICKS_COUNT, new=AsyncMock(return_value=0)),
+            patch(_CC_ACTIVE, new=AsyncMock(return_value=[])),
+        ):
+            content = await build_dynamic_briefing(db)
+        assert len(content.active_observations) == 15
+        assert not any("older ones exist" in line for line in content.active_observations)

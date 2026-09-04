@@ -157,7 +157,17 @@ async def build_dynamic_briefing(db) -> BriefingContent:
     # longest-standing problems, exactly what a recovery briefing needs to
     # know exist (no-silent-caps rule).
     try:
-        obs_rows = await observations.query(db, resolved=False, limit=15)
+        # ONE SNAPSHOT for the page AND its denominator. Reading the page and
+        # then counting separately holds two, and this database runs in WAL with
+        # concurrent writers, so a row inserted between them makes
+        # "N older ones exist" false about a row that is actually the NEWEST,
+        # and a row resolved between them can delete the truncation marker while
+        # unresolved rows outside the page remain. `COUNT(*) OVER ()` is
+        # evaluated over the same result set the LIMIT applies to (Codex P2,
+        # PR #1639).
+        obs_rows, total_unresolved = await observations.query_with_total(
+            db, resolved=False, limit=15
+        )
         for row in obs_rows:
             text = row.get("content", "")
             if len(text) > 200:
@@ -167,28 +177,19 @@ async def build_dynamic_briefing(db) -> BriefingContent:
             content.active_observations.append(
                 f"[{priority}] ({source}) {text}"
             )
-        # A SHORT read (< the cap) proves the set is complete — no count
-        # needed. Only a full read can be truncated, and its denominator gets
-        # its own try: a failed count must degrade to an honest "total
-        # unknown" marker, never to silence (silence is exactly the defect).
-        if len(obs_rows) >= 15:
-            try:
-                total_unresolved = await observations.count_unresolved(db)
-            except Exception:
-                logger.warning(
-                    "Dynamic briefing: unresolved count failed", exc_info=True
-                )
-                content.active_observations.append(
-                    "(digest capped at 15 — total unresolved count unavailable)"
-                )
-            else:
-                if total_unresolved > len(obs_rows):
-                    content.active_observations.append(
-                        f"(showing the {len(obs_rows)} NEWEST of "
-                        f"{total_unresolved} unresolved observations — "
-                        f"{total_unresolved - len(obs_rows)} older ones exist "
-                        "beyond this digest)"
-                    )
+        # The denominator arrives WITH the page now, so there is no second read
+        # to fail on its own and no "count unavailable" state to degrade to: the
+        # marker is decided by comparing two numbers from one snapshot. If the
+        # single read fails, the outer handler below still reports the whole
+        # section as failed, which is the honest answer — the previous split
+        # could report a page while silently losing its denominator.
+        if total_unresolved > len(obs_rows):
+            content.active_observations.append(
+                f"(showing the {len(obs_rows)} NEWEST of "
+                f"{total_unresolved} unresolved observations — "
+                f"{total_unresolved - len(obs_rows)} older ones exist "
+                "beyond this digest)"
+            )
     except Exception:
         logger.warning("Dynamic briefing: observations query failed", exc_info=True)
 
