@@ -85,7 +85,11 @@ def _run_hook(
 
 
 def _mark(repo: Path, home: Path) -> subprocess.CompletedProcess:
-    """Run `review_state.py mark` with fresh agent-output evidence, no gstack."""
+    """Run `review_state.py mark` with fresh agent-output evidence, no gstack.
+
+    `mark` now requires an explicit review outcome; a defect-bearing `--defects` is the
+    neutral choice for these Rule-0/1/2 tests (they don't exercise the escalation streak).
+    """
     (home / ".genesis" / "last_code_review.txt").write_text("adversarial review: OK\n")
     env = {**os.environ, "HOME": str(home)}
     return subprocess.run(
@@ -95,6 +99,7 @@ def _mark(repo: Path, home: Path) -> subprocess.CompletedProcess:
             "mark",
             "--agent-output",
             str(home / ".genesis" / "last_code_review.txt"),
+            "--defects",
         ],
         cwd=str(repo),
         env=env,
@@ -489,7 +494,11 @@ def test_mark_succeeds_without_gstack(repo: Path, home: Path) -> None:
 
 
 def test_mark_refuses_without_agent_output(repo: Path, home: Path) -> None:
-    """Authoritative evidence (agent output) is still mandatory."""
+    """Authoritative evidence (agent output) is still mandatory.
+
+    Passes a valid outcome flag (--defects) so this exercises the AGENT-OUTPUT refusal
+    specifically, not the separate required-outcome refusal.
+    """
     env = {**os.environ, "HOME": str(home)}
     res = subprocess.run(
         [
@@ -498,6 +507,7 @@ def test_mark_refuses_without_agent_output(repo: Path, home: Path) -> None:
             "mark",
             "--agent-output",
             str(home / ".genesis" / "does_not_exist.txt"),
+            "--defects",
         ],
         cwd=str(repo),
         env=env,
@@ -507,6 +517,7 @@ def test_mark_refuses_without_agent_output(repo: Path, home: Path) -> None:
     )
     assert res.returncode == 1
     assert "REFUSED" in res.stderr
+    assert "not found" in res.stderr.lower()  # the agent-output refusal, not the outcome one
 
 
 def test_commit_allowed_after_marking(repo: Path, home: Path) -> None:

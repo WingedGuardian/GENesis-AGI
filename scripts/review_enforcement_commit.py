@@ -611,16 +611,20 @@ def _merge_note(cwd: str | None) -> str:
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--git-dir"],
-            cwd=cwd, capture_output=True, text=True, timeout=5,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if out.returncode != 0 or not out.stdout.strip():
             return ""
         raw = out.stdout.strip()
         git_dir = Path(raw) if Path(raw).is_absolute() else Path(cwd or ".") / raw
-        merging = any(
-            (git_dir / n).exists()
-            for n in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")
-        ) or (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists()
+        merging = (
+            any((git_dir / n).exists() for n in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"))
+            or (git_dir / "rebase-merge").exists()
+            or (git_dir / "rebase-apply").exists()
+        )
     except (subprocess.SubprocessError, OSError, ValueError):
         return ""
     if not merging:
@@ -727,7 +731,9 @@ def main() -> None:
         _deny(
             "BLOCKED: --no-verify / -n bypasses review enforcement AND the "
             "native pre-commit guards (secrets, large files, direct-to-main). "
-            "Remove it and establish a review first via /review."
+            "Remove it and establish a review first (`/review` where the optional "
+            "`superpowers` plugin is installed, else `/deep-review`, or review and "
+            "then `python3 scripts/review_state.py mark --agent-output <file>`)."
         )
         return
 
@@ -921,12 +927,18 @@ def main() -> None:
             return
 
     # Rule 3: review escalation cap. After ESCALATION_ROUND_CAP CONSECUTIVE
-    # defect-bearing review→fix→re-review rounds on this change (a clean review
-    # resets the streak — see review_state.bump_review_round), block the commit
+    # defect-bearing review→fix→re-review rounds on this change, block the commit
     # until an explicit '# escalation-ack' trailing comment — a machine-enforced
-    # STOP so a genuine review→fix loop can't silently run long on a standing
-    # "proceed" (see genesis-development SKILL.md), while honestly-clean
-    # multi-commit development never trips. Checked BEFORE
+    # STOP. The streak is CROSS-MODEL ONLY: only an EXTERNAL, non-Anthropic reviewer
+    # (Codex/Kimi/…) marked `--source external` advances or resets it (see
+    # review_state.bump_review_round). Internal same-model self/subagent reviews
+    # (genesis-architect/genesis-security/any spawned agent) NEVER count — they are
+    # free and share the author's blind spots, so penalizing them just punishes
+    # self-review. This is why the mode-switch audit below (an internal subagent) does
+    # NOT trip the cap: only a repeat EXTERNAL non-convergence does. The machine-
+    # enforced STOP keeps a genuine cross-model review→fix loop from silently running
+    # long on a standing "proceed" (see genesis-development SKILL.md), while
+    # honestly-clean multi-commit development never trips. Checked BEFORE
     # both the docs/config skip AND Rule 2 ON PURPOSE: the hard stop must not be
     # bypassable by file extension (a reviewed prompt/skill/docs-only commit at the
     # cap would otherwise sneak past via the docs skip), nor by '# review-override'
@@ -945,16 +957,17 @@ def main() -> None:
         )
         if not acked:
             _deny(
-                f"BLOCKED: review escalation cap reached — {round_n} consecutive review "
-                f"rounds each surfaced NEW defects (cap {ESCALATION_ROUND_CAP}). The "
-                "review→fix loop has run long — the round-2 mode-switch audit did NOT "
-                "converge, which means the DESIGN or the problem statement is likely "
-                "wrong, not just this fix. STOP and get a FRESH user decision on how to "
-                "proceed (robust-by-construction redesign / narrow scope / shelve), then "
+                f"BLOCKED: review escalation cap reached — {round_n} consecutive "
+                f"EXTERNAL cross-model review rounds each surfaced NEW defects (cap "
+                f"{ESCALATION_ROUND_CAP}; internal same-model self/subagent audits are "
+                "not counted). The cross-model review→fix loop has run long — the "
+                "round-2 mode-switch audit did NOT converge, which means the DESIGN or "
+                "the problem statement is likely wrong, not just this fix. STOP and get "
+                "a FRESH user decision on how to proceed (robust-by-construction "
+                "redesign / narrow scope / shelve), then "
                 "acknowledge that decision with a trailing shell comment (outside any "
                 "quotes):\n"
-                '  git commit -m "your message"  # escalation-ack'
-                + _merge_note(cwd)
+                '  git commit -m "your message"  # escalation-ack' + _merge_note(cwd)
             )
             return
         # Acked = a fresh decision to continue → reset the round budget so the next
@@ -981,15 +994,18 @@ def main() -> None:
         )
         if not acked:
             _deny(
-                f"BLOCKED (mode-switch): {round_n} consecutive review rounds each "
-                f"surfaced NEW defects (cap {ESCALATION_ROUND_CAP}). You are fixing the "
-                "INSTANCE the reviewer named, not the CLASS — a third round is how the "
-                "loop runs away. Do NOT commit another one-line patch. STOP and switch "
-                "approach:\n"
+                f"BLOCKED (mode-switch): {round_n} consecutive EXTERNAL cross-model "
+                f"review rounds each surfaced NEW defects (cap {ESCALATION_ROUND_CAP}; "
+                "internal self/subagent audits are not counted). You are fixing the "
+                "INSTANCE the reviewer named, not the CLASS — a third external round is "
+                "how the loop runs away. Do NOT commit another one-line patch. STOP and "
+                "switch approach:\n"
                 "  1. Dispatch a FRESH-CONTEXT adversarial reviewer (a subagent with "
                 "clean context) over the ENTIRE diff — tell it to exhaustively "
                 "enumerate every edge/boundary/sentinel/hierarchy/error case, "
-                "independent of what the bot flagged.\n"
+                "independent of what the bot flagged. (This audit is INTERNAL — mark it "
+                "`--source internal` or plainly; it does NOT advance the cap, so it can "
+                "never be the round that blocks you — that was the bug this fixes.)\n"
                 "  2. For any domain semantics in play (cgroup, systemd, SQLite, async, "
                 "timezones, …), READ the authoritative docs/source — do not reason from "
                 "assumption; assumption is what produced the serial defects.\n"
@@ -997,8 +1013,7 @@ def main() -> None:
                 "case.\n"
                 "Then acknowledge you did the audit (not another blind patch) with a "
                 "trailing shell comment (outside any quotes):\n"
-                '  git commit -m "your message"  # audit-ack'
-                + _merge_note(cwd)
+                '  git commit -m "your message"  # audit-ack' + _merge_note(cwd)
             )
             return
 
@@ -1093,7 +1108,9 @@ def main() -> None:
                 "hierarchy class, READ authoritative semantics for any domain code), save it "
                 "to the per-worktree path from `python3 scripts/review_state.py evidence-path` "
                 "(concurrent sessions don't clobber it), then re-mark:\n"
-                "  python3 scripts/review_state.py mark\n"
+                "  python3 scripts/review_state.py mark   # a genesis-architect audit is "
+                "INTERNAL — it satisfies this depth gate and never counts toward the "
+                "escalation cap; no outcome flag needed\n"
                 "If the audit genuinely ran but its format isn't recognized, acknowledge with "
                 "a trailing shell comment (outside any quotes):  # depth-ack"
             )
@@ -1132,9 +1149,14 @@ def main() -> None:
             return
         _deny(
             "BLOCKED: Code changes exist without review. "
-            "Run /review and dispatch the genesis-architect agent (adversarial audit) first, "
-            "save it to `python3 scripts/review_state.py evidence-path`, "
-            "then run: python3 scripts/review_state.py mark\n"
+            "Run an adversarial audit first — `/review` where the optional `superpowers` "
+            "plugin is installed, else `/deep-review`, or dispatch the genesis-architect "
+            "agent — save it to `python3 scripts/review_state.py evidence-path`, then "
+            "re-mark: `python3 scripts/review_state.py mark --agent-output <that file>` "
+            "(a genesis-architect audit is INTERNAL and satisfies this gate; it never "
+            "counts toward the escalation cap — no outcome flag needed). Only a "
+            "non-Anthropic cross-model review (Codex/Kimi) is marked `--source external "
+            "--defects|--clean`.\n"
             "If findings are intentionally accepted, append a trailing shell "
             "comment (outside any quotes): '  # review-override'"
         )

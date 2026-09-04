@@ -112,10 +112,10 @@ IDENTITY_GATE_SITES: dict[str, tuple[str, str | None, str]] = {
     "runtime/init/learning.py::_evolve_user_model": (
         "gated",
         None,
-        "USER_KNOWLEDGE synthesis; first_party by authorship (reflection-"
-        "derived deltas). FLIP BLOCKER: observations carry no origin_class, so "
-        "externally-planted user-facts stay first_party until delta-level "
-        "provenance lands",
+        "USER_KNOWLEDGE synthesis; emits with the accepted deltas' aggregated "
+        "stored origin_class (external_untrusted iff any contributing delta is "
+        "external, else first_party) — run-level via reflection_window_origin, "
+        "NULL/legacy deltas read first_party; per-delta provenance is future work",
     ),
 }
 
@@ -219,8 +219,15 @@ AUTONOMY_GATE_SITES: dict[str, tuple[str, str]] = {
     ),
     "autonomy/email_gate_watcher.py::drain_pending_email_sends": (
         "gated-via",
-        "owner approve -> record_success / owner reject -> record_correction; "
-        "threads origin_class='owner' (owner decisions are the evidence)",
+        "owner reject/cancel -> record_correction; threads origin_class='owner' "
+        "(owner decisions are the evidence). The owner-approve record_success path "
+        "moved to _terminalize_delivered_hold (identical origin_class threading)",
+    ),
+    "autonomy/email_gate_watcher.py::_terminalize_delivered_hold": (
+        "gated-via",
+        "owner approve -> record_success, gated on the pes.mark_sent single-flip "
+        "claim (at-most-once); threads origin_class='owner' (owner decisions are the "
+        "evidence). Shared by the DELIVERED + consumed-approval reconcile branches",
     ),
     "dashboard/routes/autonomy.py::autonomy_flag_send": (
         "gated-via",

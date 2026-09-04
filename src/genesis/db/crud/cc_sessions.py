@@ -348,28 +348,36 @@ async def dispatch_info_for_proposals(
     proposal_ids: list[str],
 ) -> dict[str, dict]:
     """Map ``proposal_id -> {session_id, transcript_path, output_excerpt}`` for
-    ego-dispatch sessions whose ``metadata.caller_context`` is
-    ``ego_proposal:<id>`` (set by ``direct_session._store_result``).
+    ego-dispatch sessions whose ego-proposal linkage is ``ego_proposal:<id>``
+    (set by ``direct_session._store_result``).
 
-    One bounded query over the passed id set (the caller caps it). Newest session
-    wins per proposal (retries re-dispatch under the same caller_context). The
-    excerpt is capped so the dashboard payload stays small — the full text lives
-    in ``metadata.output_text`` and the CC transcript at ``transcript_path``.
-    Filters on ``json_extract(metadata,'$.caller_context')`` — an unindexed scan
-    of cc_sessions, acceptable for an on-demand dashboard read.
+    Matches on ``COALESCE(origin_caller_context, caller_context)``: a rate-limit
+    park→resume rewrites ``caller_context`` to ``rate_limit_resume:<park_id>`` and
+    carries the original ``ego_proposal:<id>`` on ``origin_caller_context``, so the
+    resumed (delivering) session would otherwise be invisible to this read (see
+    ``rate_limit_park.effective_caller_context``). One bounded query over the
+    passed id set (the caller caps it). Newest session wins per proposal — a resume
+    started later than its parked original, so its output correctly supersedes.
+    The excerpt is capped so the dashboard payload stays small — the full text
+    lives in ``metadata.output_text`` and the CC transcript at ``transcript_path``.
+    An unindexed scan of cc_sessions, acceptable for an on-demand dashboard read.
     """
     if not proposal_ids:
         return {}
     keys = [f"ego_proposal:{pid}" for pid in proposal_ids]
     placeholders = ",".join("?" * len(keys))
+    _ctx = (
+        "COALESCE(json_extract(metadata, '$.origin_caller_context'), "
+        "json_extract(metadata, '$.caller_context'))"
+    )
     cursor = await db.execute(
         f"""SELECT id AS session_id,
-                   json_extract(metadata, '$.caller_context') AS caller_context,
+                   {_ctx} AS caller_context,
                    json_extract(metadata, '$.transcript_path') AS transcript_path,
                    json_extract(metadata, '$.output_text') AS output_text
             FROM cc_sessions
             WHERE json_valid(metadata)
-              AND json_extract(metadata, '$.caller_context') IN ({placeholders})
+              AND {_ctx} IN ({placeholders})
             ORDER BY started_at DESC""",
         tuple(keys),
     )
@@ -616,11 +624,26 @@ async def update_topic_and_keywords(
     *,
     topic: str,
     keywords: str,
+    topic_updated_at: str | None = None,
 ) -> bool:
-    """Update the session topic and keywords index."""
+    """Update the session topic and keywords index.
+
+    Stamps ``topic_updated_at`` alongside. ``last_extracted_at`` is NOT a
+    substitute and must not be used as the topic's age: it is written by
+    ``update_extraction_watermark``, a different function, and the extraction
+    job advances it unconditionally while calling THIS function only when it
+    actually has a topic. MEASURED on a live install: 219 of 899 rows carry a
+    watermark with no topic. The concurrent-session peer line compares this
+    stamp against the charter's ``mission_updated_at`` to decide which is the
+    more recent account of what a session is doing; using the watermark there
+    would let a pass that produced no topic suppress a genuinely newer mission.
+    """
+    from datetime import UTC, datetime  # local, matching this module's idiom
+
+    stamp = topic_updated_at or datetime.now(UTC).isoformat()
     cursor = await db.execute(
-        "UPDATE cc_sessions SET topic = ?, keywords = ? WHERE id = ?",
-        (topic, keywords, id),
+        "UPDATE cc_sessions SET topic = ?, keywords = ?, topic_updated_at = ? WHERE id = ?",
+        (topic, keywords, stamp, id),
     )
     await db.commit()
     return cursor.rowcount > 0
