@@ -243,7 +243,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 975d3944 2026-08-31
+verified: 225f9e3b 2026-09-04
 ```
 
 - **Cross-session awareness — how concurrent CC sessions perceive each other.**
@@ -295,6 +295,29 @@ verified: 975d3944 2026-08-31
   COALESCEs content columns; a writer distinguishes "read fine, nothing to
   report" (empty string — CLEARS) from "could not read" (None — PRESERVES), and
   collapsing those two is what makes a finished topic immortal.
+
+- **Slot-door session recovery — detection + hand-relaunch parity (non-destructive layer).**
+  LIVE. A `cc-N` tmux slot can be ALIVE but sitting at a bare shell: `cc-slot.sh`'s
+  `tmux new-session -A` ATTACHES to an existing session and silently DISCARDS the
+  launch command, so a slot born without claude stays that way on every reconnect.
+  `src/genesis/cc/slot_liveness.py` answers "is an interactive claude actually running
+  in this slot?" by walking `/proc` for a `claude` under any of the slot's pane pids —
+  reading only world-readable `comm`/`cmdline` (never the ptrace-gated `environ`), and
+  biased toward reporting ALIVE (a false ALIVE costs a plain attach; a false POISONED
+  would clobber a live TUI). The manual/dashboard slot map uses it to ANNOTATE a
+  claude-less slot (`no claude running — re-enter through this slot's door`) under a
+  shared WHOLE-MAP wall-clock budget, so a cosmetic probe never slows a login. The
+  bashrc `claude()` wrapper gained an in-tmux branch: a hand-typed relaunch inside
+  ANY interactive tmux pane (not only a `cc-N` slot; opt out with
+  `GENESIS_NO_TMUX_WRAP=1`) now gets the permission flag, CC's temp dirs, the
+  fallback OAuth login (via
+  the same `login_gate` + `read_fallback_token` the door uses), and exit capture —
+  instead of falling through to a bare `command claude`. The create `exec` pins `TMPDIR`
+  and the resolved `GENESIS_CC_SLOT_OAUTH` lever via `-e` (MEASURED on tmux 3.4: a new
+  session on a pre-existing server inherits the SERVER's env for these, not the door's;
+  PATH already propagates from the client, so it is deliberately NOT pinned). The
+  destructive recovery (kill-and-recreate a poisoned slot on consent) is a SEPARATE
+  layer, not shipped here.
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
   (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A restricted

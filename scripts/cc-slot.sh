@@ -45,6 +45,42 @@ fi
 
 MODE_ARG="$1"
 shift
+
+# Liveness verdict for the cosmetic slot map: ALIVE | POISONED | UNKNOWN |
+# TIMEOUT (empty on any failure). The map is purely informational and runs once
+# per listed slot on the interactive login path, so it must never be what makes
+# a login feel slow. Two budgets bound it: a short per-probe leash and a
+# WHOLE-MAP wall-clock ceiling. Defined here — above the manual-mode map that is
+# its only caller — because bash resolves a function only once its definition has
+# RUN; GENESIS_ROOT is set above. An unavailable probe prints nothing, and the
+# caller treats that as "no verdict".
+_MAP_PROBE_BUDGET=3
+_MAP_PROBE_GAVE_UP=0
+# A WHOLE-MAP wall-clock ceiling, not a per-probe one: N slots that each finish
+# just under the per-probe budget would otherwise delay a login by N x budget.
+# `SECONDS` is inherited by the `$(...)` subshell the probe runs in, so an
+# ABSOLUTE deadline is readable there even though a variable set inside it can
+# never travel back out.
+_MAP_TOTAL_BUDGET=6
+_MAP_DEADLINE=0
+_map_verdict() {
+    local out="" rc=0
+    [ -x "${GENESIS_ROOT}/.venv/bin/python" ] || { printf '%s' ""; return 0; }
+    [ "$_MAP_PROBE_GAVE_UP" = "1" ] && { printf '%s' ""; return 0; }
+    local _budget="$_MAP_PROBE_BUDGET" _rem
+    if [ "$_MAP_DEADLINE" -gt 0 ]; then
+        _rem=$(( _MAP_DEADLINE - SECONDS ))
+        # The map is COSMETIC; it must never be what makes a login feel slow.
+        [ "$_rem" -le 0 ] && { printf '%s' "TIMEOUT"; return 0; }
+        [ "$_rem" -lt "$_budget" ] && _budget="$_rem"
+    fi
+    out=$(timeout "$_budget" "${GENESIS_ROOT}/.venv/bin/python" \
+        -m genesis.cc.slot_liveness "$@" 2>/dev/null | sed -n '1p') || rc=$?
+    # 124 is timeout(1)'s "deadline expired".
+    [ "$rc" = "124" ] && { printf '%s' "TIMEOUT"; return 0; }
+    printf '%s' "$out"
+}
+
 # Extra claude args exist only in manual mode (SSH RemoteCommand passes %n only).
 CLAUDE_EXTRA_ARGS=("$@")
 
@@ -57,11 +93,38 @@ if [[ "$MODE_ARG" == "manual" ]]; then
         -F '#{session_name}|#{session_attached}|#{t:session_activity}' \
         2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
     if [[ -n "$slot_map" ]]; then
+        # Arm the whole-map deadline HERE, immediately before the only loop that
+        # probes: every probe below shares it, so the map costs at most
+        # _MAP_TOTAL_BUDGET no matter how many slots exist.
+        _MAP_DEADLINE=$(( SECONDS + _MAP_TOTAL_BUDGET ))
         echo "Existing slots (reattach: tmux attach -t <name>):" >&2
         while IFS='|' read -r name attached activity; do
             state="detached"
             [[ "$attached" -ge 1 ]] && state="attached"
-            echo "  ${name}  ${state}  (last activity: ${activity})" >&2
+            # Say when a slot is alive but running NO claude. Manual allocation
+            # never takes over an existing session, and only the hostname door
+            # heals its own slot — so without this the map lists a stuck slot as
+            # though it were healthy, and the `tmux attach` hint above sends the
+            # operator straight back to the bare prompt. One probe per listed
+            # slot; anything other than an explicit POISONED prints nothing, so an
+            # unavailable probe never renders as a verdict.
+            note=""
+            # `|| true` is load-bearing: under `set -euo pipefail` a
+            # `var=$(tmux ... | tr ...)` whose FIRST component fails takes the
+            # whole door down with no message (pipefail promotes it past `tr`,
+            # `set -e` exits). A listed session going away before it is inspected
+            # is ordinary — the tmux server shuts down the moment the last slot's
+            # claude exits, and `list-panes` on a missing session exits 1 — and on
+            # the manual door that would drop the operator at a bare prompt.
+            _map_pids=$(tmux list-panes -s -t "=${name}" -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ' || true)
+            _map_v=""
+            [ -n "$_map_pids" ] && _map_v=$(_map_verdict $_map_pids)
+            # Set in the LOOP's shell, not inside the substitution above.
+            [ "$_map_v" = "TIMEOUT" ] && _MAP_PROBE_GAVE_UP=1
+            if [[ "$_map_v" == "POISONED" ]]; then
+                note="  (no claude running — 'tmux attach' will NOT relaunch it; re-enter through this slot's door)"
+            fi
+            echo "  ${name}  ${state}  (last activity: ${activity})${note}" >&2
         done <<<"$slot_map"
     fi
     SLOT=1
@@ -485,9 +548,26 @@ fi
 # python path, home-anchored token file), and if the repo is gone that python is too
 # → the read silently no-ops before cd fails. Do NOT move it after the `&&`
 # (test_cd_guard_skips_claude_on_bad_cd).
+#
+# The two extra `-e` pins below are each a MEASURED gap, not a guess. `tmux
+# new-session` builds a new session's env from the tmux SERVER's environment,
+# updated by the client only for `update-environment` vars (SSH_*, DISPLAY, …).
+# MEASURED on tmux 3.4, a new session on a server someone else started:
+#   TMPDIR                 -> SERVER's value  (gap: pin it, or CC temp lands on
+#                             the ambient/foreign dir, often /tmp this repo avoids)
+#   GENESIS_CC_SLOT_OAUTH  -> SERVER's value  (gap: pin the RESOLVED lever so a
+#                             hand-relaunch via the in-tmux bashrc wrapper honours
+#                             the operator's always/off, not the default conditional)
+#   PATH                   -> CLIENT's value  (NO gap: the door's PATH already
+#                             propagates, so it is deliberately NOT pinned here.
+#                             Do not "helpfully" add it — measured unnecessary.)
+# CLAUDE_CODE_TMPDIR was already pinned for the same server-env reason.
+# LANG stays LAST — a doors test parses the create line from its final -e.
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
     -e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" \
+    -e "TMPDIR=$TMPDIR" \
+    -e "GENESIS_CC_SLOT_OAUTH=${_slot_oauth_mode}" \
     -e "LANG=$LANG" \
     "${_OAUTH_SRC}cd ${GENESIS_ROOT} && claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"

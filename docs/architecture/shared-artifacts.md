@@ -47,10 +47,15 @@ readers:
   - src/genesis/onboarding/floor.py
   - scripts/guardian-gateway.sh
   - scripts/cc-slot.sh
+  - scripts/bootstrap.sh
 allowlist:
   - src/genesis/guardian/credential_bridge.py
 ```
 
+- `bootstrap.sh` — the in-tmux `claude` wrapper reads it through the same
+  `login_gate` + `read_fallback_token` pair the slot door uses, so a relaunch
+  typed by hand inside a slot is not the one launch that cannot use the
+  fallback.
 - `cc/login_health.py` — injects it into the container's own CC sessions
   (foreground + background) when the container login is hard-expired.
 - `cc/login_gate.py` — the interactive-slot decision gate: reads the token (via

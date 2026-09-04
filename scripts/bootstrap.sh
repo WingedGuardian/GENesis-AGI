@@ -875,7 +875,9 @@ read -r -d '' TMUX_WRAP_BLOCK <<'WRAPEOF' || true
 # Interactive `claude` outside tmux lands in a persistent cc-N tmux slot
 # (lowest free; attach-or-create via scripts/cc-slot.sh manual). A dropped
 # SSH or closed browser tab just detaches the session — reattach with
-# `tmux attach -t cc-N`. Opt out: GENESIS_NO_TMUX_WRAP=1.
+# `tmux attach -t cc-N`. Inside tmux the slot env (permission flag, temp dirs,
+# exit capture) is applied in place rather than nesting a session.
+# Opt out: GENESIS_NO_TMUX_WRAP=1.
 claude() {
     local arg
     for arg in "$@"; do
@@ -883,6 +885,117 @@ claude() {
             -p|--print|--version|-v|--help|-h) command claude "$@"; return $? ;;
         esac
     done
+    if [ -t 0 ] && [ -t 1 ] && [ -n "${TMUX:-}" ] && [ -z "${GENESIS_NO_TMUX_WRAP:-}" ]; then
+        # ALREADY inside tmux — typically relaunching by hand in a slot pane
+        # whose claude has exited. Before this branch that case fell straight
+        # through to a bare `command claude`, so a hand-typed relaunch was a
+        # second-class session: no permission flag (the operator had to
+        # remember it), not the temp dirs CC expects, and no exit capture — so
+        # the NEXT crash in that pane left no trace, which is the whole reason
+        # the capture exists.
+        #
+        # It applies that environment in place rather than calling cc-slot.sh,
+        # because cc-slot.sh's job is to allocate and attach a SLOT; there is
+        # already one here. (It is not a recursion guard — the slot branch below
+        # is gated on TMUX being empty, so it never ran in here to begin with.)
+        local _perm _slot _ec
+        _slot="${GENESIS_SLOT:-manual}"
+        case "${GENESIS_CC_PERMISSION_MODE:-auto}" in
+            bypass|dangerous|skip) _perm="--dangerously-skip-permissions" ;;
+            *)                     _perm="--permission-mode auto" ;;
+        esac
+        for arg in "$@"; do
+            case "$arg" in
+                --dangerously-skip-permissions|--permission-mode|--permission-mode=*)
+                    _perm="" ;;
+            esac
+        done
+        # chmod matches cc-slot.sh: this dir holds CC session state, and on a
+        # fresh install this may be what creates it — at the ambient umask it
+        # would land world-readable.
+        # A FAILED mkdir must not be shrugged past: exporting TMPDIR to a
+        # directory that does not exist is worse than not exporting it at all —
+        # every temp write then fails inside CC rather than here, where the
+        # cause is visible. And "just use the ambient TMPDIR" is NOT a fallback
+        # in this branch: it only runs INSIDE a slot pane, where the launcher
+        # has already exported TMPDIR to the very directory whose creation just
+        # failed. The fallback has to name a different directory explicitly, or
+        # clear the variables so the system default applies.
+        # Deliberately NOT fatal: refusing to start Claude because a mkdir
+        # failed strands the operator.
+        _ctmp="$HOME/.genesis/cc-tmp"
+        if mkdir -p "$_ctmp" 2>/dev/null; then
+            chmod 700 "$_ctmp" 2>/dev/null || true
+        elif mkdir -p "$HOME/tmp" 2>/dev/null; then
+            # Same 0700 as the primary path: this holds CC session state, and
+            # at the ambient umask it would land world-readable. NOTE for
+            # whoever reads this next: ~/tmp is swept by disk_hygiene.sh's
+            # 7-day prune, so this is a degraded fallback, not an equal one.
+            chmod 700 "$HOME/tmp" 2>/dev/null || true
+            echo "genesis: could not create $_ctmp — using $HOME/tmp instead." >&2
+            _ctmp="$HOME/tmp"
+        else
+            echo "genesis: could not create $_ctmp or $HOME/tmp; starting Claude with" >&2
+            echo "genesis: the system default temp dir (check disk space/permissions)." >&2
+            _ctmp=""
+        fi
+        # A SUBSHELL, so the fallback token below is scoped to this launch and
+        # never lingers in the operator's interactive shell.
+        (
+            # Fallback OAuth, through the SAME gate and the SAME token parser
+            # the slot door uses — not a second implementation of either.
+            # Without this the hand-relaunch path is the one launch that cannot
+            # use a configured fallback token, and it is exactly the path this
+            # feature makes likely: the operator declines the rebuild to keep
+            # their shell, then types `claude` themselves. `login_gate` owns the
+            # mode semantics (conditional/always/off, stale-token and
+            # peer-route exclusions); this only honours its verdict.
+            _lg="$HOME/genesis/.venv/bin/python"
+            _mode="${GENESIS_CC_SLOT_OAUTH:-conditional}"
+            # `--bare` must skip this entirely. The canonical launcher does the
+            # same, because claude IGNORES CLAUDE_CODE_OAUTH_TOKEN under --bare:
+            # running the probe anyway would export an inert token and announce
+            # that the session is on the stored fallback when it is not,
+            # misleading exactly the person trying to diagnose their auth.
+            _bare=0
+            for _a in "$@"; do
+                if [ "$_a" = "--bare" ]; then _bare=1; fi
+            done
+            if [ "$_mode" != "off" ] && [ "$_bare" = "0" ] && [ -x "$_lg" ]; then
+                # stderr is NOT discarded: the gate's stderr is its OPERATOR
+                # diagnostic. With `always` and a missing or stale setup token
+                # it prints the exact provisioning instruction and declines —
+                # swallowing that leaves the operator with normal auth and no
+                # explanation, which is the whole reason they are reading this
+                # terminal.
+                if _notice=$(timeout 30 env GENESIS_CC_SLOT_OAUTH="$_mode" \
+                        "$_lg" -m genesis.cc.login_gate); then
+                    _tok=$("$_lg" -c 'import sys; from genesis.cc.login_health import read_fallback_token as r; sys.stdout.write(r() or str())' 2>/dev/null)
+                    # Export ONLY when non-empty: a failed read must never
+                    # export a blank credential over a working login.
+                    if [ -n "$_tok" ]; then
+                        export CLAUDE_CODE_OAUTH_TOKEN="$_tok"
+                        printf '%s\n' "$_notice" >&2
+                    fi
+                fi
+            fi
+            if [ -n "$_ctmp" ]; then
+                TMPDIR="$_ctmp" CLAUDE_CODE_TMPDIR="$_ctmp" \
+                    command claude ${_perm:+$_perm} "$@"
+            else
+                # `env` execs the binary from PATH and never sees a shell
+                # function, so this cannot recurse back into this wrapper the
+                # way a bare `claude` would; `command` is a builtin and cannot
+                # be used here.
+                env -u TMPDIR -u CLAUDE_CODE_TMPDIR claude ${_perm:+$_perm} "$@"
+            fi
+        )
+        _ec=$?
+        unset _ctmp
+        [ -x "$HOME/genesis/scripts/cc_exit_capture.sh" ] \
+            && "$HOME/genesis/scripts/cc_exit_capture.sh" "$_slot" "$_ec" >/dev/null 2>&1
+        return $_ec
+    fi
     if [ -t 0 ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ -z "${GENESIS_NO_TMUX_WRAP:-}" ] \
         && [ -x "$HOME/genesis/scripts/cc-slot.sh" ] \
         && command -v tmux >/dev/null 2>&1; then
