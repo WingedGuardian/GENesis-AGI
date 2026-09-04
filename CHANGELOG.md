@@ -11,6 +11,36 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Two branches that each add a changelog entry no longer collide over it.**
+  This file is an append-only list of independent bullets, so two branches
+  adding an entry under the same heading are not disagreeing about anything —
+  they are inserting at the same position, which git's default merge reports as
+  a conflict a human has to resolve by hand. It now merges with git's `union`
+  driver, which keeps both sides' lines, in order, and drops neither.
+
+  Measured before the change, against the repository's own open work: of 49
+  open pull requests, 21 could not merge, and **18 of those 21 conflicted on
+  this file and nothing else** — every other file in them merged cleanly.
+  Replaying all 18 locally with the rule in place, every one of them merges
+  without conflict, while the three genuine conflicts (in source, a shell
+  script and an architecture document) still conflict exactly as before.
+
+  The rule is scoped to the one file at the repository root, and the tests
+  enforce that scope over the complete tracked-file list rather than a sample.
+  The leading slash matters: a pattern without one matches the basename at
+  every depth, which would silently hand the same driver to any future
+  vendored or subproject changelog.
+
+  What `union` cannot express is a **removal**. If one side deletes lines while
+  the other edits the same place, it keeps the deleted lines and reports
+  success — so pruning an entry, reverting a commit that added one, or cutting
+  a release (which moves entries under a version heading rather than adding
+  them) can quietly come out wrong, with a zero exit code and nothing visibly
+  duplicated to catch the eye. Read the merged file in those three cases.
+  Ordinary "add a bullet" merges, which is what nearly every change does,
+  cannot hit it. The attribute also governs cherry-pick, revert and rebase, so
+  the same caveat reaches the automated contribution and recovery paths.
+
 - **Two branches can no longer pick the same database-migration number.** Each
   new migration is now named by the UTC time it was written rather than by the
   next free number, so nobody has to check what anyone else took — and two

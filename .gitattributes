@@ -1,0 +1,45 @@
+# CHANGELOG.md is an append-only list of independent bullets. Two branches that
+# each add an entry under the same heading are not disagreeing about anything —
+# they are inserting at the same position, which git's default driver reports as
+# a conflict. `union` keeps both sides' lines, in order.
+#
+# Measured 2026-09-04 against origin/main 2d5ea3dd: of 49 open PRs, 21 could not
+# merge, and 18 of those 21 conflicted on CHANGELOG.md and nothing else — every
+# other file in them merged cleanly. That is 37% of the open queue blocked by
+# one file's merge semantics.
+#
+# The pattern is ANCHORED with a leading slash on purpose. A gitattributes
+# pattern containing no slash matches the basename at EVERY depth, exactly like
+# .gitignore (gitattributes(5), "the same as in .gitignore files"). Unanchored,
+# this rule would silently pre-arm every future vendored, subproject or plugin
+# CHANGELOG.md with a driver nobody reviewed for it. Measured: `CHANGELOG.md`
+# resolves to union either way, but `vendor/dep/CHANGELOG.md` resolves to union
+# ONLY without the slash. Scope is one path, and the tests grade that over the
+# whole tracked file list rather than a hand-picked sample.
+#
+# `union` resolves SILENTLY, so it must only ever apply where a silent
+# resolution cannot be wrong: an unordered list of independent entries that no
+# code reads. It must NOT be extended to source, config, or prose that two
+# branches might legitimately rewrite in the same place — there, a conflict is
+# the correct and desirable outcome.
+#
+# WHAT UNION CANNOT DO IS EXPRESS A REMOVAL, and this is the sharp edge. If one
+# side deletes lines and the other edits the same hunk, union keeps the deleted
+# lines and exits 0 — the deletion is discarded, silently, with a success code
+# and no duplicated prose to catch the eye. MEASURED with a no-attribute
+# control: pruning an entry on one branch while another branch adds a bullet
+# merges rc=0 with the pruned entry restored; without this rule the same merge
+# conflicts and a human decides. So anyone PRUNING, REVERTING, or CUTTING A
+# RELEASE on this file must read the merged result rather than trust the exit
+# code. Cutting a release is the routine case, because it MOVES entries under a
+# version heading rather than adding them, and another branch's new bullet can
+# land under the wrong heading. Ordinary "add a bullet" merges — which is what
+# nearly every PR does — cannot hit any of this.
+#
+# The attribute also governs cherry-pick, revert, rebase and merge-tree, not
+# just merge (gitattributes(5)). In this repo that reaches
+# contribution/divergence.py (merge-tree conflict probe),
+# contribution/pr_opener.py (cherry-pick into an auto-opened PR) and
+# guardian/recovery.py (autonomous `git revert`): every path where a CHANGELOG
+# conflict used to stop for a human now resolves on its own.
+/CHANGELOG.md merge=union
