@@ -246,15 +246,25 @@ verified: 29a382e7 2026-09-03
   (offline, our timeout, an MCP crash, a stale session) is a `CCError` on the same
   branch but never reaches the provider, and `note_failure` declines it; and records
   refresh ONLY while the home model is down, so they are last-observed facts carrying
-  `observed_at`/`age_seconds`, never current state. A third, learned the hard way: a
-  self-report is an EXPOSURE surface, so provider prose is scrubbed at the single
-  read/write chokepoint and never merely on the way in — the state file is read into
-  every health snapshot, reaches an LLM context via the health MCP tool, and is
-  JSON-dumped whole into `sentinel/monitor.py`'s monitoring prompt with no
-  sanitisation on that path. A write-only scrub therefore republished (and
-  re-persisted) any credential already on disk. Bounding is per-FIELD and never
-  truncates: a cut identifier merged two peers onto one key, so one peer's success
-  cleared another's recorded failure.
+  `observed_at`/`age_seconds`, never current state. A third, learned across four review
+  rounds: a self-report is an EXPOSURE surface, so the record stores NO FREE TEXT
+  at all — every field is a closed set, and a row read from disk is either exactly
+  what the module writes or it is DROPPED, never repaired. The state file is read
+  into every health snapshot, reaches an LLM context via the health MCP tool, and
+  is JSON-dumped whole into `sentinel/monitor.py`'s prompt with no sanitisation,
+  so a text field here is a text field in an LLM prompt; the provider's prose goes
+  to the log at the point of failure instead. That is a deletion rather than a
+  guard, and it was the answer to two generators that no amount of patching
+  closed: per-field REPAIR of a foreign document (seven findings), and inferring
+  whether credential discovery had succeeded from a config loader that degrades
+  silently by design (two P1s).
+- **A failover attempt that EXECUTED TOOLS is never retried** (`cc/conversation.py`,
+  `note_stream_effect`). The loop used to model "what did this turn do" as answer
+  text alone, so a peer that ran an MCP tool — an outreach send, a database write —
+  and then returned nothing looked identical to one that did nothing, and the next
+  peer re-ran the same prompt with `skip_permissions=True` and the full user-scoped
+  toolset. Every advance path is now gated on effects, and a turn that acted but
+  produced no answer ends with an explicit message rather than a silent retry.
 - **Cross-session awareness — how concurrent CC sessions perceive each other.**
   LIVE. Two DISTINCT stores answer two different questions, and conflating them
   is the trap: `cc_sessions` (+ a `/proc` walk, `observability/cc_slots.

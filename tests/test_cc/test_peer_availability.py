@@ -1,9 +1,11 @@
 """Tests for the CC roster peer-availability record (genesis.cc.peer_availability).
 
-Two of these are regression locks for defects found in adversarial review of the
-first draft, and are commented as such: attribution (a local fault must never be
-blamed on the peer) and the scrub ordering (truncating before scrubbing leaked a
-secret's prefix to disk).
+One of these is a regression lock for a defect found in adversarial review of the
+first draft, and is commented as such: attribution — a local fault must never be
+blamed on the peer. (The scrub-ordering lock is gone with the scrub itself: the
+record no longer stores free text, so there is no secret to order anything
+around. See ``test_generator_B_is_structurally_absent_no_credential_discovery``,
+which asserts the mechanism cannot come back.)
 
 NOTE ON WHAT IS *NOT* TESTED HERE. An earlier draft asserted that recording a
 peer as blocked left ``roster.failover_chain`` unchanged. That test was
@@ -18,6 +20,7 @@ tests/test_cc/test_conversation_failover.py.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import pytest
 
@@ -85,7 +88,6 @@ def test_success_clears_a_prior_block():
     st = PA.read_peer("peer-x")
     assert st.available is True
     assert st.reason == ""
-    assert st.detail == ""
     assert st.reset_at == ""
 
 
@@ -100,81 +102,6 @@ def test_peers_are_tracked_independently():
 def test_empty_peer_name_is_ignored():
     assert PA.note_failure("", CCRateLimitError("429")) is False
     assert PA.read() == {}
-
-
-# ── secret handling ──────────────────────────────────────────────────────────
-
-
-def test_bounding_can_never_emit_a_partial_value(monkeypatch):
-    """The scrub-order defect class is CLOSED BY CONSTRUCTION — this locks the
-    construction, not the ordering.
-
-    Original defect (review blocker B3): the value was cut to a length bound and
-    THEN scanned for secrets, so a secret straddling the bound lost its tail, no
-    longer matched the environment value, and its head was written to disk
-    verbatim (reproduced: a 64-char token at offset 290 leaked a 10-char prefix).
-    The fix at the time was to reorder scrub-before-bound.
-
-    That ordering lock is now UNTESTABLE, and honesty is better than a fixture
-    contorted to look like it still works: `_bound_text` returns the value WHOLE
-    or replaces it with a fixed-size marker, so bounding cannot produce a proper
-    prefix for a scrub to miss. VERIFIED by mutation — with the scrub/bound order
-    deliberately reversed, no prefix leaks, because an oversized value is
-    replaced entirely rather than cut.
-
-    So the property worth locking is the structural one that closed the class.
-    If anyone reintroduces truncation, this fails and the prefix leak returns.
-    """
-    for text in ("short", "x" * (PA._MAX_DETAIL - 1), "y" * PA._MAX_DETAIL,
-                 "z" * (PA._MAX_DETAIL + 1), "w" * (PA._MAX_DETAIL * 10)):
-        out = PA._bound_text(text)
-        assert out == text or not text.startswith(out), (
-            f"bounding emitted a PROPER PREFIX of a {len(text)}-char value — "
-            "the exact shape that let a straddling secret leak its head"
-        )
-
-    # And end to end: a secret crossing the bound leaves nothing behind.
-    secret = "TOKENVALUE-" + ("z" * 53)
-    monkeypatch.setenv("SOME_API_KEY", secret)
-    msg = ("a" * (PA._MAX_DETAIL - (len(secret) // 2))) + secret
-    assert len(msg) > PA._MAX_DETAIL, "fixture must cross the bound"
-    PA.note_failure("peer-x", CCRateLimitError(msg))
-    raw = PA._state_path().read_text()
-    assert secret not in raw
-    for n in (10, 16, 24):
-        assert secret[:n] not in raw, f"leaked a {n}-char prefix of the secret"
-
-
-def test_only_credential_named_env_values_are_scrubbed(monkeypatch):
-    """Filtering by value LENGTH alone also redacts PWD / VIRTUAL_ENV /
-    ANTHROPIC_BASE_URL — which would blank out the only human-readable field
-    exactly when a connection error is what you need to read."""
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.example.invalid/anthropic")
-    monkeypatch.setenv("SOME_API_KEY", "SECRETVALUE-abcdefghijklmnop")
-    PA.note_failure(
-        "peer-x",
-        CCRateLimitError(
-            "429 from https://api.example.invalid/anthropic using SECRETVALUE-abcdefghijklmnop"
-        ),
-    )
-    detail = PA.read_peer("peer-x").detail
-    assert "https://api.example.invalid/anthropic" in detail  # readable
-    assert "SECRETVALUE-abcdefghijklmnop" not in detail  # redacted
-    assert "<redacted>" in detail
-
-
-def test_short_env_values_are_not_scrubbed(monkeypatch):
-    monkeypatch.setenv("SHORT_KEY", "1")
-    PA.note_failure("peer-x", CCRateLimitError("rejected with code 1"))
-    assert "code 1" in PA.read_peer("peer-x").detail
-
-
-def test_detail_is_bounded_after_scrubbing():
-    """Bounded by OMISSION, not by a cut — see the invariant tests below."""
-    PA.note_failure("peer-x", CCRateLimitError("x" * 5000))
-    detail = PA.read_peer("peer-x").detail
-    assert "omitted" in detail and "5000" in detail
-    assert "xxxx" not in detail, "kept a fragment of the omitted value"
 
 
 # ── reset parsing (reuses genesis.cc.rate_limit_reset) ───────────────────────
@@ -223,17 +150,6 @@ def test_non_utf8_file_does_not_raise(tmp_path):
     with strict UTF-8 broke that promise on a corrupt/binary file."""
     (tmp_path / "cc_peer_availability.json").write_bytes(b"\xff\xfe\x00binary")
     assert PA.read() == {}
-
-
-def test_oversized_detail_from_disk_is_rebounded_on_read(tmp_path):
-    """A file written by another build must not push an unbounded blob into the
-    health snapshot (and from there into an LLM context via the health MCP tool)."""
-    (tmp_path / "cc_peer_availability.json").write_text(
-        json.dumps({"peers": {"p": {"available": False, "detail": "y" * 50_000}}})
-    )
-    detail = PA.read_peer("p").detail
-    assert "omitted" in detail and "50000" in detail
-    assert "yyyy" not in detail, "kept a fragment of the omitted value"
 
 
 def test_peer_count_is_capped():
@@ -297,45 +213,6 @@ def test_a_corrupt_row_does_not_permanently_kill_recording(tmp_path):
     assert PA.read_peer("final") is not None
 
 
-def test_oversized_row_from_disk_is_rebounded_when_writing(tmp_path):
-    """Bounding applies to the value being written; a blob left by another build
-    must not be re-persisted verbatim on the next record."""
-    (tmp_path / "cc_peer_availability.json").write_text(
-        json.dumps({"peers": {"old": {"available": False, "detail": "y" * 50_000}}})
-    )
-    PA.note_failure("new", CCRateLimitError("429"))
-    assert len(PA._state_path().read_text()) < 5_000
-
-
-def test_roster_declared_auth_env_is_scrubbed_even_without_a_hint_word(monkeypatch):
-    """A peer's own token is the credential most likely to appear in that peer's
-    error text, and auth_env names are user-chosen — `GLM_PAT` matches no hint."""
-    token = "PEERTOKEN-abcdefghijklmnop"
-    monkeypatch.setenv("GLM_PAT", token)
-    # Patch the ROSTER, not _secret_names. Stubbing _secret_names skips the
-    # auth_env loop entirely, so the test passed even with that loop deleted —
-    # it asserted nothing about the mechanism its own name claims to cover.
-    monkeypatch.setattr(
-        "genesis.cc.roster.load_roster",
-        lambda *a, **k: {"models": {"glm": {"auth_env": "GLM_PAT"}}},
-    )
-    PA.note_failure("peer-x", CCRateLimitError(f"429 rejected token {token}"))
-    assert token not in PA._state_path().read_text()
-
-
-def test_longest_secret_is_redacted_first(monkeypatch):
-    """When one credential contains another, redacting the shorter first would
-    leave the longer one's tail behind as an unmatched fragment."""
-    short = "TOKENPREFIX-1234"
-    long = short + "-EXTENDEDTAILVALUE"
-    monkeypatch.setenv("A_KEY", short)
-    monkeypatch.setenv("B_KEY", long)
-    PA.note_failure("peer-x", CCRateLimitError(f"429 using {long}"))
-    detail = PA.read_peer("peer-x").detail
-    assert "EXTENDEDTAILVALUE" not in detail
-    assert long not in detail
-
-
 # ── the snapshot surface (what an operator/LLM actually reads) ───────────────
 
 
@@ -353,18 +230,8 @@ def test_snapshot_reports_blocked_first_with_age_and_no_current_state_claim():
     assert isinstance(blocked["age_seconds"], int) and blocked["age_seconds"] >= 0
     assert set(blocked) == {
         "peer", "available", "reason", "observed_at",
-        "age_seconds", "detail", "reset_at", "limit_kind",
+        "age_seconds", "reset_at", "limit_kind",
     }
-
-
-def test_snapshot_age_is_none_for_an_unparseable_stamp(tmp_path):
-    """None, never 0 — a garbage stamp must not read as 'just observed'."""
-    from genesis.observability.snapshots.cc_sessions import _peer_availability_snapshot
-
-    (tmp_path / "cc_peer_availability.json").write_text(
-        json.dumps({"peers": {"p": {"available": False, "observed_at": "not-a-date"}}})
-    )
-    assert _peer_availability_snapshot()[0]["age_seconds"] is None
 
 
 def test_snapshot_is_empty_and_silent_with_no_records():
@@ -376,23 +243,71 @@ def test_snapshot_is_empty_and_silent_with_no_records():
 # ── review round 3 (PR #1646) ────────────────────────────────────────────────
 
 
-def test_malformed_timestamps_do_not_evict_the_record_being_written(tmp_path):
-    """REGRESSION LOCK: eviction ranked by the RAW string, so a row carrying
-    observed_at="zzzz" outranked every real ISO stamp by ASCII. Once _MAX_PEERS
-    such rows existed, each genuine new observation was evicted the instant it
-    was written — note_failure returned True while read_peer found nothing, and
-    recording stayed broken until someone deleted the file by hand."""
-    poison = {
-        f"junk-{i}": {"available": False, "observed_at": "zzzz"}
-        for i in range(PA._MAX_PEERS + 5)
+def _valid_row(**over):
+    """A row through the ACCEPT set, so fixtures actually land in the store.
+
+    Two eviction tests used to seed rows the decoder rejects outright, so they
+    ran against an EMPTY store and passed with the eviction logic deleted —
+    MEASURED at 35 rows written, 0 decoded. Anything asserting on eviction has
+    to build rows that survive `_decode_row` first.
+    """
+    row = {
+        "available": False,
+        "reason": "quota",
+        "observed_at": datetime.now(UTC).isoformat(),
+        "reset_at": "",
+        "limit_kind": "unknown",
     }
-    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": poison}))
+    row.update(over)
+    return row
+
+
+def test_a_full_store_does_not_evict_the_row_just_written(tmp_path):
+    """REGRESSION LOCK, rebuilt so it can fail.
+
+    The original defect: eviction ranked by the RAW timestamp string, so a row
+    carrying observed_at="zzzz" outranked every real ISO stamp by ASCII, and once
+    _MAX_PEERS of them existed each genuine observation was evicted the instant it
+    was written — note_failure returned True while read_peer found nothing.
+
+    That exact fixture is now unreachable (a malformed stamp is rejected, so it
+    never reaches eviction at all), which is why the test is rebuilt on VALID
+    rows rather than deleted: the property it guards — a full store must not
+    swallow the newest write — is still real, and eviction is still by insertion
+    order with the new row re-inserted last.
+    """
+    full = {f"old-{i:03d}": _valid_row() for i in range(PA._MAX_PEERS + 5)}
+    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": full}))
+    assert len(PA.read()) == PA._MAX_PEERS, "fixture must actually populate the store"
 
     assert PA.note_failure("real-peer", CCRateLimitError("429")) is True
     st = PA.read_peer("real-peer")
-    assert st is not None, "the row just written was evicted by malformed rows"
+    assert st is not None, "the row just written was evicted by a full store"
     assert st.available is False
-    assert len(PA.read()) <= PA._MAX_PEERS
+    # Assert on the FILE, not on read(): the read-side cap also trims to
+    # _MAX_PEERS, so checking read() alone passes even with WRITE-side eviction
+    # deleted. Found by mutation — a sibling layer masking the mechanism.
+    on_disk = json.loads(PA._state_path().read_text())["peers"]
+    assert len(on_disk) == PA._MAX_PEERS, "write-side eviction did not run"
+    assert "real-peer" in on_disk
+
+
+def test_a_naive_timestamp_is_rejected_not_stored(tmp_path):
+    """Replaces a mixed-naive/aware test whose premise the decoder removed.
+
+    `_record` only ever writes `datetime.now(UTC).isoformat()`, so a naive stamp
+    is not something this module emits. It round-trips through `fromisoformat`
+    perfectly, though, so the round-trip check alone accepted it — and the
+    snapshot then subtracted an aware `now` from it, suppressed the TypeError and
+    reported `age_seconds: null`. A blocked peer with no staleness is exactly
+    what a reader takes as current state.
+    """
+    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": {
+        "naive": _valid_row(observed_at="2026-09-04T00:00:00"),
+        "aware": _valid_row(),
+    }}))
+    assert PA.read_peer("naive") is None, "accepted a stamp we never write"
+    assert PA.read_peer("aware") is not None, "rejected a stamp we do write"
 
 
 def test_record_reports_false_when_the_write_fails(monkeypatch):
@@ -448,22 +363,6 @@ def test_an_mcp_error_mentioning_funds_is_not_a_peer_refusal():
 # ── review round 4 (PR #1646) — eviction redesigned, write hardened ──────────
 
 
-def test_mixed_naive_and_aware_timestamps_do_not_break_recording(tmp_path):
-    """REGRESSION LOCK: a parsed-timestamp sort raised TypeError the moment a
-    legacy NAIVE stamp met an aware one, and the failure was swallowed — every
-    later observation returned False and went unrecorded. Eviction no longer
-    parses timestamps at all, so mixed shapes are simply data."""
-    rows = {}
-    for i in range(PA._MAX_PEERS + 3):
-        stamp = "2026-01-01T00:00:00" if i % 2 else "2026-01-01T00:00:00+00:00"
-        rows[f"legacy-{i}"] = {"available": False, "observed_at": stamp}
-    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": rows}))
-
-    assert PA.note_failure("fresh", CCRateLimitError("429")) is True
-    assert PA.read_peer("fresh") is not None
-    assert len(PA.read()) <= PA._MAX_PEERS
-
-
 def test_state_file_round_trips_as_valid_json(tmp_path):
     """Sanity check on the published file, NOT a regression lock.
 
@@ -509,49 +408,6 @@ def test_concurrent_recorders_do_not_drop_each_others_rows(tmp_path):
 # ── round-5: the three BLOCKERs from the full-diff audit ────────────────────
 
 
-def test_every_field_and_the_key_are_bounded_not_just_detail(tmp_path):
-    """BLOCKER: one blanket cap bounded 1 of 7 fields, and nothing bounded the KEY.
-
-    A foreign row was re-persisted whole and handed to the snapshot untouched —
-    measured at a 300KB state file and a 100,000-char `reason` reaching an LLM
-    through the health MCP tool. The previous test passed only because it seeded
-    the one field that WAS bounded, which is how this survived a round.
-    """
-    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": {
-        "K" * 50_000: {
-            "available": False,
-            "reason": "R" * 100_000,
-            "observed_at": "O" * 100_000,
-            "detail": "D" * 100_000,
-            "reset_at": "T" * 100_000,
-            "limit_kind": "L" * 100_000,
-        },
-    }}))
-    # The row is DROPPED outright: its key is unstorable, and truncating the key
-    # to make it fit is the collision bug (see the peer-identity invariant).
-    assert PA.read() == {}, "a row with an unstorable key must be dropped, not cut"
-
-    # A row whose KEY is fine but whose FIELDS are foreign keeps the row and
-    # rejects the values — each field by what it means, not by a blanket cut.
-    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": {
-        "p": {
-            "available": False,
-            "reason": "R" * 100_000,
-            "observed_at": "O" * 100_000,
-            "detail": "D" * 100_000,
-            "reset_at": "T" * 100_000,
-            "limit_kind": "L" * 100_000,
-        },
-    }}))
-    st = PA.read_peer("p")
-    assert (st.reason, st.observed_at, st.reset_at, st.limit_kind) == ("", "", "", "")
-    assert "omitted" in st.detail and "D" * 20 not in st.detail
-
-    # ...and the bound must survive a write, not just a read.
-    PA.note_failure("fresh", CCRateLimitError("429"))
-    assert len(PA._state_path().read_text()) < 10_000
-
-
 def test_re_recording_a_peer_makes_it_newest_not_oldest(tmp_path):
     """BLOCKER: assigning an existing dict key does NOT reorder it, so insertion
     order decayed to FIRST-seen and eviction dropped the most recently observed
@@ -567,11 +423,19 @@ def test_re_recording_a_peer_makes_it_newest_not_oldest(tmp_path):
     assert len(peers) <= PA._MAX_PEERS
 
 
-def test_lock_acquisition_is_bounded_not_blocking(tmp_path):
-    """BLOCKER: a bare LOCK_EX stalled the asyncio event loop — measured at 1.2s
-    while another holder ran. This path is reached synchronously from an async
-    failover turn, so advisory bookkeeping could delay every concurrent
-    conversation during the very outage it exists to observe."""
+def test_lock_contention_fails_closed_rather_than_clobbering(tmp_path):
+    """Contention must NOT write unserialized — that is the data-loss bug.
+
+    The original defect was a bare LOCK_EX stalling the event loop. The fix
+    (non-blocking + bounded retry) then "degraded OPEN" on exhaustion and wrote
+    anyway, which does not rescue OUR row — it clobbers the holder's. MEASURED
+    with 12 concurrent writers at the old 10 x 20ms budget: ~50% of runs lost at
+    least one row, because acquisition is a LOTTERY, not a queue.
+
+    Now: contention yields False and nothing is written, and `note_failure`
+    reports False honestly. Losing our own observation beats destroying someone
+    else's, and the return value already means "the row landed".
+    """
     import fcntl
     import time
 
@@ -580,17 +444,21 @@ def test_lock_acquisition_is_bounded_not_blocking(tmp_path):
     holder = lock_path.open("a+")
     fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
     try:
+        monkey_budget = 3  # keep the test fast; the property is the fail DIRECTION
+        real = PA._LOCK_ATTEMPTS
+        PA._LOCK_ATTEMPTS = monkey_budget
         start = time.monotonic()
-        assert PA.note_failure("peer-x", CCRateLimitError("429")) is True
+        landed = PA.note_failure("peer-x", CCRateLimitError("429"))
         elapsed = time.monotonic() - start
     finally:
+        PA._LOCK_ATTEMPTS = real
         fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
         holder.close()
 
-    # Bounded by _LOCK_ATTEMPTS * _LOCK_SLEEP_S, then degrades OPEN and records.
-    budget = PA._LOCK_ATTEMPTS * PA._LOCK_SLEEP_S
-    assert elapsed < budget * 3, f"blocked {elapsed:.2f}s against a {budget:.2f}s budget"
-    assert PA.read_peer("peer-x") is not None, "degrade-open must still record"
+    assert landed is False, "reported a row landed while the lock was held"
+    assert PA.read_peer("peer-x") is None, "wrote unserialized — this clobbers the holder"
+    budget = monkey_budget * PA._LOCK_SLEEP_S
+    assert elapsed < budget * 5, f"waited {elapsed:.2f}s against a {budget:.2f}s budget"
 
 
 # ── THE MODULE'S INVARIANTS, AS EXECUTABLE TESTS ─────────────────────────────
@@ -647,79 +515,6 @@ def test_invariant_an_unstorable_name_is_dropped_not_truncated():
     assert PA.read() == {}, f"an unstorable name reached the store: {list(PA.read())}"
 
 
-def test_invariant_oversized_text_is_omitted_wholesale_not_cut_in_half():
-    """I5. A pathological value is REPLACED by a marker, never amputated.
-
-    A truncated value still LOOKS complete, so nobody checks it; an honest gap
-    does not. The marker must name the real size so a reader can tell what was
-    dropped, and must not carry a fragment of the original.
-    """
-    body = "PROVIDER-BODY-" + ("x" * 100_000)
-    PA.note_failure("peer-x", CCRateLimitError(body))
-    detail = PA.read_peer("peer-x").detail
-
-    assert "omitted" in detail, f"expected an omission marker, got: {detail[:80]!r}"
-    assert str(len(body)) in detail, "marker must state the real size that was dropped"
-    assert "PROVIDER-BODY-" not in detail, "kept a fragment of the amputated value"
-    assert len(detail) < 200, "the marker itself must be fixed-size"
-
-
-def test_invariant_a_real_provider_message_survives_whole():
-    """I5. The acceptance bar for the bound: real refusal prose is NOT cut.
-
-    MEASURED against 60 days of this install's server log: 183/670 (27.3%) of
-    real refusal messages exceed the 300-char cap the first draft invented, and
-    0/670 exceed the bound used now (observed max 1057). A bound that amputates
-    a quarter of the real population makes the field pointless — which is the
-    whole reason the field exists.
-    """
-    # Shape taken from a real provider refusal: a JSON error body, not a sentence.
-    real = json.dumps({
-        "error": {
-            "message": (
-                "Rate limit reached for model `peer-model` in organization "
-                "`org_0123456789abcdefghijklmn` service tier `on_demand` on tokens "
-                "per minute (TPM): Limit 30000, Used 29847, Requested 1200. "
-                "Please try again in 2.5s. Need more? Visit the billing console."
-            ),
-            "type": "rate_limit_exceeded",
-            "code": "rate_limit_exceeded",
-        },
-    }, indent=2)
-    assert 300 < len(real) < 2000, "fixture must sit in the band that used to be cut"
-
-    PA.note_failure("peer-x", CCRateLimitError(real))
-    detail = PA.read_peer("peer-x").detail
-
-    assert "omitted" not in detail, "a real provider message was treated as pathological"
-    assert "rate_limit_exceeded" in detail, "lost the machine-readable cause"
-    assert "billing console" in detail, "amputated the tail of a real message"
-
-
-def test_invariant_fail_closed_when_credential_discovery_fails(monkeypatch):
-    """I6. Uncertain secret discovery ⇒ drop `detail` entirely.
-
-    `auth_env` names are user-chosen and need not contain a hint word
-    (`auth_env: GLM_PAT`), so when the roster cannot be read the scrub CANNOT
-    know which env values are credentials. Falling back to hints alone writes
-    that peer's own token to disk verbatim — and the token most likely to appear
-    in a peer's error text is precisely that peer's own. Losing diagnostic prose
-    is strictly safer than leaking a credential.
-    """
-    monkeypatch.setenv("GLM_PAT", "PATVALUE-abcdefghijklmnopqrstuvwxyz")
-
-    def _boom(*a, **k):
-        raise RuntimeError("roster unreadable")
-
-    monkeypatch.setattr("genesis.cc.roster.load_roster", _boom)
-    PA.note_failure("peer-x", CCRateLimitError("401 using PATVALUE-abcdefghijklmnopqrstuvwxyz"))
-
-    raw = PA._state_path().read_text()
-    assert "PATVALUE-abcdefghijklmnopqrstuvwxyz" not in raw, "leaked a roster-declared credential"
-    assert PA.read_peer("peer-x") is not None, "the observation itself must still be recorded"
-    assert PA.read_peer("peer-x").available is False
-
-
 def test_invariant_read_path_enforces_the_peer_cap(tmp_path):
     """I5. The cap must hold on READ, not only on write.
 
@@ -746,34 +541,9 @@ def test_invariant_a_pathological_file_is_not_read_into_memory(tmp_path):
     # to test a 1MB bound and asserted against a hard-coded 50MB, which is the
     # same expiry-date anti-pattern this file warns about elsewhere.
     f = tmp_path / "cc_peer_availability.json"
-    f.write_text(json.dumps({"peers": {"p": {"available": True,
-                                             "detail": "z" * PA._MAX_STATE_BYTES}}}))
+    f.write_text(json.dumps({"peers": {"p" * PA._MAX_STATE_BYTES: {"available": True}}}))
     assert f.stat().st_size > PA._MAX_STATE_BYTES
     assert PA.read() == {}, "an implausibly large state file must be refused, not parsed"
-
-
-def test_invariant_field_values_are_typed_not_merely_short(tmp_path):
-    """I5. Each field is bounded by what it MEANS, not by one blanket number.
-
-    `reason` and `limit_kind` are closed enums and `observed_at`/`reset_at` are
-    timestamps; a foreign value in any of them is INVALID, not "too long". A
-    blanket character cap answers the wrong question — it turns 100k chars of
-    garbage into 300 chars of garbage and calls it bounded.
-    """
-    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": {
-        "p": {
-            "available": False,
-            "reason": "R" * 100_000,
-            "observed_at": "O" * 100_000,
-            "reset_at": "T" * 100_000,
-            "limit_kind": "L" * 100_000,
-        },
-    }}))
-    st = PA.read_peer("p")
-    assert st.reason == "", "an unknown reason is invalid, not truncatable"
-    assert st.limit_kind == "", "an unknown limit_kind is invalid, not truncatable"
-    assert st.observed_at == "", "a non-timestamp observed_at is invalid, not truncatable"
-    assert st.reset_at == "", "a non-timestamp reset_at is invalid, not truncatable"
 
 
 def test_invariant_recording_never_raises_on_a_hostile_exception():
@@ -785,67 +555,197 @@ def test_invariant_recording_never_raises_on_a_hostile_exception():
         def __str__(self):
             raise RuntimeError("hostile __str__")
 
-    assert PA.note_failure("peer-x", Hostile()) is False
+    # True now, and that is an IMPROVEMENT worth stating rather than a
+    # regression: the old False came from `detail = str(exc)` raising inside the
+    # guard. With no free-text field there is nothing to stringify on this path,
+    # so a hostile __str__ no longer costs us the observation. The property under
+    # test is unchanged and is the one that matters — it does not RAISE.
+    assert PA.note_failure("peer-x", Hostile()) is True
     assert PA.note_success("peer-x") is True
 
 
-def test_invariant_a_credential_on_disk_is_scrubbed_on_the_way_OUT(monkeypatch, tmp_path):
-    """I6. The scrub was WRITE-ONLY, so the read path republished a secret.
+# ── PROOF THAT THE GENERATORS ARE CLOSED ─────────────────────────────────────
+#
+# Four external review rounds produced 15 findings. Seven were one generator
+# (per-field REPAIR of a foreign document) and four were another (inferring
+# whether credential discovery had succeeded). Neither was closed by any of the
+# fixes, because each fix added a predicate to the mechanism that was generating
+# them. These tests assert the mechanisms are GONE, not that the known holes are
+# patched — a patched hole is evidence about one input, an absent mechanism is
+# evidence about all of them.
 
-    A row left by an older build — or by this build in an environment where the
-    credential was not discoverable — was handed verbatim to every health
-    snapshot, from there into an LLM context via the health MCP tool and into
-    `sentinel/monitor.py`'s unsanitised monitoring prompt, and was re-persisted
-    forever by the next merge. `_sanitise` is documented as THE chokepoint where
-    reader and writer agree; it bounded `detail` and did not scrub it.
+
+def test_generator_B_is_structurally_absent_no_credential_discovery():
+    """The scrub/discovery apparatus cannot fail because it no longer exists.
+
+    It needed credential NAMES, which came from the roster, which required
+    knowing whether that read had SUCCEEDED — and every way of inferring that
+    had a hole, because Genesis config loaders degrade silently by design
+    (`roster._load_yaml` swallows and returns {}; a malformed overlay returns the
+    BASE, which still carries `models.claude`). Two P1s, three rounds apart.
+
+    Deleting the only free-text field deleted the need. This test fails the
+    moment anyone reintroduces it.
     """
-    secret = "SECRETVALUE-abcdefghijklmnop"
-    monkeypatch.setenv("FOO_API_KEY", secret)
-    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": {
-        "legacy": {"available": False, "reason": "quota",
-                   "detail": f"429 rejected token {secret}"},
-    }}))
+    import inspect
 
-    assert secret not in PA.read_peer("legacy").detail, "read republished a credential"
-    assert "<redacted>" in PA.read_peer("legacy").detail
+    # Check the MECHANISM, not the prose. An earlier version of this test grepped
+    # for "redact" and failed on the module docstring that documents the
+    # deletion — a test that fires on its own explanation is a bad test.
+    for gone in ("_scrub", "_scrub_with", "_secret_names", "_secret_values",
+                 "_secret_context", "_bound_text", "_SECRET_NAME_HINTS",
+                 "_MAX_DETAIL", "_OMITTED_TEXT", "_OMITTED_UNSAFE"):
+        assert not hasattr(PA, gone), f"{gone} is back — so is the generator"
 
-    # ...and it must not survive the next merge either.
-    PA.note_failure("fresh", CCRateLimitError("429"))
-    assert secret not in PA._state_path().read_text(), "re-persisted a credential"
+    source = inspect.getsource(PA)
+    assert "os.environ" not in source, "reads the environment — the scrub is back"
+    assert "from genesis.cc import roster" not in source, "roster coupling is back"
+
+    # And no field of the record may be free text: every one is a closed set.
+    fields = {f for f in PA.PeerStatus.__dataclass_fields__}
+    assert fields == {"peer", "available", "reason", "observed_at", "reset_at", "limit_kind"}
 
 
-def test_invariant_an_unreadable_roster_fails_closed(monkeypatch, tmp_path):
-    """I6. Break the FILE, not the function.
+def test_generator_A_rejects_by_default_over_a_generated_corpus(tmp_path):
+    """Enumeration, not a spot-check: no generated document may yield a REPAIRED row.
 
-    The previous version of this test monkeypatched `roster.load_roster` to
-    RAISE — a condition the real loader cannot produce, because
-    `roster._load_yaml` swallows every read failure and returns {}. It proved the
-    `except` branch worked while the guard was dead for the cause its own
-    docstring named. The completeness signal is now keyed on the RESULT.
+    The repair layer accepted by default, so every finding was an accept that
+    should have been a reject — and each round supplied a value the last one had
+    not imagined (naive-vs-aware stamps, unbounded fractional seconds,
+    `bool("false") is True`, a truncated name merging two peers). The decoder
+    rejects by default, so the accept-set is exactly the vocabulary we emit.
     """
-    monkeypatch.setenv("GLM_PAT", "PATVALUE-abcdefghijklmnopqrstuvwxyz")
-    # What an unreadable/absent roster actually yields from the real loader.
-    monkeypatch.setattr("genesis.cc.roster.load_roster", lambda *a, **k: {})
+    good_stamp = datetime.now(UTC).isoformat()
+    hostile_values = [
+        "false", "true", 0, 1, None, [], {}, "", "  ",
+        "2026-09-04T00:00:00.123456789+00:00",   # R4: parses, normalises, ≠ input
+        "2026-09-04T00:00:00",                    # naive — we never write naive
+        "zzzz", "quota ", "QUOTA", "Quota", "session\n",
+        "x" * 5000, "\x00", "../../etc/passwd", True,
+    ]
+    rows = []
+    for v in hostile_values:
+        for field in ("available", "reason", "observed_at", "reset_at", "limit_kind"):
+            base = {"available": False, "reason": "quota", "observed_at": good_stamp,
+                    "reset_at": "", "limit_kind": "unknown"}
+            base[field] = v
+            rows.append(base)
+    doc = {"peers": {f"p{i:04d}": r for i, r in enumerate(rows)}}
+    (tmp_path / "cc_peer_availability.json").write_text(json.dumps(doc, default=str))
 
-    names, ok = PA._secret_names()
-    assert ok is False, "an empty roster must read as INCOMPLETE discovery"
+    survivors = PA.read()
+    for st in survivors.values():
+        # Anything that survived must be EXACTLY what this module emits.
+        assert isinstance(st.available, bool)
+        assert st.reason in PA._REASONS
+        assert st.limit_kind in PA._LIMIT_KINDS
+        assert st.observed_at and datetime.fromisoformat(st.observed_at).isoformat() == st.observed_at
+        assert st.reset_at == "" or datetime.fromisoformat(st.reset_at).isoformat() == st.reset_at
+        assert (st.reason == PA.QUOTA) is (st.available is False)
+        assert datetime.fromisoformat(st.observed_at).tzinfo is not None
 
-    PA.note_failure("peer-x", CCRateLimitError("401 using PATVALUE-abcdefghijklmnopqrstuvwxyz"))
-    raw = PA._state_path().read_text()
-    assert "PATVALUE-abcdefghijklmnopqrstuvwxyz" not in raw, "leaked a roster credential"
-    assert PA.read_peer("peer-x").available is False, "lost the observation itself"
+
+def test_generator_A_round_trip_everything_we_write_decodes(tmp_path):
+    """The other half: rejecting by default is only correct if OUR OWN rows pass.
+
+    Without this the strictness could silently disable the feature — read()
+    would return empty forever and every consumer would show a healthy-looking
+    nothing, which is the exact blindness the module exists to remove.
+    """
+    PA.note_failure("blocked-peer", CCRateLimitError(
+        "limit", raw_text="Claude usage limit reached · resets 4:10am (America/Los_Angeles)"))
+    PA.note_success("healthy-peer")
+
+    on_disk = json.loads(PA._state_path().read_text())["peers"]
+    assert set(on_disk) == {"blocked-peer", "healthy-peer"}
+    assert set(PA.read()) == {"blocked-peer", "healthy-peer"}, "rejected a row we wrote"
+
+    blocked = PA.read_peer("blocked-peer")
+    assert blocked.available is False and blocked.reason == PA.QUOTA
+    assert blocked.reset_at, "the parsed reset time must survive the decoder"
 
 
-def test_read_resolves_the_roster_once_not_once_per_row(tmp_path, monkeypatch):
-    """Scrubbing at the chokepoint must not reload the roster for every peer —
-    read() is on the health snapshot path."""
+@pytest.mark.parametrize("field,bad", [
+    ("available", "false"),
+    ("reason", "rate-limit"),
+    ("observed_at", "2026-09-04T00:00:00.123456789+00:00"),
+    ("reset_at", "soon"),
+    ("limit_kind", "hourly"),
+])
+def test_generator_A_mutating_any_field_drops_the_row(tmp_path, field, bad):
+    """Per-FIELD proof that the round-trip test above is not vacuous."""
+    PA.note_failure("peer-x", CCRateLimitError("429"))
+    doc = json.loads(PA._state_path().read_text())
+    assert PA.read_peer("peer-x") is not None, "precondition: the row decodes"
+
+    doc["peers"]["peer-x"][field] = bad
+    PA._state_path().write_text(json.dumps(doc))
+    assert PA.read_peer("peer-x") is None, f"a foreign {field} was repaired instead of rejected"
+
+
+def test_a_corrupt_row_does_not_take_the_others_with_it(tmp_path):
+    """Rejection is per ROW, never per document.
+
+    Discarding the whole file on one bad row would let a single corrupt entry
+    destroy every other peer's observation — trading a repair bug for a much
+    louder availability bug.
+    """
+    PA.note_failure("good-1", CCRateLimitError("429"))
+    PA.note_success("good-2")
+    doc = json.loads(PA._state_path().read_text())
+    doc["peers"]["rotten"] = {"available": "false", "reason": "???"}
+    PA._state_path().write_text(json.dumps(doc))
+
+    assert set(PA.read()) == {"good-1", "good-2"}
+
+
+@pytest.mark.parametrize("bad", ["true", "false", 1, 0, "", None, [], "yes"])
+def test_available_must_be_a_real_json_boolean(tmp_path, bad):
+    """Isolates the bool check from the coherence rule that also happens to catch
+    most bad values.
+
+    Found by mutation: replacing the strict check with `bool(available)` SURVIVED,
+    because a blocked row's `reason == "quota"` then tripped the coherence rule
+    instead. That made the bool check individually unproven. These rows are
+    coherent for whichever way truthiness resolves, so only the type check can
+    reject them — which is the point, since `bool("false") is True` and a missing
+    value fabricated a healthy observation (R4 finding).
+    """
+    stamp = datetime.now(UTC).isoformat()
     (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": {
-        f"p{i}": {"available": False, "reason": "quota", "detail": "429"}
-        for i in range(20)
+        # coherent as HEALTHY if truthiness says True, coherent as BLOCKED if False
+        "truthy": {"available": bad, "reason": "", "observed_at": stamp,
+                   "reset_at": "", "limit_kind": ""},
     }}))
-    calls = []
-    real = __import__("genesis.cc.roster", fromlist=["x"]).load_roster
-    monkeypatch.setattr("genesis.cc.roster.load_roster",
-                        lambda *a, **k: (calls.append(1), real(*a, **k))[1])
-    assert len(PA.read()) == 20
-    assert len(calls) <= 1, f"resolved the roster {len(calls)} times for 20 rows"
+    assert PA.read_peer("truthy") is None, f"accepted a non-boolean available={bad!r}"
+
+
+@pytest.mark.parametrize("bad", ["hourly", "SESSION", "weekly ", 5, None, ["session"]])
+def test_limit_kind_must_be_a_member_of_the_closed_set(tmp_path, bad):
+    """Isolates the limit_kind enum check.
+
+    The coherence rule says nothing about `limit_kind` on a blocked row, so this
+    is the only mechanism that can reject these — unlike `reason`, where
+    coherence provides a second net and masked the check under mutation.
+    """
+    stamp = datetime.now(UTC).isoformat()
+    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": {
+        "p": {"available": False, "reason": "quota", "observed_at": stamp,
+              "reset_at": "", "limit_kind": bad},
+    }}))
+    assert PA.read_peer("p") is None, f"accepted limit_kind={bad!r}"
+
+
+def test_reason_must_be_a_member_even_when_coherence_would_pass(tmp_path):
+    """Isolates the reason enum check from the coherence rule.
+
+    On an AVAILABLE row the coherence rule only requires `reason` to be falsy, so
+    a repaired-to-empty foreign value would slip through it. Only the enum check
+    rejects the row outright.
+    """
+    stamp = datetime.now(UTC).isoformat()
+    (tmp_path / "cc_peer_availability.json").write_text(json.dumps({"peers": {
+        "p": {"available": True, "reason": "rate-limit", "observed_at": stamp,
+              "reset_at": "", "limit_kind": ""},
+    }}))
+    assert PA.read_peer("p") is None, "a foreign reason was repaired instead of rejected"

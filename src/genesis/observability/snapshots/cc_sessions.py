@@ -57,6 +57,11 @@ def _peer_availability_snapshot() -> list[dict]:
 
     Advisory: nothing consumes this to route or gate. Ordered blocked-first so
     the surface that matters is not buried behind healthy peers.
+
+    Carries NO free text by construction — every field is a closed set. This
+    payload is JSON-dumped whole into an LLM context by the health MCP tool and
+    by ``sentinel/monitor.py``, so a field that could hold provider prose would
+    be a field that holds provider prose in a prompt.
     """
     try:
         from genesis.cc.peer_availability import read as read_peers
@@ -75,7 +80,6 @@ def _peer_availability_snapshot() -> list[dict]:
                 "reason": st.reason,
                 "observed_at": st.observed_at,
                 "age_seconds": age,
-                "detail": st.detail,
                 "reset_at": st.reset_at,
                 "limit_kind": st.limit_kind,
             })

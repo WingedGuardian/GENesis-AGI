@@ -39,23 +39,36 @@ equivalent).
 
 Written with the same discipline as ``fallback_state.py``: atomic replace so a
 reader never sees partial JSON, and never raises (it sits on the conversation
-failover path). No secret is stored — provider text is scrubbed BEFORE it is
-bounded, because bounding first lets a secret straddling the bound survive as an
-unmatched prefix, and the scrub fails CLOSED (prose is dropped) when the roster
-cannot be read to discover custom-named credentials.
+failover path).
 
-WHY THE SCRUB MATTERS, precisely: this file is NOT captured by backups
-(``scripts/backup.sh`` is selective and takes no blanket ``~/.genesis/*.json``).
-It is read into every health snapshot, reaches an LLM's context through the
-health MCP tool, and ``sentinel/monitor.py`` JSON-dumps the whole ``cc_sessions``
-payload — provider ``detail`` included — into a monitoring prompt with no
-sanitisation on that path. That is the exposure the scrub exists for.
+NO FREE TEXT IS EVER STORED, and that is a structural guarantee rather than a
+careful one. Every field is a closed set — a bool, one of two reason values, one
+of four limit kinds, or a timestamp that must round-trip byte-identically. There
+is no field a provider's prose could occupy, so there is nothing to scrub, no
+credentials to discover, and no way for this record to carry a secret.
 
-NOTHING IS EVER TRUNCATED. A value is stored whole or replaced by a fixed-size
-marker naming what was dropped. A truncated value still LOOKS complete, so
-nobody checks it; and truncating the peer NAME merged two peers onto one key,
-letting one peer's success clear another's recorded failure. Bounds here are
-per-FIELD and derived from what each field means (see ``_sanitise``).
+That is a DELETION, not a hardening, and it was the answer to four review rounds.
+An earlier design stored the provider's refusal text and needed ~150 lines to
+make it safe: redaction by env-var name, the roster's user-chosen ``auth_env``
+names, and a fail-closed guard for "did that roster read actually succeed?".
+Every attempt to answer that last question had a hole, because Genesis config
+loaders degrade silently BY DESIGN — so no downstream inference could be sound.
+The prose now goes to the log at the point of failure (see
+``conversation._try_roster_failover``), which is both a better home for it and
+outside the exposure path below.
+
+THE EXPOSURE PATH, for anyone tempted to add a text field back: this file is read
+into every health snapshot, reaches an LLM's context through the health MCP tool
+(``mcp/health/status.py``), and is JSON-dumped whole into
+``sentinel/monitor.py``'s monitoring prompt with no sanitisation. It is NOT
+captured by backups (``scripts/backup.sh`` is selective), but the first three are
+enough. A free-text field here is a free-text field in an LLM prompt.
+
+NOTHING IS EVER TRUNCATED OR REPAIRED. A row read from disk either matches
+exactly what this module writes or it is DROPPED (see ``_decode_row``). Repairing
+a foreign value accepts by default, and every unanticipated value is then a hole
+someone finds later; rejecting by default makes the accept-set exactly the
+vocabulary we emit.
 
 CONCURRENCY: the read-modify-write is SERIALIZED across processes by a sidecar
 flock (see ``_record_lock``). An earlier draft accepted last-writer-wins on the
@@ -69,6 +82,7 @@ bounded retry and degrades OPEN, so it cannot stall the event loop.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import json
 import logging
@@ -85,27 +99,6 @@ logger = logging.getLogger(__name__)
 
 _STATE_FILE = "cc_peer_availability.json"
 
-#: Bound on stored provider prose — the point at which a value stops being a
-#: MESSAGE and starts being a BODY. Above it the whole value is replaced by a
-#: fixed-size marker; below it the value is kept WHOLE. Never a mid-value cut.
-#:
-#: DERIVED, not invented. Measured over 60 days of a live install's server log,
-#: 183/670 (27.3%) of real refusal messages exceed the 300-char cap an earlier
-#: draft used, and 0/670 exceed this one (observed max 1057) — a bound that
-#: amputates a quarter of the real population makes the field pointless, which
-#: is the only reason the field exists. The corpus is refusal-concept prose from
-#: one install, so it bounds the SHAPE of provider text, not this exact call
-#: site's population; the headroom above the observed max is deliberate.
-_MAX_DETAIL = 2000
-
-#: Emitted INSTEAD of an oversized value. Fixed size, states what was dropped,
-#: and carries no fragment of the original: a truncated value still LOOKS
-#: complete so nobody checks it, where an explicit gap invites the question.
-_OMITTED_TEXT = "<omitted: {n} chars of provider text — too large to store>"
-
-#: Emitted instead of `detail` when credential discovery failed (see _scrub).
-_OMITTED_UNSAFE = "<omitted: credential discovery unavailable — see logs>"
-
 #: Sanity bound on a peer NAME. NOT a truncation bound — a longer name is
 #: DROPPED, never cut, because cutting two names to a shared prefix merges two
 #: peers onto one key and lets one peer's success clear another's failure.
@@ -120,20 +113,15 @@ _MAX_PEER_NAME = 512
 #: ours to interpret.
 _MAX_STATE_BYTES = 1_000_000
 
+#: An ISO8601 stamp with offset is ~32 chars. This is a REJECT bound, never a
+#: truncation: a longer value is not a stamp we wrote, so its row is dropped.
+#: It exists so a pathological value is refused before `fromisoformat` parses it.
+_MAX_STAMP = 64
+
 #: Hard cap on tracked peers. A roster holds a handful; this only bounds a
 #: pathological case (a renamed/rotating peer id) so the file cannot grow without
 #: limit — it is read whole into every health snapshot.
 _MAX_PEERS = 32
-
-#: Only environment variables whose NAME looks credential-bearing are scrubbed.
-#: Filtering by value length alone also redacts PWD / VIRTUAL_ENV /
-#: ANTHROPIC_BASE_URL, which destroys the only human-readable field in the record
-#: — a provider connection error would render as "<redacted>".
-_SECRET_NAME_HINTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
-
-#: Below this length a value is too generic to redact safely (an env var set to
-#: "1" would blank every digit in the prose while protecting nothing).
-_MIN_SECRET_LEN = 8
 
 #: The only reason recorded. A named constant so the recorder, the snapshot and
 #: any future renderer agree on the string. No dashboard template consumes it
@@ -147,7 +135,7 @@ _REASONS = frozenset({"", QUOTA})
 
 
 def _load_limit_kinds() -> frozenset[str]:
-    # Resolved ONCE at import, not per row. A deferred import inside _sanitise
+    # Resolved ONCE at import, not per row. A deferred import inside the decoder
     # made read() capable of raising ImportError, contradicting its documented
     # "Never raises" contract on the health snapshot path.
     try:
@@ -176,131 +164,10 @@ class PeerStatus:
 
     peer: str = ""
     available: bool = True
-    # "" when available. When NOT available it is QUOTA — or "" if the recorded
-    # reason came from disk and was not an interpretable value, which is stated
-    # here rather than repaired: inventing QUOTA would fabricate an observation.
-    reason: str = ""
+    reason: str = ""  # "" when available, else QUOTA
     observed_at: str = ""  # ISO8601 UTC of the observation
-    detail: str = ""  # bounded, scrubbed provider text
     reset_at: str = ""  # ISO8601 when the provider's reset time was parseable
     limit_kind: str = ""  # session / weekly / unknown, per rate_limit_reset
-
-
-def _secret_names() -> tuple[set[str], bool]:
-    """Credential-bearing env var names, and whether discovery was COMPLETE.
-
-    Name hints, PLUS every ``auth_env`` the roster itself declares. Those names
-    are user-chosen (``auth_env: GLM_PAT``) and need not contain any hint word,
-    so hint-matching alone would write a peer's own token to disk verbatim —
-    precisely the credential most likely to appear in that peer's error text.
-
-    The second element is FALSE when the roster could not be read, and it is the
-    whole point of the tuple. Falling back to hints alone is silently unsafe: it
-    looks like a scrub and is not one for exactly the custom-named credential
-    this function exists to catch.
-    """
-    names = {n for n in os.environ if any(h in n.upper() for h in _SECRET_NAME_HINTS)}
-    try:
-        from genesis.cc import roster
-
-        models = roster.load_roster().get("models")
-    except Exception:
-        logger.warning("roster import/load raised during scrub", exc_info=True)
-        return names, False
-    if not isinstance(models, dict) or not models:
-        # KEYING ON THE RESULT, NOT ON A RAISE. `roster._load_yaml` swallows every
-        # read failure and returns {}, and `merge_local_overlay` degrades the same
-        # way — so `load_roster()` never raises for the cause this guard names,
-        # and a guard keyed on "it raised" would be DEAD on arrival. The shipped
-        # `config/cc_roster.yaml` always declares at least the native model, so
-        # an empty models map means we could not read the roster, not that the
-        # user has none. Safe to treat as incomplete: no models also means no
-        # peers, so no observation is lost by dropping prose here.
-        logger.warning(
-            "roster declared no models — dropping peer detail rather than "
-            "persisting text a custom-named credential may appear in",
-        )
-        return names, False
-    for raw in models.values():
-        if isinstance(raw, dict) and raw.get("auth_env"):
-            names.add(str(raw["auth_env"]))
-    return names, True
-
-
-def _secret_values() -> tuple[list[str], bool]:
-    """Credential values worth redacting, LONGEST FIRST, + discovery completeness.
-
-    Order matters: when one secret contains another (a token and a prefix of it
-    both set in the environment), redacting the shorter first would leave the
-    longer one's tail behind as an unmatched fragment.
-    """
-    names, discovery_ok = _secret_names()
-    out = []
-    for name in names:
-        value = os.environ.get(name)
-        if value and len(value) >= _MIN_SECRET_LEN:
-            out.append(value)
-    return sorted(out, key=len, reverse=True), discovery_ok
-
-
-def _bound_text(text: str) -> str:
-    """Keep a value WHOLE, or omit it wholesale. Never a partial value.
-
-    Truncation is the absence of a decision: it cuts at a point that has nothing
-    to do with meaning, and the result still LOOKS complete, so nobody checks it.
-    Either the value is a message we can store (the overwhelming majority — see
-    ``_MAX_DETAIL``) or it is a body we should not, and saying so plainly is
-    more useful than a plausible fragment of it.
-    """
-    return text if len(text) <= _MAX_DETAIL else _OMITTED_TEXT.format(n=len(text))
-
-
-def _secret_context() -> tuple[list[str], bool]:
-    """The scrub context for ONE operation. Never raises.
-
-    Hoisted out of ``_scrub`` so a read or a merge resolves the roster ONCE
-    rather than once per row — ``read()`` runs on the health snapshot path and
-    would otherwise reload the roster for every peer it returns.
-    """
-    try:
-        return _secret_values()
-    except Exception:
-        # Fail CLOSED on the prose, never on the observation: letting this
-        # escape would be swallowed by _record and drop the whole row, losing
-        # the availability signal over a fault in an auxiliary redaction step.
-        logger.warning("credential discovery raised — dropping detail", exc_info=True)
-        return [], False
-
-
-def _scrub_with(text: str, values: list[str], discovery_ok: bool) -> str:
-    """Redact, THEN bound, against an already-resolved secret context."""
-    out = (text or "").strip()
-    if not out:
-        return ""
-    if not discovery_ok:
-        return _OMITTED_UNSAFE
-    for value in values:
-        if value in out:
-            out = out.replace(value, "<redacted>")
-    return _bound_text(out)
-
-
-def _scrub(text: str) -> str:
-    """Redact credential values, THEN bound. Fails CLOSED on unknown credentials.
-
-    Order is load-bearing and was a real defect: bounding first let a secret that
-    straddled the bound lose its tail, so it no longer matched the environment
-    value and its head was written to disk verbatim (reproduced with a 64-char
-    token at offset 290). The file reaches the health snapshot and, through the
-    health MCP tool, an LLM's context — so a partial-prefix leak is a real leak.
-
-    When credential discovery is INCOMPLETE the prose is dropped entirely. A
-    peer's own token is the credential most likely to appear in that peer's error
-    text, and its env var name is user-chosen, so a hints-only pass cannot rule
-    it out. Losing diagnostic prose is recoverable; leaking a token is not.
-    """
-    values, discovery_ok = _secret_context()
-    return _scrub_with(text, values, discovery_ok)
 
 
 def _read_raw() -> dict:
@@ -334,71 +201,101 @@ def _read_raw() -> dict:
     return peers if isinstance(peers, dict) else {}
 
 
-def _valid_stamp(value: str) -> str:
-    """An ISO8601 stamp, or "" — never a fragment of one.
+def _decode_stamp(value: object) -> str | None:
+    """The stamp we EMIT, or None to reject the row. ``""`` is a valid absent stamp.
 
-    A timestamp is a SHAPE, not a length. Half a timestamp is not a shorter
-    timestamp; it is a value every reader will fail to parse, which is why
-    ``age_seconds`` is documented to go None rather than 0 on one.
+    Round-tripping is the whole check, and it is what makes this closed-set:
+    a value is accepted only if ``fromisoformat(v).isoformat() == v``, i.e. only
+    if it is byte-identical to something this module would have written. An ISO
+    string with an arbitrarily long fractional-second component parses fine and
+    normalises to microseconds, so it fails the round trip and its row is
+    dropped — where a "validate it parses" check accepted it and returned the
+    original unbounded string straight into a health snapshot.
     """
-    try:
-        datetime.fromisoformat(value)
-    except (ValueError, TypeError):
+    if value == "":
         return ""
+    if not isinstance(value, str) or len(value) > _MAX_STAMP:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+    # The round trip alone is TZ-AGNOSTIC: a naive stamp round-trips perfectly
+    # and was accepted, though `_record` only ever writes `datetime.now(UTC)`.
+    # The snapshot then subtracts an aware `now` from it, raises TypeError, and
+    # reports `age_seconds: null` — so a blocked peer arrives in an LLM's context
+    # with no staleness at all, which is the one thing that makes this record
+    # interpretable. Rejecting is right: naive is not something we emit.
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    if parsed.isoformat() != value:
+        return None
     return value
 
 
-def _enum(value: str, allowed: frozenset[str]) -> str:
-    """A member of a closed set, or "".
+def _decode_row(peer: object, raw: object) -> tuple[str, dict] | None:
+    """STRICTLY decode one (peer, row) pair, or None to DROP the row.
 
-    A value outside the set is INVALID, not "too long". Cutting 100,000
-    characters of foreign data down to 300 characters of foreign data answers
-    the wrong question and calls the result bounded.
+    THE mechanism this module's read path is built on, and the one that replaced
+    a per-field REPAIR layer. The difference is the default, and it is the whole
+    design: repair ACCEPTS by default and every unanticipated value is a hole to
+    be found later; this REJECTS by default, so the accept-set is exactly the
+    vocabulary we emit and a value nobody thought of is dropped rather than
+    coerced into a health snapshot.
+
+    Four review rounds found seven holes in the repair layer — naive-vs-aware
+    stamps, unbounded fractional seconds, ``bool("false") is True``, a truncated
+    name merging two peers, an unbounded row count, an unbounded file, an
+    unscrubbed re-publish. Every one was an accept that should have been a
+    reject. None of them is reachable here, because nothing is repaired: a row
+    either matches what we write, exactly, or it is not a row.
+
+    Rejection is per ROW, never per document — one corrupt row must not destroy
+    every other peer's observation. The dropped row self-heals on the next write.
     """
-    return value if value in allowed else ""
-
-
-def _sanitise(peer: str, raw: dict, secrets: tuple[list[str], bool]) -> tuple[str, dict] | None:
-    """Validate a (peer, row) pair, or None to DROP it. The single chokepoint.
-
-    Each field is bounded by what it MEANS. ``reason`` and ``limit_kind`` are
-    closed enums, ``observed_at``/``reset_at`` are timestamps, and ``detail`` is
-    the only genuinely free text — so it is the only field with a length bound at
-    all, and even that one omits rather than cuts.
-
-    ``detail`` is SCRUBBED here, not only where a record is written. The scrub
-    was previously write-only, so a row left by an older build — or by this build
-    in an environment where the credential was not discoverable — was handed
-    verbatim to every health snapshot, from there into an LLM context via the
-    health MCP tool and into ``sentinel/monitor.py``'s unsanitised monitoring
-    prompt, and was re-persisted forever by the next merge. Reader and writer
-    both go through here precisely so they cannot disagree about that.
-
-    A row is DROPPED (not repaired) when its peer name exceeds the sanity bound.
-    Truncating the key is what let two distinct peers collide, so one peer's
-    success cleared another peer's recorded failure — a correctness bug
-    manufactured by the cap that was supposed to be protective. Reader and writer
-    both go through here so the two can never disagree about what is storable.
-    """
-    name = str(peer)
-    if not name:
-        logger.debug("dropping peer availability row: empty peer name")
+    if not isinstance(peer, str) or not peer or len(peer) > _MAX_PEER_NAME:
         return None
-    if len(name) > _MAX_PEER_NAME:
-        logger.debug(
-            "dropping peer availability row: name is %d chars (cap %d)",
-            len(name), _MAX_PEER_NAME,
-        )
+    if not isinstance(raw, dict):
         return None
-    row = {
-        "available": bool(raw.get("available", True)),
-        "reason": _enum(str(raw.get("reason", "")), _REASONS),
-        "observed_at": _valid_stamp(str(raw.get("observed_at", ""))),
-        "detail": _scrub_with(str(raw.get("detail", "")), *secrets),
-        "reset_at": _valid_stamp(str(raw.get("reset_at", ""))),
-        "limit_kind": _enum(str(raw.get("limit_kind", "")), _LIMIT_KINDS),
+
+    # A real JSON boolean — NOT Python truthiness. `bool(raw.get("available"))`
+    # read the string "false" as True and a missing key as an invented healthy
+    # observation, both of which are surfaced to consumers as fact.
+    available = raw.get("available")
+    if not isinstance(available, bool):
+        return None
+
+    reason = raw.get("reason", "")
+    limit_kind = raw.get("limit_kind", "")
+    if not isinstance(reason, str) or reason not in _REASONS:
+        return None
+    if not isinstance(limit_kind, str) or limit_kind not in _LIMIT_KINDS:
+        return None
+
+    observed_at = _decode_stamp(raw.get("observed_at", ""))
+    reset_at = _decode_stamp(raw.get("reset_at", ""))
+    if observed_at is None or reset_at is None:
+        return None
+    # We ALWAYS write an observation time, and a record without one is
+    # uninterpretable — the whole module turns on "how stale is this?".
+    if not observed_at:
+        return None
+
+    # Coherence, because "what we emit" includes the RELATIONSHIP between fields:
+    # an available peer carries no refusal detail, and an unavailable one always
+    # carries the one reason this module records.
+    if available and (reason or reset_at or limit_kind):
+        return None
+    if not available and reason != QUOTA:
+        return None
+
+    return peer, {
+        "available": available,
+        "reason": reason,
+        "observed_at": observed_at,
+        "reset_at": reset_at,
+        "limit_kind": limit_kind,
     }
-    return name, row
 
 
 def read() -> dict[str, PeerStatus]:
@@ -411,12 +308,8 @@ def read() -> dict[str, PeerStatus]:
     out: dict[str, PeerStatus] = {}
     dropped = 0
     try:
-        secrets = _secret_context()
         for name, raw in _read_raw().items():
-            if not isinstance(raw, dict):
-                dropped += 1
-                continue
-            pair = _sanitise(name, raw, secrets)
+            pair = _decode_row(name, raw)
             if pair is None:
                 dropped += 1
                 continue
@@ -468,6 +361,18 @@ _BALANCE_REFUSALS = (
 )
 
 
+def is_provider_refusal(exc: BaseException) -> bool:
+    """Public alias — the single place that decides what counts as evidence.
+
+    Callers need this SEPARATELY from ``note_failure``'s return value, which is
+    False for four different reasons (declined classification, lock contention,
+    a failed write, an internal fault). Treating "returned False" as "declined"
+    let a transient write failure convert a provider refusal into a recorded
+    SUCCESS — the opposite observation, standing for days.
+    """
+    return _is_provider_refusal(exc)
+
+
 def _is_provider_refusal(exc: BaseException) -> bool:
     """True only for an error the PROVIDER returned about capacity or credit.
 
@@ -503,7 +408,6 @@ def note_failure(peer: str, exc: BaseException) -> bool:
     try:
         if not peer or not _is_provider_refusal(exc):
             return False
-        detail = str(exc)
     except Exception:
         # This module promises it never raises, and it sits on the failover
         # path: a raise here escapes into the peer loop and abandons every
@@ -532,7 +436,6 @@ def note_failure(peer: str, exc: BaseException) -> bool:
         peer,
         available=False,
         reason=QUOTA,
-        detail=detail,
         reset_at=reset_at,
         limit_kind=limit_kind,
     )
@@ -552,59 +455,115 @@ def note_success(peer: str) -> bool:
 #: outlive the file it protects.
 _LOCK_FILE = "cc_peer_availability.lock"
 
-#: Lock acquisition is NON-BLOCKING with a bounded retry, never a bare LOCK_EX.
-#: This runs synchronously inside an async failover turn, so a blocking flock
-#: stalls the whole event loop — advisory bookkeeping would then delay every
-#: concurrent conversation during the outage it exists to observe, which is a
-#: worse failure than the lost row it prevents. 10 x 20ms caps the stall at
-#: ~200ms under contention, after which it degrades open exactly as documented.
-_LOCK_ATTEMPTS = 10
-_LOCK_SLEEP_S = 0.02
+#: Lock acquisition is NON-BLOCKING with a bounded retry.
+#:
+#: The budget used to be 10 x 20ms because this ran synchronously inside an async
+#: failover turn, where a blocking flock would stall the event loop. THAT
+#: CONSTRAINT IS GONE — recording now runs via ``asyncio.to_thread``
+#: (``conversation._record_peer``), so the wait costs a worker thread, not the
+#: loop. The old budget survived the move and was far too tight: acquisition is a
+#: LOTTERY, not a queue, so with 12 contending writers an unlucky one could lose
+#: all 10 draws. MEASURED at that budget: ~50% of runs lost at least one row.
+#:
+#: Still bounded rather than a blocking LOCK_EX, so a wedged holder cannot pin a
+#: worker thread indefinitely. 40 x 25ms = 1s: five times the measured need
+#: (loss appeared at a 0.2s budget) and short enough that a stuck holder cannot
+#: monopolise one of asyncio's ~10 shared default-executor workers for long.
+_LOCK_ATTEMPTS = 40
+_LOCK_SLEEP_S = 0.025
+
+#: errnos that mean "someone else holds it" as opposed to "this filesystem has no
+#: flock". The distinction decides the FAIL DIRECTION, so it is not cosmetic:
+#: contention must fail CLOSED (see below), a missing implementation may not.
+_LOCK_CONTENDED = frozenset({errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK})
 
 
 @contextlib.contextmanager
 def _record_lock():
-    """Serialize read-modify-write across processes. Never raises.
+    """Serialize the read-modify-write across processes. Never raises.
+
+    Yields True when the caller may write, False when it must not.
 
     Without it the sequence is last-writer-wins: two processes recording
     DIFFERENT peers in the same instant each read the map, each add their row,
-    and the second write drops the first. An earlier draft accepted that on the
-    grounds it was advisory and self-healing — but "self-healing" was itself a
-    claim that had to be retracted (records refresh only during a home outage),
-    so a lost record can persist for days, and losing an observation is exactly
-    the silence this module exists to remove.
+    and the second write drops the first. A lost record can stand for days
+    (records refresh only during a home-model outage), which is exactly the
+    silence this module exists to remove.
 
-    Degrades OPEN: if the lock cannot be taken (a filesystem without flock, a
-    permissions problem), the write still proceeds unserialized rather than
-    being dropped. A racy record beats no record on an advisory path.
+    THE FAIL DIRECTION IS SPLIT, and getting it wrong is what caused a measured
+    data-loss bug rather than merely risking one:
+
+    * **Contention** (someone holds the lock) fails CLOSED — yield False, write
+      nothing. An earlier version "degraded open" here and wrote unserialized,
+      which does not rescue our row; it CLOBBERS the holder's. Losing our own
+      observation and reporting False is strictly better than silently
+      destroying someone else's, and ``_record`` already promises that True
+      means the row landed.
+    * **No flock on this filesystem** degrades OPEN — yield True and write
+      unserialized. There is no lock to wait for, so refusing would disable
+      recording entirely on that platform. A racy record beats no record.
+    """
+    fh, acquired, may_write = _acquire_record_lock()
+    try:
+        yield may_write
+    finally:
+        if fh is not None and acquired:
+            with contextlib.suppress(Exception):
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        if fh is not None:
+            with contextlib.suppress(Exception):
+                fh.close()
+
+
+def _acquire_record_lock():
+    """Try to take the lock. Returns ``(fh, acquired, may_write)``. Never raises.
+
+    Split out of the context manager on purpose: with the acquisition loop inline,
+    the ``yield False`` for the contended case sat INSIDE the outer
+    ``try/except Exception``. An exception thrown in at that yield was swallowed,
+    control fell through to the second yield, and contextlib raised
+    ``RuntimeError("generator didn't stop after throw()")`` — replacing the real
+    error with a misleading one. The generator now has exactly one yield and no
+    enclosing except, so it cannot eat a caller's exception.
     """
     path = _state_path().parent / _LOCK_FILE
     fh = None
+    acquired = False
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fh = path.open("a+")
         for attempt in range(_LOCK_ATTEMPTS):
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
                 break
-            except OSError:
+            except OSError as exc:
+                if exc.errno not in _LOCK_CONTENDED:
+                    # Not contention — flock is unavailable here. Degrade open.
+                    logger.debug("flock unsupported — proceeding unserialized", exc_info=True)
+                    with contextlib.suppress(Exception):
+                        fh.close()
+                    fh = None
+                    break
                 if attempt == _LOCK_ATTEMPTS - 1:
-                    raise
+                    logger.warning(
+                        "peer availability lock held for %.1fs — not recording this "
+                        "observation rather than clobbering the holder's",
+                        _LOCK_ATTEMPTS * _LOCK_SLEEP_S,
+                    )
+                    with contextlib.suppress(Exception):
+                        fh.close()
+                    fh = None
+                    return None, False, False
                 time.sleep(_LOCK_SLEEP_S)
     except Exception:
+        # Could not even open the lock file. Same reasoning as "no flock".
         logger.debug("peer availability lock unavailable — proceeding unserialized", exc_info=True)
         if fh is not None:
             with contextlib.suppress(Exception):
                 fh.close()
             fh = None
-    try:
-        yield
-    finally:
-        if fh is not None:
-            with contextlib.suppress(Exception):
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            with contextlib.suppress(Exception):
-                fh.close()
+    return fh, acquired, True
 
 
 def _record(
@@ -612,7 +571,6 @@ def _record(
     *,
     available: bool,
     reason: str = "",
-    detail: str = "",
     reset_at: str = "",
     limit_kind: str = "",
 ) -> bool:
@@ -624,51 +582,35 @@ def _record(
             available=available,
             reason="" if available else reason,
             observed_at=datetime.now(UTC).isoformat(),
-            # NOT scrubbed here — _sanitise is the single chokepoint and scrubs
-            # on the way to disk, so reader and writer cannot diverge. This value
-            # never reaches the file unscrubbed.
-            detail="" if available else detail,
             reset_at="" if available else reset_at,
             limit_kind="" if available else limit_kind,
         )
-        # Resolve the scrub context BEFORE taking the lock. It reads the roster
-        # CONFIG, not the state file, so it does not need serializing — and doing
-        # it inside the lock lengthened the critical section by a YAML read+parse,
-        # which pushed contending writers past their bounded retry budget so they
-        # degraded OPEN and dropped a row. MEASURED: 1 of 12 concurrent recorders
-        # lost its observation until this moved out.
-        secrets = _secret_context()
-        # Merge onto a SANITISED view of what is on disk, under the lock so a
-        # concurrent recorder cannot drop this row. Writing _read_raw()
-        # straight back would (a) crash the eviction sort below on a non-dict row
-        # — permanently killing recording, because the failure is swallowed by
-        # the except clause and note_failure just returns False forever — and
-        # (b) re-persist an oversized detail written by another build, since
-        # the per-field validation otherwise applies only to the value
-        # being written now.
-        with _record_lock():
-            return _merge_and_write(peer, status, secrets)
+        # Merge onto a DECODED view of what is on disk, under the lock so a
+        # concurrent recorder cannot drop this row. Writing _read_raw() straight
+        # back would re-persist whatever another build left there — the decode is
+        # what stops a foreign row surviving a merge it never passed.
+        with _record_lock() as may_write:
+            if not may_write:
+                return False
+            return _merge_and_write(peer, status)
     except Exception:
         logger.debug("peer availability record failed for %s", peer, exc_info=True)
         return False
 
 
-def _merge_and_write(peer: str, status: PeerStatus, secrets: tuple[list[str], bool]) -> bool:
+def _merge_and_write(peer: str, status: PeerStatus) -> bool:
     """Read-modify-write the peer map. Caller holds :func:`_record_lock`.
 
-    Merges onto a SANITISED view of what is on disk. Writing ``_read_raw()``
-    straight back would re-persist a non-dict row (which older eviction logic
-    then choked on) and an oversized detail written by another build, since
-    per-field validation otherwise applies only to the value being written now.
+    Merges onto a DECODED view of what is on disk, so a row that would not pass
+    ``read()`` cannot survive by being merged forward either. Reader and writer
+    share one decoder precisely so they cannot disagree about what a row is.
     """
     peers = {}
     for k, v in _read_raw().items():
-        if not isinstance(v, dict):
-            continue
-        pair = _sanitise(k, v, secrets)
+        pair = _decode_row(k, v)
         if pair is not None:
             peers[pair[0]] = pair[1]
-    pair = _sanitise(peer, {k: v for k, v in asdict(status).items() if k != "peer"}, secrets)
+    pair = _decode_row(peer, {k: v for k, v in asdict(status).items() if k != "peer"})
     if pair is None:
         # An unstorable name is not recordable, and saying so is the honest
         # return: _record's contract is that True means the row landed.
