@@ -20,7 +20,18 @@ providers:
     type: mistral
     model: mistral-large-latest
     profile: mistral-large-3
-    free: true
+    # `free` is account-tier semantics — what THIS account pays, not the model's
+    # list price (see _detect_mislabeled_free_openrouter's docstring in
+    # routing/config.py). Flipped to false 2026-09: Mistral removed Large from
+    # free-tier entitlement (403 tier_not_allowed measured on two independent
+    # free-tier accounts 2026-08-27, confirmed by Mistral support), and paid-plan
+    # pricing is $0.5/$1.5 per MTok — so cost is tracked at real rates and
+    # never_pays chains exclude it. If an install's account tier genuinely
+    # entitles Large at $0, override free: true in the local overlay. The
+    # provider NAME keeps its historical "-free" suffix deliberately: 30
+    # call-site chains reference it, and an in-place semantic fix beats a
+    # rename churn (same reasoning as the groq-free alias below).
+    free: false
     rpm_limit: 4
     open_duration_s: 120
   mistral-small-free:

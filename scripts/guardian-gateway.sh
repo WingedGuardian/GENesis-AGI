@@ -147,6 +147,21 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
     status)
         cat "$STATE_DIR/state.json" 2>/dev/null || echo '{"current_state": "unknown"}'
         ;;
+    paused)
+        # Read-only: report whether an UNEXPIRED gateway pause is currently active,
+        # so a deploy can avoid clobbering a pause it did not create. Mirrors the
+        # guardian's own check.py::_gateway_pause_active — present + paused is the
+        # literal boolean true + expires_at in the future. Fail-safe: a missing,
+        # malformed, or expired file reads as NOT paused (single-line python, like
+        # the version verb, to avoid case-body indentation errors).
+        # Fully mirror check.py::_gateway_pause_active: paused is literal true, and
+        # now < expires_at <= now + 3600 (max_ahead — a far-future pause is IGNORED,
+        # so it never mutes monitoring; 3600 matches this gateway's own TTL cap and
+        # the guardian's default gateway_pause_max_ahead_s). A naive timestamp is
+        # coerced to UTC (as check.py does) so the compare can't raise.
+        _PAUSED_STATE=$(python3 -c "import json,datetime as dt;d=json.load(open('$STATE_DIR/paused.json'));e=d.get('expires_at');now=dt.datetime.now(dt.timezone.utc);x=(dt.datetime.fromisoformat(e.replace('Z','+00:00')) if e else None);x=(x.replace(tzinfo=dt.timezone.utc) if (x and x.tzinfo is None) else x);print('true' if (d.get('paused') is True and x is not None and now<x<=now+dt.timedelta(seconds=3600)) else 'false')" 2>/dev/null || echo false)
+        printf '{"paused": %s}\n' "$_PAUSED_STATE"
+        ;;
     reset-state)
         # Reset Guardian state to HEALTHY when stuck in confirmed_dead/recovering/recovered.
         # Safety: refuses to reset from active investigation states (healthy, confirming, surveying).

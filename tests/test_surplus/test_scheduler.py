@@ -14,10 +14,54 @@ from genesis.surplus.compute_availability import ComputeAvailability
 from genesis.surplus.executor import StubExecutor
 from genesis.surplus.idle_detector import IdleDetector
 from genesis.surplus.queue import SurplusQueue
-from genesis.surplus.scheduler import SurplusScheduler, _restart_safe_hourly
+from genesis.surplus.scheduler import (
+    SurplusScheduler,
+    _pump_surplus_heartbeat,
+    _restart_safe_hourly,
+)
 from genesis.surplus.types import ComputeTier, TaskType
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_pump_surplus_heartbeat_logs_on_failure(monkeypatch, caplog):
+    # A silently-failing heartbeat write would starve the 900s zombie watchdog while
+    # the loop runs fine (2026-09-01 incident candidate). It must LOG, not swallow.
+    import logging
+
+    import genesis.runtime as runtime_mod
+
+    class _BoomRt:
+        def record_job_success(self, name):
+            raise RuntimeError("db down")
+
+    monkeypatch.setattr(runtime_mod.GenesisRuntime, "instance", staticmethod(lambda: _BoomRt()))
+    with caplog.at_level(logging.WARNING):
+        _pump_surplus_heartbeat("loop-entry")
+
+    assert any(
+        "surplus heartbeat write failed" in r.getMessage() and "loop-entry" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_pump_surplus_heartbeat_silent_on_success(monkeypatch, caplog):
+    import logging
+
+    import genesis.runtime as runtime_mod
+
+    calls = []
+
+    class _OkRt:
+        def record_job_success(self, name):
+            calls.append(name)
+
+    monkeypatch.setattr(runtime_mod.GenesisRuntime, "instance", staticmethod(lambda: _OkRt()))
+    with caplog.at_level(logging.WARNING):
+        _pump_surplus_heartbeat("pre-dispatch")
+
+    assert calls == ["surplus_dispatch"]  # the write actually happened
+    assert not any("surplus heartbeat write failed" in r.getMessage() for r in caplog.records)
 
 
 def _make_scheduler(db, *, idle=True, lmstudio_up=False):

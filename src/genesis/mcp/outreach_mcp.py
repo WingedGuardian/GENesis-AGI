@@ -286,6 +286,62 @@ async def marketing_send(prospect_id: str, subject: str, body: str) -> str:
 
 
 @mcp.tool()
+async def marketing_prospects_list(limit: int = 100) -> str:
+    """List the ACTIVE, non-opted-out marketing prospects — the cold-outreach targets
+    the campaign may pitch — so it can enumerate → personalise a pitch → call
+    ``marketing_send(prospect_id, subject, body)``.
+
+    READ-ONLY (never sends). Returns ``id``/``email``/``name``/``company`` per row.
+    Excludes any prospect that is opted-out OR already ``contacted``/``replied``
+    (``list_active`` semantics), so a target that has been delivered a pitch never
+    reappears here — this is what stops the campaign re-pitching the same person.
+    Also returns the live ``mode`` of the ``marketing_outreach`` lever so the campaign
+    can do nothing when it is ``off``. On a fresh clone the store is empty and this
+    returns an empty list.
+
+    Args:
+        limit: max prospects to return (default 100). ``truncated`` flags a longer store.
+    """
+    from genesis.outreach.marketing_config import effective_mode
+
+    mode = effective_mode()
+    if _db is None:
+        return json.dumps({"status": "error", "reason": "no_database", "mode": mode, "prospects": []})
+    if mode == "off":
+        # Mirror marketing_send's OUTER off-switch: when the marketing lever is off the
+        # cold-send substrate surfaces NOTHING — don't hand the target inventory to a
+        # campaign session that shouldn't be running. Code-gated (not LLM-trusted to
+        # read the `mode` field), so the off posture holds even for a misbehaving caller.
+        return json.dumps({
+            "status": "ok", "mode": mode, "count": 0, "total": 0, "truncated": False,
+            "prospects": [],
+        })
+
+    from genesis.db.crud import marketing_prospects as mp
+
+    n = limit if isinstance(limit, int) and limit > 0 else 100
+    rows = await mp.list_active(_db)
+    truncated = len(rows) > n
+    prospects = [
+        {
+            "id": r["id"],
+            "email": r["email"],
+            "name": r.get("name"),
+            "company": r.get("company"),
+        }
+        for r in rows[:n]
+    ]
+    return json.dumps({
+        "status": "ok",
+        "mode": mode,
+        "count": len(prospects),
+        "total": len(rows),  # denominator for `truncated` (no silent cap)
+        "truncated": truncated,
+        "prospects": prospects,
+    })
+
+
+@mcp.tool()
 async def outreach_poll(
     channel: str,
     question: str,

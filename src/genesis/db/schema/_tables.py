@@ -502,7 +502,11 @@ TABLES = {
             rate_limited_at  TEXT,
             rate_limit_resumes_at TEXT,
             origin_class     TEXT,
-            chat_id          TEXT
+            chat_id          TEXT,
+            -- when the TOPIC was written, as distinct from
+            -- last_extracted_at, which is a pass watermark the extraction
+            -- job advances even when it writes no topic.
+            topic_updated_at TEXT
         )
     """,
     "inbox_items": """
@@ -617,21 +621,6 @@ TABLES = {
             source_subsystem    TEXT
         )
     """,
-    "predictions": """
-        CREATE TABLE IF NOT EXISTS predictions (
-            id                TEXT PRIMARY KEY,
-            action_id         TEXT NOT NULL,
-            timestamp         TEXT NOT NULL DEFAULT (datetime('now')),
-            prediction        TEXT NOT NULL,
-            confidence        REAL NOT NULL,
-            confidence_bucket TEXT NOT NULL,
-            domain            TEXT NOT NULL CHECK (domain IN ('outreach', 'triage', 'procedure', 'routing')),
-            reasoning         TEXT NOT NULL,
-            outcome           TEXT,
-            correct           INTEGER,
-            matched_at        TEXT
-        )
-    """,
     "outcome_events": """
         CREATE TABLE IF NOT EXISTS outcome_events (
             id                TEXT PRIMARY KEY,
@@ -680,19 +669,6 @@ TABLES = {
             details          TEXT,
             session_id       TEXT,
             created_at       TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """,
-    "calibration_curves": """
-        CREATE TABLE IF NOT EXISTS calibration_curves (
-            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-            domain               TEXT NOT NULL,
-            confidence_bucket    TEXT NOT NULL,
-            predicted_confidence REAL NOT NULL,
-            actual_success_rate  REAL NOT NULL,
-            sample_count         INTEGER NOT NULL,
-            correction_factor    REAL NOT NULL,
-            computed_at          TEXT NOT NULL DEFAULT (datetime('now')),
-            UNIQUE(domain, confidence_bucket)
         )
     """,
     "approval_requests": """
@@ -1867,7 +1843,30 @@ TABLES = {
             updated_a    TEXT,
             updated_b    TEXT,
             created_at   TEXT NOT NULL,
-            applied_at   TEXT
+            applied_at   TEXT,
+            -- Human review gate (PR-1): a proposed_merge is applied ONLY after a
+            -- human sets approved_at. NULL = unreviewed; the apply path filters
+            -- on approved_at IS NOT NULL so no merge is ever auto-applied.
+            approved_at  TEXT,
+            approved_by  TEXT
+        )
+    """,
+    # Reversibility journal (PR-1): a pre-delete snapshot of the loser's identity
+    # + mentions + links, written INSIDE merge_entity before the destructive
+    # DELETEs, so an applied merge can be undone (unmerge_entity — follow-up).
+    # merge_entity DELETEs the loser's mention/link rows, so without this snapshot
+    # a merge is irreversible. Retention: pruned by age in disk_hygiene.
+    "entity_merge_journal": """
+        CREATE TABLE IF NOT EXISTS entity_merge_journal (
+            id           TEXT PRIMARY KEY,
+            loser_id     TEXT NOT NULL,
+            survivor_id  TEXT NOT NULL,
+            loser_name   TEXT,
+            loser_norm   TEXT,
+            loser_type   TEXT,
+            mentions_json TEXT,
+            links_json   TEXT,
+            merged_at    TEXT NOT NULL
         )
     """,
     # Session-manager durable spine (PR-2a, migration 0058). session_id is the
@@ -1885,7 +1884,10 @@ TABLES = {
             pointers         TEXT NOT NULL DEFAULT '[]',
             compaction_count INTEGER NOT NULL DEFAULT 0,
             created_at       TEXT NOT NULL,
-            updated_at       TEXT
+            updated_at       TEXT,
+            -- when the MISSION was last set, as distinct from updated_at, which
+            -- is a ROW timestamp bumped by pointer edits and the upsert too.
+            mission_updated_at TEXT
         )
     """,
     # Data-migration framework ledger (WS-C). Kept in LOCKSTEP with migration
@@ -2411,6 +2413,11 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_entity_links_target ON entity_links(target_id)",
     # entity adjudication ledger — hot query is the propose_only→live backlog scan
     "CREATE INDEX IF NOT EXISTS idx_entity_adjud_verdict ON entity_adjudications(verdict)",
+    # Human-approved backlog scan: verdict='proposed_merge' AND approved_at IS NOT NULL.
+    "CREATE INDEX IF NOT EXISTS idx_entity_adjud_approved ON entity_adjudications(verdict, approved_at)",
+    # Merge journal: unmerge lookup by loser, and age-prune by merged_at.
+    "CREATE INDEX IF NOT EXISTS idx_entity_merge_journal_loser ON entity_merge_journal(loser_id)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_merge_journal_merged_at ON entity_merge_journal(merged_at)",
     # pending embeddings
     "CREATE INDEX IF NOT EXISTS idx_pending_embeddings_status ON pending_embeddings(status)",
     "CREATE INDEX IF NOT EXISTS idx_pending_embeddings_memory ON pending_embeddings(memory_id)",
@@ -2420,10 +2427,6 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity)",
     "CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)",
-    # calibration
-    "CREATE INDEX IF NOT EXISTS idx_predictions_domain ON predictions(domain)",
-    "CREATE INDEX IF NOT EXISTS idx_predictions_bucket ON predictions(confidence_bucket)",
-    "CREATE INDEX IF NOT EXISTS idx_predictions_unmatched ON predictions(outcome) WHERE outcome IS NULL",
     # outcome bus (self-improvement ledger)
     "CREATE INDEX IF NOT EXISTS idx_outcome_events_domain ON outcome_events(domain)",
     "CREATE INDEX IF NOT EXISTS idx_outcome_events_source ON outcome_events(source)",

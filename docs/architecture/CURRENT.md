@@ -16,6 +16,17 @@ claimed twice, or vanished; stale stamps only warn. After changing a
 subsystem's capabilities, update its entry and bump its stamp (PR-template
 checkbox).
 
+**Stamp a commit that SURVIVES THE MERGE — a default-branch commit, never your
+feature-branch HEAD.** Squash-merge discards branch commits, so a branch-head
+sha is unresolvable forever the moment the PR lands. That is not hypothetical:
+two stamps already name dead feature-branch heads, and because
+`check_subsystem_map.check_staleness` returns on the FIRST sha it cannot
+resolve, those two silently disabled the freshness check for ALL fourteen
+entries — reporting it as "shallow or incomplete git history", a cause that is
+not the cause. Stamp the `origin/main` tip you verified against.
+And bump ONLY when you re-verified: the stamp asserts "verified at this
+commit", so bumping on faith writes a false claim into permanent record.
+
 **Naming trap.** The `capability_map` DB table and `ego/capability_aggregator.py`
 are the ego's per-domain *self-confidence model* — completely unrelated to this
 document. Everything here is "subsystem map".
@@ -117,7 +128,8 @@ Easy-to-forget mechanisms:
   — first-party memory vs knowledge-base is a load-bearing distinction.
 - **Entity layer (WS-H Pillar 2)** — typed entity nodes with identity:
   `entities`/`entity_mentions`/`entity_links` tables (migration 0051),
-  `db/crud/entities.py` (recursive-CTE traversal, bi-temporal edge validity,
+  `db/crud/entities.py` (Python frontier BFS — one flat `IN`-list query per
+  depth level, NOT a recursive CTE — bi-temporal edge validity,
   EXTRACTED/INFERRED/AMBIGUOUS provenance, `merge_entity` tombstone-with-
   redirect), `memory/entity_registry.py` (string→ID resolution tiering; fuzzy
   matches queue `entity_adjudication`), `memory/entity_seed.py` (curated spine
@@ -131,7 +143,18 @@ Easy-to-forget mechanisms:
   rediscovers historical fuzzy pairs. Settings lever `entity_adjudication`
   (off/propose_only/live) + `GENESIS_ENTITY_ADJUDICATION_DISABLED`. Distinct from
   `memory/entity_resolution.py`, which is near-duplicate memory-PAIR dedup.
-  Bitemporal timestamps are canonicalized at the write gate
+  **Human-approval apply gate** (`entity_adjudication_approve`/`_apply`/`_reject`
+  MCP tools + `approved_at`): a `proposed_merge` applies only after a human
+  approves. Apply runs per-row on an owned `get_raw_db()` `BEGIN IMMEDIATE`
+  transaction — re-checks identity/direction/norm staleness inside the lock,
+  atomically claims (`proposed_merge`→`merge`) so concurrent appliers can't
+  double-merge, and marks stale *conditionally* (only while still
+  `proposed_merge`) so a losing applier can't clobber an applied merge or a human
+  `distinct`. Approval is invalidated at the write boundary when a re-adjudication
+  changes the approved direction/identity/norms (`record_verdict`), and the three
+  write tools refuse in a dispatched/unsupervised session
+  (`is_dispatched_session_env`) so no autonomous path can self-approve an
+  irreversible merge. Bitemporal timestamps are canonicalized at the write gate
   (`db/timeutil.canonical_iso`, migration 0050).
 
 **Consolidation (dream cycle)** — `memory/dream_cycle.py` (~1480 LOC):
@@ -222,6 +245,56 @@ entry: execution-cc
 modules: [cc]
 verified: 975d3944 2026-08-31
 ```
+
+- **Cross-session awareness — how concurrent CC sessions perceive each other.**
+  LIVE. Two DISTINCT stores answer two different questions, and conflating them
+  is the trap: `cc_sessions` (+ a `/proc` walk, `observability/cc_slots.
+  enumerate_cc_slots`) is what the DASHBOARD renders; `session_heartbeats` is
+  what SESSIONS tell each other. They share no source and neither substitutes
+  for the other. `session_heartbeats` has exactly ONE reader in the tree —
+  `scripts/proactive_memory_hook.py`, which prints a `[Concurrent | …]` tag into
+  each peer session's context on UserPromptSubmit — so it is an AGENT-ONLY
+  channel with no human surface. Written by that same hook and refreshed
+  (liveness only, `updated_at`, at most one write per minute per session --
+  the throttle is a stamp FILE whose contents carry the claim time; the flock
+  around it resolves the parallel-tool-call race, it is not itself the
+  throttle) from `scripts/hooks/session_observer_hook.py` on
+  PostToolUse, because `get_active_sync` hides any row older than ten minutes
+  and a heads-down session would otherwise vanish from its peers while busiest.
+  **Field-source rules, each derived from measurement, not assumption:** the
+  rendered `topic` is whichever of two sources is the more RECENT statement of
+  what the session is doing: `cc_sessions.topic` (written by
+  `memory/extraction_job.py` on a multi-hour cycle) or the charter's mission
+  (set the moment a session declares a pivot), decided by comparing
+  `cc_sessions.topic_updated_at` against `session_charters.mission_updated_at`
+  (migration 0091). BOTH columns are new, and the second one is why:
+  `last_extracted_at` is a PASS watermark the extraction job advances even on
+  passes that write no topic (219 of 899 live rows carry a watermark with no
+  topic), so using it as the topic's age would commit on that side the exact
+  defect `mission_updated_at` exists to avoid. That column exists because `updated_at` CANNOT answer it — it is a row
+  timestamp that `set_pointers` and the charter upsert also bump, so a pointer
+  edit would promote a stale founding mission. Timestamps are compared PARSED, not
+  lexically — for heterogeneous offsets and naive stamps, NOT for the
+  microsecond reason an earlier draft gave (measured: 0 disagreements over
+  200,000 same-format pairs). When the comparison is impossible — a pre-0091 row whose
+  mission age is genuinely unknown, an unparseable stamp, or no extraction to
+  compare against — the extracted summary keeps precedence, which is both the
+  safe direction and the pre-0091 behaviour, so the migration is inert until a
+  mission is next set. Then the mission regardless of age, then its newest live
+  ledger item; the raw first user message is NEVER a fallback and the peer's
+  typed prompt is never rendered at all, since another session's user text is
+  decontextualised in yours. `model` comes from the SessionStart cache with
+  `GENESIS_ROSTER_MODEL` taking precedence, NOT from `cc_sessions.model` — on a
+  live install that column is dominated by the literal string `unknown`.
+  Liveness comes ONLY from `session_heartbeats`: `cc_sessions.pid` is unset for
+  most rows and its `status`/`last_activity_at` go stale on running sessions, so
+  it must never be used to decide who is alive. **Every rendered field is
+  peer-authored, so all pass through `sanitize_detail`** — a newline in any of
+  them forges an extra `[Concurrent | …]` line in the reader's context. The
+  writers are partial by design (each knows a different subset), so the upsert
+  COALESCEs content columns; a writer distinguishes "read fine, nothing to
+  report" (empty string — CLEARS) from "could not read" (None — PRESERVES), and
+  collapsing those two is what makes a finished topic immortal.
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
   (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A restricted
@@ -432,7 +505,7 @@ gated — that contract is one-directional.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 84c7259d 2026-08-31
+verified: 5808e7cd 2026-09-03
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -493,10 +566,35 @@ verified: 84c7259d 2026-08-31
   MUST be a curated, non-opted-out `marketing_prospects` row (authorization is
   DECOUPLED from send-lifecycle status, so a `contacted` follow-up still sends) —
   an unknown / opted-out recipient trips (`recipient_not_curated` / `opted_out`)
-  → demote + hold (fail-closed). PR2 will wire graduation, send-time contact
-  stamping, AND a hard per-window cap on hold-creation (the ASK-state
-  approval-flood guard) alongside the batch-approval card — `marketing_send` has
-  no autonomous caller until then.
+  → demote + hold (fail-closed). Graduation for the BULK cell rides the generic
+  capability-promotion path (`capability_grants.detect_promotable_cells` — no
+  risk-class filter → `email:send:bulk` qualifies once it has ≥5 owner-approved
+  successes + posterior ≥0.70). **Contact-stamping (loop-fix):** on a CONFIRMED
+  delivery a matching prospect is advanced active → `contacted` via one
+  active-guarded CRUD (`marketing_prospects.mark_contacted_by_email`) called from
+  BOTH delivery paths — the email-gate drain (`email_gate_watcher`) for a HELD →
+  owner-approved send, AND `pipeline._deliver` for a GRANTED-cell autonomous send
+  (which delivers inline and never touches the drain, so the fix survives
+  graduation). Keyed on the RECIPIENT being a curated prospect, NOT `cell_risk_class`
+  (a FINANCIAL-misclassified pitch is still stamped); a send that never delivers
+  (dropped/expired/rejected) leaves the prospect `active`, re-eligible. Without this,
+  `mark_contacted` had no caller and `list_active` re-returned a delivered prospect
+  every tick. **DEFERRED (hot follow-up, before arming at volume):** an atomic
+  per-prospect in-flight dedup + a per-window approval-flood cap + the batch-approval
+  card — `marketing_send` has no autonomous caller until the campaign is armed.
+- **Marketing reply → owner Telegram ping (notify-only).** When a GENUINE human
+  reply lands (auto-responders + foreign senders already gated out by the
+  reply→engagement bridge, `outreach/engagement.py`) AND the reply's recipient is
+  a curated `marketing_prospects` row (`get_by_email` — NOT the thread
+  `signal_type`, which the owner-approval resume path overwrites to
+  `email_gate_resume`, so it never survives a held→approved cold send), the owner
+  gets ONE brief `submit_raw` Telegram ping (`make_marketing_reply_notifier`,
+  wired in `runtime/init/outreach.py`). Owner-facing, so never gated; best-effort
+  (a non-DELIVERED ping is logged, not retried — the reply is already durably
+  recorded in `outreach_history`/`email_threads`). Attacker-controlled reply
+  fields are HTML-escaped + control-char-stripped (`_sanitize_ping_field`) because
+  the outreach telegram path delivers with `parse_mode="HTML"` unescaped. The
+  autonomous `ReplyHandler` auto-reply path is unchanged by this.
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
   PII scan for EXTERNAL channels and `content`-category drafts only. Never
   applied to owner channels — don't add them.
@@ -949,7 +1047,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 3de52202 2026-09-02
+verified: 29a382e7 2026-09-03
 ```
 
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
@@ -1076,6 +1174,21 @@ verified: 3de52202 2026-09-02
   `job.failed` is in the ego's `_REFLEX_OWNED_EVENT_TYPES` so it never spins a
   reactive ego cycle. Ingested by the reflex arc as of PR-2b (`ingest.py`
   consumes `job.failed`, guarded on `error_type` presence).
+- **A resumed reflection runs against a DIFFERENT tick than the one that asked.**
+  When a user approves a reflection's gated CC fallback, `_resume_approved_reflections`
+  dispatches it with `self._last_tick_result` — the CURRENT tick — because the
+  loop's own scoring may never reach that depth again. So what a person approved
+  and what runs are about different moments — and per that method's docstring
+  the reason is availability, not a preference for fresher state: the current
+  tick is the only one it has. The ORIGINATING tick is genuinely unrecoverable: the approval context is
+  built from a fixed key set with no tick field, and `_approval_key` excludes
+  per-invocation identity on purpose so recurring dispatches reuse one pending
+  row rather than minting a new approval every tick. The resume log therefore
+  names the approval, its age, and the tick being run against, and says outright
+  that this is not the requesting tick — rather than implying a lineage that
+  does not exist. Giving it one would mean a key-neutral carrier that does not
+  currently exist; do not smuggle a tick id into `action_label` or
+  `extra_context`, both of which feed the approval key.
 - **perception/**: the real-time reflection engine — MICRO (and LIGHT without
   a CC bridge) run in-process via the router; DEEP/STRATEGIC go to the CC
   reflection bridge. GROUNDWORK: user-model-synthesis, pre-execution-gate
@@ -1335,12 +1448,16 @@ verified: 50b79ffb 2026-09-01
   Tier taxonomy is load-bearing: Tier-1 ground truth outranks user approval.
   `record_outcome` must never raise. Deliberately "observation, not
   reinforcement" — don't rename toward RL.
-- **calibration/**: Bayesian prediction-calibration primitives, currently
-  wired via outreach (engagement reconciliation). **Four distinct
-  "calibration" surfaces exist** (this package, `learning/triage/calibration`,
-  `feedback/calibration` ego-ECE, `eval/calibration` golden-set loader) —
-  don't conflate. Slated for WS-2 sunset (P5) once the ledger's unified
-  calibration table bakes.
+- **calibration/**: the pure ECE/MCE + confidence-bucket primitives
+  (`metrics.py`, `types.py`), consumed by the WS-2 ledger (`ledger/cells.py`) and
+  the ego-ECE path (`feedback/calibration.py`). **Four distinct "calibration"
+  surfaces exist** (this package, `learning/triage/calibration`,
+  `feedback/calibration` ego-ECE, `eval/calibration` golden-set loader) — don't
+  conflate. **WS-2 P5 sunset DONE (migration 0090):** the legacy per-domain
+  curve/reconcile loop (`curves.py`/`logger.py`/`reconciler.py`, the
+  `calibration_curves` table, and the proto-ledger `predictions` table — archived
+  to `predictions_legacy_ws2`) is retired; `calibration_cells` (P3) is the live
+  calibration surface.
 - **ledger/** (WS-2 P1a+P1b+P2+P3): the cognitive ledger — falsifiable predictions
   in `ledger_predictions` (migration 0064), written only through the
   validating CRUD (`db/crud/ledger_predictions.py`) against the code registry
@@ -1427,7 +1544,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: 409338c9 2026-08-07
+verified: b8232425 2026-09-02
 ```
 
 - **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
@@ -1435,10 +1552,87 @@ verified: 409338c9 2026-08-07
   free-only. Per-provider circuit breaker (3 failures, exponential backoff
   capped 30 min — 4h for QUOTA_EXHAUSTED; 429 = backpressure, NOT a breaker
   failure; state persisted cross-process to
-  `~/.genesis/circuit_breaker_state.json`). Degradation levels are
+  `~/.genesis/circuit_breaker_state.json`). **Probe/call evidence symmetry** —
+  a probe may only undo what a probe did: `probe_suspect()` downgrades CLOSED to
+  HALF_OPEN on a failed probe and a clean probe may clear THAT, but a breaker
+  opened by a real call failure (`_opened_by_call`) is closed only by a real
+  `record_success`. A models-listing 200 evidences *reachable*, never *working* —
+  it is what a 403-on-use, an exhausted quota or a truncated completion looks
+  like from outside. The probe heal deliberately does NOT fire `on_recovery`
+  (which resolves the `provider_failure` observation and clears `first_trip_at`),
+  so a listing can no longer erase an outage clock. This does not hold a provider
+  out of rotation: OPEN auto-transitions to HALF_OPEN on backoff, HALF_OPEN is
+  `is_available()`, so the next real call IS the retry. Supersedes PR #705. Consequence to know before touching it: the heal
+  branch also zeroes `_trip_count`, so refusing it leaves the backoff climbing
+  to the cap instead of resetting — a dead provider is retried less often, and a
+  quota-dead one may wait the full 4h. `last_failure_category` is restored from
+  disk for any NON-CLOSED saved state (OPEN or HALF_OPEN — see below) and never
+  for CLOSED — a qualifier must not outlive the state it qualifies, or it
+  poisons the heal guard for a healthy provider. The
+  same rule governs `_opened_by_call`, with one asymmetry that decides the
+  first cycle after any upgrade: a file written before the field existed has NO
+  key, and a saved-OPEN row with no recorded origin defaults to **call**-opened,
+  because legacy `probe_suspect()` produced HALF_OPEN and never OPEN — so a
+  probe cannot have been the cause. Reading that absence as "probe" would hand
+  the first post-upgrade probe a breaker real calls had opened. A keyless
+  saved-HALF_OPEN row defaults the other way, to **probe**: that state is
+  reachable both by `probe_suspect()` and by a call trip whose window elapsed,
+  so its origin is genuinely ambiguous and assuming "call" would strand a
+  provider that never failed a real call.
+  **BOTH non-closed states restore, and that scope is what makes the guarantee
+  outlive a deploy.** Restoring only OPEN silently expired it at the next
+  restart: `.state` assigns HALF_OPEN when merely READ (it mutates and does not
+  notify), and `save_state` serialises EVERY breaker's raw `_state`, so any
+  other breaker's change persists a call-tripped one as `half_open` — which
+  then restored CLOSED, i.e. a dead provider reading healthy and probe-healable
+  again, the original defect returning on every merge-restart. The failure
+  category restores under the same widened condition, because it qualifies any
+  breaker that is not closed; blanking it for HALF_OPEN stripped the reason from
+  `observability/snapshots/api_keys.py` and `dashboard/routes/vitals.py`. The ONLY
+  external mutator of breaker state is the dashboard toggle
+  (`dashboard/routes/providers.py`), and it goes through `force_open()` /
+  `force_close()` rather than assigning private fields, so the origin flag
+  cannot drift out of step with the state. Both are COMPLETE transitions --
+  they notify (which is what the registry wires to `save_state`) and clear the
+  qualifiers they invalidate. They are complete with respect to
+  BREAKER FIELDS only — neither fires `on_recovery`, so an operator re-enable
+  deliberately leaves the `provider_failure` observation open. A guard test in
+  `tests/test_routing/test_circuit_breaker.py` parses the tree for assignment to
+  breaker private state on a non-`self` receiver; it cannot see `__dict__` or
+  `object.__setattr__` writes. KNOWN LIMIT:
+  `_opened_by_call` is two-valued while the question now has three answers
+  (call / probe / operator), so the dashboard mislabels an operator disable. Degradation levels are
   hand-curated: L2 sheds nice-to-haves; **L3 keeps ONLY micro-reflection,
   embeddings, tagging** — changing those sets changes what survives an outage.
   Some call sites alias another site's chain — don't assume 1:1.
+- **routing/escalation.py**: breaker trips → a high-priority `provider_failure`
+  observation at 5 trips (~10 min), carrying `first_trip_at` — the only
+  per-provider "failing since" timestamp. Once the outage passes
+  `_NOTIFY_AFTER_S` (1h) it ALSO writes a `priority="critical"` observation on a
+  separate `provider_dead_notify:<name>` content hash, which the existing
+  fire-once path (`outreach/scheduler.py::_critical_observations_job` +
+  `mark_surfaced`) turns into exactly ONE Telegram. The age is read off the
+  unresolved observation, not in-memory state, so it survives a restart; the
+  EARLIEST unresolved row wins, because a duplicate would otherwise reset the
+  outage clock. **The hour check is CLOCK-driven, not trip-driven**: the
+  awareness tick (5 min) calls `sweep_due_notifications`, which reads the
+  durable rows and holds no in-memory state — the trip-driven version starved
+  when traffic stopped and its per-process flags produced four review defects.
+  Lever: `provider_outage_notify` domain (off/propose_only/live) +
+  `GENESIS_PROVIDER_NOTIFY_DISABLED`; off resolves open notify rows (so off→on
+  re-notifies a still-dead provider, deliberately). Recovery resolves BOTH
+  hashes — **notify hash FIRST**: the two
+  are separately committed (this connection has no transactions), so a failure
+  between them must leave the VISIBLE row open (a provider shown as failing when
+  it is not, which the next recovery clears) rather than the SILENT one (an open
+  notify row makes `skip_if_duplicate` suppress this provider's notifications
+  until some later recovery happens to succeed). Do not raise the 10-minute
+  observation to critical instead — it would page on every transient blip.
+  ONE KNOWN GAP remains documented in-code, not fixed: the row is stamped at
+  the 5th trip rather than the first (duration short by the ramp) — its fix
+  needs the `first_trip_at` anchor bounded first; see the follow-up. The
+  restart-gate gap that used to sit beside it is GONE by construction: the
+  sweep consults no in-memory flag, so a restart changes nothing.
 - **providers/**: the `ToolProvider` registry for NON-LLM tools (search,
   embeddings, STT/TTS, crawl, probes). Adapters register GATED ON ENV KEYS —
   silent non-registration is by design (absence ≠ bug). LLM breaker/health
@@ -1556,7 +1750,11 @@ verified: 3de52202 2026-09-02
   sentinel's own `last_probe_at` and fail toward their safe default.
 - **observability/**: event bus dispatches inline AND logs every event;
   persist-queue overflow drops events but emits a rate-limited "dropped"
-  meta-event (WS-17). Two health layers (async probes vs systemd shell-out);
+  meta-event (WS-17). Two health layers (async probes vs systemd shell-out) — a
+  probe may HEAL only a breaker that a PROBE downgraded (`probe_suspect`);
+  one opened by a real call failure needs a real success, whatever the failure
+  category (a models-listing 200 is exactly what a 403-on-use looks like, and a
+  false heal resets the outage clock — measured live twice);
   `/health` is a dashboard route, not an MCP tool; `job_health` state machine
   is runtime-owned. `snapshots/deploy_health.py` = merged-vs-deployed drift
   (never does network I/O; host guardian state comes from

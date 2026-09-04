@@ -485,7 +485,7 @@ async def test_telemetry_row_recorded(tmp_path, sessions_root, shadow_mode, db_p
 # suite fully green. A mode gate that nothing holds is not a gate.
 
 M90 = importlib.import_module(
-    "genesis.db.migrations.0090_session_ledger_ambient_extractor"
+    "genesis.db.migrations.0095_session_ledger_ambient_extractor"
 )
 
 
