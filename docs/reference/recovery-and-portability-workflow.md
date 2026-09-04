@@ -49,14 +49,18 @@ gets its own branch like any other change:
    fragment-validation CI job recognises the pairing — a fragment may only
    disappear in a change whose `CHANGELOG.md` diff actually contains its entry.
 
-   **Merge this last, and re-run step 2 first if anything else landed while it
-   was open.** Other PRs keep merging while the release PR sits in review, and
+   **Merge this last, and if anything else landed while it was open: merge the
+   latest `main` into the release branch FIRST, then re-run step 2.** The order
+   matters — re-running the assembler on a stale release branch reassembles the
+   same old tree, because the newly merged fragment only exists on `main`, and
+   its arrival there does not conflict with this branch's deletions, so nothing
+   forces the sync. Other PRs keep merging while the release PR sits in review;
    git carries their fragments forward without touching the version section you
    already generated. Nothing is lost — those fragments survive and appear in
    the *next* release — but they are filed under the wrong version, and neither
    CI nor the assembler can see it, because the fragment still exists and still
-   validates. Re-running the assembler immediately before merging is what makes
-   the section match the tag.
+   validates. Sync, reassemble, then merge is what makes the section match the
+   tag.
 5. **Tag** `vX.Y` on `main` once that PR has merged.
 6. **Publish** the GitHub Release from the matching `CHANGELOG.md` section.
 

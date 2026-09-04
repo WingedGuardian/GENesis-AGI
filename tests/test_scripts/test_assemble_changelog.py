@@ -481,7 +481,9 @@ def test_a_directory_named_readme_md_cannot_hide_fragments(tmp_path: Path) -> No
 # ── --base: a fragment must not vanish outside the release fold ──────────────
 
 
-def _repo_with_a_committed_fragment(tmp_path: Path) -> tuple[Path, str]:
+def _repo_with_a_committed_fragment(
+    tmp_path: Path, body: str = "- **Kept.** x"
+) -> tuple[Path, str]:
     """A real git repo holding one fragment and a CHANGELOG, plus its base SHA.
 
     Built with plumbing rather than a porcelain commit so it depends on neither
@@ -507,7 +509,7 @@ def _repo_with_a_committed_fragment(tmp_path: Path) -> tuple[Path, str]:
 
     git("init", "--quiet", "-b", "trunk")
     (repo / "CHANGELOG.md").write_text(CHANGELOG_SKELETON)
-    (repo / "changelog.d" / "20260904210000-fixed-kept.md").write_text("- **Kept.** x\n")
+    (repo / "changelog.d" / "20260904210000-fixed-kept.md").write_text(body + "\n")
     git("add", "-A")
     base = git("commit-tree", git("write-tree"), "-m", "base")
     git("update-ref", "refs/heads/trunk", base)
@@ -878,3 +880,92 @@ def test_fragments_are_read_as_utf8_regardless_of_the_ambient_locale(
         f"reading depended on the ambient locale: {proc.stderr[-400:]}"
     )
     assert proc.returncode == 0, proc.stderr[-400:]
+# ── the fold claim requires the WHOLE entry, as exact lines ──────────────────
+
+
+def test_a_partial_fold_that_drops_continuation_lines_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """First-line-only was satisfiable by a fold that lost the paragraphs.
+
+    The deleted fragment's ENTIRE nonblank body must arrive in the changelog
+    diff, line for line — a fold that carried the headline and dropped the
+    continuation is a partial loss the old check certified as complete.
+    """
+    repo, base = _repo_with_a_committed_fragment(
+        tmp_path, body="- **Kept.** headline\n\n  A continuation paragraph."
+    )
+    _patch_module_to(repo, monkeypatch)
+    (repo / "changelog.d" / "20260904210000-fixed-kept.md").unlink()
+    (repo / "CHANGELOG.md").write_text(
+        CHANGELOG_SKELETON.replace("### Fixed\n", "### Fixed\n\n- **Kept.** headline\n")
+    )
+    assert ac.main(["--check", "--base", base]) == 2
+
+
+def test_a_substring_coincidence_does_not_count_as_a_fold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Matching inside a glued blob let `- fix` be "preserved" by any added
+    line that happened to contain that text. Lines must match as LINES."""
+    repo, base = _repo_with_a_committed_fragment(tmp_path, body="- fix")
+    _patch_module_to(repo, monkeypatch)
+    (repo / "changelog.d" / "20260904210000-fixed-kept.md").unlink()
+    (repo / "CHANGELOG.md").write_text(
+        CHANGELOG_SKELETON.replace(
+            "### Fixed\n", "### Fixed\n\n- fixed something unrelated\n"
+        )
+    )
+    assert ac.main(["--check", "--base", base]) == 2
+
+
+def test_a_complete_fold_of_a_multiline_fragment_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = "- **Kept.** headline\n\n  A continuation paragraph."
+    repo, base = _repo_with_a_committed_fragment(tmp_path, body=body)
+    _patch_module_to(repo, monkeypatch)
+    (repo / "changelog.d" / "20260904210000-fixed-kept.md").unlink()
+    (repo / "CHANGELOG.md").write_text(
+        CHANGELOG_SKELETON.replace(
+            "### Fixed\n",
+            "### Fixed\n\n- **Kept.** headline\n\n  A continuation paragraph.\n",
+        )
+    )
+    assert ac.main(["--check", "--base", base]) == 0
+
+
+# ── an interrupt mid-cleanup restores everything and stays an interrupt ──────
+
+
+def test_ctrl_c_mid_cleanup_restores_everything_and_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catching only OSError left Ctrl-C with the worst of both: changelog
+    rewritten, some fragments surviving, and the documented re-run then folds
+    the survivors a second time. The interrupt must roll back like any other
+    failure — and still terminate the process as an interrupt, not as success.
+    """
+    d = tmp_path / "changelog.d"
+    for i, slug in enumerate(("one", "two", "three")):
+        _fragment(d, f"2026090421000{i}-fixed-{slug}.md", body=f"- **{slug}.** body")
+    cl = tmp_path / "CHANGELOG.md"
+    cl.write_text(CHANGELOG_SKELETON)
+    monkeypatch.setattr(ac, "FRAGMENT_DIR", d)
+    monkeypatch.setattr(ac, "CHANGELOG", cl)
+
+    before = {p.name for p in d.iterdir()}
+    real_unlink = Path.unlink
+    calls = {"n": 0}
+
+    def interrupt_on_second(self, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise KeyboardInterrupt
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", interrupt_on_second)
+    with pytest.raises(KeyboardInterrupt):
+        ac.main([])
+    assert {p.name for p in d.iterdir()} == before
+    assert cl.read_text() == CHANGELOG_SKELETON

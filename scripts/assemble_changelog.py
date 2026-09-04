@@ -348,14 +348,20 @@ def _check_no_fragment_lost(base: str) -> None:
         check=False,
         cwd=REPO_ROOT,
     )
-    added = (
-        "\n".join(
-            ln[1:]
+    # Exact LINES the diff added, not one glued string. A substring test over a
+    # glued blob is satisfiable by accident — a short entry like "- fix" occurs
+    # inside unrelated added text — and checking only the FIRST line lets a
+    # partial manual fold that dropped the continuation paragraphs pass. The
+    # fold claim is only proven when EVERY nonblank line of the deleted
+    # fragment arrived, as lines.
+    added_lines = (
+        {
+            ln[1:].rstrip()
             for ln in diffed.stdout.splitlines()
             if ln.startswith("+") and not ln.startswith("+++")
-        )
+        }
         if diffed.returncode == 0
-        else ""
+        else set()
     )
     still_lost: list[str] = []
     for name in lost:
@@ -366,10 +372,14 @@ def _check_no_fragment_lost(base: str) -> None:
             check=False,
             cwd=REPO_ROOT,
         )
-        first = next((ln for ln in blob.stdout.splitlines() if ln.strip()), "")
+        body_lines = [ln.rstrip() for ln in blob.stdout.splitlines() if ln.strip()]
         # Fail CLOSED on an unreadable blob: not being able to tell is not the
         # same as being satisfied.
-        if blob.returncode != 0 or not first or first not in added:
+        if (
+            blob.returncode != 0
+            or not body_lines
+            or any(ln not in added_lines for ln in body_lines)
+        ):
             still_lost.append(name)
     if not still_lost:
         return  # every dropped fragment's entry is now IN the changelog
@@ -485,24 +495,38 @@ def main(argv: list[str] | None = None) -> int:
     removed: list[tuple[Path, str]] = []
     try:
         for _ts, _category, path in fragments:
-            text = path.read_text(encoding="utf-8")
+            # Capture BEFORE unlink, so there is no instant at which a file is
+            # gone but unrecorded. The rollback rewriting a file that was never
+            # actually unlinked is harmless — same content, idempotent.
+            removed.append((path, path.read_text(encoding="utf-8")))
             path.unlink()
-            removed.append((path, text))
-    except OSError as exc:
+    except BaseException as exc:
         # Put back everything already destroyed, not just the changelog. Rolling
         # back only CHANGELOG.md would leave the fragments deleted BEFORE the
         # failure in neither place — the exact silent loss this directory exists
         # to prevent, reintroduced by its own recovery path, and the message
         # would then send the operator to re-run and ship without them.
+        #
+        # BaseException on purpose: Ctrl-C lands here too, and an interrupted
+        # fold left half-done invites the re-run that duplicates entries. This
+        # cannot cover SIGKILL or a power cut — no in-process handler can — and
+        # the durable recovery for THOSE is git itself: fragments and
+        # CHANGELOG.md are tracked, so `git status` shows the half-done state
+        # and `git restore` returns to the pre-fold tree. That, not a staging
+        # scheme, is the recovery of record; building a second one beside git
+        # would be a store nobody reconciles.
         for done, text in removed:
             done.write_text(text, encoding="utf-8")
         CHANGELOG.write_text(original, encoding="utf-8")
         print(
-            f"changelog.d: could not remove {path.name} ({exc}); every fragment "
-            "and CHANGELOG.md have been restored, so nothing was lost and a "
-            "rerun after fixing the permissions is correct.",
+            f"changelog.d: interrupted while removing fragments ({exc!r}); every "
+            "fragment and CHANGELOG.md have been restored, so nothing was lost "
+            "and a rerun is correct. (After a hard kill, recover with git: the "
+            "fragments and CHANGELOG.md are tracked files.)",
             file=sys.stderr,
         )
+        if not isinstance(exc, OSError):
+            raise  # Ctrl-C etc. must still terminate as what they are
         return 2
     print(
         f"changelog.d: folded {len(fragments)} fragment(s) into CHANGELOG.md "
