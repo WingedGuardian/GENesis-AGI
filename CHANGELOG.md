@@ -34,7 +34,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   asked to make. Rebuilding is deliberately a
   decision you make rather than one the launcher makes for you: only the person
   looking at the slot can know whether the shell sitting in it is idle or is
-  halfway through something that matters.
+  halfway through something that matters. Everything the rebuild depends on is
+  re-checked at the moment it acts rather than when it asked — including
+  whether the machine can still afford another Claude Code process, which can
+  change while you are deciding. And a slot that disappears while the door is
+  preparing is no longer quietly re-created: that path would skip the checks a
+  normal connection performs, so the door says so and asks you to reconnect.
 - **Launching Claude Code by hand inside a slot no longer produces a degraded
   session.** The `claude` shell wrapper only did its work outside tmux, so running
   `claude` from a slot's prompt skipped the permission mode, the temp directories

@@ -315,10 +315,21 @@ verified: 1aedb682 2026-09-03
   relaunching with stale values. The respawn's exit status IS the delivery
   check, and a failure is reported rather than claimed.
 
-  What still guards the action is non-inferential and stays: the pane is
-  re-read under a per-slot flock and must be the one that was probed, and a
-  second liveness probe must still say POISONED — so a slot that came alive
-  while the door was preparing is never rebuilt. Every one of these gates is
+  What still guards the action is non-inferential, and it is ENUMERATED rather
+  than accumulated — five review rounds each found a different input that was
+  read before the operator's pause and used after it, so the set the action
+  depends on is written down in `cc-slot.sh` and every member is re-derived in
+  the final gate: (1) the pane exists and is the one probed, (2) no claude is
+  running in it, (3) it still runs what the operator was SHOWN, (4) the session
+  still exists — `-A` CREATES when it does not, and a create reached that way
+  traverses none of the create gates, which pre-dates this feature and is
+  guarded for the plain attach path too, (5) the box can still afford another
+  claude, re-asked with a freshly recounted session population, (6) the pane
+  environment is set, (7) the per-slot lock is held. Immune by construction and
+  listed so the set is complete rather than convenient: the OAuth token is read
+  at pane-exec time so it cannot go stale, and PATH/TMPDIR/permission mode/LANG
+  come from the door's own environment. An eighth member would mean the
+  enumeration was wrong and the mechanism, not the instance, needs changing. Every one of these gates is
   mutation-verified: breaking it turns a named test RED, with a no-op control
   proving the harness itself can pass. Accepted and stated: the respawn
   destroys the pane's VISIBLE screen (scrollback survives), and a heal is

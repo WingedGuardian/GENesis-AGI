@@ -686,6 +686,28 @@ done
 # `2>/dev/null` on the exec line would silence this script's stderr for the
 # REST OF THE RUN. Probe writability with an ordinary command first (safe to
 # silence), and exec only once it is known to succeed.
+# ── WHAT THE DESTRUCTIVE ACTION DEPENDS ON ─────────────────────────────────
+# `respawn-pane -k` kills a process group, and the operator's answer sits an
+# unbounded time before it. Five review rounds each found a DIFFERENT input
+# that was read before that pause and used after it. Patching them one at a
+# time is what produced those five rounds, so the set is ENUMERATED here and
+# every member is re-derived in the final gate:
+#
+#   1. the pane exists and is the one that was probed   _revalidate_heal
+#   2. no claude is running in it                       _revalidate_heal
+#   3. it still runs what the operator was SHOWN        _disclosed_cmd compare
+#   4. the session still exists                         checked before the exec
+#   5. the box can afford another claude                _capacity_permits
+#   6. the pane environment is set                      set-environment, guarded
+#   7. the per-slot lock is held                        _acquire_heal_lock
+#
+# Immune BY CONSTRUCTION, listed so this is a complete set rather than a
+# convenient one: the OAuth token is read at pane-exec time by `_OAUTH_SRC`, so
+# it cannot go stale across the pause; PATH, TMPDIR, the permission mode and
+# LANG come from this process's own environment and do not vary with time.
+#
+# If a review finds an eighth, this enumeration was wrong and the mechanism —
+# not the instance — is what needs to change.
 _acquire_heal_lock() {
     _lock="${HOME}/.genesis/cc-slot-heal-${SLOT}.lock"
     _LOCK_HELD=0
@@ -708,6 +730,62 @@ _acquire_heal_lock() {
 # verdict taken BEFORE the prompt and acted on AFTER it is the same
 # decision-time/action-time defect this door has already shipped twice; moving
 # the decision to a human does not retire that defect, it lengthens its window.
+# Capacity, as a FRESH verdict on every call. The session count is recounted
+# here rather than reused from door entry: a count taken once and judged later
+# is the same stale-input defect as every other member of the list above.
+# Sets _cap_action / _cap_msg / _cap_reason; an empty action means no verdict.
+_capacity_verdict() {
+    local live n out
+    _cap_action=""; _cap_msg=""; _cap_reason=""
+    [ -x "${GENESIS_ROOT}/.venv/bin/python" ] || return 0
+    live=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+           | grep -cE "^${SESSION_PREFIX}-[0-9]+$" || true)
+    # A rebuild is create-like for MEMORY, and a create's count excludes the
+    # session about to exist — so ask about one fewer. Clamped: a negative
+    # reaches the gate as a nonsense population (caught by an earlier round).
+    n=$(( live > 0 ? live - 1 : 0 ))
+    out=$(timeout 15 "${GENESIS_ROOT}/.venv/bin/python" \
+        -m genesis.cc.session_cap --existing "$n" 2>/dev/null || true)
+    _cap_action=$(printf '%s\n' "$out" | sed -n '1p')
+    _cap_msg=$(printf '%s\n' "$out" | sed -n '2p')
+    _cap_reason=$(printf '%s\n' "$out" | sed -n '3p')
+}
+
+# True when the box can take another claude. Explains itself on a refusal.
+# Called TWICE by design — once before the prompt so RECLAIM can be disclosed,
+# and again in the final gate so the verdict acted on is the freshest taken.
+_capacity_permits() {
+    _capacity_verdict
+    case "$_cap_action" in
+        ALLOW) return 0 ;;
+        RECLAIM)
+            # RECLAIM covers a full box (tradeable) and the OOM floor (not).
+            # Below the floor, starting a process risks an OOM that takes every
+            # session with it, so it is refused rather than offered — the same
+            # place the create path refuses when there is nothing to trade.
+            if [ "$_cap_reason" = "oom_floor" ]; then
+                echo "cc-slot: ${SESSION_NAME} has no claude running, but ${_cap_msg}" >&2
+                echo "cc-slot: attaching to the slot's shell instead — free memory and reconnect to rebuild." >&2
+                return 1
+            fi
+            return 0
+            ;;
+        DENY)
+            echo "cc-slot: ${SESSION_NAME} has no claude running, but the capacity gate declined to start one: ${_cap_msg}" >&2
+            echo "cc-slot: attaching to the slot's shell instead — free a slot and reconnect to rebuild." >&2
+            return 1
+            ;;
+        *)
+            # No complete verdict — fail CLOSED. "Fail open like create" was an
+            # earlier justification and it was false: create falls through to
+            # `_cap_fail_open`, which still enforces a cap and the OOM floor.
+            echo "cc-slot: ${SESSION_NAME} has no claude running, but the capacity gate returned no usable verdict — not starting one without it." >&2
+            echo "cc-slot: attaching to the slot's shell instead." >&2
+            return 1
+            ;;
+    esac
+}
+
 _revalidate_heal() {
     _panes_now=$(tmux list-panes -s -t "=$SESSION_NAME" \
         -F '#{pane_id} #{pane_pid} #{pane_current_command}' 2>/dev/null || true)
@@ -733,89 +811,15 @@ if [ "$_HEAL" = "1" ]; then
 fi
 
 if [ "$_HEAL" = "1" ]; then
-    # CAPACITY — restored, and this time over the WHOLE outcome space.
-    #
-    # A human cannot answer this. They are asked "is this pane in use?", which
-    # they can see; they are NOT asked "can a swapless box afford another
-    # ~3GB?", which they cannot. So capacity is consulted before the prompt.
-    #
-    # WHICH ARMS ARE REACHABLE — stated honestly, because an earlier version of
-    # this comment got it wrong in a way that then propagated into the
-    # subsystem map. MEASURED: `session_cap.decide()` returns DENY only for a
-    # NON-OPERATOR origin (it keys on SSH_CONNECTION). The only entrance that
-    # reaches this code is the SSH slot door, where the origin is always
-    # lan/tailscale, so ALLOW and RECLAIM are the reachable answers and
-    # **DENY is not reachable today**. The dashboard terminal does NOT reach
-    # here despite having a pty: it enters through `cc-slot.sh manual`, which
-    # allocates the first slot whose `has-session` FAILS, while this whole
-    # branch requires that session to EXIST.
-    # The DENY arm is kept anyway, and deliberately: handling a SUBSET of a
-    # gate's outcome space is the exact defect that made the previous version
-    # of this gate a no-op, and a future non-operator entrance onto an existing
-    # slot must not rebuild past a denial. It is enumeration, not dead weight.
-    #
-    # ALLOW proceeds. Anything WITHOUT a complete verdict — no venv, a timeout,
-    # an empty or unparseable action — stands the rebuild DOWN.
-    #
-    # "Fail open like the create path" was the earlier reasoning and it was
-    # WRONG: create does not fail open, it falls through to `_cap_fail_open`,
-    # which still enforces a MemTotal-derived cap and the hard OOM floor. So
-    # falling through here made a rebuild WEAKER than a create on a degraded
-    # Python environment — it could start the measured ~3GB process on a
-    # swapless box where a create would refuse. Standing down costs an operator
-    # one manual repair; the other direction costs an OOM that takes every
-    # session with it. (Note the venv-absent case cannot actually reach here:
-    # `_probe_liveness` uses the same interpreter, so without it there is no
-    # POISONED verdict and no rebuild. It is enumerated anyway.)
-    #
-    # `--existing $((existing - 1))`: for a CREATE the count excludes the
-    # session about to be made, so the raw count would judge a rebuild one
-    # session busier than the create it is modelled on — and at the cap that
-    # makes a poisoned slot permanently unrebuildable, stranding the operator
-    # on the one slot that is broken.
-    _heal_cap_py="${GENESIS_ROOT}/.venv/bin/python"
-    if [ ! -x "$_heal_cap_py" ]; then
-        _HEAL=0
-        echo "cc-slot: ${SESSION_NAME} has no claude running, but the capacity gate is unavailable — not starting one without it." >&2
-        echo "cc-slot: attaching to the slot's shell instead." >&2
+    # Dependency 5, asked here so a RECLAIM can be DISCLOSED in the prompt. The
+    # verdict acted on is the one taken again in the final gate below; this one
+    # only shapes what the operator is told.
+    if _capacity_permits; then
+        if [ "$_cap_action" = "RECLAIM" ]; then
+            _cap_warn="   NOTE: ${_cap_msg}"
+        fi
     else
-        _heal_existing=$(( existing > 0 ? existing - 1 : 0 ))
-        _heal_cap_out=$(timeout 15 "$_heal_cap_py" \
-            -m genesis.cc.session_cap --existing "$_heal_existing" 2>/dev/null || true)
-        case "$(printf '%s\n' "$_heal_cap_out" | sed -n '1p')" in
-            DENY)
-                _HEAL=0
-                echo "cc-slot: ${SESSION_NAME} has no claude running, but the capacity gate declined to start one: $(printf '%s\n' "$_heal_cap_out" | sed -n '2p')" >&2
-                echo "cc-slot: attaching to the slot's shell instead — free a slot and reconnect to rebuild." >&2
-                ;;
-            RECLAIM)
-                # RECLAIM covers TWO different situations (session_cap.py):
-                # `cap_full` — full, but sessions could be traded — and
-                # `oom_floor` — RAM genuinely below the safety floor. Inventing
-                # one sentence for both told the OOM case the wrong thing, and
-                # that is precisely the case where an uninformed yes hurts. So
-                # the gate's OWN message is surfaced verbatim, and the OOM
-                # floor is not offered as a choice at all: the create path
-                # refuses there when there is nothing to trade, and starting a
-                # process on a swapless box below its floor risks an OOM that
-                # takes down every session, not just this one.
-                _cap_reason=$(printf '%s\n' "$_heal_cap_out" | sed -n '3p')
-                if [ "$_cap_reason" = "oom_floor" ]; then
-                    _HEAL=0
-                    echo "cc-slot: ${SESSION_NAME} has no claude running, but $(printf '%s\n' "$_heal_cap_out" | sed -n '2p')" >&2
-                    echo "cc-slot: attaching to the slot's shell instead — free memory and reconnect to rebuild." >&2
-                else
-                    _cap_warn="   NOTE: $(printf '%s\n' "$_heal_cap_out" | sed -n '2p')"
-                fi
-                ;;
-            ALLOW) ;;
-            *)
-                # No complete verdict. Fail CLOSED — see the note above.
-                _HEAL=0
-                echo "cc-slot: ${SESSION_NAME} has no claude running, but the capacity gate returned no usable verdict — not starting one without it." >&2
-                echo "cc-slot: attaching to the slot's shell instead." >&2
-                ;;
-        esac
+        _HEAL=0
     fi
 fi
 
@@ -908,6 +912,14 @@ if [ "$_HEAL" = "1" ]; then
     _revalidate_heal
 fi
 
+if [ "$_HEAL" = "1" ] && ! _capacity_permits; then
+    # Dependency 5, RE-DERIVED. The earlier verdict is up to 120s old by now
+    # and its session count older still; another slot can have started or free
+    # memory fallen inside that window, and a stale ALLOW would put the
+    # measured ~3GB process below the current floor on a swapless box.
+    _HEAL=0
+fi
+
 if [ "$_HEAL" = "1" ] && [ "${_disclosed_cmd+set}" = "set" ] \
    && [ "$_fresh_cmd" != "$_disclosed_cmd" ]; then
     # CONSENT IS FOR A STATE, NOT A SLOT. The operator said yes to destroying
@@ -981,6 +993,24 @@ fi
 # pane) ends at the keystrokes above, so release it here.
 if [ "${_LOCK_HELD:-0}" = "1" ]; then
     exec 9>&-
+fi
+
+# Dependency 4, and it guards the ATTACH path too, not just a rebuild.
+# `-A` CREATES when the session is gone, and a create reached this way has
+# traversed none of the create gates — not capacity, not the OAuth gate.
+# `_SESSION_EXISTS` was latched near the top of this run, and a great deal
+# happens after it: two liveness probes, the OAuth gate's 30s, the lock's 45s,
+# and a 120s human prompt. The latch and the `-A` both PRE-DATE the rebuild, so
+# this is not a defect the rebuild introduced — but the prompt widens the
+# window enormously, which is what makes it worth closing here.
+# Exiting is the honest repair: reconnecting re-enters the create path with
+# every gate intact, where creating from here would silently skip them.
+if [ "$_SESSION_EXISTS" = "1" ] \
+   && ! tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
+    echo "cc-slot: ${SESSION_NAME} disappeared while this door was preparing." >&2
+    echo "cc-slot: not creating it from here — a session created on this path would" >&2
+    echo "cc-slot: skip the capacity and login gates. Reconnect to create it cleanly." >&2
+    exit 1
 fi
 
 # Exactly ONE new-session on every path (create, alive-attach, heal-attach).

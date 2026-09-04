@@ -42,6 +42,14 @@ if [[ "$args" == *has-session* ]]; then
         prev="$a"
     done
     name="${name#=}"
+    if [[ -n "${FAKE_SESSION_VANISHES:-}" ]]; then
+        # Models a session that goes away mid-run: succeeds until the Nth call,
+        # fails after. Without this the `-A` create-on-attach race is not
+        # expressible and the guard against it cannot be tested.
+        s=0; [[ -f "$FAKE_TMUX_SESSIONS_N" ]] && s=$(cat "$FAKE_TMUX_SESSIONS_N")
+        echo $(( s + 1 )) > "$FAKE_TMUX_SESSIONS_N"
+        if (( s + 1 >= FAKE_SESSION_VANISHES )); then exit 1; fi
+    fi
     [[ -f "$FAKE_TMUX_SESSIONS" ]] && grep -qxF "$name" "$FAKE_TMUX_SESSIONS" && exit 0
     exit 1
 fi
@@ -162,7 +170,12 @@ def door(tmp_path):
         # claude, so it consults this the way a create does.
         'if [[ "$*" == *session_cap* && -n "${FAKE_HEAL_CAP:-}" ]]; then\n'
         '  echo "session_cap $*" >> "$FAKE_PROBE_LOG"\n'
-        '  printf \'%s\\n\' "${FAKE_HEAL_CAP%%|*}" "cap message" "${FAKE_HEAL_CAP#*|}"; exit 0\n'
+        '  c=0; [[ -f "$FAKE_HEAL_CAP_N" ]] && c=$(cat "$FAKE_HEAL_CAP_N")\n'
+        '  IFS=";" read -ra _c <<< "$FAKE_HEAL_CAP"\n'
+        '  ci=$c; (( ci >= ${#_c[@]} )) && ci=$(( ${#_c[@]} - 1 ))\n'
+        '  echo $(( c + 1 )) > "$FAKE_HEAL_CAP_N"\n'
+        '  _one="${_c[$ci]}"\n'
+        '  printf \'%s\\n\' "${_one%%|*}" "cap message" "${_one#*|}"; exit 0\n'
         "fi\n"
         # Any other module (the capacity gate with no fake, the login gate) ->
         # no verdict, which those paths already treat as unavailable.
@@ -180,6 +193,7 @@ def door(tmp_path):
             "HOME": str(home),
             "FAKE_TMUX_LOG": str(log),
             "FAKE_TMUX_SESSIONS": str(sessions),
+            "FAKE_TMUX_SESSIONS_N": str(tmp_path / "sess_calls.txt"),
             "FAKE_TMUX_LIST": str(listing),
             "FAKE_TMUX_PANES": str(panes),
             "FAKE_LIVENESS": os.environ.get("_TEST_FAKE_LIVENESS", ""),
@@ -193,6 +207,8 @@ def door(tmp_path):
             "FAKE_TMUX_SETENV_FAIL": os.environ.get("_TEST_FAKE_SETENV_FAIL", ""),
             "FAKE_TMUX_FDS": str(tmp_path / "tmux_fds.txt"),
             "FAKE_HEAL_CAP": os.environ.get("_TEST_FAKE_HEAL_CAP", ""),
+            "FAKE_HEAL_CAP_N": str(tmp_path / "cap_calls.txt"),
+            "FAKE_SESSION_VANISHES": os.environ.get("_TEST_FAKE_VANISH", ""),
         }
 
     def _reset_counters() -> None:
@@ -203,6 +219,8 @@ def door(tmp_path):
         (tmp_path / "liveness_calls.txt").unlink(missing_ok=True)
         (tmp_path / "probe_order.txt").unlink(missing_ok=True)
         (tmp_path / "panes_calls.txt").unlink(missing_ok=True)
+        (tmp_path / "cap_calls.txt").unlink(missing_ok=True)
+        (tmp_path / "sess_calls.txt").unlink(missing_ok=True)
 
     def run(*args: str) -> subprocess.CompletedProcess:
         env = _env()
@@ -595,6 +613,7 @@ class TestSlotHeal:
         session="cc-4",
         panes2_text=None,
         heal_cap="ALLOW|ok",
+        vanish=None,
         stdin_text=None,
         wait_for=None,
         panes3_text=None,
@@ -617,6 +636,8 @@ class TestSlotHeal:
             os.environ["_TEST_FAKE_PANES2"] = str(run.panes2)
         if heal_cap:
             os.environ["_TEST_FAKE_HEAL_CAP"] = heal_cap
+        if vanish is not None:
+            os.environ["_TEST_FAKE_VANISH"] = str(vanish)
         if panes3_text is not None:
             p3 = run.panes2.parent / "panes3.txt"
             p3.write_text(panes3_text)
@@ -635,6 +656,7 @@ class TestSlotHeal:
             os.environ.pop("_TEST_FAKE_LIVENESS", None)
             os.environ.pop("_TEST_FAKE_PANES2", None)
             os.environ.pop("_TEST_FAKE_HEAL_CAP", None)
+            os.environ.pop("_TEST_FAKE_VANISH", None)
             os.environ.pop("_TEST_FAKE_PANES3", None)
             os.environ.pop("_TEST_FAKE_RESPAWN_FAIL", None)
             os.environ.pop("_TEST_FAKE_SETENV_FAIL", None)
@@ -1132,6 +1154,35 @@ class TestSlotHeal:
         assert "respawn-pane" not in log, f"rebuilt with no capacity verdict:\n{log}"
         assert "Rebuild this slot?" not in proc.stdout, "asked before it could answer"
         assert "no usable verdict" in proc.stdout
+
+    def test_capacity_is_re_derived_after_the_answer(self, door):
+        """Dependency 5 of the enumerated set, and the last one to be closed.
+
+        The capacity verdict shown to the operator can be 120 seconds old by
+        the time they answer, and the session count behind it older still.
+        Another slot can start, or free memory fall, inside that window — and a
+        stale ALLOW would put the measured ~3GB process below the current floor
+        on a swapless box. Here the gate says ALLOW while deciding and DENY by
+        the time it matters; the yes must not survive that.
+        """
+        _proc, log = self._run_with(
+            door, "POISONED", confirm="y", heal_cap="ALLOW|ok;DENY|cap_full",
+        )
+        assert "respawn-pane" not in log, f"acted on a stale capacity verdict:\n{log}"
+
+    def test_a_vanished_session_is_not_silently_created(self, door):
+        """Dependency 4, and it PRE-DATES the rebuild.
+
+        `-A` creates when the session is gone, and `_SESSION_EXISTS` is latched
+        near the top of the run — so a session that disappears during the
+        probes, the OAuth gate, the lock or the prompt turns an attach into a
+        create that traversed none of the create gates. The door must refuse
+        and send the operator back through the front door instead.
+        """
+        proc, log = self._run_with(door, "POISONED", confirm="y", vanish=2)
+        assert "new-session" not in log, f"created a session past the create gates:\n{log}"
+        assert proc.returncode != 0, "exited 0 on a race it did not handle"
+        assert "disappeared while this door was preparing" in proc.stdout
 
     def test_confirming_rebuilds_the_slot(self, door):
         _proc, log = self._run_with(door, "POISONED", confirm="y")
