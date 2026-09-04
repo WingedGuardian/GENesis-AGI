@@ -13,8 +13,12 @@ Usage:
 """
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
+
+# Distinguishes "key absent" from "key present and falsy" (0, "", False).
+_MISSING = object()
 
 
 def find_genesis_root() -> Path:
@@ -73,6 +77,204 @@ def check_venv(genesis_root: Path) -> None:
         print(f"  Venv OK: {python}")
 
 
+# Key in cc-global-settings.yaml holding the settings that configure the CC
+# CLIENT rather than a project, with a `policy` per entry. See that file's own
+# header — it is the contract, this is just the applier.
+_USER_LEVEL_SECTION = "user_level_defaults"
+
+
+def _write_json(path: Path, data: dict) -> None:
+    """Write JSON by truncating the file IN PLACE. Deliberately not atomic.
+
+    An earlier revision of this used temp-file + rename. Don't reintroduce it
+    without reading this: `os.replace` installs a NEW inode, and that silently
+    discards three properties of the target that matter more here than
+    atomicity does.
+
+      * mode — this file routinely holds an `env` block with API keys, and the
+        rename reset 0600 to the umask default on every run;
+      * ownership — under sudo the new inode is root's, leaving the operator's
+        CC unable to write its own settings;
+      * symlink-ness — a dotfiles-managed settings.json is commonly a symlink.
+        The rename replaced the LINK with a regular file, so the managed copy
+        silently kept the old value and the next `stow`/`chezmoi` restored it,
+        reintroducing whatever the setting was fixing. No signal, no error.
+
+    An in-place truncate keeps all three for free, because the inode never
+    changes. What it gives up is a torn file if the process is killed between
+    truncate and write — a narrow window on a small file, and the behaviour
+    this script had for years. That trade is the right way round: a torn file
+    is loud and fixable, a silently-forked source of truth is neither.
+    """
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _load_user_settings(path: Path) -> dict | None:
+    """Existing user settings, or None if unreadable/not an object."""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    # ValueError covers JSONDecodeError AND UnicodeDecodeError — a settings file
+    # that is binary-corrupt must warn, not traceback out of a deploy step.
+    except (OSError, ValueError) as exc:
+        print(f"WARNING: could not read {path}: {exc}")
+        return None
+    if not isinstance(data, dict):
+        print(f"WARNING: {path} is not a JSON object — leaving it alone.")
+        return None
+    return data
+
+
+def _target_for(key: str, entry: dict) -> tuple[int | None, bool]:
+    """`(value, operator_forced)` for a `policy: floor` entry.
+
+    When the entry's `env_override` is set to a usable integer, the operator has
+    named an exact value and it is AUTHORITATIVE — it sets rather than floors, so
+    `GENESIS_CC_RETENTION_DAYS=30` genuinely yields 30 even against a higher
+    existing value. That is what the docs promise; treating it as merely a lower
+    floor would leave a documented lever that silently does nothing.
+
+    Values below 1 are refused: CC's own schema rejects `cleanupPeriodDays < 1`,
+    and a negative would put the sweep's cutoff in the FUTURE — i.e. older-than-
+    everything. Refusing to write it is the fail-closed direction on the one key
+    this whole module exists to keep safe.
+    """
+    value = entry.get("value")
+    default = value if isinstance(value, int) and not isinstance(value, bool) else None
+    name = entry.get("env_override")
+    raw = os.environ.get(name) if name else None
+    if raw is None or raw == "":
+        return default, False
+    try:
+        parsed = int(raw)
+    except ValueError:
+        print(f"WARNING: {name}={raw!r} is not an integer — using {default}.")
+        return default, False
+    if parsed < 1:
+        print(f"WARNING: {name}={raw!r} is below 1 — refusing it, using {default}.")
+        return default, False
+    return parsed, True
+
+
+def _apply_user_level_defaults(settings: dict, section: dict) -> list[str]:
+    """Apply each manifest entry to `settings` in place. Returns change lines."""
+    changes: list[str] = []
+    for key, entry in sorted(section.items()):
+        if not isinstance(entry, dict) or "policy" not in entry:
+            print(f"WARNING: {key} in the manifest has no policy — skipped.")
+            continue
+        policy, have = entry["policy"], settings.get(key, _MISSING)
+
+        if policy == "set_if_absent":
+            # An entry with no `value` would otherwise write a null into every
+            # install's CC settings; refuse rather than propagate a manifest typo.
+            if "value" not in entry:
+                print(f"WARNING: {key} is set_if_absent but declares no value — skipped.")
+            elif have is _MISSING:
+                settings[key] = entry["value"]
+                changes.append(f"  {key}: <unset> -> {entry['value']}")
+
+        elif policy == "floor":
+            target, forced = _target_for(key, entry)
+            if target is None:
+                print(f"WARNING: {key} has no usable integer value — skipped.")
+            elif forced:
+                if have != target:
+                    settings[key] = target
+                    changes.append(f"  {key}: {'<unset>' if have is _MISSING else have}"
+                                   f" -> {target} (operator override)")
+            # An explicit `null` must heal exactly like an absent key. CC resolves
+            # the value with `?? Y` (nullish-coalescing, Y=30), so `null` IS the
+            # 30-day default — the precise state this module exists to prevent.
+            # Leaving it alone would fail OPEN on the one key that matters, and
+            # would disagree with the two shell writers, which use `.get()` and
+            # heal it. MEASURED before the fix: shells -> 180, this path -> null.
+            elif have is _MISSING or have is None:
+                settings[key] = target
+                changes.append(
+                    f"  {key}: {'<unset>' if have is _MISSING else 'null'} -> {target}"
+                )
+            elif not isinstance(have, int) or isinstance(have, bool):
+                print(f"WARNING: {key} is {have!r}, not an integer — left alone.")
+            elif have < target:
+                settings[key] = target
+                changes.append(f"  {key}: {have} -> {target} (raised to Genesis floor)")
+
+        else:
+            print(f"WARNING: {key} has unknown policy {policy!r} — skipped.")
+    return changes
+
+
+def ensure_user_cc_defaults(genesis_root: Path, dry_run: bool) -> None:
+    """Apply the manifest's user_level_defaults to ~/.claude/settings.json.
+
+    Runs unconditionally, NOT behind --global: --global force-sets `model` and
+    `effortLevel`, so running it on every update would stomp an operator's model
+    choice. This path only ever raises a floor or fills an absent key, which is
+    safe on every bootstrap — and bootstrap is what update.sh re-runs, so it is
+    the route that reaches installs that already exist.
+
+    NEVER raises. bootstrap.sh calls this script bare under `set -euo pipefail`
+    from update.sh, which runs `set -Eeuo pipefail` with an armed ERR trap — so
+    an exception here would escalate into a full update rollback, reported as a
+    JSON error rather than a settings problem.
+    """
+    try:
+        _ensure_user_cc_defaults(genesis_root, dry_run)
+    except Exception as exc:  # noqa: BLE001 — never fail a deploy over settings
+        print(f"WARNING: could not apply user-level CC defaults: {exc}")
+        print("  Continuing; re-run scripts/setup_claude_config.py after fixing.")
+
+
+def _ensure_user_cc_defaults(genesis_root: Path, dry_run: bool) -> None:
+    try:
+        import yaml
+    except ImportError:
+        print("WARNING: pyyaml unavailable — user-level CC defaults NOT applied.")
+        return
+
+    manifest_path = genesis_root / "config" / "cc-global-settings.yaml"
+    settings_path = Path.home() / ".claude" / "settings.json"
+
+    if not manifest_path.exists():
+        print(f"WARNING: settings manifest not found: {manifest_path}")
+        print("  User-level CC defaults NOT applied.")
+        return
+
+    manifest = yaml.safe_load(manifest_path.read_text()) or {}
+    section = manifest.get(_USER_LEVEL_SECTION) or {}
+    if not isinstance(section, dict) or not section:
+        print(f"WARNING: {manifest_path.name} has no '{_USER_LEVEL_SECTION}' section.")
+        return
+
+    current = _load_user_settings(settings_path)
+    if current is None:
+        print("  User-level CC defaults NOT applied (fix the file, then re-run).")
+        return
+
+    changes = _apply_user_level_defaults(current, section)
+    if not changes:
+        # Print the live values, not just "ok". This runs on every update, so it
+        # is the one recurring receipt that the settings are actually in force —
+        # the original bug was a value that looked right and did nothing, and a
+        # bare "already satisfied" would have printed happily throughout.
+        live = {k: current.get(k) for k in sorted(section)}
+        print(f"~/.claude/settings.json: user-level CC defaults in force: {live}")
+        print("  (user-level only — CC exposes no resolver for the effective value)")
+        return
+
+    print("~/.claude/settings.json: applying user-level CC defaults:")
+    for line in changes:
+        print(line)
+    if dry_run:
+        print("  (dry run — not written)")
+        return
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(settings_path, current)
+    print("  Written.")
+
+
 def configure_global_settings(genesis_root: Path, dry_run: bool) -> None:
     """Configure ~/.claude/settings.json from the global settings manifest."""
     import yaml  # Only imported when --global is used
@@ -88,7 +290,10 @@ def configure_global_settings(genesis_root: Path, dry_run: bool) -> None:
     manifest = yaml.safe_load(manifest_path.read_text())
 
     # Read existing global settings (preserve user overrides)
-    current = json.loads(global_settings_path.read_text()) if global_settings_path.exists() else {}
+    current = _load_user_settings(global_settings_path)
+    if current is None:
+        print("  Global settings NOT applied (fix the file, then re-run).")
+        return
 
     # Merge manifest values
     changes = []
@@ -107,7 +312,8 @@ def configure_global_settings(genesis_root: Path, dry_run: bool) -> None:
         for c in changes:
             print(c)
         if not dry_run:
-            global_settings_path.write_text(json.dumps(current, indent=2) + "\n")
+            global_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_json(global_settings_path, current)
             print("  Written.")
     else:
         print("~/.claude/settings.json: already matches manifest")
@@ -222,6 +428,12 @@ def main():
             print("  Written.")
         else:
             print("  Would copy template to .claude/settings.local.json")
+
+    # User-level CC defaults that cannot live in the repo's project settings.
+    # Unconditional (not behind --global) so update.sh -> bootstrap.sh carries
+    # them to installs that already exist; set-if-absent, so it never overwrites.
+    print()
+    ensure_user_cc_defaults(genesis_root, args.dry_run)
 
     # Global settings
     if args.do_global:

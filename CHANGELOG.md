@@ -246,6 +246,33 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Claude Code was deleting your session transcripts after 30 days, not the 180
+  the repo advertised.** Genesis shipped `cleanupPeriodDays: 180` in its project
+  settings, but CC's retention sweep is machine-wide while a project-level value
+  only binds sessions launched inside that project — so any session started
+  elsewhere (a worktree, `~/tmp`, a dispatched background session) swept every
+  project directory at CC's 30-day default. On the reference install this
+  destroyed 198 local sessions over 73 days; all were recoverable, because
+  encrypted backups keep transcripts forever. Retention now ships **user-level**
+  from `config/cc-global-settings.yaml` and applies to every session on the
+  machine, at a **180-day floor** — 6x CC's default: an install carrying a lower
+  value is raised on its next update, a higher value you set is kept (raise it to
+  365 if you want a year), and `GENESIS_CC_RETENTION_DAYS` is the supported way to
+  deliberately choose lower. Applied by `install.sh` (fresh),
+  `setup_claude_config.py` via bootstrap (every `update.sh`, so existing installs
+  heal), and `host-setup.sh` (host VM). Your `~/.claude/settings.json` is never
+  clobbered — only an absent or too-low value is touched. Disk: transcripts
+  accumulate at 14-51 MB/day depending on workload (measured across two installs),
+  so budget from your own rate — `du -sh ~/.claude/projects` divided by the age of
+  your oldest transcript. Encrypted backups keep transcripts forever either way,
+  so the floor governs only how far `/resume` reaches without a restore.
+  **Recovering already-deleted sessions:** they are in your `genesis-backups`
+  repo under `transcripts/`, gpg-encrypted with `GENESIS_BACKUP_PASSPHRASE`.
+- **AI-authorship trailers no longer depend on your checkout being current.** The
+  `attribution` setting that suppresses `Co-authored-by: Claude` on commits and
+  PRs shipped project-level only, so a branch cut before it landed never had it —
+  measured: 10 of 11 leaked commits came from exactly that. It is now seeded
+  user-level alongside retention, where a stale checkout cannot miss it.
 - **Campaign names stored before the control-character fix are now cleaned at
   startup.** Names have been sanitized at the write boundary since the previous
   release, so nothing new lands malformed, but rows written earlier were never

@@ -493,9 +493,13 @@ fi
 #
 # RETENTION POLICY — KEEP FOREVER BY DEFAULT. Backed-up transcripts are Genesis's
 # durable long-term conversational memory. The LOCAL store (~/.claude/projects)
-# expires on Claude Code's cleanupPeriodDays, but the BACKUP is the permanent
-# archive: transcripts/*.gpg accumulate here and are NEVER auto-pruned (the only
-# delete below is the pre-encryption plaintext staging, not the .gpg archive).
+# expires on Claude Code's cleanupPeriodDays — seeded USER-level from
+# config/cc-global-settings.yaml, because CC's sweep is machine-wide while a
+# project-level value binds only sessions launched in that project (see
+# docs/reference/cc-compatibility.md; this cost 198 sessions once, all recovered
+# from here). The BACKUP is the permanent archive: transcripts/*.gpg accumulate
+# here and are NEVER auto-pruned (the only delete below is the pre-encryption
+# plaintext staging, not the .gpg archive).
 # Any future retention work (GFS snapshot pruning, local-staging prune) MUST
 # EXEMPT transcripts/ — a user may opt into expiry, but the system must never
 # auto-expire transcripts the way the local store does.

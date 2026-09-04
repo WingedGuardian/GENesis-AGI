@@ -122,6 +122,36 @@ returned 0 in-server and **three** features shipped green but inert since
 July; the module's docstring claim "same-uid reads succeed" was a shell-tested
 falsehood. The fix routed around the ptrace-gated read entirely.)
 
+**The config twin of that rule: a setting's EFFECT scope and its SOURCE scope are
+different questions, and only the second one is obvious.** Ask "which sessions /
+processes does this file actually bind?" — never "is this file read?". Config is
+read per-process from wherever that process happens to sit, so a value whose
+effect is machine-wide but whose source is per-session binds a minority and does
+nothing for the rest, while looking correct everywhere you check. It is not
+"ignored", which is why grepping for the key and finding it loaded proves
+nothing: the file loads, for the sessions that read it.
+
+The tell is a mismatch between the two scopes. Before shipping any config, name
+the set of processes the value must govern, then name the set that will actually
+load the file — if the second is smaller, the config is wrong however well it
+works in your session. This is the same shape as the deploy-path question in the
+Generalizability Gate ("how does this reach other installs?"), one level down:
+how does this reach other SESSIONS?
+
+Genesis has bitten itself with this twice, both in Claude Code's own settings:
+auto-updater suppression (2026-06-01) and transcript retention (2026-06-21, found
+2026-09-02 after it had silently deleted 198 local sessions over 73 days). Both
+shipped in the repo's `.claude/settings.json`, which CC merges only for sessions
+launched inside the project — while the behaviour each controls spans the whole
+machine. Full write-up, and the rule for which settings can never live at project
+level: `docs/reference/cc-compatibility.md`. The mechanical tripwire is
+`tests/test_scripts/test_cc_user_level_settings.py`, which fails CI if one of an
+ENUMERATED list of client-scope keys reappears in project settings — reach for a
+check like that rather than trusting the next author to remember, but note what
+such a check can and cannot be: it is a list, so it catches the shape that bit
+you and not the class. Say so where you claim it, or the next reader treats a
+tripwire as a proof.
+
 ### Acceptance Bar + Measured Rate — the primary methodology
 
 **Use this as often as it applies. It is the default way to build anything here,
@@ -262,6 +292,31 @@ these are the GATES that make it enforceable:
   evidence) is a phase that FINISHES before any fix is proposed — never propose
   fixes in the same breath as the symptom. "It's probably X, let me fix that"
   = investigation skipped.
+- **A root cause is VERIFIED TO CERTAINTY, or it is not a root cause.** Never
+  speculated, never inherited as hearsay. A mechanism you have not tested is a
+  HYPOTHESIS, and saying it in the grammar of a diagnosis is the failure — worse
+  than saying nothing, because the fix then gets designed against fiction and
+  looks correct while the real cause keeps firing. Three rules make it
+  enforceable:
+  1. **Name the artifact that would falsify it, then go get that artifact.** A
+     cause is verified when a specific query, file, timestamp or run comes back
+     the way the cause predicts and could have come back otherwise. "Consistent
+     with" is not verification — a wrong cause is usually consistent too.
+  2. **A subagent's or reviewer's stated mechanism is a LEAD, at their stated
+     confidence, and it does not become fact by being repeated.** Confidence
+     does not survive the retelling: an 70%-hedged claim relayed without its
+     hedge reads as established, and the next decision is built on it. Re-derive
+     it from ground truth before it drives any change or lands in durable record.
+  3. **Enumerate the population, not a sample, and report the outliers.** N
+     instances explained by a mechanism is a claim about those N. Sweep every
+     instance; if k of N do not fit, SAY "k of N unexplained" rather than
+     generalising from the majority — the outlier is where the second bug lives.
+  (Origin, 2026-09-02: an AI-attribution leak into the public repo was relayed as
+  "dispatched sessions don't load project settings", which was a 70% hypothesis
+  restated as cause. Measured: 10 of 11 leaking commits came from worktrees whose
+  checkout PREDATED the setting — a stale-checkout problem with nothing to do
+  with settings scope — and 1 of 11 remains unexplained. The fix aimed at the
+  speculated cause would have shipped clean and changed nothing.)
 - **Fix-attempt cap: 3 failed fixes → STOP and question the architecture.**
   The debugging twin of the review escalation cap, with the same mechanics
   (count attempts visibly; the cap consumes standing approval). Each failed fix
