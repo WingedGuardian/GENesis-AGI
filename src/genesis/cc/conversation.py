@@ -63,10 +63,14 @@ def _bg_notice(output) -> str:
 def _is_oom_death(exc: BaseException) -> bool:
     """Whether this failure was attributed to an out-of-memory reap.
 
-    Reads ``CCProcessError.oom_suspected`` — the machine-readable half of the
-    attribution — never the message prose, which is a human-facing string that will
-    be reworded. ``getattr`` rather than an isinstance check so every CCError type
-    can answer the question and none has to.
+    Reads ``CCError.oom_suspected`` — the machine-readable half of the attribution
+    — never the message prose, which is a human-facing string that will be
+    reworded. The flag lives on the BASE, so a reap that also produced recognisable
+    output (an MCP line, a session-expiry message, buffered quota text) is still
+    attributed: those exits classify as a typed error, and while the flag lived only
+    on ``CCProcessError`` they arrived here with nothing to read and took the
+    stale-resume branch anyway. ``getattr`` is kept for the non-CCError case, since
+    this is called on a bare ``BaseException``.
 
     An OOM death is a THIRD kind of failure alongside the rate/quota/timeout/offline
     family already fast-re-raised: not a stale resume. The resumed session is
@@ -1124,7 +1128,7 @@ class ConversationLoop:
             if not peers:
                 return None
             sticky = self._session_fallback_session(session)
-            for peer_name, peer_inv in peers:
+            for peer_idx, (peer_name, peer_inv) in enumerate(peers):
                 if streamed and streamed.get("text"):
                     break  # a prior peer already streamed answer text — can't fail
                     # over to another without double-output; degrade instead.
@@ -1135,7 +1139,27 @@ class ConversationLoop:
                     )
                 except (CCRateLimitError, CCQuotaExhaustedError):
                     continue  # this peer is also down → try the next one
-                except CCError:
+                except CCError as exc:
+                    if _is_oom_death(exc):
+                        # STOP, do not try the next peer. Every peer runs the same
+                        # memory-heavy prompt through a LOCAL subprocess, so "try
+                        # another model" re-arms the identical failure under the
+                        # identical pressure — the retry amplification this
+                        # attribution exists to end, once per peer. The peer is not
+                        # what failed; this box ran out of memory.
+                        #
+                        # Logged at ERROR, not warning: a peer being down is routine
+                        # and a reap is not, and if a later peer had succeeded the
+                        # cause would have vanished entirely from the record.
+                        logger.error(
+                            "failover peer %s was OOM-reaped locally — abandoning "
+                            "failover rather than re-arming the workload on the "
+                            "remaining %d peer(s): %s",
+                            peer_name,
+                            len(peers) - peer_idx - 1,
+                            exc,
+                        )
+                        break
                     logger.warning("failover peer %s failed", peer_name, exc_info=True)
                     continue
                 # Success on this peer. Record the account-wide flag + this session's

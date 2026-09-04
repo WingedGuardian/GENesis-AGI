@@ -2474,3 +2474,112 @@ def test_classify_error_marks_an_oom_death_machine_readably(invoker):
     err = invoker._classify_error("", "", oom_note="probable cause: out-of-memory reap")
     assert err.oom_suspected is True
     assert invoker._classify_error("boom").oom_suspected is False
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_type_name"),
+    [
+        ("MCP server 'memory' failed to start", "CCMCPError"),
+        ("session not found", "CCSessionError"),
+        ("usage limit reached", "CCQuotaExhaustedError"),
+        ("Rate limit exceeded, status 429", "CCRateLimitError"),
+        ("thinking blocks cannot be modified", "CCSessionError"),
+    ],
+)
+def test_an_oom_attribution_survives_every_typed_classification(
+    invoker, text, expected_type_name
+):
+    """A process that SAID something on its way out still died of the same cause.
+
+    The sibling test above asserts the typed classification wins — and passed even
+    while the attribution was being dropped, because it only checked the TYPE. This
+    is the other half, and it is the half with teeth: the note used to be applied
+    only on the generic fallthrough, so any pre-kill output at all erased it.
+
+    That erasure picked the worst branch available in each case. An MCP or session
+    match with no flag enters stale-resume recovery and re-runs the same
+    memory-heavy work; a quota match can park the turn for a capacity reset that
+    was never the problem.
+    """
+    note = "probable cause: out-of-memory reap"
+    err = invoker._classify_error(text, "", oom_note=note)
+    assert type(err).__name__ == expected_type_name, "classification must not change"
+    assert err.oom_suspected is True, (
+        f"{expected_type_name} dropped the OOM attribution — this exit re-runs the "
+        "workload or parks it for the wrong reason"
+    )
+    assert note in str(err), "the human half of the attribution is missing too"
+
+
+def test_the_typed_state_survives_the_oom_annotation(invoker):
+    """The other direction: annotating must not cost the keyword state the typed
+    exceptions carry. `annotate_oom` rewrites args[0] in place rather than
+    reconstructing, precisely so `server_name` / `raw_text` cannot be dropped —
+    a rebuild would have to enumerate them and would silently lose the next field
+    someone adds."""
+    note = "probable cause: out-of-memory reap"
+    mcp = invoker._classify_error("MCP server 'memory' failed", "", oom_note=note)
+    assert mcp.server_name == "memory"
+    quota = invoker._classify_error("usage limit reached", "", oom_note=note)
+    assert quota.raw_text is not None and "usage limit" in quota.raw_text
+
+
+@pytest.mark.asyncio
+async def test_cleaning_up_a_survivor_does_not_claim_the_leader_s_exit(
+    invoker, monkeypatch
+):
+    """The OOM killer takes the CC leader; an MCP helper in its group outlives it.
+
+    `self_killed` answers ONE question — did WE produce the leader's exit code?
+    Only a kill landing on a LIVE leader can. Here the leader is already dead at
+    -9 and the cleanup SIGKILL is aimed at a survivor, so claiming it made the
+    probe decline a VALID attribution and sent the no-result path back to an
+    empty, and therefore successful-looking, CCOutput.
+
+    A common process-tree shape, silently recorded as work that completed — which
+    is precisely what this whole file exists to stop.
+    """
+    probe = _RecordingProbe.install(monkeypatch, None)
+    mock_proc = _reaped_stream_proc(returncode=-9)  # leader ALREADY reaped
+    monkeypatch.setattr("genesis.cc.invoker.process_group_alive", lambda _p: True)
+    monkeypatch.setattr("genesis.cc.invoker.kill_process_group", lambda _p: None)
+    monkeypatch.setattr("genesis.cc.invoker._ESCALATION_GRACE_S", 0)
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        await invoker.run_streaming(CCInvocation(prompt="hello"))
+
+    assert probe.calls, "the probe was never consulted — the test proves nothing"
+    assert probe.calls[-1]["returncode"] == -9
+    assert probe.calls[-1]["self_killed"] is False, (
+        "descendant cleanup was recorded as killing the leader, so a real OOM "
+        "attribution is discarded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_killing_a_live_leader_is_still_declared_self_killed(
+    invoker, monkeypatch
+):
+    """The control on the other side, and the reason the flag exists at all: when
+    the leader is STILL ALIVE our escalation SIGKILL is what sets -9, and reporting
+    that as a probable OOM would replace a known true cause with a plausible wrong
+    one. Narrowing the condition must not lose this."""
+    probe = _RecordingProbe.install(monkeypatch, None)
+    mock_proc = _reaped_stream_proc(returncode=None)  # leader still alive
+    monkeypatch.setattr("genesis.cc.invoker.process_group_alive", lambda _p: True)
+    monkeypatch.setattr("genesis.cc.invoker.kill_process_group", lambda _p: None)
+    monkeypatch.setattr("genesis.cc.invoker._ESCALATION_GRACE_S", 0)
+
+    waits = {"n": 0}
+
+    async def _wait():
+        waits["n"] += 1
+        if waits["n"] >= 2:
+            mock_proc.returncode = -9
+
+    mock_proc.wait = _wait
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        await invoker.run_streaming(CCInvocation(prompt="hello"))
+
+    assert probe.calls[-1]["self_killed"] is True

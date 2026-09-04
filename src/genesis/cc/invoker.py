@@ -24,6 +24,7 @@ from genesis.cc.exceptions import (
     CCRateLimitError,
     CCSessionError,
     CCTimeoutError,
+    annotate_oom,
 )
 from genesis.cc.types import (
     CCInvocation,
@@ -552,16 +553,27 @@ class CCInvoker:
     def _classify_error(
         stderr_text: str, stdout_text: str = "", *, oom_note: str | None = None
     ) -> CCError:
-        """Classify CC output into a typed CC exception.
+        """Classify CC output into a typed CC exception, then annotate the cause.
 
-        ``oom_note`` carries a cause this function cannot derive from text, because
-        the failure it describes produces none: a process reaped by the OOM killer
-        dies by SIGKILL with empty output, so every pattern below misses and it lands
-        on the generic error at the end. The note is appended to the message rather
-        than routed to a new exception type, because a new type would change the
-        retry semantics of every handler at once. Callers that must BRANCH on the
-        cause read ``CCProcessError.oom_suspected``, set here alongside the note —
-        never the message text, which is prose and will be reworded.
+        TWO INDEPENDENT FACTS, applied in that order and never traded for each
+        other: what the process managed to SAY before it died (the text patterns
+        below), and what KILLED it (``oom_note``, which no amount of text can
+        reveal — a reaped process dies by SIGKILL writing nothing).
+
+        The annotation used to be applied only on the generic fallthrough, on the
+        reasoning that a reaped process matches no pattern. Usually true, and
+        wrong in exactly the case that matters: a process that emitted an MCP
+        startup error, a session-expiry line, or buffered quota text BEFORE the
+        kernel took it returns a typed exception from an earlier branch, and the
+        attribution was dropped on the floor. Those exits then took the worst
+        available branch — MCP and session errors entered stale-resume recovery
+        and re-ran the memory-heavy workload, and a quota match could park the
+        turn for a capacity reset that was never the problem. So the note is
+        applied at the ONE exit, to whatever was classified.
+
+        Callers that must BRANCH on the cause read ``CCError.oom_suspected``
+        (set by ``annotate_oom`` alongside the human note) — never the message
+        text, which is prose and will be reworded.
 
         Checks both stderr and stdout — when CC runs in streaming-JSON
         mode the rate-limit / quota signal often appears in stdout
@@ -569,6 +581,18 @@ class CCInvoker:
         Limiting classification to stderr would mis-categorize those as
         generic CCProcessError and skip downstream retry branches that
         key off the typed exception.
+        """
+        err = CCInvoker._classify_error_text(stderr_text, stdout_text)
+        return annotate_oom(err, oom_note) if oom_note else err
+
+    @staticmethod
+    def _classify_error_text(stderr_text: str, stdout_text: str = "") -> CCError:
+        """The TEXT half of ``_classify_error`` — what the process said, only.
+
+        Split out so the OOM annotation has exactly one place to attach. It is
+        deliberately ignorant of the kill cause: every ``return`` below answers
+        "what does this output look like", and none of them may decide whether an
+        attribution survives.
         """
         combined = f"{stderr_text}\n{stdout_text}"
         lower = combined.lower()
@@ -632,16 +656,11 @@ class CCInvoker:
         # CCError on resumes, so this only improves classification fidelity.
         if "thinking" in lower and "cannot be modified" in lower:
             return CCSessionError(source)
-        # Generic process error — and the one place an OOM note can land, because a
-        # reaped process matches none of the patterns above. `source` is typically
-        # EMPTY here (SIGKILL writes nothing), which is exactly the bare "[killed]"
-        # this note exists to replace; the fallback text keeps the message from being
-        # only the annotation with no statement of what happened.
-        if oom_note:
-            return CCProcessError(
-                f"{source or 'killed with no output'} — {oom_note}",
-                oom_suspected=True,
-            )
+        # Generic process error — where a reaped process lands, since SIGKILL
+        # writes nothing and none of the patterns above can match. The OOM note
+        # is NOT applied here: `_classify_error` attaches it to whatever this
+        # returns, so a process that DID say something on its way out keeps both
+        # its classification and its cause.
         return CCProcessError(source)
 
     async def _notify_status_change(self, error: CCError | None) -> None:
@@ -1218,10 +1237,22 @@ class CCInvoker:
             # short beat (stdio children normally exit sub-second on parent
             # death); costs latency only when a survivor actually exists.
             await asyncio.sleep(_ESCALATION_GRACE_S)
-        if proc.returncode is None or process_group_alive(proc):
-            # This SIGKILL is ours, and it lands on a process whose exit is inspected
-            # below — record it so the OOM probe cannot read our own -9 as a reap.
-            self_killed = True
+        leader_alive = proc.returncode is None
+        if leader_alive or process_group_alive(proc):
+            # `self_killed` answers ONE question: did WE produce the leader's exit
+            # code? Only a kill that lands on a LIVE leader can. When the leader is
+            # already dead and only an MCP/helper descendant survives, this branch is
+            # descendant CLEANUP — our signal cannot change an exit code that is
+            # already set, so claiming it here would discard someone else's news.
+            #
+            # And the news is precisely the case this file exists for: the OOM killer
+            # reaps the CC leader, a helper in its group outlives it, `returncode` is
+            # already -9, and marking that as self-inflicted made `describe` decline a
+            # VALID attribution — sending the no-result path back to an empty, and
+            # therefore SUCCESSFUL-looking, CCOutput. A common process-tree shape,
+            # silently recorded as work that completed.
+            if leader_alive:
+                self_killed = True
             logger.warning(
                 "CC streaming group survived graceful stop/kill "
                 "(PID %s, rc=%s) — group-killing",

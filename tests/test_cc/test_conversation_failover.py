@@ -369,3 +369,79 @@ async def test_an_unattributed_process_error_still_recovers_a_stale_resume(loop,
     loop._recover_stale_resume.assert_awaited_once()
     assert invoker.run.await_count == 2
     assert out.text == "reply"
+
+
+@pytest.mark.asyncio
+async def test_an_oom_stops_the_peer_loop_instead_of_re_arming_the_workload(
+    loop, invoker, monkeypatch
+):
+    """Two peers, the first OOM-reaped: the second must NEVER be tried.
+
+    Every peer runs the same memory-heavy prompt through a LOCAL subprocess, so
+    "try another model" re-arms the identical failure under the identical
+    pressure — the retry amplification the attribution exists to end, once per
+    peer. The peer is not what failed; this box ran out of memory.
+
+    It also loses the cause: if peer two had happened to succeed, the reply would
+    have been returned and nothing would record that the first attempt was killed.
+    """
+    second = CCInvocation(
+        prompt="x", model_id_override="kimi-k3",
+        anthropic_base_url="https://kimi", anthropic_auth_token="sk",
+        roster_eligible=True,
+    )
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("glm-5.2", _PEER_INV), ("kimi-k3", second)],
+    )
+    tried: list[str] = []
+
+    async def _peer(peer_name, peer_inv, **kw):
+        tried.append(peer_name)
+        raise _oom_error()
+
+    loop._run_failover_peer = AsyncMock(side_effect=_peer)
+    result = await loop._try_roster_failover(
+        CCInvocation(prompt="x"), session={"id": "cc-1"},
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM, prompt_text="x",
+    )
+    assert tried == ["glm-5.2"], f"the loop re-armed the workload on {tried[1:]}"
+    # None, not a raise: the method's contract is that failover never breaks the
+    # turn. Contingency runs next, and it does not spawn a local CC subprocess, so
+    # falling through to it does not re-arm anything.
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_peer_failure_still_tries_the_next_peer(
+    loop, invoker, monkeypatch
+):
+    """The control on the other side. Only an ATTRIBUTED OOM stops the loop — a
+    peer that is merely broken must still fall through to the next one, or this
+    change would have quietly disabled failover itself."""
+    second = CCInvocation(
+        prompt="x", model_id_override="kimi-k3",
+        anthropic_base_url="https://kimi", anthropic_auth_token="sk",
+        roster_eligible=True,
+    )
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("glm-5.2", _PEER_INV), ("kimi-k3", second)],
+    )
+    tried: list[str] = []
+
+    async def _peer(peer_name, peer_inv, **kw):
+        tried.append(peer_name)
+        if peer_name == "glm-5.2":
+            raise CCProcessError("plain crash")
+        return _output(text="second peer reply", session_id="kimi-1")
+
+    loop._run_failover_peer = AsyncMock(side_effect=_peer)
+    result = await loop._try_roster_failover(
+        CCInvocation(prompt="x"), session={"id": "cc-1"},
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM, prompt_text="x",
+    )
+    assert tried == ["glm-5.2", "kimi-k3"]
+    assert result is not None and "second peer reply" in result
