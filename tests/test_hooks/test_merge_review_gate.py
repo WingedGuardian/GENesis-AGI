@@ -1276,6 +1276,108 @@ class TestCheckInlineReviewFindings:
         # The doc-path P2 must remain VISIBLE in the pre-merge report, not dropped.
         assert "[doc P2]" in capsys.readouterr().err
 
+    # ── Documentation is prose at any depth, and the treatment is a lever ──
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "AGENTS.md",
+            "CLAUDE.md",
+            ".claude/skills/genesis-development/SKILL.md",
+            ".claude/agents/genesis-architect.md",
+            "docs/architecture/CURRENT.md",
+            "src/genesis/memory/NOTES.md",
+            "README.rst",
+            "LICENSE",
+        ],
+    )
+    def test_documentation_is_prose_at_any_depth(self, guard_module, path):
+        """Widened 2026-09-04: markdown outside `docs/` used to be treated as code.
+
+        That meant a finding on a skill or agent prompt file could block a merge.
+        The commit-time gate classifies those independently and still demands an
+        adversarial review, so what this changes is only whether a REVIEWER'S
+        FINDING blocks the MERGE.
+        """
+        assert guard_module._is_doc_path(path) is True
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "docs/requirements.txt",
+            "docs/conf.py",
+            "docs/CMakeLists.txt",
+            "src/genesis/memory/graph.py",
+            "scripts/hooks/git_push_guard.py",
+            "config/model_routing.yaml",
+            "",
+            "docs/READ\x85ME.md",
+        ],
+    )
+    def test_non_prose_still_blocks(self, guard_module, path):
+        """The allowlist stays fail-closed: only provably-prose paths are exempt.
+
+        Includes the control-char case — `gh --jq` emits a literal NEL (0x85), and a
+        path carrying one must never classify as a document.
+        """
+        assert guard_module._is_doc_path(path) is False
+
+    def test_doc_findings_default_is_skip(self, guard_module, monkeypatch):
+        monkeypatch.delenv("_TEST_DOC_FINDINGS_MODE", raising=False)
+        monkeypatch.delenv("GENESIS_MERGE_GATE_DOC_FINDINGS", raising=False)
+        monkeypatch.setattr(guard_module.os.path, "expanduser", lambda p: "/nonexistent")
+        assert guard_module._doc_findings_mode() == "skip"
+
+    @pytest.mark.parametrize("bad", ["", "  ", "yes", "SKIPP", "1", None])
+    def test_unknown_mode_falls_back_to_the_documented_default(
+        self, guard_module, monkeypatch, bad
+    ):
+        """Deliberately NOT fail-closed-to-stricter: the shipped default IS the
+        permissive end by owner decision, so a malformed value must land on the
+        documented default rather than silently tightening."""
+        if bad is None:
+            monkeypatch.delenv("_TEST_DOC_FINDINGS_MODE", raising=False)
+        else:
+            monkeypatch.setenv("_TEST_DOC_FINDINGS_MODE", bad)
+        monkeypatch.delenv("GENESIS_MERGE_GATE_DOC_FINDINGS", raising=False)
+        monkeypatch.setattr(guard_module.os.path, "expanduser", lambda p: "/nonexistent")
+        assert guard_module._doc_findings_mode() == "skip"
+
+    def test_skip_mode_a_doc_p1_does_not_block(self, guard_module, monkeypatch, capsys):
+        """The whole point of the default: prose findings never block a merge."""
+        monkeypatch.setenv("_TEST_DOC_FINDINGS_MODE", "skip")
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="AGENTS.md")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+        assert "[doc P1]" in capsys.readouterr().err, "surfaced, never silently dropped"
+
+    def test_p1_only_mode_a_doc_p1_blocks_but_a_doc_p2_does_not(
+        self, guard_module, monkeypatch
+    ):
+        """The middle setting, so it can be dialled back without another PR."""
+        monkeypatch.setenv("_TEST_DOC_FINDINGS_MODE", "p1_only")
+        with self._mock(guard_module, [self._codex(1, _P1_BODY, path="AGENTS.md")]):
+            assert guard_module._check_inline_review_findings("100")[0] is True
+        with self._mock(guard_module, [self._codex(2, _P2_BODY, path="AGENTS.md")]):
+            assert guard_module._check_inline_review_findings("100")[0] is False
+
+    def test_score_mode_restores_the_old_behaviour(self, guard_module, monkeypatch):
+        """Two doc P2s = 1.0 → blocks, exactly as two code P2s would."""
+        monkeypatch.setenv("_TEST_DOC_FINDINGS_MODE", "score")
+        comments = [
+            self._codex(1, _P2_BODY, path="AGENTS.md"),
+            self._codex(2, _P2_BODY, path="docs/CURRENT.md"),
+        ]
+        with self._mock(guard_module, comments):
+            assert guard_module._check_inline_review_findings("100")[0] is True
+
+    def test_a_code_finding_is_unaffected_by_every_mode(self, guard_module, monkeypatch):
+        """The control. Code must block in all three modes, or the lever leaks."""
+        for mode in ("skip", "p1_only", "score"):
+            monkeypatch.setenv("_TEST_DOC_FINDINGS_MODE", mode)
+            with self._mock(guard_module, [self._codex(1, _P1_BODY, path="src/genesis/a.py")]):
+                assert guard_module._check_inline_review_findings("100")[0] is True, mode
+
     def test_replied_p1_is_acknowledged_by_maintainer(self, guard_module):
         """A MAINTAINER reply (author_association OWNER/MEMBER/COLLABORATOR) acks a P1."""
         comments = [
@@ -1411,9 +1513,9 @@ class TestCheckInlineReviewFindings:
 
     def test_inline_p1_on_a_changelog_fragment_does_not_block(self, guard_module):
         # changelog.d/ holds one changelog entry per file — the same prose that
-        # would otherwise be a bullet in CHANGELOG.md, which this allowlist
-        # already exempts by stem. Without this, every PR carrying a fragment
-        # could be blocked from merging by a wording nit.
+        # would otherwise be a bullet in CHANGELOG.md. Covered by the general
+        # Markdown rule rather than by a rule of its own; pinned here because a
+        # PR carrying a fragment must never be blocked by a wording nit.
         with self._mock(
             guard_module,
             [self._codex(1, _P1_BODY, path="changelog.d/20260904210000-fixed-thing.md")],
@@ -1424,32 +1526,11 @@ class TestCheckInlineReviewFindings:
     def test_inline_p1_on_a_non_markdown_file_in_changelog_d_still_blocks(
         self, guard_module
     ):
-        # The rule is Markdown-only. A script that somehow lands in that
+        # The allowlist is extension-based, so a script that lands in that
         # directory is not prose and must not inherit the exemption.
         with self._mock(
             guard_module,
             [self._codex(1, _P1_BODY, path="changelog.d/generate.py")],
-        ):
-            block, _ = guard_module._check_inline_review_findings("100")
-        assert block
-
-    def test_inline_p1_nested_under_changelog_d_still_blocks(self, guard_module):
-        # The rule is deliberately flat: the assembler rejects nested files, so
-        # a subdirectory here is already a contract violation and must not be
-        # able to smuggle a path through this allowlist.
-        with self._mock(
-            guard_module,
-            [self._codex(1, _P1_BODY, path="changelog.d/nested/thing.md")],
-        ):
-            block, _ = guard_module._check_inline_review_findings("100")
-        assert block
-
-    def test_inline_p1_on_a_lookalike_prefix_still_blocks(self, guard_module):
-        # ``changelog.dist/`` is not ``changelog.d/``. A prefix test that used
-        # startswith on the bare name would pass this and should not.
-        with self._mock(
-            guard_module,
-            [self._codex(1, _P1_BODY, path="changelog.dist/thing.md")],
         ):
             block, _ = guard_module._check_inline_review_findings("100")
         assert block
@@ -1462,12 +1543,27 @@ class TestCheckInlineReviewFindings:
         assert block
         assert "Make queue claim atomic" in msg
 
-    def test_inline_p1_on_random_md_still_blocks(self, guard_module):
-        # Safe default: a non-allowlisted *.md (not CHANGELOG/README, not under
-        # docs/) is NOT a doc → still blocks.
+    def test_inline_p1_on_a_markdown_file_no_longer_blocks(self, guard_module):
+        """DELIBERATE REVERSAL (owner decision, 2026-09-04) of the old default.
+
+        This test previously locked the opposite: a `*.md` outside `docs/` was NOT a
+        doc and its findings blocked. That narrowness was itself deliberate — a `.md`
+        in this repo is often an executable prompt surface — so the flip is recorded
+        here rather than quietly deleted, the way the other residue-locks in this repo
+        are flipped when a decision changes.
+
+        The ground for reversing it: the COMMIT gate classifies prompt/skill surfaces
+        independently (`review_enforcement_commit._is_prompt_surface`, "behavior
+        surface — reviewable, never docs-skipped") and still requires an adversarial
+        review to edit them. So what this changes is only whether a REVIEWER'S FINDING
+        can block a MERGE on prose — not whether prose gets reviewed.
+
+        Reversible without a code change: `merge_gate.doc_findings: score` restores
+        exactly the behaviour this test used to assert (covered below).
+        """
         with self._mock(guard_module, [self._codex(1, _P1_BODY, path="NOTES.md")]):
             block, _ = guard_module._check_inline_review_findings("100")
-        assert block
+        assert not block
 
     def test_inline_p1_on_code_under_docs_still_blocks(self, guard_module):
         # docs/conf.py is executable Python — a finding there must still block.
