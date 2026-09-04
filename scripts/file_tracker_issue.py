@@ -131,23 +131,39 @@ def _run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
 def _finish(code: int) -> int:
     """Return `code` and make sure the interpreter cannot override it.
 
-    CPython flushes stdout during shutdown, AFTER main() returns. If stdout is
-    closed or full that flush fails and the process exits 120 — silently
-    replacing whatever we returned. MEASURED: a run whose issue was created
-    successfully exited 120 under `> /dev/full`, i.e. a confirmed post reported
-    as an undocumented failure, sending the operator to retry into a duplicate.
+    CPython flushes stdout during shutdown, AFTER main() returns. If that flush
+    fails the process exits 120, silently replacing whatever we returned —
+    MEASURED: a run whose issue was created successfully exited 120 under
+    `> /dev/full`, i.e. a confirmed post reported as an undocumented failure.
 
-    So: flush here, where we can still react, and if that fails put a usable fd
-    under stdout so the shutdown flush has nothing to fail on.
+    This function is deliberately TOTAL: it is the guarantee, so it must not be
+    able to raise. Every stdout shape is handled —
+
+      * `sys.stdout is None`      (launched with fd 1 closed, e.g. `>&-`).
+        Nothing to flush and nothing for shutdown to flush either.
+      * a closed stream           (`flush()` raises ValueError, and so does the
+        `fileno()` we would use to recover — the recovery path needs its own
+        guard, which an earlier version of this function did not have).
+      * a full or broken pipe     (flush raises OSError; put a usable fd under
+        it so shutdown has nothing to fail on).
     """
+    stream = getattr(sys, "stdout", None)
+    if stream is None:
+        return code
     try:
-        sys.stdout.flush()
+        stream.flush()
+        return code
     except (OSError, ValueError):
-        try:
-            devnull = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull, sys.stdout.fileno())
-        except OSError:
-            pass  # nothing further to try; the exit code is still ours
+        pass
+    except Exception:  # noqa: BLE001 - a guarantee must never raise
+        return code
+    try:
+        fd = stream.fileno()
+    except (OSError, ValueError, AttributeError):
+        return code  # no fd to repair; shutdown has nothing usable to flush
+    with contextlib.suppress(OSError):
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, fd)
     return code
 
 
@@ -364,7 +380,12 @@ def _reconcile_uncertain_create(slug: str, title: str, cause: str, run: Runner) 
     # necessarily the one this invocation created — not a pre-existing one.
     try:
         found = find_duplicate(slug, title, run)
-    except Refused as exc:
+    except (Refused, OSError, ValueError) as exc:
+        # Not just Refused: the reconciling `gh` may fail to START at all
+        # (FileNotFoundError during an executable swap, ENOMEM, a decode error).
+        # Those are OSError/ValueError, which main()'s generic handler turns into
+        # exit 1 — "unexpected error" — when the truth is that the issue MAY
+        # exist. Everything that leaves the outcome unknown must land on exit 4.
         raise Indeterminate(
             f"{cause}, and the reconciling lookup then failed ({exc}). The issue MAY "
             f"exist on {slug}. Check the tracker for this exact title BEFORE retrying "
@@ -425,6 +446,18 @@ def create_issue(
     return url
 
 
+def _report_posted(posted: str, why: str) -> int:
+    """A confirmed post stays confirmed, whatever failed afterwards.
+
+    Once `gh issue create` has returned a URL the issue is durable. Any later
+    failure — a lock release, a print, a flush, an interrupt — is a REPORTING
+    problem, and reporting it as a failure is what sends an operator to retry
+    into a duplicate.
+    """
+    _warn(f"POSTED ({why}): {posted}")
+    return _finish(0)
+
+
 def _warn(message: str) -> None:
     """stderr write that cannot itself become the failure being reported."""
     with contextlib.suppress(OSError):
@@ -459,6 +492,8 @@ def main(argv: Sequence[str] | None = None, run: Runner = _run) -> int:
     with contextlib.suppress(ValueError, OSError):
         signal.signal(signal.SIGTERM, _sigterm_as_interrupt)
 
+    posted: str | None = None
+
     try:
         try:
             with open(args.title_file, encoding="utf-8") as fh:
@@ -491,19 +526,18 @@ def main(argv: Sequence[str] | None = None, run: Runner = _run) -> int:
         with tracker_lock(slug):
             dup = find_duplicate(slug, title, run)
             if dup is not None:
-                print(
-                    f"DUPLICATE: {slug}#{dup} already has this exact title. Nothing filed.",
-                    file=sys.stderr,
-                )
-                return 3
+                _warn(f"DUPLICATE: {slug}#{dup} already has this exact title. Nothing filed.")
+                return _finish(3)
             if args.dry_run:
                 print(f"DRY RUN ok — would file to {slug} (perm={perm}) with labels {labels}")
-                return 0
+                return _finish(0)
             # Create FIRST, report second. If stdout is closed or full, the post
             # has already happened — letting the print's OSError fall through to
             # the generic handler would report exit 1 for a CONFIRMED issue and
             # send the operator to retry into a duplicate.
             posted = create_issue(slug, title, args.body_file, labels, run)
+        # From here the issue EXISTS. Nothing below may report otherwise — see
+        # the handlers, which all check `posted` first.
         try:
             print(posted)
         except OSError:
@@ -514,16 +548,26 @@ def main(argv: Sequence[str] | None = None, run: Runner = _run) -> int:
                 print(f"POSTED (could not write the URL to stdout): {posted}", file=sys.stderr)
         return _finish(0)
     except Indeterminate as exc:
+        if posted:
+            return _report_posted(posted, f"after creation: {exc}")
         _warn(f"INDETERMINATE: {exc}")
         return _finish(4)
     except Refused as exc:
+        if posted:
+            return _report_posted(posted, f"after creation: {exc}")
         _warn(f"REFUSED: {exc}")
         return _finish(2)
     except KeyboardInterrupt:
-        # Outside the create window, so nothing was posted.
+        # An interrupt arriving while the lock is released, the URL printed, or
+        # stdout flushed is AFTER the post. Reporting "nothing was created" there
+        # would send the operator to retry into a duplicate.
+        if posted:
+            return _report_posted(posted, "interrupted after creation")
         _warn("REFUSED: interrupted before the issue was created.")
         return _finish(2)
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        if posted:
+            return _report_posted(posted, f"after creation: {exc}")
         _warn(f"ERROR: {exc}")
         return _finish(1)
 

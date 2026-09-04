@@ -852,3 +852,160 @@ def test_confirmed_post_does_not_exit_120_when_stdout_is_full(tmp_path):
         "a CONFIRMED post exited 120 — CPython's shutdown flush overrode the exit code"
     )
     assert proc.returncode == 0, f"expected 0 for a successful post, got {proc.returncode}"
+
+
+# ===========================================================================
+# round 6 — the guarantee's own edges. Each of these is a hole IN the fix that
+# was written to close the previous hole.
+# ===========================================================================
+
+
+def test_finish_survives_stdout_being_none():
+    """`>&-` makes sys.stdout None; the guard itself raised AttributeError."""
+    real = sys.stdout
+    try:
+        sys.stdout = None
+        assert fti._finish(0) == 0
+        assert fti._finish(4) == 4
+    finally:
+        sys.stdout = real
+
+
+def test_finish_survives_an_already_closed_stream():
+    """flush() raises ValueError, and so does the fileno() used to recover."""
+
+    class Closed:
+        closed = True
+
+        def flush(self):
+            raise ValueError("I/O operation on closed file")
+
+        def fileno(self):
+            raise ValueError("I/O operation on closed file")
+
+    real = sys.stdout
+    try:
+        sys.stdout = Closed()
+        assert fti._finish(0) == 0
+    finally:
+        sys.stdout = real
+
+
+def test_finish_never_raises_for_any_stdout_shape():
+    """It IS the exit-code guarantee, so it must be total."""
+
+    class Hostile:
+        def flush(self):
+            raise RuntimeError("unexpected")
+
+        def fileno(self):
+            raise RuntimeError("unexpected")
+
+    real = sys.stdout
+    try:
+        for stream in (None, Hostile()):
+            sys.stdout = stream
+            assert fti._finish(7) == 7
+    finally:
+        sys.stdout = real
+
+
+def test_a_late_interrupt_after_creation_reports_the_post_not_a_refusal(tmp_path, capsys):
+    """SIGINT while releasing the lock is AFTER the post — exit 0, not 2."""
+
+    class InterruptingLock:
+        def __init__(self, slug):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            raise KeyboardInterrupt
+
+    run = _runner(
+        {
+            "isFork": _proc(
+                json.dumps({"isFork": False, "nameWithOwner": "Org/Repo", "parent": None})
+            ),
+            "viewerPermission": _proc(json.dumps({"viewerPermission": "ADMIN"})),
+            "gh api": _proc(""),
+            "issue create": _proc("https://example/9"),
+        }
+    )
+    import unittest.mock
+
+    with unittest.mock.patch.object(fti, "tracker_lock", InterruptingLock):
+        tf, bf = _drafts(tmp_path)
+        rc = fti.main(
+            ["--title-file", tf, "--body-file", bf, "--area", "area:memory",
+             "--difficulty", "help wanted"],
+            run,
+        )
+    assert rc == 0, "the issue exists; reporting a refusal invites a duplicate retry"
+    err = capsys.readouterr().err
+    assert "POSTED" in err and "https://example/9" in err
+
+
+def test_reconcile_failing_to_start_gh_is_indeterminate_not_exit_1():
+    """FileNotFoundError is an OSError — it bypassed the Refused-only clause."""
+
+    def run(argv):
+        if "issue create" in " ".join(argv):
+            return _proc(returncode=1, stderr="connection reset")
+        raise FileNotFoundError("gh: no such file")
+
+    with pytest.raises(fti.Indeterminate):
+        fti.create_issue("Org/Repo", "t", "/tmp/b.md", ["area:eval", "help wanted"], run)
+
+
+def test_dry_run_is_finalized_through_finish(tmp_path, monkeypatch):
+    """Every return path must be finalized, or it exits 120 on a bad stdout."""
+    seen = {}
+    real_finish = fti._finish
+
+    def spy(code):
+        seen["code"] = code
+        return real_finish(code)
+
+    monkeypatch.setattr(fti, "_finish", spy)
+    run = _runner(
+        {
+            "isFork": _proc(
+                json.dumps({"isFork": False, "nameWithOwner": "Org/Repo", "parent": None})
+            ),
+            "viewerPermission": _proc(json.dumps({"viewerPermission": "ADMIN"})),
+            "gh api": _proc(""),
+        }
+    )
+    tf, bf = _drafts(tmp_path)
+    rc = fti.main(
+        ["--title-file", tf, "--body-file", bf, "--area", "area:memory",
+         "--difficulty", "help wanted", "--dry-run"],
+        run,
+    )
+    assert rc == 0
+    assert seen.get("code") == 0, "the dry-run path bypassed the exit-code guarantee"
+
+
+def test_duplicate_path_is_finalized_through_finish(tmp_path, monkeypatch):
+    seen = {}
+    real_finish = fti._finish
+    monkeypatch.setattr(fti, "_finish", lambda c: (seen.setdefault("code", c), real_finish(c))[1])
+    run = _runner(
+        {
+            "isFork": _proc(
+                json.dumps({"isFork": False, "nameWithOwner": "Org/Repo", "parent": None})
+            ),
+            "viewerPermission": _proc(json.dumps({"viewerPermission": "ADMIN"})),
+            "gh api": _proc(json.dumps({"number": 3, "title": "A real title"})),
+        }
+    )
+    tf, bf = _drafts(tmp_path)
+    rc = fti.main(
+        ["--title-file", tf, "--body-file", bf, "--area", "area:memory",
+         "--difficulty", "help wanted"],
+        run,
+    )
+    assert rc == 3
+    assert seen.get("code") == 3
