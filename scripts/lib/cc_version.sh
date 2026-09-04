@@ -95,11 +95,28 @@ _cc_supp_persist_outcome() {
 # shellcheck disable=SC2120  # optional args by design (settings path + extra defaults)
 cc_ensure_updater_suppressed() {
     local _rc=0
+    # DID THIS RUN CREATE THE FILE, or merely modify one that was already there?
+    #
+    # `repaired` answers neither: it is set for ANY successful modification. A
+    # caller that reads it as "we made this file" then acts on a file the
+    # operator already owned — which is exactly how host-setup.sh came to chown a
+    # pre-existing dotfiles-managed target it had promised not to touch.
+    #
+    # Computed HERE, once, rather than at each `repaired` assignment: there are
+    # two of those and adding a third is a convention the next branch forgets.
+    # `-e` follows a symlink deliberately — the question is whether the operator
+    # already had a settings file, not whether a link existed.
+    local _sf="${1:-$HOME/.claude/settings.json}"
+    if [ -e "$_sf" ]; then CC_SUPPRESSION_CREATED=0; else CC_SUPPRESSION_CREATED=1; fi
     # "$@" MUST be forwarded: the inner function takes an optional settings
     # path ($1) and optional extra defaults ("$@"). Dropping it silently
     # discards both for any caller that uses them.
     # shellcheck disable=SC2120  # optional args by design; no current caller passes any
     _cc_ensure_updater_suppressed_inner "$@" || _rc=$?
+    # A run that did not end in `repaired` wrote nothing, so it created nothing.
+    # shellcheck disable=SC2034  # cross-file: host-setup.sh reads this, the linter
+    # only sees this file (same blindness already noted for CC_SUPPRESSION_STATE)
+    [ "${CC_SUPPRESSION_STATE:-}" = "repaired" ] || CC_SUPPRESSION_CREATED=0
     _cc_supp_persist_outcome
     return "$_rc"
 }
@@ -211,7 +228,32 @@ _cc_ensure_updater_suppressed_inner() {
                     return 1
                 fi
             fi
-            local _tmp_settings="${_write_to}.tmp.$$"
+            # EXCLUSIVE creation, never a PID-derived name. `$$` is
+            # predictable, so on a shared host — and this branch runs under sudo
+            # from host-setup.sh — another process able to write the operator's
+            # .claude directory can pre-create that exact path as a SYMLINK. The
+            # redirect below follows it and overwrites the victim as root,
+            # before `mv` ever runs; the function then reports `repaired`.
+            #
+            # `mktemp` creates with O_EXCL and mode 0600, so a pre-existing path
+            # makes it fail rather than be followed.
+            #
+            # FAIL CLOSED if mktemp is unavailable. This branch exists for
+            # minimal hosts, so the tool cannot simply be assumed — but the
+            # alternative is a guessable name, and declining to repair is far
+            # better than repairing through someone else's symlink.
+            local _tmp_settings=""
+            if command -v mktemp >/dev/null 2>&1; then
+                _tmp_settings="$(mktemp "${_write_to}.tmp.XXXXXX" 2>/dev/null)" || _tmp_settings=""
+            fi
+            if [ -z "$_tmp_settings" ]; then
+                umask "$_umask_prev"
+                CC_SUPPRESSION_STATE=failed
+                echo "  WARNING: cc_ensure_updater_suppressed: cannot create a temporary" \
+                     "file exclusively (mktemp unavailable or failed) — refusing to write" \
+                     "through a predictable path; suppression NOT applied" >&2
+                return 1
+            fi
             if printf '%s\n' \
                 '{' \
                 '  "env": {' \

@@ -1147,14 +1147,19 @@ class TestVerifiedByConstruction:
     def _bin_sans_python(self, tmp_path: Path) -> Path:
         """A bin dir with everything the no-python branch needs EXCEPT python3.
 
-        mv and grep are the create path's own dependencies and are deliberately
-        included — they are not in _TOOLS because no test ever exercised this
-        branch before. Every tool asserted present: a missing one would
-        silently route down a different branch than the test names.
+        mv, grep and mktemp are the create path's own dependencies and are
+        deliberately included — they are not in _TOOLS because no test ever
+        exercised this branch before. Every tool asserted present: a missing one
+        would silently route down a different branch than the test names.
+
+        mktemp is REQUIRED, not optional: the create path refuses to write
+        through a predictable `.tmp.$$` name, so without mktemp it fails closed
+        by design. Omitting it here would test the refusal rather than the
+        create, which is a different branch wearing the same test names.
         """
         d = tmp_path / "nopybin"
         d.mkdir(exist_ok=True)
-        for tool in ("bash", "sh", "env", "mkdir", "dirname", "cat", "rm", "mv", "grep"):
+        for tool in ("bash", "sh", "env", "mkdir", "dirname", "cat", "rm", "mv", "grep", "mktemp"):
             dest = d / tool
             if dest.exists() or dest.is_symlink():
                 continue
@@ -1253,6 +1258,86 @@ class TestVerifiedByConstruction:
         assert env["DISABLE_UPDATES"] == "1"
         # Reading back THROUGH the link is what proves the link still resolves.
         assert json.loads(settings.read_text())["env"]["DISABLE_UPDATES"] == "1"
+
+    def test_a_pre_created_temp_symlink_cannot_be_written_through(self, tmp_path: Path) -> None:
+        """The temp path must be created EXCLUSIVELY, not derived from the PID.
+
+        `$$` is predictable, and this branch runs under sudo from host-setup.sh.
+        A process able to write the operator's `.claude` directory can
+        pre-create that exact path as a symlink; the redirect then follows it
+        and overwrites the victim AS ROOT before `mv` ever runs, after which the
+        function reports `repaired`.
+
+        The victim here stands in for any file the attacker points at. It must
+        come out untouched, and the run must not claim a repair it achieved by
+        clobbering it.
+        """
+        bindir = self._bin_sans_python(tmp_path)
+        for tool in ("mktemp", "ln", "readlink"):
+            src = shutil.which(tool)
+            assert src, f"{tool} missing — this test would not exercise its branch"
+            if not (bindir / tool).exists():
+                (bindir / tool).symlink_to(src)
+
+        settings = _settings(tmp_path)
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        victim = tmp_path / "home" / "victim.txt"
+        victim.write_text("PRECIOUS")
+
+        # Plant the symlink at the EXACT path the old scheme would use, from
+        # inside the same shell, so `$$` is the real PID rather than a guess.
+        #
+        # A first version of this test planted PIDs 2..4000 from Python and
+        # passed against the vulnerable code — the shell's actual `$$` was
+        # outside that range, so the attack was never planted and the test
+        # proved nothing. Deriving the path from `$$` in the shell that will use
+        # it removes the guess entirely.
+        r = _run(
+            tmp_path,
+            'ln -s "$HOME/victim.txt" "$HOME/.claude/settings.json.tmp.$$"; '
+            'cc_ensure_updater_suppressed || true; '
+            'echo "STATE=${CC_SUPPRESSION_STATE:-unset}"',
+            path_dir=bindir,
+        )
+
+        assert victim.read_text() == "PRECIOUS", (
+            "the redirect followed a pre-created symlink and overwrote an "
+            f"unrelated file as the invoking user; stdout={r.stdout!r}"
+        )
+        # The real settings file must still have been produced properly.
+        assert "STATE=repaired" in r.stdout, (r.stdout, r.stderr)
+        assert json.loads(settings.read_text())["env"]["DISABLE_UPDATES"] == "1"
+
+    def test_created_is_distinct_from_merely_repaired(self, tmp_path: Path) -> None:
+        """`repaired` means modified; it cannot answer "did we make this file".
+
+        host-setup.sh chowns the settings file to the operator, and its comments
+        promise to hand back only what THIS run created. Keyed on `repaired` it
+        also chowned a pre-existing dotfiles-managed file, because every
+        successful modification reports `repaired`.
+        """
+        settings = _settings(tmp_path)
+        settings.parent.mkdir(parents=True, exist_ok=True)
+
+        # Absent -> created.
+        r = _run(tmp_path, 'cc_ensure_updater_suppressed || true; '
+                           'echo "S=$CC_SUPPRESSION_STATE C=$CC_SUPPRESSION_CREATED"')
+        assert "S=repaired" in r.stdout and "C=1" in r.stdout, (r.stdout, r.stderr)
+
+        # Present but missing a key -> repaired, NOT created.
+        settings.write_text(json.dumps({"env": {"DISABLE_AUTOUPDATER": "1"}}))
+        r = _run(tmp_path, 'cc_ensure_updater_suppressed || true; '
+                           'echo "S=$CC_SUPPRESSION_STATE C=$CC_SUPPRESSION_CREATED"')
+        assert "S=repaired" in r.stdout, (r.stdout, r.stderr)
+        assert "C=0" in r.stdout, (
+            "a modification of a pre-existing file reported itself as a creation — "
+            "host-setup.sh would chown a file the operator already owned"
+        )
+
+        # Already correct -> neither.
+        r = _run(tmp_path, 'cc_ensure_updater_suppressed || true; '
+                           'echo "S=$CC_SUPPRESSION_STATE C=$CC_SUPPRESSION_CREATED"')
+        assert "S=ok" in r.stdout and "C=0" in r.stdout, (r.stdout, r.stderr)
 
     def test_a_create_whose_write_did_not_land_reports_failed(self, tmp_path: Path) -> None:
         """Sabotaged mv: the rename 'succeeds' but the content never arrives.

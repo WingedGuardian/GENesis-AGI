@@ -1379,16 +1379,42 @@ if [ -L "$_host_settings_file" ]; then
         /*)  _chown_target="$_link" ;;
         *)   _chown_target="$(dirname "$_host_settings_file")/$_link" ;;
     esac
-    # Only inside the operator's own home. A link into a dotfiles checkout
-    # elsewhere is left entirely alone, which is what the original guard was
-    # protecting and is still worth protecting.
-    case "$_chown_target" in
-        "$_host_home"/*) : ;;
-        *) _chown_target="" ;;
-    esac
+    # CANONICALIZE before the containment test. A LEXICAL prefix check is not a
+    # containment check: `$_host_home/.claude/../../outside/settings.json` starts
+    # with $_host_home and resolves outside it, and so does any path whose
+    # intermediate directory is itself a symlink. The chown that follows is
+    # PRIVILEGED and follows the resolved path, so a lexical pass here hands an
+    # external file to the operator.
+    #
+    # Fail closed if realpath is unavailable: skipping the chown costs a
+    # readable warning, while proceeding uncanonicalized costs an ownership
+    # change on a file this script cannot vouch for.
+    if [ -n "$_chown_target" ]; then
+        if command -v realpath >/dev/null 2>&1; then
+            _canon_target="$(realpath -- "$_chown_target" 2>/dev/null || true)"
+            _canon_home="$(realpath -- "$_host_home" 2>/dev/null || true)"
+        else
+            _canon_target=""; _canon_home=""
+        fi
+        if [ -z "$_canon_target" ] || [ -z "$_canon_home" ]; then
+            echo "  WARNING: cannot canonicalize $_chown_target — skipping the ownership" \
+                 "fix rather than chowning a path that may resolve outside" \
+                 "$_host_home"
+            _chown_target=""
+        else
+            case "$_canon_target" in
+                "$_canon_home"/*) _chown_target="$_canon_target" ;;
+                *) _chown_target="" ;;
+            esac
+        fi
+    fi
 fi
 
-if [ "${CC_SUPPRESSION_STATE:-unverified}" = "repaired" ] &&
+# `repaired` is set for ANY successful modification, so it cannot answer "did we
+# make this file". CC_SUPPRESSION_CREATED can, and it is the right question: the
+# comments above promise to hand back only what this run created, and chowning a
+# pre-existing dotfiles-managed target breaks that promise.
+if [ "${CC_SUPPRESSION_CREATED:-0}" = "1" ] &&
    [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] &&
    [ -n "$_chown_target" ] && [ -e "$_chown_target" ]; then
     # Owner ONLY — no trailing colon. MEASURED: `chown user:` resets the group
