@@ -807,6 +807,56 @@ else
     log "Overlays: no backup directory"
 fi
 
+# ── 6d. Hook audit stores ────────────────────────────────────────────
+# NEVER overwrite a live record, even under --force. Restoring is purely ADDITIVE
+# and that is a property of the store's shape rather than a rule we enforce: each
+# file is named from the writing instant plus pid, so a backup file and a live one
+# cannot collide unless they ARE the same record. The explicit existence test below
+# fills the gaps a rebuild left and cannot destroy anything a running install has
+# written since — deliberately not `cp -n`, whose skip is indistinguishable from a
+# copy in its exit status and which coreutils warns may change behaviour.
+log "--- Hook audit stores ---"
+_AUDIT_SRC="$BACKUP_DIR/audit/merge_overrides"
+# ASK, do not assume — same resolver the writer and the pruner use. Restoring to
+# the hardcoded default put an install with a custom GENESIS_MERGE_OVERRIDE_DIR
+# back together with its audit trail in a directory nothing reads (Codex P2,
+# PR #1609).
+_AUDIT_DST="$(python3 "$_SCRIPT_DIR/hooks/audit_jsonl.py" --store-dir GENESIS_MERGE_OVERRIDE_DIR 2>/dev/null \
+    || printf '%s' "$HOME/.genesis/merge_overrides")"
+if [ ! -d "$_AUDIT_SRC" ]; then
+    log "Audit stores: no backup payload"
+elif $DRY_RUN; then
+    log "Audit stores: would restore $(find "$_AUDIT_SRC" -maxdepth 1 -type f -name '*.jsonl' 2>/dev/null | wc -l) file(s) → $_AUDIT_DST"
+else
+    mkdir -p "$_AUDIT_DST" && chmod 0700 "$_AUDIT_DST"
+    _AUDIT_RESTORED=0
+    while IFS= read -r -d '' _f; do
+        # 0600 to match the writer's own guarantee; umask alone would not promise it.
+        _dst="$_AUDIT_DST/$(basename "$_f")"
+        # Count only REAL copies. `cp -n` exits 0 when it SKIPS an existing file, so
+        # counting its status reported every skipped file as restored. Test the
+        # destination's absence instead, which is the condition actually meant.
+        if [ ! -e "$_dst" ]; then
+            # Copy to a TEMP name and rename into place. A bare `cp` that fails
+            # partway — a full disk is the realistic one — leaves a truncated
+            # JSONL at the destination, adds no warning, and lets the restore
+            # report success; every later restore then SKIPS that file because
+            # `-e` is now true, even with --force, so the corruption is permanent
+            # and silent (Codex P2, PR #1609). rename(2) is atomic within the
+            # directory, so the destination either does not exist or is whole.
+            _tmp="$_dst.partial.$$"
+            if cp "$_f" "$_tmp" 2>/dev/null && mv -f "$_tmp" "$_dst" 2>/dev/null; then
+                chmod 0600 "$_dst" 2>/dev/null || true
+                _AUDIT_RESTORED=$(( _AUDIT_RESTORED + 1 ))
+            else
+                rm -f "$_tmp" 2>/dev/null || true
+                warn "audit record $(basename "$_f") could not be restored"
+            fi
+        fi
+    done < <(find "$_AUDIT_SRC" -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
+    log "Audit stores: $_AUDIT_RESTORED file(s) restored → $_AUDIT_DST (existing left untouched)"
+fi
+
 # ── 7. Secrets ───────────────────────────────────────────────────────
 log "--- Secrets ---"
 SECRETS_SRC="$BACKUP_DIR/secrets/secrets.env.gpg"

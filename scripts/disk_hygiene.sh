@@ -27,6 +27,9 @@
 #  12. Retention prune of entity_merge_journal (>180d) → scripts/prune_entity_merge_journal.py
 #      (reversibility snapshot store; generous window so unmerge_entity outlives
 #      the mis-merge discovery horizon)
+#  13. Size trim of the hook audit stores (>5MB each) → scripts/prune_hook_audit_logs.py
+#      (merge-override + git-discard records, one file per flush — oldest whole
+#      files dropped; an age prune cannot bound an append-forever store)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -174,6 +177,14 @@ main() {
             -mtime +45 -delete 2>/dev/null \
             || echo "reconcile ghost-export prune exited $?"
     fi
+
+    echo "--- hook audit store size trim (>5MB per store, newest kept) ---"
+    # One file per hook flush, so the oldest whole files are deleted past the byte
+    # bound. This is the shape the ghost-export note above explains an age prune
+    # cannot handle for an append-forever file. Retention lives here, never on the
+    # hook path: a guard returning a security verdict must not also groom a store.
+    "$VENV_PY" "$REPO_DIR/scripts/prune_hook_audit_logs.py" --max-bytes 5000000 \
+        || echo "prune_hook_audit_logs exited $?"
 
     echo "=== genesis-disk-hygiene done ==="
 }
