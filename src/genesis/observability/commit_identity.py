@@ -5,10 +5,10 @@ genesis-server, which must not).
 There are deliberately TWO verdicts, and they answer different questions. Do
 not "unify" them — the divergence is the design.
 
-``is_behind`` — AWARENESS. Does this process's code differ from the tree's
-CURRENT HEAD? Used by the advisory surfaces (the per-prompt hook nudge and the
-dashboard stale-code badge). It observes HEAD directly, so it needs no producer
-and cannot be bypassed.
+``differs_from_head`` — AWARENESS. Does this process's code differ from the
+tree's CURRENT HEAD? Used by the advisory surfaces (the per-prompt hook nudge
+and the dashboard code-differs badge). It observes HEAD directly, so it needs
+no producer and cannot be bypassed.
 
 ``is_stale`` — AUTHORIZATION. Did a RECORDED deploy land after this process
 started? Used by the MCP middleware guard, which BLOCKS a guarded tool. It is
@@ -20,9 +20,9 @@ answer DIFFERENT questions — quoting either as "the" number is wrong:
 
 * **Record coverage — 5 rows for 46 HEAD movements over 30 days (10.9%).** How
   often a code change is recorded at all.
-* **Verdict recall — 4/52 (7.7%) against 52/52 for ``is_behind``.** A replay
-  over the same history asking, per movement, whether a session spawned just
-  before it would actually be TOLD. It is lower than coverage, and the gap is
+* **Verdict recall — 4/52 (7.7%) against 52/52 for ``differs_from_head``.** A
+  replay over the same history asking, per movement, whether a session spawned
+  just before it would actually be TOLD. It is lower than coverage, and the gap is
   the time axis: a recorded deploy only helps a session that started before it.
   (52 vs 46 because the replay counts every HEAD-moving reflog entry, including
   the checkouts the coverage figure excludes.)
@@ -39,9 +39,9 @@ dozens of commits.
 
 That blindness is a defect in an ADVISORY surface (a warning that never fires)
 and merely conservative in a BLOCKING one (a gate that declines to block).
-Repointing the blocking guard at ``is_behind`` would widen a live block from
-~never-firing to firing on most long-lived sessions — a policy change, not a bug
-fix. It is therefore left on ``is_stale`` until that decision is taken
+Repointing the blocking guard at ``differs_from_head`` would widen a live block
+from ~never-firing to firing on most long-lived sessions — a policy change, not
+a bug fix. It is therefore left on ``is_stale`` until that decision is taken
 deliberately.
 """
 
@@ -61,7 +61,7 @@ def same_commit(a: str | None, b: str | None) -> bool:
     return bool(a and b and (a.startswith(b) or b.startswith(a)))
 
 
-def is_behind(spawn_commit: str | None, head_commit: str | None) -> bool:
+def differs_from_head(spawn_commit: str | None, head_commit: str | None) -> bool:
     """True iff a process's code differs from the tree's CURRENT HEAD.
 
     The AWARENESS verdict (see the module docstring). No time axis: ``is_stale``
@@ -71,10 +71,15 @@ def is_behind(spawn_commit: str | None, head_commit: str | None) -> bool:
     for a worktree session; see ``mcp_spawn_identity``) and the caller reads HEAD
     from that same tree.
 
-    Mismatch alone does NOT prove the process is behind: HEAD can move backwards
-    (a reset or a force-move), which is a divergence rather than a deploy. The
-    caller distinguishes those by counting commits in ``spawn..head`` — it holds
-    the git data; this leaf stays pure.
+    IT IS AN INEQUALITY, AND THE NAME NOW SAYS SO. This was ``is_behind``, and
+    every consumer that read the name rather than the docstring inherited a
+    direction it does not establish: the dashboard badge said "running older
+    code", which is false after a reset, a force-move, or a checkout of an
+    earlier ref — cases where the process holds code the tree no longer has.
+    Two shas cannot answer "which way"; only the history can, and this leaf
+    deliberately does no IO. ``genesis_urgent_alerts._deploy_span`` answers it
+    where the git data is, by reading ``spawn...head`` with ``--left-right`` and
+    reporting BOTH sides rather than one count.
 
     Fail-open: a missing value on either side yields ``False``.
     """
@@ -99,9 +104,9 @@ def is_stale(
     not help against THIS record). Identity alone would wrongly flag the ahead
     case.
 
-    Note what that means in practice, and why ``is_behind`` exists: a session
-    ahead of the last recorded deploy can still be far behind live HEAD. This
-    verdict is silent there by design.
+    Note what that means in practice, and why ``differs_from_head`` exists: a
+    session ahead of the last recorded deploy can still be far behind live
+    HEAD. This verdict is silent there by design.
 
     Fail-open: any missing/unparseable input yields ``False`` — never a false
     positive.

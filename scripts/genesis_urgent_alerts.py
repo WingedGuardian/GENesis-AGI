@@ -332,17 +332,33 @@ def _current_head(root: Path) -> str | None:
     return sha if _is_sha(sha) else None
 
 
-def _deploy_span(root: Path, spawn: str, head: str) -> tuple[int, list[str]] | None:
-    """``(commit_count, pr_numbers)`` for ``spawn..head``, or None on failure.
+def _deploy_span(root: Path, spawn: str, head: str) -> tuple[int, int, list[str]] | None:
+    """``(landed, only_ours, pr_numbers)`` for ``spawn...head``, or None on failure.
 
-    ONE ``git log``, reached only after ``is_behind`` has already said the shas
-    differ — so the cost lands on the transition, never on the steady state.
+    ONE ``git log``, reached only after ``differs_from_head`` has already said
+    the shas differ — so the cost lands on the transition, never on the steady
+    state.
 
-    A count of ZERO is meaningful, not empty: it means HEAD is not a descendant
-    of the spawn commit, so the histories DIVERGED (a reset or force-move)
-    rather than main moving forward. The caller stays silent on it. This is the
-    one case ``is_stale``'s time axis used to cover, handled here where the git
-    data actually is instead of in the pure verdict.
+    THE SPLIT IS THE POINT. ``differs_from_head`` compares two shas and so knows
+    only that they are not equal; the DIRECTION lives in the history, and this is
+    where the history is read. A symmetric ``spawn...head`` with ``--left-right``
+    answers it in that same one call: ``>`` marks a commit only the checkout has
+    (what landed under us), ``<`` marks one only this process has (what the
+    checkout does not contain).
+
+    Returning the two counts separately, rather than a single number, is what
+    makes the three states distinguishable by the caller instead of guessed:
+
+        only_ours == 0, landed > 0   main moved forward — an ordinary deploy
+        only_ours > 0,  landed > 0   the histories DIVERGED (a rebase/force-move)
+        only_ours > 0,  landed == 0  the checkout moved BACK past this process
+
+    The predecessor asked ``spawn..head`` (two dots) and read a count of zero as
+    "diverged". That is wrong in both directions and it is the defect Codex named
+    (P2, PR #1651): git defines ``A..B`` as commits reachable from B and not from
+    A, so a genuine divergence is NON-zero and was reported as an ordinary
+    "main moved N commits", while zero actually means the checkout moved BACK —
+    the one case where restarting loses code rather than gaining it.
 
     PR numbers come from the trailing ``(#N)`` that squash merges append —
     MEASURED 40/40 on recent main commits. Anchored to end-of-line so a subject
@@ -357,7 +373,15 @@ def _deploy_span(root: Path, spawn: str, head: str) -> tuple[int, list[str]] | N
         return None
     try:
         proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["git", "-C", str(root), "log", "--oneline", f"{spawn}..{head}"],
+            [
+                "git",
+                "-C",
+                str(root),
+                "log",
+                "--oneline",
+                "--left-right",
+                f"{spawn}...{head}",
+            ],
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_S,
@@ -372,25 +396,44 @@ def _deploy_span(root: Path, spawn: str, head: str) -> tuple[int, list[str]] | N
     # losing that line's PR number. The count is the one author-influenceable
     # value in an LLM-visible line, so it gets the exact separator git used.
     lines = [ln for ln in proc.stdout.split("\n") if ln.strip()]
-    prs = [m.group(1) for ln in lines if (m := re.search(r"\(#(\d+)\)$", ln))]
-    return len(lines), prs
+    # `--left-right` prefixes every line with `<` or `>` and nothing else, so the
+    # side is read off column 0. A line with neither marker is not classified as
+    # either side: it would mean git changed its output shape, and inventing a
+    # side for it is how a wrong direction gets asserted with confidence.
+    landed = [ln for ln in lines if ln.startswith(">")]
+    only_ours = [ln for ln in lines if ln.startswith("<")]
+    prs = [m.group(1) for ln in landed if (m := re.search(r"\(#(\d+)\)$", ln))]
+    return len(landed), len(only_ours), prs
 
 
-def _deploy_message(spawn: str, head: str, count: int, prs: list[str]) -> str | None:
+def _deploy_message(
+    spawn: str, head: str, landed: int, only_ours: int, prs: list[str]
+) -> str | None:
     """The notice line, or None when there is nothing honest to say.
 
     Pure (no IO) so the wording and every suppression rule are unit-testable.
     Suppresses on a non-sha either side (the line becomes LLM-visible prompt
-    context, so nothing but a real sha is ever interpolated) and on a
-    non-positive count (a diverged history — see ``_deploy_span``).
+    context, so nothing but a real sha is ever interpolated) and when neither
+    side has a unique commit (nothing observed, so nothing to say).
 
-    Carries only shas, a count, and PR numbers: no commit subjects, no paths,
+    THE LEAD CLAUSE IS CHOSEN BY THE COUNTS, NOT ASSUMED. Three states reach
+    here (see ``_deploy_span``) and they are not the same news:
+
+    * main moved forward — the ordinary deploy, and the only one that may say so;
+    * the histories diverged — this process holds commits the checkout does not,
+      so a restart REPLACES that code rather than catching up to it;
+    * the checkout moved back — a restart loses code outright.
+
+    The remedy tail is identical in all three (a restart is still what changes
+    what is loaded), which is exactly why the lead has to carry the difference.
+
+    Carries only shas, counts, and PR numbers: no commit subjects, no paths,
     no branch names. That is a privacy floor and it also removes tag-forgery as
     a concern outright — there is no attacker-controlled text in the line.
     """
     if not _is_sha(spawn) or not _is_sha(head):
         return None
-    if count <= 0:
+    if landed <= 0 and only_ours <= 0:
         return None
     shown = prs[:_PR_CAP]
     pr_clause = ""
@@ -399,11 +442,50 @@ def _deploy_message(spawn: str, head: str, count: int, prs: list[str]) -> str | 
         if len(prs) > len(shown):
             listed += f" +{len(prs) - len(shown)} more"
         pr_clause = f" — PRs {listed}"
-    noun = "commit" if count == 1 else "commits"
+    def _n(k: int) -> str:
+        return f"{k} commit" if k == 1 else f"{k} commits"
+
+    # The LABEL moves with the state too. "Deploy" is a claim in its own right —
+    # a rollback announced under it reads as new code arriving, which is the
+    # opposite of what happened.
+    if only_ours == 0:
+        label = "Deploy"
+        lead = f"main moved {_n(landed)} under this session"
+    elif landed == 0:
+        label = "Rollback"
+        lead = (
+            f"the checkout moved BACK past this session — it is missing "
+            f"{_n(only_ours)} this session's code has"
+        )
+    else:
+        label = "Diverged"
+        lead = (
+            f"the checkout DIVERGED from this session — {_n(landed)} landed "
+            f"that this session lacks, and {only_ours} it has are not in the "
+            f"checkout"
+        )
+    # WHAT IS ALREADY LIVE, and what each stale thing actually needs — both
+    # narrowed to what is true (Codex P2 x2, PR #1651).
+    #
+    # "hooks/policy are already live" over-claimed. A hook's COMMAND is re-read
+    # per invocation, so a change to hook CODE is live — but Claude Code
+    # snapshots hook CONFIGURATION at session start, so a commit that adds or
+    # removes a hook, or changes its matcher or timeout in .claude/settings.json,
+    # is NOT live in this session. Saying "hooks are live" tells a session it
+    # need not act on exactly the change it must act on.
+    #
+    # And "a session restart" does not restart genesis-server. Restarting the
+    # session respawns its MCP children; genesis-server is an independent
+    # systemd user unit and needs `systemctl --user restart genesis-server`
+    # (CLAUDE.md, Process Management). Naming one action for two different
+    # things left the server running old code with the notice reading as though
+    # it had been handled.
     return (
-        f"[⚠ Deploy: main moved {count} {noun} under this session "
-        f"({spawn[:8]} → {head[:8]}){pr_clause} — hooks/policy are already live; "
-        f"MCP + genesis-server need a session restart to load]"
+        f"[⚠ {label}: {lead} "
+        f"({spawn[:8]} → {head[:8]}){pr_clause} — hook CODE is live; hook CONFIG "
+        f"changes are not (snapshotted at session start). MCP needs a session "
+        f"restart; genesis-server needs "
+        f"`systemctl --user restart genesis-server`]"
     )
 
 
@@ -489,7 +571,7 @@ def _emit_deploy_nudge(session_id: str) -> None:
     try:
         from genesis.env import repo_root
         from genesis.observability.cc_slots import read_proc_start_iso
-        from genesis.observability.commit_identity import is_behind
+        from genesis.observability.commit_identity import differs_from_head
         from genesis.observability.mcp_spawn_store import (
             enumerate_spawn_slots,
             read_spawn_identity,
@@ -521,7 +603,7 @@ def _emit_deploy_nudge(session_id: str) -> None:
         # path, and the launcher does not export GENESIS_REPO_ROOT.
         repo = repo_root()
         head = _current_head(repo)
-        if head is None or not is_behind(spawn, head):
+        if head is None or not differs_from_head(spawn, head):
             return
         # Already announced THIS deploy to THIS session — silent until HEAD moves
         # again. Checked before the `git log`, so the steady state costs one
@@ -529,13 +611,24 @@ def _emit_deploy_nudge(session_id: str) -> None:
         if _deploy_stamped(session_id) == head:
             return
         span = _deploy_span(repo, spawn, head)
-        msg = _deploy_message(spawn, head, *span) if span else None
-        # Stamp on ANY conclusive observation of `head`, including the ones we
-        # deliberately stay silent about (a diverged history, an unreachable
-        # spawn object). Stamping only on success would leave those states
-        # unstamped and re-paying TWO git subprocesses on every later prompt,
-        # for the whole life of the session — the silence is intended, the
-        # recurring cost is not.
+        if span is None:
+            # A FAILED read is not an observation. `_deploy_span` returns None
+            # only when it could not look — git timed out, exited nonzero, or a
+            # ref would not resolve — and it signals the conclusive
+            # "nothing to say" case as a count of ZERO instead. Stamping on None
+            # recorded a failure as a completed announcement, and because the
+            # stamp check runs BEFORE the git call, that session then exited
+            # early on every later prompt: one transient timeout silenced the
+            # deploy nudge for the whole life of the session (Codex P2,
+            # PR #1651). Returning here re-pays two subprocesses on the next
+            # prompt, which is the cost of not knowing — and it is the cheap
+            # error against a nudge that never fires again.
+            return
+        msg = _deploy_message(spawn, head, *span)
+        # Stamp on any CONCLUSIVE observation of `head`, including the ones we
+        # deliberately stay silent about (neither side holds a unique commit).
+        # Those states are genuinely answered, so re-paying two git subprocesses
+        # on every later prompt for them is waste, not caution.
         persisted = _record_deploy_notice(session_id, head)
         # Print only if the stamp landed: an unwritable session dir reads back as
         # "not yet told", so printing anyway would repeat the banner every prompt.

@@ -128,7 +128,7 @@ def _slot(
 # Commit-identity + time staleness fixtures. deploy = (completed_at, new_commit).
 _HEAD = "abc1234def567800000000000000000000000000"  # the main tree's CURRENT commit (40 hex)
 # (spawn_commit, spawn_at) — spawn_at is retained because read_spawn_identity
-# returns it, but the badge verdict no longer reads it (see is_behind).
+# returns it, but the badge verdict no longer reads it (see differs_from_head).
 _SPAWN_BEHIND = ("0000000000000000000000000000000000000000", "2026-07-14T09:00:00+00:00")
 _SPAWN_FRESH = ("abc1234def5678", "2026-07-14T09:00:00+00:00")  # prefix of HEAD → not stale
 _SPAWN_AFTER_LAST_RECORDED_DEPLOY = (
@@ -227,7 +227,7 @@ async def test_slot_merge_by_pid(db, monkeypatch):
         "rss_mb": 512.0,
         "slot_status": "healthy",
         "started_at": None,
-        "stale_code": False,
+        "code_differs": False,
         "head_commit": None,
     }
     assert row["flags"] == []
@@ -316,7 +316,7 @@ async def test_empty_state(db):
         "discrepant": 0,
         "completed_24h": 0,
         "failed_24h": 0,
-        "stale_code": 0,
+        "code_differs": 0,
     }
 
 
@@ -710,7 +710,7 @@ async def test_pulse_confirm_resolves_annotation_before_ledger_write(db, monkeyp
 # ── Part B: stale-code visibility (spawn commit vs the tree's CURRENT head) ──
 #
 # The badge asks the AWARENESS question — does this proc's code differ from what
-# is checked out NOW — via `commit_identity.is_behind`, the same verdict the
+# is checked out NOW — via `commit_identity.differs_from_head`, the same verdict the
 # per-prompt deploy nudge uses. It deliberately no longer reads `update_history`:
 # that record captured 10.9% of real HEAD movements on a live install, so the
 # badge showed sessions fresh while they ran commits-old code.
@@ -723,9 +723,9 @@ async def test_live_stale_when_spawn_differs_from_head(db, monkeypatch):
     _patch_spawn(monkeypatch, {("1", 100): _SPAWN_BEHIND})
     result = await _collect_detail(db, [_slot("1", 100)], now=_NOW, head=_HEAD)
     live = result["sessions"][0]["live"]
-    assert live["stale_code"] is True
+    assert live["code_differs"] is True
     assert live["head_commit"] == _HEAD  # what to restart TO
-    assert result["stats"]["stale_code"] == 1
+    assert result["stats"]["code_differs"] == 1
 
 
 @pytest.mark.asyncio
@@ -736,9 +736,9 @@ async def test_live_not_stale_when_spawn_matches_head_prefix(db, monkeypatch):
     _patch_spawn(monkeypatch, {("1", 100): _SPAWN_FRESH})
     result = await _collect_detail(db, [_slot("1", 100)], now=_NOW, head=_HEAD)
     live = result["sessions"][0]["live"]
-    assert live["stale_code"] is False
+    assert live["code_differs"] is False
     assert live["head_commit"] is None
-    assert result["stats"]["stale_code"] == 0
+    assert result["stats"]["code_differs"] == 0
 
 
 @pytest.mark.asyncio
@@ -754,8 +754,8 @@ async def test_session_past_the_last_recorded_deploy_is_still_flagged(db, monkey
     await _seed_session(db, sid="s1", pid=100)
     _patch_spawn(monkeypatch, {("1", 100): _SPAWN_AFTER_LAST_RECORDED_DEPLOY})
     result = await _collect_detail(db, [_slot("1", 100)], now=_NOW, head=_HEAD)
-    assert result["sessions"][0]["live"]["stale_code"] is True
-    assert result["stats"]["stale_code"] == 1
+    assert result["sessions"][0]["live"]["code_differs"] is True
+    assert result["stats"]["code_differs"] == 1
 
 
 @pytest.mark.asyncio
@@ -765,7 +765,7 @@ async def test_unknown_identity_not_stale(db, monkeypatch):
     await _seed_session(db, sid="s1", pid=100)
     _patch_spawn(monkeypatch, {})
     result = await _collect_detail(db, [_slot("1", 100)], now=_NOW, head=_HEAD)
-    assert result["sessions"][0]["live"]["stale_code"] is False
+    assert result["sessions"][0]["live"]["code_differs"] is False
 
 
 @pytest.mark.asyncio
@@ -775,8 +775,8 @@ async def test_unknown_head_never_stale(db, monkeypatch):
     await _seed_session(db, sid="s1", pid=100)
     _patch_spawn(monkeypatch, {("1", 100): _SPAWN_BEHIND})
     result = await _collect_detail(db, [_slot("1", 100)], now=_NOW, head=None)
-    assert result["sessions"][0]["live"]["stale_code"] is False
-    assert result["stats"]["stale_code"] == 0
+    assert result["sessions"][0]["live"]["code_differs"] is False
+    assert result["stats"]["code_differs"] == 0
 
 
 @pytest.mark.asyncio
@@ -788,6 +788,6 @@ async def test_unmatched_slot_carries_identity_staleness(db, monkeypatch):
     assert result["sessions"] == []
     unmatched = result["unmatched_slots"]
     assert len(unmatched) == 1
-    assert unmatched[0]["stale_code"] is True
+    assert unmatched[0]["code_differs"] is True
     assert unmatched[0]["head_commit"] == _HEAD
-    assert result["stats"]["stale_code"] == 1
+    assert result["stats"]["code_differs"] == 1

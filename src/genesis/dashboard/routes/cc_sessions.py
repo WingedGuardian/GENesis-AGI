@@ -28,7 +28,7 @@ import aiosqlite
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
-from genesis.observability.commit_identity import is_behind
+from genesis.observability.commit_identity import differs_from_head
 from genesis.observability.mcp_spawn_store import read_spawn_identity
 
 logger = logging.getLogger(__name__)
@@ -48,7 +48,7 @@ def _current_head() -> str | None:
     tree (`env.repo_root()`) because that is the tree a spawn identity is
     captured from (`mcp_spawn_identity`), so both sides are on one line even for
     a worktree session. Sync + cheap (~4 ms); the caller runs it off the event
-    loop. Fail-open None on any git failure → nothing is flagged stale.
+    loop. Fail-open None on any git failure → nothing is flagged.
     """
     from genesis.env import repo_root
     from genesis.observability.git_health import _run_git
@@ -159,8 +159,8 @@ async def _collect_detail(
     inject fakes instead of scanning /proc or shelling out to git.
 
     `head` is the main tree's CURRENT commit. A live proc is flagged
-    `stale_code` iff its PERSISTED spawn commit — read per slot, pid-validated —
-    differs from it (`commit_identity.is_behind`), which is the same AWARENESS
+    `code_differs` iff its PERSISTED spawn commit — read per slot, pid-validated —
+    differs from it (`commit_identity.differs_from_head`), which is the same AWARENESS
     verdict the per-prompt deploy nudge uses, so badge and nudge cannot disagree.
 
     This deliberately does NOT use `is_stale`/`update_history`, which the badge
@@ -171,19 +171,25 @@ async def _collect_detail(
     still uses `is_stale`; see `commit_identity` for why that divergence is
     intended.
 
-    Fail-open: unknown identity or unknown head → not stale. Default None →
-    nothing stale (empty-state)."""
+    Fail-open: unknown identity or unknown head → no difference reported.
+    Default None → nothing flagged (empty-state)."""
     now = now or datetime.now(UTC)
     db.row_factory = aiosqlite.Row
 
-    def _slot_stale(
+    def _slot_differs(
         slot: str | None, spid: int | None, proc_start: str | None = None
     ) -> tuple[bool, str | None]:
-        """(stale, commit_to_restart_to) for a live slot proc."""
+        """(differs, commit_to_restart_to) for a live slot proc.
+
+        DIFFERS, not "stale": two shas can only be compared for equality, and
+        the checkout is not always the newer side (a reset, a force-move, or a
+        checkout of an earlier ref puts the newer code in the RUNNING process).
+        See `commit_identity.differs_from_head`.
+        """
         ident = read_spawn_identity(slot, spid, proc_start)
         if not ident or not head:
             return False, None
-        if is_behind(ident[0], head):
+        if differs_from_head(ident[0], head):
             return True, head
         return False, None
 
@@ -207,25 +213,25 @@ async def _collect_detail(
         "discrepant": 0,
         "completed_24h": 0,
         "failed_24h": 0,
-        "stale_code": 0,
+        "code_differs": 0,
     }
     for row in rows:
         live = None
         pid = row.get("pid")
         if pid in slot_by_pid and pid not in consumed:
             s = slot_by_pid[pid]
-            stale, dc = _slot_stale(s.get("slot"), s.get("pid"), s.get("started_at"))
+            differs, dc = _slot_differs(s.get("slot"), s.get("pid"), s.get("started_at"))
             live = {
                 "slot": s.get("slot"),
                 "pid": s.get("pid"),
                 "rss_mb": s.get("rss_mb"),
                 "slot_status": s.get("status"),
                 "started_at": s.get("started_at"),
-                "stale_code": stale,
+                "code_differs": differs,
                 "head_commit": dc,
             }
-            if stale:
-                stats["stale_code"] += 1
+            if differs:
+                stats["code_differs"] += 1
             consumed.add(pid)
 
         flags: list[str] = []
@@ -272,11 +278,11 @@ async def _collect_detail(
         if s.get("pid") is None or s["pid"] in consumed:
             continue
         d = dict(s)
-        stale, dc = _slot_stale(s.get("slot"), s.get("pid"))
-        d["stale_code"] = stale
+        differs, dc = _slot_differs(s.get("slot"), s.get("pid"))
+        d["code_differs"] = differs
         d["head_commit"] = dc
-        if stale:
-            stats["stale_code"] += 1
+        if differs:
+            stats["code_differs"] += 1
         unmatched_slots.append(d)
     stats["discrepant"] += len(unmatched_slots)
 

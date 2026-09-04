@@ -86,7 +86,7 @@ def repo(tmp_path: Path) -> Path:
 
 
 def test_message_names_count_shas_and_prs():
-    msg = _ua._deploy_message(FULL_A, FULL_B, 15, ["1573", "1560"])
+    msg = _ua._deploy_message(FULL_A, FULL_B, 15, 0, ["1573", "1560"])
     assert msg is not None
     assert "15 commits" in msg
     assert FULL_A[:8] in msg and FULL_B[:8] in msg
@@ -95,39 +95,66 @@ def test_message_names_count_shas_and_prs():
 
 
 def test_message_singular_commit():
-    assert "1 commit " in _ua._deploy_message(FULL_A, FULL_B, 1, [])
+    assert "1 commit " in _ua._deploy_message(FULL_A, FULL_B, 1, 0, [])
 
 
 def test_message_caps_the_pr_list():
     prs = [str(1500 + i) for i in range(9)]
-    msg = _ua._deploy_message(FULL_A, FULL_B, 9, prs)
+    msg = _ua._deploy_message(FULL_A, FULL_B, 9, 0, prs)
     assert msg.count("#") == _ua._PR_CAP
     assert f"+{9 - _ua._PR_CAP} more" in msg
 
 
 def test_message_without_prs_omits_the_clause():
-    msg = _ua._deploy_message(FULL_A, FULL_B, 3, [])
+    msg = _ua._deploy_message(FULL_A, FULL_B, 3, 0, [])
     assert "PRs" not in msg and "3 commits" in msg
 
 
-def test_message_suppressed_on_zero_count():
-    # A diverged history (HEAD not a descendant of spawn) is not a deploy.
-    assert _ua._deploy_message(FULL_A, FULL_B, 0, []) is None
+def test_message_suppressed_when_neither_side_holds_a_unique_commit():
+    """The ONLY honest silence left. Two different shas with no unique commit
+    on either side is not a state git can produce, so this is a floor rather
+    than a case — and it is what stops the three lead clauses below from being
+    reachable with nothing to report."""
+    assert _ua._deploy_message(FULL_A, FULL_B, 0, 0, []) is None
+
+
+def test_message_says_MOVED_BACK_when_only_this_session_has_commits():
+    """The predecessor read this as "diverged" and stayed silent — the exact
+    state where silence costs most. The session is running code the checkout no
+    longer contains (a reset or a rollback), so restarting LOSES that code
+    rather than catching up to it, and it must not be described as a deploy."""
+    msg = _ua._deploy_message(FULL_A, FULL_B, 0, 2, [])
+    assert msg is not None
+    assert "moved BACK" in msg
+    assert "main moved" not in msg, "a rollback announced as a deploy"
+    assert "Rollback:" in msg and "Deploy:" not in msg, "the LABEL is a claim too"
+
+
+def test_message_says_DIVERGED_when_both_sides_have_commits():
+    """A rebase or force-move of main. `spawn..head` is NON-empty here, so the
+    predecessor's two-dot count reported it as an ordinary "main moved N
+    commits" — a fast-forward it had not established (Codex P2, PR #1651)."""
+    msg = _ua._deploy_message(FULL_A, FULL_B, 4, 2, ["1500"])
+    assert msg is not None
+    assert "DIVERGED" in msg
+    assert "4 commits landed" in msg and "2 it has" in msg
+    assert "main moved" not in msg
+    assert "Diverged:" in msg and "Deploy:" not in msg
 
 
 def test_message_suppressed_on_non_sha():
     # The line is LLM-visible prompt context: never interpolate a non-sha.
-    assert _ua._deploy_message("not-a-sha", FULL_B, 3, []) is None
-    assert _ua._deploy_message(FULL_A, "../../etc/passwd", 3, []) is None
-    assert _ua._deploy_message("", FULL_B, 3, []) is None
+    assert _ua._deploy_message("not-a-sha", FULL_B, 3, 0, []) is None
+    assert _ua._deploy_message(FULL_A, "../../etc/passwd", 3, 0, []) is None
+    assert _ua._deploy_message("", FULL_B, 3, 0, []) is None
 
 
 def test_message_carries_no_commit_subjects(repo: Path):
     # Privacy floor: shas, a count and PR numbers only.
     head = _commit(repo, "feat: a private looking subject line (#1234)")
     spawn = _git(repo, "rev-parse", "HEAD~1")
-    count, prs = _ua._deploy_span(repo, spawn, head)
-    msg = _ua._deploy_message(spawn, head, count, prs)
+    count, only_ours, prs = _ua._deploy_span(repo, spawn, head)
+    msg = _ua._deploy_message(spawn, head, count, only_ours, prs)
     assert "private looking" not in msg
     assert "#1234" in msg
 
@@ -165,8 +192,8 @@ def test_span_counts_commits_and_collects_prs(repo: Path):
     _commit(repo, "fix: one (#1101)")
     _commit(repo, "feat: two (#1102)")
     head = _commit(repo, "fix: three (#1103)")
-    count, prs = _ua._deploy_span(repo, spawn, head)
-    assert count == 3
+    count, only_ours, prs = _ua._deploy_span(repo, spawn, head)
+    assert (count, only_ours) == (3, 0), "a fast-forward has no commits on our side"
     assert prs == ["1103", "1102", "1101"]  # newest first, as git log orders
 
 
@@ -181,7 +208,7 @@ def test_span_pr_regex_is_anchored_to_end_of_line(repo: Path):
     """
     spawn = _git(repo, "rev-parse", "HEAD")
     head = _commit(repo, 'revert: "feat: the thing (#1200)" (#1350)')
-    _count, prs = _ua._deploy_span(repo, spawn, head)
+    _count, _ours, prs = _ua._deploy_span(repo, spawn, head)
     assert prs == ["1350"], "unanchored, this also harvests the quoted #1200"
 
 
@@ -189,19 +216,37 @@ def test_span_ignores_a_commit_with_no_pr_suffix(repo: Path):
     spawn = _git(repo, "rev-parse", "HEAD")
     _commit(repo, "wip: local commit with no PR")
     head = _commit(repo, "fix: real one (#1200)")
-    count, prs = _ua._deploy_span(repo, spawn, head)
+    count, _ours, prs = _ua._deploy_span(repo, spawn, head)
     assert count == 2 and prs == ["1200"]
 
 
-def test_span_zero_when_history_diverged(repo: Path):
-    """HEAD moved BACKWARDS (a reset/force-move): the shas differ but nothing
-    landed. Zero is the signal the caller suppresses on."""
+def test_span_splits_the_sides_when_the_checkout_moved_back(repo: Path):
+    """HEAD moved BACKWARDS (a reset/force-move). Nothing landed, and the ONE
+    commit this session holds is the whole story — a single count cannot carry
+    it, which is why the split exists."""
     spawn = _commit(repo, "feat: later (#1300)")
     _git(repo, "reset", "--hard", "HEAD~1")
     head = _git(repo, "rev-parse", "HEAD")
     assert spawn != head
-    count, prs = _ua._deploy_span(repo, spawn, head)
-    assert count == 0 and prs == []
+    landed, only_ours, prs = _ua._deploy_span(repo, spawn, head)
+    assert (landed, only_ours) == (0, 1)
+    assert prs == [], "PRs are harvested from what LANDED, never from our side"
+
+
+def test_span_reports_both_sides_of_a_real_divergence(repo: Path):
+    """THE case the two-dot range got wrong. Both branches carry unique commits,
+    so `spawn..head` is non-empty and the predecessor called it an ordinary
+    deploy. MEASURED against real git rather than reasoned: the left/right split
+    names which side each commit is on.
+    """
+    base = _git(repo, "rev-parse", "HEAD")
+    spawn = _commit(repo, "feat: ours (#1401)")
+    _git(repo, "reset", "--hard", base)
+    _commit(repo, "feat: theirs one (#1402)")
+    head = _commit(repo, "feat: theirs two (#1403)")
+    landed, only_ours, prs = _ua._deploy_span(repo, spawn, head)
+    assert (landed, only_ours) == (2, 1)
+    assert prs == ["1403", "1402"], "only the landed side contributes PR numbers"
 
 
 def test_span_none_on_unknown_revision(repo: Path):
@@ -324,8 +369,18 @@ def test_emit_silent_when_session_is_at_head(monkeypatch, capsys, tmp_path, repo
     assert capsys.readouterr().out == ""
 
 
-def test_emit_silent_when_history_diverged(monkeypatch, capsys, tmp_path, repo):
-    """Shas differ but HEAD is not a descendant — a reset, not a deploy."""
+def test_emit_speaks_when_the_checkout_moved_back(monkeypatch, capsys, tmp_path, repo):
+    """DELIBERATE REVERSAL of the predecessor, and the reason is the finding.
+
+    This state used to be silent, because a `spawn..head` count of 0 was read as
+    "diverged — nothing honest to say". It is not diverged: the checkout moved
+    BACK, and this session is running a commit the checkout no longer contains.
+    That is the state where silence is most expensive — the session cannot see
+    that a rollback happened under it, and restarting would DROP the code it is
+    running rather than update it.
+
+    So the nudge speaks, and the lead clause says which way it went.
+    """
     spawn = _commit(repo, "feat: to be rolled back (#1500)")
     _git(repo, "reset", "--hard", "HEAD~1")
     _wire(
@@ -337,7 +392,9 @@ def test_emit_silent_when_history_diverged(monkeypatch, capsys, tmp_path, repo):
         root=repo,
     )
     _ua._emit_deploy_nudge(SID)
-    assert capsys.readouterr().out == ""
+    out = capsys.readouterr().out
+    assert "moved BACK" in out
+    assert "main moved" not in out, "a rollback must not read as a deploy"
 
 
 def test_emit_silent_when_the_path_is_not_a_repo(monkeypatch, capsys, tmp_path):
@@ -526,8 +583,8 @@ def test_span_counts_by_newline_only(repo: Path):
     spawn = _git(repo, "rev-parse", "HEAD")
     sep = chr(0x2028)  # LINE SEPARATOR: splitlines() breaks on it, split("\n") does not
     head = _commit(repo, f"fix: subject with a{sep}line separator inside (#1400)")
-    count, prs = _ua._deploy_span(repo, spawn, head)
-    assert count == 1, "U+2028 must not split one commit into two"
+    count, only_ours, prs = _ua._deploy_span(repo, spawn, head)
+    assert (count, only_ours) == (1, 0), "U+2028 must not split one commit into two"
     assert prs == ["1400"]
 
 
@@ -561,13 +618,19 @@ def test_emit_stamps_even_when_it_stays_silent(monkeypatch, capsys, tmp_path, re
     """A suppressed state must cost ONE rev-parse on later prompts, not two git
     subprocesses forever.
 
-    Diverged history: the silence is intended, the recurring cost is not. The
-    stamp is written on any conclusive observation of head, so the next prompt
-    short-circuits at the stamp check.
+    The stamp is written on any CONCLUSIVE observation of head — whether or not
+    we choose to speak about it — so a state we deliberately keep quiet does not
+    re-pay two git subprocesses on every prompt for the rest of the session.
+
+    Silence is now rare (the moved-back case above SPEAKS), so the suppression is
+    injected rather than staged from git: what this pins is the WIRING — that
+    stamping does not depend on there being a message — which is precisely what
+    a future suppression rule would otherwise quietly break. Contrast
+    `test_a_failed_span_read_does_not_silence_the_session_for_good`: a FAILED
+    read reaches the stamp by a different path and must NOT stamp.
     """
-    spawn = _commit(repo, "feat: to be rolled back (#1500)")
-    _git(repo, "reset", "--hard", "HEAD~1")
-    head = _git(repo, "rev-parse", "HEAD")
+    spawn, head = _behind(repo)
+    monkeypatch.setattr(_ua, "_deploy_message", lambda *a, **k: None)
     _wire(
         monkeypatch,
         tmp_path,
@@ -579,3 +642,83 @@ def test_emit_stamps_even_when_it_stays_silent(monkeypatch, capsys, tmp_path, re
     _ua._emit_deploy_nudge(SID)
     assert capsys.readouterr().out == ""
     assert _ua._deploy_stamped(SID) == head, "silent, but stamped — cost must not recur"
+
+
+# ── the notice may not claim more than it knows (PR #1651) ──────────────────
+
+
+def test_the_notice_does_not_claim_hook_CONFIG_is_live():
+    """A hook's COMMAND is re-read per invocation, so changed hook CODE is live.
+    Claude Code snapshots hook CONFIGURATION at session start, so a commit that
+    adds or removes a hook, or changes its matcher or timeout, is NOT live in
+    this session — and "hooks/policy are already live" told the session it need
+    not act on exactly the change it must act on.
+
+    Pinned as two halves, because the failure mode is dropping the second: the
+    line must say which half IS live and which is not.
+    """
+    msg = _ua._deploy_message(FULL_A, FULL_B, 3, 0, [])
+    assert msg is not None
+    low = msg.lower()
+    assert "hook code is live" in low
+    assert "config" in low, "the half that is NOT live must be named"
+    assert "hooks/policy are already live" not in low
+
+
+def test_the_notice_names_the_action_that_restarts_the_server():
+    """Restarting the session respawns its MCP children. genesis-server is an
+    independent systemd user unit and needs its own command — naming one action
+    ("a session restart") for two different things left the server on old code
+    while the notice read as though it had been handled.
+    """
+    msg = _ua._deploy_message(FULL_A, FULL_B, 3, 0, [])
+    assert msg is not None
+    assert "systemctl --user restart genesis-server" in msg
+    assert "MCP needs a session restart" in msg
+
+
+def test_a_failed_span_read_does_not_silence_the_session_for_good(
+    monkeypatch, capsys, tmp_path, repo
+):
+    """THE one that silences a session forever.
+
+    ``_deploy_span`` returns None only when it could NOT LOOK — git timed out,
+    exited nonzero, a ref would not resolve — and signals the conclusive
+    "nothing to say" case as a count of 0 instead. Stamping on None recorded a
+    failed read as a completed announcement; and because the stamp check runs
+    BEFORE the git call, that session then short-circuited on every later
+    prompt. One transient timeout, no deploy nudge for the rest of the session's
+    life.
+
+    Asserted as the RECOVERY, not just the absent stamp: a later prompt whose
+    read succeeds must still speak. That is the property the defect destroyed,
+    and an "unstamped" assertion alone would also pass for a nudge that had been
+    switched off.
+
+    The CONTROL against this becoming "never stamp" is
+    ``test_emit_stamps_even_when_it_stays_silent`` above: a diverged history is
+    a conclusive answer and DOES stamp, so the recurring two-subprocess cost is
+    still paid only for genuinely unknown state.
+    """
+    spawn, head = _behind(repo)
+    _wire(
+        monkeypatch,
+        tmp_path,
+        pid=PID,
+        slots=[("1", PID, SPAWN_AT)],
+        ident=(spawn, SPAWN_AT),
+        root=repo,
+    )
+    real_span = _ua._deploy_span
+    monkeypatch.setattr(_ua, "_deploy_span", lambda *a, **k: None)
+
+    _ua._emit_deploy_nudge(SID)
+    assert capsys.readouterr().out == "", "a failed read has nothing honest to say"
+    assert _ua._deploy_stamped(SID) is None, "a failed read was recorded as told"
+
+    # The transient failure clears; the SAME head must still be announced.
+    monkeypatch.setattr(_ua, "_deploy_span", real_span)
+    _ua._emit_deploy_nudge(SID)
+    out = capsys.readouterr().out
+    assert "main moved 2 commits" in out, "one timeout silenced the session for good"
+    assert _ua._deploy_stamped(SID) == head

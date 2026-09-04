@@ -1694,11 +1694,14 @@ verified: 50b79ffb 2026-09-01
   its `GUARDIAN_HOST_PATHS` must stay in LOCKSTEP with update.sh
   GUARDIAN_PATHS.
   **`commit_identity.py` carries TWO verdicts and the split is deliberate — do
-  not "unify" them.** `is_behind(spawn, HEAD)` = AWARENESS, used by the advisory
-  surfaces (the per-prompt deploy nudge in `scripts/genesis_urgent_alerts.py`
-  and the dashboard stale-code badge in `dashboard/routes/cc_sessions.py`); it
-  observes HEAD, so it needs no producer. `is_stale(spawn, spawn_at, deploy…)` =
-  AUTHORIZATION, used ONLY by `mcp_middleware`'s guard, which BLOCKS
+  not "unify" them.** `differs_from_head(spawn, HEAD)` = AWARENESS, used by the
+  advisory surfaces (the per-prompt deploy nudge in
+  `scripts/genesis_urgent_alerts.py` and the dashboard code-differs badge in
+  `dashboard/routes/cc_sessions.py`); it observes HEAD, so it needs no producer.
+  It is an INEQUALITY and nothing more — the direction lives in the history, so
+  `_deploy_span` reads `spawn...head --left-right` and reports BOTH sides
+  (landed / only-ours), which is what tells a deploy from a rollback.
+  `is_stale(spawn, spawn_at, deploy…)` = AUTHORIZATION, used ONLY by `mcp_middleware`'s guard, which BLOCKS
   `procedure_store`; it fires only on a deploy recorded in `update_history` by
   `scripts/update.sh`. MEASURED 2026-09-03, two figures answering DIFFERENT
   questions: record COVERAGE is 5 rows per 46 HEAD movements over 30 days
@@ -1712,10 +1715,10 @@ verified: 50b79ffb 2026-09-01
   next `update.sh` run — days at a stretch in practice (a live slot measured 15
   commits behind read as fresh). That is a defect in an advisory
   surface and merely conservative in a blocking one, so the advisory surfaces
-  moved to `is_behind` and the guard did NOT: repointing it would widen a live
-  block from ~never-firing to most long-lived sessions, which is a policy
-  decision, not a bug fix. Both sides of `is_behind` resolve to the MAIN tree
-  (`env.repo_root()` is the installed package's location, and a worktree
+  moved to `differs_from_head` and the guard did NOT: repointing it would widen
+  a live block from ~never-firing to most long-lived sessions, which is a policy
+  decision, not a bug fix. Both sides of `differs_from_head` resolve to the MAIN
+  tree (`env.repo_root()` is the installed package's location, and a worktree
   editable install is guard-blocked), so a worktree session still compares on
   main's line.
 - **security/**: prompt-injection defense + outbound scanning — sanitizer is
