@@ -155,7 +155,7 @@ async def _record_telemetry(db_path: Path | str, status: str, detail: str) -> bo
 # DISPATCHED CC session, and the shadow report's leak invariant keys on this
 # value to assert the extractor has written nothing live. One shared value would
 # make that check unable to tell the two apart on the day it starts mattering.
-# Mirrored by a schema CHECK (migration 0095).
+# Mirrored by a schema CHECK (the session_ledger_ambient_extractor migration).
 PROMOTION_ADDED_BY = "ambient_ledger_extractor"
 
 # INTERIM cap on rows promoted per run. Explicitly temporary: it is a guard held

@@ -24,7 +24,7 @@ from genesis.session_awareness import ledger_worker as lw
 M58 = importlib.import_module("genesis.db.migrations.0058_session_charters")
 M59 = importlib.import_module("genesis.db.migrations.0059_session_ledger_shadow")
 M95 = importlib.import_module(
-    "genesis.db.migrations.0095_session_ledger_ambient_extractor"
+    "genesis.db.migrations.20260904231054_session_ledger_ambient_extractor"
 )
 
 SID = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
@@ -49,10 +49,10 @@ def shadow_mode(monkeypatch):
 async def db_path(tmp_path) -> Path:
     """The schema a real install has once this release's migrations have run.
 
-    0095 is included even though these tests exercise SHADOW mode: migrations
-    run in order, so a DB carrying 0059 but not 0095 is not a state any install
+    The ambient-extractor migration is included even though these tests exercise SHADOW mode: migrations
+    run in order, so a DB carrying 0059 without it is not a state any install
     reaches. Stopping at 0059 made the fixture describe a shape that cannot
-    exist, and the first writer to depend on 0095's column failed here while
+    exist, and the first writer to depend on its column failed here while
     being correct everywhere real.
 
     Mode is what keeps these tests shadow-only, not the absence of a column.
@@ -498,7 +498,7 @@ async def test_telemetry_row_recorded(tmp_path, sessions_root, shadow_mode, db_p
 # one-token edit that makes the shadow lane write to the live ledger — left the
 # suite fully green. A mode gate that nothing holds is not a gate.
 
-M90 = M95   # historical alias; the module is 0095
+M90 = M95   # historical alias for the ambient-extractor migration module
 
 
 @pytest.fixture

@@ -1,4 +1,4 @@
-"""Migration 0095 — widen session_ledger.added_by for the ambient extractor.
+"""Migration widen session_ledger.added_by for the ambient extractor.
 
 Covers the rebuild itself (rows, constraint, indexes, idempotency) and, more
 importantly, the DRIFT that made this migration necessary in the first place.
@@ -21,11 +21,13 @@ import pytest
 from genesis.db.crud.session_charters import VALID_ADDED_BY
 from genesis.db.schema._tables import TABLES
 
-M90 = importlib.import_module("genesis.db.migrations.0095_session_ledger_ambient_extractor")
+M90 = importlib.import_module(
+    "genesis.db.migrations.20260904231054_session_ledger_ambient_extractor"
+)
 
 EXTRACTOR = "ambient_ledger_extractor"
 
-# The pre-0095 table, verbatim, so the migration is exercised against the shape
+# The pre-migration table, verbatim, so the migration is exercised against the shape
 # it will actually meet on a real install rather than against its own output.
 _OLD_DDL = """
     CREATE TABLE session_ledger (
