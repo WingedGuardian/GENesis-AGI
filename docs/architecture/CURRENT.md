@@ -667,6 +667,10 @@ verified: 50b79ffb 2026-09-01
   `surplus/scheduler.py`.
 - `follow_ups/` = accountability ledger + dispatcher (every 5 min) that turns
   follow-ups into surplus tasks; retention sweep on the learning scheduler. The
+  `follow_up_create` MCP tool routes USER-OWNED and purely-local operational work
+  here; Genesis-repo work goes to the public GitHub tracker as an issue (CLAUDE.md
+  "Where deferred work goes"). Templated pipelines write via `crud.follow_ups.create()`
+  directly and are governed at their own call sites. The
   `follow_up_create`/`update` MCP tools take a `work_state`
   (ready/blocked_on_trigger/deferred_cold) and DERIVE the hot(`follow_up`)/
   cold(`tabled`) lane, so priority never picks the lane; `blocked_on_trigger`
