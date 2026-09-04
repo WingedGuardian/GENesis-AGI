@@ -3442,3 +3442,90 @@ class TestInlinePaginationRobustness:
             block, msg = guard_module._check_inline_review_findings("100")
         assert block is True
         assert "unreadable" in msg.lower()
+
+
+class TestFenceClosingFollowsCommonMark:
+    """The mask decides what the merge gate is allowed to SEE, and a hand-rolled
+    toggle got CommonMark's closing rule wrong in a shape CodeRabbit emits by
+    design: it wraps a suggestion in FOUR backticks precisely when the suggested
+    markdown contains a three-backtick fence (Codex P2, PR #1677).
+
+    A closing fence must use the same character, be at least as long as the
+    opener, and carry NO info string. Toggling on any fence line closes the outer
+    block at the inner one — and everything after it, quoted `---` and quoted
+    severity headers included, is then read as real findings.
+    """
+
+    def test_a_shorter_inner_fence_does_not_close_the_outer_block(self, guard_module):
+        body = (
+            "_🎯 Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n**A nit.**\n\n"
+            "````suggestion\n"
+            "```md\n"
+            "---\n"
+            "_🗄️ Data Integrity_ | _🔴 Critical_ | _🏗️ Heavy lift_\n"
+            "```\n"
+            "````\n"
+        )
+        assert len(guard_module._cr_findings(body)) == 1, (
+            "quoted markdown inside a four-backtick suggestion was split into a "
+            "second, blocking finding"
+        )
+
+    def test_a_fence_line_carrying_an_info_string_does_not_close(self, guard_module):
+        """The other half of the same rule, isolated: same length, same char, but
+        an info string — a closer never has one."""
+        body = (
+            "_🎯 Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n**A nit.**\n\n"
+            "```\n"
+            "```python\n"
+            "---\n"
+            "_🗄️ Data Integrity_ | _🔴 Critical_ | _🏗️ Heavy lift_\n"
+            "```\n"
+        )
+        assert len(guard_module._cr_findings(body)) == 1
+
+    def test_a_tilde_fence_does_not_close_a_backtick_fence(self, guard_module):
+        """Same character, too — a `~~~` line inside a ``` block is content."""
+        body = (
+            "_🎯 Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n**A nit.**\n\n"
+            "```\n"
+            "~~~\n"
+            "---\n"
+            "_🗄️ Data Integrity_ | _🔴 Critical_ | _🏗️ Heavy lift_\n"
+            "```\n"
+        )
+        assert len(guard_module._cr_findings(body)) == 1
+
+    def test_a_matching_closer_still_closes(self, guard_module):
+        """CONTROL, and the one that stops this becoming a mask-everything fix: a
+        REAL finding after a properly closed fence must still be seen. Without
+        it, never closing any fence would pass all three tests above and silently
+        hide every finding that follows a code block — the fail-OPEN direction."""
+        body = (
+            "_🎯 Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n**A nit.**\n\n"
+            "```suggestion\nx = 1\n```\n\n"
+            "---\n\n"
+            "_🗄️ Data Integrity_ | _🔴 Critical_ | _🏗️ Heavy lift_\n\n**Real one.**\n"
+        )
+        segs = guard_module._cr_findings(body)
+        assert len(segs) == 2, segs
+        assert guard_module._cr_severity(segs[1])[0] == "critical"
+
+    def test_an_unclosed_fence_does_not_hide_the_rest_of_the_body(self, guard_module):
+        """A deliberate DEVIATION from CommonMark, in the safe direction.
+
+        The spec says an unclosed fence runs to the end of the document, so
+        masking to the end is "correct" — but this mask decides what a merge gate
+        may see, and hiding every finding after a stray backtick run is fail-OPEN:
+        a real Critical goes unreported and the merge proceeds. A phantom finding,
+        the other error, blocks loudly and gets looked at.
+        """
+        body = (
+            "_🎯 Correctness_ | _🟡 Minor_ | _⚡ Quick win_\n\n**A nit.**\n\n"
+            "```suggestion\nx = 1\n"  # never closed
+            "\n---\n\n"
+            "_🗄️ Data Integrity_ | _🔴 Critical_ | _🏗️ Heavy lift_\n\n**Real one.**\n"
+        )
+        segs = guard_module._cr_findings(body)
+        assert len(segs) == 2, f"an unclosed fence swallowed a Critical: {segs}"
+        assert guard_module._cr_severity(segs[1])[0] == "critical"

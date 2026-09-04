@@ -1182,6 +1182,12 @@ def _cr_severity(body: str) -> tuple[str | None, bool]:
     return None, False
 
 
+#: An opening or closing code fence: three-or-more backticks/tildes, then an
+#: optional info string. Captured separately because CommonMark's CLOSING rule
+#: depends on both — same character, at least as long, and no info string.
+_CR_FENCE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
+
+
 def _cr_markup_mask(body: str) -> list[bool]:
     """Per line: True when it sits inside a fenced block or a ``<details>`` section.
 
@@ -1200,16 +1206,33 @@ def _cr_markup_mask(body: str) -> list[bool]:
     never finding content. ``<details>`` is tracked only OUTSIDE a fence, matching
     how a markdown renderer reads it.
     """
+    lines = body.split("\n")
     mask: list[bool] = []
-    in_fence = False
+    fence_char: str | None = None
+    fence_len = 0
+    fence_opened_at: int | None = None
     in_details = False
-    for line in body.split("\n"):
+    for idx, line in enumerate(lines):
         stripped = line.strip()
-        if stripped.startswith(("```", "~~~")):
-            in_fence = not in_fence
+        fence = _CR_FENCE_RE.match(stripped)
+        if fence:
+            run, info = fence.group(1), fence.group(2).strip()
+            if fence_char is None:
+                fence_char, fence_len, fence_opened_at = run[0], len(run), idx
+            elif run[0] == fence_char and len(run) >= fence_len and not info:
+                # CommonMark: a closing fence uses the SAME character, is at
+                # least as long as the opener, and carries NO info string.
+                # Toggling on any fence line broke on CodeRabbit's own output:
+                # it wraps a suggestion in FOUR backticks precisely when the
+                # suggested markdown contains a three-backtick fence, so the
+                # inner ```md closed the outer block and everything after it —
+                # a quoted `---` and a Major-shaped header — was read as real
+                # findings, blocking a merge on the strength of quoted content
+                # (Codex P2, PR #1677).
+                fence_char, fence_len, fence_opened_at = None, 0, None
             mask.append(True)
             continue
-        if in_fence:
+        if fence_char is not None:
             mask.append(True)
             continue
         low = stripped.casefold()
@@ -1222,6 +1245,16 @@ def _cr_markup_mask(body: str) -> list[bool]:
             mask.append(True)
             continue
         mask.append(in_details)
+    if fence_opened_at is not None:
+        # An UNCLOSED fence. CommonMark says it runs to the end of the document,
+        # and masking to the end is therefore "correct" — but this mask decides
+        # what the merge gate is allowed to SEE, and hiding every finding after a
+        # stray backtick run is the fail-OPEN direction: a real Critical goes
+        # unreported and the merge proceeds. A phantom finding, the other error,
+        # blocks loudly and gets looked at. So a fence that never closes is
+        # treated as ordinary content from the line it opened on.
+        for i in range(fence_opened_at, len(mask)):
+            mask[i] = False
     return mask
 
 
