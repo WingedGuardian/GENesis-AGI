@@ -110,6 +110,36 @@ def test_observe_blocks_memory_writes():
     assert "mcp__genesis-memory__procedure_store" in PROFILES["observe"]
 
 
+# --- Entity-merge human-approval gate (safety-critical) ---
+# The whole point of the entity-merge approval gate is that NO autonomous session
+# can approve+apply its own merges (self-approving the human gate). approve/apply/
+# reject must therefore be denied in EVERY profile; only the read-only list stays.
+
+_ENTITY_ADJUD_WRITE_TOOLS = (
+    "mcp__genesis-memory__entity_adjudication_approve",
+    "mcp__genesis-memory__entity_adjudication_apply",
+    "mcp__genesis-memory__entity_adjudication_reject",
+)
+
+
+@pytest.mark.parametrize("profile", sorted(PROFILES))
+def test_every_profile_blocks_entity_adjudication_writes(profile):
+    """No autonomous profile may approve/apply/reject entity merges — that would
+    let a background session self-approve the human gate it exists to enforce."""
+    for tool in _ENTITY_ADJUD_WRITE_TOOLS:
+        assert tool in PROFILES[profile], (
+            f"{profile} must block {tool} — a background session that can "
+            "approve+apply defeats the entity-merge human-approval gate"
+        )
+
+
+@pytest.mark.parametrize("profile", sorted(PROFILES))
+def test_entity_adjudication_list_stays_readable(profile):
+    """The read-only review listing is safe — it must NOT be swept into the deny
+    list (a profile with memory access may surface proposals for a human)."""
+    assert "mcp__genesis-memory__entity_adjudication_list" not in PROFILES[profile]
+
+
 def test_observe_blocks_outreach_send():
     assert "mcp__genesis-outreach__outreach_send" in PROFILES["observe"]
     assert "mcp__genesis-outreach__outreach_send_and_wait" in PROFILES["observe"]
@@ -468,6 +498,31 @@ def test_marketing_send_cannot_be_re_enabled_via_tool_exceptions(profile):
     )
     inv = runner._build_invocation(req, "test-session")
     assert _MARKETING_SEND in inv.disallowed_tools
+
+
+@pytest.mark.parametrize("profile", list(PROFILES))
+@pytest.mark.parametrize(
+    "tool",
+    [
+        "mcp__genesis-memory__entity_adjudication_approve",
+        "mcp__genesis-memory__entity_adjudication_apply",
+        "mcp__genesis-memory__entity_adjudication_reject",
+    ],
+)
+def test_entity_adjudication_writes_cannot_be_re_enabled_via_tool_exceptions(profile, tool):
+    """A per-request tool_exception must NOT unblock approve/apply/reject on ANY
+    profile — otherwise a background session could self-approve the human entity-
+    merge gate through the exception hole, defeating the universal deny. Mirrors
+    the marketing_send / recursive-spawn (direct_session_run) protections."""
+    runner = _make_runner()
+    req = DirectSessionRequest(
+        prompt="t",
+        profile=profile,
+        model=CCModel.SONNET,
+        tool_exceptions=(tool,),
+    )
+    inv = runner._build_invocation(req, "test-session")
+    assert tool in inv.disallowed_tools
 
 
 _MARKETING_LIST = "mcp__genesis-outreach__marketing_prospects_list"
