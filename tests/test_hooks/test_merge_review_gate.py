@@ -1409,6 +1409,51 @@ class TestCheckInlineReviewFindings:
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block
 
+    def test_inline_p1_on_a_changelog_fragment_does_not_block(self, guard_module):
+        # changelog.d/ holds one changelog entry per file — the same prose that
+        # would otherwise be a bullet in CHANGELOG.md, which this allowlist
+        # already exempts by stem. Without this, every PR carrying a fragment
+        # could be blocked from merging by a wording nit.
+        with self._mock(
+            guard_module,
+            [self._codex(1, _P1_BODY, path="changelog.d/20260904210000-fixed-thing.md")],
+        ):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block
+
+    def test_inline_p1_on_a_non_markdown_file_in_changelog_d_still_blocks(
+        self, guard_module
+    ):
+        # The rule is Markdown-only. A script that somehow lands in that
+        # directory is not prose and must not inherit the exemption.
+        with self._mock(
+            guard_module,
+            [self._codex(1, _P1_BODY, path="changelog.d/generate.py")],
+        ):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_inline_p1_nested_under_changelog_d_still_blocks(self, guard_module):
+        # The rule is deliberately flat: the assembler rejects nested files, so
+        # a subdirectory here is already a contract violation and must not be
+        # able to smuggle a path through this allowlist.
+        with self._mock(
+            guard_module,
+            [self._codex(1, _P1_BODY, path="changelog.d/nested/thing.md")],
+        ):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
+    def test_inline_p1_on_a_lookalike_prefix_still_blocks(self, guard_module):
+        # ``changelog.dist/`` is not ``changelog.d/``. A prefix test that used
+        # startswith on the bare name would pass this and should not.
+        with self._mock(
+            guard_module,
+            [self._codex(1, _P1_BODY, path="changelog.dist/thing.md")],
+        ):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert block
+
     def test_inline_p1_on_code_path_still_blocks(self, guard_module):
         with self._mock(
             guard_module, [self._codex(1, _P1_BODY, path="src/genesis/foo.py")]

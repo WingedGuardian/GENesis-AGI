@@ -27,8 +27,18 @@ The public repo (`GENesis-AGI`) is the primary repo, so there is no separate
 "strip and stage" step. Leak protection is enforced on every PR by the
 `leak-detector` job in `.github/workflows/ci.yml` (detect-secrets + gitleaks
 with the repo's `.gitleaks.toml` PII/infrastructure rules + portability
-+ email scans). Releases are cut by tagging `vX.Y` on `main` and publishing a
-GitHub Release from the matching `CHANGELOG.md` section.
++ email scans).
+
+Releases are cut in three steps, and the first one is not optional:
+
+1. **Assemble the changelog.** Run `scripts/assemble_changelog.py` on `main`. It
+   folds every `changelog.d/` fragment into the `[Unreleased]` section and
+   deletes the fragments; review the result and commit the fold together with
+   the deletions. Skipping this ships a release whose notes are missing every
+   entry merged since the last tag — silently, because the section still reads
+   as complete. `--dry-run` prints the result without touching anything.
+2. **Tag** `vX.Y` on `main`.
+3. **Publish** the GitHub Release from the matching `CHANGELOG.md` section.
 
 ## Current Recovery Anchors
 

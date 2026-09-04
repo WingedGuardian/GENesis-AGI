@@ -1046,7 +1046,15 @@ def _is_doc_path(path: str) -> bool:
     if ext == "rst":
         return True
     # (3) An unambiguous documentation extension under a top-level docs/ directory.
-    return ext in _DOC_EXTS and path.startswith("docs/")
+    if ext in _DOC_EXTS and path.startswith("docs/"):
+        return True
+    # (4) A changelog fragment. ``changelog.d/`` holds one changelog entry per
+    # file (see its README) — the same prose that would otherwise be a bullet in
+    # CHANGELOG.md, which rule 1 already exempts by stem. Restricted to Markdown
+    # DIRECTLY in that directory: the assembler rejects nested files anyway, and
+    # keeping the rule flat means a future subdirectory cannot smuggle a
+    # non-prose path through this allowlist.
+    return ext == "md" and path.startswith("changelog.d/") and path.count("/") == 1
 
 
 # ── Direct-sqlite-write detection ────────────────────────────────────────────
@@ -1316,8 +1324,8 @@ def _check_inline_review_findings(
     if doc_skipped:
         print(
             f"NOTE: PR #{pr_num} — {len(doc_skipped)} inline [P1] finding(s) on "
-            f"documentation paths (CHANGELOG/README/LICENSE/NOTICE/docs/**/*.rst) "
-            f"NOT blocking:",
+            f"documentation paths (CHANGELOG/README/LICENSE/NOTICE/docs/**/*.rst/"
+            f"changelog.d/*.md) NOT blocking:",
             file=sys.stderr,
         )
         for title in doc_skipped[:5]:

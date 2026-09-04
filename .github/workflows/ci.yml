@@ -379,6 +379,25 @@ jobs:
             python3 scripts/check_migration_prefixes.py
           fi
 
+  changelog-fragments:
+    # Every file in changelog.d/ is a legal fragment — the residue is a
+    # violation, for the same reason the migration-id check treats it that way:
+    # a fragment nobody recognises is a changelog entry that never ships, and
+    # nothing notices, because the release section still looks complete.
+    #
+    # Validated on every PR rather than at release, because collect_fragments is
+    # all-or-nothing: one malformed fragment from any merged PR blocks assembly
+    # of EVERY fragment, and discovering that on release day means discovering
+    # it from the wrong person at the wrong time.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Validate changelog.d fragments
+        run: python scripts/assemble_changelog.py --check
+
   external-io-check:
     # WS5 regression guard: no NEW ungated autonomous external-world egress
     # (Discord REST/webhook, public social APIs) outside the reasoned allowlist.
