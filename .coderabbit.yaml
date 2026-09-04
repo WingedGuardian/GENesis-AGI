@@ -33,12 +33,31 @@ reviews:
 
   # Excluded from review, not from the repo. Each of these is either machine-
   # generated or binary, so a reviewer comment on it can never be actionable.
+  #
+  # DOCUMENTATION is excluded for a different reason, and it is a deliberate
+  # trade rather than an oversight: prose ships no behaviour, so a finding on it
+  # cannot prevent a defect, while it costs exactly what a finding on code costs
+  # — a review round, and a merge held. This reviewer's budget goes to the code.
+  #
+  # WHAT THIS GIVES UP, stated so it is a choice and not a discovery: this is the
+  # reviewer that actually READS prose, so nothing automated now reads the
+  # changelog or docs of a PUBLIC repo for an inadvertent disclosure. The CI leak
+  # detector still scans every diff for known private patterns, and the pre-push
+  # privacy review still runs, but those match PATTERNS — they do not read a
+  # sentence and notice it reveals something. Keep that in mind when a docs PR
+  # describes infrastructure.
   path_filters:
     - "!src/genesis/dashboard/webui/vendor/**"
     - "!**/*.min.js"
     - "!**/*.min.css"
     - "!docs/images/**"
     - "!**/package-lock.json"
+    # Documentation — see the note above.
+    - "!**/*.md"
+    - "!**/*.rst"
+    - "!**/*.adoc"
+    - "!**/*.asciidoc"
+    - "!docs/**"
 
   # The walkthrough is read at merge time; keep it to substance.
   poem: false
