@@ -196,13 +196,18 @@ only replaying a known-positive tells them apart.
 amputation is LOSS — the value cut here was the only copy. Nothing else. A
 bounded PREVIEW of something stored intact elsewhere is a selection, and stays
 one even if its handle is useless. Bounding against a hard external budget is
-likewise correct: a hook's stdout cap, a database column, a context window. So is
-refusing an oversized value outright.
+likewise correct: a hook's stdout cap, a context window, a column whose limit is
+actually ENFORCED. That last qualifier is load-bearing here — this repo's SQLite
+`TEXT` columns enforce no length at all, so "the database column" does not
+excuse a cut; a self-imposed storage assumption is a decision to justify, not a
+budget to obey. So is refusing an oversized value outright.
 
 **And a SAFETY cap may be lossy — that is the one place cutting the only copy is
 right.** An unbounded stream has no other copy by definition, and reading it to
 the end to avoid "truncating" is how a runaway command exhausts memory; this repo
-bounds subprocess output at a few MiB for exactly that reason. Losing the tail of
+bounds subprocess output at a few MiB for exactly that reason
+(`autonomy/executor/deterministic.py` `_read_limited`, whose own comment names
+the `yes`-command threat; verified 2026-09-04). Losing the tail of
 a log beats losing the process. The obligation there is not to keep the bytes, it
 is to be LOUD about the cut — say the output was bounded and roughly by how much,
 so nobody reads a clipped log as a complete one. A silent lossy cap is still the
@@ -262,15 +267,18 @@ Three rules when a bound really is needed:
   plausible-looking fragment. The bound-plus-loud-flag half of this is already
   the house pattern; the character-count marker is a proposal, so do not go
   looking for a precedent that is not there.
-  **The line is DECLARED versus SILENT, not omit versus cut.** That is the
-  distinction this whole section is really about, and stating it as "never cut"
-  overshoots: this repo cuts mid-value in several places on purpose and is right
-  to — a resource guard on an unbounded stream, a preview rendered next to the
-  full record, a display string trimmed before escaping so the cut cannot land
-  mid-entity. Every one of those is a decision someone made and can defend. What
-  is forbidden is the cut nobody decided and nothing announces, because that is
-  the one that reaches a reader looking complete. Prefer the marker; when you cut
-  instead, say so where the value is read.
+  **Declaration is a requirement on top of the loss rules, never a substitute
+  for them.** Stating the rule as "never cut" overshoots: this repo cuts
+  mid-value in several places on purpose and is right to — a resource guard on
+  an unbounded stream, a preview rendered next to the full record, a display
+  string trimmed before escaping so the cut cannot land mid-entity. Each of
+  those is a cut the loss rules PERMIT (a safety cap, a pointer-backed
+  selection, third-party display text), and each is declared or bounded where
+  it is read. The order matters: first the loss rules decide whether a cut may
+  happen at all — announcing a sliced KEY does not un-merge the two identities
+  it collapsed — and only then does declaration decide whether the permitted
+  cut is honest. A silent permitted cut is still a defect; a loud forbidden cut
+  is still forbidden.
   **When the total is not already known, say that instead of computing it.**
   Bounding a stream is the case: learning the exact discarded length means
   reading the whole source, which is the cost the bound existed to avoid. So
@@ -307,25 +315,34 @@ unbounded default does NOT apply: fail closed, omit wholesale with a marker as
 the "omit explicitly" rule says, and keep only non-sensitive metadata. Losing
 diagnostic prose is recoverable; leaking a token is not.
 
-**Then ask WHO WROTE IT, before you ask where it is going.** Authorship is the
-axis that decides, and it beats destination outright. Third-party-authored
-content stays bounded and sanitized no matter how trusted the destination is —
+**Then ask WHO WROTE IT as well as where it is going — two independent axes,
+and each governs a different decision.** Destination governs DISCLOSURE: what
+may cross a trust boundary is decided by where it lands, whoever wrote it — a
+user-authored secret bound for an external channel still gets scanned and
+quarantined. Authorship governs SANITIZATION: third-party-authored content
+stays bounded and escaped no matter how trusted the destination is —
 this repo truncates and HTML-escapes a stranger's email fields on the way to the
-OWNER'S OWN chat, because that channel renders HTML unescaped, so a display name
-someone else chose would otherwise arrive as live markup in the one place the
-user trusts absolutely. Maximally authorized destination, maximally defensive
-treatment. Any rule that reads "it's going somewhere trusted, so pass it whole"
-deletes that defence.
+OWNER'S OWN chat (`outreach/engagement.py` `_sanitize_ping_field`, whose
+docstring names both the threat and the destination; verified 2026-09-04),
+because that channel renders HTML unescaped, so a display name someone else
+chose would otherwise arrive as live markup in the one place the user trusts
+absolutely. Maximally authorized destination, maximally defensive treatment.
+Any rule that reads "it's going somewhere trusted, so pass it whole" deletes
+that defence.
 
 **And an authorized destination does not mean untreated.** The rule is narrow:
 do not strip the USER'S OWN content on its way to the user. It is not a licence
-to stop scrubbing on owner-facing surfaces, and this repo does not — it rewrites
-username-bearing paths out of what the owner's own dashboard renders, gates
-credential values behind an explicit reveal rather than showing them, scrubs the
-draft the user reviews so the copy they approve is already clean, and in at least
-one subsystem deliberately keeps captured text out of its own private store
-entirely. "Into a private store" is emphatically not a blanket exemption; some
-stores are built specifically to never receive the value.
+to stop scrubbing on owner-facing surfaces, and this repo does not (each
+verified 2026-09-04): it rewrites username-bearing paths out of what the owner's
+own dashboard renders (`dashboard/routes/backup.py` `_scrub_reason`), gates
+credential values behind an explicit reveal rather than showing them (the
+References tab), scrubs the draft the user reviews so the copy they approve is
+already clean (`content/egress.py` `should_gate`, `category == "content"`), and
+in at least one subsystem deliberately keeps captured text out of its own
+private store entirely (`attention/types.py`: "never stored";
+`db/crud/attention.py`: "value-free … NO text"). "Into a private store" is
+emphatically not a blanket exemption; some stores are built specifically to
+never receive the value.
 
 **One last thing, learned the hard way from this section itself.** Four review
 rounds found defects in it, and every single one had the same shape: the cited
