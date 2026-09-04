@@ -92,6 +92,33 @@ _EMAIL_PASSWORD_PATTERN = re.compile(
 
 # B. Known key prefixes — format-only, no keyword needed.
 # These prefixes are near-certain indicators of real credentials.
+# DELIBERATELY NARROWER than the prefix classes in
+# ``scripts/hooks/secret_scrub.py`` and ``src/genesis/security/output_scanner.py``.
+# All three detect credentials; only this one ACTS on a match by writing a
+# reference the user sees. The other two redact or flag, where over-matching is
+# nearly free — here a false positive fabricates a credential entry in the
+# reference store and the dashboard, which is the exact junk-capture this
+# module's precision tests exist to prevent.
+#
+# Concretely: admitting ``-``/``_`` into the tail (correct for redaction, since
+# modern keys namespace themselves) makes ordinary hyphenated slugs clear the
+# length floor — "sk-learn-pipeline-preprocessing" and "glpat-staging-eu-west1"
+# were both captured as credentials while that class was shared.
+#
+# What the narrowing actually excludes, stated precisely because the broad
+# reading ("no unlabelled key is captured here") is wrong and would mislead the
+# next reader — the plain forms below ARE captured unlabelled. MEASURED against
+# this pattern:
+#   * captured   — ghp_/gho_ + alnum, sk- + alnum, AKIA, AIza (hyphens allowed
+#                  in its tail), xoxb-/xoxp-, di-
+#   * NOT captured — a NAMESPACED tail on a narrowed prefix (`sk-ant-oat01-…`,
+#                  `sk-or-v1-…`), because those prefixes admit only [A-Za-z0-9]
+#                  after them; and any prefix carried solely by the scrubber's
+#                  wider list (`github_pat_`, `glpat-`, `gsk_`, `hf_`, …).
+# For those, the labelled path (_CREDENTIAL_TOKEN_PATTERN, "the API key is
+# <value>") covers the ordinary conversational phrasing, and real-time
+# ``reference_store`` calls remain the primary capture path — this module is
+# only the safety net.
 _KNOWN_KEY_PREFIX_PATTERN = re.compile(
     r"(?P<token>"
     r"ghp_[A-Za-z0-9]{30,}"       # GitHub personal access token

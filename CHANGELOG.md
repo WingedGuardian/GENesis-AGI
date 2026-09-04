@@ -11,6 +11,62 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Captured session output is now redacted before it is stored.** When an
+  interactive session exits, Genesis records a tail of the terminal scrollback to
+  `~/.genesis/logs/cc_exit_<slot>.log` so a crash can be diagnosed afterwards.
+  That tail is raw terminal output, so it passes through the secret scrubber on
+  the way in; if the scrubber cannot run, the tail is withheld rather than stored
+  unscrubbed. The exit status and crash diagnosis are recorded either way, so the
+  log keeps its diagnostic value.
+- **Credential detection covers modern key formats.** The shared
+  secret-detection patterns expected an unbroken run of letters and digits after a
+  vendor prefix, which most current key formats no longer are. Detection now
+  handles them, along with several provider prefixes, JWTs, webhook URLs and bot
+  tokens. Detection is shape-based and therefore not exhaustive; the labelled and
+  `KEY=VALUE` forms remain the broadest net. The reference-capture path keeps a
+  deliberately narrower rule, so an ordinary hyphenated name is never stored as
+  though it were a credential.
+- **Secret scrubbing completes in linear time on every input shape.** Two
+  detection patterns backtracked quadratically against long unbroken character
+  runs, taking tens of seconds on 40KB of the wrong shape. The rework is
+  measured across a matrix of input classes rather than a single benchmark —
+  the first attempt was validated on one shape and remained quadratic on
+  another — and every cell now completes in under 40ms where the slowest was
+  previously tens of seconds. A locked perf-matrix test spans those classes so
+  a future pattern edit cannot pass on a flattering input. In practice the
+  capture path was already insulated (terminal capture wraps long lines at pane
+  width, measured), so this is hardening for any future caller that feeds
+  unbroken machine output.
+- **Private-key blocks and more vendor key formats are detected.** A pasted or
+  displayed PEM private key is now redacted — including one that is only
+  partly on screen, since a captured tail starts and ends at arbitrary points
+  — along with several additional vendor prefixes, and tokens appearing on
+  diff-style `-`/`+` lines are handled the same as anywhere else. Redaction
+  around a key marker covers the adjacent key material and stops there, so an
+  ordinary diagnostic keeps its surrounding lines. Key material is recognised
+  even when the capture decorates every line — a log timestamp, a service
+  prefix, a diff marker, an indent — rather than only when it starts at the
+  left margin. The scrub subprocess in the
+  exit-capture path also gained a wall-clock bound and an input cap, both
+  failing toward withholding the tail rather than storing it unscrubbed.
+- **A password inside a URL is redacted whatever the URL looks like.** Two
+  length limits had been placed on parts of a connection URL to keep scanning
+  fast, and each one quietly stopped redacting past its ceiling. Both are gone:
+  the scan no longer looks at the part that needed bounding, so it stays linear
+  with no length at which a real credential is missed. A URL that carries a
+  password and no username — the form some generated connection strings take —
+  is now redacted too; nothing else recognises an unlabelled password, so it
+  had been stored as-is.
+- **Long terminal lines are redacted as one line, not as fragments.** A
+  terminal stores a line longer than the window is wide as several rows.
+  The capture now reassembles them before scanning, so a value that happens to
+  straddle the right edge is treated as the single value it is.
+- **The scrubber runs on any supported Python.** Its patterns use only
+  widely-available regex syntax, so the capture path works with whatever
+  `python3` an install provides rather than requiring a recent one — it is
+  deliberately not tied to the project virtualenv, which may be unavailable at
+  exactly the moment a session is crashing. Scanning cost stays linear in the
+  size of the captured text.
 - **Two branches can no longer pick the same database-migration number.** Each
   new migration is now named by the UTC time it was written rather than by the
   next free number, so nobody has to check what anyone else took — and two
