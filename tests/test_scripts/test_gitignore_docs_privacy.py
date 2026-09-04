@@ -69,7 +69,22 @@ _DATED_RE = re.compile(r"^20[0-9][0-9]-")
 
 # Scrubbed so an ambient GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE (a suite run from
 # inside a hook or a rebase) cannot redirect any of the git calls below.
-_GIT_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+#
+# HOME and XDG_CONFIG_HOME go too, and the additions are not belt-and-braces:
+# `-c core.excludesFile=/dev/null` neutralises ONE ambient source, and git reads
+# several. `core.ignoreCase=true` in a global config was MEASURED to keep every
+# assertion here green while the rule was miscased to `Docs/**/20[0-9][0-9]-*`
+# — the lock would have stopped locking, silently, on whoever ran it. Pointing
+# GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM at /dev/null is git's own documented
+# way to say "no ambient config", and it covers the sources an excludesFile
+# override does not (Codex P2, PR #1633).
+_GIT_ENV = {
+    **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_SYSTEM": os.devnull,
+    "HOME": tempfile.gettempdir(),
+    "XDG_CONFIG_HOME": tempfile.gettempdir(),
+}
 
 
 # --------------------------------------------------------------------------
@@ -194,8 +209,32 @@ def _tracked_docs() -> list[str]:
     return [p for p in out.split("\0") if p]
 
 
-@functools.lru_cache(maxsize=1)
-def _isolated_repo() -> Path:
+def _copy_ignore_file(src: Path, dest: Path) -> None:
+    """Copy a `.gitignore`, REFUSING a symlink rather than following one.
+
+    `shutil.copyfile` follows the link and writes its TARGET's bytes as a
+    regular file, so the isolated repo would evaluate rules the live checkout
+    does not: git explicitly does not follow a symlinked `.gitignore`. Every
+    assertion here would pass against content that is inert in reality — the
+    lock reporting green on rules git never reads (Codex P2, PR #1633).
+
+    Refused rather than handled, because a symlinked ignore file in this repo
+    would itself be the finding.
+    """
+    if src.is_symlink():
+        raise AssertionError(
+            f"{src} is a SYMLINK. Git does not follow a symlinked .gitignore, so "
+            "its rules are inert in the real checkout — copying it here would "
+            "make this suite pass against rules that do not apply."
+        )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dest)
+
+
+def _make_repo(
+    gitignore_text: str | None = None,
+    extra_ignores: dict[str, str] | None = None,
+) -> Path:
     """A throwaway repo carrying only this repository's own ignore rules.
 
     `git check-ignore` run in the live checkout answers from the union of
@@ -215,21 +254,43 @@ def _isolated_repo() -> Path:
         capture_output=True,
         env=_GIT_ENV,
     )
-    shutil.copyfile(REPO_ROOT / ".gitignore", tmp / ".gitignore")
+    # Case sensitivity is PINNED, not inherited: a case-insensitive match would
+    # accept a miscased rule that the real (case-sensitive) checkout ignores.
+    subprocess.run(
+        ["git", "config", "core.ignoreCase", "false"],
+        cwd=tmp,
+        check=True,
+        capture_output=True,
+        env=_GIT_ENV,
+    )
+    if gitignore_text is None:
+        _copy_ignore_file(REPO_ROOT / ".gitignore", tmp / ".gitignore")
+    else:
+        (tmp / ".gitignore").write_text(gitignore_text)
     # Nested `.gitignore` files under docs/ also apply to docs paths. There are
     # none today (MEASURED: 0 of 92 tracked docs); copying them keeps the
     # isolation faithful if one is ever added, instead of silently dropping it.
     for nested in (p for p in _tracked_docs() if Path(p).name == ".gitignore"):
-        dest = tmp / nested
+        _copy_ignore_file(REPO_ROOT / nested, tmp / nested)
+    # Nested ignore files the caller invents — the mutation harness uses this to
+    # ask whether a `.gitignore` added DEEPER in the tree can reopen the leak.
+    for relpath, text in (extra_ignores or {}).items():
+        dest = tmp / relpath
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(REPO_ROOT / nested, dest)
+        dest.write_text(text)
     exclude = tmp / ".git" / "info" / "exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
     exclude.write_text("")
     return tmp
 
 
-def _ignored_subset(relpaths: Sequence[str]) -> set[str]:
+@functools.lru_cache(maxsize=1)
+def _isolated_repo() -> Path:
+    """The baseline repo, carrying this repository's real ignore rules."""
+    return _make_repo()
+
+
+def _ignored_subset_in(repo: Path, relpaths: Sequence[str]) -> set[str]:
     """Of `relpaths`, the ones git would ignore. The paths need not exist.
 
     `--no-index` on purpose: the threat is a NEW, untracked file swept up by
@@ -250,7 +311,7 @@ def _ignored_subset(relpaths: Sequence[str]) -> set[str]:
             "-z",
             "--stdin",
         ],
-        cwd=_isolated_repo(),
+        cwd=repo,
         input="\0".join(relpaths) + "\0",
         capture_output=True,
         text=True,
@@ -263,6 +324,11 @@ def _ignored_subset(relpaths: Sequence[str]) -> set[str]:
             f"rc={result.returncode} {result.stderr}"
         )
     return {p for p in result.stdout.split("\0") if p}
+
+
+def _ignored_subset(relpaths: Sequence[str]) -> set[str]:
+    """`_ignored_subset_in` against the real rules."""
+    return _ignored_subset_in(_isolated_repo(), relpaths)
 
 
 def _is_ignored(relpath: str) -> bool:
@@ -448,4 +514,206 @@ def test_no_currently_tracked_doc_uses_the_dated_naming():
     assert not stale, (
         "_EXPLICITLY_PUBLIC_DATED_DOCS names paths that are no longer tracked "
         f"docs — the exemption has outlived its file: {stale}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Can this suite actually DETECT the rule being broken?
+# --------------------------------------------------------------------------
+#
+# Twelve review findings landed on this file (PR #1633) and every one of them
+# had the same shape: "replace the rule with <narrowing> and all 43 tests still
+# pass while <a real path> becomes publishable". They are not twelve bugs. They
+# are twelve reports that the SUITE'S PROBE CORPUS is thinner than the contract
+# it claims to lock — and arguing corpus adequacy finding-by-finding is how a
+# thirteenth arrives.
+#
+# So adequacy is MEASURED instead. Each mutation below is applied to a copy of
+# the real `.gitignore`, the whole corpus is re-evaluated by git, and the suite
+# fails if nothing flips. A mutation that survives is this file's bug, reported
+# as this file's bug, before it is anyone else's.
+#
+# This is the same instrument as verify-RED, pointed at the suite rather than at
+# one test: a lock nobody has watched fail is a lock nobody has tested.
+
+_DATED_RULE = "docs/**/20[0-9][0-9]-*"
+
+#: (name, replacement-for-_DATED_RULE, why it is plausible)
+_NARROWINGS = (
+    (
+        "depth-narrowed",
+        "docs/*/20[0-9][0-9]-*",
+        "`*` instead of `**` — reads as 'a dated file in a docs subdir' and "
+        "still ignores direct children, so only a NESTED probe can see it",
+    ),
+    (
+        "decade-narrowed",
+        "docs/**/20[23][0-9]-*",
+        "plausible tidy-up 'we only care about this decade'; needs a probe "
+        "outside 2020-2039",
+    ),
+    (
+        "suffix-narrowed",
+        "docs/**/20[0-9][0-9]-??*",
+        "a `?` added to 'require a real name'; needs a probe with a zero- or "
+        "one-character suffix",
+    ),
+    (
+        "case-changed",
+        "Docs/**/20[0-9][0-9]-*",
+        "a capitalised path from an editor or a case-insensitive machine; only "
+        "visible with core.ignoreCase pinned false",
+    ),
+    (
+        "deleted",
+        "",
+        "the rule removed outright — the floor of this whole file",
+    ),
+)
+
+#: Negations appended BELOW the rule. Last match wins, so a `/*` or `/**`
+#: negation re-publishes everything under it. Each spelling leaks identically
+#: and each was measured to do so.
+_LEAKING_APPENDS = (
+    ("negated-toplevel", "!docs/architecture/**"),
+    ("negated-root-anchored", "!/docs/architecture/**"),
+    ("negated-nested", "!docs/architecture/sub/**"),
+    ("negated-wildcard-mid", "!docs/*/architecture/**"),
+)
+
+
+def _privacy_probes() -> list[str]:
+    """Every path the dated-docs rule is supposed to withhold.
+
+    ONE corpus, shared by the mutation harness, so "what this suite covers" is a
+    single readable list rather than an emergent property of nine parametrised
+    tests. Spans the axes each finding named: depth, year, suffix length, and
+    file-vs-directory.
+    """
+    probes: list[str] = []
+    for subdir in _opt_in_dirs():
+        base = f"docs/{subdir}"
+        for year in (2000, 2019, 2026, 2040, 2099):  # inside and outside 20[23]x
+            probes += [
+                f"{base}/{year}-working-draft.md",  # direct child, long suffix
+                f"{base}/sub/{year}-working-draft.md",  # NESTED — needs `**`
+                f"{base}/sub/deeper/{year}-notes.md",  # deeper still
+                f"{base}/{year}-x",  # single-char suffix, no extension
+                f"{base}/{year}-",  # ZERO-character suffix
+                f"{base}/{year}-sprint/notes.md",  # dated DIRECTORY
+                # A subdirectory NAMED after an opt-in dir. Found by the
+                # mutation harness itself: `!docs/*/architecture/**` appended
+                # below the rule matched nothing in the corpus, because every
+                # probe put `architecture` at depth 1 and that negation needs it
+                # at depth 2. Without this row a negation carrying an
+                # INTERMEDIATE wildcard reopens the leak unseen (Codex P2,
+                # PR #1633) — and the harness reported it before a reviewer did.
+                f"{base}/{subdir}/{year}-namesake-draft.md",
+            ]
+    return probes
+
+
+def test_the_probe_corpus_is_not_empty():
+    """Guard the guard: an empty corpus makes every mutation 'undetected' —
+    which would fail loudly — but an almost-empty one fails for the wrong
+    reason. Assert the shape directly."""
+    probes = _privacy_probes()
+    assert len(probes) == len(_opt_in_dirs()) * 5 * 7, len(probes)
+    assert _ignored_subset(probes) == set(probes), (
+        "the BASELINE rule does not ignore its own corpus — every mutation "
+        "result below would be meaningless: "
+        f"{sorted(set(probes) - _ignored_subset(probes))[:10]}"
+    )
+
+
+def _mutated_repo(gitignore_text: str) -> Path:
+    return _make_repo(gitignore_text)
+
+
+@pytest.mark.parametrize(
+    ("name", "replacement", "why"), _NARROWINGS, ids=[m[0] for m in _NARROWINGS]
+)
+def test_a_narrowed_rule_is_detected(name, replacement, why):
+    """Each narrowing must make at least one probe leak. If none does, the
+    corpus cannot see that mutation and this suite would greet it as healthy."""
+    original = (REPO_ROOT / ".gitignore").read_text()
+    assert _DATED_RULE in original, (
+        f"the dated-docs rule {_DATED_RULE!r} is not in .gitignore verbatim — "
+        "the mutation harness is targeting a line that no longer exists"
+    )
+    mutated = original.replace(_DATED_RULE, replacement)
+    probes = _privacy_probes()
+    leaked = set(probes) - _ignored_subset_in(_mutated_repo(mutated), probes)
+    assert leaked, (
+        f"mutation '{name}' SURVIVED: replacing the rule with {replacement!r} "
+        f"left every probe still ignored, so this suite cannot detect it. "
+        f"Why it is plausible: {why}. Add a probe to _privacy_probes() that "
+        "this narrowing would expose."
+    )
+
+
+@pytest.mark.parametrize(("name", "line"), _LEAKING_APPENDS, ids=[m[0] for m in _LEAKING_APPENDS])
+def test_a_negation_below_the_rule_is_detected(name, line):
+    """The hazard the module docstring measured: a `/*` or `/**` negation placed
+    BELOW the rule re-publishes everything under it, in any spelling. The suite
+    must see each one."""
+    original = (REPO_ROOT / ".gitignore").read_text()
+    mutated = original.replace(_DATED_RULE, f"{_DATED_RULE}\n{line}")
+    probes = _privacy_probes()
+    leaked = set(probes) - _ignored_subset_in(_mutated_repo(mutated), probes)
+    assert leaked, (
+        f"mutation '{name}' SURVIVED: appending {line!r} below the rule left "
+        "every probe still ignored, so this suite would not notice that "
+        "negation reopening the leak."
+    )
+
+
+def test_an_unrelated_edit_is_not_flagged():
+    """CONTROL, and it is load-bearing: without it, a harness that reported
+    EVERY mutation as detected — because the corpus was somehow always leaking —
+    would pass every test above while proving nothing."""
+    original = (REPO_ROOT / ".gitignore").read_text()
+    mutated = original + "\n# a comment changes nothing\n*.unrelated-extension\n"
+    probes = _privacy_probes()
+    leaked = set(probes) - _ignored_subset_in(_mutated_repo(mutated), probes)
+    assert not leaked, (
+        "an edit that does not touch the docs rules was reported as a leak: "
+        f"{sorted(leaked)[:5]}"
+    )
+
+
+#: A `.gitignore` added DEEPER in the tree. Git applies it to everything below
+#: its own directory and it is evaluated AFTER the root file, so a negation
+#: there wins last-match-wins over the root rule — the same leak as an appended
+#: negation, arriving through a file the root parse never reads.
+_NESTED_IGNORE_LEAKS = (
+    ("nested-negation-bare", "!20[0-9][0-9]-*"),
+    ("nested-negation-globbed", "!**/20[0-9][0-9]-*"),
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "line"), _NESTED_IGNORE_LEAKS, ids=[m[0] for m in _NESTED_IGNORE_LEAKS]
+)
+def test_a_negation_in_a_nested_gitignore_is_detected(name, line):
+    """A negation can arrive in a `.gitignore` the root parse never reads.
+
+    There are none under `docs/` today, so this is not a live leak — it is the
+    question of whether the suite would SEE one. It would not have: the opt-in
+    list and every probe are derived from the root file, so a tracked
+    `docs/<dir>/sub/.gitignore` containing `!20[0-9][0-9]-*` republishes that
+    subtree with all 43 tests green (Codex P2, PR #1633).
+
+    Detected here without teaching the parser about nested files — the harness
+    asks GIT, which already knows, and the corpus's nested probes are what make
+    the answer visible.
+    """
+    subdir = _opt_in_dirs()[0]
+    repo = _make_repo(extra_ignores={f"docs/{subdir}/sub/.gitignore": f"{line}\n"})
+    probes = _privacy_probes()
+    leaked = set(probes) - _ignored_subset_in(repo, probes)
+    assert leaked, (
+        f"mutation '{name}' SURVIVED: a nested .gitignore under "
+        f"docs/{subdir}/sub/ containing {line!r} left every probe still "
+        "ignored, so this suite would not notice that subtree being reopened."
     )
