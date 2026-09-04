@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
@@ -363,6 +363,76 @@ async def memories_mentioning(
     return out
 
 
+async def _journal_merge(
+    db: aiosqlite.Connection, *, loser_id: str, survivor_id: str, now: str
+) -> None:
+    """Write the pre-delete reversibility snapshot of the loser to entity_merge_journal.
+
+    Captures the loser's identity plus its mention and link rows exactly as they
+    stand before ``merge_entity`` copies-then-DELETEs them, so a later
+    ``unmerge_entity`` can reconstruct the loser node. No commit — runs inside the
+    caller's merge transaction.
+    """
+    cur = await db.execute(
+        "SELECT name, norm_name, entity_type FROM entities WHERE entity_id = ?",
+        (loser_id,),
+    )
+    row = await cur.fetchone()
+    loser_name, loser_norm, loser_type = (row[0], row[1], row[2]) if row else (None, None, None)
+    mcur = await db.execute(
+        "SELECT memory_id, provenance, confidence, source, created_at "
+        "FROM entity_mentions WHERE entity_id = ?",
+        (loser_id,),
+    )
+    mentions = [
+        {
+            "memory_id": r[0],
+            "provenance": r[1],
+            "confidence": r[2],
+            "source": r[3],
+            "created_at": r[4],
+        }
+        for r in await mcur.fetchall()
+    ]
+    lcur = await db.execute(
+        "SELECT source_id, target_id, link_type, provenance, confidence, "
+        "evidence_memory_id, valid_at, invalid_at, invalidated_by, created_at "
+        "FROM entity_links WHERE source_id = ? OR target_id = ?",
+        (loser_id, loser_id),
+    )
+    links = [
+        {
+            "source_id": r[0],
+            "target_id": r[1],
+            "link_type": r[2],
+            "provenance": r[3],
+            "confidence": r[4],
+            "evidence_memory_id": r[5],
+            "valid_at": r[6],
+            "invalid_at": r[7],
+            "invalidated_by": r[8],
+            "created_at": r[9],
+        }
+        for r in await lcur.fetchall()
+    ]
+    await db.execute(
+        "INSERT INTO entity_merge_journal "
+        "(id, loser_id, survivor_id, loser_name, loser_norm, loser_type, "
+        "mentions_json, links_json, merged_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            uuid.uuid4().hex,
+            loser_id,
+            survivor_id,
+            loser_name,
+            loser_norm,
+            loser_type,
+            json.dumps(mentions),
+            json.dumps(links),
+            now,
+        ),
+    )
+
+
 async def merge_entity(
     db: aiosqlite.Connection,
     *,
@@ -376,7 +446,19 @@ async def merge_entity(
     when the survivor already holds the same mention/relation, the
     higher-confidence row wins — a merge must never discard the
     strongest evidence (the loser is often the better-attested record).
+
+    Human-gated primitive: this is the irreversible entity tombstone the whole
+    adjudication approval gate exists to protect, and the app-level FLOOR of that gate
+    (below this is raw SQL on the DB — out of scope, tracked separately). Refuse a
+    dispatched/unsupervised session here too, so importing merge_entity directly can't
+    bypass the approve/apply guards one layer up. Both legitimate callers run in-server
+    (the live-mode drainer and the gated apply path, neither dispatched), so this is a
+    no-op for them; it only blocks a dispatched-session direct import. See
+    ``guard_human_gate``.
     """
+    from genesis.security.immunity_shadow import guard_human_gate
+
+    guard_human_gate("merge_entity")
     # Self-merge guard: writing ``merged_into = self`` makes the entity
     # unresolvable (the _resolve_active seen-set walk dead-ends), so a caller
     # that resolved both sides to the same row (easy via merge-following
@@ -384,6 +466,11 @@ async def merge_entity(
     if loser_id == survivor_id:
         raise ValueError(f"merge_entity: self-merge refused (loser == survivor == {loser_id!r})")
     now = datetime.now(UTC).isoformat()
+    # Reversibility journal: snapshot the loser BEFORE the destructive DELETEs
+    # below. merge_entity physically removes the loser's mention/link rows, so
+    # without this an applied merge cannot be undone (see entity_merge_journal +
+    # the unmerge_entity follow-up). Same transaction as the merge itself.
+    await _journal_merge(db, loser_id=loser_id, survivor_id=survivor_id, now=now)
     await db.execute(
         "INSERT INTO entity_mentions "
         "(memory_id, entity_id, provenance, confidence, source, created_at) "
@@ -435,6 +522,47 @@ async def merge_entity(
     )
     if _commit:
         await db.commit()
+
+
+async def prune_merge_journal(
+    db: aiosqlite.Connection,
+    *,
+    older_than_days: int = 180,
+    now: str,
+    _commit: bool = True,
+) -> int:
+    """Delete ``entity_merge_journal`` rows older than *older_than_days*.
+
+    Retention for the unbounded reversibility journal (wired into
+    ``scripts/disk_hygiene.sh``). The window is generous (180d default) because the
+    journal is a safety net for ``unmerge_entity`` — it must outlive the "did we
+    mis-merge?" discovery window, not just an audit horizon. ``now`` is injected
+    (never wall-clock here) for deterministic tests. No-ops before the
+    approval-gate migration (table-existence guard). Returns rows deleted.
+
+    Rejects a sub-1-day retention window: with ``older_than_days <= 0`` the cutoff
+    lands at or in the FUTURE relative to ``now`` (a negative subtracts a negative,
+    pushing it forward), so ``merged_at < cutoff`` would match EVERY row and wipe
+    the entire reversibility journal — the one store ``unmerge_entity`` depends on.
+    A retention window that destroys the whole safety net is always a bug, so fail
+    loud rather than silently deleting it.
+    """
+    if older_than_days < 1:
+        raise ValueError(
+            f"prune_merge_journal: retention window must be >= 1 day, got "
+            f"{older_than_days!r}; a sub-1 window sets the cutoff at/after now and "
+            f"would delete the ENTIRE entity_merge_journal (reversibility safety net)."
+        )
+    cur = await db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='entity_merge_journal'"
+    )
+    if not await cur.fetchone():
+        return 0
+    cutoff = (datetime.fromisoformat(now) - timedelta(days=older_than_days)).isoformat()
+    cursor = await db.execute("DELETE FROM entity_merge_journal WHERE merged_at < ?", (cutoff,))
+    if _commit:
+        await db.commit()
+    return cursor.rowcount or 0
 
 
 async def delete_entities_cascade(

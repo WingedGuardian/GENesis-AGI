@@ -232,9 +232,12 @@ def test_load_full_yaml(monkeypatch):
         "mistral-large-free",
     ]
 
-    # mistral-large-free provider (consolidated from mistral-free + mistral-large)
+    # mistral-large-free provider (consolidated from mistral-free + mistral-large).
+    # free: false since 2026-09: Mistral removed Large from free-tier entitlement
+    # (403 tier_not_allowed, measured on two independent free-tier accounts), so
+    # cost is tracked at paid rates and never_pays chains exclude it.
     ml = cfg.providers["mistral-large-free"]
-    assert ml.is_free is True
+    assert ml.is_free is False
     assert ml.model_id == "mistral-large-latest"
 
     # groq-free provider — MIGRATED 2026-08-06: Groq deprecated

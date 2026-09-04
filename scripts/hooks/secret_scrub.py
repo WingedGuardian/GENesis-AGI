@@ -140,8 +140,14 @@ _KNOWN_KEY_PREFIX_PATTERN = re.compile(
 # complete block written on ONE line (an env assignment with escaped newlines)
 # takes the whole line — the safe direction for that shape.
 _PEM_LABEL = r"(?: [A-Z0-9]{1,32}){0,4}"
-# `BLOCK` covers the PGP family (`-----BEGIN PGP PRIVATE KEY BLOCK-----`), the
-# armour `gpg --export-secret-keys -a` emits.
+# `BLOCK` covers the PGP family (`-----BEGIN PGP PRIVATE KEY BLOCK-----`), the  # pragma: allowlist secret
+# armour `gpg --export-secret-keys -a` emits. The pragma above is a
+# false-positive suppression, not a real key: detect-secrets' PrivateKeyDetector
+# matches the ARMOUR TEXT, so naming the shape this module exists to redact is
+# itself a "finding" and turned the blocking leak-detector job red. The literal
+# stays — it is the whole documentation value of the line — and it is the only
+# occurrence that needs the pragma, because every other spelling in this file
+# interpolates `_PEM_LABEL` and so is not a contiguous match.
 _PEM_BEGIN_LINE = re.compile(rf"-----BEGIN{_PEM_LABEL} PRIVATE KEY(?: BLOCK)?-----")
 _PEM_END_LINE = re.compile(rf"-----END{_PEM_LABEL} PRIVATE KEY(?: BLOCK)?-----")
 _PEM_MARKER_LITERAL = "PRIVATE KEY"
@@ -264,13 +270,37 @@ _SINGLE_CREDENTIAL_PATTERN = re.compile(
 # Credentials embedded in a URL's userinfo section (the user/password pair that
 # can precede an "@" host separator). Only fires when an "@" follows, so a plain
 # host-and-port URL never matches.
-# Only the SCHEME is bounded, and that bound carries the whole perf win:
-# MEASURED on a 40KB run, 2,788ms -> 6.6ms from the scheme bound alone. The span
-# after `://` was previously capped at 253 as if it were a hostname — it is the
-# USERINFO (the username before the `:`), so that cap bought nothing and simply
-# stopped long usernames being redacted. Unbounded here, same 6.6ms.
+#
+# NO LENGTH BOUND ANYWHERE, and that is the point. Two successive bounds were
+# tried here and BOTH were fail-opens dressed as perf fixes: a 253 cap on the
+# span after `://` (labelled "hostname" — it is the USERINFO, so the cap bought
+# nothing and stopped long usernames being redacted) and then a 32 cap on the
+# SCHEME (which stopped redacting any credential URL whose scheme ran longer,
+# a length RFC 3986 does not limit). Each bound was added to kill a quadratic
+# scan, and each one silently traded a redaction for it.
+#
+# The scan is gone instead of bounded: the pattern no longer matches the scheme
+# AT ALL. `://` is a 3-character literal the engine can find directly, whereas a
+# leading `[a-zA-Z][a-zA-Z0-9+.\-]*` re-scans the whole of every admitted-char
+# run from every offset in it — that run, not the scheme's length, was the cost.
+# Dropping it removes the quadratic AND the ceiling together, so there is no
+# longer a length at which a real credential URL stops being redacted.
+# MEASURED at 64/128/256KB on four adversarial shapes (a `://` with a long
+# no-`@` tail, dense `://`, a colon storm, a long alnum run): every ratio is
+# ~2.0 at 2x input, i.e. linear, and 256KB costs <15ms against a 10s timeout.
+#
+# Precision is unchanged by the drop: `://` in text that is not a URL is
+# essentially nonexistent, and the discriminator was always the `://…:…@` shape
+# rather than the scheme letters. Verified in both directions over 12 cases —
+# `http://example.com/a:b@c`, `https://host:8080/path`, a bare `foo:bar@baz` and
+# a plain repo URL still do NOT match.
+#
+# The userinfo repeat is `*`, not `+`: `https://:s3cr3t@host` (the password-only
+# form a generated DSN emits, e.g. `redis://:pw@192.0.2.10:6379/0`) has an EMPTY
+# username, and no other arm recognises an unlabelled password, so `+` let it
+# through in plaintext.
 _URL_CREDENTIAL_PATTERN = re.compile(
-    r"(?P<pre>[a-zA-Z][a-zA-Z0-9+.\-]{0,32}://[^:/@\s]+:)(?P<pw>[^@/\s]+)(?P<at>@)",
+    r"(?P<pre>://[^:/@\s]*:)(?P<pw>[^@/\s]+)(?P<at>@)",
 )
 
 # .env-style UPPER_SNAKE=value. The bare pattern over-redacts (PYTHONPATH=…,

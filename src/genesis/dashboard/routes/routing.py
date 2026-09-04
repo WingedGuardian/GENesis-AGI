@@ -35,9 +35,25 @@ def routing_config_read():
     }
 
     cb_states = {}
+    # Parallel map, deliberately NOT folded into cb_states: that key is a plain
+    # state string and several consumers lowercase it directly, so changing its
+    # shape would break them silently.
+    #
+    # `opened_by` answers what the state alone cannot: a HALF_OPEN breaker is on
+    # PROBATION, never "currently failing" (any failure in HALF_OPEN trips it
+    # straight back to OPEN). "call" means real calls failed and it is awaiting
+    # its next real trial; "probe" means only a health probe could not reach it.
+    # Rendering both as the same amber told the user a healthy-but-unproven
+    # provider was broken.
+    cb_detail = {}
     for name in cfg.providers:
         cb = rt.router.breakers.get(name)
         cb_states[name] = cb.state.value if hasattr(cb, "state") else "closed"
+        opened_by = None
+        state_val = cb_states[name]
+        if state_val in ("open", "half_open"):
+            opened_by = "call" if getattr(cb, "_opened_by_call", False) else "probe"
+        cb_detail[name] = {"state": state_val, "opened_by": opened_by}
 
     # Read raw YAML + local overlay for CC fields edited via the dashboard.
     # Local overlay (.local.yaml) contains user customizations that survive
@@ -87,6 +103,7 @@ def routing_config_read():
     return jsonify({
         "providers": providers,
         "cb_states": cb_states,
+        "cb_detail": cb_detail,
         "call_sites": call_sites,
         "disabled_providers": dict(cfg.disabled_providers),
     })

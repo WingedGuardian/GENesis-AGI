@@ -399,6 +399,37 @@ class TestBoundingNeverFailsOpen:
             url = f"https://{'u' * n}:{'p' * 40}@host.example/path"
             assert R in s.scrub(url), f"userinfo of {n} chars silently unredacted"
 
+    def test_long_url_scheme_is_still_redacted(self):
+        # The SECOND bound tried on this pattern, and the same failure as the
+        # first: RFC 3986 puts no ceiling on a scheme, so a 32-char cap simply
+        # stopped redacting past it. Both bounds are gone — the pattern no
+        # longer matches the scheme at all — so no length may reintroduce this.
+        for n in (3, 32, 33, 40, 300):
+            scheme = "a" + "1" * n
+            url = f"{scheme}://user:{self.UNLABELLED}@host.example/path"
+            assert R in s.scrub(url), f"scheme of {n + 1} chars silently unredacted"
+
+    def test_url_password_with_empty_username_is_redacted(self):
+        # `redis://:pw@host` is the form a generated DSN emits. Nothing else in
+        # this module recognises an unlabelled password, so requiring at least
+        # one username character wrote it to the log in plaintext.
+        for url in (
+            f"https://:{self.UNLABELLED}@host.example/path",
+            f"redis://:{self.UNLABELLED}@192.0.2.10:6379/0",
+        ):
+            assert R in s.scrub(url), f"empty-username password unredacted: {url}"
+
+    def test_dropping_the_scheme_did_not_widen_the_match(self):
+        # The control on the other side: `://` is no longer preceded by a
+        # scheme in the pattern, so these must still be left alone.
+        for text in (
+            "http://example.com/a:b@c",  # colon and @ in the PATH
+            "https://host.example:8080/path",  # host:port, no @
+            "see foo:bar@baz for details",  # no `://` at all
+            "https://github.com/WingedGuardian/GENesis-AGI",
+        ):
+            assert R not in s.scrub(text), f"over-redacted: {text}"
+
     def test_long_secret_value_is_still_redacted(self):
         # The side the original bounding DID protect — kept as a guard so a
         # future fix cannot trade one direction for the other.

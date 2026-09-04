@@ -2112,6 +2112,158 @@ async def _check_cc_login_expiry(db) -> None:
         logger.debug("cc login expiry check failed", exc_info=True)
 
 
+async def _check_provider_outage_notify(db) -> None:
+    """Notify once when a provider outage passes the hour floor (5-min band).
+
+    The DECISION lives in `routing/escalation.py::sweep_due_notifications` —
+    this wrapper supplies only the clock (the tick) and the operator lever.
+    Driving it from here rather than from `breaker.tripped` events is the
+    redesign's point: "has an hour passed" is a clock question, and answering
+    it from trip events made delivery depend on traffic (a provider whose
+    traffic stopped after escalating was never reported at all — found
+    independently by two reviewers on PR #1573).
+
+    Best-effort — never raises into the tick. Dedup is durable
+    (`skip_if_duplicate` on the unresolved notify row), so overlapping ticks
+    and restarts cannot double-send.
+    """
+    if db is None:
+        return
+    try:
+        from genesis.awareness import provider_notify_config as cfg_mod
+        from genesis.routing.escalation import sweep_due_notifications
+
+        mode = cfg_mod.effective_mode()  # fresh read per tick — no cache
+        if mode == "off":
+            # Loop contract: a disabled check resolves its own open alerts so
+            # flipping the lever off never strands one. USER-DECIDED cost:
+            # off→on re-notifies a still-dead provider.
+            await _resolve_provider_outage_notify(db)
+            return
+        priority = "critical" if mode == "live" else "high"
+
+        # LIVENESS SOURCE for the sweep (its BLOCKER fence): the breaker
+        # registry, when this process has one. A provider whose breaker reads
+        # CLOSED has proven recovery with real calls — a stale row must not
+        # page for it. Registry absent (partial boot, tests) → None, and the
+        # sweep then behaves as before; a KeyError (provider dropped from
+        # config) is raised through so the sweep's own catch skips that
+        # provider — fail toward silence.
+        provider_still_failing = None
+        try:
+            from genesis.routing.types import ProviderState
+            from genesis.runtime import GenesisRuntime
+
+            _breakers = getattr(GenesisRuntime.instance(), "_circuit_breakers", None)
+            if _breakers is not None:
+                def provider_still_failing(name, _reg=_breakers):
+                    return _reg.get(name).state != ProviderState.CLOSED
+        except Exception:
+            provider_still_failing = None
+
+        if mode == "live":
+            # MODE-UPGRADE contract (propose_only -> live): an open notify row
+            # written at priority="high" would satisfy `skip_if_duplicate`
+            # forever, so the critical row — the ONE that reaches Telegram —
+            # could never be written and the upgrade would silently deliver
+            # nothing. Resolve the demoted rows; the sweep below re-creates
+            # them at critical in this same tick, which delivers the pending
+            # notification — the point of turning the lever up.
+            await _promote_demoted_provider_notify(db)
+
+        written = await sweep_due_notifications(
+            db, priority=priority, provider_still_failing=provider_still_failing
+        )
+        if written:
+            logger.info(
+                "provider-outage sweep wrote %d notification(s) (mode=%s)",
+                written,
+                mode,
+            )
+    except Exception:
+        logger.warning("provider-outage notify check failed", exc_info=True)
+
+
+async def _open_notify_rows(db) -> list[dict]:
+    """The open NOTIFICATION rows (never the failure rows they derive from).
+
+    Discriminator: notify rows are the only writer of `outage_started_at` into
+    this (source, type) — failure rows carry `first_trip_at` instead, and no
+    third writer exists (enumerated at review). A row whose content is not JSON
+    matches neither and is left alone.
+    """
+    import json as _json
+
+    from genesis.db.crud import observations
+
+    rows = await observations.query(
+        db, source="routing", type="provider_failure", resolved=False, limit=200
+    )
+    out = []
+    for r in rows:
+        try:
+            blob = _json.loads(r.get("content") or "")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(blob, dict) and "outage_started_at" in blob:
+            out.append(r)
+    return out
+
+
+async def _promote_demoted_provider_notify(db) -> None:
+    """Resolve high-priority notify rows so live mode can rewrite them critical.
+
+    Without this, a row written under `propose_only` blocks the critical write
+    via `skip_if_duplicate` (dedup keys exclude priority) and upgrading the
+    lever silently delivers nothing — found at review.
+    """
+    try:
+        from genesis.db.crud import observations
+
+        demoted = [r["id"] for r in await _open_notify_rows(db)
+                   if r.get("priority") == "high"]
+        if demoted:
+            from datetime import UTC, datetime
+
+            await observations.resolve_batch(
+                db,
+                demoted,
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes=(
+                    "superseded: lever raised to live — re-created at critical"
+                ),
+            )
+            logger.info(
+                "provider-outage notify: promoted %d propose_only row(s) to live",
+                len(demoted),
+            )
+    except Exception:
+        logger.warning("provider-outage notify promotion failed", exc_info=True)
+
+
+async def _resolve_provider_outage_notify(db) -> None:
+    """Resolve open notify rows when the lever is off (the check's pair)."""
+    try:
+        from genesis.db.crud import observations
+
+        ids = [r["id"] for r in await _open_notify_rows(db)]
+        if ids:
+            from datetime import UTC, datetime
+
+            await observations.resolve_batch(
+                db,
+                ids,
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes="provider-outage notify lever turned off",
+            )
+            logger.info(
+                "provider-outage notify disabled — resolved %d open notification(s)",
+                len(ids),
+            )
+    except Exception:
+        logger.warning("provider-outage notify resolve failed", exc_info=True)
+
+
 async def _check_cc_cap_detection(db) -> None:
     """Alert when output-expecting cognitive CC invocations return empty in a run.
 
@@ -2561,6 +2713,29 @@ async def perform_tick(
     return result
 
 
+def _approval_age(resolved_at: str | None) -> str:
+    """How long ago an approval was granted, for a log line — never a raise.
+
+    `resolved_at` is a DB column reached through a resume path that dispatches
+    real work; a log line must not be what breaks it. Anything unparseable or
+    absent degrades to "age unknown", which is also the honest rendering.
+    """
+    if not resolved_at:
+        return "age unknown"
+    try:
+        resolved = datetime.fromisoformat(str(resolved_at))
+    except (TypeError, ValueError):
+        return "age unknown"
+    if resolved.tzinfo is None:
+        resolved = resolved.replace(tzinfo=UTC)
+    minutes = int((datetime.now(UTC) - resolved).total_seconds() // 60)
+    if minutes < 0:
+        return "age unknown"
+    if minutes < 60:
+        return f"{minutes}m ago"
+    return f"{minutes // 60}h{minutes % 60:02d}m ago"
+
+
 class AwarenessLoop:
     """The metronome — drives the 5-minute awareness tick via APScheduler."""
 
@@ -2934,6 +3109,11 @@ class AwarenessLoop:
             # completions (recorded by the invoker) and alerts on a run. Guarded
             # on db internally; a query failure no-ops (never breaks the tick).
             await _check_cc_cap_detection(self._db)
+            # Dead-provider notification sweep — clock-driven ON PURPOSE (the
+            # trip-driven version starved when traffic stopped; PR #1573).
+            # Guarded on db internally; lever: provider_outage_notify domain +
+            # GENESIS_PROVIDER_NOTIFY_DISABLED.
+            await _check_provider_outage_notify(self._db)
             # Git-repository health (F.1) — cheap structural probe + rootfs-RO
             # write-probe. NOT gated on db_available: git health matters most
             # when the DB is broken (the observation write is guarded on db
@@ -3459,10 +3639,28 @@ class AwarenessLoop:
                 consumed = await gate.mark_consumed(approved["id"])
                 if not consumed:
                     continue  # Another tick already consumed it
+                # Name the tick this actually runs against, and say plainly
+                # that it is not the tick that asked. A resumed reflection is
+                # dispatched with `self._last_tick_result` — the CURRENT tick —
+                # so what a person approved and what runs are about different
+                # moments. Per this method's own docstring the current tick is
+                # the only one available (the loop's scoring may never reach
+                # that depth again), NOT a freshness preference; either way the
+                # gap was invisible, because the line named only the approval.
+                #
+                # The ORIGINATING tick is not recoverable. Nothing records it:
+                # the approval context is built from a fixed key set with no
+                # tick field, and the approval key deliberately excludes
+                # per-invocation identity so recurring dispatches reuse one
+                # pending row. So this states what is known, and what is not.
                 logger.info(
-                    "Resuming %s reflection from approved request %s",
+                    "Resuming %s reflection from approval %s (approved %s) — "
+                    "running against the current tick %s, NOT the tick that "
+                    "requested it, which is not recorded",
                     depth_name,
                     approved["id"][:8],
+                    _approval_age(approved.get("resolved_at")),
+                    tick.tick_id[:8],
                 )
                 await self._cc_reflection_bridge.reflect(
                     depth,
