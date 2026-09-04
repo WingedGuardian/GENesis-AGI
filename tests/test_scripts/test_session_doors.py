@@ -72,6 +72,18 @@ if [[ "$args" == *list-panes* ]]; then
     fi
     exit 0
 fi
+if [[ "$args" == *respawn-pane* && -n "${FAKE_TMUX_RESPAWN_FAIL:-}" ]]; then
+    # An undeliverable relaunch (pane gone, server dying). Logged above, so a
+    # test can still see the attempt, and the door must report rather than
+    # claim a heal.
+    exit 1
+fi
+if [[ "$args" == *set-environment* && -n "${FAKE_TMUX_SETENV_FAIL:-}" ]]; then
+    # Session env could not be set. Respawning anyway would relaunch with
+    # STALE values — the exact defect the respawn design removes — so the door
+    # must stand the heal down.
+    exit 1
+fi
 if [[ "$args" == *send-keys* && -n "${FAKE_TMUX_SENDKEYS_FAIL:-}" ]]; then
     # Undeliverable keystrokes (pane died, server gone). Logged above, so the
     # tests can still see the attempt.
@@ -175,6 +187,8 @@ def door(tmp_path):
             "FAKE_TMUX_LIST_PANES_FAIL": os.environ.get("_TEST_FAKE_LIST_PANES_FAIL", ""),
             "FAKE_HEAL_CAP": os.environ.get("_TEST_FAKE_HEAL_CAP", ""),
             "FAKE_TMUX_ATTACHED": os.environ.get("_TEST_FAKE_ATTACHED", ""),
+            "FAKE_TMUX_RESPAWN_FAIL": os.environ.get("_TEST_FAKE_RESPAWN_FAIL", ""),
+            "FAKE_TMUX_SETENV_FAIL": os.environ.get("_TEST_FAKE_SETENV_FAIL", ""),
             "FAKE_TMUX_FDS": str(tmp_path / "tmux_fds.txt"),
         }
         # Per-invocation call counters: two run() calls in one test must not
@@ -473,6 +487,8 @@ class TestSlotHeal:
         idle=None,
         panes2_text=None,
         sendkeys_fail=False,
+        respawn_fail=False,
+        setenv_fail=False,
         heal_cap=None,
         attached=None,
     ):
@@ -487,6 +503,10 @@ class TestSlotHeal:
             os.environ["_TEST_FAKE_PANES2"] = str(run.panes2)
         if sendkeys_fail:
             os.environ["_TEST_FAKE_SENDKEYS_FAIL"] = "1"
+        if respawn_fail:
+            os.environ["_TEST_FAKE_RESPAWN_FAIL"] = "1"
+        if setenv_fail:
+            os.environ["_TEST_FAKE_SETENV_FAIL"] = "1"
         if heal_cap is not None:
             os.environ["_TEST_FAKE_HEAL_CAP"] = heal_cap
         if attached is not None:
@@ -500,6 +520,8 @@ class TestSlotHeal:
             os.environ.pop("_TEST_FAKE_SENDKEYS_FAIL", None)
             os.environ.pop("_TEST_FAKE_HEAL_CAP", None)
             os.environ.pop("_TEST_FAKE_ATTACHED", None)
+            os.environ.pop("_TEST_FAKE_RESPAWN_FAIL", None)
+            os.environ.pop("_TEST_FAKE_SETENV_FAIL", None)
         return proc, log.read_text()
 
     def test_a_denied_capacity_gate_stands_the_heal_down(self, door):
@@ -511,7 +533,7 @@ class TestSlotHeal:
         healing is a real allocation on a swapless box.
         """
         proc, log = self._run_with(door, "POISONED", heal_cap="DENY")
-        assert "send-keys" not in log, "typed a launch line the gate declined"
+        assert "respawn-pane" not in log, "typed a launch line the gate declined"
         assert "capacity gate declined" in proc.stderr, proc.stderr
 
     def test_a_denied_heal_still_attaches_instead_of_exiting(self, door):
@@ -546,7 +568,7 @@ class TestSlotHeal:
         become an outage — and the pre-existing behaviour for this slot was a
         dead prompt, which is worse than an unchecked relaunch."""
         _proc, log = self._run_with(door, "POISONED")  # no fake -> gate exits 1
-        assert "send-keys" in log
+        assert "respawn-pane" in log
 
     def test_an_attached_session_is_never_typed_into(self, door):
         """Child-presence cannot see shell-NATIVE work.
@@ -558,40 +580,56 @@ class TestSlotHeal:
         it asks the right question: is anyone there.
         """
         proc, log = self._run_with(door, "POISONED", attached="1")
-        assert "send-keys" not in log, "typed into a session with a client attached"
+        assert "respawn-pane" not in log, "typed into a session with a client attached"
         assert "another client is attached" in proc.stderr, proc.stderr
 
     def test_an_unattached_poisoned_slot_still_heals(self, door):
         """Guard the guard: the test above must not pass by killing the heal."""
         _proc, log = self._run_with(door, "POISONED", attached="0")
-        assert "send-keys" in log
+        assert "respawn-pane" in log
 
     def test_an_unreadable_attachment_count_spares_the_session(self, door):
         """Same fail direction as every other gate here: only a positive
         answer permits keystrokes. A tmux that prints nothing usable must not
         be read as 'nobody is there'."""
         proc, log = self._run_with(door, "POISONED", attached="not-a-number")
-        assert "send-keys" not in log or "another client is attached" in proc.stderr
+        assert "respawn-pane" not in log or "another client is attached" in proc.stderr
 
     def test_poisoned_slot_is_healed_with_the_full_launch_line(self, door):
-        proc, log = self._run_with(door, "POISONED")
-        assert "send-keys" in log, f"no heal attempted:\n{log}"
-        literal = [ln for ln in log.splitlines() if "send-keys" in ln and " -l " in ln]
-        assert literal, f"no literal payload sent:\n{log}"
-        payload = literal[0]
+        _proc, log = self._run_with(door, "POISONED")
+        respawn = [ln for ln in log.splitlines() if "respawn-pane" in ln]
+        assert respawn, f"no heal attempted:\n{log}"
+        payload = respawn[0]
         # The healed pane must run the SAME thing a fresh slot runs: cd guard,
         # permission flag, exit-capture trailer, exit-code preservation.
         for fragment in ("cd ", "claude ", "--permission-mode auto",
                          "cc_exit_capture.sh 4", "; __ec=", "exit $__ec"):
             assert fragment in payload, f"missing {fragment!r} in heal payload:\n{payload}"
 
-    def test_heal_clears_the_prompt_before_typing(self, door):
+    def test_the_heal_is_one_atomic_command_and_types_nothing(self, door):
+        """Replaces a test of the C-c / C-u / type / Enter ladder.
+
+        That ladder existed to re-create by hand what `new-session` provides,
+        and review found four separate members of that obligation across three
+        rounds. `respawn-pane` runs the command from the tmux SERVER's
+        environment exactly as create does, so there is one command and its
+        exit status IS the delivery check.
+
+        The send-keys assertion is kept as a TOMBSTONE: reintroducing the
+        keystroke path would silently restore the whole class this removed.
+        """
         _proc, log = self._run_with(door, "POISONED")
-        keys = [ln for ln in log.splitlines() if "send-keys" in ln]
-        joined = "\n".join(keys)
-        assert "C-c" in joined, "stray foreground process not interrupted"
-        assert "C-u" in joined, "prompt residue not cleared"
-        assert keys[-1].endswith("Enter"), f"payload never submitted:\n{joined}"
+        respawn = [ln for ln in log.splitlines() if "respawn-pane" in ln]
+        assert len(respawn) == 1, f"expected exactly one respawn:\n{log}"
+        assert "-k" in respawn[0], "respawn must replace the pane's process"
+        assert "send-keys" not in log, f"the keystroke ladder came back:\n{log}"
+
+    def test_a_failed_environment_set_stands_the_heal_down(self, door):
+        """Respawning with STALE env is the exact defect this design removes,
+        so a failed set must not fall through to the relaunch."""
+        proc, log = self._run_with(door, "POISONED", setenv_fail=True)
+        assert "respawn-pane" not in log, f"relaunched with stale env:\n{log}"
+        assert "stale values" in proc.stderr, proc.stderr
 
     def test_heal_prints_an_honest_message(self, door):
         proc, _log = self._run_with(door, "POISONED")
@@ -599,31 +637,31 @@ class TestSlotHeal:
 
     def test_alive_slot_is_attached_untouched(self, door):
         proc, log = self._run_with(door, "ALIVE")
-        assert "send-keys" not in log, f"typed into a LIVE session:\n{log}"
+        assert "respawn-pane" not in log, f"typed into a LIVE session:\n{log}"
         assert "running no claude" not in proc.stderr
 
     def test_unknown_verdict_spares_the_session(self, door):
         _proc, log = self._run_with(door, "UNKNOWN")
-        assert "send-keys" not in log, f"typed into a session of unknown state:\n{log}"
+        assert "respawn-pane" not in log, f"typed into a session of unknown state:\n{log}"
 
     def test_empty_verdict_spares_the_session(self, door):
         # Broken venv / timeout / crashed probe -> no verdict at all.
         _proc, log = self._run_with(door, "")
-        assert "send-keys" not in log, f"typed on an absent verdict:\n{log}"
+        assert "respawn-pane" not in log, f"typed on an absent verdict:\n{log}"
 
     def test_garbage_verdict_spares_the_session(self, door):
         _proc, log = self._run_with(door, "banana")
-        assert "send-keys" not in log
+        assert "respawn-pane" not in log
 
     def test_unenumerable_panes_spares_the_session(self, door):
         _proc, log = self._run_with(door, "POISONED", panes_text="")
-        assert "send-keys" not in log, f"healed without knowing which pane:\n{log}"
+        assert "respawn-pane" not in log, f"healed without knowing which pane:\n{log}"
 
     def test_heal_targets_the_first_windows_pane(self, door):
         # list-panes -s lists in window order, so row 1 is window 1's pane —
         # where the canonical launch lives.
         _proc, log = self._run_with(door, "POISONED", panes_text="%5 111 bash\n%7 222 bash\n")
-        sk = [ln for ln in log.splitlines() if "send-keys" in ln]
+        sk = [ln for ln in log.splitlines() if "respawn-pane" in ln]
         assert all("%5" in ln for ln in sk), f"heal aimed at the wrong pane:\n{sk}"
 
     def test_heal_consults_the_oauth_gate(self, door):
@@ -637,13 +675,13 @@ class TestSlotHeal:
         assert '[ "$_HEAL" = "1" ]' in gate.split("_OAUTH_SRC=\"\"")[1].split("fi")[0], (
             "the OAuth gate condition does not include the heal path"
         )
-        assert "send-keys" in log
+        assert "respawn-pane" in log
 
     def test_alive_attach_still_skips_the_oauth_gate(self, door):
         # An attach does not re-run the pane command, so injecting a token
         # there would be inert and would waste a probe.
         _proc, log = self._run_with(door, "ALIVE")
-        assert "send-keys" not in log
+        assert "respawn-pane" not in log
 
     def test_heal_does_not_silence_the_doors_own_stderr(self, door):
         """Regression: the per-slot lock is opened with `exec`, whose
@@ -653,7 +691,7 @@ class TestSlotHeal:
         nothing. Assert a message that is emitted AFTER the lock is taken.
         """
         proc, log = self._run_with(door, "POISONED")
-        assert "send-keys" in log
+        assert "respawn-pane" in log
         assert proc.stderr.strip(), "the door went silent after taking the lock"
         assert "relaunching" in proc.stderr, proc.stderr
 
@@ -669,12 +707,12 @@ class TestSlotHeal:
         alone — including the C-c, which is itself destructive.
         """
         _proc, log = self._run_with(door, "POISONED", panes_text="%0 4242 vim\n")
-        assert "send-keys" not in log, f"typed into a pane running vim:\n{log}"
+        assert "respawn-pane" not in log, f"typed into a pane running vim:\n{log}"
 
     @pytest.mark.parametrize("busy", ["vim", "ssh", "python", "pytest", "less", "node"])
     def test_non_shell_panes_are_all_spared(self, door, busy):
         _proc, log = self._run_with(door, "POISONED", panes_text=f"%0 4242 {busy}\n")
-        assert "send-keys" not in log, f"typed into a pane running {busy}:\n{log}"
+        assert "respawn-pane" not in log, f"typed into a pane running {busy}:\n{log}"
 
     def test_busy_pane_stand_down_is_announced(self, door):
         proc, _log = self._run_with(door, "POISONED", panes_text="%0 4242 rsync\n")
@@ -685,7 +723,7 @@ class TestSlotHeal:
         # Login shells arrive with a leading dash; missing them would make the
         # gate refuse to heal the exact shape that motivated this change.
         _proc, log = self._run_with(door, "POISONED", panes_text=f"%0 4242 {shell}\n")
-        assert "send-keys" in log, f"refused to heal an idle {shell} pane:\n{log}"
+        assert "respawn-pane" in log, f"refused to heal an idle {shell} pane:\n{log}"
 
     def test_idleness_is_the_LAST_verdict_before_any_keystroke(self, door):
         """Whichever probe runs last is the only one whose answer is still
@@ -700,7 +738,7 @@ class TestSlotHeal:
         """
         run, _log, _sessions, _listing, _panes = door
         _proc, log = self._run_with(door, "POISONED")
-        assert "send-keys" in log, "heal did not run; ordering unexercised"
+        assert "respawn-pane" in log, "heal did not run; ordering unexercised"
         order = run.probe_log.read_text().split()
         assert order, "probe shim recorded nothing — harness regression"
         assert order[-1] == "idle", (
@@ -712,7 +750,7 @@ class TestSlotHeal:
         """Ordering must not depend on the happy path."""
         run, _log, _sessions, _listing, _panes = door
         _proc, log = self._run_with(door, "POISONED", idle="BUSY")
-        assert "send-keys" not in log
+        assert "respawn-pane" not in log
         order = run.probe_log.read_text().split()
         # The SHAPE, not just the last element: under the old order a BUSY
         # verdict stands the heal down before the liveness re-check ever runs,
@@ -727,17 +765,17 @@ class TestSlotHeal:
         # The typed payload (`export K=V;`, `__ec=$?`) is POSIX and a parse
         # error in fish — a broken relaunch is worse than a plain attach.
         _proc, log = self._run_with(door, "POISONED", panes_text="%0 4242 fish\n")
-        assert "send-keys" not in log, f"typed a POSIX payload into fish:\n{log}"
+        assert "respawn-pane" not in log, f"typed a POSIX payload into fish:\n{log}"
 
     def test_process_name_containing_a_space_is_spared(self, door):
         # pane_current_command is the row REMAINDER, not its first token —
         # a renamed process reporting "bash x" must not pass as "bash".
         _proc, log = self._run_with(door, "POISONED", panes_text="%0 4242 bash x\n")
-        assert "send-keys" not in log, f"first-token match let a masquerade through:\n{log}"
+        assert "respawn-pane" not in log, f"first-token match let a masquerade through:\n{log}"
 
     def test_malformed_pane_id_is_never_a_send_keys_target(self, door):
         _proc, log = self._run_with(door, "POISONED", panes_text="garbage 4242 bash\n")
-        assert "send-keys" not in log, f"typed at a non-pane target:\n{log}"
+        assert "respawn-pane" not in log, f"typed at a non-pane target:\n{log}"
 
     def test_slot_that_came_alive_during_preparation_is_not_typed_into(self, door):
         """The verdict is re-confirmed immediately before the keystrokes.
@@ -749,7 +787,7 @@ class TestSlotHeal:
         must never cause, so a stale POISONED must not be acted on.
         """
         _proc, log = self._run_with(door, "POISONED,ALIVE")
-        assert "send-keys" not in log, f"typed into a slot that came alive:\n{log}"
+        assert "respawn-pane" not in log, f"typed into a slot that came alive:\n{log}"
 
     def test_race_stand_down_is_announced(self, door):
         proc, _log = self._run_with(door, "POISONED,ALIVE")
@@ -757,7 +795,7 @@ class TestSlotHeal:
 
     def test_still_heals_when_the_recheck_agrees(self, door):
         _proc, log = self._run_with(door, "POISONED,POISONED")
-        assert "send-keys" in log, f"re-check wrongly blocked a real heal:\n{log}"
+        assert "respawn-pane" in log, f"re-check wrongly blocked a real heal:\n{log}"
 
     # ── G1: idleness is CURRENT state, established immediately before keys ──
 
@@ -767,7 +805,7 @@ class TestSlotHeal:
         that tells an idle prompt from a busy shell — only IDLE may be typed at.
         """
         _proc, log = self._run_with(door, "POISONED", idle="BUSY")
-        assert "send-keys" not in log, f"typed over a running shell job:\n{log}"
+        assert "respawn-pane" not in log, f"typed over a running shell job:\n{log}"
 
     def test_busy_shell_stand_down_is_announced(self, door):
         proc, _log = self._run_with(door, "POISONED", idle="BUSY")
@@ -776,7 +814,7 @@ class TestSlotHeal:
     def test_idle_probe_without_a_verdict_spares(self, door):
         # Broken venv / timeout / crashed probe -> no IDLE affirmation -> no keys.
         proc, log = self._run_with(door, "POISONED", idle="EMPTY")
-        assert "send-keys" not in log, f"typed on an absent idle verdict:\n{log}"
+        assert "respawn-pane" not in log, f"typed on an absent idle verdict:\n{log}"
         # And the message must not claim knowledge the probe never produced —
         # "mid-job" here sends an operator debugging a never-healing slot to
         # inspect a job that does not exist.
@@ -785,7 +823,7 @@ class TestSlotHeal:
 
     def test_unknown_idleness_spares(self, door):
         _proc, log = self._run_with(door, "POISONED", idle="UNKNOWN")
-        assert "send-keys" not in log
+        assert "respawn-pane" not in log
 
     def test_safety_gate_reads_fresh_pane_state_not_the_decision_snapshot(self, door):
         """The pane list is captured when the heal is DECIDED, but the OAuth
@@ -799,7 +837,7 @@ class TestSlotHeal:
             panes_text="%0 4242 bash\n",
             panes2_text="%0 4242 vim\n",
         )
-        assert "send-keys" not in log, f"acted on the stale pane snapshot:\n{log}"
+        assert "respawn-pane" not in log, f"acted on the stale pane snapshot:\n{log}"
 
     def test_pane_replaced_mid_flight_is_not_typed_into(self, door):
         # The first window's pane id changed between decision and action —
@@ -809,7 +847,7 @@ class TestSlotHeal:
             panes_text="%0 4242 bash\n",
             panes2_text="%9 5555 bash\n",
         )
-        assert "send-keys" not in log, f"typed into a pane never probed:\n{log}"
+        assert "respawn-pane" not in log, f"typed into a pane never probed:\n{log}"
 
     # ── G2: the heal path must be EQUIVALENT to the create path ─────────────
 
@@ -819,14 +857,23 @@ class TestSlotHeal:
         environment the old shell had unless the heal carries the same set.
         """
         _proc, log = self._run_with(door, "POISONED")
-        literal = [ln for ln in log.splitlines() if "send-keys" in ln and " -l " in ln]
-        assert literal, f"no literal payload sent:\n{log}"
-        payload = literal[0]
-        for var in ("GENESIS_SLOT=4", "GENESIS_CC_PERMISSION_MODE=",
-                    "CLAUDE_CODE_TMPDIR=", "TMPDIR=", "LANG="):
-            assert f"export {var}" in payload, (
-                f"healed pane not given {var!r}:\n{payload}"
-            )
+        setenv = [ln for ln in log.splitlines() if "set-environment" in ln]
+        assert setenv, f"no session environment set:\n{log}"
+        joined = "\n".join(setenv)
+        # PATH is in this set BECAUSE of the switch to respawn: the command now
+        # runs from the tmux SERVER's environment, whose PATH is right only by
+        # luck of who started the server.
+        for var in ("GENESIS_SLOT", "GENESIS_CC_PERMISSION_MODE",
+                    "CLAUDE_CODE_TMPDIR", "TMPDIR", "PATH", "LANG"):
+            assert var in joined, f"healed pane not given {var!r}:\n{joined}"
+        # Set BEFORE the respawn — the respawned command reads it at exec.
+        first_respawn = next(
+            i for i, ln in enumerate(log.splitlines()) if "respawn-pane" in ln
+        )
+        last_setenv = max(
+            i for i, ln in enumerate(log.splitlines()) if "set-environment" in ln
+        )
+        assert last_setenv < first_respawn, f"env set after the relaunch:\n{log}"
 
     def test_create_path_still_passes_env_via_dash_e(self, door):
         # Guards the refactor that unifies the two paths' env source.
@@ -846,18 +893,25 @@ class TestSlotHeal:
         """
         run, _log, _sessions, _listing, _panes = door
         _proc, log = self._run_with(door, "POISONED")
-        assert "send-keys" in log  # the heal (and so the lock) happened
+        assert "respawn-pane" in log  # the heal (and so the lock) happened
         fds = run.fds_file.read_text() if run.fds_file.exists() else ""
         assert fds.strip(), "fd recording never ran — shim regression"
         assert "cc-slot-heal" not in fds, (
             f"heal lock fd leaked into the tmux client:\n{fds}"
         )
 
-    def test_undeliverable_keystrokes_are_reported_not_claimed(self, door):
-        proc, log = self._run_with(door, "POISONED", sendkeys_fail=True)
-        assert "send-keys" in log  # the attempt was made…
-        assert "could not be delivered" in proc.stderr, proc.stderr
+    def test_an_undeliverable_relaunch_is_reported_not_claimed(self, door):
+        """The respawn's exit status IS the delivery check.
 
+        This is the shape's real advantage over the keystroke ladder it
+        replaced: tmux could accept a keystroke that the shell then ignored, so
+        delivery had to be inferred. A failed respawn is simply a non-zero
+        exit, and the door must say so rather than attach while the operator
+        expects claude.
+        """
+        proc, log = self._run_with(door, "POISONED", respawn_fail=True)
+        assert "respawn-pane" in log, "no relaunch was attempted at all"
+        assert "could not relaunch" in proc.stderr, proc.stderr
 
 
 class TestWrapperInsideTmux:

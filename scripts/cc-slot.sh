@@ -703,13 +703,19 @@ _PANE_ENV=(
     # heal into an already-running shell cannot inherit it at all. Same reason
     # CLAUDE_CODE_TMPDIR has always been in this list.
     "TMPDIR=${TMPDIR}"
+    # PATH is pinned for the same reason, and it is why the ACTION changed.
+    # `respawn-pane` runs the command from the tmux SERVER's environment, which
+    # is correct only by luck of who started the server; the typed heal it
+    # replaced inherited the STALE PANE SHELL's PATH instead, which is worse.
+    # `_PANE_CMD` resolves `command claude` through PATH, so neither ambient
+    # value may be trusted. Pinning it here means the create and heal paths
+    # resolve the same binary from one source.
+    "PATH=${PATH}"
     "LANG=${LANG:-}"
 )
 _PANE_ENV_FLAGS=()
-_HEAL_ENV_EXPORTS=""
 for _kv in "${_PANE_ENV[@]}"; do
     _PANE_ENV_FLAGS+=(-e "$_kv")
-    _HEAL_ENV_EXPORTS+="export $(printf '%q' "$_kv"); "
 done
 
 if [ "$_HEAL" = "1" ]; then
@@ -834,21 +840,44 @@ if [ "$_HEAL" = "1" ]; then
     # reached the pane and the operator attaches expecting claude. On the
     # first failure no further keys are sent (a best-effort C-u sweeps any
     # half-typed payload) and the failure is said out loud.
-    _heal_sent=1
-    tmux send-keys -t "$_HEAL_PANE" C-c 2>/dev/null || _heal_sent=0
-    if [ "$_heal_sent" = "1" ]; then
-        sleep 0.3 || true
-        tmux send-keys -t "$_HEAL_PANE" C-u 2>/dev/null || _heal_sent=0
-    fi
-    if [ "$_heal_sent" = "1" ]; then
-        tmux send-keys -t "$_HEAL_PANE" -l "${_HEAL_ENV_EXPORTS}${_PANE_CMD}" 2>/dev/null || _heal_sent=0
-    fi
-    if [ "$_heal_sent" = "1" ]; then
-        tmux send-keys -t "$_HEAL_PANE" Enter 2>/dev/null || _heal_sent=0
-    fi
-    if [ "$_heal_sent" != "1" ]; then
-        tmux send-keys -t "$_HEAL_PANE" C-u 2>/dev/null || true
-        echo "cc-slot: heal keystrokes could not be delivered — attaching without a relaunch." >&2
+    # The action is ONE tmux command, and that is the point of this design.
+    #
+    # It replaced a keystroke ladder (C-c, C-u, type the line, Enter) that had
+    # to RE-CREATE by hand everything `new-session` provides. That obligation is
+    # open-ended, and review found four separate members of it across three
+    # rounds — the OAuth token, the environment, TMPDIR, the capacity gate —
+    # each fixed one at a time while the next waited. `respawn-pane` runs the
+    # command from the tmux SERVER's environment, exactly as `new-session`
+    # does, so create and heal share one execution context instead of one
+    # hand-maintained imitation of it. What remains inheritable (PATH) is
+    # pinned in `_PANE_ENV` above.
+    #
+    # `-k` kills the pane's existing process, which is STRICTLY more
+    # destructive than the C-c it replaces (a process GROUP, not just the
+    # foreground job). Every gate above is therefore load-bearing, and the
+    # shell-name whitelist most of all: its job is now "never -k a non-shell".
+    #
+    # Session env must be set BEFORE the respawn — the respawned command reads
+    # it at exec. A failed set stands the heal down rather than respawning with
+    # stale values, which is the exact defect this design exists to remove.
+    _heal_ok=1
+    for _kv in "${_PANE_ENV[@]}"; do
+        # `=` targets the session EXACTLY (tmux prefix-matches otherwise, the
+        # same trap `has-session` has), and `--` stops a value that begins with
+        # a dash being read as an option.
+        tmux set-environment -t "=$SESSION_NAME" -- "${_kv%%=*}" "${_kv#*=}" \
+            2>/dev/null || _heal_ok=0
+    done
+    if [ "$_heal_ok" != "1" ]; then
+        echo "cc-slot: could not set the slot's environment — not relaunching with stale values; attaching instead." >&2
+    else
+        # The exit status IS the delivery check: no separate "did it land"
+        # question, unlike a keystroke that tmux accepts and a shell ignores.
+        if tmux respawn-pane -k -t "$_HEAL_PANE" "$_PANE_CMD" 2>/dev/null; then
+            :
+        else
+            echo "cc-slot: could not relaunch in the pane — attaching without a relaunch." >&2
+        fi
     fi
 fi
 

@@ -282,11 +282,30 @@ verified: 1aedb682 2026-09-03
   children, while `bash script.sh`, an editor, or rsync all do, and
   `send-keys C-c` would kill them. The pane command is built ONCE (`_PANE_CMD`)
   and shared by the create and heal paths, so a healed slot cannot drift into a
-  claude without the OAuth prefix, permission flag or exit-capture trailer; the
-  heal also exports the same env set the create path passes via
-  `new-session -e` (one `_PANE_ENV` source), closes its per-slot lock fd before
-  the client `exec` (an inherited fd would hold the flock for the whole
-  session), and reports undeliverable keystrokes instead of claiming a heal.
+  claude without the OAuth prefix, permission flag or exit-capture trailer.
+  **The heal ACTION is `tmux respawn-pane -k`, not typed keystrokes, and the
+  reason is structural rather than cosmetic.** A typed ladder (C-c, C-u, type,
+  Enter) has to re-create by hand everything `new-session` provides, which is
+  an open-ended obligation: review found four separate members of it across
+  three rounds — the OAuth token, the environment, TMPDIR, the capacity gate —
+  each fixed one at a time while the next waited. `respawn-pane` runs the
+  command from the tmux SERVER's environment exactly as `new-session` does, so
+  the two paths share one execution context instead of one hand-maintained
+  imitation of it, and the class is closed rather than sampled. What remains
+  inheritable is pinned: `PATH` joined `_PANE_ENV` for precisely this reason,
+  since the server's value is right only by luck of who started it. Session env
+  is set with `tmux set-environment` BEFORE the respawn (the command reads it
+  at exec) and a failed set stands the heal down rather than relaunching with
+  stale values. The respawn's exit status IS the delivery check — no inferring
+  whether a keystroke landed — and a failure is reported instead of claimed.
+  `-k` kills the pane's process GROUP, which is strictly more destructive than
+  the C-c it replaced, so every gate above is load-bearing and the shell-name
+  whitelist most of all: its job is now "never `-k` a non-shell". Accepted and
+  stated: the respawn destroys the pane's VISIBLE screen (scrollback survives),
+  which for a slot sitting at a bare prompt is close to nothing, and the exit
+  capture already holds the dying session's tail. The door still closes its
+  per-slot lock fd before the client `exec` (an inherited fd would hold the
+  flock for the whole session).
   Two further gates, both added because child-presence and session-count each
   answer a NARROWER question than they appear to. (1) A session with another
   client ATTACHED is never typed into: child-presence cannot see shell-NATIVE

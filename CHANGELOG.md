@@ -20,7 +20,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   session silently discards the command it was given. The door now checks whether
   Claude Code is actually running in the slot and relaunches it in place when it
   is not, telling you it did so. If it cannot tell, it attaches exactly as before
-  — it will never type into a session that is in use, nor over a job the slot's
+  — it will never disturb a session that is in use, nor a job the slot's
   shell is running. The slot list printed by a manual connection now also marks
   a slot that is running no Claude Code, and says that reattaching to it will
   not relaunch it: only that slot's own door does. Two things it will not do:

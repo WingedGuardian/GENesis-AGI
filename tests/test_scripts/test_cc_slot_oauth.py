@@ -171,18 +171,36 @@ def test_pane_command_is_built_once_and_reused(script_text):
     # The heal usage rides behind the env exports derived from the SAME
     # _PANE_ENV array the create path hands to `new-session -e`, so the two
     # paths still share one command builder AND one env source.
-    assert script_text.count('"$_PANE_CMD"') == 1  # create: exec tmux
-    assert script_text.count('"${_HEAL_ENV_EXPORTS}${_PANE_CMD}"') == 1  # heal: send-keys
+    # TWO uses, one builder: `exec tmux new-session` on create and
+    # `respawn-pane` on heal. It was 1 while the heal typed
+    # `"${_HEAL_ENV_EXPORTS}${_PANE_CMD}"` as a keystroke payload; the switch to
+    # respawn makes both paths pass the SAME variable to tmux, which is the
+    # drift-proofing this test exists to pin, expressed more literally.
+    assert script_text.count('"$_PANE_CMD"') == 2  # create: exec tmux; heal: respawn-pane
+    # TOMBSTONE: the typed payload is gone. `_HEAL_ENV_EXPORTS` existed only to
+    # re-create, as shell text, the environment `new-session -e` gives a fresh
+    # pane. The heal now sets session env via `tmux set-environment` and lets
+    # `respawn-pane` run the command from the SERVER's environment, exactly as
+    # create does — which is what removed the whole create-vs-heal drift class
+    # rather than one property of it per review round.
+    assert script_text.count("_HEAL_ENV_EXPORTS") == 0
+    assert script_text.count("set-environment") >= 1
 
 
 def test_pane_command_bypasses_the_bashrc_wrapper_function(tmp_path, script_text):
     """A shared STRING is not shared EXECUTION.
 
-    tmux runs the create path under a non-interactive `sh -c` (no rc files); the
-    heal path is typed into an INTERACTIVE shell that has sourced ~/.bashrc,
-    where `claude` is a wrapper FUNCTION. If the payload said bare `claude` the
-    function would interpose on the heal path only — re-deriving the environment
-    and invoking cc_exit_capture twice — so the two paths would diverge despite
+    tmux runs BOTH paths under a non-interactive `sh -c` now (create via
+    `new-session`, heal via `respawn-pane`), so neither sources ~/.bashrc and
+    the `claude` wrapper FUNCTION cannot interpose on either. The `command`
+    prefix is therefore belt-and-braces rather than load-bearing — but it is
+    kept, and this test with it, because it WAS load-bearing under the typed
+    heal this replaced: there the payload went into an INTERACTIVE shell that
+    had sourced ~/.bashrc, and a bare `claude` would have re-derived the
+    environment and invoked cc_exit_capture twice on that path only. Dropping
+    the prefix would silently restore that divergence for anyone who
+    reintroduces a keystroke path. Historically, the function would interpose on
+    the heal path only — so the two paths diverged despite
     passing the string-identity check above.
     """
     launch = _extract_launch_line(script_text)
