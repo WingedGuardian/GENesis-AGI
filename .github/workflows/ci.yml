@@ -305,27 +305,24 @@ jobs:
           printf '%s\n%s\n' "$added" "$body" | python3 scripts/ci/private_pattern_scan.py --patterns "$pf"
 
   migration-check:
-    # Catch duplicate migration prefixes before merge — two PRs creating
-    # the same NNNN_*.py prefix will collide at runtime.
+    # Migration ids: no duplicate prefix in either namespace, and no NEW
+    # hand-allocated 4-digit id (that namespace is frozen — new migrations use
+    # a UTC timestamp, which nobody has to allocate and two branches therefore
+    # cannot both claim).
+    #
+    # The check moved out of shell deliberately. The old glob+grep restated the
+    # runners' filename semantics in a second language and could not survive
+    # mixed-width ids in EITHER direction (both measured 2026-09-03): its
+    # 4-digit glob made timestamp migrations invisible to the guard, and
+    # widening the glob while keeping `grep -oP '^\d{4}'` truncated every
+    # 20260903… id to "2026", reporting two distinct migrations as duplicates.
+    # scripts/check_migration_prefixes.py imports the runners' own patterns, so
+    # the guard cannot drift from what actually runs.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Check migration prefix uniqueness
-        run: |
-          set -euo pipefail
-          dir="src/genesis/db/migrations"
-          dupes=$(ls "$dir"/[0-9][0-9][0-9][0-9]_*.py 2>/dev/null \
-            | xargs -I{} basename {} \
-            | grep -oP '^\d{4}' \
-            | sort | uniq -d || true)
-          if [[ -n "$dupes" ]]; then
-            echo "::error::Duplicate migration prefixes found: $dupes"
-            for p in $dupes; do
-              echo "  Files: $(ls "$dir"/${p}_*.py)"
-            done
-            exit 1
-          fi
-          echo "Migration prefix check: CLEAN"
+      - name: Check migration ids (uniqueness + legacy freeze)
+        run: python3 scripts/check_migration_prefixes.py
 
   external-io-check:
     # WS5 regression guard: no NEW ungated autonomous external-world egress

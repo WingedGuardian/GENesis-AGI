@@ -1,7 +1,34 @@
 """Migration runner — discovers and applies versioned schema migrations.
 
-Each migration is a Python file in this directory named NNNN_description.py
-(e.g., 0001_add_update_history.py). Files must define:
+Each migration is a Python file in this directory. **New migrations use a UTC
+timestamp id** — ``YYYYMMDDHHMMSS_description.py``, e.g.
+``20260903200000_add_widget_table.py``; generate it with
+``date -u +%Y%m%d%H%M%S``. The legacy hand-allocated 4-digit ids
+(``0001``-``0091``) are FROZEN: they still run, and nothing renames them, but
+no new one may be added (enforced by ``scripts/check_migration_prefixes.py``
+in CI).
+
+Why: a hand-allocated id has to be CHOSEN, so two branches routinely choose
+the same one — measured 2026-09-03, one PR was renumbered twice in a single
+day and four open PRs held live collisions. A duplicate prefix is not cosmetic
+(see the pre-flight below), so the contention was worth removing at the root
+rather than detecting later. Nobody allocates a timestamp; the clock does.
+
+Ordering is unchanged in practice: ids sort lexicographically, every legacy id
+begins with ``0`` and every timestamp with ``2``, so the frozen history always
+precedes new work.
+
+The one property to know: the id encodes CREATION time, not merge time. A
+fresh install replays creation order; an existing install only runs what is
+still pending, i.e. merge order. They agree unless a migration is authored
+before, but merged after, one it depends on — so if that happens, RENAME IT AT
+MERGE TIME to a later id rather than at creation. CI replays the full sequence
+against an empty database on every PR (``tests/test_db/test_migrations_runner``
+and the security suites), so an ordering that breaks at the SQL level fails
+loudly there; a purely semantic dependency (A backfills what B adds) would
+not, which is why the rename rule is stated rather than left to the tests.
+
+Files must define:
 
     async def up(db: aiosqlite.Connection) -> None:
         '''Apply the migration. MUST NOT call db.commit() or db.rollback()
@@ -29,7 +56,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
-import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -38,10 +64,18 @@ from pathlib import Path
 
 import aiosqlite
 
+from genesis.db._migration_ids import SCHEMA_MIGRATION_PATTERN
+
 logger = logging.getLogger(__name__)
 
 _MIGRATIONS_DIR = Path(__file__).parent
-_MIGRATION_PATTERN = re.compile(r"^(\d{4})_\w+\.py$")
+#: Frozen legacy ids (``0001``-``0091``) OR a UTC timestamp id
+#: (``YYYYMMDDHHMMSS``). Both widths are all-digits, so they sort together and
+#: '0' < '2' keeps every legacy id ahead of every timestamp one. Defined in
+#: ``db/_migration_ids`` (stdlib-only) so CI's guard can bind to the REAL
+#: pattern without importing this module's aiosqlite dependency; aliased here
+#: because the name is part of this module's established surface.
+_MIGRATION_PATTERN = SCHEMA_MIGRATION_PATTERN
 
 # SQL statements that would escape the runner's outer BEGIN IMMEDIATE /
 # COMMIT / ROLLBACK envelope. Matched case-insensitively against the
@@ -260,7 +294,8 @@ class MigrationRunner:
                 raise RuntimeError(
                     f"Duplicate migration prefix '{mid}': "
                     f"'{seen[mid]}' and '{name}'. "
-                    f"Rename one file to use the next available prefix."
+                    f"Rename one file to a fresh UTC timestamp id "
+                    f"(`date -u +%Y%m%d%H%M%S`)."
                 )
             seen[mid] = name
 
