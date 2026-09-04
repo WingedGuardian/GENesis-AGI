@@ -11,6 +11,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The wrong-repo commit check now says when it did not run.** It works out which
+  repository a `git add`/`commit` targets by reading the command text, and when that
+  text did not determine a directory — a shell variable, a command substitution, a
+  glob — it joined the unexpanded token onto the current path anyway. The result
+  cannot exist, so every lookup against it failed and the check was skipped through
+  the same branch that means "this repository is not covered". A command it could
+  not inspect was therefore indistinguishable from one it deliberately ignored.
+  It now reports that the check did not run, on **119 of 2,264 (5.3%)** real
+  `add`/`commit` commands. Deliberately an advisory and **not** a new refusal:
+  replaying those same 119 through the old behaviour, it blocked **0** of them —
+  it was failing open, so nobody has ever been wrongly stopped by this, and making
+  it refuse would newly stop 119 ordinary commands to fix a silence.
+
 - **The cold-marketing campaign no longer re-pitches the same person.** Once a
   marketing pitch is delivered to a prospect, that prospect is marked contacted and
   drops out of the campaign's target list — previously nothing recorded the contact,
