@@ -163,6 +163,12 @@ def test_union_applies_to_exactly_one_tracked_path() -> None:
     the paths a widened or unanchored pattern actually captures are, by
     definition, the ones nobody thought of. Since ``union`` resolves silently,
     the invariant has to be an equality over every tracked file.
+
+    Scope of the guarantee, stated so it is not read as more than it is: this
+    grades the repository's own attribute surface. A developer who sets
+    ``merge.default`` locally routes every *unspecified* path to that driver,
+    and no committed file can prevent it — that is a per-machine choice, not
+    something this repo controls.
     """
     assert GITATTRIBUTES.is_file(), "repo-root .gitattributes is missing"
     files = _git_ok("ls-files", "-z", cwd=REPO_ROOT)

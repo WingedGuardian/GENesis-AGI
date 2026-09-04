@@ -1,7 +1,13 @@
 # CHANGELOG.md is an append-only list of independent bullets. Two branches that
 # each add an entry under the same heading are not disagreeing about anything —
 # they are inserting at the same position, which git's default driver reports as
-# a conflict. `union` keeps both sides' lines, in order.
+# a conflict. `union` keeps both sides' lines instead of leaving markers.
+#
+# It does NOT promise an ordering. gitattributes(5) on the union driver: "This
+# tends to leave the added lines in the resulting file in random order and the
+# user should verify the result." For a list of independent bullets that is a
+# proofreading matter, not a correctness one — but it is why nothing here claims
+# the entries come out in the order they were written.
 #
 # Measured 2026-09-04 against origin/main 2d5ea3dd: of 49 open PRs, 21 could not
 # merge, and 18 of those 21 conflicted on CHANGELOG.md and nothing else — every

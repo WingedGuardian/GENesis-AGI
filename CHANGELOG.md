@@ -16,7 +16,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   adding an entry under the same heading are not disagreeing about anything —
   they are inserting at the same position, which git's default merge reports as
   a conflict a human has to resolve by hand. It now merges with git's `union`
-  driver, which keeps both sides' lines, in order, and drops neither.
+  driver, which keeps both sides' lines instead of leaving markers. It makes no
+  promise about their ORDER — git's own documentation says union "tends to leave
+  the added lines in the resulting file in random order and the user should
+  verify the result" — so a merged section may need its entries re-sorted by
+  hand. For a list of independent bullets that is proofreading, not breakage.
 
   Measured before the change, against the repository's own open work: of 49
   open pull requests, 21 could not merge, and **18 of those 21 conflicted on
