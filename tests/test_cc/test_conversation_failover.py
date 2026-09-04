@@ -1037,3 +1037,45 @@ async def test_an_ordinary_stale_resume_still_retries_fresh(loop, invoker, monke
         on_event=AsyncMock(), streamed={"text": False, "tools": False},
     )
     assert invoker.run_streaming.await_count == 2, "the fresh retry was lost"
+
+
+@pytest.mark.asyncio
+async def test_a_peer_that_ran_tools_still_leaves_a_resumable_session(
+    loop, invoker, monkeypatch,
+):
+    """The effects guard ends the turn rather than replaying a tool call on a
+    second peer — but it returned BEFORE the sticky-session write, so the peer's
+    session id was dropped.
+
+    The user's next message during the same outage then started a FRESH peer
+    session with no memory of the tool that ran, which defeats the guard twice:
+    the interrupted turn cannot be continued in context, and a later attempt has
+    no record of the effect the guard exists to avoid repeating.
+    """
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+
+    async def _tool_then_empty(*a, **k):
+        on_event = k.get("on_event")
+        if on_event:
+            await on_event(StreamEvent(event_type="tool_use", tool_name="outreach_send"))
+        return _output(text="", session_id="peer-sess-9")
+
+    invoker.run_streaming = AsyncMock(side_effect=_tool_then_empty)
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+    loop._session_fallback_session = lambda s: None
+
+    await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x",
+        on_event=AsyncMock(), streamed={"text": False, "tools": False},
+    )
+
+    writes = [c for c in loop._merge_session_metadata.await_args_list
+              if "fallback_session" in str(c)]
+    assert writes, "the peer session was not persisted, so the turn cannot be resumed"
+    assert "peer-sess-9" in str(writes[0]), "persisted the wrong session id"

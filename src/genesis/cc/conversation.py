@@ -1207,6 +1207,30 @@ class ConversationLoop:
                     logger.debug("peer availability record failed", exc_info=True)
                     return False
 
+            async def _remember_peer_session(out) -> None:
+                """Persist this peer's session id so the turn can be continued.
+
+                Every path that ENDS the turn on a peer needs this, not just the
+                success path. The effects guard's two safety returns skipped it,
+                so a peer that ran a tool and then produced nothing left no
+                sticky session — the user's next message during the same outage
+                started a FRESH peer session with no memory of the tool call.
+                That defeats the guard twice over: the user cannot continue the
+                interrupted turn in context, and a later attempt has no record of
+                the effect the guard exists to avoid repeating.
+
+                Only with a real session id: an empty one cannot resume anything.
+                """
+                if not getattr(out, "session_id", ""):
+                    return
+                await self._merge_session_metadata(
+                    session["id"],
+                    {"fallback_session": {
+                        "cc_session_id": out.session_id,
+                        "roster_model": peer_name,
+                    }},
+                )
+
             # ATTEMPT-scoped, deliberately NOT the turn-scoped `streamed` dict.
             # `streamed` is created once per turn and is already fed by the HOME
             # model's invocation, so reading tools from it made this predicate
@@ -1390,6 +1414,7 @@ class ConversationLoop:
                         "failover peer %s returned no usable answer on a "
                         "non-observable path — not advancing", peer_name,
                     )
+                    await _remember_peer_session(output)
                     return _not_retried_after_effects(peer_name, observed=False)
                 if not usable and not _streamed_text() and _executed_tools():
                     # The exposure this branch introduced. Advancing here re-runs
@@ -1400,6 +1425,7 @@ class ConversationLoop:
                     # handed to the user while the peer is recorded available), so
                     # the advance is gated on effects rather than deleted.
                     await _record_peer(peer_availability.note_success, peer_name)
+                    await _remember_peer_session(output)
                     return _not_retried_after_effects(peer_name)
                 if not usable and not _streamed_text():
                     # No usable answer and nothing shown to the user: the invoker
@@ -1421,14 +1447,7 @@ class ConversationLoop:
                 # sticky peer session (only with a real session id, else continuity
                 # can't resume). Home identity in cc_sessions stays on Claude.
                 transitioned = fallback_state.enter(home, peer_name, "rate_limit")
-                if output.session_id:
-                    await self._merge_session_metadata(
-                        session["id"],
-                        {"fallback_session": {
-                            "cc_session_id": output.session_id,
-                            "roster_model": peer_name,
-                        }},
-                    )
+                await _remember_peer_session(output)
                 # Keep the session fresh. Cost + triage are intentionally NOT recorded
                 # for failover turns: CC's cost_usd is bogus for routed models, and
                 # triage must not attribute a peer model's output to the home model's

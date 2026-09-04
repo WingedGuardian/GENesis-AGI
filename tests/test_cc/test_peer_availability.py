@@ -1055,3 +1055,53 @@ def test_a_failed_setup_does_not_leak_the_temp_descriptor(tmp_path, monkeypatch)
         assert PA.note_success("peer-x") is False, "the write must report failure"
     after = len(_os.listdir("/proc/self/fd"))
     assert after - before < 5, f"leaked ~{after - before} descriptors over 25 writes"
+
+
+def test_a_recurring_unreadable_file_warns_every_time_it_recurs(tmp_path, caplog):
+    """The unreadable warning identifies on the file NAME, which never changes —
+    so without clearing the condition on a successful read it fires once in the
+    life of the process and then never again, while every health snapshot keeps
+    silently losing its peers.
+
+    A suppressor whose condition is never cleared is a suppressor that reports
+    once. This is the half I left out when adding that warning.
+    """
+    f = tmp_path / "cc_peer_availability.json"
+    f.write_text(json.dumps({"peers": {"ok": _valid_row()}}))
+
+    def _flap():
+        f.chmod(0o000)
+        try:
+            assert PA.read() == {}
+        finally:
+            f.chmod(0o600)
+        assert set(PA.read()) == {"ok"}, "must recover between failures"
+
+    with caplog.at_level("WARNING", logger="genesis.cc.peer_availability"):
+        _flap()
+        _flap()
+        _flap()
+    hits = [r for r in caplog.records if "Unreadable" in r.getMessage()]
+    assert len(hits) == 3, f"three separate outages must warn three times, got {len(hits)}"
+
+
+def test_deeply_nested_json_does_not_disable_recording_forever(tmp_path):
+    """A syntactically VALID file can still break the parser: ~20KB of nested
+    arrays exceeds the recursion limit, and RecursionError is not a ValueError,
+    so it escaped the corrupt-file handler entirely.
+
+    `read()` absorbs that in its outer guard, which is why this hid — but the
+    WRITE path calls `_read_raw` directly, so every record attempt failed before
+    reaching `_write` and the file could never be overwritten. Recording stayed
+    disabled until a human deleted the file. A corrupt file must always be
+    recoverable by writing over it; that is the whole reason this path returns
+    empty rather than raising.
+    """
+    f = tmp_path / "cc_peer_availability.json"
+    f.write_text("[" * 10_000 + "]" * 10_000)
+    assert f.stat().st_size < PA._MAX_STATE_BYTES, "must be under the size cap to isolate this"
+
+    assert PA.read() == {}, "read() must survive it"
+    # The real property: the write path SELF-HEALS rather than being wedged.
+    assert PA.note_failure("peer-x", CCRateLimitError("429")) is True
+    assert PA.read_peer("peer-x") is not None, "the file never recovered"

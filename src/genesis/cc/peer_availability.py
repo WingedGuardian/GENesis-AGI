@@ -197,9 +197,19 @@ def _read_raw() -> dict:
             return {}
         _complaint_resolved("oversize")
         raw = path.read_text(encoding="utf-8", errors="replace")
+        # The read SUCCEEDED, so the unreadable condition is over. Without this
+        # the warning below fires exactly once in the life of the process and
+        # never again: its identity is the constant file name, so a recurrence
+        # looks identical to the occurrence already reported, and a file that
+        # keeps flapping between readable and not goes silent after the first
+        # line while every health snapshot keeps losing its peers. A suppressor
+        # whose condition is never cleared is a suppressor that reports once.
+        _complaint_resolved("unreadable")
     except FileNotFoundError:
         # The ONLY silent case: no file yet is the normal state before any
-        # failover has ever run.
+        # failover has ever run. It also ENDS an unreadable condition — the file
+        # is not unreadable, it is gone — so re-arm here too.
+        _complaint_resolved("unreadable")
         return {}
     except OSError:
         # Everything else — PermissionError, EIO, a vanished mount — used to
@@ -223,7 +233,16 @@ def _read_raw() -> dict:
         return {}
     try:
         data = json.loads(raw)
-    except (json.JSONDecodeError, TypeError, ValueError):
+    # RecursionError is NOT a ValueError, so it used to escape this handler
+    # entirely. A syntactically VALID file of deeply nested arrays — ~20 KB buys
+    # ten thousand levels, far under the size cap — therefore raised straight out
+    # of `_read_raw`. `read()` absorbs that in its outer guard, but the WRITE path
+    # calls `_read_raw` directly, so every note_success/note_failure returned
+    # False before reaching `_write` and the file could never be replaced:
+    # recording disabled permanently until a human deleted it. A corrupt file
+    # must always be recoverable by writing over it, which is the whole reason
+    # this branch returns empty instead of raising.
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
         _complain_on_change(
             "corrupt", "Corrupt %s — treating as empty", _STATE_FILE,
             identity=ident, exc_info=True,
