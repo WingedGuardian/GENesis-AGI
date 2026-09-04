@@ -480,3 +480,78 @@ class TestExecutionPrefixesDoNotHideTheTarget:
         cmd = cmd_tpl.format(RM="rm", H=H)
         r = _run(cmd, fake_home)
         assert r.returncode == 0, f"{label}: a resolved prefix was over-blocked. err={r.stderr!r}"
+
+
+class TestTheConservativeCheckIsPerSegment:
+    """Three ways a WHOLE-COMMAND question let a real deletion through.
+
+    The conservative check landed asking its questions of the command line
+    rather than of each segment, and a cross-model review found one bypass per
+    question. They are one defect: a command is a LIST of things that run, and a
+    predicate over the list cannot answer "is THIS one safe".
+
+    Each test below pairs the bypass with the shape it must not start blocking,
+    because every one of these fixes widens a refusal.
+    """
+
+    def test_an_unrelated_deletion_earlier_on_the_line_does_not_excuse_a_later_one(
+        self, fake_home
+    ):
+        """"Does ANY segment resolve to rm?" — one harmless deletion in /tmp
+        answered yes and switched the fallback off for every other segment, so
+        the deletion behind the prefix was never examined."""
+        r = _run(f"rm /tmp/harmless; setpriv --no-new-privs rm -r {H}/genesis/data", fake_home)
+        assert r.returncode == 2, f"a resolved rm excused a hidden one: err={r.stderr!r}"
+
+    def test_the_prefixed_branch_sees_an_ANCESTOR_not_just_a_literal_alias(self, fake_home):
+        """A substring scan looks for the protected path's own spelling, so by
+        construction it cannot see the operand forms `_operand_blocks` exists
+        for. `$HOME` names no protected directory and removes all of them."""
+        r = _run(f"setpriv --no-new-privs rm -r {H}", fake_home)
+        assert r.returncode == 2, f"an ancestor deletion passed: err={r.stderr!r}"
+
+    def test_the_prefixed_branch_sees_a_GLOB_target(self, fake_home):
+        """The other operand form a substring scan cannot express."""
+        r = _run(f"setpriv --no-new-privs rm -rf {H}/genesis/da*", fake_home)
+        assert r.returncode == 2, f"a glob deletion passed: err={r.stderr!r}"
+
+    def test_a_prefixed_deletion_INSIDE_a_nested_script_is_seen(self, fake_home):
+        """"Top-level segments only" skipped exactly the segments `analyze()`
+        works to surface: `sh -c '…'` yields its inner command at depth 1."""
+        r = _run(f"bash -c 'setpriv --no-new-privs rm -r {H}/genesis/data'", fake_home)
+        assert r.returncode == 2, f"a nested prefixed deletion passed: err={r.stderr!r}"
+
+    def test_prose_in_a_heredoc_is_STILL_not_scanned(self, fake_home):
+        """THE reason the depth filter existed, and why it is kept on the
+        substring branch alone.
+
+        MEASURED when it was absent: a 40,925-character heredoc writing a plan
+        document was refused, because two lines deep inside the prose began with
+        a shell name. Reading the OPERANDS of a deletion that is really in the
+        argv is a different act from scanning text for a path — the first is now
+        allowed at any depth, the second still is not.
+        """
+        body = "\n".join(
+            [
+                "setpriv is one way to run a command under reduced privileges.",
+                f"Never point it at {H}/genesis/data.",
+                "eval is another, and is worse.",
+            ]
+        )
+        r = _run(f"cat > /tmp/plan.md <<'EOF'\n{body}\nEOF\nrm /tmp/scratch", fake_home)
+        assert r.returncode == 0, f"heredoc prose was scanned: err={r.stderr!r}"
+
+    def test_an_unmodeled_prefix_over_a_protected_path_with_no_deletion_is_allowed(
+        self, fake_home
+    ):
+        """The over-block control for the widened branch. `setpriv` is not in the
+        wrapper table, so nothing is resolved and the segment reaches the new
+        code — with no deletion word in it, nothing may be refused."""
+        r = _run(f"setpriv --no-new-privs grep -r needle {H}/genesis/data", fake_home)
+        assert r.returncode == 0, f"a read behind an unmodeled prefix blocked: err={r.stderr!r}"
+
+    def test_a_prefixed_deletion_of_an_UNPROTECTED_path_is_allowed(self, fake_home):
+        """The other half of the control: the new branch must decide on the
+        TARGET, not on the presence of a prefix plus a deletion."""
+        r = _run(f"setpriv --no-new-privs rm -rf {H}/scratch/build", fake_home)
+        assert r.returncode == 0, f"a benign prefixed deletion blocked: err={r.stderr!r}"

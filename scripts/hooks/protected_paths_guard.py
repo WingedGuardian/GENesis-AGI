@@ -218,6 +218,75 @@ def _leading_word(raw: str) -> str:
     return os.path.basename(first.strip("'\""))
 
 
+def _deletion_tail(argv: list[str]) -> list[str] | None:
+    """``argv`` from the first deletion word onward, when one runs behind a prefix.
+
+    The prefix itself is unresolved by definition here, so its OWN options cannot
+    be modelled — and they must not have to be. Rather than trying to find where
+    the prefix stops and the command starts (`setpriv --reuid 1000 rm …` defeats
+    any "skip the dashed words" rule the moment an option takes a value), look for
+    the deletion word anywhere in the argv and read from there.
+
+    That over-detects by construction, and the direction is deliberate: the cost
+    of a false hit is a refusal on a command that contains the literal word `rm`
+    AND a protected path AND an unresolved execution prefix; the cost of a miss is
+    the data. A word that is merely an OPERAND of something else (`grep rm file`)
+    reaches this only when it also sits behind such a prefix, and the operand scan
+    that follows then has to find a protected path in it before anything is
+    refused.
+    """
+    for i, tok in enumerate(argv):
+        if os.path.basename(tok) in ("rm", "rmdir"):
+            return argv[i:]
+    return None
+
+
+def _prefixed_deletion_reason(
+    seg, cwd: str | None, dirs: list[str], files: list[str]
+) -> str | None:
+    """Why a deletion running behind an UNRESOLVED execution prefix is refused.
+
+    Two branches, and which one applies is decided by whether a deletion is
+    READABLE in the segment's argv:
+
+    * it is — then this is an ordinary deletion that merely happens to sit behind
+      a prefix, so it gets the ORDINARY operand analysis: brace expansion,
+      ancestors, globs, unresolved-variable fallback. Anything less re-creates the
+      substring check's blind spot for the operand forms it cannot express.
+    * it is not — the command is opaque (a re-parsing prefix hands over one quoted
+      token), so fall back to the conservative substring check, scoped to THIS
+      SEGMENT rather than the whole command line, and only at top level.
+    """
+    tail = _deletion_tail(seg.argv)
+    if tail is None:
+        if seg.depth != 0:
+            return None
+        if _legacy_substring_block(seg.raw, dirs):
+            return (
+                "a command that runs another command could not be resolved to what it "
+                "actually executes, and a protected path appears in it. Rewrite it so "
+                "the command being run is visible — or, if the path is only being "
+                "mentioned, write that text with an editor rather than through a shell."
+            )
+        return None
+
+    unresolved = False
+    for raw_operand in _rm_operands(tail):
+        for operand in brace_expand(raw_operand):
+            reason = _operand_blocks(operand, cwd, dirs, files)
+            if reason:
+                return f"{reason} — and it is being deleted behind '{seg.exe or _leading_word(seg.raw)}', which runs the command that follows it"
+            if _expand(operand, cwd) is None:
+                unresolved = True
+    if unresolved and _legacy_substring_block(seg.raw, dirs):
+        return (
+            "a deletion behind a command-running prefix has a target this guard "
+            "cannot resolve, and a protected path appears in the same command. "
+            "Rewrite it with the target spelled out."
+        )
+    return None
+
+
 def _legacy_substring_block(cmd: str, dirs: list[str]) -> str | None:
     """The pre-2026-08 substring check — kept ONLY as the fallback for a
     command shlex cannot tokenize (conservative: over-blocks, never under)."""
@@ -301,14 +370,10 @@ def main() -> int:
     # simple command. Those all resolve to something that is not `rm`, and the
     # loop below would skip them in silence.
     #
-    # So do not certify: when a prefix token appears at a command position and no
-    # segment resolved to a deletion, fall back to the same conservative
-    # whole-command check used for an untokenizable command. It only refuses when
-    # a protected path is actually present, so an ordinary prefixed command is
-    # untouched — which is the property the tests pin.
-    # Fire ONLY where resolution actually failed, which is the whole point — a
-    # prefix the parser resolved tells us exactly what runs, and if that is not a
-    # deletion there is nothing to be conservative about. Two failure shapes:
+    # So do not certify. Fire ONLY where resolution actually failed, which is the
+    # whole point — a prefix the parser resolved tells us exactly what runs, and
+    # if that is not a deletion there is nothing to be conservative about. Two
+    # failure shapes:
     #
     #   * the leading word is a prefix the wrapper table does not know, so
     #     nothing was unwrapped and the resolved exe IS still that prefix; or
@@ -321,32 +386,33 @@ def main() -> int:
     # along with three other ordinary shapes, because `sudo` is both extremely
     # common and already resolved correctly. Firing on a resolved prefix buys
     # nothing and costs real commands.
-    # TOP-LEVEL segments only. A nested one sits inside a construct the parser
-    # already descends into — `bash -c '…'` yields the inner command as its own
-    # segment, which the loop below then judges on its own merits. It also sits
-    # inside constructs the parser does NOT model, and a here-document body is the
-    # common one: its lines are read as commands although nothing executes them.
-    # MEASURED: without this, a 40,925-character heredoc writing a plan document
-    # was refused, because two lines deep inside the prose began with a shell name.
-    # `_legacy_substring_block` decides IF a protected path is present, but its
-    # message names a cause that is false here — this command tokenized fine — so
-    # the refusal below carries its own reason. A gate that refuses with the wrong
-    # reason sends the reader to fix the wrong thing.
-    if (
-        not any(s.exe in ("rm", "rmdir") for s in segs)
-        and any(
-            s.depth == 0
-            and (s.exe in _EXECUTION_PREFIXES or _leading_word(s.raw) in _REPARSING_PREFIXES)
-            for s in segs
-        )
-        and _legacy_substring_block(cmd, dirs)
-    ):
-        return _block(
-            "a command that runs another command could not be resolved to what it "
-            "actually executes, and a protected path appears in it. Rewrite it so "
-            "the command being run is visible — or, if the path is only being "
-            "mentioned, write that text with an editor rather than through a shell."
-        )
+    #
+    # PER SEGMENT, AND THAT IS THE CORRECTION (Codex P1 x3, PR #1615). The first
+    # version asked its three questions of the WHOLE COMMAND, and each one let a
+    # real deletion through:
+    #
+    #   * "does ANY segment resolve to rm?" — one unrelated deletion in /tmp
+    #     earlier on the line switched the fallback off for every other segment;
+    #   * a substring scan for a literal protected-path alias — which by
+    #     construction cannot see the operand forms `_operand_blocks` exists to
+    #     catch, so an ANCESTOR of every protected directory passed;
+    #   * top-level segments only — but `sh -c '…'` surfaces its inner command as
+    #     a DEPTH-1 segment, so the same deletion one level down passed.
+    #
+    # The depth filter had a real reason and it is kept where it belongs: on the
+    # SUBSTRING branch only. MEASURED — without it, a 40,925-character heredoc
+    # writing a plan document was refused, because two lines deep inside the prose
+    # began with a shell name. Reading the OPERANDS of a deletion that is actually
+    # in the argv is a different act from scanning text for a path, so that runs
+    # at any depth; scanning prose stays at depth 0.
+    for seg in segs:
+        if seg.exe in ("rm", "rmdir"):
+            continue  # resolved — the loop below judges it on its own operands
+        if not (seg.exe in _EXECUTION_PREFIXES or _leading_word(seg.raw) in _REPARSING_PREFIXES):
+            continue
+        reason = _prefixed_deletion_reason(seg, cwd, dirs, files)
+        if reason:
+            return _block(reason)
 
     for seg in segs:
         if seg.exe not in ("rm", "rmdir"):

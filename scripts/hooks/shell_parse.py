@@ -918,7 +918,8 @@ def analyze(command: str) -> list[Segment]:
         override = _has_trailing_override(raw)
         # argv is tokenized from the redirect-STRIPPED source, so a redirect target
         # (incl. an expansion one) can never become argv[1] and spoof the subcommand.
-        argv = _strip_wrappers(_argv(seg.argv_src))
+        src_argv = _argv(seg.argv_src)
+        argv = _strip_wrappers(src_argv)
         exe = _basename(argv[0]) if argv else ""
         out.append(
             Segment(exe=exe, argv=argv, override=override, raw=raw, redirects=list(seg.redirects))
@@ -928,6 +929,9 @@ def analyze(command: str) -> list[Segment]:
             script = _nested_script(argv)
             if script:
                 nested.append(script)
+        reparsed = _eval_input(src_argv, argv)
+        if reparsed:
+            nested.append(reparsed)
         # $(...) / `...` bodies also execute — parsed from RAW, which STILL carries any
         # expansion redirect target, so a nested command stays visible to the guards.
         nested.extend(_substitutions(raw))
@@ -1025,6 +1029,46 @@ def _substitutions(text: str) -> list[str]:
                 continue
         i += 1
     return subs
+
+
+def _eval_input(src_argv: list[str], argv: list[str]) -> str:
+    """The string ``eval`` re-parses as shell input, or '' when there is no eval.
+
+    ``help eval``: it CONCATENATES ITS ARGUMENTS WITH SPACES and executes the
+    result as shell input. So the second parse sees a string, and characters the
+    first parse settled as literal data become syntax again:
+
+        eval echo ok \\; pytest tests/    -> first parse: `\\;` is a literal ';'
+                                         -> second parse: ';' SEPARATES, and
+                                            `pytest tests/` runs
+        eval "echo ok; pytest tests/"    -> first parse: one quoted word
+                                         -> second parse: two commands
+
+    Both shapes hid an executed command from every consumer, because a segment
+    list built from the FIRST parse is a complete answer only for a command that
+    is parsed once. `\\|` and `\\&` behave identically (Codex P2, PR #1615).
+
+    THE SPACE-JOIN IS NOT AN APPROXIMATION — it is what bash does, including the
+    word-splitting people are surprised by: `eval rm "$HOME/my dir"` really does
+    re-split at the space and remove two paths. Reconstructing it any more
+    "carefully" would model a shell that does not exist.
+
+    Returns '' unless a leading prefix word was literally ``eval``, so nothing
+    else pays for this. Termination: the reconstruction drops the ``eval`` token,
+    so each recursion is strictly shorter and a chain (``eval eval eval x``)
+    unwinds rather than loops.
+    """
+    if not argv:
+        return ""
+    # `argv` is `src_argv` with prefix material stripped; find where it starts so
+    # the check is on words that really ARE prefixes, not on an `eval` sitting in
+    # an operand (`grep eval file` must not reparse anything).
+    start = len(src_argv) - len(argv)
+    if start <= 0 or src_argv[start:] != argv:
+        return ""
+    if not any(_basename(tok) == "eval" for tok in src_argv[:start]):
+        return ""
+    return " ".join(argv)
 
 
 def _nested_script(argv: list[str]) -> str:

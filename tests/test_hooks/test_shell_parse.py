@@ -1068,3 +1068,66 @@ class TestUnquotedBackslash:
         assert len(top) == 1, [s.raw for s in top]
         assert top[0].argv[:3] == ["git", "-C", "/wt"]
         assert "src/b.py" in top[0].argv
+
+
+class TestEvalReparsesItsInput:
+    """`eval` parses its input TWICE, so one segment list is not a full answer.
+
+    `help eval`: it concatenates its arguments with spaces and executes the
+    result as shell input. Characters the FIRST parse settled as literal data are
+    therefore syntax again on the SECOND — and a consumer holding only the first
+    parse's segments sees a command that bash will run as no command at all.
+
+    This is the general form of a P2 from PR #1615's review. The narrow reading
+    is "escaped operators": a backslash-escaped ';', '|' or '&' survives the
+    first parse as a literal and separates on the second. The wider one is the
+    quoted-string spelling,
+    which was open on every revision before this — same mechanism, no backslash
+    in sight.
+
+    Modelled by RE-ANALYZING the reconstruction, not by suppressing the escapes:
+    the first parse is CORRECT about the first parse, and un-consuming its
+    escapes would make it wrong about a command that is only parsed once.
+    """
+
+    def _inner(self, cmd: str) -> list[tuple[int, str]]:
+        return [(s.depth, s.exe) for s in sp.analyze(cmd)]
+
+    def test_an_escaped_separator_separates_on_the_second_parse(self):
+        found = self._inner(r"eval echo ok \; pytest tests/")
+        assert (1, "pytest") in found, f"the eval'd pytest run stayed hidden: {found}"
+
+    @pytest.mark.parametrize("op", [";", "|", "&"])
+    def test_every_escaped_operator_behaves_the_same_way(self, op):
+        """The class, not the one member the review happened to cite."""
+        found = self._inner(f"eval echo ok \\{op} pytest tests/")
+        assert (1, "pytest") in found, f"escaped {op!r} hid the second command: {found}"
+
+    def test_the_quoted_string_spelling_is_the_same_defect(self):
+        """No backslash anywhere, and it hid the command on every prior revision:
+        the whole script arrives as ONE argument and is parsed on the way out."""
+        found = self._inner('eval "echo ok; pytest tests/"')
+        assert (1, "pytest") in found, f"a quoted eval script stayed hidden: {found}"
+
+    def test_the_first_parse_is_still_reported(self):
+        """The reparse ADDS a reading, it does not replace one. A consumer that
+        keys on the first parse (the literal `;` really is one argv token to
+        `eval`) must still see what it saw."""
+        found = self._inner(r"eval echo ok \; pytest tests/")
+        assert (0, "echo") in found, f"the first parse was thrown away: {found}"
+
+    def test_eval_as_an_OPERAND_reparses_nothing(self):
+        """The over-read control. `eval` matters only at a command position —
+        searching for the word must not turn a grep into two commands."""
+        assert self._inner("grep eval /etc/profile") == [(0, "grep")]
+
+    def test_a_non_reparsing_prefix_is_not_reparsed(self):
+        """The other half of that control: `sudo` passes argv through unchanged,
+        so there is no second parse to model and no extra segment to invent."""
+        assert self._inner("sudo echo ok") == [(0, "echo")]
+
+    def test_a_chain_of_evals_terminates(self):
+        """Each reconstruction drops the `eval` token, so it is strictly shorter
+        and the recursion unwinds. Written as a test because a reparse that fed
+        itself would hang the hook rather than fail it."""
+        assert (0, "echo") in self._inner("eval eval eval echo hi")
