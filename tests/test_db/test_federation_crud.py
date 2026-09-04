@@ -581,6 +581,6 @@ def test_migration_and_base_ddl_match_for_federation_tables():
 
     from genesis.db.schema import TABLES
 
-    mig = importlib.import_module("genesis.db.migrations.0096_federation")
+    mig = importlib.import_module("genesis.db.migrations.20260904231414_federation")
     assert _norm_ddl(mig._CONTACTS_DDL) == _norm_ddl(TABLES["federation_contacts"])
     assert _norm_ddl(mig._MESSAGES_DDL) == _norm_ddl(TABLES["federation_messages"])

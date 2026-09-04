@@ -349,6 +349,12 @@ def _isolate_user_config_dir(tmp_path):
     # re-resolve against the patched _config_overlay each call, so they need no
     # separate patch. The guard test tracks module-level importers of both names.
     mp.setattr(immunity, "_resolve_overlay_path", _sandboxed_resolve)
+    # federation/config.py binds `_resolve_overlay_path` by name at module level
+    # too (same class as immunity — the guard test flagged it on introduction).
+    # It is stdlib+yaml-light, so patching beats allow-listing.
+    from genesis.federation import config as federation_config
+
+    mp.setattr(federation_config, "_resolve_overlay_path", _sandboxed_resolve)
     try:
         yield
     finally:
