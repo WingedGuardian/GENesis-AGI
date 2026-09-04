@@ -64,14 +64,22 @@ def test_an_absorbed_parameter_is_named_as_the_real_cause():
     hint = absorbed_parameter_hint(exc, {"content": absorbed})
 
     assert hint is not None
-    assert "NOT a missing value" in hint
+    assert "POSSIBLY a malformed tool call" in hint
     assert "`content`" in hint
     assert "reason" in hint
-    assert "re-sending the same call" in hint
+    assert "re-sending the call unchanged will fail identically" in hint
+    # BOTH readings must be offered. That is what makes a false positive
+    # harmless, and it is the property that replaced three rounds of predicate
+    # tightening.
+    assert "If the markup is deliberate prose" in hint
 
 
 def test_the_truncation_fingerprint_is_reported_when_present():
-    absorbed = 'body<parameter name="work_state">ready</parameter>\n</domain>'
+    """The fixture carries the shape a real absorption has: the holder's own
+    closing tag arrives BEFORE the markup it failed to close. An earlier version
+    put the marker first, which no real emission does — invented data that the
+    structural check correctly rejects."""
+    absorbed = 'body</contents>\n<parameter name="work_state">ready</parameter>\n</domain>'
     exc = _missing_error(content=absorbed)
 
     hint = absorbed_parameter_hint(exc, {"content": absorbed})
@@ -154,7 +162,7 @@ def test_the_client_receives_the_diagnosis_not_the_missing_argument_error():
         _call({"content": absorbed})
 
     message = str(excinfo.value)
-    assert "NOT a missing value" in message
+    assert "POSSIBLY a malformed tool call" in message
     assert "absorbed" in message
 
 
@@ -165,7 +173,7 @@ def test_an_ordinary_missing_argument_still_reports_normally():
         _call({"content": "a perfectly ordinary sentence"})
 
     message = str(excinfo.value)
-    assert "NOT a missing value" not in message
+    assert "POSSIBLY a malformed tool call" not in message
     assert "reason" in message
 
 
@@ -242,11 +250,11 @@ def test_a_parameter_with_no_evidence_is_not_claimed_to_have_been_swallowed():
     hint = absorbed_parameter_hint(_missing_error(content=partial), {"content": partial})
 
     assert hint is not None
-    # `reason` is evidenced; `work_state` is not and must be flagged as possibly
-    # genuinely absent rather than asserted swallowed.
-    assert "reason was sent and swallowed" in hint
-    assert "No markup was found for work_state" in hint
-    assert "may genuinely be absent" in hint
+    # `reason` is evidenced; `work_state` is not, and must be flagged as more
+    # likely genuinely absent rather than asserted swallowed.
+    assert "markup naming reason" in hint
+    assert "No such markup was found for work_state" in hint
+    assert "more likely genuinely absent" in hint
 
 
 def test_every_missing_parameter_evidenced_leaves_no_caveat():
@@ -258,8 +266,8 @@ def test_every_missing_parameter_evidenced_leaves_no_caveat():
 
     hint = absorbed_parameter_hint(_missing_error(content=absorbed), {"content": absorbed})
 
-    assert "reason, work_state were sent and swallowed" in hint
-    assert "may genuinely be absent" not in hint
+    assert "markup naming reason, work_state" in hint
+    assert "more likely genuinely absent" not in hint
 
 
 # ── the invariants the substitution must not disturb ────────────────────
@@ -324,14 +332,42 @@ def test_the_original_error_is_kept_as_the_cause():
     caller; the underlying ValidationError has to survive for anything reading
     __cause__ (tracebacks, error reporting)."""
     absorbed = 'text</content>\n<parameter name="reason">why</parameter>'
-    hint = absorbed_parameter_hint(_missing_error(content=absorbed), {"content": absorbed})
-    assert hint is not None  # precondition: this input does trigger the substitution
 
-    err = ToolError(hint)
-    try:
-        raise err from _missing_error(content=absorbed)
-    except ToolError as raised:
-        assert isinstance(raised.__cause__, ValidationError)
+    # Exercised at the MIDDLEWARE, which is where the chain has to exist.
+    #
+    # Two earlier versions of this test were wrong in opposite directions. The
+    # first constructed and raised its own exception, so deleting `from exc` in
+    # the middleware left it green — it tested Python's `raise ... from`. The
+    # second asserted through the CLIENT, where `__cause__` is always None:
+    # MEASURED, the chain does not survive the MCP protocol boundary, because the
+    # error is serialized and reconstructed. That is a property of the transport,
+    # not a defect, and nothing should claim client-visible chaining.
+    #
+    # What matters is the server-side chain, for tracebacks and error reporting.
+    original = _missing_error(content=absorbed)
+
+    class _Msg:
+        # Matched to the error's own title, because the binding check added for
+        # the body-raised case compares them. A real binding failure is titled
+        # `call[<tool>]`; this helper's error is titled after the local function,
+        # so the tool name is taken from the error rather than hard-coded — the
+        # alternative would be a fixture that silently skips the substitution and
+        # a test that passes for the wrong reason.
+        name = getattr(original, "title", "demo")
+        arguments = {"content": absorbed}
+
+    class _Ctx:
+        message = _Msg()
+
+    async def _raise(_ctx):
+        raise original
+
+    mw = InstrumentationMiddleware(ProviderActivityTracker(), "diag", db=None)
+
+    with pytest.raises(ToolError) as excinfo:
+        asyncio.run(mw.on_call_tool(_Ctx(), _raise))
+
+    assert excinfo.value.__cause__ is original
 
 
 def test_the_feature_depends_on_a_fastmcp_default_that_is_pinned_here():
@@ -362,7 +398,9 @@ def test_a_marker_in_the_middle_of_a_huge_value_is_still_found():
     no window any more — `finditer` scans the whole value without copying it, at
     roughly 0.8 ms/MB on a call that has already failed.
     """
-    marker = '<parameter name="reason">because</parameter>'
+    # Shaped like a real absorption: the holder's own closing tag arrives first,
+    # then the swallowed parameter, then whatever followed it.
+    marker = '</contents>\n<parameter name="reason">because</parameter>'
     value = ("a" * 200_050) + marker + ("b" * 200_050)
 
     hint = absorbed_parameter_hint(_missing_error(content=value), {"content": value})
@@ -405,7 +443,10 @@ def test_a_mixed_validation_error_is_left_intact():
     def mixed(content: str, count: int, reason: str) -> str:
         return content
 
-    absorbed = 'body<parameter name="reason">r</parameter>'
+    # The fixture must REACH the guard. An earlier version had no closing tag,
+    # so the evidence check refused first and the mixed-error guard was never
+    # exercised — deleting it left the suite green.
+    absorbed = 'body</contents>\n<parameter name="reason">r</parameter>'
     with pytest.raises(ValidationError) as excinfo:
         mixed(content=absorbed, count="not-an-int")
 
@@ -425,3 +466,184 @@ def test_a_marker_without_a_closing_tag_is_not_enough_evidence():
     prose = 'the docs mention <parameter name="reason"> as the opening form'
 
     assert absorbed_parameter_hint(_missing_error(content=prose), {"content": prose}) is None
+
+
+def test_prose_about_the_syntax_gets_a_hedge_not_an_accusation():
+    """The resolution of a boundary that generated THREE review rounds.
+
+    Each round tightened the predicate so an ASSERTIVE message would be safe:
+    any marker, then a closing tag anywhere, then a closing tag positioned
+    before the marker. Text order is unbounded, so it never converged — and the
+    ordering rule was wrong in BOTH directions (it fired on
+    `a stray </parameter> before <parameter name="x">v</parameter>`, and missed a
+    real absorption whose holder also discussed the syntax).
+
+    The message was the harm, not the predicate. A caller who simply forgot an
+    argument must not be told it was "sent and swallowed" — but they can be shown
+    both readings and decide. That is what this pins, and it is why the predicate
+    is deliberately permissive now.
+    """
+    prose = 'the form is <parameter name="reason">a value</parameter>, as documented'
+
+    hint = absorbed_parameter_hint(_missing_error(content=prose), {"content": prose})
+
+    assert hint is not None
+    assert "POSSIBLY" in hint
+    assert "If the markup is deliberate prose" in hint
+    # The accusation the old message made, which is what actually misled.
+    assert "was sent and swallowed" not in hint
+
+
+def test_a_real_absorption_is_found_even_when_the_holder_discusses_the_syntax():
+    """REGRESSION PIN for the false NEGATIVE the ordering rule introduced.
+
+    With the marker-ordering rule, a holder whose prose mentioned the syntax
+    BEFORE the absorbed block was skipped entirely — the first marker was the
+    prose one, so the stray closing tag after it was never reached. A memory or
+    follow-up *about* tool-call syntax is exactly where absorption is most
+    likely, so the rule went silent on its own best case.
+    """
+    value = (
+        'I am documenting <parameter name="reason"> usage.\n'
+        "MORE TEXT</contents>\n"
+        '<parameter name="work_state">ready</parameter>'
+    )
+
+    hint = absorbed_parameter_hint(_missing_error(content=value), {"content": value})
+
+    assert hint is not None
+    assert "work_state" in hint
+
+
+@pytest.mark.parametrize("tag", ["</my-tag>", "</ns:tag>", "</a.b>"])
+def test_a_mis_spelled_tag_with_punctuation_still_counts(tag):
+    """The charset must not exclude the shapes the premise is about.
+
+    The whole diagnosis assumes the closing tag was MIS-SPELLED. A pattern
+    accepting only `[A-Za-z_][A-Za-z0-9_]*` excluded hyphens, colons and dots —
+    ordinary in real markup, and exactly the sort of thing a slip produces.
+    """
+    value = f'text{tag}\n<parameter name="reason">why</parameter>'
+
+    assert absorbed_parameter_hint(_missing_error(content=value), {"content": value})
+
+
+def test_evidence_is_aggregated_across_every_argument():
+    """REGRESSION PIN. Evidence was per-argument; the claim was per-call.
+
+    `_absorbing_argument` returned on the FIRST holder, so a second argument's
+    markup was invisible — and the message then announced that a parameter was
+    "genuinely absent" while its markup sat one argument over. That is verbatim
+    the defect the unevidenced-names split exists to prevent, committed one
+    scope up.
+    """
+    a = 'A</x>\n<parameter name="reason">r</parameter>'
+    b = 'B</y>\n<parameter name="work_state">w</parameter>'
+
+    hint = absorbed_parameter_hint(_missing_error(content=a), {"content": a, "other": b})
+
+    assert hint is not None
+    assert "No such markup was found for work_state" not in hint
+    assert "`content`" in hint and "`other`" in hint
+
+
+def test_a_missing_argument_raised_inside_a_tool_body_is_not_diagnosed():
+    """REGRESSION PIN for a fabricated explanation on a call that bound fine.
+
+    FastMCP re-raises a ValidationError unwrapped from anywhere inside
+    `tool.run`, not only from argument binding. A `missing_argument` raised by a
+    helper INSIDE the tool body names parameters that are not this tool's, so
+    diagnosing it invents an absorption for a call that never had one. Latent
+    today — nothing in src/genesis uses `validate_call` — but it spans four
+    servers and every tool added later, which is why it is checked rather than
+    left as an unwritten invariant.
+    """
+
+    @validate_call
+    def inner(alpha: str, beta: str) -> str:
+        return alpha
+
+    with pytest.raises(ValidationError) as excinfo:
+        inner()
+
+    absorbed = 'x</contents>\n<parameter name="alpha">v</parameter>'
+
+    # Without the tool name there is nothing to compare against — unchanged.
+    assert absorbed_parameter_hint(excinfo.value, {"content": absorbed}) is not None
+    # With it, the mismatch between the error's title and the tool is the signal.
+    assert absorbed_parameter_hint(excinfo.value, {"content": absorbed}, "demo_tool") is None
+
+
+def test_no_argument_value_reaches_the_message():
+    """These arguments carry secrets, paths and personal data, and the message
+    may be logged. The only value-derived token is the trailing tag, which is
+    constrained to a tag shape."""
+    secret = "sk-live-DEADBEEF-and-a-private-note"
+    value = f'{secret}</contents>\n<parameter name="reason">why</parameter>'
+
+    hint = absorbed_parameter_hint(_missing_error(content=value), {"content": value})
+
+    assert hint is not None
+    assert secret not in hint
+    assert "DEADBEEF" not in hint
+
+
+def test_a_mis_spelled_closing_tag_is_still_recognised():
+    """TRUE-POSITIVE CONTROL, and the reason the check is not `</{holder}>`.
+
+    The commonest real cause is a MIS-SPELLED closing tag — which is precisely
+    why the parser never closed the block. Testing for the holder's own name
+    would miss every one of them, so the check is any closing tag before the
+    marker.
+    """
+    absorbed = 'real content</contents>\n<parameter name="reason">why</parameter>'
+
+    hint = absorbed_parameter_hint(_missing_error(content=absorbed), {"content": absorbed})
+
+    assert hint is not None
+    assert "reason" in hint
+
+
+def test_a_model_level_missing_field_is_not_a_missing_argument():
+    """The `missing_argument` filter must not accept `missing`.
+
+    Pydantic emits `missing_argument` for a call-binding failure and `missing`
+    for a required FIELD of a model. They are different failures: a nested
+    model's absent field was never a tool parameter, so diagnosing it invents an
+    absorption for a call that bound fine. Found by mutation — widening the
+    filter to accept both survived the whole suite, and that filter is the only
+    defence against the body-raised case.
+    """
+    from pydantic import BaseModel
+
+    class Inner(BaseModel):
+        alpha: str
+
+    with pytest.raises(ValidationError) as excinfo:
+        Inner()
+
+    types = {e.get("type") for e in excinfo.value.errors()}
+    assert "missing" in types and "missing_argument" not in types, (
+        f"precondition: pydantic no longer distinguishes these ({types})"
+    )
+    assert missing_argument_names(excinfo.value) == []
+
+
+def test_a_malformed_errors_payload_does_not_crash_the_diagnosis():
+    """`errors()` is a third-party contract; a non-dict entry must not propagate.
+
+    Found by mutation: dropping the isinstance guard survived, because nothing
+    fed it an entry that was not a dict. The diagnosis runs on an already-failing
+    path, so an exception escaping it would replace a real error with a crash.
+    """
+
+    class _Weird(Exception):
+        def errors(self):
+            return [
+                {"type": "missing_argument", "loc": ("reason",)},
+                "not-a-dict",
+                {"type": "missing_argument", "loc": ()},
+                {"type": "missing_argument", "loc": (0,)},
+            ]
+
+    assert missing_argument_names(_Weird()) == ["reason"]

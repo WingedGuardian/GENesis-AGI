@@ -96,7 +96,9 @@ class InstrumentationMiddleware(Middleware):
             hint = None
             try:
                 hint = absorbed_parameter_hint(
-                    exc, getattr(context.message, "arguments", None) or {}
+                    exc,
+                    getattr(context.message, "arguments", None) or {},
+                    tool_name,
                 )
             except Exception:  # diagnosis must never replace the real error
                 # WARNING, not debug: this only fires when the diagnosis ITSELF

@@ -19,7 +19,9 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   recognised, with the evidence sitting in the error's own echoed input the whole time.
   The MCP middleware now inspects a missing-argument error, and when a *provided*
   argument's text contains the markup for a parameter reported *missing*, it replaces
-  the message with the real cause and what to do about it. This runs on every MCP tool
+  the message with both readings — the malformed-call one and the genuinely-absent one
+  — and what to do in each case. It is offered as a possibility rather than a verdict,
+  because prose *about* tool-call syntax looks identical from the arguments alone. This runs on every MCP tool
   rather than the handful that happen to have that shape, and only ever on a call that
   is already failing — it never alters arguments and cannot make a well-formed call
   fail.
