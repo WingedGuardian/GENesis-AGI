@@ -65,6 +65,34 @@ profiles:
     last_reviewed: "2026-08-19"
     review_source: nvidia_nim_live_probe
 
+  glm-4-flash:
+    display_name: "GLM-4 Flash"
+    provider: zhipu
+    api_id: "glm-4-flash"
+    intelligence_tier: B
+    reasoning: C
+    instruction_following: B
+    anti_sycophancy: C
+    context_window: 128000
+    cost_tier: free
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    latency: low
+    strengths:
+      - fast responses (~3s on live probe)
+      - clean bare JSON without fencing (live probe)
+      - free-tier daily capacity independent of every other vendor
+    weaknesses:
+      - small-model reasoning depth
+      - quality beyond smoke-probe UNMEASURED on real Genesis workloads
+    best_for: [fact_extraction, outcome_classification]
+    avoid_for: [deep_reflection, code_work, math_heavy]
+    free_tier:
+      available: true
+      limits: "published ~1K req/day (unverified against account)"
+    last_reviewed: "2026-09-03"
+    review_source: zai_general_endpoint_live_probe
+
   glm-5.1:
     display_name: "GLM-5.1"
     provider: zenmux

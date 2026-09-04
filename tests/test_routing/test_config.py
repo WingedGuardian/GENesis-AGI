@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 from genesis.routing.config import load_config, load_config_from_string
 
@@ -133,7 +135,8 @@ def test_load_full_yaml(monkeypatch):
     # unwired openrouter-qwen3coder (delisted qwen/qwen3-coder:free slug).
     # 2026-08-19: 26 → 25 after removing dead nvidia-nim-kimi (moonshotai/kimi-k2.6
     # 404-for-account on NIM); nvidia-nim-deepseek repointed v4-pro → v4-flash-0731.
-    assert len(cfg.providers) == 25
+    # 2026-09-03: 25 → 26 adding zhipu-glm-flash (Zhipu direct, general endpoint).
+    assert len(cfg.providers) == 26
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
     assert "openrouter-deepseek-r1" not in cfg.providers  # removed from config
@@ -239,6 +242,23 @@ def test_load_full_yaml(monkeypatch):
     ml = cfg.providers["mistral-large-free"]
     assert ml.is_free is False
     assert ml.model_id == "mistral-large-latest"
+
+    # zhipu-glm-flash (2026-09): Zhipu direct on the GENERAL endpoint with the
+    # published free flash model. Inserted immediately before the first paid
+    # DeepSeek member, only where that member is not the chain lead; free
+    # last-resort tails already below the paid members keep their positions
+    # (success rate unmeasured beyond a live smoke probe — no promotion).
+    zp = cfg.providers["zhipu-glm-flash"]
+    assert zp.provider_type == "zhipu"
+    assert zp.model_id == "glm-4-flash"
+    assert zp.is_free is True
+    assert zp.base_url == "https://api.z.ai/api/paas/v4"
+    chain_38 = cfg.call_sites["38_procedure_extraction"].chain
+    pos = chain_38.index("zhipu-glm-flash")
+    assert chain_38[pos + 1] in (
+        "openrouter-deepseek-v4-flash", "openrouter-deepseek-v4",
+    ), "zhipu-glm-flash must sit immediately ahead of the paid fallback"
+    assert pos > 0, "zhipu-glm-flash must not lead a chain yet (unmeasured)"
 
     # groq-free provider — MIGRATED 2026-08-06: Groq deprecated
     # llama-3.3-70b-versatile (shutdown 2026-08-16) → openai/gpt-oss-120b, its
@@ -720,3 +740,155 @@ def test_detect_mislabeled_free_openrouter_flags_paid_slug_marked_free():
     # (substring checks collide: "or-paid" is inside "or-paid-as-free").
     flagged_names = {f.split(":", 1)[0] for f in flagged}
     assert flagged_names == {"or-paid-as-free", "or-curated-bad"}, flagged
+
+
+_CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
+
+
+@pytest.fixture(scope="module")
+def routing_config() -> dict:
+    """The SHIPPED routing config, parsed as data.
+
+    Read straight from the file rather than through load_config(): these two
+    classes assert properties of what the repo ships — which chains exist and
+    which providers sit in them — and a loader that merged a local overlay would
+    make the assertions describe this install instead.
+    """
+    return yaml.safe_load((_CONFIG_DIR / "model_routing.yaml").read_text())
+
+
+@pytest.fixture(scope="module")
+def profiles_config() -> dict:
+    return yaml.safe_load((_CONFIG_DIR / "model_profiles.yaml").read_text())
+
+
+# ─── a challenge chain has a second requirement the cost rule cannot see ──────
+
+
+_CHALLENGE_ROLE = re.compile(r"challenge|adversarial|devil", re.IGNORECASE)
+#: Anti-sycophancy grades that disqualify a model from a challenge chain.
+_WEAK_ANTI_SYCOPHANCY = {"C", "D", "F"}
+
+
+def _iter_call_sites(routing: dict):
+    """Every (name, site) with a chain, wherever it sits in the file."""
+
+    def walk(node, name=""):
+        if isinstance(node, dict):
+            if isinstance(node.get("chain"), list):
+                yield name, node
+            else:
+                for k, v in node.items():
+                    yield from walk(v, k)
+
+    yield from walk(routing)
+
+
+class TestChallengeChainsRejectWeakChallengers:
+    """A challenge site's entire job is to DISAGREE with a verdict another model
+    already produced, so anti-sycophancy is its load-bearing capability — and a
+    challenger that agrees is not a challenger. It silently turns a two-model
+    gate into a one-model gate while still looking like two.
+
+    The consequences are not symmetric with an ordinary chain's:
+    `dream_cycle_entity_challenge` deprecates a memory on agreement,
+    `entity_adjudication_challenge` irreversibly merges two entities, and
+    `20_adversarial_counterargument` is the executor's devil's advocate. Codex
+    named the first two (P1, PR #1626); the third is the same class and was not
+    named, which is why this is a rule over the whole role rather than a fix to
+    two chains.
+
+    The role is derived from the site's name and description rather than a
+    hand-kept list, so a challenge site added tomorrow is covered without anyone
+    remembering to add it here.
+    """
+
+    def _sites(self, routing):
+        return [
+            (name, site)
+            for name, site in _iter_call_sites(routing)
+            if _CHALLENGE_ROLE.search(f"{name} {site.get('description', '')}")
+        ]
+
+    def test_the_role_predicate_actually_matches_something(self, routing_config):
+        """Guard the guard: a predicate that matched nothing would make every
+        assertion below vacuously true."""
+        assert len(self._sites(routing_config)) >= 3
+
+    def test_no_challenge_chain_contains_a_weak_challenger(
+        self, routing_config, profiles_config
+    ):
+        providers = routing_config.get("providers") or {}
+        profiles = profiles_config.get("profiles") or profiles_config
+        offenders = []
+        for name, site in self._sites(routing_config):
+            for member in site["chain"]:
+                key = (providers.get(member) or {}).get("profile")
+                grade = (profiles.get(key) or {}).get("anti_sycophancy")
+                if grade in _WEAK_ANTI_SYCOPHANCY:
+                    offenders.append(f"{name}: {member} (anti_sycophancy={grade})")
+        assert not offenders, (
+            "a model rated C or worse on anti-sycophancy sits in a chain whose "
+            "job is to disagree — the gate looks like two models and behaves "
+            "like one: " + "; ".join(offenders)
+        )
+
+
+class TestEveryKeyedProviderTypeIsMappedInTheDashboard:
+    """A provider type absent from `_KEY_TO_PROVIDER_TYPES` fails silently and in
+    the worse direction: `secretHealthStatus()` falls back to the raw persisted
+    status, so Settings reports the key as configured while that provider's
+    breaker is open and its chains fall through to paid fallbacks.
+
+    The old mechanism was a comment saying "MAINTENANCE: update when adding new
+    providers". Measured 2026-09-04, two of thirteen key-bearing types were
+    missing — the one this PR adds, and one that had been absent since it landed.
+    A convention that must be remembered is the thing being replaced here.
+    """
+
+    _LOCAL_BASE_URL = re.compile(
+        r"localhost|127\.0\.0\.1|\$\{(?:OLLAMA_URL|LM_STUDIO_URL)"
+    )
+
+    def _keyed_types(self, routing: dict) -> set[str]:
+        """Provider types that need an API key.
+
+        Derived from the config — a type whose every provider points at a local
+        base_url needs no key — rather than an exemption list that would drift
+        the same way the mapping did.
+        """
+        by_type: dict[str, list[str]] = {}
+        for provider in (routing.get("providers") or {}).values():
+            ptype = provider.get("type")
+            if ptype:
+                by_type.setdefault(ptype, []).append(str(provider.get("base_url") or ""))
+        return {
+            t
+            for t, urls in by_type.items()
+            if not (urls and all(self._LOCAL_BASE_URL.search(u) for u in urls))
+        }
+
+    def _mapped_types(self) -> set[str]:
+        js = (
+            Path(__file__).resolve().parents[2]
+            / "src/genesis/dashboard/webui/js/dashboard.js"
+        ).read_text()
+        block = re.search(r"_KEY_TO_PROVIDER_TYPES:\s*\{(.*?)\n\s*\},", js, re.S)
+        assert block, "the mapping moved — retarget this test rather than deleting it"
+        return set(re.findall(r"'([a-z0-9_]+)'", block.group(1)))
+
+    def test_the_local_predicate_leaves_real_providers_in_scope(self, routing_config):
+        """Guard the guard: if the 'needs no key' predicate ever widened to
+        everything, the assertion below would pass while checking nothing."""
+        keyed = self._keyed_types(routing_config)
+        assert "openrouter" in keyed and "groq" in keyed
+        assert "ollama" not in keyed and "lmstudio" not in keyed
+
+    def test_every_keyed_provider_type_is_mapped(self, routing_config):
+        missing = sorted(self._keyed_types(routing_config) - self._mapped_types())
+        assert not missing, (
+            "provider type(s) with no key mapping in dashboard.js: "
+            f"{missing}. Settings will report their keys as configured even "
+            "while the breaker is open and chains fall through to paid "
+            "fallbacks. Add KEY_NAME: ['<type>'] to _KEY_TO_PROVIDER_TYPES."
+        )
