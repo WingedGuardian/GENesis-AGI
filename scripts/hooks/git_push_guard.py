@@ -1734,6 +1734,22 @@ def _comment_repo(argv: list[str]) -> str | None:
     return val
 
 
+def _final_round_chained_advisory(pr_num: str) -> str:
+    """A second terminal-stage dispatch behind the SAME acceptance.
+
+    The sigil is matched command-wide so the documented nested form
+    (`bash -c '…' # final-round-accept`) keeps working, which also meant
+    `request && request # final-round-accept` could chain arbitrarily many rounds
+    behind one decision while the advisory promised "ONE more round".
+    """
+    return (
+        f"BLOCKED: a second terminal-stage review request for PR #{pr_num} in the "
+        "same command. '# final-round-accept' authorises ONE dispatch — the user "
+        "directed one more round, not a chain of them.\n\n"
+        "Run the requests separately, each with its own decision behind it."
+    )
+
+
 def _final_round_advisory(pr_num: str, rounds: int, repo: str | None = None) -> str:
     """The terminal, stated for the DISPATCH side of the loop.
 
@@ -1869,6 +1885,9 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
         # at cap-1 would otherwise dispatch round N+1 unacknowledged (round-2
         # finding). Keyed per (repo, pr) so distinct PRs don't cross-count.
         in_cmd: dict[str, int] = {}
+        # One '# final-round-accept' authorises ONE dispatch across the whole
+        # command; see where it is spent below.
+        terminal_license_spent = False
         for seg in segs:
             # Stop scanning once the shared budget is drained. Past that point every
             # remaining gh call still gets the 1.0s floor, so a long compound command
@@ -1900,6 +1919,18 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
             if effective >= FINAL_ROUND_CAP:
                 if not final_acked:
                     return True, _final_round_advisory(pr_num, effective, repo)
+                # ONE decision licenses ONE dispatch. `final_acked` is computed with
+                # any() over the whole command — deliberately, because a nested
+                # `bash -c '…' # final-round-accept` carries the sigil on the OUTER
+                # segment, so per-segment binding would break the documented nested
+                # form. But command-wide truth also let `request && request # sigil`
+                # chain arbitrarily many rounds behind a single decision, while the
+                # advisory promises the user is directing "ONE more round". Spending
+                # the license on first use keeps the nested form working and closes
+                # the chain.
+                if terminal_license_spent:
+                    return True, _final_round_chained_advisory(pr_num)
+                terminal_license_spent = True
             elif effective >= ESCALATION_ROUND_CAP and not acked:
                 return True, _escalation_advisory(pr_num, effective, repo)
             in_cmd[key] = in_cmd.get(key, 0) + 1

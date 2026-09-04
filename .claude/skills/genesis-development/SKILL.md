@@ -1221,7 +1221,10 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `# final-round-accept` does. **That gate keeps no state**, so unlike the commit
   side the sigil is required on EVERY dispatch rather than being spent once — a
   review request changes nothing on its own, and the commit gate remains the
-  terminal that actually bites.
+  terminal that actually bites. Within ONE command it licenses ONE dispatch:
+  `request && request  # final-round-accept` is refused, because the sigil is
+  matched command-wide (so the nested `bash -c '…' # sigil` form keeps working)
+  and that would otherwise chain arbitrarily many rounds behind one decision.
 
   **A new branch starts clean, and that is the sanctioned way out.** `lifetime` is
   per-branch, so `git checkout -b` resets the terminal. Read that as option (b) —

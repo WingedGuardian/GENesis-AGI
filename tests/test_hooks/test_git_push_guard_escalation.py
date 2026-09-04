@@ -498,6 +498,28 @@ class TestCodexRoundTerminal:
         assert "final-round-accept" in msg
         assert "user" in msg.lower()
 
+    def test_one_acceptance_licenses_only_one_dispatch(self, monkeypatch):
+        """`request && request  # final-round-accept` must not chain rounds.
+
+        The sigil is matched command-wide on purpose — a nested
+        `bash -c '…' # final-round-accept` carries it on the OUTER segment, so
+        per-segment binding would break the documented nested form. That same
+        command-wide truth let one decision authorise every trigger in a compound,
+        while the advisory promises the user directed "ONE more round".
+        """
+        self._at(monkeypatch, _mod.FINAL_ROUND_CAP)
+        one = f"{TRIGGER}  # final-round-accept"
+        assert _check(one)[0] is False, "control: a single licensed dispatch allows"
+        blocked, msg = _check(f"{TRIGGER} && {TRIGGER}  # final-round-accept")
+        assert blocked, "a second terminal-stage dispatch rode the same acceptance"
+        assert "one dispatch" in msg.lower() or "second terminal-stage" in msg.lower()
+
+    def test_the_nested_form_still_works_at_the_terminal(self, monkeypatch):
+        """Guard the guard: the fix must not break the sigil-on-the-outer-segment form."""
+        self._at(monkeypatch, _mod.FINAL_ROUND_CAP)
+        nested = f"bash -c '{TRIGGER}'  # final-round-accept"
+        assert _check(nested)[0] is False, "nested single dispatch must still be licensed"
+
     def test_an_unreadable_count_fails_open(self, monkeypatch):
         """Advisory posture unchanged: an unreadable count never hard-blocks.
 

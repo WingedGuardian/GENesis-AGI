@@ -31,7 +31,9 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   escape hatch. The limit also applies when requesting the next review, because the
   local count sleeps through rounds that happen entirely in the cloud, which is
   exactly the shape a long loop takes; that second check keeps no state of its own,
-  so there the acknowledgement is required every time rather than being spent once.
+  so there the acknowledgement is required every time rather than being spent once —
+  and one acknowledgement covers one request, so a single decision cannot be chained
+  into several.
 
 ### Fixed
 
