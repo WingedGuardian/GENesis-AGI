@@ -1,37 +1,144 @@
 # CC model roster — first-class model diversification (run non-Anthropic models
-# behind Claude Code). Managed via the `cc_roster` settings domain.
+# behind Claude Code), and the fallback used when the Anthropic subscription hits
+# its usage cap.
 #
-# `default` is the active model when none is chosen. `models` defines each
-# roster member. Claude = the native Anthropic Max subscription (no overrides).
-# Other members are reached via their NATIVE Anthropic-compatible endpoint:
+# THIS FILE SHIPS INFRASTRUCTURE, NOT PEERS — and the reason is VERSION CHURN,
+# not "peers are user data". Be clear about which argument is load-bearing,
+# because the weaker one does not survive contact with this repo:
+# `config/model_routing.yaml` ships ~28 named vendor providers, every one of
+# them inert without its key, and `routing/config.py` states that intent
+# outright ("Partial API-key configuration is the normal install state").
+# `roster.py`'s failover chain gates each peer on its `auth_env` being present,
+# so a shipped peer with no key is PROVABLY inert here too. By that standard a
+# shipped peer would cost an unprovisioned install nothing, and "it is user
+# data" would be the wrong reason to omit it.
+#
+# The reason that DOES hold: a roster peer pins a `model_id`, and model ids go
+# EOL. This file already shipped `glm-5.2` past its replacement by `glm-5.3`.
+# A stale pinned id fails at exactly one moment — when the subscription caps and
+# the fallback is finally needed — and it fails while LOOKING configured, which
+# is worse than an empty roster that fails honestly. A routing provider degrades
+# to "one model of ~28 is down"; a stale roster peer degrades to "the fallback
+# you were relying on does not exist". Different blast radius, different answer.
+#
+# So: declare your peer yourself, against a model id you have actually tested.
+# The overlay is deep-merged over this file and is where the `cc_roster`
+# settings domain writes:
+#
+#     ~/.genesis/config/cc_roster.local.yaml
+#
+# An overlay ADDS to `models` (keys union), and can shadow a key but never
+# delete one — so `claude` below survives any overlay whose `models:` is a
+# mapping. (A hand-edited overlay with a non-mapping `models:` — bare `models:`,
+# which parses as null, or a list — REPLACES the block instead of merging, and
+# would take `claude` with it. `models: {}` is safe.)
+#
+# Peer fields:
 #   anthropic_base_url — the provider's Anthropic-compatible base URL
-#   auth_env           — name of the secrets.env var holding the API key
-#                        (the token VALUE is never stored here)
+#   auth_env           — NAME of the secrets.env var holding the key
+#                        (the token VALUE is never stored in config)
 #   model_id           — the provider's model id (sent via ANTHROPIC_MODEL)
-# Selection + failover happen in genesis.cc.roster (policy layer); the invoker
-# only honors the resolved fields. failover_order: lower = tried first when the
-# active model rate-limits/exhausts (0 = primary; skipped as a failover peer is
-# not done — claude IS a valid peer when something else is active).
+#   failover_order     — lower = tried first when the active model exhausts
+#                        (0 = primary; `claude` is a valid failover peer)
+#   validated          — ADVISORY ONLY. A human note recording when someone last
+#                        confirmed this peer actually worked. It is PARSED into
+#                        `RosterEntry.validated` and then acted on by nothing:
+#                        it gates nothing, anywhere. Do not carry a stamp
+#                        forward without re-testing — an unverified date is
+#                        worse than none.
 #
-# Interactive use: `gmodel` (scripts/gmodel) launches a foreground `claude`
-# session on any model here — `gmodel glm-5.2` (peer), `gmodel opus` (native Max
-# tier), `gmodel` alone lists them. `gmodel --print-env <name>` previews the env.
+# Selection + failover live in genesis.cc.roster; the invoker only honors the
+# resolved fields. Interactive use: `gmodel <name>` launches a foreground
+# `claude` on any roster member, `gmodel` alone lists them, and
+# `gmodel --print-env <name>` previews the env without launching.
 default: claude
 # Agentic gauntlet (genesis.eval.gauntlet) — validates that a roster member can
-# still drive Claude Code through a coding fix-loop. `genesis eval gauntlet run
+# still drive Claude Code through a coding fix-loop. `genesis eval gauntlet -m
 # <model>` runs on demand anytime. The WEEKLY auto-run is OFF by default because
-# it spends inference on paid peers (e.g. GLM); flip `scheduled: true` (here or
-# via the cc_roster settings domain) to enable it for all runnable roster models.
+# it spends inference on paid peers; flip `scheduled: true` (here or via the
+# cc_roster settings domain) to enable it for all runnable roster models.
 gauntlet:
   scheduled: false
 models:
   claude:
     native_subscription: true
     failover_order: 0
-    validated: "2026-06-29"
-  glm-5.2:
-    anthropic_base_url: "https://open.bigmodel.cn/api/anthropic"
-    auth_env: ZHIPU_API_KEY
-    model_id: glm-5.2
-    failover_order: 1
-    validated: "2026-06-29"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXAMPLE PEERS — copy one into ~/.genesis/config/cc_roster.local.yaml and fill
+# in your own key name. Nothing below is active.
+#
+# NAME YOUR PEER EXACTLY WHAT ITS `model_id` IS. This is a real constraint, not
+# a style preference: `roster.apply_active` returns the model_id where its
+# callers expect the roster NAME, so a peer whose key differs from its model_id
+# breaks two things downstream — the account-wide fallback flag never clears
+# (`direct_session.py`, which compares against a roster name), and the resume
+# endpoint is never persisted (`endpoint_payload` looks the name up and misses).
+# Keeping key == model_id sidesteps it entirely. Tracked as a follow-up.
+#
+# GLM / Z.AI ships on TWO platforms with DIFFERENT provisioning requirements and
+# DIFFERENT endpoints, but the SAME model id — so pick the one you can actually
+# sign up for and use ONE entry, changing only the URL and the key name:
+#
+#   models:
+#     glm-5.3:
+#       # international (z.ai):
+#       anthropic_base_url: "https://api.z.ai/api/anthropic"
+#       auth_env: ZAI_CODING_API_KEY
+#       # ...or China (BigModel) — swap BOTH of the two lines above for:
+#       #   anthropic_base_url: "https://open.bigmodel.cn/api/anthropic"
+#       #   auth_env: BIGMODEL_CODING_API_KEY
+#       # NOT ZHIPU_API_KEY: that is the general/prepaid slot for /api/paas/v4,
+#       # and pointing it at /api/anthropic is exactly the 1113 failure below.
+#       # A Coding Plan is bought PER PLATFORM, so the key is not portable.
+#       model_id: glm-5.3
+#       failover_order: 1
+#
+# WHICH KEY GOES WHERE — using the wrong one returns `1113 Insufficient balance`
+# even when the account is funded, because the two endpoints draw on different
+# products:
+#   * a GLM Coding Plan key  -> the CODING endpoints (/api/anthropic, and the
+#     OpenAI-protocol /api/coding/paas/v4). This is what Claude Code needs.
+#   * a general/prepaid key  -> the GENERAL endpoint (/api/paas/v4) only.
+# Per Z.AI's published GLM Coding Plan terms (read 2026-09-02): Coding-Plan
+# endpoints may only be used from provider-approved tools, and Claude Code is
+# named on that list. Third-party terms change — re-check before relying on it.
+# Genesis's ROUTER must never use a Coding-Plan key — give routing its own
+# general-endpoint key.
+# The China platform additionally requires real-name identity verification
+# (实名认证) to buy a Coding Plan, which an international account cannot satisfy.
+#
+# OTHER ANTHROPIC-COMPATIBLE PROVIDERS. The endpoints below are published by
+# their vendors; they are NOT verified in this repo. Treat them as starting
+# points and confirm against current provider docs before relying on one:
+#
+#     moonshot:      anthropic_base_url: "https://api.moonshot.cn/anthropic"
+#     minimax:       anthropic_base_url: "https://api.minimaxi.com/anthropic"
+#     deepseek:      anthropic_base_url: "https://api.deepseek.com/anthropic"
+#
+# Kimi Code is the one exception to "not verified": it was gauntlet-validated
+# 2026-08-27. It is still an EXAMPLE and not a shipped peer, for this file's own
+# reason — its `model_id` is tier-dependent, which is the stale-pinned-id
+# failure above with an extra way to go wrong. `kimi-for-coding` (256K) is the
+# entry tier; the larger k3 ids need a higher one. Set it from what YOUR account
+# exposes, and note that this endpoint bills a subscription quota rather than
+# per-token, which makes it a fallback for a rate-limited primary rather than a
+# cheaper primary:
+#
+#     kimi-for-coding:
+#       anthropic_base_url: "https://api.kimi.com/coding/"
+#       auth_env: KIMI_CODING_API_KEY
+#       model_id: kimi-for-coding
+#       failover_order: 2
+#
+# The key is `kimi-for-coding`, not `kimi`, and that is the rule at the top of
+# this file rather than a naming preference — a key that differs from its
+# model_id never persists its resume endpoint, so session continuity can later
+# target the wrong provider. This example is the one most likely to be copied
+# with an edit, because the tier decides the id: if your account exposes a
+# different one, change the KEY AND the `model_id` together, never just one.
+#
+# Prove a peer before you depend on it: `gmodel --print-env <name>` to check the
+# env resolves, then `genesis eval gauntlet -m <name>` to confirm it can
+# actually drive a coding fix-loop. Record the date in `validated:` yourself.
+# ─────────────────────────────────────────────────────────────────────────────
