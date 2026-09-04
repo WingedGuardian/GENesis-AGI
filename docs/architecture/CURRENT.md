@@ -1663,7 +1663,7 @@ verified: 50b79ffb 2026-09-01
   non-schema backfills (Qdrant payloads, entity graphs) that run POST-boot as a
   background `tracked_task` (kicked from `runtime/_core`), never abort boot, are
   idempotent, and are claimed atomically via the `data_migrations` ledger (so
-  server + bridge-fallback can't double-run). `dNNNN_*.py` modules expose sync
+  server + bridge-fallback can't double-run). `d`-prefixed modules expose sync
   `migrate()`+`verify()` (runner offloads via `to_thread`); `requires_operator`
   ones sit `operator_pending` and never auto-run. Shared file-discovery with the
   schema runner (`db/_migration_discovery.py`), deliberately NOT the atomic-txn
