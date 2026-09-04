@@ -955,31 +955,18 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
                     created_at          TEXT NOT NULL
                 )
             """)
-            # Defense-in-depth: normalize engagement_outcome in the copy (same
-            # CASE as rebuild #4) so this rebuild is independent of #4 having
-            # already cleaned the data — if #4 raised mid-boot leaving dirty
-            # rows, a straight copy would violate this table's enforcing CHECK.
-            await db.execute(f"""
-                INSERT INTO outreach_history_new
-                    (id, person_id, signal_type, topic, category, salience_score,
-                     channel, message_content, drive_alignment, labeled_surplus,
-                     content_hash, delivery_id, delivered_at, opened_at,
-                     user_response, action_taken, engagement_outcome,
-                     engagement_signal, prediction_error, created_at)
-                SELECT
-                     id, person_id, signal_type, topic, category, salience_score,
-                     channel, message_content, drive_alignment, labeled_surplus,
-                     content_hash, delivery_id, delivered_at, opened_at,
-                     user_response, action_taken,
-                     CASE
-                         WHEN engagement_outcome IN ({_CANONICAL_OUTCOMES_SQL})
-                             THEN engagement_outcome
-                         WHEN engagement_outcome = 'replied' THEN 'useful'
-                         ELSE NULL
-                     END,
-                     engagement_signal, prediction_error, created_at
-                FROM outreach_history
-            """)  # noqa: S608 — interpolant is a module-local literal constant
+            # Copy over the live↔rebuild column INTERSECTION (drift-safe). If the
+            # live table carries a column this rebuild target lacks — e.g. a
+            # concurrent schema-bearing branch added one — _intersection_copy
+            # RAISES instead of silently dropping it; the enclosing try/except then
+            # keeps the ORIGINAL table intact (recoverable) and the rebuild
+            # self-heals once this CREATE is corrected to match the canonical
+            # _tables.py DDL. By the time this block runs, rebuild #4 has already
+            # normalized engagement_outcome under the enforcing CHECK, so the
+            # straight column copy is clean.
+            await _intersection_copy(
+                db, src="outreach_history", dst="outreach_history_new"
+            )
             await db.execute("DROP TABLE outreach_history")
             await db.execute(
                 "ALTER TABLE outreach_history_new RENAME TO outreach_history"

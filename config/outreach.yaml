@@ -67,6 +67,9 @@ delivery_routing:
   # not an official proposal. They belong in the private DM, never a
   # supergroup topic. (Official proposals go to the Ego Proposals topic.)
   notification: dm
+  # Marketing updates go to the dedicated Marketing topic — never DM. Pinned
+  # explicitly (not left to `default`) so it holds on installs whose default is dm.
+  marketing: supergroup
 
 health_alerts:
   # Only these alert IDs go to Telegram (CRITICAL severity only).
