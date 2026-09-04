@@ -33,13 +33,29 @@ def build_argv(
 
     No ``--effort``: the ambient call sites pin Haiku, which doesn't take
     one. ``--strict-mcp-config`` + the repo's no_mcp.json keep MCP
-    servers out of the subprocess.
+    servers out of the subprocess, and ``--disallowedTools "*"`` denies
+    every BUILT-IN tool as well: these are pure-completion judges over
+    text that includes EXTERNAL content (PR titles/bodies via repo-pulse),
+    and the child runs outside the project tree where no project guard
+    loads. Measured (2026-09-04, execution-proof probe: a touch via the
+    Bash tool): default-deny is NOT reliable headlessly — the tool ran
+    without ``--dangerously-skip-permissions`` under this install's user
+    settings — while the ``"*"`` deny stopped it; a name-enumerated deny
+    list would silently reopen with every new built-in.
     """
     if no_mcp_config is None:
         # Deferred: only resolved when the caller didn't pin a config.
         from genesis.env import repo_root
 
         no_mcp_config = str(repo_root() / "config" / "no_mcp.json")
+    # The child runs from background_session_dir(), so any RELATIVE path in
+    # the argv would resolve against the wrong directory (including a
+    # relative GENESIS_REPO_ROOT flowing through repo_root()). Anchor
+    # path-shaped values to the PARENT's cwd now; a bare command word
+    # (``claude``) stays bare so PATH lookup is untouched.
+    no_mcp_config = os.path.abspath(no_mcp_config)
+    if os.sep in claude_path:
+        claude_path = os.path.abspath(claude_path)
     return [
         claude_path,
         "-p",
@@ -50,6 +66,8 @@ def build_argv(
         "--max-turns",
         "1",
         "--dangerously-skip-permissions",
+        "--disallowedTools",
+        "*",
         "--mcp-config",
         no_mcp_config,
         "--strict-mcp-config",

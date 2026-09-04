@@ -31,8 +31,27 @@ def test_build_argv_pinned_shape():
     assert argv[argv.index("--max-turns") + 1] == "1"
     assert "--strict-mcp-config" in argv
     assert "--dangerously-skip-permissions" in argv
+    # Pure-completion judge over text that includes EXTERNAL content, running
+    # outside project-guard scope: every built-in tool is denied wholesale.
+    # Execution-proof measured 2026-09-04: a name list reopens with every new
+    # built-in; the wildcard closed the set (touch-via-Bash probe, both
+    # directions). Default-deny without the flag was REFUTED on a live
+    # install — user settings made the tool run.
+    assert argv[argv.index("--disallowedTools") + 1] == "*"
     assert "--effort" not in argv
     assert "--output-format" in argv
+    assert argv.index("claude") == 0  # bare command stays bare (PATH lookup)
+
+
+def test_build_argv_anchors_relative_paths():
+    """The child runs from the background dir — relative path arguments must
+    be resolved against the PARENT's cwd before the spawn, or every ambient
+    call breaks under a relative override (incl. GENESIS_REPO_ROOT=.)."""
+    argv = build_argv(MODEL, "./bin/claude", "config/no_mcp.json")
+    import os
+
+    assert os.path.isabs(argv[0])
+    assert os.path.isabs(argv[argv.index("--mcp-config") + 1])
 
 
 @pytest.mark.asyncio
