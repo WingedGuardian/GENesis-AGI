@@ -1186,7 +1186,52 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   | Round | Gate | Demands | Sigil | Resets counter? |
   |---|---|---|---|---|
   | 2 (`cap-1`) | **MODE-SWITCH block** | Stop patching the named instance. Dispatch a FRESH-CONTEXT adversarial subagent over the ENTIRE diff; READ authoritative docs/source for any domain semantics; fix the whole enumerated CLASS in one commit. | `# audit-ack` | **No** |
-  | 3 (`cap`) | **HARD STOP** | The full round-ledger stop above. | `# escalation-ack` | **Yes** |
+  | 3 (`cap`) | **HARD STOP** | The full round-ledger stop above. | `# escalation-ack` | **Yes** — which is what makes the cycle repeat |
+  | **7 (`FINAL_ROUND_CAP`, lifetime)** | **TERMINAL** | Two full cycles have already run. Decide: ACCEPT the outstanding findings and merge (document each in the PR body), or ABANDON and restart from a design that does not need seven rounds. | `# final-round-accept` | **No, and it is ONE-SHOT** |
+
+  **The first two tiers have no terminal, and that is the gap round 7 closes.**
+  Because `# escalation-ack` *resets* the streak, the cap is repeatable by
+  construction: rounds 1-2-3, ack, 4-5-6, ack, 7-8-9, ack, without end. A change
+  can consume fifteen external rounds and the machine never says "enough" — only
+  "enough, for now", once every three rounds. So a SECOND counter exists
+  (`review_state.get_review_lifetime`) that acks never reset; only a branch change
+  does. It counts the same rounds the streak does — EXTERNAL cross-model only, so
+  internal audits (including the one tier 2 mandates) stay free.
+
+  At the terminal, `# escalation-ack` does **not** help: the lifetime check runs
+  BEFORE the streak check precisely because the streak has usually just been reset
+  by an earlier ack and would not fire. And `# final-round-accept` clears exactly
+  ONE commit — the block returns on the next one, and re-applying the sigil is
+  refused with "already used". That is deliberate: a sigil that kept working would
+  just be a fourth repeatable sigil, which is the defect being closed. The decision
+  has to actually end the loop.
+
+  **Both sigils can be required at once.** `streak >= 3` and `lifetime >= 7` is a
+  reachable state, so the co-required form is
+  `git commit -m "…"  # final-round-accept escalation-ack`; the terminal's own
+  message names the second sigil when it applies. The acceptance is spent at the
+  ALLOW, not when the tier honours it — a command another rule then denies does not
+  burn it.
+
+  **THE SAME TERMINAL FIRES WHEN YOU REQUEST THE NEXT ROUND**, not only when you
+  commit. `git_push_guard._check_codex_round_escalation` counts the PR's ACTUAL
+  Codex reviews from the API, because the local counter above sleeps through rounds
+  that ran entirely in the cloud — the #1372 whack-a-mole was five Codex rounds with
+  the local counter at 0. Past `FINAL_ROUND_CAP` that gate blocks
+  `gh pr comment … @codex review`, `# escalation-ack` does not clear it, and
+  `# final-round-accept` does. **That gate keeps no state**, so unlike the commit
+  side the sigil is required on EVERY dispatch rather than being spent once — a
+  review request changes nothing on its own, and the commit gate remains the
+  terminal that actually bites. Within ONE command it licenses ONE dispatch:
+  `request && request  # final-round-accept` is refused, because the sigil is
+  matched command-wide (so the nested `bash -c '…' # sigil` form keeps working)
+  and that would otherwise chain arbitrarily many rounds behind one decision.
+
+  **A new branch starts clean, and that is the sanctioned way out.** `lifetime` is
+  per-branch, so `git checkout -b` resets the terminal. Read that as option (b) —
+  abandon and restart from a better design — not as a loophole: carrying the same
+  unconverged change across is the loop continuing under a new name, and the point
+  of the terminal is that a person decides which of the two is happening.
 
   The round-2 block is not the round-3 cap arriving early — it is a different
   instruction. It says the *approach* is wrong (you are fixing instances, not the
@@ -1207,10 +1252,12 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   WARNING and will be rejected by that gate — re-write the evidence with concrete
   anchors rather than acking past it.
 
-  Backing all of it: `review_state.py` keeps a per-branch counter of
-  CONSECUTIVE defect-bearing review rounds, and the commit gate
-  (`review_enforcement_commit.py`) HARD-BLOCKS the commit at `ESCALATION_ROUND_CAP`
-  (3) unless the command carries a deliberate trailing `# escalation-ack`.
+  Backing all of it: `review_state.py` keeps TWO per-branch counters — `round`
+  (CONSECUTIVE defect-bearing rounds, reset by `# escalation-ack`) and `lifetime`
+  (the same rounds over the branch's whole life, which no ack resets). The commit
+  gate (`review_enforcement_commit.py`) HARD-BLOCKS at `ESCALATION_ROUND_CAP` (3)
+  pending `# escalation-ack`, and at `FINAL_ROUND_CAP` (7) pending a one-shot
+  `# final-round-accept`. Both counters advance on EXTERNAL rounds only.
 
   **THE COUNTER IS CROSS-MODEL ONLY.** The streak exists to catch *cross-model
   non-convergence* — an EXTERNAL reviewer finding NEW defects round after round. It does
