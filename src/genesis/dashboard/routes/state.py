@@ -332,7 +332,12 @@ async def settings_timezone():
         existing = {}
         if cfg_path.is_file():
             with cfg_path.open() as fh:
-                existing = yaml.safe_load(fh) or {}
+                loaded = yaml.safe_load(fh)
+            # `or {}` covers an empty file but keeps a truthy non-mapping root, and
+            # the assignment below would then TypeError into an opaque 500. This
+            # dropdown is the recovery surface for a broken genesis.yaml, so it has
+            # to survive the one file the operator has just broken.
+            existing = loaded if isinstance(loaded, dict) else {}
         existing["timezone"] = new_tz
         # Ensure the config dir exists — on an install that never ran
         # setup-local-config, ~/.genesis/config/ may be absent and the dropdown

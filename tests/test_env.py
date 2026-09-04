@@ -348,3 +348,198 @@ class TestEmbedPriorityTier:
         monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {"memory": {"embed_priority_tier": False}})
         monkeypatch.setenv("GENESIS_EMBED_PRIORITY_TIER", "true")
         assert env_mod.embed_priority_tier() is True
+
+
+# The accessors that read a NESTED key out of a local-config section, paired with
+# the section they read and the value they must fall back to. This list is
+# hand-maintained and therefore CANNOT catch a new accessor that forgets the helper —
+# an omission is simply absent from it. `test_no_unrouted_nested_config_read` below is
+# the enforcement; this list is the behavioural coverage for the ones that exist.
+_SECTION_ACCESSORS = [
+    ("ollama_url", "network", "http://localhost:11434"),
+    ("lm_studio_url", "network", "http://localhost:1234/v1"),
+    ("ollama_enabled", "network", False),
+    ("embed_priority_tier", "memory", True),
+    ("build_lane_enabled", "build_lane", False),
+    ("models_md_synthesis_enabled", "models_md_synthesis", True),
+    ("github_user", "github", ""),
+    ("github_public_repo", "github", "GENesis-AGI"),
+]
+
+# Env vars that would short-circuit an accessor before it ever reads the config.
+_SECTION_ACCESSOR_ENV = [
+    "OLLAMA_URL",
+    "LM_STUDIO_URL",
+    "GENESIS_ENABLE_OLLAMA",
+    "GENESIS_EMBED_PRIORITY_TIER",
+    "GENESIS_BUILD_LANE_ENABLED",
+    "GENESIS_MODELS_MD_SYNTHESIS_OFF",
+    "GENESIS_GITHUB_USER",
+    "GENESIS_GITHUB_PUBLIC_REPO",
+]
+
+
+class TestLocalConfigSectionRobustness:
+    """A malformed section must degrade to the default, never raise.
+
+    `_local_config`'s own docstring promises callers "fall through to their
+    hardcoded defaults gracefully", and `models_md_synthesis_enabled` promises
+    "local config swallows" — but a nested `.get` on a section that is not a
+    mapping raises AttributeError instead. That reaches real boot paths:
+    `runtime/init/memory.py` catches Exception and records an init degradation,
+    so a one-line yaml typo silently runs the whole install with NO vector
+    memory. The user-editable file must not be able to do that.
+
+    Two malformed shapes, both reachable from hand-edited yaml:
+      `memory:`            with the child commented out  -> None
+      `memory: enabled`    a scalar where a mapping goes -> str
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_env_shortcircuit(self, monkeypatch: pytest.MonkeyPatch):
+        for name in _SECTION_ACCESSOR_ENV:
+            monkeypatch.delenv(name, raising=False)
+
+    @pytest.mark.parametrize(("accessor", "section", "expected"), _SECTION_ACCESSORS)
+    @pytest.mark.parametrize("bad", [None, "enabled", ["a"], 7, True])
+    def test_malformed_section_falls_through_to_default(
+        self, monkeypatch: pytest.MonkeyPatch, accessor: str, section: str, expected, bad
+    ):
+        import genesis.env as env_mod
+
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {section: bad})
+        assert getattr(env_mod, accessor)() == expected
+
+    @pytest.mark.parametrize(("accessor", "section", "expected"), _SECTION_ACCESSORS)
+    @pytest.mark.parametrize("root", [["a", "b"], "scalar", 7])
+    def test_non_mapping_config_root_falls_through(
+        self, monkeypatch: pytest.MonkeyPatch, accessor: str, section: str, expected, root
+    ):
+        """A yaml file whose ROOT is a list or scalar breaks every accessor at once.
+
+        `_local_config` guards `None` via `or {}` but keeps a truthy non-mapping.
+        """
+        import genesis.env as env_mod
+
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", root)
+        assert getattr(env_mod, accessor)() == expected
+
+    def test_non_mapping_root_does_not_break_top_level_reads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """`user_timezone` reads a top-level key, so the root guard is its only cover."""
+        import genesis.env as env_mod
+
+        # USER_TIMEZONE is the var this accessor actually reads. Deleting the two
+        # plausible-looking names instead left the isolation a no-op, and
+        # `isinstance(..., str)` is true of every possible return — so the test
+        # asserted only "does not raise" while claiming to exercise the fallback.
+        monkeypatch.delenv("USER_TIMEZONE", raising=False)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", ["not", "a", "mapping"])
+        assert env_mod.user_timezone() == "UTC"
+
+    def test_well_formed_section_still_wins(self, monkeypatch: pytest.MonkeyPatch):
+        """The guard must not swallow a VALID opt-out — that would be worse."""
+        import genesis.env as env_mod
+
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {"memory": {"embed_priority_tier": False}})
+        assert env_mod.embed_priority_tier() is False
+
+
+class TestSecretsTemplateDoesNotShadowYaml:
+    """A template line that is COPIED to secrets.env silently outranks the yaml.
+
+    `bootstrap.sh` copies secrets.env.example to secrets.env on a fresh install and
+    the server loads it into the environment; every accessor here checks env FIRST.
+    So an uncommented assignment in the template makes the documented yaml lever
+    dead on arrival for exactly the operators reading the docs for the first time —
+    including the answers `setup-local-config.sh` interactively PROMPTS for, which a
+    shadowing assignment turns into a silently dead setup step.
+
+    THE PREDICATE, because the obvious one is wrong: an assignment is safe to comment
+    out iff the template value EQUALS the `${VAR:-default}` that config/model_routing.yaml
+    expands. It is NOT "has no shell-expansion consumer" — the three URLs below all have
+    one and are still safe, because their defaults are byte-identical.
+    GENESIS_ENABLE_OLLAMA is the case that fails the predicate: template `false` vs
+    expansion default `true`, so commenting it out would turn Ollama ON everywhere.
+    It is asserted PRESENT below, as the control.
+    """
+
+    SHADOWING = ("GENESIS_EMBED_PRIORITY_TIER", "OLLAMA_URL", "LM_STUDIO_URL", "LM_STUDIO_HEALTH_URL")
+
+    def _assignments(self, name: str) -> list[str]:
+        from genesis.env import repo_root
+
+        template = (repo_root() / "secrets.env.example").read_text()
+        return [ln for ln in template.splitlines() if ln.strip().startswith(f"{name}=")]
+
+    @pytest.mark.parametrize("name", SHADOWING)
+    def test_yaml_lever_is_not_shadowed(self, name: str):
+        assert not self._assignments(name), (
+            f"secrets.env.example assigns {name}, which is copied to secrets.env and "
+            "beats the genesis.yaml setting of the same name. Comment it out — its "
+            f"model_routing.yaml expansion already defaults to the same value. Found: "
+            f"{self._assignments(name)}"
+        )
+
+    def test_enable_ollama_stays_assigned(self):
+        """The control, and the reason the predicate is value-vs-default.
+
+        Without the assignment `${GENESIS_ENABLE_OLLAMA:-true}` turns Ollama ON for
+        every fresh install. If this ever goes red because someone "swept the class",
+        the sweep used the wrong rule.
+        """
+        assert self._assignments("GENESIS_ENABLE_OLLAMA"), (
+            "GENESIS_ENABLE_OLLAMA must stay UNCOMMENTED in secrets.env.example: "
+            "config/model_routing.yaml expands it to `true` when unset."
+        )
+
+
+class TestNestedConfigReadsAreRouted:
+    """Structural enforcement — the hand-maintained list above cannot do this."""
+
+    def test_no_unrouted_nested_config_read(self):
+        """Every nested local-config read must go through `_local_section`.
+
+        A chained `_local_config().get(x).get(y)` — or the `(… or {}).get(y)` variant —
+        is the exact shape that raises on a malformed section. Caught here as a source
+        property rather than per-accessor, so an accessor added later cannot reintroduce
+        the class by simply not being listed.
+        """
+        import ast
+
+        from genesis.env import repo_root
+
+        tree = ast.parse((repo_root() / "src" / "genesis" / "env.py").read_text())
+        def _is_get(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+            )
+
+        def _reads_config(node: ast.AST) -> bool:
+            return any(
+                isinstance(n, ast.Name) and n.id == "_local_config" for n in ast.walk(node)
+            )
+
+        # Flag a CHAINED get — `x.get(a).get(b)` — or the `(x or {}).get(b)` guard
+        # form, and only when the chain actually reads the local config. A single
+        # `_local_config().get(key)` is a top-level read and is safe (the root is
+        # normalized), and `_local_section(name).get(key)` is the routed form; both
+        # must stay green or this test would forbid its own fix.
+        bad = [
+            (node.lineno, ast.unparse(node))
+            for node in ast.walk(tree)
+            if _is_get(node)
+            and (_is_get(node.func.value) or isinstance(node.func.value, ast.BoolOp))
+            and _reads_config(node.func.value)
+        ]
+        assert not bad, (
+            "nested local-config read bypassing _local_section (it will raise on a "
+            f"section that is not a mapping): {bad}"
+        )

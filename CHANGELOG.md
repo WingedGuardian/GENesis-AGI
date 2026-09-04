@@ -30,6 +30,46 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `memory_recall` tool call through a standalone MCP process still uses the standard
   lane, so it can be slow without failing.
 
+  The setting is a yaml lever as well as an environment one, and the template no
+  longer overrides it: a fresh install copies `secrets.env.example` to `secrets.env`
+  and the environment is read first, so an uncommented assignment in the template
+  would have quietly outranked `memory.embed_priority_tier: false` and left the
+  documented opt-out doing nothing.
+
+- **The setup script's questions about local inference servers had no effect.** The
+  same shadowing applied to the Ollama and LM Studio addresses: the template assigned
+  them, a fresh install copied that to its environment, and the environment outranks
+  the config file — so the address the interactive setup script asks for was written
+  to the config and then ignored, and every call went to localhost regardless. Those
+  assignments are now commented out; the values they held were already the defaults.
+  The Ollama on/off switch deliberately stays assigned, because unlike the addresses
+  its default differs from the template value, and removing it would switch Ollama on
+  everywhere.
+
+- **A malformed config section could quietly weaken the private-data scan.** The
+  fingerprint harvester, which collects this install's private values so they can be
+  blocked from ever reaching a public push, read config sections the same unguarded
+  way — and its error handling covers the whole harvest, so one bad section dropped
+  not just the addresses it was reading but the timezone and private-repository
+  patterns queued behind them, with nothing logged. Sections are now read defensively
+  there too. Separately, ignoring a malformed section is no longer silent anywhere: it
+  logs which section was discarded and that defaults are in force, because two of
+  those settings fail toward spending money and toward running an autonomous job the
+  operator had switched off.
+
+- **A one-line typo in the install config could silently disable vector memory.**
+  Accessors that read a nested setting out of `~/.genesis/config/genesis.yaml`
+  assumed the section around it was a mapping. Two shapes an ordinary edit produces
+  are not: a section whose only child is commented out (which yaml reads as empty
+  rather than absent), and a section given a plain value instead of a block. Either
+  one raised on the next read, and because the memory subsystem catches everything
+  around its own startup, the install would come up reporting a degradation and then
+  run with no vector memory at all — from a config file the operator is invited to
+  edit by hand. Every such setting — the local inference URLs, the Ollama switch, the
+  recall priority lane, the build lane, the models-file synthesis job, and the GitHub
+  identity — now falls back to its documented default instead, as does a config file
+  whose top level is malformed outright.
+
 - **The cold-marketing campaign no longer re-pitches the same person.** Once a
   marketing pitch is delivered to a prospect, that prospect is marked contacted and
   drops out of the campaign's target list — previously nothing recorded the contact,

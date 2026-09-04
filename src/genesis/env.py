@@ -52,7 +52,10 @@ def _local_config() -> dict:
     """
     global _LOCAL_CONFIG, _LOCAL_CONFIG_LOADED
     if _LOCAL_CONFIG_LOADED:
-        return _LOCAL_CONFIG or {}
+        # Normalized on the CACHED path too, not just after a load: this function
+        # has two returns, and guarding only the loader would leave the one that
+        # serves every call after the first unprotected.
+        return _LOCAL_CONFIG if isinstance(_LOCAL_CONFIG, dict) else {}
     _LOCAL_CONFIG_LOADED = True
     cfg_path = Path.home() / ".genesis" / "config" / "genesis.yaml"
     if not cfg_path.is_file():
@@ -62,11 +65,49 @@ def _local_config() -> dict:
         import yaml  # noqa: PLC0415 — lazy import, yaml is always available
 
         with cfg_path.open() as fh:
-            _LOCAL_CONFIG = yaml.safe_load(fh) or {}
+            loaded = yaml.safe_load(fh)
+        # `or {}` alone covers a null/empty file but KEEPS a truthy non-mapping
+        # root (a yaml list, or a bare scalar from a stray edit), and every caller
+        # below then calls `.get` on it. Hand-edited file, documented graceful
+        # contract: anything that is not a mapping is treated as absent.
+        _LOCAL_CONFIG = loaded if isinstance(loaded, dict) else {}
     except Exception:
         logger.warning("Failed to load local config from %s", cfg_path, exc_info=True)
         _LOCAL_CONFIG = {}
     return _LOCAL_CONFIG
+
+
+def _local_section(name: str) -> dict:
+    """Return the named local-config section, or ``{}`` if it is not a mapping.
+
+    Every accessor that reads a nested key MUST go through this rather than
+    ``_local_config().get(name, {})``. That spelling supplies its default only
+    for a MISSING key, so both shapes a hand-edited yaml actually produces —
+    ``memory:`` with the child commented out (loads as ``None``) and
+    ``memory: enabled`` (loads as ``str``) — survive it and raise AttributeError
+    on the next ``.get``.
+
+    That raise is not contained. ``runtime/init/memory.py`` catches ``Exception``
+    around the memory bootstrap and records an init degradation, so a one-line
+    typo in the user-editable config silently runs the whole install with no
+    vector memory — while ``_local_config``'s docstring promises callers fall
+    through to their defaults gracefully.
+    """
+    section = _local_config().get(name)
+    if section is not None and not isinstance(section, dict):
+        # Never discard a declared policy SILENTLY. Two of the settings under here
+        # fail toward spending money (the paid embedding lane) and toward running an
+        # autonomous job the operator switched off, so "your config was ignored" has
+        # to be visible. Matches the existing precedent for an unreadable-but-present
+        # setting elsewhere in the tree: enforce the default, and say so.
+        logger.warning(
+            "genesis.yaml section %r is %s, not a mapping — ignoring it and using the "
+            "default for every setting under it. Fix the config to restore your "
+            "declared policy.",
+            name,
+            type(section).__name__,
+        )
+    return section if isinstance(section, dict) else {}
 
 
 def repo_root() -> Path:
@@ -457,7 +498,7 @@ def ollama_url() -> str:
     env_val = os.environ.get("OLLAMA_URL")
     if env_val:
         return env_val.strip()
-    local_val = _local_config().get("network", {}).get("ollama_url")
+    local_val = _local_section("network").get("ollama_url")
     if local_val:
         return str(local_val).strip()
     return _DEFAULT_OLLAMA_URL
@@ -475,7 +516,7 @@ def lm_studio_url() -> str:
     env_val = os.environ.get("LM_STUDIO_URL")
     if env_val:
         return env_val.strip()
-    local_val = _local_config().get("network", {}).get("lm_studio_url")
+    local_val = _local_section("network").get("lm_studio_url")
     if local_val:
         return str(local_val).strip()
     return _DEFAULT_LM_STUDIO_URL
@@ -494,7 +535,7 @@ def ollama_enabled() -> bool:
     env_val = os.environ.get("GENESIS_ENABLE_OLLAMA")
     if env_val is not None:
         return env_val.strip().lower() not in {"0", "false", "no", "off"}
-    local_val = _local_config().get("network", {}).get("ollama_enabled")
+    local_val = _local_section("network").get("ollama_enabled")
     if local_val is not None:
         return bool(local_val)
     return False
@@ -529,13 +570,10 @@ def embed_priority_tier() -> bool:
     env_val = os.environ.get("GENESIS_EMBED_PRIORITY_TIER")
     if env_val is not None:
         return env_val.strip().lower() not in {"0", "false", "no", "off"}
-    # `or {}` and not `.get("memory", {})`: the default only applies to a MISSING
-    # key, not a null one. A user following the docstring above and then commenting
-    # the child back out leaves `memory:` with no value, which yaml loads as None —
-    # and `None.get(...)` raises straight out of the memory bootstrap that calls
-    # this, taking the whole memory subsystem down. The documented opt-out must not
-    # be able to break the thing it opts out of.
-    local_val = (_local_config().get("memory") or {}).get("embed_priority_tier")
+    # Via `_local_section`, which tolerates every shape a hand-edited yaml can
+    # produce: the documented opt-out must not be able to break the thing it opts
+    # out of. See that helper for what an unguarded read costs here specifically.
+    local_val = _local_section("memory").get("embed_priority_tier")
     if local_val is not None:
         return bool(local_val)
     return True
@@ -555,7 +593,7 @@ def build_lane_enabled() -> bool:
     env_val = os.environ.get("GENESIS_BUILD_LANE_ENABLED")
     if env_val is not None:
         return env_val.strip().lower() not in {"0", "false", "no", "off"}
-    local_val = _local_config().get("build_lane", {}).get("enabled")
+    local_val = _local_section("build_lane").get("enabled")
     if local_val is not None:
         return bool(local_val)
     return False
@@ -582,7 +620,7 @@ def models_md_synthesis_enabled() -> bool:
     if env_val is not None:
         # The env var names the OFF state: a truthy value DISABLES the job.
         return env_val.strip().lower() not in {"1", "true", "yes", "on"}
-    local_val = _local_config().get("models_md_synthesis", {}).get("enabled")
+    local_val = _local_section("models_md_synthesis").get("enabled")
     if local_val is not None:
         return bool(local_val)
     return True
@@ -648,7 +686,7 @@ def github_user() -> str:
     env_val = os.environ.get("GENESIS_GITHUB_USER")
     if env_val:
         return env_val.strip()
-    local_val = _local_config().get("github", {}).get("user")
+    local_val = _local_section("github").get("user")
     if local_val:
         return str(local_val).strip()
     return ""
@@ -662,7 +700,7 @@ def github_public_repo() -> str:
     env_val = os.environ.get("GENESIS_GITHUB_PUBLIC_REPO")
     if env_val:
         return env_val.strip()
-    local_val = _local_config().get("github", {}).get("public_repo")
+    local_val = _local_section("github").get("public_repo")
     if local_val:
         return str(local_val).strip()
     return "GENesis-AGI"
