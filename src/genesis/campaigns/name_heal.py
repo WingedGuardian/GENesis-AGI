@@ -86,7 +86,46 @@ async def heal_campaign_names(db: Any) -> int:
         except Exception:
             logger.exception("Campaign %s: name heal failed", row.get("id"))
             continue
-        await _migrate_job_health(db, name, clean)
+        # The rename is already COMMITTED at this point (`crud.update_campaign`
+        # commits), so a swallowed failure here would be permanent rather than
+        # transient: on the next startup `clean == name`, the row is skipped
+        # before ever reaching this line, and the old job keys stay orphaned
+        # forever — which is precisely the state this module exists to remove.
+        #
+        # So the rename is undone when its dependent migration fails, restoring
+        # the pair to "both un-migrated" and leaving the row eligible for a
+        # retry next startup. A dirty name still runs; a permanently orphaned
+        # history does not repair itself.
+        if not await _migrate_job_health(db, name, clean):
+            try:
+                # Raw UPDATE, deliberately NOT `crud.update_campaign`. That
+                # helper sanitizes at the write boundary, so handing it the
+                # original dirty name writes the CLEAN one straight back and the
+                # revert becomes a silent no-op — the row stays renamed and
+                # still never retries. Restoring a pre-boundary value is the one
+                # case that has to go around the boundary, which is the same
+                # reason this module's tests insert their fixtures with raw SQL.
+                await db.execute(
+                    "UPDATE campaigns SET name = ? WHERE id = ?", (name, row["id"])
+                )
+                await db.commit()
+                logger.warning(
+                    "Campaign %s: job-state migration failed — rename reverted so "
+                    "the next startup retries it",
+                    row.get("id"),
+                )
+            except Exception:
+                # Both halves failed. Nothing left to do but say so loudly: the
+                # campaign is renamed and its history is not, which is the
+                # orphan case, and it will not self-heal.
+                logger.exception(
+                    "Campaign %s: job-state migration failed AND the rename could "
+                    "not be reverted — job history is orphaned under %r and will "
+                    "not be retried; migrate or delete it by hand",
+                    row.get("id"),
+                    f"campaign_{name}",
+                )
+            continue
         taken.discard(name)
         taken.add(clean)
         healed += 1
@@ -95,8 +134,13 @@ async def heal_campaign_names(db: Any) -> int:
     return healed
 
 
-async def _migrate_job_health(db: Any, old_name: str, new_name: str) -> None:
+async def _migrate_job_health(db: Any, old_name: str, new_name: str) -> bool:
     """Carry a campaign's durable job state across a rename.
+
+    Returns True if the state moved (or there was none to move), False if it
+    could not. The return value is load-bearing: the caller undoes the rename on
+    False, because the rename is already committed by then and a silent failure
+    would never be retried.
 
     Two tables are keyed by the derived scheduler name ``campaign_{name}``
     (``campaigns/runner.py``), and BOTH must move or the rename splits the
@@ -117,8 +161,8 @@ async def _migrate_job_health(db: Any, old_name: str, new_name: str) -> None:
     ``job_stale`` warning on every health sweep, forever, and enters the ego
     reconciliation snapshot. Nothing ever purges it.
 
-    Best-effort and non-fatal — a heal that cannot carry the history must still
-    leave the (correctly renamed) campaign running.
+    Non-fatal — a heal that cannot carry the history must never prevent
+    campaigns from starting.
     """
     old_job, new_job = f"campaign_{old_name}", f"campaign_{new_name}"
     try:
@@ -159,5 +203,7 @@ async def _migrate_job_health(db: Any, old_name: str, new_name: str) -> None:
             (new_job, old_job),
         )
         await db.commit()
+        return True
     except Exception:
         logger.exception("job state migration failed for campaign rename")
+        return False

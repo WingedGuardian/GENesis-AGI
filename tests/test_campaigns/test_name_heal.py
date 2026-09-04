@@ -239,6 +239,51 @@ async def test_job_run_events_follow_the_rename(db):
     assert (await cur.fetchone())[0] == 0, "events stranded under the dirty name"
 
 
+async def test_failed_state_migration_reverts_the_rename_so_it_retries(db):
+    """A swallowed migration failure would be PERMANENT, not transient.
+
+    ``crud.update_campaign`` commits, so by the time the state migration runs the
+    rename is already durable. If the migration then failed silently, the next
+    startup would compute ``clean == name``, skip the row before reaching the
+    migration at all, and leave the old job keys orphaned forever — exactly the
+    state this module exists to remove, reintroduced through the error path.
+
+    So a failed migration undoes the rename, putting the pair back to "both
+    un-migrated" and leaving the row eligible for a retry.
+    """
+    import genesis.campaigns.name_heal as nh
+
+    await _insert_raw(db, "c-retry", "retry\tme")
+    await db.execute(
+        "INSERT INTO job_health (job_name, total_runs, total_successes, "
+        "total_failures, consecutive_failures, updated_at) VALUES (?,?,?,?,?,?)",
+        ("campaign_retry\tme", 11, 11, 0, 0, "2026-08-27T00:00:00Z"),
+    )
+    await db.commit()
+
+    async def _fail(*_a, **_k):
+        return False
+
+    original = nh._migrate_job_health
+    nh._migrate_job_health = _fail
+    try:
+        assert await nh.heal_campaign_names(db) == 0, "a failed migration counted as healed"
+    finally:
+        nh._migrate_job_health = original
+
+    cur = await db.execute("SELECT name FROM campaigns WHERE id = ?", ("c-retry",))
+    assert (await cur.fetchone())[0] == "retry\tme", (
+        "rename survived a failed migration — the row can never be retried"
+    )
+
+    # The whole point: with the real migration back, the next run completes.
+    assert await nh.heal_campaign_names(db) == 1
+    cur = await db.execute(
+        "SELECT total_runs FROM job_health WHERE job_name = ?", ("campaign_retry me",)
+    )
+    assert (await cur.fetchone())[0] == 11, "retry did not carry the history"
+
+
 async def test_reserved_scheduler_name_is_not_healed_into(db):
     """Healing into a name the runner reserves would silently kill the campaign.
 
