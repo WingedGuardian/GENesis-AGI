@@ -86,6 +86,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - **aws-fde-delivery** — Forward Deployed Engineer delivery contract for AWS engagements, build-first artifacts, grounded cost estimates, Well-Architected review, evolution roadmap
 - **browser-automation** — Web automation with 4-layer escalation (Fetch, Genesis Browser, On-Demand MCP, Computer Use), anti-detection, and persistent profiles
 - **cc-update** — Update Claude Code (the CC CLI / "clog code") to a new version, or bump the pinned CC version. Use when the user asks to update Claude Code, bump the CC pin, evaluate a new CC release, or says "clog code update". Routes to the canonical, standardized process in docs/reference/cc-compatibility.md — do NOT re-derive the update mechanism by grepping every time. Do NOT use for general "what changed in CC" trivia with no intent to update.
+- **closing-session** — This skill should be used when a session's job is to DRIVE OPEN PRs TO MERGE rather than to write new code — "work the PR queue", "close out the open PRs", "review and fix the open PRs", "drive #1234 to green", "what's blocking our PRs". It owns the In Review column: it reads each PR's gate status, verifies and fixes review findings on PRs OTHER sessions built, replies in-thread, and stops at the merge gate for the user's per-PR approval. Do NOT load it for building a feature and opening its PR — that is a build session (`genesis-development`).
 - **code-intelligence** — Code understanding tool selection. Use when exploring architecture, finding definitions, tracing call chains, assessing blast radius of changes, or debugging code paths in the Genesis codebase.
 - **content-publish** — End-to-end content creation and publishing. Takes a topic (or generates one), drafts in the user's voice, gets approval via Telegram, and publishes to Medium via browser automation. Invoke with "publish a post about X", "write and publish to Medium", "content-publish", or when an ego-dispatched session needs to create and distribute content.
 - **debugging** — Systematic debugging of issues — use when a test fails, runtime error occurs, unexpected behavior is reported, or an awareness tick produces anomalous results
@@ -109,7 +110,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - **linkedin-post-writer** — This skill should be used when the user asks to "write a LinkedIn post", "draft a post about", "help me post on LinkedIn", "create LinkedIn content", or when Genesis proactively generates post ideas during surplus compute. Also triggered by content calendar execution or when the user shares a topic they want to write about.
 - **linkedin-profile-optimizer** — This skill should be used when the user asks to "optimize my LinkedIn profile", "update my LinkedIn headline", "rewrite my LinkedIn summary", "improve my LinkedIn about section", or when Genesis identifies that the user's profile doesn't align with their current goals or target audience.
 - **obstacle-resolution** — Resolve obstacles using fallback chains — use when an approach fails, a dependency is unavailable, an API returns errors, or a task is blocked and needs an alternative path forward
-- **onboarding** — First-run onboarding — guides new users through Genesis setup on their first CC session. Configures user profile, essential API keys, Telegram, GitHub backup, and service verification. Triggered automatically when ~/.genesis/setup-complete is absent. Re-runnable by asking Genesis to "run setup" or "reconfigure [section]".
+- **onboarding** — First-run onboarding — guides new users through Genesis setup on their first CC session. Configures user profile, essential API keys, Telegram, GitHub backup, and service verification. Triggered automatically while the install is not yet FUNCTIONAL (the setup floor — Claude Code login + an LLM key + an embedding key — is unmet), not merely while ~/.genesis/setup-complete is absent. Re-runnable by asking Genesis to "run setup" or "reconfigure [section]".
 - **osint** — OSINT investigation — discover, track, and report on people, companies, and technologies
 - **prospect-researcher** — This skill should be used when the user asks to "research this company", "look into this person", "find the best angle for reaching out to", "who should I contact at [company]", "what does [company] care about", or when preparing outreach to a specific target. Also triggered by "help me prepare for an interview with [company]" or "I want to apply to [company]". Combines lead-generation intelligence with LinkedIn-specific approach planning.
 - **research** — Deep research on a topic — use when investigating unfamiliar domains, answering complex questions requiring multiple sources, or when an evaluation flags something for deeper analysis
@@ -156,6 +157,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - `campaign_trigger` — Manually trigger a campaign tick (bypasses schedule).
 - `campaign_update` — Update campaign configuration.
 - `codebase_navigate` — Navigate the Genesis codebase progressively.
+- `contributor_issue_propose` — Propose a public GitHub issue for the Contributor Work-Log — sanitize it server-side and, if clean, hold it for owner approval on the dashboard.
 - `db_schema` — Query database schema: list all tables, or get columns for a specific table.
 - `direct_session_list` — List recent direct background sessions.
 - `direct_session_run` — Spawn a directed background CC session with profile-based tool restrictions.
@@ -197,6 +199,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 
 **genesis-outreach**
 
+- `marketing_send` — Stage a COLD marketing email to a curated prospect. Returns a neutral queued/refused JSON status.
 - `outreach_digest` — Generate a digest of recent outreach activity.
 - `outreach_engagement` — Record an engagement OUTCOME (useful, engaged, acted_on, acknowledged, not_useful, ambivalent, ignored; 'replied' maps to 'useful').
 - `outreach_poll` — Create a Discord poll via webhook. Returns JSON with message_id.
