@@ -9,7 +9,142 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **A review comment on documentation no longer blocks a merge.** The pre-merge
+  check already declined to count findings on prose, but its idea of prose was
+  narrow: markdown counted only underneath `docs/`, so a comment on a top-level
+  guide, or on one of the instruction files that shape how the assistant works,
+  was treated as a finding on code and held the merge. Any markdown, reStructured-
+  Text or AsciiDoc file now counts as documentation wherever it lives.
+
+  The narrowness was deliberate, and it is being relaxed on one specific ground:
+  a separate check, at the moment work is committed rather than merged, classifies
+  those instruction files independently and still requires a proper review before
+  they can change. So what moves is only whether a reviewer's comment on prose can
+  hold up a merge — not whether prose gets reviewed.
+
+  Reversible without another change: `merge_gate.doc_findings` accepts `skip`
+  (the default, prose never blocks), `p1_only` (only the highest severity blocks
+  on prose), or `score` (prose is treated exactly like code, the previous
+  behaviour). Findings are listed in the pre-merge report under every setting —
+  the lever decides whether they count, never whether anyone sees them.
+
+### Added
+
+- **The review-round limit now has an end, not just a speed bump.** The existing
+  limit pauses after three rounds in which an independent reviewer keeps finding new
+  problems, and asks for a conscious decision to continue — but acknowledging it
+  resets the count, so the same three-round cycle can repeat without limit. A change
+  could consume fifteen rounds and never be told "enough", only "enough, for now".
+
+  A second count now runs over the whole life of a change, and at seven rounds it
+  stops rather than pausing. Two full cycles have already run by then, each of which
+  already asked for a decision; something still surfacing new problems after that is
+  not converging, and the remaining question — accept what is outstanding and ship
+  it, or abandon the branch and start from a design that does not need seven rounds —
+  is a judgement call, not one to keep deferring. Both answers require a person, so
+  the block says so and neither is available to an unattended session.
+
+  Where the decision is recorded — committing the accepted work — the acceptance is
+  spent when used: it clears one commit, once, and re-using it does not buy another
+  round. That is the whole difference between a terminal and a fourth repeatable
+  escape hatch. The limit also applies when requesting the next review, because the
+  local count sleeps through rounds that happen entirely in the cloud, which is
+  exactly the shape a long loop takes; that second check keeps no state of its own,
+  so there the acknowledgement is required every time rather than being spent once —
+  and one acknowledgement covers one request, so a single decision cannot be chained
+  into several.
+
 ### Fixed
+
+- **Two branches that each add a changelog entry no longer collide over it.**
+  This file is an append-only list of independent bullets, so two branches
+  adding an entry under the same heading are not disagreeing about anything —
+  they are inserting at the same position, which git's default merge reports as
+  a conflict a human has to resolve by hand. It now merges with git's `union`
+  driver, which keeps both sides' lines instead of leaving markers. It makes no
+  promise about their ORDER — git's own documentation says union "tends to leave
+  the added lines in the resulting file in random order and the user should
+  verify the result" — so a merged section may need its entries re-sorted by
+  hand. For a list of independent bullets that is proofreading, not breakage.
+
+  Measured before the change, against the repository's own open work: of 49
+  open pull requests, 21 could not merge, and **18 of those 21 conflicted on
+  this file and nothing else** — every other file in them merged cleanly.
+  **Two things it deliberately does not do**, because the measurement above is
+  easy to over-read. It does not make a conflicting pull request mergeable on
+  GitHub: GitHub ignores a repository's `.gitattributes` in its server-side
+  merge, measured against GitHub's own merge engine on two branch pairs built to
+  collide on this file, which conflicted both with the attribute present and
+  without it. And it does not help a branch's *first* merge, which is the one an
+  already-open pull request needs — attributes resolve from the checkout rather
+  than from the commits being merged, so on a branch created before this file
+  existed the merge that introduces the rule is not governed by it. Measured on
+  a real open pull request: the changelog still conflicts.
+
+  What it does buy, stated narrowly: once a branch contains the file — every
+  branch cut after this lands, and any older branch after its first merge —
+  later merges of the base branch resolve the changelog with no hand-editing.
+  Measured in that direction across the same 18: all of them clean, with every
+  bullet from both sides intact. The structural fix is one fragment per change
+  under `changelog.d/`; this rule does not replace it.
+
+  The rule is scoped to the one file at the repository root, and the tests
+  enforce that scope over the complete tracked-file list rather than a sample.
+  The leading slash matters: a pattern without one matches the basename at
+  every depth, which would silently hand the same driver to any future
+  vendored or subproject changelog.
+
+  What `union` cannot express is a **removal**. If one side deletes lines while
+  the other edits the same place, it keeps the deleted lines and reports
+  success — so pruning an entry, reverting a commit that added one, or cutting
+  a release (which moves entries under a version heading rather than adding
+  them) can quietly come out wrong, with a zero exit code and nothing visibly
+  duplicated to catch the eye. Read the merged file in those three cases.
+
+  Union merges lines, not records, and that reaches insertion-only merges too:
+  two entries sharing an identical aligned line — the same closing sentence, the
+  same title — can collapse into one, again at exit 0. Measured across the 18
+  real colliding pull requests, every bullet from both sides survived intact in
+  all 18; the failure needs identical lines and these entries are long
+  distinctive prose. So it is a real edge with a measured rate of zero, worth
+  knowing when writing a terse or templated entry.
+
+  The attribute also governs `git revert` and `git cherry-pick`
+  (`gitattributes(5)`) and, measured here, `git merge-tree` — but only when the
+  checkout running them already carries this rule, since attributes resolve from
+  the current checkout rather than from the commits being compared. Two
+  consequences were measured rather than assumed: reverting an *older* commit
+  that added an entry is absorbed, and git then reports "nothing to commit" with
+  a non-zero exit, so a caller checking exit status still notices; and the
+  guardian's automated `git revert HEAD` on a clean tree is unaffected, because
+  there both sides equal the base and the driver never runs.
+
+- **Two branches can no longer pick the same database-migration number.** Each
+  new migration is now named by the UTC time it was written rather than by the
+  next free number, so nobody has to check what anyone else took — and two
+  people working at once cannot both claim the same one. The numbers already in
+  use are frozen exactly as they are; an existing install is unaffected and runs
+  nothing again. A migration that has already shipped can no longer be renamed
+  or removed either: installs that already ran it would never run its
+  replacement, so the two would drift apart with nothing to notice. And a
+  migration whose name is subtly wrong — a digit too few, filed in the wrong
+  folder — is now reported instead of being quietly skipped, which is what used
+  to happen: the file simply never ran, and the change that needed it shipped
+  without it.
+- **The wrong-repo commit check now says when it did not run.** It works out which
+  repository a `git add`/`commit` targets by reading the command text, and when that
+  text did not determine a directory — a shell variable, a command substitution, a
+  glob — it joined the unexpanded token onto the current path anyway. The result
+  cannot exist, so every lookup against it failed and the check was skipped through
+  the same branch that means "this repository is not covered". A command it could
+  not inspect was therefore indistinguishable from one it deliberately ignored.
+  It now reports that the check did not run, on **119 of 2,264 (5.3%)** real
+  `add`/`commit` commands. Deliberately an advisory and **not** a new refusal:
+  replaying those same 119 through the old behaviour, it blocked **0** of them —
+  it was failing open, so nobody has ever been wrongly stopped by this, and making
+  it refuse would newly stop 119 ordinary commands to fix a silence.
 
 - **The cold-marketing campaign no longer re-pitches the same person.** Once a
   marketing pitch is delivered to a prospect, that prospect is marked contacted and

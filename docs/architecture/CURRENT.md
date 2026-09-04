@@ -667,6 +667,10 @@ verified: 50b79ffb 2026-09-01
   `surplus/scheduler.py`.
 - `follow_ups/` = accountability ledger + dispatcher (every 5 min) that turns
   follow-ups into surplus tasks; retention sweep on the learning scheduler. The
+  `follow_up_create` MCP tool routes USER-OWNED and purely-local operational work
+  here; Genesis-repo work goes to the public GitHub tracker as an issue (CLAUDE.md
+  "Where deferred work goes"). Templated pipelines write via `crud.follow_ups.create()`
+  directly and are governed at their own call sites. The
   `follow_up_create`/`update` MCP tools take a `work_state`
   (ready/blocked_on_trigger/deferred_cold) and DERIVE the hot(`follow_up`)/
   cold(`tabled`) lane, so priority never picks the lane; `blocked_on_trigger`
@@ -1687,8 +1691,17 @@ verified: 3de52202 2026-09-02
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
   schema paths coexist: base DDL (`schema/_tables.py`, 118 CREATE TABLE; docs
-  still say "60+") plus versioned `migrations/` 0001..0089 run ONCE at startup
-  before any other init step touches data; a failed migration ABORTS bootstrap.
+  still say "60+") plus versioned `migrations/` run ONCE at startup before any
+  other init step touches data; a failed migration ABORTS bootstrap. Ids are
+  92 FROZEN legacy 4-digit ones (`0001`..`0093`, with a GAP at `0092` from a
+  rename) plus new `YYYYMMDDHHMMSS_*.py` UTC timestamps — nobody allocates an
+  id any more, which is what removed the cross-branch collisions. The legacy
+  set is ENUMERATED in `db/_migration_ids.FROZEN_LEGACY_FILES` (a range cannot
+  express the `0092` gap), and discovery REFUSES a directory holding any file
+  it cannot classify, because a name matching nothing is discovered by nothing
+  and would never run. Discovery enforces RUNNABLE; CI
+  (`scripts/check_migration_prefixes.py`) additionally enforces this repo's
+  freeze, so a fork's own 4-digit migration runs rather than bricking its boot.
   EVERY table must be in BOTH paths (fresh-install DDL + its numbered
   migration) — a design CONVENTION whose TABLE-set parity is NOT test-enforced:
   `test_db/test_schema.py`'s `EXPECTED_TABLES` allow-list only pins the DDL
@@ -1705,7 +1718,7 @@ verified: 3de52202 2026-09-02
   non-schema backfills (Qdrant payloads, entity graphs) that run POST-boot as a
   background `tracked_task` (kicked from `runtime/_core`), never abort boot, are
   idempotent, and are claimed atomically via the `data_migrations` ledger (so
-  server + bridge-fallback can't double-run). `dNNNN_*.py` modules expose sync
+  server + bridge-fallback can't double-run). `d`-prefixed modules expose sync
   `migrate()`+`verify()` (runner offloads via `to_thread`); `requires_operator`
   ones sit `operator_pending` and never auto-run. Shared file-discovery with the
   schema runner (`db/_migration_discovery.py`), deliberately NOT the atomic-txn
