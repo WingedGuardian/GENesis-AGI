@@ -189,7 +189,13 @@ class TestGitCleanFailsClosedOnGuardCrash:
         assert self._run_broken(tmp_path, cmd).returncode == 2
 
     @pytest.mark.parametrize(
-        "cmd", ["git checkout foo", "git reset --soft HEAD~1", "git clean -nd", "git clean -f  # discard-override"]
+        "cmd",
+        [
+            "git checkout foo",
+            "git reset --soft HEAD~1",
+            "git clean -nd",
+            "git clean -f  # discard-override",
+        ],
     )
     def test_non_destructive_advisory_on_crash(self, tmp_path, cmd):
         assert self._run_broken(tmp_path, cmd).returncode != 2
@@ -416,8 +422,7 @@ def test_merge_no_arg_resolves_branch_pr(tmp_path):
     """No number, but the branch has an open PR -> gates run against it."""
     env = _gh_stub(
         tmp_path,
-        'case "$*" in *"--json number"*) echo 42;; '
-        '*"--json mergeable"*) echo MERGEABLE;; esac',
+        'case "$*" in *"--json number"*) echo 42;; *"--json mergeable"*) echo MERGEABLE;; esac',
     )
     result = _run("gh pr merge --squash", env_extra=env)
     assert result.returncode == 0
@@ -555,6 +560,8 @@ class TestGenesisDedup:
     def test_broad_rm_still_blocks_in_genesis(self):
         r = _run("rm -rf /", cwd=self._GENESIS_CWD)
         assert r.returncode == 2
+
+
 # --- pip editable arm + force-removal arm: anchored predicates (2026-09-03) ---
 #
 # Both arms matched raw command text, so the phrase inside a grep pattern, a
@@ -579,9 +586,23 @@ _WT = "/srv/genesis/.claude/worktrees/somebranch"
 
 
 class TestPipEditableArm:
-    """Both directions. A benign-block rate of zero reads identically for a
-    correct guard and an inert one, so every allow-case is paired with a block
-    case that must still fire."""
+    """This arm DELIBERATELY over-matches. Do not anchor it — see the hook.
+
+    An earlier revision of this PR keyed the predicate on command position so the
+    phrase could not match inside a heredoc, a grep pattern or a commit message.
+    Cross-model review found the anchored form fell OPEN on a leading redirection
+    and on the `command` / `env` wrappers, each of which the substring form
+    catches. The anchoring was reverted, and this class inverted with it: the
+    allow-cases below are block-cases now, and that friction is the accepted
+    cost of not having a hole in a guard that exists because an editable install
+    to a worktree once OOM-crashed the container.
+
+    MEASURED end-to-end — the real pre-PR blob against the reverted one, over
+    the shapes in this class: 0 regressions. The revert restores exact parity.
+
+    Both directions still, because a benign-block rate of zero reads identically
+    for a correct guard and for an inert one.
+    """
 
     @pytest.mark.parametrize(
         "cmd",
@@ -602,73 +623,107 @@ class TestPipEditableArm:
         assert r.returncode == 2, r.stdout + r.stderr
         assert "PYTHONPATH" in r.stderr
 
-    def test_flag_must_belong_to_the_pip_command(self):
-        """The decoupling defect: two independent whole-command greps let an
-        unrelated `-e` (here, grep's) satisfy the editable half while an
-        unrelated path satisfied the worktree half — a block with no editable
-        install anywhere in the command."""
-        r = _run(f"pip install ruff && ls {_WT} && grep {_E} foo /dev/null")
-        assert r.returncode == 0, r.stderr
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            f"2>/dev/null pip install {_E} {_WT}",
+            f">/dev/null pip install {_E} {_WT}",
+            f"command pip install {_E} {_WT}",
+            f"env pip install {_E} {_WT}",
+        ],
+    )
+    def test_the_shapes_the_anchored_predicate_let_through_still_block(self, cmd):
+        """REGRESSION PIN — these are the fail-open bypasses review surfaced.
 
-    def test_long_flag_containing_dash_e_is_not_an_editable_install(self):
-        """`--extra-index-url` contains `-e`; the old unanchored alternative
-        matched inside it."""
-        r = _run(f"pip install requests --extra-index-url https://example.invalid/s && ls {_WT}")
-        assert r.returncode == 0, r.stderr
+        MEASURED old=BLOCK / anchored=ALLOW / reverted=BLOCK. If a future change
+        anchors this arm again, these fail first and name the reason. Note the
+        anchored form tolerated leading ENV ASSIGNMENTS but not leading
+        REDIRECTIONS, which is precisely the sort of gap a regex over shell
+        grammar leaves and a tokenizer does not.
+        """
+        r = _run(cmd)
+        assert r.returncode == 2, r.stdout + r.stderr
+
+    def test_a_bundled_short_flag_is_a_known_gap_in_both_forms(self):
+        """NOT a regression — MEASURED allow on the pre-PR blob AND the reverted
+        one. `-qe` contains no literal `-e`, so the substring predicate never
+        covered it; review reported it alongside two genuine regressions, and
+        restating it as one would have been wrong.
+
+        Asserted as CURRENT behaviour so the gap is visible rather than implicit.
+        The delegation follow-up is what closes it — if this test starts failing,
+        the gap was closed and this test should be deleted, not repaired.
+        """
+        assert _run(f"pip install -qe {_WT}").returncode == 0
 
     @pytest.mark.parametrize(
         "cmd",
         [
+            f"pip install ruff && ls {_WT} && grep {_E} foo /dev/null",
+            f"pip install requests --extra-index-url https://example.invalid/s && ls {_WT}",
             f"grep -rn 'pip install {_E}' {_WT}",
             f"echo 'never pip install {_E} from a worktree' >> {_WT}/notes.md",
             f"git commit -m 'docs: explain pip install {_E} risk in {_WT}'",
         ],
     )
-    def test_mention_only_is_not_an_install(self, cmd):
-        r = _run(cmd)
-        assert r.returncode == 0, r.stderr
+    def test_a_mere_mention_is_blocked_and_that_is_intended(self, cmd):
+        """THE ACCEPTED FRICTION, pinned so it reads as a choice, not a bug.
 
-    def test_heredoc_body_mentioning_it_is_not_an_install(self):
-        """The exact shape that cost a file write on 2026-09-03: a heredoc whose
-        BODY quotes the phrase. The block discarded the whole call, the write
-        included, and reported only the pip rule."""
-        r = _run(
-            f"cat > {_WT}/probe_doc.py <<'PYEOF'\n"
-            f'"""Use PYTHONPATH, never pip install {_E} from a worktree."""\n'
-            "PYEOF"
-        )
-        assert r.returncode == 0, r.stderr
+        None of these installs anything: an unrelated `-e` from grep, the `-e`
+        inside `--extra-index-url`, the phrase as a search pattern, as prose, and
+        in a commit message. All are refused. MEASURED at 12/6000 real commands.
+
+        This is the cost side of the trade and it is deliberately paid. Anyone
+        reading a block on one of these should route around it (see the hook's
+        comment), not sharpen the predicate — that path was taken once and
+        produced the bypasses pinned above.
+        """
+        r = _run(cmd)
+        assert r.returncode == 2, r.stdout + r.stderr
 
     def test_pip_subcommand_other_than_install_is_ignored(self):
-        """Forward-looking only: this does NOT discriminate old from new (the old
-        predicate required `pip install` too, so it allowed this as well). Kept as
-        a pin against a future widening to any pip subcommand, and labelled so it
-        is not mistaken for a regression test."""
+        """Forward-looking only: this does NOT discriminate old from new (both
+        predicates require the literal `pip install`). Kept as a pin against a
+        future widening to any pip subcommand, and labelled so it is not
+        mistaken for a regression test."""
         r = _run(f"pip download {_E} {_WT}")
         assert r.returncode == 0, r.stderr
 
 
 class TestWorktreeForceRemovalArm:
-    """The same class, six lines below the pip arm — fixed together, because
-    fixing only the arm that was reported is fixing the list, not the class."""
+    """The same class, six lines below the pip arm — and reverted with it.
 
-    def test_force_removal_still_blocks(self):
-        r = _run("git worktree remove --force /tmp/wt")
-        assert r.returncode == 2, r.stdout + r.stderr
+    Review named the pip arm and the inline wrapper arm. This third arm was
+    anchored in the same commit with the identical structure and was NOT named;
+    replaying the same shapes against it MEASURED 5 of 8 regressing from BLOCK
+    to allow. Findings are a sample of a class, not a list, so all three arms
+    were reverted together.
+    """
 
-    def test_short_force_flag_still_blocks(self):
-        r = _run("git worktree remove -f /tmp/wt")
-        assert r.returncode == 2, r.stdout + r.stderr
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git worktree remove --force /tmp/wt",
+            "git worktree remove -f /tmp/wt",
+            "git -C /srv/genesis worktree remove --force /tmp/wt",
+        ],
+    )
+    def test_force_removal_still_blocks(self, cmd):
+        """TRUE-POSITIVE CONTROL — the reason the arm exists."""
+        assert _run(cmd).returncode == 2
 
-    def test_global_flag_before_the_subcommand_still_blocks(self):
-        """TRUE-POSITIVE CONTROL, not a regression pin. MEASURED old=BLOCK /
-        new=BLOCK: this hook's old predicate never required `git` at all, so a
-        global flag was never a hole HERE. (It was one in worktree_cwd_guard,
-        whose own test at test_worktree_guard.py is the genuine pin — measured
-        old=ALLOW / new=BLOCK.) The `-C` operand is inert; the verdict is
-        identical with any path."""
-        r = _run("git -C /srv/genesis worktree remove --force /tmp/wt")
-        assert r.returncode == 2, r.stdout + r.stderr
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "2>/dev/null git worktree remove -f /tmp/wt",
+            ">/dev/null git worktree remove --force /tmp/wt",
+            "command git worktree remove -f /tmp/wt",
+            "env git worktree remove -f /tmp/wt",
+        ],
+    )
+    def test_the_shapes_the_anchored_predicate_let_through_still_block(self, cmd):
+        """REGRESSION PIN — MEASURED old=BLOCK / anchored=ALLOW / reverted=BLOCK."""
+        assert _run(cmd).returncode == 2
 
     @pytest.mark.parametrize(
         "cmd",
@@ -678,11 +733,17 @@ class TestWorktreeForceRemovalArm:
             "git worktree remove /tmp/wt && rm -f /tmp/x",
         ],
     )
-    def test_mention_or_unrelated_force_flag_is_allowed(self, cmd):
-        """The last case is the segment-scoping one: an `rm -f` in a LATER
-        segment is not a force flag on the removal."""
-        r = _run(cmd)
-        assert r.returncode == 0, r.stderr
+    def test_a_mere_mention_is_blocked_and_that_is_intended(self, cmd):
+        """THE ACCEPTED FRICTION. The phrase as a search pattern, as prose, and
+        a non-forced removal followed by an unrelated `rm -f` in a LATER segment.
+        All refused; losing uncommitted work in a worktree is unrecoverable, so
+        this arm errs toward refusing.
+
+        Inside a genesis checkout the project-level worktree_cwd_guard.py covers
+        removals with the real tokenizer; this arm is the belt for everywhere
+        else, where no project hooks are loaded.
+        """
+        assert _run(cmd).returncode == 2
 
 
 class TestHookIsSyntacticallyValid:

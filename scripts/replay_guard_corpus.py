@@ -36,6 +36,7 @@ import argparse
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
@@ -55,13 +56,13 @@ _GUARD_TIMEOUT_S = 15
 # ── corpus ───────────────────────────────────────────────────────────────────
 
 
-def _extract_commands() -> list[str]:
+def _extract_commands() -> list[tuple[str, str]]:
     """Every Bash `input.command` in this install's transcripts, deduped.
 
     Streams line by line: the transcript tree is ~1.4 GB and this box is swapless,
     so it is never read whole.
     """
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     files = sorted(_TRANSCRIPTS.rglob("*.jsonl"))
     for n, path in enumerate(files, 1):
         if n % 200 == 0:
@@ -88,15 +89,35 @@ def _extract_commands() -> list[str]:
                         continue
                     cmd = (block.get("input") or {}).get("command")
                     if isinstance(cmd, str) and cmd.strip():
-                        seen.add(cmd)
+                        # The cwd the command was actually typed in. Guards that
+                        # ask "am I in a worktree?" answer differently here than
+                        # at the repo root, so replaying without it measures a
+                        # situation that never happened.
+                        cwd = rec.get("cwd")
+                        seen.add((cmd, cwd if isinstance(cwd, str) else ""))
     return sorted(seen)
 
 
-def load_corpus(*, rebuild: bool = False) -> list[str]:
+def load_corpus(*, rebuild: bool = False) -> list[tuple[str, str]]:
+    """The corpus as (command, cwd) pairs.
+
+    A v1 cache held bare command strings with no cwd. Rather than silently
+    replaying those from the repo root — the very defect this format change
+    fixes — a legacy cache is detected and rebuilt, so a stale file cannot
+    masquerade as a valid measurement.
+    """
     if _CACHE.exists() and not rebuild:
         _harden(_CACHE)
         with _CACHE.open() as f:
-            return [json.loads(line) for line in f if line.strip()]
+            rows = [json.loads(line) for line in f if line.strip()]
+        if any(isinstance(r, str) for r in rows):
+            print(
+                "cache predates the cwd field (v1) — rebuilding, because "
+                "replaying it would measure the wrong directory",
+                file=sys.stderr,
+            )
+        else:
+            return [(c, w) for c, w in rows]
     print("building corpus from transcripts (streaming)…", file=sys.stderr)
     cmds = _extract_commands()
     _CACHE.parent.mkdir(parents=True, exist_ok=True)
@@ -105,10 +126,22 @@ def load_corpus(*, rebuild: bool = False) -> list[str]:
     # (an inline `SSHPASS=…` was found in it), so it must never exist even
     # briefly at the default 0644.
     fd = os.open(_CACHE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # os.open's mode argument applies ONLY on the call that actually CREATES the
+    # file. Rebuilding over a cache that already exists at 0644 leaves it 0644,
+    # so tighten the inode explicitly — before a single byte is written, while
+    # O_TRUNC has just emptied it.
+    os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w") as f:
-        for c in cmds:
-            f.write(json.dumps(c) + "\n")
-    print(f"cached {len(cmds)} unique commands -> {_CACHE} (mode 0600)", file=sys.stderr)
+        for pair in cmds:
+            f.write(json.dumps(pair) + "\n")
+    # Report the mode the file ACTUALLY carries. A hard-coded "(mode 0600)" is
+    # how the bug above stayed invisible: the line claimed a mode nothing had
+    # verified, on a file that demonstrably holds secrets.
+    mode = stat.S_IMODE(_CACHE.stat().st_mode)
+    print(
+        f"cached {len(cmds)} unique commands -> {_CACHE} (mode {mode:04o})",
+        file=sys.stderr,
+    )
     return cmds
 
 
@@ -129,16 +162,30 @@ def _harden(path: Path) -> None:
 # would be a bug in one of them, not a third opinion.
 
 
-def _payload(cmd: str) -> dict:
+# Commands whose recorded directory no longer exists are replayed from the repo
+# root, which is a SUBSTITUTED cwd — counted here so the report can say so rather
+# than quietly folding them into the rate.
+_SUBSTITUTED_CWD = {"n": 0}
+
+
+def _effective_cwd(cwd: str) -> str:
+    """The recorded cwd if it still exists, else the repo root (counted)."""
+    if cwd and os.path.isdir(cwd):
+        return cwd
+    _SUBSTITUTED_CWD["n"] += 1
+    return str(_REPO)
+
+
+def _payload(cmd: str, cwd: str) -> dict:
     return {
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
         "tool_input": {"command": cmd},
-        "cwd": str(_REPO),
+        "cwd": cwd,
     }
 
 
-def _run_python_guard(module_name: str, cmd: str) -> bool:
+def _run_python_guard(module_name: str, cmd: str, cwd: str) -> bool:
     """True if the guard BLOCKS. Imports once, then calls main() in process.
 
     `main()` returns the intended exit code (0 allow / 2 block) — `run_guard` only
@@ -151,10 +198,17 @@ def _run_python_guard(module_name: str, cmd: str) -> bool:
     if mod is None:
         mod = __import__(module_name)
         _run_python_guard._loaded[module_name] = mod  # type: ignore[attr-defined]
-    payload = _payload(cmd)
+    here = _effective_cwd(cwd)
+    payload = _payload(cmd, here)
     original = getattr(mod, "read_payload", None)
     mod.read_payload = lambda: payload  # type: ignore[assignment]
+    # These guards read os.getcwd() DIRECTLY (worktree_cwd_guard's self-brick
+    # check, the routing guard's repo resolution) — the payload's cwd field is
+    # not what they consult, so the process cwd has to move as well or the
+    # threading would be cosmetic.
+    prior = os.getcwd()
     try:
+        os.chdir(here)
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             code = mod.main()
         return code == 2
@@ -165,6 +219,7 @@ def _run_python_guard(module_name: str, cmd: str) -> bool:
         # guards, so count it as one rather than silently scoring it benign.
         return True
     finally:
+        os.chdir(prior)
         if original is not None:
             mod.read_payload = original
 
@@ -172,14 +227,15 @@ def _run_python_guard(module_name: str, cmd: str) -> bool:
 _run_python_guard._loaded = {}  # type: ignore[attr-defined]
 
 
-def _run_shell_guard(argv: list[str], cmd: str) -> bool:
+def _run_shell_guard(argv: list[str], cmd: str, cwd: str) -> bool:
+    here = _effective_cwd(cwd)
     proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
         argv,
-        input=json.dumps(_payload(cmd)),
+        input=json.dumps(_payload(cmd, here)),
         capture_output=True,
         text=True,
         timeout=_GUARD_TIMEOUT_S,
-        cwd=str(_REPO),
+        cwd=here,
     )
     return proc.returncode == 2
 
@@ -209,23 +265,23 @@ def _inline_blob() -> str:
 # wrapped by run_guard, so this harness's crash-counts-as-block rule would
 # misreport it: in production it fails OPEN.
 GUARDS: dict[str, object] = {
-    "protected_paths": lambda c: _run_python_guard("protected_paths_guard", c),
-    "worktree_cwd": lambda c: _run_python_guard("worktree_cwd_guard", c),
-    "git_push": lambda c: _run_python_guard("git_push_guard", c),
-    "bash_safety": lambda c: _run_shell_guard(
-        ["bash", str(_REPO / "scripts" / "bash_safety_hook.sh")], c
+    "protected_paths": lambda c, w: _run_python_guard("protected_paths_guard", c, w),
+    "worktree_cwd": lambda c, w: _run_python_guard("worktree_cwd_guard", c, w),
+    "git_push": lambda c, w: _run_python_guard("git_push_guard", c, w),
+    "bash_safety": lambda c, w: _run_shell_guard(
+        ["bash", str(_REPO / "scripts" / "bash_safety_hook.sh")], c, w
     ),
-    "inline_blob": lambda c: _run_shell_guard(["bash", "-c", _inline_blob()], c),
+    "inline_blob": lambda c, w: _run_shell_guard(["bash", "-c", _inline_blob()], c, w),
 }
 
 
 _SHELL_GUARDS = frozenset({"bash_safety", "inline_blob"})
 
 
-def _probe(args: tuple[str, str]) -> bool:
-    guard, cmd = args
+def _probe(args: tuple[str, str, str]) -> bool:
+    guard, cmd, cwd = args
     try:
-        return bool(GUARDS[guard](cmd))  # type: ignore[operator]
+        return bool(GUARDS[guard](cmd, cwd))  # type: ignore[operator]
     except subprocess.TimeoutExpired:
         return True  # a hung guard is not a pass
     except Exception:
@@ -243,35 +299,48 @@ def replay(guard: str, corpus: list[str], show: int, jobs: int) -> int:
     per worker.
     """
     blocked: list[str] = []
+    _SUBSTITUTED_CWD["n"] = 0
     if guard in _SHELL_GUARDS and jobs > 1:
         import multiprocessing as mp
 
         with mp.Pool(jobs) as pool:
             for i, hit in enumerate(
-                pool.imap(_probe, ((guard, c) for c in corpus), chunksize=32), 1
+                pool.imap(_probe, ((guard, c, w) for c, w in corpus), chunksize=32), 1
             ):
                 if i % 2000 == 0:
                     print(f"  … {i}/{len(corpus)}", file=sys.stderr)
                 if hit:
-                    blocked.append(corpus[i - 1])
+                    blocked.append(corpus[i - 1][0])
     else:
         fn = GUARDS[guard]
-        for i, cmd in enumerate(corpus, 1):
+        for i, (cmd, cwd) in enumerate(corpus, 1):
             if i % 5000 == 0:
                 print(f"  … {i}/{len(corpus)}", file=sys.stderr)
             try:
-                if fn(cmd):  # type: ignore[operator]
+                if fn(cmd, cwd):  # type: ignore[operator]
                     blocked.append(cmd)
             except subprocess.TimeoutExpired:
                 blocked.append(cmd)
     n = len(corpus)
     pct = (100.0 * len(blocked) / n) if n else 0.0
-    print(f"{guard:16s} blocked {len(blocked)}/{n} benign ({pct:.2f}%)")
+    # "blocked", not "benign". Nothing here classifies a command as benign or
+    # dangerous, and the earlier wording asserted the classification anyway —
+    # directly against this script's promise to report a rate and never a
+    # verdict. It matters: the figure it produced was quoted in a PR body as a
+    # false-positive rate when this PR's own numbers said 146 of 150 were
+    # genuine. Reading the sample below is how a rate becomes a verdict.
+    print(f"{guard:16s} blocked {len(blocked)}/{n} ({pct:.2f}%) — UNCLASSIFIED")
     for cmd in blocked[:show]:
         flat = " ".join(cmd.split())
         print(f"    {flat[:150]}")
     if show and len(blocked) > show:
         print(f"    … and {len(blocked) - show} more")
+    if _SUBSTITUTED_CWD["n"]:
+        sub = _SUBSTITUTED_CWD["n"]
+        print(
+            f"    note: {sub}/{n} replayed from the repo root because the "
+            "recorded directory no longer exists",
+        )
     return len(blocked)
 
 

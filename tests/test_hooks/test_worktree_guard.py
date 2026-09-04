@@ -398,7 +398,40 @@ class TestMentionIsNotExecution:
     def test_removal_behind_a_global_flag_now_blocks(self, guard_cmd: str) -> None:
         """REGRESSION PIN for a fail-OPEN hole the old regex had: it required
         `git` immediately followed by the subcommand, so a global flag in between
-        hid a real removal. Six such commands were found in the corpus."""
+        hid a real removal. Six such commands were found in the corpus.
+
+        NOTE this case passes with the index bug below too — `/srv/genesis` is
+        not the subcommand's name, so `argv.index()` happens to land correctly.
+        It pins the regex fix, not the index fix.
+        """
         inner = f"git -C /srv/genesis {_SUB} {_OP} /tmp/some-worktree"
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
+
+    def test_global_flag_operand_equal_to_the_subcommand_name_blocks(self, guard_cmd: str) -> None:
+        """REGRESSION PIN for the fail-open cross-model review found.
+
+        The operand extraction re-found the subcommand with
+        `argv.index(_SUBCOMMAND)`, which returns the FIRST matching token. Here
+        the `-C` operand IS the literal subcommand name, so the index landed on
+        the operand, the tail started one token early, `after_sub[0]` was the
+        subcommand name rather than the operation, and a REAL removal was
+        ALLOWED.
+
+        The directory does not need to exist — the guard classifies argv before
+        touching the filesystem, and the `-C` operand is never resolved.
+        """
+        inner = f"git -C {_SUB} {_SUB} {_OP} /tmp/some-worktree"
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
+
+    def test_subcommand_name_as_a_removal_target_still_blocks(self, guard_cmd: str) -> None:
+        """The mirror shape: the TARGET path equal to the subcommand name.
+
+        Guards against a fix that simply searched for the LAST occurrence
+        instead of the first — that would land on the target here and skip the
+        segment just as silently.
+        """
+        inner = f"git {_SUB} {_OP} {_SUB}"
         result = _run_guard(guard_cmd, {"command": inner})
         assert result.returncode == 2, result.stdout + result.stderr

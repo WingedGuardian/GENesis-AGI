@@ -39,7 +39,11 @@ import sys
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import read_payload, run_guard, tool_input  # noqa: E402
-from shell_parse import analyze, git_subcommand, untokenizable  # noqa: E402
+from shell_parse import (  # noqa: E402
+    analyze,
+    git_subcommand_index,
+    untokenizable,
+)
 
 # Kept ONLY for the untokenizable fallback below and as a cheap pre-gate — never
 # as the verdict. As the verdict it was quote-blind: it matched the phrase inside
@@ -90,12 +94,17 @@ def _extract_worktree_targets(cmd: str) -> list[str]:
     """
     targets: list[str] = []
     for seg in analyze(cmd):
-        if seg.exe != "git" or git_subcommand(seg.argv) != _SUBCOMMAND:
+        if seg.exe != "git":
             continue
-        try:
-            after_sub = seg.argv[seg.argv.index(_SUBCOMMAND) + 1 :]
-        except ValueError:  # pragma: no cover — git_subcommand already found it
+        # The INDEX from the parser's own scan, never `argv.index(_SUBCOMMAND)`:
+        # that returns the first token equal to the name, and a global option's
+        # operand can BE that name. `git -C worktree worktree remove /tmp/x` anchored on
+        # the `-C` operand, so `after_sub[0]` was the literal "worktree" instead of
+        # "remove", the segment was skipped, and a real removal was ALLOWED.
+        sub_idx = git_subcommand_index(seg.argv)
+        if sub_idx is None or seg.argv[sub_idx] != _SUBCOMMAND:
             continue
+        after_sub = seg.argv[sub_idx + 1 :]
         if not after_sub or after_sub[0] != _OPERATION:
             continue
         for token in after_sub[1:]:

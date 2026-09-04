@@ -127,40 +127,44 @@ class TestUnrelatedAllowed:
         assert _run("git push origin feature/x").returncode == 0
 
 
-class TestWrapperArmIsAnchored:
-    """The runtime-wrapper arm, anchored at command position (2026-09-03).
+class TestWrapperArmOverMatches:
+    """The runtime-wrapper arm DELIBERATELY over-matches. Do not anchor it.
 
-    It was three unanchored, quote-blind globs: `*"X"*"genesis"*` matched any
+    It is three unanchored, quote-blind globs: `*"X"*"genesis"*` matches any
     command mentioning both anywhere, IN THAT ORDER. Every path in this repo
-    contains "genesis", so ANY in-repo command mentioning the wrapper was refused
-    — a read-only grep included. Reproduced three separate times on 2026-09-03,
-    once by an exploring subagent that hit it while reading the guard's own source.
+    contains "genesis", so any in-repo command mentioning the wrapper is refused
+    — a read-only grep included. That was reproduced three times on 2026-09-03,
+    once by an exploring subagent that hit it while reading the guard's source,
+    and it is a real cost: MEASURED 12/6000 real commands.
 
-    The old glob knew nothing of adjacency, pipes, or whether a launch was even
-    happening. MEASURED against origin/main's blob, all three BLOCK: the wrapper
-    and "genesis" in separate statements, with a pipe between them, and with no
-    launch at all. Only the ORDER matters — hence _PATH below.
+    An earlier revision of this PR anchored it at command position, taking that
+    to 7/6000. Cross-model review then found the anchored form fell OPEN on a
+    leading redirection, so the anchoring was reverted along with its two sibling
+    arms and this class was inverted with it.
 
-    MEASURED: the inline blob's benign-block rate over a 6,000-command sample of
-    real commands fell from 12/6000 (0.20%) to 7/6000 (0.12%); the residual is a
-    DIFFERENT arm in the same blob, recorded separately.
+    The reason is structural: this arm lives inside a `bash -c` blob in
+    settings.json with no access to the canonical tokenizer, so anchoring it means
+    modelling shell grammar with a regex — an open set the review loop finds one
+    member of per round. Over-blocking is friction; under-blocking lets the full
+    runtime boot against a worktree, which OOM-crashed the container on
+    2026-07-03. Friction is the correct side to err on.
 
     Fragments, so this file's text cannot trip the live hook.
     """
 
     _W = "no" + "hup"
 
-    # MUST contain the literal word "genesis" — it is the second half of the old
-    # glob, and it is what makes the allow-cases below DISCRIMINATE. MEASURED: with
-    # this value the grep and prose cases are old=BLOCK / new=ALLOW; swap in a path
-    # without the word (e.g. /srv/repo) and BOTH become old=ALLOW / new=ALLOW —
-    # still green, but pinning nothing. Any future sanitization pass that changes
-    # this value must re-run that old-vs-new table, not just the suite.
+    # MUST contain the literal word "genesis" — it is the second half of the glob,
+    # and it is what makes the friction cases below DISCRIMINATE. MEASURED: with
+    # this value they block; swap in a path without the word (e.g. /srv/repo) and
+    # they stop blocking — still green, but pinning nothing. Any future
+    # sanitization pass that changes this value must re-run that table, not just
+    # the suite.
     _PATH = "/srv/genesis"
 
     def test_real_runtime_launch_still_blocks(self):
         """TRUE-POSITIVE CONTROL — TestKeptArms above covers the plain form; this
-        pins the wrapped forms the anchoring has to keep catching."""
+        pins the wrapped forms the arm has to keep catching."""
         assert _run(f"{self._W} python -m genesis serve &").returncode == 2
 
     def test_launch_after_a_separator_blocks(self):
@@ -169,20 +173,27 @@ class TestWrapperArmIsAnchored:
     def test_launch_behind_an_env_assignment_blocks(self):
         assert _run(f"PYTHONPATH=/x {self._W} python -m genesis serve").returncode == 2
 
-    def test_grep_mentioning_it_in_a_repo_path_is_allowed(self):
-        """The measured false positive: the word as a search PATTERN, with the
-        path supplying the second half of the old glob (see _PATH)."""
-        assert _run(f"grep -rn {self._W} {self._PATH}/scripts").returncode == 0
+    def test_launch_behind_a_redirection_blocks(self):
+        """REGRESSION PIN — the fail-open bypass review surfaced in the anchored
+        form, which tolerated leading env assignments but not redirections.
+        MEASURED old=BLOCK / anchored=ALLOW / reverted=BLOCK."""
+        assert _run(f"2>/dev/null {self._W} python -m genesis serve").returncode == 2
 
-    def test_prose_mentioning_it_is_allowed(self):
-        assert _run(f'echo "never use {self._W}" >> {self._PATH}/notes.md').returncode == 0
+    def test_grep_mentioning_it_in_a_repo_path_is_blocked_and_that_is_intended(self):
+        """THE ACCEPTED FRICTION: the word as a search PATTERN, with the path
+        supplying the second half of the glob (see _PATH). Refused. Route around
+        it rather than sharpening the predicate."""
+        assert _run(f"grep -rn {self._W} {self._PATH}/scripts").returncode == 2
+
+    def test_prose_mentioning_it_is_blocked_and_that_is_intended(self):
+        assert _run(f'echo "never use {self._W}" >> {self._PATH}/notes.md').returncode == 2
 
     def test_wrapper_as_an_argument_is_not_a_launch(self):
         """Forward-looking only: this does NOT discriminate old from new. MEASURED
-        old=ALLOW / new=ALLOW — but NOT because of the pipe. The old glob was an
+        old=ALLOW / new=ALLOW — but NOT because of the pipe. The glob is an
         ordered pair (`*wrapper*genesis*`), and here "genesis" appears only BEFORE
-        the wrapper, so it never matched. Reordering the same operands
-        (`grep <wrapper> /srv/genesis/x`) DOES trip the old glob. Kept as a pin
-        against a future widening to any mention of the wrapper, and labelled so it
-        is not mistaken for a regression test."""
+        the wrapper, so it never matches. Reordering the same operands
+        (`grep <wrapper> /srv/genesis/x`) DOES trip it. Kept as a pin against a
+        future widening to any mention of the wrapper, and labelled so it is not
+        mistaken for a regression test."""
         assert _run(f"cat {self._PATH}/scripts/update.sh | grep {self._W}").returncode == 0

@@ -81,24 +81,29 @@ fi
 # pip install -e from/to worktree — catches both explicit worktree paths AND
 # "pip install -e ." run from inside a worktree directory.
 #
-# The installer must sit at COMMAND POSITION (start, or after a ;/&/| separator,
-# optionally behind env assignments or `python -m`) and the editable flag must be
-# a real argv token. The previous predicate was `pip install.*(-e|--editable)`
-# over the whole command, which had two defects: the phrase matched wherever it
-# appeared — a heredoc body, a docstring, a grep pattern, a commit message — and
-# the unanchored `-e` alternative matched INSIDE an unrelated long flag, so
-# `pip install requests --extra-index-url …` tripped it. Same anchoring idiom as
-# the git-push arm below ("^git push|[;&|] *git push").
-# ONE regex, not two: the flag has to belong to the SAME command. A first cut
-# used two independent whole-command greps, which meant
-# `pip install ruff && ls .../worktrees && grep -e foo` blocked — the `-e` came
-# from grep and the worktree marker from the ls path, with no editable install
-# anywhere. That is the exact false-positive class this arm was being fixed for,
-# reintroduced inside the fix. `[^;&|]*` keeps the flag inside the pip segment,
-# and the trailing class accepts `-e.`, `--editable=x` and `-e <path>` while
-# rejecting the `-e` embedded in a longer flag like --extra-index-url.
-_PIP_EDITABLE_INSTALL="(^|[;&|])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*([^[:space:];&|]*python[0-9.]*[[:space:]]+-m[[:space:]]+)?pip[0-9.]*[[:space:]]+install[^;&|]*[[:space:]](-e|--editable)([^A-Za-z0-9_-]|$)"
-if echo "$CMD" | grep -qE "$_PIP_EDITABLE_INSTALL"; then
+# DELIBERATELY OVER-MATCHING — do not "fix" this into an anchored predicate.
+# An earlier revision of this PR keyed it on command position so the phrase could
+# not match inside a heredoc, a grep pattern or a commit message. Cross-model
+# review found three fail-OPEN bypasses in that version, and replaying the same
+# shapes against the sibling arm found five more: a leading redirection
+# (`2>/dev/null <cmd>`), a bundled short flag (`-qe`), and the `command` / `env`
+# wrappers all slipped past the anchor while the substring form caught each one.
+#
+# The reason is structural, not a bug to patch. This arm runs SHELL-side in the
+# global user-level hook, with no access to the canonical tokenizer
+# (scripts/hooks/shell_parse.py), so it is modelling shell grammar with a regex.
+# That is an open set: every named bypass is one member of it, and the review
+# loop finds them one per round without converging.
+#
+# Over-blocking here is friction (MEASURED: 12/6000 real commands); under-
+# blocking risks the editable-install spiral that OOM-crashed this container
+# on 2026-03-16. Friction is the correct side to err on.
+#
+# The durable fix is DELEGATION to a Python guard — the idiom this file
+# already uses for rm and git-clean below, which is how those arms get the
+# real tokenizer without leaving the shell. Filed as a follow-up rather than
+# done inline, because it needs a guard that does not yet exist.
+if echo "$CMD" | grep -qE "pip install.*(-e|--editable)"; then
     _block=0
     # Check 1: explicit worktree path in command
     echo "$CMD" | grep -qiE "worktree" && _block=1
@@ -139,13 +144,29 @@ fi
 
 # git worktree remove --force / -f
 #
-# Anchored for the same reason as the pip arm above, and found the same way: the
-# previous `worktree remove.*(--force|-f )` matched the phrase anywhere, so a
-# read-only `grep -rn 'worktree remove --force' scripts/` was refused. It sits six
-# lines from an arm that was already fixed, which is what fixing the named
-# instance instead of the class looks like.
-_WT_FORCE_REMOVE="(^|[;&|])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git[[:space:]]+([^;&|]*[[:space:]])?worktree[[:space:]]+remove[^;&|]*[[:space:]](--force|-f)([^A-Za-z0-9_-]|$)"
-if echo "$CMD" | grep -qE "$_WT_FORCE_REMOVE"; then
+# DELIBERATELY OVER-MATCHING — do not "fix" this into an anchored predicate.
+# An earlier revision of this PR keyed it on command position so the phrase could
+# not match inside a heredoc, a grep pattern or a commit message. Cross-model
+# review found three fail-OPEN bypasses in that version, and replaying the same
+# shapes against the sibling arm found five more: a leading redirection
+# (`2>/dev/null <cmd>`), a bundled short flag (`-qe`), and the `command` / `env`
+# wrappers all slipped past the anchor while the substring form caught each one.
+#
+# The reason is structural, not a bug to patch. This arm runs SHELL-side in the
+# global user-level hook, with no access to the canonical tokenizer
+# (scripts/hooks/shell_parse.py), so it is modelling shell grammar with a regex.
+# That is an open set: every named bypass is one member of it, and the review
+# loop finds them one per round without converging.
+#
+# Over-blocking here is friction (a read-only `grep` for the phrase is
+# refused); under-blocking loses uncommitted work in a worktree, which is
+# unrecoverable. MEASURED on this arm: 5 of 8 probed shapes regressed from
+# BLOCK to allow under the anchored predicate.
+#
+# Inside a genesis checkout the project-level worktree_cwd_guard.py already covers
+# this with the real parser; this arm is the belt for everywhere else, where
+# no project hooks are loaded.
+if echo "$CMD" | grep -qE "worktree remove.*(--force|-f )"; then
     echo "BLOCKED: git worktree remove --force destroys uncommitted work in the worktree." >&2
     echo "Use git worktree remove without --force, or ask the user first." >&2
     exit 2
