@@ -1027,11 +1027,25 @@ _DOC_STEMS = {
 
 
 def _is_doc_path(path: str) -> bool:
-    """Whether a review finding's file *path* is documentation whose findings do
-    NOT block a merge. FAIL-CLOSED allowlist (see the section comment): anything
-    not provably prose — a source/config/manifest file under ``docs/`` (incl. a
-    ``.txt`` build manifest), a random top-level ``*.md``, a missing path, or a
-    control-char-bearing path — blocks."""
+    """Whether a review finding's file *path* is documentation.
+
+    OWNER DECISION 2026-09-04: a documentation extension is prose AT ANY DEPTH,
+    not only under ``docs/``. Previously a markdown file outside ``docs/`` was
+    treated as code, so a finding on ``AGENTS.md``, ``CLAUDE.md`` or any
+    ``.claude/skills/**/SKILL.md`` could block a merge. The old narrowness was
+    deliberate — a ``.md`` here is often an executable prompt surface rather than
+    prose — and it is being widened knowingly, on one specific ground: the
+    COMMIT-time gate classifies those files independently via
+    ``review_enforcement_commit._is_prompt_surface`` ("behavior surface —
+    reviewable, never docs-skipped"), so editing them still requires an
+    adversarial review. What changes is only whether a REVIEWER'S FINDING on a
+    prose file can block the MERGE. See ``_doc_findings_mode`` for the lever that
+    turns this back on.
+
+    Still FAIL-CLOSED on everything that is not provably prose: a source, config
+    or manifest file (including one under ``docs/``, and including a ``.txt``
+    build manifest), a missing path, or a control-char-bearing path all block.
+    """
     # Reject the COMPLETE control-character range (Unicode Cc): C0 (<0x20), DEL
     # (0x7F), and C1 (0x80-0x9F, incl. NEL 0x85 which ``gh --jq`` emits literally).
     if not path or any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in path):
@@ -1043,11 +1057,64 @@ def _is_doc_path(path: str) -> bool:
     # (1) A known doc-named file with a doc/text/empty extension, at any depth.
     if stem_l in _DOC_STEMS and ext in _DOC_STEM_EXTS:
         return True
-    # (2) A pure documentation format (reStructuredText) anywhere.
-    if ext == "rst":
-        return True
-    # (3) An unambiguous documentation extension under a top-level docs/ directory.
-    return ext in _DOC_EXTS and path.startswith("docs/")
+    # (2) An unambiguous documentation extension, AT ANY DEPTH. ``.txt`` is still
+    # excluded here and remains prose only on a known doc stem (rule 1), because
+    # a build/dep manifest carries it too.
+    return ext in _DOC_EXTS
+
+
+# How a finding on a documentation path is treated. The lever exists so the
+# widening above is reversible without a code change:
+#   skip     — a doc-path finding NEVER scores, at any severity (the default,
+#              and the owner's current policy: prose must not block a merge).
+#   p1_only  — a doc-path P1 scores and can block; lower severities only surface.
+#   score    — doc paths get no special treatment; findings score as code does.
+# Findings are SURFACED in every mode — the lever decides whether they count
+# toward the blocking score, never whether a human sees them.
+_DOC_FINDINGS_MODES = ("skip", "p1_only", "score")
+_DEFAULT_DOC_FINDINGS_MODE = "skip"
+
+
+def _doc_findings_mode() -> str:
+    """Resolve the doc-findings policy: env seam, then local config, then default.
+
+        # ~/.genesis/config/genesis.yaml
+        merge_gate:
+          doc_findings: p1_only
+
+    Unlike its siblings this does NOT fail toward more review, and the asymmetry
+    is deliberate rather than an oversight: the SHIPPED default is the permissive
+    end by owner decision, so there is no stricter default to fall back to. Any
+    unreadable file, parse error, duplicate key, wrong type or unknown value
+    therefore falls back to ``skip`` — the documented default — which is the
+    predictable behaviour, not a silent tightening an operator never asked for.
+    An install that wants findings to block on prose sets the key explicitly.
+    """
+    raw = os.environ.get("_TEST_DOC_FINDINGS_MODE") or os.environ.get(
+        "GENESIS_MERGE_GATE_DOC_FINDINGS"
+    )
+    if raw is None:
+        try:
+            import yaml  # lazy: keep the hook import-light; the genesis venv has pyyaml
+
+            path = os.path.expanduser("~/.genesis/config/genesis.yaml")
+            with open(path) as fh:
+                text = fh.read()
+            # Same duplicate-key line scan as the sibling readers: yaml.safe_load
+            # silently keeps the LAST value for a repeated key, so a badly-merged
+            # file could quietly change policy without anyone editing it.
+            if (
+                len(re.findall(r"(?m)^merge_gate\s*:", text)) > 1
+                or len(re.findall(r"(?m)^\s*doc_findings\s*:", text)) > 1
+            ):
+                raise ValueError("duplicate merge_gate/doc_findings key")
+            cfg = yaml.safe_load(text) or {}
+            raw = (cfg.get("merge_gate") or {}).get("doc_findings")
+        except Exception:
+            raw = None
+    if isinstance(raw, str) and raw.strip().lower() in _DOC_FINDINGS_MODES:
+        return raw.strip().lower()
+    return _DEFAULT_DOC_FINDINGS_MODE
 
 
 # ── Direct-sqlite-write detection ────────────────────────────────────────────
@@ -1295,16 +1362,18 @@ def _check_inline_review_findings(
         if _INLINE_P1_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — treated as acknowledged
-            if _is_doc_path(c.get("path") or ""):
+            if _is_doc_path(c.get("path") or "") and _doc_findings_mode() == "skip":
                 # A P1 on a documentation file (ledger 54eb3752) is surfaced but
                 # does NOT block; a code file (incl. code under docs/) still does.
+                # Under `p1_only` or `score` this falls through and DOES block —
+                # a doc-path P1 is the one a reader most often wants enforced.
                 doc_skipped.append(_inline_title(body))
                 continue
             p1.append(_inline_title(body))
         elif _INLINE_P2_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — maintainer consciously accepted the P2
-            if _is_doc_path(c.get("path") or ""):
+            if _is_doc_path(c.get("path") or "") and _doc_findings_mode() in ("skip", "p1_only"):
                 # A P2 on a doc path is not a code defect — excluded from the SCORE, but
                 # still SURFACED as a NOTE (mirroring doc-path P1s). A documentation-
                 # correctness P2 can be substantive, so it must stay visible in the
@@ -1317,7 +1386,7 @@ def _check_inline_review_findings(
     if doc_skipped:
         print(
             f"NOTE: PR #{pr_num} — {len(doc_skipped)} inline [P1] finding(s) on "
-            f"documentation paths (CHANGELOG/README/LICENSE/NOTICE/docs/**/*.rst) "
+            f"documentation paths (any *.md/*.rst/*.adoc, plus CHANGELOG/README/LICENSE) "
             f"NOT blocking:",
             file=sys.stderr,
         )
