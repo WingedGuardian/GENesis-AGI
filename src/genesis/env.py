@@ -165,6 +165,20 @@ def memory_writebacks_off() -> bool:
     )
 
 
+def daily_budget_disabled() -> bool:
+    """True when the per-provider daily budget ledger must be inert
+    (kill switch). With the switch on, ``DailyBudgetLedger.exhausted()``
+    is always False and ``record()`` no-ops — routing behaves exactly as
+    before the feature existed. Read live per check, so toggling does not
+    require a restart.
+    """
+    return os.environ.get("GENESIS_DAILY_BUDGET_DISABLED", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def memory_rerank_off() -> bool:
     """True when Voyage cross-encoder reranking on the MCP recall tools must be
     suppressed (kill switch).

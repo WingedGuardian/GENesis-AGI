@@ -480,6 +480,7 @@ def test_routing_config_read_includes_call_sites(client):
         ),
     }
     mock_router = MagicMock()
+    mock_router._daily_budget = None
     mock_router.config = mock_cfg
     mock_router.breakers = {"openrouter-sonnet": MagicMock(state=MagicMock(value="closed"))}
     mock_rt = MagicMock()
@@ -495,6 +496,59 @@ def test_routing_config_read_includes_call_sites(client):
     assert "autonomous_executor_reasoning" in data["call_sites"]
     assert data["call_sites"]["autonomous_executor_reasoning"]["chain"] == ["openrouter-sonnet"]
     assert data["call_sites"]["autonomous_executor_reasoning"]["default_paid"] is True
+
+
+def test_routing_config_read_surfaces_daily_budget_counters(client):
+    """WIRING: a daily-exhausted provider reads "closed" in cb_states while
+    every call skips it, so the route must surface the ledger's counters —
+    unit-named, only for daily-limited providers. Uses a REAL ledger: a
+    MagicMock would answer truthy for status() whatever the route did."""
+    from genesis.routing.daily_budget import DailyBudgetLedger
+    from genesis.routing.types import CallResult, ProviderConfig
+
+    limited = ProviderConfig(
+        name="limited", provider_type="groq", model_id="m", is_free=True,
+        rpm_limit=None, open_duration_s=120, rpd_limit=10, tpd_limit=1000,
+    )
+    unlimited = ProviderConfig(
+        name="unlimited", provider_type="google", model_id="m", is_free=True,
+        rpm_limit=None, open_duration_s=120,
+    )
+    import tempfile
+    from pathlib import Path as _P
+    with tempfile.TemporaryDirectory() as td:
+        ledger = DailyBudgetLedger(state_path=_P(td) / "b.json")
+        ledger.record(
+            limited,
+            CallResult(success=True, content="x", input_tokens=5, output_tokens=5),
+        )
+
+        mock_cfg = SimpleNamespace()
+        mock_cfg.disabled_providers = {}
+        mock_cfg.providers = {"limited": limited, "unlimited": unlimited}
+        mock_cfg.call_sites = {}
+        mock_router = MagicMock()
+        mock_router._daily_budget = ledger
+        mock_router.config = mock_cfg
+        mock_router.breakers = {}
+        mock_rt = MagicMock()
+        mock_rt.is_bootstrapped = True
+        mock_rt.router = mock_router
+
+        with patch("genesis.runtime.GenesisRuntime") as MockRT:
+            MockRT.instance.return_value = mock_rt
+            resp = client.get("/api/genesis/routing/config")
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["daily_budget"] == {
+        "limited": {
+            "requests_used": 1, "rpd_limit": 10,
+            "tokens_used": 10, "tpd_limit": 1000,
+            "exhausted": False,
+        },
+    }
+    assert "unlimited" not in data["daily_budget"]
 
 
 def test_routing_config_read_reports_why_a_breaker_is_not_closed(client):
@@ -538,6 +592,7 @@ def test_routing_config_read_reports_why_a_breaker_is_not_closed(client):
     }
     mock_cfg.call_sites = {}
     mock_router = MagicMock()
+    mock_router._daily_budget = None
     mock_router.config = mock_cfg
     mock_router.breakers = reg
     mock_rt = MagicMock()
@@ -568,6 +623,7 @@ def test_routing_config_update_endpoint(client):
     from unittest.mock import AsyncMock
 
     mock_router = MagicMock()
+    mock_router._daily_budget = None
     # scan_dlq_orphans_after_reload is awaited by the async route handler;
     # it must be an AsyncMock returning an int so the `await` resolves.
     mock_router.scan_dlq_orphans_after_reload = AsyncMock(return_value=0)
@@ -606,6 +662,7 @@ def test_routing_config_reload_endpoint(client):
     from unittest.mock import AsyncMock
 
     mock_router = MagicMock()
+    mock_router._daily_budget = None
     mock_router.scan_dlq_orphans_after_reload = AsyncMock(return_value=0)
     mock_rt = MagicMock()
     mock_rt.is_bootstrapped = True

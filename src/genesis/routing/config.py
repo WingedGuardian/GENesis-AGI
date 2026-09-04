@@ -229,6 +229,39 @@ def _detect_mislabeled_free_openrouter(
     return findings
 
 
+def _parse_daily_limit(provider: str, key: str, value) -> int | None:
+    """Validate a daily-budget limit at PARSE time, so the hot-path
+    ``exhausted()`` comparison can trust the type. Env expansion / quoted
+    YAML can deliver strings (same reality the ``enabled`` parser handles),
+    and a string limit would raise inside the router's chain walk — turning
+    this deliberately fail-open feature fail-closed for every chain holding
+    the provider. Zero/negative is rejected outright: a born-exhausted
+    provider is deselected all day with no crossing event to announce it.
+    """
+    if value is None:
+        return None
+    # `int(value)` is NOT integer validation, and the docstring above promised
+    # it was. YAML gives `1.9` as a float and `true` as a bool (a subclass of
+    # int), and both survive: 1.9 truncates to 1 and True IS 1, so a typo in a
+    # user overlay silently becomes a ONE-REQUEST daily limit that deselects the
+    # provider after a single call, with no correction until the UTC day rolls
+    # over (Codex P2, PR #1624). Booleans are rejected before the int check
+    # because `isinstance(True, int)` is True — testing the type after coercion
+    # would let them through.
+    if isinstance(value, bool) or not isinstance(value, int | str):
+        msg = f"provider '{provider}': {key} must be an integer, got {value!r}"
+        raise ValueError(msg)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        msg = f"provider '{provider}': {key} must be an integer, got {value!r}"
+        raise ValueError(msg) from None
+    if parsed <= 0:
+        msg = f"provider '{provider}': {key} must be positive, got {parsed}"
+        raise ValueError(msg)
+    return parsed
+
+
 def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
     """Parse raw YAML dict into a validated RoutingConfig."""
     if not isinstance(raw, dict):
@@ -275,6 +308,8 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
             provider_type=p["type"],
             model_id=p["model"],
             is_free=p.get("free", False),
+            rpd_limit=_parse_daily_limit(name, "rpd_limit", p.get("rpd_limit")),
+            tpd_limit=_parse_daily_limit(name, "tpd_limit", p.get("tpd_limit")),
             rpm_limit=p.get("rpm_limit"),
             open_duration_s=p.get("open_duration_s", 120),
             base_url=p.get("base_url"),

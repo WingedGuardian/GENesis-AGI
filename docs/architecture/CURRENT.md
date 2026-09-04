@@ -1517,12 +1517,23 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: b8232425 2026-09-02
+verified: fcc863f3 2026-09-03
 ```
 
 - **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
   each a free-first → paid-last chain; `never_pays` sites are filtered to
-  free-only. Per-provider circuit breaker (3 failures, exponential backoff
+  free-only. **Daily free-tier budgets** (`daily_budget.py`,
+  `DailyBudgetLedger`): providers may carry `rpd_limit` / `tpd_limit`, each in
+  the provider's OWN unit (Groq caps tokens/day, Gemini requests/day — never
+  converted); when spent, the chain walk DESELECTS the provider until the next
+  UTC day — no breaker trip (budget is not a health signal), one WARNING
+  `provider.budget_exhausted` event at the crossing, counters visible in the
+  routing config route (`daily_budget` map). Counters are router-observed and
+  undercount-biased by design (429s/timeouts never counted; the provider's own
+  429s backstop any undercount, while an overcount would deselect with no
+  correcting signal); state persists to `~/.genesis/routing_budget_state.json`,
+  server-only writer (WS-3c, like the breaker file), kill switch
+  `GENESIS_DAILY_BUDGET_DISABLED`. Per-provider circuit breaker (3 failures, exponential backoff
   capped 30 min — 4h for QUOTA_EXHAUSTED; 429 = backpressure, NOT a breaker
   failure; state persisted cross-process to
   `~/.genesis/circuit_breaker_state.json`). **Probe/call evidence symmetry** —

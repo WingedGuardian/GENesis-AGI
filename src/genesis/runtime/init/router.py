@@ -82,6 +82,8 @@ def init(rt: GenesisRuntime) -> None:
         rt._cost_tracker = cost_tracker
         rt._dead_letter_queue = dead_letter
 
+        from genesis.routing.daily_budget import DailyBudgetLedger
+
         rt._router = Router(
             config=config,
             breakers=breakers,
@@ -90,6 +92,9 @@ def init(rt: GenesisRuntime) -> None:
             delegate=delegate,
             event_bus=rt._event_bus,
             dead_letter=dead_letter,
+            # The server is the single WRITER of the daily-budget state file
+            # (same WS-3c rule as the breaker state file).
+            daily_budget=DailyBudgetLedger(),
         )
         if rt._activity_tracker:
             rt._router.set_activity_tracker(rt._activity_tracker)

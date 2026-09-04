@@ -59,6 +59,14 @@ providers:
     profile: gpt-oss-120b
     free: true
     rpm_limit: 30
+    # Daily free-tier budget, each cap in Groq's OWN unit (never converted):
+    # tpd_limit measured from Groq's own 429 text ("tokens per day (TPD):
+    # Limit 200000"); rpd_limit per the documented free tier (1K RPD, cited
+    # above). When spent, the router DESELECTS this provider until the next
+    # UTC day instead of burning the rest of the day on 429s. NOTE: the real
+    # budget is per ACCOUNT — keep one provider entry per Groq account.
+    rpd_limit: 1000
+    tpd_limit: 200000
     open_duration_s: 120
     params:
       extra_body:
@@ -76,6 +84,10 @@ providers:
     profile: gemini-3.5-flash
     free: true
     rpm_limit: 15
+    # NO rpd_limit yet, deliberately: live 429s show "limit: 20" and Genesis
+    # peaks well under 20/min, so a ~20 requests/DAY cap is INFERRED but not
+    # proven. A wrong shipped daily cap would deselect the provider on every
+    # install. Measure (count successes per UTC day vs 20) before setting.
     open_duration_s: 120
     # gemini-3.5-flash reasons by default (~70-90 thinking tokens even on trivial
     # prompts → empty content at tight max_tokens + free-tier TPM bloat). This is

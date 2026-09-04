@@ -13,6 +13,7 @@ from genesis.observability.spans import SpanKind, start_span
 from genesis.observability.types import Severity, Subsystem
 from genesis.routing.circuit_breaker import CircuitBreakerRegistry
 from genesis.routing.cost_tracker import CostTracker
+from genesis.routing.daily_budget import DailyBudgetLedger
 from genesis.routing.dead_letter import DeadLetterQueue
 from genesis.routing.degradation import DegradationTracker
 from genesis.routing.rate_gate import RateGateRegistry
@@ -49,6 +50,7 @@ class Router:
         delegate: CallDelegate,
         event_bus: GenesisEventBus | None = None,
         dead_letter: DeadLetterQueue | None = None,
+        daily_budget: DailyBudgetLedger | None = None,
     ) -> None:
         self.config = config
         self.breakers = breakers
@@ -57,6 +59,7 @@ class Router:
         self.delegate = delegate
         self._event_bus = event_bus
         self._dead_letter = dead_letter
+        self._daily_budget = daily_budget
         self._activity_tracker: ProviderActivityTracker | None = None
         self._rate_gates = self._build_rate_gates(config)
 
@@ -294,6 +297,17 @@ class Router:
                 failed_providers.append(provider_name)
                 continue
 
+            # Skip a provider whose provider-side DAILY budget (rpd/tpd) is
+            # spent — deselection, not a breaker trip (budget is not a
+            # health signal), checked before the rate gate so we never sleep
+            # for a provider we will not call. Limits come from the live
+            # config, so a dashboard reload takes effect immediately.
+            if self._daily_budget is not None and self._daily_budget.exhausted(
+                provider_cfg
+            ):
+                failed_providers.append(provider_name)
+                continue
+
             # Skip paid providers if budget exceeded (unless override)
             if (
                 not provider_cfg.is_free
@@ -306,6 +320,20 @@ class Router:
             # Rate gate — pace requests per provider RPM limit
             await self._rate_gates.acquire(provider_name)
 
+            # RECHECK after the gate. The check above happened BEFORE a sleep
+            # that can last seconds, and `acquire` queues concurrent callers —
+            # so several can pass a not-yet-exhausted budget, queue, and each
+            # resume into the delegate after an earlier one has already crossed
+            # the limit. The first check is still worth having (it avoids
+            # sleeping for a provider we will not call); it is simply not the
+            # last word, because its answer can change while we wait
+            # (Codex P2, PR #1624).
+            if self._daily_budget is not None and self._daily_budget.exhausted(
+                provider_cfg
+            ):
+                failed_providers.append(provider_name)
+                continue
+
             # Try with retry (timed for activity tracking)
             t0 = time.monotonic()
             result = await self._try_with_retry(
@@ -314,6 +342,46 @@ class Router:
             )
             latency_ms = (time.monotonic() - t0) * 1000
             attempts += 1
+
+            # Count the visit against the provider's daily budget (requests/
+            # tokens, undercount-biased — see daily_budget.py). On the
+            # not-exhausted -> exhausted crossing, say so once.
+            if self._daily_budget is not None:
+                try:
+                    crossed = self._daily_budget.record(provider_cfg, result)
+                except Exception:
+                    logger.warning(
+                        "Daily budget record failed for %s", provider_name,
+                        exc_info=True,
+                    )
+                else:
+                    if crossed and self._event_bus:
+                        # Own try/except: the call already succeeded and
+                        # spent tokens — an emit failure must not fail it.
+                        try:
+                            budget_now = self._daily_budget.status(provider_cfg) or {}
+                            spent = [
+                                f"{label} {budget_now.get(used)}/{budget_now.get(limit)}"
+                                for label, used, limit in (
+                                    ("requests", "requests_used", "rpd_limit"),
+                                    ("tokens", "tokens_used", "tpd_limit"),
+                                )
+                                if budget_now.get(limit) is not None
+                            ]
+                            await self._event_bus.emit(
+                                Subsystem.ROUTING, Severity.WARNING,
+                                "provider.budget_exhausted",
+                                f"{provider_name} daily budget spent — "
+                                f"deselected until the next UTC day "
+                                f"({', '.join(spent)})",
+                                provider=provider_name,
+                                **budget_now,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "budget_exhausted emit failed for %s",
+                                provider_name, exc_info=True,
+                            )
 
             # Record to activity tracker (fire-and-forget, never breaks caller)
             if self._activity_tracker:
