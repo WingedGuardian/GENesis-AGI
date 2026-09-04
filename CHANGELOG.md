@@ -20,6 +20,31 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   days after a failed last run (matching the job-health floor), while
   non-critical sites keep the tight 24h window so long-abandoned one-off
   sites still don't nag.
+- **Two branches can no longer pick the same database-migration number.** Each
+  new migration is now named by the UTC time it was written rather than by the
+  next free number, so nobody has to check what anyone else took — and two
+  people working at once cannot both claim the same one. The numbers already in
+  use are frozen exactly as they are; an existing install is unaffected and runs
+  nothing again. A migration that has already shipped can no longer be renamed
+  or removed either: installs that already ran it would never run its
+  replacement, so the two would drift apart with nothing to notice. And a
+  migration whose name is subtly wrong — a digit too few, filed in the wrong
+  folder — is now reported instead of being quietly skipped, which is what used
+  to happen: the file simply never ran, and the change that needed it shipped
+  without it.
+- **The wrong-repo commit check now says when it did not run.** It works out which
+  repository a `git add`/`commit` targets by reading the command text, and when that
+  text did not determine a directory — a shell variable, a command substitution, a
+  glob — it joined the unexpanded token onto the current path anyway. The result
+  cannot exist, so every lookup against it failed and the check was skipped through
+  the same branch that means "this repository is not covered". A command it could
+  not inspect was therefore indistinguishable from one it deliberately ignored.
+  It now reports that the check did not run, on **119 of 2,264 (5.3%)** real
+  `add`/`commit` commands. Deliberately an advisory and **not** a new refusal:
+  replaying those same 119 through the old behaviour, it blocked **0** of them —
+  it was failing open, so nobody has ever been wrongly stopped by this, and making
+  it refuse would newly stop 119 ordinary commands to fix a silence.
+
 - **The cold-marketing campaign no longer re-pitches the same person.** Once a
   marketing pitch is delivered to a prospect, that prospect is marked contacted and
   drops out of the campaign's target list — previously nothing recorded the contact,
