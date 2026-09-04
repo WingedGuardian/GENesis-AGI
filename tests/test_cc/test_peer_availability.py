@@ -28,6 +28,7 @@ from genesis.cc import peer_availability as PA
 from genesis.cc.exceptions import (
     CCMCPError,
     CCNetworkOfflineError,
+    CCProcessError,
     CCQuotaExhaustedError,
     CCRateLimitError,
     CCSessionError,
@@ -40,6 +41,11 @@ def _hermetic_home(tmp_path, monkeypatch):
     # genesis_home() honors GENESIS_HOME — point it at a tmp dir so tests never
     # touch the real ~/.genesis/cc_peer_availability.json.
     monkeypatch.setenv("GENESIS_HOME", str(tmp_path))
+    # The read-path complaint suppressor is deliberate module state (see
+    # `_last_read_complaint`), so it survives between tests and would make any
+    # warning assertion depend on execution ORDER — a leaked-state false green,
+    # and the hardest kind to attribute. Reset it with the rest of the world.
+    monkeypatch.setattr(PA, "_last_read_complaint", {})
     return tmp_path
 
 
@@ -749,3 +755,204 @@ def test_reason_must_be_a_member_even_when_coherence_would_pass(tmp_path):
               "reset_at": "", "limit_kind": ""},
     }}))
     assert PA.read_peer("p") is None, "a foreign reason was repaired instead of rejected"
+
+
+def test_public_classifier_never_raises_on_a_hostile_exception():
+    """R5-P1. The PUBLIC alias is called from the failover loop's retry gate,
+    which sits OUTSIDE ``note_failure``'s guard.
+
+    Splitting classification out of recording (so callers could ask the question
+    separately) reintroduced the exact outage-amplifier shape I2 exists to
+    prevent: ``_is_provider_refusal`` calls ``str(exc)`` on a foreign exception,
+    and an unguarded raise there escapes into the peer loop and abandons every
+    REMAINING peer. The guard belongs on the shared entry point, not on one of
+    its two callers.
+    """
+
+    class Hostile(CCProcessError):
+        def __str__(self):
+            raise RuntimeError("hostile __str__")
+
+    assert PA.is_provider_refusal(Hostile()) is False
+
+
+def test_a_persistently_malformed_file_warns_once_not_once_per_read(tmp_path, caplog):
+    """R5-P2. ``read()`` runs on EVERY health poll, and a bad row survives until
+    some failover happens to rewrite the file — which only occurs during a
+    home-model outage.
+
+    So a single malformed row emitted an identical WARNING forever, burying the
+    real ones. The drop count is already collapsed to one line per read; the
+    missing half is collapsing it across reads. The condition, not the read, is
+    what deserves a line.
+    """
+    f = tmp_path / "cc_peer_availability.json"
+    f.write_text(json.dumps({"peers": {
+        "good-1": _valid_row(),
+        "bad-1": {"available": "yes"},
+    }}))
+
+    with caplog.at_level("WARNING", logger="genesis.cc.peer_availability"):
+        for _ in range(5):
+            assert set(PA.read()) == {"good-1"}, "fixture must drop exactly one row"
+    first = [r for r in caplog.records if "unusable peer availability" in r.getMessage()]
+    assert len(first) == 1, f"one condition, five reads, {len(first)} warnings"
+
+    # A CHANGED condition is news again — suppression must not silence a file
+    # that got worse.
+    caplog.clear()
+    f.write_text(json.dumps({"peers": {
+        "good-1": _valid_row(),
+        "bad-1": {"available": "yes"},
+        "bad-2": {"available": "no"},
+    }}))
+    with caplog.at_level("WARNING", logger="genesis.cc.peer_availability"):
+        PA.read()
+        PA.read()
+    second = [r for r in caplog.records if "unusable peer availability" in r.getMessage()]
+    assert len(second) == 1, f"a worsened file must re-warn exactly once, got {len(second)}"
+
+
+# ── SUPPLY, not just the predicate ───────────────────────────────────────────
+#
+# The tests above hand `is_provider_refusal` an exception they constructed. That
+# proves the predicate reads the TYPE; it cannot prove production ever produces
+# that type. It did not: `_classify_error` returns CCMCPError — a SIBLING of
+# CCProcessError, not a subclass — for any output mentioning MCP, and that branch
+# runs BEFORE the generic fallback over the combined stderr+stdout. A drained
+# account whose stderr carries an ordinary MCP start-up line was therefore
+# invisible to a predicate that matched CCProcessError alone.
+
+
+@pytest.mark.parametrize("stderr_text,stdout_text", [
+    ("API error: insufficient balance", ""),
+    ("API Error (HTTP 402): Insufficient credits", ""),
+    ("error: insufficient_quota", "step completed"),
+])
+def test_a_drained_account_is_evidence_when_the_classifier_can_see_it(
+    stderr_text, stdout_text,
+):
+    """Built by routing REAL provider text through the REAL classifier.
+
+    Constructing the exception directly proves only that the predicate reads the
+    TYPE; it cannot prove production produces that type. This is the supply side.
+    """
+    from genesis.cc.invoker import CCInvoker
+
+    exc = CCInvoker._classify_error(stderr_text, stdout_text)
+    assert PA.is_provider_refusal(exc) is True, (
+        f"a drained account typed as {type(exc).__name__} was not read as evidence"
+    )
+
+
+@pytest.mark.parametrize("stderr_text,stdout_text", [
+    ("MCP server 'genesis-health' started\nAPI error: insufficient balance", ""),
+    ("API error: insufficient balance", "mcp__genesis-health__health_status"),
+])
+def test_a_drained_account_is_INVISIBLE_when_mcp_shadows_the_classifier(
+    stderr_text, stdout_text,
+):
+    """A KNOWN GAP, pinned as a DECISION rather than left as an accident.
+
+    `_classify_error` tests `"mcp" in lower` over the combined stderr+stdout
+    BEFORE its generic fallback, and CCMCPError is a sibling of CCProcessError —
+    so a drained account whose output mentions MCP anywhere is typed CCMCPError
+    and never recorded. An adversarial audit called this a defect and proposed
+    widening the predicate to CCMCPError. That was tried and reverted: it
+    reverses the module's central invariant, and
+    `test_an_mcp_error_mentioning_funds_is_not_a_peer_refusal` pins the exact
+    false positive it would create. A wrong "down" is worse than no record.
+
+    If this test ever fails, someone has widened the predicate — read that test
+    and the tradeoff in `_BALANCE_REFUSALS`' comment before deciding they were
+    right to.
+    """
+    from genesis.cc.invoker import CCInvoker
+
+    exc = CCInvoker._classify_error(stderr_text, stdout_text)
+    assert type(exc).__name__ == "CCMCPError", "the shadowing premise no longer holds"
+    assert PA.is_provider_refusal(exc) is False
+
+
+def test_every_read_path_complaint_is_deduplicated_not_just_the_two_i_noticed(
+    tmp_path, caplog,
+):
+    """The first flood fix covered `dropped` and `over_cap` and left the three
+    complaints in `_read_raw` untouched — including the corrupt-JSON line, which
+    carries a full traceback on EVERY health poll and is far likelier than a
+    single bad row (a truncated or foreign file corrupts wholesale).
+
+    Fixing the two that were noticed, in a change whose whole point was covering
+    populations, is the failure this test exists to prevent recurring.
+    """
+    f = tmp_path / "cc_peer_availability.json"
+
+    def _reads(n=4):
+        for _ in range(n):
+            PA.read()
+
+    with caplog.at_level("WARNING", logger="genesis.cc.peer_availability"):
+        f.write_text("{not json at all")
+        _reads()
+        corrupt = [r for r in caplog.records if "Corrupt" in r.getMessage()]
+        assert len(corrupt) == 1, f"corrupt-file warning fired {len(corrupt)}x over 4 reads"
+
+        caplog.clear()
+        f.write_text(json.dumps({"peers": {"p" * PA._MAX_STATE_BYTES: {"available": True}}}))
+        _reads()
+        over = [r for r in caplog.records if "refusing to parse" in r.getMessage()]
+        assert len(over) == 1, f"oversize warning fired {len(over)}x over 4 reads"
+
+
+def test_a_different_bad_row_at_the_same_count_is_still_news(tmp_path, caplog):
+    """Keying the suppressor on the COUNT swallowed a brand-new corruption
+    whenever it replaced an old one one-for-one — while the comment above it
+    claimed a file that breaks again is news a second time. Identity, not count.
+    """
+    f = tmp_path / "cc_peer_availability.json"
+    with caplog.at_level("WARNING", logger="genesis.cc.peer_availability"):
+        f.write_text(json.dumps({"peers": {"ok": _valid_row(), "bad-A": {"available": "yes"}}}))
+        PA.read()
+        caplog.clear()
+        # Same count, different peer, different defect.
+        f.write_text(json.dumps({"peers": {"ok": _valid_row(), "bad-B": {"available": 1}}}))
+        PA.read()
+    hits = [r for r in caplog.records if "unusable peer availability" in r.getMessage()]
+    assert len(hits) == 1, "a new bad row was swallowed because the count matched"
+
+
+def test_a_repaired_then_re_broken_file_warns_again(tmp_path, caplog):
+    """The suppressor's docstring promises that clearing a condition RE-ARMS it —
+    a file that gets fixed and then breaks again is news a second time.
+
+    A mutation sweep caught that promise untested: deleting the re-arm entirely
+    left every test green, which means the sentence was documentation of an
+    intention rather than of a behaviour.
+
+    Targeted at the row-rejection condition specifically. The file-level
+    conditions key on (size, mtime), which re-arms on its own because a rewritten
+    file has a new identity — so deleting the explicit re-arm is BEHAVIOURALLY
+    NULL there and a test written against it proves nothing. Only a condition
+    whose identity can REPEAT exactly can catch this.
+    """
+    f = tmp_path / "cc_peer_availability.json"
+    broken = {"peers": {"ok": _valid_row(), "bad-A": {"available": "yes"}}}
+    good = {"peers": {"ok": _valid_row()}}
+
+    with caplog.at_level("WARNING", logger="genesis.cc.peer_availability"):
+        f.write_text(json.dumps(broken))
+        PA.read()
+        assert [r for r in caplog.records if "unusable" in r.getMessage()], "no first warning"
+
+        # Repaired: the condition no longer holds, so it must be forgotten.
+        caplog.clear()
+        f.write_text(json.dumps(good))
+        assert set(PA.read()) == {"ok"}, "the repaired file must parse"
+
+        # Broken again, IDENTICALLY. Same rejected row, same count — so the
+        # identity alone cannot distinguish this from the first occurrence.
+        caplog.clear()
+        f.write_text(json.dumps(broken))
+        PA.read()
+    again = [r for r in caplog.records if "unusable" in r.getMessage()]
+    assert len(again) == 1, f"a re-broken file must warn again, got {len(again)}"

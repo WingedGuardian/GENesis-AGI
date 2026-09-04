@@ -265,6 +265,20 @@ verified: 29a382e7 2026-09-03
   peer re-ran the same prompt with `skip_permissions=True` and the full user-scoped
   toolset. Every advance path is now gated on effects, and a turn that acted but
   produced no answer ends with an explicit message rather than a silent retry.
+  The gate reads `StreamEvent.event_type`, which rests on one measured property of
+  an EXTERNAL surface: CC's `stream-json` emits ONE content block per `assistant`
+  line, so `from_raw`'s first-block-wins parse loses nothing. MEASURED 2026-09-04
+  against CC 2.1.246, 8/8 lines across two probes, 0 multi-block — including a
+  thinking→text→tool_use turn and three PARALLEL tool calls, which the API packs
+  into a single message and the CLI splits across three lines. The version is
+  part of the claim: this is a property of a CLI build, and eight lines is a thin
+  denominator for a negative property across versions and modes. A review round
+  argued the opposite from the code shape alone; the probe is what settled it, and
+  the assumption is RECORDED by a canary in `invoker.run_streaming` rather than
+  defended against with code for a condition that does not occur. That canary is a
+  log line and nothing polls it — it makes a future batching CC diagnosable in one
+  grep, it does not alert. If it ever fires, this gate and `invoker`'s
+  `collected_text` both need revisiting.
 - **Cross-session awareness — how concurrent CC sessions perceive each other.**
   LIVE. Two DISTINCT stores answer two different questions, and conflating them
   is the trap: `cc_sessions` (+ a `/proc` walk, `observability/cc_slots.

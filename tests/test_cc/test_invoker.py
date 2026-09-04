@@ -2246,3 +2246,94 @@ async def test_streaming_escalates_when_leader_exits_but_group_survives(
     import signal as _signal
 
     assert (99992, _signal.SIGKILL) in calls
+
+
+@pytest.mark.asyncio
+async def test_a_multi_block_assistant_line_warns_exactly_once(invoker, caplog):
+    """Pin the assumption the stream loop relies on, instead of coding around a
+    condition that does not occur.
+
+    MEASURED 2026-09-04 against the real surface (`claude -p --output-format
+    stream-json --verbose`, two probes): 8/8 `assistant` lines carried exactly
+    ONE content block, 0 multi-block — including a thinking→text→tool_use turn
+    and three PARALLEL tool calls, which the API packs into a single message and
+    the CLI splits across three lines. `StreamEvent.from_raw` keeps only the
+    first recognized block, which is therefore lossless here.
+
+    That is an external CLI's wire format, not a contract. If a future CC starts
+    batching, this fails LOUDLY rather than silently dropping tool calls and
+    answer text. Once per invocation, not once per line — the same flood shape
+    fixed on the peer-availability read path.
+    """
+    events = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "hmm"},
+            {"type": "tool_use", "name": "Read", "input": {}},
+        ]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "hi"},
+            {"type": "tool_use", "name": "Bash", "input": {}},
+        ]}},
+        {
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "done", "session_id": "s9", "total_cost_usd": 0.01,
+            "duration_ms": 100, "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {},
+        },
+    ]
+    mock_proc = AsyncMock()
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.wait = AsyncMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.returncode = 0
+
+    with (
+        caplog.at_level("WARNING", logger="genesis.cc.invoker"),
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    hits = [r for r in caplog.records if "content blocks" in r.getMessage()]
+    assert len(hits) == 1, f"two multi-block lines, {len(hits)} warnings (want 1)"
+
+
+@pytest.mark.asyncio
+async def test_the_canary_does_not_fire_on_an_unrecognized_block(invoker, caplog):
+    """A canary that cries wolf trains its reader to ignore it.
+
+    `from_raw` returns on the first RECOGNIZED block, so a line pairing an
+    unrecognized block (`redacted_thinking`, or any future type) with one
+    recognized block loses nothing. Counting raw list length would fire here and
+    devalue every real firing.
+    """
+    events = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "redacted_thinking", "data": "x"},
+            {"type": "text", "text": "hi"},
+        ]}},
+        {
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "done", "session_id": "s10", "total_cost_usd": 0.01,
+            "duration_ms": 100, "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {},
+        },
+    ]
+    mock_proc = AsyncMock()
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.wait = AsyncMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.returncode = 0
+
+    with (
+        caplog.at_level("WARNING", logger="genesis.cc.invoker"),
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+    ):
+        output = await invoker.run_streaming(CCInvocation(prompt="x"))
+
+    assert output.text == "done"
+    hits = [r for r in caplog.records if "content blocks" in r.getMessage()]
+    assert not hits, "canary fired on a line from_raw parses losslessly"

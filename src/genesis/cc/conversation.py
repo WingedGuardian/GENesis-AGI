@@ -10,7 +10,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from genesis.cc import rate_limit_park, roster
+from genesis.cc import peer_availability, rate_limit_park, roster
 from genesis.cc.context_injector import ContextInjector
 from genesis.cc.exceptions import (
     CCError,
@@ -118,6 +118,17 @@ def note_stream_effect(streamed: dict, ev: StreamEvent) -> None:
     double-outputs), ``tools`` reached the world (a retry can send a second
     message or write a second row). Callers read them via the failover loop's
     ``_streamed_text`` / ``_executed_tools`` predicates.
+
+    Reads ``event_type`` rather than re-deriving the answer from ``ev.raw``.
+    ``StreamEvent.from_raw`` keeps only the first recognized content block, so
+    that would matter if CC ever batched blocks onto one ``assistant`` line — but
+    MEASURED 2026-09-04 on the real surface, it does not: 8/8 lines across two
+    probes carried exactly one block, 0 multi-block, including a
+    thinking→text→tool_use turn and three PARALLEL tool calls (which the API
+    packs into one message and the CLI splits across three lines). Scanning
+    ``ev.raw`` here would be indirection against a condition that does not occur.
+    The assumption is pinned where it is relied upon, by the canary in
+    ``invoker.run_streaming``; if that ever fires, revisit this.
     """
     if ev.event_type == "text" and ev.text:
         streamed["text"] = True
@@ -1088,16 +1099,34 @@ class ConversationLoop:
             # network is not a stale peer resume — retrying fresh won't help and
             # must not mark the sticky peer session stale.
             raise
-        except CCError:
+        except CCError as exc:
             # Don't re-run: nothing to recover if already fresh, never once answer
             # text has reached the user (would double-output), and never once the
             # attempt executed TOOLS — this is a full re-run of the same prompt on
             # the same peer, so it repeats any effect the first attempt had. The
             # tool guard was missing while only `text` was tracked.
+            #
+            # And never for a provider refusal. A DRAINED prepaid account arrives
+            # here as a generic CCProcessError rather than CCQuotaExhaustedError,
+            # because the invoker's global classifier deliberately does not know
+            # the balance phrases (teaching it would let a drained BACKUP report
+            # the primary as down — see peer_availability._BALANCE_REFUSALS). So
+            # it lands on this branch and buys a full second invocation of the
+            # same dead peer before the caller ever classifies it. A fresh
+            # session cannot refill an empty balance.
+            #
+            # Module-level import, deliberately: a DEFERRED import here would sit
+            # inside the `except` block, and an ImportError from it is not a
+            # CCError — it would skip both handlers in the peer loop, land on the
+            # outer `except Exception`, and abandon every remaining peer. That is
+            # the same outage-amplifier shape the never-raises guard exists to
+            # prevent. `peer_availability` imports only stdlib and `genesis.env`,
+            # so there is no cycle to work around.
             if (
                 inv.resume_session_id is None
                 or (streamed and streamed.get("text"))
                 or (effects and effects.get("tools"))
+                or peer_availability.is_provider_refusal(exc)
             ):
                 raise
             logger.warning(
@@ -1122,7 +1151,7 @@ class ConversationLoop:
         path. Returns the formatted reply on success, or None to fall through to
         contingency. Never raises (failover must not break the turn)."""
         try:
-            from genesis.cc import fallback_state, peer_availability
+            from genesis.cc import fallback_state
             home = roster.active_model()
             # A resume turn carries no system prompt (identity lives in the home CC
             # session being resumed). The peer runs a FRESH session, so re-assemble

@@ -974,3 +974,66 @@ async def test_a_balance_refusal_after_streaming_is_not_cleared_as_available(
     assert st is not None and st.available is False, (
         "a drained peer was recorded AVAILABLE — a refusal was read as a decline"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_balance_refusal_does_not_trigger_a_fresh_sticky_retry(
+    loop, invoker, monkeypatch,
+):
+    """R5-P2. A DRAINED prepaid account reaches us as a generic ``CCProcessError``,
+    because the invoker's global classifier deliberately does not know the
+    balance phrases (teaching it would let a drained BACKUP report the primary as
+    down). So the refusal lands on the generic stale-resume branch and buys a
+    redundant full re-invocation on the same dead peer before the outer handler
+    ever gets to classify it.
+
+    A fresh session cannot refill an empty balance. Re-raise instead, and let the
+    peer loop advance.
+    """
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+    invoker.run_streaming = AsyncMock(
+        side_effect=CCProcessError("API error: insufficient balance"),
+    )
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+    loop._session_fallback_session = lambda s: {
+        "roster_model": "peer-a", "cc_session_id": "sticky-1",
+    }
+
+    await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x",
+        on_event=AsyncMock(), streamed={"text": False, "tools": False},
+    )
+    assert invoker.run_streaming.await_count == 1, (
+        "retried a drained account with a fresh session"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_stale_resume_still_retries_fresh(loop, invoker, monkeypatch):
+    """The other direction of the same gate, so the fix cannot be satisfied by
+    simply never retrying. An ambiguous CCError on a sticky resume is exactly
+    what the fresh retry exists for."""
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+    invoker.run_streaming = AsyncMock(side_effect=CCMCPError("stale resume"))
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+    loop._session_fallback_session = lambda s: {
+        "roster_model": "peer-a", "cc_session_id": "sticky-1",
+    }
+
+    await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x",
+        on_event=AsyncMock(), streamed={"text": False, "tools": False},
+    )
+    assert invoker.run_streaming.await_count == 2, "the fresh retry was lost"

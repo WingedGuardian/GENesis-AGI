@@ -177,24 +177,40 @@ def _read_raw() -> dict:
         # Bound the INPUT, not just the parsed result: this runs synchronously on
         # the health path, and discarding rows after json.loads() has already
         # paid the whole memory spike. Anything this large is not a file we wrote.
-        size = path.stat().st_size
+        # File IDENTITY for de-duplicating the three complaints below. Every one
+        # of them survives until a failover rewrites the file, so each was
+        # re-logging on every health poll — the corrupt-JSON one with a full
+        # traceback. Keying on (size, mtime) means a rewritten file is a NEW
+        # condition and warns again, while an unchanged bad file stays quiet.
+        stat = path.stat()
+        size, ident = stat.st_size, (stat.st_size, stat.st_mtime_ns)
         if size > _MAX_STATE_BYTES:
-            logger.warning(
+            _complain_on_change(
+                "oversize",
                 "%s is %d bytes (cap %d) — refusing to parse it",
                 _STATE_FILE, size, _MAX_STATE_BYTES,
+                identity=ident,
             )
             return {}
+        _complaint_resolved("oversize")
         raw = path.read_text(encoding="utf-8", errors="replace")
     except (FileNotFoundError, OSError):
         return {}
     except Exception:  # pragma: no cover — defence in depth on a hot path
-        logger.warning("Unreadable %s — treating as empty", _STATE_FILE, exc_info=True)
+        _complain_on_change(
+            "unreadable", "Unreadable %s — treating as empty", _STATE_FILE,
+            identity=(_STATE_FILE,), exc_info=True,
+        )
         return {}
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError, ValueError):
-        logger.warning("Corrupt %s — treating as empty", _STATE_FILE, exc_info=True)
+        _complain_on_change(
+            "corrupt", "Corrupt %s — treating as empty", _STATE_FILE,
+            identity=ident, exc_info=True,
+        )
         return {}
+    _complaint_resolved("corrupt")
     if not isinstance(data, dict):
         return {}
     peers = data.get("peers")
@@ -298,20 +314,83 @@ def _decode_row(peer: object, raw: object) -> tuple[str, dict] | None:
     }
 
 
+#: Last payload this process warned about, per CONDITION. The read path runs on
+#: EVERY health poll and a bad file survives until some failover rewrites it —
+#: which only happens during a home-model outage. Warning per READ therefore
+#: meant one malformed file logged an identical line forever and buried the real
+#: ones; the corrupt-JSON line carried a full traceback each time.
+#:
+#: Keyed by condition AND payload, so this covers the whole population of
+#: read-path complaints rather than the two that were noticed first — and so a
+#: DIFFERENT corruption re-warns even when the count is unchanged. An earlier
+#: revision keyed on the dropped COUNT alone and silently swallowed a new bad row
+#: substituted for an old one, while its comment claimed otherwise.
+#:
+#: Process-local and best-effort: concurrent readers can race to a duplicate or a
+#: skipped line. Acceptable for log volume, and would not be for anything
+#: load-bearing — nothing reads this but the warnings it gates.
+_last_read_complaint: dict[str, tuple] = {}
+
+
+def _complain_on_change(
+    key: str,
+    msg: str,
+    *args: object,
+    identity: tuple | None = None,
+    exc_info: bool = False,
+) -> None:
+    """Warn only when this condition's payload CHANGES. Never raises.
+
+    *identity* separates WHAT MAKES IT THE SAME COMPLAINT from what gets logged,
+    so a message can report a count while de-duplicating on the underlying set —
+    which is what stops a different bad row at an unchanged count from being
+    swallowed. It also keeps unbounded foreign strings (a rejected peer key, a
+    parser message) out of the log line while still distinguishing them.
+
+    Clearing a condition re-arms it: a file that gets fixed and then breaks again
+    is news a second time.
+    """
+    try:
+        payload = identity if identity is not None else args
+        if _last_read_complaint.get(key) == payload:
+            return
+        _last_read_complaint[key] = payload
+        logger.warning(msg, *args, exc_info=exc_info)
+    except Exception:  # pragma: no cover — a logging helper must never escalate
+        pass
+
+
+def _complaint_resolved(key: str) -> None:
+    """Re-arm *key* once its condition no longer holds. Never raises.
+
+    Load-bearing only where an identity can REPEAT exactly — the row-rejection
+    keys, whose identity is the set of rejected names. The file-level keys are
+    identified by (size, mtime), so a rewritten file already looks new and this
+    is belt-and-braces for them; a mutation sweep proved that by surviving until
+    the test was pointed at a repeatable identity. Kept uniform anyway, so that
+    changing an identity's shape cannot silently drop the property.
+    """
+    _last_read_complaint.pop(key, None)
+
+
 def read() -> dict[str, PeerStatus]:
     """Every recorded peer's last-observed status. Never raises.
 
-    Detail is re-bounded on read so a file written by an older/other build cannot
-    push an oversized blob into a health snapshot (and from there into an LLM
-    context via the health MCP tool).
+    Every row is re-validated here, not merely on write: this file is copied whole
+    into every health snapshot and from there into an LLM context via the health
+    MCP tool, and a file written by an older or foreign build is exactly the input
+    that has no guarantees. A row is either what ``_decode_row`` accepts or it is
+    DROPPED — never repaired.
     """
     out: dict[str, PeerStatus] = {}
-    dropped = 0
+    rejected: list[str] = []
     try:
         for name, raw in _read_raw().items():
             pair = _decode_row(name, raw)
             if pair is None:
-                dropped += 1
+                # Kept for the de-dup IDENTITY only — never logged, so an
+                # unbounded foreign key cannot reach a log line.
+                rejected.append(repr(name))
                 continue
             key, row = pair
             out[key] = PeerStatus(peer=key, **row)
@@ -320,20 +399,32 @@ def read() -> dict[str, PeerStatus]:
         # health snapshot path and an earlier revision could raise ImportError
         # through a deferred import. A partial map beats an exception here.
         logger.warning("peer availability read failed — returning what parsed", exc_info=True)
-    if dropped:
-        # ONE line per read, not one per row: this is on the health path and a
-        # single malformed file would otherwise re-log on every snapshot forever.
-        logger.warning("ignored %d unusable peer availability row(s)", dropped)
+    if rejected:
+        # De-duplicated on the rejected SET, reported as a count: a different bad
+        # row at the same count is a new condition and still gets a line.
+        _complain_on_change(
+            "unusable_rows",
+            "ignored %d unusable peer availability row(s)",
+            len(rejected),
+            identity=tuple(sorted(rejected)),
+        )
+    else:
+        _complaint_resolved("unusable_rows")
     if len(out) > _MAX_PEERS:
         # The cap must hold HERE, not only on write. This file is copied whole
         # into every health snapshot and from there into an LLM context, while
         # write-side eviction only runs when an observation is recorded — which
         # happens only during a home-model outage. A foreign or older file would
         # otherwise inflate every snapshot for days.
-        dropped = len(out) - _MAX_PEERS
-        logger.warning("state file holds %d peers (cap %d) — ignoring %d",
-                       len(out), _MAX_PEERS, dropped)
+        over_cap = len(out) - _MAX_PEERS
+        _complain_on_change(
+            "peer_cap",
+            "state file holds %d peers (cap %d) — ignoring %d",
+            len(out), _MAX_PEERS, over_cap,
+        )
         out = dict(list(out.items())[-_MAX_PEERS:])
+    else:
+        _complaint_resolved("peer_cap")
     return out
 
 
@@ -351,8 +442,13 @@ def read_peer(peer: str) -> PeerStatus | None:
 #: phrases would let a drained BACKUP report the primary as down, and would also
 #: outrank the invoker's later MCP classification (an MCP tool whose own error
 #: text says "insufficient funds" would be parked as a provider quota failure).
-#: This module is advisory-only, so the same knowledge is safe here and affects
-#: nothing but the record.
+#: Advisory for the RECORD, and — since the round-5 fix — also a same-peer retry
+#: suppressor in ``conversation._run_failover_peer``. That is a real widening and
+#: is stated here rather than left in the old "affects nothing but the record"
+#: wording, which this change made false. It still never removes a peer from the
+#: chain: the exception propagates and the loop advances to the next peer. A
+#: false positive costs one fresh retry on a peer that might have recovered,
+#: never a lost backup. Do not widen it past that.
 _BALANCE_REFUSALS = (
     "insufficient balance",
     "insufficient credit",
@@ -369,8 +465,22 @@ def is_provider_refusal(exc: BaseException) -> bool:
     a failed write, an internal fault). Treating "returned False" as "declined"
     let a transient write failure convert a provider refusal into a recorded
     SUCCESS — the opposite observation, standing for days.
+
+    Never raises — and the guard belongs HERE, on the shared entry point, not on
+    each caller (there are three: ``note_failure`` below, and the retry gate and
+    the ``declined`` computation in ``conversation._try_roster_failover``'s peer
+    loop). ``_is_provider_refusal`` imports and ``str()``s a
+    foreign exception, either of which can raise on a hostile ``__str__``; when
+    classification was split out of recording so callers could ask the question
+    separately, this alias inherited the question without the guard that made it
+    safe. A raise from the retry gate escapes into the peer loop and abandons
+    every REMAINING peer — an observability helper turned outage amplifier.
     """
-    return _is_provider_refusal(exc)
+    try:
+        return _is_provider_refusal(exc)
+    except Exception:
+        logger.debug("peer availability classification failed", exc_info=True)
+        return False
 
 
 def _is_provider_refusal(exc: BaseException) -> bool:
@@ -387,6 +497,23 @@ def _is_provider_refusal(exc: BaseException) -> bool:
     # A drained account is a refusal in substance but reaches us as a generic
     # process error, because the global classifier deliberately does not know
     # these phrases (see above). Text-matching is confined to this advisory path.
+    #
+    # A KNOWN, DELIBERATE GAP, recorded here so it is not rediscovered as a bug.
+    # CCMCPError is a SIBLING of CCProcessError, not a subclass, and
+    # `_classify_error`'s `"mcp" in lower` branch runs BEFORE the generic
+    # fallback over the COMBINED stderr+stdout. MEASURED 2026-09-04: a drained
+    # account whose output mentions MCP anywhere — an ordinary session start-up
+    # line — arrives typed as CCMCPError and is therefore NOT recorded.
+    #
+    # Widening to CCMCPError was tried and REVERTED. It reverses this module's
+    # central invariant (a local fault is never blamed on the peer), which
+    # `test_local_fault_is_never_blamed_on_the_peer` and
+    # `test_an_mcp_error_mentioning_funds_is_not_a_peer_refusal` both pin: an MCP
+    # tool relaying a PROVIDER's credit error is indistinguishable, by type or by
+    # text, from the peer's own account being drained. The tradeoff is already
+    # stated above and it decides this: a wrong "down" is worse than no record,
+    # so the missed observation is the cheaper error. The cost is bounded — the
+    # peer is simply not recorded, and the failover loop tries it regardless.
     from genesis.cc.exceptions import CCProcessError
 
     if isinstance(exc, CCProcessError):
@@ -405,16 +532,18 @@ def note_failure(peer: str, exc: BaseException) -> bool:
     Synchronous (roster read, lock, tempfile, fsync, replace) — call via
     ``asyncio.to_thread`` from async code; it sits on the async failover path.
     """
-    try:
-        if not peer or not _is_provider_refusal(exc):
-            return False
-    except Exception:
-        # This module promises it never raises, and it sits on the failover
-        # path: a raise here escapes into the peer loop and abandons every
-        # REMAINING peer, turning an observability helper into an outage
-        # amplifier. _is_provider_refusal imports and str()s a foreign
-        # exception, both of which can raise on a hostile __str__.
-        logger.debug("peer availability classification failed for %s", peer, exc_info=True)
+    # Through the PUBLIC alias, which owns the never-raises guard. Two copies of
+    # that guard is how one of them came to be missing: the caller that skipped
+    # it was the one added last.
+    if not peer:
+        return False
+    if not is_provider_refusal(exc):
+        # The alias cannot name the peer, and per-peer attribution is this
+        # module's entire job — so the one caller that HAS the name logs it.
+        logger.debug(
+            "peer availability declined to classify %s as evidence (%s)",
+            peer, type(exc).__name__,
+        )
         return False
     reset_at, limit_kind = "", ""
     try:
