@@ -221,9 +221,17 @@ Three rules when a bound really is needed:
 
 - **Bound by MEANING, not by one blanket number.** A closed set is validated
   against that set — a value outside it is INVALID, not "too long". A timestamp
-  is a shape; half a timestamp is not a shorter timestamp. Only genuinely free
-  text gets a length bound. A blanket cap turns 100,000 characters of foreign
-  data into 300 characters of foreign data and calls it bounded.
+  is a shape; half a timestamp is not a shorter timestamp. A blanket cap turns
+  100,000 characters of foreign data into 300 characters of foreign data and
+  calls it bounded.
+  **This governs HOW you bound, never WHETHER you may.** Rejecting a structured
+  value or a collection by size is correct and stays correct: an over-long id, an
+  over-large batch or an implausibly large file is simply not a value we accept,
+  and refusing it is a resource guard, not an amputation
+  (`channels/voice/transcript_writer.py` rejects a `session_id` over 128 chars;
+  `dashboard/routes/follow_ups.py` rejects a batch over 200 ids). What is
+  forbidden is silently CUTTING them to fit. Only free text gets a bound it is
+  expected to sit under; everything else gets one it must not cross.
 - **Derive the number, and record how.** Measure the real population and report
   `k/N` per the Acceptance Bar — then name the corpus, the query and the date, so
   the next reader can re-derive it rather than take it on faith. Re-derivable
@@ -242,22 +250,39 @@ Three rules when a bound really is needed:
   -consequence model in `memory/integrity_repair.py:27` ("Truncation asymmetry").
 
 One trap worth naming: a cap can manufacture a correctness bug in the data it was
-added to protect. Bounding an IDENTIFIER by truncation merges two distinct
-identities onto one key, and downstream code then attributes one subject's state
-to another.
+added to protect. Truncating an identifier used as a KEY merges two distinct
+identities into one, and downstream code then attributes one subject's state to
+another. A short DISPLAY handle is a different thing and is the house pattern —
+`memory_expand` resolves an 8-char prefix and reports `ambiguous` rather than
+guessing. The rule is about the stored key, not the rendered one.
 
 **A real need to truncate is a CONVERSATION to have, not a magic number to pick
 alone.** If you catch yourself choosing 300 or 200 or 1000, stop and raise it —
 and if there is nobody to raise it with (an unattended background session), the
-default is: emit the value WHOLE and record a follow-up naming the value, the
-population you could not measure, and the decision owed. Never pick the number
-just because no one was there to stop you.
+default is: emit the value WHOLE and record the decision owed — the value, the
+population you could not measure, and what you could not decide. Never pick the
+number just because no one was there to stop you.
+
+Record it somewhere that session can actually reach AND that PRESERVES it —
+availability is not preservation, and checking only the first is how this very
+paragraph came out wrong the first time. An autonomy executor CODE or VERIFICATION
+step is tool-scoped (`step_dispatcher.py` hands those two the reflection denylist,
+whose allowed set in `cc/session_config.py` carries `follow_up_list` but not
+`follow_up_create`), so there "file a follow-up" is not an instruction it can
+execute. Its `result` field is no answer either: the contract calls it a "brief
+description" and every consumer cuts it — `[:200]` into the next step's prompt and
+into the trace, `[:2000]` on the write path — so a decision placed there is
+amputated by the machinery, which is the failure this section exists to name. Use
+`TASK_NOTEPAD.md`'s `## Decisions` section, which steps are already instructed to
+append to and which `engine._promote_notepad` stores WHOLE. Other unattended
+profiles differ — `interact` and `research` keep `follow_up_create` — so check the
+surface you are actually on instead of assuming the strictest case.
 
 That default is about SIZE, never about secrecy, and the two must not be
 confused. If a value may carry a credential, token, or personal data, the
 unbounded default does NOT apply: fail closed and omit it wholesale with a
-marker, exactly as the "omit explicitly" rule says, and keep only non-sensitive
-metadata in the follow-up. Losing diagnostic prose is recoverable; leaking a
+marker, exactly as the "omit explicitly" rule says, and record only
+non-sensitive metadata. Losing diagnostic prose is recoverable; leaking a
 token is not. Emitting whole and omitting wholesale are the same discipline —
 both refuse to hand on a fragment that looks complete.
 
