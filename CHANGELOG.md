@@ -11,6 +11,69 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Two branches that each add a changelog entry no longer collide over it.**
+  This file is an append-only list of independent bullets, so two branches
+  adding an entry under the same heading are not disagreeing about anything —
+  they are inserting at the same position, which git's default merge reports as
+  a conflict a human has to resolve by hand. It now merges with git's `union`
+  driver, which keeps both sides' lines instead of leaving markers. It makes no
+  promise about their ORDER — git's own documentation says union "tends to leave
+  the added lines in the resulting file in random order and the user should
+  verify the result" — so a merged section may need its entries re-sorted by
+  hand. For a list of independent bullets that is proofreading, not breakage.
+
+  Measured before the change, against the repository's own open work: of 49
+  open pull requests, 21 could not merge, and **18 of those 21 conflicted on
+  this file and nothing else** — every other file in them merged cleanly.
+  **Two things it deliberately does not do**, because the measurement above is
+  easy to over-read. It does not make a conflicting pull request mergeable on
+  GitHub: GitHub ignores a repository's `.gitattributes` in its server-side
+  merge, measured against GitHub's own merge engine on two branch pairs built to
+  collide on this file, which conflicted both with the attribute present and
+  without it. And it does not help a branch's *first* merge, which is the one an
+  already-open pull request needs — attributes resolve from the checkout rather
+  than from the commits being merged, so on a branch created before this file
+  existed the merge that introduces the rule is not governed by it. Measured on
+  a real open pull request: the changelog still conflicts.
+
+  What it does buy, stated narrowly: once a branch contains the file — every
+  branch cut after this lands, and any older branch after its first merge —
+  later merges of the base branch resolve the changelog with no hand-editing.
+  Measured in that direction across the same 18: all of them clean, with every
+  bullet from both sides intact. The structural fix is one fragment per change
+  under `changelog.d/`; this rule does not replace it.
+
+  The rule is scoped to the one file at the repository root, and the tests
+  enforce that scope over the complete tracked-file list rather than a sample.
+  The leading slash matters: a pattern without one matches the basename at
+  every depth, which would silently hand the same driver to any future
+  vendored or subproject changelog.
+
+  What `union` cannot express is a **removal**. If one side deletes lines while
+  the other edits the same place, it keeps the deleted lines and reports
+  success — so pruning an entry, reverting a commit that added one, or cutting
+  a release (which moves entries under a version heading rather than adding
+  them) can quietly come out wrong, with a zero exit code and nothing visibly
+  duplicated to catch the eye. Read the merged file in those three cases.
+
+  Union merges lines, not records, and that reaches insertion-only merges too:
+  two entries sharing an identical aligned line — the same closing sentence, the
+  same title — can collapse into one, again at exit 0. Measured across the 18
+  real colliding pull requests, every bullet from both sides survived intact in
+  all 18; the failure needs identical lines and these entries are long
+  distinctive prose. So it is a real edge with a measured rate of zero, worth
+  knowing when writing a terse or templated entry.
+
+  The attribute also governs `git revert` and `git cherry-pick`
+  (`gitattributes(5)`) and, measured here, `git merge-tree` — but only when the
+  checkout running them already carries this rule, since attributes resolve from
+  the current checkout rather than from the commits being compared. Two
+  consequences were measured rather than assumed: reverting an *older* commit
+  that added an entry is absorbed, and git then reports "nothing to commit" with
+  a non-zero exit, so a caller checking exit status still notices; and the
+  guardian's automated `git revert HEAD` on a clean tree is unaffected, because
+  there both sides equal the base and the driver never runs.
+
 - **Two branches can no longer pick the same database-migration number.** Each
   new migration is now named by the UTC time it was written rather than by the
   next free number, so nobody has to check what anyone else took — and two
