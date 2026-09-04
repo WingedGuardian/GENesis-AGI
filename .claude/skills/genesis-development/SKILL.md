@@ -197,7 +197,17 @@ amputation is LOSS — the value cut here was the only copy. Nothing else. A
 bounded PREVIEW of something stored intact elsewhere is a selection, and stays
 one even if its handle is useless. Bounding against a hard external budget is
 likewise correct: a hook's stdout cap, a database column, a context window. So is
-refusing an oversized value outright. This section is about the loss case.
+refusing an oversized value outright.
+
+**And a SAFETY cap may be lossy — that is the one place cutting the only copy is
+right.** An unbounded stream has no other copy by definition, and reading it to
+the end to avoid "truncating" is how a runaway command exhausts memory; this repo
+bounds subprocess output at a few MiB for exactly that reason. Losing the tail of
+a log beats losing the process. The obligation there is not to keep the bytes, it
+is to be LOUD about the cut — say the output was bounded and roughly by how much,
+so nobody reads a clipped log as a complete one. A silent lossy cap is still the
+defect; a declared one is a resource guard doing its job. This section is about
+the remaining case.
 
 **A handle that does not resolve is a separate defect, and do not conflate the
 two** — that conflation is the mistake this section made about itself, twice.
@@ -248,10 +258,19 @@ Three rules when a bound really is needed:
   needing its own denominator — "the cap discards the part worth keeping" is
   exactly the sentence that sounds measured because it followed a measurement.
 - **Omit explicitly, with a constant-bounded marker** (`<omitted: 104,823
-  chars>`), never a mid-value cut. An honest gap beats a plausible-looking
-  fragment. The bound-plus-loud-flag half of this is already the house pattern;
-  the character-count marker is a proposal, so do not go looking for a precedent
-  that is not there.
+  chars>`) in preference to a mid-value cut. An honest gap beats a
+  plausible-looking fragment. The bound-plus-loud-flag half of this is already
+  the house pattern; the character-count marker is a proposal, so do not go
+  looking for a precedent that is not there.
+  **The line is DECLARED versus SILENT, not omit versus cut.** That is the
+  distinction this whole section is really about, and stating it as "never cut"
+  overshoots: this repo cuts mid-value in several places on purpose and is right
+  to — a resource guard on an unbounded stream, a preview rendered next to the
+  full record, a display string trimmed before escaping so the cut cannot land
+  mid-entity. Every one of those is a decision someone made and can defend. What
+  is forbidden is the cut nobody decided and nothing announces, because that is
+  the one that reaches a reader looking complete. Prefer the marker; when you cut
+  instead, say so where the value is read.
   **When the total is not already known, say that instead of computing it.**
   Bounding a stream is the case: learning the exact discarded length means
   reading the whole source, which is the cost the bound existed to avoid. So
@@ -284,20 +303,29 @@ What made the original defect dangerous was never that 300 existed — it was th
 
 That default is about SIZE, never about secrecy, and the two must not be
 confused. If a value may carry a credential, token, or personal data, the
-unbounded default does NOT apply — but what replaces it depends on WHERE the
-value is going, not on what it contains. Bound for unauthorized egress and for
-storage you cannot vouch for: fail closed, omit wholesale with a marker as the
-"omit explicitly" rule says, and keep only non-sensitive metadata. Losing
+unbounded default does NOT apply: fail closed, omit wholesale with a marker as
+the "omit explicitly" rule says, and keep only non-sensitive metadata. Losing
 diagnostic prose is recoverable; leaking a token is not.
 
-**Do not apply that to an authorized destination.** The user's own messages,
-memories and diagnostics flowing to the user, or into a private store, are
-personal data arriving exactly where it belongs; stripping them there is not a
-safeguard, it is data loss dressed as one — and this repo already draws that
-line, scanning and quarantining on the OUTBOUND path while leaving owner-facing
-content untouched. Ask which boundary the value is crossing before deciding.
-Where it is crossing one, emitting whole and omitting wholesale are the same
-discipline: both refuse to hand on a fragment that looks complete.
+**Then ask WHO WROTE IT, before you ask where it is going.** Authorship is the
+axis that decides, and it beats destination outright. Third-party-authored
+content stays bounded and sanitized no matter how trusted the destination is —
+this repo truncates and HTML-escapes a stranger's email fields on the way to the
+OWNER'S OWN chat, because that channel renders HTML unescaped, so a display name
+someone else chose would otherwise arrive as live markup in the one place the
+user trusts absolutely. Maximally authorized destination, maximally defensive
+treatment. Any rule that reads "it's going somewhere trusted, so pass it whole"
+deletes that defence.
+
+**And an authorized destination does not mean untreated.** The rule is narrow:
+do not strip the USER'S OWN content on its way to the user. It is not a licence
+to stop scrubbing on owner-facing surfaces, and this repo does not — it rewrites
+username-bearing paths out of what the owner's own dashboard renders, gates
+credential values behind an explicit reveal rather than showing them, scrubs the
+draft the user reviews so the copy they approve is already clean, and in at least
+one subsystem deliberately keeps captured text out of its own private store
+entirely. "Into a private store" is emphatically not a blanket exemption; some
+stores are built specifically to never receive the value.
 
 **One last thing, learned the hard way from this section itself.** Four review
 rounds found defects in it, and every single one had the same shape: the cited
@@ -308,6 +336,15 @@ unsliced — and "therefore it is a cheap place to record something" was wrong,
 because reaching it aborted the whole run. Verifying that each cited fact is true
 is the easy half, and it is not the half that fails. **State the inference as its
 own claim, and check THAT.**
+
+The sharpest instance is this section committing that error in the sentence next
+to the one warning against it. A draft of the paragraph above cited a real file
+that says, correctly, that a particular scrub applies to external audiences and
+not to replies going to the user — and generalised it into "this repo leaves
+owner-facing content untouched", which four other paths contradict. True fact,
+false inference, two paragraphs from the rule forbidding exactly that. The
+generalisation is the step to distrust, and it is seductive precisely when the
+evidence under it is solid.
 
 ### A blocked compound command loses EVERYTHING in it
 
