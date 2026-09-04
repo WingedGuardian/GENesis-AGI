@@ -9,6 +9,30 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **The review-round limit now has an end, not just a speed bump.** The existing
+  limit pauses after three rounds in which an independent reviewer keeps finding new
+  problems, and asks for a conscious decision to continue — but acknowledging it
+  resets the count, so the same three-round cycle can repeat without limit. A change
+  could consume fifteen rounds and never be told "enough", only "enough, for now".
+
+  A second count now runs over the whole life of a change, and at seven rounds it
+  stops rather than pausing. Two full cycles have already run by then, each of which
+  already asked for a decision; something still surfacing new problems after that is
+  not converging, and the remaining question — accept what is outstanding and ship
+  it, or abandon the branch and start from a design that does not need seven rounds —
+  is a judgement call, not one to keep deferring. Both answers require a person, so
+  the block says so and neither is available to an unattended session.
+
+  Where the decision is recorded — committing the accepted work — the acceptance is
+  spent when used: it clears one commit, once, and re-using it does not buy another
+  round. That is the whole difference between a terminal and a fourth repeatable
+  escape hatch. The limit also applies when requesting the next review, because the
+  local count sleeps through rounds that happen entirely in the cloud, which is
+  exactly the shape a long loop takes; that second check keeps no state of its own,
+  so there the acknowledgement is required every time rather than being spent once.
+
 ### Fixed
 
 - **The cold-marketing campaign no longer re-pitches the same person.** Once a

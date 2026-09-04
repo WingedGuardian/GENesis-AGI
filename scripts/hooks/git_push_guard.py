@@ -125,12 +125,13 @@ from hook_input import field, read_payload, run_guard  # noqa: E402
 # convert it to a block, and CC treats non-2 as non-blocking → EVERY fail-closed
 # gate in this file (force-push, merge, sqlite) would silently vanish.
 try:
-    from review_state import ESCALATION_ROUND_CAP  # noqa: E402
+    from review_state import ESCALATION_ROUND_CAP, FINAL_ROUND_CAP  # noqa: E402
 except Exception:  # noqa: BLE001 — ANY failure (absent OR broken: SyntaxError,
     # read error, top-level runtime error in review_state) must degrade to the
     # default cap, NEVER propagate: a module-load exception exits 1 (non-blocking)
     # and silently disables every fail-closed gate in this file (round-6 P1).
     ESCALATION_ROUND_CAP = 3  # the genesis-development SKILL.md prose cap
+    FINAL_ROUND_CAP = 7  # keep in step with review_state.FINAL_ROUND_CAP
 
 from shell_parse import (  # noqa: E402
     analyze,
@@ -1346,9 +1347,7 @@ def _check_inline_review_findings(
         for title in p2[:8]:
             print(f"  [P2] {title}", file=sys.stderr)
     if score >= _INLINE_SCORE_BLOCK_THRESHOLD:
-        listing = "\n".join(
-            [f"  [P1] {t}" for t in p1[:5]] + [f"  [P2] {t}" for t in p2[:5]]
-        )
+        listing = "\n".join([f"  [P1] {t}" for t in p1[:5]] + [f"  [P2] {t}" for t in p2[:5]])
         return True, (
             f"review score {score:.1f} >= {_INLINE_SCORE_BLOCK_THRESHOLD:.1f} blocks "
             f"(P1=1.0, P2={_INLINE_P2_SCORE_WEIGHT} each): {len(p1)} unresolved [P1] + "
@@ -1735,6 +1734,48 @@ def _comment_repo(argv: list[str]) -> str | None:
     return val
 
 
+def _final_round_advisory(pr_num: str, rounds: int, repo: str | None = None) -> str:
+    """The terminal, stated for the DISPATCH side of the loop.
+
+    Counted from the PR's own review history rather than the local counter, so it
+    fires even when every round ran in the cloud and none was marked locally —
+    which is the case this gate exists for, and therefore the case the commit-side
+    terminal cannot see.
+
+    DELIBERATELY STATELESS, unlike the commit-side terminal. That one spends its
+    acceptance because it licenses a state change (a commit that lands work); this
+    one licenses a review REQUEST, which changes nothing on its own — a session
+    that can re-request reviews but cannot commit fixes achieves nothing, so the
+    commit gate remains the terminal that bites. Making an advisory, fail-open
+    gate carry per-branch consumption state would also contradict the
+    "stateless, authoritative" property the rest of this scan is built on. The
+    consequence is stated rather than hidden: the ack is required on EVERY
+    dispatch past the terminal, and it is not one-shot here.
+    """
+    repo_arg = f" --repo {repo}" if repo else ""
+    return (
+        f"BLOCKED: this would be Codex round {rounds + 1} on PR #{pr_num} — "
+        f"{rounds} rounds already ran on this PR, at or past the terminal "
+        f"({FINAL_ROUND_CAP}). Two full escalation cycles have run and each already "
+        "asked for a fresh decision. '# escalation-ack' does NOT clear this one; if "
+        "it did, the cycle would simply continue, which is what the terminal exists "
+        "to end.\n\n"
+        "There are exactly two ways out, and neither is this session's to choose "
+        "alone:\n"
+        "  (a) ACCEPT the outstanding findings and merge — document each one and why "
+        "it is acceptable in the PR body. The COMMIT gate is where that decision is "
+        "recorded, and there the acceptance is one-shot.\n"
+        "  (b) ABANDON the branch and restart from a design that does not need this "
+        "many rounds.\n\n"
+        "If the user directs ONE more round, that decision rides on this command:\n"
+        f"    gh pr comment {pr_num}{repo_arg} --body '@codex review'  # final-round-accept\n"
+        "Required on EVERY dispatch past the terminal — this gate keeps no state, so "
+        "the sigil is not spent here.\n\n"
+        "Take it to the user. A dispatched session with nobody reading cannot pick "
+        "any of these — surface it and stop."
+    )
+
+
 def _escalation_advisory(pr_num: str, rounds: int, repo: str | None = None) -> str:
     repo_arg = f" --repo {repo}" if repo else ""
     return (
@@ -1787,11 +1828,17 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
       '# escalation-ack' trailing ANY segment     → allow the whole command (a
         nested `bash -c '…' # escalation-ack` carries the ack on the OUTER
         segment; the ack is a conscious human-directed act, so one ack licenses
-        the command it trails)
+        the command it trails) — BUT ONLY BELOW THE TERMINAL. At or past
+        FINAL_ROUND_CAP it does not clear the block; '# final-round-accept' does.
+        This is why the ack is no longer a top-of-function short-circuit: a
+        short-circuit could never see the count it needed to be bounded by.
+      rounds >= FINAL_ROUND_CAP, no final-accept → BLOCK with the terminal (an
+        escalation-ack here is deliberately not enough)
       numberless/branch target (no PR number)     → that segment allows;
         SCANNING CONTINUES (an allowed segment must not shield a later one)
       gh/API/parse error (ids is None)            → that segment allows, scan on
       rounds < ESCALATION_ROUND_CAP               → that segment allows, scan on
+      cap <= rounds < FINAL_ROUND_CAP, no ack    → BLOCK with the step-back order
       any segment at rounds >= cap, no ack        → BLOCK with the step-back
         order (URL targets carry their OWN repo into the count — counting the
         hook cwd's repo for a cross-repo URL could produce a FALSE block)
@@ -1799,8 +1846,16 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
     fail-closed exit-2, which would turn an advisory bug into a hard block).
     """
     try:
-        if any(has_trailing_override(s.raw, "escalation-ack") for s in segs):
-            return False, ""
+        # Both sigils resolved up front, and the escalation-ack short-circuit is
+        # now CONDITIONAL on not having reached the terminal. It used to return
+        # before any counting, which meant this gate — the one that counts the
+        # PR's ACTUAL Codex rounds, and exists precisely because the local counter
+        # sleeps through them — could be re-acked forever. The commit-side terminal
+        # reads only that sleeping local counter, so it inherited the same blind
+        # spot: a review/fix loop driven entirely through cloud rounds never
+        # reached it.
+        acked = any(has_trailing_override(s.raw, "escalation-ack") for s in segs)
+        final_acked = any(has_trailing_override(s.raw, "final-round-accept") for s in segs)
         # Bound this scan's gh (_codex_reviews) calls by the SHARED hook deadline,
         # so a slow API + a compound command can't push the aggregate past the
         # ~60s hook wall-clock and get the WHOLE hook SIGKILLed — which fails open
@@ -1815,6 +1870,14 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
         # finding). Keyed per (repo, pr) so distinct PRs don't cross-count.
         in_cmd: dict[str, int] = {}
         for seg in segs:
+            # Stop scanning once the shared budget is drained. Past that point every
+            # remaining gh call still gets the 1.0s floor, so a long compound command
+            # against a hung API could walk the aggregate toward the hook wall-clock
+            # and get the WHOLE hook SIGKILLed — which fails open on every gate. The
+            # merge path already breaks here; this scan did not, and it now makes gh
+            # calls on acked commands that previously short-circuited before arming.
+            if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+                break
             if gh_pr_subcommand(seg.argv) != "comment":
                 continue
             if not any("@codex review" in tok.lower() for tok in seg.argv):
@@ -1830,7 +1893,14 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
                 continue
             key = f"{repo or ''}|{pr_num}"
             effective = len(reviews) + in_cmd.get(key, 0)
-            if effective >= ESCALATION_ROUND_CAP:
+            # TERMINAL tier, checked first and NOT clearable by the repeatable
+            # sigil — the whole point of a terminal is that the cycle cannot reach
+            # past it. Counted from the PR's real review history, so it holds even
+            # when every one of those rounds went unmarked locally.
+            if effective >= FINAL_ROUND_CAP:
+                if not final_acked:
+                    return True, _final_round_advisory(pr_num, effective, repo)
+            elif effective >= ESCALATION_ROUND_CAP and not acked:
                 return True, _escalation_advisory(pr_num, effective, repo)
             in_cmd[key] = in_cmd.get(key, 0) + 1
     except Exception:
@@ -2901,10 +2971,7 @@ def _marker_kind_or_none(block: str) -> str | None:
 
 def _scheduled_review_marker_scan(
     pr_num: str, repo: str | None = None, head_sha: str | None = None
-) -> (
-    tuple[dict[str, set[str]], dict[str, set[str]], list[tuple[str | None, str, bool]]]
-    | None
-):
+) -> tuple[dict[str, set[str]], dict[str, set[str]], list[tuple[str | None, str, bool]]] | None:
     """``(accepted, rejected_not_clean, unusable, blocking_residue)`` for the PR's scheduled-review
     markers, or ``None`` on an UNREADABLE fetch.
 
@@ -2967,7 +3034,7 @@ def _scheduled_review_marker_scan(
     # order -- the sort is stable. Residue, stated: an edited REVIEW body has no edit
     # timestamp in the API, so a finding added by editing a review keeps the review's
     # original position.
-    rows = sorted(rows, key=lambda r: (r.get("stamp") or r.get("created_at") or ""))
+    rows = sorted(rows, key=lambda r: r.get("stamp") or r.get("created_at") or "")
     for row in rows:
         body = row.get("body") or ""
         # Blocks are parsed BEFORE the trust checks, so a row about to be dropped can
@@ -3018,8 +3085,7 @@ def _scheduled_review_marker_scan(
                         )
                 else:
                     why = (
-                        "it is carried by a DISMISSED review, which no longer vouches "
-                        "for anything"
+                        "it is carried by a DISMISSED review, which no longer vouches for anything"
                     )
                 unusable.append((_marker_kind_or_none(block), why, True))
             continue
@@ -3114,9 +3180,7 @@ def _scheduled_review_marker_scan(
                     # is not evidence about one review, it is evidence about all of them.
                     _residue_kind = _marker_kind_or_none(block)
                     blocking_residue.setdefault("", set()).add(
-                        _residue_kind
-                        if _residue_kind in _KNOWN_SCHEDULED_REVIEW_KINDS
-                        else "*"
+                        _residue_kind if _residue_kind in _KNOWN_SCHEDULED_REVIEW_KINDS else "*"
                     )
                 unusable.append((_marker_kind_or_none(block), why, True))
                 continue
@@ -6162,10 +6226,14 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
             # NEVER render a carried-forward review as one made at head: this line is
             # what a human (and a structured consumer) reads to judge freshness, and
             # "ok (at head)" here would be a false assertion about what was reviewed.
-            sched_state = "ok (" + "; ".join(
-                f"{kind} carried from {anc}, {check} green at head"
-                for kind, anc, check in sched_relief
-            ) + ")"
+            sched_state = (
+                "ok ("
+                + "; ".join(
+                    f"{kind} carried from {anc}, {check} green at head"
+                    for kind, anc, check in sched_relief
+                )
+                + ")"
+            )
         else:
             sched_state = "ok (at head)"
         print(f"scheduled-claude: {sched_state}")

@@ -702,6 +702,16 @@ def bump_review_round(
         if _prev and _prev.get("branch") == branch
         else 0
     )
+    # Carried through every write below for the same reason as `lifetime`: each
+    # branch here REBUILDS the state dict, so a field that is not named again is
+    # dropped. A spent acceptance that vanished on the next marked round would
+    # hand the change a fresh one — reopening the terminal by simply running
+    # another review, which is the loop this tier exists to end.
+    consumed = (
+        bool(_prev.get("final_accept_consumed"))
+        if _prev and _prev.get("branch") == branch
+        else False
+    )
     if clean:
         # A clean round resets the STREAK but not the lifetime. A change that
         # alternates clean and defect-bearing rounds has still consumed every one
@@ -714,6 +724,7 @@ def bump_review_round(
                 "lifetime": lifetime,
                 "last_hash": content_hash,
                 "last_source": "external",
+                "final_accept_consumed": consumed,
             },
             cwd,
         )
@@ -746,10 +757,56 @@ def bump_review_round(
             "lifetime": lifetime + 1,
             "last_hash": content_hash,
             "last_source": "external",
+            "final_accept_consumed": consumed,
         }
     # else: same branch + same staged diff → same round (idempotent re-mark).
     _write_round(state, cwd)
     return _coerce_finite_int(state.get("round", 0))
+
+
+def get_final_accept_consumed(cwd: str | None = None) -> bool:
+    """True once this branch has spent its ONE final-round acceptance.
+
+    Branch-scoped on purpose: a global latch would permanently disarm the sigil
+    for every later change on the install. Never raises — an unreadable or
+    foreign-branch counter reads as "not consumed", which fails toward letting a
+    genuine acceptance through rather than stranding a change behind a gate whose
+    state it cannot see.
+    """
+    state = _load_round(cwd)
+    if not state or state.get("branch") != get_current_branch(cwd=cwd):
+        return False
+    return bool(state.get("final_accept_consumed"))
+
+
+def consume_final_accept(cwd: str | None = None) -> None:
+    """Spend this branch's final-round acceptance. Best-effort, never raises.
+
+    Recorded at the moment the gate ALLOWS the acked commit, because a PreToolUse
+    hook has no post-execution callback — there is no later point at which to
+    learn the commit succeeded. Burning it on allow is the deliberate direction:
+    if the commit then fails for an unrelated reason the change is stuck, and at
+    round seven "stuck" means "take it to the user", which is the intent.
+
+    No-ops when no same-branch counter exists. That state is unreachable from the
+    only caller — the terminal fires on ``lifetime >= FINAL_ROUND_CAP``, which
+    requires exactly such a counter — so writing a synthetic one here could only
+    invent a lifetime that was never counted.
+
+    ONE-SHOT IS NOT A HARD GUARANTEE, and the limit is worth naming: both this and
+    ``get_final_accept_consumed`` compare against ``get_current_branch``, which
+    returns ``"unknown"`` on a git timeout or read error. A transient git failure
+    therefore makes this a silent no-op and makes the read report "not consumed",
+    refunding the acceptance. That is the correct direction for a best-effort
+    counter that must never raise into a commit — it fails toward letting a real
+    decision through rather than stranding a change behind state it cannot see —
+    but nobody should read "one-shot" as tamper-proof.
+    """
+    branch = get_current_branch(cwd=cwd)
+    state = _load_round(cwd)
+    if not branch or not state or state.get("branch") != branch:
+        return
+    _write_round({**state, "final_accept_consumed": True}, cwd)
 
 
 def get_review_lifetime(cwd: str | None = None) -> int:
@@ -801,7 +858,16 @@ def reset_review_round(cwd: str | None = None) -> None:
             _round_file(cwd).unlink(missing_ok=True)
         return
     _write_round(
-        {"branch": branch, "round": 0, "lifetime": lifetime, "last_source": "external"}, cwd
+        {
+            "branch": branch,
+            "round": 0,
+            "lifetime": lifetime,
+            "last_source": "external",
+            # Carried for the same reason as `lifetime`: an escalation-ack resets
+            # the streak, and must not also refund a spent final acceptance.
+            "final_accept_consumed": bool(state.get("final_accept_consumed")),
+        },
+        cwd,
     )
 
 

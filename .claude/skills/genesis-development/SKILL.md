@@ -1200,9 +1200,34 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   At the terminal, `# escalation-ack` does **not** help: the lifetime check runs
   BEFORE the streak check precisely because the streak has usually just been reset
   by an earlier ack and would not fire. And `# final-round-accept` clears exactly
-  ONE commit — the block returns on the next one. That is deliberate: a sigil that
-  kept working would just be a fourth repeatable sigil, which is the defect being
-  closed. The decision has to actually end the loop.
+  ONE commit — the block returns on the next one, and re-applying the sigil is
+  refused with "already used". That is deliberate: a sigil that kept working would
+  just be a fourth repeatable sigil, which is the defect being closed. The decision
+  has to actually end the loop.
+
+  **Both sigils can be required at once.** `streak >= 3` and `lifetime >= 7` is a
+  reachable state, so the co-required form is
+  `git commit -m "…"  # final-round-accept escalation-ack`; the terminal's own
+  message names the second sigil when it applies. The acceptance is spent at the
+  ALLOW, not when the tier honours it — a command another rule then denies does not
+  burn it.
+
+  **THE SAME TERMINAL FIRES WHEN YOU REQUEST THE NEXT ROUND**, not only when you
+  commit. `git_push_guard._check_codex_round_escalation` counts the PR's ACTUAL
+  Codex reviews from the API, because the local counter above sleeps through rounds
+  that ran entirely in the cloud — the #1372 whack-a-mole was five Codex rounds with
+  the local counter at 0. Past `FINAL_ROUND_CAP` that gate blocks
+  `gh pr comment … @codex review`, `# escalation-ack` does not clear it, and
+  `# final-round-accept` does. **That gate keeps no state**, so unlike the commit
+  side the sigil is required on EVERY dispatch rather than being spent once — a
+  review request changes nothing on its own, and the commit gate remains the
+  terminal that actually bites.
+
+  **A new branch starts clean, and that is the sanctioned way out.** `lifetime` is
+  per-branch, so `git checkout -b` resets the terminal. Read that as option (b) —
+  abandon and restart from a better design — not as a loophole: carrying the same
+  unconverged change across is the loop continuing under a new name, and the point
+  of the terminal is that a person decides which of the two is happening.
 
   The round-2 block is not the round-3 cap arriving early — it is a different
   instruction. It says the *approach* is wrong (you are fixing instances, not the

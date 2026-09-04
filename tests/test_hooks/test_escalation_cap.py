@@ -995,6 +995,90 @@ def test_final_round_accept_is_one_shot(repo, home):
     assert "final" in again.stderr.lower()
 
 
+def test_final_round_accept_cannot_be_reused(repo, home):
+    """The sigil must be CONSUMED, not merely re-required on every commit.
+
+    Its sibling above only retries WITHOUT the sigil, so it proves the block
+    returns — not that the acceptance was spent. Re-applying the same sigil is the
+    reuse path, and if it keeps working the terminal is just a fourth repeatable
+    escape hatch, which is the whole defect this tier exists to close.
+    """
+    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
+    first = _run_hook('git commit -m "accept"  # final-round-accept', repo, home)
+    assert first.returncode == 0, first.stderr
+    reused = _run_hook('git commit -m "more fixes"  # final-round-accept', repo, home)
+    assert reused.returncode == 2, reused.stdout + reused.stderr
+    assert "already used" in reused.stderr.lower(), reused.stderr
+
+
+def test_a_denied_command_does_not_spend_the_acceptance(repo, home):
+    """The token must be spent at the ALLOW, never inside the tier that honours it.
+
+    Rule 3a is checked FIRST, but four later rules can still deny the same command.
+    Consuming inside the tier burned the one-shot token on a commit that never ran,
+    and since the consuming tier is checked first on the retry, the branch became
+    permanently uncommittable. MEASURED before the fix, at streak 7 / lifetime 7 —
+    a state this gate's own comment calls reachable — every sigil combination
+    returned 2, including the one the block message itself prints.
+    """
+    _reach_rounds(repo, home, review_state.FINAL_ROUND_CAP)
+    # Terminal cleared, but the escalation cap still denies: both sigils are
+    # genuinely required in this state, so this command does NOT commit.
+    denied = _run_hook('git commit -m "accept"  # final-round-accept', repo, home)
+    assert denied.returncode == 2, denied.stdout + denied.stderr
+    assert "already used" not in denied.stderr.lower()
+    # The acceptance must still be available to the co-required form.
+    ok = _run_hook('git commit -m "accept"  # final-round-accept escalation-ack', repo, home)
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    # ...and only NOW is it spent.
+    after = _run_hook('git commit -m "more"  # final-round-accept escalation-ack', repo, home)
+    assert after.returncode == 2, after.stdout + after.stderr
+    assert "already used" in after.stderr.lower(), after.stderr
+
+
+def test_consumption_survives_a_later_external_round(repo, home):
+    """A new review round after the accept must not hand back a fresh acceptance.
+
+    `bump_review_round` rebuilds the state dict on every write, so a field that is
+    not explicitly carried is silently dropped — the exact way `last_source` was
+    lost once already. If the flag vanished here, running one more Codex round
+    would reopen the terminal, which is precisely the loop being ended.
+    """
+    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
+    assert _run_hook('git commit -m "accept"  # final-round-accept', repo, home).returncode == 0
+    _stage(repo, "after = 1\n")
+    m = _mark(repo, home)
+    assert m.returncode == 0, m.stderr
+    again = _run_hook('git commit -m "post-round"  # final-round-accept', repo, home)
+    # Assert the REASON, not just the code. A bare `returncode == 2` is satisfied by
+    # any of the sibling rules that can also block here, so it stays green even when
+    # the carry-through is deleted — measured, this exact test passed under that
+    # mutation until the message check was added.
+    assert again.returncode == 2, again.stdout + again.stderr
+    assert "already used" in again.stderr.lower(), again.stderr
+
+
+def test_a_new_branch_gets_a_fresh_acceptance(repo, home):
+    """Consumption is scoped to the change, not the machine.
+
+    Without this the flag would be a global latch that permanently disarms the
+    sigil for every future branch on the install.
+    """
+    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
+    assert _run_hook('git commit -m "accept"  # final-round-accept', repo, home).returncode == 0
+    subprocess.run(
+        ["git", "checkout", "-b", "a-different-change"], cwd=repo, check=True, capture_output=True
+    )
+    # ARM THE TERMINAL ON THE NEW BRANCH. Without this the test never reaches
+    # get_final_accept_consumed at all — a fresh branch has lifetime 0, so the tier
+    # is skipped entirely and the assertion passes on a GLOBAL latch too. Measured:
+    # deleting the branch check from that accessor left this test green.
+    _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
+    res = _run_hook('git commit -m "fresh start"  # final-round-accept', repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "already used" not in res.stderr.lower(), res.stderr
+
+
 def test_final_ack_inside_message_does_not_bypass(repo, home):
     """A token buried in -m is not a trailing comment (mirrors the sibling acks)."""
     _reach_lifetime(repo, home, review_state.FINAL_ROUND_CAP)
@@ -1025,6 +1109,33 @@ def test_below_final_round_the_normal_cycle_still_applies(repo, home):
     assert res.returncode == 0, res.stdout + res.stderr
 
 
+def _refund_final_accept(repo: Path, home: Path) -> None:
+    """Clear the spent-acceptance flag so one test can exercise two acked commits.
+
+    Only for tests whose subject is something OTHER than consumption (sigil parse
+    order, message content). Consumption itself is covered by
+    test_final_round_accept_cannot_be_reused and friends, which must never call this.
+    """
+    env = {**os.environ, "HOME": str(home)}
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import sys, json; sys.path.insert(0, {str(_REPO_ROOT / 'scripts')!r}); "
+            f"import review_state as r; st = r._load_round({str(repo)!r}); "
+            # Refuse to write back an empty counter: that would silently disarm the
+            # terminal and turn the caller GREEN while testing nothing.
+            "assert st.get('lifetime'), f'refund would blank the counter: {st!r}'; "
+            "st.pop('final_accept_consumed', None); "
+            f"r._write_round(st, {str(repo)!r})",
+        ],
+        env=env,
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+
 def test_terminal_and_cap_together_accept_either_sigil_order(repo, home):
     """streak>=3 AND lifetime>=7 is reachable, and BOTH sigils are then required.
 
@@ -1044,6 +1155,10 @@ def test_terminal_and_cap_together_accept_either_sigil_order(repo, home):
         'git commit -m "wip"  # final-round-accept escalation-ack',
         'git commit -m "wip"  # escalation-ack final-round-accept',
     ):
+        # The first accepted commit SPENDS the acceptance, so without this the
+        # second order would be blocked by consumption rather than by parsing —
+        # a green/red that says nothing about the property under test.
+        _refund_final_accept(repo, home)
         res = _run_hook(cmd, repo, home)
         assert res.returncode == 0, f"{cmd} -> {res.returncode}: {res.stderr}"
 

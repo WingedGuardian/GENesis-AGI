@@ -754,7 +754,9 @@ def main() -> None:
         from review_state import (
             ESCALATION_ROUND_CAP,
             FINAL_ROUND_CAP,
+            consume_final_accept,
             get_current_branch,
+            get_final_accept_consumed,
             get_review_lifetime,
             get_review_round,
             has_code_changes,
@@ -954,6 +956,23 @@ def main() -> None:
     round_n = get_review_round(cwd=cwd)
     commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
 
+    # Set when Rule 3a honours a '# final-round-accept', SPENT only at an actual
+    # allow. The two must not be the same moment: Rule 3a is checked FIRST, but
+    # four later rules (the escalation cap, the mode-switch tier, the depth gate,
+    # Rule 2) can still deny the very same command — and consuming inside the tier
+    # burned the one-shot token on a commit that never ran. Because the consuming
+    # tier is then checked first on the retry, the branch became permanently
+    # uncommittable. MEASURED before this fix, at streak 7 / lifetime 7 (a state
+    # this file's own comment calls reachable): all four sigil combinations
+    # returned exit 2, including the one the block message itself prints.
+    spend_final_accept = False
+
+    def _allow() -> None:
+        """Exit 0, spending the acceptance only if one was actually honoured."""
+        if spend_final_accept:
+            consume_final_accept(cwd=cwd)
+        sys.exit(0)
+
     # Rule 3a: the FINAL-ROUND terminal. Checked BEFORE the consecutive cap below,
     # and that ordering is the entire point — at the terminal the round counter has
     # typically just been reset by an earlier '# escalation-ack', so the cap would
@@ -975,6 +994,28 @@ def main() -> None:
         final_acked = bool(commit_segs) and all(
             has_trailing_override(s.raw, sigil="final-round-accept") for s in commit_segs
         )
+        # "Clears exactly ONE commit" has to be RECORDED to be true. Re-requiring the
+        # sigil on every commit is not a terminal — a session under a mandate to make
+        # progress just appends it again, which is the fourth repeatable escape hatch
+        # this tier exists to remove. The acceptance is spent on first use and the
+        # branch cannot buy another.
+        if final_acked and get_final_accept_consumed(cwd=cwd):
+            _deny(
+                f"BLOCKED: the final-round acceptance for this branch was ALREADY USED "
+                f"(lifetime {lifetime_n} >= terminal {FINAL_ROUND_CAP}). It clears one "
+                "commit, once — re-applying the sigil does not buy another round, or it "
+                "would be the repeatable escape hatch this terminal replaced.\n\n"
+                "You accepted the outstanding findings and committed. If that commit "
+                "still needs work, the loop did not end, and continuing is no longer a "
+                "call this session makes:\n"
+                "  (a) TAKE IT TO THE USER — say what is still open and that the branch "
+                "is past its terminal. Only they can authorise more work here.\n"
+                "  (b) ABANDON the branch and restart from a design that does not need "
+                "seven rounds.\n\n"
+                "A dispatched session with nobody reading cannot choose either alone — "
+                "surface it and stop." + _merge_note(cwd)
+            )
+            return
         if not final_acked:
             # The terminal deliberately does NOT reset the streak, so streak>=3 and
             # lifetime>=7 is a REACHABLE state in which BOTH sigils are genuinely
@@ -1002,7 +1043,10 @@ def main() -> None:
             )
             return
         # Acked = the accept decision was made. Deliberately NO reset: the counter
-        # stays at/above the terminal so the next commit blocks again.
+        # stays at/above the terminal so the next commit blocks again. The spend is
+        # DEFERRED to the allow (see `_allow` above) — the later rules can still
+        # deny this command, and a token spent on a denied command bricks the branch.
+        spend_final_accept = True
 
     if round_n >= ESCALATION_ROUND_CAP:
         acked = bool(commit_segs) and all(
@@ -1093,7 +1137,7 @@ def main() -> None:
     if not commit_may_add_content:
         staged = _staged_files(cwd)
         if staged and all(_is_docs_or_config(p) for p in staged):
-            sys.exit(0)
+            _allow()
 
     # Rule 2.5: review DEPTH. A SUBSTANTIAL change needs an ADVERSARIAL audit, not a
     # precision-filtered inline pass — a "no findings" from a confidence-≥80 reviewer
@@ -1189,7 +1233,7 @@ def main() -> None:
                 "Findings acknowledged by session.",
                 file=sys.stderr,
             )
-            sys.exit(0)
+            _allow()
         if override == "in_quote":
             _deny(
                 "BLOCKED: '# review-override' is not a clean trailing shell "
@@ -1216,7 +1260,7 @@ def main() -> None:
         return
 
     # All checks passed — allow
-    sys.exit(0)
+    _allow()
 
 
 def _deny(message: str) -> None:
