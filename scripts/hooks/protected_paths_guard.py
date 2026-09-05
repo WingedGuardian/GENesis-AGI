@@ -139,6 +139,154 @@ def _rm_operands(argv: list[str]) -> list[str]:
     return operands
 
 
+# Commands whose job is to run ANOTHER command. A deletion behind one is still a
+# deletion, so a segment led by one must not be certified safe merely because its
+# resolved executable is not `rm`.
+#
+# Deliberately a superset of shell_parse's wrapper table, and deliberately not
+# claimed to be complete: this drives a CONSERVATIVE check, so a member that does
+# not belong costs a refusal only when a protected path is already present, while
+# a missing member costs nothing that was not already missing. That asymmetry is
+# why it is safe to be generous here and precise there.
+_EXECUTION_PREFIXES = frozenset(
+    {
+        "eval",
+        "coproc",
+        "builtin",
+        "command",
+        "exec",
+        "sudo",
+        "doas",
+        "su",
+        "runuser",
+        "setpriv",
+        "chroot",
+        "env",
+        "nice",
+        "ionice",
+        "chrt",
+        "nohup",
+        "setsid",
+        "stdbuf",
+        "time",
+        "timeout",
+        "xargs",
+        "flock",
+        "unshare",
+        "systemd-run",
+        "script",
+        "watch",
+        "parallel",
+        "proot",
+        "torsocks",
+        "strace",
+        "ltrace",
+        # Shell names are deliberately absent: `shell_parse` already DESCENDS into
+        # `sh -c '…'` and yields the inner command as its own segment, so the loop
+        # below sees any deletion there without help. Listing them added no
+        # coverage and cost a false refusal.
+    }
+)
+
+
+# The subset that RE-PARSES a single argument string rather than passing argv
+# through. No wrapper table can resolve these: the command arrives as one opaque
+# token, so whatever executable comes back is a fragment of it. Kept small and
+# separate from the set above, because this one drives a check that fires even
+# when resolution appeared to succeed.
+#
+# `source` and `.` are deliberately NOT here, though they do run other commands.
+# They execute a FILE: there is no command in the argv to unwrap, so being
+# conservative about the argv buys nothing — whatever runs is in a file this
+# guard cannot read either way. MEASURED: including them refused 11 of 137
+# reachable real commands, every one benign (`source .venv/bin/activate` before a
+# heredoc that happens to mention both a path and a deletion word — including this
+# work's own probe scripts). Zero coverage, real cost.
+_REPARSING_PREFIXES = frozenset({"eval", "coproc"})
+
+
+def _leading_word(raw: str) -> str:
+    """Basename of a segment's first raw word, or "" when there is none.
+
+    Uses the RAW text rather than the parsed argv because the shapes this is for
+    are the ones whose argv resolution went elsewhere.
+    """
+    stripped = raw.strip()
+    if not stripped:
+        return ""
+    first = stripped.split(None, 1)[0]
+    return os.path.basename(first.strip("'\""))
+
+
+def _deletion_tail(argv: list[str]) -> list[str] | None:
+    """``argv`` from the first deletion word onward, when one runs behind a prefix.
+
+    The prefix itself is unresolved by definition here, so its OWN options cannot
+    be modelled — and they must not have to be. Rather than trying to find where
+    the prefix stops and the command starts (`setpriv --reuid 1000 rm …` defeats
+    any "skip the dashed words" rule the moment an option takes a value), look for
+    the deletion word anywhere in the argv and read from there.
+
+    That over-detects by construction, and the direction is deliberate: the cost
+    of a false hit is a refusal on a command that contains the literal word `rm`
+    AND a protected path AND an unresolved execution prefix; the cost of a miss is
+    the data. A word that is merely an OPERAND of something else (`grep rm file`)
+    reaches this only when it also sits behind such a prefix, and the operand scan
+    that follows then has to find a protected path in it before anything is
+    refused.
+    """
+    for i, tok in enumerate(argv):
+        if os.path.basename(tok) in ("rm", "rmdir"):
+            return argv[i:]
+    return None
+
+
+def _prefixed_deletion_reason(
+    seg, cwd: str | None, dirs: list[str], files: list[str]
+) -> str | None:
+    """Why a deletion running behind an UNRESOLVED execution prefix is refused.
+
+    Two branches, and which one applies is decided by whether a deletion is
+    READABLE in the segment's argv:
+
+    * it is — then this is an ordinary deletion that merely happens to sit behind
+      a prefix, so it gets the ORDINARY operand analysis: brace expansion,
+      ancestors, globs, unresolved-variable fallback. Anything less re-creates the
+      substring check's blind spot for the operand forms it cannot express.
+    * it is not — the command is opaque (a re-parsing prefix hands over one quoted
+      token), so fall back to the conservative substring check, scoped to THIS
+      SEGMENT rather than the whole command line, and only at top level.
+    """
+    tail = _deletion_tail(seg.argv)
+    if tail is None:
+        if seg.depth != 0:
+            return None
+        if _legacy_substring_block(seg.raw, dirs):
+            return (
+                "a command that runs another command could not be resolved to what it "
+                "actually executes, and a protected path appears in it. Rewrite it so "
+                "the command being run is visible — or, if the path is only being "
+                "mentioned, write that text with an editor rather than through a shell."
+            )
+        return None
+
+    unresolved = False
+    for raw_operand in _rm_operands(tail):
+        for operand in brace_expand(raw_operand):
+            reason = _operand_blocks(operand, cwd, dirs, files)
+            if reason:
+                return f"{reason} — and it is being deleted behind '{seg.exe or _leading_word(seg.raw)}', which runs the command that follows it"
+            if _expand(operand, cwd) is None:
+                unresolved = True
+    if unresolved and _legacy_substring_block(seg.raw, dirs):
+        return (
+            "a deletion behind a command-running prefix has a target this guard "
+            "cannot resolve, and a protected path appears in the same command. "
+            "Rewrite it with the target spelled out."
+        )
+    return None
+
+
 def _legacy_substring_block(cmd: str, dirs: list[str]) -> str | None:
     """The pre-2026-08 substring check — kept ONLY as the fallback for a
     command shlex cannot tokenize (conservative: over-blocks, never under)."""
@@ -211,7 +359,62 @@ def main() -> int:
         return _block(reason) if reason else 0
 
     cwd = payload.get("cwd") if isinstance(payload, dict) else None
-    for seg in analyze(cmd):
+    segs = analyze(cmd)
+
+    # An EXECUTION PREFIX runs the command that follows it, so a deletion behind
+    # one is a deletion. `shell_parse`'s wrapper table resolves many of them, but
+    # a table is a WHITELIST: it fails open on its complement, and the complement
+    # is open-ended (`setpriv`, `systemd-run`, `unshare`, `flock`, `runuser`,
+    # `script -c`, …), as are the spellings a table cannot express at all — a
+    # prefix that re-parses a quoted argument, or takes a compound rather than a
+    # simple command. Those all resolve to something that is not `rm`, and the
+    # loop below would skip them in silence.
+    #
+    # So do not certify. Fire ONLY where resolution actually failed, which is the
+    # whole point — a prefix the parser resolved tells us exactly what runs, and
+    # if that is not a deletion there is nothing to be conservative about. Two
+    # failure shapes:
+    #
+    #   * the leading word is a prefix the wrapper table does not know, so
+    #     nothing was unwrapped and the resolved exe IS still that prefix; or
+    #   * the leading word RE-PARSES its argument, which no wrapper table can
+    #     resolve — the command arrives as one opaque token, so the exe that
+    #     comes back is a fragment of it rather than the executable.
+    #
+    # An earlier revision keyed on "leading word is any prefix" and MEASURED as a
+    # bad over-block: `sudo grep -r '<pattern>' <protected-dir>` was refused,
+    # along with three other ordinary shapes, because `sudo` is both extremely
+    # common and already resolved correctly. Firing on a resolved prefix buys
+    # nothing and costs real commands.
+    #
+    # PER SEGMENT, AND THAT IS THE CORRECTION (Codex P1 x3, PR #1615). The first
+    # version asked its three questions of the WHOLE COMMAND, and each one let a
+    # real deletion through:
+    #
+    #   * "does ANY segment resolve to rm?" — one unrelated deletion in /tmp
+    #     earlier on the line switched the fallback off for every other segment;
+    #   * a substring scan for a literal protected-path alias — which by
+    #     construction cannot see the operand forms `_operand_blocks` exists to
+    #     catch, so an ANCESTOR of every protected directory passed;
+    #   * top-level segments only — but `sh -c '…'` surfaces its inner command as
+    #     a DEPTH-1 segment, so the same deletion one level down passed.
+    #
+    # The depth filter had a real reason and it is kept where it belongs: on the
+    # SUBSTRING branch only. MEASURED — without it, a 40,925-character heredoc
+    # writing a plan document was refused, because two lines deep inside the prose
+    # began with a shell name. Reading the OPERANDS of a deletion that is actually
+    # in the argv is a different act from scanning text for a path, so that runs
+    # at any depth; scanning prose stays at depth 0.
+    for seg in segs:
+        if seg.exe in ("rm", "rmdir"):
+            continue  # resolved — the loop below judges it on its own operands
+        if not (seg.exe in _EXECUTION_PREFIXES or _leading_word(seg.raw) in _REPARSING_PREFIXES):
+            continue
+        reason = _prefixed_deletion_reason(seg, cwd, dirs, files)
+        if reason:
+            return _block(reason)
+
+    for seg in segs:
         if seg.exe not in ("rm", "rmdir"):
             continue
         seg_unresolved = False

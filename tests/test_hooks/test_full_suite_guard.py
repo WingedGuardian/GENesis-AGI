@@ -183,3 +183,40 @@ class TestEndToEnd:
         # post-#1455 the redirect TARGET (errors.py) is stripped from argv, so this is a
         # bare pytest → BLOCK (no phantom .py file target).
         assert _run_guard("pytest 2> errors.py").returncode == 2
+
+
+class TestEvalHidesNothing:
+    """A whole-directory run behind `eval` is a whole-directory run.
+
+    `eval` parses its input twice (see `shell_parse`'s TestEvalReparsesItsInput),
+    so this guard's segment list was complete only for commands parsed once. Both
+    spellings below run the full suite and neither was refused: the escaped
+    separator survives the first parse as a literal, and the quoted script arrives
+    as one argument.
+
+    This guard is the reason the module-level fix went into the PARSER rather than
+    here — the same blind spot belonged to every consumer, and a copy of the
+    reconstruction logic per guard is how they drift apart.
+    """
+
+    def test_an_escaped_separator_does_not_hide_the_suite_run(self):
+        assert _run_guard(r"eval echo ok \; pytest tests/").returncode == 2
+
+    def test_a_quoted_eval_script_does_not_hide_the_suite_run(self):
+        assert _run_guard('eval "echo ok; pytest tests/"').returncode == 2
+
+    def test_a_targeted_run_behind_eval_is_still_allowed(self):
+        """The control. The reparse must decide on what the command IS, not on
+        the presence of `eval`."""
+        r = _run_guard('eval "pytest tests/test_hooks/test_full_suite_guard.py -q"')
+        assert r.returncode == 0, r.stderr
+
+    def test_a_continued_targeted_run_is_allowed(self):
+        """The FP this PR exists to remove, at the guard boundary. MEASURED over
+        52,353 real commands from this install's transcripts: of the 5,107 that
+        mention pytest, 105 were refused before the continuation fold and are
+        allowed after it — and all 105 name a specific test file or a -k/-m
+        selector. The split made the operand look like a separate command, so a
+        targeted run read as a bare one."""
+        r = _run_guard("python -m pytest \\\n  tests/test_hooks/test_full_suite_guard.py -q")
+        assert r.returncode == 0, r.stderr
