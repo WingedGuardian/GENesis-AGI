@@ -11,6 +11,8 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **Closing a pull request now asks for your approval, and a dispatched session cannot do it at all.** Closing a PR abandons reviewed work and cannot be undone from the outside, so it is your decision to make, not a session's. An interactive session now gets an approve/deny prompt it cannot answer for itself before `gh pr close` (or the REST-API equivalent) runs; a dispatched/autonomous session is refused and told to ask you. Closing a PR that already exhausted its review rounds additionally asks for a short written commitment to rebuild first — closing work that could not pass review is a return to the drawing board, not the end of it. Closing an issue, commenting, editing, or reopening a PR are unaffected.
+
 - **A review comment on documentation no longer blocks a merge.** The pre-merge
   check already declined to count findings on prose, but its idea of prose was
   narrow: markdown counted only underneath `docs/`, so a comment on a top-level

@@ -1403,6 +1403,14 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
 - **Worktree removal is not yours to do.** `git worktree remove` is blocked;
   `scripts/worktree_lifecycle.py` owns it, with a 7-day trash bin, and reaps
   unchanged worktrees on a daily timer. Leave a dead worktree alone.
+- **Closing a PR is a user decision, not the session's.** `gh pr close` (and the
+  `gh api … PATCH …/pulls/N … state=closed` REST form) is gated: interactive →
+  a native approve/deny dialog you cannot self-satisfy; dispatched → hard-denied,
+  ask via `outreach_send_and_wait`. Closing a PR that hit the review terminal
+  ALSO needs a written rebuild-commitment first (closing failed work is "back to
+  the drawing board", not the end). So at the round-7 terminal there is no
+  unilateral escape: merge is `--admin`-gated, close is ask-gated — both yours.
+  `gh issue close` / `gh pr comment` / `gh pr edit` / `gh pr reopen` are ungated.
 - **Editing a tracked git hook blocks the commit** until its hash is re-recorded
   (`scripts/update_hook_versions.sh`), and editing `scripts/hooks/*` changes
   nothing until `sync-hooks.sh` copies it into `.git/hooks/`.

@@ -123,6 +123,21 @@ over.
 - `gh pr merge` without `--admin`, or with unresolved review findings —
   **hard-blocked** (a `# review-override` trailing comment acknowledges
   intentionally-accepted findings on the *merge* command only).
+- `gh pr close` (and its REST/GraphQL equivalents — a `gh api … PATCH` to the
+  PR's `/pulls/N` **or** `/issues/N` resource with `state=closed`, or a
+  `gh api graphql … closePullRequest` mutation) — closing a PR abandons reviewed
+  work and is irreversible-outward,
+  so it is a **user decision**, never the session's. An **interactive** session
+  gets a native approve/deny dialog it cannot self-satisfy; a **dispatched**
+  session is **hard-denied** and pointed at `outreach_send_and_wait` to ask the
+  user. Closing a PR that reached the review **terminal** (`FINAL_ROUND_CAP`
+  rounds, counted from the PR's real review history) additionally requires a
+  written rebuild-commitment first — closing work that could not pass review is
+  "back to the drawing board", not the end — and its opening is quoted into the
+  approval dialog. Directed by the user on 2026-09-04 after PR #1579 was closed
+  without their approval. `gh issue close`, `gh pr comment`, `gh pr edit`, and
+  `gh pr reopen` are **not** gated — the point is to stop a session *deciding*
+  to abandon reviewed work, not to stop it speaking or labelling.
 
 The push dialog replaced the old `# review-override` token for the push gate —
 the agent can no longer self-approve a push. All code changes go through PRs;
