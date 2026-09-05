@@ -187,6 +187,89 @@ async def _impl_follow_up_create(
         return {"error": f"Failed to create follow-up: {exc}"}
 
 
+async def _enrich_external_state(db, items: list[dict]) -> dict[str, str]:
+    """Decorate *items* in place with the external state a triage pass needs, and
+    report whether each source could actually be read.
+
+    Two things about a follow-up live outside the ``follow_ups`` row, and neither
+    was reachable from here before:
+
+    ``issue``
+        The GitHub issue Genesis filed for this row. The link is stored in the
+        other direction (``pending_issue_posts.source_ref → follow_ups.id``), so
+        without this a triage pass cannot tell an unfiled row from a filed one and
+        re-files work that is already public.
+    ``pulse_proposal``
+        A repo-pulse annotation proposing that a merged PR completed this row.
+        These are written for ``target_kind='follow_up'`` and rendered NOWHERE —
+        the charter block is ledger-only (correctly: it renders a
+        ``session_ledger_update`` confirm command that cannot resolve a follow_up
+        id, and follow_up proposals are session-agnostic) and the dashboard panel
+        lists ledger only. Any proposal written would therefore go stale unseen.
+        MEASURED on this install: no follow_up annotation has yet been *proposed*
+        (all are ``applied``, which auto-absorbs and needs no surface), so this
+        closes a LATENT gap rather than one currently losing data. It fires on the
+        four branches that propose instead of absorbing — a pinned row, an
+        absorb-miss race, ``propose_only`` mode, and a bare-hex citation.
+
+    Returns a per-source availability map rather than failing the listing. Both
+    sources sit behind migrations (0079, 0084) an older install may not have, and
+    the sources are independent — one being absent must not blank the other.
+
+    The distinction the map exists to preserve: a MISSING key means "looked, found
+    nothing"; ``unavailable`` means "could not look". Collapsing those is how a
+    reader concludes a follow-up has no issue when the truth is nobody asked.
+    """
+    availability = {"issues": "unavailable", "proposals": "unavailable"}
+    by_id = {str(it["id"]): it for it in items if it.get("id")}
+
+    try:
+        from genesis.db.crud import pending_issue_posts
+
+        index = await pending_issue_posts.issue_by_follow_up(db)
+        for follow_up_id, linked in index.items():
+            row = by_id.get(follow_up_id)
+            if row is not None:
+                row["issue"] = linked
+        availability["issues"] = "ok"
+    except Exception:
+        logger.debug("follow_up_list: issue link unavailable", exc_info=True)
+
+    try:
+        from genesis.db.crud import repo_pulse
+
+        if await repo_pulse.tables_available(db):
+            # Bounded by the rows being decorated, NOT by a row cap. Scanning the
+            # global proposed set under a default limit would make a result AT the
+            # cap indistinguishable from a complete one, and the rows past the cut
+            # would carry no key — reading as "nothing to report" while the map
+            # still said "ok". That is the exact collapse this map exists to stop,
+            # so the query is made incapable of truncating instead of watched for it.
+            anns = await repo_pulse.list_annotations(
+                db,
+                status="proposed",
+                target_kind="follow_up",
+                item_ids=list(by_id),
+            )
+            # Newest first from the query; keep the first per row so a row with
+            # several proposals shows the most recent rather than an arbitrary one.
+            for ann in anns:
+                row = by_id.get(str(ann.get("item_id")))
+                if row is not None and "pulse_proposal" not in row:
+                    row["pulse_proposal"] = {
+                        "annotation_id": ann.get("id"),
+                        "pr_number": ann.get("pr_number"),
+                        "pr_title": ann.get("pr_title"),
+                        "confidence": ann.get("confidence"),
+                        "observed_at": ann.get("observed_at"),
+                    }
+            availability["proposals"] = "ok"
+    except Exception:
+        logger.debug("follow_up_list: pulse proposals unavailable", exc_info=True)
+
+    return availability
+
+
 async def _impl_follow_up_list(
     status_filter: str | None = None,
     limit: int = 20,
@@ -220,10 +303,16 @@ async def _impl_follow_up_list(
 
         counts = await follow_ups.get_summary_counts(db, include_tabled=include_tabled)
 
+        listed = items[:limit]
+        # Enrich only what is RETURNED, not everything fetched — the decoration is
+        # for the reader, and doing it before the slice would query on behalf of
+        # rows nobody sees.
+        external = await _enrich_external_state(db, listed)
         result = {
-            "follow_ups": items[:limit],
+            "follow_ups": listed,
             "counts": counts,
             "total": sum(counts.values()),
+            "external_state": external,
         }
         if not include_tabled:
             # Count each non-follow_up lane DIRECTLY (not by subtraction, which
@@ -634,6 +723,17 @@ async def follow_up_list(
     By default only the actionable follow_up lane is listed; the response's
     ``tabled_count`` says how many someday/maybe items are shelved. Set
     include_tabled=True to include tabled items in the list itself.
+
+    Each row may carry two keys describing state that lives OUTSIDE the follow-up:
+    ``issue`` (``{number, url, repo}``) when Genesis already filed a GitHub issue
+    for it — check this before filing another — and ``pulse_proposal`` when
+    repo-pulse has proposed that a merged PR completed it.
+
+    ``external_state`` reports whether each source could be READ, and the
+    difference is load-bearing: a row with NO ``issue`` key was checked and has
+    none, but ``external_state.issues == "unavailable"`` means the lookup could
+    not run at all, so absence proves nothing for ANY row in that response. Do not
+    conclude "no issue filed" from a missing key while its source is unavailable.
 
     Args:
         status_filter: Filter by status (pending, scheduled, in_progress, completed, failed, blocked). Empty for all.

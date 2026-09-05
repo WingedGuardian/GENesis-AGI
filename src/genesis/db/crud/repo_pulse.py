@@ -280,17 +280,33 @@ async def list_annotations(
     session_id: str | None = None,
     status: str | None = None,
     target_kind: str | None = None,
+    item_ids: list[str] | None = None,
     limit: int = 500,
 ) -> list[dict]:
-    """Annotations newest first, optionally filtered by session, status, and/or
-    target_kind. Each returned dict carries ``target_kind`` (SELECT *), so a
-    caller may also dispatch per-row without pre-filtering."""
+    """Annotations newest first, optionally filtered by session, status,
+    target_kind, and/or a specific set of item ids. Each returned dict carries
+    ``target_kind`` (SELECT *), so a caller may also dispatch per-row without
+    pre-filtering.
+
+    ``item_ids`` exists so a caller decorating a KNOWN set of rows can bound the
+    query by that set instead of by ``limit``. Without it such a caller must scan
+    the global matching set and trust it fits under the cap — and a result AT the
+    cap is a truncated read, indistinguishable from a complete one, so rows past
+    the cut silently look like rows with nothing to report. An empty list is a
+    real filter (matches nothing), distinct from ``None`` (no filter).
+    """
     if status is not None and status not in ANNOTATION_STATUSES:
         raise ValueError(f"invalid annotation status: {status!r}")
     if target_kind is not None and target_kind not in TARGET_KINDS:
         raise ValueError(f"invalid target_kind: {target_kind!r}")
     lim = max(1, min(int(limit), 2000))
     clauses, params = [], []
+    if item_ids is not None:
+        if not item_ids:
+            return []
+        placeholders = ",".join("?" * len(item_ids))
+        clauses.append(f"item_id IN ({placeholders})")  # noqa: S608 — bound placeholders
+        params.extend(str(i) for i in item_ids)
     if session_id is not None:
         clauses.append("item_session_id = ?")
         params.append(session_id)
