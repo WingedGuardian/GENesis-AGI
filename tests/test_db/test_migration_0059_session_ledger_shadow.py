@@ -331,3 +331,30 @@ async def test_list_promoted_events_with_runs_is_complete_and_paired(db):
 @pytest.mark.asyncio
 async def test_list_promoted_events_with_runs_noops_pre_migration(db):
     assert await crud.list_promoted_events_with_runs(db) == ([], [])
+
+
+@pytest.mark.asyncio
+async def test_list_events_for_runs_is_one_joined_window(db):
+    """Events selected BY the run window — never an independent cap.
+
+    Two independent newest-N caps stop covering the same span once runs carry
+    more proposals than the caps' ratio; a run whose events fell off then
+    reads as swept-with-no-proposals and its foreground rows are charged as
+    false negatives. Selecting by run id makes the mismatch impossible."""
+    await M59.up(db)
+    await crud.record_run(
+        db,
+        **_run_kwargs(run_id="r-in", started_at="2026-07-01T00:00:00+00:00"),
+        events=[_event(id="e-in-1", observed_at="2026-07-01T00:00:10+00:00"),
+                _event(id="e-in-2", observed_at="2026-07-01T00:00:05+00:00")],
+    )
+    await crud.record_run(
+        db,
+        **_run_kwargs(run_id="r-out", started_at="2026-07-02T00:00:00+00:00"),
+        events=[_event(id="e-out", observed_at="2026-07-02T00:00:10+00:00")],
+    )
+    events = await crud.list_events_for_runs(db, ["r-in"])
+    assert [e["id"] for e in events] == ["e-in-2", "e-in-1"], (
+        "wrong membership or ordering — oldest first, selected runs only"
+    )
+    assert await crud.list_events_for_runs(db, []) == []

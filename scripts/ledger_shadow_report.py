@@ -482,7 +482,7 @@ async def _load(db_path: str) -> tuple[list[dict], list[dict], list[dict], list[
     import aiosqlite
 
     from genesis.db.crud.session_charters import ledger_all
-    from genesis.db.crud.session_ledger_shadow import list_events, list_runs
+    from genesis.db.crud.session_ledger_shadow import list_runs
 
     async with aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5) as db:
         db.row_factory = aiosqlite.Row
@@ -495,11 +495,22 @@ async def _load(db_path: str) -> tuple[list[dict], list[dict], list[dict], list[
                 return []
 
         runs = await _all(list_runs, "shadow runs", limit=1000)
-        # NEWEST first, like the runs query — the two PRECISION windows must
-        # cover the same recent span. Newest runs against OLDEST events meant
-        # that once retention held more rows than either cap, the windows
-        # stopped overlapping at all.
-        events = await _all(list_events, "shadow events", limit=2000, newest_first=True)
+        # ONE JOINED WINDOW: events are selected BY the runs the report chose,
+        # not by an independent row-count cap. Two independent newest-N caps
+        # stop covering the same span the moment runs average more proposals
+        # than the caps' ratio — runs whose events fell off then read as
+        # swept-with-no-proposals and their foreground rows were charged as
+        # false negatives while the headline still counted every run.
+        events: list[dict] = []
+        try:
+            from genesis.db.crud.session_ledger_shadow import list_events_for_runs
+
+            events = await list_events_for_runs(db, [r["run_id"] for r in runs])
+        except Exception as exc:
+            print(
+                f"ledger_shadow_report: joined event read failed: {exc}",
+                file=sys.stderr,
+            )
         ledger = await _all(ledger_all, "session_ledger", limit=10000)
         # The ATTRIBUTION set is loaded by its key, never through the windows
         # above: the leak verdict must see every promoted event however old,

@@ -163,30 +163,26 @@ async def list_events(
     session_id: str | None = None,
     *,
     limit: int = 500,
-    newest_first: bool = False,
 ) -> list[dict]:
-    """Proposal events, optionally per-session. Oldest first by default.
+    """Proposal events oldest first, optionally per-session.
 
-    *newest_first* exists for the shadow REPORT, whose runs query is
-    newest-first: loading newest runs against OLDEST events meant the two
-    windows stopped overlapping once retention held more rows than the caps,
-    and every event whose run fell outside the run window lost its mode
-    provenance — which the leak invariant then read as a violation. The
-    worker's own callers keep the oldest-first default: the dedup pool's
-    duplicate_of chains root on the earliest occurrence, and reversing that
-    order would re-root them.
+    Deliberately NOT the shadow report's read: the report selects events BY
+    its chosen run window (``list_events_for_runs``) and reads attribution by
+    key (``list_promoted_events_with_runs``) — an independent row-count cap
+    here cannot promise to cover the same span as the runs query. This stays
+    the worker's read, where oldest-first is load-bearing: the dedup pool's
+    duplicate_of chains root on the earliest occurrence.
     """
     lim = max(1, min(int(limit), 2000))
-    order = "DESC" if newest_first else "ASC"
     if session_id is None:
         cursor = await db.execute(
-            f"SELECT * FROM session_ledger_shadow_events ORDER BY observed_at {order} LIMIT ?",  # noqa: S608 — order is a literal from a bool
+            "SELECT * FROM session_ledger_shadow_events ORDER BY observed_at ASC LIMIT ?",
             (lim,),
         )
     else:
         cursor = await db.execute(
-            f"SELECT * FROM session_ledger_shadow_events WHERE session_id = ? "
-            f"ORDER BY observed_at {order} LIMIT ?",  # noqa: S608 — order is a literal from a bool
+            "SELECT * FROM session_ledger_shadow_events WHERE session_id = ? "
+            "ORDER BY observed_at ASC LIMIT ?",
             (session_id, lim),
         )
     return [dict(r) for r in await cursor.fetchall()]
@@ -321,3 +317,42 @@ async def list_promoted_events_with_runs(
         )
         runs.extend(dict(r) for r in await cursor.fetchall())
     return events, runs
+
+
+async def list_events_for_runs(
+    db: aiosqlite.Connection,
+    run_ids: list[str],
+    *,
+    max_events: int = 24000,
+) -> list[dict]:
+    """Every event belonging to *run_ids*, oldest first — ONE joined window.
+
+    The shadow report's precision populations need events selected BY the run
+    window it already chose, not by an independent row-count cap: two
+    independent newest-N caps stop covering the same span the moment runs
+    average more proposals than the ratio of the caps, and runs whose events
+    fell off then read as swept-with-no-proposals — charged false negatives.
+    *max_events* is a resource tripwire sized from the schema's own worst case
+    (a run stores at most 12 proposals; 1000 runs -> 12,000, doubled for
+    slack), not a window: exceeding it raises rather than silently narrowing
+    the population this exists to keep whole.
+    """
+    if not await _tables_available(db) or not run_ids:
+        return []
+    out: list[dict] = []
+    for i in range(0, len(run_ids), 500):  # SQLite parameter-count safety
+        chunk = run_ids[i : i + 500]
+        placeholders = ", ".join("?" for _ in chunk)
+        cursor = await db.execute(
+            f"SELECT * FROM session_ledger_shadow_events WHERE run_id IN ({placeholders})",  # noqa: S608 — placeholders only
+            chunk,
+        )
+        out.extend(dict(r) for r in await cursor.fetchall())
+        if len(out) > max_events:
+            raise RuntimeError(
+                f"events for {len(run_ids)} runs exceed {max_events} — the "
+                "per-run proposal bound is broken; refusing to hand the report "
+                "a silently narrowed population"
+            )
+    out.sort(key=lambda e: e.get("observed_at") or "")
+    return out

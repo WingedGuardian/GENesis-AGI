@@ -1202,3 +1202,30 @@ async def test_early_failures_carry_the_prompt_version(
         assert r["prompt_version"] == lw.PROMPT_VERSION, (
             f"{r['status']} row lost its version — filed as legacy by the report"
         )
+
+
+async def test_promotion_failure_re_marks_the_durable_run_row(
+    tmp_path, sessions_root, live_mode, live_db_path, transcript, monkeypatch
+):
+    """The run ROW must say failed, not just telemetry and the outcome dict.
+
+    The shadow row is deliberately written status='ok' before the sweep (audit
+    trail first) — but the report's status histogram and failure rate read run
+    rows, so a live promotion failure that only flipped telemetry looked
+    healthy exactly where the flip decision looks. The row is re-marked after
+    the fact."""
+    import genesis.db.crud.session_charters as charters_crud
+
+    async def _boom(*a, **k):
+        raise RuntimeError("simulated ledger write failure")
+
+    monkeypatch.setattr(charters_crud, "ledger_add", _boom)
+    out = await _run_once(tmp_path, transcript, live_db_path, [AGREEMENT])
+    assert out["status"] == "failed"
+    assert out["promotion_failed_rows"] == 1
+
+    (run,) = await _runs(live_db_path)
+    assert run["status"] == "failed", (
+        "the durable run row still says ok — the report's histogram reads rows"
+    )
+    assert "promotion_failed=1" in (run["detail"] or "")

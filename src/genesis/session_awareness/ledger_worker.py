@@ -307,23 +307,30 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
                 )
 
             for ev in candidates:
-                if effective_mode() != "live":
-                    # Rollback mid-sweep: stop before the NEXT transaction.
-                    # Candidates already written stay written (they were made
-                    # under a live gate); everything else waits, unpromoted.
-                    mode_stopped = True
-                    logger.warning(
-                        "ledger promotion stopped mid-sweep for %s — mode left "
-                        "'live' with %d candidate(s) unprocessed",
-                        session_id, len(candidates) - written - disqualified - failed,
-                    )
-                    break
                 try:
                     # Hold the write lock across recheck + insert: in WAL mode
                     # a DEFERRED read snapshot could miss a foreground row
                     # committed after it, and that stale novelty answer is the
                     # TOCTOU this transaction exists to close.
                     await db.execute("BEGIN IMMEDIATE")
+                    # The rollback gate is re-read AFTER the lock is held, per
+                    # candidate — not merely before the loop iteration. BEGIN
+                    # IMMEDIATE can wait out the full busy timeout behind a
+                    # concurrent writer, and an operator's `mode: shadow`
+                    # landing during that wait must stop THIS write, not the
+                    # one after it. Config is read fresh per call, so the
+                    # recheck is real; a stopped candidate rolls back the
+                    # freshly-acquired (empty) transaction and ends the sweep.
+                    if effective_mode() != "live":
+                        mode_stopped = True
+                        await db.rollback()
+                        logger.warning(
+                            "ledger promotion stopped mid-sweep for %s — mode "
+                            "left 'live' with %d candidate(s) unprocessed",
+                            session_id,
+                            len(candidates) - written - disqualified - failed,
+                        )
+                        break
                     # OPEN rows only. A CLOSED row is a finished agreement,
                     # and the same agreement being renewed later is a NEW
                     # commitment, not a duplicate of the old one — but matching
@@ -440,6 +447,28 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
         "sweep_error": sweep_error,
         "mode_stopped": mode_stopped,
     }
+
+
+async def _mark_run_failed(db_path: Path | str, run_id: str, note: str) -> None:
+    """Flip an already-committed run row to failed, appending *note* to detail.
+
+    Best-effort on its own short-lived connection (worker discipline): the
+    caller has already surfaced the failure through telemetry and its outcome,
+    so a miss here loses only the run-row copy of a fact recorded elsewhere.
+    """
+    import aiosqlite
+
+    try:
+        async with aiosqlite.connect(str(db_path), timeout=10) as db:
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute(
+                "UPDATE session_ledger_shadow_runs SET status = 'failed', "
+                "detail = COALESCE(detail || '; ', '') || ? WHERE run_id = ?",
+                (note, run_id),
+            )
+            await db.commit()
+    except Exception:
+        logger.warning("could not re-mark run %s failed", run_id, exc_info=True)
 
 
 async def _record_run(db_path: Path | str, **kwargs) -> bool:
@@ -823,6 +852,20 @@ async def _run_locked(
     )
     if promotion.get("mode_stopped"):
         detail_notes.append("promotion_stopped_mode_changed_midsweep")
+    if recorded and _write_failed:
+        # The DURABLE run row was written status='ok' before the sweep ran —
+        # deliberately, so the shadow audit trail exists even if promotion
+        # then fails — but the report's status histogram and failure rate read
+        # run rows, not telemetry. Leaving 'ok' standing meant live promotion
+        # failures looked healthy exactly where the flip decision looks. The
+        # row is re-marked failed after the fact, best-effort on its own
+        # connection: if THIS write also fails, telemetry still carries it.
+        await _mark_run_failed(
+            db_path,
+            run_id,
+            f"promotion_failed={promotion.get('failed_rows', 0)}"
+            f"|sweep_error={int(bool(promotion.get('sweep_error')))}",
+        )
     await _record_telemetry(
         db_path,
         "failed" if _write_failed else "ok",
