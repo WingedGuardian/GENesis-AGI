@@ -1,0 +1,29 @@
+# Federation relay — the private, human-in-the-loop Genesis↔Genesis channel.
+#
+# OPT-IN and dark by default. A fresh clone never federates until you set a mode
+# below (or in ~/.genesis/config/federation.local.yaml). All cross-owner comms
+# are least-privilege and human-in-the-loop: inbound peer messages are verified,
+# quarantined, and QUEUED for you; outbound messages are HELD for your approval.
+#
+# Emergency stop: `mode: off` here, or the env kill switch
+# GENESIS_FEDERATION_DISABLED=1 (also freezes any dispatched background session).
+
+enabled: true
+
+# off          — subsystem dark (default): no poll loop, no pairing, no send.
+# propose_only — active + safe: poll for inbound (verify + quarantine + queue),
+#                hold every outbound for your approval. Nothing auto-acts.
+# live         — reserved for v2 (per-contact earned-trust automation); in v1 it
+#                behaves exactly like propose_only.
+mode: off
+
+# Transcript bodies (plaintext/ciphertext) are pruned after this many days by the
+# disk-hygiene retention path. The hash-chain skeleton is kept forever so a pruned
+# transcript still verifies.
+retention_days: 90
+
+# Reject a peer message whose plaintext exceeds this many bytes (both directions).
+max_message_bytes: 16384
+
+# How often the active subsystem polls the relay for inbound messages.
+poll_interval_seconds: 300
