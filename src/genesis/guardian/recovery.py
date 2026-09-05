@@ -4,7 +4,8 @@ Recovery actions in escalation order:
 1. RESTART_SERVICES  — systemctl restart genesis-server
 2. IO_TRIAGE         — kill top I/O consumer (one per cycle)
 3. RESOURCE_CLEAR    — clear /tmp, reclaim page cache, restart
-4. REVERT_CODE       — git stash && git revert HEAD, restart
+4. REVERT_CODE       — git stash && git revert <pinned sha>, restart (aborts if
+                       the stash failed; never reverts an unvetted HEAD)
 5. RESTART_CONTAINER — incus restart genesis
 6. SNAPSHOT_ROLLBACK — incus snapshot restore genesis {last_healthy}
 7. ESCALATE          — alert user, stop automated recovery
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -29,6 +31,11 @@ from genesis.guardian.snapshots import SnapshotManager
 from genesis.guardian.state_machine import ConfirmationStateMachine
 
 logger = logging.getLogger(__name__)
+
+# A resolved commit sha, used to validate the value before it is interpolated
+# into a shell command run inside the container. Shape-checking it is what keeps
+# a contaminated or error-path `git rev-parse` result from reaching the shell.
+_FULL_SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
 @dataclass(frozen=True)
@@ -294,28 +301,98 @@ class RecoveryEngine:
         return await self._restart_services(container)
 
     async def _revert_code(self, container: str) -> tuple[bool, str]:
-        """Stash uncommitted changes and revert last commit, then restart."""
-        # Stash any uncommitted work
-        rc, _, _ = await _run_subprocess(
+        """Stash uncommitted changes and revert the last commit, then restart.
+
+        This runs against the container's LIVE development checkout, not a
+        pristine deploy tree, so two things are guarded:
+
+        - **The stash must SUCCEED.** Its exit code used to be discarded, so a
+          FAILED stash still went on to revert — on top of uncommitted work that
+          was never saved. Note `git stash` exits 0 with "No local changes to
+          save" on a clean tree, so rc is the success test, not whether anything
+          was actually stashed.
+        - **The commit is PINNED by sha.** HEAD is resolved in one `incus exec`
+          and the revert runs in another, with the stash round-trip in between;
+          a deploy landing in that window would otherwise revert a commit this
+          never looked at. Reverting the pinned sha stays correct if HEAD moved.
+
+        A failed revert is ABORTED rather than left in place. Together those two
+        guards would otherwise deadlock each other: a conflicted revert leaves an
+        unmerged index, `git stash` refuses an unmerged index, and the stash
+        guard would then refuse this rung on every future attempt.
+
+        The stash is deliberately NOT popped — a revert that restored the same
+        uncommitted changes could reintroduce the fault. The outcome string says
+        where the work went so the recovery alert carries it. Note plain
+        `git stash` takes TRACKED files only; untracked files stay in the tree.
+
+        Caveat inherited from the rung's design: when HEAD arrived by
+        fast-forward, reverting it undoes ONE commit of the batch that landed,
+        not the whole deploy.
+        """
+        rc, stdout, stderr = await _run_subprocess(
+            "incus", "exec", container, "--",
+            "su", "-", "ubuntu", "-c",
+            # `pipefail` because the pipe would otherwise report tail's status:
+            # `git rev-parse HEAD` exits 128 on a broken repo AND prints the
+            # literal "HEAD" to stdout, so without it a failure reads as rc=0.
+            # `| tail -n1` drops a login-shell banner (nvm/direnv/~/.profile).
+            # The shape check below is still the real gate.
+            "set -o pipefail; cd ~/genesis && git rev-parse HEAD | tail -n1",
+            timeout=15.0,
+        )
+        sha = stdout.strip()
+        if rc != 0 or not _FULL_SHA_RE.fullmatch(sha):
+            return False, (
+                f"could not resolve HEAD to a commit sha: {stderr or stdout or 'no output'}"
+            )
+
+        # Stash any TRACKED uncommitted work. Plain `git stash` does not take
+        # untracked files, which is why the outcome string below says "tracked".
+        rc, _, stderr = await _run_subprocess(
             "incus", "exec", container, "--",
             "su", "-", "ubuntu", "-c",
             "cd ~/genesis && git stash",
             timeout=15.0,
         )
+        if rc != 0:
+            return False, f"git stash failed, refusing to revert: {stderr}"
 
-        # Revert the last commit
+        # Revert the PINNED commit, not symbolic HEAD.
+        logger.info("REVERT_CODE reverting pinned commit %s", sha)
         rc, stdout, stderr = await _run_subprocess(
             "incus", "exec", container, "--",
             "su", "-", "ubuntu", "-c",
-            "cd ~/genesis && git revert --no-edit HEAD",
+            f"cd ~/genesis && git revert --no-edit {sha}",
             timeout=30.0,
         )
         if rc != 0:
+            # A failed revert leaves the checkout MID-REVERT — unmerged paths and
+            # conflict markers in tracked files. Left behind, that state poisons
+            # every later attempt: `git stash` refuses an unmerged index, so the
+            # stash guard above would then refuse this rung forever. Abort so the
+            # tree returns to the sha we pinned. Best-effort: if the abort itself
+            # fails there is nothing further this can safely do, and the recovery
+            # is already being reported as failed.
+            _abort_rc, _, abort_err = await _run_subprocess(
+                "incus", "exec", container, "--",
+                "su", "-", "ubuntu", "-c",
+                "cd ~/genesis && git revert --abort",
+                timeout=15.0,
+            )
+            if _abort_rc != 0:
+                logger.error(
+                    "git revert --abort failed after a failed revert — the "
+                    "checkout may be left mid-revert: %s", abort_err,
+                )
             return False, f"git revert failed: {stderr}"
 
         # Restart services after code change
         svc_ok, svc_detail = await self._restart_services(container)
-        return svc_ok, f"Code reverted, {svc_detail}"
+        return svc_ok, (
+            f"Code reverted ({sha[:12]}; tracked uncommitted work is in "
+            f"`git stash list`), {svc_detail}"
+        )
 
     async def _restart_container(self, container: str) -> tuple[bool, str]:
         """Restart the entire container (or start it, if stopped).
