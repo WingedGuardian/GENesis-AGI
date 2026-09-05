@@ -32,6 +32,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **A `tmux kill-server` with no socket binding now draws an advisory.** tmux
+  resolves its target server from the inherited `$TMUX` variable before
+  `TMUX_TMPDIR`, so a cleanup aimed at a scratch or probe server can address
+  the main server instead and take down every live session on it — including
+  the one issuing the command. Clearing `$TMUX` does not help: that only
+  re-targets the default socket, which is usually the main server too. A new
+  advisory-tier guard flags a `kill-server` carrying no explicit `-S`/`-L`
+  binding and points at the one safe form — binding the kill to its own
+  socket. Session-scoped kills (`kill-session`) are deliberately not flagged,
+  and the advisory never blocks anything.
+
 - **The review-round limit now has an end, not just a speed bump.** The existing
   limit pauses after three rounds in which an independent reviewer keeps finding new
   problems, and asks for a conscious decision to continue — but acknowledging it
@@ -74,6 +85,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   only the blocking ones, so an advisory list stops re-reporting settled findings and
   burying the unsettled.
 
+- **Marketing campaign updates now post to their own Telegram topic.** The marketing
+  campaign's tick updates previously routed to the shared Morning Reports topic; they
+  now go to a dedicated "Marketing" forum topic via a new `marketing` outreach
+  category, keeping them separate from the morning report and other digests. Existing
+  installs pick up the category automatically on restart (an additive schema
+  migration); the morning report and all other topics are unaffected.
 - **Proactive memory recall could time out completely.** The embedding provider
   queues standard-rate requests when a model is busy, and that wait can run past
   recall's four-and-a-half-second budget — measured at eight to thirteen seconds
@@ -292,6 +309,32 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Claude Code's auto-updater suppression now re-asserts itself, and "verified"
+  means verified.** The two kill switches (`DISABLE_AUTOUPDATER`/`DISABLE_UPDATES`
+  in the user-level `~/.claude/settings.json`) were written only at install time,
+  so a machine whose settings drifted stayed silently unprotected until someone
+  re-ran setup — twice CC self-updated past the pin that way. One shared owner now
+  re-asserts them on every install/bootstrap/update and on a daily container timer
+  (`genesis-cc-settings-align.timer`), whose unit goes red rather than staying
+  green when it cannot verify. The outcome channel is fail-closed by
+  construction: the state starts `unverified` and is promoted to `ok`/`repaired`
+  only where a post-operation read confirms both keys are on disk — an audit
+  found nine paths that previously reported success without checking (a
+  busy lock, a missing library, a write never read back, and callers that
+  discarded the outcome entirely), and each now either verifies or says plainly
+  that it could not.
+
+  Three follow-ons keep that honesty intact where it was still leaking. A repair
+  performed during the early part of a deploy is now recorded even though the
+  later check finds nothing left to fix — previously that repair vanished
+  entirely, because it happened in a separate process whose result could not
+  travel back. A verified-clean run that happens to overlap another run now
+  counts as clean, so the next unrelated repair is no longer misreported as "the
+  second in a row" and does not raise a false alarm about something repeatedly
+  rewriting the settings file. And `uninstall.sh --dry-run` no longer clears the
+  saved timer schedules for real: that was the one step in the uninstall that
+  ignored dry-run, and it can change whether a missed scheduled run replays
+  after a later reinstall.
 - **Telegram ping when someone replies to a marketing pitch.** When a real person
   replies to one of Genesis's cold marketing emails, you now get one brief
   Telegram notification — the sender and the first line of their reply.
