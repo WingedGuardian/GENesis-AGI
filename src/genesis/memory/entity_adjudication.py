@@ -165,26 +165,12 @@ def digit_only_difference(a: str, b: str) -> bool:
 # ── entity loading / redirect resolution ─────────────────────────────────────
 
 
-async def _resolve_active(db: aiosqlite.Connection, entity_id: str) -> dict | None:
-    """Follow ``merged_into`` redirects to the active survivor, or None if the
-    chain dead-ends in a merged-with-no-target / gone / missing entity.
-
-    Uses ``get_entity`` (raw row, does NOT follow merges) — the redirect walk is
-    done here."""
-    seen: set[str] = set()
-    current = entity_id
-    while current and current not in seen:
-        seen.add(current)
-        ent = await entities_crud.get_entity(db, current)
-        if ent is None:
-            return None
-        if ent["status"] == "active":
-            return ent
-        if ent["status"] == "merged" and ent["merged_into"]:
-            current = ent["merged_into"]
-            continue
-        return None  # gone, or merged with no target
-    return None
+#: Shared chain walk (MW-3 PR-2b): the seen-set redirect walk this module
+#: pioneered now lives in the CRUD layer (``entities.resolve_active``) so the
+#: query lane and lookups share ONE implementation. Aliased rather than
+#: re-imported at call sites to keep the 6 existing call sites and the tests'
+#: monkeypatch surface stable.
+_resolve_active = entities_crud.resolve_active
 
 
 # ── LLM adjudication ─────────────────────────────────────────────────────────
@@ -613,6 +599,34 @@ async def _apply_one_proposal(
                         # must NOT clobber that terminal state back to stale. It
                         # returns False then — count the row as skipped, not stale.
                         marked = await adj_crud.mark_stale(own, pair_key=pair_key, _commit=False)
+                        if (
+                            marked
+                            and ent_a is not None
+                            and ent_b is not None
+                            and ent_a["entity_id"] != ent_b["entity_id"]
+                        ):
+                            # Immediate re-enqueue of the RE-RESOLVED active pair
+                            # (MW-3 PR-2b): without this, a stale pair waited for the
+                            # WEEKLY sweep to rediscover it — 9→1 shard convergence
+                            # took weeks by construction (the park-on-cap variant was
+                            # tried and reverted; the sweep's own comment routes the
+                            # convergence redesign here). Only the norm-drift case has
+                            # a live pair to re-judge: converged/gone chains leave
+                            # nothing. Skipped when the NEW pair is already settled
+                            # (a non-stale verdict exists under its key);
+                            # enqueue_adjudication's own dedup covers pending rows in
+                            # either orientation, and its enable-gate still applies.
+                            prior = await adj_crud.get_by_pair(
+                                own, ent_a["entity_id"], ent_b["entity_id"]
+                            )
+                            if prior is None or prior["verdict"] == "stale":
+                                await entities_crud.enqueue_adjudication(
+                                    own,
+                                    entity_id=ent_a["entity_id"],
+                                    similar_entity_id=ent_b["entity_id"],
+                                    _commit=False,
+                                )
+                                counts["reenqueued"] = counts.get("reenqueued", 0) + 1
                         await own.commit()
                         if marked:
                             counts["stale"] += 1
@@ -774,6 +788,7 @@ async def _emit_run_observation(
             "merged": counts["merged"],
             "proposed": counts["proposed"],
             "stale": counts["stale"],
+            "reenqueued": counts.get("reenqueued", 0),
             "judged": counts["judged"],
             "examples": example_merges,
         }
