@@ -805,6 +805,22 @@ def _merge_and_write(peer: str, status: PeerStatus) -> bool:
         # return: _record's contract is that True means the row landed.
         return False
     peer, row = pair
+    # Never let an OLDER observation overwrite a NEWER one. The observation is
+    # stamped BEFORE the lock is acquired, and the lock's bounded retry means two
+    # concurrent recorders can both eventually win it — in either order. Without
+    # this, a delayed quota failure could replace a fresher success (or the
+    # reverse) and the reversal stands for days, since records only refresh
+    # during a home outage. Compared as PARSED datetimes, not strings: the
+    # decoder admits any ISO stamp with an offset, and lexicographic order lies
+    # across different offsets. fromisoformat cannot raise here — both stamps
+    # already round-tripped through it inside _decode_row. Ties go to the
+    # incoming row (same instant, later write wins).
+    prior = peers.get(peer)
+    if prior is not None and (
+        datetime.fromisoformat(prior["observed_at"])
+        > datetime.fromisoformat(row["observed_at"])
+    ):
+        return True  # the newer observation is already on disk; ours is history
     # pop-then-set UNCONDITIONALLY: assigning an existing key does NOT move it in
     # a dict, so without this the order is first-seen and eviction below drops the
     # MOST RECENTLY observed peer while keeping stale ones. Measured: re-recording

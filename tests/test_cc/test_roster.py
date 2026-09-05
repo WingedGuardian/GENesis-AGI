@@ -348,3 +348,31 @@ def test_a_peer_too_long_to_observe_is_announced_at_load(monkeypatch, caplog):
     hits = [r for r in caplog.records if "never appear in peer-availability" in r.getMessage()]
     assert len(hits) == 1, f"an unobservable peer must be announced, got {len(hits)}"
     assert long_name not in caplog.text, "the name itself must not be logged whole"
+
+
+def test_a_non_string_roster_key_cannot_disable_the_backup_chain(monkeypatch, caplog):
+    """A hand-edited YAML roster with an unquoted numeric key parses to an int.
+
+    The observability warning added at load time calls len() on the name, and a
+    TypeError there is raised while BUILDING failover_chain — before the
+    per-peer skip logic — so one malformed entry silently disabled the entire
+    backup chain at exactly the moment it was needed. The defect was introduced
+    by the warning itself, which is why this lock exists.
+    """
+    from genesis.cc import roster as R
+
+    monkeypatch.setenv("FAKE_PEER_TOKEN", "x")
+    fake = {"models": {
+        "active-one": {"failover_order": 0, "auth_env": "FAKE_PEER_TOKEN"},
+        123: {"failover_order": 1, "auth_env": "FAKE_PEER_TOKEN"},
+        "good-peer": {"failover_order": 2, "auth_env": "FAKE_PEER_TOKEN"},
+    }}
+
+    with caplog.at_level("WARNING", logger="genesis.cc.roster"):
+        chain = R.failover_chain("active-one", roster=fake)
+
+    assert "good-peer" in chain, "one malformed key must not cost the whole chain"
+    assert 123 not in chain
+    hits = [r for r in caplog.records if "not a string" in r.getMessage()]
+    assert len(hits) == 1, "the skipped entry must be announced"
+    assert "123" not in caplog.text, "the key's VALUE must not be logged"

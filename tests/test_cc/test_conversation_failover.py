@@ -716,3 +716,74 @@ async def test_an_ordinary_stale_resume_still_retries_fresh(loop, invoker, monke
     assert invoker.run_streaming.await_count == 2, "the fresh retry was lost"
 
 
+
+
+@pytest.mark.asyncio
+async def test_a_declined_limit_error_after_streaming_clears_a_stale_block(
+    loop, invoker, monkeypatch,
+):
+    """The typed rate-limit branch is no longer refusals-only: since the MCP
+    exclusion, a tool's own 429 arrives there typed CCRateLimitError and is
+    correctly DECLINED as evidence about the peer. But the declined-plus-streamed
+    stale-block clearing lived only on the generic CCError branch — so a
+    previously blocked peer that had just SERVED text stayed falsely blocked,
+    potentially for days, on exactly the branch that runs first.
+    """
+    peer_availability.note_failure("peer-a", CCRateLimitError("429 earlier"))
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+    streamed: dict = {"text": False}
+
+    async def _stream_then_tool_429(*a, **k):
+        streamed["text"] = True
+        raise CCRateLimitError("MCP server 'web-search' returned error: 429 rate limit")
+
+    invoker.run_streaming = AsyncMock(side_effect=_stream_then_tool_429)
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x",
+        on_event=AsyncMock(), streamed=streamed,
+    )
+    st = peer_availability.read_peer("peer-a")
+    assert st is not None and st.available is True, (
+        "a peer that served text stayed blocked after a declined tool 429"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_genuine_refusal_after_streaming_still_blocks(
+    loop, invoker, monkeypatch,
+):
+    """The control: a REAL refusal after streaming must keep the peer blocked —
+    the cleanup fires only for declined evidence, or the branch would launder
+    genuine quota blocks into availability."""
+    monkeypatch.setattr(
+        roster, "failover_invocations",
+        lambda home, base, *a, **k: [("peer-a", _PEER_INV)],
+    )
+    streamed: dict = {"text": False}
+
+    async def _stream_then_refused(*a, **k):
+        streamed["text"] = True
+        raise CCRateLimitError("429 rate limit exceeded")
+
+    invoker.run_streaming = AsyncMock(side_effect=_stream_then_refused)
+    loop._merge_session_metadata = AsyncMock()
+    loop._session_mgr = MagicMock(update_activity=AsyncMock())
+
+    await loop._try_roster_failover(
+        session={"id": "s1"}, base_inv=CCInvocation(prompt="x", roster_eligible=True),
+        channel=ChannelType.TERMINAL, model=CCModel.SONNET,
+        effort=EffortLevel.LOW, prompt_text="x",
+        on_event=AsyncMock(), streamed=streamed,
+    )
+    st = peer_availability.read_peer("peer-a")
+    assert st is not None and st.available is False, (
+        "a genuine refusal after streaming was laundered into availability"
+    )

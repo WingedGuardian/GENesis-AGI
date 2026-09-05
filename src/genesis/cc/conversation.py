@@ -1213,8 +1213,20 @@ class ConversationLoop:
                     # sleeps, then a tempfile write, fsync and replace. Run inline
                     # it blocks the event loop — stalling every other conversation
                     # during the very outage it exists to observe.
+                    # This branch is no longer refusals-only: since the MCP
+                    # exclusion, a tool's own 429 arrives HERE typed as a
+                    # rate-limit error and is correctly DECLINED as evidence.
+                    # So the declined-plus-streamed cleanup below applies on
+                    # this branch too — without it, a previously blocked peer
+                    # that just SERVED text stayed falsely blocked for days
+                    # because its clearing lived only on the generic branch.
+                    declined = not peer_availability.is_provider_refusal(exc)
                     await _record_peer(peer_availability.note_failure, peer_name, exc)
                     if streamed and streamed.get("text"):
+                        if declined:
+                            await _record_peer(
+                                peer_availability.note_success, peer_name,
+                            )
                         # Text already reached the user this turn. Returning ""
                         # (not None) stops the caller running contingency, which
                         # would stack a SECOND answer on the first.

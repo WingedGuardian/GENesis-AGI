@@ -344,6 +344,19 @@ def failover_chain(active: str, roster: dict | None = None) -> list[str]:
     r = roster if roster is not None else load_roster()
     peers: list[tuple[int, str]] = []
     for name, raw in (r.get("models") or {}).items():
+        if not isinstance(name, str):
+            # A hand-edited YAML roster with an unquoted numeric key parses to
+            # an int. Everything downstream assumes str — the observability
+            # warning below calls len(), invocation building formats it — and a
+            # raise HERE is before the per-peer skip logic, so one malformed
+            # entry would disable the ENTIRE backup chain. Skip it loudly
+            # instead; type() only, never the value, in case someone pasted a
+            # secret where a name goes.
+            logger.warning(
+                "roster model key is %s, not a string — skipping this entry",
+                type(name).__name__,
+            )
+            continue
         if name == active:
             continue
         entry = _entry_from(name, raw)

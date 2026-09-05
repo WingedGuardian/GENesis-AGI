@@ -1105,3 +1105,39 @@ def test_deeply_nested_json_does_not_disable_recording_forever(tmp_path):
     # The real property: the write path SELF-HEALS rather than being wedged.
     assert PA.note_failure("peer-x", CCRateLimitError("429")) is True
     assert PA.read_peer("peer-x") is not None, "the file never recovered"
+
+
+def test_an_older_observation_never_overwrites_a_newer_one(tmp_path):
+    """The stamp is taken BEFORE the lock, and the lock's bounded retry means two
+    concurrent recorders can win it in either order — so a delayed failure could
+    replace a fresher success, and the reversal stands until the next outage.
+
+    Simulated by writing the rows in reversed stamp order through the real merge
+    path, which is exactly what the losing interleaving produces.
+    """
+    from datetime import timedelta
+
+    newer = datetime.now(UTC)
+    older = newer - timedelta(seconds=30)
+
+    def _status(available, stamp):
+        return PA.PeerStatus(
+            peer="peer-x", available=available,
+            reason="" if available else PA.QUOTA,
+            observed_at=stamp.isoformat(), reset_at="",
+            limit_kind="" if available else "unknown",
+        )
+
+    # _merge_and_write owns the ordering rule (its caller holds the lock; no
+    # concurrency needed to exercise the losing interleaving's exact writes).
+    assert PA._merge_and_write("peer-x", _status(True, newer)) is True
+    assert PA._merge_and_write("peer-x", _status(False, older)) is True
+    st = PA.read_peer("peer-x")
+    assert st is not None and st.available is True, (
+        "a 30s-older failure overwrote a fresh success"
+    )
+    # And the newer-wins rule is not sticky-first: a genuinely newer write lands.
+    assert PA._merge_and_write(
+        "peer-x", _status(False, newer + timedelta(seconds=5))
+    ) is True
+    assert PA.read_peer("peer-x").available is False
