@@ -329,6 +329,71 @@ class TestUntokenizable:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# ANSI-C DECODE — escape-free $'...' resolves to what bash runs, so a verb or
+# flag hidden in one is seen by the ordinary gate (not just the fail-closed net)
+# ══════════════════════════════════════════════════════════════════════════
+class TestAnsiCDecode:
+    """shlex leaves the ``$`` on ``$'push'`` (token ``$push``), one char off from
+    what bash runs. ``_decode_escape_free_ansi_c`` rewrites the escape-free span
+    so the resolved subcommand/flag matches bash. Each assertion here fails if
+    the decode is reverted (verify-RED confirmed against the pre-fix module)."""
+
+    def test_ansic_verb_resolves_to_the_real_subcommand(self):
+        # $'push' hid the verb: git_subcommand read $push and no gate saw a push.
+        segs = sp.analyze(f"{GIT} $'{PUSH}' origin main {FORCE}")
+        assert any(s.exe == "git" and sp.git_subcommand(s.argv) == PUSH for s in segs)
+
+    def test_ansic_gh_pr_token_resolves(self):
+        segs = sp.analyze("gh $'pr' merge 5 " + ADMIN)
+        assert any(s.exe == "gh" and sp.gh_pr_subcommand(s.argv) == "merge" for s in segs)
+
+    def test_ansic_gh_merge_subcommand_resolves(self):
+        segs = sp.analyze("gh pr $'merge' 5 " + ADMIN)
+        assert any(s.exe == "gh" and sp.gh_pr_subcommand(s.argv) == "merge" for s in segs)
+
+    def test_ansic_flag_on_visible_verb_resolves(self):
+        # verb visible, --no-verify hidden as --$'no-verify': the flag must show.
+        segs = sp.analyze(f"{GIT} {COMMIT} --$'no-''verify' -m x")
+        assert any(s.exe == "git" and sp.commit_skips_hooks(s.argv) for s in segs)
+
+    def test_escape_bearing_span_is_NOT_decoded(self):
+        # hex-encoded verb: a partial escape decoder is a blind spot, so the
+        # decode leaves it — this is the documented residual (follow-up), and the
+        # test PINS that we did not silently half-decode it into a false gate.
+        segs = sp.analyze(r"git $'\x70\x75\x73\x68' origin main")
+        assert not any(s.exe == "git" and sp.git_subcommand(s.argv) == PUSH for s in segs)
+
+    def test_ansic_inside_double_quotes_is_not_decoded(self):
+        # bash does not treat $'...' as ANSI-C inside "..." — decoding there
+        # would corrupt an ordinary argument. The verb stays echo, no push.
+        segs = sp.analyze(f'echo "$\'{PUSH}\'"')
+        assert all(sp.git_subcommand(s.argv) != PUSH for s in segs)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# git_push_guard — decoded ANSI-C reaches the ORDINARY gate verdict (BLOCK),
+# and the escaped/heredoc cases still route to the fail-closed net
+# ══════════════════════════════════════════════════════════════════════════
+class TestAnsiCDecodeGuard:
+    def test_ansic_verb_force_push_blocks(self, tmp_path):
+        # git $'push' --force → decodes to a force push → the plain-form verdict.
+        r = _run(_PUSH_GUARD, f"{GIT} $'{PUSH}' origin main {FORCE}", cwd=str(tmp_path))
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
+
+    def test_ansic_gh_merge_verb_blocks(self, tmp_path):
+        r = _run(_PUSH_GUARD, f"gh $'pr' merge 5 {ADMIN}", cwd=str(tmp_path))
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
+
+    def test_ansic_flag_no_verify_blocks(self, tmp_path):
+        r = _run(_PUSH_GUARD, f"{GIT} {COMMIT} --$'no-''verify' -m x", cwd=str(tmp_path))
+        assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
+
+    def test_benign_ansic_echo_not_blocked(self, tmp_path):
+        r = _run(_PUSH_GUARD, "echo $'hello world'", cwd=str(tmp_path))
+        assert _decision(r) == "allow", r.stdout + r.stderr
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # git_push_guard — the net flips the unparseable cases to BLOCK (verify-RED)
 # ══════════════════════════════════════════════════════════════════════════
 class TestPushGuardNet:
