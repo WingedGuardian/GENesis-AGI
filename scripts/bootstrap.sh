@@ -900,6 +900,25 @@ claude() {
         # is gated on TMUX being empty, so it never ran in here to begin with.)
         local _perm _slot _ec
         _slot="${GENESIS_SLOT:-manual}"
+        # Read the operator's PERSISTED levers, not just the pane environment —
+        # the same file, for the same reason, as the launcher (see its own
+        # "Load operator config levers" block). A pane that predates the `-e`
+        # pins, or that was made with plain tmux, carries none of them, and
+        # those are exactly the stale slots a hand relaunch is used on: without
+        # this the relaunch quietly ignores a configured
+        # GENESIS_CC_PERMISSION_MODE=bypass or GENESIS_CC_SLOT_OAUTH=off and
+        # falls back to the defaults, which is the opposite of the slot parity
+        # this branch exists to provide. A pane value still wins, since it was
+        # set for THIS slot. `|| true` keeps a malformed file from aborting an
+        # interactive shell.
+        if [ -f "$HOME/.genesis/cc-slot.env" ]; then
+            local _pm_env="${GENESIS_CC_PERMISSION_MODE:-}"
+            local _oa_env="${GENESIS_CC_SLOT_OAUTH:-}"
+            . "$HOME/.genesis/cc-slot.env" 2>/dev/null || true
+            [ -n "$_pm_env" ] && GENESIS_CC_PERMISSION_MODE="$_pm_env"
+            [ -n "$_oa_env" ] && GENESIS_CC_SLOT_OAUTH="$_oa_env"
+            unset _pm_env _oa_env
+        fi
         case "${GENESIS_CC_PERMISSION_MODE:-auto}" in
             bypass|dangerous|skip) _perm="--dangerously-skip-permissions" ;;
             *)                     _perm="--permission-mode auto" ;;

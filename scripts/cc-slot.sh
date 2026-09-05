@@ -46,41 +46,6 @@ fi
 MODE_ARG="$1"
 shift
 
-# Liveness verdict for the cosmetic slot map: ALIVE | POISONED | UNKNOWN |
-# TIMEOUT (empty on any failure). The map is purely informational and runs once
-# per listed slot on the interactive login path, so it must never be what makes
-# a login feel slow. Two budgets bound it: a short per-probe leash and a
-# WHOLE-MAP wall-clock ceiling. Defined here — above the manual-mode map that is
-# its only caller — because bash resolves a function only once its definition has
-# RUN; GENESIS_ROOT is set above. An unavailable probe prints nothing, and the
-# caller treats that as "no verdict".
-_MAP_PROBE_BUDGET=3
-_MAP_PROBE_GAVE_UP=0
-# A WHOLE-MAP wall-clock ceiling, not a per-probe one: N slots that each finish
-# just under the per-probe budget would otherwise delay a login by N x budget.
-# `SECONDS` is inherited by the `$(...)` subshell the probe runs in, so an
-# ABSOLUTE deadline is readable there even though a variable set inside it can
-# never travel back out.
-_MAP_TOTAL_BUDGET=6
-_MAP_DEADLINE=0
-_map_verdict() {
-    local out="" rc=0
-    [ -x "${GENESIS_ROOT}/.venv/bin/python" ] || { printf '%s' ""; return 0; }
-    [ "$_MAP_PROBE_GAVE_UP" = "1" ] && { printf '%s' ""; return 0; }
-    local _budget="$_MAP_PROBE_BUDGET" _rem
-    if [ "$_MAP_DEADLINE" -gt 0 ]; then
-        _rem=$(( _MAP_DEADLINE - SECONDS ))
-        # The map is COSMETIC; it must never be what makes a login feel slow.
-        [ "$_rem" -le 0 ] && { printf '%s' "TIMEOUT"; return 0; }
-        [ "$_rem" -lt "$_budget" ] && _budget="$_rem"
-    fi
-    out=$(timeout "$_budget" "${GENESIS_ROOT}/.venv/bin/python" \
-        -m genesis.cc.slot_liveness "$@" 2>/dev/null | sed -n '1p') || rc=$?
-    # 124 is timeout(1)'s "deadline expired".
-    [ "$rc" = "124" ] && { printf '%s' "TIMEOUT"; return 0; }
-    printf '%s' "$out"
-}
-
 # Extra claude args exist only in manual mode (SSH RemoteCommand passes %n only).
 CLAUDE_EXTRA_ARGS=("$@")
 
@@ -93,74 +58,11 @@ if [[ "$MODE_ARG" == "manual" ]]; then
         -F '#{session_name}|#{session_attached}|#{t:session_activity}' \
         2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
     if [[ -n "$slot_map" ]]; then
-        # Arm the whole-map deadline HERE, immediately before the only loop that
-        # probes: every probe below shares it, so the map costs at most
-        # _MAP_TOTAL_BUDGET no matter how many slots exist.
-        _MAP_DEADLINE=$(( SECONDS + _MAP_TOTAL_BUDGET ))
         echo "Existing slots (reattach: tmux attach -t <name>):" >&2
         while IFS='|' read -r name attached activity; do
             state="detached"
             [[ "$attached" -ge 1 ]] && state="attached"
-            # Say when a slot is alive but running NO claude, AND name an action
-            # that actually relaunches it. NOTHING in this script relaunches a
-            # poisoned slot: manual allocation never takes over an existing
-            # session, and the hostname door's `new-session -A` ATTACHES to the
-            # existing session and silently DISCARDS the launch command — which
-            # is the whole defect. So the working move is to attach and run
-            # `claude` by hand, which the bashrc in-tmux wrapper gives the slot's
-            # full environment (permission flag, temp dirs, fallback login, exit
-            # capture). Pointing anywhere else — back through the door, say —
-            # would loop the operator to the same bare prompt. One probe per
-            # listed slot; anything other than an explicit POISONED prints
-            # nothing, so an unavailable probe never renders as a verdict.
-            note=""
-            # `|| true` is load-bearing: under `set -euo pipefail` a
-            # `var=$(tmux ... | tr ...)` whose FIRST component fails takes the
-            # whole door down with no message (pipefail promotes it past `tr`,
-            # `set -e` exits). A listed session going away before it is inspected
-            # is ordinary — the tmux server shuts down the moment the last slot's
-            # claude exits, and `list-panes` on a missing session exits 1 — and on
-            # the manual door that would drop the operator at a bare prompt.
-            # BOUNDED, and charged to the SAME whole-map deadline as the probe
-            # below. A budget that covers only the probe is not a budget: this
-            # `list-panes` is a blocking round-trip to the tmux server, runs once
-            # per listed slot on the interactive login path, and a wedged server
-            # would hang the login here — before the launch — in a feature this
-            # code calls COSMETIC. `-k` because `timeout` sends SIGTERM and then
-            # waits, which a process stuck in uninterruptible I/O outlives.
-            # Once the budget is SPENT, stop calling tmux altogether — do not
-            # substitute a shorter timeout. Every remaining slot would otherwise
-            # still pay a fresh round-trip (plus the -k grace), so the "whole-map
-            # ceiling" would not be a ceiling at all; it would just be a slower
-            # per-slot one. Skipping is also less code than the arithmetic it
-            # replaces, and it is bounded BY CONSTRUCTION: after exhaustion the
-            # loop makes zero further calls, so the map costs at most the budget
-            # plus the one call that overran it.
-            _map_v=""
-            if [ "$_MAP_PROBE_GAVE_UP" = "0" ]; then
-                _map_t="$_MAP_PROBE_BUDGET"
-                if [ "$_MAP_DEADLINE" -gt 0 ]; then
-                    _map_rem=$(( _MAP_DEADLINE - SECONDS ))
-                    if [ "$_map_rem" -le 0 ]; then
-                        _MAP_PROBE_GAVE_UP=1
-                    elif [ "$_map_rem" -lt "$_map_t" ]; then
-                        _map_t="$_map_rem"
-                    fi
-                fi
-            fi
-            if [ "$_MAP_PROBE_GAVE_UP" = "0" ]; then
-                # `-k` because timeout sends SIGTERM and then WAITS, which a
-                # process stuck in uninterruptible I/O outlives.
-                _map_pids=$(timeout -k 2 "$_map_t" tmux list-panes -s -t "=${name}" \
-                    -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ' || true)
-                [ -n "$_map_pids" ] && _map_v=$(_map_verdict $_map_pids)
-            fi
-            # Set in the LOOP's shell, not inside the substitution above.
-            [ "$_map_v" = "TIMEOUT" ] && _MAP_PROBE_GAVE_UP=1
-            if [[ "$_map_v" == "POISONED" ]]; then
-                note="  (no claude running — attach, then run 'claude' to relaunch it in place)"
-            fi
-            echo "  ${name}  ${state}  (last activity: ${activity})${note}" >&2
+            echo "  ${name}  ${state}  (last activity: ${activity})" >&2
         done <<<"$slot_map"
     fi
     SLOT=1

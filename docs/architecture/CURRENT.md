@@ -296,33 +296,31 @@ verified: 225f9e3b 2026-09-04
   report" (empty string — CLEARS) from "could not read" (None — PRESERVES), and
   collapsing those two is what makes a finished topic immortal.
 
-- **Slot-door session recovery — detection + hand-relaunch parity (non-destructive layer).**
+- **Hand-relaunch parity + slot env pinning.**
   LIVE. A `cc-N` tmux slot can be ALIVE but sitting at a bare shell: `cc-slot.sh`'s
   `tmux new-session -A` ATTACHES to an existing session and silently DISCARDS the
   launch command, so a slot born without claude stays that way on every reconnect.
-  `src/genesis/cc/slot_liveness.py` answers "is an interactive claude actually running
-  in this slot?" by walking `/proc` for a `claude` under any of the slot's pane pids —
-  reading only world-readable `comm`/`cmdline` (never the ptrace-gated `environ`), and
-  biased toward reporting ALIVE (a false ALIVE costs a plain attach; a false POISONED
-  would clobber a live TUI). The MANUAL-mode slot map uses it to ANNOTATE a
-  claude-less slot (`no claude running — attach, then run 'claude' to relaunch it in
-  place`, the move the in-tmux wrapper below makes first-class; NOTHING here
-  relaunches a poisoned slot, since `new-session -A` attaches and discards the
-  launch command) under a
-  shared WHOLE-MAP wall-clock budget, so a cosmetic probe never slows a login. The
-  bashrc `claude()` wrapper gained an in-tmux branch: a hand-typed relaunch inside
-  ANY interactive tmux pane (not only a `cc-N` slot; opt out with
-  `GENESIS_NO_TMUX_WRAP=1`) now gets the permission flag, CC's temp dirs, the
-  fallback OAuth login (via
-  the same `login_gate` + `read_fallback_token` the door uses), and exit capture —
-  instead of falling through to a bare `command claude`. The create `exec` pins `TMPDIR`
-  and the resolved `GENESIS_CC_SLOT_OAUTH` lever via `-e` (the temp pins are
-  conditional — with no usable candidate the door leaves both names UNSET
-  rather than exporting an empty value the tmux server would inherit) (MEASURED on tmux 3.4: a new
-  session on a pre-existing server inherits the SERVER's env for these, not the door's;
-  PATH already propagates from the client, so it is deliberately NOT pinned). The
-  destructive recovery (kill-and-recreate a poisoned slot on consent) is a SEPARATE
-  layer, not shipped here.
+  Recovering one means relaunching by hand in that pane, and the bashrc `claude()`
+  wrapper now makes that a first-class launch instead of a second-class one: an
+  in-tmux branch applies the permission flag, CC's temp dirs, the fallback OAuth
+  login (via the same `login_gate` + `read_fallback_token` the door uses) and exit
+  capture, rather than falling through to a bare `command claude`. It fires in ANY
+  interactive tmux pane, not only a `cc-N` slot (opt out with
+  `GENESIS_NO_TMUX_WRAP=1`), and it reads the operator's PERSISTED levers from
+  `~/.genesis/cc-slot.env` exactly as the launcher does — a pane predating the `-e`
+  pins carries none of them, and those stale slots are precisely where a hand
+  relaunch is used, so reading only the pane environment would silently ignore a
+  configured permission mode or OAuth lever.
+  The create `exec` pins `TMPDIR` and the resolved `GENESIS_CC_SLOT_OAUTH` lever via
+  `-e` (MEASURED on tmux 3.4: a new session on a pre-existing server inherits the
+  SERVER's env for these, not the door's; PATH already propagates from the client,
+  so it is deliberately NOT pinned). Both temp-dir candidate loops require a
+  directory to be writable AND to accept `chmod 700` — creation is not usability,
+  and `mkdir -p` succeeds on one that already exists — and when none is usable both
+  names are left genuinely UNSET rather than exported empty, because this script
+  ends in `exec tmux`, which STARTS the server that every later slot inherits from.
+  DETECTION of a claude-less slot, and the consented kill-and-recreate that repairs
+  one, are a SEPARATE layer and are not shipped here.
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
   (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A restricted

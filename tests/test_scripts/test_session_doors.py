@@ -73,31 +73,6 @@ exit 0
 """
 
 
-# Fake venv python: cc-slot resolves GENESIS_ROOT from HOME and consults a venv
-# python for the slot-map liveness verdict. Fake it so the map's annotation
-# branch can be driven directly; the probe's own logic is unit-tested in
-# tests/test_cc/test_slot_liveness.py.
-_FAKE_VENV_PY = """#!/usr/bin/env bash
-if [[ "$*" == *slot_liveness* ]]; then
-  # Ordered call log (which probe ran, in which order) + an optional per-probe
-  # sleep so the whole-map deadline is exercisable (else every fake probe
-  # returns instantly and a per-probe vs shared budget are indistinguishable).
-  [[ -n "${FAKE_PROBE_LOG:-}" ]] && echo liveness >> "$FAKE_PROBE_LOG"
-  if [[ -n "${FAKE_PROBE_SLEEP:-}" ]]; then sleep "$FAKE_PROBE_SLEEP"; fi
-  # FAKE_LIVENESS may be a comma-separated SEQUENCE; each call consumes the next
-  # entry (last one repeats). Empty -> no verdict line (probe "unavailable").
-  n=0; [[ -f "$FAKE_LIVENESS_N" ]] && n=$(cat "$FAKE_LIVENESS_N")
-  IFS="," read -ra _v <<< "${FAKE_LIVENESS:-}"
-  idx=$n; (( idx >= ${#_v[@]} )) && idx=$(( ${#_v[@]} - 1 ))
-  echo "${_v[$idx]:-}"
-  echo "note"
-  echo $(( n + 1 )) > "$FAKE_LIVENESS_N"
-  exit 0
-fi
-exit 1
-"""
-
-
 @pytest.fixture()
 def door(tmp_path):
     """Run cc-slot.sh with a fake tmux + isolated HOME.
@@ -115,17 +90,11 @@ def door(tmp_path):
 
     home = tmp_path / "home"
     home.mkdir()
-    venv_bin = home / "genesis" / ".venv" / "bin"
-    venv_bin.mkdir(parents=True)
-    fake_py = venv_bin / "python"
-    fake_py.write_text(_FAKE_VENV_PY)
-    fake_py.chmod(fake_py.stat().st_mode | stat.S_IEXEC)
 
     log = tmp_path / "tmux.log"
     sessions = tmp_path / "sessions.txt"
     listing = tmp_path / "list.txt"
     panes = tmp_path / "panes.txt"
-    probe_log = tmp_path / "probe_log.txt"
 
     def run(*args: str) -> subprocess.CompletedProcess:
         env = {
@@ -135,12 +104,6 @@ def door(tmp_path):
             "FAKE_TMUX_SESSIONS": str(sessions),
             "FAKE_TMUX_LIST": str(listing),
             "FAKE_TMUX_PANES": str(panes),
-            "FAKE_LIVENESS_N": str(tmp_path / "liveness_calls.txt"),
-            # Test-controlled knobs, forwarded from the test's os.environ so a
-            # test can drive the verdict without changing the fixture signature.
-            "FAKE_LIVENESS": os.environ.get("_TEST_FAKE_LIVENESS", ""),
-            "FAKE_PROBE_SLEEP": os.environ.get("_TEST_FAKE_PROBE_SLEEP", ""),
-            "FAKE_PROBE_LOG": str(probe_log),
             "FAKE_TMUX_LIST_PANES_FAIL": os.environ.get(
                 "_TEST_FAKE_LIST_PANES_FAIL", ""),
         }
@@ -161,7 +124,6 @@ def door(tmp_path):
             timeout=30,
         )
 
-    run.probe_log = probe_log  # ordered log of which slot-map probes ran
     run.home = home  # so a test can make the temp-dir candidates unusable
     return run, log, sessions, listing, panes
 
@@ -240,93 +202,6 @@ class TestManualMode:
             f"empty one poisons the server it starts:\n{body}\n{proc.stderr}"
         )
         assert "-e TMPDIR=" not in body, f"pinned an unusable TMPDIR:\n{body}"
-
-    def test_slot_map_marks_a_session_with_no_claude(self, door):
-        """The printed map is the only honest surface for a slot NOTHING here
-        relaunches, so it must both SAY the slot has no claude and name an
-        action that actually works.
-
-        The action matters as much as the flag: manual allocation never grabs an
-        existing session, and the hostname door's `new-session -A` attaches and
-        discards the launch command — so pointing back at the door would loop
-        the operator to the same bare prompt. The working move is to attach and
-        run `claude`, which the bashrc in-tmux wrapper gives the slot's full
-        environment.
-        """
-        run, _log, sessions, listing, panes = door
-        sessions.write_text("cc-1\n")
-        listing.write_text("cc-1|0|Thu Jul 16 20:00:00 2026\n")
-        panes.write_text("4242\n")
-        os.environ["_TEST_FAKE_LIVENESS"] = "POISONED"
-        try:
-            proc = run("manual")
-        finally:
-            os.environ.pop("_TEST_FAKE_LIVENESS", None)
-        assert proc.returncode == 0, proc.stderr
-        assert "no claude" in proc.stderr, (
-            f"a claude-less slot was listed as if healthy:\n{proc.stderr}"
-        )
-        # The advice must name the relaunch that works. A note that only flags
-        # the slot, or sends the operator back through the door, is a dead end.
-        assert "run 'claude'" in proc.stderr, (
-            f"the note does not name the action that relaunches:\n{proc.stderr}"
-        )
-        assert "through this slot's door" not in proc.stderr, (
-            f"the note points back at the door, which does not relaunch:\n{proc.stderr}"
-        )
-
-    def test_slot_map_leaves_a_live_slot_unannotated(self, door):
-        run, _log, sessions, listing, panes = door
-        sessions.write_text("cc-1\n")
-        listing.write_text("cc-1|1|Thu Jul 16 20:00:00 2026\n")
-        panes.write_text("4242\n")
-        os.environ["_TEST_FAKE_LIVENESS"] = "ALIVE"
-        try:
-            proc = run("manual")
-        finally:
-            os.environ.pop("_TEST_FAKE_LIVENESS", None)
-        assert "cc-1  attached" in proc.stderr, proc.stderr
-        assert "no claude" not in proc.stderr, (
-            f"a live slot was wrongly annotated:\n{proc.stderr}"
-        )
-
-    def test_slot_map_is_silent_when_the_probe_cannot_run(self, door):
-        """No verdict must never render as a verdict."""
-        run, _log, sessions, listing, panes = door
-        sessions.write_text("cc-1\n")
-        listing.write_text("cc-1|0|Thu Jul 16 20:00:00 2026\n")
-        panes.write_text("4242\n")
-        os.environ["_TEST_FAKE_LIVENESS"] = ""
-        try:
-            proc = run("manual")
-        finally:
-            os.environ.pop("_TEST_FAKE_LIVENESS", None)
-        assert proc.returncode == 0, proc.stderr
-        assert "cc-1" in proc.stderr
-        assert "no claude" not in proc.stderr, (
-            f"an absent verdict was rendered as one:\n{proc.stderr}"
-        )
-
-    def test_the_door_survives_a_session_dying_during_the_slot_map(self, door):
-        """A session can vanish between listing and inspecting it (the server
-        shuts down when the last slot's claude exits). Under set -euo pipefail a
-        `var=$(tmux ... | tr ...)` whose first component fails would abort the
-        whole door; the `|| true` guard must keep the login alive."""
-        run, log, sessions, listing, panes = door
-        sessions.write_text("cc-1\n")
-        listing.write_text("cc-1|0|Thu Jul 16 20:00:00 2026\n")
-        panes.write_text("4242\n")
-        os.environ["_TEST_FAKE_LIST_PANES_FAIL"] = "1"
-        try:
-            proc = run("manual")
-        finally:
-            os.environ.pop("_TEST_FAKE_LIST_PANES_FAIL", None)
-        assert proc.returncode == 0, (
-            f"the door died when a listed session went away:\n{proc.stderr}"
-        )
-        assert "new-session" in log.read_text(), (
-            f"the door never reached the launch:\n{proc.stderr}"
-        )
 
     def test_allocation_skips_existing_sessions(self, door):
         run, log, sessions, listing, _panes = door
@@ -422,40 +297,6 @@ class TestManualMode:
         assert "exit $__ec" in line, line  # claude's code reproduced as the pane's
         assert "exec claude" not in line, "inner exec must be dropped so the trailer runs"
 
-
-class TestSlotMapBudget:
-    """The slot map is COSMETIC and must never be what makes a login feel slow."""
-
-    def test_one_deadline_is_shared_across_probes(self, door):
-        """A per-probe timeout is not a budget: N slots each finishing just
-        under it still cost N x budget. Twelve slots at 1s each, with a shared
-        ~6s deadline, must stop probing partway through — strictly fewer than
-        twelve probes run."""
-        run, log, _sessions, listing, panes = door
-        listing.write_text("".join(f"cc-{i}|0|ts\n" for i in range(1, 13)))
-        panes.write_text("4242\n")  # non-empty so a probe is attempted per slot
-        os.environ["_TEST_FAKE_PROBE_SLEEP"] = "1"
-        try:
-            result = run("manual")
-        finally:
-            os.environ.pop("_TEST_FAKE_PROBE_SLEEP", None)
-        assert "Existing slots" in result.stderr
-        probes = run.probe_log.read_text().split().count("liveness")
-        assert probes < 12, (
-            f"every slot was probed ({probes}); the map is spending per-probe "
-            f"budget rather than one shared deadline"
-        )
-        # And once the budget is spent the map must stop calling tmux AT ALL.
-        # Bounding each call without bounding the aggregate is not a ceiling:
-        # every remaining slot would still pay a round-trip (plus the -k grace),
-        # which is how a wedged server could outlast the declared budget.
-        listings = [
-            ln for ln in log.read_text().splitlines() if "list-panes" in ln
-        ]
-        assert len(listings) < 12, (
-            f"list-panes ran for every slot ({len(listings)}); the deadline "
-            f"bounds each call but not the map"
-        )
 
 
 class TestHostnameMode:
@@ -650,6 +491,33 @@ echo "RC=$?" >> {str(rec)!r}
         )
         assert "OAUTH=sk-fake-fallback" in rec, (
             f"the hand relaunch did not receive the slot's fallback token:\n{rec}"
+        )
+
+    def test_persisted_levers_are_read_from_the_config_file(self, tmp_path):
+        """The wrapper must read ~/.genesis/cc-slot.env, as the launcher does.
+
+        A pane created before the `-e` pins — or with plain tmux — carries none
+        of the GENESIS_* levers, and those stale slots are exactly where a hand
+        relaunch gets used. Reading only the pane environment there silently
+        ignores a configured permission mode and OAuth lever, which is the
+        opposite of the parity this branch exists to give.
+        """
+        text = Path(_BOOTSTRAP).read_text()
+        home = tmp_path / "home"
+        (home / ".genesis").mkdir(parents=True, exist_ok=True)
+        (home / ".genesis" / "cc-slot.env").write_text(
+            "GENESIS_CC_PERMISSION_MODE=bypass\nGENESIS_CC_SLOT_OAUTH=off\n"
+        )
+        # No GENESIS_* in the pane env at all — the legacy-slot shape.
+        _unused, rec = self._harness(
+            tmp_path, "export TMUX=/tmp/fake,1,0", bootstrap_text=text, oauth=True
+        )
+        assert "--dangerously-skip-permissions" in rec, (
+            f"ignored the configured permission mode:\n{rec}"
+        )
+        assert "--permission-mode auto" not in rec, rec
+        assert "OAUTH=none" in rec, (
+            f"injected a token despite the configured off lever:\n{rec}"
         )
 
     def test_the_oauth_lever_still_turns_the_fallback_off(self, tmp_path):
