@@ -409,3 +409,120 @@ class TestCommitGuardFailsClosedOnCrash:
             "a broken review_state hard-blocks every commit, including the one "
             f"that would fix it.\n{r.stdout}{r.stderr}"
         )
+
+
+class TestOpaqueConstructs:
+    """Constructs the segmenter cannot represent, which shlex tokenizes cleanly.
+
+    `untokenizable()` began as "shlex raised", and that is a strictly narrower
+    question than the one every caller actually asks: can the parse be trusted?
+    A construct can tokenize perfectly and still leave `analyze()` reporting an
+    executable that is not one — a reserved word, or the letters trailing an
+    option bundle — with no signal that anything was missed. "Nothing gated
+    here" and "I could not see this" then return the same value, which is the
+    exact confusion this probe exists to remove.
+
+    The inner command in every fixture below is a NEUTRAL placeholder, not a
+    gated verb. These cases are about whether the parser can see a command
+    position at all; using a real gated operation would add nothing to the test
+    and would put a working shape in a public file.
+    """
+
+    # Assembled rather than written, per this file's convention.
+    _INNER = "my" + "cmd"
+
+    @pytest.mark.parametrize(
+        "label,command",
+        [
+            ("case arm", f"case x in x) {_INNER};; esac"),
+            ("function body", f"f() {{ {_INNER}; }}; f"),
+            ("function keyword", f"function f {{ {_INNER}; }}; f"),
+            ("coproc", f"coproc {_INNER}"),
+            ("interpreter bundle, c not last", f"bash -ce '{_INNER}'"),
+            ("interpreter bundle, other letter", f"bash -cl '{_INNER}'"),
+            ("sh bundle", f"sh -ce '{_INNER}'"),
+        ],
+    )
+    def test_a_construct_the_segmenter_cannot_represent_is_reported(self, label, command):
+        """The parse must be declared untrustworthy, so callers fail closed.
+
+        Each of these leaves `analyze()` with no segment for the inner command
+        while raising nothing, so a caller that keys on parsed segments has no
+        way to know it saw an incomplete picture.
+        """
+        import shell_parse as sp
+
+        assert not any(s.exe == self._INNER for s in sp.analyze(command)), (
+            f"{label}: fixture is stale — the segmenter now sees this, so the "
+            "case it was written for no longer exists"
+        )
+        assert sp.untokenizable(command), f"{label}: parse is incomplete and says nothing"
+
+    @pytest.mark.parametrize(
+        "label,command",
+        [
+            ("plain", _INNER),
+            ("if/then", f"if true; then {_INNER}; fi"),
+            ("while/do", f"while false; do {_INNER}; done"),
+            ("for/do", f"for i in 1; do {_INNER}; done"),
+            ("select/do", f"select i in a; do {_INNER}; done"),
+            ("subshell", f"( {_INNER} )"),
+            ("brace group", f"{{ {_INNER}; }}"),
+            ("negation", f"! {_INNER}"),
+            ("interpreter, plain -c", f"bash -c '{_INNER}'"),
+            ("interpreter bundle, c last", f"bash -ec '{_INNER}'"),
+        ],
+    )
+    def test_a_construct_the_segmenter_handles_is_not_reported(self, label, command):
+        """The other half of the measurement.
+
+        Over-reporting is the safe direction but it is not free: every caller
+        treats this signal as "fall back to the coarse path", so a probe that
+        fires on ordinary syntax quietly converts the whole guard layer back to
+        substring matching. These are the shapes the segmenter demonstrably
+        handles, and they must stay clean.
+        """
+        import shell_parse as sp
+
+        assert any(s.exe == self._INNER for s in sp.analyze(command)), (
+            f"{label}: fixture is stale — the segmenter no longer sees this"
+        )
+        assert not sp.untokenizable(command), f"{label}: false positive on ordinary syntax"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "grep -r 'case x in x) something;; esac' .",
+            "echo 'define with f() { ... }'",
+            "git commit -m 'use coproc for the reader'",
+        ],
+    )
+    def test_a_reserved_word_inside_a_quoted_argument_is_not_a_construct(self, command):
+        """The discriminator is TOKENS, not raw text, and that is the whole
+        reason this is quote-safe: shlex keeps a quoted argument as ONE token,
+        so a reserved word inside it never appears as a bare token. A raw-text
+        scan would fire on every one of these and re-block the mention-only
+        commands the parser migration exists to release."""
+        import shell_parse as sp
+
+        assert not sp.untokenizable(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A zero-argument call in a heredoc body. This probe reads heredoc
+            # text as ordinary command text by design, so without the brace
+            # requirement these fired: MEASURED 574 of them in 51,052 real
+            # commands, every one of which would have pushed a guard back onto
+            # its coarse path.
+            "python3 - <<'PY' import x\nmain()\nPY",
+            "echo build; runner()",
+        ],
+    )
+    def test_a_call_without_a_body_brace_is_not_a_function_definition(self, command):
+        """`name()` alone is not the grammar. A shell function definition is
+        `name() {`, and requiring the brace is what separates it from a call
+        appearing in embedded code."""
+        import shell_parse as sp
+
+        assert not sp.untokenizable(command)
