@@ -443,7 +443,9 @@ every emitter's arithmetic, so this class cannot go quiet again.
   gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
   everything before starting the next thing. Just lean, gently, toward landing or
   closing open PRs over opening more — so work doesn't pile up and go stale on the
-  repo instead of getting done.
+  repo instead of getting done. (Merge-DRIVING specifically — when to actively
+  chase one PR to merged — is scoped by the genesis-development skill's "When to
+  DRIVE a Merge" rule; this lean governs closing-shaped work, not watching.)
 - **Procedure recall is automatic** — the proactive hook surfaces relevant
   procedures. Store new procedures immediately when you discover them.
 - **Never insert directly into `task_states`.** Use `task_submit` MCP

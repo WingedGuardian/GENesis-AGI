@@ -1967,6 +1967,43 @@ never edit-in-place dev environments. An emergency hand-edit on a host gets a
 same-day PR that lands the same change at source — a host divergence that
 outlives its incident is a bug.
 
+## When to DRIVE a Merge (standing user rule, 2026-09-05)
+
+A session does not shepherd its own PRs toward merge by default: open the
+work and let the PR bake in the normal flow. DRIVING is the UNPROMPTED extra
+cycle — polling a quiet PR's gates, soliciting re-review with nothing new
+pushed, initiating a merge on a PR that still has un-green gates — and it is
+justified ONLY when:
+
+- tracked work is GATED on that PR's merge: the PR body carries a
+  `Ledger:`/`Follow-up:` completion marker, a hot follow-up's close depends
+  on it, a stacked branch needs its base, or a live hazard closes with it; or
+- the user asks for that PR by name.
+
+Three things are NEVER driving — they stay mandatory:
+
+- **Answering.** Findings received while you are present are answered before
+  you stop (the zero-drop rule), and the mandatory post-push
+  `@codex review` (Gate Machinery above) is part of answering. A fix round
+  you have begun is FINISHED, not "chased": answered, pushed, re-review
+  triggered — never abandoned half-answered.
+- **Closing a green PR.** A PR already fully green at head is past baking:
+  merging it under the standing pre-approval (or asking, where none exists)
+  is closing, not driving — green DECAYS with base drift and head-freshness
+  rules, so a cleared gate is a now-or-re-earn asset.
+- **The stopping handoff.** A session that stops while its own PR has any
+  gate un-green creates a `ready` follow-up naming the PR and the event it
+  awaits, BEFORE stopping. That row is the drain's intake — an un-driven
+  open PR without its row IS a stranded artifact under the zero-drop rule,
+  never "the normal flow". Until a dedicated closing station exists, the
+  queue drains through those rows under the project's ≈51/49 lean.
+
+Scope against CLAUDE.md's ≈51/49 close-before-open lean: unchanged for
+closing-shaped work (answering, merging green PRs, the handoff row). What
+this rule removes is only the WATCHING — unprompted gate-polling and
+review-soliciting between a push and the next external event. When you do
+merge, the Pre-Merge Gate below governs unchanged.
+
 ## Pre-Merge Gate
 
 **Canonical pre-merge check:** run
