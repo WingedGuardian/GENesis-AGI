@@ -52,12 +52,25 @@ reviews:
     - "!**/*.min.css"
     - "!docs/images/**"
     - "!**/package-lock.json"
-    # Documentation — see the note above.
+    # Documentation — see the note above. Filtered by EXTENSION, deliberately not
+    # by directory: a blanket `!docs/**` would also hide anything under docs/ that
+    # is not prose, and there is exactly such a file —
+    # docs/genesis-architecture-interactive.html, a user-facing page linked from
+    # the README that carries its own interaction logic. Excluding executable code
+    # is not the trade that was made here; excluding prose is.
+    # BOTH forms on purpose. Glob implementations disagree about whether `**/`
+    # matches ZERO directories, so `**/*.md` alone may not cover a TOP-LEVEL file —
+    # which is precisely CHANGELOG.md and AGENTS.md, the ones this exclusion exists
+    # for. Betting on the matcher's semantics here would fail silently and look
+    # like the filter simply not working.
+    - "!*.md"
     - "!**/*.md"
+    - "!*.rst"
     - "!**/*.rst"
+    - "!*.adoc"
     - "!**/*.adoc"
+    - "!*.asciidoc"
     - "!**/*.asciidoc"
-    - "!docs/**"
 
   # The walkthrough is read at merge time; keep it to substance.
   poem: false
