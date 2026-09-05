@@ -844,27 +844,55 @@ async def test_the_exhaustion_message_carries_both_counts(
     ][0].args[3]
     assert "2 attempted of 3 walkable" in message, message
     assert "free-1" in message, "the breaker-skipped provider is the point of the event"
+    # …and it is labelled a SKIP with its reason, not a failure: it was never
+    # called, and `failed` would read as an outage where there is none.
+    assert "skipped: free-1 (breaker open)" in message, message
+    assert "free-1" not in message.split("skipped:")[0], (
+        "the failed clause absorbed a provider that was never called"
+    )
+    assert "failed: free-2, paid-1" in message, message
 
 
-def test_no_provider_failed_prints_no_dangling_failed_clause():
-    """EMPTY IS A REAL STATE. Every chain member skipped before it was tried — an
-    open breaker, a missing key, an exceeded budget — or the aggregate deadline
-    abandoned the walk. `failed: ` with nothing after it reads as a formatting
-    bug, and the `0 attempted of N` counts already tell that story on their own.
+def test_nothing_recorded_prints_no_dangling_clause():
+    """EMPTY IS A REAL STATE. Only the aggregate deadline abandons the walk while
+    recording nothing — `failed: ` or `skipped: ` with nothing after it reads as
+    a formatting bug, and the `0 attempted of N` counts already tell that story
+    on their own.
     """
-    from genesis.routing.router import _failed_clause
+    from genesis.routing.router import _exhaustion_clause
 
-    assert _failed_clause([]) == ""
+    assert _exhaustion_clause([], []) == ""
+
+
+def test_a_skipped_provider_is_not_labelled_failed():
+    """A provider passed over for a missing key, an open breaker, or a spent
+    budget was never CALLED — printing it under `failed:` reads as an outage
+    where there may be none. Missing keys are the normal state of a fresh
+    install, and a budget gate is a decision, not a fault. Each skip carries
+    its reason so the operator can tell those states apart from the log line
+    alone."""
+    from genesis.routing.router import _exhaustion_clause
+
+    clause = _exhaustion_clause(
+        ["really-down"], [("unconfigured", "no API key"), ("gated", "budget exceeded")]
+    )
+    assert "failed: really-down" in clause
+    assert "skipped: unconfigured (no API key), gated (budget exceeded)" in clause
+    # The failed clause must not absorb the skipped names.
+    failed_part = clause.split("skipped:")[0]
+    assert "unconfigured" not in failed_part
+    assert "gated" not in failed_part
 
 
 def test_a_long_chain_summarises_instead_of_flooding_one_log_line():
     """A bound on an ERROR line that goes to journalctl. Chains are single digits
     today, so this never trims in practice — it is here so a future long chain
-    cannot turn one line into a paragraph."""
-    from genesis.routing.router import _FAILED_NAMES_IN_MESSAGE, _failed_clause
+    cannot turn one line into a paragraph. Applied per clause, so a long failed
+    list cannot squeeze out the skipped one or vice versa."""
+    from genesis.routing.router import _FAILED_NAMES_IN_MESSAGE, _exhaustion_clause
 
     names = [f"p-{i}" for i in range(_FAILED_NAMES_IN_MESSAGE + 3)]
-    clause = _failed_clause(names)
+    clause = _exhaustion_clause(names, [])
     assert clause.count("p-") == _FAILED_NAMES_IN_MESSAGE, clause
     assert "+3 more" in clause, "the trimmed count is what stops it reading as complete"
     assert names[-1] not in clause

@@ -1697,7 +1697,10 @@ verified: 29a382e7 2026-09-03
   for an open breaker, a missing API key or an exceeded budget costs no attempt,
   so "attempts: 2" on a seven-provider chain is indistinguishable from a
   two-provider chain fully tried. The `all_exhausted` event carries
-  `failed_providers` and `chain_size` alongside `attempts`, and the exhaustion
+  `failed_providers` and `chain_size` alongside `attempts`; the log MESSAGE
+  additionally keeps called-and-failed providers (`failed:`) apart from
+  never-called ones (`skipped:` with the reason), while the payload's
+  `failed_providers` keeps the combined meaning its consumers predate. The exhaustion
   `RoutingResult` returns `failed_providers` — which the SUCCESS path had always
   returned while the failure path accumulated the same list and dropped it.
   `chain_size` is the WALKABLE chain (post-`_filter_chain`), not the one written

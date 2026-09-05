@@ -39,27 +39,46 @@ UNKNOWN_CALL_SITE_ERROR_PREFIX = "Unknown call site:"
 # How many provider names an exhaustion line names before it summarises. A
 # chain is single digits today, so this never trims in practice — it is here so
 # that a future long chain cannot turn one ERROR line into a paragraph in
-# `journalctl`, which is where this message is read.
+# `journalctl`, which is where this message is read. Applied per clause
+# (`failed:` and `skipped:` each), so the line stays bounded either way.
 _FAILED_NAMES_IN_MESSAGE = 8
 
 
-def _failed_clause(failed_providers: list[str]) -> str:
-    """The `; failed: a, b, c` tail of an exhaustion message, or '' when empty.
-
-    EMPTY IS A REAL STATE AND IT SAYS SOMETHING: every chain member was skipped
-    before it was tried (an open breaker, a missing key, an exceeded budget) or
-    the aggregate deadline abandoned the walk. Emitting `failed: ` with nothing
-    after it would read as a formatting bug, so the clause is dropped and the
-    `N attempted of M walkable` counts carry that case on their own — 0 of 7 is
-    the whole story there.
-    """
-    if not failed_providers:
-        return ""
-    shown = failed_providers[:_FAILED_NAMES_IN_MESSAGE]
+def _bounded_names(names: list[str]) -> str:
+    shown = names[:_FAILED_NAMES_IN_MESSAGE]
     listed = ", ".join(shown)
-    if len(failed_providers) > len(shown):
-        listed += f", +{len(failed_providers) - len(shown)} more"
-    return f"; failed: {listed}"
+    if len(names) > len(shown):
+        listed += f", +{len(names) - len(shown)} more"
+    return listed
+
+
+def _exhaustion_clause(
+    called_failed: list[str], skipped: list[tuple[str, str]]
+) -> str:
+    """The `; failed: a, b; skipped: c (breaker open)` tail of an exhaustion
+    message, or '' when the walk recorded nothing.
+
+    `failed` lists only providers that were actually CALLED and returned a
+    failure. A provider passed over before any call is listed under `skipped`
+    with its reason — an open breaker, a missing API key, an exceeded budget —
+    because printing it as `failed` reads as an outage where there may be
+    none: partial API-key configuration is the NORMAL state of a fresh
+    install, and a budget gate is a decision, not a fault.
+
+    EMPTY IS A REAL STATE AND IT SAYS SOMETHING: only the aggregate deadline
+    abandons the walk while recording nothing, and `failed: ` or `skipped: `
+    with nothing after it would read as a formatting bug — the
+    `N attempted of M walkable` counts carry that case on their own; 0 of 7
+    is the whole story there.
+    """
+    parts = []
+    if called_failed:
+        parts.append(f"; failed: {_bounded_names(called_failed)}")
+    if skipped:
+        parts.append(
+            f"; skipped: {_bounded_names([f'{n} ({r})' for n, r in skipped])}"
+        )
+    return "".join(parts)
 
 
 class Router:
@@ -286,6 +305,13 @@ class Router:
         attempts = 0
         first_provider = chain[0]
         failed_providers: list[str] = []
+        # The exhaustion MESSAGE splits the combined list above: providers
+        # whose call actually failed vs providers passed over before any call.
+        # `failed_providers` itself keeps the combined meaning — it feeds
+        # `RoutingResult.failed_providers` and the event details, whose
+        # consumers predate the split.
+        called_failed: list[str] = []
+        skipped: list[tuple[str, str]] = []
 
         # Aggregate wall-clock deadline across the whole chain walk (retries x
         # chain length). A GATE only — checked between providers/attempts, never
@@ -311,12 +337,14 @@ class Router:
             # normal install state on freshly-installed systems.
             if not provider_cfg.has_api_key:
                 failed_providers.append(provider_name)
+                skipped.append((provider_name, "no API key"))
                 continue
 
             # Skip if circuit breaker is open
             cb = self.breakers.get(provider_name)
             if not cb.is_available():
                 failed_providers.append(provider_name)
+                skipped.append((provider_name, "breaker open"))
                 continue
 
             # Skip paid providers if budget exceeded (unless override)
@@ -326,6 +354,7 @@ class Router:
                 and budget_status == BudgetStatus.EXCEEDED
             ):
                 failed_providers.append(provider_name)
+                skipped.append((provider_name, "budget exceeded"))
                 continue
 
             # Rate gate — pace requests per provider RPM limit
@@ -420,6 +449,7 @@ class Router:
                 )
             else:
                 failed_providers.append(provider_name)
+                called_failed.append(provider_name)
                 category = classify_error(result.status_code, result.error or "")
                 # RATE_LIMITED (429) and BAD_REQUEST (400/422) are NOT provider-
                 # health signals: a 429 is expected backpressure (the rate gate
@@ -463,7 +493,7 @@ class Router:
                 "all_exhausted",
                 f"All providers exhausted for {call_site_id} "
                 f"({attempts} attempted of {len(chain)} walkable"
-                f"{_failed_clause(failed_providers)})",
+                f"{_exhaustion_clause(called_failed, skipped)})",
                 call_site=call_site_id,
                 attempts=attempts,
                 failed_providers=tuple(failed_providers),
