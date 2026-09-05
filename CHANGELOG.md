@@ -11,6 +11,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **The session charter now lists every open ledger item, not just the oldest
+  six.** The ledger is a curated list of one-line to-dos, and the old window
+  meant a session with more than six open items never saw a newly added one in
+  its own prompt — it existed only in the aggregate count. The list is now
+  effectively unbounded (a 200-row ceiling with an explicit "more than 200 —
+  the rest are not listed" note), and an oversized charter block degrades by
+  dropping whole sections with a marker rather than cutting mid-bullet, with
+  the open/closed count preserved.
+
 - **A review comment on documentation no longer blocks a merge.** The pre-merge
   check already declined to count findings on prose, but its idea of prose was
   narrow: markdown counted only underneath `docs/`, so a comment on a top-level

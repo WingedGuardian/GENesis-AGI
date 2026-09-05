@@ -14,6 +14,10 @@ _spec = importlib.util.spec_from_file_location(
 _rep = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_rep)
 
+from genesis.session_awareness.ledger_extractor import (  # noqa: E402
+    PROMPT_VERSION,
+)
+
 SID = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
 
 
@@ -30,6 +34,12 @@ def _run(run_id: str, status: str = "ok", *, trigger: str = "manual", started: s
         truncated=0,
         latency_ms=12000,
         mode="shadow",
+        # The report now scopes its precision population to the CURRENT prompt
+        # version — mixing versions makes the headline number describe a
+        # population that no longer exists. A fixture without this field is a
+        # legacy run by definition, so it would be excluded and every metric
+        # would read zero. Tests that WANT the legacy case override it.
+        prompt_version=PROMPT_VERSION,
     )
     row.update(over)
     return row
@@ -145,13 +155,140 @@ def test_backfill_excluded_by_default_included_on_flag():
     assert rep2["backfill_events"] == []
 
 
-def test_leak_invariant_detects_ambient_rows():
+def _extractor_row(rid, text, *, evidence=None, source_quote=None):
+    """A ledger row shaped exactly as `_promote_live` writes one."""
+    return dict(
+        _fg_row(rid, text),
+        added_by="ambient_ledger_extractor",
+        evidence=evidence,
+        source_quote=source_quote,
+    )
+
+
+def _promotion_event(eid, rid, *, run_id):
+    """The shadow event that ATTRIBUTES a promoted ledger row to its run.
+
+    Every real promotion writes one — `_promote_live` stamps
+    `promoted_item_id` immediately after `ledger_add`. A test row without it
+    describes a shape the system cannot produce, and the report now treats an
+    unattributable extractor row as a leak precisely because something other
+    than the promotion path must have written it.
+    """
+    return _event(eid, "promoted proposal", run_id=run_id, promoted_item_id=rid)
+
+
+def test_leak_invariant_flags_an_extractor_row_in_shadow_mode():
+    """In shadow/off the extractor must write NOTHING live. Any row is a leak.
+
+    Keyed on the EXTRACTOR's own provenance value. It previously keyed on
+    "ambient", which is what a DISPATCHED CC session stamps — a different
+    writer entirely — so the first dispatched session to add a ledger row would
+    have been reported as an extractor leak.
+    """
     runs = [_run("r1", started=T1)]
-    ambient_row = dict(_fg_row("LX", "sneaky ambient write"), added_by="ambient")
-    rep = _rep.build_report(runs, [], [ambient_row])
+    rep = _rep.build_report(
+        runs, [], [_extractor_row("LX", "written in shadow")], mode="shadow"
+    )
     assert rep["leak_invariant_ok"] is False
-    md = _rep.render_md(rep, generated_at=T1)
-    assert "LEAK INVARIANT VIOLATION" in md
+    assert "LEAK INVARIANT VIOLATION" in _rep.render_md(rep, generated_at=T1)
+
+
+def test_a_dispatched_session_row_is_not_an_extractor_leak():
+    """The false-positive side, and the reason the values must stay distinct.
+
+    `_default_added_by()` stamps "ambient" on any dispatched CC session. That is
+    a human-directed write, not the extractor, and reporting it as a leak would
+    make the invariant cry wolf on the first one.
+    """
+    runs = [_run("r1", started=T1)]
+    dispatched = dict(_fg_row("LY", "dispatched session wrote this"),
+                      added_by="ambient")
+    rep = _rep.build_report(runs, [], [dispatched], mode="shadow")
+    assert rep["leak_invariant_ok"] is True
+
+
+def test_live_mode_holds_when_every_extractor_row_carries_its_quote():
+    """In live the rows are expected; the invariant becomes "show your source".
+
+    This is the case that was VIOLATED by construction: the promotion filter
+    demands a verified quote and `ledger_add` had no `evidence` column to put it
+    in, so every promoted row failed and the report screamed on every normal
+    run. An alarm that always fires is an alarm nobody reads.
+    """
+    runs = [_run("r1", started=T1, mode="live")]
+    rep = _rep.build_report(
+        runs,
+        [_promotion_event("e1", "LZ", run_id="r1")],
+        [_extractor_row("LZ", "promoted", source_quote="the source quote")],
+        mode="live",
+    )
+    assert rep["leak_invariant_ok"] is True, rep["leaks"]
+
+
+def test_a_rollback_does_not_retroactively_brand_rows_promoted_while_live():
+    """The emergency rollback live -> shadow must not indict its own history.
+
+    Rows promoted WHILE live are legitimate, and they persist across the
+    rollback. Judging them by the mode active NOW turned every one of them into
+    a leak the moment an operator rolled back — so the report screamed loudest
+    about exactly the rows the rollback was protecting, which is how an operator
+    learns to stop reading it.
+
+    A row is judged by the mode of the run that promoted it, which each shadow
+    event records.
+    """
+    runs = [_run("r_live", started=T1, mode="live"), _run("r_now", started="2026-07-15T12:00:00+00:00", mode="shadow")]
+    rep = _rep.build_report(
+        runs,
+        [_promotion_event("e1", "LOLD", run_id="r_live")],
+        [_extractor_row("LOLD", "promoted before the rollback",
+                        source_quote="the source quote")],
+        mode="shadow",          # rolled back since
+    )
+    assert rep["leak_invariant_ok"] is True, rep["leaks"]
+
+
+def test_a_row_promoted_while_not_live_is_a_leak_even_after_going_live():
+    """The other direction: going live does not launder a row written in shadow."""
+    runs = [_run("r_shadow", started=T1, mode="shadow")]
+    rep = _rep.build_report(
+        runs,
+        [_promotion_event("e1", "LBAD", run_id="r_shadow")],
+        [_extractor_row("LBAD", "written while shadow", source_quote="q")],
+        mode="live",
+    )
+    assert rep["leak_invariant_ok"] is False
+
+
+def test_a_repo_pulse_absorption_does_not_look_like_a_leak():
+    """`evidence` is a RESOLUTION field — repo-pulse replaces it with PR text.
+
+    Sharing one column for provenance and resolution meant a promoted row lost
+    its quote the moment repo-pulse absorbed it, and then failed the invariant
+    it had satisfied the day before. `source_quote` is the provenance field and
+    no resolver writes it.
+    """
+    runs = [_run("r1", started=T1, mode="live")]
+    rep = _rep.build_report(
+        runs,
+        [_promotion_event("e1", "LABS", run_id="r1")],
+        [_extractor_row("LABS", "absorbed by repo-pulse",
+                        evidence="PR #1234: something (merged) [repo-pulse exact]",
+                        source_quote="the original transcript quote")],
+        mode="live",
+    )
+    assert rep["leak_invariant_ok"] is True, rep["leaks"]
+
+
+def test_live_mode_flags_an_extractor_row_with_no_quote():
+    """The other direction — the invariant must still be able to fire."""
+    runs = [_run("r1", started=T1, mode="live")]
+    rep = _rep.build_report(
+        runs,
+        [_promotion_event("e1", "LW", run_id="r1")],
+        [_extractor_row("LW", "promoted, unsourced")], mode="live"
+    )
+    assert rep["leak_invariant_ok"] is False
 
 
 def test_health_metrics_and_render():
@@ -182,3 +319,142 @@ def test_pivots_listed_never_scored():
     assert len(rep["pivots"]) == 1
     md = _rep.render_md(rep, generated_at=T1)
     assert "pivoted to incident response" in md
+
+
+# ── Round-8/9 review fixes: windows, buckets, floors, denominators ──────────
+
+
+def _ext_row(rid, text, *, created="2026-07-14T12:30:00+00:00", quote="q"):
+    return {
+        "id": rid,
+        "session_id": SID,
+        "text": text,
+        "status": "open",
+        "added_by": "ambient_ledger_extractor",
+        "created_at": created,
+        "source_quote": quote,
+        "evidence": quote,
+    }
+
+
+def test_attribution_is_read_by_key_never_through_the_window():
+    """The leak verdict must see every promoted event, however old.
+
+    Retention exempts promoted events so the verifier can always see them —
+    but a verifier reading through a capped newest-first scan ages them out
+    of its own LIMIT, and the invariant quietly narrows to recent-rows-only
+    while saying HELD (or convicts an old legitimate row as unattributed).
+    The attribution set is therefore passed SEPARATELY, queried by the key:
+    here the windowed `events` list has lost the old claiming event, and the
+    verdict is still correct because `attribution_events` carries it.
+    The CONTROL shows the failure shape the separation prevents: without the
+    attribution set, the same data convicts.
+    """
+    old_run = _run("r-old", started="2026-07-01T00:00:00+00:00", mode="live")
+    old_claim = _event("e-old", "an old promoted agreement", run_id="r-old",
+                       observed_at="2026-07-01T00:00:05+00:00",
+                       promoted_item_id="LX")
+    windowed_events = [_event("e1", "recent proposal", run_id="r1",
+                              observed_at="2026-07-14T12:00:00+00:00")]
+    runs = [_run("r1", started=T1, mode="live"), old_run]
+    old_row = _ext_row("LX", "an old promoted agreement",
+                       created="2026-07-01T00:00:06+00:00")
+
+    rep = _rep.build_report(
+        runs, windowed_events, [old_row], attribution_events=[old_claim]
+    )
+    assert rep["leak_invariant_ok"] is True, rep["ambient_leaks"]
+
+    # CONTROL: the windowed fallback (no attribution set) convicts the same
+    # row — which is exactly why the CLI loader always passes the real set.
+    rep = _rep.build_report(runs, windowed_events, [old_row])
+    assert rep["leak_invariant_ok"] is False
+
+
+def test_an_attributed_row_with_a_missing_run_is_excused_and_labeled():
+    """A claiming event whose run row is GONE is attributed, mode unknown.
+
+    Producible on installs that pruned before the exemption shipped (the old
+    prune deleted runs unconditionally). Convicting would permanently
+    VIOLATED every such install; vouching 'live' would state more than the
+    data supports. It is excused from conviction and counted under its
+    honest cause — 'run row missing', not a query-window story — and an
+    UNQUOTED row in this state still trips the quote clause, because the
+    quote lives on the row and needs no run lookup."""
+    claim = _event("e1", "promoted thing", run_id="r-gone",
+                   promoted_item_id="LP")
+    row = _ext_row("LP", "promoted thing")
+    rep = _rep.build_report([], [], [row], attribution_events=[claim])
+    assert rep["leak_invariant_ok"] is True, rep["ambient_leaks"]
+    assert rep["n_attributed_run_missing"] == 1
+
+    # An unquoted attributed row is a promotion-filter failure whichever
+    # mode wrote it — the quote check does not need the run.
+    bare = dict(row, source_quote=None, evidence=None)
+    rep = _rep.build_report([], [], [bare], attribution_events=[claim])
+    assert rep["leak_invariant_ok"] is False
+
+
+def test_legacy_events_are_not_filed_as_backfill():
+    """v1 compaction proposals must not render under 'Backfill proposals'.
+
+    'run_id not in the current-version set' used to be the backfill test, so
+    on any upgraded install the whole v1 corpus was mislabelled backfill.
+    Classification now reads the event's own run: trigger for backfill,
+    version for legacy, absence for window-orphan."""
+    runs = [
+        _run("r-v1", started=T1, prompt_version="v1"),
+        _run("r-bf", started=T1, trigger="backfill"),
+    ]
+    events = [
+        _event("e-v1", "a v1 proposal", run_id="r-v1"),
+        _event("e-bf", "a backfill proposal", run_id="r-bf"),
+        _event("e-orphan", "an orphan proposal", run_id="r-gone"),
+    ]
+    rep = _rep.build_report(runs, events, [])
+    assert [e["id"] for e in rep["legacy_events"]] == ["e-v1"]
+    assert [e["id"] for e in rep["backfill_events"]] == ["e-bf"]
+    assert [e["id"] for e in rep["window_orphan_events"]] == ["e-orphan"]
+
+    md = _rep.render_md(rep, generated_at=T1)
+    assert "Legacy prompt-version proposals (excluded; 1)" in md
+    assert "a v1 proposal" in md.split("Legacy prompt-version")[1]
+
+
+def test_fn_floor_excludes_rows_swept_by_the_previous_version():
+    """Rows the OLD prompt already covered are not the new prompt's misses.
+
+    The cursor never rewinds on a version bump, so a foreground row created
+    before v1's last successful sweep was never in v2's delta — charging it
+    as a v2 FN depressed recall with structurally-impossible misses. A row
+    created AFTER that floor stays chargeable (the fresh-install case, with
+    no legacy runs at all, is the existing FN tests, which still pass)."""
+    runs = [
+        _run("r-v1", started="2026-07-14T10:00:00+00:00", prompt_version="v1"),
+        _run("r-v2", started="2026-07-14T12:00:00+00:00"),
+    ]
+    ledger = [
+        _fg_row("L-old", "an agreement v1 swept", created="2026-07-14T09:00:00+00:00"),
+        _fg_row("L-new", "an agreement v2 missed", created="2026-07-14T11:00:00+00:00"),
+    ]
+    rep = _rep.build_report(runs, [], ledger)
+    assert [r["id"] for r in rep["fn"]] == ["L-new"], (
+        "the pre-v2 row was charged as a v2 miss"
+    )
+
+
+def test_headline_renders_the_version_denominator():
+    """The narrowed population must SAY it is narrowed, where it is read.
+
+    build_report already recorded version/excluded counts; neither the
+    markdown nor the CLI consumed them, so a small fresh-v2 subset read as
+    the full retained corpus at flip-adjudication time."""
+    runs = [
+        _run("r1", started=T1),
+        _run("r-v1", started=T1, prompt_version="v1"),
+    ]
+    rep = _rep.build_report(runs, [], [])
+    md = _rep.render_md(rep, generated_at=T1)
+    assert f"prompt **{PROMPT_VERSION}** only" in md
+    assert "1 other-version run(s) excluded" in md
+    assert "v1" in md
