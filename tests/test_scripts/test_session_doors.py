@@ -195,10 +195,17 @@ class TestManualMode:
         assert line.index("GENESIS_CC_SLOT_OAUTH=") < line.index(" LANG="), line
 
     def test_slot_map_marks_a_session_with_no_claude(self, door):
-        """The printed map is the door's only honest surface for a slot the
-        door itself will not heal: manual allocation never grabs an existing
-        session, so the map must SAY a slot has no claude and point at the door
-        rather than `tmux attach` (which reattaches to the bare prompt)."""
+        """The printed map is the only honest surface for a slot NOTHING here
+        relaunches, so it must both SAY the slot has no claude and name an
+        action that actually works.
+
+        The action matters as much as the flag: manual allocation never grabs an
+        existing session, and the hostname door's `new-session -A` attaches and
+        discards the launch command — so pointing back at the door would loop
+        the operator to the same bare prompt. The working move is to attach and
+        run `claude`, which the bashrc in-tmux wrapper gives the slot's full
+        environment.
+        """
         run, _log, sessions, listing, panes = door
         sessions.write_text("cc-1\n")
         listing.write_text("cc-1|0|Thu Jul 16 20:00:00 2026\n")
@@ -211,6 +218,14 @@ class TestManualMode:
         assert proc.returncode == 0, proc.stderr
         assert "no claude" in proc.stderr, (
             f"a claude-less slot was listed as if healthy:\n{proc.stderr}"
+        )
+        # The advice must name the relaunch that works. A note that only flags
+        # the slot, or sends the operator back through the door, is a dead end.
+        assert "run 'claude'" in proc.stderr, (
+            f"the note does not name the action that relaunches:\n{proc.stderr}"
+        )
+        assert "through this slot's door" not in proc.stderr, (
+            f"the note points back at the door, which does not relaunch:\n{proc.stderr}"
         )
 
     def test_slot_map_leaves_a_live_slot_unannotated(self, door):

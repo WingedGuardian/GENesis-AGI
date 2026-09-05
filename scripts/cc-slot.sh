@@ -101,13 +101,18 @@ if [[ "$MODE_ARG" == "manual" ]]; then
         while IFS='|' read -r name attached activity; do
             state="detached"
             [[ "$attached" -ge 1 ]] && state="attached"
-            # Say when a slot is alive but running NO claude. Manual allocation
-            # never takes over an existing session, and only the hostname door
-            # heals its own slot — so without this the map lists a stuck slot as
-            # though it were healthy, and the `tmux attach` hint above sends the
-            # operator straight back to the bare prompt. One probe per listed
-            # slot; anything other than an explicit POISONED prints nothing, so an
-            # unavailable probe never renders as a verdict.
+            # Say when a slot is alive but running NO claude, AND name an action
+            # that actually relaunches it. NOTHING in this script relaunches a
+            # poisoned slot: manual allocation never takes over an existing
+            # session, and the hostname door's `new-session -A` ATTACHES to the
+            # existing session and silently DISCARDS the launch command — which
+            # is the whole defect. So the working move is to attach and run
+            # `claude` by hand, which the bashrc in-tmux wrapper gives the slot's
+            # full environment (permission flag, temp dirs, fallback login, exit
+            # capture). Pointing anywhere else — back through the door, say —
+            # would loop the operator to the same bare prompt. One probe per
+            # listed slot; anything other than an explicit POISONED prints
+            # nothing, so an unavailable probe never renders as a verdict.
             note=""
             # `|| true` is load-bearing: under `set -euo pipefail` a
             # `var=$(tmux ... | tr ...)` whose FIRST component fails takes the
@@ -122,7 +127,7 @@ if [[ "$MODE_ARG" == "manual" ]]; then
             # Set in the LOOP's shell, not inside the substitution above.
             [ "$_map_v" = "TIMEOUT" ] && _MAP_PROBE_GAVE_UP=1
             if [[ "$_map_v" == "POISONED" ]]; then
-                note="  (no claude running — 'tmux attach' will NOT relaunch it; re-enter through this slot's door)"
+                note="  (no claude running — attach, then run 'claude' to relaunch it in place)"
             fi
             echo "  ${name}  ${state}  (last activity: ${activity})${note}" >&2
         done <<<"$slot_map"

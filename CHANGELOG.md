@@ -131,9 +131,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 - **The slot list now tells you which slots have no Claude running.** A slot can
   be alive but sitting at a bare shell (reattaching to it lands you at the
   prompt, not in Claude). The manual/dashboard slot list now marks those and
-  points you at re-entering through the slot's door — the only path that
-  relaunches Claude — instead of listing them as if they were healthy. The probe
-  is bounded so it never slows a login.
+  tells you the move that actually revives one — attach, then run `claude`,
+  which now picks up the slot's own settings (see the entry above) — instead of
+  listing them as if they were healthy. The probe is bounded so it never slows a
+  login.
 - **A session slot started after another tmux server no longer gets the wrong
   temp directory.** A new slot created while a tmux server started in some other
   context is already running used to inherit that server's temp directory
