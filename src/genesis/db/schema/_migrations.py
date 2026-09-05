@@ -1589,13 +1589,33 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             topic           TEXT,
             user_summary    TEXT,
             genesis_summary TEXT,
-            updated_at      TEXT NOT NULL
+            updated_at      TEXT NOT NULL,
+            pid             INTEGER,
+            pid_started_at  TEXT,
+            cwd             TEXT,
+            git_branch      TEXT,
+            slot            TEXT
         )
     """)
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_heartbeat_updated "
         "ON session_heartbeats(updated_at)"
     )
+    # Roster identity columns for LEGACY DBs on the base path (fresh DBs get
+    # them from the CREATE above; runner-managed DBs from migration
+    # 20260905194140_roster_identity_columns). Inline AFTER the create, per
+    # the knowledge_units pattern below — _migrate_add_columns runs earlier
+    # than this CREATE and would log no-such-table on every fresh bootstrap.
+    for _col, _ctype in (
+        ("pid", "INTEGER"),
+        ("pid_started_at", "TEXT"),
+        ("cwd", "TEXT"),
+        ("git_branch", "TEXT"),
+        ("slot", "TEXT"),
+    ):
+        await _try_alter(db,
+            f"ALTER TABLE session_heartbeats ADD COLUMN {_col} {_ctype}",
+            f"session_heartbeats.{_col}")
 
     # Knowledge pipeline: source_pipeline, purpose, ingestion_source
     await _try_alter(db,

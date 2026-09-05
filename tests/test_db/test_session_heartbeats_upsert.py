@@ -120,3 +120,191 @@ async def test_sync_upsert_preserves_identically(tmp_path):
     assert _read() == ("m1", "t1"), (
         f"sync upsert wiped a field it was never told about: {_read()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Roster identity columns (pid, pid_started_at, cwd, git_branch, slot)
+# ---------------------------------------------------------------------------
+
+
+async def _identity_row(db, sid: str = _SID) -> dict:
+    cur = await db.execute(
+        "SELECT pid, pid_started_at, cwd, git_branch, slot "
+        "FROM session_heartbeats WHERE cc_session_id = ?",
+        (sid,),
+    )
+    r = await cur.fetchone()
+    assert r is not None, "the heartbeat row was never written"
+    return dict(r)
+
+
+@pytest.mark.parametrize("column,value", [("cwd", "/some/dir"), ("slot", "3")])
+async def test_identity_column_preserved_when_omitted(db, column, value):
+    """cwd/slot follow the table's COALESCE contract: omitted = unknown."""
+    await session_heartbeats.upsert(db, cc_session_id=_SID, **{column: value})
+    assert (await _identity_row(db))[column] == value, "setup: value never stored"
+
+    await session_heartbeats.upsert(db, cc_session_id=_SID)
+
+    assert (await _identity_row(db))[column] == value, (
+        f"{column} was WIPED by a writer that did not know it"
+    )
+
+
+async def test_pid_pair_writes_and_preserves_atomically(db):
+    """pid and pid_started_at move as ONE pair.
+
+    pid_started_at exists solely to reject a recycled pid at observe time, so a
+    stored (pid, started_at) from two different writes would attribute one
+    process's start time to another — worse than unknown. The contract: a write
+    that KNOWS the pid updates both; a write that does not know the pid (None)
+    touches neither.
+    """
+    await session_heartbeats.upsert(
+        db, cc_session_id=_SID, pid=100, pid_started_at="2026-01-01T00:00:00+00:00"
+    )
+    row = await _identity_row(db)
+    assert (row["pid"], row["pid_started_at"]) == (100, "2026-01-01T00:00:00+00:00")
+
+    # Resume case: same session id, NEW process — an informed write overwrites.
+    await session_heartbeats.upsert(
+        db, cc_session_id=_SID, pid=200, pid_started_at="2026-02-02T00:00:00+00:00"
+    )
+    row = await _identity_row(db)
+    assert (row["pid"], row["pid_started_at"]) == (200, "2026-02-02T00:00:00+00:00")
+
+    # Uninformed write (walker failed): the PAIR is preserved, not half of it.
+    await session_heartbeats.upsert(db, cc_session_id=_SID)
+    row = await _identity_row(db)
+    assert (row["pid"], row["pid_started_at"]) == (200, "2026-02-02T00:00:00+00:00")
+
+
+async def test_git_branch_three_valued_contract(db):
+    """"" = known-not-on-a-branch (overwrites); None = unknown (preserves)."""
+    await session_heartbeats.upsert(db, cc_session_id=_SID, git_branch="main")
+    assert (await _identity_row(db))["git_branch"] == "main"
+
+    # Left the repo / detached: the writer KNOWS there is no branch.
+    await session_heartbeats.upsert(db, cc_session_id=_SID, git_branch="")
+    assert (await _identity_row(db))["git_branch"] == "", (
+        "an empty string is a real value and must overwrite"
+    )
+
+    await session_heartbeats.upsert(db, cc_session_id=_SID, git_branch="feat/x")
+    await session_heartbeats.upsert(db, cc_session_id=_SID, git_branch=None)
+    assert (await _identity_row(db))["git_branch"] == "feat/x", (
+        "None means resolution failed — it must not clear a known branch"
+    )
+
+
+async def test_sync_identity_columns_parity(tmp_path):
+    """The sync twin carries the same identity-column contract as the async."""
+    import sqlite3
+
+    import aiosqlite
+
+    from genesis.db.schema import create_all_tables
+
+    path = tmp_path / "hb2.db"
+    conn = await aiosqlite.connect(str(path))
+    try:
+        await create_all_tables(conn)
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    session_heartbeats.upsert_sync(
+        str(path),
+        cc_session_id=_SID,
+        pid=100,
+        pid_started_at="2026-01-01T00:00:00+00:00",
+        cwd="/w",
+        git_branch="main",
+        slot="2",
+    )
+
+    def _read() -> tuple | None:
+        c = sqlite3.connect(str(path))
+        try:
+            return c.execute(
+                "SELECT pid, pid_started_at, cwd, git_branch, slot "
+                "FROM session_heartbeats WHERE cc_session_id = ?",
+                (_SID,),
+            ).fetchone()
+        finally:
+            c.close()
+
+    assert _read() == (100, "2026-01-01T00:00:00+00:00", "/w", "main", "2"), (
+        "setup failed: the identity write never landed (upsert_sync swallows errors)"
+    )
+
+    # Pure liveness touch preserves everything.
+    session_heartbeats.upsert_sync(str(path), cc_session_id=_SID)
+    assert _read() == (100, "2026-01-01T00:00:00+00:00", "/w", "main", "2")
+
+
+async def test_roster_reads_degrade_on_premigration_schema(tmp_path):
+    """MEASURED live (2026-09-05): on a DB that predates the identity
+    migration, selecting the new columns raises and the swallow turned the
+    whole roster into [] — every peer invisible, which reads exactly like "no
+    concurrent sessions". The mid-deploy window (hooks updated at session
+    start, DB migrated at server restart) puts EVERY install here. The read
+    must degrade to the legacy column set with identity fields as None.
+
+    The legacy schema is built by replaying the PRE-migration DDL: create the
+    current schema, then apply the migration's own down() — so this fixture
+    tracks reality instead of a hand-copied CREATE."""
+    import importlib
+
+    import aiosqlite
+
+    from genesis.db.schema import create_all_tables
+
+    path = tmp_path / "legacy.db"
+    conn = await aiosqlite.connect(str(path))
+    try:
+        await create_all_tables(conn)
+        mig = importlib.import_module(
+            "genesis.db.migrations.20260905194140_roster_identity_columns"
+        )
+        await mig.down(conn)  # strip the identity columns -> legacy shape
+        await conn.commit()
+        from datetime import UTC, datetime
+
+
+        # legacy-writer shape: the OLD upsert had no identity kwargs; emulate
+        # with a direct minimal insert through the same connection.
+        await conn.execute(
+            "INSERT INTO session_heartbeats (cc_session_id, updated_at) "
+            "VALUES (?, ?)",
+            ("legacy-peer", datetime.now(UTC).isoformat()),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    rows = session_heartbeats.get_roster_sync(str(path))
+    assert len(rows) == 1, "pre-migration schema must degrade, not read empty"
+    assert rows[0]["cc_session_id"] == "legacy-peer"
+    assert rows[0]["pid"] is None and rows[0]["git_branch"] is None
+
+
+async def test_roster_dedupes_same_pid_keeping_newest(db):
+    """A /clear starts a new cc_session_id in the SAME claude process; the
+    old conversation's row keeps a live pid for 24h and rendered as a
+    phantom live peer (review finding). One row per pid — the newest."""
+    from genesis.db.crud.session_heartbeats import get_roster
+
+    await session_heartbeats.upsert(db, cc_session_id="old-convo", pid=4242,
+                                    pid_started_at="2026-01-01T00:00:00+00:00")
+    await session_heartbeats.upsert(db, cc_session_id="new-convo", pid=4242,
+                                    pid_started_at="2026-01-01T00:00:00+00:00")
+    await session_heartbeats.upsert(db, cc_session_id="pidless-a")
+    await session_heartbeats.upsert(db, cc_session_id="pidless-b")
+
+    rows = await get_roster(db)
+    ids = [r["cc_session_id"] for r in rows]
+    assert "new-convo" in ids and "old-convo" not in ids, (
+        f"same-pid dedupe must keep only the newest conversation: {ids}"
+    )
+    assert "pidless-a" in ids and "pidless-b" in ids, "pid-less rows exempt"
