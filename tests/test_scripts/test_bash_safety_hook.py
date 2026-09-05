@@ -555,3 +555,88 @@ class TestGenesisDedup:
     def test_broad_rm_still_blocks_in_genesis(self):
         r = _run("rm -rf /", cwd=self._GENESIS_CWD)
         assert r.returncode == 2
+
+
+class TestDiscardedWriteNote:
+    """The refusal names the writes it threw away.
+
+    A PreToolUse block discards the WHOLE Bash call, not the step objected to, so
+    a write chained with a refused step is lost SILENTLY. This script has 18
+    separate ``exit 2`` sites and no shared emitter, so ONE ``EXIT`` trap covers
+    them all rather than refactoring an 18KB safety script.
+
+    The trap sits in a SAFETY script, so every case asserts the exit code
+    directly: a note that cost a block would be far worse than no note at all.
+    """
+
+    #: Substring-blocked by this hook with no external dependencies. Built rather
+    #: than written literally so the hook's own whole-command scan does not fire
+    #: on a developer command that merely MENTIONS it.
+    _BLOCKER = "git reset --" + "hard"
+    #: The note's stable marker. Spelled ONCE: the absence assertions below are
+    #: vacuous against a stale string, and a reworded note would silently turn three
+    #: of these tests green while emitting nothing.
+    _MARKER = "ENTIRE command was discarded"
+
+    def test_a_block_reports_that_the_whole_command_went(self):
+        r = _run(f"cp a b && {self._BLOCKER}")
+        assert r.returncode == 2
+        assert self._MARKER in r.stderr
+
+    def test_the_note_does_NOT_name_the_discarded_command_or_its_files(self):
+        """The contract that replaced the file list, asserted end-to-end.
+
+        Deriving which operands were files meant modelling each tool's option
+        grammar — unbounded, and measured as a fail-open in this very script. A
+        future 'small improvement' that reintroduces a name fails here.
+        """
+        r = _run(f"cat > /tmp/zz.txt <<EOF\nbody\nEOF\n{self._BLOCKER}")
+        assert r.returncode == 2
+        assert self._MARKER in r.stderr
+        assert "/tmp/zz.txt" not in r.stderr
+
+    def test_a_block_that_discarded_NOTHING_stays_silent(self):
+        """The zero-false-positive property: silence when the refused step was the
+        whole call, so nothing was carried alongside it."""
+        r = _run(self._BLOCKER)
+        assert r.returncode == 2
+        assert self._MARKER not in r.stderr
+
+    def test_an_ALLOWED_command_still_exits_zero_and_says_nothing(self):
+        r = _run("echo hello world")
+        assert r.returncode == 0
+        assert self._MARKER not in r.stderr
+
+    def test_an_allowed_command_WITH_a_write_says_nothing(self):
+        """The note is emitted only at a refusal. A write on an ALLOWED command
+        was not discarded, and saying otherwise would fire on ordinary work."""
+        r = _run("cp a b && echo done")
+        assert r.returncode == 0
+        assert self._MARKER not in r.stderr
+
+    def _run_detached_copy(self, tmp_path, command):
+        """Run a copy of the hook from a directory with no `hooks/` beside it, so
+        the trap cannot find its helper."""
+        copy = tmp_path / "bash_safety_hook.sh"
+        copy.write_text(HOOK.read_text())
+        env = dict(os.environ)
+        env.pop("GENESIS_BASH_ALLOWLIST", None)
+        return subprocess.run(
+            ["bash", str(copy)],
+            input=json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}),
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=_OUTSIDE,
+        )
+
+    def test_a_BROKEN_helper_cannot_turn_a_block_into_an_allow(self, tmp_path):
+        """The decisive safety property. If this ever fails, a COSMETIC note has
+        acquired the power to defeat a refusal."""
+        r = self._run_detached_copy(tmp_path, f"cp a b && {self._BLOCKER}")
+        assert r.returncode == 2, "a missing helper must not turn a block into an allow"
+        assert self._MARKER not in r.stderr
+
+    def test_a_BROKEN_helper_cannot_turn_an_allow_into_a_block(self, tmp_path):
+        """The other direction, which a `set -e` or a stray `exit` would break."""
+        assert self._run_detached_copy(tmp_path, "echo hi").returncode == 0

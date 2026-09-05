@@ -34,6 +34,28 @@ from shell_parse import (  # noqa: E402
     untokenizable,
 )
 
+try:  # A refusal discards the WHOLE Bash call, so name any write it took with it.
+    from discarded_write import prompt_note as _prompt_discarded  # noqa: E402
+    from discarded_write import remember as _remember_command  # noqa: E402
+    from discarded_write import warn as _warn_discarded  # noqa: E402
+except Exception:  # noqa: BLE001
+
+    def _remember_command(_command=None):
+        """No-op stand-in.
+
+        The note is cosmetic, but an UNGUARDED import that failed would abort this
+        module's load — and CC reads a non-2 exit as a NON-blocking error, so the
+        unreviewed commit this hook exists to refuse would proceed. A missing note
+        must never become a missing block.
+        """
+
+    def _warn_discarded(_command=None):
+        """No-op stand-in. See ``_remember_command``."""
+
+    def _prompt_discarded(_command=None):
+        """No-op stand-in returning no note. See ``_remember_command``."""
+        return None
+
 # Sentinel: the commit's effective cwd cannot be confidently resolved (a cd into
 # a variable/command-substitution, a subshell, or a commit nested at depth>0).
 # Fail closed on it — treat as main (block Rule 1) and do NOT take the docs skip.
@@ -644,6 +666,7 @@ def main() -> None:
     command = field(payload, "command")
     if not _COMMIT_PATTERN.search(command):
         sys.exit(0)  # Not a commit, allow
+    _remember_command(command)
 
     # Parse the command into the segments it actually executes (through
     # wrappers, bash -c, command substitutions). Reused for Rule 0, the
@@ -1266,6 +1289,9 @@ def main() -> None:
 def _deny(message: str) -> None:
     """Output denial message and block the tool via exit code 2."""
     print(message, file=sys.stderr)
+    # Last, so it reads as a footnote to the refusal above. The command was handed
+    # over in main(); stdin was consumed by the payload read and cannot be re-read.
+    _warn_discarded()
     sys.exit(2)
 
 
@@ -1277,7 +1303,18 @@ def _ask(reason: str) -> None:
     Claude Code runs the tool only on explicit approval, which the agent cannot
     self-satisfy. Mirrors ``git_push_guard._ask``. Exits 0 with the decision on
     stdout (the hook JSON carries the verdict; the exit code must NOT be 2).
+
+    The collateral note goes INTO ``reason``, not to stderr: the operator is reading
+    a dialog and stderr is not part of it. This path is reached for a command the
+    parser could NOT resolve — often a heredoc compounded with a commit — so
+    declining it discards a write the operator may not have connected to the commit
+    they were asked about. Appended defensively: ``_prompt_discarded`` is the no-op
+    stand-in when the cosmetic helper is unimportable, and a note must never be able
+    to cost this gate its prompt.
     """
+    extra = _prompt_discarded()
+    if extra:
+        reason = f"{reason}\n\n{extra}"
     print(
         json.dumps(
             {

@@ -19,6 +19,19 @@ from __future__ import annotations
 import os
 import sys
 
+try:  # A refusal discards the WHOLE Bash call, not just the piped step.
+    from discarded_write import warn as _warn_discarded  # noqa: E402
+except Exception:  # noqa: BLE001
+
+    def _warn_discarded(_command=None):
+        """No-op stand-in.
+
+        The note is cosmetic, but an UNGUARDED import that failed would abort
+        this module's load — and CC reads a non-2 exit as a NON-blocking error,
+        so the command this hook exists to refuse would RUN. A missing note must
+        never become a missing block.
+        """
+
 # Self-locate so hook_input/shell_parse resolve whether run as a script or imported.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import read_payload, tool_input  # noqa: E402
@@ -50,6 +63,12 @@ def main() -> None:
             "`bash that_script.sh`.",
             file=sys.stderr,
         )
+        # This exit discards the WHOLE call, so a `cp a b && producer | consumer`
+        # also loses the copy — and the message above names only the pipe, which
+        # reads as "the pipeline was rejected", never "and your earlier write
+        # never happened". Every other refusal point emits this; this guard was
+        # wired without it, so its refusals were the silent ones.
+        _warn_discarded(cmd)
         sys.exit(2)
 
 
