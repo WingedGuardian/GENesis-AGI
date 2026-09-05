@@ -734,3 +734,51 @@ async def test_drain_with_real_store_delete_end_to_end(tmp_path, monkeypatch):
         "SELECT status FROM deferred_work_queue WHERE work_type='memory_deferred_delete'",
     )
     assert [r[0] for r in rows] == ["completed"]
+
+
+# ── graph-cache invalidation on edge-purging repairs (issue #1641 gap) ────
+
+
+async def test_ghost_purge_invalidates_the_graph_cache(tmp_path, monkeypatch):
+    """The sweep deletes memory_links rows directly (no CRUD), and this module
+    carried zero invalidations — the cached graph kept ghost edges until an
+    unrelated write refreshed it."""
+    path = await _db(tmp_path)
+    await _seed(path, "ok", created_at=_OLD)
+    client = _points(
+        {
+            "episodic_memory": {
+                "ok": {"created_at": _OLD},
+                "ghost_old": {"created_at": _OLD},
+                "ghost_old2": {"created_at": _OLD},
+            }
+        }
+    )
+    calls = []
+    monkeypatch.setattr(
+        "genesis.memory.graph.invalidate_graph_cache", lambda: calls.append(1)
+    )
+
+    result = await _run(path, client, monkeypatch, tmp_path)
+
+    assert result.ghosts_deleted == 2
+    assert calls, "an edge-purging repair left the cached graph stale"
+    # TWO ghosts, ONE call: with a single ghost this assertion is vacuous
+    # (per-row and per-sweep both produce 1) — the second ghost makes it bite.
+    assert len(calls) == 1, "invalidation is a flag flip — once per sweep, not per row"
+
+
+async def test_clean_reconcile_does_not_invalidate(tmp_path, monkeypatch):
+    """CONTROL: a sweep that deletes nothing must not dirty the cache."""
+    path = await _db(tmp_path)
+    await _seed(path, "ok", created_at=_OLD)
+    client = _points({"episodic_memory": {"ok": {"created_at": _OLD}}})
+    calls = []
+    monkeypatch.setattr(
+        "genesis.memory.graph.invalidate_graph_cache", lambda: calls.append(1)
+    )
+
+    result = await _run(path, client, monkeypatch, tmp_path)
+
+    assert result.ghosts_deleted == 0
+    assert not calls

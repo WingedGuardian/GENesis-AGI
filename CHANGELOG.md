@@ -69,6 +69,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A graph backend that cannot answer no longer erases the shield's memory.**
+  "The graph store is unreachable" and "no bridge memories exist" used to look
+  identical — an empty answer — so a missing library or unreachable backend
+  made the nightly centrality pass wipe its cache, and the importance shield
+  then protected nothing until the backend came back AND the pass re-ran.
+  Unavailability is now its own loud signal: the pass keeps the previous
+  bridge-node population standing and says why, while a genuinely empty graph
+  still supersedes stale rows. Two writers also stopped leaving the cached
+  graph stale: superseding a memory now tells the graph about the new
+  succession edge, and the integrity sweep that purges a dead memory's edges
+  now invalidates the cache it just made wrong.
+
 - **The pre-merge check now reads the second review bot it was already fetching.**
   Two automated reviewers comment on every pull request, and the gate that decides
   whether a change is ready to merge only understood the format of one of them. The
