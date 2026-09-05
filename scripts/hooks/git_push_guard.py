@@ -1671,11 +1671,15 @@ def _check_inline_review_findings(
                     else:
                         cr_advisory.append(title)
                     continue
-                if _is_doc_path(c.get("path") or ""):
+                if _is_doc_path(c.get("path") or "") and _doc_findings_mode() == "skip":
                     # Its OWN list, not the Codex `doc_skipped` one — landing a
                     # CodeRabbit finding there printed it as "[doc P1]" under a
                     # heading that names Codex severities, which misattributes
-                    # both the reviewer and the level.
+                    # both the reviewer and the level. Mirrors the Codex P1
+                    # branch's mode handling: Critical/Major carry P1-equivalent
+                    # weight, so under `p1_only` or `score` this falls through
+                    # and DOES block — otherwise the stricter setting silently
+                    # enforced one reviewer and not the other (Codex P2, #1677).
                     cr_doc_skipped.append(_coderabbit_title(seg))
                     continue
                 cr_block.append(_coderabbit_title(seg))

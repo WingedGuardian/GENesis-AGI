@@ -1862,6 +1862,26 @@ class TestCheckInlineReviewFindings:
         with self._mock(guard_module, [self._codex(2, _P2_BODY, path="AGENTS.md")]):
             assert guard_module._check_inline_review_findings("100")[0] is False
 
+    def test_stricter_modes_apply_to_coderabbit_doc_findings_too(
+        self, guard_module, monkeypatch
+    ):
+        """The mode lever must govern BOTH reviewers (Codex P2, PR #1677 round 4).
+
+        A CodeRabbit Critical/Major carries P1-equivalent weight, so under
+        `p1_only` and `score` a doc-path Major blocks exactly as a Codex doc P1
+        does — otherwise the stricter setting enforced one reviewer and not the
+        other. Under the default `skip` it stays non-blocking (control).
+        """
+        for mode in ("score", "p1_only"):
+            monkeypatch.setenv("_TEST_DOC_FINDINGS_MODE", mode)
+            with self._mock(guard_module, [self._coderabbit(1, _CR_MAJOR_BODY, path="AGENTS.md")]):
+                block, _ = guard_module._check_inline_review_findings("100")
+            assert block, f"a doc-path CodeRabbit Major did not block under {mode!r}"
+        monkeypatch.setenv("_TEST_DOC_FINDINGS_MODE", "skip")
+        with self._mock(guard_module, [self._coderabbit(1, _CR_MAJOR_BODY, path="AGENTS.md")]):
+            block, _ = guard_module._check_inline_review_findings("100")
+        assert not block, "the default must keep doc findings non-blocking"
+
     def test_score_mode_restores_the_old_behaviour(self, guard_module, monkeypatch):
         """Two doc P2s = 1.0 → blocks, exactly as two code P2s would."""
         monkeypatch.setenv("_TEST_DOC_FINDINGS_MODE", "score")
