@@ -156,8 +156,8 @@ _on_signal_prestop() {
     exit 1
 }
 
-# ── Suppression-outcome watermark, taken BEFORE anything in this deploy can
-# repair the keys.
+# ── Suppression-outcome channel, CONSUMED (cleared) BEFORE anything in this
+# deploy can repair the keys.
 #
 # bootstrap.sh runs as a SUBPROCESS later in this script and calls
 # cc_ensure_local, which may repair CC's auto-updater suppression. That repair
@@ -167,10 +167,21 @@ _on_signal_prestop() {
 # and bootstrap's own message is usually cut by its `tail -10`.
 #
 # cc_ensure_updater_suppressed leaves a durable breadcrumb on any non-ok
-# outcome. Recording the epoch now is what lets the consumer tell "repaired
-# during THIS deploy" from a breadcrumb left weeks ago.
-_CC_SUPP_MARK="$(cut -d' ' -f2 "$HOME/.genesis/cc_suppression_outcome" 2>/dev/null || true)"
-case "${_CC_SUPP_MARK:-}" in ''|*[!0-9]*) _CC_SUPP_MARK=0 ;; esac
+# outcome. CLEARING the file here is what lets the consumer tell "repaired
+# during THIS deploy" from a breadcrumb left weeks ago: anything present after
+# the subprocess was written by this deploy, BY CONSTRUCTION. This replaced an
+# epoch watermark compared with `-gt` — an ordering that rode on the wall
+# clock, so a clock rollback, a snapshot restore carrying a future-dated
+# breadcrumb, or a same-second overwrite each made a GENUINE repair read as a
+# clean deploy. Existence cannot be reordered. The epoch inside the file is
+# display data only, and no reader may compare it again.
+rm -f "$HOME/.genesis/cc_suppression_outcome" 2>/dev/null || true
+if [ -e "$HOME/.genesis/cc_suppression_outcome" ]; then
+    # The clear is load-bearing for attribution; a file that survives it would
+    # quietly restore the old weeks-ago-breadcrumb misattribution for one run.
+    echo "  WARNING: could not clear $HOME/.genesis/cc_suppression_outcome —" \
+         "a suppression outcome reported later in this deploy may predate it"
+fi
 
 # Refuse to run from a worktree — pip install -e in bootstrap.sh would
 # redirect system-wide imports and cause I/O death spiral.
@@ -551,14 +562,14 @@ _sync_deploy_targets() {
             # `ok` HERE does not mean nothing happened. bootstrap.sh ran earlier
             # in this same deploy, as a subprocess, and may already have repaired
             # the keys — leaving this call nothing to do and nothing to report.
-            # The breadcrumb is the only surviving evidence; the watermark taken
-            # at the top of this script is what distinguishes a repair made
-            # DURING this deploy from one recorded long ago.
+            # The breadcrumb is the only surviving evidence, and the file was
+            # CLEARED at the top of this script — so its mere existence now
+            # means "written during this deploy". No epoch comparison: that is
+            # the wall-clock ordering this channel used to ride on, and a clock
+            # rollback or restored snapshot made a genuine repair read as clean.
             _supp_line="$(cat "$HOME/.genesis/cc_suppression_outcome" 2>/dev/null || true)"
             _supp_state="${_supp_line%% *}"
-            _supp_at="${_supp_line##* }"
-            case "${_supp_at:-}" in ''|*[!0-9]*) _supp_at=0 ;; esac
-            if [ -n "$_supp_state" ] && [ "$_supp_at" -gt "${_CC_SUPP_MARK:-0}" ]; then
+            if [ -n "$_supp_state" ]; then
                 HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_${_supp_state}"
                 echo "  NOTE: auto-updater suppression was '${_supp_state}' earlier in this" \
                      "deploy (bootstrap) — recording it, since this later check found the" \

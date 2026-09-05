@@ -72,8 +72,11 @@ CC_PROBE_DIRS="${CC_PROBE_DIRS:-/usr/local/bin:/usr/bin:$HOME/.npm-global/bin}"
 # visible deploy output. This file is that missing channel.
 #
 # `ok` is deliberately NOT written: absence means "nothing to report", so a
-# stale breadcrumb can never manufacture a degradation. Readers compare the
-# recorded epoch against a mark they took before the subprocess ran.
+# stale breadcrumb can never manufacture a degradation. The reader (update.sh)
+# CLEARS this file before the subprocess runs, so existence afterwards means
+# "written during this deploy" by construction — the epoch inside is display
+# data only, and no reader may compare it (wall-clock ordering here broke
+# three ways: clock rollback, snapshot restore, same-second overwrite).
 _CC_SUPP_OUTCOME_FILE="${HOME:-}/.genesis/cc_suppression_outcome"
 
 _cc_supp_persist_outcome() {
@@ -94,9 +97,10 @@ _cc_supp_persist_outcome() {
         return 1
     fi
     # EPOCHSECONDS first: it is a bash builtin, so the stamp does not depend on
-    # `date` being on PATH. A zero stamp is not harmless — the reader compares
-    # it against a watermark, so `0` makes a real repair invisible rather than
-    # merely undated. `date` remains the fallback for bash < 5.0.
+    # `date` being on PATH; `date` remains the fallback for bash < 5.0. The
+    # epoch is DISPLAY DATA for an operator reading the file — attribution is
+    # by existence-after-clear in the consumer, so a zero stamp is merely
+    # undated, and no reader may compare this value again.
     if ! printf '%s %s\n' "${CC_SUPPRESSION_STATE:-unverified}" \
         "${EPOCHSECONDS:-$(date -u +%s 2>/dev/null || echo 0)}" \
         > "$_CC_SUPP_OUTCOME_FILE" 2>/dev/null; then
@@ -374,7 +378,7 @@ _cc_ensure_updater_suppressed_inner() {
     #     makes the function honest regardless of how the next one is written.
     rc=0
     out="$(python3 - "$settings_file" "${extra_defaults[@]}" <<'PYEOF'
-import json, os, random, shutil, signal, sys, tempfile, time
+import json, os, random, shutil, signal, stat, sys, tempfile, time
 
 # SIGTERM must RAISE, or the cleanup arm below is decorative.
 #
@@ -456,6 +460,18 @@ def identity():
 for _attempt in range(ATTEMPTS):
     before, st_before = identity()
     if before is not None:
+        # Only a REGULAR file is readable-and-replaceable on this path. A FIFO
+        # at the (resolved) settings path makes the open() below BLOCK until a
+        # writer appears — the daily align unit would hang to its full timeout —
+        # and a writer that supplies valid JSON would get the FIFO itself
+        # REPLACED by a regular file carrying its mode. A device or directory
+        # fails later with a message naming the wrong cause. stat never blocks,
+        # so judge the type first and decline everything that is not a plain
+        # file. Residual: the window between this check and the open is
+        # unguarded — same irreducible class as the CAS residual noted below.
+        if not stat.S_ISREG(st_before.st_mode):
+            fail("settings.json is not a regular file — left untouched; set the "
+                 "two keys by hand")
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
@@ -484,6 +500,17 @@ for _attempt in range(ATTEMPTS):
     for k in missing_defaults:
         env[k] = DEFAULTS[k]
 
+    # The RESOLVED target's directory may not exist: a dangling symlink into a
+    # dotfiles tree (settings.json -> ../dotfiles/claude/settings.json) resolves
+    # to a path whose parent was never made, and mkstemp then fails ENOENT —
+    # reported as `failed`, PERMANENTLY on the host, which has no recurring
+    # settings timer. The no-python branch already creates the resolved parent;
+    # this is the same obligation on this branch. A no-op when the file exists.
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    except OSError as exc:
+        fail("cannot create the directory for settings.json (%s) — left untouched"
+             % exc.strerror)
     try:
         fd, tmp = tempfile.mkstemp(
             dir=os.path.dirname(path) or ".", prefix=".settings.", suffix=".tmp",

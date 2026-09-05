@@ -130,7 +130,7 @@ sys.exit(subprocess.run(
 _CHOWN_SHIM_TEMPLATE = """#!%(python)s
 import subprocess, sys
 
-ANCHOR = "import json, os, random, shutil, signal, sys, tempfile, time"
+ANCHOR = "import json, os, random, shutil, signal, stat, sys, tempfile, time"
 INJECT = (
     "import errno as _te, os as _to\\n"
     "_t_real_stat = _to.stat\\n"
@@ -1557,6 +1557,107 @@ class TestVerifiedByConstruction:
         assert env["DISABLE_AUTOUPDATER"] == "1"
         assert env["DISABLE_UPDATES"] == "1"
 
+    def test_a_dangling_link_into_a_missing_directory_repairs_with_python(
+        self, tmp_path: Path
+    ) -> None:
+        """The PYTHON path must create the resolved target's directory too.
+
+        Round-8 reproduction: settings.json -> ../dotfiles/claude/settings.json
+        with `dotfiles/claude` not yet made. realpath resolves the dangling
+        link, mkstemp then gets the missing directory and fails ENOENT — so the
+        function reported `failed` and left BOTH keys absent, permanently on
+        the host (no recurring timer there). The no-python branch already
+        creates the resolved parent; this pins the same obligation on the
+        python branch.
+        """
+        settings = _settings(tmp_path)
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        target = tmp_path / "home" / "dotfiles" / "claude" / "settings.json"
+        settings.symlink_to(Path("..") / "dotfiles" / "claude" / "settings.json")
+        assert settings.is_symlink() and not target.parent.exists()
+
+        r = _run(
+            tmp_path,
+            'cc_ensure_updater_suppressed || true; '
+            'echo "STATE=${CC_SUPPRESSION_STATE:-unset}"',
+        )
+
+        assert "STATE=repaired" in r.stdout, (r.stdout, r.stderr)
+        assert settings.is_symlink(), "the operator's link was replaced"
+        assert target.exists(), "the resolved target was never created"
+        env = json.loads(settings.read_text())["env"]
+        assert env["DISABLE_AUTOUPDATER"] == "1"
+        assert env["DISABLE_UPDATES"] == "1"
+
+    def test_a_fifo_settings_file_is_declined_not_replaced(self, tmp_path: Path) -> None:
+        """A FIFO at the settings path must be declined FAST, never opened.
+
+        Round-8 reproduction: stat accepts a FIFO, and the reconciler's open()
+        then BLOCKS until a writer appears — the daily align unit hangs to its
+        full timeout — while a writer supplying valid JSON gets the FIFO itself
+        replaced by a regular file carrying its mode. stat never blocks, so the
+        type is judged first and anything non-regular declines. Against the
+        old code this test does not fail an assertion — it TIMES OUT, which is
+        the finding's hang, observed.
+        """
+        settings = _settings(tmp_path)
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(settings)
+
+        r = _run(
+            tmp_path,
+            'cc_ensure_updater_suppressed || true; '
+            'echo "STATE=${CC_SUPPRESSION_STATE:-unset}"',
+        )
+
+        assert "STATE=failed" in r.stdout, (r.stdout, r.stderr)
+        assert "not a regular file" in r.stderr, (r.stdout, r.stderr)
+        assert stat.S_ISFIFO(os.stat(settings, follow_symlinks=False).st_mode), (
+            "the FIFO was replaced — whatever wiring fed it is now broken"
+        )
+
+    def test_a_genuine_repair_survives_a_future_dated_breadcrumb(
+        self, tmp_path: Path
+    ) -> None:
+        """The channel's ordering is existence-after-clear, not the wall clock.
+
+        Round-8 reproduction, protocol-level: a breadcrumb seeded with a FUTURE
+        epoch (clock rollback / snapshot restore) made a genuine repair's fresh
+        breadcrumb compare BELOW the watermark, so the deploy recorded clean.
+        update.sh now clears the file before bootstrap can repair; this
+        replays the consumer's sequence — clear, then repair — and pins that
+        the outcome is attributable with NO epoch arithmetic at all. The
+        structural companion (`test_update_sh_consults_the_breadcrumb...`)
+        pins where the clear sits in update.sh itself.
+        """
+        home = tmp_path / "home"
+        (home / ".claude").mkdir(parents=True)
+        crumb = home / ".genesis" / "cc_suppression_outcome"
+        crumb.parent.mkdir(parents=True)
+        future = 4102444800  # 2100-01-01: any real clock is "rolled back" vs this
+        crumb.write_text(f"repaired {future}\n")
+
+        # The consumer's first act: consume-by-clearing.
+        crumb.unlink()
+
+        # A genuine repair during "this deploy" (both keys missing -> created).
+        r = _run(tmp_path, 'cc_ensure_updater_suppressed || true; '
+                           'echo "STATE=${CC_SUPPRESSION_STATE:-unset}"')
+        assert "STATE=repaired" in r.stdout, (r.stdout, r.stderr)
+
+        assert crumb.exists(), (
+            "the repair left no breadcrumb — nothing to attribute at all"
+        )
+        recorded, _, at = crumb.read_text().strip().partition(" ")
+        assert recorded == "repaired", recorded
+        # The factual pivot of the round-8 finding: the fresh epoch IS below
+        # the seeded future one, so the old `-gt` watermark would have
+        # discarded exactly this genuine outcome. Existence does not care.
+        assert at.isdigit() and int(at) < future, (
+            "fixture no longer reproduces the rollback shape — the seeded "
+            "epoch must sit in the repair's future"
+        )
+
     def test_a_symlink_cycle_is_declined_not_broken(self, tmp_path: Path) -> None:
         """A cycle of links is operator wiring to DECLINE, not to rename over.
 
@@ -1618,7 +1719,7 @@ class TestVerifiedByConstruction:
             "the SIGTERM handler is installed after the temp file is created — "
             "the unprotected window is exactly the one being closed"
         )
-        assert "import json, os, random, shutil, signal, sys, tempfile, time" in src
+        assert "import json, os, random, shutil, signal, stat, sys, tempfile, time" in src
 
     def test_a_create_whose_write_did_not_land_reports_failed(self, tmp_path: Path) -> None:
         """Sabotaged mv: the rename 'succeeds' but the content never arrives.
@@ -1705,6 +1806,34 @@ class TestAlignVerifiesNotAssumes:
         assert r.returncode == 0, (r.stdout, r.stderr)
         assert "verified read-only" in r.stdout
         assert "both suppression keys present" in r.stdout
+
+    def test_a_held_lock_with_a_fifo_settings_file_fails_fast(self, tmp_path: Path) -> None:
+        """The read-only contention path must not BLOCK on a FIFO.
+
+        Round-8 reproduction for the align script's other read: the contended
+        path's json.load(open(...)) parks until a writer appears, so a FIFO at
+        the settings path hangs the unit to its full timeout — on exactly the
+        input the write path now declines. stat never blocks; the type is
+        judged first. Against the old code this test times out rather than
+        failing an assertion: that IS the hang, observed.
+        """
+        import fcntl as _fcntl
+
+        home = self._seed(tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1"}})
+        settings = home / ".claude" / "settings.json"
+        settings.unlink()
+        os.mkfifo(settings)
+
+        with self._hold_lock(home) as fh:
+            _fcntl.flock(fh, _fcntl.LOCK_EX)
+            r = self._run_script(home)
+
+        assert r.returncode != 0, (
+            "a FIFO under contention verified as clean — nothing was read"
+        )
+        assert stat.S_ISFIFO(os.stat(settings, follow_symlinks=False).st_mode), (
+            "the contention path is read-only by contract and replaced the file"
+        )
 
     def test_a_clean_contended_run_resets_the_repair_history(self, tmp_path: Path) -> None:
         """repair -> clean-under-contention -> repair must NOT read as a repeat.
@@ -1828,7 +1957,8 @@ class TestConsumersReadTheChannel:
         assert at.isdigit() and int(at) > 0, f"breadcrumb has no usable epoch: {at!r}"
 
         # A subsequent CLEAN run must not overwrite it with `ok`: the reader
-        # compares epochs against a watermark, and `ok` carries no information.
+        # treats existence after its own clear as "written during this deploy",
+        # so an `ok` write would manufacture a report out of nothing.
         before = crumb.read_text()
         r2 = _run(tmp_path, 'cc_ensure_updater_suppressed || true; echo "state=$CC_SUPPRESSION_STATE"')
         assert "state=ok" in r2.stdout, (r2.stdout, r2.stderr)
@@ -1838,35 +1968,47 @@ class TestConsumersReadTheChannel:
         """`ok` in update.sh's own call does not mean nothing happened.
 
         Structural, because the branch only fires inside a real deploy: the
-        watermark must be taken BEFORE bootstrap.sh runs, and the consumer must
-        compare against it. A watermark read after the subprocess would always
-        equal the breadcrumb and the branch would be dead.
+        channel must be CLEARED before bootstrap.sh runs, and the consumer must
+        treat mere existence-after-clear as "written during this deploy". A
+        clear placed after the subprocess would eat this deploy's own outcome
+        and the branch would be dead.
+
+        This REPLACED an epoch watermark compared with `-gt` — wall-clock
+        ordering, under which a clock rollback, a snapshot restore carrying a
+        future-dated breadcrumb, or a same-second overwrite each made a GENUINE
+        repair read as a clean deploy (round-8 finding, reproduced by seeding a
+        future epoch). Existence cannot be reordered, so the comparison must
+        not merely be fixed — it must be GONE.
         """
         src = (_REPO_ROOT / "scripts" / "update.sh").read_text()
 
         # TEXTUAL position cannot prove EXECUTION order in a shell script, and
         # two earlier versions of this test got that wrong in different ways:
-        #   1. `"_CC_SUPP_MARK=" in src` was satisfied by the fallback line
-        #      `_CC_SUPP_MARK=0` alone, so deleting the real read stayed green.
-        #   2. comparing against the position of `scripts/bootstrap.sh` was
-        #      satisfied by the CONSUMER's own `cat` of the breadcrumb — which
+        #   1. a substring check satisfied by an unrelated fallback line, so
+        #      deleting the real mechanism stayed green;
+        #   2. comparing against the position of `scripts/bootstrap.sh` —
+        #      satisfied by the CONSUMER's own `cat` of the breadcrumb, which
         #      lives inside `_sync_deploy_targets`, a function DEFINED near the
         #      top of the file and CALLED long after bootstrap.
-        # What actually matters is that the watermark is read at top level,
-        # ahead of the function that later consumes it.
-        assert '_CC_SUPP_MARK="$(cut' in src, (
-            "the watermark is never read from the breadcrumb file"
+        # What actually matters: the clear happens at top level, ahead of the
+        # function that later consumes the file.
+        clear_line = 'rm -f "$HOME/.genesis/cc_suppression_outcome"'
+        assert clear_line in src, (
+            "the breadcrumb channel is never cleared — a breadcrumb left weeks "
+            "ago is indistinguishable from one written by this deploy"
         )
-        mark_read = src.index('_CC_SUPP_MARK="$(cut')
         consumer_def = src.index("_sync_deploy_targets() {")
-        assert mark_read < consumer_def, (
-            "the watermark must be taken at top level BEFORE the function that "
-            "consumes it is even defined — inside it, the value would be read "
-            "after bootstrap has already repaired, and a real repair would be "
-            "indistinguishable from one recorded weeks ago"
+        assert src.index(clear_line) < consumer_def, (
+            "the clear must happen at top level BEFORE the function that "
+            "consumes the file is even defined — cleared inside it, this "
+            "deploy's own outcome would be eaten"
         )
-        assert '-gt "${_CC_SUPP_MARK:-0}"' in src, (
-            "the breadcrumb is never compared against the watermark"
+        # The watermark variable and the parsed epoch WERE the old mechanism;
+        # any surviving reference means wall-clock ordering crept back.
+        assert "_CC_SUPP_MARK" not in src and "_supp_at" not in src, (
+            "an epoch watermark survives — wall-clock ordering is the mechanism "
+            "the round-8 finding broke three ways (rollback, snapshot restore, "
+            "same-second overwrite); it must be deleted, not repaired"
         )
 
     def test_uninstall_dry_run_does_not_clear_timer_state(self) -> None:

@@ -136,8 +136,13 @@ if ! flock -n "$LOCK_FD"; then
     # so VERIFY read-only and report the truth: green only if both keys are on
     # disk right now.
     if command -v python3 >/dev/null 2>&1 && python3 - "$HOME/.claude/settings.json" <<'RONLY'
-import json, sys
+import json, os, stat, sys
 try:
+    # Type first, and stat never blocks: open() on a FIFO parks until a writer
+    # appears, which would hang this "read-only, races nothing" verification —
+    # and with it the unit — on exactly the input the write path now declines.
+    if not stat.S_ISREG(os.stat(sys.argv[1]).st_mode):
+        sys.exit(1)
     env = (json.load(open(sys.argv[1])).get("env") or {})
 except Exception:
     sys.exit(1)
