@@ -1738,6 +1738,46 @@ Verify before any commit:
   mention WITHOUT the `Ledger:` marker is context, not completion (the pulse
   only proposes it). Find ids via `session_charter` or the charter injection
   block.
+- **Anything a hook prints to CC's context has a hard, measured ceiling.**
+  The harness FILES a hook's stdout above **10,000 characters per hook entry**
+  (CC 2.1.246; undocumented, version-volatile — see
+  `docs/reference/cc-compatibility.md`) and shows the model a 2 KB preview;
+  the rest silently never arrives. The SessionStart injection is therefore
+  four `--part` entries with per-part budgets, CI ceilings on every tracked
+  identity file (`tests/test_scripts/test_context_injection_budget.py`), and a
+  watcher over the harness's own filings. Adding protocol text to an identity
+  file is a budget decision: put DETAIL in a reference doc and a pointer in the
+  injected file. If you add or grow a hook's stdout, measure it against the
+  cap; after a CC bump, re-run the probe (`GENESIS_CTX_PROBE_BYTES`).
+  **Emit through `scripts/hooks/hook_output.py`** — the single home of the
+  measured constant, whose `BoundedStdout` enforces the budget at the WRITER so
+  a block that forgets to check cannot overrun (2 of 12 blocks checked when the
+  budget was per-caller), and whose `print_json_bounded` trims named free-text
+  fields while never sacrificing the JSON envelope — an oversized advisory must
+  lose prose, never its `permissionDecision`. Only SessionStart,
+  UserPromptSubmit and UserPromptExpansion carry bare stdout to the model; a
+  Stop hook that `print`s on exit 0 is INERT.
+
+  **NEVER compute characters at the call site — say what the DEGRADE looks
+  like.** `out.emit_or_degrade(text, block=…, pointer=…, notice=…, reserve=…)`
+  settles every number (the divider, `print`'s newline, the closing-line
+  reserve, what is already emitted) and returns which branch it took. There is
+  no `fits()` for emitters to call any more, deliberately: five review findings
+  in one cycle were a caller re-deriving what the writer already knew — the
+  audit reserve counted twice, a `fits` that undercharged by one and approved
+  blocks the writer then destroyed, a 120-char reserve for a 206-char line, a
+  pointer reserved in a part that cannot emit one, a `keep` derived from the
+  budget constant instead of the room. The arithmetic was never hard; having it
+  in six places was. An AST test bans `.room`/`.fits` from the emitter so the
+  next "just one `fits` call" cannot reintroduce the class.
+
+  The general shape, which is the transferable part: when several call sites
+  must each remember to do something — bound their output, report a failed
+  read, escape untrusted text — that is a CONVENTION, and conventions are what
+  reviewers keep finding one instance of at a time. Move the obligation into a
+  chokepoint the callers cannot bypass, then LOCK the chokepoint with a test
+  that fails when someone routes around it. A chokepoint nobody is forced
+  through is a convention with better documentation.
 
 ## Generalizability Gate — build for ANY install, not this one
 

@@ -8,6 +8,31 @@ competitive comparison. The package-level structural companion is
 `.claude/skills/genesis-development/references/codebase-map.md`; the
 philosophical "why" is `docs/architecture/genesis-v3-vision.md`.
 
+**This is a MAP, not the territory — and the test for what goes on it is RATE OF
+CHANGE, not importance.** A map earns its keep by staying true without constant
+maintenance, so it carries only what changes rarely: that a subsystem exists and
+is LIVE / shadow / dark / gated; that a store moved from SQLite to Postgres; a
+trap that costs a session if forgotten; a do-not-touch edge. **If a fact would
+change in an ordinary PR, it does not belong here** — a function refactored, a
+constant retuned, a parameter renamed, a value re-measured. Those are true, and
+they rot, and each one added makes the whole file less trustworthy because a
+reader cannot tell the rotted lines from the sound ones.
+
+**For detail, go to the ground.** This file tells you WHERE to look and what to
+watch out for; it is not where you learn how something currently works. Use
+Serena / `codebase_navigate` for symbols and callers, the docstring for
+behaviour, the code for truth. Answering a detail question FROM this file
+instead of from the code is using it wrong — and adding that detail here "to
+help" is exactly how the map rots. When a family is too big to name — the
+awareness `_check_*` monitors, the signal collectors — describe the FAMILY and
+point at the module holding the list; never enumerate members, because a stale
+member list still READS as complete. (Measured 2026-08-31: that check family had
+grown to 16 with 6 unnamed here, and nothing marked the list partial.)
+
+**Absence from this file is never absence in Genesis.** The map is deliberately
+incomplete. Verify by enumeration before any "Genesis lacks X" claim — the
+audit-by-enumeration protocol in the genesis-development skill.
+
 **How this file stays honest.** Every entry claims its top-level
 `src/genesis` modules in a fenced `yaml subsystem-map` block and carries a
 `verified: <short-sha> <date>` stamp. CI (`subsystem-map-check`, backed by
@@ -1145,11 +1170,14 @@ verified: 29a382e7 2026-09-03
   that works across concurrent loops). Probe sensitivity is deliberately
   single-failure; do not add consecutive-failure gating.
 
-- **awareness/**: the 5-min heartbeat. ~23 signal collectors (the richer
+- **awareness/**: the 5-min heartbeat. Signal collectors (the richer
   `learning/signals/*` set REPLACES the bootstrap placeholders in
   `signals.py` — those stubs are GROUNDWORK(signal-bootstrap), not the live
   collectors). Tick → depth classification (MICRO/LIGHT/DEEP/STRATEGIC) →
-  reflection dispatch. Also per-tick `_check_*` housekeeping: CC-slot RSS leak
+  reflection dispatch. Also a FAMILY of per-tick and hourly `_check_*` monitors
+  that read state and raise/resolve observations — **`awareness/loop.py` holds
+  the authoritative list**; what follows names only the ones carrying a trap,
+  and is deliberately not an inventory. Per-tick: CC-slot RSS leak
   watch, subscription-cap detection, SQLite WAL hygiene, resilience-axis folds,
   liveness heartbeat, and (hourly) embedding-backlog degradation — counts
   `memory_metadata.embedding_status='failed'` (permanently keyword-only rows the
@@ -1198,10 +1226,8 @@ verified: 29a382e7 2026-09-03
   ~24 rows/day. `duration_ms` is honest-or-NULL (only from an explicit
   `record_job_start` marker; never derived from `last_run`). 90-day prune via
   `_wire_drip_retention_jobs` — which (2026-07-24) also prunes the observability
-  `events` bus table itself (`events_prune`, the last high-volume table with no
-  retention: 45k+ rows / ~108d). `crud.events.prune` takes an ISO cutoff, not
-  `days=`; the DELETE's lexical `timestamp < cutoff` is chronological because
-  every `events.timestamp` is a UTC isoformat. **Failure payloads (2026-07-23):** the three
+  `events` bus table itself (`events_prune`, the last high-volume table that had
+  no retention). **Failure payloads:** the three
   scheduler emitters (reflection, outreach, surplus) thread the exception into
   `observability/failure_details.py`, which sets `error_type` **IFF** a real
   exception caused the failure — a semantic failure (external blocker, e.g. a
@@ -1276,6 +1302,32 @@ verified: 29a382e7 2026-09-03
   retrieved_count** (retrieval connection is mode=ro; protects
   MEM-005/H-1 baselines). Fail-open at the hook boundary. Kill switch:
   `GENESIS_SESSION_AWARENESS_DISABLED=1`.
+- **SessionStart context injection + its watcher** (LIVE): identity, charter and
+  essential knowledge reach a foreground CC window from
+  `scripts/genesis_session_context.py`, split across several SessionStart hook
+  entries; a mis-wired invocation degrades to a loud in-band alert, never
+  silence. **The trap this exists for:** Claude Code PERSISTS a hook's stdout
+  above a size threshold and shows the model a short preview instead. It is not
+  an error, nothing announces it, and the preview reads as ordinary furniture —
+  195 windows over a month ran without identity, charter or EK before anyone
+  noticed. Each part is therefore bounded, mirrored whole under
+  `~/.genesis/sessions/<sid>/`, and carries a recovery pointer inside the
+  preview by construction. **Do-not-touch edge:** that threshold is undocumented
+  by CC and MOVES between versions — never key behaviour on a byte count, treat
+  the wrapper as the signal, and re-measure on a CC pin bump
+  (`docs/reference/cc-compatibility.md`; the cap has ONE home in
+  `scripts/hooks/hook_output.py`). The hourly injection check
+  (`observability/snapshots/context_injection.py`) is the independent ground
+  truth: it counts the HARNESS'S OWN filings rather than trusting any emitter's
+  arithmetic, so an emitter bug or a moved cap cannot silence it. Scoped to
+  Genesis checkouts (foreign filings counted, never alerted); alerts at
+  `critical` — the fast Telegram path, deliberately, because this class went
+  unnoticed for a month. Settings lever + env kill switch as usual; disabling
+  RESOLVES the open alert rather than orphaning it.
+- **Open-PR resurfacing** (LIVE): a SessionStart surface lists open PRs left
+  idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
+  rotting. Sibling of the PR-watch surface above (external PR *changes*); this
+  one is age-based and passive. `session_awareness/repo_pulse*.py`.
 - **Session charter + ledger** (session-manager stages 1-2): the
   `session_charters` + `session_ledger` DB tables (migration 0058) are the
   canonical store; `~/.genesis/sessions/<sid>/charter.md` is the regenerated
@@ -1291,10 +1343,27 @@ verified: 29a382e7 2026-09-03
   owned by the `session_charter*`/`session_ledger*` MCP tools on
   genesis-health (`mcp/health/session_charter_tools.py`), which may create a
   stub row before the first compaction. Read paths:
-  `genesis_session_context.py` re-injects origin + open ledger on every
-  startup/resume/compact (NOT clear), and `genesis_urgent_alerts.py` emits a
-  per-turn `[Charter: <mission> | open: N]` drift tag (both mode=ro,
-  fail-open). Ledger statuses: open/in_progress/done/absorbed/dropped —
+  `genesis_session_context.py --part charter` re-injects origin + mission +
+  EVERY open ledger row (uncut; above the block's size cap it degrades
+  STRUCTURALLY — every id and the `charter.md` path survive, never a mid-row cut
+  — and the part's fixed overhead is pinned by a test, so a flat cut can never
+  reach the rows) in every
+  startup/resume/compact window (NOT clear) — position within the window is not
+  guaranteed, since CC concatenates parallel hook output in COMPLETION order.
+  A ledger read that hits its fetch cap is ANNOUNCED in the footer, never
+  silently dropped. `genesis_urgent_alerts.py` emits a per-turn
+  INVENTORY — `[Ledger open: N | mission: …]` plus one `- <full-32-hex-id>
+  <text>` line per open row (capped visibly; ids render in FULL because
+  `session_ledger_update` does no prefix resolution, so a truncated id is not
+  actionable), a `mission: UNSET after N compactions` drift label, and
+  `→ escalated: follow_up <id>` beside a row that has an escalation follow-up
+  (matched on `dedup_key`; the sweep that WRITES those rows is
+  `GROUNDWORK(ledger-escalation)` — NOT built, so this link renders as nothing
+  today). Both mode=ro, fail-open. A count
+  was the previous tag and a count is indistinguishable from "handled" — a
+  session ran a week with its founding asks open behind `open: 6`. Ledger rows
+  outrank follow-ups in any status report. Ledger statuses:
+  open/in_progress/done/absorbed/dropped —
   `absorbed` + `evidence` is written by the repo-pulse exact tier (below)
   as well as the MCP tools. Dispatched sessions
   (GENESIS_CC_SESSION=1) are skipped — task_states is their continuity spine.
@@ -1741,9 +1810,9 @@ verified: 50b79ffb 2026-09-01
   a lagging install self-heals on next pull+restart with no control plane. Bulk
   write/delete migrations MUST commit in batches (`_util.commit_in_batches`) so a
   big backfill never holds the single WAL writer long enough to starve the live
-  server (which waits only 5s for the lock); the runner also retries a
+  server (which waits only briefly for the lock); the runner also retries a
   lock-contended ledger write (#1179 regression guard).
-- **runtime/**: sequential bootstrap (secrets → db → … → sentinel, ~27 steps);
+- **runtime/**: sequential bootstrap (secrets → db → … → sentinel);
   each step records ok/degraded/failed in the manifest — only db aborts.
   `~/.genesis/capabilities.json` + `bootstrap_manifest.json` are projected at
   bootstrap tail; readonly probes must never clobber the primary's state.
@@ -1751,8 +1820,8 @@ verified: 50b79ffb 2026-09-01
   installs a fail-closed `DenyHighRiskSentinel` FIRST so ctor failures degrade
   to blocking. GROUNDWORK: task-verify (constructed, `.verify()` never called
   — dark), web-dd.
-- **resilience/**: RecoveryOrchestrator on a 30-min interval (3 confirmation
-  probes before draining); `DeferredWorkQueue` priorities + staleness policies;
+- **resilience/**: RecoveryOrchestrator on a periodic tick (confirmation probes
+  before draining); `DeferredWorkQueue` priorities + staleness policies;
   dead-letter replay. The `dream_synthesis_slice` worklist is deliberately
   excluded from the backlog alarm (drift-guard test pins it).
   `NetworkSentinel` (`network_sentinel.py`) probes the open internet (DNS+TCP to
@@ -1766,7 +1835,7 @@ verified: 50b79ffb 2026-09-01
   shadow) through the shared `network_config.parking_decision()` gate: the
   **CC-invoker network preflight** (`cc/invoker.py::_network_preflight` — raises
   `CCNetworkOfflineError` BEFORE the subprocess spawns for a WAN endpoint,
-  turning a `timeout_s`-bounded hang (7200s default) into a sub-second fail; a
+  turning a `timeout_s`-bounded hang into a sub-second fail; a
   LAN CC peer, classified via `util/netclass.py`, still runs), and the
   **surplus tier filter** (`surplus/dispatch.py::_filter_tiers_for_network` —
   strips cloud compute tiers so internet-dependent tasks stay `pending` instead
@@ -1789,7 +1858,14 @@ verified: 50b79ffb 2026-09-01
   `~/.genesis/host_gateway_state.json`, written by `cc_align_host_sync` on
   every gateway version probe — update.sh and the nightly cc-align timer);
   its `GUARDIAN_HOST_PATHS` must stay in LOCKSTEP with update.sh
-  GUARDIAN_PATHS.
+  GUARDIAN_PATHS. **Total-cessation detection** (`observability/liveness.py`,
+  and for outreach a deliberately channel-INDEPENDENT heartbeat in
+  `outreach/heartbeat.py`): a subsystem that stops entirely emits nothing, so
+  absence-of-signal is itself the signal — the alarm keys on the gap since the
+  last pulse rather than on any error, which is what a silent death does not
+  produce. The GC that prunes those pulses must retain the latest row per
+  subsystem, or a subsystem dead longer than the retention window loses its
+  only pulse and reads as never-having-run (false green).
 - **security/**: prompt-injection defense + outbound scanning — sanitizer is
   LOG-ONLY for internal sources (perimeter EMAIL/INBOX can block);
   `output_scanner` = deterministic outbound secrets/IP scan; `skill_scan`
@@ -2000,7 +2076,10 @@ The afferent nerve for Genesis's own screaming bugs: detect `task.failed` /
 card → fix under a human-gated tier model. **PR1 (dark) + PR1.5 (observability)
 + PR-2b (job.failed intake) + PR-2c (manual resolve/dismiss with verdict)** —
 ingestion, its watch surface, and the human exit lane; no auto diagnose/fix
-sessions/LLM yet. Spec: `docs/superpowers/specs/2026-07-21-reflex-arc-design.md`.
+sessions/LLM yet. Its design spec is an INSTALL-LOCAL doc (design docs are
+local, and `docs/superpowers/` was removed from the public tree) — it is not a
+path in this repo, so do not send readers to one; the code plus this entry are
+the authoritative description here.
 
 ```yaml subsystem-map
 entry: reflex-arc

@@ -333,7 +333,16 @@ extraction pipeline is the safety net.
 
 Foreground sessions carry a durable charter + ledger (DB-backed, re-injected
 into every post-compaction window — see the `## Session Charter` block and
-the per-turn `[Charter: … | open: N]` tag).
+the per-turn `[Ledger open: N | mission: …]` inventory, one line per open row).
+
+**The ledger is the session's founding mission and OUTRANKS every follow-up.**
+Follow-ups are durable system-wide; ledger rows exist only on the ledger. In
+any status report or wrap-up, open ledger rows come FIRST, by name — never as
+"older items" or fine print under follow-ups you created yourself — and a
+wrap-up cannot say "only follow-ups left" while a ledger row is open. Every
+open row is either getting done or gets a disposition (done / absorbed /
+dropped, with the reason) — a row left undisposed is a defect, not a backlog.
+A ledger row is ONE sentence; evidence carries the detail.
 
 **Real-time capture is your responsibility.** At agreement moments — the
 user says "yes, do that", approves a plan item, or you promise work — call
@@ -341,7 +350,9 @@ user says "yes, do that", approves a plan item, or you promise work — call
 compaction summary can erase. Close items with `session_ledger_update`
 (done / absorbed-with-evidence / dropped) as work lands; set the living
 mission via `session_charter_update` when the session's purpose
-crystallizes or pivots. You are the first line of defense; ambient
+crystallizes or pivots — the tag prints `mission: UNSET after N compactions`
+until you do, because an unset mission falls back to the raw origin prompt and
+reads as noise. You are the first line of defense; ambient
 extraction (session-manager PR-3) is only the safety net. Plan files stay
 the working documents — ledger rows are the durable index, not a duplicate.
 
@@ -364,6 +375,37 @@ When a user shares a file path or URL in conversation:
   the knowledge base as an authoritative source?"
 - Never auto-ingest without explicit user confirmation.
 - The dashboard also supports drag-drop file upload on the Knowledge tab.
+
+## Hook Output Persistence — a withheld hook is a SILENT loss
+
+Claude Code persists a hook's stdout above a size threshold instead of
+delivering it: the full text goes to a file and you get a short preview. It is
+not an error and nothing else announces it. MEASURED on this install: the
+SessionStart injection was withheld from 195 windows across a month — sessions
+ran without identity, charter and essential knowledge and nobody noticed,
+because the preview reads as ordinary furniture at the top of a window.
+
+**If a hook result arrives as a preview + a saved path** (as of CC 2.1.246:
+`<persisted-output>`, `Output too large (N KB). Full output saved to: <path>`,
+`Preview (first 2KB)`), that hook's contribution to this window was withheld:
+
+- **SessionStart** — Read the path the wrapper names **before anything else**,
+  then tell the user it happened. Genesis parts also mirror themselves to
+  `~/.genesis/sessions/<sid>/context-<part>.md` and name it in a
+  `[genesis-ctx:<part> · mirror: …]` header, so read the mirror if the
+  wrapper's path is gone. If neither exists, say which part this window lost.
+- **Any other hook** — that turn ran without what the hook was carrying (a
+  memory recall, a guard advisory). Say so rather than proceeding as if it
+  arrived.
+
+The size threshold is undocumented and **moves between CC versions** — treat
+the wrapper itself as the signal, never a byte count.
+`scripts/hooks/hook_output.py` is the single home of the measured cap and
+bounds the two hooks that carry the most to the model (the SessionStart
+injection and the per-prompt session-state tags); **route any new model-facing
+stdout through it** — the other hooks are not bounded yet. The hourly
+`context_injection_monitor` watches the harness's own filings independently of
+every emitter's arithmetic, so this class cannot go quiet again.
 
 ## Traps
 
