@@ -193,6 +193,30 @@ class TestFlapDamping:
             is WatchdogAction.RESTART
         )
 
+    def test_reason_damps_against_its_own_history(
+        self, tmp_path: Path, stale_status: Path,
+    ):
+        """The go-forward case, and the one a rename can silently break: a reason
+        must match the history it is itself writing."""
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3, backoff_max_s=10)
+        assert (
+            checker._restart_if_allowed(
+                self._seed(3, reason="target_inactive"), reason="target_inactive",
+            )
+            is WatchdogAction.BACKOFF
+        )
+
+    def test_unrelated_reasons_still_do_not_cross_count(
+        self, tmp_path: Path, stale_status: Path,
+    ):
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3, backoff_max_s=10)
+        assert (
+            checker._restart_if_allowed(
+                self._seed(3, reason="zombie_scheduler"), reason="target_inactive",
+            )
+            is WatchdogAction.RESTART
+        )
+
     def test_different_reasons_dont_cross_count(self, tmp_path: Path, stale_status: Path):
         checker = _make_checker(tmp_path, stale_status, flap_threshold=3, backoff_max_s=10)
         now = time.time()
@@ -395,21 +419,174 @@ class TestConfigValidation:
         assert not any("Secrets" in i for i in issues)
 
 
-class TestBridgeActiveCheck:
+class TestInactiveTargetReasonLabel:
+    """The reason string reaches an operator: it is written to `last_reason` in
+    the watchdog state file, rendered on the dashboard's degraded card, and
+    interpolated into the deploy-defer log line.
+
+    It read `bridge_inactive` while the unit it actually monitors is
+    genesis-server (`_detect_genesis_service` prefers genesis-server whenever
+    that unit FILE is installed — `is-active` is not consulted). A reader who
+    saw the log concluded the watchdog was chasing genesis-bridge, a unit that
+    has been dead for two months, and the misdiagnosis cost a whole
+    investigation before the code said otherwise.
+    """
+
+    def test_reason_names_the_target_not_the_legacy_relay(
+        self, tmp_path: Path, fresh_status: Path,
+    ):
+        checker = _make_checker(tmp_path, fresh_status)
+        with (
+            patch.object(checker, "_is_bridge_active", return_value=False),
+            patch.object(checker, "_bridge_exited_unconfigured", return_value=False),
+            patch.object(checker, "_restart_if_allowed") as restart,
+        ):
+            checker.check()
+        assert restart.call_args.kwargs["reason"] == "target_inactive", (
+            "the reason is operator-facing; naming a unit this watchdog does not "
+            "monitor sends the reader after the wrong service"
+        )
+
+    def test_deploy_defer_covers_the_inactive_target_path(
+        self, tmp_path: Path, fresh_status: Path,
+    ):
+        # watchdog.py guards this path with update_in_progress() too, but only
+        # the STALE path had a test for it.
+        checker = _make_checker(tmp_path, fresh_status)
+        with (
+            patch.object(checker, "_is_bridge_active", return_value=False),
+            patch.object(checker, "_bridge_exited_unconfigured", return_value=False),
+            patch("genesis.autonomy.watchdog.update_in_progress", return_value=True),
+        ):
+            assert checker.check() is WatchdogAction.SKIP
+
+
+class TestOperatorFacingTextNamesTheTarget:
+    """Every journal line this tick emits about the target must name the unit it
+    actually monitors.
+
+    The reason string was not the only surface saying "bridge": the stale-status
+    warning is the COMMON path (it fires on ordinary degradation, not just an
+    inactive unit), so it is the line most likely to be read — and it said
+    "bridge may be down" while the watchdog was monitoring genesis-server.
+    """
+
+    def test_stale_status_warning_names_the_target(
+        self, tmp_path: Path, stale_status: Path, caplog,
+    ):
+        checker = _make_checker(tmp_path, stale_status)
+        checker._target_service = "genesis-server.service"
+        with caplog.at_level("WARNING", logger="genesis.autonomy.watchdog"):
+            checker.check()
+        stale = [r for r in caplog.records if "Status file stale" in r.getMessage()]
+        assert stale, "expected the stale-status warning"
+        assert "genesis-server.service" in stale[0].getMessage()
+        assert "bridge" not in stale[0].getMessage().lower()
+
+    def test_inactive_target_warning_names_the_target(
+        self, tmp_path: Path, fresh_status: Path, caplog,
+    ):
+        checker = _make_checker(tmp_path, fresh_status)
+        checker._target_service = "genesis-server.service"
+        with (
+            patch.object(checker, "_is_bridge_active", return_value=False),
+            patch.object(checker, "_bridge_exited_unconfigured", return_value=False),
+            caplog.at_level("WARNING", logger="genesis.autonomy.watchdog"),
+        ):
+            checker.check()
+        msgs = [r.getMessage() for r in caplog.records if "not active" in r.getMessage()]
+        assert msgs, "expected the inactive-target warning"
+        assert "genesis-server.service" in msgs[0]
+
+    def test_unconfigured_exit_notice_names_the_target(
+        self, tmp_path: Path, fresh_status: Path, caplog,
+    ):
+        checker = _make_checker(tmp_path, fresh_status)
+        checker._target_service = "genesis-server.service"
+        with (
+            patch.object(checker, "_is_bridge_active", return_value=False),
+            patch.object(checker, "_bridge_exited_unconfigured", return_value=True),
+            caplog.at_level("INFO", logger="genesis.autonomy.watchdog"),
+        ):
+            checker.check()
+        msgs = [r.getMessage() for r in caplog.records if "unconfigured" in r.getMessage()]
+        assert msgs, "expected the unconfigured-exit notice"
+        assert "genesis-server.service" in msgs[0]
+
+
+class TestLegacyReasonNormalisation:
+    """`~/.genesis/watchdog_state.json` survives upgrades, so it still carries the
+    reason under its retired name after a rename. Both surfaces that hold one are
+    normalised on load: `restart_history` (matched by equality in the flap
+    window) and `last_reason` (rendered on the dashboard's degraded card).
+
+    Losing the history match would silently reset the flap counter for a full
+    flap_window — granting flap_threshold extra unrestrained restarts to a
+    service that is already flapping.
+    """
+
+    def _write(self, tmp_path: Path, state: dict) -> Path:
+        f = tmp_path / "watchdog_state.json"
+        f.write_text(json.dumps(state))
+        return f
+
+    def test_history_written_under_the_old_name_still_damps(
+        self, tmp_path: Path, stale_status: Path,
+    ):
+        now = time.time()
+        self._write(tmp_path, {
+            "consecutive_failures": 0,
+            "next_attempt_after": None,
+            "restart_history": [
+                {"ts": now - 5, "reason": "bridge_inactive"} for _ in range(3)
+            ],
+        })
+        # _make_checker points the checker at tmp_path/"watchdog_state.json",
+        # which is exactly what _write created.
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3, backoff_max_s=10)
+        assert (
+            checker._restart_if_allowed(checker._load_state(), reason="target_inactive")
+            is WatchdogAction.BACKOFF
+        )
+
+    def test_last_reason_is_healed_for_the_dashboard(self, tmp_path: Path):
+        self._write(tmp_path, {"last_reason": "bridge_inactive"})
+        checker = _make_checker(tmp_path, tmp_path / "status.json")
+        assert checker._load_state()["last_reason"] == "target_inactive"
+
+    def test_unrelated_reasons_pass_through_untouched(self, tmp_path: Path):
+        self._write(tmp_path, {
+            "last_reason": "zombie_scheduler",
+            "restart_history": [{"ts": 1.0, "reason": "stale_status_restart"}],
+        })
+        checker = _make_checker(tmp_path, tmp_path / "status.json")
+        state = checker._load_state()
+        assert state["last_reason"] == "zombie_scheduler"
+        assert state["restart_history"][0]["reason"] == "stale_status_restart"
+
+    def test_a_malformed_history_entry_does_not_raise(self, tmp_path: Path):
+        # The file is hand-editable and shared with the dashboard; a non-dict
+        # entry must not take the whole tick down on load.
+        self._write(tmp_path, {"restart_history": ["not-a-dict", None]})
+        checker = _make_checker(tmp_path, tmp_path / "status.json")
+        assert checker._load_state()["restart_history"] == ["not-a-dict", None]
+
+
+class TestTargetActiveCheck:
     def test_inactive_bridge_triggers_restart(self, tmp_path: Path, fresh_status: Path):
-        """If bridge is inactive, skip staleness check and go to restart."""
+        """If the target is inactive, skip staleness check and go to restart."""
         checker = _make_checker(tmp_path, fresh_status)
         with patch.object(checker, "_is_bridge_active", return_value=False):
             assert checker.check() is WatchdogAction.RESTART
 
     def test_active_bridge_uses_normal_flow(self, tmp_path: Path, fresh_status: Path):
-        """If bridge is active and status fresh, return SKIP."""
+        """If the target is active and status fresh, return SKIP."""
         checker = _make_checker(tmp_path, fresh_status)
         with patch.object(checker, "_is_bridge_active", return_value=True):
             assert checker.check() is WatchdogAction.SKIP
 
     def test_unknown_bridge_uses_normal_flow(self, tmp_path: Path, fresh_status: Path):
-        """If bridge status unknown (None), fall through to staleness check."""
+        """If target status is unknown (None), fall through to staleness check."""
         checker = _make_checker(tmp_path, fresh_status)
         with patch.object(checker, "_is_bridge_active", return_value=None):
             assert checker.check() is WatchdogAction.SKIP
@@ -1022,7 +1199,7 @@ class TestLivenessRestartGate:
         ):
             assert c.check() is WatchdogAction.SKIP
 
-    def test_bridge_inactive_never_probes(self, tmp_path: Path):
+    def test_inactive_target_never_probes(self, tmp_path: Path):
         # service down = definitionally dead; the probe is not consulted.
         c = _liveness_checker(tmp_path, _stale_file(tmp_path))
         with (

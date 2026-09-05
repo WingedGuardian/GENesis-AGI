@@ -36,9 +36,10 @@ to the repository root.
 - Max 5 consecutive restart attempts before `WatchdogAction.NOTIFY`
 - Pre-restart config validation: checks `secrets.env` exists with `TELEGRAM_BOT_TOKEN`, compiles bridge module for syntax errors
 - Restarts the **auto-detected** target service — `_detect_target_service()` reuses
-  `observability.service_status._detect_genesis_service()` (is-enabled → is-active →
-  default), which resolves to `genesis-server.service` on a normal install and never
-  targets the deprecated relay when genesis-server is present. Via `systemctl --user
+  `observability.service_status._detect_genesis_service()` (genesis-server unit FILE
+  installed, via `list-unit-files` → else the legacy relay), which resolves to
+  `genesis-server.service` on a normal install and never targets the deprecated relay
+  when genesis-server is present — enabled or not, running or not. Via `systemctl --user
   restart <target>` — never `os.kill()`
 - State persisted in `~/.genesis/watchdog_state.json` (survives process restarts)
 - Also checks `systemctl --user is-active <target>` as a fast-path before staleness check

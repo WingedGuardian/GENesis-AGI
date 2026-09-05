@@ -43,6 +43,25 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent.parent / "config" / "autonomy.yaml"
 
+# Restart reasons persisted under an older name, normalised once on load.
+# ~/.genesis/watchdog_state.json survives upgrades, so a rename that stopped
+# matching the old entries would silently reset the flap counter for a full
+# flap_window (6h) — granting flap_threshold extra unrestrained restarts on a
+# service that is ALREADY flapping.
+#
+# Normalising on load rather than matching aliases at compare time keeps the
+# flap filter a plain equality, self-heals the persisted `last_reason` the
+# dashboard renders, and leaves no alias set that could be written without its
+# own current name (which would stop a reason matching its own go-forward
+# history). `restart_history` is pruned to flap_window_s on every write, so this
+# shim goes inert on its own within one window of the rename.
+_LEGACY_REASONS: dict[str, str] = {
+    # Renamed once the watchdog's target became genesis-server: `_detect_genesis_service`
+    # prefers genesis-server whenever that unit FILE is installed, so the old label
+    # named a unit this never monitors.
+    "bridge_inactive": "target_inactive",
+}
+
 
 class WatchdogChecker:
     """Stateless health checker — called by systemd timer or standalone script.
@@ -105,8 +124,10 @@ class WatchdogChecker:
         """Auto-detect which Genesis service to monitor.
 
         Reuses the canonical detector (``observability.service_status``): it
-        probes ``is-enabled`` then ``is-active`` for genesis-server, then the
-        legacy relay, and defaults to genesis-server. It never targets the
+        probes whether the genesis-server unit FILE is installed
+        (``list-unit-files``) and prefers it whenever it is — enabled or not,
+        running or not — falling back to the legacy relay only when that unit is
+        genuinely absent. It never targets the
         deprecated relay when genesis-server is present (the 2026-07-02 §7
         recovery bug: restarting an inactive unit "succeeds" but hides
         genesis-server crash loops) while still recovering a relay-only legacy
@@ -160,12 +181,18 @@ class WatchdogChecker:
         bridge_active = self._is_bridge_active()
         if bridge_active is False:
             if self._bridge_exited_unconfigured():
-                logger.info("Bridge exited unconfigured (exit 2) — skipping restart")
+                logger.info(
+                    "%s exited unconfigured (exit 2) — skipping restart",
+                    self._target_service,
+                )
                 return WatchdogAction.SKIP
-            logger.warning("Bridge service is not active — skipping staleness check, going to restart logic")
+            logger.warning(
+                "%s is not active — skipping staleness check, going to restart logic",
+                self._target_service,
+            )
             # Fall through to backoff/validation/restart below
             state = self._load_state()
-            return self._restart_if_allowed(state, reason="bridge_inactive")
+            return self._restart_if_allowed(state, reason="target_inactive")
 
         # 1. Read status.json
         status = self._read_status()
@@ -227,8 +254,8 @@ class WatchdogChecker:
             return WatchdogAction.SKIP  # Healthy — no action needed
 
         logger.warning(
-            "Status file stale: %.0fs old (threshold %ds) — bridge may be down",
-            staleness_s, self._staleness_threshold,
+            "Status file stale: %.0fs old (threshold %ds) — %s may be down",
+            staleness_s, self._staleness_threshold, self._target_service,
         )
 
         # 3. Stale — attempt restart via shared logic
@@ -580,10 +607,28 @@ class WatchdogChecker:
     def _load_state(self) -> dict:
         if self._state_path.exists():
             try:
-                return json.loads(self._state_path.read_text())
+                return self._normalise_legacy_reasons(
+                    json.loads(self._state_path.read_text()),
+                )
             except (json.JSONDecodeError, OSError):
                 pass
         return {"consecutive_failures": 0, "next_attempt_after": None, "last_reason": None, "last_restart_at": None, "last_check_at": None, "restart_history": []}
+
+    @staticmethod
+    def _normalise_legacy_reasons(state: dict) -> dict:
+        """Rewrite reason strings persisted under a previous name, in place.
+
+        Covers both surfaces that carry one: every `restart_history` entry (which
+        the flap window matches by equality) and `last_reason` (which the
+        dashboard's degraded card renders). Without the second, an operator keeps
+        seeing the retired label until the next restart decision writes over it.
+        """
+        for entry in state.get("restart_history") or []:
+            if isinstance(entry, dict) and entry.get("reason") in _LEGACY_REASONS:
+                entry["reason"] = _LEGACY_REASONS[entry["reason"]]
+        if state.get("last_reason") in _LEGACY_REASONS:
+            state["last_reason"] = _LEGACY_REASONS[state["last_reason"]]
+        return state
 
     def _save_state(self, state: dict) -> None:
         self._state_path.parent.mkdir(parents=True, exist_ok=True)

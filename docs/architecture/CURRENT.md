@@ -1048,7 +1048,8 @@ verified: 84c7259d 2026-08-31
 - **autonomy zombie-scheduler watchdog** (`autonomy/watchdog.py`, run out-of-process
   by `genesis-watchdog.timer` every 300s via `watchdog_runner.py`; distinct from the
   container `watchdog.py` above): reads `~/.genesis/status.json` (written by the runtime's
-  `status_writer_loop`) and RESTARTS the bridge/runtime on status-file staleness, or a
+  `status_writer_loop`) and RESTARTS its auto-detected target — genesis-server on any
+  install where that unit file exists, NOT the deprecated relay — on status-file staleness, or a
   specific scheduler on a stale `scheduler_heartbeats` entry (`awareness`/`surplus`,
   `job_health.last_run` age > 900s) — the "zombie scheduler, alive but not dispatching"
   case. Restart is deferred while `heavy_workload` is set (dream cycle), during a boot
