@@ -319,3 +319,142 @@ def test_pivots_listed_never_scored():
     assert len(rep["pivots"]) == 1
     md = _rep.render_md(rep, generated_at=T1)
     assert "pivoted to incident response" in md
+
+
+# ── Round-8/9 review fixes: windows, buckets, floors, denominators ──────────
+
+
+def _ext_row(rid, text, *, created="2026-07-14T12:30:00+00:00", quote="q"):
+    return {
+        "id": rid,
+        "session_id": SID,
+        "text": text,
+        "status": "open",
+        "added_by": "ambient_ledger_extractor",
+        "created_at": created,
+        "source_quote": quote,
+        "evidence": quote,
+    }
+
+
+def test_attribution_is_read_by_key_never_through_the_window():
+    """The leak verdict must see every promoted event, however old.
+
+    Retention exempts promoted events so the verifier can always see them —
+    but a verifier reading through a capped newest-first scan ages them out
+    of its own LIMIT, and the invariant quietly narrows to recent-rows-only
+    while saying HELD (or convicts an old legitimate row as unattributed).
+    The attribution set is therefore passed SEPARATELY, queried by the key:
+    here the windowed `events` list has lost the old claiming event, and the
+    verdict is still correct because `attribution_events` carries it.
+    The CONTROL shows the failure shape the separation prevents: without the
+    attribution set, the same data convicts.
+    """
+    old_run = _run("r-old", started="2026-07-01T00:00:00+00:00", mode="live")
+    old_claim = _event("e-old", "an old promoted agreement", run_id="r-old",
+                       observed_at="2026-07-01T00:00:05+00:00",
+                       promoted_item_id="LX")
+    windowed_events = [_event("e1", "recent proposal", run_id="r1",
+                              observed_at="2026-07-14T12:00:00+00:00")]
+    runs = [_run("r1", started=T1, mode="live"), old_run]
+    old_row = _ext_row("LX", "an old promoted agreement",
+                       created="2026-07-01T00:00:06+00:00")
+
+    rep = _rep.build_report(
+        runs, windowed_events, [old_row], attribution_events=[old_claim]
+    )
+    assert rep["leak_invariant_ok"] is True, rep["ambient_leaks"]
+
+    # CONTROL: the windowed fallback (no attribution set) convicts the same
+    # row — which is exactly why the CLI loader always passes the real set.
+    rep = _rep.build_report(runs, windowed_events, [old_row])
+    assert rep["leak_invariant_ok"] is False
+
+
+def test_an_attributed_row_with_a_missing_run_is_excused_and_labeled():
+    """A claiming event whose run row is GONE is attributed, mode unknown.
+
+    Producible on installs that pruned before the exemption shipped (the old
+    prune deleted runs unconditionally). Convicting would permanently
+    VIOLATED every such install; vouching 'live' would state more than the
+    data supports. It is excused from conviction and counted under its
+    honest cause — 'run row missing', not a query-window story — and an
+    UNQUOTED row in this state still trips the quote clause, because the
+    quote lives on the row and needs no run lookup."""
+    claim = _event("e1", "promoted thing", run_id="r-gone",
+                   promoted_item_id="LP")
+    row = _ext_row("LP", "promoted thing")
+    rep = _rep.build_report([], [], [row], attribution_events=[claim])
+    assert rep["leak_invariant_ok"] is True, rep["ambient_leaks"]
+    assert rep["n_attributed_run_missing"] == 1
+
+    # An unquoted attributed row is a promotion-filter failure whichever
+    # mode wrote it — the quote check does not need the run.
+    bare = dict(row, source_quote=None, evidence=None)
+    rep = _rep.build_report([], [], [bare], attribution_events=[claim])
+    assert rep["leak_invariant_ok"] is False
+
+
+def test_legacy_events_are_not_filed_as_backfill():
+    """v1 compaction proposals must not render under 'Backfill proposals'.
+
+    'run_id not in the current-version set' used to be the backfill test, so
+    on any upgraded install the whole v1 corpus was mislabelled backfill.
+    Classification now reads the event's own run: trigger for backfill,
+    version for legacy, absence for window-orphan."""
+    runs = [
+        _run("r-v1", started=T1, prompt_version="v1"),
+        _run("r-bf", started=T1, trigger="backfill"),
+    ]
+    events = [
+        _event("e-v1", "a v1 proposal", run_id="r-v1"),
+        _event("e-bf", "a backfill proposal", run_id="r-bf"),
+        _event("e-orphan", "an orphan proposal", run_id="r-gone"),
+    ]
+    rep = _rep.build_report(runs, events, [])
+    assert [e["id"] for e in rep["legacy_events"]] == ["e-v1"]
+    assert [e["id"] for e in rep["backfill_events"]] == ["e-bf"]
+    assert [e["id"] for e in rep["window_orphan_events"]] == ["e-orphan"]
+
+    md = _rep.render_md(rep, generated_at=T1)
+    assert "Legacy prompt-version proposals (excluded; 1)" in md
+    assert "a v1 proposal" in md.split("Legacy prompt-version")[1]
+
+
+def test_fn_floor_excludes_rows_swept_by_the_previous_version():
+    """Rows the OLD prompt already covered are not the new prompt's misses.
+
+    The cursor never rewinds on a version bump, so a foreground row created
+    before v1's last successful sweep was never in v2's delta — charging it
+    as a v2 FN depressed recall with structurally-impossible misses. A row
+    created AFTER that floor stays chargeable (the fresh-install case, with
+    no legacy runs at all, is the existing FN tests, which still pass)."""
+    runs = [
+        _run("r-v1", started="2026-07-14T10:00:00+00:00", prompt_version="v1"),
+        _run("r-v2", started="2026-07-14T12:00:00+00:00"),
+    ]
+    ledger = [
+        _fg_row("L-old", "an agreement v1 swept", created="2026-07-14T09:00:00+00:00"),
+        _fg_row("L-new", "an agreement v2 missed", created="2026-07-14T11:00:00+00:00"),
+    ]
+    rep = _rep.build_report(runs, [], ledger)
+    assert [r["id"] for r in rep["fn"]] == ["L-new"], (
+        "the pre-v2 row was charged as a v2 miss"
+    )
+
+
+def test_headline_renders_the_version_denominator():
+    """The narrowed population must SAY it is narrowed, where it is read.
+
+    build_report already recorded version/excluded counts; neither the
+    markdown nor the CLI consumed them, so a small fresh-v2 subset read as
+    the full retained corpus at flip-adjudication time."""
+    runs = [
+        _run("r1", started=T1),
+        _run("r-v1", started=T1, prompt_version="v1"),
+    ]
+    rep = _rep.build_report(runs, [], [])
+    md = _rep.render_md(rep, generated_at=T1)
+    assert f"prompt **{PROMPT_VERSION}** only" in md
+    assert "1 other-version run(s) excluded" in md
+    assert "v1" in md

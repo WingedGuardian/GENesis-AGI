@@ -250,9 +250,18 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
     writes the discovered match back onto the event (which permanently
     disqualifies it — ``match_kind`` leaves ``'none'``), and skips.
 
-    Crash windows are self-healing by the same mechanism: a ledger row
-    committed whose event update was lost is re-found by the next sweep's
-    recheck as an exact match of its own text and marked, never re-inserted.
+    Crash windows are closed by ATOMICITY, not by recovery: the ledger insert
+    and the event's ``promoted_item_id`` link land in one transaction, so a
+    crash leaves either both (promotion complete) or neither (the event still
+    qualifies and the next sweep retries it cleanly). The old recovery story —
+    re-finding an orphaned row as an exact match of its own text — held only
+    while the row stayed open, and silently minted duplicates once it closed.
+
+    The mode gate is re-read per candidate as well as before the sweep: five
+    transactions with lock waits between them is a real interval, and the
+    documented emergency rollback (``mode: shadow``) must stop the NEXT write,
+    not just the next sweep. ``effective_mode`` reads config fresh per call
+    (verified — "per call, NO cache"), which is what makes the recheck real.
 
     Best-effort per row: one bad row must not cost the rest, and none of it
     may cost the shadow record that has already been written.
@@ -271,6 +280,8 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
     disqualified = 0
     failed = 0
     n_qualifying = 0
+    mode_stopped = False
+    sweep_error = False
     try:
         async with aiosqlite.connect(str(db_path), timeout=10) as db:
             # Row factory is REQUIRED, not tidiness: `crud.get` builds
@@ -296,6 +307,17 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
                 )
 
             for ev in candidates:
+                if effective_mode() != "live":
+                    # Rollback mid-sweep: stop before the NEXT transaction.
+                    # Candidates already written stay written (they were made
+                    # under a live gate); everything else waits, unpromoted.
+                    mode_stopped = True
+                    logger.warning(
+                        "ledger promotion stopped mid-sweep for %s — mode left "
+                        "'live' with %d candidate(s) unprocessed",
+                        session_id, len(candidates) - written - disqualified - failed,
+                    )
+                    break
                 try:
                     # Hold the write lock across recheck + insert: in WAL mode
                     # a DEFERRED read snapshot could miss a foreground row
@@ -355,11 +377,18 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
                         # yesterday fails today.
                         evidence=ev.get("quote_preview"),
                         source_quote=ev.get("quote_preview"),
+                        # ATOMIC with the link below — one transaction, one
+                        # commit. When ledger_add committed on its own, a crash
+                        # in the gap left a row no event claimed; the recheck
+                        # re-found it only while the row stayed OPEN (exact
+                        # match of its own text). Closed before the next sweep,
+                        # it was invisible to the open-only recheck and the
+                        # still-qualifying event inserted a second copy — while
+                        # the leak invariant read the first as unattributed.
+                        # Insert + link landing together removes the gap
+                        # instead of narrowing it.
+                        commit=False,
                     )
-                    # ledger_add commits (closing the IMMEDIATE transaction).
-                    # If we die between that commit and this update, the next
-                    # sweep's recheck finds the row as an exact match of its
-                    # own text and disqualifies the event — no duplicate.
                     await db.execute(
                         "UPDATE session_ledger_shadow_events "
                         "SET promoted_item_id = ? WHERE id = ?",
@@ -393,6 +422,14 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
         # Deliberately vague: this wraps the connect AND the whole sweep, so
         # naming one cause would mislead on most of its surface. exc_info
         # carries the specific failure.
+        #
+        # The flag is the fix for the counters lying by omission: a sweep that
+        # died at connect returned the same all-zero dict as one where nothing
+        # qualified, so the run reported `ok` — to telemetry AND the detached
+        # wrapper — while zero promotion work happened. "Nothing to do" and
+        # "could not do anything" are different facts, and only the caller can
+        # act on the difference.
+        sweep_error = True
         logger.warning("ledger promotion sweep aborted", exc_info=True)
 
     return {
@@ -400,6 +437,8 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
         "qualifying": n_qualifying,
         "disqualified_at_write": disqualified,
         "failed_rows": failed,
+        "sweep_error": sweep_error,
+        "mode_stopped": mode_stopped,
     }
 
 
@@ -459,7 +498,17 @@ async def _load_match_context(
     try:
         async with aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5) as db:
             db.row_factory = aiosqlite.Row
-            items = await ledger_list(db, session_id)
+            # OPEN rows only, mirroring the transactional recheck in
+            # _promote_live. Matching here against closed rows stamped a
+            # renewal of a finished agreement `exact`/`fuzzy` at observation
+            # time — and the sweep's `match_kind = 'none'` prefilter then
+            # rejected it before the (already open-only) transactional check
+            # could ever run, so the renewed commitment never promoted. The
+            # report is unaffected: it recomputes matching itself against the
+            # full foreground set and never trusts this stored verdict.
+            items = await ledger_list(
+                db, session_id, statuses=["open", "in_progress"]
+            )
             priors = await shadow_crud.list_events(db, session_id)
             return items, priors, True
     except Exception:
@@ -539,6 +588,12 @@ async def _run(
                 trigger=trigger,
                 status="lock_busy",
                 mode=mode,
+                # Stamped even though no extraction ran: the report scopes its
+                # health population by version, and a current run that failed
+                # BEFORE extraction is still a current run — leaving the column
+                # NULL filed these rows as legacy and made worker health look
+                # better precisely when it was failing early.
+                prompt_version=PROMPT_VERSION,
             )
             return {"status": "lock_busy"}
         return await _run_locked(
@@ -590,6 +645,9 @@ async def _run_locked(
             trigger=trigger,
             status="failed",
             mode=mode,
+            # Same rule as the lock_busy row: a current-version early failure
+            # must stay in the current-version health population.
+            prompt_version=PROMPT_VERSION,
             detail=f"transcript_unreadable: {exc}",
         )
         await _record_telemetry(db_path, "failed", "transcript_unreadable")
@@ -754,7 +812,17 @@ async def _run_locked(
     # failed/timeout and so stayed silent. The failure count was carried in the
     # detail string, where nothing reads it. The counters below still separate
     # "nothing qualified" from "everything failed"; the STATUS now does too.
-    _write_failed = (not recorded) or bool(promotion.get("failed_rows", 0))
+    # `sweep_error` is what keeps an aborted sweep from wearing "nothing
+    # qualified"'s clothes: both return zero counters, and only the flag says
+    # the zeros were never computed. `mode_stopped` is informational, not a
+    # failure — an operator rollback honoured mid-sweep is the design working.
+    _write_failed = (
+        (not recorded)
+        or bool(promotion.get("failed_rows", 0))
+        or bool(promotion.get("sweep_error"))
+    )
+    if promotion.get("mode_stopped"):
+        detail_notes.append("promotion_stopped_mode_changed_midsweep")
     await _record_telemetry(
         db_path,
         "failed" if _write_failed else "ok",
@@ -763,6 +831,7 @@ async def _run_locked(
         f"|promoted={promotion.get('promoted', 0)}"
         f"|disqualified={promotion.get('disqualified_at_write', 0)}"
         f"|promotion_failed={promotion.get('failed_rows', 0)}"
+        f"|sweep_error={int(bool(promotion.get('sweep_error')))}"
         + (f"|{'; '.join(detail_notes)}" if detail_notes else ""),
     )
     return {

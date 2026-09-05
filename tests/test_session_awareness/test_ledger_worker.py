@@ -790,7 +790,7 @@ async def test_a_failed_promotion_is_retried_by_the_next_run(
 
 
 async def test_a_foreground_row_written_after_observation_is_not_duplicated(
-    tmp_path, sessions_root, live_db_path
+    tmp_path, sessions_root, live_db_path, live_mode
 ):
     """The TOCTOU P2, replayed at the seam it names.
 
@@ -825,7 +825,7 @@ async def test_a_foreground_row_written_after_observation_is_not_duplicated(
 
 
 async def test_a_crashed_mark_self_heals_without_a_duplicate(
-    tmp_path, sessions_root, live_db_path
+    tmp_path, sessions_root, live_db_path, live_mode
 ):
     """The crash window between ledger commit and event mark.
 
@@ -853,7 +853,7 @@ async def test_a_crashed_mark_self_heals_without_a_duplicate(
 
 
 async def test_a_stale_prompt_generation_backlog_is_never_promoted(
-    tmp_path, sessions_root, live_db_path
+    tmp_path, sessions_root, live_db_path, live_mode
 ):
     """Flipping live must not ship the backlog an OLD prompt produced.
 
@@ -907,7 +907,7 @@ async def test_backfill_rejects_an_unsafe_session_id(
 
 
 async def test_shadow_era_proposals_are_not_promoted_when_live_is_switched_on(
-    tmp_path, sessions_root, live_db_path
+    tmp_path, sessions_root, live_db_path, live_mode
 ):
     """The flip must not be RETROACTIVE.
 
@@ -931,7 +931,7 @@ async def test_shadow_era_proposals_are_not_promoted_when_live_is_switched_on(
 
 
 async def test_a_duplicate_of_an_ineligible_root_is_still_promoted(
-    tmp_path, sessions_root, live_db_path
+    tmp_path, sessions_root, live_db_path, live_mode
 ):
     """The mirror-image defect: silent, permanent SUPPRESSION.
 
@@ -1031,3 +1031,174 @@ def test_the_session_id_guard_is_one_definition_not_a_copy():
     assert not lw._SESSION_ID_RE.match("abc\n"), "trailing newline accepted"
     assert lw._SESSION_ID_RE.match("a" * 255)
     assert not lw._SESSION_ID_RE.match("a" * 256)
+
+
+# ── Round-8/9 review fixes: renewal, atomicity, mid-sweep rollback, honesty ──
+
+
+async def test_a_renewed_agreement_promotes_after_its_old_row_closed(
+    tmp_path, sessions_root, live_mode, live_db_path
+):
+    """A closed ledger row must not permanently disqualify its own renewal.
+
+    The transactional recheck was narrowed to open rows in an earlier round —
+    but observation-time matching still ran against ALL statuses, stamped the
+    renewal `exact` against the finished row, and the sweep's
+    `match_kind = 'none'` prefilter rejected it before the recheck could run.
+    The fresh-evidence finding: only the inner SELECT was narrowed. This test
+    drives the OBSERVATION path (`_load_match_context` -> `match_proposals`),
+    not a pre-stamped fixture, so the prefilter is actually exercised.
+    """
+    import genesis.db.crud.session_charters as charters_crud
+
+    text = "ship the retention follow-up for the shadow store"
+    async with aiosqlite.connect(str(live_db_path)) as db:
+        await charters_crud.upsert_stub(db, SID)
+        old_id = await charters_crud.ledger_add(db, session_id=SID, text=text)
+        await charters_crud.ledger_update(db, item_id=old_id, status="done")
+
+    # The observation half: the match pool the extractor's stamping reads
+    # from must already exclude the closed row, or match_proposals stamps the
+    # renewal `exact` and the sweep prefilter rejects it forever.
+    items, _priors, ok = await lw._load_match_context(live_db_path, SID)
+    assert ok
+    assert items == [], "a closed row reached the observation-time match pool"
+
+    # The sweep half: an event stamped 'none' (as the open-only pool now
+    # yields) must promote even though a closed twin exists.
+    await _fabricate_run(live_db_path, [_fab_event(text)])
+    out = await lw._promote_live(live_db_path, SID, trigger="manual")
+    assert out["promoted"] == 1, (
+        "the renewal was disqualified by its closed predecessor — the renewed "
+        "commitment can never reach the ledger"
+    )
+    rows = await _ledger(live_db_path)
+    assert [r["status"] for r in rows] == ["done", "open"]
+
+
+async def test_promotion_insert_and_link_land_atomically(
+    tmp_path, sessions_root, live_mode, live_db_path
+):
+    """Crash between the ledger insert and the event link mints no orphan.
+
+    With `ledger_add` committing on its own, a crash in the gap left a row no
+    event claimed: invisible to the (open-only) recheck once it closed, minted
+    as a duplicate by the still-qualifying event, and read by the leak
+    invariant as unattributed. Insert + link now share one transaction — this
+    simulates the crash as a rollback at the exact old commit point and
+    asserts NEITHER side landed, then that the retry promotes exactly once.
+    """
+    import genesis.db.crud.session_charters as charters_crud
+
+    text = "wire the audit trail into the flip decision"
+    await _fabricate_run(live_db_path, [_fab_event(text)])
+
+    async with aiosqlite.connect(str(live_db_path)) as db:
+        db.row_factory = aiosqlite.Row
+        await charters_crud.upsert_stub(db, SID)
+        await db.execute("BEGIN IMMEDIATE")
+        item_id = await charters_crud.ledger_add(
+            db, session_id=SID, text=text,
+            added_by=lw.PROMOTION_ADDED_BY, commit=False,
+        )
+        # crash before the link would have been written
+        await db.rollback()
+
+    rows = await _ledger(live_db_path)
+    assert rows == [], f"the insert survived the crash alone: {rows}"
+    events = await _shadow_event_rows(live_db_path)
+    assert events[0]["promoted_item_id"] is None
+    assert item_id  # the id existed in-transaction; nothing durable did
+
+    out = await lw._promote_live(live_db_path, SID, trigger="manual")
+    assert out["promoted"] == 1
+    (row,) = await _ledger(live_db_path)
+    events = await _shadow_event_rows(live_db_path)
+    assert events[0]["promoted_item_id"] == row["id"], (
+        "promotion landed without its attribution link"
+    )
+
+
+async def test_mode_rollback_midsweep_stops_before_the_next_write(
+    tmp_path, sessions_root, live_db_path, monkeypatch
+):
+    """An operator's `mode: shadow` during the sweep stops the NEXT candidate.
+
+    The pre-sweep recheck closed the window before the sweep; five separate
+    transactions with lock waits between them are a real interval too, and
+    the emergency-rollback contract is about the next WRITE, not the next
+    sweep. `effective_mode` reads config fresh per call (no cache), which is
+    what makes a per-candidate re-read meaningful at all.
+    """
+    modes = iter(["live", "shadow"])
+    monkeypatch.setattr(lw, "effective_mode", lambda: next(modes, "shadow"))
+    await _fabricate_run(
+        live_db_path,
+        [_fab_event("first agreement", ev_id="ev-a"),
+         _fab_event("second agreement", ev_id="ev-b")],
+    )
+    out = await lw._promote_live(live_db_path, SID, trigger="manual")
+    assert out["promoted"] == 1, (out, "the first candidate ran under a live gate")
+    assert out["mode_stopped"] is True
+    rows = await _ledger(live_db_path)
+    assert len(rows) == 1, "the rolled-back mode still got a second write"
+
+
+async def test_an_aborted_sweep_is_not_an_ok_run(
+    tmp_path, sessions_root, live_mode, tmp_path_factory
+):
+    """`sweep_error` distinguishes 'could not sweep' from 'nothing qualified'.
+
+    A sweep that died at connect returned the same all-zero counters as one
+    with no candidates, so the run reported ok while zero promotion work
+    happened — the exact silent-failure shape the counters were added to kill,
+    one layer up.
+    """
+    missing = tmp_path_factory.mktemp("gone") / "no-such-subdir" / "genesis.db"
+    out = await lw._promote_live(missing, SID, trigger="manual")
+    assert out["promoted"] == 0
+    assert out["sweep_error"] is True, (
+        "an aborted sweep is indistinguishable from an empty one"
+    )
+
+
+async def test_early_failures_carry_the_prompt_version(
+    tmp_path, sessions_root, shadow_mode, live_db_path
+):
+    """lock_busy and transcript-unreadable rows are CURRENT runs, and say so.
+
+    The report scopes its health population by prompt_version; recording these
+    rows without one filed them as legacy, so worker health looked better
+    precisely when runs were failing before extraction.
+    """
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("")
+
+    # transcript_unreadable: point the worker at a path that does not exist.
+    out = await lw.run_ledger_worker(
+        SID, str(tmp_path / "missing.jsonl"), 10, trigger="manual",
+        db_path=live_db_path,
+    )
+    assert out["status"] == "failed"
+
+    # lock_busy: hold the per-session flock ourselves.
+    session_dir = lw._sessions_root() / SID
+    session_dir.mkdir(parents=True, exist_ok=True)
+    with (session_dir / lw.LOCK_FILENAME).open("w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        out = await lw.run_ledger_worker(
+            SID, str(transcript), 0, trigger="manual", db_path=live_db_path,
+        )
+        assert out["status"] == "lock_busy"
+
+    async with aiosqlite.connect(str(live_db_path)) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT status, prompt_version FROM session_ledger_shadow_runs"
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+    assert rows, "no run rows recorded"
+    for r in rows:
+        assert r["prompt_version"] == lw.PROMPT_VERSION, (
+            f"{r['status']} row lost its version — filed as legacy by the report"
+        )

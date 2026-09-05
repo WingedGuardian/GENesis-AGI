@@ -163,18 +163,30 @@ async def list_events(
     session_id: str | None = None,
     *,
     limit: int = 500,
+    newest_first: bool = False,
 ) -> list[dict]:
-    """Proposal events oldest first, optionally per-session."""
+    """Proposal events, optionally per-session. Oldest first by default.
+
+    *newest_first* exists for the shadow REPORT, whose runs query is
+    newest-first: loading newest runs against OLDEST events meant the two
+    windows stopped overlapping once retention held more rows than the caps,
+    and every event whose run fell outside the run window lost its mode
+    provenance — which the leak invariant then read as a violation. The
+    worker's own callers keep the oldest-first default: the dedup pool's
+    duplicate_of chains root on the earliest occurrence, and reversing that
+    order would re-root them.
+    """
     lim = max(1, min(int(limit), 2000))
+    order = "DESC" if newest_first else "ASC"
     if session_id is None:
         cursor = await db.execute(
-            "SELECT * FROM session_ledger_shadow_events ORDER BY observed_at ASC LIMIT ?",
+            f"SELECT * FROM session_ledger_shadow_events ORDER BY observed_at {order} LIMIT ?",  # noqa: S608 — order is a literal from a bool
             (lim,),
         )
     else:
         cursor = await db.execute(
-            "SELECT * FROM session_ledger_shadow_events WHERE session_id = ? "
-            "ORDER BY observed_at ASC LIMIT ?",
+            f"SELECT * FROM session_ledger_shadow_events WHERE session_id = ? "
+            f"ORDER BY observed_at {order} LIMIT ?",  # noqa: S608 — order is a literal from a bool
             (session_id, lim),
         )
     return [dict(r) for r in await cursor.fetchall()]
@@ -209,19 +221,55 @@ async def prune_session_ledger_shadow(
     mirroring ``prune_capability_shadow_events``. ``now`` is injected (never
     wall-clock here) so the cutover is deterministic and testable. No-ops
     before migration 0059; never creates tables. Returns rows deleted.
+
+    PROMOTED events — and the runs they belong to — are EXEMPT, deliberately
+    and without a secondary age cap (owner decision, 2026-09-05). A promoted
+    event is the attribution record the shadow report's leak invariant reads:
+    it is the only thing that says WHICH run, in WHICH mode, wrote a given
+    extractor ledger row. Deleting it by age turns a legitimate 46-day-old
+    promotion into an "unattributed leak" and the report into a permanent
+    false VIOLATED — absence of provenance must never read as violation when
+    the absence is this function's own doing. The exempt set is bounded in
+    practice, not by this code: promotions happen only in live mode, at most
+    PROMOTION_CAP (5) per compaction, so the survivors accrue at tens-to-
+    hundreds of rows per year, each one line of text.
     """
     if not await _tables_available(db):
         return 0
     cutoff = _iso_days_before(now, older_than_days)
     deleted = 0
-    cursor = await db.execute(
-        "DELETE FROM session_ledger_shadow_events WHERE observed_at < ?", (cutoff,)
-    )
-    deleted += cursor.rowcount or 0
-    cursor = await db.execute(
-        "DELETE FROM session_ledger_shadow_runs WHERE started_at < ?", (cutoff,)
-    )
-    deleted += cursor.rowcount or 0
+    # The exemption column arrives with a LATER migration than the tables
+    # themselves (0059 made the tables; the ambient-extractor migration added
+    # `promoted_item_id`). Retention must keep its no-crash contract on a DB
+    # sitting between the two — there is nothing to exempt there anyway, since
+    # promotion cannot have written without the column.
+    cursor = await db.execute("PRAGMA table_info(session_ledger_shadow_events)")
+    has_promoted = any(r[1] == "promoted_item_id" for r in await cursor.fetchall())
+    if has_promoted:
+        cursor = await db.execute(
+            "DELETE FROM session_ledger_shadow_events "
+            "WHERE observed_at < ? AND promoted_item_id IS NULL",
+            (cutoff,),
+        )
+        deleted += cursor.rowcount or 0
+        # A run row is the mode half of the attribution (event -> run_id ->
+        # mode), so it survives exactly as long as a promoted event points at it.
+        cursor = await db.execute(
+            "DELETE FROM session_ledger_shadow_runs WHERE started_at < ? "
+            "AND run_id NOT IN (SELECT run_id FROM session_ledger_shadow_events "
+            "                   WHERE promoted_item_id IS NOT NULL)",
+            (cutoff,),
+        )
+        deleted += cursor.rowcount or 0
+    else:
+        cursor = await db.execute(
+            "DELETE FROM session_ledger_shadow_events WHERE observed_at < ?", (cutoff,)
+        )
+        deleted += cursor.rowcount or 0
+        cursor = await db.execute(
+            "DELETE FROM session_ledger_shadow_runs WHERE started_at < ?", (cutoff,)
+        )
+        deleted += cursor.rowcount or 0
     await db.commit()
     return deleted
 
@@ -232,3 +280,44 @@ def _iso_days_before(now_iso: str, days: int) -> str:
 
     dt = datetime.fromisoformat(now_iso)
     return (dt - timedelta(days=days)).isoformat()
+
+
+async def list_promoted_events_with_runs(
+    db: aiosqlite.Connection,
+) -> tuple[list[dict], list[dict]]:
+    """The COMPLETE attribution set: every promoted event, plus its run.
+
+    The leak invariant's verifier must never read attribution through a
+    windowed scan — retention exempts promoted events precisely so the
+    verifier can always see them, and a capped newest-first read would age
+    them out of the verifier's own LIMIT while the report still said HELD.
+    Query by the attribution key instead. Unbounded on the same argument as
+    the prune exemption (live-mode-only promotion, PROMOTION_CAP per
+    compaction: tens-to-hundreds of one-line rows per year), with a generous
+    ceiling that is a tripwire, not a budget: hitting it means the premise
+    broke, and the caller is told loudly rather than handed a silent subset.
+    """
+    if not await _tables_available(db):
+        return [], []
+    cursor = await db.execute(
+        "SELECT * FROM session_ledger_shadow_events "
+        "WHERE promoted_item_id IS NOT NULL ORDER BY observed_at ASC LIMIT 10001"
+    )
+    events = [dict(r) for r in await cursor.fetchall()]
+    if len(events) > 10000:
+        raise RuntimeError(
+            "attribution set exceeds 10,000 promoted events — the "
+            "bounded-by-promotion-cap premise is broken; refusing to hand the "
+            "leak invariant a silent subset"
+        )
+    run_ids = sorted({e["run_id"] for e in events})
+    runs: list[dict] = []
+    for i in range(0, len(run_ids), 500):  # SQLite parameter-count safety
+        chunk = run_ids[i : i + 500]
+        placeholders = ", ".join("?" for _ in chunk)
+        cursor = await db.execute(
+            f"SELECT * FROM session_ledger_shadow_runs WHERE run_id IN ({placeholders})",  # noqa: S608 — placeholders only
+            chunk,
+        )
+        runs.extend(dict(r) for r in await cursor.fetchall())
+    return events, runs

@@ -1307,7 +1307,12 @@ verified: 29a382e7 2026-09-03
   false positives, so the metric measures the complement of what would
   ship. The flip gate is hand adjudication of what would have been written
   (v1: 17/40 wanted = 43%, 2026-08-29 — the reason prompt v2 exists).
-  Retention 45d via `scripts/prune_ledger_shadow.py` (disk-hygiene step 8).
+  Retention 45d via `scripts/prune_ledger_shadow.py` (disk-hygiene step 8) —
+  EXCEPT promoted events + their runs, which are the leak invariant's
+  attribution record and survive retention unbounded (owner decision
+  2026-09-05; bounded in practice by live-mode-only promotion at
+  PROMOTION_CAP per compaction). Promotion inserts the ledger row and stamps
+  the claiming event in ONE transaction, so a crash leaves both or neither.
   Telemetry: `call_site_last_run` row `ambient_ledger_extractor`
   (deliberately not a critical site).
 - **Repo-pulse annotator** (session-manager stage 4) — **LIVE (exact tier)**.

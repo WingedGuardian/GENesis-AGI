@@ -219,8 +219,18 @@ async def ledger_add(
     added_by: str = "foreground",
     evidence: str | None = None,
     source_quote: str | None = None,
+    commit: bool = True,
 ) -> str:
     """Add an open ledger item and return its id.
+
+    *commit=False* leaves the INSERT inside the caller's open transaction —
+    for a caller that must make the insert atomic with its OWN bookkeeping
+    write. The promotion path is why this exists: inserting the row and
+    stamping ``promoted_item_id`` on the claiming shadow event must land
+    together, because a crash between them leaves a ledger row no event
+    claims — which the next sweep can duplicate once the row closes, and
+    which the leak invariant reads as an unattributed write. Default True
+    preserves every existing caller byte-for-byte.
 
     TWO PROVENANCE FIELDS, because two different writers answer two different
     questions and they must not share a column:
@@ -250,7 +260,8 @@ async def ledger_add(
         (item_id, session_id, text, source_ref, added_by, evidence,
          source_quote, _now_iso()),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
     return item_id
 
 

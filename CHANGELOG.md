@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **The session charter now shows up to 15 open ledger items, not 6.** The
+  ledger is a curated list of one-line to-dos, and the old window meant a
+  session with more than six open items never saw a newly added one in its own
+  prompt — it existed only in the aggregate count. Fifteen covers every real
+  ledger observed; past that, the count still says how many more there are,
+  and an oversized block now trims on whole lines instead of mid-bullet.
+
 - **A review comment on documentation no longer blocks a merge.** The pre-merge
   check already declined to count findings on prose, but its idea of prose was
   narrow: markdown counted only underneath `docs/`, so a comment on a top-level

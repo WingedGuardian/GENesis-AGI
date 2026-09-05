@@ -988,10 +988,20 @@ def _load_charter_db(session_id: str, db_path: Path | None) -> tuple[dict | None
                     charter["pointers"] = json.loads(charter.get("pointers") or "[]")
                 except (ValueError, TypeError):
                     charter["pointers"] = []
+                # 15, not "all", and not the old 6 (owner decision, 2026-09-05).
+                # The ledger is a curated to-do list of one-liners, and the old
+                # oldest-6 window meant a session with 6+ open items NEVER saw
+                # a newly added or extractor-promoted row in its own prompt —
+                # promotion "succeeded" invisibly. Unbounded is ruled out by a
+                # hard external budget (a hook entry's stdout is capped at a
+                # measured 10k chars, and ledger text may legally run 1000
+                # chars/item), so the shape is a bound that covers every real
+                # ledger observed, with the existing open-count footer as the
+                # loud "+N more" for the pathological case.
                 cur = await db.execute(
                     "SELECT id, text, status FROM session_ledger"
                     " WHERE session_id = ? AND status IN ('open','in_progress')"
-                    " ORDER BY created_at LIMIT 6",
+                    " ORDER BY created_at LIMIT 15",
                     (session_id,),
                 )
                 items = [dict(r) for r in await cur.fetchall()]
@@ -1127,12 +1137,23 @@ def _charter_emission_block(
         footer += f" · ledger: {open_n} open / {closed_n} closed"
     footer += f" · full charter: ~/.genesis/sessions/{session_id}/charter.md_"
     lines += ["", footer]
-    block = "\n".join(lines)
-    # ~600-token ceiling (char proxy): bounded by construction in the typical
-    # case; the guard only bites on pathological field contents.
-    if len(block) > 2800:
-        block = block[:2800] + "\n_…[truncated — full charter in charter.md]_"
-    return block
+    # ~1000-token ceiling (char proxy), raised in step with the ledger window
+    # (6 -> 15 items at <=120 chars each): bounded by construction in the
+    # typical case; the guard only bites on pathological field contents.
+    # Degrade by WHOLE LINES, not mid-character — a bullet cut mid-word looks
+    # complete and reads wrong; a dropped line plus the loud marker does not.
+    # The FOOTER is reserved before truncation, not truncated with the body:
+    # it carries the open/closed counts — the very "+N more" disclosure that
+    # makes a bounded list honest — and end-truncation was dropping it first,
+    # exactly when it mattered most.
+    footer_line = lines[-1]
+    body = "\n".join(lines[:-1])
+    budget = 4600 - len(footer_line) - 1
+    if len(body) > budget:
+        cut = body.rfind("\n", 0, budget)
+        body = body[: cut if cut > 0 else budget]
+        body += "\n_…[truncated — full charter in charter.md]_"
+    return body + "\n" + footer_line
 
 
 if __name__ == "__main__":
