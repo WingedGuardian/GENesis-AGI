@@ -311,24 +311,34 @@ What made the original defect dangerous was never that 300 existed — it was th
 
 That default is about SIZE, never about secrecy, and the two must not be
 confused. If a value may carry a credential, token, or personal data, the
-unbounded default does NOT apply: fail closed, omit wholesale with a marker as
-the "omit explicitly" rule says, and keep only non-sensitive metadata. Losing
-diagnostic prose is recoverable; leaking a token is not.
+unbounded default does NOT apply — for UNAUTHORIZED egress and for storage you
+cannot vouch for: there, fail closed, omit wholesale with a marker as the "omit
+explicitly" rule says, and keep only non-sensitive metadata. Losing diagnostic
+prose is recoverable; leaking a token is not. The scope qualifier is
+load-bearing and an earlier revision dropped it while restructuring — read
+unconditionally, "omit wholesale" would delete values existing features exist
+to hold: the References store deliberately RETAINS credentials and exposes
+plaintext only through its explicit reveal flow
+(`dashboard/routes/references.py`; verified 2026-09-04). An authorized, gated
+store holding a secret is the feature working, not a leak.
 
 **Then ask WHO WROTE IT as well as where it is going — two independent axes,
 and each governs a different decision.** Destination governs DISCLOSURE: what
 may cross a trust boundary is decided by where it lands, whoever wrote it — a
 user-authored secret bound for an external channel still gets scanned and
-quarantined. Authorship governs SANITIZATION: third-party-authored content
-stays bounded and escaped no matter how trusted the destination is —
-this repo truncates and HTML-escapes a stranger's email fields on the way to the
-OWNER'S OWN chat (`outreach/engagement.py` `_sanitize_ping_field`, whose
-docstring names both the threat and the destination; verified 2026-09-04),
-because that channel renders HTML unescaped, so a display name someone else
-chose would otherwise arrive as live markup in the one place the user trusts
-absolutely. Maximally authorized destination, maximally defensive treatment.
-Any rule that reads "it's going somewhere trusted, so pass it whole" deletes
-that defence.
+quarantined. Authorship is a RISK INPUT to sanitization, and the treatment
+itself is chosen by the CONSUMING SINK: the same stranger-authored email
+fields are HTML-escaped and truncated where the sink renders raw HTML
+(`outreach/engagement.py` `_sanitize_ping_field`, whose docstring names both
+the threat and the destination; verified 2026-09-04) and stored CANONICAL —
+unescaped, unbounded — where the sink is a parameterised database column
+(`db/crud/email_threads.py` `record_reply`; verified 2026-09-04). Escaping at
+ingestion would corrupt the canonical copy; passing raw markup to a live
+renderer hands a stranger the user's most trusted channel. Maximally
+authorized destination, maximally defensive treatment AT THE RENDERER — any
+rule that reads "it's going somewhere trusted, so pass it whole" deletes that
+defence, and any rule that reads "a stranger wrote it, so escape it
+everywhere" corrupts the stored original.
 
 **And an authorized destination does not mean untreated.** The rule is narrow:
 do not strip the USER'S OWN content on its way to the user. It is not a licence
