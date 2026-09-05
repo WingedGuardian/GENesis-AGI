@@ -2393,8 +2393,17 @@
           } catch (e) { console.warn("Secrets fetch failed:", e); }
         },
         toggleSecretEdit(keyName) {
-          this.secretsEditing = {...this.secretsEditing, [keyName]: !this.secretsEditing[keyName]};
-          if (!this.secretsEditing[keyName]) { delete this.secretsValues[keyName]; }
+          const opening = !this.secretsEditing[keyName];
+          this.secretsEditing = {...this.secretsEditing, [keyName]: opening};
+          if (!opening) { delete this.secretsValues[keyName]; return; }
+          // SEED the buffer from the current value. Without this it stays undefined
+          // until an `input` event, so opening a configured override and pressing
+          // Save WITHOUT TYPING reads as empty — and since empty now means "unset",
+          // that silently deleted the override. An untouched field must mean "no
+          // change", never "delete".
+          const def = (this.secretsGroups || []).flatMap(g => g.keys || [])
+            .find(k => k.key === keyName);
+          this.secretsValues = {...this.secretsValues, [keyName]: (def && def.value) || ''};
         },
         async saveSecret(keyName) {
           const val = (this.secretsValues[keyName] || '').trim();
@@ -2409,6 +2418,14 @@
           const clearable = !!(def && def.is_optional_override);
           if (!val && !clearable) {
             this.secretsMessage = {type: 'error', text: 'Value cannot be empty'};
+            return;
+          }
+          // Clearing is destructive and easy to do by accident, and seeding the
+          // buffer cannot cover every case — a masked value is not readable, so it
+          // seeds empty. Make the deletion an explicit act.
+          if (!val && clearable && !confirm(
+                'Remove the ' + keyName + ' override?\n\nThe setting falls back to ' +
+                'genesis.yaml or its built-in default.')) {
             return;
           }
           this.secretsSaving = true;

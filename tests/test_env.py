@@ -622,7 +622,18 @@ class TestYamlBooleanSpellings:
             monkeypatch.delenv(name, raising=False)
 
     @pytest.mark.parametrize(("accessor", "section", "key"), _ACCESSORS)
-    @pytest.mark.parametrize("falsey", ["false", "False", "FALSE", "no", "off", "0", " false "])
+    @pytest.mark.parametrize(
+        "falsey",
+        [
+            "false", "False", "FALSE", "no", "off", "0", " false ",
+            # EMPTY is false too, and it is listed here because the token-set check
+            # alone gets it WRONG: "" is in none of the no-words, so it would read
+            # as true — the exact regression this helper nearly introduced while
+            # fixing quoted booleans, and on `embed_priority_tier` it would have
+            # silently selected the PAID lane. `bool("")` was already correct.
+            "", "   ",
+        ],
+    )
     def test_quoted_false_means_false(
         self, monkeypatch: pytest.MonkeyPatch, accessor, section, key, falsey
     ):

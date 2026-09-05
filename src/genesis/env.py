@@ -117,7 +117,17 @@ def _yaml_bool(value: object) -> bool:
     ``false``, ``0``, an empty list — all already correct under it).
     """
     if isinstance(value, str):
-        return value.strip().lower() not in _FALSEY_TOKENS
+        stripped = value.strip()
+        # EMPTY IS FALSE, and this branch has to say so explicitly. The token set
+        # below answers "is this one of the words meaning no", and an empty string
+        # is in none of them — so without this line `ollama_enabled: ""` would read
+        # as TRUE, where the `bool()` it replaced correctly read it as False. That
+        # is a regression this helper would have introduced while fixing its
+        # sibling: `embed_priority_tier: ""` would silently select the PAID lane.
+        # An empty value is an absent value, not an affirmation.
+        if not stripped:
+            return False
+        return stripped.lower() not in _FALSEY_TOKENS
     return bool(value)
 
 

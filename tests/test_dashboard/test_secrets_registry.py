@@ -234,3 +234,47 @@ def test_an_unset_key_is_not_appended_as_empty(tmp_path, monkeypatch):
 
     mod._update_secrets_file({"OLLAMA_URL": ""})
     assert "OLLAMA_URL" not in env_file.read_text()
+
+
+def test_opening_an_editor_seeds_the_value_so_save_is_not_a_delete():
+    """An UNTOUCHED field must mean "no change", never "delete".
+
+    Structural, because there is no JS harness here — but the failure it guards is
+    concrete and was live: `config.html` binds
+    `:value="secretsValues[k.key] ?? k.value ?? ''"`, so the displayed value comes
+    from `k.value` while `secretsValues[k.key]` stays UNDEFINED until an `input`
+    event fires. Opening a configured override and pressing Save without typing
+    therefore read as empty — and once empty meant "unset", that silently removed
+    the override the operator had just been looking at.
+    """
+    from genesis.env import repo_root
+
+    js = (repo_root() / "src/genesis/dashboard/webui/js/dashboard.js").read_text()
+    start = js.index("toggleSecretEdit(keyName)")
+    handler = js[start : start + 900]
+    assert "secretsValues" in handler and "def.value" in handler, (
+        "toggleSecretEdit must seed the edit buffer from the current value; "
+        "without it an untouched field saves as an empty string, i.e. a deletion"
+    )
+    # The backstop: seeding cannot cover a masked value, so clearing is confirmed.
+    save = js[js.index("async saveSecret(keyName)") :][:1600]
+    assert "confirm(" in save, "clearing an override must be an explicit act"
+
+
+def test_the_empty_string_is_false_for_every_boolean_accessor():
+    """Guards the sibling regression from the same commit, at the API boundary.
+
+    `_yaml_bool` answers "is this one of the words meaning no", and "" is in none
+    of them — so the token check alone read an empty quoted scalar as TRUE, where
+    the `bool()` it replaced read it as False. On `embed_priority_tier` that
+    silently selects the paid lane.
+    """
+    from genesis.env import _yaml_bool
+
+    for empty in ("", "   ", "\t"):
+        assert _yaml_bool(empty) is False, repr(empty)
+    # Controls in both directions.
+    assert _yaml_bool("false") is False
+    assert _yaml_bool("true") is True
+    assert _yaml_bool(False) is False
+    assert _yaml_bool(True) is True
