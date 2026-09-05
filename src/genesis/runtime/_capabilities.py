@@ -159,6 +159,14 @@ def _write_bootstrap_manifest_file(runtime: GenesisRuntime) -> None:
 
     In ``readonly`` bootstrap mode we do NOT overwrite the primary runtime's
     file — a readonly probe's manifest would clobber the real one.
+
+    ``pid`` records WHICH process wrote this, because the path is user-global and
+    the server is not its only writer: the bridge (``channels/bridge.py``) and the
+    interactive terminal (``cc/terminal.py``, which takes ``bootstrap()``'s default
+    ``mode="full"``) write the same file. A reader that wants THE SERVER'S manifest
+    can compare this against the unit's ``MainPID`` and get a yes/no answer, rather
+    than inferring ownership from recency — which is unanswerable, since any of
+    those writers can land at any moment.
     """
     if getattr(runtime, "_bootstrap_mode", "") == "readonly":
         return
@@ -168,6 +176,7 @@ def _write_bootstrap_manifest_file(runtime: GenesisRuntime) -> None:
         "bootstrapped": True,
         "manifest": dict(runtime._bootstrap_manifest),
         "persisted_at": datetime.now(UTC).isoformat(),
+        "pid": os.getpid(),
     }
     try:
         manifest_file.parent.mkdir(parents=True, exist_ok=True)
