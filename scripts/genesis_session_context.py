@@ -158,6 +158,31 @@ _AUDIT_LINE_RESERVE = (
     + 16  # slack for a longer home path than this box's
 )
 
+
+def _audit_reserve(part: str, mirror: Path | None) -> int:
+    """Reserve for THIS part's audit line, from its REAL worst case.
+
+    :data:`_AUDIT_LINE_RESERVE` bakes a 36-char session id into its worst case,
+    but the id lands INSIDE the line via the mirror path and
+    ``is_safe_session_id`` accepts up to 255 chars. Because ``_cut_here`` fills
+    to the ceiling by construction, ``room`` at ``emit_final`` time is exactly
+    the reserve — so any shortfall clips the line's TAIL, which is the mirror
+    pointer, the one part the reader needs. MEASURED: a 64-char id overran the
+    constant by 13 UTF-16 units, a 255-char id by 204.
+
+    Floored at the constant so ordinary UUIDs change NOTHING — the arithmetic
+    pins measured against the constant keep holding exactly. A longer id grows
+    the reserve instead of clipping the proof; the content above degrades
+    through its normal loud paths, which is the right trade (the completion
+    proof must land whole precisely when something was cut). Billed with
+    ``emit_cost`` — the same unit the budget is enforced in.
+    """
+    where = f" — full text: {mirror}" if mirror is not None else " — MIRROR UNAVAILABLE"
+    worst = _audit_line(
+        part, 99_999, 99_999, cut=("x" * _AUDIT_BLOCK_LABEL_MAX, 99_999), where=where
+    )
+    return max(_AUDIT_LINE_RESERVE, emit_cost(worst))
+
 # Every part is ALSO written whole to ~/.genesis/sessions/<sid>/context-<part>.md.
 # The harness keeps a filed payload on disk; a hard cut would not, so without
 # this mirror the chokepoint would trade a recoverable failure for an
@@ -338,7 +363,7 @@ def _begin_part(part: str, mirror: Path | None, session_id: str = "") -> None:
     _OUT = BoundedStdout(
         budget,
         label=part,
-        reserve=_AUDIT_LINE_RESERVE,
+        reserve=_audit_reserve(part, mirror),
         mirror_hint=str(mirror) if mirror else "",
     )
     _OUT.emit(_recovery_header(part, mirror), block="recovery-header")

@@ -72,6 +72,44 @@ from genesis.env import repo_root
 # distinguish them by.
 _PROBE_SENTINEL = b"PROBE-START"
 
+#: The probe emitter's closed shape (genesis_session_context.py, the
+#: GENESIS_CTX_PROBE_BYTES seam): `PROBE-START <one repeated filler char>
+#: PROBE-END`. The filler alphabet is the emitter's, verbatim — "A", or "é"
+#: in multibyte mode.
+_PROBE_FILLERS = (b"A", "\u00e9".encode())
+_PROBE_TAIL = b" PROBE-END"
+
+
+def _probe_shaped(head: bytes) -> bool:
+    """Whether ``head`` is the probe emitter's OWN closed shape — not merely
+    its prefix.
+
+    The probe branch is the only one that DROPS a filing from the findings, so
+    it must authenticate more than a public literal: ``PROBE-START`` appears in
+    this repo and in the watcher's own alert text, so an oversized recall
+    payload quoting it first would otherwise be silently excluded — the exact
+    loss this collector exists to report, suppressed by its own suppression
+    branch. The real emitter writes ``PROBE-START `` + one repeated filler
+    character + `` PROBE-END`` and nothing else, so require exactly that.
+
+    ``head`` is the first :data:`_HEAD_BYTES` bytes. When it is SHORTER than
+    the window we hold the whole file and the closing marker must be present;
+    at exactly the window size the tail may be out of view, so only the filler
+    run is checked (a multibyte filler may be split mid-character at the cut —
+    "is a prefix of the filler repeated" covers that).
+    """
+    prefix = _PROBE_SENTINEL + b" "
+    if not head.startswith(prefix):
+        return False
+    body = head[len(prefix):]
+    if body.endswith(_PROBE_TAIL):
+        body = body[: -len(_PROBE_TAIL)]
+    elif len(head) < _HEAD_BYTES:
+        return False  # whole file in view, no closing marker: not our probe
+    return any(
+        (f * (len(body) // len(f) + 1)).startswith(body) for f in _PROBE_FILLERS
+    )
+
 #: Label for a filing we cannot attribute to a known producer. The findings name
 #: that filing's PATH instead of quoting it — see :func:`_attribute`.
 OTHER_HOOK = "other hook"
@@ -584,7 +622,7 @@ def _attribute(path: Path, reads: _Reads) -> tuple[str, bool]:
     # unanchored match is a fail-open — any hook merely MENTIONING the sentinel
     # in its first bytes would suppress a real loss, where a mis-read stamp only
     # picks the wrong remedy. The probe writes it at byte 0 by construction.
-    if head.startswith(_PROBE_SENTINEL):
+    if _probe_shaped(head):
         return ("cap-measurement probe", True)
     # match, not search: the emitter guarantees the stamp is at byte 0 (the
     # recovery header is the first thing `_begin_part` writes). Searching the

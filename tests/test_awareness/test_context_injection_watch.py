@@ -331,7 +331,7 @@ def test_the_known_part_set_matches_the_emitter(tmp_path):
 
 
 def test_probe_artifacts_are_excluded_but_counted(tmp_path):
-    _file(tmp_path, name="hook-p-stdout.txt", body=b"PROBE-START AAAA")
+    _file(tmp_path, name="hook-p-stdout.txt", body=b"PROBE-START AAAA PROBE-END")
     h = _collect(tmp_path)
     assert h.fresh_filings == []
     assert h.probe_filings == 1
@@ -339,7 +339,7 @@ def test_probe_artifacts_are_excluded_but_counted(tmp_path):
 
 
 def test_a_real_filing_beside_probe_artifacts_still_alerts(tmp_path):
-    _file(tmp_path, name="hook-p-stdout.txt", body=b"PROBE-START AAAA")
+    _file(tmp_path, name="hook-p-stdout.txt", body=b"PROBE-START AAAA PROBE-END")
     _file(tmp_path, name="hook-r-stdout.txt", body=b"## Session Configuration")
     h = _collect(tmp_path)
     assert len(h.fresh_filings) == 1
@@ -1403,3 +1403,45 @@ def test_the_escaping_lock_can_itself_fail():
         assert _health_list_writers(sample), f"detector is blind to: {label}"
     # An unrelated list must not be flagged, or the lock becomes noise.
     assert not _health_list_writers("def f(h):\n    h.other.append(x)\n")
+
+
+def test_a_filing_that_merely_starts_with_the_sentinel_is_not_a_probe(tmp_path):
+    """The probe branch is the only one that DROPS a filing — authenticate it.
+
+    `_attribute` used to accept ANY head beginning `PROBE-START` as a probe
+    artifact. That literal is public (it appears in this repo, and in the very
+    alert text this watcher emits), so an oversized recall-hook payload whose
+    first line quotes it — e.g. a memory recalled about this incident — would be
+    silently excluded from the findings: the exact loss this collector exists to
+    report, suppressed by its own suppression branch. The real probe emitter
+    writes a closed shape (`PROBE-START <one repeated filler char> PROBE-END`),
+    so anything else after the sentinel is NOT our probe and must be reported.
+    """
+    _file(
+        tmp_path,
+        name="hook-spoof-stdout.txt",
+        body=b"PROBE-START [Memory | 2w | infrastructure] recall text about the probe",
+    )
+    h = _collect(tmp_path)
+    assert h.probe_filings == 0, "a spoofed head was swallowed by the probe branch"
+    assert len(h.fresh_filings) == 1, "the filing must be REPORTED, not dropped"
+
+
+def test_real_probe_shapes_are_still_excluded(tmp_path):
+    """Controls: every shape the real emitter produces still reads as a probe.
+
+    Three shapes from the actual seam (`GENESIS_CTX_PROBE_BYTES`): a short run
+    whose ` PROBE-END` closer is in view; a run longer than the head window
+    (closer out of view — the truncated case); and the multibyte filler mode,
+    truncated mid-character. Tightening that breaks these has inverted the fix.
+    """
+    _file(tmp_path, name="hook-p1-stdout.txt", body=b"PROBE-START AAAA PROBE-END")
+    _file(tmp_path, name="hook-p2-stdout.txt", body=b"PROBE-START " + b"A" * 600)
+    _file(
+        tmp_path,
+        name="hook-p3-stdout.txt",
+        body=b"PROBE-START " + "é".encode() * 300,
+    )
+    h = _collect(tmp_path)
+    assert h.probe_filings == 3, (h.probe_filings, [f for f in h.fresh_filings])
+    assert not h.fresh_filings

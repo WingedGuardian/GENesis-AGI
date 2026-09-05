@@ -712,3 +712,29 @@ def test_all_mode_is_not_cut_by_one_entrys_budget(monkeypatch, capsys, tmp_path)
     out = _direct_part(monkeypatch, capsys, ident, "all")
     assert "S" * 9_000 in out
     assert "T" * 9_000 in out
+
+
+def test_a_long_session_id_does_not_clip_the_audit_line(tmp_path, monkeypatch, capsys):
+    """The reserve must fit the audit line for EVERY id the validator accepts.
+
+    `_AUDIT_LINE_RESERVE`'s worst case bakes in a 36-char session id, but
+    `is_safe_session_id` accepts up to 255 — and the id lands INSIDE the line,
+    via the mirror path. MEASURED: a 64-char id overruns the reserve by 13
+    UTF-16 units, a 255-char id by 204. Because `_cut_here` fills to the ceiling
+    by construction, `room` at `emit_final` time is exactly the reserve, so the
+    overrun clips the line's TAIL — which is the mirror pointer, the one part
+    the reader needs. The reserve is now derived from the REAL mirror path at
+    `_begin_part`, floored at the constant so ordinary UUIDs change nothing.
+    """
+    sid = "s" * 255
+    mirror = tmp_path / sid / "context-knowledge.md"
+    monkeypatch.setattr(_ctx, "_mirror_path", lambda s, p: mirror)
+    _ctx._OUT = None
+    _ctx._begin_part("knowledge", mirror)
+    _ctx._emit("Z" * 20_000, block="essential-knowledge")
+    _ctx._finish_part("knowledge", sid)
+    out = capsys.readouterr().out
+    audit = out.rstrip("\n").splitlines()[-1]
+    assert audit.endswith("]_"), f"audit line clipped: …{audit[-80:]!r}"
+    assert str(mirror) in audit, "the mirror pointer is the part that must survive"
+    assert _ctx.utf16_len(out) <= _ctx._PART_BUDGET
