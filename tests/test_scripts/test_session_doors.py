@@ -670,6 +670,33 @@ echo "RC=$?" >> {str(rec)!r}
         assert "--permission-mode" not in rec, f"opt-out ignored:\n{rec}"
         assert "CAPTURE=" not in rec, f"opt-out still ran exit capture:\n{rec}"
 
+    def test_setup_token_is_never_wrapped(self, tmp_path):
+        """`claude setup-token` PRINTS a long-lived credential to the terminal.
+
+        Wrapping it would run the exit capture, which appends a scrollback tail
+        to a log file — writing that credential to disk. It must pass straight
+        through, with no permission flag and no capture. The same applies to
+        every other subcommand: none is an interactive session.
+        """
+        text = Path(_BOOTSTRAP).read_text()
+        for sub in ("setup-token", "mcp", "doctor", "update"):
+            sub_dir = tmp_path / sub
+            sub_dir.mkdir()
+            _unused, rec = self._harness(
+                sub_dir,
+                "export TMUX=/tmp/fake,1,0\nexport GENESIS_SLOT=7",
+                bootstrap_text=text,
+                args=sub,
+            )
+            assert "RC=7" in rec, f"{sub}: harness never reached claude:\n{rec}"
+            assert "--permission-mode" not in rec, (
+                f"{sub}: a subcommand was given a permission flag:\n{rec}"
+            )
+            assert "CAPTURE=" not in rec, (
+                f"{sub}: exit capture ran for a subcommand — for setup-token that "
+                f"writes a credential to a log:\n{rec}"
+            )
+
     def test_print_mode_still_passes_straight_through(self, tmp_path):
         text = Path(_BOOTSTRAP).read_text()
         _unused, rec = self._harness(

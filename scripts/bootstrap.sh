@@ -897,6 +897,20 @@ claude() {
     for arg in "$@"; do
         case "$arg" in
             -p|--print|--version|-v|--help|-h) command claude "$@"; return $? ;;
+            # SUBCOMMANDS are not interactive sessions and must not be wrapped.
+            # `setup-token` is the one that matters: it PRINTS a long-lived
+            # credential to the terminal, and wrapping it would run the exit
+            # capture, which appends a scrollback tail to a log — i.e. write that
+            # credential to disk. The rest are listed because none of them is a
+            # session either, so wrapping them only adds a permission flag they
+            # do not want and capture noise. List derived from `claude --help`
+            # (the grammar is `claude [options] [command] [prompt]`); an unlisted
+            # FUTURE subcommand simply gets wrapped, which is the pre-existing
+            # behaviour and merely noisy — but any future subcommand that emits a
+            # credential MUST be added here for the reason above.
+            agents|auth|auto-mode|doctor|gateway|import|install|mcp|plugin|\
+            plugins|project|setup-token|ultrareview|update)
+                command claude "$@"; return $? ;;
         esac
     done
     if [ -t 0 ] && [ -t 1 ] && [ -n "${TMUX:-}" ] && [ -z "${GENESIS_NO_TMUX_WRAP:-}" ]; then
