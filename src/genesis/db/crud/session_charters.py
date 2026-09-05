@@ -191,6 +191,23 @@ async def set_pointers(db: aiosqlite.Connection, session_id: str, pointers: list
     return cursor.rowcount > 0
 
 
+def _one_line(text: str) -> str:
+    """Ledger text as ONE line, capped. Whitespace runs collapse to one space.
+
+    `.strip()` alone trims only the ENDS, so an embedded newline survived into
+    two model-facing renderers that emit one line PER ROW — the charter block
+    re-injected into every post-compaction window, and the per-prompt inventory
+    tag. A single row then rendered as two, and the second line was
+    indistinguishable from a genuine ledger row in Genesis's own voice.
+
+    Normalised HERE, at the write chokepoint, rather than in each renderer: both
+    renderers and `charter.md` inherit one rule, and a renderer added later
+    cannot forget it. A row is one sentence by convention, so collapsing
+    internal whitespace loses nothing real.
+    """
+    return " ".join(text.split())[:MAX_LEDGER_TEXT_CHARS]
+
+
 async def ledger_add(
     db: aiosqlite.Connection,
     *,
@@ -202,7 +219,7 @@ async def ledger_add(
     """Add an open ledger item and return its id."""
     if added_by not in VALID_ADDED_BY:
         raise ValueError(f"invalid added_by: {added_by!r}")
-    text = text.strip()[:MAX_LEDGER_TEXT_CHARS]
+    text = _one_line(text)
     if not text:
         raise ValueError("ledger text must be non-empty")
     item_id = _new_id()
@@ -233,7 +250,7 @@ async def ledger_update(
         sets.append("status = ?")
         params.append(status)
     if text is not None:
-        text = text.strip()[:MAX_LEDGER_TEXT_CHARS]
+        text = _one_line(text)
         if not text:
             raise ValueError("ledger text must be non-empty")
         sets.append("text = ?")
