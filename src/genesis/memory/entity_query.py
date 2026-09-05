@@ -168,11 +168,20 @@ async def resolve_query_entities(
     if not ngrams:
         return {}
 
-    # norm_name → [entity_id]; active-only (= post-merge survivors). One scan;
-    # the entity count is small enough to hold in-process (ranking.py precedent).
+    # norm_name → [entity_id]; active norms plus merged-away surface forms
+    # redirected to their survivors. One scan each; the entity count is small
+    # enough to hold in-process (ranking.py precedent).
     name_to_ids: dict[str, list[str]] = {}
     for norm_name, entity_id, _etype in await entities_crud.list_norm_names(db):
         name_to_ids.setdefault(norm_name, []).append(entity_id)
+    # Merge-following (MW-3 PR-2b): the moment a merge applies, the loser's
+    # surface form vanishes from the active map — a query naming the OLD form
+    # went dark. Redirects map each merged-away norm to its active survivor.
+    for loser_norm, survivor_ids in (await entities_crud.merged_norm_redirects(db)).items():
+        ids = name_to_ids.setdefault(loser_norm, [])
+        for survivor_id in survivor_ids:
+            if survivor_id not in ids:
+                ids.append(survivor_id)
 
     weights: dict[str, float] = {}
     for gram in ngrams:
