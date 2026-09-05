@@ -268,7 +268,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 29a382e7 2026-09-03
+verified: 51f9a358 2026-09-05
 ```
 
 - **Roster peer availability is OBSERVATION, never a gate** (`cc/peer_availability.py`,
@@ -366,6 +366,23 @@ verified: 29a382e7 2026-09-03
   COALESCEs content columns; a writer distinguishes "read fine, nothing to
   report" (empty string — CLEARS) from "could not read" (None — PRESERVES), and
   collapsing those two is what makes a finished topic immortal.
+
+- **Slot environment pinning + usable temp directories.**
+  LIVE. `tmux new-session` builds a new session's environment from the tmux
+  SERVER's, updated by the client only for `update-environment` vars — so a slot
+  created on a server someone else started inherited that server's values.
+  MEASURED on tmux 3.4: `TMPDIR` and `GENESIS_CC_SLOT_OAUTH` resolve to the
+  SERVER's value (both now pinned via `-e`), while `PATH` resolves to the
+  CLIENT's (no gap, so deliberately NOT pinned). Both temp-dir candidates must be
+  created AND writable AND accept `chmod 700` — creation is not usability, since
+  `mkdir -p` succeeds on a directory that already exists, and one this user
+  cannot make private would put session temp state where others can read it. When
+  no candidate is usable both names are left genuinely UNSET rather than exported
+  empty, and the pane command unsets them itself: this script ends in
+  `exec tmux`, which STARTS the server every later slot inherits from, and
+  omitting a pin is not the same as having no value.
+  Recovering a slot that is alive but running no claude — detecting it, and
+  rebuilding it on consent — is a SEPARATE layer and is not shipped here.
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
   (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A restricted

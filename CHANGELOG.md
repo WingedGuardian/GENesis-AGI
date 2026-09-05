@@ -262,6 +262,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   a non-zero exit, so a caller checking exit status still notices; and the
   guardian's automated `git revert HEAD` on a clean tree is unaffected, because
   there both sides equal the base and the driver never runs.
+- **A session slot started after another tmux server no longer gets the wrong
+  temp directory.** A new slot created while a tmux server started in some other
+  context is already running used to inherit that server's temp directory
+  (often the small system `/tmp` Genesis keeps Claude off of). The temp
+  directory and the OAuth-durability setting are now pinned to the slot
+  explicitly (when a usable temp directory exists at all — if none does, the
+  session is left on the system default rather than pointed at a bad path).
 
 - **Two branches can no longer pick the same database-migration number.** Each
   new migration is now named by the UTC time it was written rather than by the
