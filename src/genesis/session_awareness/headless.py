@@ -18,71 +18,86 @@ extraction and keeps its own). Locked invariants carried over verbatim:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import shutil
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 logger = logging.getLogger(__name__)
 
-# Dedicated working directory for ambient judges — deliberately NOT
-# background_session_dir(), and not nested beneath it. Dispatched background
-# sessions (research/interact/campaign profiles) retain the Write tool and
-# run FROM that shared directory, so an injected one can drop a CLAUDE.md or
-# a project .claude/settings.json there — which CC discovers from the
-# child's cwd: instructions for every later judge, or hooks that EXECUTE.
-# Tool denial does not stop instruction poisoning; a judge-owned cwd closes
-# the CWD-LEVEL surfaces. Honest boundary: CC also walks ANCESTOR
-# directories for memory files, and that level is a separate write-guard's
-# job (tracked follow-up) — this dir closes what a shared cwd exposed, not
-# every path a fully unscoped writer has. A SIBLING under ~/.genesis keeps
-# the property the background dir was chosen for (outside any git repo, so
-# CC's resume picker never lists these transcripts) without inheriting the
-# shared directory itself as an ancestor. New file-plane justification
-# (anti-proliferation gate): the existing store IS the trust boundary being
-# escaped; the dir holds no data of its own — judges write nothing here,
-# and the accessor ENFORCES that emptiness rather than assuming it.
-_AMBIENT_JUDGE_DIR = Path.home() / ".genesis" / "ambient-judges"
+# Per-call working directory for ambient judges, under one stable parent.
+#
+# The judge child must not inherit CONTEXT it did not author: CC reads
+# CLAUDE.md / CLAUDE.local.md / .mcp.json from its cwd, and a project
+# .claude/settings.json there gives it HOOKS THAT EXECUTE. Tool denial does
+# not stop instruction poisoning, and dispatched background sessions
+# (research/interact/campaign) hold Write with no path scope — so any
+# directory that outlives a call is a plantable surface.
+#
+# Rather than defend a fixed directory, each call gets a FRESH one: nothing
+# can PRE-plant in a directory whose name did not exist a moment ago. Three
+# review rounds went into finding holes in a defended-fixed-directory design
+# (a shared parent, then a sweep a symlink walked past); this shape has no
+# interior at the cwd level for such a hole to live in — no sweep, no
+# tripwire, no symlink case there.
+#
+# HONEST BOUNDARY — what this does NOT close, MEASURED 2026-09-05 with the
+# shipped argv against a real child: CC also reads memory files from every
+# ANCESTOR of the cwd, and always loads the user-level ~/.claude/CLAUDE.md.
+# A memory file placed in this parent, in ~/.genesis, or in the home
+# directory is therefore read by every judge — the cwd being fresh does not
+# make the directories ABOVE it fresh. Constraining what may write those
+# paths is a separate control and is tracked as such; do not read this
+# design as closing it. (Parent-level .claude/settings.json hooks do NOT
+# execute: CC resolves the project root from the cwd, which has none.)
+#
+# Residual within scope, accepted: a RESIDENT same-uid process can watch
+# this parent and write into a per-call directory between its creation and
+# the child reading it — 0700 is no barrier to the same uid. The redesign
+# converts a plant-once-poison-every-future-call attack into one needing
+# continuous presence and a won race. A real reduction, not an elimination.
+#
+# The stable PARENT gives the debris one predictable home for disk hygiene
+# to target (transcript-retention issue #1709); it is never itself a cwd.
+#
+# Out of any git repo, as before, so CC's resume picker never lists these
+# one-turn judgments beside interactive sessions.
+_AMBIENT_JUDGE_ROOT = Path.home() / ".genesis" / "ambient-judges"
 
-# Context-bearing names CC would honor in the judge cwd. Anything matching
-# is foreign by definition ("judges write nothing here") and is removed
-# before every spawn — the emptiness invariant is enforced, not assumed.
-_FOREIGN_CONTEXT = ("CLAUDE.md", "CLAUDE.local.md", ".mcp.json")
 
+@contextlib.contextmanager
+def _judge_cwd() -> Iterator[str]:
+    """A fresh, private working directory for one judge call.
 
-def _ambient_judge_dir() -> str:
-    """Provision the isolated judge cwd and enforce its emptiness.
-
-    Empty-state safe (fresh install: mkdir). Any context-bearing file found
-    here was planted by something else — remove it and say so loudly; the
-    log line is the tripwire for the write-guard follow-up.
+    Yields the path; removes it on exit, including after a timeout or a
+    cancellation. Cleanup failure is logged and swallowed — a leftover
+    directory is disk debris for hygiene to reap, never a reason to fail a
+    call that already ran.
     """
-    _AMBIENT_JUDGE_DIR.mkdir(parents=True, exist_ok=True)
-    for name in _FOREIGN_CONTEXT:
-        f = _AMBIENT_JUDGE_DIR / name
-        try:
-            if f.exists():
-                f.unlink()
-                logger.error(
-                    "ambient-judge dir contained foreign context file %s — "
-                    "removed (nothing should ever write here)", name,
-                )
-        except OSError:
-            logger.error("could not remove foreign context file %s", f, exc_info=True)
-    proj = _AMBIENT_JUDGE_DIR / ".claude"
+    _AMBIENT_JUDGE_ROOT.mkdir(parents=True, exist_ok=True)
+    # mkdir(exist_ok=True) ACCEPTS a symlink-to-directory — is_dir() follows
+    # links — which would silently relocate every judge cwd under a path
+    # somebody else chose. That is the same shape as the symlink that walked
+    # past the sweep this design replaced, one level up. O_NOFOLLOW is the
+    # check that cannot be faked; failure propagates into the caller's status
+    # dict rather than running a judge from an unverified location.
+    fd = os.open(
+        _AMBIENT_JUDGE_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    os.close(fd)
+    path = tempfile.mkdtemp(prefix="judge-", dir=_AMBIENT_JUDGE_ROOT)
     try:
-        if proj.is_dir():
-            import shutil
-
-            shutil.rmtree(proj, ignore_errors=True)
-            logger.error(
-                "ambient-judge dir contained a planted .claude/ project dir — "
-                "removed (project hooks would EXECUTE in judge spawns)",
-            )
-    except OSError:
-        logger.error("could not inspect %s", proj, exc_info=True)
-    return str(_AMBIENT_JUDGE_DIR)
+        yield path
+    finally:
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            logger.warning("ambient-judge dir %s not removed", path, exc_info=True)
 
 
 def build_argv(
@@ -109,7 +124,7 @@ def build_argv(
         from genesis.env import repo_root
 
         no_mcp_config = str(repo_root() / "config" / "no_mcp.json")
-    # The child runs from _AMBIENT_JUDGE_DIR (not the parent's cwd), so any
+    # The child runs from a per-call judge dir (not the parent's cwd), so any
     # RELATIVE path in the argv would resolve against the wrong directory (a
     # relative GENESIS_REPO_ROOT flowing through repo_root()). Anchor
     # path-shaped values to the PARENT's cwd now; a bare command word
@@ -153,6 +168,30 @@ async def run_headless_json(
     and fail-closed there.
     """
     try:
+        with _judge_cwd() as judge_cwd:
+            return await _run_in_cwd(
+                prompt,
+                model=model,
+                claude_path=claude_path,
+                no_mcp_config=no_mcp_config,
+                timeout_s=timeout_s,
+                cwd=judge_cwd,
+            )
+    except Exception as exc:
+        return {"status": "failed", "reason": f"{type(exc).__name__}: {exc}"}
+
+
+async def _run_in_cwd(
+    prompt: str,
+    *,
+    model: str,
+    claude_path: str,
+    no_mcp_config: str | None,
+    timeout_s: float,
+    cwd: str,
+) -> dict:
+    """The spawn itself, in a caller-owned cwd (see ``_judge_cwd``)."""
+    try:
         argv = build_argv(model, claude_path, no_mcp_config)
         env = dict(os.environ)
         env["GENESIS_CC_SESSION"] = "1"  # never re-enter Genesis hooks
@@ -165,16 +204,16 @@ async def run_headless_json(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
-            # Run OUTSIDE the project tree, in the judges' OWN directory
-            # (see _AMBIENT_JUDGE_DIR): the transcript lands under a
-            # non-interactive project key, so CC's resume picker never
-            # lists ambient workers, the repo's SessionStart hooks don't
-            # inject context into a one-turn judgment call, and no
-            # tool-enabled session shares the cwd CC auto-discovers
-            # CLAUDE.md from. Measured 2026-09-04: without this,
-            # arbiter/ledger/repo-pulse transcripts accumulated in the
-            # interactive project dir and surfaced in /resume.
-            cwd=_ambient_judge_dir(),
+            # A fresh per-call directory outside any git repo (see
+            # _judge_cwd): the transcript lands under a non-interactive
+            # project key so CC's resume picker never lists these one-turn
+            # judgments, the repo's SessionStart hooks don't inject
+            # context into them, and nothing can have planted context in a
+            # directory that did not exist a moment ago. Measured
+            # 2026-09-04: without this, arbiter/ledger/repo-pulse
+            # transcripts accumulated in the interactive project dir and
+            # surfaced in /resume.
+            cwd=cwd,
             # Own session/group (setsid in the C helper — never preexec_fn:
             # post-fork Python can deadlock in the threaded server) so the
             # timeout below can killpg the whole claude tree.

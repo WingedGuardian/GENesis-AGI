@@ -54,7 +54,7 @@ def _hermetic_background_session_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(
         _cc_types, "_BACKGROUND_SESSION_DIR", tmp_path / "bg-sessions"
     )
-    monkeypatch.setattr(_headless, "_AMBIENT_JUDGE_DIR", tmp_path / "ambient-judges")
+    monkeypatch.setattr(_headless, "_AMBIENT_JUDGE_ROOT", tmp_path / "ambient-judges")
 
 
 # Captured at import time — before any fixture patches the modules — so the
@@ -64,5 +64,5 @@ import genesis.session_awareness.headless as _headless_orig  # noqa: E402
 
 _PRODUCTION_DIRS = {
     "background": _cc_types_orig._BACKGROUND_SESSION_DIR,
-    "judge": _headless_orig._AMBIENT_JUDGE_DIR,
+    "judge": _headless_orig._AMBIENT_JUDGE_ROOT,
 }

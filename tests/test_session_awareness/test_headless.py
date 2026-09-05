@@ -44,7 +44,7 @@ def test_build_argv_pinned_shape():
 
 
 def test_build_argv_anchors_relative_paths():
-    """The child runs from the background dir — relative path arguments must
+    """The child runs from a per-call judge dir — relative path arguments must
     be resolved against the PARENT's cwd before the spawn, or every ambient
     call breaks under a relative override (incl. GENESIS_REPO_ROOT=.)."""
     argv = build_argv(MODEL, "./bin/claude", "config/no_mcp.json")
@@ -217,6 +217,36 @@ async def test_timeout_reap_is_bounded(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_parent_symlink_refused(tmp_path, monkeypatch):
+    """A symlinked judge ROOT would relocate every judge cwd somewhere else's
+    ancestors — the same shape as the symlink that walked past the sweep this
+    design replaced, one level up. O_NOFOLLOW refuses it; the call degrades to
+    the documented failed status rather than running from an unverified path."""
+    import genesis.session_awareness.headless as headless_mod
+
+    real = tmp_path / "elsewhere"
+    real.mkdir()
+    link = tmp_path / "judge-root"
+    link.symlink_to(real, target_is_directory=True)
+    monkeypatch.setattr(headless_mod, "_AMBIENT_JUDGE_ROOT", link)
+
+    spawned = []
+
+    async def fake_exec(*a, **k):  # pragma: no cover - must never run
+        spawned.append(a)
+        raise AssertionError("spawned from a symlinked judge root")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    res = await run_headless_json(
+        "p", model=MODEL, claude_path="claude",
+        no_mcp_config="/dev/null", timeout_s=5,
+    )
+    assert res["status"] == "failed"
+    assert not spawned
+    assert list(real.iterdir()) == []  # nothing was created behind the link
+
+
+@pytest.mark.asyncio
 async def test_cancel_group_kills_and_reraises(monkeypatch):
     """Task cancellation mid-call must group-kill the detached claude tree
     before propagating — with its own session, no ambient signal reaches it."""
@@ -237,8 +267,10 @@ async def test_cancel_group_kills_and_reraises(monkeypatch):
 
     proc.communicate = _hang
     proc.wait = AsyncMock(return_value=-9)
+    cwds: list[str] = []
 
     async def fake_exec(*args, **kwargs):
+        cwds.append(kwargs["cwd"])
         return proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
@@ -253,6 +285,9 @@ async def test_cancel_group_kills_and_reraises(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert killpg_calls and killpg_calls[0][0] == 424243
+    # _judge_cwd's docstring promises cleanup "including after a timeout or a
+    # cancellation" — the timeout half is locked elsewhere; this is the other.
+    assert cwds and not Path(cwds[0]).exists()
 
 
 def test_production_dirs_disjoint_and_unnested(production_dirs):
@@ -266,46 +301,35 @@ def test_production_dirs_disjoint_and_unnested(production_dirs):
     assert judge not in bg.parents
 
 
-def test_judge_dir_sweeps_foreign_context(tmp_path, monkeypatch):
-    """The emptiness invariant is ENFORCED: planted context-bearing files
-    (and a .claude/ project dir, whose hooks would EXECUTE) are removed
-    before the spawn."""
-    import genesis.session_awareness.headless as headless_mod
-
-    d = tmp_path / "judges"
-    monkeypatch.setattr(headless_mod, "_AMBIENT_JUDGE_DIR", d)
-    d.mkdir()
-    (d / "CLAUDE.md").write_text("planted instructions")
-    (d / ".mcp.json").write_text("{}")
-    (d / ".claude").mkdir()
-    (d / ".claude" / "settings.json").write_text("{}")
-
-    out = headless_mod._ambient_judge_dir()
-    assert out == str(d)
-    assert not (d / "CLAUDE.md").exists()
-    assert not (d / ".mcp.json").exists()
-    assert not (d / ".claude").exists()
-
-
 @pytest.mark.asyncio
-async def test_spawns_from_isolated_judge_dir(tmp_path, monkeypatch):
-    """The child runs from the judges' OWN out-of-repo dir — not the
-    inherited server cwd (else transcripts pollute the interactive
-    /resume list, measured 2026-09-04), and not the shared
-    background-sessions dir: tool-enabled dispatched sessions run there
-    with Write retained, so a poisoned one could plant a CLAUDE.md that
-    CC auto-discovers from the judge's cwd (external round-2 P1)."""
+async def test_each_call_gets_a_fresh_private_cwd(tmp_path, monkeypatch):
+    """The isolation mechanism, end to end: every call runs from a
+    directory created for it alone, under the stable judge root, outside
+    the shared background-sessions dir — and the directory is gone
+    afterwards.
+
+    Nothing can pre-plant context (CLAUDE.md, .mcp.json, a hook-bearing
+    .claude/) in a directory whose name did not exist a moment ago, which
+    is why this design needs no sweep. It also keeps the original fix: an
+    out-of-repo cwd means CC's resume picker never lists these one-turn
+    judgments (measured 2026-09-04)."""
     import genesis.cc.types as cc_types
     import genesis.session_awareness.headless as headless_mod
 
-    bg = tmp_path / "judge-dir"
-    monkeypatch.setattr(headless_mod, "_AMBIENT_JUDGE_DIR", bg)
+    root = tmp_path / "judge-root"
+    monkeypatch.setattr(headless_mod, "_AMBIENT_JUDGE_ROOT", root)
     shared = tmp_path / "bg-sessions"
     monkeypatch.setattr(cc_types, "_BACKGROUND_SESSION_DIR", shared)
-    captured: dict = {}
+    seen: list[str] = []
+    # Recorded, not asserted, INSIDE the mock: the runner's `except Exception`
+    # would swallow an AssertionError raised here into a status dict with an
+    # empty reason, destroying the diagnostic. Assert after the call.
+    at_spawn: list[tuple[bool, list]] = []
 
     async def fake_exec(*argv, **kwargs):
-        captured.update(kwargs)
+        cwd = kwargs["cwd"]
+        seen.append(cwd)
+        at_spawn.append((Path(cwd).is_dir(), list(Path(cwd).iterdir())))
 
         class _P:
             returncode = 0
@@ -317,16 +341,48 @@ async def test_spawns_from_isolated_judge_dir(tmp_path, monkeypatch):
         return _P()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    res = await run_headless_json(
-        "p", model=MODEL, claude_path="claude", no_mcp_config="/dev/null", timeout_s=5
-    )
-    assert res["status"] == "ok"
-    assert captured.get("cwd") == str(bg)
-    assert bg.is_dir()  # accessor provisions it (empty-state: fresh install)
-    from genesis.cc.types import background_session_dir
+    for _ in range(2):
+        res = await run_headless_json(
+            "p", model=MODEL, claude_path="claude",
+            no_mcp_config="/dev/null", timeout_s=5,
+        )
+        assert res["status"] == "ok"
 
-    judge = Path(captured["cwd"])
-    shared_resolved = Path(background_session_dir())
-    assert judge != shared_resolved
-    # Not nested: the shared dir must never be an ancestor CLAUDE.md source.
-    assert shared_resolved not in judge.parents
+    # LIVE and EMPTY at spawn time, every call.
+    assert at_spawn and all(live and files == [] for live, files in at_spawn), at_spawn
+    assert len(set(seen)) == 2, "each call must get its OWN directory"
+    for cwd in seen:
+        assert Path(cwd).parent == root
+        assert not Path(cwd).exists(), "the call must remove its own dir"
+        assert shared not in Path(cwd).parents
+
+
+@pytest.mark.asyncio
+async def test_judge_cwd_removed_after_timeout(tmp_path, monkeypatch):
+    """Cleanup is in a finally — a timed-out call leaks no directory."""
+    import genesis.session_awareness.headless as headless_mod
+
+    root = tmp_path / "judge-root"
+    monkeypatch.setattr(headless_mod, "_AMBIENT_JUDGE_ROOT", root)
+    seen: list[str] = []
+
+    async def fake_exec(*argv, **kwargs):
+        seen.append(kwargs["cwd"])
+
+        class _P:
+            returncode = None
+            pid = 12345
+
+            async def communicate(self, _in):
+                await asyncio.sleep(10)
+
+        return _P()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", lambda *a: None)
+    res = await run_headless_json(
+        "p", model=MODEL, claude_path="claude",
+        no_mcp_config="/dev/null", timeout_s=0.05,
+    )
+    assert res["status"] == "timeout"
+    assert seen and not Path(seen[0]).exists()
