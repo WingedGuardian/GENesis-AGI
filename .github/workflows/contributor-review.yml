@@ -1,0 +1,393 @@
+name: Contributor review trigger
+
+# Ask the automated reviewer to look at an OUTSIDE contributor's PR — but only
+# when that PR answers an issue we both LABELLED as invited and ASSIGNED to that
+# contributor. Two maintainer actions, and the assignment is the one that
+# authorises: it needs triage permission, so no fork author can grant it to
+# themselves. The closing link is author-controlled and authorises nothing on
+# its own.
+#
+# WHY THIS EXISTS. The reviewer runs automatically for the maintainer's own PRs
+# and does not for forks, which is the right default: an outside PR should not be
+# able to spend the reviewer's quota by existing. But a contributor who picked up
+# a labelled issue is not a drive-by, and making them wait for a human to type
+# "@codex review" is friction we chose, not friction we want.
+#
+# ── SECURITY: why this is `pull_request_target`, and what that obliges ───────
+# A `pull_request` run for a fork gets a READ-ONLY token, so it cannot comment.
+# `pull_request_target` gets a writable token — but it runs in the BASE repo's
+# context with that token available, so if it ever executed head-ref code, an
+# outside contributor would be running arbitrary code with repository write
+# access. That is the single well-known footgun of this trigger.
+#
+# The mitigation here is structural rather than careful: this workflow NEVER
+# obtains the head code. There is no `actions/checkout`, no build, no install, no
+# test, and no `run:` step that consumes PR-authored content. It reads metadata
+# through the API and posts one comment. Nothing an author writes is executed,
+# and the one author-influenced input — WHICH issue is linked — decides nothing
+# on its own: the issue must be in this repository, must carry a label only a
+# maintainer can set, and must be ASSIGNED BY A MAINTAINER to this PR's author.
+# No author-supplied string is interpolated into a shell, a template, or a query.
+#
+# The one-review-per-issue budget further down is a courtesy bound, not part of
+# this boundary: it reads author-mutable state and must never be relied on as a
+# control. Assignment is what holds.
+#
+# Keep it that way. If this workflow ever needs to inspect the diff, that work
+# belongs in a separate `pull_request` job with the default read-only token.
+
+on:
+  # ELIGIBILITY IS A FUNCTION OF TWO OBJECTS — the pull request AND the issue —
+  # so BOTH sides are watched. Listening to only one is why the most natural
+  # real sequence never fired: a contributor opens a PR, and the maintainer
+  # assigns them AFTERWARDS. Nothing re-evaluated that, so the automation this
+  # workflow exists to provide simply did not happen in the common case.
+  pull_request_target:
+    # `opened` is the normal case. `ready_for_review` covers a PR opened as a
+    # draft. `edited` covers the closing link arriving late — the contributor
+    # opens the PR and then adds "Closes #N", which is the common path, not an
+    # edge case. `reopened` covers a PR whose eligibility changed while closed.
+    types: [opened, ready_for_review, edited, reopened]
+  issues:
+    # The maintainer half of the predicate. Each of these is the moment
+    # eligibility can BECOME true for a PR that already exists and already
+    # links the issue.
+    #
+    # Safe to widen to: every one of these actions requires triage permission,
+    # so an outside contributor cannot emit them. This is the maintainer saying
+    # "go", which is exactly the signal the workflow was missing.
+    types: [assigned, labeled, reopened]
+  label:
+    # The label itself is a THIRD object with exactly one eligibility-flipping
+    # mutation: RENAMING an existing label to `good first issue` attaches the
+    # invited name to every issue already carrying it — and GitHub emits no
+    # `issues` event for that, only this repository-level one. `created` cannot
+    # flip eligibility (a fresh label is attached to nothing yet — attaching it
+    # later fires `issues: labeled`), and `deleted`/renamed-away only make
+    # eligibility FALSE, which needs no trigger: every claim re-validates from
+    # live state anyway. Editing labels requires push access, so this is
+    # maintainer-only, same as the issues actions above.
+    types: [edited]
+
+# Least privilege. `pull-requests: write` is the ONLY elevated scope, and it
+# exists solely to post the trigger comment.
+permissions:
+  contents: read
+  issues: read
+  pull-requests: write
+
+concurrency:
+  # Serialises repeat events for the SAME subject — a draft opened then marked
+  # ready, or a burst of body edits. It cannot serialise across subjects, which
+  # is why the budget below is documented as best-effort rather than exact.
+  group: contributor-review-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number || github.event.label.name }}
+  # Supersede rather than queue. Every run recomputes eligibility from current
+  # state, so an in-flight run is never worth more than the one behind it, and
+  # queueing a burst of body edits would just serialise identical work. The run
+  # that survives sees the latest state; the budget check still prevents a
+  # second request if an earlier run already posted.
+  cancel-in-progress: true
+
+jobs:
+  request-review:
+    runs-on: ubuntu-latest
+    # A cheap pre-filter ONLY, and only for PR events. It is not the eligibility
+    # rule and must not be read as one: the script applies the real predicate to
+    # every candidate, this PR included, from LIVE data. A condition enforced
+    # here and not there is how the two drift apart.
+    if: >-
+      github.event_name == 'issues' ||
+      github.event_name == 'label' ||
+      (github.event.pull_request.head.repo.full_name != github.repository &&
+       github.event.pull_request.draft == false)
+    steps:
+      - name: Trigger a review when the PR answers a labelled issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // ─────────────────────────────────────────────────────────────
+            // ONE DEFINITION OF "ELIGIBLE", APPLIED TO EVERY PR FROM LIVE DATA.
+            //
+            // Read this before changing anything. Two design facts here were
+            // each learned the expensive way, and both look like details.
+            //
+            // 1. ELIGIBILITY IS A FUNCTION OF TWO OBJECTS — the pull request
+            //    and the issue — and both can change independently. Nine review
+            //    findings, re-read as a matrix of (object x property), were all
+            //    one defect: "eligible" had no single definition, so each object
+            //    got its own ad-hoc subset of the checks and every round found
+            //    another empty cell. `isEligible` below is now the only place
+            //    it is decided, and it runs over LIVE data for every candidate,
+            //    this PR included.
+            //
+            // 2. THE BUDGET IS BEST-EFFORT, AND CANNOT BE MADE EXACT HERE.
+            //    It is derived from `closedByPullRequestsReferences`, which is
+            //    author-MUTABLE. An earlier revision added a lowest-number
+            //    tie-break to make it exact, arguing that PR numbers are
+            //    monotonic so a later PR always sees the earlier ones. That
+            //    argument is FALSE under the `edited` trigger: a higher-numbered
+            //    PR can link the issue first and scan while alone, then a
+            //    lower-numbered PR links afterwards. Both then believe they won.
+            //    The tie-break is gone rather than patched, because it existed
+            //    to manufacture an exact bound out of inexact state — which is
+            //    the part that cannot be done. Making it exact needs a
+            //    bot-owned durable claim on the issue, i.e. `issues: write` on a
+            //    `pull_request_target` workflow, which is a bigger grant than
+            //    this convenience feature is worth.
+            //
+            //    So the budget is a COURTESY BOUND: it stops the ordinary repeat
+            //    cases, and two simultaneous claims can still both post. That is
+            //    a wasted review, not a breach. THE SECURITY PROPERTY IS
+            //    `isEligible`, and specifically the assignment, which no author
+            //    can grant themselves.
+            // ─────────────────────────────────────────────────────────────
+
+            const INVITED = ['good first issue', 'first-timers-only'];
+            const MAX_LINKED_PRS = 30;
+            const MAX_LINKED_ISSUES = 20;
+
+            const R = { owner: context.repo.owner, repo: context.repo.repo };
+            const SELF_REPO = `${R.owner}/${R.repo}`;
+
+            /**
+             * THE predicate. `candidate` always comes from the live GraphQL
+             * node, never from a webhook payload — a payload is a snapshot of
+             * the moment the event fired, and a PR can be closed or returned to
+             * draft between the event and this job running.
+             */
+            function isEligible(candidate, issue, why) {
+              const author = (candidate.author || '').toLowerCase();
+              const checks = {
+                'pr is open':        candidate.state === 'OPEN',
+                'pr is not a draft': candidate.isDraft === false,
+                'pr is from a fork': candidate.isCrossRepository === true,
+                'issue is open':     issue.state === 'open',
+                'issue is invited':  (issue.labels || []).some(l =>
+                  INVITED.includes(((typeof l === 'string' ? l : l.name) || '').toLowerCase())),
+                'issue is assigned to the pr author': (issue.assignees || []).some(
+                  a => ((a && a.login) || '').toLowerCase() === author && author !== ''),
+              };
+              const failed = Object.keys(checks).filter(k => !checks[k]);
+              if (failed.length && why) core.info(`  ${why}: ${failed.join('; ')}`);
+              return failed.length === 0;
+            }
+
+            // GitHub logins are case-insensitive, so a human's "@Codex review"
+            // is the same request as "@codex review". Matching case-sensitively
+            // made the workflow post a SECOND trigger after a human had already
+            // asked. This repo's own escalation guard lowercases for the same
+            // reason (scripts/hooks/git_push_guard.py).
+            const REQUESTED = /@codex\s+review/i;
+
+            const linkQ = `
+              query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
+                repository(owner:$owner, name:$repo) {
+                  pullRequest(number:$number) {
+                    closingIssuesReferences(first: 50, after: $cursor) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { number repository { nameWithOwner } }
+                    }
+                  }
+                }
+              }`;
+
+            const prsForIssueQ = `
+              query($owner:String!, $repo:String!, $issue:Int!, $cursor:String) {
+                repository(owner:$owner, name:$repo) {
+                  issue(number:$issue) {
+                    closedByPullRequestsReferences(first: 30, after: $cursor, includeClosedPrs: true) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        number
+                        state
+                        isDraft
+                        isCrossRepository
+                        repository { nameWithOwner }
+                        author { login }
+                        comments(first: 100) { pageInfo { hasNextPage } nodes { body } }
+                      }
+                    }
+                  }
+                }
+              }`;
+
+            /** Every PR that closes `issueNumber`, live, paginated, capped. */
+            async function prsClosing(issueNumber) {
+              const out = [];
+              let cur = null;
+              for (;;) {
+                const d = await github.graphql(prsForIssueQ, { ...R, issue: issueNumber, cursor: cur });
+                const conn = d.repository.issue.closedByPullRequestsReferences;
+                // Closing references CROSS repositories: a PR elsewhere can say
+                // "closes <owner>/<repo>#N" about OUR issue, and a same-numbered
+                // foreign node would then be read by every consumer of this list
+                // as if it were ours — the spent-budget walk would decline our
+                // real PR over a stranger's comment, and the candidate lookup
+                // below would validate the foreign PR's author/state under our
+                // number. The mirror function (issuesClosedBy) has always
+                // filtered its direction; this one never did. Filter at the ONE
+                // producer, so no consumer has to remember.
+                out.push(...(conn.nodes || []).filter(
+                  n => n.repository && n.repository.nameWithOwner === SELF_REPO));
+                if (out.length > MAX_LINKED_PRS) {
+                  core.info(
+                    `Issue #${issueNumber} has more than ${MAX_LINKED_PRS} linked PRs — ` +
+                    `cannot establish whether its review was already requested; declining.`
+                  );
+                  return null;
+                }
+                if (!conn.pageInfo.hasNextPage) break;
+                cur = conn.pageInfo.endCursor;
+              }
+              return out;
+            }
+
+            /** Invited issues that `prNumber` closes, in THIS repository. */
+            async function issuesClosedBy(prNumber) {
+              const linked = [];
+              let cur = null;
+              for (;;) {
+                const d = await github.graphql(linkQ, { ...R, number: prNumber, cursor: cur });
+                const conn = d.repository.pullRequest.closingIssuesReferences;
+                linked.push(...(conn.nodes || []));
+                if (linked.length > MAX_LINKED_ISSUES) {
+                  core.info(
+                    `PR #${prNumber} closes more than ${MAX_LINKED_ISSUES} issues — ` +
+                    `declining rather than fanning out on request.`
+                  );
+                  return [];
+                }
+                if (!conn.pageInfo.hasNextPage) break;
+                cur = conn.pageInfo.endCursor;
+              }
+              return linked
+                .filter(i => i.repository && i.repository.nameWithOwner === SELF_REPO)
+                .map(i => i.number);
+            }
+
+            /**
+             * May `prNumber` claim `issueNumber`'s automatic review?
+             *
+             * ORDER MATTERS, and getting it wrong was a real finding: the spent
+             * check runs over EVERY linked PR before any eligibility filtering.
+             * A PR that received a review and was later closed is no longer
+             * eligible, but the review it consumed is still spent — filtering
+             * it out first made the budget look untouched and let a replacement
+             * PR spend a second one.
+             */
+            async function mayClaim(prNumber, issueNumber) {
+              const { data: issue } = await github.rest.issues.get({ ...R, issue_number: issueNumber });
+              const nodes = await prsClosing(issueNumber);
+              if (nodes === null) return false;
+
+              for (const n of nodes) {
+                if (n.comments.pageInfo.hasNextPage) {
+                  core.info(
+                    `PR #${n.number} (closing #${issueNumber}) has more comments than one ` +
+                    `page — cannot establish whether a review was requested; declining.`
+                  );
+                  return false;
+                }
+                if ((n.comments.nodes || []).some(c => c.body && REQUESTED.test(c.body))) {
+                  core.info(
+                    `Issue #${issueNumber} already spent its automatic review on ` +
+                    `PR #${n.number} — not requesting another.`
+                  );
+                  return false;
+                }
+              }
+
+              // Live state for the candidate, from the same walk that judged
+              // every other PR. Falling back to a lookup covers the window
+              // before the closing link is indexed.
+              let node = nodes.find(n => n.number === prNumber);
+              if (!node) {
+                const d = await github.graphql(
+                  `query($owner:String!,$repo:String!,$number:Int!){
+                     repository(owner:$owner,name:$repo){
+                       pullRequest(number:$number){
+                         number state isDraft isCrossRepository author { login } } } }`,
+                  { ...R, number: prNumber });
+                node = d.repository.pullRequest;
+              }
+              const candidate = {
+                number: node.number,
+                author: (node.author && node.author.login) || '',
+                state: node.state,
+                isDraft: node.isDraft,
+                isCrossRepository: node.isCrossRepository,
+              };
+              return isEligible(candidate, issue, `PR #${prNumber} vs issue #${issueNumber}`);
+            }
+
+            // ── Which PRs does THIS event ask us to consider? ────────────────
+            // A pull_request event names one. An issue event — the maintainer
+            // assigning, labelling or reopening — is the moment eligibility can
+            // become true for PRs that already exist, so every PR closing that
+            // issue is reconsidered, lowest number first.
+            let candidates;
+            if (context.eventName === 'issues') {
+              const issueNumber = context.payload.issue.number;
+              const nodes = await prsClosing(issueNumber);
+              if (!nodes) return;
+              candidates = nodes.map(n => n.number).sort((a, b) => a - b);
+              core.info(
+                `Issue #${issueNumber} ${context.payload.action} — reconsidering ` +
+                `${candidates.length} linked PR(s).`
+              );
+            } else if (context.eventName === 'label') {
+              // A rename INTO an invited name flips eligibility for every open
+              // issue already carrying the label, silently. Only the new name
+              // matters: renamed-away makes eligibility false, and false needs
+              // no trigger (every claim re-validates from live state).
+              const newName = ((context.payload.label || {}).name || '');
+              if (!INVITED.includes(newName.toLowerCase())) {
+                core.info(`Label edit ("${newName}") is not an invited name — nothing to do.`);
+                return;
+              }
+              // One page, and SAY SO when it truncates: an install with 100+
+              // open issues under one invited label is far past the point where
+              // an automatic courtesy trigger is the right tool anyway.
+              const { data: listed } = await github.rest.issues.listForRepo({
+                ...R, labels: newName, state: 'open', per_page: 100,
+              });
+              const issues = listed.filter(i => !i.pull_request);
+              if (listed.length === 100) {
+                core.info(
+                  `More than one page of open issues carries "${newName}" — ` +
+                  `reconsidering only the first 100; touch older issues ` +
+                  `(relabel/reassign) to reconsider them.`
+                );
+              }
+              const seen = new Set();
+              candidates = [];
+              for (const issue of issues) {
+                const nodes = await prsClosing(issue.number);
+                for (const n of nodes || []) {
+                  if (!seen.has(n.number)) { seen.add(n.number); candidates.push(n.number); }
+                }
+              }
+              candidates.sort((a, b) => a - b);
+              core.info(
+                `Label "${newName}" now carries an invited name — reconsidering ` +
+                `${candidates.length} linked PR(s) across ${issues.length} open issue(s).`
+              );
+            } else {
+              candidates = [context.payload.pull_request.number];
+            }
+
+            for (const prNumber of candidates) {
+              for (const issueNumber of await issuesClosedBy(prNumber)) {
+                if (!(await mayClaim(prNumber, issueNumber))) continue;
+                await github.rest.issues.createComment({
+                  ...R, issue_number: prNumber, body: '@codex review',
+                });
+                core.info(
+                  `Requested a review on PR #${prNumber} — it closes invited issue ` +
+                  `#${issueNumber}, which is assigned to its author, and that issue's ` +
+                  `automatic review had not been requested.`
+                );
+                return;   // one review per run
+              }
+            }
+            core.info('No claimable PR/issue pair — no review requested.');

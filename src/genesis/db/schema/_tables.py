@@ -245,7 +245,7 @@ TABLES = {
             topic               TEXT NOT NULL,
             category            TEXT NOT NULL CHECK (category IN (
                 'blocker', 'alert', 'finding', 'insight', 'opportunity',
-                'digest', 'surplus', 'approval', 'content', 'notification'
+                'digest', 'surplus', 'approval', 'content', 'notification', 'marketing'
             )),
             salience_score      REAL NOT NULL,
             channel             TEXT NOT NULL,

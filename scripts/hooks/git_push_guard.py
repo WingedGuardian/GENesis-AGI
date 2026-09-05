@@ -972,6 +972,48 @@ _REVIEW_BOTS = {"chatgpt-codex-connector[bot]", "github-actions[bot]"}
 # 118 merged PRs passed unseen, 64 of them P1).
 _INLINE_P1_RE = re.compile(r"!\[P1 Badge\]")
 _INLINE_P2_RE = re.compile(r"!\[P2 Badge\]")
+
+# CodeRabbit states severity in a pipe-separated italic header on its FIRST line:
+#   _🔒 Security & Privacy_ | _🟠 Major_ | _🏗️ Heavy lift_
+# Its findings were already REACHED by the scan below — `user.type` is "Bot", so
+# they pass the author filter — and then dropped, because neither badge pattern
+# above matches and the if/elif has no else. Read, not recognised; a PR carrying
+# a Major reported `inline-findings: ok`, indistinguishable from a clean one.
+_CODERABBIT_LOGINS = {"coderabbitai[bot]"}
+# The documented ladder. An unrecognised level is NON-BLOCKING (surfaced with a
+# canary) — a severity name this set has not seen must not silently start
+# blocking every PR the moment the vendor adds one.
+_CR_SEVERITIES = frozenset({"critical", "major", "minor", "trivial", "info"})
+_CR_BLOCKING_SEVERITIES = frozenset({"critical", "major"})
+# ONE header field: an italic span carrying no interior underscore. Anchored
+# whole (`^…$`) so a field is recognised only as a complete span, never as a
+# substring found somewhere inside one.
+#
+# The 64-char bound is deliberately double the observed ceiling, not tight to
+# it. MEASURED across 124 real findings, the longest category field is
+# `📐 Maintainability & Code Quality` at EXACTLY 32 characters — so a 32-char
+# bound sits precisely on live data, and a vendor renaming one category one
+# character longer would push a genuine Critical into the non-blocking path.
+# The bound is a sanity check against runaway prose, not a filter doing real
+# work, so it costs nothing to give it real headroom.
+_CR_HEADER_FIELD_RE = re.compile(r"^_([^_\n]{1,64})_$")
+# A line that LOOKS like an attempted severity header — italic markers and a
+# field separator — used only to tell "not a header" apart from "a header this
+# code failed to parse". Conflating those two makes an unparsed finding print
+# as "below Major", a false statement about a level that was never read.
+_CR_HEADER_SHAPE_RE = re.compile(r"^_.*\|.*_$")
+# CodeRabbit bundles SEVERAL findings into ONE inline comment, separated by a
+# markdown rule, when they land near each other in the diff. Each segment is
+# its own finding with its own severity.
+# At most THREE leading spaces: CommonMark reads a 4+-space-indented rule as
+# CODE, and CodeRabbit quotes markdown as indented code blocks — an indented
+# `---` inside quoted code must not become a finding boundary (Codex P2, #1677).
+_CR_FINDING_SPLIT_RE = re.compile(r"^ {0,3}-{3,}\s*$", re.M)
+# Scoring policy (2026-09-03, issue #1642): Critical and Major each score a full
+# 1.0; every other level scores 0 and is surfaced only. Deliberately fed through
+# the SAME weighted machinery as the Codex findings rather than a second blocking
+# path, so there is one score and one threshold to reason about.
+_CR_BLOCKING_WEIGHT = 1.0
 # Weighted review score for inline findings: a P1 is a full blocker (1.0), a P2
 # is half (0.5), so the gate blocks at any unresolved P1 OR >= 2 unresolved P2s.
 # Doc-path and maintainer-replied (consciously-accepted) findings are excluded
@@ -1166,6 +1208,240 @@ def _inline_title(body: str) -> str:
     return (first[0].strip() if first else "")[:120]
 
 
+def _cr_severity(body: str) -> tuple[str | None, bool]:
+    """Severity read from a CodeRabbit finding's header LINE. -> (level, header_seen)
+
+    Anchored to the header rather than searched for anywhere in the body, because
+    a review-bot comment is a CODE-BEARING DOCUMENT: it quotes the diff and embeds
+    ```suggestion``` blocks. `_` is simultaneously CodeRabbit's severity delimiter,
+    markdown emphasis, AND the snake_case separator, so a body-wide search for a
+    `_`-delimited severity word matches ordinary source. MEASURED against this
+    repo, a whole-body search matched `MAX_CRITICAL_ERRORS`, `def is_major_bump`,
+    the prose NEGATION `_not critical_`, the path `runtime_critical_path.py` —
+    152 such tokens — and, self-demonstratingly, this feature's own test fixture
+    `_CR_MAJOR_BODY`. A *Minor* finding quoting any one of them would have blocked
+    the merge and been reported as "Critical/Major": worse than the blindness it
+    replaces, since issue #1642 warns that poor precision trains reflex overrides.
+
+    Every field must be a COMPLETE italic span, so a line is accepted as a header
+    only if it is entirely one. Severity is read as the field's LAST word, never
+    by position — one observed finding omits the severity field entirely, and a
+    positional read would take the effort field ("Heavy lift") for a severity.
+    The emoji is deliberately not matched: only Minor and Major were ever observed
+    across 104 findings, so the emoji for Critical, Trivial and Info is unknown
+    here and guessing it would silently miss the most severe level.
+
+    `header_seen` separates "a CodeRabbit finding whose level we do not recognise"
+    from "a comment with no severity header at all". Neither blocks; only the
+    first is a canary worth printing. A line that LOOKS like a header but does
+    not fully parse counts as SEEN — reporting it as "below Major" would be a
+    false statement about a level this code never actually read.
+    """
+    for line in body.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        fields = [_CR_HEADER_FIELD_RE.match(f.strip()) for f in stripped.split("|")]
+        if not all(fields):
+            # Header-SHAPED but unparseable is a canary, not a clean miss.
+            return None, bool(_CR_HEADER_SHAPE_RE.match(stripped))
+        hits = []
+        for fld in fields:
+            words = fld.group(1).split()  # type: ignore[union-attr]
+            if words and words[-1].casefold() in _CR_SEVERITIES:
+                hits.append(words[-1].casefold())
+        if len(set(hits)) == 1 and hits:
+            # Exactly one DISTINCT level — including the unanimous-duplicate
+            # case (`_Business Critical_ | _🔴 Critical_`), where demoting a
+            # real Critical to the non-blocking canary would be the worse read.
+            return hits[0], True
+        if len(hits) > 1:
+            # Two severity-looking fields (`_Business Critical_ | _🟡 Minor_`)
+            # is a format this code cannot adjudicate. First-match-wins read
+            # that example as Critical — a false block; last-match-wins would
+            # hide a real Major behind a decorative trailing field. Neither
+            # guess is safe, so it is reported as unknown, the canary path
+            # (Codex P2, PR #1677).
+            return None, True
+        return None, True  # a header, but no field names a level we know
+    return None, False
+
+
+#: An opening or closing code fence: three-or-more backticks/tildes, then an
+#: optional info string. Captured separately because CommonMark's CLOSING rule
+#: depends on both — same character, at least as long, and no info string.
+_CR_FENCE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
+
+
+def _cr_markup_mask(body: str) -> list[bool]:
+    """Per line: True when it sits inside a fenced block or a ``<details>`` section.
+
+    Shared by the splitter and the title extractor because they MUST agree about
+    what is quoted content. They did not: the title extractor skipped fences while
+    the splitter cut across them, so a horizontal rule inside a ```suggestion```
+    manufactured a finding out of quoted markdown — which the title extractor then
+    could only name by its severity header.
+
+    MEASURED before the fix, on a body CodeRabbit plausibly emits (a Minor whose
+    suggestion edits a markdown file containing a rule and an italic two-field
+    line): one Minor finding split into two, the second reading as a MAJOR, and a
+    non-blocking review blocking the merge on the strength of quoted code.
+
+    Fence lines and the ``<details>`` tags themselves count as markup — they are
+    never finding content. ``<details>`` is tracked only OUTSIDE a fence, matching
+    how a markdown renderer reads it.
+    """
+    lines = body.split("\n")
+    # Fence and <details> contributions are tracked as SEPARATE masks and OR'd
+    # at the end, because each has an unclosed-construct recovery that clears
+    # its own contribution — and clearing a single combined mask would also
+    # unmask the OTHER construct's quoted content, silently re-opening the
+    # fence bug whenever a fence sits inside an unclosed <details>.
+    fence_mask = [False] * len(lines)
+    details_mask = [False] * len(lines)
+    fence_char: str | None = None
+    fence_len = 0
+    fence_opened_at: int | None = None
+    details_depth = 0
+    details_opened_at: int | None = None
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        # CommonMark gives fence DELIMITERS at most three leading spaces; a
+        # 4+-space-indented backtick run is code CONTENT. Stripping first and
+        # matching meant an indented ```` line inside a four-backtick
+        # suggestion closed the outer fence (Codex P2, #1677).
+        indent = len(line) - len(line.lstrip(" \t"))
+        fence = _CR_FENCE_RE.match(stripped) if indent <= 3 else None
+        if fence:
+            run, info = fence.group(1), fence.group(2).strip()
+            if fence_char is None:
+                fence_char, fence_len, fence_opened_at = run[0], len(run), idx
+            elif run[0] == fence_char and len(run) >= fence_len and not info:
+                # CommonMark: a closing fence uses the SAME character, is at
+                # least as long as the opener, and carries NO info string.
+                # Toggling on any fence line broke on CodeRabbit's own output:
+                # it wraps a suggestion in FOUR backticks precisely when the
+                # suggested markdown contains a three-backtick fence, so the
+                # inner ```md closed the outer block and everything after it —
+                # a quoted `---` and a Major-shaped header — was read as real
+                # findings, blocking a merge on the strength of quoted content
+                # (Codex P2, PR #1677).
+                fence_char, fence_len, fence_opened_at = None, 0, None
+            fence_mask[idx] = True
+            continue
+        if fence_char is not None:
+            fence_mask[idx] = True
+            continue
+        low = stripped.casefold()
+        if low.startswith("<details"):
+            # Nesting is a DEPTH, not a boolean: valid nested <details> meant
+            # the INNER close unmasked the rest of the outer collapsed section,
+            # so a quoted rule + severity header there manufactured a blocking
+            # finding out of collapsed content (Codex P2, PR #1677).
+            if details_depth == 0:
+                details_opened_at = idx
+            details_depth += 1
+            details_mask[idx] = True
+            continue
+        if low.startswith("</details"):
+            details_depth = max(0, details_depth - 1)
+            if details_depth == 0:
+                details_opened_at = None
+            details_mask[idx] = True
+            continue
+        details_mask[idx] = details_depth > 0
+    if fence_opened_at is not None:
+        # An UNCLOSED fence. CommonMark says it runs to the end of the document,
+        # and masking to the end is therefore "correct" — but this mask decides
+        # what the merge gate is allowed to SEE, and hiding every finding after a
+        # stray backtick run is the fail-OPEN direction: a real Critical goes
+        # unreported and the merge proceeds. A phantom finding, the other error,
+        # blocks loudly and gets looked at. So a fence that never closes is
+        # treated as ordinary content from the line it opened on.
+        for i in range(fence_opened_at, len(lines)):
+            fence_mask[i] = False
+    if details_opened_at is not None:
+        # An UNCLOSED <details> gets the same recovery for the same reason: a
+        # stray tag must not hide a later genuine Major from the gate. Only the
+        # details CONTRIBUTION is cleared — quoted fenced content inside the
+        # section stays masked via fence_mask. A complete inner section between
+        # the unclosed opener and end-of-body is unmasked too; that is the
+        # phantom-finding direction, which blocks loudly, and is accepted for
+        # the same reason the fence recovery accepts it (Codex P2, PR #1677).
+        for i in range(details_opened_at, len(lines)):
+            details_mask[i] = False
+    return [f or d for f, d in zip(fence_mask, details_mask, strict=True)]
+
+
+def _cr_findings(body: str) -> list[str]:
+    """Split one CodeRabbit comment into its individual findings.
+
+    ONE GitHub comment is not one finding. CodeRabbit bundles several into a
+    single inline comment, separated by a markdown rule, when they land near
+    each other in the diff. Reading only the first is the ORIGINAL BUG of this
+    feature reincarnated one level down — read, then silently dropped.
+
+    MEASURED on live PR #1647, comment id 3925021846: one comment carrying two
+    distinct Major findings. Before this split, `_cr_severity` returned the
+    first and the second existed nowhere in the gate's output. The dangerous
+    ordering is Minor-then-Major: the comment scored as `minor`, landed in the
+    advisory list, and printed "below Major, NOT counted" — a false claim about
+    a Major that was never seen at all.
+
+    A segment carrying no header is folded into the previous one rather than
+    treated as a finding: a rule inside prose is not a finding boundary, and
+    splitting on it would invent findings that do not exist. That fold is not
+    sufficient on its own — it only catches a rule whose following segment has no
+    header, and quoted markdown routinely supplies one. Rules inside fenced or
+    ``<details>`` content are therefore not boundaries at all (see
+    ``_cr_markup_mask``).
+    """
+    lines = body.split("\n")
+    markup = _cr_markup_mask(body)
+    parts: list[str] = []
+    current: list[str] = []
+    for line, is_markup in zip(lines, markup, strict=True):
+        if not is_markup and _CR_FINDING_SPLIT_RE.match(line):
+            parts.append("\n".join(current))
+            current = []
+            continue
+        current.append(line)
+    parts.append("\n".join(current))
+    out: list[str] = []
+    for part in parts:
+        if not part.strip():
+            continue
+        _, header_seen = _cr_severity(part)
+        if header_seen or not out:
+            out.append(part)
+        else:
+            out[-1] = out[-1] + "\n---\n" + part
+    return out or [body]
+
+
+def _coderabbit_title(body: str) -> str:
+    """The finding's title, which for CodeRabbit is not its first line.
+
+    Codex leads with badge-plus-title, so `_inline_title` reads correctly there.
+    CodeRabbit leads with the severity header (`_category_ | _severity_ |
+    _effort_`) and puts the title in the first BOLD line beneath it — using the
+    generic extractor here reports the severity header as the finding's name,
+    which tells a reader nothing about what is wrong.
+
+    Fenced blocks and `<details>` sections are skipped: both routinely carry bold
+    text belonging to QUOTED CODE or to collapsed static-analysis output, not to
+    the finding, and reporting one of those as the title misnames the finding in
+    the pre-merge report a human reads to decide a merge.
+    """
+    for line, is_markup in zip(body.split("\n"), _cr_markup_mask(body), strict=True):
+        if is_markup:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("**") and stripped.rstrip("*").strip():
+            return _INLINE_MARKUP_RE.sub("", stripped).strip().strip("*").strip()[:120]
+    return _inline_title(body)
+
+
 def _scan_unreadable(what: str) -> tuple[bool, str]:
     """Return value for a finding scan that could NOT be read — a gh error,
     timeout, or malformed JSON — as distinct from a scan that ran and found
@@ -1352,6 +1628,11 @@ def _check_inline_review_findings(
     p2: list[str] = []
     doc_skipped: list[str] = []  # P1s on doc paths — surfaced, never blocking
     doc_skipped_p2: list[str] = []  # P2s on doc paths — surfaced, excluded from score
+    cr_block: list[str] = []  # CodeRabbit Critical/Major — 1.0 each
+    cr_advisory: list[str] = []  # every other CodeRabbit level — surfaced, 0.0
+    cr_unknown: list[str] = []  # a severity header naming a level we don't know
+    cr_doc_skipped: list[str] = []  # CodeRabbit Critical/Major on a doc path
+    unmatched_bot: list[tuple[str, str]] = []  # (login, title) — read, unrecognised
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
         body = c.get("body") or ""
@@ -1359,6 +1640,58 @@ def _check_inline_review_findings(
             continue
         if c.get("reply_to"):
             continue  # replies aren't findings
+        if login in _CODERABBIT_LOGINS:
+            # Engagement is checked ONCE, for the whole comment, BEFORE severity —
+            # not per-severity below. It used to sit inside the blocking branch, so
+            # only Critical/Major honoured a maintainer reply while every Minor,
+            # Trivial, Info and unknown-severity finding was re-reported on every
+            # run no matter how many times it had been consciously answered. That
+            # contradicted the promise made two comments down ("the same engagement
+            # treatment the Codex path gets"), and a growing list of already-settled
+            # advisories is how a genuinely unresolved one gets buried.
+            #
+            # Comment-level granularity is the only granularity GitHub offers — a
+            # reply attaches to the comment, not to one finding inside a bundle —
+            # and it matches what the Codex P1/P2 paths already do.
+            if c.get("id") in replied_to:
+                continue
+            # ONE COMMENT CAN CARRY SEVERAL FINDINGS — see _cr_findings. Scoring
+            # the comment rather than each finding undercounts, and a Major
+            # bundled after a Minor disappears entirely.
+            for seg in _cr_findings(body):
+                # Same engagement and doc-path treatment the Codex path gets
+                # below — otherwise the two reviewers are inconsistent for no
+                # stated reason, and a maintainer-accepted finding from one
+                # would still block.
+                severity, _header_seen = _cr_severity(seg)
+                if severity not in _CR_BLOCKING_SEVERITIES:
+                    title = _coderabbit_title(seg)
+                    if severity is None:
+                        # No recognised severity — whether the header names a
+                        # level this gate does not know, is ambiguous, or is
+                        # missing entirely. Every observed CodeRabbit finding
+                        # leads with the italic pipe header, so a headerless
+                        # original is FORMAT DRIFT: filing it as an ordinary
+                        # advisory printed "below Major" about a level that was
+                        # never read, and a drifted Major would ride through
+                        # under that label (Codex P2, PR #1677).
+                        cr_unknown.append(title)
+                    else:
+                        cr_advisory.append(title)
+                    continue
+                if _is_doc_path(c.get("path") or "") and _doc_findings_mode() == "skip":
+                    # Its OWN list, not the Codex `doc_skipped` one — landing a
+                    # CodeRabbit finding there printed it as "[doc P1]" under a
+                    # heading that names Codex severities, which misattributes
+                    # both the reviewer and the level. Mirrors the Codex P1
+                    # branch's mode handling: Critical/Major carry P1-equivalent
+                    # weight, so under `p1_only` or `score` this falls through
+                    # and DOES block — otherwise the stricter setting silently
+                    # enforced one reviewer and not the other (Codex P2, #1677).
+                    cr_doc_skipped.append(_coderabbit_title(seg))
+                    continue
+                cr_block.append(_coderabbit_title(seg))
+            continue
         if _INLINE_P1_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — treated as acknowledged
@@ -1382,7 +1715,47 @@ def _check_inline_review_findings(
                 doc_skipped_p2.append(_inline_title(body))
                 continue
             p2.append(_inline_title(body))
+        else:
+            # The silent-drop CLASS, not just its CodeRabbit instance. A comment
+            # that reached this loop was authored by a Bot or an allowlisted review
+            # account, so it is review output by construction — and until this
+            # branch existed, any such comment matching no known severity format
+            # fell out of the if/elif and contributed nothing, indistinguishable
+            # from a clean PR. That is exactly how 104 CodeRabbit findings went
+            # unseen. `github-advanced-security[bot]` is allowlisted TODAY with no
+            # matcher of its own and would have been the next one.
+            # Surfaced, never scored: recognising a format is what earns a weight,
+            # and guessing a severity from an unknown format would be worse than
+            # the blindness. The point is that it can no longer be INVISIBLE.
+            unmatched_bot.append((login, _inline_title(body)))
 
+    if unmatched_bot:
+        print(
+            f"NOTE: PR #{pr_num} — {len(unmatched_bot)} review-bot comment(s) in a "
+            f"format this gate does not recognise. NOT scored; listed so an "
+            f"unrecognised reviewer cannot be silently invisible:",
+            file=sys.stderr,
+        )
+        for bot_login, title in unmatched_bot[:5]:
+            print(f"  [unrecognised: {bot_login}] {title}", file=sys.stderr)
+    if cr_unknown:
+        print(
+            f"NOTE: PR #{pr_num} — {len(cr_unknown)} CodeRabbit finding(s) whose "
+            f"severity this gate could not read (unknown level, ambiguous header, "
+            f"or no recognisable header — the format may have changed). "
+            f"NOT scored — verify the level by hand before merging:",
+            file=sys.stderr,
+        )
+        for title in cr_unknown[:5]:
+            print(f"  [CodeRabbit unknown-severity] {title}", file=sys.stderr)
+    if cr_doc_skipped:
+        print(
+            f"NOTE: PR #{pr_num} — {len(cr_doc_skipped)} CodeRabbit Critical/Major "
+            f"finding(s) on documentation paths, NOT blocking:",
+            file=sys.stderr,
+        )
+        for title in cr_doc_skipped[:5]:
+            print(f"  [doc CodeRabbit Critical/Major] {title}", file=sys.stderr)
     if doc_skipped:
         print(
             f"NOTE: PR #{pr_num} — {len(doc_skipped)} inline [P1] finding(s) on "
@@ -1404,7 +1777,26 @@ def _check_inline_review_findings(
     # Weighted review score: P1 = 1.0 (full blocker), P2 = 0.5. Blocks at
     # score >= threshold — any unresolved P1, OR >= 2 unresolved P2s. Doc-path
     # and maintainer-replied findings were already excluded from p1/p2 above.
-    score = len(p1) + _INLINE_P2_SCORE_WEIGHT * len(p2)
+    score = (
+        len(p1) + _INLINE_P2_SCORE_WEIGHT * len(p2) + _CR_BLOCKING_WEIGHT * len(cr_block)
+    )
+    if cr_advisory:
+        print(
+            f"NOTE: PR #{pr_num} — {len(cr_advisory)} CodeRabbit finding(s) below "
+            f"Major, surfaced and NOT counted toward the review score:",
+            file=sys.stderr,
+        )
+        for title in cr_advisory[:5]:
+            print(f"  [CodeRabbit] {title}", file=sys.stderr)
+    if cr_block:
+        print(
+            f"WARNING: PR #{pr_num} has {len(cr_block)} CodeRabbit "
+            f"Critical/Major finding(s) (each adds "
+            f"{_CR_BLOCKING_WEIGHT:.0f} to the review score):",
+            file=sys.stderr,
+        )
+        for title in cr_block[:8]:
+            print(f"  [CodeRabbit Critical/Major] {title}", file=sys.stderr)
     if p2:
         print(
             f"WARNING: PR #{pr_num} has {len(p2)} inline [P2] review finding(s) "
@@ -1416,11 +1808,17 @@ def _check_inline_review_findings(
         for title in p2[:8]:
             print(f"  [P2] {title}", file=sys.stderr)
     if score >= _INLINE_SCORE_BLOCK_THRESHOLD:
-        listing = "\n".join([f"  [P1] {t}" for t in p1[:5]] + [f"  [P2] {t}" for t in p2[:5]])
+        listing = "\n".join(
+            [f"  [P1] {t}" for t in p1[:5]]
+            + [f"  [P2] {t}" for t in p2[:5]]
+            + [f"  [CodeRabbit Critical/Major] {t}" for t in cr_block[:5]]
+        )
         return True, (
             f"review score {score:.1f} >= {_INLINE_SCORE_BLOCK_THRESHOLD:.1f} blocks "
-            f"(P1=1.0, P2={_INLINE_P2_SCORE_WEIGHT} each): {len(p1)} unresolved [P1] + "
-            f"{len(p2)} unresolved [P2] finding(s), none maintainer-replied:\n{listing}\n"
+            f"(P1=1.0, P2={_INLINE_P2_SCORE_WEIGHT}, CodeRabbit Critical/Major="
+            f"{_CR_BLOCKING_WEIGHT:.0f} each): {len(p1)} unresolved [P1] + "
+            f"{len(p2)} unresolved [P2] + {len(cr_block)} CodeRabbit "
+            f"Critical/Major finding(s), none maintainer-replied:\n{listing}\n"
             f"Fix and reply in-thread, or append '# review-override' "
             f"to the merge command to acknowledge and proceed."
         )

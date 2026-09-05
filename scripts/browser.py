@@ -16,12 +16,26 @@ Usage:
 
 import argparse
 import sys
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
 USER_DATA_DIR = Path.home() / ".genesis" / "browser-profile"
-DEFAULT_SCREENSHOT = str(Path.home() / "tmp" / "browser_screenshot.png")
+
+
+def _default_screenshot_path() -> str:
+    """A unique path per capture, so consecutive screenshots don't overwrite.
+
+    A module-level constant cannot do this — it would bind one name for the
+    life of the process, which is the bug this replaces. Same scheme as the
+    MCP tool's `_impl_browser_screenshot` (genesis/mcp/health/browser.py):
+    sortable timestamp + full uuid4 hex. Deliberately duplicated rather than
+    imported — this CLI stays free of genesis imports so it can run standalone.
+    """
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    return str(Path.home() / "tmp" / f"browser_screenshot_{stamp}_{uuid.uuid4().hex}.png")
 
 
 def _launch(pw):
@@ -83,7 +97,7 @@ def cmd_screenshot(args):
     with sync_playwright() as pw:
         context, page = _launch(pw)
         try:
-            path = args.path or DEFAULT_SCREENSHOT
+            path = args.path or _default_screenshot_path()
             page.screenshot(path=path)
             print(f"Screenshot saved: {path}")
         finally:
