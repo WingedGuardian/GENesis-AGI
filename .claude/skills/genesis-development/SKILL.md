@@ -920,15 +920,20 @@ For "does Genesis already have X", consult the subsystem map
 
 ## Adaptive Review Protocol
 
-**Review early and often DURING the build, not only at the end.** After each
-meaningful chunk of CODE — a function wired, a guard changed, a test file
-written — run the built-in `/code-review` at **low** effort. It is cheap, it
-is not a gate, and it clears nothing; its value is catching drift while the
-fix is one edit instead of a review round. (Chunks the table below rates
-"None" — docs, mechanical renames — need no in-build pass either.) Every
-defect that survives to the end-of-build review costs an adversarial cycle
-there, and every one that survives THAT costs an external Codex round against
-the escalation cap.
+**Review rides the commit, because the commit is the only mechanical
+trigger.** "After each meaningful chunk" is unenforceable — nobody can gate a
+vibe — but this repo commits continuously, so the commit IS the chunk, and the
+commit gate already refuses unreviewed code commits in every session type
+(hooks are session-agnostic; a dispatched builder hits the same gate an
+interactive one does). What this paragraph adds is the named DEFAULT below the
+substantial line: for an ordinary code commit, run the built-in `/code-review`
+at **low** effort and let its findings feed the evidence you mark. Cheap,
+catches drift while the fix is one edit instead of a review round, and it is
+NOT a clearance — the marker flow is unchanged. (Commits the table below rates
+"None" — docs, mechanical renames — stay exempt as ever.) Every defect that
+survives to the end-of-build review costs an adversarial cycle there, and
+every one that survives THAT costs an external Codex round against the
+escalation cap.
 
 **For a SUBSTANTIAL change, the end-of-build review is canonical, not the
 builder's choice: run `/deep-review`.** Substantial is the commit gate's own
