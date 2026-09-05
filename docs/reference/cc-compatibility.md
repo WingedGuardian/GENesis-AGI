@@ -1155,6 +1155,53 @@ typed turn writes no transcript, and "newest transcript" mis-attributes a
 concurrent session's — identify your own transcript by before/after set
 difference and send a real turn.
 
+### Bypass/auto mode tells the agent to edit via Bash — safe for reads, NOT for writes (measured 2.1.246, 2026-09-05)
+
+In bypass or auto permission mode the CC binary injects a meta message:
+> Do your work through the Bash tool wherever it can accomplish the job: read
+> files with cat, head, or sed -n, search with grep and find, and **make file
+> changes with sed, heredocs, or short scripts**, rather than using the
+> dedicated Read, Edit, or Write tools.
+
+**Provenance (established, not inferred):** the text is compiled into the CC
+binary and emitted purely on permission mode (`e.bypass ? … : e.steerOnly ? …`);
+it is in no `settings.json`, `CLAUDE.md`, output-style, or agent file. Because it
+is gated on MODE (where nothing prompts, so the dedicated tools' permission value
+is gone), it is an **efficiency heuristic** — it makes no correctness claim. The
+same is true of the sibling `AgentTool`/workflows restriction lines: also in the
+binary (`grep -c -a -F` → 2 occurrences each), also not install config. Neither
+is install-specific; both apply to every CC user of this version.
+
+**Reads: follow it.** `cat`/`sed -n`/`grep`/`find` are cheaper round-trips and
+carry no correctness cost.
+
+**Writes to source: do NOT use bare `sed -i`. Prefer Edit/Write.** Measured
+contrast (fixtures + results kept locally under `~/tmp/edit-probe/`, pre-registered
+decision rule):
+
+| case | `sed -i` | Edit |
+|---|---|---|
+| anchor absent | exit 0, file unchanged, **no error** (silent no-op) | refuses: "String to replace not found" |
+| anchor non-unique (×3) | exit 0, **replaces all 3**, incl. unrelated lines | refuses, names the count, demands `replace_all` |
+| anchor with regex metachar, literal intent | exit 0, **wrong-target rewrite or silent no-op** | applied correctly (literal match) |
+| control: valid unique anchor | applied | applied |
+
+Three reasons the split is correct HERE specifically (all universal to any
+Genesis clone, since the machinery is tracked):
+1. **`sed`'s silent-failure contract** above is `sed`, not this box — a
+   mis-anchored edit that changes nothing, or the wrong thing, returns exit 0.
+2. **`Edit`/`Write` fire five PostToolUse hooks** wired in the tracked
+   `.claude/settings.json` (`edit_verify_advisory`, `file_modification_audit`,
+   `edit_failure_sensor`, `subsystem_traps`, `file_context`); a `Bash` write
+   fires none of them — it bypasses the repo's own post-edit verification plane.
+3. **Heredoc writes sit in blocked-compound blast radius** — a PreToolUse block
+   discards the whole call including the heredoc, silently.
+MEASURED cost of ignoring this in practice: **75.2% of realistic edit anchors in
+this repo carry a `sed` regex metacharacter** (3,678 / 4,892 removed lines ≥8
+chars over 200 commits on `src/` + `scripts/`) — the unsafe case is the common
+one, not a tail. A "short script" that does a literal `str.replace` AND asserts
+its occurrence count is acceptable — it re-implements Edit's two checks by hand.
+
 ## Known Risks
 
 ### Rebase-Like Risk for CC

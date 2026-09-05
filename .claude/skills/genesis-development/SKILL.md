@@ -453,6 +453,25 @@ to be reverted as cross-branch contamination. Guard false-positives make this
 worse: `shell_parse` mis-parses backslash line-continuations and quoted heredoc
 bodies, so legitimate commands get blocked too.
 
+### Editing source in bypass/auto mode: reads via Bash, WRITES via Edit/Write
+
+In bypass or auto permission mode the CC binary injects a meta message telling
+the session to prefer Bash (`sed`, heredocs, scripts) over Read/Edit/Write. It
+is gated on permission mode, so it is an EFFICIENCY heuristic and makes no
+correctness claim (provenance + full measurement:
+`docs/reference/cc-compatibility.md` "Bypass/auto mode tells the agent to edit
+via Bash"). For reads and search it is simply right — use `cat`/`sed -n`/`grep`/
+`find` freely. For WRITES TO SOURCE it is not: a bare `sed -i` returns exit 0 on
+an absent anchor (silent no-op), rewrites ALL matches of a non-unique one, and
+silently hits the wrong line on a regex-metacharacter anchor where a literal was
+meant — where Edit fails LOUDLY on each. A Bash write also bypasses the five
+`Edit|Write` PostToolUse hooks (the repo's own post-edit verification plane) and
+a heredoc sits in the blocked-compound blast radius above. MEASURED: 75% of real
+edit anchors in this repo carry a `sed` metacharacter, so the unsafe case is the
+common one. Use Edit/Write for source; a script that does a literal replace AND
+asserts its occurrence count is acceptable (it re-implements Edit's checks). This
+is universal — the machinery is tracked, so every clone inherits it.
+
 ### Instance-Fix vs Class-Fix Gate
 
 When a mechanism failed to write or propagate something (a memory, a

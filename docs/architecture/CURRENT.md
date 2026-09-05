@@ -1139,7 +1139,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 29a382e7 2026-09-03
+verified: 9730efe9 2026-09-05
 ```
 
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
@@ -1340,7 +1340,16 @@ verified: 29a382e7 2026-09-03
   Genesis checkouts (foreign filings counted, never alerted); alerts at
   `critical` — the fast Telegram path, deliberately, because this class went
   unnoticed for a month. Settings lever + env kill switch as usual; disabling
-  RESOLVES the open alert rather than orphaning it.
+  RESOLVES the open alert rather than orphaning it. **Cross-store coupling (do
+  not touch blind):** the watcher's blind-scan guard uses a NON-EMPTY
+  `~/.genesis/sessions/` as its proof that CC has ever run here — without it, a
+  moved CC data root reads as a clean all-clear instead of blindness. That
+  directory is pruned at 60 days by `scripts/disk_hygiene.sh` (step 8b), so the
+  60-day floor is load-bearing for THIS check too: lower it toward a live
+  session's age and the guard silently disarms. The two do not collide today (60d
+  is far past any live session), but the coupling lives only in the script's own
+  comment — recorded here because it is exactly the do-not-touch edge the map is
+  for.
 - **Open-PR resurfacing** (LIVE): a SessionStart surface lists open PRs left
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
@@ -1756,7 +1765,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: 50b79ffb 2026-09-01
+verified: 9730efe9 2026-09-05
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
@@ -1791,8 +1800,9 @@ verified: 50b79ffb 2026-09-01
   framed, refreshed on return to Overview) is **PR-B2b** — shipped.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
-  schema paths coexist: base DDL (`schema/_tables.py`, 118 CREATE TABLE; docs
-  still say "60+") plus versioned `migrations/` run ONCE at startup before any
+  schema paths coexist: base DDL (`schema/_tables.py`, 117 CREATE TABLE, a count
+  that drifts every table-adding PR — re-measure, do not trust) plus versioned
+  `migrations/` run ONCE at startup before any
   other init step touches data; a failed migration ABORTS bootstrap. Ids are
   92 FROZEN legacy 4-digit ones (`0001`..`0093`, with a GAP at `0092` from a
   rename) plus new `YYYYMMDDHHMMSS_*.py` UTC timestamps — nobody allocates an
