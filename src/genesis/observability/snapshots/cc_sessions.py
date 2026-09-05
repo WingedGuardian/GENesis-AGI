@@ -81,18 +81,31 @@ async def cc_sessions(
     avg_duration_ms = {}
     failed_24h = 0
     try:
+        # Real columns only (2026-09-04: the old queries referenced ended_at
+        # and duration_ms, which never existed — every snapshot errored into
+        # this except and failed_24h sat at 0 forever, unreachable-branch
+        # dashboard included; a schema-pinning test now locks the class).
+        # COALESCE(completed_at, last_activity_at): the terminal timestamp
+        # where the discipline has stamped it, else the best-known end proxy —
+        # which also keeps historical unstamped rows countable with no
+        # backfill migration.
         cursor = await db.execute(
-            """SELECT session_type, AVG(duration_ms) as avg_ms
+            """SELECT session_type,
+                      AVG((julianday(COALESCE(completed_at, last_activity_at))
+                           - julianday(started_at)) * 86400000.0) as avg_ms
                FROM cc_sessions
-               WHERE status = 'completed' AND ended_at >= datetime('now', '-1 day')
+               WHERE status = 'completed'
+                 AND COALESCE(completed_at, last_activity_at) >= datetime('now', '-1 day')
                GROUP BY session_type"""
         )
         for row in await cursor.fetchall():
-            avg_duration_ms[row["session_type"]] = round(row["avg_ms"])
+            if row["avg_ms"] is not None:
+                avg_duration_ms[row["session_type"]] = round(row["avg_ms"])
 
         cursor = await db.execute(
             """SELECT COUNT(*) as cnt FROM cc_sessions
-               WHERE status = 'failed' AND ended_at >= datetime('now', '-1 day')"""
+               WHERE status = 'failed'
+                 AND COALESCE(completed_at, last_activity_at) >= datetime('now', '-1 day')"""
         )
         row = await cursor.fetchone()
         failed_24h = row["cnt"] if row else 0

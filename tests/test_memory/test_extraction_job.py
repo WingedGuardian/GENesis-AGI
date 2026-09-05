@@ -225,9 +225,10 @@ class TestSourceTagCoverage:
         )
         assert not unclassified, f"unclassified source_tag literals: {unclassified}"
 
-        # Indirect writers the regex cannot see (raw parameterized SQL) must be
-        # classified by hand — assert the known ones so they can't silently drop.
-        known_indirect = ["priority_0"]  # cc_budget.py f"priority_{n}" INSERT
+        # Legacy tags with no surviving writer must STAY classified — real
+        # installs carry the rows (priority_* from the deleted cc_budget
+        # raw-SQL INSERT). Asserted so the classification can't silently drop.
+        known_indirect = ["priority_0"]  # legacy cc_budget rows
         missing = [t for t in known_indirect if not classified(t, False)]
         assert not missing, f"unclassified indirect source_tags: {missing}"
 
@@ -391,3 +392,41 @@ class TestRunExtractionCycle:
                 "WHERE project_type='reference'",
             )
             assert (await cursor.fetchone())[0] >= 1
+
+
+class TestHonestAdoption:
+    """Filesystem adoption must record LIVE sessions as active (measured
+    2026-09-04: a session with a 4-second-old transcript adopted as
+    'completed'), and dead ones with an honest completed_at."""
+
+    @pytest.mark.asyncio
+    async def test_fresh_transcript_adopts_active(self, db, tmp_path):
+        import uuid as _uuid
+
+        sid = str(_uuid.uuid4())
+        (tmp_path / f"{sid}.jsonl").write_text('{"type":"user"}\n')  # mtime = now
+        from genesis.db.crud import cc_sessions as crud
+
+        await _find_extractable_sessions(db, transcript_dir=tmp_path)
+        row = await crud.get_by_id(db, sid)
+        assert row is not None
+        assert row["status"] == "active"
+        assert row["completed_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_stale_transcript_adopts_completed_with_timestamp(self, db, tmp_path):
+        import os
+        import uuid as _uuid
+
+        sid = str(_uuid.uuid4())
+        f = tmp_path / f"{sid}.jsonl"
+        f.write_text('{"type":"user"}\n')
+        old = 1_700_000_000  # far in the past
+        os.utime(f, (old, old))
+        from genesis.db.crud import cc_sessions as crud
+
+        await _find_extractable_sessions(db, transcript_dir=tmp_path)
+        row = await crud.get_by_id(db, sid)
+        assert row is not None
+        assert row["status"] == "completed"
+        assert row["completed_at"] is not None

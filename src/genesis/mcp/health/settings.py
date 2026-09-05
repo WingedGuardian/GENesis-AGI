@@ -251,7 +251,9 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         name="cc_foreground_reaper",
         description=(
             "Foreground-session liveness reaper (D3) — master `enabled` + `mode` "
-            "off/observe/notify, plus idle_hours/max_per_tick. notify (default) "
+            "off/observe/notify, plus idle_hours/max_per_tick and the "
+            "pid-evidence fast path (close_dead, dead_process_minutes). "
+            "notify (default) "
             "reaps abandoned foreground sessions to 'checkpointed' and tells the "
             "origin user their request was interrupted (crisp unanswered-user "
             "signal only); observe reaps + records without notifying; off does "
@@ -1539,13 +1541,13 @@ def _validate_cc_foreground_reaper(changes: dict) -> list[str]:
     from genesis.cc.foreground_reaper_config import INT_KNOBS, MODES
 
     errors: list[str] = []
-    valid_keys = ("enabled", "mode", *INT_KNOBS)
+    valid_keys = ("enabled", "mode", "close_dead", *INT_KNOBS)
     for key, value in changes.items():
         if key not in valid_keys:
             errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
-        elif key == "enabled":
+        elif key in ("enabled", "close_dead"):
             if not isinstance(value, bool):
-                errors.append("'enabled' must be a boolean")
+                errors.append(f"'{key}' must be a boolean")
         elif key == "mode":
             if value not in MODES:
                 errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
