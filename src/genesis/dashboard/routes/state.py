@@ -348,9 +348,16 @@ async def settings_timezone():
             # replaced, which at least left the file intact. Side the original
             # first, and tell the operator where it went.
             if not isinstance(loaded, dict):
-                backup = cfg_path.with_suffix(
-                    f".malformed-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.yaml"
-                )
+                # Second-resolution timestamps COLLIDE: two malformed writes in
+                # the same second would have the second overwrite the first
+                # backup, losing the very content the backup exists to preserve.
+                # Find a free name instead of trusting the clock to be unique.
+                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+                backup = cfg_path.with_suffix(f".malformed-{stamp}.yaml")
+                suffix = 2
+                while backup.exists():
+                    backup = cfg_path.with_suffix(f".malformed-{stamp}-{suffix}.yaml")
+                    suffix += 1
                 shutil.copy2(cfg_path, backup)
                 malformed_backup = str(backup)
                 logger.warning(

@@ -175,3 +175,27 @@ def test_the_ui_actually_renders_the_recovery_warning():
         "never told the config was replaced or where the backup went"
     )
     assert "alert(" in handler, "the warning must be impossible to miss, not just logged"
+
+
+def test_a_second_malformed_write_does_not_overwrite_the_first_backup(client, tmp_path):
+    """Timestamps are second-resolution, so two writes in one second collide.
+
+    The backup exists to preserve content that is about to be replaced; a colliding
+    name silently destroys the earlier one, which is the same data loss the backup
+    was added to prevent, one level down.
+    """
+    cfg = _write_malformed(tmp_path)
+    first_content = cfg.read_text()
+    assert client.post("/api/genesis/settings/timezone",
+                       json={"timezone": "Europe/Paris"}).status_code == 200
+
+    # Break it again and repeat immediately — same second in practice.
+    cfg.write_text("- second: malformed\n")
+    second_content = cfg.read_text()
+    assert client.post("/api/genesis/settings/timezone",
+                       json={"timezone": "Europe/Lisbon"}).status_code == 200
+
+    backups = sorted(cfg.parent.glob("genesis.malformed-*.yaml"))
+    assert len(backups) == 2, f"a backup was overwritten: {[b.name for b in backups]}"
+    saved = {b.read_text() for b in backups}
+    assert first_content in saved and second_content in saved
