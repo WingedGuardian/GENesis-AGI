@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,10 +28,40 @@ import aiosqlite
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
-from genesis.observability.commit_identity import is_stale
+from genesis.observability.commit_identity import differs_from_head
 from genesis.observability.mcp_spawn_store import read_spawn_identity
 
 logger = logging.getLogger(__name__)
+
+_SHA_RE = re.compile(r"[0-9a-fA-F]{4,64}")
+# A REQUEST-path bound, not the background-tick one. `git_health._CHEAP_TIMEOUT_S`
+# is 10s, which is fine for a periodic health probe but would pin a worker thread
+# for ten seconds on a dashboard fetch; `rev-parse HEAD` measures ~4ms, and the
+# only thing that makes it slow is a wedged filesystem.
+_HEAD_TIMEOUT_S = 1.5
+
+
+def _current_head() -> str | None:
+    """The main tree's CURRENT commit, or None if unknowable.
+
+    The badge compares each slot's spawn commit against this. Reads the MAIN
+    tree (`env.repo_root()`) because that is the tree a spawn identity is
+    captured from (`mcp_spawn_identity`), so both sides are on one line even for
+    a worktree session. Sync + cheap (~4 ms); the caller runs it off the event
+    loop. Fail-open None on any git failure → nothing is flagged.
+    """
+    from genesis.env import repo_root
+    from genesis.observability.git_health import _run_git
+
+    rc, out, _ = _run_git(repo_root(), "rev-parse", "HEAD", timeout=_HEAD_TIMEOUT_S)
+    sha = out.strip()
+    # Hex-guard the result, matching the hook's `_is_sha` chokepoint: the value
+    # is rendered into a browser tooltip and could otherwise carry anything git
+    # printed. Alpine binds it as text, not HTML, so this is defense in depth —
+    # but the two readers of the same file plane should not disagree about what
+    # counts as a commit.
+    return sha if rc == 0 and _SHA_RE.fullmatch(sha) else None
+
 
 ORIGIN_PROMPT_CAP = 4000  # chars — origins are typically short; a pasted wall is truncated
 WAYPOINT_TAIL = 200  # newest waypoint lines returned (compaction cadence makes this ~weeks)
@@ -122,32 +153,44 @@ async def _collect_detail(
     db,
     slots: list[dict],
     now: datetime | None = None,
-    deploy: tuple[str, str] | None = None,
+    head: str | None = None,
 ) -> dict:
-    """Assemble the modal payload. `slots` and `deploy` are passed in so tests
-    inject fakes instead of scanning /proc or reading update_history.
+    """Assemble the modal payload. `slots` and `head` are passed in so tests
+    inject fakes instead of scanning /proc or shelling out to git.
 
-    `deploy` is `(completed_at, new_commit)` of the last successful deploy
-    (`update_history.last_successful_update`, or None). A live proc is flagged
-    `stale_code` iff its PERSISTED (spawn_commit, spawn_at) — read per slot,
-    pid-validated — is BEHIND that deploy: commit differs AND the deploy completed
-    after the proc started. This is the exact `commit_identity.is_stale` verdict
-    Part A's guard uses, so a session AHEAD of the last recorded deploy (main tree
-    advanced by a manual `git pull`) is NOT flagged. Fail-open: unknown identity or
-    no deploy → not stale. Default None → nothing stale (empty-state)."""
+    `head` is the main tree's CURRENT commit. A live proc is flagged
+    `code_differs` iff its PERSISTED spawn commit — read per slot, pid-validated —
+    differs from it (`commit_identity.differs_from_head`), which is the same AWARENESS
+    verdict the per-prompt deploy nudge uses, so badge and nudge cannot disagree.
+
+    This deliberately does NOT use `is_stale`/`update_history`, which the badge
+    read until 2026-09-03: that record captured 10.9% of real HEAD movements on
+    a live install (5 rows against 46 movements in 30 days), because the
+    sanctioned code-only deploy path writes no row — so the badge showed
+    sessions as fresh while they ran commits-old code. The MCP middleware guard
+    still uses `is_stale`; see `commit_identity` for why that divergence is
+    intended.
+
+    Fail-open: unknown identity or unknown head → no difference reported.
+    Default None → nothing flagged (empty-state)."""
     now = now or datetime.now(UTC)
     db.row_factory = aiosqlite.Row
 
-    def _slot_stale(
+    def _slot_differs(
         slot: str | None, spid: int | None, proc_start: str | None = None
     ) -> tuple[bool, str | None]:
-        """(stale, deploy_commit_to_restart_to) for a live slot proc."""
+        """(differs, commit_to_restart_to) for a live slot proc.
+
+        DIFFERS, not "stale": two shas can only be compared for equality, and
+        the checkout is not always the newer side (a reset, a force-move, or a
+        checkout of an earlier ref puts the newer code in the RUNNING process).
+        See `commit_identity.differs_from_head`.
+        """
         ident = read_spawn_identity(slot, spid, proc_start)
-        if not ident or not deploy:
+        if not ident or not head:
             return False, None
-        completed_at, new_commit = deploy
-        if is_stale(ident[0], ident[1], completed_at, new_commit):
-            return True, new_commit
+        if differs_from_head(ident[0], head):
+            return True, head
         return False, None
 
     cutoff = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
@@ -170,25 +213,25 @@ async def _collect_detail(
         "discrepant": 0,
         "completed_24h": 0,
         "failed_24h": 0,
-        "stale_code": 0,
+        "code_differs": 0,
     }
     for row in rows:
         live = None
         pid = row.get("pid")
         if pid in slot_by_pid and pid not in consumed:
             s = slot_by_pid[pid]
-            stale, dc = _slot_stale(s.get("slot"), s.get("pid"), s.get("started_at"))
+            differs, dc = _slot_differs(s.get("slot"), s.get("pid"), s.get("started_at"))
             live = {
                 "slot": s.get("slot"),
                 "pid": s.get("pid"),
                 "rss_mb": s.get("rss_mb"),
                 "slot_status": s.get("status"),
                 "started_at": s.get("started_at"),
-                "stale_code": stale,
-                "deploy_commit": dc,
+                "code_differs": differs,
+                "head_commit": dc,
             }
-            if stale:
-                stats["stale_code"] += 1
+            if differs:
+                stats["code_differs"] += 1
             consumed.add(pid)
 
         flags: list[str] = []
@@ -235,11 +278,11 @@ async def _collect_detail(
         if s.get("pid") is None or s["pid"] in consumed:
             continue
         d = dict(s)
-        stale, dc = _slot_stale(s.get("slot"), s.get("pid"))
-        d["stale_code"] = stale
-        d["deploy_commit"] = dc
-        if stale:
-            stats["stale_code"] += 1
+        differs, dc = _slot_differs(s.get("slot"), s.get("pid"))
+        d["code_differs"] = differs
+        d["head_commit"] = dc
+        if differs:
+            stats["code_differs"] += 1
         unmatched_slots.append(d)
     stats["discrepant"] += len(unmatched_slots)
 
@@ -256,7 +299,6 @@ async def _collect_detail(
 async def cc_sessions_detail():
     """Per-session detail for the CC Sessions modal: DB rows × live procs ×
     charters, with discrepancy flags."""
-    from genesis.db.crud.update_history import last_successful_update
     from genesis.observability.cc_slots import enumerate_cc_slots
     from genesis.runtime import GenesisRuntime
 
@@ -266,8 +308,9 @@ async def cc_sessions_detail():
 
     # /proc scan is ~1s of sync syscalls — keep it off the event loop.
     slots = await asyncio.to_thread(enumerate_cc_slots)
-    deploy = await last_successful_update(rt.db)  # (completed_at, new_commit) | None
-    return jsonify(await _collect_detail(rt.db, slots, deploy=deploy))
+    # Same treatment for the git call: sync subprocess, off the loop.
+    head = await asyncio.to_thread(_current_head)
+    return jsonify(await _collect_detail(rt.db, slots, head=head))
 
 
 # ── per-session cockpit detail (session-manager PR-4b) ──────────────────────

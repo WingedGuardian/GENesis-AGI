@@ -187,16 +187,17 @@ class TestHooksDoNotEscapeSessionDir:
             "a safe id must still be buffered — the guard is inert, not selective"
         )
 
-    def test_urgent_alerts_staleness_marker_does_not_escape(self, tmp_path, monkeypatch):
+    def test_urgent_alerts_deploy_stamp_does_not_escape(self, tmp_path, monkeypatch):
         mod = _load("genesis_urgent_alerts", "genesis_urgent_alerts.py")
         monkeypatch.setattr(mod, "_GENESIS_DIR", tmp_path / ".genesis")
-        mod._record_staleness_nudge("../../escaped2", datetime.now(UTC))
+        sha = "0123456789abcdef0123456789abcdef01234567"
+        mod._record_deploy_notice("../../escaped2", sha)
         assert not (tmp_path / "escaped2").exists()
         # Same control as above: prove the guard discriminates rather than refuses
         # everything.
-        mod._record_staleness_nudge(REAL_IDS[0], datetime.now(UTC))
+        mod._record_deploy_notice(REAL_IDS[0], sha)
         assert (tmp_path / ".genesis" / "sessions" / REAL_IDS[0]).exists(), (
-            "a safe id must still record its marker"
+            "a safe id must still record its stamp"
         )
 
     def test_proactive_trail_path_does_not_escape(self, tmp_path, monkeypatch):

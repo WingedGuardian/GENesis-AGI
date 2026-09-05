@@ -524,6 +524,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Your session now tells you when a deploy lands underneath it — and the
+  warning that was supposed to do that actually fires.** A Claude Code session's
+  MCP subprocesses load Genesis code once at spawn and never reload, so pulling
+  new code mid-session leaves recall (and its security read-exclusions) running
+  the old build until you restart. The existing warning keyed on
+  `update_history`, which only `scripts/update.sh` writes — so the sanctioned
+  code-only deploy path (`git pull` + reinstall + restart) was invisible to it.
+  Measured on a live install over 30 days: only 5 of 46 real code changes were
+  recorded at all, and a per-change replay of whether a session would actually be
+  *told* scored the old warning at 4/52 against 52/52 for the new one. Worse, it
+  could only ever fire for sessions started *before* the last `update.sh` run, so
+  once you deployed by pulling, later sessions went unwarned until the next
+  `update.sh` — days at a time in practice, while the tree moved dozens of
+  commits (one session measured 15 commits behind, silent).
+  It now compares your session's code against what is actually checked out, and
+  names what landed: how far the tree moved, which PRs merged, and that hooks are
+  already live while MCP and genesis-server need a session restart. It speaks
+  once per deploy rather than re-nudging on a timer. The dashboard's stale-code
+  badge is fixed the same way. The `procedure_store` staleness guard deliberately
+  keeps the old conservative rule — widening a block that refuses a tool is a
+  decision to take on its own, not a side effect of this fix.
 - **Campaign names stored before the control-character fix are now cleaned at
   startup.** Names have been sanitized at the write boundary since the previous
   release, so nothing new lands malformed, but rows written earlier were never

@@ -1,9 +1,17 @@
-"""Tests for the prefix-tolerant commit-identity compare (stdlib leaf shared by
-the Part A guard and the Part B dashboard badge)."""
+"""Tests for the commit-identity leaf: the prefix-tolerant compare, plus the
+TWO verdicts it deliberately carries.
+
+`differs_from_head` (AWARENESS — spawn vs live HEAD) drives the advisory surfaces: the
+per-prompt deploy nudge and the dashboard stale-code badge. `is_stale`
+(AUTHORIZATION — spawn vs the last RECORDED deploy) drives the MCP middleware
+guard, which BLOCKS a tool, and stays deliberately conservative. The
+`test_the_two_verdicts_*` cases below pin that divergence so a future change
+cannot quietly collapse them into one.
+"""
 
 from __future__ import annotations
 
-from genesis.observability.commit_identity import is_stale, same_commit
+from genesis.observability.commit_identity import differs_from_head, is_stale, same_commit
 
 FULL = "0123456789abcdef0123456789abcdef01234567"
 SHORT = FULL[:8]
@@ -76,3 +84,64 @@ def test_mixed_offset_timestamps_compared_by_instant():
     assert (
         is_stale(FULL, "2026-07-14T11:30:00+00:00", "2026-07-14T09:00:00-04:00", "fedcba98") is True
     )  # =13:00Z > 11:30Z
+
+
+# ── differs_from_head (AWARENESS: spawn vs live HEAD) ───────────────────────────────
+
+
+def test_behind_when_commits_differ():
+    assert differs_from_head(FULL, "fedcba9876543210fedcba9876543210fedcba98") is True
+
+
+def test_not_behind_at_head():
+    assert differs_from_head(FULL, FULL) is False
+
+
+def test_not_behind_when_head_is_the_short_form_of_spawn():
+    # A short/full mismatch is the SAME commit, not a deploy.
+    assert differs_from_head(FULL, SHORT) is False
+    assert differs_from_head(SHORT, FULL) is False
+
+
+def test_behind_fails_open_on_missing_inputs():
+    assert differs_from_head(None, FULL) is False
+    assert differs_from_head(FULL, None) is False
+    assert differs_from_head("", FULL) is False
+    assert differs_from_head(FULL, "") is False
+
+
+def test_behind_has_no_time_axis():
+    """Unlike is_stale, differs_from_head takes no timestamps: nothing can be ahead of
+    live HEAD, so there is no ahead/behind ambiguity to resolve."""
+    import inspect
+
+    assert list(inspect.signature(differs_from_head).parameters) == ["spawn_commit", "head_commit"]
+
+
+# ── the two verdicts are deliberately different ─────────────────────────────
+
+
+def test_the_two_verdicts_diverge_on_the_measured_live_case():
+    """The defect that motivated `differs_from_head`, as measured on a live install.
+
+    A session spawned 2026-09-02 was 15 commits behind HEAD, while the newest
+    `update_history` row was completed 2026-08-31 — BEFORE the spawn. `is_stale`
+    requires the recorded deploy to postdate the spawn, so it is silent; the
+    session really was behind, and `differs_from_head` says so.
+    """
+    spawn, spawn_at = FULL, "2026-09-02T19:37:13+00:00"
+    head = "fedcba9876543210fedcba9876543210fedcba98"
+    recorded_deploy_at, recorded_commit = "2026-08-31T21:48:19+00:00", "87590955"
+
+    assert is_stale(spawn, spawn_at, recorded_deploy_at, recorded_commit) is False
+    assert differs_from_head(spawn, head) is True
+
+
+def test_the_two_verdicts_agree_when_the_record_is_current():
+    """When update_history HAS kept up, both verdicts fire — the conservative
+    one is a subset of the accurate one, never a contradiction."""
+    spawn, spawn_at = FULL, "2026-08-20T00:00:00+00:00"
+    head = "fedcba9876543210fedcba9876543210fedcba98"
+
+    assert is_stale(spawn, spawn_at, "2026-08-21T00:00:00+00:00", head) is True
+    assert differs_from_head(spawn, head) is True

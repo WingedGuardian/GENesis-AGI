@@ -93,10 +93,10 @@
                     <span style="font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: 4px; background: rgba(240,173,78,0.15); color: #f0ad4e; white-space: nowrap;"
                           x-text="'proc alive, db says ' + s.status"></span>
                   </template>
-                  <template x-if="s.live && s.live.stale_code">
+                  <template x-if="s.live && s.live.code_differs">
                     <span style="font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: 4px; background: rgba(240,173,78,0.15); color: #f0ad4e; white-space: nowrap;"
-                          :title="'This session\'s MCP tools are running pre-deploy code (deployed commit ' + (s.live.deploy_commit || '?') + '). Restart the session to load it.'"
-                          x-text="'stale · restart for ' + (s.live.deploy_commit || 'latest')"></span>
+                          :title="'This session\'s MCP tools are running code that DIFFERS from the checkout (now at ' + (s.live.head_commit || '?') + '). Usually the checkout moved ahead; after a reset or a branch switch it can differ the other way. Restart the session to load what is checked out now.'"
+                          x-text="'differs · restart for ' + ((s.live.head_commit || 'latest').slice(0, 8))"></span>
                   </template>
                 </div>
               </template>
@@ -109,10 +109,10 @@
                 <template x-for="u in $store.genesisDashboard.ccSessionsModal.data.unmatched_slots" :key="u.pid">
                   <div style="font-size: 0.75rem; color: #f87171; display: flex; gap: 0.4rem; align-items: center;">
                     <span x-text="(u.slot ? '#' + u.slot + ' ' : '') + 'pid ' + u.pid + ' ' + (u.rss_mb / 1024).toFixed(1) + 'G (' + u.status + ')'"></span>
-                    <template x-if="u.stale_code">
+                    <template x-if="u.code_differs">
                       <span style="font-size: 0.68rem; padding: 0.05rem 0.35rem; border-radius: 4px; background: rgba(240,173,78,0.15); color: #f0ad4e; white-space: nowrap;"
-                            :title="'This process is running pre-deploy code (deployed commit ' + (u.deploy_commit || '?') + '). Restart it to load the deployed code.'"
-                            x-text="'stale · restart for ' + (u.deploy_commit || 'latest')"></span>
+                            :title="'This process is running code that DIFFERS from the checkout (now at ' + (u.head_commit || '?') + '). Usually the checkout moved ahead; after a reset or a branch switch it can differ the other way. Restart it to load what is checked out now.'"
+                            x-text="'differs · restart for ' + ((u.head_commit || 'latest').slice(0, 8))"></span>
                     </template>
                   </div>
                 </template>

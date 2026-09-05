@@ -6,9 +6,9 @@ tags to stdout (the harness prepends them to the prompt as context) and
 maintains session-scoped state files:
 1. Absolute timestamp / session clock (temporal awareness)
 2. Charter drift tag ([Charter: … | open: N]; chartered sessions only)
-3. MCP stale-code nudge — only when THIS session's MCP subprocesses run code
-   OLDER than the last deploy (they snapshot code at spawn and never reload;
-   there is no auto-restart, so the user is nudged to restart); throttled
+3. Deploy nudge — only when main has MOVED under this session (its MCP
+   subprocesses snapshot code at spawn and never reload, and there is no
+   auto-restart, so the session is told what landed); once per deploy
 4. Rolling buffer of the last few user messages (for session bookmarks)
 5. /shelve|/unshelve soft hint
 
@@ -33,7 +33,9 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
+import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.request import pathname2url
@@ -62,10 +64,37 @@ _MAX_MSG_LENGTH = 200
 
 _SHELVE_PATTERN = re.compile(r"/(?:shelve|unshelve)\b", re.IGNORECASE)
 
-# Re-nudge a stale session at most this often (staleness persists until the
-# session restarts, but a single scrolled-away banner is easy to miss, so a
-# quiet periodic reminder is worth more than a once-ever one).
-_STALENESS_COOLDOWN_S = 3 * 3600
+# The deploy nudge speaks ONCE PER DEPLOY, not on a clock: it stamps the sha it
+# announced and stays silent until HEAD moves again. A deploy is an EVENT, so the
+# periodic re-nudge the old update_history-keyed banner used would repeat the
+# same line for the life of the session now that detection actually fires.
+_DEPLOY_STAMP = "deploy_notified"
+# `git rev-parse HEAD` measured at 3.86 ms on the reference install. The bound is
+# BUDGETED, not nominal: this hook's own timeout in .claude/settings.json is 10s
+# and it must also cover two SQLite opens, so two git calls may not be allowed to
+# consume it between them. 1.5s is still ~390x the measured cost, and the only
+# thing that makes git slower is a wedged/read-only filesystem.
+_GIT_TIMEOUT_S = 1.5
+# Keep the notice to one line; the rest collapse into "+N more".
+_PR_CAP = 5
+_SHA_RE = re.compile(r"[0-9a-fA-F]{4,64}")
+
+
+def _is_sha(value: str | None) -> bool:
+    """True iff ``value`` is a bare hex commit ref.
+
+    THE chokepoint — every sha is validated through here, and validation happens
+    where a value ENTERS (a git argv, the emitted line), never only where it is
+    printed. That ordering is the point: a spawn commit read from the file plane
+    reaches ``git log`` as part of the ``<spawn>..<head>`` operand, and git
+    accepts leading-dash operands as OPTIONS. MEASURED with git 2.43.0: a value
+    of ``--output=<path>`` makes ``git log`` create/truncate ``<path>..HEAD`` and
+    exit 0 with empty stdout — an arbitrary-write primitive that then reads as a
+    silent no-op. The file plane is written only from ``git rev-parse`` output
+    today, so this is defense in depth; but it is defense the module previously
+    only CLAIMED to have, because the guard sat downstream of the git call.
+    """
+    return bool(value) and _SHA_RE.fullmatch(value) is not None
 
 
 def _get_session_start() -> str:
@@ -271,125 +300,278 @@ def _claude_ancestor_pid() -> int | None:
     return None
 
 
-def _last_successful_deploy(db_path: Path) -> tuple[str, str] | None:
-    """``(completed_at, new_commit)`` of the newest successful deploy, or None.
+def _current_head(root: Path) -> str | None:
+    """The main tree's CURRENT HEAD sha, or None if unknowable.
 
-    Read-only stdlib sqlite3 (``mode=ro`` URI — WAL-aware, never ``immutable=1``
-    which misses un-checkpointed writes), tight budget: runs on EVERY prompt.
-    Mirrors ``db.crud.update_history.last_successful_update`` exactly (same
-    ``status='success'`` filter + ``datetime(completed_at)`` ordering) but
-    stdlib-only so the hook never imports aiosqlite. None on any failure."""
-    if not db_path.exists():
+    A subprocess ``git rev-parse``, deliberately, rather than reading
+    ``.git/HEAD`` and the ref file: a ref may live loose, packed in
+    ``packed-refs``, or both (all three states occur), so a loose-only reader
+    works until the next ``git gc`` and then fails SILENTLY — the worst failure
+    mode for a fail-open hook. Measured at 3.86 ms on the reference install,
+    against a hook that already opens SQLite twice.
+
+    ``root`` is the MAIN tree. That is the same tree a spawn identity is
+    captured from (``mcp_spawn_identity`` reads ``env.repo_root()`` so a
+    worktree session still reports main's HEAD), so both sides of the
+    comparison are on one line. Fail-open None on any failure.
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    sha = proc.stdout.strip()
+    # Validate BEFORE returning: this value becomes a git argv operand in
+    # _deploy_span, not just message text. See _is_sha.
+    return sha if _is_sha(sha) else None
+
+
+def _deploy_span(root: Path, spawn: str, head: str) -> tuple[int, int, list[str]] | None:
+    """``(landed, only_ours, pr_numbers)`` for ``spawn...head``, or None on failure.
+
+    ONE ``git log``, reached only after ``differs_from_head`` has already said
+    the shas differ — so the cost lands on the transition, never on the steady
+    state.
+
+    THE SPLIT IS THE POINT. ``differs_from_head`` compares two shas and so knows
+    only that they are not equal; the DIRECTION lives in the history, and this is
+    where the history is read. A symmetric ``spawn...head`` with ``--left-right``
+    answers it in that same one call: ``>`` marks a commit only the checkout has
+    (what landed under us), ``<`` marks one only this process has (what the
+    checkout does not contain).
+
+    Returning the two counts separately, rather than a single number, is what
+    makes the three states distinguishable by the caller instead of guessed:
+
+        only_ours == 0, landed > 0   main moved forward — an ordinary deploy
+        only_ours > 0,  landed > 0   the histories DIVERGED (a rebase/force-move)
+        only_ours > 0,  landed == 0  the checkout moved BACK past this process
+
+    The predecessor asked ``spawn..head`` (two dots) and read a count of zero as
+    "diverged". That is wrong in both directions and it is the defect Codex named
+    (P2, PR #1651): git defines ``A..B`` as commits reachable from B and not from
+    A, so a genuine divergence is NON-zero and was reported as an ordinary
+    "main moved N commits", while zero actually means the checkout moved BACK —
+    the one case where restarting loses code rather than gaining it.
+
+    PR numbers come from the trailing ``(#N)`` that squash merges append —
+    MEASURED 40/40 on recent main commits. Anchored to end-of-line so a subject
+    that cites another PR mid-sentence (``(supersedes #1446) (#1577)``) yields
+    only the real merge number. Newest first, as ``git log`` orders them.
+
+    Both refs are re-validated here rather than trusted from the caller: they
+    become a single ``<spawn>..<head>`` argv operand, and git reads a
+    leading-dash operand as an OPTION (see ``_is_sha``).
+    """
+    if not _is_sha(spawn) or not _is_sha(head):
         return None
     try:
-        conn = sqlite3.connect(_ro_uri(db_path), uri=True, timeout=0.5)
-        try:
-            conn.execute("PRAGMA busy_timeout=300")
-            row = conn.execute(
-                "SELECT completed_at, new_commit FROM update_history "
-                "WHERE status = 'success' ORDER BY datetime(completed_at) DESC LIMIT 1"
-            ).fetchone()
-        finally:
-            conn.close()
-    except sqlite3.Error:
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            [
+                "git",
+                "-C",
+                str(root),
+                "log",
+                "--oneline",
+                "--left-right",
+                f"{spawn}...{head}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
-    if not row or not row[0] or not row[1]:
+    if proc.returncode != 0:
         return None
-    return str(row[0]), str(row[1])
+    # Split on "\n" ONLY, not str.splitlines(): the latter also breaks on
+    # U+2028/U+2029/\x0b/\x85, which a commit subject may legitimately contain —
+    # MEASURED, one such subject becomes two "commits", inflating the count and
+    # losing that line's PR number. The count is the one author-influenceable
+    # value in an LLM-visible line, so it gets the exact separator git used.
+    lines = [ln for ln in proc.stdout.split("\n") if ln.strip()]
+    # `--left-right` prefixes every line with `<` or `>` and nothing else, so the
+    # side is read off column 0. A line with neither marker is not classified as
+    # either side: it would mean git changed its output shape, and inventing a
+    # side for it is how a wrong direction gets asserted with confidence.
+    landed = [ln for ln in lines if ln.startswith(">")]
+    only_ours = [ln for ln in lines if ln.startswith("<")]
+    prs = [m.group(1) for ln in landed if (m := re.search(r"\(#(\d+)\)$", ln))]
+    return len(landed), len(only_ours), prs
 
 
-def _staleness_message(
-    spawn_commit: str, spawn_at: str, deploy: tuple[str, str] | None
+def _deploy_message(
+    spawn: str, head: str, landed: int, only_ours: int, prs: list[str]
 ) -> str | None:
-    """The nudge line if this session's MCP code is BEHIND the deploy, else None.
+    """The notice line, or None when there is nothing honest to say.
 
-    ``deploy`` is ``(completed_at, new_commit)``. Delegates the verdict to
-    ``commit_identity.is_stale`` — the EXACT same leaf the dashboard stale-code
-    badge and the Part-A guard use, so all three can never disagree (a session
-    AHEAD of the last recorded deploy, e.g. a manual ``git pull``, is NOT
-    flagged). Pure (no IO) so the verdict+wording is unit-testable."""
-    from genesis.observability.commit_identity import is_stale
+    Pure (no IO) so the wording and every suppression rule are unit-testable.
+    Suppresses on a non-sha either side (the line becomes LLM-visible prompt
+    context, so nothing but a real sha is ever interpolated) and when neither
+    side has a unique commit (nothing observed, so nothing to say).
 
-    if not deploy:
+    THE LEAD CLAUSE IS CHOSEN BY THE COUNTS, NOT ASSUMED. Three states reach
+    here (see ``_deploy_span``) and they are not the same news:
+
+    * main moved forward — the ordinary deploy, and the only one that may say so;
+    * the histories diverged — this process holds commits the checkout does not,
+      so a restart REPLACES that code rather than catching up to it;
+    * the checkout moved back — a restart loses code outright.
+
+    The remedy tail is identical in all three (a restart is still what changes
+    what is loaded), which is exactly why the lead has to carry the difference.
+
+    Carries only shas, counts, and PR numbers: no commit subjects, no paths,
+    no branch names. That is a privacy floor and it also removes tag-forgery as
+    a concern outright — there is no attacker-controlled text in the line.
+    """
+    if not _is_sha(spawn) or not _is_sha(head):
         return None
-    completed_at, new_commit = deploy
-    # Defense-in-depth: this value becomes LLM-visible prompt context, so only ever
-    # interpolate a real short/full SHA. update_history is deploy-pipeline-only today
-    # (no user-facing writer), but a hex guard removes the vector entirely rather
-    # than trusting provenance. Also fail-open (skip) on a malformed commit.
-    if not re.fullmatch(r"[0-9a-fA-F]{4,64}", new_commit or ""):
+    if landed <= 0 and only_ours <= 0:
         return None
-    if not is_stale(spawn_commit, spawn_at, completed_at, new_commit):
-        return None
-    date = str(completed_at)[:10]  # YYYY-MM-DD
+    shown = prs[:_PR_CAP]
+    pr_clause = ""
+    if shown:
+        listed = " ".join(f"#{n}" for n in shown)
+        if len(prs) > len(shown):
+            listed += f" +{len(prs) - len(shown)} more"
+        pr_clause = f" — PRs {listed}"
+    def _n(k: int) -> str:
+        return f"{k} commit" if k == 1 else f"{k} commits"
+
+    # The LABEL moves with the state too. "Deploy" is a claim in its own right —
+    # a rollback announced under it reads as new code arriving, which is the
+    # opposite of what happened.
+    if only_ours == 0:
+        label = "Deploy"
+        lead = f"main moved {_n(landed)} under this session"
+    elif landed == 0:
+        label = "Rollback"
+        lead = (
+            f"the checkout moved BACK past this session — it is missing "
+            f"{_n(only_ours)} this session's code has"
+        )
+    else:
+        label = "Diverged"
+        lead = (
+            f"the checkout DIVERGED from this session — {_n(landed)} landed "
+            f"that this session lacks, and {only_ours} it has are not in the "
+            f"checkout"
+        )
+    # WHAT IS ALREADY LIVE, and what each stale thing actually needs — both
+    # narrowed to what is true (Codex P2 x2, PR #1651).
+    #
+    # "hooks/policy are already live" over-claimed. A hook's COMMAND is re-read
+    # per invocation, so a change to hook CODE is live — but Claude Code
+    # snapshots hook CONFIGURATION at session start, so a commit that adds or
+    # removes a hook, or changes its matcher or timeout in .claude/settings.json,
+    # is NOT live in this session. Saying "hooks are live" tells a session it
+    # need not act on exactly the change it must act on.
+    #
+    # And "a session restart" does not restart genesis-server. Restarting the
+    # session respawns its MCP children; genesis-server is an independent
+    # systemd user unit and needs `systemctl --user restart genesis-server`
+    # (CLAUDE.md, Process Management). Naming one action for two different
+    # things left the server running old code with the notice reading as though
+    # it had been handled.
     return (
-        f"[⚠ Memory MCP stale: this session's MCP predates the {date} deploy "
-        f"(now {new_commit[:8]}) — restart the session to refresh recall "
-        f"+ security read-exclusions]"
+        f"[⚠ {label}: {lead} "
+        f"({spawn[:8]} → {head[:8]}){pr_clause} — hook CODE is live; hook CONFIG "
+        f"changes are not (snapshotted at session start). MCP needs a session "
+        f"restart; genesis-server needs "
+        f"`systemctl --user restart genesis-server`]"
     )
 
 
-def _staleness_throttled(session_id: str, now: datetime) -> bool:
-    """True if a staleness nudge fired within the cooldown for this session.
+def _deploy_stamped(session_id: str) -> str | None:
+    """The sha last announced to this session, or None if never/unreadable.
 
-    Best-effort: an unreadable/absent/garbled marker → not throttled (emit),
-    consistent with the fail-open posture (better a repeat nudge than a missed
-    stale-code warning). A marker timestamp in the FUTURE (clock stepped back, or a
-    hand-edited file) is likewise treated as NOT throttled: a negative elapsed is
-    always < cooldown, which would otherwise wedge the nudge OFF until wall-clock
-    catches up + a full cooldown — suppressing a genuine stale-code warning."""
+    None means "not yet told", which lets the notice through — fail-open toward
+    surfacing a deploy, consistent with every sibling emitter here.
+
+    ``ValueError`` is caught alongside ``OSError`` and is NOT redundant:
+    ``read_text`` raises ``UnicodeDecodeError`` on non-UTF-8 bytes, and that is
+    a ``ValueError``, not an ``OSError`` (verified). Catching only ``OSError``
+    let a torn/garbled stamp escape to the caller's blanket handler, which
+    returns BEFORE re-stamping — so one bad write silenced that session's nudge
+    permanently. Fail-open here re-reads as "not yet told" and the next emit
+    overwrites the bad file.
+    """
     sdir = _session_dir(session_id)
     if sdir is None:
-        return False
-    marker = sdir / "staleness_last_nudge"
+        return None
     try:
-        last = datetime.fromisoformat(marker.read_text().strip())
-        elapsed = (now - last).total_seconds()
-    except (OSError, ValueError, TypeError):
-        # unreadable / garbled / tz-naive (aware-minus-naive raises TypeError) →
-        # not throttled (emit), fail-open toward surfacing the stale-code warning.
-        return False
-    if elapsed < 0:
-        return False  # future marker → do not suppress; emit
-    return elapsed < _STALENESS_COOLDOWN_S
+        return (sdir / _DEPLOY_STAMP).read_text().strip() or None
+    except (OSError, ValueError):
+        return None
 
 
-def _record_staleness_nudge(session_id: str, now: datetime) -> bool:
-    """Stamp the per-session cooldown marker. Returns True iff it persisted.
+def _record_deploy_notice(session_id: str, head: str) -> bool:
+    """Stamp the announced sha. Returns True iff it persisted.
 
     A persistently unwritable ``~/.genesis/sessions/`` would otherwise let the
-    nudge print on EVERY prompt — the absent/unreadable-marker path in
-    ``_staleness_throttled`` reads as "not throttled" (fail-open toward emitting).
-    Returning False lets the caller SUPPRESS instead of spam, so a broken
-    filesystem degrades to silence, not a per-prompt banner."""
+    notice print on EVERY prompt, since an unreadable stamp reads as "not yet
+    told". Returning False lets the caller SUPPRESS instead of spam, so a broken
+    filesystem degrades to silence rather than a per-prompt banner. Written
+    BEFORE the line is printed, for the same reason.
+
+    Written ATOMICALLY (tempfile in the same dir + ``os.replace``, mirroring
+    ``mcp_spawn_store.persist_spawn_commit``): a bare ``write_text`` can leave a
+    truncated or garbled stamp if the process dies mid-write, and a reader
+    cannot tell that from a real sha.
+    """
     sdir = _session_dir(session_id)
     if sdir is None:
         return False
-    marker = sdir / "staleness_last_nudge"
     try:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(now.isoformat())
+        sdir.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(sdir), prefix=f".{_DEPLOY_STAMP}.")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(head)
+            os.replace(tmp, sdir / _DEPLOY_STAMP)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
         return True
     except OSError:
         return False
 
 
-def _emit_staleness_nudge(session_id: str, now: datetime) -> None:
-    """One-line nudge when THIS session's MCP subprocesses run code OLDER than
-    the last deploy.
+def _emit_deploy_nudge(session_id: str) -> None:
+    """One line when main has moved under this session, once per deploy.
 
-    Each FastMCP subprocess snapshots its code at spawn and NEVER reloads; a
-    deploy landing MID-session (update.sh restarts genesis-server, NOT a live
-    session's MCPs) leaves recall — and its current security read-exclusions —
-    on stale code until the user restarts the session. There is no auto-restart,
-    so the remedy is a nudge. Identify this session's slot by matching the
-    walked ``claude`` pid against the ``mcp-spawn`` file plane (world-readable;
-    pid- AND start-time-validated by ``read_spawn_identity`` against a recycled
-    pid), then apply the shared ``is_stale`` verdict. Throttled per session;
-    wrapped fail-open so a miss never surfaces as an error and a fresh session
-    stays silent."""
+    Each FastMCP subprocess snapshots its code at spawn and NEVER reloads, and
+    genesis-server holds imported code until restart — while CC hooks re-exec
+    per invocation from the main tree and so are already live. A deploy landing
+    mid-session therefore leaves the session's recall (and its security
+    read-exclusions) on old code with no auto-restart, so the remedy is a nudge
+    naming what landed.
+
+    Detection is OBSERVED HEAD DRIFT, not the ``update_history`` record. MEASURED
+    on a live install (2026-09-03): 46 HEAD movements in 30 days produced 5 rows
+    (10.9%), because the sanctioned code-only deploy path writes none — so a
+    record-keyed verdict was silent for 89% of deploys, and structurally silent
+    for EVERY session spawned after the last ``scripts/update.sh`` run. Observing
+    HEAD needs no producer and cannot be bypassed. See ``commit_identity`` for
+    why the BLOCKING guard deliberately keeps the record-keyed verdict.
+
+    Identify this session's slot by matching the walked ``claude`` pid against
+    the ``mcp-spawn`` file plane (world-readable; pid- AND start-time-validated
+    by ``read_spawn_identity`` against a recycled pid). Wrapped fail-open so a
+    miss never surfaces as an error and a session at HEAD stays silent.
+    """
     try:
+        from genesis.env import repo_root
         from genesis.observability.cc_slots import read_proc_start_iso
+        from genesis.observability.commit_identity import differs_from_head
         from genesis.observability.mcp_spawn_store import (
             enumerate_spawn_slots,
             read_spawn_identity,
@@ -407,17 +589,50 @@ def _emit_staleness_nudge(session_id: str, now: datetime) -> None:
         ident = read_spawn_identity(slot, pid, read_proc_start_iso(pid))
         if ident is None:
             return
-        root = os.environ.get("GENESIS_REPO_ROOT", "")
-        db = (Path(root) if root else Path.home() / "genesis") / "data" / "genesis.db"
-        msg = _staleness_message(ident[0], ident[1], _last_successful_deploy(db))
-        if not msg:
+        spawn = ident[0]
+        # The spawn commit comes off the file plane, and it becomes half of a
+        # `<spawn>..<head>` git argv operand below — validate at the boundary it
+        # ENTERS, not where it is printed. See _is_sha.
+        if not _is_sha(spawn):
             return
-        if _staleness_throttled(session_id, now):
+        # repo_root() — the SAME resolver the spawn commit was captured with
+        # (mcp_spawn_identity), so both sides of the comparison are provably on
+        # one tree. It resolves to the installed package's own location, which is
+        # the main tree on every install; `Path.home() / "genesis"` would have
+        # been a guess that happens to be right only where the repo is at that
+        # path, and the launcher does not export GENESIS_REPO_ROOT.
+        repo = repo_root()
+        head = _current_head(repo)
+        if head is None or not differs_from_head(spawn, head):
             return
-        # Persist the cooldown BEFORE printing: if the marker can't be written
-        # (unwritable session dir), suppress rather than spam the banner on every
-        # prompt — the absent-marker throttle path reads as "not throttled".
-        if not _record_staleness_nudge(session_id, now):
+        # Already announced THIS deploy to THIS session — silent until HEAD moves
+        # again. Checked before the `git log`, so the steady state costs one
+        # rev-parse and a small file read.
+        if _deploy_stamped(session_id) == head:
+            return
+        span = _deploy_span(repo, spawn, head)
+        if span is None:
+            # A FAILED read is not an observation. `_deploy_span` returns None
+            # only when it could not look — git timed out, exited nonzero, or a
+            # ref would not resolve — and it signals the conclusive
+            # "nothing to say" case as a count of ZERO instead. Stamping on None
+            # recorded a failure as a completed announcement, and because the
+            # stamp check runs BEFORE the git call, that session then exited
+            # early on every later prompt: one transient timeout silenced the
+            # deploy nudge for the whole life of the session (Codex P2,
+            # PR #1651). Returning here re-pays two subprocesses on the next
+            # prompt, which is the cost of not knowing — and it is the cheap
+            # error against a nudge that never fires again.
+            return
+        msg = _deploy_message(spawn, head, *span)
+        # Stamp on any CONCLUSIVE observation of `head`, including the ones we
+        # deliberately stay silent about (neither side holds a unique commit).
+        # Those states are genuinely answered, so re-paying two git subprocesses
+        # on every later prompt for them is waste, not caution.
+        persisted = _record_deploy_notice(session_id, head)
+        # Print only if the stamp landed: an unwritable session dir reads back as
+        # "not yet told", so printing anyway would repeat the banner every prompt.
+        if not msg or not persisted:
             return
         print(msg)
         sys.stdout.flush()
@@ -450,15 +665,22 @@ def main() -> None:
         _emit_temporal_context(session_id, now)
         # 1b. Charter drift tag (chartered sessions only; fail-open)
         _emit_charter_tag(session_id)
-        # 1c. MCP stale-code nudge (only when this session's MCP is behind the
-        # last deploy; throttled; fail-open)
-        _emit_staleness_nudge(session_id, now)
 
-    # 2. Buffer user message for bookmarks
+    # 2. Buffer user message for bookmarks. Deliberately BEFORE the deploy nudge:
+    # the nudge is the only step here that spawns subprocesses, so it is the only
+    # one that can burn the hook's whole timeout (a wedged/read-only filesystem).
+    # This hook's timeout is not fatal to the turn, but a kill part-way through
+    # would silently drop the bookmark buffer AND last_prompt_time — which would
+    # then also corrupt the NEXT prompt's "Last msg" tag. Cheap state first.
     if session_id and prompt:
         _buffer_message(session_id, prompt, now)
 
-    # 3. Shelve/unshelve hint
+    # 3. Deploy nudge (only when main has moved under this session; once per
+    # deploy; fail-open). Last of the session-state writes, for the reason above.
+    if session_id:
+        _emit_deploy_nudge(session_id)
+
+    # 4. Shelve/unshelve hint
     if prompt:
         _check_shelve_hint(prompt)
 
