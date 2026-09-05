@@ -113,7 +113,29 @@ import time
 # Self-locate so sibling hook modules resolve whether run as a script or imported.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload  # noqa: E402
-from shell_parse import analyze, has_trailing_override  # noqa: E402
+from shell_parse import analyze_checked, has_trailing_override  # noqa: E402
+
+#: The chokepoint, parsed ONCE per process. `main` reaches three consumers that each
+#: analyse the SAME command string (_clean_violation, _submodule_recurse_violation,
+#: _record_snapshots), and the parse is a pure function of that string — so three
+#: identical parses were pure cost on a clock this guard SHARES.
+#:
+#: That clock is the reason this exists rather than being a tidiness nicety.
+#: `bash_safety_hook.sh` is registered at 5s and delegates to THREE guards over the
+#: same command, this one included, so those duplicates were 3 of the 5 full parses on
+#: one budget. MEASURED end to end, worst payload inside both bounds: 6.12s BEFORE
+#: (over the registration, i.e. the hook is killed and the command is PERMITTED) and
+#: 2.92s after. Bounding the input was not enough on its own; the work per command had
+#: to stop being done three times.
+_PARSE_MEMO: dict[str, tuple] = {}
+
+
+def _parse_once(cmd: str) -> tuple:
+    """`analyze_checked`, memoised for the lifetime of this hook process."""
+    if cmd not in _PARSE_MEMO:
+        _PARSE_MEMO[cmd] = analyze_checked(cmd)
+    return _PARSE_MEMO[cmd]
+
 
 # Substrings that gate the parse path; absent all of them the command cannot be
 # a worktree-overwriting git op, so we return instantly. `clean` is included
@@ -332,8 +354,43 @@ def _clean_violation(cmd: str) -> str | None:
     detection (``"clean" in argv``) NOT positional resolution: resolution
     depends on skipping git's OPEN set of value-taking global flags, so a
     pathological ``git checkout clean`` merely over-blocks (override escape) —
-    the direction this boundary wants."""
-    for seg in analyze(cmd):
+    the direction this boundary wants.
+
+    A parse cut short by one of shell_parse's BOUNDS lands on the same fail-closed
+    message as a parser crash, because it is the same situation: this guard cannot
+    prove a clean-mentioning command safe. It matters that the parser says so rather
+    than raising — a bound does not crash, it silently returns fewer segments, and
+    reading that as "no clean here" is a silent allow of the one unrecoverable
+    operation this guard blocks. MEASURED before this call was switched: a
+    `git clean -fd` nested 9 deep went from refused to allowed.
+
+    `untokenizable` is deliberately EXCLUDED. It predates the bounds and this guard
+    already allowed those commands, so failing closed on it would be a new
+    over-block rather than a restoration — MEASURED at 209 of 1,367 real
+    clean-mentioning commands, against 0 for the bounds. Widening to it is a
+    separate decision with its own evidence, not a rider on this one.
+
+    BOTH bounds refuse here. An earlier revision honoured it and softened the length axis, on the
+    written grounds that "`bash_safety_hook.sh` keeps the real coverage there: its
+    `git clean` check greps RAW text per shell segment". THAT WAS FALSE, and measured
+    so: the coarse fallback at bash_safety_hook.sh:220 runs only when `_handled == 0`,
+    i.e. when python3 or this guard is ABSENT or this guard CRASHED. Exiting 0 — which
+    is exactly what softening produced — sets `_handled=1` and SKIPS the fallback.
+    MEASURED on `echo "<49,200 chars>" && git clean -fd`: guard rc=0, hook rc=0, so
+    nothing anywhere blocked a real, executing `git clean -fd`.
+
+    That is the sibling-layer trap in its purest form: a fail-open justified by a
+    second layer that does not actually cover the case, asserted in a comment rather
+    than checked. The rule this leaves behind: a guard whose only verdicts are BLOCK
+    and ALLOW must fail closed on ANY blindness, because "ask" is not available to it
+    and the alternative to blocking is permitting. The per-axis severity flag that
+    made this mistake possible has since been DELETED outright — see BlindSpot.
+
+    Cost of refusing both: 0 of 45,956 real commands reach either bound."""
+    segs, blind = _parse_once(cmd)
+    if blind is not None and blind.bounds_induced:
+        return _CLEAN_PARSE_FAILED_MSG
+    for seg in segs:
         if seg.exe != "git":
             continue
         if "clean" not in set(seg.argv[1:]):
@@ -401,8 +458,24 @@ def _submodule_recurse_violation(cmd: str) -> str | None:
     worktrees, so recursing into them is unrecoverable (like clean) and a
     superproject snapshot is a false recovery promise. Closed-set: literal
     snapshot-verb membership AND a recursing token; honors ``# discard-override``
-    per segment. Returns a block message or None. Pure argv (no subprocess)."""
-    for seg in analyze(cmd):
+    per segment. Returns a block message or None. Pure argv (no subprocess).
+
+    Fails CLOSED when a shell_parse BOUND cut the parse short, for the reason given
+    in _clean_violation: a bound returns fewer segments without raising, so treating
+    that as "no recursing verb" silently allows the unrecoverable case this blocks.
+    MEASURED: `git checkout --recurse-submodules .` nested 9 deep went from refused
+    to allowed. The guard's documented fail-OPEN is for a parser CRASH, which is a
+    different event; `untokenizable` stays on that fail-open path unchanged.
+
+    BOTH bounds refuse, for the reason given in _clean_violation — and here there was
+    never even a sibling to appeal to: `bash_safety_hook.sh` has no submodule check at
+    all, so softening the length axis left this operation with NO coverage whatsoever.
+    MEASURED on `echo "<49,200 chars>" && git checkout --recurse-submodules .`: guard
+    rc=0, hook rc=0."""
+    segs, blind = _parse_once(cmd)
+    if blind is not None and blind.bounds_induced:
+        return _SUBMODULE_BLOCK_MSG
+    for seg in segs:
         if seg.exe != "git":
             continue
         if not (set(seg.argv[1:]) & _SUBMODULE_RECURSE_VERBS):
@@ -430,7 +503,24 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
     seen_cwds: set[str] = set()
     deadline = time.monotonic() + _TOTAL_SNAPSHOT_BUDGET_S
     budget_hit = False
-    for seg in analyze(cmd):
+    segs, blind = _parse_once(cmd)
+    # The same "never silent" rule the time budget already obeys, applied to the other
+    # reason this can come up short: a parse stopped by a bound yields no segment for
+    # a nested snapshot verb, so the recovery point is simply missing — and a missing
+    # recovery point that says nothing is indistinguishable from "nothing needed one"
+    # exactly when someone is about to discard work. (`untokenizable` excluded for the
+    # reason given in _clean_violation: pre-existing here, and noting it would fire on
+    # ordinary work.)
+    #
+    # DEFERRED until after the loop, never appended ahead of it. This note asserts
+    # that NO snapshot was recorded, and the loop below can still record one for a
+    # repository the parse did reach. Emitting first produced additional context that
+    # said "no recovery snapshot was recorded" AND supplied a recovery SHA — leaving
+    # the recovery status unreadable at the one moment it is load-bearing. The note is
+    # about what the guard could NOT see, so it can only be written once the loop has
+    # finished establishing what it could.
+    blind_unrecorded = blind is not None and blind.bounds_induced
+    for seg in segs:
         if seg.exe != "git":
             continue
         # Literal VERB membership — never positional subcommand resolution
@@ -477,6 +567,21 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
             f"{_TOTAL_SNAPSHOT_BUDGET_S:.0f}s snapshot budget — one or more later "
             "repos in this compound were NOT snapshotted. Run a single git "
             "command per repo if you need its recovery point."
+        )
+    if blind_unrecorded:
+        # `seen_cwds` is provably EMPTY here, so this says so plainly rather than
+        # hedging. A bounds-induced blind spot means `analyze_checked` returned no
+        # segments at all, and `seen_cwds` is filled only from inside the segment
+        # loop — so "cut short but still snapshotted something" is not a state this
+        # function can be in. An earlier revision branched on `sorted(seen_cwds)` and
+        # spoke of the repositories it "did snapshot"; that branch was unreachable,
+        # and the wording it left on the live path implied repositories that cannot
+        # exist. Defensive phrasing against an impossible state is not caution, it is
+        # a false claim with a conditional in front of it.
+        notes.append(
+            f"[git-discard-guard] no recovery snapshot was recorded at all: this "
+            f"command {blind.cause}, so the guard could not tell which "
+            f"repositories it touches. To get the missing snapshots: {blind.hint}."
         )
     return notes
 

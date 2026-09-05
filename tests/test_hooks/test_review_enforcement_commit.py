@@ -28,6 +28,16 @@ _HOOK = _REPO_ROOT / "scripts" / "review_enforcement_commit.py"
 _REVIEW_STATE = _REPO_ROOT / "scripts" / "review_state.py"
 _INVALIDATE = _REPO_ROOT / "scripts" / "review_invalidate_on_commit.py"
 
+sys.path.insert(0, str(_REPO_ROOT / "scripts" / "hooks"))
+sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+import review_invalidate_on_commit as _invalidator  # noqa: E402
+import shell_parse  # noqa: E402
+
+#: The invalidator's no-parser fallback, IMPORTED rather than re-typed so a fixture
+#: can prove it is a form that fallback misses. A copied regex would drift and leave
+#: these tests asserting against a pattern nobody ships.
+_STRICT_COMMIT_PAT = _invalidator._STRICT_COMMIT
+
 
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
@@ -626,6 +636,65 @@ def test_invalidate_ignores_non_commit(repo: Path, home: Path) -> None:
     assert len(_markers(home)) == 1  # marker survives
 
 
+def test_invalidate_clears_when_the_parse_went_blind(repo: Path, home: Path) -> None:
+    """A commit the parser could not reach must still clear the marker.
+
+    `analyze` stops descending past a depth bound, so for a commit buried deeper
+    than that the segment list comes back WITHOUT it. Treating that as "no commit
+    happened" is this module's documented bypass in its worst form: the marker is
+    never cleared, and the next commit reuses a review that no longer applies —
+    silently, and for the marker's whole TTL.
+
+    Over-clearing costs one redundant re-review, which is the direction this module
+    already chose everywhere else it cannot be sure. The parse reports that it went
+    blind, so the choice is available rather than guessed at.
+    """
+    assert _mark(repo, home).returncode == 0
+    assert len(_markers(home)) == 1
+
+    buried = "$(" * 40 + "git commit -m done" + ")" * 40
+    _run_invalidate(buried, repo, home)
+    assert _markers(home) == [], (
+        "a commit buried past the parser's depth bound left the review marker in "
+        "place — the next commit would reuse a review that no longer applies"
+    )
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        "git commit -m done",
+        "git -C {repo} commit -m done",
+        "git -c user.name=x commit -m done",
+    ],
+    ids=["plain", "dash_C", "dash_c_config"],
+)
+def test_invalidate_clears_for_every_commit_form_the_checker_gates(
+    repo: Path, home: Path, form: str
+) -> None:
+    """The forms matter, and the first version of this test only covered one of them.
+
+    A blind parse used to fall back to `_STRICT_COMMIT` (`\\bgit\\s+commit\\b`), which
+    requires ADJACENCY. MEASURED: it matches `git commit` but NOT `git -C <dir> commit`
+    nor `git -c k=v commit` — precisely the forms the PreToolUse checker still gates.
+    So for those, the marker survived a real commit and the next one rode a stale
+    review, which is the bypass this module's own header warns about.
+
+    The original regression test used the plain form, the one shape the regex does
+    match, so it passed while the other two stayed broken. Parametrising over the
+    checker's whole accepted set is what makes it non-vacuous.
+    """
+    assert _mark(repo, home).returncode == 0
+    assert len(_markers(home)) == 1
+
+    buried = "$(" * 40 + form.format(repo=repo) + ")" * 40
+    _run_invalidate(buried, repo, home)
+    assert _markers(home) == [], (
+        f"a buried {form!r} left the review marker in place — the checker gates this "
+        "form, so the invalidator must clear for it too or the two disagree"
+    )
+
+
 # ── Invalidator/checker cwd symmetry (the #1254 follow-up, ab42b04f) ──────
 # #1254 made the PreToolUse checker resolve the commit's real worktree via
 # `git -C` / the last `cd` / the payload cwd. The PostToolUse invalidator was
@@ -687,6 +756,123 @@ def test_git_dash_C_commit_clears_target_worktree_not_shell(
         f"git -C {repo} commit -m done", run_from=repo_b, payload_cwd=repo_b, home=home
     )
     assert _markers(home) == [], "`git -C W commit` did not clear W's marker"
+
+
+def test_clear_all_markers_reports_an_unreadable_dir_instead_of_claiming_success(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An unreadable marker dir must be a REPORTED failure, never a clean success.
+
+    `Path.glob` does not raise on a directory it cannot read — it swallows the
+    PermissionError and yields nothing. VERIFIED on 3.12: a marker dir at mode 000
+    holding one marker globs to `[]`. So an `except OSError` around the glob is dead
+    code, and "0 markers found" is indistinguishable between "none exist" and "every
+    marker survived and I could not see them".
+
+    The second is precisely the bypass this function exists to close — a review marker
+    outliving its commit — and it was being reported as success, which is worse than
+    an error because nothing downstream looks again.
+    """
+    import review_state as rs
+
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    (markers / "a.json").write_text("{}")
+    monkeypatch.setattr(rs, "_MARKER_DIR", markers)
+    monkeypatch.setattr(rs, "_LEGACY_STATE_FILE", tmp_path / "legacy.json")
+
+    os.chmod(markers, 0o000)
+    try:
+        cleared, failures = rs.clear_all_markers()
+    finally:
+        os.chmod(markers, 0o700)  # always restore, or tmp_path cleanup fails
+    assert cleared == 0
+    assert failures, "an unreadable marker dir must be REPORTED, not silently empty"
+    assert (markers / "a.json").exists(), "fixture sanity: the marker did survive"
+
+    # And the ordinary path still works, so the probe is not simply always-failing.
+    cleared, failures = rs.clear_all_markers()
+    assert cleared == 1 and not failures
+    assert not list(markers.glob("*.json"))
+
+
+def test_clear_all_markers_does_not_count_an_absent_legacy_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`missing_ok=True` succeeds on an absent file, so counting it unconditionally
+    reported "cleared 1" against an empty marker directory — a number the
+    operator-facing message repeats verbatim."""
+    import review_state as rs
+
+    markers = tmp_path / "markers_empty"
+    markers.mkdir()
+    monkeypatch.setattr(rs, "_MARKER_DIR", markers)
+    monkeypatch.setattr(rs, "_LEGACY_STATE_FILE", tmp_path / "nope.json")
+    assert rs.clear_all_markers() == (0, [])
+
+
+def test_an_over_length_dash_C_commit_clears_the_marker_it_cannot_identify(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    """Over the SIZE limit, the `-C` target is unrecoverable — so clear everything.
+
+    `git -C W commit -m '<payload over the cap>'` yields no segments at all (a
+    bounded parse returns nothing, because a truncated one is a wrong answer rather
+    than a weak one). The candidate-set over-clear covers the payload cwd, a leading
+    `cd`, and the process cwd — every SHELL-side candidate — but W is named only
+    inside the command, so W's marker survived a real commit and could authorize an
+    unreviewed one for its TTL.
+
+    Recovering `-C` from the raw string would mean a second, hand-rolled shell
+    parser, which is the trap these guards exist to avoid. The fail-safe is breadth:
+    this module's own cost model says an extra clear costs one redundant re-review
+    while a survivor costs an unreviewed commit.
+    """
+    repo_b = _second_repo(tmp_path, "repo_b_overlong")  # the shell's worktree
+    assert _mark(repo, home).returncode == 0  # review recorded for repo (= W)
+    assert len(_markers(home)) == 1
+    over_cap = "x" * (shell_parse.MAX_COMMAND_CHARS + 1024)
+    _run_invalidate_at(
+        f"git -C {repo} commit -m '{over_cap}'",
+        run_from=repo_b,
+        payload_cwd=repo_b,
+        home=home,
+    )
+    assert _markers(home) == [], (
+        "an over-length `git -C W commit` left a marker alive. The target is not "
+        "recoverable from a bounded parse, so blind invalidation must clear broadly "
+        "rather than clear only the shell-side candidates"
+    )
+
+
+def test_an_untokenizable_dash_C_commit_still_uses_its_recovered_segments(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    """`untokenizable` does NOT truncate, so its segments must still be used.
+
+    An apostrophe inside a trailing comment is valid shell that shlex cannot
+    tokenize. The parse still resolves the complete `git -C W commit` argv — but an
+    earlier version discarded the segments for ANY blind spot and fell back to
+    `_STRICT_COMMIT` (`\\bgit\\s+commit\\b`), which requires adjacency and so misses
+    the `-C` form entirely. Invalidation then exited and W's marker survived.
+
+    This is the counterpart to the over-length test above: there the parse yields
+    nothing and the answer is to clear broadly; here it yields an EXACT answer and
+    the answer is to use it.
+    """
+    repo_b = _second_repo(tmp_path, "repo_b_untok")
+    assert _mark(repo, home).returncode == 0
+    assert len(_markers(home)) == 1
+    cmd = f"git -C {repo} commit -m done # don" + chr(39) + "t"
+    assert shell_parse.untokenizable(cmd), "fixture must genuinely defeat the tokenizer"
+    assert not _STRICT_COMMIT_PAT.search(cmd), (
+        "fixture must be a form the strict-adjacency fallback MISSES, or it proves nothing"
+    )
+    _run_invalidate_at(cmd, run_from=repo_b, payload_cwd=repo_b, home=home)
+    assert _markers(home) == [], (
+        "an untokenizable `git -C W commit` left W's marker alive — its recovered "
+        "segments name the target exactly and were thrown away"
+    )
 
 
 def test_git_dash_C_no_stale_bypass_e2e(repo: Path, home: Path, tmp_path: Path) -> None:

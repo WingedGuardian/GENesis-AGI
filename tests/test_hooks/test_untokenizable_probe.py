@@ -17,6 +17,7 @@ carry them (matching the convention in test_shell_parse.py).
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -172,8 +173,15 @@ class TestProtectedPathsUsesTheSharedProbe:
         The guard does `sys.path.insert(0, dirname(__file__))` before importing,
         so the sibling written here is the module it actually gets — PYTHONPATH
         shadowing loses to that (measured in the crash test below). Every name
-        except `untokenizable` is delegated to the genuine parser, so exactly
+        except `analyze_checked` is delegated to the genuine parser, so exactly
         one variable changes between the two calls.
+
+        `analyze_checked` is the poison target because it is the CHOKEPOINT the
+        guards now ask — one call returning both the segments and whether the parse
+        could read all of the command. Poisoning `untokenizable` instead would prove
+        nothing about wiring: the guard reaches it only THROUGH the chokepoint, so a
+        guard that had dropped the chokepoint entirely would sail past a poisoned
+        `untokenizable` and this test would go green on a guard that asks nothing.
         """
         hooks = tmp_path / label / "hooks"
         hooks.mkdir(parents=True)
@@ -200,7 +208,7 @@ class TestProtectedPathsUsesTheSharedProbe:
             # costume of a verdict. This way the ONLY difference from a real run
             # is the probe's answer, by construction.
             "def __getattr__(name):\n    return getattr(_real, name)\n"
-            f"def untokenizable(*a, **k):\n    {body}\n"
+            f"def analyze_checked(*a, **k):\n    {body}\n"
         )
         return subprocess.run(
             [_PY, str(hooks / _PROTECTED_GUARD.name)],
@@ -241,7 +249,7 @@ class TestProtectedPathsUsesTheSharedProbe:
         """
         benign = f"rm -rf {tmp_path}/a/b/c/scratch"
         honest = self._guard_in_tree_whose_probe(
-            tmp_path, "honest", "return _real.untokenizable(*a, **k)", benign
+            tmp_path, "honest", "return _real.analyze_checked(*a, **k)", benign
         )
         assert honest.returncode == 0, (
             "POSITIVE CONTROL FAILED — this command is not an allow in the temp "
@@ -294,14 +302,25 @@ class TestCommitGuardFailsClosedOnCrash:
         # test_import_time_failure_is_a_documented_gap below. To exercise the
         # wrapper the failure has to originate inside main().
         (hooks / "hook_input.py").write_text((_HOOKS_DIR / "hook_input.py").read_text())
+        # Delegate every name to the real parser and poison exactly one, rather than
+        # hand-listing the guard's imports. A hand-written list goes stale the moment
+        # the guard imports one more symbol, and it fails in disguise: the import
+        # raises, the child exits 1, and that is the DOCUMENTED import-time gap
+        # wearing the costume of a runtime crash — so this test would pass or fail
+        # for a reason unrelated to what it asserts. (Measured: it did exactly that
+        # when the guard moved to `analyze_checked`.) Same technique as
+        # `_guard_in_tree_whose_probe` above, for the same reason.
         (hooks / "shell_parse.py").write_text(
-            "def analyze(command):\n"
+            "import importlib.util, sys\n"
+            "_s = importlib.util.spec_from_file_location(\n"
+            f"    '_real_sp', {str(_HOOKS_DIR / 'shell_parse.py')!r}\n"
+            ")\n"
+            "_real = importlib.util.module_from_spec(_s)\n"
+            "sys.modules['_real_sp'] = _real\n"
+            "_s.loader.exec_module(_real)\n"
+            "def __getattr__(name):\n    return getattr(_real, name)\n"
+            "def analyze_checked(*a, **k):\n"
             "    raise RuntimeError('induced failure inside the real guard')\n"
-            "def commit_skips_hooks(*a, **k):\n    return False\n"
-            "def git_subcommand(*a, **k):\n    return None\n"
-            "def has_trailing_override(*a, **k):\n    return False\n"
-            "def split_segments(*a, **k):\n    return []\n"
-            "def untokenizable(*a, **k):\n    return False\n"
         )
         r = subprocess.run(
             [_PY, str(scripts / _COMMIT_GUARD.name)],
@@ -408,4 +427,225 @@ class TestCommitGuardFailsClosedOnCrash:
         assert r.returncode == 0, (
             "a broken review_state hard-blocks every commit, including the one "
             f"that would fix it.\n{r.stdout}{r.stderr}"
+        )
+
+
+class TestEveryGuardConsultsTheChokepoint:
+    """Each guard that fails closed on an unreadable command must ASK, not just import.
+
+    `analyze_checked` is one call answering two questions — what does this run, and
+    could I read all of it. That collapses what used to be a per-call-site convention
+    (remember `untokenizable`, and now remember `over_nested` too) into a single
+    question. But a chokepoint only helps if each consumer actually reaches it, and an
+    import proves nothing: this repo has shipped a guard that imported a helper and
+    never called it, with a green suite, more than once.
+
+    So the observable is the CALL. Each guard runs twice from a temp tree that differs
+    in one variable — the chokepoint answers honestly, or it raises — on a command
+    whose honest verdict is "no gate". A guard that consults it turns the raise into a
+    fail-closed refusal; a guard that does not is untouched and allows. The positive
+    control is what makes the second run mean anything: without it, a guard that
+    refuses for some unrelated reason would look wired.
+    """
+
+    def _tree(self, tmp_path, label: str, guard: Path, body: str) -> Path:
+        scripts = tmp_path / label / "scripts"
+        hooks = scripts / "hooks"
+        hooks.mkdir(parents=True)
+        # Mirror the guard's REAL position in the tree. Each guard resolves its
+        # dependencies from its own location — a hooks/ guard inserts its own dir, a
+        # scripts/ guard inserts its sibling hooks/ — so a copy placed in the wrong
+        # one cannot import hook_input and dies before reaching any parser at all.
+        # (The positive control caught exactly that; without it the run would have
+        # been a non-zero exit that looked like a wired guard.)
+        target = (hooks if guard.parent.name == "hooks" else scripts) / guard.name
+        target.write_text(guard.read_text())
+        (hooks / "hook_input.py").write_text((_HOOKS_DIR / "hook_input.py").read_text())
+        (hooks / "shell_parse.py").write_text(
+            "import importlib.util, sys\n"
+            "_s = importlib.util.spec_from_file_location(\n"
+            f"    '_real_sp', {str(_HOOKS_DIR / 'shell_parse.py')!r}\n"
+            ")\n"
+            "_real = importlib.util.module_from_spec(_s)\n"
+            "sys.modules['_real_sp'] = _real\n"
+            "_s.loader.exec_module(_real)\n"
+            "def __getattr__(name):\n    return getattr(_real, name)\n"
+            f"def analyze_checked(*a, **k):\n    {body}\n"
+        )
+        return target
+
+    #: A poison that RETURNS a blind spot instead of raising, for the guards that
+    #: catch exceptions and fail open. For those, a raising probe is indistinguishable
+    #: from an honest one — both end in "allow" — so the raise proves nothing and the
+    #: test would pass against a guard that never asked. What distinguishes them is
+    #: the guard ACTING on a reported blind spot.
+    #:
+    #: Returns the module's REAL over-length blind spot rather than a hand-built one.
+    #: A hand-built BlindSpot coupled this test to the poison rather than to the
+    #: shipped policy, so a change to a real blind spot's fields left it green.
+    #: Returning a shipped singleton means the poison carries whatever the module
+    #: actually declares.
+    #:
+    #: `_BLIND_OVER_LONG` specifically: while a per-axis severity flag briefly
+    #: existed, the length bound was the SOFT one, and the guards wired to it
+    #: fail-opened on a real unrecoverable discard. That flag is deleted and every
+    #: bounds-induced blind spot now refuses identically, so the choice no longer
+    #: discriminates — it is kept deliberately, because any future attempt to
+    #: re-introduce a soft axis would have to soften THIS one first, and this test
+    #: would go red the moment it did.
+    _POISON_RETURNS_BLIND = "return ([], _real._BLIND_OVER_LONG)"
+
+    #: The other poison: raise. For guards whose wrapper fails CLOSED on an exception,
+    #: where the raise turning an allow into a refusal IS the observation.
+    _RAISE = "raise RuntimeError('chokepoint consulted')"
+
+    @pytest.mark.parametrize(
+        "guard_path,benign,poison,expect_rc",
+        [
+            (_COMMIT_GUARD, f"echo about to {COMMIT} nothing", _RAISE, 2),
+            (_HOOKS_DIR / "git_push_guard.py", "echo about to push nothing", _RAISE, 2),
+            # These two catch exceptions and fail open, so they need the returning
+            # poison. Both were REGRESSIONS: a bound silently removed the buried
+            # command they block on, and each went from refused to allowed.
+            # Must contain "git" AND a trigger substring, or main() early-outs before
+            # the parse and the run proves nothing. (It did exactly that on the first
+            # attempt; the positive control is what surfaced it.)
+            (
+                _HOOKS_DIR / "git_discard_guard.py",
+                "echo git cleanup notes",
+                _POISON_RETURNS_BLIND,
+                2,
+            ),
+            (
+                _HOOKS_DIR / "full_suite_guard.py",
+                "echo pytest is a tool",
+                _POISON_RETURNS_BLIND,
+                2,
+            ),
+        ],
+        ids=[
+            "review_enforcement_commit",
+            "git_push_guard",
+            "git_discard_guard",
+            "full_suite_guard",
+        ],
+    )
+    def test_the_guard_consults_analyze_checked(
+        self, tmp_path, guard_path, benign, poison, expect_rc
+    ):
+        honest = self._tree(tmp_path, "honest", guard_path, "return _real.analyze_checked(*a, **k)")
+        r_honest = subprocess.run(
+            [_PY, str(honest)],
+            input=json.dumps(
+                {"tool_name": "Bash", "tool_input": {"command": benign}, "cwd": str(tmp_path)}
+            ),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=_child_env(),
+            cwd=str(tmp_path),
+        )
+        assert r_honest.returncode == 0, (
+            "POSITIVE CONTROL FAILED — this command is not an allow in the temp "
+            "tree, so the poisoned run below cannot mean what it claims.\n"
+            f"{r_honest.stdout}{r_honest.stderr}"
+        )
+
+        poisoned = self._tree(tmp_path, "poisoned", guard_path, poison)
+        r_poisoned = subprocess.run(
+            [_PY, str(poisoned)],
+            input=json.dumps(
+                {"tool_name": "Bash", "tool_input": {"command": benign}, "cwd": str(tmp_path)}
+            ),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=_child_env(),
+            cwd=str(tmp_path),
+        )
+        assert r_poisoned.returncode == expect_rc, (
+            "a poisoned chokepoint did not change this guard's verdict, so the guard "
+            "is not asking whether its parse could read the whole command.\n"
+            f"{r_poisoned.stdout}{r_poisoned.stderr}"
+        )
+
+
+class TestNoConsumerCanSkipTheChokepoint:
+    """The lock. Wiring guards by hand is the convention that already failed twice.
+
+    ``shell_parse.analyze()`` is BOUNDED — it stops at a depth limit, and refuses a
+    command over a length cap — and it reports neither. A consumer holding bare
+    ``analyze`` therefore cannot tell "found nothing" from "stopped looking", and
+    every such consumer got strictly WORSE when the bounds landed: the unbounded
+    parser used to reach a buried command by accident, and a bound stops at an exact
+    index an attacker picks. MEASURED at the time, both going from refused to allowed
+    when nested 9 deep: the discard guard's unrecoverable-delete block, and the
+    full-suite guard's untargeted-run block.
+
+    Two review rounds found that class, twice, because the fix each time was "wire
+    the consumers I can think of". So the consumer set is DERIVED FROM THE CODE here
+    instead. Importing bare ``analyze`` now requires being on the allowlist below
+    with a written reason, which makes forgetting impossible rather than unlikely.
+    """
+
+    #: Modules permitted to import bare ``analyze``, each with the reason it is safe.
+    #: Adding a name is a deliberate act that must survive review; the reason is the
+    #: point, not the entry.
+    _BARE_ANALYZE_ALLOWED = {
+        "git_push_guard.py": (
+            "One use, for cwd matching, which filters to `depth == 0` — a depth bound "
+            "only removes segments BELOW that, so the filtered result is identical "
+            "either way. The length cap can only fire on a command longer than the "
+            "cap, and such a command is caught upstream by this guard's own "
+            "blind-spot net before this code runs (verified end to end)."
+        ),
+    }
+
+    def _shell_parse_imports(self, path: Path) -> set[str]:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "shell_parse":
+                names.update(alias.name for alias in node.names)
+        return names
+
+    def test_bare_analyze_requires_being_on_the_allowlist(self):
+        scanned = 0
+        offenders = []
+        for path in sorted((_WORKTREE / "scripts").rglob("*.py")):
+            if path.name == "shell_parse.py":
+                continue  # the parser's own internals are bounded by construction
+            imports = self._shell_parse_imports(path)
+            if not imports:
+                continue
+            scanned += 1
+            if "analyze" in imports and path.name not in self._BARE_ANALYZE_ALLOWED:
+                offenders.append(str(path.relative_to(_WORKTREE)))
+
+        # A floor, because a walk that silently matches NOTHING passes every assertion
+        # below and reports a clean lock over an empty set.
+        assert scanned >= 6, (
+            f"only {scanned} shell_parse consumers found — the walk is broken, so a "
+            "green result here means nothing"
+        )
+        assert not offenders, (
+            "these modules import bare `analyze`, which cannot report that the parse "
+            "was cut short by a bound — so an empty result reads as 'nothing found' "
+            "when it may mean 'stopped looking'. Use `analyze_checked` and decide what "
+            "a blind parse means for this guard, or add the module to "
+            f"_BARE_ANALYZE_ALLOWED with the reason it is safe: {offenders}"
+        )
+
+    def test_the_allowlist_itself_is_still_accurate(self):
+        """An allowlist entry for a module that no longer imports bare `analyze` is
+        rot — it silently pre-approves a future re-import nobody reviewed."""
+        actually_importing = {
+            path.name
+            for path in (_WORKTREE / "scripts").rglob("*.py")
+            if path.name != "shell_parse.py" and "analyze" in self._shell_parse_imports(path)
+        }
+        stale = set(self._BARE_ANALYZE_ALLOWED) - actually_importing
+        assert not stale, (
+            f"allowlist entries for modules that no longer import bare `analyze`: "
+            f"{stale}. Remove them so the exemption cannot be inherited silently."
         )
