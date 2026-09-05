@@ -69,6 +69,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Marketing campaign updates now post to their own Telegram topic.** The marketing
+  campaign's tick updates previously routed to the shared Morning Reports topic; they
+  now go to a dedicated "Marketing" forum topic via a new `marketing` outreach
+  category, keeping them separate from the morning report and other digests. Existing
+  installs pick up the category automatically on restart (an additive schema
+  migration); the morning report and all other topics are unaffected.
 - **Proactive memory recall could time out completely.** The embedding provider
   queues standard-rate requests when a model is busy, and that wait can run past
   recall's four-and-a-half-second budget — measured at eight to thirteen seconds
