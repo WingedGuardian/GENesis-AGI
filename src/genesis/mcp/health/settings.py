@@ -321,6 +321,26 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # re-read every hourly tick
     ),
+    "context_injection_watch": SettingsDomain(
+        name="context_injection_watch",
+        description=(
+            "Context-injection watcher (awareness hourly band) — master `enabled` + "
+            "`lookback_hours` / `max_listed` / `alert_priority`. Watches the GROUND "
+            "TRUTH of the silent-context-loss class: a hook-stdout file the Claude "
+            "Code harness persisted instead of injecting (the session then ran "
+            "without that hook's content, invisibly). Scoped to this install's "
+            "checkouts and attributed per producer, so another hook's filing is "
+            "reported too, with its own remedy. One deduped, self-resolving "
+            "infrastructure_alert; "
+            "default priority critical (~5-min Telegram path — this class ran "
+            "unnoticed for a month). Read-and-alert only. off (or env "
+            "GENESIS_CONTEXT_INJECTION_WATCH_DISABLED=1) silences it. Read live each "
+            "hourly tick — no restart."
+        ),
+        config_filename="context_injection_watch.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every hourly tick
+    ),
     "provider_outage_notify": SettingsDomain(
         name="provider_outage_notify",
         description=(
@@ -1709,6 +1729,33 @@ def _validate_follow_up_watchdog(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_context_injection_watch(changes: dict) -> list[str]:
+    """Validate context-injection watcher lever changes (see
+    genesis.awareness.context_injection_watch_config)."""
+    from genesis.awareness.context_injection_watch_config import (
+        _VALID_ALERT_PRIORITY,
+        INT_KNOBS,
+    )
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "alert_priority", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "alert_priority":
+            if value not in _VALID_ALERT_PRIORITY:
+                errors.append(
+                    f"'alert_priority' must be one of {', '.join(_VALID_ALERT_PRIORITY)}; "
+                    f"got {value!r}"
+                )
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
 def _validate_provider_outage_notify(changes: dict) -> list[str]:
     """Validate dead-provider notify lever changes (see
     genesis.awareness.provider_notify_config)."""
@@ -1730,6 +1777,7 @@ def _validate_provider_outage_notify(changes: dict) -> list[str]:
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "ego_reconcile": _validate_ego_reconcile,
     "follow_up_watchdog": _validate_follow_up_watchdog,
+    "context_injection_watch": _validate_context_injection_watch,
     "provider_outage_notify": _validate_provider_outage_notify,
     "surplus_ideation_promotion": _validate_surplus_ideation_promotion,
     "memory_integrity": _validate_memory_integrity,
