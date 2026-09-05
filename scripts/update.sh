@@ -1792,7 +1792,25 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     HEALTH_OK=false
     DEGRADED=""
 
-    for attempt in $(seq 1 12); do
+    # The window must outlast a slow BOOT, not just a slow answer: bootstrap
+    # under load has been measured well past 3 minutes (2026-09-05: the server
+    # was still starting schedulers when a fixed 12x15s loop expired, and a
+    # WORKING deploy was rolled back). "Dead" and "still booting" are different
+    # states with different correct responses, so the loop keys on the unit:
+    # while genesis-server is alive it gets the full window; the moment the
+    # unit leaves the active/activating states the wait stops early - a dead
+    # server never answers, and waiting out the window would only delay the
+    # rollback it needs. Window is overridable for constrained installs.
+    HEALTH_WINDOW_SECS="${GENESIS_DEPLOY_HEALTH_WINDOW_SECS:-600}"
+    case "$HEALTH_WINDOW_SECS" in
+        ''|*[!0-9]*) HEALTH_WINDOW_SECS=600 ;;  # non-numeric -> default, never a broken gate
+    esac
+    [ "$HEALTH_WINDOW_SECS" -lt 180 ] && HEALTH_WINDOW_SECS=180  # never tighter than the old gate
+    HEALTH_DEADLINE=$(( $(date +%s) + HEALTH_WINDOW_SECS ))
+    HEALTH_UNIT_STATE=""
+    attempt=0
+    while [ "$(date +%s)" -lt "$HEALTH_DEADLINE" ]; do
+        attempt=$((attempt + 1))
         sleep 15
         # --max-time 20: bound a hung connection (server accepts but never
         # answers) so a single attempt can't block the update forever. Kept
@@ -1804,7 +1822,16 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
             HEALTH_OK=true
             break
         fi
-        echo "  Attempt $attempt: health endpoint not responding..."
+        HEALTH_UNIT_STATE=$(systemctl --user is-active genesis-server.service 2>/dev/null || true)
+        case "$HEALTH_UNIT_STATE" in
+            active|activating|reloading)
+                echo "  Attempt $attempt: health endpoint not responding (unit $HEALTH_UNIT_STATE - still booting, waiting)..."
+                ;;
+            *)
+                echo "  Attempt $attempt: genesis-server unit is '$HEALTH_UNIT_STATE' - it will not come up on its own; stopping the wait."
+                break
+                ;;
+        esac
     done
 
     if [ "$HEALTH_OK" = "true" ]; then
@@ -1843,7 +1870,7 @@ except Exception:
     fi
 
     if [ "$HEALTH_OK" = "false" ]; then
-        _do_rollback "health endpoint did not respond after 12 attempts (3 minutes)"
+        _do_rollback "health endpoint did not respond within ${HEALTH_WINDOW_SECS}s ($attempt attempts, final unit state: ${HEALTH_UNIT_STATE:-unknown})"
         exit 1
     fi
     echo ""
