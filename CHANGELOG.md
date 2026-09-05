@@ -246,14 +246,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   a non-zero exit, so a caller checking exit status still notices; and the
   guardian's automated `git revert HEAD` on a clean tree is unaffected, because
   there both sides equal the base and the driver never runs.
-- **Typing `claude` again inside a session slot now behaves like the slot does.**
-  When a persistent `cc-N` slot's Claude Code has exited and you relaunch it by
-  hand from that pane, it used to start as a second-class session — without the
-  permission mode the slot uses, without Claude Code's dedicated temp
-  directories, without the fallback login token that keeps you signed in, and
-  without the crash-capture that records why a session died. All four now apply
-  automatically, so a hand relaunch is no longer the one launch that silently
-  loses them.
 - **A session slot started after another tmux server no longer gets the wrong
   temp directory.** A new slot created while a tmux server started in some other
   context is already running used to inherit that server's temp directory

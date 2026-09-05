@@ -342,31 +342,22 @@ verified: 51f9a358 2026-09-05
   report" (empty string — CLEARS) from "could not read" (None — PRESERVES), and
   collapsing those two is what makes a finished topic immortal.
 
-- **Hand-relaunch parity + slot env pinning.**
-  LIVE. A `cc-N` tmux slot can be ALIVE but sitting at a bare shell: `cc-slot.sh`'s
-  `tmux new-session -A` ATTACHES to an existing session and silently DISCARDS the
-  launch command, so a slot born without claude stays that way on every reconnect.
-  Recovering one means relaunching by hand in that pane, and the bashrc `claude()`
-  wrapper now makes that a first-class launch instead of a second-class one: an
-  in-tmux branch applies the permission flag, CC's temp dirs, the fallback OAuth
-  login (via the same `login_gate` + `read_fallback_token` the door uses) and exit
-  capture, rather than falling through to a bare `command claude`. It fires in ANY
-  interactive tmux pane, not only a `cc-N` slot (opt out with
-  `GENESIS_NO_TMUX_WRAP=1`), and it reads the operator's PERSISTED levers from
-  `~/.genesis/cc-slot.env` exactly as the launcher does — a pane predating the `-e`
-  pins carries none of them, and those stale slots are precisely where a hand
-  relaunch is used, so reading only the pane environment would silently ignore a
-  configured permission mode or OAuth lever.
-  The create `exec` pins `TMPDIR` and the resolved `GENESIS_CC_SLOT_OAUTH` lever via
-  `-e` (MEASURED on tmux 3.4: a new session on a pre-existing server inherits the
-  SERVER's env for these, not the door's; PATH already propagates from the client,
-  so it is deliberately NOT pinned). Both temp-dir candidate loops require a
-  directory to be writable AND to accept `chmod 700` — creation is not usability,
-  and `mkdir -p` succeeds on one that already exists — and when none is usable both
-  names are left genuinely UNSET rather than exported empty, because this script
-  ends in `exec tmux`, which STARTS the server that every later slot inherits from.
-  DETECTION of a claude-less slot, and the consented kill-and-recreate that repairs
-  one, are a SEPARATE layer and are not shipped here.
+- **Slot environment pinning + usable temp directories.**
+  LIVE. `tmux new-session` builds a new session's environment from the tmux
+  SERVER's, updated by the client only for `update-environment` vars — so a slot
+  created on a server someone else started inherited that server's values.
+  MEASURED on tmux 3.4: `TMPDIR` and `GENESIS_CC_SLOT_OAUTH` resolve to the
+  SERVER's value (both now pinned via `-e`), while `PATH` resolves to the
+  CLIENT's (no gap, so deliberately NOT pinned). Both temp-dir candidates must be
+  created AND writable AND accept `chmod 700` — creation is not usability, since
+  `mkdir -p` succeeds on a directory that already exists, and one this user
+  cannot make private would put session temp state where others can read it. When
+  no candidate is usable both names are left genuinely UNSET rather than exported
+  empty, and the pane command unsets them itself: this script ends in
+  `exec tmux`, which STARTS the server every later slot inherits from, and
+  omitting a pin is not the same as having no value.
+  Recovering a slot that is alive but running no claude — detecting it, and
+  rebuilding it on consent — is a SEPARATE layer and is not shipped here.
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
   (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A restricted
