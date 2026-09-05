@@ -70,6 +70,24 @@ def _local_config() -> dict:
         # root (a yaml list, or a bare scalar from a stray edit), and every caller
         # below then calls `.get` on it. Hand-edited file, documented graceful
         # contract: anything that is not a mapping is treated as absent.
+        #
+        # AND IT SAYS SO. Discarding the whole file silently is the same defect the
+        # section guard was fixed for, one level up: an accidental top-level list
+        # still CONTAINS the operator's settings, so `{}` throws away a declared
+        # policy — including the opt-out that stops recall using the paid lane —
+        # and `_local_section` never gets the chance to warn, because there is no
+        # section left to be malformed. Before this normalization the resulting
+        # exception at least surfaced a memory-bootstrap degradation; a quiet
+        # fallback is worse than the crash it replaced unless it is announced.
+        if loaded is not None and not isinstance(loaded, dict):
+            logger.warning(
+                "genesis.yaml root is %s, not a mapping — the ENTIRE file is being "
+                "ignored and every setting falls back to its default. Nothing in it "
+                "is in force. Fix the file (its top level must be a mapping) to "
+                "restore your declared policy. Path: %s",
+                type(loaded).__name__,
+                cfg_path,
+            )
         _LOCAL_CONFIG = loaded if isinstance(loaded, dict) else {}
     except Exception:
         logger.warning("Failed to load local config from %s", cfg_path, exc_info=True)

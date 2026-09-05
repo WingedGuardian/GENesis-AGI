@@ -169,3 +169,68 @@ def test_prose_is_not_mistaken_for_a_key():
     text = (repo_root() / "secrets.env.example").read_text()
     for k in keys:
         assert f"{k}=" in text, f"{k} registered but never assigned in the template"
+
+
+# ── An optional override must be reversible ───────────────────────────────────
+#
+# Registering the commented keys made them editable, which opened a ONE-WAY DOOR:
+# setting one writes an assignment into secrets.env, the environment then shadows
+# genesis.yaml permanently, and later config edits appear to do nothing. Recoverable
+# only by hand-editing the file the dashboard exists to avoid.
+
+
+def test_optional_overrides_are_flagged_clearable():
+    """The commented keys — and only those — advertise that they can be cleared."""
+    by_key = {d.key: d for d in _parse_example_file()}
+    for key in ("OLLAMA_URL", "LM_STUDIO_URL", "GENESIS_EMBED_PRIORITY_TIER"):
+        assert by_key[key].is_optional_override is True, key
+    # The control. A required credential must NOT be clearable, or the editor would
+    # happily blank an API key and report success.
+    for key in ("API_KEY_DEEPINFRA", "TELEGRAM_BOT_TOKEN"):
+        assert by_key[key].is_optional_override is False, key
+
+
+def test_clearing_an_override_comments_the_assignment_out(tmp_path, monkeypatch):
+    """Empty means UNSET, and unset must not be written as `KEY=`.
+
+    The accessors branch on `os.environ.get(key) is not None`, so an empty
+    assignment still shadows genesis.yaml — just with an empty string, which is
+    worse than the value it replaced. The line has to stop being an assignment.
+    """
+    from genesis.dashboard.routes import secrets as mod
+
+    env_file = tmp_path / "secrets.env"
+    env_file.write_text("OLLAMA_URL=http://was-set.invalid:11434\nAPI_KEY_GROQ=abc\n")
+    monkeypatch.setattr(mod, "secrets_path", lambda: env_file)
+
+    mod._update_secrets_file({"OLLAMA_URL": ""})
+    text = env_file.read_text()
+    assert "\nOLLAMA_URL=" not in "\n" + text, f"still an active assignment:\n{text}"
+    assert "# OLLAMA_URL=http://was-set.invalid:11434" in text, text
+    # The untouched key must survive verbatim — a rewrite that loses siblings is
+    # the same data-loss shape as the timezone handler's.
+    assert "API_KEY_GROQ=abc" in text
+
+
+def test_setting_a_value_still_writes_an_assignment(tmp_path, monkeypatch):
+    """The control in the other direction: clearing must not break setting."""
+    from genesis.dashboard.routes import secrets as mod
+
+    env_file = tmp_path / "secrets.env"
+    env_file.write_text("OLLAMA_URL=http://old.invalid:11434\n")
+    monkeypatch.setattr(mod, "secrets_path", lambda: env_file)
+
+    mod._update_secrets_file({"OLLAMA_URL": "http://new.invalid:11434"})
+    assert "OLLAMA_URL=http://new.invalid:11434" in env_file.read_text()
+
+
+def test_an_unset_key_is_not_appended_as_empty(tmp_path, monkeypatch):
+    """Clearing a key absent from the file must add nothing at all."""
+    from genesis.dashboard.routes import secrets as mod
+
+    env_file = tmp_path / "secrets.env"
+    env_file.write_text("API_KEY_GROQ=abc\n")
+    monkeypatch.setattr(mod, "secrets_path", lambda: env_file)
+
+    mod._update_secrets_file({"OLLAMA_URL": ""})
+    assert "OLLAMA_URL" not in env_file.read_text()

@@ -536,6 +536,143 @@ class TestSecretsTemplateDoesNotShadowYaml:
         assert _expand_env_vars("y: ${SOME_UNMAPPED_VAR:-fallback}").strip() == "y: fallback"
 
 
+class TestMalformedRootIsAnnounced:
+    """Discarding the WHOLE file must not be quieter than discarding one section.
+
+    `_local_section` warns when a section is not a mapping. The root guard did not,
+    so an accidental top-level list — which still CONTAINS the operator's settings —
+    was dropped in silence, and `_local_section` never got the chance to warn because
+    no section survived to be malformed. Before the guard existed the resulting
+    exception at least surfaced a memory-bootstrap degradation, so a quiet fallback
+    was strictly worse than the crash it replaced.
+    """
+
+    @staticmethod
+    def _load(tmp_path, monkeypatch, text):
+        import genesis.env as env_mod
+
+        cfg = tmp_path / ".genesis" / "config" / "genesis.yaml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(text)
+        monkeypatch.setattr(env_mod.Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", False)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", None)
+        return env_mod
+
+    def test_non_mapping_root_logs_a_warning(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        env_mod = self._load(
+            tmp_path, monkeypatch, "- memory:\n    embed_priority_tier: false\n"
+        )
+        with caplog.at_level(logging.WARNING, logger="genesis.env"):
+            assert env_mod._local_config() == {}
+        assert any("not a mapping" in r.message for r in caplog.records), caplog.text
+        assert any("ENTIRE file" in r.message for r in caplog.records), (
+            "the warning must say the whole file is ignored, not merely that it is odd"
+        )
+
+    def test_a_well_formed_root_logs_nothing(self, tmp_path, monkeypatch, caplog):
+        """Control: warning on every load would be noise that hides the signal."""
+        import logging
+
+        env_mod = self._load(
+            tmp_path, monkeypatch, "memory:\n  embed_priority_tier: false\n"
+        )
+        with caplog.at_level(logging.WARNING, logger="genesis.env"):
+            assert env_mod._local_config() == {"memory": {"embed_priority_tier": False}}
+        assert not [r for r in caplog.records if "not a mapping" in r.message]
+
+    def test_an_empty_file_logs_nothing(self, tmp_path, monkeypatch, caplog):
+        """`None` from an empty file is ABSENCE, not malformation — stay quiet."""
+        import logging
+
+        env_mod = self._load(tmp_path, monkeypatch, "")
+        with caplog.at_level(logging.WARNING, logger="genesis.env"):
+            assert env_mod._local_config() == {}
+        assert not [r for r in caplog.records if "not a mapping" in r.message]
+
+
+class TestYamlBooleanSpellings:
+    """A quoted yaml boolean must mean what it says.
+
+    PyYAML returns a plain STRING for a quoted scalar, so `bool()` reads
+    `embed_priority_tier: "false"` as True — the opposite of the operator's intent,
+    and on that setting it silently keeps the PAID lane running. The same value
+    unquoted parses to a real False, and in secrets.env the env branch reads it
+    correctly, so one intention had three spellings and two answers.
+
+    RESTORED after an editing accident deleted this whole class: an index-based
+    splice that replaced a region between two anchors removed everything between
+    them, this class included. The suite stayed green because the assertions were
+    GONE, not because they passed — which is why the equivalence test below
+    compares the two code paths against each other rather than against a constant.
+    """
+
+    _ACCESSORS = [
+        ("ollama_enabled", "network", "ollama_enabled"),
+        ("embed_priority_tier", "memory", "embed_priority_tier"),
+        ("build_lane_enabled", "build_lane", "enabled"),
+        ("models_md_synthesis_enabled", "models_md_synthesis", "enabled"),
+    ]
+
+    @pytest.fixture(autouse=True)
+    def _no_env_shortcircuit(self, monkeypatch: pytest.MonkeyPatch):
+        for name in _SECTION_ACCESSOR_ENV:
+            monkeypatch.delenv(name, raising=False)
+
+    @pytest.mark.parametrize(("accessor", "section", "key"), _ACCESSORS)
+    @pytest.mark.parametrize("falsey", ["false", "False", "FALSE", "no", "off", "0", " false "])
+    def test_quoted_false_means_false(
+        self, monkeypatch: pytest.MonkeyPatch, accessor, section, key, falsey
+    ):
+        import genesis.env as env_mod
+
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {section: {key: falsey}})
+        assert getattr(env_mod, accessor)() is False, f"{accessor} read {falsey!r} as true"
+
+    @pytest.mark.parametrize(("accessor", "section", "key"), _ACCESSORS)
+    @pytest.mark.parametrize("truthy", ["true", "yes", "on", "1"])
+    def test_quoted_true_still_means_true(
+        self, monkeypatch: pytest.MonkeyPatch, accessor, section, key, truthy
+    ):
+        """The control: a guard reading EVERYTHING false would pass the test above
+        and break every opt-in."""
+        import genesis.env as env_mod
+
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {section: {key: truthy}})
+        assert getattr(env_mod, accessor)() is True
+
+    @pytest.mark.parametrize(("accessor", "section", "key"), _ACCESSORS)
+    def test_native_yaml_booleans_are_unaffected(
+        self, monkeypatch: pytest.MonkeyPatch, accessor, section, key
+    ):
+        import genesis.env as env_mod
+
+        for native, expected in ((False, False), (True, True)):
+            monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+            monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {section: {key: native}})
+            assert getattr(env_mod, accessor)() is expected
+
+    def test_yaml_and_env_agree_on_every_spelling(self, monkeypatch: pytest.MonkeyPatch):
+        """The property that matters: same token, same answer, either home.
+
+        Asserted against the env branch ITSELF rather than a hardcoded expectation,
+        so the two cannot drift apart without this failing.
+        """
+        import genesis.env as env_mod
+
+        for token in ("false", "FALSE", "no", "off", "0", "true", "yes", "on", "1", "x"):
+            monkeypatch.setenv("GENESIS_EMBED_PRIORITY_TIER", token)
+            via_env = env_mod.embed_priority_tier()
+            monkeypatch.delenv("GENESIS_EMBED_PRIORITY_TIER", raising=False)
+            monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+            monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", {"memory": {"embed_priority_tier": token}})
+            assert via_env == env_mod.embed_priority_tier(), f"{token!r} disagrees"
+
+
 class TestNestedConfigReadsAreRouted:
     """Structural enforcement — the hand-maintained list above cannot do this."""
 

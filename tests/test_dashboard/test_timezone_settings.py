@@ -154,3 +154,24 @@ def test_a_well_formed_config_is_not_backed_up(client, tmp_path):
     data = yaml.safe_load(cfg.read_text())
     assert data["timezone"] == "Europe/Paris"
     assert data["network"]["ollama_url"] == "http://inference.invalid:11434"
+
+
+def test_the_ui_actually_renders_the_recovery_warning():
+    """The API returning `warning` is useless if the handler drops it.
+
+    A deliberately structural test, because there is no JS test harness here: it
+    asserts the timezone handler in dashboard.js READS `d.warning` and surfaces it.
+    That is weak as tests go — it cannot prove the UI renders correctly — but it is
+    not nothing: it catches the exact failure that happened, which was a backend
+    field no client consumed, and it fails loudly if someone deletes the branch.
+    """
+    from genesis.env import repo_root
+
+    js = (repo_root() / "src/genesis/dashboard/webui/js/dashboard.js").read_text()
+    start = js.index("async saveTimezone")
+    handler = js[start : start + 2000]
+    assert "d.warning" in handler, (
+        "the timezone handler ignores the API's `warning` field, so an operator is "
+        "never told the config was replaced or where the backup went"
+    )
+    assert "alert(" in handler, "the warning must be impossible to miss, not just logged"
