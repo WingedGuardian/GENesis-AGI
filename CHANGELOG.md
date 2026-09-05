@@ -141,7 +141,8 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   context is already running used to inherit that server's temp directory
   (often the small system `/tmp` Genesis keeps Claude off of). The temp
   directory and the OAuth-durability setting are now pinned to the slot
-  explicitly.
+  explicitly (when a usable temp directory exists at all — if none does, the
+  session is left on the system default rather than pointed at a bad path).
 
 - **Two branches can no longer pick the same database-migration number.** Each
   new migration is now named by the UTC time it was written rather than by the

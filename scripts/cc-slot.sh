@@ -128,19 +128,33 @@ if [[ "$MODE_ARG" == "manual" ]]; then
             # would hang the login here — before the launch — in a feature this
             # code calls COSMETIC. `-k` because `timeout` sends SIGTERM and then
             # waits, which a process stuck in uninterruptible I/O outlives.
-            _map_t="$_MAP_PROBE_BUDGET"
-            if [ "$_MAP_DEADLINE" -gt 0 ]; then
-                _map_rem=$(( _MAP_DEADLINE - SECONDS ))
-                if [ "$_map_rem" -le 0 ]; then
-                    _MAP_PROBE_GAVE_UP=1
-                    _map_rem=1
-                fi
-                [ "$_map_rem" -lt "$_map_t" ] && _map_t="$_map_rem"
-            fi
-            _map_pids=$(timeout -k 2 "$_map_t" tmux list-panes -s -t "=${name}" \
-                -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ' || true)
+            # Once the budget is SPENT, stop calling tmux altogether — do not
+            # substitute a shorter timeout. Every remaining slot would otherwise
+            # still pay a fresh round-trip (plus the -k grace), so the "whole-map
+            # ceiling" would not be a ceiling at all; it would just be a slower
+            # per-slot one. Skipping is also less code than the arithmetic it
+            # replaces, and it is bounded BY CONSTRUCTION: after exhaustion the
+            # loop makes zero further calls, so the map costs at most the budget
+            # plus the one call that overran it.
             _map_v=""
-            [ -n "$_map_pids" ] && _map_v=$(_map_verdict $_map_pids)
+            if [ "$_MAP_PROBE_GAVE_UP" = "0" ]; then
+                _map_t="$_MAP_PROBE_BUDGET"
+                if [ "$_MAP_DEADLINE" -gt 0 ]; then
+                    _map_rem=$(( _MAP_DEADLINE - SECONDS ))
+                    if [ "$_map_rem" -le 0 ]; then
+                        _MAP_PROBE_GAVE_UP=1
+                    elif [ "$_map_rem" -lt "$_map_t" ]; then
+                        _map_t="$_map_rem"
+                    fi
+                fi
+            fi
+            if [ "$_MAP_PROBE_GAVE_UP" = "0" ]; then
+                # `-k` because timeout sends SIGTERM and then WAITS, which a
+                # process stuck in uninterruptible I/O outlives.
+                _map_pids=$(timeout -k 2 "$_map_t" tmux list-panes -s -t "=${name}" \
+                    -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ' || true)
+                [ -n "$_map_pids" ] && _map_v=$(_map_verdict $_map_pids)
+            fi
             # Set in the LOOP's shell, not inside the substitution above.
             [ "$_map_v" = "TIMEOUT" ] && _MAP_PROBE_GAVE_UP=1
             if [[ "$_map_v" == "POISONED" ]]; then
@@ -473,20 +487,44 @@ echo "→ Slot ${SLOT} (session: ${SESSION_NAME}, live: ${existing})" >&2
 # be created AND writable before it is accepted, in a loop no future candidate
 # can be added without. ~/tmp is a DEGRADED fallback (disk_hygiene.sh prunes it
 # at 7 days), never an equal one.
-TMPDIR=""
+# UNSET, never TMPDIR="". Blanking an ALREADY-EXPORTED variable keeps the
+# export attribute, so the child would receive a literal `TMPDIR=` — and this
+# script ends in `exec tmux`, which STARTS the server when none is running, so
+# an empty value would be inherited by that server and (per the MEASURED note
+# at the exec below) by every slot created on it afterwards. That would defeat
+# the conditional `-e` pin further down via the ambient environment, on this
+# very path, and make the "system default" message a lie.
+unset TMPDIR CLAUDE_CODE_TMPDIR
+# TWIN: the in-tmux wrapper in scripts/bootstrap.sh carries this same
+# loop. It must be self-contained inside ~/.bashrc, so it cannot call
+# this one — keep the two in sync by hand, as with the other
+# deliberately-duplicated pairs in this repo.
 for _cand in "$HOME/.genesis/cc-tmp" "$HOME/tmp"; do
     mkdir -p "$_cand" 2>/dev/null || continue
     [ -w "$_cand" ] || continue
-    chmod 700 "$_cand" 2>/dev/null || true
+    # A directory we cannot make PRIVATE is not a usable candidate: `-w` alone
+    # passes on a group/world-writable directory owned by SOMEONE ELSE, where
+    # `chmod` then fails — and swallowing that would put CC session temp state
+    # where other users can read it. So a failed chmod rejects the candidate.
+    # ACCEPTED RESIDUAL: the tests come before the repair, so a directory we DO
+    # own whose mode already lacks u+w (only reachable under a pathological
+    # umask like 077-and-worse at creation time) is rejected rather than
+    # repaired, and stays rejected. Deliberate: ordering the repair first would
+    # make the rejection path unreachable for any directory this user owns,
+    # which is exactly the path the security case needs to keep.
+    chmod 700 "$_cand" 2>/dev/null || continue
     TMPDIR="$_cand"
     break
 done
 unset _cand
-if [ -n "$TMPDIR" ]; then
+if [ -n "${TMPDIR:-}" ]; then
     export TMPDIR
     [ "$TMPDIR" = "$HOME/.genesis/cc-tmp" ] \
         || echo "cc-slot: ${HOME}/.genesis/cc-tmp is unusable — using ${TMPDIR} instead." >&2
 else
+    # Make the message TRUE: leave BOTH names genuinely unset so CC resolves the
+    # system default, rather than an exported empty string.
+    unset TMPDIR CLAUDE_CODE_TMPDIR
     echo "cc-slot: no usable temp dir (${HOME}/.genesis/cc-tmp or ${HOME}/tmp) —" >&2
     echo "cc-slot: leaving CC on the system default (check disk space/permissions)." >&2
 fi
@@ -494,9 +532,12 @@ fi
 # Move CC's Bash sandbox off volatile /tmp onto persistent disk.
 # CC uses CLAUDE_CODE_TMPDIR for its sandbox root (/claude-<uid>/<cwd>/).
 # Without this, intermittent ENOENT failures on /tmp break the Bash tool.
-# Same resolved directory as TMPDIR above — never a second, unchecked path.
-CLAUDE_CODE_TMPDIR="$TMPDIR"
-[ -n "$CLAUDE_CODE_TMPDIR" ] && export CLAUDE_CODE_TMPDIR
+# Same resolved directory as TMPDIR above — never a second, unchecked path, and
+# left UNSET (not empty) when there is none, for the same export-attribute
+# reason documented at the loop.
+if [ -n "${TMPDIR:-}" ]; then
+    export CLAUDE_CODE_TMPDIR="$TMPDIR"
+fi
 
 # Permission mode for this interactive dev console. Default: auto — auto-approves
 # common ops but still prompts on deny/ask rules, which the operator answers in
@@ -617,7 +658,7 @@ fi
 # into the session, which is worse than not pinning it (CC would resolve an
 # empty TMPDIR rather than fall back to the system default).
 _TMPDIR_PIN=()
-if [ -n "$TMPDIR" ]; then
+if [ -n "${TMPDIR:-}" ]; then
     _TMPDIR_PIN=(-e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" -e "TMPDIR=$TMPDIR")
 fi
 exec tmux -u new-session -A -s "$SESSION_NAME" \

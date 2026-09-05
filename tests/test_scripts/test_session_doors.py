@@ -32,6 +32,11 @@ _BOOTSTRAP = _REPO_ROOT / "scripts" / "bootstrap.sh"
 _FAKE_TMUX = """#!/usr/bin/env bash
 # Records every invocation; simulates has-session against a session list file.
 echo "$*" >> "$FAKE_TMUX_LOG"
+# Record the TMPDIR this process INHERITED, distinguishing unset from empty.
+# `exec tmux` is what starts the tmux SERVER when none is running, so an empty
+# exported TMPDIR here would be inherited by that server and by every slot
+# created on it afterwards — invisible on the argv line the other assertions read.
+echo "INHERITED_TMPDIR=[${TMPDIR-<unset>}]" >> "$FAKE_TMUX_LOG"
 args="$*"
 if [[ "$args" == *has-session* ]]; then
     # invoked as: tmux has-session -t =cc-N
@@ -139,6 +144,12 @@ def door(tmp_path):
             "FAKE_TMUX_LIST_PANES_FAIL": os.environ.get(
                 "_TEST_FAKE_LIST_PANES_FAIL", ""),
         }
+        # Only set when a test asks: the door must be exercised with a REAL
+        # inherited TMPDIR to see what it passes on, and an unconditional entry
+        # would change every other test's environment.
+        _inherited = os.environ.get("_TEST_INHERITED_TMPDIR")
+        if _inherited:
+            env["TMPDIR"] = _inherited
         # Deliberately NOT inheriting os.environ wholesale: the test itself may
         # run inside a cc slot, whose GENESIS_CC_PERMISSION_MODE / TMUX would
         # contaminate the branch under test.
@@ -151,6 +162,7 @@ def door(tmp_path):
         )
 
     run.probe_log = probe_log  # ordered log of which slot-map probes ran
+    run.home = home  # so a test can make the temp-dir candidates unusable
     return run, log, sessions, listing, panes
 
 
@@ -194,6 +206,40 @@ class TestManualMode:
         assert "-e PATH=" not in line, f"PATH pinned despite no measured gap:\n{line}"
         assert line.index(" TMPDIR=") < line.index(" LANG="), line  # LANG last
         assert line.index("GENESIS_CC_SLOT_OAUTH=") < line.index(" LANG="), line
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the mode bit")
+    def test_no_usable_temp_dir_leaves_tmpdir_unset_not_empty(self, door, tmp_path):
+        """When NO candidate is usable, the door must leave TMPDIR genuinely
+        unset — never exported-but-empty.
+
+        `TMPDIR=""` on an already-exported variable KEEPS the export attribute,
+        so the child receives a literal `TMPDIR=`. This script ends in
+        `exec tmux`, which STARTS the server when none is running, so an empty
+        value is inherited by that server and — per the measured note at the
+        exec — by every slot created on it afterwards. It would also make the
+        "leaving CC on the system default" message false, and it bypasses the
+        conditional `-e` pin through the ambient environment rather than the
+        argv line the other assertions read.
+        """
+        run, log, _sessions, _listing, _panes = door
+        home = Path(run.home)
+        for cand in (home / ".genesis" / "cc-tmp", home / "tmp"):
+            cand.mkdir(parents=True, exist_ok=True)
+            cand.chmod(0o500)  # exists, ours, but chmod 700 cannot be applied...
+        os.environ["_TEST_INHERITED_TMPDIR"] = "/inherited/from/parent"
+        try:
+            proc = run("manual")
+        finally:
+            os.environ.pop("_TEST_INHERITED_TMPDIR", None)
+            for cand in (home / ".genesis" / "cc-tmp", home / "tmp"):
+                cand.chmod(0o700)  # so tmp_path teardown can clean up
+        assert proc.returncode == 0, proc.stderr
+        body = log.read_text()
+        assert "INHERITED_TMPDIR=[<unset>]" in body, (
+            "the door handed tmux an exported TMPDIR when none was usable; an "
+            f"empty one poisons the server it starts:\n{body}\n{proc.stderr}"
+        )
+        assert "-e TMPDIR=" not in body, f"pinned an unusable TMPDIR:\n{body}"
 
     def test_slot_map_marks_a_session_with_no_claude(self, door):
         """The printed map is the only honest surface for a slot NOTHING here
@@ -385,7 +431,7 @@ class TestSlotMapBudget:
         under it still cost N x budget. Twelve slots at 1s each, with a shared
         ~6s deadline, must stop probing partway through — strictly fewer than
         twelve probes run."""
-        run, _log, _sessions, listing, panes = door
+        run, log, _sessions, listing, panes = door
         listing.write_text("".join(f"cc-{i}|0|ts\n" for i in range(1, 13)))
         panes.write_text("4242\n")  # non-empty so a probe is attempted per slot
         os.environ["_TEST_FAKE_PROBE_SLEEP"] = "1"
@@ -398,6 +444,17 @@ class TestSlotMapBudget:
         assert probes < 12, (
             f"every slot was probed ({probes}); the map is spending per-probe "
             f"budget rather than one shared deadline"
+        )
+        # And once the budget is spent the map must stop calling tmux AT ALL.
+        # Bounding each call without bounding the aggregate is not a ceiling:
+        # every remaining slot would still pay a round-trip (plus the -k grace),
+        # which is how a wedged server could outlast the declared budget.
+        listings = [
+            ln for ln in log.read_text().splitlines() if "list-panes" in ln
+        ]
+        assert len(listings) < 12, (
+            f"list-panes ran for every slot ({len(listings)}); the deadline "
+            f"bounds each call but not the map"
         )
 
 

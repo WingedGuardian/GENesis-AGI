@@ -316,7 +316,9 @@ verified: 225f9e3b 2026-09-04
   fallback OAuth login (via
   the same `login_gate` + `read_fallback_token` the door uses), and exit capture —
   instead of falling through to a bare `command claude`. The create `exec` pins `TMPDIR`
-  and the resolved `GENESIS_CC_SLOT_OAUTH` lever via `-e` (MEASURED on tmux 3.4: a new
+  and the resolved `GENESIS_CC_SLOT_OAUTH` lever via `-e` (the temp pins are
+  conditional — with no usable candidate the door leaves both names UNSET
+  rather than exporting an empty value the tmux server would inherit) (MEASURED on tmux 3.4: a new
   session on a pre-existing server inherits the SERVER's env for these, not the door's;
   PATH already propagates from the client, so it is deliberately NOT pinned). The
   destructive recovery (kill-and-recreate a poisoned slot on consent) is a SEPARATE

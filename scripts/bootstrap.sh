@@ -938,11 +938,20 @@ claude() {
         # disk_hygiene.sh's 7-day prune, so it is a degraded fallback, not an
         # equal one. 0700 because this holds CC session state and the ambient
         # umask would leave it world-readable.
+        # TWIN: scripts/cc-slot.sh carries this same loop. This copy must be
+        # self-contained inside ~/.bashrc, so it cannot call that one — keep the
+        # two in sync by hand.
         _ctmp=""
         for _cand in "$HOME/.genesis/cc-tmp" "$HOME/tmp"; do
             mkdir -p "$_cand" 2>/dev/null || continue
             [ -w "$_cand" ] || continue
-            chmod 700 "$_cand" 2>/dev/null || true
+            # A directory we cannot make PRIVATE is not a usable candidate: `-w`
+            # alone passes on a group/world-writable directory owned by SOMEONE
+            # ELSE, where `chmod` then fails, and swallowing that would put CC
+            # session temp state where other users can read it. (Same accepted
+            # residual as the twin: a dir we own whose mode already lacks u+w is
+            # rejected rather than repaired.)
+            chmod 700 "$_cand" 2>/dev/null || continue
             _ctmp="$_cand"
             break
         done
