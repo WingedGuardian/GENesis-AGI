@@ -233,31 +233,48 @@ class TestRecoveryIOTriage:
 
 _SHA_A = "a" * 40
 _SHA_B = "b" * 40
+_SHA_OTHER = "c" * 40
 
 
 def _revert_mock(
-    *, head: tuple[int, str] = (0, _SHA_A), stash: tuple[int, str] = (0, ""),
+    *, head: tuple[int, str] = (0, _SHA_A), in_flight: str = "",
+    left_behind: str | None = None, stash: tuple[int, str] = (0, ""),
     revert: tuple[int, str] = (0, ""), abort: tuple[int, str] = (0, ""),
     calls: list[str] | None = None,
 ):
     """Mock `_run_subprocess` for the revert path, dispatching on the shell command.
 
-    ``head`` is the (rc, stdout) of the `git rev-parse HEAD` probe; ``stash``,
-    ``revert`` and ``abort`` are the (rc, stderr) of their respective calls.
-    Order matters: `--abort` is checked before the bare revert, since its
-    command string also contains "git revert".
+    ``head``        (rc, stdout) of the `git rev-parse HEAD` probe. stdout may
+                    carry a login-shell banner ahead of the sha.
+    ``in_flight``   REVERT_HEAD BEFORE we start ("" = no revert in progress).
+    ``left_behind`` REVERT_HEAD AFTER our revert ran; defaults to the sha we
+                    pinned when the revert failed, "" when it succeeded.
+    ``stash`` / ``revert`` / ``abort``  (rc, stderr) of those calls.
+
+    Dispatch order matters: REVERT_HEAD is matched before the bare `rev-parse
+    HEAD`, and `revert --abort` before the bare `git revert` — each pair shares
+    a substring.
     """
+    state = {"revert_ran": False}
+
     async def mock(*args, **kwargs):
         cmd = args[-1]
         if calls is not None:
             calls.append(cmd)
-        if "rev-parse" in cmd:
+        if "REVERT_HEAD" in cmd:
+            if not state["revert_ran"]:
+                return (0, in_flight, "")
+            if left_behind is not None:
+                return (0, left_behind, "")
+            return (0, (head[1] if revert[0] != 0 else ""), "")
+        if "rev-parse HEAD" in cmd:
             return (head[0], head[1], "")
         if "git stash" in cmd:
             return (stash[0], "", stash[1])
         if "revert --abort" in cmd:
             return (abort[0], "", abort[1])
         if "git revert" in cmd:
+            state["revert_ran"] = True
             return (revert[0], "", revert[1])
         return (0, "", "")
     return mock
@@ -280,13 +297,17 @@ class TestRecoveryRevertCode:
 
 class TestRevertCodeGuards:
     """REVERT_CODE runs `git stash` then `git revert` against the container's
-    LIVE dev checkout. Two ways that destroyed work it should not touch:
+    LIVE dev checkout. Ways that destroyed work it should not touch:
 
-    1. The stash's exit code was DISCARDED (`rc, _, _ = ...`), so a failed stash
-       still went on to revert — on top of uncommitted work never saved.
-    2. HEAD was resolved implicitly by the revert itself. With a stash round-trip
-       in between, a deploy landing in that window meant reverting a commit the
-       action never looked at.
+    1. The stash's exit code was DISCARDED, so a failed stash still reverted on
+       top of uncommitted work that was never saved.
+    2. HEAD was resolved implicitly by the revert itself, so a commit landing
+       during the stash round-trip redirected the revert onto a commit nothing
+       had inspected.
+    3. A failed revert left the tree mid-revert; `git stash` refuses an unmerged
+       index, so the new stash guard would then decline this rung forever.
+    4. Cleaning that up unconditionally would reset a revert ANOTHER session
+       started, destroying a conflict resolution our stash never captured.
     """
 
     @pytest.mark.asyncio
@@ -315,7 +336,7 @@ class TestRevertCodeGuards:
             "genesis.guardian.recovery._run_subprocess",
             _revert_mock(stash=(-1, "timeout"), calls=calls),
         ):
-            ok, detail = await engine._revert_code("genesis")
+            ok, _ = await engine._revert_code("genesis")
         assert ok is False
         assert not any("git revert" in c for c in calls)
 
@@ -330,48 +351,73 @@ class TestRevertCodeGuards:
         ):
             ok, _ = await engine._revert_code("genesis")
         assert ok is True
-        revert_cmds = [c for c in calls if "git revert" in c]
+        revert_cmds = [c for c in calls if "git revert" in c and "--abort" not in c]
         assert len(revert_cmds) == 1
         assert _SHA_B in revert_cmds[0], "the resolved sha must be what gets reverted"
         assert "HEAD" not in revert_cmds[0], (
-            "reverting symbolic HEAD re-resolves it — a deploy landing after the "
-            "probe would then revert a commit that was never vetted"
+            "reverting symbolic HEAD re-resolves it — a commit landing after the "
+            "probe would then revert something that was never vetted"
         )
 
     @pytest.mark.asyncio
-    async def test_refuses_when_head_cannot_be_resolved(
+    async def test_login_shell_banner_does_not_disable_the_rung(
         self, engine: RecoveryEngine,
     ) -> None:
+        # `su -` runs a LOGIN shell: its startup files write to the same stdout
+        # BEFORE the -c command runs, so a pipe inside that command cannot filter
+        # them — the banner was never its input. Parsing the last line in Python
+        # is what stops a supported shell config failing this rung closed on
+        # every attempt.
+        banner = "Found '.nvmrc' with version <22>\ndirenv: loading ~/.envrc\n"
         calls: list[str] = []
         with patch(
             "genesis.guardian.recovery._run_subprocess",
-            _revert_mock(head=(128, ""), calls=calls),
+            _revert_mock(head=(0, banner + _SHA_B), calls=calls),
         ):
-            ok, detail = await engine._revert_code("genesis")
-        assert ok is False
-        assert "resolve" in detail.lower()
-        assert not any("git stash" in c for c in calls), (
-            "refuse BEFORE stashing — a refusal that stashes still displaces the work"
-        )
-        assert not any("git revert" in c for c in calls)
+            ok, _ = await engine._revert_code("genesis")
+        assert ok is True, "a login-shell banner must not be read as a bad sha"
+        revert_cmds = [c for c in calls if "git revert" in c and "--abort" not in c]
+        assert _SHA_B in revert_cmds[0]
 
-    @pytest.mark.parametrize(
-        "contaminated",
-        [
-            "nvm: loaded\n" + _SHA_A,          # login-shell banner ahead of the value
-            "$(rm -rf /)",                      # not sha-shaped at all
-            _SHA_A + "; rm -rf /",              # sha-shaped prefix, shell suffix
-            "HEAD",
-            "",
-        ],
-    )
+    @pytest.mark.asyncio
+    async def test_probe_does_not_pipe_away_its_exit_status(
+        self, engine: RecoveryEngine,
+    ) -> None:
+        # The mock cannot execute a shell, so assert on the command TEXT. A pipe
+        # makes the probe report the filter's status instead of git's, and
+        # `git rev-parse HEAD` exits 128 while printing the literal "HEAD".
+        calls: list[str] = []
+        with patch("genesis.guardian.recovery._run_subprocess", _revert_mock(calls=calls)):
+            await engine._revert_code("genesis")
+        probe = next(c for c in calls if "rev-parse HEAD" in c)
+        assert "|" not in probe, (
+            "piping the probe replaces git's exit status with the filter's; the "
+            "last-line parse belongs in Python, where rc stays meaningful"
+        )
+
+    @pytest.mark.asyncio
+    async def test_nonzero_probe_rc_refuses_even_when_stdout_looks_valid(
+        self, engine: RecoveryEngine,
+    ) -> None:
+        # Isolates the `rc != 0` half of the probe guard: a test that ALSO passed
+        # empty stdout would pass on the regex alone and leave this clause dead.
+        calls: list[str] = []
+        with patch(
+            "genesis.guardian.recovery._run_subprocess",
+            _revert_mock(head=(128, _SHA_A), calls=calls),
+        ):
+            ok, _ = await engine._revert_code("genesis")
+        assert ok is False
+        assert not any("git stash" in c for c in calls)
+
+    @pytest.mark.parametrize("contaminated", ["$(id)", "`id`", _SHA_A + "; echo INJECTED", "HEAD", "", "a" * 7, "a" * 39, "a" * 41])
     @pytest.mark.asyncio
     async def test_refuses_any_head_value_that_is_not_a_bare_sha(
         self, engine: RecoveryEngine, contaminated: str,
     ) -> None:
         # The sha is interpolated into a shell command inside the container, so
-        # the shape check is a boundary, not a formality. `| tail -n1` strips a
-        # banner; this refuses whatever still is not a bare 40-hex sha.
+        # the shape check is a boundary, not a formality. The length cases pin
+        # the exact-40 requirement: an abbreviated sha is still hex.
         calls: list[str] = []
         with patch(
             "genesis.guardian.recovery._run_subprocess",
@@ -382,86 +428,85 @@ class TestRevertCodeGuards:
         assert not any("git revert" in c for c in calls)
 
     @pytest.mark.asyncio
-    async def test_failed_revert_aborts_so_the_tree_is_not_left_mid_revert(
+    async def test_refuses_when_another_revert_is_already_in_progress(
         self, engine: RecoveryEngine,
     ) -> None:
-        # Without the abort the two guards deadlock: a conflicted revert leaves
-        # an unmerged index, `git stash` refuses an unmerged index, and the stash
-        # guard then refuses this rung on EVERY later attempt.
         calls: list[str] = []
         with patch(
             "genesis.guardian.recovery._run_subprocess",
-            _revert_mock(revert=(1, "error: could not revert... conflict"), calls=calls),
+            _revert_mock(in_flight=_SHA_OTHER, calls=calls),
+        ):
+            ok, detail = await engine._revert_code("genesis")
+        assert ok is False
+        assert "already in progress" in detail.lower()
+        assert not any("git stash" in c for c in calls), (
+            "refuse BEFORE stashing — our own revert would fail against another "
+            "session's sequencer state, and cleanup would then abort THEIRS"
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_revert_aborts_only_our_own(
+        self, engine: RecoveryEngine,
+    ) -> None:
+        calls: list[str] = []
+        with patch(
+            "genesis.guardian.recovery._run_subprocess",
+            _revert_mock(revert=(1, "conflict"), calls=calls),
         ):
             ok, detail = await engine._revert_code("genesis")
         assert ok is False
         assert "revert failed" in detail.lower()
         assert any("revert --abort" in c for c in calls), (
-            "a failed revert must be aborted, or the conflicted tree disables the rung"
+            "our own failed revert must be aborted, or the conflicted tree "
+            "disables this rung permanently"
         )
 
     @pytest.mark.asyncio
-    async def test_abort_failure_is_reported_but_does_not_mask_the_revert_failure(
+    async def test_does_not_abort_a_revert_this_did_not_start(
         self, engine: RecoveryEngine,
     ) -> None:
+        # Race window: another session began a revert between our pre-check and
+        # our own revert. Aborting it would reset their state and destroy a
+        # staged conflict resolution our stash never captured.
+        calls: list[str] = []
+        with patch(
+            "genesis.guardian.recovery._run_subprocess",
+            _revert_mock(revert=(1, "conflict"), left_behind=_SHA_OTHER, calls=calls),
+        ):
+            ok, detail = await engine._revert_code("genesis")
+        assert ok is False
+        assert not any("revert --abort" in c for c in calls)
+        assert "did not start" in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_no_abort_when_the_failed_revert_left_nothing_behind(
+        self, engine: RecoveryEngine,
+    ) -> None:
+        calls: list[str] = []
+        with patch(
+            "genesis.guardian.recovery._run_subprocess",
+            _revert_mock(revert=(1, "bad object"), left_behind="", calls=calls),
+        ):
+            ok, detail = await engine._revert_code("genesis")
+        assert ok is False
+        assert not any("revert --abort" in c for c in calls)
+        assert "revert failed" in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_abort_failure_is_surfaced_in_the_result_not_only_logged(
+        self, engine: RecoveryEngine,
+    ) -> None:
+        # The recovery ALERT is built from this string. If cleanup failed, the
+        # checkout is left with an unmerged index that makes every later stash
+        # fail — reporting only the original revert error hides that.
         with patch(
             "genesis.guardian.recovery._run_subprocess",
             _revert_mock(revert=(1, "conflict"), abort=(1, "no revert in progress")),
         ):
             ok, detail = await engine._revert_code("genesis")
         assert ok is False
-        # The caller still learns why the RECOVERY failed, not why cleanup did.
-        assert "revert failed" in detail.lower()
-
-    @pytest.mark.asyncio
-    async def test_nonzero_probe_rc_refuses_even_when_stdout_looks_valid(
-        self, engine: RecoveryEngine,
-    ) -> None:
-        # Isolates the `rc != 0` half of the probe guard. Without pipefail the
-        # pipe reports tail's status, so a failing `git rev-parse` reads as rc=0;
-        # a test that also supplies empty stdout would pass on the regex alone
-        # and leave this clause unverified.
-        calls: list[str] = []
-        with patch(
-            "genesis.guardian.recovery._run_subprocess",
-            _revert_mock(head=(128, _SHA_A), calls=calls),
-        ):
-            ok, _ = await engine._revert_code("genesis")
-        assert ok is False
-        assert not any("git stash" in c for c in calls)
-
-    @pytest.mark.asyncio
-    async def test_probe_command_restores_pipeline_exit_status(
-        self, engine: RecoveryEngine,
-    ) -> None:
-        # The mock cannot execute a shell, so assert on the command TEXT: the
-        # pipe must not be allowed to mask a failing `git rev-parse`.
-        calls: list[str] = []
-        with patch("genesis.guardian.recovery._run_subprocess", _revert_mock(calls=calls)):
-            await engine._revert_code("genesis")
-        probe = next(c for c in calls if "rev-parse" in c)
-        assert "pipefail" in probe, (
-            "`git rev-parse HEAD | tail -n1` reports tail's status; rev-parse "
-            "exits 128 AND prints 'HEAD' on a broken repo, so the rc check is "
-            "dead without pipefail"
-        )
-
-    @pytest.mark.parametrize("short_sha", ["a" * 7, "a" * 39, "a" * 41])
-    @pytest.mark.asyncio
-    async def test_refuses_a_sha_of_the_wrong_length(
-        self, engine: RecoveryEngine, short_sha: str,
-    ) -> None:
-        # Isolates the regex's exact-40 requirement: an abbreviated sha is hex
-        # and would satisfy a length-relaxed pattern, but is not what the probe
-        # is contracted to return.
-        calls: list[str] = []
-        with patch(
-            "genesis.guardian.recovery._run_subprocess",
-            _revert_mock(head=(0, short_sha), calls=calls),
-        ):
-            ok, _ = await engine._revert_code("genesis")
-        assert ok is False
-        assert not any("git revert" in c for c in calls)
+        assert "revert failed" in detail.lower(), "the original cause must survive"
+        assert "manual repair" in detail.lower(), "the poisoned checkout must be named"
 
     @pytest.mark.asyncio
     async def test_success_detail_says_where_uncommitted_work_went(

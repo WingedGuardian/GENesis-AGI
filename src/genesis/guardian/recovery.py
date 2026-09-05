@@ -300,6 +300,88 @@ class RecoveryEngine:
         # Restart services
         return await self._restart_services(container)
 
+    async def _git_probe(
+        self, container: str, git_cmd: str,
+    ) -> tuple[int, str, str]:
+        """Run a read-only git command in the checkout. Returns (rc, value, stderr).
+
+        ``value`` is the LAST non-empty stdout line. `su -` starts a LOGIN shell,
+        whose startup files (nvm / direnv / ~/.profile) write to the same stdout
+        BEFORE the ``-c`` command runs — so a pipe inside that command cannot
+        filter them, the banner never being its input. Taking the last line here
+        also keeps the exit status meaningful, which a pipe would otherwise
+        replace with the filter's, and avoids depending on the account's login
+        shell supporting any particular option.
+        """
+        rc, stdout, stderr = await _run_subprocess(
+            "incus", "exec", container, "--",
+            "su", "-", "ubuntu", "-c",
+            f"cd ~/genesis && {git_cmd}",
+            timeout=15.0,
+        )
+        lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
+        return rc, (lines[-1] if lines else ""), stderr
+
+    async def _clean_up_failed_revert(
+        self, container: str, sha: str, revert_err: str,
+    ) -> str:
+        """Undo OUR failed revert, and describe what the checkout was left as.
+
+        A failed revert leaves the tree mid-revert — unmerged paths, conflict
+        markers. Left there it poisons every later attempt, because `git stash`
+        refuses an unmerged index and the stash guard would then decline this
+        rung forever.
+
+        The abort is CONDITIONAL: it fires only when the in-flight revert is the
+        one this invocation started. If another session began a revert in the
+        race window, aborting would reset ITS state and destroy a conflict
+        resolution that our stash never captured.
+
+        Returns the detail string for the recovery result — the original revert
+        error ALWAYS survives, with any cleanup problem appended, so an alert
+        never reports a tidy failure over a poisoned checkout.
+        """
+        base = f"git revert failed: {revert_err}"
+
+        rc, in_flight, probe_err = await self._git_probe(
+            container, "git rev-parse --verify --quiet REVERT_HEAD || true",
+        )
+        if rc != 0:
+            logger.error("post-revert state probe failed: %s", probe_err)
+            return (
+                f"{base} — could not determine whether a revert was left in "
+                f"progress ({probe_err}); the checkout may need manual repair"
+            )
+        if not in_flight:
+            return base  # nothing was left behind; nothing to clean up
+        if in_flight != sha:
+            logger.warning(
+                "a revert of %s is in progress and is not ours (%s) — not aborting",
+                in_flight, sha,
+            )
+            return (
+                f"{base} — left alone: a revert of {in_flight[:12]} is in "
+                "progress that this did not start"
+            )
+
+        rc, _, abort_err = await _run_subprocess(
+            "incus", "exec", container, "--",
+            "su", "-", "ubuntu", "-c",
+            "cd ~/genesis && git revert --abort",
+            timeout=15.0,
+        )
+        if rc != 0:
+            logger.error(
+                "git revert --abort failed — the checkout is left mid-revert "
+                "with an unmerged index: %s", abort_err,
+            )
+            return (
+                f"{base} — AND `git revert --abort` failed ({abort_err}); the "
+                "checkout is left mid-revert with an unmerged index and needs "
+                "manual repair before this rung can run again"
+            )
+        return f"{base} (revert aborted; checkout restored)"
+
     async def _revert_code(self, container: str) -> tuple[bool, str]:
         """Stash uncommitted changes and revert the last commit, then restart.
 
@@ -316,10 +398,13 @@ class RecoveryEngine:
           a deploy landing in that window would otherwise revert a commit this
           never looked at. Reverting the pinned sha stays correct if HEAD moved.
 
-        A failed revert is ABORTED rather than left in place. Together those two
-        guards would otherwise deadlock each other: a conflicted revert leaves an
-        unmerged index, `git stash` refuses an unmerged index, and the stash
-        guard would then refuse this rung on every future attempt.
+        A failed revert is ABORTED rather than left in place — but only when the
+        in-flight revert is the one this started. Without the cleanup the two
+        guards deadlock each other: a conflicted revert leaves an unmerged index,
+        `git stash` refuses an unmerged index, and the stash guard would then
+        refuse this rung on every future attempt. Without the ownership check the
+        cleanup would reset a revert another session began, destroying a conflict
+        resolution the stash never captured.
 
         The stash is deliberately NOT popped — a revert that restored the same
         uncommitted changes could reintroduce the fault. The outcome string says
@@ -330,21 +415,26 @@ class RecoveryEngine:
         fast-forward, reverting it undoes ONE commit of the batch that landed,
         not the whole deploy.
         """
-        rc, stdout, stderr = await _run_subprocess(
-            "incus", "exec", container, "--",
-            "su", "-", "ubuntu", "-c",
-            # `pipefail` because the pipe would otherwise report tail's status:
-            # `git rev-parse HEAD` exits 128 on a broken repo AND prints the
-            # literal "HEAD" to stdout, so without it a failure reads as rc=0.
-            # `| tail -n1` drops a login-shell banner (nvm/direnv/~/.profile).
-            # The shape check below is still the real gate.
-            "set -o pipefail; cd ~/genesis && git rev-parse HEAD | tail -n1",
-            timeout=15.0,
-        )
-        sha = stdout.strip()
+        rc, sha, stderr = await self._git_probe(container, "git rev-parse HEAD")
         if rc != 0 or not _FULL_SHA_RE.fullmatch(sha):
             return False, (
-                f"could not resolve HEAD to a commit sha: {stderr or stdout or 'no output'}"
+                f"could not resolve HEAD to a commit sha: {stderr or sha or 'no output'}"
+            )
+
+        # Refuse if a revert is ALREADY in flight — it is not ours to touch, and
+        # proceeding would make our own revert fail and our cleanup abort someone
+        # else's operation (destroying a staged conflict resolution that our stash
+        # never captured). Safe to read "" as "none in flight": HEAD just resolved,
+        # so the repo is readable and an empty answer is a real answer.
+        rc, in_flight, stderr = await self._git_probe(
+            container, "git rev-parse --verify --quiet REVERT_HEAD || true",
+        )
+        if rc != 0:
+            return False, f"could not check for an in-flight revert: {stderr}"
+        if in_flight:
+            return False, (
+                f"a revert of {in_flight[:12]} is already in progress in the "
+                "checkout — refusing to disturb another operation"
             )
 
         # Stash any TRACKED uncommitted work. Plain `git stash` does not take
@@ -367,25 +457,7 @@ class RecoveryEngine:
             timeout=30.0,
         )
         if rc != 0:
-            # A failed revert leaves the checkout MID-REVERT — unmerged paths and
-            # conflict markers in tracked files. Left behind, that state poisons
-            # every later attempt: `git stash` refuses an unmerged index, so the
-            # stash guard above would then refuse this rung forever. Abort so the
-            # tree returns to the sha we pinned. Best-effort: if the abort itself
-            # fails there is nothing further this can safely do, and the recovery
-            # is already being reported as failed.
-            _abort_rc, _, abort_err = await _run_subprocess(
-                "incus", "exec", container, "--",
-                "su", "-", "ubuntu", "-c",
-                "cd ~/genesis && git revert --abort",
-                timeout=15.0,
-            )
-            if _abort_rc != 0:
-                logger.error(
-                    "git revert --abort failed after a failed revert — the "
-                    "checkout may be left mid-revert: %s", abort_err,
-                )
-            return False, f"git revert failed: {stderr}"
+            return False, await self._clean_up_failed_revert(container, sha, stderr)
 
         # Restart services after code change
         svc_ok, svc_detail = await self._restart_services(container)
