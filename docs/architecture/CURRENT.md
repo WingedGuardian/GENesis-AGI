@@ -1649,7 +1649,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: b8232425 2026-09-02
+verified: 9730efe9 2026-09-05
 ```
 
 - **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
