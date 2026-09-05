@@ -2113,8 +2113,35 @@ The public repo (`GENesis-AGI`) is the primary development repo.
 Standard open-source workflow: PRs go directly to the public repo.
 
 - **Squash merges only** — merge commits are disabled on the public repo.
-  Always `git pull --rebase origin main` after merging a PR before
+  Always `git pull --rebase origin main` **on main** after merging a PR before
   committing locally, or push will be rejected (non-fast-forward).
+- **Once a branch is pushed: merge main IN, never rebase it** — force-push is
+  banned, so a rebased pushed branch diverges from its remote with no way to
+  publish the rewrite. A merge commit on a *branch* is fine — the squash erases
+  it at PR merge; "squash only" above governs merging into main, not
+  reconciling a branch.
+- **In a reconciliation merge, the base wins on policy.** The merge commit may
+  DELETE from your branch (a rule main superseded, a test that pinned your
+  now-dead behavior); it may never re-litigate main. Scope, precisely: base
+  wins where main *deliberately changed a thing your branch also changes*; on
+  your branch's own new work the merge integrates both sides — keep your
+  feature, adopt main's surrounding changes. "Base wins" is never
+  `--theirs` on a whole hunk. If you disagree with what main did, that is a
+  NEW PR with its own review (a sanctioned revert PR is exactly that — the ban
+  is on *unreviewed* reversals) — never a conflict resolution, which is the
+  one diff nobody re-reviews. And a clean auto-merge is not a clean
+  reconciliation: the superseded-rule case usually merges with NO textual
+  conflict, because your rule and main's live in different hunks — so after
+  merging main in, re-check every rule and test your branch carries against
+  what main changed in the interval. The lived failure (2026-09-04): main
+  widened a gate rule while a narrower rule for the same paths sat in review;
+  restoring the branch's rule "so its tests stay green" would have silently
+  reverted a deliberate policy change inside a merge commit. Delete your
+  superseded rule AND its tests — a test pinning behavior the base retired is
+  not coverage, it is a revert waiting to be committed — and name every such
+  deletion in the PR body; if you suspect main's change is a bug rather than
+  policy, file that before merging. A deleted test with no filed disagreement
+  is how coverage disappears.
 - **README is public-authoritative** — the public repo's `README.md` is
   hand-crafted and must NEVER be overwritten.
 - **CHANGELOG audience is users** — only include entries a user updating
