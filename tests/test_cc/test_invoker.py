@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -231,6 +232,288 @@ def test_build_env_strips_parent_anthropic_base_url(invoker):
     with patch.dict("os.environ", {"ANTHROPIC_BASE_URL": "http://leaked:8100"}):
         env = invoker._build_env(inv)
         assert "ANTHROPIC_BASE_URL" not in env
+
+
+def test_scope_args_empty_when_probe_fails(monkeypatch):
+    """An env-scrubbed spawner (some agent CLIs' shell tooling, CI runners) has
+    the systemd-run binary but no reachable user manager — the probe must fail
+    closed to 'no scope wrap' instead of letting systemd-run kill the CC
+    subprocess at 0.0s with 'Failed to connect to bus'."""
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+
+    def _probe_fails(*args, **kwargs):
+        return real_subprocess.CompletedProcess(args[0], 1, b"", b"Failed to connect to bus")
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_fails)
+    assert inv_mod._build_scope_args() == []
+
+
+def test_scope_args_empty_when_probe_raises(monkeypatch):
+    """Probe timeout / spawn failure also degrades to no wrap, never raises."""
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+
+    def _probe_times_out(*args, **kwargs):
+        raise real_subprocess.TimeoutExpired(cmd="systemd-run", timeout=15)
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_times_out)
+    assert inv_mod._build_scope_args() == []
+
+
+def test_probe_raising_announces_the_lost_isolation(monkeypatch, caplog):
+    """A raising probe must degrade LOUDLY, like the non-zero-exit branch.
+
+    Silence here is indistinguishable from a scoped box: MemoryHigh/MemoryMax
+    are gone and nothing in the log says so. `announce=False` (a backoff
+    re-probe) still demotes to debug so a permanently-unscoped box does not
+    warn on every retry forever.
+    """
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+
+    def _probe_times_out(*args, **kwargs):
+        raise real_subprocess.TimeoutExpired(cmd="systemd-run", timeout=15)
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_times_out)
+
+    with caplog.at_level(logging.WARNING, logger=inv_mod.logger.name):
+        assert inv_mod._build_scope_args(announce=True) == []
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "probe raised and nothing warned — the degradation is silent"
+    assert "TimeoutExpired" in warnings[0].getMessage()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=inv_mod.logger.name):
+        assert inv_mod._build_scope_args(announce=False) == []
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+        "re-probe warned again — announce=False must demote to debug"
+    )
+
+
+def test_probe_sets_the_same_properties_as_the_real_invocation(monkeypatch):
+    """The probe must carry the scope's properties, not just ask for a scope.
+
+    `systemd-run` exits non-zero on a property it cannot accept (measured on
+    systemd 255: "Unknown assignment: ..." and "Failed to parse MemoryMax=..."
+    both exit 1), and older systemd predates the ``N%`` syntax. A property-free
+    probe would SUCCEED on such a box, cache that verdict for the process
+    lifetime, and leave every real dispatch dying inside systemd-run before
+    Claude starts.
+    """
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+    seen = []
+
+    def _probe_ok(*args, **kwargs):
+        seen.append(list(args[0]))
+        return real_subprocess.CompletedProcess(args[0], 0, b"", b"")
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_ok)
+    out = inv_mod._build_scope_args()
+
+    assert len(seen) == 1
+    probe_argv = seen[0]
+    assert probe_argv[-1] == "/bin/true"
+    # Everything the real prefix passes, the probe passed too — compared as the
+    # whole argv so a future property added to one side and not the other fails
+    # here instead of at dispatch time.
+    assert probe_argv[:-1] == out
+    for prop in inv_mod._SCOPE_PROPERTIES:
+        assert ["-p", prop] == probe_argv[
+            probe_argv.index(prop) - 1 : probe_argv.index(prop) + 1
+        ]
+        assert prop in out
+
+
+def test_scope_args_built_when_probe_succeeds(monkeypatch):
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+
+    def _probe_ok(*args, **kwargs):
+        return real_subprocess.CompletedProcess(args[0], 0, b"", b"")
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_ok)
+    out = inv_mod._build_scope_args()
+    assert out[:3] == ["systemd-run", "--user", "--scope"]
+    assert "MemoryMax=75%" in out
+
+
+# --- _get_scope_args caching: success is permanent, FAILURE is not ------------
+# genesis-server is long-lived. Caching one transient probe failure for the
+# process lifetime silently drops MemoryHigh/MemoryMax from every later CC
+# subprocess, for days, on a swapless box — the exact thing the scope exists to
+# prevent. These pin the asymmetry in both directions.
+
+
+def _stub_probe(monkeypatch, results):
+    """Patch the probe to yield `results` in order; return the call counter."""
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    calls = []
+    seq = list(results)
+
+    def _probe(*args, **kwargs):
+        calls.append(args[0])
+        # NOT `next(iter(...))`. An exhausted iterator raises StopIteration,
+        # which is pathological across an `await` — the over-probing case this
+        # stub exists to catch HUNG the test run instead of failing it, so the
+        # mutation read as "no result" rather than RED. Fail loudly instead.
+        if len(calls) > len(seq):
+            raise AssertionError(
+                f"probe called {len(calls)}x but only {len(seq)} result(s) were "
+                "stubbed — the caller is probing more often than expected"
+            )
+        return real_subprocess.CompletedProcess(
+            args[0], seq[len(calls) - 1], b"", b"bus error"
+        )
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe)
+    # Reset the module cache through monkeypatch so it is restored for siblings.
+    monkeypatch.setattr(inv_mod, "_SCOPE_ARGS", None)
+    monkeypatch.setattr(inv_mod, "_SCOPE_PROBE_FAILED_AT", None)
+    monkeypatch.setattr(inv_mod, "_SCOPE_PROBE_FAILURES", 0)
+    monkeypatch.setattr(inv_mod, "_SCOPE_PROBE_LOCK", None)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_scope_probe_failure_is_retried_after_the_cooldown(monkeypatch):
+    import genesis.cc.invoker as inv_mod
+
+    calls = _stub_probe(monkeypatch, [1, 0])  # fail, then succeed
+    now = [1000.0]
+    # Patch the module's own clock seam, NOT time.monotonic — `inv_mod.time` is
+    # the stdlib module object, so patching its attribute would replace the
+    # clock process-wide for the duration of this test.
+    monkeypatch.setattr(inv_mod, "_now", lambda: now[0])
+
+    assert await inv_mod._get_scope_args() == []
+    assert len(calls) == 1
+
+    # Inside the first cooldown step: no re-probe, still degraded.
+    now[0] += inv_mod._SCOPE_RETRY_SCHEDULE_S[0] - 1
+    assert await inv_mod._get_scope_args() == []
+    assert len(calls) == 1, "re-probed inside the cooldown — probes every dispatch"
+
+    # Past it: re-probe, and the recovered scope is used again.
+    now[0] += 2
+    out = await inv_mod._get_scope_args()
+    assert len(calls) == 2, "never re-probed — one transient failure is permanent"
+    assert "MemoryMax=75%" in out
+
+
+@pytest.mark.asyncio
+async def test_scope_probe_backoff_escalates_on_repeated_failure(monkeypatch):
+    """A permanently-unscoped box must decay to hourly, not probe every 5min.
+
+    The no-reachable-bus case is a property of the machine, so a fixed retry
+    would spawn a subprocess 288x/day forever and log a warning each time.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    calls = _stub_probe(monkeypatch, [1, 1, 1, 1, 1])
+    now = [1000.0]
+    monkeypatch.setattr(inv_mod, "_now", lambda: now[0])
+
+    schedule = inv_mod._SCOPE_RETRY_SCHEDULE_S
+    assert await inv_mod._get_scope_args() == []
+    for step, wait in enumerate(schedule, start=1):
+        # Just before this step elapses, still cooling down.
+        now[0] += wait - 1
+        assert await inv_mod._get_scope_args() == []
+        assert len(calls) == step, f"re-probed early at step {step}"
+        now[0] += 2
+        assert await inv_mod._get_scope_args() == []
+        assert len(calls) == step + 1, f"failed to re-probe at step {step}"
+
+    # The last interval is the cap — it must not keep growing past the table.
+    assert schedule[-1] == max(schedule)
+
+    # BEYOND the table: failures now outnumber the schedule, so the index has
+    # to CLAMP rather than walk off the end. Asserting the constant above only
+    # says the table is sorted; this exercises the clamp itself — an unclamped
+    # index raises IndexError inside the cooldown check, and a clamp to the
+    # WRONG end (first entry) would re-probe after 300s instead of the 3600s
+    # cap, restoring the 288-warnings-a-day behaviour the schedule prevents.
+    now[0] += schedule[0] + 1
+    assert await inv_mod._get_scope_args() == []
+    assert len(calls) == len(schedule) + 1, (
+        "re-probed one short-interval after the cap — the backoff index clamped "
+        "to the wrong end of the schedule"
+    )
+    now[0] += schedule[-1] - schedule[0] + 1
+    assert await inv_mod._get_scope_args() == []
+    assert len(calls) == len(schedule) + 2, "never re-probed past the capped interval"
+
+
+@pytest.mark.asyncio
+async def test_only_the_first_probe_failure_warns(monkeypatch):
+    """Announce once, then demote — otherwise the retry turns a one-line
+    degradation notice into 288 warnings a day."""
+    import genesis.cc.invoker as inv_mod
+
+    _stub_probe(monkeypatch, [1, 1])
+    now = [1000.0]
+    monkeypatch.setattr(inv_mod, "_now", lambda: now[0])
+    announced: list[bool] = []
+    real_build = inv_mod._build_scope_args
+    monkeypatch.setattr(
+        inv_mod,
+        "_build_scope_args",
+        lambda announce=True: (announced.append(announce), real_build(announce))[1],
+    )
+
+    await inv_mod._get_scope_args()
+    now[0] += inv_mod._SCOPE_RETRY_SCHEDULE_S[0] + 1
+    await inv_mod._get_scope_args()
+    assert announced == [True, False], announced
+
+
+@pytest.mark.asyncio
+async def test_concurrent_dispatches_share_one_probe(monkeypatch):
+    """Single-flight: N dispatches during startup must not spawn N probes."""
+    import genesis.cc.invoker as inv_mod
+
+    calls = _stub_probe(monkeypatch, [0])
+    monkeypatch.setattr(inv_mod, "_now", lambda: 1000.0)
+
+    results = await asyncio.gather(*(inv_mod._get_scope_args() for _ in range(5)))
+    assert len(calls) == 1, f"{len(calls)} probes for 5 concurrent dispatches"
+    assert all("MemoryMax=75%" in r for r in results)
+
+
+@pytest.mark.asyncio
+async def test_scope_probe_success_is_cached_for_the_process_lifetime(monkeypatch):
+    """The other direction: a working user manager must not be re-probed."""
+    import genesis.cc.invoker as inv_mod
+
+    calls = _stub_probe(monkeypatch, [0])
+    monkeypatch.setattr(inv_mod, "_now", lambda: 1e9)
+
+    first = await inv_mod._get_scope_args()
+    assert "MemoryMax=75%" in first
+    for _ in range(3):
+        assert await inv_mod._get_scope_args() == first
+    assert len(calls) == 1, "re-probed despite a cached success"
 
 
 def test_build_env_applies_env_overrides_last(invoker):
