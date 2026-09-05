@@ -37,24 +37,14 @@ class CCBudgetTracker:
         self._threshold = throttle_threshold_pct
         self._clock = clock or (lambda: datetime.now(UTC))
 
-    async def record_session_start(self, session_type: str, priority: int) -> None:
-        """Record that a CC session was started (writes to cc_sessions)."""
-        import uuid
-
-        now = self._clock().isoformat()
-        try:
-            await self._db.execute(
-                """INSERT INTO cc_sessions
-                   (id, session_type, model, started_at, last_activity_at, status, source_tag)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (str(uuid.uuid4()), session_type, "sonnet", now, now, "active", f"priority_{priority}"),
-            )
-            await self._db.commit()
-        except Exception:
-            logger.error(
-                "CC budget record FAILED: session_type=%s priority=%d",
-                session_type, priority, exc_info=True,
-            )
+    # record_session_start was DELETED (2026-09-04): a fourth, raw-SQL
+    # creation path into cc_sessions with a hardcoded model and no closer —
+    # its rows (source_tag='priority_<n>') stayed 'active' forever. Its only
+    # caller was its own test. _count_recent_sessions below counts rows the
+    # REAL creation paths write (SessionManager, registration, adoption), so
+    # the budget needs no private recorder. Legacy priority_* rows on
+    # existing installs remain excluded from extraction by the
+    # _EXCLUDED_SOURCE_TAG_PREFIXES classification.
 
     async def _count_recent_sessions(self) -> int:
         """Count sessions started in the last hour (active or completed).

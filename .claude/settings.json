@@ -24,6 +24,15 @@
                 "hooks": [
                     {
                         "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/register_cc_session.py",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook check_stale_pending.py",
                         "timeout": 30
                     }

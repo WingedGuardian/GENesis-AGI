@@ -489,6 +489,10 @@ async def test_settings_tools_registered():
 class TestValidateCcForegroundReaper:
     def test_valid_changes(self):
         assert _validate_cc_foreground_reaper({"mode": "notify", "idle_hours": 12}) == []
+        assert _validate_cc_foreground_reaper(
+            {"close_dead": False, "dead_process_minutes": 45}
+        ) == []
+        assert _validate_cc_foreground_reaper({"close_dead": "yes"}) != []
 
     def test_invalid_mode(self):
         errs = _validate_cc_foreground_reaper({"mode": "notfy"})

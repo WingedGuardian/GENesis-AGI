@@ -259,3 +259,177 @@ async def test_notify_delivery_failure_preserves_alert(db, monkeypatch):
     cur = await db.execute("SELECT priority FROM observations WHERE type='dark_foreground_session'")
     rows = await cur.fetchall()
     assert len(rows) == 1 and rows[0][0] == "high"  # eligibility-driven, survives failure
+
+
+# ── Evidence-based reaping (2026-09-04: the 6.5h ghost) ───────────────────
+# A fresh heartbeat is ALIVE-proof (skip, both paths); a dead pid on a
+# terminal-registered row is DEATH-proof (checkpoint after
+# dead_process_minutes, not 24h). Heartbeat ABSENCE proves nothing.
+
+FRESH_HB = "2026-07-22T11:55:00+00:00"  # 5 min before NOW → fresh
+IDLE_40M = "2026-07-22T11:20:00+00:00"  # 40 min before NOW
+
+
+async def _seed_terminal(db, *, sid="term-1", last_activity=IDLE_40M, pid=4242):
+    await cc_sessions.register_from_filesystem(
+        db, id=sid, cc_session_id=sid, started_at=last_activity, status="active",
+    )
+    await db.execute(
+        "UPDATE cc_sessions SET last_activity_at = ? WHERE id = ?",
+        (last_activity, sid),
+    )
+    await db.commit()
+    await cc_sessions.set_pid(db, sid, pid=pid)
+
+
+async def _hb(db, cc_sid, updated_at):
+    await db.execute(
+        "INSERT INTO session_heartbeats (cc_session_id, updated_at) VALUES (?, ?)",
+        (cc_sid, updated_at),
+    )
+    await db.commit()
+
+
+async def test_fresh_heartbeat_blocks_24h_reap(db, monkeypatch):
+    """A 60h-idle row with a 5-minute-old heartbeat is ALIVE — the old
+    pure-timestamp path would have checkpointed it."""
+    await _seed(db, last_activity=OLD)
+    await _hb(db, "cc-s1", FRESH_HB)
+    _patch_tail(monkeypatch, [])
+    res = await fr.reap_dark_foreground(_rt(db), now=NOW, idle_hours=24, mode="observe")
+    row = await cc_sessions.get_by_id(db, "s1")
+    assert row["status"] == "active"
+    assert res["reaped"] == 0
+
+
+async def test_dead_pid_fast_path_checkpoints(db, monkeypatch):
+    """Acceptance bar — the ghost shape: terminal row, 40 min idle, pid
+    provably dead → checkpointed NOW, not 24h later."""
+    await _seed_terminal(db)
+    _patch_tail(monkeypatch, [])
+    monkeypatch.setattr(fr, "_pid_dead", lambda pid, row: True)
+    res = await fr.reap_dark_foreground(_rt(db), now=NOW, idle_hours=24, mode="observe")
+    row = await cc_sessions.get_by_id(db, "term-1")
+    assert row["status"] == "checkpointed"
+    assert row["checkpointed_at"] is not None
+    assert res["reaped"] == 1
+
+
+async def test_alive_pid_untouched_by_fast_path(db, monkeypatch):
+    await _seed_terminal(db)
+    _patch_tail(monkeypatch, [])
+    monkeypatch.setattr(fr, "_pid_dead", lambda pid, row: False)
+    res = await fr.reap_dark_foreground(_rt(db), now=NOW, idle_hours=24, mode="observe")
+    row = await cc_sessions.get_by_id(db, "term-1")
+    assert row["status"] == "active"
+    assert res["reaped"] == 0
+
+
+async def test_dead_pid_with_fresh_heartbeat_stays(db, monkeypatch):
+    """Alive-proof outranks death evidence: a fresh heartbeat means the
+    session IS running (pid evidence may be stale — recycled row pid)."""
+    await _seed_terminal(db)
+    await _hb(db, "term-1", FRESH_HB)
+    _patch_tail(monkeypatch, [])
+    monkeypatch.setattr(fr, "_pid_dead", lambda pid, row: True)
+    await fr.reap_dark_foreground(_rt(db), now=NOW, idle_hours=24, mode="observe")
+    row = await cc_sessions.get_by_id(db, "term-1")
+    assert row["status"] == "active"
+
+
+async def test_close_dead_lever_disables_fast_path(db, monkeypatch):
+    await _seed_terminal(db)
+    _patch_tail(monkeypatch, [])
+    monkeypatch.setattr(fr, "_pid_dead", lambda pid, row: True)
+    base_cfg = fr.load_config()
+    monkeypatch.setattr(fr, "load_config", lambda: {**base_cfg, "close_dead": False})
+    res = await fr.reap_dark_foreground(_rt(db), now=NOW, idle_hours=24, mode="observe")
+    row = await cc_sessions.get_by_id(db, "term-1")
+    assert row["status"] == "active"
+    assert res["reaped"] == 0
+
+
+class TestPidDead:
+    def _row(self, started="2026-07-22T00:00:00+00:00", last=None):
+        return {"started_at": started, "last_activity_at": last or started}
+
+    def test_missing_proc_is_dead(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(fr, "_PROC_ROOT", str(tmp_path))
+        assert fr._pid_dead(424242, self._row()) is True
+
+    def test_wrong_comm_is_dead(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(fr, "_PROC_ROOT", str(tmp_path))
+        d = tmp_path / "4242"
+        d.mkdir()
+        (d / "comm").write_text("python3\n")
+        assert fr._pid_dead(4242, self._row()) is True
+
+    def test_recycled_pid_is_dead(self, tmp_path, monkeypatch):
+        """Same pid, but the process started AFTER the row's newest
+        liveness stamp — a recycle."""
+        monkeypatch.setattr(fr, "_PROC_ROOT", str(tmp_path))
+        d = tmp_path / "4242"
+        d.mkdir()
+        (d / "comm").write_text("claude\n")
+        monkeypatch.setattr(
+            fr, "read_proc_start_iso", lambda pid: "2026-07-22T11:00:00+00:00"
+        )
+        assert fr._pid_dead(
+            4242, self._row(last="2026-07-22T10:00:00+00:00")
+        ) is True
+
+    def test_resumed_session_is_alive(self, tmp_path, monkeypatch):
+        """The audit's false-death case: --resume reopens the row with a NEW
+        pid in the same write that stamps last_activity_at, so the process
+        starts after started_at but BEFORE the anchor — alive, not
+        recycled. Anchoring to started_at alone read every resumed session
+        as dead after 30 idle minutes."""
+        monkeypatch.setattr(fr, "_PROC_ROOT", str(tmp_path))
+        d = tmp_path / "4242"
+        d.mkdir()
+        (d / "comm").write_text("claude\n")
+        monkeypatch.setattr(
+            fr, "read_proc_start_iso", lambda pid: "2026-07-22T11:00:00+00:00"
+        )
+        assert fr._pid_dead(
+            4242,
+            self._row(
+                started="2026-07-22T00:00:00+00:00",
+                last="2026-07-22T11:00:05+00:00",
+            ),
+        ) is False
+
+    def test_unreadable_proc_entry_is_alive(self, tmp_path, monkeypatch):
+        """EACCES-style unreadability is 'cannot see', never death proof
+        (audit SF-2): only a MISSING pid is positive evidence."""
+        import genesis.cc.foreground_reaper as _fr
+
+        monkeypatch.setattr(_fr, "_PROC_ROOT", str(tmp_path))
+        d = tmp_path / "4242"
+        d.mkdir()
+        comm = d / "comm"
+        comm.write_text("claude\n")
+        comm.chmod(0o000)
+        try:
+            assert _fr._pid_dead(4242, self._row()) is False
+        finally:
+            comm.chmod(0o644)
+
+    def test_unreadable_start_is_alive(self, tmp_path, monkeypatch):
+        """Fail-open: unknown start time never flags."""
+        monkeypatch.setattr(fr, "_PROC_ROOT", str(tmp_path))
+        d = tmp_path / "4242"
+        d.mkdir()
+        (d / "comm").write_text("claude\n")
+        monkeypatch.setattr(fr, "read_proc_start_iso", lambda pid: None)
+        assert fr._pid_dead(4242, self._row()) is False
+
+    def test_live_matching_claude_is_alive(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(fr, "_PROC_ROOT", str(tmp_path))
+        d = tmp_path / "4242"
+        d.mkdir()
+        (d / "comm").write_text("claude\n")
+        monkeypatch.setattr(
+            fr, "read_proc_start_iso", lambda pid: "2026-07-21T23:00:00+00:00"
+        )
+        assert fr._pid_dead(4242, self._row()) is False

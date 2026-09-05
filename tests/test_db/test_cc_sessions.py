@@ -276,3 +276,130 @@ async def test_checkpoint_dark_and_race_guard(db, sess_fields):
         db, "sess-1", checkpointed_at="2026-07-22T13:00:00+00:00"
     )
     assert again is False
+
+
+# ── Terminal-timestamp discipline (update_status as the single writer) ────
+# Origin (measured 2026-09-04): completed_at had ZERO writers — 0 of 4556
+# live rows ever carried one — because update_status wrote status alone and
+# it is the sole status writer for complete/fail/expire.
+
+
+async def test_update_status_terminal_stamps_completed_at(db, sess_fields):
+    await cc_sessions.create(db, **sess_fields)
+    for status in ("completed", "failed", "expired"):
+        await cc_sessions.update_status(
+            db, "sess-1", status=status, ts="2026-03-07T09:00:00"
+        )
+        row = await cc_sessions.get_by_id(db, "sess-1")
+        assert row["status"] == status
+        assert row["completed_at"] == "2026-03-07T09:00:00", status
+
+
+async def test_update_status_checkpoint_stamps_checkpointed_at(db, sess_fields):
+    """SessionManager.checkpoint inherited the same omission — only the
+    reaper's checkpoint_dark ever stamped checkpointed_at."""
+    await cc_sessions.create(db, **sess_fields)
+    await cc_sessions.update_status(
+        db, "sess-1", status="checkpointed", ts="2026-03-07T09:00:00"
+    )
+    row = await cc_sessions.get_by_id(db, "sess-1")
+    assert row["checkpointed_at"] == "2026-03-07T09:00:00"
+    assert row["completed_at"] is None
+
+
+async def test_update_status_reopen_clears_completed_at(db, sess_fields):
+    """A row flipped back to active must not keep a terminal timestamp —
+    the pair (status='active', completed_at=<set>) is a lie in both
+    directions. checkpointed_at stays as history, documented."""
+    await cc_sessions.create(db, **sess_fields)
+    await cc_sessions.update_status(
+        db, "sess-1", status="completed", ts="2026-03-07T09:00:00"
+    )
+    await cc_sessions.update_status(db, "sess-1", status="active")
+    row = await cc_sessions.get_by_id(db, "sess-1")
+    assert row["completed_at"] is None
+
+
+async def test_update_status_default_ts_is_utc_now(db, sess_fields):
+    await cc_sessions.create(db, **sess_fields)
+    await cc_sessions.update_status(db, "sess-1", status="completed")
+    row = await cc_sessions.get_by_id(db, "sess-1")
+    assert row["completed_at"] is not None
+
+
+# ── Honest filesystem adoption ────────────────────────────────────────────
+
+
+async def test_register_from_filesystem_active_when_alive(db):
+    """A live terminal session must adopt as ACTIVE — the measured lie was
+    a 4-second-old session carrying status='completed'."""
+    inserted = await cc_sessions.register_from_filesystem(
+        db,
+        id="cc-live",
+        cc_session_id="cc-live",
+        started_at="2026-03-07T08:00:00",
+        status="active",
+    )
+    assert inserted
+    row = await cc_sessions.get_by_id(db, "cc-live")
+    assert row["status"] == "active"
+    assert row["completed_at"] is None
+
+
+async def test_register_from_filesystem_dead_stamps_completed_at(db):
+    inserted = await cc_sessions.register_from_filesystem(
+        db,
+        id="cc-dead",
+        cc_session_id="cc-dead",
+        started_at="2026-03-07T08:00:00",
+        status="completed",
+        completed_at="2026-03-07T08:30:00",
+    )
+    assert inserted
+    row = await cc_sessions.get_by_id(db, "cc-dead")
+    assert row["status"] == "completed"
+    assert row["completed_at"] == "2026-03-07T08:30:00"
+
+
+# ── Dead-candidate query (pid-evidence fast path) ─────────────────────────
+
+
+async def test_query_dead_candidate_foreground(db, sess_fields):
+    """Terminal-registered rows only: pid set AND id == cc_session_id;
+    channel rows (uuid4 id ≠ cc uuid) and voice rows excluded."""
+    # Terminal-registered, idle, pid known → candidate.
+    await cc_sessions.register_from_filesystem(
+        db, id="term-1", cc_session_id="term-1",
+        started_at="2026-03-07T00:00:00", status="active",
+    )
+    await cc_sessions.set_pid(db, "term-1", pid=4242)
+    # Channel row: pid set but id != cc_session_id → never a candidate.
+    ch = dict(sess_fields, id="chan-1", started_at="2026-03-07T00:00:00",
+              last_activity_at="2026-03-07T00:00:00")
+    await cc_sessions.create(db, **ch)
+    await cc_sessions.update_cc_session_id(db, "chan-1", cc_session_id="other-uuid")
+    await cc_sessions.set_pid(db, "chan-1", pid=4243)
+    # Voice row: id == cc_session_id but excluded by tag.
+    await cc_sessions.register_voice_session(
+        db, id="voice-1", started_at="2026-03-07T00:00:00",
+    )
+    await cc_sessions.set_pid(db, "voice-1", pid=4244)
+
+    rows = await cc_sessions.query_dead_candidate_foreground(
+        db, older_than="2026-03-07T01:00:00"
+    )
+    assert [r["id"] for r in rows] == ["term-1"]
+    assert rows[0]["pid"] == 4242
+
+
+async def test_voice_orphan_sweep_stamps_completed_at(db):
+    await cc_sessions.register_voice_session(
+        db, id="voice-2", started_at="2026-03-07T00:00:00",
+    )
+    n = await cc_sessions.complete_orphaned_voice_sessions(
+        db, idle_before="2026-03-07T01:00:00"
+    )
+    assert n == 1
+    row = await cc_sessions.get_by_id(db, "voice-2")
+    assert row["status"] == "completed"
+    assert row["completed_at"] is not None
