@@ -386,6 +386,18 @@ async def run_reconcile(
             if i % _SWEEP_COMMIT_EVERY == 0:
                 await db.commit()
         await db.commit()
+        if deleted:
+            # This sweep deletes memory_links rows directly (no CRUD), and this
+            # module previously contained zero invalidations — the cached graph
+            # kept ghost edges until an unrelated write refreshed it. The other
+            # of the two known invalidation gaps (issue #1641). Once per sweep,
+            # not per row: invalidation is a flag flip, rebuild happens lazily.
+            try:
+                from genesis.memory.graph import invalidate_graph_cache
+
+                invalidate_graph_cache()
+            except ImportError:
+                pass
 
     # ── Repair: mirrors (re-read → requeue for re-embed) ──
     mirrors_requeued = 0
